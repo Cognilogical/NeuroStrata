@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# test-backup.sh — automated coverage for scripts/backup.sh step 4b:
-# the store-state sidecar carry and pair-aware pruning.
+# test-backup.sh — automated coverage for scripts/backup.sh steps 4b/4c:
+# the store-state sidecar carry, the WAL carry on the daemon-inactive
+# path, and pair-aware pruning.
 #
 # Covers:
 #   1. Recorded store (db + <db>.store-state.json present): the backup's
@@ -8,10 +9,16 @@
 #      byte-identical to the source sidecar.
 #   2. Pre-sidecar store (db only): the backup is created with no
 #      companion file.
-#   3. Pair-aware pruning: with NEUROSTRATA_MAX_BACKUPS exceeded, pruned
-#      backups lose their companions with them, surviving backups keep
-#      theirs, and no orphan companion is left behind.
-#   4. Failure contract: a sidecar-only verify failure (step 4b) exits
+#   3. Daemon-inactive store with a WAL (db + sidecar + <db>.wal
+#      present; the harness shim always reports the daemon inactive, so
+#      no checkpoint happened): the backup's companion
+#      db-<timestamp>.wal is created and is byte-identical to the
+#      source WAL, and the db + sidecar companions are as in (1).
+#   4. Pair-aware pruning: with NEUROSTRATA_MAX_BACKUPS exceeded, pruned
+#      backups lose their sidecar and WAL companions with them,
+#      surviving backups keep theirs, and no orphan companion is left
+#      behind.
+#   5. Failure contract: a sidecar-only verify failure (step 4b) exits
 #      non-zero, deletes BOTH the backup db and its companion, and
 #      leaves the source db and source sidecar byte-untouched.
 #
@@ -79,7 +86,7 @@ run_backup() {
 
 # run_backup_path <extra_path_dir> <config> <backup_dir> <max_backups>:
 # like run_backup, with one extra directory prepended to PATH (scenario
-# 4's corrupting cp shim); returns backup.sh's exit code.
+# 5's corrupting cp shim); returns backup.sh's exit code.
 run_backup_path() {
     local extra_path="$1" config="$2" backup_dir="$3" max_backups="$4" rc=0
     env PATH="$extra_path:$SHIM_DIR:$PATH" \
@@ -91,27 +98,32 @@ run_backup_path() {
     return "$rc"
 }
 
-# make_store <dir> <with_sidecar:0|1>: fixture db (+ sidecar) and a
-# config.json pointing at it. Prints the config path.
+# make_store <dir> <with_sidecar:0|1> [with_wal:0|1]: fixture db
+# (+ sidecar) (+ WAL) and a config.json pointing at it. Prints the
+# config path.
 make_store() {
-    local dir="$1" with_sidecar="$2"
+    local dir="$1" with_sidecar="$2" with_wal="${3:-0}"
     mkdir -p "$dir"
     printf 'fixture-db-bytes-%s\n' "$dir" > "$dir/store.db"
     if [ "$with_sidecar" = "1" ]; then
         printf '{"embedding_model":"fixture-model","dimension":4}\n' \
             > "$dir/store.db.store-state.json"
     fi
+    if [ "$with_wal" = "1" ]; then
+        printf 'fixture-wal-bytes-%s\n' "$dir" > "$dir/store.db.wal"
+    fi
     printf '{"db_path": "%s/store.db"}\n' "$dir" > "$dir/config.json"
     printf '%s/config.json' "$dir"
 }
 
-# count_backups <dir>: db-* files excluding sidecar companions.
+# count_backups <dir>: db-* files excluding sidecar and WAL companions.
 count_backups() {
     local dir="$1" f n=0
     shopt -s nullglob
     for f in "$dir"/db-*; do
         case "$f" in
             *.store-state.json) ;;
+            *.wal) ;;
             *) n=$((n + 1)) ;;
         esac
     done
@@ -135,6 +147,7 @@ only_backup() {
     for f in "$dir"/db-*; do
         case "$f" in
             *.store-state.json) ;;
+            *.wal) ;;
             *) found="$f" ;;
         esac
     done
@@ -187,61 +200,118 @@ pass "scenario 2: exactly one backup file created"
     || fail "scenario 2: unexpected companion file in backup dir"
 pass "scenario 2: no companion file exists in the backup dir"
 
-# --- Scenario 3: pair-aware pruning ---------------------------------------
-# backup.sh selects prune victims with `ls -1t` (mtime, newest first),
-# so seeded backups get both old names and old, name-ordered mtimes;
-# seeded names can then never collide with the new run's timestamp.
-echo "== scenario 3: pair-aware pruning (MAX_BACKUPS=2)"
+# --- Scenario 3: daemon-inactive store with a WAL carries it -------------
+# The shim forces the daemon-inactive path, so no checkpoint folded the
+# WAL into the db before the copy: the WAL holds writes the db file
+# alone does not, and the backup must carry it as a .wal companion.
+echo "== scenario 3: daemon-inactive store with WAL (db + sidecar + wal)"
 S3="$WORK/s3"
-CONFIG3="$(make_store "$S3/store" 1)"
-mkdir -p "$S3/backups"
-seed() { # seed <name> <touch-date> <with_companion:0|1>
-    printf 'seeded backup %s\n' "$1" > "$S3/backups/$1"
-    touch -d "$2" "$S3/backups/$1"
-    if [ "$3" = "1" ]; then
-        printf '{"seeded":true}\n' > "$S3/backups/$1.store-state.json"
-        touch -d "$2" "$S3/backups/$1.store-state.json"
-    fi
-}
-seed db-20000101-000001 "2000-01-01 00:00:01" 1
-seed db-20000102-000002 "2000-01-02 00:00:02" 1
-seed db-20000103-000003 "2000-01-03 00:00:03" 0
-seed db-20000104-000004 "2000-01-04 00:00:04" 1
-
-if ! run_backup "$CONFIG3" "$S3/backups" 2; then
+CONFIG3="$(make_store "$S3/store" 1 1)"
+if ! run_backup "$CONFIG3" "$S3/backups" 7; then
     cat "$WORK/last-run.log" >&2
     fail "scenario 3: backup.sh exited non-zero (see log above)"
 fi
 pass "scenario 3: backup.sh exits 0"
 
-[ "$(count_backups "$S3/backups")" = "2" ] \
-    || fail "scenario 3: expected 2 non-companion backups after pruning, found $(count_backups "$S3/backups")"
-pass "scenario 3: total non-companion backups == MAX_BACKUPS (2)"
+[ "$(count_backups "$S3/backups")" = "1" ] \
+    || fail "scenario 3: expected exactly 1 backup, found $(count_backups "$S3/backups")"
+pass "scenario 3: exactly one backup file created"
+
+BACKUP3="$(only_backup "$S3/backups")"
+cmp -s "$S3/store/store.db" "$BACKUP3" \
+    || fail "scenario 3: backup bytes differ from fixture db"
+pass "scenario 3: backup is byte-identical to the fixture db"
+
+[ -f "$BACKUP3.wal" ] \
+    || fail "scenario 3: WAL companion $BACKUP3.wal missing"
+pass "scenario 3: WAL companion db-*.wal exists"
+
+cmp -s "$S3/store/store.db.wal" "$BACKUP3.wal" \
+    || fail "scenario 3: WAL companion bytes differ from fixture WAL"
+pass "scenario 3: WAL companion is byte-identical to the fixture WAL"
+
+cmp -s "$S3/store/store.db.store-state.json" "$BACKUP3.store-state.json" \
+    || fail "scenario 3: sidecar companion missing or bytes differ from fixture sidecar"
+pass "scenario 3: sidecar companion exists and is byte-identical to the fixture sidecar"
+
+# --- Scenario 4: pair-aware pruning ---------------------------------------
+# backup.sh selects prune victims with `ls -1t` (mtime, newest first),
+# so seeded backups get both old names and old, name-ordered mtimes;
+# seeded names can then never collide with the new run's timestamp.
+echo "== scenario 4: pair-aware pruning (MAX_BACKUPS=2)"
+S4="$WORK/s4"
+CONFIG4="$(make_store "$S4/store" 1)"
+mkdir -p "$S4/backups"
+seed() { # seed <name> <touch-date> <with_companion:0|1> <with_wal:0|1>
+    printf 'seeded backup %s\n' "$1" > "$S4/backups/$1"
+    touch -d "$2" "$S4/backups/$1"
+    if [ "$3" = "1" ]; then
+        printf '{"seeded":true}\n' > "$S4/backups/$1.store-state.json"
+        touch -d "$2" "$S4/backups/$1.store-state.json"
+    fi
+    if [ "$4" = "1" ]; then
+        printf 'seeded wal %s\n' "$1" > "$S4/backups/$1.wal"
+        touch -d "$2" "$S4/backups/$1.wal"
+    fi
+}
+seed db-20000101-000001 "2000-01-01 00:00:01" 1 1
+seed db-20000102-000002 "2000-01-02 00:00:02" 1 1
+seed db-20000103-000003 "2000-01-03 00:00:03" 0 1
+seed db-20000104-000004 "2000-01-04 00:00:04" 1 1
+
+if ! run_backup "$CONFIG4" "$S4/backups" 2; then
+    cat "$WORK/last-run.log" >&2
+    fail "scenario 4: backup.sh exited non-zero (see log above)"
+fi
+pass "scenario 4: backup.sh exits 0"
+
+[ "$(count_backups "$S4/backups")" = "2" ] \
+    || fail "scenario 4: expected 2 non-companion backups after pruning, found $(count_backups "$S4/backups")"
+pass "scenario 4: total non-companion backups == MAX_BACKUPS (2)"
 
 for pruned in db-20000101-000001 db-20000102-000002 db-20000103-000003; do
-    [ ! -e "$S3/backups/$pruned" ] \
-        || fail "scenario 3: backup $pruned should have been pruned"
-    [ ! -e "$S3/backups/$pruned.store-state.json" ] \
-        || fail "scenario 3: pruned backup $pruned left its companion behind"
+    [ ! -e "$S4/backups/$pruned" ] \
+        || fail "scenario 4: backup $pruned should have been pruned"
+    [ ! -e "$S4/backups/$pruned.store-state.json" ] \
+        || fail "scenario 4: pruned backup $pruned left its companion behind"
 done
-pass "scenario 3: pruned backups and their companions are gone"
+pass "scenario 4: pruned backups and their companions are gone"
 
-[ -f "$S3/backups/db-20000104-000004" ] \
-    || fail "scenario 3: newest seeded backup should have survived pruning"
-[ -f "$S3/backups/db-20000104-000004.store-state.json" ] \
-    || fail "scenario 3: surviving backup lost its companion"
-pass "scenario 3: surviving seeded backup keeps its companion"
+for pruned in db-20000101-000001 db-20000102-000002 db-20000103-000003; do
+    [ ! -e "$S4/backups/$pruned.wal" ] \
+        || fail "scenario 4: pruned backup $pruned left its WAL companion behind"
+done
+pass "scenario 4: pruned backups' WAL companions are gone"
+
+[ -f "$S4/backups/db-20000104-000004" ] \
+    || fail "scenario 4: newest seeded backup should have survived pruning"
+[ -f "$S4/backups/db-20000104-000004.store-state.json" ] \
+    || fail "scenario 4: surviving backup lost its companion"
+pass "scenario 4: surviving seeded backup keeps its companion"
+
+[ -f "$S4/backups/db-20000104-000004.wal" ] \
+    || fail "scenario 4: surviving backup lost its WAL companion"
+pass "scenario 4: surviving seeded backup keeps its WAL companion"
 
 shopt -s nullglob
-for companion in "$S3/backups"/*.store-state.json; do
+for companion in "$S4/backups"/*.store-state.json; do
     partner="${companion%.store-state.json}"
     [ -f "$partner" ] \
-        || fail "scenario 3: orphan companion $companion has no db-* partner"
+        || fail "scenario 4: orphan companion $companion has no db-* partner"
 done
 shopt -u nullglob
-pass "scenario 3: no orphan companion exists"
+pass "scenario 4: no orphan companion exists"
 
-# --- Scenario 4: sidecar failure contract (step 4b) -----------------------
+shopt -s nullglob
+for wal_companion in "$S4/backups"/*.wal; do
+    partner="${wal_companion%.wal}"
+    [ -f "$partner" ] \
+        || fail "scenario 4: orphan WAL companion $wal_companion has no db-* partner"
+done
+shopt -u nullglob
+pass "scenario 4: no orphan WAL companion exists"
+
+# --- Scenario 5: sidecar failure contract (step 4b) -----------------------
 # A cp shim corrupts ONLY the companion copy: it delegates to the real
 # cp, then appends a byte when the destination is a *.store-state.json
 # path. The db copy passes through uncorrupted, so backup.sh clears
@@ -249,11 +319,11 @@ pass "scenario 3: no orphan companion exists"
 # md5 mismatch must delete BOTH copies and exit non-zero. (Shimming cp,
 # not md5sum: the mismatch is then genuine — real bytes checked by the
 # real md5sum — instead of a lying verifier.)
-echo "== scenario 4: sidecar verify failure deletes both copies"
-S4="$WORK/s4"
-CONFIG4="$(make_store "$S4/store" 1)"
-cp -p "$S4/store/store.db" "$S4/expected.db"
-cp -p "$S4/store/store.db.store-state.json" "$S4/expected.sidecar"
+echo "== scenario 5: sidecar verify failure deletes both copies"
+S5="$WORK/s5"
+CONFIG5="$(make_store "$S5/store" 1)"
+cp -p "$S5/store/store.db" "$S5/expected.db"
+cp -p "$S5/store/store.db.store-state.json" "$S5/expected.sidecar"
 
 CP_SHIM_DIR="$WORK/cp-shim"
 mkdir -p "$CP_SHIM_DIR"
@@ -279,26 +349,26 @@ esac
 EOF
 chmod +x "$CP_SHIM_DIR/cp"
 
-if run_backup_path "$CP_SHIM_DIR" "$CONFIG4" "$S4/backups" 7; then
+if run_backup_path "$CP_SHIM_DIR" "$CONFIG5" "$S5/backups" 7; then
     cat "$WORK/last-run.log" >&2
-    fail "scenario 4: backup.sh exited 0 on a sidecar verify failure (see log above)"
+    fail "scenario 5: backup.sh exited 0 on a sidecar verify failure (see log above)"
 fi
-pass "scenario 4: backup.sh exits non-zero on sidecar verify failure"
+pass "scenario 5: backup.sh exits non-zero on sidecar verify failure"
 
-[ "$(count_backups "$S4/backups")" = "0" ] \
-    || fail "scenario 4: backup db file survived a sidecar verify failure"
-pass "scenario 4: backup db file is deleted on sidecar verify failure"
+[ "$(count_backups "$S5/backups")" = "0" ] \
+    || fail "scenario 5: backup db file survived a sidecar verify failure"
+pass "scenario 5: backup db file is deleted on sidecar verify failure"
 
-[ "$(count_companions "$S4/backups")" = "0" ] \
-    || fail "scenario 4: companion file survived a sidecar verify failure"
-pass "scenario 4: companion file is deleted on sidecar verify failure"
+[ "$(count_companions "$S5/backups")" = "0" ] \
+    || fail "scenario 5: companion file survived a sidecar verify failure"
+pass "scenario 5: companion file is deleted on sidecar verify failure"
 
-cmp -s "$S4/expected.db" "$S4/store/store.db" \
-    || fail "scenario 4: source db bytes changed"
-pass "scenario 4: source db is byte-untouched"
+cmp -s "$S5/expected.db" "$S5/store/store.db" \
+    || fail "scenario 5: source db bytes changed"
+pass "scenario 5: source db is byte-untouched"
 
-cmp -s "$S4/expected.sidecar" "$S4/store/store.db.store-state.json" \
-    || fail "scenario 4: source sidecar bytes changed"
-pass "scenario 4: source sidecar is byte-untouched"
+cmp -s "$S5/expected.sidecar" "$S5/store/store.db.store-state.json" \
+    || fail "scenario 5: source sidecar bytes changed"
+pass "scenario 5: source sidecar is byte-untouched"
 
-echo "PASS: all $CHECKS checks passed (backup sidecar carry + pair-aware pruning + sidecar failure contract)"
+echo "PASS: all $CHECKS checks passed (backup sidecar + WAL carry + pair-aware pruning + sidecar failure contract)"
