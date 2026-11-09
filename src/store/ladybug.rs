@@ -3984,6 +3984,106 @@ impl LadybugStore {
     }
 }
 
+/// Reconcile the physical width of `Memory.embedding` with the width
+/// this process serves, on a store the caller has already armed for
+/// reconciliation (recorded pristine, or fresh and unrecorded — see
+/// `VectorStore::init`). The physical width is read from the engine
+/// catalog (`CALL table_info('Memory')` — rows of
+/// (id, name, type, default, primary key); the embedding row's type is
+/// rendered `FLOAT[n]`), never inferred from the sidecar: the engine
+/// is the only witness that can attest both the column's width and
+/// the table's row count. A width mismatch is reconciled only when
+/// the engine attests the table is empty, by dropping `Memory` and
+/// its five rel tables and recreating them from the caller's DDL
+/// strings (the rel tables go first: they reference `Memory`). The
+/// narrower alternative — `ALTER TABLE Memory DROP embedding` plus
+/// `ALTER TABLE … ADD embedding FLOAT[n]` — was spiked first and
+/// rejected on evidence: the DDL succeeds, but the engine then
+/// segfaults on the production MERGE upsert against the re-added
+/// column, so the recreated table (fresh, contiguous property ids)
+/// is the mechanism the spike proved. A pristine-labelled table that
+/// is not empty is the stale-label residual class: the open is
+/// refused with a plain error naming the inconsistency, and nothing
+/// is altered. An unparseable or missing physical width is likewise
+/// an error — fail closed, never a guess.
+fn reconcile_pristine_embedding_width(
+    conn: &Connection,
+    dimensions: usize,
+    create_node_table: &str,
+    create_rel_tables: &[&str],
+) -> Result<()> {
+    let mut physical: Option<usize> = None;
+    for row in conn.query("CALL table_info('Memory') RETURN *")? {
+        let name = match row.get(1) {
+            Some(lbug::Value::String(s)) => s.as_str(),
+            _ => continue,
+        };
+        if name != "embedding" {
+            continue;
+        }
+        let ty = match row.get(2) {
+            Some(lbug::Value::String(s)) => s.clone(),
+            other => {
+                anyhow::bail!(
+                    "cannot reconcile the embedding width: the Memory table's embedding property has an unreadable catalog type ({other:?})"
+                )
+            }
+        };
+        physical = Some(
+            ty.strip_prefix("FLOAT[")
+                .and_then(|rest| rest.strip_suffix(']'))
+                .and_then(|digits| digits.parse::<usize>().ok())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "cannot reconcile the embedding width: the Memory table's embedding property type '{ty}' is not a FLOAT[width] column"
+                    )
+                })?,
+        );
+    }
+    let physical = physical.ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot reconcile the embedding width: the Memory table has no embedding property in the engine catalog"
+        )
+    })?;
+    if physical == dimensions {
+        return Ok(());
+    }
+
+    let mut count_rows = conn.query("MATCH (m:Memory) RETURN count(m)")?;
+    let rows = match count_rows.next() {
+        Some(row) => match row.get(0) {
+            Some(lbug::Value::Int64(n)) => *n,
+            other => {
+                anyhow::bail!(
+                    "cannot reconcile the embedding width: the Memory row count came back unreadable ({other:?})"
+                )
+            }
+        },
+        None => {
+            anyhow::bail!(
+                "cannot reconcile the embedding width: the Memory row count query returned no rows"
+            )
+        }
+    };
+    if rows > 0 {
+        anyhow::bail!(
+            "refusing to reconcile the embedding width of a store recorded as pristine: the Memory table already holds {rows} row(s), its embedding column is FLOAT[{physical}], and this process serves FLOAT[{dimensions}]; the recorded pristine state is inconsistent with the table's contents, so the store is left unchanged — open it under its recorded model, or investigate the stale store-state sidecar"
+        );
+    }
+
+    // The table is engine-attested empty, and a pristine store's rel
+    // tables are empty by construction (edges require Memory nodes),
+    // so dropping and recreating loses nothing.
+    for table in ["RELATES_TO", "CONTAINS", "GOVERNS", "EXTRACTED_FROM", "DEPENDS_ON", "Memory"] {
+        conn.query(&format!("DROP TABLE {table}"))?;
+    }
+    conn.query(create_node_table)?;
+    for ddl in create_rel_tables {
+        conn.query(ddl)?;
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl VectorStore for LadybugStore {
     async fn init(&self, namespace: &str) -> Result<()> {
@@ -4009,6 +4109,17 @@ impl VectorStore for LadybugStore {
         }
 
         let dimensions = self.dimensions;
+        // Width reconciliation is armed only for stores the identity
+        // system manages as pristine: recorded pristine, or fresh and
+        // not yet recorded. A data-bearing store's mismatched open is
+        // already refused above, and a pre-sidecar (LockedUnknown)
+        // store keeps today's behavior exactly — its width backstop
+        // stays at the engine, at vector use.
+        let reconcile_width = match self.cached_store_state() {
+            CachedStoreState::Recorded(recorded) => !recorded.has_data,
+            CachedStoreState::FreshUnrecorded => true,
+            CachedStoreState::LockedUnknown => false,
+        };
         // Use write_with_deadline so the write lock is held INSIDE the
         // spawn_blocking closure (see R5). Holding an async lock across
         // with_conn releases it on timeout while the C++ call is still running.
@@ -4035,12 +4146,26 @@ impl VectorStore for LadybugStore {
 
             // F7: dependency edges (directed).
             let create_depends_table = "CREATE REL TABLE DEPENDS_ON (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING, origin STRING)";
-            for ddl in [create_rel_table, create_contains_table, create_governs_table, create_extracted_table, create_depends_table] {
+            let create_rel_tables = [create_rel_table, create_contains_table, create_governs_table, create_extracted_table, create_depends_table];
+            for ddl in create_rel_tables {
                 if let Err(e) = conn.query(ddl) {
                     if !e.to_string().contains("already exists") {
                         return Err(e.into());
                     }
                 }
+            }
+
+            // Reconcile the pristine store's physical vector width
+            // with the serving width before the sidecar maintenance
+            // after this closure can adopt the serving descriptor: a
+            // descriptor is never adopted over an unreconciled schema.
+            if reconcile_width {
+                reconcile_pristine_embedding_width(
+                    conn,
+                    dimensions,
+                    &create_node_table,
+                    &create_rel_tables,
+                )?;
             }
 
             // RDF projection (Phase 1): idempotent migration for DBs created before
@@ -15670,6 +15795,166 @@ eurostrata\src\daemon.rs",
             "a pre-sidecar width failure is not the identity refusal: {err}"
         );
         assert!(restart_to_apply_message(&err).is_none(), "{err}");
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn pristine_store_reconciles_width_on_different_width_adoption() {
+        // A pristine store created under the default-width model
+        // adopts a different-width pick end-to-end: init reconciles
+        // the physical FLOAT column to the serving width (the engine
+        // attests the table is empty) before the descriptor is
+        // adopted, so the first write under the pick lands.
+        let previous = without_model_env();
+        let fx = store_state_fixture("fwidth-reconcile", "NomicEmbedTextV15");
+        std::fs::write(
+            fx.config_dir.join("embedders.json"),
+            "[{\"model_name\":\"NomicEmbedTextV15\",\"dimensions\":768}]",
+        )
+        .expect("write 768 fixture config");
+        let creator = LadybugStore::for_testing(&fx.db, 768)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_dims("NomicEmbedTextV15", 768)));
+        creator.init("probe").await.expect("init");
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["has_data"], json!(false));
+        assert_eq!(sidecar["descriptor"]["model"], json!("NomicEmbedTextV15"));
+        assert_eq!(sidecar["descriptor"]["dims"], json!(768));
+        drop(creator);
+
+        std::fs::write(
+            fx.config_dir.join("embedders.json"),
+            "[{\"model_name\":\"BGESmallENV15Q\",\"dimensions\":384}]",
+        )
+        .expect("write 384 fixture config");
+        let store = LadybugStore::for_testing(&fx.db, 384)
+            .expect("reopen temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_dims("BGESmallENV15Q", 384)));
+        store
+            .init("probe")
+            .await
+            .expect("init adopts the different-width pick on a pristine store");
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["has_data"], json!(false));
+        assert_eq!(sidecar["descriptor"]["model"], json!("BGESmallENV15Q"));
+        assert_eq!(sidecar["descriptor"]["dims"], json!(384));
+
+        store
+            .upsert("probe", "m1", vec![0.1; 384], store_state_payload())
+            .await
+            .expect("a 384-wide upsert lands after width reconciliation");
+        let found = store
+            .search("probe", vec![0.1; 384], 5, false, false)
+            .await
+            .expect("search under the reconciled width");
+        assert!(!found.is_empty(), "the reconciled store reads its row back");
+        assert_eq!(read_sidecar(&fx.db)["has_data"], json!(true));
+
+        let err = store
+            .upsert("probe", "m2", vec![0.1; 768], store_state_payload())
+            .await
+            .expect_err("the reconciled FLOAT[384] column rejects a 768-wide vector");
+        assert!(
+            err.to_string().contains("Expected: 384"),
+            "the old width is rejected by the engine at the new width: {err}"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn pristine_labelled_store_with_rows_refuses_width_reconciliation() {
+        // The stale-label state (the F1 residual class): the sidecar
+        // says pristine but the table holds a row. Reconciliation
+        // must refuse the mismatched open with a truthful error and
+        // leave the store byte-untouched — never alter a table the
+        // engine attests is not empty.
+        let previous = without_model_env();
+        let fx = store_state_fixture("fwidth-stale-label", "ModelA");
+        std::fs::write(
+            fx.config_dir.join("embedders.json"),
+            "[{\"model_name\":\"ModelA\",\"dimensions\":768}]",
+        )
+        .expect("write 768 fixture config");
+        let creator = LadybugStore::for_testing(&fx.db, 768)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_dims("ModelA", 768)));
+        creator.init("probe").await.expect("init");
+        creator
+            .upsert("probe", "m1", vec![0.1; 768], store_state_payload())
+            .await
+            .expect("seed upsert");
+        assert_eq!(read_sidecar(&fx.db)["has_data"], json!(true));
+        drop(creator);
+
+        // Hand-rewrite the sidecar to the stale pristine label.
+        crate::model_choice::write_store_state(
+            &fx.db,
+            &crate::model_choice::StoreState {
+                version: crate::model_choice::STORE_STATE_VERSION,
+                has_data: false,
+                descriptor: serving_descriptor_dims("ModelA", 768),
+            },
+        )
+        .expect("rewrite the sidecar to the stale pristine label");
+        let sidecar_before =
+            std::fs::read(crate::model_choice::store_state_path(&fx.db)).expect("read sidecar");
+
+        std::fs::write(
+            fx.config_dir.join("embedders.json"),
+            "[{\"model_name\":\"ModelB\",\"dimensions\":384}]",
+        )
+        .expect("write 384 fixture config");
+        let store = LadybugStore::for_testing(&fx.db, 384)
+            .expect("reopen temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_dims("ModelB", 384)));
+        let err = store
+            .init("probe")
+            .await
+            .expect_err("a pristine-labelled store with rows refuses width reconciliation");
+        let message = err.to_string();
+        assert!(
+            message.contains("pristine") && message.contains("768") && message.contains("384"),
+            "the error names the recorded-pristine inconsistency and both widths: {message}"
+        );
+        assert!(
+            embedding_identity_refusal_message(&err).is_none(),
+            "the reconciliation refusal is a plain error, not the identity refusal: {err}"
+        );
+        assert!(restart_to_apply_message(&err).is_none(), "{err}");
+        assert_eq!(
+            std::fs::read(crate::model_choice::store_state_path(&fx.db)).expect("re-read sidecar"),
+            sidecar_before,
+            "a refused reconciliation leaves the sidecar byte-identical"
+        );
+        drop(store);
+
+        // The schema is untouched: the store still opens and writes
+        // under its recorded width.
+        std::fs::write(
+            fx.config_dir.join("embedders.json"),
+            "[{\"model_name\":\"ModelA\",\"dimensions\":768}]",
+        )
+        .expect("restore 768 fixture config");
+        let store = LadybugStore::for_testing(&fx.db, 768)
+            .expect("reopen temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_dims("ModelA", 768)));
+        store
+            .init("probe")
+            .await
+            .expect("the store still opens under its recorded model");
+        store
+            .upsert("probe", "m2", vec![0.1; 768], store_state_payload())
+            .await
+            .expect("a 768-wide upsert still lands: the column was never altered");
         drop(store);
         let _ = std::fs::remove_dir_all(&fx.root);
         restore_model_env(previous);
