@@ -31,7 +31,7 @@ jobs:
         #             only target where OpenSSL is vendored.
         #   windows - MSVC and the CMake/Ninja assumptions, plus the 4 GiB
         #             static-library limit that decides debug vs release.
-        #             OpenSSL is vendored here too: lbug 0.20.4 hard-links it.
+        #             OpenSSL is vendored here too: lbug 0.22.3 hard-links it.
         #   macos   - Clang and libc++ rather than GCC or MSVC, and the other
         #             side of the OpenSSL target gate (Security.framework).
         #             macos-15 is arm64, a standard runner, free on a public

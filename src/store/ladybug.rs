@@ -4855,9 +4855,11 @@ impl VectorStore for LadybugStore {
         let dir = std::path::PathBuf::from(dir);
         let source = self.local_path.clone();
         // Checkpoint first so the snapshot cannot miss writes still in the
-        // WAL. The engine's EXPORT DATABASE is not used: it SIGSEGVs in
+        // WAL. The engine's EXPORT DATABASE is not used: it SIGSEGVd in
         // lbug 0.20.4's planner on every store (planExportTableData ->
-        // std::__format on a dangling string_view).
+        // std::__format on a dangling string_view). Revalidated on lbug
+        // 0.22.3: EXPORT DATABASE of a fixture store succeeded (Linux
+        // x86_64); the file copy below remains the snapshot mechanism.
         let started = std::time::Instant::now();
         let checkpoint_result: Result<()> = self
             .with_conn(move |conn| {
