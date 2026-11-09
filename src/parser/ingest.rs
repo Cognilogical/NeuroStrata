@@ -1052,29 +1052,28 @@ pub async fn ingest_directory(
     let mut prev_node_kinds: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     if prev_gen > 0 {
-        match vector_store.list(namespace, None, None).await {
+        // Only this generation's rows, and only the fields read below: the
+        // full `list` carried every row's text and cost ~100 MB per call on a
+        // large namespace.
+        match vector_store.generation_summary(namespace, prev_gen).await {
             Ok(rows) => {
                 for r in rows {
-                    let id = r.id.clone();
-                    let (_ns, gen, tail) = match crate::parser::ingest::split_scoped_id(&id) {
+                    let (_ns, gen, tail) = match crate::parser::ingest::split_scoped_id(&r.id) {
                         Some(x) => x,
                         None => continue,
                     };
                     if gen != prev_gen { continue; }
-                    if matches!(r.payload.memory_type.as_str(), "directory" | "file" | "markdown") {
-                        prev_node_kinds
-                            .insert(r.payload.location.clone(), r.payload.memory_type.clone());
+                    if matches!(r.memory_type.as_str(), "directory" | "file" | "markdown") {
+                        prev_node_kinds.insert(r.location.clone(), r.memory_type.clone());
                     }
-                    let hash = r.payload.metadata.get("file_sha256").and_then(|v| v.as_str()).map(|s| s.to_string());
-                    if let Some(h) = hash {
-                        prev_file_map.insert(tail.to_string(), h.clone());
+                    if let Some(h) = r.file_sha256 {
+                        prev_file_map.insert(tail.to_string(), h);
                     }
-                    let stamp = r.payload.metadata.get("ingest_version").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    prev_stamps.push(stamp);
+                    prev_stamps.push(r.ingest_version);
                 }
             }
             Err(e) => {
-                tracing::warn!("vector_store.list failed while building prev_file_map for '{namespace}': {e}");
+                tracing::warn!("vector_store.generation_summary failed while building prev_file_map for '{namespace}': {e}");
             }
         }
     }
@@ -1229,7 +1228,7 @@ pub async fn ingest_directory(
     // no previous row is carried in that mode.
     if prev_gen > 0 && !force_reparse && !unchanged {
         let mut carried = 0usize;
-        let rows = match vector_store.list(namespace, None, None).await {
+        let rows = match vector_store.generation_summary(namespace, prev_gen).await {
             Ok(rows) => rows,
             Err(e) => {
                 tracing::warn!(
@@ -1249,8 +1248,8 @@ pub async fn ingest_directory(
             // The row's `location` is the file it came from (stamped at
             // ingest time), which survives `#` in file names unlike
             // splitting the symbol id.
-            let file_path = r.payload.location.clone();
-            let hash = r.payload.metadata.get("file_sha256").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let file_path = r.location.clone();
+            let hash = r.file_sha256.clone();
             // Carry a previous row only when its file is still present with
             // the same bytes, or (for no-hash rows) when the path is still
             // visited. Deleted files and stale symbols drop out.
@@ -1269,7 +1268,7 @@ pub async fn ingest_directory(
             // with the old one: a directory turned file would be put back as a
             // directory, and the next ingest would repeat it. Directory rows
             // carry no hash, so the hash test above cannot catch this.
-            let row_kind = r.payload.memory_type.as_str();
+            let row_kind = r.memory_type.as_str();
             let current_kind = current_kinds.get(&file_path).map(String::as_str);
             let is_node_row = matches!(row_kind, "directory" | "file" | "markdown");
             if is_node_row && current_kind != Some(row_kind) { continue; }
@@ -2338,6 +2337,111 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    /// The slim per-generation read must hand ingest exactly the rows `list`
+    /// used to, minus the content.
+    #[tokio::test]
+    async fn generation_summary_matches_the_rows_list_gave_ingest() {
+        use crate::traits::GenerationRow;
+        let tmp = std::env::temp_dir().join(format!("ns-gensum-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        std::fs::write(tmp.join("a.rs"), "fn a() {}\nfn b() {}").expect("write file");
+        std::fs::write(tmp.join("notes.md"), "# Title\n\nbody\n").expect("write file");
+        let db = std::env::temp_dir().join(format!("ns-gensum-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("probe").await.expect("create the schema");
+        let schema = ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+
+        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", None, &[])
+            .await
+            .expect("first ingest");
+        // A second ingest after a change leaves a superseded generation behind.
+        std::fs::write(tmp.join("a.rs"), "fn a() {}\nfn c() {}").expect("edit file");
+        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", None, &[])
+            .await
+            .expect("second ingest");
+        let gen = store.active_generation("probe", &source_key_for(&tmp)).await.expect("read");
+
+        let mut got = store.generation_summary("probe", gen).await.expect("summary");
+        let mut want: Vec<GenerationRow> = store
+            .list("probe", None, None)
+            .await
+            .expect("list")
+            .into_iter()
+            .filter(|r| crate::parser::ingest::split_scoped_id(&r.id).is_some_and(|(_, g, _)| g == gen))
+            .map(|r| GenerationRow::from_payload(r.id, &r.payload))
+            .collect();
+        got.sort_by(|a, b| a.id.cmp(&b.id));
+        want.sort_by(|a, b| a.id.cmp(&b.id));
+        assert!(got.len() > 2, "the active generation has directory, file and symbol rows");
+        assert_eq!(got, want, "same rows, same fields, as the full listing gave");
+        assert!(got.iter().any(|r| r.file_sha256.is_some()), "file rows carry their hash");
+        assert!(got.iter().all(|r| !r.ingest_version.is_empty()), "every current row is stamped");
+
+        let stale = store.generation_summary("probe", gen + 1000).await.expect("summary");
+        assert!(stale.is_empty(), "a generation that is not active yields nothing");
+
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    /// Two sources in one namespace. The generation counter is per namespace
+    /// (see `begin_generation`), so two sources never share a generation
+    /// number, but they do interleave: here source a is ingested, then source
+    /// b, then source a again, which supersedes a's first generation. For each
+    /// generation number the summary has to give the rows the full listing
+    /// does, and only the rows of the source that owns it.
+    #[tokio::test]
+    async fn generation_summary_matches_list_for_two_sources_in_one_namespace() {
+        use crate::traits::GenerationRow;
+        let (tmp_a, db, store, schema) = kind_fixture("gensum-two-a").await;
+        let tmp_b = std::env::temp_dir().join(format!("ns-gensum-two-b-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp_b).expect("create second source");
+        std::fs::write(tmp_a.join("a.rs"), "fn a() {}").expect("write a");
+        std::fs::write(tmp_b.join("b.rs"), "fn b() {}").expect("write b");
+
+        ingest_directory(&tmp_a, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", None, &[])
+            .await
+            .expect("ingest source a");
+        ingest_directory(&tmp_b, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", None, &[])
+            .await
+            .expect("ingest source b");
+        std::fs::write(tmp_a.join("a.rs"), "fn a() {}\nfn a2() {}").expect("edit a");
+        ingest_directory(&tmp_a, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", None, &[])
+            .await
+            .expect("re-ingest source a");
+        let gen_a = store.active_generation("probe", &source_key_for(&tmp_a)).await.expect("gen a");
+        let gen_b = store.active_generation("probe", &source_key_for(&tmp_b)).await.expect("gen b");
+        assert_eq!((gen_b, gen_a), (2, 3), "b took the second number, a's re-ingest the third");
+
+        for gen in 1..=3u64 {
+            let mut got = store.generation_summary("probe", gen).await.expect("summary");
+            let mut want: Vec<GenerationRow> = store
+                .list("probe", None, None)
+                .await
+                .expect("list")
+                .into_iter()
+                .filter(|r| crate::parser::ingest::split_scoped_id(&r.id).is_some_and(|(_, g, _)| g == gen))
+                .map(|r| GenerationRow::from_payload(r.id, &r.payload))
+                .collect();
+            got.sort_by(|a, b| a.id.cmp(&b.id));
+            want.sort_by(|a, b| a.id.cmp(&b.id));
+            assert_eq!(got, want, "generation {gen}: same rows as the full listing");
+        }
+        let first = store.generation_summary("probe", 1).await.expect("summary of generation 1");
+        let second = store.generation_summary("probe", 2).await.expect("summary of generation 2");
+        let third = store.generation_summary("probe", 3).await.expect("summary of generation 3");
+        assert!(first.is_empty(), "a's superseded first generation yields nothing");
+        assert!(second.iter().all(|r| r.location != "a.rs"), "b's generation holds none of a's files");
+        assert!(third.iter().all(|r| r.location != "b.rs"), "a's generation holds none of b's files");
+        assert!(second.iter().any(|r| r.location == "b.rs"), "b's file is read");
+        assert!(third.iter().any(|r| r.location == "a.rs"), "a's file is read");
+
+        std::fs::remove_dir_all(&tmp_a).ok();
+        std::fs::remove_dir_all(&tmp_b).ok();
         std::fs::remove_dir_all(&db).ok();
     }
 
