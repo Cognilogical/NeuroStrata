@@ -1212,6 +1212,15 @@ pub struct LadybugStore {
     /// a sidecar-less store that predates it is a pre-fix store whose
     /// data state is unknowable from outside (fail-closed).
     db_preexisting: bool,
+    /// Whether this process opened the database through a recovery
+    /// path in `with_system_config` — the checksum-mismatch reopen,
+    /// the unverified-WAL replay, or the WAL-discard reopen — rather
+    /// than the normal verified open. A recovery open's view of the
+    /// store is unauthenticated: rows that lived only in the WAL can
+    /// present as absent, so an apparently empty table on such an
+    /// open is not evidence the store is pristine, and `init` must
+    /// not run the LockedUnknown provenance upgrade from it.
+    opened_via_recovery: bool,
     /// This process's view of the store-state sidecar, loaded on first
     /// use. The sidecar is the setup-time model choice's lock record:
     /// see `crate::model_choice::store_has_data`.
@@ -1650,12 +1659,14 @@ impl LadybugStore {
 
         // Open with verification first. Only if the WAL fails to authenticate do we
         // consider replaying it unverified, and never quietly.
+        let mut opened_via_recovery = false;
         let db = match Database::new(&local_path, initial_config) {
             Ok(db) => db,
             Err(e) => {
                 let err_msg = e.to_string();
                 let checksum_mismatch = err_msg.contains("enableChecksums");
                 if checksum_mismatch {
+                    opened_via_recovery = true;
                     eprintln!("WARN: DB checksum config mismatch; reopening with checksums disabled.");
                     match Database::new(&local_path, unverified_config()) {
                         Ok(db) => db,
@@ -1680,6 +1691,7 @@ impl LadybugStore {
 
                 match Database::new(&local_path, unverified_config()) {
                     Ok(db) => {
+                        opened_via_recovery = true;
                         eprintln!("Recovered by replaying the unverified write-ahead log.");
                         // The replay only brought the writes back into memory.
                         // Checkpoint them into the main DB files right away, so
@@ -1734,6 +1746,7 @@ impl LadybugStore {
                             dropped_bytes
                         );
                         eprintln!("ERROR: they were kept at {:?} -- do not delete it if those writes mattered.", corrupted_file);
+                        opened_via_recovery = true;
                         // No WAL left to verify at this point.
                         Database::new(&local_path, verifying_config()).map_err(|last_e| {
                             anyhow::anyhow!("Retry failed after discarding the WAL: {}", last_e)
@@ -1768,6 +1781,7 @@ impl LadybugStore {
             embed_config_dir: crate::embed::config_dir(),
             serving_descriptor: std::sync::Mutex::new(None),
             db_preexisting,
+            opened_via_recovery,
             store_state: Arc::new(std::sync::Mutex::new(None)),
         })
     }
@@ -4390,8 +4404,17 @@ impl VectorStore for LadybugStore {
         // after the closure succeeds. A store with rows is never
         // upgraded, refused, or reconciled here: genuine legacy
         // behavior is unchanged.
+        //
+        // The candidate is also gated on this process having opened
+        // the database through the normal verified path: on a
+        // recovery open (`opened_via_recovery`) the engine's empty
+        // attestation is unauthenticated — WAL-only rows can present
+        // as absent — so the upgrade never runs, the store stays
+        // LockedUnknown, and a later verified open can still upgrade
+        // it (panel condition 1, finding P1-F1).
         let locked_unknown_upgrade_candidate =
             matches!(self.cached_store_state(), CachedStoreState::LockedUnknown)
+                && !self.opened_via_recovery
                 && match self.serving_descriptor() {
                     Some(serving) => self.serving_matches_configured(&serving),
                     None => false,
@@ -16330,6 +16353,231 @@ eurostrata\src\daemon.rs",
         );
         assert!(restart_to_apply_message(&err).is_none(), "{err}");
         drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    /// The physical width of `Memory.embedding` as the engine's
+    /// catalog reports it for an already-open store.
+    async fn physical_embedding_width(store: &LadybugStore) -> Option<usize> {
+        store
+            .with_conn(|conn| {
+                let mut width = None;
+                for row in conn.query("CALL table_info('Memory') RETURN *")? {
+                    let name = match row.get(1) {
+                        Some(lbug::Value::String(s)) => s.as_str(),
+                        _ => continue,
+                    };
+                    if name != "embedding" {
+                        continue;
+                    }
+                    if let Some(lbug::Value::String(ty)) = row.get(2) {
+                        width = ty
+                            .strip_prefix("FLOAT[")
+                            .and_then(|rest| rest.strip_suffix(']'))
+                            .and_then(|digits| digits.parse::<usize>().ok());
+                    }
+                }
+                Ok(width)
+            })
+            .await
+            .expect("read the physical embedding width")
+    }
+
+    /// Leave `rows` Memory writes in an uncheckpointed WAL beside
+    /// `db`, then corrupt the WAL in place. The writes are made
+    /// through a raw engine handle that is deliberately leaked
+    /// (`mem::forget`): a clean drop would checkpoint the WAL into
+    /// the main file, and the rows must exist *only* in the WAL.
+    /// With `delete_rows`, each row is deleted again inside the same
+    /// WAL, so the table the WAL describes is genuinely empty.
+    /// Corrupting every WAL byte makes the verified replay fail with
+    /// a checksum error while the unverified replay still opens —
+    /// presenting an empty table (the recovery shape of upstream
+    /// issue #69, measured recovering 0 of 6 WAL-only records).
+    fn plant_corrupted_uncheckpointed_wal(db: &std::path::Path, rows: usize, delete_rows: bool) {
+        let cfg = SystemConfig::default()
+            .max_db_size(512 * 1024 * 1024)
+            .buffer_pool_size(64 * 1024 * 1024)
+            .throw_on_wal_replay_failure(true);
+        let raw = Database::new(db, cfg).expect("raw open to seed the WAL");
+        let conn = Connection::new(&raw).expect("raw connection");
+        for i in 0..rows {
+            conn.query(&format!(
+                "CREATE (m:Memory {{id: 'wal-only-{i}', namespace: 'probe', content: 'wal row {i}', user_id: '', memory_type: 'fact', agent_name: '', location: '', location_lines: '', metadata: '{{}}', embedding: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]}})"
+            ))
+            .expect("seed a WAL-only row");
+            if delete_rows {
+                conn.query(&format!(
+                    "MATCH (m:Memory) WHERE m.id = 'wal-only-{i}' DELETE m"
+                ))
+                .expect("delete the seeded row inside the same WAL");
+            }
+        }
+        std::mem::forget(conn);
+        std::mem::forget(raw);
+        let mut wal_os = db.to_path_buf().into_os_string();
+        wal_os.push(".wal");
+        let wal = std::path::PathBuf::from(wal_os);
+        let len = std::fs::metadata(&wal)
+            .expect("the uncheckpointed WAL is on disk")
+            .len();
+        assert!(len > 0, "the seeded writes left a non-empty WAL");
+        std::fs::write(&wal, vec![0xFFu8; len as usize]).expect("corrupt the WAL in place");
+    }
+
+    /// Opt this process into the unverified-WAL recovery fallback
+    /// (the operator opt-in the WAL-discard/unverified arms require),
+    /// returning the previous values for restoration.
+    fn allow_unverified_wal_recovery() -> (Option<String>, Option<String>) {
+        let previous = (
+            std::env::var("NEUROSTRATA_STRICT_WAL").ok(),
+            std::env::var("NEUROSTRATA_ALLOW_UNVERIFIED_WAL").ok(),
+        );
+        std::env::remove_var("NEUROSTRATA_ALLOW_UNVERIFIED_WAL");
+        std::env::set_var("NEUROSTRATA_STRICT_WAL", "0");
+        previous
+    }
+
+    fn restore_wal_env(previous: (Option<String>, Option<String>)) {
+        match previous.0 {
+            Some(value) => std::env::set_var("NEUROSTRATA_STRICT_WAL", value),
+            None => std::env::remove_var("NEUROSTRATA_STRICT_WAL"),
+        }
+        match previous.1 {
+            Some(value) => std::env::set_var("NEUROSTRATA_ALLOW_UNVERIFIED_WAL", value),
+            None => std::env::remove_var("NEUROSTRATA_ALLOW_UNVERIFIED_WAL"),
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_open_never_upgrades_empty_locked_unknown_store() {
+        // Panel condition 1 (finding P1-F1): a pre-sidecar store
+        // whose rows exist only in an uncheckpointed WAL can present
+        // as empty on a recovery open — the verified replay refuses
+        // the corrupted WAL and the unverified fallback opens over
+        // the main file alone. That unauthenticated empty view must
+        // never run the LockedUnknown provenance upgrade: no pristine
+        // sidecar may be stamped, the cached state must stay
+        // LockedUnknown, and the physical width must not be
+        // reconciled (the upgrade helper would drop and recreate all
+        // six tables at the serving width first). The trigger arm is
+        // the unverified-WAL replay (arm b): it is the arm the
+        // existing harness can drive deterministically in-process
+        // (raw seed + leaked handle + in-place WAL corruption), and
+        // it is the arm upstream issue #69 measured recovering 0 of 6
+        // records. The checksum-mismatch and WAL-discard arms set the
+        // same recovery flag in `with_system_config`.
+        let previous = without_model_env();
+        let fx = store_state_fixture("cond1-recovery-wal-rows", "ModelA");
+
+        // The pre-sidecar store: schema at FLOAT[8], created by a
+        // non-serving open, so no sidecar exists and the next
+        // construction classifies LockedUnknown.
+        let creator = LadybugStore::for_testing(&fx.db, 8)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        creator.init("probe").await.expect("init");
+        drop(creator);
+        assert!(
+            !crate::model_choice::store_state_path(&fx.db).exists(),
+            "the pre-sidecar fixture carries no sidecar"
+        );
+
+        // Six rows that live only in the WAL, behind a corrupted WAL
+        // the verified replay refuses.
+        plant_corrupted_uncheckpointed_wal(&fx.db, 6, false);
+
+        // The recovery open: serving bound, serving == configured
+        // (ModelA at the store's width 4), unverified recovery opted
+        // in — exactly the shape that used to stamp the sidecar.
+        let previous_wal = allow_unverified_wal_recovery();
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("the recovery open succeeds")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        store
+            .init("probe")
+            .await
+            .expect("init succeeds on the recovery open");
+        assert!(
+            !crate::model_choice::store_state_path(&fx.db).exists(),
+            "a recovery open must not stamp a pristine sidecar over an unauthenticated empty view"
+        );
+        assert!(
+            matches!(store.cached_store_state(), CachedStoreState::LockedUnknown),
+            "the cached state stays LockedUnknown after a recovery open"
+        );
+        assert_eq!(
+            physical_embedding_width(&store).await,
+            Some(8),
+            "the physical width is unchanged: the upgrade helper never ran"
+        );
+        drop(store);
+        restore_wal_env(previous_wal);
+
+        // The conservatism is per-open, not a permanent lockout: a
+        // later verified open of the (now genuinely empty) store can
+        // still run the upgrade and record the pristine identity.
+        let verified = LadybugStore::for_testing(&fx.db, 4)
+            .expect("reopen temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        verified.init("probe").await.expect("verified init");
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["has_data"], json!(false));
+        assert_eq!(sidecar["descriptor"]["model"], json!("ModelA"));
+        drop(verified);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn recovery_open_of_genuinely_empty_store_stays_locked_unknown() {
+        // Companion case: a genuinely empty pre-sidecar store (its
+        // WAL writes insert and delete the same rows, so the table
+        // truly holds nothing) on a recovery open also stays
+        // LockedUnknown. That is intended conservatism: a recovery
+        // open cannot distinguish this store from one whose WAL-only
+        // rows it failed to recover, so neither may be upgraded.
+        let previous = without_model_env();
+        let fx = store_state_fixture("cond1-recovery-empty", "ModelA");
+        let creator = LadybugStore::for_testing(&fx.db, 8)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        creator.init("probe").await.expect("init");
+        drop(creator);
+        assert!(
+            !crate::model_choice::store_state_path(&fx.db).exists(),
+            "the pre-sidecar fixture carries no sidecar"
+        );
+
+        plant_corrupted_uncheckpointed_wal(&fx.db, 2, true);
+
+        let previous_wal = allow_unverified_wal_recovery();
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("the recovery open succeeds")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        store
+            .init("probe")
+            .await
+            .expect("init succeeds on the recovery open");
+        assert!(
+            !crate::model_choice::store_state_path(&fx.db).exists(),
+            "even a genuinely empty store earns no sidecar from a recovery open"
+        );
+        assert!(
+            matches!(store.cached_store_state(), CachedStoreState::LockedUnknown),
+            "the cached state stays LockedUnknown after a recovery open"
+        );
+        assert_eq!(
+            physical_embedding_width(&store).await,
+            Some(8),
+            "the physical width is unchanged: the upgrade helper never ran"
+        );
+        drop(store);
+        restore_wal_env(previous_wal);
         let _ = std::fs::remove_dir_all(&fx.root);
         restore_model_env(previous);
     }
