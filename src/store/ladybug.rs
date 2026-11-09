@@ -1916,9 +1916,23 @@ impl LadybugStore {
     /// here. Best effort: a sidecar failure must not fail init for
     /// stores the feature never touches, so errors are logged, not
     /// propagated.
+    ///
+    /// The recorded-pristine adoption never runs on a recovery open
+    /// (`opened_via_recovery`): the recorded descriptor is only
+    /// rewritten from evidence a verified open produced, and on a
+    /// recovery open the sidecar's `has_data=false` claim is the
+    /// sole basis for adoption while the engine's view of the store
+    /// is unauthenticated — WAL-only rows can present as absent —
+    /// so the record stays exactly as found and a later verified
+    /// open adopts as today (overseer panel condition 1, findings
+    /// AC-F1/SA-F2). The gate lives here, inside the function, so
+    /// both `init` call sites (the schema-ready fast path and the
+    /// post-closure call) are covered.
     fn maintain_store_state(&self) {
         match self.cached_store_state() {
-            CachedStoreState::Recorded(recorded) if !recorded.has_data => {
+            CachedStoreState::Recorded(recorded)
+                if !recorded.has_data && !self.opened_via_recovery =>
+            {
                 if let Some(serving) = self.serving_descriptor() {
                     if serving != recorded.descriptor && self.serving_matches_configured(&serving) {
                         let state = crate::model_choice::StoreState {
@@ -4400,11 +4414,22 @@ impl VectorStore for LadybugStore {
         // already refused above, and a pre-sidecar (LockedUnknown)
         // store keeps today's behavior exactly — its width backstop
         // stays at the engine, at vector use.
-        let reconcile_width = match self.cached_store_state() {
-            CachedStoreState::Recorded(recorded) => !recorded.has_data,
-            CachedStoreState::FreshUnrecorded => true,
-            CachedStoreState::LockedUnknown => false,
-        };
+        //
+        // The arming is also gated on this process having opened the
+        // database through the normal verified path: on a recovery
+        // open (`opened_via_recovery`) the engine's width/emptiness
+        // view is unauthenticated — WAL-only rows can present as
+        // absent, so the `count(m)` the reconciliation reads can be
+        // stale — and reconciliation is disarmed rather than allowed
+        // to drop/recreate a recorded-pristine store's tables from
+        // that view; a later verified open reconciles as today
+        // (overseer panel condition 1, findings AC-F1/SA-F2).
+        let reconcile_width = !self.opened_via_recovery
+            && match self.cached_store_state() {
+                CachedStoreState::Recorded(recorded) => !recorded.has_data,
+                CachedStoreState::FreshUnrecorded => true,
+                CachedStoreState::LockedUnknown => false,
+            };
         // Issue #74: a LockedUnknown classification is ambiguous — it
         // covers both a genuine pre-sidecar store and a fresh store
         // whose provenance was lost because its first touch was a
@@ -16700,6 +16725,110 @@ eurostrata\src\daemon.rs",
         );
         drop(store);
         restore_wal_env(previous_wal);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn recovery_open_never_reconciles_or_adopts_recorded_pristine_store() {
+        // Overseer panel condition 1 (findings AC-F1/SA-F2): the
+        // recovery gate landed for the LockedUnknown provenance
+        // stamp in 54b85ac must cover the whole init trust surface.
+        // A recorded-pristine store whose rows exist only in an
+        // uncheckpointed WAL can present as empty on a recovery
+        // open; that unauthenticated view must neither arm the
+        // pristine width reconciliation (which reads a stale
+        // `count(m)` and would drop/recreate all six tables) nor
+        // run the recorded-pristine adoption in
+        // `maintain_store_state` (which would rewrite the sidecar
+        // descriptor to the serving descriptor on the sole basis
+        // of the sidecar's has_data=false claim).
+        let previous = without_model_env();
+        let fx = store_state_fixture("cond1-recovery-pristine", "ModelA");
+        std::fs::write(
+            fx.config_dir.join("embedders.json"),
+            "[{\"model_name\":\"ModelA\",\"dimensions\":8}]",
+        )
+        .expect("write 8-wide fixture config");
+
+        // The recorded-pristine store: schema at FLOAT[8], sidecar
+        // recording ModelA with has_data=false.
+        let creator = LadybugStore::for_testing(&fx.db, 8)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_dims("ModelA", 8)));
+        creator.init("probe").await.expect("init");
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["has_data"], json!(false));
+        assert_eq!(sidecar["descriptor"]["model"], json!("ModelA"));
+        assert_eq!(sidecar["descriptor"]["dims"], json!(8));
+        drop(creator);
+
+        // Six rows that live only in the WAL, behind a corrupted
+        // WAL the verified replay refuses.
+        plant_corrupted_uncheckpointed_wal(&fx.db, 6, false);
+
+        // The configured model switches to ModelB at dims 4.
+        std::fs::write(
+            fx.config_dir.join("embedders.json"),
+            "[{\"model_name\":\"ModelB\",\"dimensions\":4}]",
+        )
+        .expect("write 4-wide fixture config");
+
+        // The recovery open: serving bound, serving == configured
+        // (ModelB at dims 4), unverified recovery opted in. Init
+        // succeeds, but nothing may be reconciled or adopted from
+        // the unauthenticated view.
+        let previous_wal = allow_unverified_wal_recovery();
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("the recovery open succeeds")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_dims("ModelB", 4)));
+        store
+            .init("probe")
+            .await
+            .expect("init succeeds on the recovery open");
+        assert_eq!(
+            physical_embedding_width(&store).await,
+            Some(8),
+            "a recovery open must not reconcile the physical width"
+        );
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["has_data"], json!(false));
+        assert_eq!(
+            sidecar["descriptor"]["model"],
+            json!("ModelA"),
+            "a recovery open must not adopt the serving descriptor"
+        );
+        assert_eq!(sidecar["descriptor"]["dims"], json!(8));
+        match store.cached_store_state() {
+            CachedStoreState::Recorded(recorded) => {
+                assert!(!recorded.has_data);
+                assert_eq!(recorded.descriptor, serving_descriptor_dims("ModelA", 8));
+            }
+            _ => panic!("the cached state stays Recorded after a recovery open"),
+        }
+        drop(store);
+        restore_wal_env(previous_wal);
+
+        // The conservatism is per-open, not a permanent lockout: a
+        // later verified open at dims 4 under ModelB reconciles
+        // and adopts exactly as today.
+        let verified = LadybugStore::for_testing(&fx.db, 4)
+            .expect("reopen temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_dims("ModelB", 4)));
+        verified.init("probe").await.expect("verified init");
+        assert_eq!(
+            physical_embedding_width(&verified).await,
+            Some(4),
+            "a verified open reconciles the physical width as today"
+        );
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["has_data"], json!(false));
+        assert_eq!(sidecar["descriptor"]["model"], json!("ModelB"));
+        assert_eq!(sidecar["descriptor"]["dims"], json!(4));
+        drop(verified);
         let _ = std::fs::remove_dir_all(&fx.root);
         restore_model_env(previous);
     }
