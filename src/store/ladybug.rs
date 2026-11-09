@@ -4185,7 +4185,8 @@ impl LadybugStore {
 /// the engine attests the table holds no rows (and, on a width
 /// mismatch, the empty tables were recreated at `dimensions`). Every
 /// other outcome — rows present, an unreadable catalog width, an
-/// unreadable row count — returns `false` and leaves the store
+/// unreadable row count, or an attestation query that fails to
+/// execute — returns `false` and leaves the store
 /// exactly as found: unlike the pristine path this helper never
 /// refuses an open, because a genuine pre-sidecar store with data
 /// must behave exactly as it did before the recorded-identity
@@ -4199,7 +4200,15 @@ fn reconcile_empty_locked_unknown_width(
     create_rel_tables: &[&str],
 ) -> Result<bool> {
     let mut physical: Option<usize> = None;
-    for row in conn.query("CALL table_info('Memory') RETURN *")? {
+    // A query-EXECUTION failure attests nothing either: downgrade
+    // it to the same leave-as-found `false` as an unreadable width
+    // below — this helper never refuses an open (panel condition 2,
+    // finding P4-F3).
+    let table_info = match conn.query("CALL table_info('Memory') RETURN *") {
+        Ok(rows) => rows,
+        Err(_) => return Ok(false),
+    };
+    for row in table_info {
         let name = match row.get(1) {
             Some(lbug::Value::String(s)) => s.as_str(),
             _ => continue,
@@ -4220,7 +4229,12 @@ fn reconcile_empty_locked_unknown_width(
         return Ok(false);
     };
 
-    let mut count_rows = conn.query("MATCH (m:Memory) RETURN count(m)")?;
+    // Same downgrade as the table-info query above: an
+    // unexecutable count attests nothing, so leave as found.
+    let mut count_rows = match conn.query("MATCH (m:Memory) RETURN count(m)") {
+        Ok(rows) => rows,
+        Err(_) => return Ok(false),
+    };
     let rows = match count_rows.next() {
         Some(row) => match row.get(0) {
             Some(lbug::Value::Int64(n)) => *n,
@@ -16355,6 +16369,114 @@ eurostrata\src\daemon.rs",
         drop(store);
         let _ = std::fs::remove_dir_all(&fx.root);
         restore_model_env(previous);
+    }
+
+    /// Raw handle fixture for the attestation-helper tests: run
+    /// `body` against a connection to a database at a fresh temp
+    /// path, with no NeuroStrata schema created unless the body
+    /// creates it.
+    fn with_attestation_conn(name: &str, body: impl FnOnce(&Connection)) {
+        let root = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create the fixture root");
+        let db_path = root.join("attestation.db");
+        let cfg = SystemConfig::default()
+            .max_db_size(512 * 1024 * 1024)
+            .buffer_pool_size(64 * 1024 * 1024);
+        let raw = Database::new(&db_path, cfg).expect("raw open");
+        let conn = Connection::new(&raw).expect("raw connection");
+        body(&conn);
+        drop(conn);
+        drop(raw);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    const ATTESTATION_NODE_DDL: &str = "CREATE NODE TABLE Memory (id STRING, namespace STRING, content STRING, user_id STRING, memory_type STRING, agent_name STRING, location STRING, location_lines STRING, metadata STRING, embedding FLOAT[4], PRIMARY KEY (id))";
+    const ATTESTATION_REL_DDLS: [&str; 1] = ["CREATE REL TABLE RELATES_TO (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING, origin STRING)"];
+
+    #[test]
+    fn locked_unknown_attestation_table_info_failure_leaves_store_as_found() {
+        // Panel condition 2 (finding P4-F3): the #74 attestation
+        // helper documents that it never refuses an open, but a
+        // query-EXECUTION failure used to propagate. Here the Memory
+        // table is absent, so `CALL table_info('Memory')` itself
+        // fails at execution ("Memory does not exist in catalog")
+        // while the store opened fine. The helper must downgrade
+        // that to the same leave-as-found Ok(false) its value
+        // mismatches already return — and Memory must stay absent.
+        with_attestation_conn("cond2-attestation-no-memory", |conn| {
+            assert!(
+                conn.query("CALL table_info('Memory') RETURN *").is_err(),
+                "precondition: table_info fails at execution with no Memory table"
+            );
+            let attested = reconcile_empty_locked_unknown_width(
+                conn,
+                4,
+                ATTESTATION_NODE_DDL,
+                &ATTESTATION_REL_DDLS,
+            );
+            assert!(
+                matches!(attested, Ok(false)),
+                "an unexecutable table-info query leaves the store as found, got {attested:?}"
+            );
+            assert!(
+                conn.query("CALL table_info('Memory') RETURN *").is_err(),
+                "the store is left as found: Memory is still absent afterwards"
+            );
+        });
+    }
+
+    #[test]
+    fn locked_unknown_attestation_count_failure_leaves_store_as_found() {
+        // Panel condition 2 (finding P4-F3), the count-query leg:
+        // `Memory` exists in the catalog as a REL table carrying an
+        // `embedding FLOAT[8]` property, so table_info executes and
+        // attests a physical width — but `MATCH (m:Memory)` cannot
+        // bind a rel table as a node pattern, so the count query
+        // fails at execution ("Cannot bind Memory as a node pattern
+        // label") while the store opened fine. The helper must
+        // downgrade that to leave-as-found Ok(false) too: no
+        // drop/recreate, no record, catalog exactly as found.
+        with_attestation_conn("cond2-attestation-rel-memory", |conn| {
+            conn.query("CREATE NODE TABLE Other (id STRING, PRIMARY KEY (id))")
+                .expect("create the rel table's endpoint table");
+            conn.query("CREATE REL TABLE Memory (FROM Other TO Other, embedding FLOAT[8])")
+                .expect("create Memory as a rel table");
+            assert!(
+                conn.query("CALL table_info('Memory') RETURN *").is_ok(),
+                "precondition: table_info executes for the rel-table Memory"
+            );
+            assert!(
+                conn.query("MATCH (m:Memory) RETURN count(m)").is_err(),
+                "precondition: the count query fails at execution for a rel-table Memory"
+            );
+            let attested = reconcile_empty_locked_unknown_width(
+                conn,
+                4,
+                ATTESTATION_NODE_DDL,
+                &ATTESTATION_REL_DDLS,
+            );
+            assert!(
+                matches!(attested, Ok(false)),
+                "an unexecutable count query leaves the store as found, got {attested:?}"
+            );
+            // Left exactly as found: table_info still attests the same
+            // rel-table Memory at FLOAT[8], and the count still fails.
+            let mut widths = Vec::new();
+            for row in conn
+                .query("CALL table_info('Memory') RETURN *")
+                .expect("table_info still executes afterwards")
+            {
+                if let Some(lbug::Value::String(ty)) = row.get(2) {
+                    widths.push(ty.clone());
+                }
+            }
+            assert_eq!(widths, vec!["FLOAT[8]".to_string()]);
+            assert!(
+                conn.query("MATCH (m:Memory) RETURN count(m)").is_err(),
+                "the store is left as found: the count query still fails afterwards"
+            );
+        });
     }
 
     /// The physical width of `Memory.embedding` as the engine's
