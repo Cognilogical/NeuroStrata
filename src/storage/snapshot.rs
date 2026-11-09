@@ -15,6 +15,13 @@ pub struct StorageHygieneConfig {
     pub checkpoint_interval_secs: u64,
     pub wal_warn_bytes: u64,
     pub snapshot_retention_count: usize,
+    /// Cap on the database engine's buffer pool, in MB. The pool caches pages
+    /// of the database file; left to itself the engine sizes it to most of the
+    /// machine's memory, so the daemon's resident memory climbs toward the size
+    /// of the whole store. 0 hands the sizing back to the engine. Values below
+    /// the floor (see `store::ladybug`) are raised to it, because a pool too
+    /// small for one query makes that query fail.
+    pub buffer_pool_mb: u64,
 }
 
 impl Default for StorageHygieneConfig {
@@ -23,6 +30,11 @@ impl Default for StorageHygieneConfig {
             checkpoint_interval_secs: 2,
             wal_warn_bytes: 64 * 1024 * 1024,
             snapshot_retention_count: 5,
+            // Measured on a copy of a 739 MB store, three passes over every
+            // namespace: 384 MB queries ran as fast as the engine default
+            // (within run-to-run noise) and cut peak memory by about 15%;
+            // 256 MB was 15 to 30% slower and 192 MB about 50% slower.
+            buffer_pool_mb: 384,
         }
     }
 }
