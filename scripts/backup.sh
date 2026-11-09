@@ -5,13 +5,26 @@
 # memory 74524cc4 / 93357321). This script bypasses the engine entirely:
 #   1. systemctl --user stop neurostrata  (graceful shutdown + checkpoint)
 #   2. lsof-verify no holders
-#   3. Raw `cp` the db file
-#   4. md5-verify the copy
-#   5. Prune old backups (keep N most recent)
+#   3. Raw `cp` the db file (plus its store-state sidecar, when present)
+#   4. md5-verify the copies
+#   5. Prune old backups (keep N most recent; a pruned backup's sidecar
+#      companion is deleted with it)
 #   6. systemctl --user start neurostrata
 #
 # Source DB is never touched. Failure modes are: bad backup (md5 mismatch)
 # → script deletes the bad copy and exits non-zero. The source is safe.
+#
+# Store-state companion: a db at path P records its embedding identity in
+# the sidecar P.store-state.json (model_choice::store_state_path). When
+# that sidecar exists, step 4 copies it alongside the backup as
+# db-<timestamp>.store-state.json and md5-verifies it the same way; any
+# sidecar copy/verify failure deletes both copies and exits non-zero,
+# under the same failure contract as the db copy. To recover, place the
+# db backup at the target db path and its companion at
+# <target db path>.store-state.json — exactly where the store looks for
+# it — so the recovered store keeps its recorded identity. A backup
+# without a companion (a pre-feature store with no sidecar) restores
+# exactly as before: no recorded identity (LockedUnknown), unchanged.
 #
 # Assumes the daemon is managed by systemd (neurostrata-mcp setup installs
 # the service). If you ran `neurostrata-mcp daemon &` ad-hoc, the stop/start
@@ -113,11 +126,40 @@ fi
 
 log "backup OK: $BACKUP_FILE (md5=$SRC_MD5)"
 
-# 5. Prune old backups
+# 4b. Copy the store-state sidecar as the backup's companion, so a
+# recovered store keeps the identity recorded at backup time. The
+# sidecar is not optional once present: a backup that silently drops
+# identity is a bad backup, under the same failure contract as above.
+SIDECAR_PATH="$DB_PATH.store-state.json"
+COMPANION_FILE="$BACKUP_FILE.store-state.json"
+
+if [ -f "$SIDECAR_PATH" ]; then
+    if ! cp -p "$SIDECAR_PATH" "$COMPANION_FILE"; then
+        rm -f "$BACKUP_FILE" "$COMPANION_FILE"
+        die "sidecar cp failed — bad backup deleted, source untouched" 7
+    fi
+    SRC_SIDECAR_MD5=$(md5sum "$SIDECAR_PATH" | awk '{print $1}')
+    DST_SIDECAR_MD5=$(md5sum "$COMPANION_FILE" | awk '{print $1}')
+
+    if [ "$SRC_SIDECAR_MD5" != "$DST_SIDECAR_MD5" ]; then
+        rm -f "$BACKUP_FILE" "$COMPANION_FILE"
+        die "sidecar md5 mismatch: src=$SRC_SIDECAR_MD5 dst=$DST_SIDECAR_MD5 — bad backup deleted, source untouched" 8
+    fi
+
+    log "sidecar OK: $COMPANION_FILE (md5=$SRC_SIDECAR_MD5)"
+else
+    log "no store-state sidecar at $SIDECAR_PATH — backup carries no recorded identity"
+fi
+
+# 5. Prune old backups (pair-aware: companions are not backups in their
+# own right — count/select only db-* files without the sidecar suffix,
+# and delete a pruned backup's companion with it)
 if [ "$MAX_BACKUPS" -gt 0 ]; then
-    PRUNE_COUNT=$(ls -1t "$BACKUP_DIR"/db-* 2>/dev/null | wc -l)
+    PRUNE_COUNT=$(ls -1t "$BACKUP_DIR"/db-* 2>/dev/null | grep -v '\.store-state\.json$' | wc -l)
     if [ "$PRUNE_COUNT" -gt "$MAX_BACKUPS" ]; then
-        ls -1t "$BACKUP_DIR"/db-* 2>/dev/null | tail -n +$((MAX_BACKUPS + 1)) | xargs -r rm -f
+        ls -1t "$BACKUP_DIR"/db-* 2>/dev/null | grep -v '\.store-state\.json$' | tail -n +$((MAX_BACKUPS + 1)) | while IFS= read -r OLD_BACKUP; do
+            rm -f "$OLD_BACKUP" "$OLD_BACKUP.store-state.json"
+        done
         log "pruned $((PRUNE_COUNT - MAX_BACKUPS)) old backup(s), keeping $MAX_BACKUPS"
     fi
 fi
