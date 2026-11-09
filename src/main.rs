@@ -874,7 +874,7 @@ fn take_daemon_lock(db_path: &std::path::Path) -> anyhow::Result<std::fs::File> 
     }
 }
 
-/// Task A5 (Decision 4): bind the fallback store's serving descriptor
+/// Bind the fallback store's serving descriptor
 /// to the embedder an arm just built, through the concrete store
 /// behind the trait object — the same downcast the RepairHygiene arm
 /// uses. The fallback group constructs its store before any arm builds
@@ -2959,7 +2959,7 @@ async fn run() -> anyhow::Result<()> {
 
     // Now parse using clap
     if let Some(command) = cli.command {
-        // Deferred embedding-model choice (surface c): materialization
+        // Deferred embedding-model choice: materialization
         // only ever records a pending choice; it is surfaced here, at
         // interactive dispatch, before the command runs — never on the
         // daemon/serving path, and not on the way to shutting down.
@@ -2970,7 +2970,7 @@ async fn run() -> anyhow::Result<()> {
             Commands::Daemon => {
                 println!("NeuroStrata MCP Server initializing in DAEMON-ONLY mode...");
                 let config = Config::from_default_path()?;
-                // Task A5 (L0): refuse a data-bearing store under a
+                // Pre-flight: refuse a data-bearing store under a
                 // commensurably different configured model before the
                 // daemon lock is taken, the embedder is built, or the
                 // engine opens — a refused start leaves the store
@@ -3378,7 +3378,7 @@ async fn run() -> anyhow::Result<()> {
                     target_wal.push(".wal");
                     std::fs::copy(&wal, std::path::PathBuf::from(target_wal))?;
                 }
-                // Task A5 (F2): the snapshot's store-state sidecar
+                // The snapshot's store-state sidecar
                 // restores to the target's sidecar path, so the
                 // restored store keeps its recorded identity.
                 // Snapshots written before sidecar carriage have none

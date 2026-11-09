@@ -57,7 +57,7 @@ async fn search_inner(
     exact: bool,
     search_mode: crate::traits::SearchMode,
 ) -> Result<DomainSearchOutcome> {
-    // Task A5, Decision 1 (L2): every vector search funnels through
+    // Every vector search funnels through
     // here, including the paths that never init (the fallback CLI's
     // chat ask): a data-bearing store refuses a query embedded under
     // a different model than the one its vectors were recorded with.
@@ -1196,13 +1196,13 @@ pub struct LadybugStore {
     /// actually built (`Embedder::embedding_descriptor()`), bound at
     /// construction by the paths that build one. The store-state
     /// sidecar's adoption and first-write guard key on this *serving*
-    /// descriptor, never on a config re-read (Task A4b-fix2): a process
+    /// descriptor, never on a config re-read: a process
     /// that started before a setup pick landed keeps serving its
     /// original model, and only a process whose serving descriptor also
     /// matches the current configuration may record or adopt store
     /// identity. `None` for processes that build no embedder (backup,
     /// restore-verify, reports): they never create or move the recorded
-    /// descriptor. Interior-mutable (Task A5, Decision 4) so the
+    /// descriptor. Interior-mutable so the
     /// fallback CLI arms — which construct the store before they build
     /// their embedder — can bind the descriptor after construction via
     /// [`LadybugStore::set_serving_descriptor`].
@@ -1218,7 +1218,7 @@ pub struct LadybugStore {
     store_state: Arc<std::sync::Mutex<Option<CachedStoreState>>>,
 }
 
-/// The store-state sidecar as this process knows it (Task A4b-fix).
+/// The store-state sidecar as this process knows it.
 #[derive(Clone)]
 enum CachedStoreState {
     /// A sidecar exists on disk (written by us or a previous process):
@@ -1233,7 +1233,7 @@ enum CachedStoreState {
     FreshUnrecorded,
 }
 
-/// The first-write guard's restart-to-apply refusal (Task A4b-fix3).
+/// The first-write guard's restart-to-apply refusal.
 ///
 /// `guard_first_write` returns this typed error — never a bare string —
 /// so a caller can tell the refusal apart from an ordinary store
@@ -1277,7 +1277,7 @@ pub fn restart_to_apply_message(err: &anyhow::Error) -> Option<String> {
         .map(|refusal| refusal.message().to_string())
 }
 
-/// The data-bearing identity refusal (Task A5, Decision 1).
+/// The data-bearing identity refusal.
 ///
 /// A store that has recorded data under one embedding model must never
 /// be searched or written under another: the vectors would silently
@@ -1300,8 +1300,7 @@ impl EmbeddingIdentityRefusal {
     }
 
     /// The refusal between a store's recorded descriptor and the
-    /// descriptor a process would serve instead (Task A5, design
-    /// §1.5's message shape).
+    /// descriptor a process would serve instead.
     pub(crate) fn between(
         recorded: &crate::traits::EmbeddingDescriptor,
         serving: &crate::traits::EmbeddingDescriptor,
@@ -1665,9 +1664,9 @@ impl LadybugStore {
             .clone()
     }
 
-    /// Bind (or replace) the serving descriptor after construction
-    /// (Task A5, Decision 4). For processes that build their embedder
-    /// only after the store exists — the fallback CLI arms — and must
+    /// Bind (or replace) the serving descriptor after construction,
+    /// for processes that build their embedder only after the store
+    /// exists — the fallback CLI arms — and must
     /// call it before the first vector operation, so the store-state
     /// guard family and the data-bearing identity check key on the
     /// model that will actually produce this process's vectors.
@@ -1716,7 +1715,7 @@ impl LadybugStore {
                 CachedStoreState::FreshUnrecorded
             }
             None => {
-                // Task A5, Decision 3: a pre-sidecar store opens
+                // A pre-sidecar store opens
                 // exactly as it always has — no refusal can key on a
                 // descriptor that was never recorded — but the Phase B
                 // population should be visible in the logs. Warn only;
@@ -1741,7 +1740,7 @@ impl LadybugStore {
     }
 
     /// Maintain the sidecar at a successful `init`, keyed on the
-    /// *serving* descriptor (Task A4b-fix2, invariants A-1..A-4): the
+    /// *serving* descriptor: the
     /// recorded descriptor is created or rewritten only from the
     /// serving embedder's own descriptor, only while the store is
     /// pristine, and only when serving and configured agree at this
@@ -1812,20 +1811,20 @@ impl LadybugStore {
         }
     }
 
-    /// The upsert race guard (Task A4b-fix, re-keyed on the serving
-    /// descriptor by A4b-fix2): while the store is pristine with a
+    /// The upsert race guard, keyed on the serving descriptor:
+    /// while the store is pristine with a
     /// recorded descriptor, a write may only land under the model this
-    /// process serves. With a serving descriptor bound (G-1), the write
+    /// process serves. With a serving descriptor bound, the write
     /// proceeds iff serving == configured and serving == recorded: a
     /// setup pick persisted while this process was running moves the
     /// configured model away from the serving one and is refused with
     /// the restart-to-apply error, and a recorded descriptor that
     /// disagrees with the serving one is refused, never healed at write
-    /// time. Without a serving descriptor (G-2), the guard falls back
+    /// time. Without a serving descriptor, the guard falls back
     /// to the configured-vs-recorded comparison. Stores with data, and
     /// stores whose state is unknown, are outside the window this
     /// guard protects. Every refusal is a [`RestartToApplyError`], so
-    /// callers can surface it verbatim (Task A4b-fix3).
+    /// callers can surface it verbatim.
     fn guard_first_write(&self) -> Result<()> {
         if let CachedStoreState::Recorded(recorded) = self.cached_store_state() {
             if !recorded.has_data {
@@ -1866,7 +1865,7 @@ impl LadybugStore {
         Ok(())
     }
 
-    /// The data-bearing identity check (Task A5, Decision 1): a store
+    /// The data-bearing identity check: a store
     /// whose sidecar records data under descriptor R refuses any
     /// vector operation this process would perform under a different
     /// serving descriptor S — full-struct inequality, same-width model
@@ -1898,8 +1897,8 @@ impl LadybugStore {
         Ok(())
     }
 
-    /// The descriptor `init` records in the embedding registry (Task
-    /// A5, Decision 2), by precedence: the serving descriptor S when
+    /// The descriptor `init` records in the embedding registry, by
+    /// precedence: the serving descriptor S when
     /// bound (the embedder's own descriptor is the provenance-correct
     /// record); else the sidecar's recorded descriptor R (an unbound
     /// open of a recorded store seeds the registry from the store's
@@ -1945,11 +1944,10 @@ impl LadybugStore {
                 // serving one when this process has an embedder (the
                 // model that produced the vectors), else the configured
                 // one. A recorded descriptor, once present, is never
-                // rewritten by the flip (G-3) — this branch runs only
-                // when none exists yet. The serving preference is
-                // deliberate and pinned by test (Task A5, Decision
-                // 5(ii)): the flip records the model that produced the
-                // vectors, never a config re-read.
+                // rewritten by the flip — this branch runs only when
+                // none exists yet. The serving preference is deliberate
+                // and pinned by test: the flip records the model that
+                // produced the vectors, never a config re-read.
                 let descriptor = match self.serving_descriptor() {
                     Some(serving) => Some(serving),
                     None => self.configured_embedding_descriptor().ok(),
@@ -1973,7 +1971,7 @@ impl LadybugStore {
         }
     }
 
-    /// The legacy placeholder identity (Task A5, Decision 2): the last
+    /// The legacy placeholder identity: the last
     /// resort of `effective_embedding_descriptor`, reached only when
     /// neither a serving descriptor, a recorded descriptor, nor a
     /// resolvable configured descriptor exists. It describes no real
@@ -3989,16 +3987,15 @@ impl LadybugStore {
 #[async_trait]
 impl VectorStore for LadybugStore {
     async fn init(&self, namespace: &str) -> Result<()> {
-        // Task A5, Decision 1 (L1): a data-bearing store refuses a
+        // A data-bearing store refuses a
         // bound serving descriptor different from its recorded one,
         // before any schema DDL or vector work.
         self.check_data_bearing_identity()?;
         // Composite Recommendation #11: verify the embedding-space identity on
         // every init (including the schema-ready fast path) so an incompatible
         // descriptor is rejected before any vector lands. The recorded
-        // descriptor is the effective one (Task A5, Decision 2:
-        // serving, else recorded, else configured, else the legacy
-        // placeholder).
+        // descriptor is the effective one (serving, else recorded,
+        // else configured, else the legacy placeholder).
         self.verify_or_record_embedding_descriptor(
             namespace,
             &self.effective_embedding_descriptor(),
@@ -4196,13 +4193,13 @@ impl VectorStore for LadybugStore {
         if namespace.trim().is_empty() {
             anyhow::bail!("namespace must be non-empty");
         }
-        // Task A4b-fix race guard: on a pristine store, refuse the first
+        // First-write race guard: on a pristine store, refuse the first
         // write if the configured model changed since this process
         // recorded the store's descriptor (a setup pick landed while the
         // store is open). Checked before any engine write, so a refused
         // upsert lands nothing.
         self.guard_first_write()?;
-        // Task A5, Decision 1 (L2): the same entry point refuses a
+        // The same entry point refuses a
         // write under a serving descriptor different from a
         // data-bearing store's recorded one — the vector paths that
         // never init (the fallback CLI's direct upserts) are covered
@@ -4848,7 +4845,7 @@ impl VectorStore for LadybugStore {
         .await;
         if outcome.is_ok() {
             self.lexical_apply_doc(lexical_doc);
-            // Task A4b-fix: the first successful upsert is the moment the
+            // The first successful upsert is the moment the
             // store stops being pristine; record it in the sidecar after
             // the engine accepted the write, before upsert returns.
             self.flip_store_state_to_data();
@@ -5432,7 +5429,7 @@ impl VectorStore for LadybugStore {
                 )
             })?;
         }
-        // Task A5 (F2): the store-state sidecar rides along too, under
+        // The store-state sidecar rides along too, under
         // the snapshot's store name. Without it a restored store has
         // no recorded identity — it reads as a pre-sidecar store and
         // silently exits the identity protection the sidecar exists
@@ -14626,7 +14623,7 @@ eurostrata\src\daemon.rs",
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // --- Task A4b-fix: the store-state sidecar (pristine-store predicate) ---
+    // --- The store-state sidecar (pristine-store predicate) ---
     //
     // The sidecar beside the db file is the store-authored record the
     // setup-time model choice keys on: `init` records a pristine store
@@ -14873,7 +14870,7 @@ eurostrata\src\daemon.rs",
         // directly, with no intervening `init`. This does NOT cover the
         // init-mediated path — the live write half always re-inits
         // first, which is where config-keyed adoption disarmed this
-        // guard (A4b finding B2); that path is covered by
+        // guard; that path is covered by
         // store_state_same_instance_reinit_after_pick_does_not_adopt_and_upsert_refuses.
         let previous = without_model_env();
         let fx = store_state_fixture("race", "ModelA");
@@ -14909,8 +14906,8 @@ eurostrata\src\daemon.rs",
 
     #[tokio::test]
     async fn store_state_same_instance_reinit_after_pick_does_not_adopt_and_upsert_refuses() {
-        // The A4b finding B2 regression, at the exact step the live
-        // write path performs: the pre-pick daemon's add re-inits the
+        // Regression, at the exact step the live write path
+        // performs: the pre-pick daemon's add re-inits the
         // store (embed_dedup_and_upsert calls init before embedding),
         // and under config-keyed adoption that re-init rewrote the
         // recorded descriptor to the picked model, disarming the guard
@@ -14950,7 +14947,7 @@ eurostrata\src\daemon.rs",
             err.to_string().contains("ModelA") && err.to_string().contains("ModelB"),
             "the refusal must name the serving and configured models: {err}"
         );
-        // Task A4b-fix3: the refusal carries the RestartToApplyError
+        // The refusal carries the RestartToApplyError
         // identity, so user-facing surfaces can extract and surface it
         // verbatim instead of a generic store-error message.
         let extracted = restart_to_apply_message(&err)
@@ -14972,7 +14969,6 @@ eurostrata\src\daemon.rs",
 
     #[test]
     fn restart_to_apply_message_matches_only_the_typed_refusal() {
-        use anyhow::Context as _;
         // Extraction sees through context layers a caller may add
         // above the store.
         let wrapped = anyhow::Error::new(RestartToApplyError::new(
@@ -15158,7 +15154,7 @@ eurostrata\src\daemon.rs",
             ("triple-pick-landed", "ModelB", "ModelA", "ModelA"),
             // The record is never trusted over the serving descriptor.
             ("triple-record-over-serving", "ModelA", "ModelA", "ModelB"),
-            // The post-adoption B2 shape: record and config agree on
+            // The post-adoption shape: record and config agree on
             // the new model, the process still serves the old one.
             ("triple-post-adoption", "ModelA", "ModelB", "ModelB"),
         ];
@@ -15200,7 +15196,7 @@ eurostrata\src\daemon.rs",
         restore_model_env(previous);
     }
 
-    // --- Task A5: data-bearing identity refusal, registry seeding,
+    // --- Data-bearing identity refusal, registry seeding,
     // pre-sidecar disposition, fallback binding, flip provenance ---
 
     #[test]
@@ -15221,7 +15217,7 @@ eurostrata\src\daemon.rs",
 
     #[tokio::test]
     async fn setup_shortlist_same_width_switch_is_refused() {
-        // Plan test (a), Task A5 §6 A1: the setup pair at its real
+        // The setup pair at its real
         // width. FP32 and Q are both 768, so only an identity check —
         // never the width backstop — can refuse this switch.
         let previous = without_model_env();
@@ -15299,7 +15295,7 @@ eurostrata\src\daemon.rs",
 
     #[tokio::test]
     async fn data_bearing_reopen_under_recorded_model_succeeds() {
-        // §6 B1: the refusal must not fire on the legitimate path.
+        // The refusal must not fire on the legitimate path.
         let previous = without_model_env();
         let fx = data_bearing_store_fixture("a5-legit-reopen").await;
         let store = LadybugStore::for_testing(&fx.db, 4)
@@ -15331,7 +15327,7 @@ eurostrata\src\daemon.rs",
 
     #[tokio::test]
     async fn data_bearing_different_width_switch_refuses_with_identity_error() {
-        // §6 B2: the identity refusal precedes the width backstop — a
+        // The identity refusal precedes the width backstop — a
         // different-width switch reports the identity error, not an
         // engine/FLOAT error.
         let previous = without_model_env();
@@ -15358,7 +15354,7 @@ eurostrata\src\daemon.rs",
 
     #[tokio::test]
     async fn data_bearing_remote_recorded_store_reopens_under_same_remote_serving() {
-        // §6 B3: R recorded from a remote serving descriptor. A
+        // R recorded from a remote serving descriptor. A
         // config-keyed refusal would compare the local configured
         // descriptor against the remote record and lock the owner out;
         // the serving-keyed check accepts the identical remote S, and
@@ -15414,7 +15410,7 @@ eurostrata\src\daemon.rs",
 
     #[tokio::test]
     async fn data_bearing_unbound_backup_and_report_opens_are_never_refused() {
-        // §6 B4: the S == None allow-list under a changed config —
+        // The S == None allow-list under a changed config —
         // backup (construct, no init, export) and direct_report (init,
         // no serving descriptor) both succeed and never move R.
         let previous = without_model_env();
@@ -15457,7 +15453,7 @@ eurostrata\src\daemon.rs",
 
     #[tokio::test]
     async fn data_bearing_initless_vector_paths_refuse_and_unbound_recycle_passes() {
-        // §6 B5: the vector paths that never init — fallback Add
+        // The vector paths that never init — fallback Add
         // (upsert directly) and Chat Ask (search_with_domain) — refuse
         // under a mismatched serving descriptor; an unbound upsert of
         // a vector read back from the store itself (NormalizeMetadata's
@@ -15521,7 +15517,7 @@ eurostrata\src\daemon.rs",
 
     #[tokio::test]
     async fn registry_records_serving_descriptor_when_bound() {
-        // §6 C1: a bound init records S in the registry — S verifies,
+        // A bound init records S in the registry — S verifies,
         // the legacy placeholder does not.
         let previous = without_model_env();
         let fx = store_state_fixture("a5-registry-serving", "ModelA");
@@ -15546,7 +15542,7 @@ eurostrata\src\daemon.rs",
 
     #[tokio::test]
     async fn registry_seeds_from_recorded_descriptor_when_unbound() {
-        // §6 C2: an unbound init of a recorded store seeds the
+        // An unbound init of a recorded store seeds the
         // registry from R — R verifies, the (changed) configured
         // descriptor does not.
         let previous = without_model_env();
@@ -15575,7 +15571,7 @@ eurostrata\src\daemon.rs",
 
     #[tokio::test]
     async fn feature_created_store_never_records_local_fastembed_placeholder() {
-        // §6 C3: with NEUROSTRATA_MODEL unset, the placeholder the old
+        // With NEUROSTRATA_MODEL unset, the placeholder the old
         // init recorded ("local-fastembed") must not verify after a
         // bound init of a feature-created store.
         let previous = without_model_env();
@@ -15598,7 +15594,7 @@ eurostrata\src\daemon.rs",
 
     #[tokio::test]
     async fn locked_unknown_opens_exactly_as_today() {
-        // §6 D1: a pre-sidecar store (db predates this process, no
+        // A pre-sidecar store (db predates this process, no
         // sidecar ever written) opens, writes, and searches under a
         // changed config exactly as it did before the feature — and
         // no sidecar is backfilled, at open or at first write.
@@ -15647,7 +15643,7 @@ eurostrata\src\daemon.rs",
 
     #[tokio::test]
     async fn locked_unknown_width_change_fails_at_the_engine_not_the_identity_check() {
-        // §6 D2: the width backstop is unchanged for pre-sidecar
+        // The width backstop is unchanged for pre-sidecar
         // stores — a different width fails at vector use with the
         // engine's error, never with the identity refusal.
         let previous = without_model_env();
@@ -15681,7 +15677,7 @@ eurostrata\src\daemon.rs",
 
     #[tokio::test]
     async fn set_serving_descriptor_binds_post_construction() {
-        // §6 E1: the fallback binding setter — a store constructed
+        // The fallback binding setter — a store constructed
         // unbound refuses after being bound to a different model, and
         // passes after being bound to the recorded one.
         let previous = without_model_env();
@@ -15741,7 +15737,7 @@ eurostrata\src\daemon.rs",
 
     #[tokio::test]
     async fn fresh_unrecorded_flip_prefers_the_serving_descriptor() {
-        // §6 F2 (Decision 5(ii), pinned): a FreshUnrecorded store's
+        // A FreshUnrecorded store's
         // flip records the serving descriptor bound after init — the
         // model that produced the vectors — not the configured one.
         let previous = without_model_env();
@@ -15778,7 +15774,7 @@ eurostrata\src\daemon.rs",
 
     #[tokio::test]
     async fn backup_restore_round_trip_preserves_store_state_sidecar() {
-        // Task A5, F2: a snapshot that does not carry the sidecar
+        // A snapshot that does not carry the sidecar
         // restores a store with no recorded identity — silently
         // LockedUnknown, outside the identity refusal's protection.
         // The round trip must preserve Recorded{has_data, R}, and the

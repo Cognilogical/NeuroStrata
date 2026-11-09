@@ -176,7 +176,7 @@ pub struct SnapshotChecksums {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wal_sha256: Option<String>,
     pub manifest_sha256: String,
-    /// The store-state sidecar's checksum (Task A5, F2): present only
+    /// The store-state sidecar's checksum: present only
     /// when the snapshot carries `ladybug.store.store-state.json`, so
     /// snapshots written before sidecar carriage (and their checksum
     /// files) deserialize and verify exactly as before.
@@ -598,7 +598,7 @@ mod tests {
 
     #[test]
     fn checksums_cover_the_store_state_sidecar() {
-        // Task A5 (F2): the snapshot carries the store-state sidecar,
+        // The snapshot carries the store-state sidecar,
         // and the checksums cover it — a tampered sidecar must fail
         // verification like any other snapshot member. Snapshots
         // without a sidecar (older backups) carry no sidecar checksum

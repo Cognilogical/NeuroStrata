@@ -2584,7 +2584,7 @@ pub(crate) async fn embed_dedup_and_upsert(
     use crate::traits::{DedupCandidateScope, RawDistanceQuery};
 
     store.init(namespace).await.map_err(|e| {
-        // Task A5: the store's data-bearing identity refusal is
+        // The store's data-bearing identity refusal is
         // actionable operator guidance, not a store failure: pass its
         // full text to the caller instead of the generic mapping every
         // other init error gets — the same verbatim-surface pattern
@@ -2862,7 +2862,7 @@ pub(crate) async fn embed_dedup_and_upsert(
         .await
         .map_err(|e| {
             tracing::warn!("store.upsert failed in handle_add_memory for '{namespace}': {e}");
-            // The store's restart-to-apply refusal (Task A4b-fix3) is
+            // The store's restart-to-apply refusal is
             // actionable operator guidance, not a store failure: pass
             // its full text to the caller instead of the generic
             // mapping every other upsert error gets.
@@ -9179,12 +9179,12 @@ mod tests {
         }
     }
 
-    /// Task A4b-fix2, the live write half one level up: a daemon that
+    /// The live write half one level up: a daemon that
     /// started before a setup pick landed serves ModelA; when its add
     /// path runs after the pick (init -> embed -> upsert), the write
     /// must refuse, land no row, and leave the store's record at
-    /// {pristine, ModelA} — the silent FP32-under-Q mix of A4b finding
-    /// B2 must not recur through the real pipeline.
+    /// {pristine, ModelA} — the silent FP32-under-Q mix must not
+    /// recur through the real pipeline.
     #[tokio::test]
     async fn add_write_half_in_same_process_after_pick_refuses() {
         use crate::store::LadybugStore;
@@ -9256,13 +9256,13 @@ mod tests {
         }
     }
 
-    /// Task A4b-fix3: the guard's refusal is actionable operator
+    /// The guard's refusal is actionable operator
     /// guidance, and the write half's generic store-error mapping must
     /// not swallow it. The caller of the add path receives the full
     /// restart-to-apply text — the serving model, the configured model,
     /// and the restart instruction — not "Failed to store memory in
-    /// database.". S1R.5 of the A4b E2E re-run #2 failed on exactly
-    /// this: the refusal fired and no data landed, but the MCP caller
+    /// database.". The regression this pins: the refusal fired and
+    /// no data landed, but the MCP caller
     /// saw only the generic string.
     #[tokio::test]
     async fn add_write_half_refusal_reaches_caller_with_restart_to_apply_text() {
@@ -9337,7 +9337,7 @@ mod tests {
         }
     }
 
-    /// Task A4b-fix3 control: an upsert error that is NOT the guard's
+    /// Control case: an upsert error that is NOT the guard's
     /// refusal keeps the generic caller message exactly. Only the
     /// restart-to-apply refusal is surfaced verbatim.
     #[tokio::test]
@@ -9388,7 +9388,7 @@ mod tests {
         }
     }
 
-    /// Task A5 (§1.2 server mapping): the write half's init mapping
+    /// The write half's init mapping
     /// must not swallow the store's data-bearing identity refusal into
     /// "Failed to initialize table." — the refusal is actionable
     /// operator guidance and reaches the caller verbatim, the way the

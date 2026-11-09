@@ -155,7 +155,7 @@ fn write_initial_embedders_file_inner(
         api_model: None,
         // The candidate's pin: a local entry without one fails closed at
         // embedder load ("no pinned SHA-256"), which would brick the
-        // first daemon start after the pick (A4b finding B1).
+        // first daemon start after the pick.
         model_sha256: Some(choice.model_sha256.to_string()),
     }];
     entries.extend(
@@ -214,7 +214,7 @@ fn write_file_atomically(
     Ok(())
 }
 
-// --- Task A4b-fix: the store-state sidecar and the pristine predicate ---
+// --- The store-state sidecar and the pristine predicate ---
 //
 // The model-choice lock used to key on the database file's existence, but
 // a bare daemon start creates the store (ladybug.db) before any user data
@@ -306,8 +306,8 @@ pub(crate) fn store_is_pristine(db_path: &Path) -> bool {
     !store_has_data(db_path)
 }
 
-/// The daemon's pre-flight identity check (Task A5, Decision 1, layer
-/// L0): a pure-filesystem refusal, run before the daemon lock is taken
+/// The daemon's pre-flight identity check: a pure-filesystem
+/// refusal, run before the daemon lock is taken
 /// and before any embedder is built or the engine opens, so a refused
 /// daemon start leaves the store byte-untouched (no lock truncation,
 /// no WAL preservation copy, no model download for a doomed start).
@@ -320,7 +320,7 @@ pub(crate) fn store_is_pristine(db_path: &Path) -> bool {
 /// remote entry's serving descriptor cannot be synthesized from
 /// config, and an unparseable name legitimately falls back to a
 /// different model at load, so both pass here; the store-level check
-/// keyed on the true serving descriptor (L1/L2) still refuses before
+/// keyed on the true serving descriptor still refuses before
 /// any vector lands. An unresolvable configuration also passes: the
 /// embedder build that follows fails on its own with the loader's
 /// error, and this pre-flight must not invent a second failure mode
@@ -365,13 +365,13 @@ pub(crate) fn check_daemon_open_identity(db_path: &Path, config_dir: &Path) -> a
     Ok(())
 }
 
-// --- Task A4: deferred setup-time choice (surface c) ---
+// --- Deferred setup-time choice ---
 //
 // Materialization runs inside daemon/serving processes whose stdin is not
 // a terminal and whose stdout is a log sink or the MCP wire, so it never
 // prompts: it only records a pending choice. The next interactive command
 // surfaces it. The offer itself is a pure rendering of the candidate
-// slice plus the Part 0 coverage, so it is testable without a terminal.
+// slice plus the measured coverage, so it is testable without a terminal.
 
 /// The pending-choice marker file, written beside `embedders.json` in the
 /// config directory at materialization time.
@@ -432,16 +432,16 @@ fn offer_condition_holds(config_dir: &Path, db_path: &Path) -> bool {
 const PERMANENCE_WARNING: &str = "This choice is permanent for this database: the store refuses any other model once data exists. Changing later requires a new database.";
 const NOT_MEASURED_MEMORY_LINE: &str = "Not measured — resident-memory delta unverified.";
 const NOT_MEASURED_QUALITY_LINE: &str = "Not measured — quality delta unverified.";
-/// Task 0e, live-store corpus: 6.08% (18/296) of items exceed 512 tokens;
-/// the measurement's plain-language line rounds that to ~6%.
+/// Measured on a live-store corpus: 6.08% (18/296) of items exceed 512
+/// tokens; the plain-language line rounds that to ~6%.
 const TRUNCATION_PCT_OVER_512: u32 = 6;
 
-/// The resident-memory line for one candidate: Part 0's measured figure
+/// The resident-memory line for one candidate: the measured figure
 /// where the candidate was measured end-to-end, the not-measured line
 /// otherwise. A candidate never displays another candidate's numbers.
 fn memory_line(choice: &ModelChoice) -> String {
     match choice.model_name {
-        // Task 0b: Q after-batch runs 330/332 MiB; FP32 947/938 MiB;
+        // Measured: Q after-batch runs 330/332 MiB; FP32 947/938 MiB;
         // reported saving 606 MiB.
         "NomicEmbedTextV15Q" => "Measured: resident memory after a batch was 330/332 MiB, a measured saving of 606 MiB against the FP32 default's 947/938 MiB (Part 0, Task 0b).".to_string(),
         _ => NOT_MEASURED_MEMORY_LINE.to_string(),
@@ -452,10 +452,10 @@ fn memory_line(choice: &ModelChoice) -> String {
 /// [`memory_line`].
 fn quality_line(choice: &ModelChoice) -> String {
     match choice.model_name {
-        // Task 0c: Probe A overlap 0.873333, mean cosine 0.948251;
+        // Measured: Probe A overlap 0.873333, mean cosine 0.948251;
         // Probe B recall 23/30 against FP32's 22/30.
         "NomicEmbedTextV15Q" => "Measured: Probe A top-5 overlap with the FP32 default was 0.873 (mean cosine 0.948); Probe B recall was 23/30 against the FP32 default's 22/30 (Part 0, Task 0c).".to_string(),
-        // Task 0c: Probe A overlap 0.666667; no resident-memory measurement.
+        // Measured: Probe A overlap 0.666667; no resident-memory measurement.
         "BGESmallENV15Q" => {
             "Measured: Probe A top-5 overlap with the FP32 default was 0.667 (Part 0, Task 0c)."
                 .to_string()
@@ -464,7 +464,7 @@ fn quality_line(choice: &ModelChoice) -> String {
     }
 }
 
-/// Render the offer for `offered` (the Decision Gate's Top 3 slice of
+/// Render the offer for `offered` (the top-three candidate slice of
 /// [`candidates()`]). Pure: the same slice always renders the same text.
 pub(crate) fn render_offer(offered: &[ModelChoice]) -> String {
     let mut out = String::new();
@@ -661,7 +661,7 @@ mod tests {
     fn writer_emits_the_candidates_pin() {
         // Every pick the writer writes must carry that candidate's pin:
         // FastEmbedder::new fails closed on a missing pin, so a `None`
-        // here bricks the daemon's first start after the pick (A4b B1).
+        // here bricks the daemon's first start after the pick.
         for choice in candidates() {
             let (tmp, config_dir) = fresh_config_dir("writer-pin");
             let db_path = tmp.path().join("neurostrata.db");
@@ -686,7 +686,7 @@ mod tests {
         }
     }
 
-    // --- Task A3: the fail-closed initial-file writer ---
+    // --- The fail-closed initial-file writer ---
 
     fn bge_small_q() -> &'static ModelChoice {
         candidates()
@@ -763,7 +763,7 @@ mod tests {
         }
     }
 
-    // --- Task A4b-fix: the lock keys on recorded store data, not on the
+    // --- The lock keys on recorded store data, not on the
     // db file's existence. A bare daemon start creates ladybug.db before
     // any user data exists, so existence alone must never refuse. The
     // store-authored sidecar (ladybug.db.store-state.json) is the record:
@@ -981,7 +981,7 @@ mod tests {
         assert!(parsed[0].model_sha256.is_none());
     }
 
-    // --- Task A4: deferred setup-time choice (surface c) ---
+    // --- Deferred setup-time choice ---
 
     fn write_default_file(config_dir: &Path) {
         let default_json =
@@ -991,8 +991,8 @@ mod tests {
 
     #[test]
     fn setup_offers_choice_when_db_exists_but_store_is_pristine() {
-        // The A4b E2E regression (S1.4/S1.5) at unit level: a bare daemon
-        // start creates ladybug.db before any user data exists, and the
+        // Regression at unit level: a bare daemon start creates
+        // ladybug.db before any user data exists, and the
         // pending choice recorded at that start must still surface and
         // persist at the next interactive command.
         let (tmp, config_dir) = fresh_config_dir("a4fix-pristine-db");
@@ -1138,7 +1138,7 @@ mod tests {
         let target = config_dir.join("embedders.json");
         let before = fs::read(&target).expect("read default file");
         record_pending_choice(&config_dir);
-        // Sabotage the writer's temp path (the A3 seam's documented name) so
+        // Sabotage the writer's temp path (the writer's documented temp name) so
         // the persist fails after staging begins.
         let tmp_blocker = config_dir.join(format!(".embedders.json.tmp-{}", std::process::id()));
         fs::create_dir(&tmp_blocker).expect("create temp blocker dir");
@@ -1193,7 +1193,7 @@ mod tests {
             nomic.contains("0.873"),
             "NomicEmbedTextV15Q shows its measured overlap"
         );
-        // Warning copy, split by context class, with the Task 0e figure.
+        // Warning copy, split by context class, with the measured figure.
         assert!(bge.contains("This model's context is 512 tokens. About 6% of the items"));
         assert!(arctic.contains("This model's context is 512 tokens. About 6% of the items"));
         assert!(
@@ -1364,8 +1364,8 @@ mod tests {
         );
     }
 
-    // --- Task A5: the daemon pre-flight identity check (L0) and the
-    // pin-backfill posture (Decision 5(iii), OUT — pinned) ---
+    // --- The daemon pre-flight identity check and the pin-backfill
+    // posture ---
 
     /// The FP32 default's descriptor, as a serving process records it.
     fn fp32_recorded_descriptor() -> crate::traits::EmbeddingDescriptor {
@@ -1404,10 +1404,10 @@ mod tests {
 
     #[test]
     fn daemon_refuses_setup_chosen_model_against_existing_db() {
-        // Plan test (b), Task A5 §6 A2: the pre-flight is
-        // filesystem-only, so the fixture store is a bare db file plus
-        // its sidecar — no engine fixture is needed, and the refusal
-        // must leave every byte (and the file set) untouched.
+        // The pre-flight is filesystem-only, so the fixture store is
+        // a bare db file plus its sidecar — no engine fixture is
+        // needed, and the refusal must leave every byte (and the file
+        // set) untouched.
         let previous = std::env::var("NEUROSTRATA_MODEL").ok();
         std::env::remove_var("NEUROSTRATA_MODEL");
         let tmp = tempfile::tempdir().expect("temp dir");
@@ -1542,9 +1542,9 @@ mod tests {
 
     #[test]
     fn hand_authored_shortlist_entry_without_pin_is_not_backfilled() {
-        // Task A5 §6 F3 (Decision 5(iii), OUT — pinned): the loader
-        // backfills only the FP32 default's pin. A hand-authored
-        // shortlist entry stays pinless through the loader and fails
+        // The loader backfills only the FP32 default's pin. A
+        // hand-authored shortlist entry stays pinless through the
+        // loader and fails
         // closed at embedder load (the embed-side pin gate is pinned
         // by `pin_gate_refuses_a_pinless_shortlist_entry`); extending
         // the backfill is a deliberate future change to this test.

@@ -246,9 +246,9 @@ fn resolve_snapshot_dir(model_dir: &Path, model_name: &str, pinned_sha: &str) ->
         if named.is_dir() {
             return Ok(named);
         }
-        // Task A5, Decision 5(i): a refs/main that reads successfully
-        // but names a missing snapshot is fail-closed — the ref is
-        // present and authoritative, so falling through to enumeration
+        // A refs/main that reads successfully but names a missing
+        // snapshot is fail-closed — the ref is present and
+        // authoritative, so falling through to enumeration
         // would verify a snapshot the ref does not name. Only a
         // genuinely unreadable refs/main (absent file) falls through
         // to the exactly-one-snapshot rule below.
@@ -912,7 +912,7 @@ mod tests {
     #[test]
     fn verify_hashes_the_file_fastembed_loads() {
         // NomicEmbedTextV15Q shares its snapshot with the FP32 file (the
-        // A4b pre-seed shape): fastembed loads onnx/model_quantized.onnx,
+        // pre-seeded cache shape): fastembed loads onnx/model_quantized.onnx,
         // so the quantized bytes' pin must pass and the FP32 sibling's
         // pin must fail — the old collector never saw the quantized file.
         let dir = fresh_cache_dir("quantized");
@@ -973,9 +973,9 @@ mod tests {
 
     #[test]
     fn verify_model_checksum_refuses_dangling_refs_main() {
-        // Task A5, Decision 5(i): a refs/main that reads successfully
-        // but names a snapshot directory that does not exist is a
-        // fail-closed case. Falling through to snapshot enumeration
+        // A refs/main that reads successfully but names a snapshot
+        // directory that does not exist is a fail-closed case.
+        // Falling through to snapshot enumeration
         // would verify whichever snapshot happens to be present
         // instead of the one the ref names.
         let dir = fresh_cache_dir("dangling-ref");
@@ -1020,11 +1020,10 @@ mod tests {
 
     #[test]
     fn pin_gate_refuses_a_pinless_shortlist_entry() {
-        // Task A5 §6 F3 (Decision 5(iii), OUT — pinned): the loader
-        // backfills only the FP32 default's pin, so a hand-authored
-        // shortlist entry without one reaches this gate pinless and
-        // is refused with the actionable error. Extending the
-        // backfill is a deliberate future change to this test and to
+        // The loader backfills only the FP32 default's pin, so a
+        // hand-authored shortlist entry without one reaches this gate
+        // pinless and is refused with the actionable error. Extending
+        // the backfill is a deliberate future change to this test and to
         // `hand_authored_shortlist_entry_without_pin_is_not_backfilled`.
         let entry = AcceptableEmbedder {
             model_name: "NomicEmbedTextV15Q".to_string(),
