@@ -3030,6 +3030,83 @@ mod tests {
             None => std::env::remove_var("NEUROSTRATA_MODEL"),
         }
     }
+
+    fn restore_copy_fixture(
+        tag: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let root =
+            std::env::temp_dir().join(format!("ns-restore-copy-{}-{}", tag, uuid::Uuid::new_v4()));
+        let snapshot_dir = root.join("snapshot");
+        let target = root.join("target").join("ladybug.store");
+        std::fs::create_dir_all(&snapshot_dir).unwrap();
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(snapshot_dir.join("ladybug.store"), b"snapshot-db").unwrap();
+        (root, snapshot_dir, target)
+    }
+
+    fn restore_target_wal_path(target: &std::path::Path) -> std::path::PathBuf {
+        let mut wal = target.as_os_str().to_os_string();
+        wal.push(".wal");
+        std::path::PathBuf::from(wal)
+    }
+
+    #[test]
+    fn restore_copy_drops_orphan_target_wal_and_sidecar_when_snapshot_has_none() {
+        let (root, snapshot_dir, target) = restore_copy_fixture("orphans");
+        // The target DB file is absent (the Restore arm's guard passes),
+        // but the old store's WAL and sidecar were left behind as orphans.
+        let target_wal = restore_target_wal_path(&target);
+        let target_sidecar = crate::model_choice::store_state_path(&target);
+        std::fs::write(&target_wal, b"orphan-wal").unwrap();
+        std::fs::write(&target_sidecar, b"orphan-sidecar").unwrap();
+
+        copy_snapshot_into_place(&snapshot_dir, &target).expect("restore copy");
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"snapshot-db");
+        assert!(
+            !target_wal.exists(),
+            "the orphan target WAL must not survive a restore whose snapshot has none"
+        );
+        assert!(
+            !target_sidecar.exists(),
+            "the orphan target sidecar must not survive a restore whose snapshot has none"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restore_copy_overwrites_orphan_target_wal_and_sidecar_from_snapshot() {
+        let (root, snapshot_dir, target) = restore_copy_fixture("overwrite");
+        std::fs::write(snapshot_dir.join("ladybug.store.wal"), b"snapshot-wal").unwrap();
+        std::fs::write(
+            snapshot_dir.join("ladybug.store.store-state.json"),
+            b"snapshot-sidecar",
+        )
+        .unwrap();
+        let target_wal = restore_target_wal_path(&target);
+        let target_sidecar = crate::model_choice::store_state_path(&target);
+        std::fs::write(&target_wal, b"orphan-wal").unwrap();
+        std::fs::write(&target_sidecar, b"orphan-sidecar").unwrap();
+
+        copy_snapshot_into_place(&snapshot_dir, &target).expect("restore copy");
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"snapshot-db");
+        assert_eq!(std::fs::read(&target_wal).unwrap(), b"snapshot-wal");
+        assert_eq!(std::fs::read(&target_sidecar).unwrap(), b"snapshot-sidecar");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restore_copy_without_snapshot_wal_or_sidecar_and_no_orphans_succeeds() {
+        let (root, snapshot_dir, target) = restore_copy_fixture("plain");
+
+        copy_snapshot_into_place(&snapshot_dir, &target).expect("restore copy");
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"snapshot-db");
+        assert!(!restore_target_wal_path(&target).exists());
+        assert!(!crate::model_choice::store_state_path(&target).exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 /// Where every CLI HTTP call goes. A constant because `bus-metrics` names it
@@ -3198,6 +3275,62 @@ fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
             }
         })
         .build()?)
+}
+
+/// Copy a snapshot's files into place for a restore: the store file, its
+/// WAL when the snapshot carries one, and its store-state sidecar when it
+/// carries one. Extracted from the Restore arm so the copy logic is
+/// testable without driving the whole CLI.
+fn copy_snapshot_into_place(
+    snapshot_dir: &std::path::Path,
+    target: &std::path::Path,
+) -> anyhow::Result<()> {
+    let snapshot = snapshot_dir.join("ladybug.store");
+    std::fs::copy(&snapshot, target)?;
+    let mut wal = snapshot.clone().into_os_string();
+    wal.push(".wal");
+    let wal = std::path::PathBuf::from(wal);
+    let mut target_wal = target.as_os_str().to_os_string();
+    target_wal.push(".wal");
+    let target_wal = std::path::PathBuf::from(target_wal);
+    if wal.exists() {
+        std::fs::copy(&wal, &target_wal)?;
+    } else if target_wal.exists() {
+        // The target DB file was absent (the Restore arm refuses an
+        // existing one), but an old store's WAL can be left behind at
+        // the target path as an orphan. It must not survive into the
+        // restored store, or the engine would replay it against a
+        // store it never belonged to (the issue-#76 hazard class,
+        // fixed for export but not restore). Removal is loud: a
+        // directory at the WAL path is an error, not a silent pass.
+        std::fs::remove_file(&target_wal).map_err(|e| {
+            anyhow::anyhow!(
+                "could not remove the stale write-ahead log at the restore target: {}",
+                e
+            )
+        })?;
+    }
+    // The snapshot's store-state sidecar
+    // restores to the target's sidecar path, so the
+    // restored store keeps its recorded identity.
+    // Snapshots written before sidecar carriage have none
+    // and restore exactly as they always have — except that an
+    // orphan sidecar left at the target path is removed, for the
+    // same reason as the WAL above: the restored store must not
+    // inherit the old store's recorded identity.
+    let snapshot_sidecar = snapshot_dir.join("ladybug.store.store-state.json");
+    let target_sidecar = crate::model_choice::store_state_path(target);
+    if snapshot_sidecar.exists() {
+        std::fs::copy(&snapshot_sidecar, &target_sidecar)?;
+    } else if target_sidecar.exists() {
+        std::fs::remove_file(&target_sidecar).map_err(|e| {
+            anyhow::anyhow!(
+                "could not remove the stale store-state sidecar at the restore target: {}",
+                e
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn main() -> anyhow::Result<()> {
@@ -3741,28 +3874,7 @@ async fn run() -> anyhow::Result<()> {
                     );
                     std::process::exit(1);
                 }
-                std::fs::copy(&snapshot, &target)?;
-                let mut wal = snapshot.clone().into_os_string();
-                wal.push(".wal");
-                let wal = std::path::PathBuf::from(wal);
-                if wal.exists() {
-                    let mut target_wal = target.clone().into_os_string();
-                    target_wal.push(".wal");
-                    std::fs::copy(&wal, std::path::PathBuf::from(target_wal))?;
-                }
-                // The snapshot's store-state sidecar
-                // restores to the target's sidecar path, so the
-                // restored store keeps its recorded identity.
-                // Snapshots written before sidecar carriage have none
-                // and restore exactly as they always have.
-                let snapshot_sidecar =
-                    std::path::Path::new(&dir).join("ladybug.store.store-state.json");
-                if snapshot_sidecar.exists() {
-                    std::fs::copy(
-                        &snapshot_sidecar,
-                        crate::model_choice::store_state_path(&target),
-                    )?;
-                }
+                copy_snapshot_into_place(std::path::Path::new(&dir), &target)?;
 
                 // Opened only after the copy, to verify the restored store
                 // reads back and to report what it holds.
