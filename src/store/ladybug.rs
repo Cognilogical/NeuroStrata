@@ -1460,6 +1460,25 @@ fn configured_embedding_descriptor_in(
     dimensions: usize,
 ) -> Result<crate::traits::EmbeddingDescriptor> {
     let configured = crate::embed::configured_model_in(embed_config_dir)?;
+    if configured.base_url.is_some() && configured.api_key_env.is_some() {
+        // The entry is one `build_embedder` serves through a
+        // RemoteEmbedder (it branches on exactly this predicate):
+        // synthesize that embedder's descriptor shape, resolving
+        // api_model exactly as `build_embedder` does, so a process
+        // serving the configured remote entry can satisfy S == C.
+        return Ok(crate::traits::EmbeddingDescriptor {
+            provider: "openai-compatible".into(),
+            model: configured
+                .api_model
+                .clone()
+                .unwrap_or_else(|| crate::embed::DEFAULT_REMOTE_API_MODEL.to_string()),
+            revision: "unknown".into(),
+            dims: dimensions,
+            normalization: "unknown".into(),
+            preprocessing: "unknown".into(),
+            distance_metric: "cosine".into(),
+        });
+    }
     Ok(crate::traits::EmbeddingDescriptor {
         provider: "fastembed".into(),
         model: configured.model_name,
@@ -1803,7 +1822,11 @@ impl LadybugStore {
     /// loader uses (`embed::configured_model_in` — the env-named entry
     /// when acceptable, otherwise the first entry), never the
     /// env-or-placeholder shortcut `store_embedding_descriptor` falls back
-    /// to. The shape mirrors `FastEmbedder::embedding_descriptor`; the
+    /// to. The shape mirrors the descriptor of the embedder
+    /// `build_embedder` would construct from the entry —
+    /// `FastEmbedder::embedding_descriptor` for a local entry, the
+    /// remote shape for an entry with both `base_url` and
+    /// `api_key_env`; the
     /// width is this store's, because every production path opens the
     /// store with the configured model's width and the store's
     /// FLOAT[width] column is the width its vectors actually have.
@@ -1996,10 +2019,10 @@ impl LadybugStore {
     /// vector operation this process would perform under a different
     /// serving descriptor S — full-struct inequality, same-width model
     /// changes included. The refusal keys on S only, never on the
-    /// configured descriptor C: C is a config re-read that structurally
-    /// cannot describe a remote-served store (it hard-codes the local
-    /// provider/revision shape) and can legitimately differ from the
-    /// model actually loaded when the configured name falls back. When
+    /// configured descriptor C: C is a config re-read, not the identity
+    /// of the embedder that produced this process's vectors, and can
+    /// legitimately differ from the model actually loaded when the
+    /// configured name falls back. When
     /// no serving descriptor is bound there is no serving identity to
     /// compare, and the check passes: the unbound production paths
     /// (backup, restore-verify, reports, export, metadata recycling)
@@ -14867,6 +14890,23 @@ eurostrata\src\daemon.rs",
         .expect("write fixture embedders.json");
     }
 
+    /// A remote embedders.json entry at the fixture width: base_url
+    /// and api_key_env both set — the predicate `build_embedder`
+    /// branches on — with `api_model` present or absent.
+    fn write_remote_embedders_config(config_dir: &std::path::Path, api_model: Option<&str>) {
+        let api_model_field = match api_model {
+            Some(model) => format!(",\"api_model\":\"{model}\""),
+            None => String::new(),
+        };
+        std::fs::write(
+            config_dir.join("embedders.json"),
+            format!(
+                "[{{\"model_name\":\"RemoteEntry\",\"dimensions\":4,\"base_url\":\"http://127.0.0.1:9/v1\",\"api_key_env\":\"NS_TEST_REMOTE_KEY\"{api_model_field}}}]"
+            ),
+        )
+        .expect("write fixture remote embedders.json");
+    }
+
     /// A temp root holding one store db plus a config dir whose
     /// embedders.json names `model` — the configured model the store
     /// resolves through the `embed::configured_model_in` seam.
@@ -14946,8 +14986,8 @@ eurostrata\src\daemon.rs",
     }
 
     /// A remote embedder's descriptor: the shape
-    /// `RemoteEmbedder::embedding_descriptor` produces, which no
-    /// config-synthesized descriptor can ever equal.
+    /// `RemoteEmbedder::embedding_descriptor` produces, and the shape a
+    /// matching remote configured entry synthesizes.
     fn remote_descriptor_for(model: &str) -> crate::traits::EmbeddingDescriptor {
         crate::traits::EmbeddingDescriptor {
             provider: "openai-compatible".into(),
@@ -15323,6 +15363,99 @@ eurostrata\src\daemon.rs",
             .expect("first upsert under the recorded model succeeds");
         assert!(crate::model_choice::store_has_data(&fx.db));
         assert_eq!(read_sidecar(&fx.db)["descriptor"]["model"], json!("ModelB"));
+        drop(store2);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[test]
+    fn configured_descriptor_for_remote_entry_matches_remote_serving_shape() {
+        let previous = without_model_env();
+        let fx = store_state_fixture("remote-configured", "ModelA");
+        write_remote_embedders_config(&fx.config_dir, Some("RemoteModel"));
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        let configured = store
+            .configured_embedding_descriptor()
+            .expect("the remote entry resolves");
+        assert_eq!(
+            configured,
+            remote_descriptor_for("RemoteModel"),
+            "a remote configured entry synthesizes the remote serving shape"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+
+        // Without api_model, the synthesis resolves the same default
+        // model build_embedder constructs the remote embedder with.
+        let fx2 = store_state_fixture("remote-configured-default", "ModelA");
+        write_remote_embedders_config(&fx2.config_dir, None);
+        let store2 = LadybugStore::for_testing(&fx2.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx2.config_dir);
+        let configured2 = store2
+            .configured_embedding_descriptor()
+            .expect("the remote entry without api_model resolves");
+        assert_eq!(
+            configured2,
+            remote_descriptor_for("text-embedding-3-small"),
+            "an api_model-absent remote entry synthesizes the default remote model"
+        );
+        drop(store2);
+        let _ = std::fs::remove_dir_all(&fx2.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn remote_switch_on_pristine_store_adopts_and_first_write_passes() {
+        let previous = without_model_env();
+        let fx = store_state_fixture("remote-switch", "ModelA");
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        store.init("probe").await.expect("init");
+        assert_eq!(read_sidecar(&fx.db)["descriptor"]["model"], json!("ModelA"));
+        assert!(!crate::model_choice::store_has_data(&fx.db));
+        drop(store);
+
+        // The config is rewritten to a same-width remote entry and the
+        // next process serves that remote embedder: its serving
+        // descriptor must equal the configured synthesis, so the
+        // pristine store adopts the remote descriptor at init and the
+        // first write under it proceeds.
+        write_remote_embedders_config(&fx.config_dir, Some("RemoteModel"));
+        let remote = remote_descriptor_for("RemoteModel");
+        let store2 = LadybugStore::for_testing(&fx.db, 4)
+            .expect("reopen temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(remote.clone()));
+        store2.init("probe").await.expect("init under remote");
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["has_data"], json!(false));
+        assert_eq!(
+            sidecar["descriptor"]["provider"],
+            json!("openai-compatible"),
+            "init adopts the remote descriptor into the sidecar"
+        );
+        assert_eq!(sidecar["descriptor"]["model"], json!("RemoteModel"));
+        assert!(
+            !crate::model_choice::store_has_data(&fx.db),
+            "adoption keeps the store pristine"
+        );
+        store2
+            .upsert("probe", "m1", vec![0.0; 4], store_state_payload())
+            .await
+            .expect("first upsert under the remote model succeeds");
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["has_data"], json!(true));
+        assert_eq!(
+            sidecar["descriptor"]["provider"],
+            json!("openai-compatible"),
+            "the flip records the remote descriptor"
+        );
+        assert_eq!(sidecar["descriptor"]["model"], json!("RemoteModel"));
         drop(store2);
         let _ = std::fs::remove_dir_all(&fx.root);
         restore_model_env(previous);

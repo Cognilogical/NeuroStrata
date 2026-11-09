@@ -591,6 +591,13 @@ impl Embedder for RemoteEmbedder {
     }
 }
 
+/// The remote API model a remote entry is served under when it names
+/// no `api_model` of its own. Shared by `build_embedder` (which
+/// constructs the `RemoteEmbedder` with it) and the store's
+/// configured-descriptor synthesis (which must predict that same
+/// descriptor), so the default cannot drift between the two sites.
+pub(crate) const DEFAULT_REMOTE_API_MODEL: &str = "text-embedding-3-small";
+
 pub fn build_embedder() -> Result<Arc<dyn Embedder>> {
     let target_model = configured_model()?;
 
@@ -602,7 +609,7 @@ pub fn build_embedder() -> Result<Arc<dyn Embedder>> {
         let api_model = target_model
             .api_model
             .clone()
-            .unwrap_or_else(|| "text-embedding-3-small".to_string());
+            .unwrap_or_else(|| DEFAULT_REMOTE_API_MODEL.to_string());
 
         eprintln!(
             "Initializing RemoteEmbedder with model: {} at {}",
