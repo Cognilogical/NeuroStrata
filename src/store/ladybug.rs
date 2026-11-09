@@ -5615,45 +5615,53 @@ impl VectorStore for LadybugStore {
         let memory_types = memory_types.to_vec();
         self.with_conn(move |conn| {
             let safe_ns = escape_ladybug_string(&namespace);
-            let vec_str = format!(
-                "[{}]",
-                vector
-                    .iter()
-                    .map(|f| {
-                        let s = format!("{}", f);
-                        if s.contains('.') || s.contains('e') || s.contains('E') {
-                            s
-                        } else {
-                            format!("{}.0", s)
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",")
-            );
             let type_list = memory_types
                 .iter()
                 .map(|t| format!("'{}'", escape_ladybug_string(t)))
                 .collect::<Vec<_>>()
                 .join(", ");
             let now = chrono::Utc::now().timestamp();
-            // Over-fetch so rows dropped below (retired, archived, conflicting)
-            // do not leave the caller short.
-            let query = format!(
-                "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.memory_type IN [{}] RETURN m.id, array_distance(m.embedding, {}) AS dist, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata ORDER BY dist ASC, m.id ASC LIMIT {}",
-                safe_ns,
-                type_list,
-                vec_str,
-                limit.saturating_mul(4)
+
+            // Name the candidate rows first, without touching the embedding
+            // column. A distance query over the Memory table reads that whole
+            // column into the buffer pool whatever filter it carries (measured:
+            // +120 MB for a namespace with no matching rows, +296 MB for one
+            // with three), so ranking is only run on the rows that qualify.
+            let id_query = format!(
+                "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.memory_type IN [{}] RETURN m.id",
+                safe_ns, type_list
             );
-            let mut out: Vec<SearchResult> = Vec::new();
-            for row in conn.query(&query)? {
-                let distance: f32 = match &row[1] {
-                    lbug::Value::Float(f) if f.is_finite() && *f >= 0.0 => *f,
-                    lbug::Value::Double(d) if d.is_finite() && *d >= 0.0 => *d as f32,
+            let mut candidate_ids: Vec<String> = Vec::new();
+            for row in conn.query(&id_query)? {
+                candidate_ids.push(format!("{}", row[0]));
+            }
+            if candidate_ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            // One keyed lookup per candidate, the same `m.id = '...'` form `get`
+            // uses. A single `m.id IN [...]` query over the same rows was
+            // measured at +286 MB, so it is not a keyed read.
+            let mut ranked: Vec<SearchResult> = Vec::new();
+            for id in &candidate_ids {
+                let query = format!(
+                    "MATCH (m:Memory) WHERE m.id = '{}' RETURN m.id, m.embedding, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata",
+                    escape_ladybug_string(id)
+                );
+                let mut result = conn.query(&query)?;
+                let Some(row) = result.next() else { continue };
+                let embedding: Vec<f32> = match &row[1] {
+                    lbug::Value::Array(_, vals) | lbug::Value::List(_, vals) => vals
+                        .iter()
+                        .filter_map(|v| match v {
+                            lbug::Value::Float(f) => Some(*f),
+                            lbug::Value::Double(d) => Some(*d as f32),
+                            _ => None,
+                        })
+                        .collect(),
                     _ => continue,
                 };
-                let metadata_str = format!("{}", row[8]);
-                let metadata = parse_metadata_or_warn(&metadata_str, "metadata");
+                let Some(distance) = l2_distance(&vector, &embedding) else { continue };
+                let metadata = parse_metadata_or_warn(&format!("{}", row[8]), "metadata");
                 if is_retired_at(&metadata, now)
                     || is_archived(&metadata)
                     || is_mesh_conflicting(&metadata)
@@ -5661,7 +5669,7 @@ impl VectorStore for LadybugStore {
                 {
                     continue;
                 }
-                out.push(SearchResult {
+                ranked.push(SearchResult {
                     id: format!("{}", row[0]),
                     score: distance,
                     payload: MemoryPayload {
@@ -5675,11 +5683,16 @@ impl VectorStore for LadybugStore {
                     },
                     evidence: None,
                 });
-                if out.len() >= limit {
-                    break;
-                }
             }
-            Ok(out)
+            // Nearest first; the id breaks ties as the engine query did.
+            ranked.sort_by(|a, b| {
+                a.score
+                    .partial_cmp(&b.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+            ranked.truncate(limit);
+            Ok(ranked)
         })
         .await
     }
@@ -9400,6 +9413,18 @@ fn is_retired(metadata: &Value) -> bool {
 
 /// Timestamp-aware variant so callers that fetch many rows in one pass can
 /// capture `now` once instead of calling Utc::now() per row.
+/// Euclidean distance between two vectors, `None` when they cannot be compared
+/// (empty, different lengths, or a non-finite result). The engine's
+/// `array_distance` is the same measure.
+fn l2_distance(a: &[f32], b: &[f32]) -> Option<f32> {
+    if a.is_empty() || a.len() != b.len() {
+        return None;
+    }
+    let sum: f32 = a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum();
+    let d = sum.sqrt();
+    d.is_finite().then_some(d)
+}
+
 fn is_retired_at(metadata: &Value, now: i64) -> bool {
     match metadata.get("valid_to") {
         Some(valid_to) if !valid_to.is_null() => valid_to.as_i64().unwrap_or(0) <= now,
@@ -11549,6 +11574,15 @@ eurostrata\src\daemon.rs",
 
         assert!(ids.contains(&"live-rule".to_string()), "{:?}", ids);
         assert!(!ids.contains(&"retired-rule".to_string()), "{:?}", ids);
+    }
+
+    #[test]
+    fn l2_distance_is_euclidean_and_refuses_unlike_vectors() {
+        assert_eq!(l2_distance(&[0.0, 0.0], &[3.0, 4.0]), Some(5.0));
+        assert_eq!(l2_distance(&[1.0, 2.0], &[1.0, 2.0]), Some(0.0));
+        assert_eq!(l2_distance(&[1.0], &[1.0, 2.0]), None);
+        assert_eq!(l2_distance(&[], &[]), None);
+        assert_eq!(l2_distance(&[f32::NAN], &[1.0]), None);
     }
 
     #[tokio::test]
