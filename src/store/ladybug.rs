@@ -5775,8 +5775,13 @@ impl VectorStore for LadybugStore {
         let target = dir.join("ladybug.store");
         std::fs::copy(&source, &target)
             .map_err(|e| anyhow::anyhow!("could not copy {:?} into the snapshot: {}", source, e))?;
-        // A WAL left behind after the checkpoint rides along, so a restore
-        // replays it exactly as the engine would have.
+        // The snapshot's companions mirror the source's: a snapshot
+        // carries exactly the companions its source has — no more, no
+        // fewer. A WAL left behind after the checkpoint rides along,
+        // so a restore replays it exactly as the engine would have;
+        // when the source has no WAL, a WAL left in a reused snapshot
+        // directory by an earlier export is removed, so it cannot be
+        // checksummed into this snapshot and replayed onto this store.
         let mut wal = source.clone().into_os_string();
         wal.push(".wal");
         let wal = std::path::PathBuf::from(wal);
@@ -5787,13 +5792,26 @@ impl VectorStore for LadybugStore {
                     e
                 )
             })?;
+        } else {
+            let stale_wal = dir.join("ladybug.store.wal");
+            if stale_wal.exists() {
+                std::fs::remove_file(&stale_wal).map_err(|e| {
+                    anyhow::anyhow!(
+                        "could not remove the stale write-ahead log {:?} from the snapshot: {}",
+                        stale_wal,
+                        e
+                    )
+                })?;
+            }
         }
-        // The store-state sidecar rides along too, under
+        // The store-state sidecar mirrors under the same rule, under
         // the snapshot's store name. Without it a restored store has
         // no recorded identity — it reads as a pre-sidecar store and
         // silently exits the identity protection the sidecar exists
         // to provide. Absent sidecar (a pre-feature store) snapshots
-        // exactly as before.
+        // exactly as before — and a sidecar left in a reused snapshot
+        // directory by an earlier export is removed, so this snapshot
+        // cannot carry a recorded identity its source never had.
         let sidecar = crate::model_choice::store_state_path(&source);
         if sidecar.exists() {
             std::fs::copy(&sidecar, dir.join("ladybug.store.store-state.json")).map_err(|e| {
@@ -5802,6 +5820,17 @@ impl VectorStore for LadybugStore {
                     e
                 )
             })?;
+        } else {
+            let stale_sidecar = dir.join("ladybug.store.store-state.json");
+            if stale_sidecar.exists() {
+                std::fs::remove_file(&stale_sidecar).map_err(|e| {
+                    anyhow::anyhow!(
+                        "could not remove the stale store-state sidecar {:?} from the snapshot: {}",
+                        stale_sidecar,
+                        e
+                    )
+                })?;
+            }
         }
         let manifest = serde_json::json!({
             "format": "neurostrata-snapshot",
@@ -16800,6 +16829,171 @@ eurostrata\src\daemon.rs",
             .expect("the restored store opens under its recorded model");
         drop(ok);
         let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn export_into_reused_directory_drops_stale_sidecar() {
+        // N4: a snapshot carries exactly the companions its source
+        // has. Exporting a recorded store into a directory carries
+        // its sidecar; exporting a pre-sidecar store into the SAME
+        // directory must drop the previous snapshot's sidecar, not
+        // leave it in place to be checksummed as a member of the new
+        // snapshot — verification would then certify a recorded
+        // identity the backed-up store never had.
+        let previous = without_model_env();
+        let recorded = data_bearing_store_fixture("n4-sidecar-recorded").await;
+        let out = recorded.root.join("snapshot");
+        let opener = LadybugStore::for_testing(&recorded.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&recorded.config_dir);
+        opener
+            .export_database(&out.to_string_lossy())
+            .await
+            .expect("export the recorded store");
+        drop(opener);
+        assert!(
+            out.join("ladybug.store.store-state.json").exists(),
+            "the first snapshot carries the recorded store's sidecar"
+        );
+        let checksums: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(out.join("checksums.json")).expect("read checksums"),
+        )
+        .expect("checksums parse");
+        assert!(
+            checksums.get("store_state_sha256").is_some_and(|v| !v.is_null()),
+            "the first snapshot checksums its sidecar"
+        );
+        let report = crate::storage::snapshot::verify_snapshot(&out).expect("verify the snapshot");
+        assert!(report.valid, "the first snapshot verifies valid");
+
+        // The pre-sidecar source, in the legacy shape: a DB created
+        // by an unbound init, with any sidecar removed.
+        let legacy = store_state_fixture("n4-sidecar-legacy", "ModelA");
+        let creator = LadybugStore::for_testing(&legacy.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&legacy.config_dir);
+        creator.init("probe").await.expect("init");
+        drop(creator);
+        let _ = std::fs::remove_file(crate::model_choice::store_state_path(&legacy.db));
+        assert!(
+            !crate::model_choice::store_state_path(&legacy.db).exists(),
+            "the pre-sidecar source carries no sidecar"
+        );
+
+        let exporter = LadybugStore::for_testing(&legacy.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&legacy.config_dir);
+        exporter
+            .export_database(&out.to_string_lossy())
+            .await
+            .expect("export the pre-sidecar store into the reused directory");
+        drop(exporter);
+        assert!(
+            !out.join("ladybug.store.store-state.json").exists(),
+            "the reused snapshot drops the stale sidecar its source does not have"
+        );
+        let checksums: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(out.join("checksums.json")).expect("read checksums"),
+        )
+        .expect("checksums parse");
+        assert!(
+            checksums.get("store_state_sha256").is_none_or(|v| v.is_null()),
+            "the reused snapshot's checksums carry no store_state_sha256"
+        );
+        let report = crate::storage::snapshot::verify_snapshot(&out).expect("verify the snapshot");
+        assert!(
+            report.valid,
+            "the reused snapshot verifies valid with no sidecar aboard"
+        );
+        let _ = std::fs::remove_dir_all(&recorded.root);
+        let _ = std::fs::remove_dir_all(&legacy.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn export_into_reused_directory_drops_stale_wal() {
+        // N4, the WAL one file over: the same mirror rule for the
+        // write-ahead log. A destination holding a previous
+        // snapshot's WAL, re-exported from a source with no WAL,
+        // must drop the stale WAL — left in place it is checksummed
+        // as a member of the new snapshot and a restore replays it
+        // onto the unrelated store.
+        let previous = without_model_env();
+        let recorded = data_bearing_store_fixture("n4-wal-recorded").await;
+        let out = recorded.root.join("snapshot");
+        let opener = LadybugStore::for_testing(&recorded.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&recorded.config_dir);
+        opener
+            .export_database(&out.to_string_lossy())
+            .await
+            .expect("export the recorded store");
+        drop(opener);
+        // The previous snapshot's WAL member: present in the
+        // directory and certified by its checksums, as a snapshot
+        // whose source left a WAL behind after its checkpoint
+        // would carry it.
+        std::fs::write(out.join("ladybug.store.wal"), b"a previous snapshot's wal")
+            .expect("plant the previous snapshot's WAL");
+        crate::storage::snapshot::write_checksums(&out).expect("checksum the snapshot");
+        let checksums: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(out.join("checksums.json")).expect("read checksums"),
+        )
+        .expect("checksums parse");
+        assert!(
+            checksums.get("wal_sha256").is_some_and(|v| !v.is_null()),
+            "the first snapshot checksums its WAL"
+        );
+        let report = crate::storage::snapshot::verify_snapshot(&out).expect("verify the snapshot");
+        assert!(report.valid, "the first snapshot verifies valid");
+
+        // The no-WAL source: created by an unbound init and closed
+        // cleanly, so its checkpoint leaves no WAL on disk.
+        let clean = store_state_fixture("n4-wal-clean", "ModelA");
+        let creator = LadybugStore::for_testing(&clean.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&clean.config_dir);
+        creator.init("probe").await.expect("init");
+        drop(creator);
+        let mut source_wal = clean.db.clone().into_os_string();
+        source_wal.push(".wal");
+        assert!(
+            !std::path::PathBuf::from(&source_wal).exists(),
+            "the cleanly closed source carries no WAL"
+        );
+
+        let exporter = LadybugStore::for_testing(&clean.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&clean.config_dir);
+        assert!(
+            !std::path::PathBuf::from(&source_wal).exists(),
+            "the reopened source still carries no WAL"
+        );
+        exporter
+            .export_database(&out.to_string_lossy())
+            .await
+            .expect("export the no-WAL store into the reused directory");
+        drop(exporter);
+        assert!(
+            !out.join("ladybug.store.wal").exists(),
+            "the reused snapshot drops the stale WAL its source does not have"
+        );
+        let checksums: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(out.join("checksums.json")).expect("read checksums"),
+        )
+        .expect("checksums parse");
+        assert!(
+            checksums.get("wal_sha256").is_none_or(|v| v.is_null()),
+            "the reused snapshot's checksums carry no wal_sha256"
+        );
+        let report = crate::storage::snapshot::verify_snapshot(&out).expect("verify the snapshot");
+        assert!(
+            report.valid,
+            "the reused snapshot verifies valid with no WAL aboard"
+        );
+        let _ = std::fs::remove_dir_all(&recorded.root);
+        let _ = std::fs::remove_dir_all(&clean.root);
         restore_model_env(previous);
     }
 
