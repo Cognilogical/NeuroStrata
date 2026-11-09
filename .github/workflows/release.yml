@@ -26,6 +26,11 @@ jobs:
   build:
     name: ${{ matrix.archive }}
     runs-on: ${{ matrix.os }}
+    env:
+      # LBUG_VERSION pins the engine archive the lbug build script
+      # downloads; keep it equal to the lbug crate version in Cargo.toml
+      # and move it whenever that version changes.
+      LBUG_VERSION: "0.22.3"
     strategy:
       # A failure on one platform still lets the rest build, so a single run
       # shows every platform that is broken rather than just the first.
