@@ -874,6 +874,25 @@ fn take_daemon_lock(db_path: &std::path::Path) -> anyhow::Result<std::fs::File> 
     }
 }
 
+/// Task A5 (Decision 4): bind the fallback store's serving descriptor
+/// to the embedder an arm just built, through the concrete store
+/// behind the trait object — the same downcast the RepairHygiene arm
+/// uses. The fallback group constructs its store before any arm builds
+/// an embedder, so the construction-time builder cannot bind it; this
+/// post-build binding is what keys the store's identity checks on the
+/// model that will actually produce the arm's vectors.
+fn bind_fallback_serving_descriptor(
+    vector_store: &Arc<dyn VectorStore>,
+    embedder: &Arc<dyn crate::traits::Embedder>,
+) {
+    use crate::store::ladybug::LadybugStore;
+    if let Some(store) =
+        crate::traits::VectorStore::as_any(vector_store.as_ref()).downcast_ref::<LadybugStore>()
+    {
+        store.set_serving_descriptor(Some(embedder.embedding_descriptor()));
+    }
+}
+
 /// Whether some process holds the daemon lock right now.
 fn daemon_holds_lock(db_path: &std::path::Path) -> bool {
     // Read-only status probes must not create the lock file: open_daemon_lock
@@ -2951,6 +2970,16 @@ async fn run() -> anyhow::Result<()> {
             Commands::Daemon => {
                 println!("NeuroStrata MCP Server initializing in DAEMON-ONLY mode...");
                 let config = Config::from_default_path()?;
+                // Task A5 (L0): refuse a data-bearing store under a
+                // commensurably different configured model before the
+                // daemon lock is taken, the embedder is built, or the
+                // engine opens — a refused start leaves the store
+                // byte-untouched. The store-level check on the true
+                // serving descriptor remains the authoritative gate.
+                crate::model_choice::check_daemon_open_identity(
+                    &config.db_path,
+                    &crate::embed::config_dir(),
+                )?;
                 // Taken before the database opens. `shutdown` waits for this lock
                 // to be released rather than for the port to close.
                 if DAEMON_LOCK.set(take_daemon_lock(&config.db_path)?).is_err() {
@@ -4116,6 +4145,7 @@ async fn run() -> anyhow::Result<()> {
                             top_k,
                         } => {
                             let embedder = build_embedder()?;
+                            bind_fallback_serving_descriptor(&vector_store, &embedder);
                             let args = serde_json::json!({
                                 "namespace": namespace,
                                 "question": question,
@@ -4188,6 +4218,7 @@ async fn run() -> anyhow::Result<()> {
                         dry_run_mode: _,
                     } => {
                         let embedder = build_embedder()?;
+                        bind_fallback_serving_descriptor(&vector_store, &embedder);
                         let dir = cli_ingest_root(&dir);
                         let dir_path = std::path::Path::new(&dir);
                         let schema_str = if let Some(path) = schema_path {
@@ -4469,6 +4500,7 @@ async fn run() -> anyhow::Result<()> {
                         location,
                     } => {
                         let embedder = build_embedder()?;
+                        bind_fallback_serving_descriptor(&vector_store, &embedder);
                         let vector = embedder.embed(&content).await?;
                         let payload = crate::traits::MemoryPayload {
                             content: content.clone(),
@@ -4493,6 +4525,7 @@ async fn run() -> anyhow::Result<()> {
                         location,
                     } => {
                         let embedder = build_embedder()?;
+                        bind_fallback_serving_descriptor(&vector_store, &embedder);
                         match crate::server::edit_memory(
                             &*vector_store,
                             &*embedder,

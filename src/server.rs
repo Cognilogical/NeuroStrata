@@ -2583,10 +2583,17 @@ pub(crate) async fn embed_dedup_and_upsert(
     use crate::judgment::policy::{DedupDecision, DedupHint, MemoryWriteReport};
     use crate::traits::{DedupCandidateScope, RawDistanceQuery};
 
-    store
-        .init(namespace)
-        .await
-        .map_err(|_| "Failed to initialize table.".to_string())?;
+    store.init(namespace).await.map_err(|e| {
+        // Task A5: the store's data-bearing identity refusal is
+        // actionable operator guidance, not a store failure: pass its
+        // full text to the caller instead of the generic mapping every
+        // other init error gets — the same verbatim-surface pattern
+        // the upsert mapping below applies to the guard's refusal.
+        match crate::store::ladybug::embedding_identity_refusal_message(&e) {
+            Some(message) => message,
+            None => "Failed to initialize table.".to_string(),
+        }
+    })?;
     let vector = emb
         .embed(&payload.content)
         .await
@@ -9372,6 +9379,88 @@ mod tests {
         assert_eq!(
             err, "Failed to store memory in database.",
             "a non-guard upsert error keeps the generic caller message"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        match previous {
+            Some(value) => std::env::set_var("NEUROSTRATA_MODEL", value),
+            None => std::env::remove_var("NEUROSTRATA_MODEL"),
+        }
+    }
+
+    /// Task A5 (§1.2 server mapping): the write half's init mapping
+    /// must not swallow the store's data-bearing identity refusal into
+    /// "Failed to initialize table." — the refusal is actionable
+    /// operator guidance and reaches the caller verbatim, the way the
+    /// guard's restart-to-apply refusal does at the upsert mapping.
+    #[tokio::test]
+    async fn add_write_half_init_identity_refusal_reaches_caller_verbatim() {
+        use crate::store::LadybugStore;
+        let previous = std::env::var("NEUROSTRATA_MODEL").ok();
+        std::env::remove_var("NEUROSTRATA_MODEL");
+
+        let root = std::env::temp_dir().join(format!(
+            "ns-write-half-identity-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("embedders.json"),
+            "[{\"model_name\":\"ModelA\",\"dimensions\":4}]",
+        )
+        .unwrap();
+        let db_path = root.join("ladybug.db");
+
+        // A data-bearing store recorded under ModelA.
+        let seed = LadybugStore::for_testing(&db_path, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&config_dir)
+            .with_serving_descriptor(Some(ModelAServingEmbedder.embedding_descriptor()));
+        seed.init("probe").await.expect("init");
+        seed.upsert(
+            "probe",
+            "m1",
+            vec![0.1, 0.2, 0.3, 0.4],
+            payload("a memory recorded under ModelA"),
+        )
+        .await
+        .expect("seed upsert");
+        drop(seed);
+
+        // A process serving ModelB runs the write half: its init
+        // refuses before any embedding happens.
+        let model_b = crate::traits::EmbeddingDescriptor {
+            provider: "fastembed".to_string(),
+            model: "ModelB".to_string(),
+            revision: "onnx".to_string(),
+            dims: 4,
+            normalization: "unknown".to_string(),
+            preprocessing: "unknown".to_string(),
+            distance_metric: "cosine".to_string(),
+        };
+        let store: Arc<dyn VectorStore> = Arc::new(
+            LadybugStore::for_testing(&db_path, 4)
+                .expect("reopen temp database")
+                .with_embed_config_dir(&config_dir)
+                .with_serving_descriptor(Some(model_b)),
+        );
+        let emb: Arc<dyn Embedder> = Arc::new(ModelAServingEmbedder);
+        let err = embed_dedup_and_upsert(&store, &emb, "probe", &payload("a late write"), None)
+            .await
+            .expect_err("the write half must refuse at init under a different model");
+        assert!(
+            err.contains("refusing to open a store that has recorded data"),
+            "the caller must see the identity refusal, got: {err}"
+        );
+        assert!(
+            err.contains("'ModelA'") && err.contains("'ModelB'"),
+            "the caller must see the recorded and serving models, got: {err}"
+        );
+        assert!(
+            !err.contains("Failed to initialize table."),
+            "the identity refusal must not be mapped to the generic init error, got: {err}"
         );
 
         let _ = std::fs::remove_dir_all(&root);

@@ -306,6 +306,65 @@ pub(crate) fn store_is_pristine(db_path: &Path) -> bool {
     !store_has_data(db_path)
 }
 
+/// The daemon's pre-flight identity check (Task A5, Decision 1, layer
+/// L0): a pure-filesystem refusal, run before the daemon lock is taken
+/// and before any embedder is built or the engine opens, so a refused
+/// daemon start leaves the store byte-untouched (no lock truncation,
+/// no WAL preservation copy, no model download for a doomed start).
+///
+/// Refuses only when the comparison is *commensurate*: the sidecar
+/// records data, and the configured entry is a local fastembed entry
+/// whose name parses — under those two conditions the descriptor
+/// synthesized from the configuration is exactly what the daemon will
+/// serve, so a mismatch with the recorded descriptor is exact. A
+/// remote entry's serving descriptor cannot be synthesized from
+/// config, and an unparseable name legitimately falls back to a
+/// different model at load, so both pass here; the store-level check
+/// keyed on the true serving descriptor (L1/L2) still refuses before
+/// any vector lands. An unresolvable configuration also passes: the
+/// embedder build that follows fails on its own with the loader's
+/// error, and this pre-flight must not invent a second failure mode
+/// for broken configs.
+pub(crate) fn check_daemon_open_identity(db_path: &Path, config_dir: &Path) -> anyhow::Result<()> {
+    use std::str::FromStr;
+
+    let Some(state) = read_store_state(db_path) else {
+        return Ok(());
+    };
+    if !state.has_data {
+        return Ok(());
+    }
+    let Ok(entry) = crate::embed::configured_model_in(config_dir) else {
+        return Ok(());
+    };
+    if entry.base_url.is_some() || entry.api_key_env.is_some() {
+        return Ok(());
+    }
+    if fastembed::EmbeddingModel::from_str(&entry.model_name).is_err() {
+        return Ok(());
+    }
+    // The daemon synthesizes its serving descriptor from the entry it
+    // resolved, in `configured_embedding_descriptor`'s shape with the
+    // entry's own width (the width the daemon opens the store with).
+    let configured = crate::traits::EmbeddingDescriptor {
+        provider: "fastembed".into(),
+        model: entry.model_name.clone(),
+        revision: "onnx".into(),
+        dims: entry.dimensions,
+        normalization: "unknown".into(),
+        preprocessing: "unknown".into(),
+        distance_metric: "cosine".into(),
+    };
+    if configured != state.descriptor {
+        return Err(crate::store::ladybug::EmbeddingIdentityRefusal::between(
+            &state.descriptor,
+            &configured,
+        )
+        .into());
+    }
+    Ok(())
+}
+
 // --- Task A4: deferred setup-time choice (surface c) ---
 //
 // Materialization runs inside daemon/serving processes whose stdin is not
@@ -1302,6 +1361,204 @@ mod tests {
             fs::read(&target).expect("re-read file"),
             before,
             "a decline writes nothing"
+        );
+    }
+
+    // --- Task A5: the daemon pre-flight identity check (L0) and the
+    // pin-backfill posture (Decision 5(iii), OUT — pinned) ---
+
+    /// The FP32 default's descriptor, as a serving process records it.
+    fn fp32_recorded_descriptor() -> crate::traits::EmbeddingDescriptor {
+        crate::traits::EmbeddingDescriptor {
+            provider: "fastembed".into(),
+            model: "NomicEmbedTextV15".into(),
+            revision: "onnx".into(),
+            dims: 768,
+            normalization: "unknown".into(),
+            preprocessing: "unknown".into(),
+            distance_metric: "cosine".into(),
+        }
+    }
+
+    /// Every file under `root`, as relative path -> bytes: the
+    /// byte-untouched comparison for the pre-flight (contents and the
+    /// file set itself — no new files may appear either).
+    fn dir_snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        let mut out = std::collections::BTreeMap::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir).expect("read dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    out.insert(
+                        path.strip_prefix(root).expect("under root").to_path_buf(),
+                        fs::read(&path).expect("read file"),
+                    );
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn daemon_refuses_setup_chosen_model_against_existing_db() {
+        // Plan test (b), Task A5 §6 A2: the pre-flight is
+        // filesystem-only, so the fixture store is a bare db file plus
+        // its sidecar — no engine fixture is needed, and the refusal
+        // must leave every byte (and the file set) untouched.
+        let previous = std::env::var("NEUROSTRATA_MODEL").ok();
+        std::env::remove_var("NEUROSTRATA_MODEL");
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store_dir = tmp.path().join("store");
+        fs::create_dir_all(&store_dir).expect("create store dir");
+        let db_path = store_dir.join("ladybug.db");
+        write_bare_db(&db_path);
+        write_store_state(
+            &db_path,
+            &StoreState {
+                version: STORE_STATE_VERSION,
+                has_data: true,
+                descriptor: fp32_recorded_descriptor(),
+            },
+        )
+        .expect("write the data-bearing sidecar");
+
+        // The Q configuration, written the setup way — against a
+        // different, empty db path, as the plan's construction does.
+        let (cfg_tmp, config_dir) = fresh_config_dir("a5-preflight-q");
+        let other_db = cfg_tmp.path().join("ladybug.db");
+        let q = candidates()
+            .iter()
+            .find(|c| c.model_name == "NomicEmbedTextV15Q")
+            .expect("shortlist contains NomicEmbedTextV15Q");
+        write_initial_embedders_file(&config_dir, q, &other_db).expect("write the Q pick");
+
+        let before = dir_snapshot(&store_dir);
+        let err = check_daemon_open_identity(&db_path, &config_dir)
+            .expect_err("the pre-flight must refuse a data-bearing FP32 store under a Q config");
+        assert!(
+            crate::store::ladybug::embedding_identity_refusal_message(&err).is_some(),
+            "the pre-flight refusal is the typed identity refusal: {err}"
+        );
+        assert!(
+            err.to_string().contains("'NomicEmbedTextV15'")
+                && err.to_string().contains("'NomicEmbedTextV15Q'"),
+            "the refusal names the recorded and configured models: {err}"
+        );
+        assert_eq!(
+            dir_snapshot(&store_dir),
+            before,
+            "a refused pre-flight leaves the store directory byte-identical, with no new files"
+        );
+
+        // Negative control: the configuration restored to the recorded
+        // model passes.
+        fs::write(
+            config_dir.join("embedders.json"),
+            "[{\"model_name\":\"NomicEmbedTextV15\",\"dimensions\":768}]",
+        )
+        .expect("restore the FP32 config");
+        check_daemon_open_identity(&db_path, &config_dir)
+            .expect("the recorded model's configuration passes");
+
+        // Negative control: a pristine sidecar passes under the Q
+        // config (nothing recorded yet — the choice is still open).
+        fs::write(
+            config_dir.join("embedders.json"),
+            "[{\"model_name\":\"NomicEmbedTextV15Q\",\"dimensions\":768}]",
+        )
+        .expect("restore the Q config");
+        write_store_state(
+            &db_path,
+            &StoreState {
+                version: STORE_STATE_VERSION,
+                has_data: false,
+                descriptor: fp32_recorded_descriptor(),
+            },
+        )
+        .expect("rewrite the sidecar as pristine");
+        check_daemon_open_identity(&db_path, &config_dir)
+            .expect("a pristine store passes under any configuration");
+
+        // Negative control: no sidecar at all (a pre-sidecar store)
+        // passes — there is no recorded identity to protect.
+        fs::remove_file(store_state_path(&db_path)).expect("remove the sidecar");
+        check_daemon_open_identity(&db_path, &config_dir)
+            .expect("a pre-sidecar store passes the pre-flight");
+
+        match previous {
+            Some(value) => std::env::set_var("NEUROSTRATA_MODEL", value),
+            None => std::env::remove_var("NEUROSTRATA_MODEL"),
+        }
+    }
+
+    #[test]
+    fn daemon_preflight_passes_incommensurate_configurations() {
+        // The pre-flight refuses only when the configured descriptor
+        // is exactly what the daemon will serve. A remote entry's
+        // serving descriptor cannot be synthesized from config, and an
+        // unparseable local name falls back to a different model at
+        // load — both pass here and remain gated by the store-level
+        // check on the true serving descriptor.
+        let previous = std::env::var("NEUROSTRATA_MODEL").ok();
+        std::env::remove_var("NEUROSTRATA_MODEL");
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let db_path = tmp.path().join("ladybug.db");
+        write_bare_db(&db_path);
+        write_store_state(
+            &db_path,
+            &StoreState {
+                version: STORE_STATE_VERSION,
+                has_data: true,
+                descriptor: fp32_recorded_descriptor(),
+            },
+        )
+        .expect("write the data-bearing sidecar");
+        let (_cfg_tmp, config_dir) = fresh_config_dir("a5-preflight-incommensurate");
+
+        fs::write(
+            config_dir.join("embedders.json"),
+            "[{\"model_name\":\"SomeRemoteModel\",\"dimensions\":768,\"base_url\":\"http://127.0.0.1:9/v1\",\"api_model\":\"SomeRemoteModel\"}]",
+        )
+        .expect("write a remote entry");
+        check_daemon_open_identity(&db_path, &config_dir)
+            .expect("a remote configuration is incommensurate for the pre-flight");
+
+        fs::write(
+            config_dir.join("embedders.json"),
+            "[{\"model_name\":\"NotARealModel\",\"dimensions\":768}]",
+        )
+        .expect("write an unparseable local entry");
+        check_daemon_open_identity(&db_path, &config_dir)
+            .expect("an unparseable name is incommensurate for the pre-flight");
+
+        match previous {
+            Some(value) => std::env::set_var("NEUROSTRATA_MODEL", value),
+            None => std::env::remove_var("NEUROSTRATA_MODEL"),
+        }
+    }
+
+    #[test]
+    fn hand_authored_shortlist_entry_without_pin_is_not_backfilled() {
+        // Task A5 §6 F3 (Decision 5(iii), OUT — pinned): the loader
+        // backfills only the FP32 default's pin. A hand-authored
+        // shortlist entry stays pinless through the loader and fails
+        // closed at embedder load (the embed-side pin gate is pinned
+        // by `pin_gate_refuses_a_pinless_shortlist_entry`); extending
+        // the backfill is a deliberate future change to this test.
+        let (_tmp, config_dir) = fresh_config_dir("a5-pin-no-backfill");
+        fs::write(
+            config_dir.join("embedders.json"),
+            "[{\"model_name\":\"NomicEmbedTextV15Q\",\"dimensions\":768}]",
+        )
+        .expect("write the hand-authored entry");
+        let entries = get_acceptable_embedders_in(&config_dir).expect("loader reads the file");
+        assert_eq!(entries[0].model_name, "NomicEmbedTextV15Q");
+        assert!(
+            entries[0].model_sha256.is_none(),
+            "the loader must not backfill a shortlist entry's pin"
         );
     }
 }
