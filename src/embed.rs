@@ -357,6 +357,12 @@ impl FastEmbedder {
             TextInitOptions::new(model_enum.clone())
                 .with_cache_dir(cache_dir.clone())
                 .with_max_length(MAX_EMBED_TOKENS)
+                // The CPU arena keeps the largest buffer any input ever
+                // needed. Texts here are embedded one at a time at their own
+                // length, so the arena ratchets up and never gives it back.
+                .with_execution_providers(vec![ort::ep::CPU::default()
+                    .with_arena_allocator(false)
+                    .build()])
                 .with_show_download_progress(true),
         )?;
 

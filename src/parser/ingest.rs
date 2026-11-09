@@ -121,7 +121,7 @@ pub fn is_qualified(namespace: &str, id: &str) -> bool {
 /// GOVERNS edges match ids by exact string, so a rule an agent wrote against
 /// `src/store/ladybug.rs` could never link to the same file ingested from the
 /// GUI -- and an absolute id does not survive the repository being checked out
-/// anywhere else (bead neurostrata-fld).
+/// anywhere else.
 pub fn node_id_for(root: &Path, path: &Path) -> String {
     // A relative walk already produces the documented form. `ingest ./src <ns>`
     // is the example in CLI-readme.md, and it must keep yielding src/lib.rs --
@@ -1288,7 +1288,7 @@ pub async fn ingest_directory(
 
     // A rule is not rewritten just because its file came back, so replay what
     // the memories still declare now that the nodes they point at are the
-    // active generation (bead neurostrata-sij).
+    // active generation.
     //
     // A failure here fails the ingest rather than warning about it: reporting
     // success would hand back a graph whose rules reach none of their code.
@@ -2283,6 +2283,34 @@ use super::x;"#;
         // Resolve TypeScript imports
         let ts_deps = resolve_dependency_paths("src/app.ts", &ts_specs, &all);
         assert!(ts_deps.contains(&"src/utils.ts".to_string()) || ts_deps.contains(&"src/helper.js".to_string()));
+    }
+
+    /// Memory probe, not a correctness test: ingests `NS_PROBE_DIR` twice into a
+    /// store opened the way the daemon opens it (default engine config, no
+    /// capped buffer pool) so peak working set can be read from outside the
+    /// process. Run:
+    ///   NS_PROBE_DIR=<dir> cargo test --bin neurostrata-mcp ingest_memory_probe -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn ingest_memory_probe() {
+        let dir = std::path::PathBuf::from(std::env::var("NS_PROBE_DIR").expect("NS_PROBE_DIR"));
+        let db = std::env::temp_dir().join(format!("ns-probe-db-{}", std::process::id()));
+        // NS_PROBE_REAL=1 loads the daemon's embedder, so the model and its
+        // runtime memory are part of what is measured.
+        let embedder: Arc<dyn Embedder> = if std::env::var("NS_PROBE_REAL").is_ok() {
+            Arc::new(crate::embed::FastEmbedder::new().expect("embedder"))
+        } else {
+            Arc::new(ZeroEmbedder)
+        };
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::new(&db, embedder.dimensions()).expect("open"));
+        store.init("probe").await.unwrap();
+        let schema = ParserSchema::load(include_str!("../schema.json")).expect("schema");
+        for pass in 1..=2 {
+            let t = std::time::Instant::now();
+            ingest_directory(&dir, &schema, embedder.clone(), store.clone(), "probe", None, &[]).await.expect("ingest");
+            println!("PROBE pass {pass} done in {:?}", t.elapsed());
+        }
     }
 
     /// F2 incremental ingest + F12 watermark.
