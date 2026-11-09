@@ -39,6 +39,7 @@ mod registry;
 mod search;
 mod secrets;
 mod server;
+mod model_choice;
 mod setup;
 mod source_context;
 mod storage;
@@ -684,6 +685,56 @@ fn config_db_path() -> Option<String> {
     }
 }
 
+/// Surface a pending first-run embedding-model choice, if materialization
+/// recorded one. Called at interactive dispatch only — the caller has
+/// already excluded the daemon and shutdown commands — and the seam
+/// re-checks that stdin is a terminal before anything is presented. Runs
+/// before the command executes, so a pick is persisted before any store
+/// creation on its path. A failure is reported, never fatal to the
+/// command.
+fn surface_pending_model_choice() {
+    use crate::model_choice::ChoiceResponse;
+    use std::io::{IsTerminal, Write};
+    let Some(db_path) = config_db_path() else {
+        return;
+    };
+    let interactive = std::io::stdin().is_terminal();
+    let mut responder = |offer: &str| -> ChoiceResponse {
+        println!("{offer}");
+        print!("Choose a model by number, or enter 0 to keep the current default: ");
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_err() {
+            return ChoiceResponse::Invalid;
+        }
+        // 0 is the documented decline input; a number picks that entry
+        // (an out-of-range number is invalid, handled by the seam);
+        // anything else — text, blank — is invalid, not a decline.
+        match line.trim().parse::<usize>() {
+            Ok(0) => ChoiceResponse::Decline,
+            Ok(n) => ChoiceResponse::Pick(n - 1),
+            Err(_) => ChoiceResponse::Invalid,
+        }
+    };
+    match crate::model_choice::surface_pending_choice(
+        &crate::embed::config_dir(),
+        std::path::Path::new(&db_path),
+        interactive,
+        &mut responder,
+    ) {
+        Ok(crate::model_choice::PendingChoiceOutcome::Chosen(name)) => {
+            println!("Embedding model set to {name} for this install.");
+        }
+        Ok(crate::model_choice::PendingChoiceOutcome::InvalidInput) => {
+            println!(
+                "That was not a valid choice, so nothing was changed. The embedding-model choice will be offered again at the next command."
+            );
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("Could not apply the pending embedding-model choice: {e}"),
+    }
+}
+
 /// Where crash breadcrumbs go: a `crash` directory beside the database.
 ///
 /// The database already lives under the user's own config directory, so the
@@ -820,6 +871,25 @@ fn take_daemon_lock(db_path: &std::path::Path) -> anyhow::Result<std::fs::File> 
             db_path
         )),
         Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
+    }
+}
+
+/// Bind the fallback store's serving descriptor
+/// to the embedder an arm just built, through the concrete store
+/// behind the trait object — the same downcast the RepairHygiene arm
+/// uses. The fallback group constructs its store before any arm builds
+/// an embedder, so the construction-time builder cannot bind it; this
+/// post-build binding is what keys the store's identity checks on the
+/// model that will actually produce the arm's vectors.
+fn bind_fallback_serving_descriptor(
+    vector_store: &Arc<dyn VectorStore>,
+    embedder: &Arc<dyn crate::traits::Embedder>,
+) {
+    use crate::store::ladybug::LadybugStore;
+    if let Some(store) =
+        crate::traits::VectorStore::as_any(vector_store.as_ref()).downcast_ref::<LadybugStore>()
+    {
+        store.set_serving_descriptor(Some(embedder.embedding_descriptor()));
     }
 }
 
@@ -2889,20 +2959,40 @@ async fn run() -> anyhow::Result<()> {
 
     // Now parse using clap
     if let Some(command) = cli.command {
+        // Deferred embedding-model choice: materialization
+        // only ever records a pending choice; it is surfaced here, at
+        // interactive dispatch, before the command runs — never on the
+        // daemon/serving path, and not on the way to shutting down.
+        if !matches!(command, Commands::Daemon | Commands::Shutdown) {
+            surface_pending_model_choice();
+        }
         match command {
             Commands::Daemon => {
                 println!("NeuroStrata MCP Server initializing in DAEMON-ONLY mode...");
                 let config = Config::from_default_path()?;
+                // Pre-flight: refuse a data-bearing store under a
+                // commensurably different configured model before the
+                // daemon lock is taken, the embedder is built, or the
+                // engine opens — a refused start leaves the store
+                // byte-untouched. The store-level check on the true
+                // serving descriptor remains the authoritative gate.
+                crate::model_choice::check_daemon_open_identity(
+                    &config.db_path,
+                    &crate::embed::config_dir(),
+                )?;
                 // Taken before the database opens. `shutdown` waits for this lock
                 // to be released rather than for the port to close.
                 if DAEMON_LOCK.set(take_daemon_lock(&config.db_path)?).is_err() {
                     tracing::debug!("DAEMON_LOCK was already initialized");
                 }
                 let embedder = build_embedder()?;
-                let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
-                    config.db_path.to_string_lossy().to_string(),
-                    embedder.dimensions(),
-                )?);
+                let vector_store: Arc<dyn VectorStore> = Arc::new(
+                    LadybugStore::new(
+                        config.db_path.to_string_lossy().to_string(),
+                        embedder.dimensions(),
+                    )?
+                    .with_serving_descriptor(Some(embedder.embedding_descriptor())),
+                );
                 vector_store.init("global").await?;
                 let outcome = daemon::start_daemon(
                     embedder,
@@ -3288,6 +3378,19 @@ async fn run() -> anyhow::Result<()> {
                     target_wal.push(".wal");
                     std::fs::copy(&wal, std::path::PathBuf::from(target_wal))?;
                 }
+                // The snapshot's store-state sidecar
+                // restores to the target's sidecar path, so the
+                // restored store keeps its recorded identity.
+                // Snapshots written before sidecar carriage have none
+                // and restore exactly as they always have.
+                let snapshot_sidecar =
+                    std::path::Path::new(&dir).join("ladybug.store.store-state.json");
+                if snapshot_sidecar.exists() {
+                    std::fs::copy(
+                        &snapshot_sidecar,
+                        crate::model_choice::store_state_path(&target),
+                    )?;
+                }
 
                 // Opened only after the copy, to verify the restored store
                 // reads back and to report what it holds.
@@ -3627,10 +3730,13 @@ async fn run() -> anyhow::Result<()> {
                             std::process::exit(1);
                         }
                         let embedder = build_embedder()?;
-                        let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
-                            config.db_path.to_string_lossy().to_string(),
-                            embed::configured_dimensions()?,
-                        )?);
+                        let vector_store: Arc<dyn VectorStore> = Arc::new(
+                            LadybugStore::new(
+                                config.db_path.to_string_lossy().to_string(),
+                                embed::configured_dimensions()?,
+                            )?
+                            .with_serving_descriptor(Some(embedder.embedding_descriptor())),
+                        );
                         let res = match crate::task::import_beads(
                             vector_store.clone(),
                             embedder.clone(),
@@ -4052,6 +4158,7 @@ async fn run() -> anyhow::Result<()> {
                             top_k,
                         } => {
                             let embedder = build_embedder()?;
+                            bind_fallback_serving_descriptor(&vector_store, &embedder);
                             let args = serde_json::json!({
                                 "namespace": namespace,
                                 "question": question,
@@ -4124,6 +4231,7 @@ async fn run() -> anyhow::Result<()> {
                         dry_run_mode: _,
                     } => {
                         let embedder = build_embedder()?;
+                        bind_fallback_serving_descriptor(&vector_store, &embedder);
                         let dir = cli_ingest_root(&dir);
                         let dir_path = std::path::Path::new(&dir);
                         let schema_str = if let Some(path) = schema_path {
@@ -4405,6 +4513,7 @@ async fn run() -> anyhow::Result<()> {
                         location,
                     } => {
                         let embedder = build_embedder()?;
+                        bind_fallback_serving_descriptor(&vector_store, &embedder);
                         let vector = embedder.embed(&content).await?;
                         let payload = crate::traits::MemoryPayload {
                             content: content.clone(),
@@ -4429,6 +4538,7 @@ async fn run() -> anyhow::Result<()> {
                         location,
                     } => {
                         let embedder = build_embedder()?;
+                        bind_fallback_serving_descriptor(&vector_store, &embedder);
                         match crate::server::edit_memory(
                             &*vector_store,
                             &*embedder,

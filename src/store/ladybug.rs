@@ -57,6 +57,12 @@ async fn search_inner(
     exact: bool,
     search_mode: crate::traits::SearchMode,
 ) -> Result<DomainSearchOutcome> {
+    // Every vector search funnels through
+    // here, including the paths that never init (the fallback CLI's
+    // chat ask): a data-bearing store refuses a query embedded under
+    // a different model than the one its vectors were recorded with.
+    // Lexical search embeds nothing and does not pass through here.
+    store.check_data_bearing_identity()?;
     let search_mode = if std::env::var("NEUROSTRATA_HYBRID_SEARCH")
         .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false)
@@ -1179,7 +1185,157 @@ pub struct LadybugStore {
     /// authoritative for the store's lifetime; a later descriptor that fails
     /// `compatible` is rejected so incompatible embedding spaces cannot be
     /// mixed through this store.
-    embedding_registry: Arc<std::sync::Mutex<std::collections::HashMap<String, crate::traits::EmbeddingDescriptor>>>,
+    embedding_registry: Arc<
+        std::sync::Mutex<std::collections::HashMap<String, crate::traits::EmbeddingDescriptor>>,
+    >,
+    /// Directory the configured embedding model is resolved from
+    /// (`embedders.json`). Production uses `crate::embed::config_dir()`;
+    /// tests override it via `with_embed_config_dir`.
+    embed_config_dir: PathBuf,
+    /// The embedding-space descriptor of the embedder this process
+    /// actually built (`Embedder::embedding_descriptor()`), bound at
+    /// construction by the paths that build one. The store-state
+    /// sidecar's adoption and first-write guard key on this *serving*
+    /// descriptor, never on a config re-read: a process
+    /// that started before a setup pick landed keeps serving its
+    /// original model, and only a process whose serving descriptor also
+    /// matches the current configuration may record or adopt store
+    /// identity. `None` for processes that build no embedder (backup,
+    /// restore-verify, reports): they never create or move the recorded
+    /// descriptor. Interior-mutable so the
+    /// fallback CLI arms — which construct the store before they build
+    /// their embedder — can bind the descriptor after construction via
+    /// [`LadybugStore::set_serving_descriptor`].
+    serving_descriptor: std::sync::Mutex<Option<crate::traits::EmbeddingDescriptor>>,
+    /// Whether the database file already existed when this process opened
+    /// it. A sidecar-less store this process created is a fresh install;
+    /// a sidecar-less store that predates it is a pre-fix store whose
+    /// data state is unknowable from outside (fail-closed).
+    db_preexisting: bool,
+    /// This process's view of the store-state sidecar, loaded on first
+    /// use. The sidecar is the setup-time model choice's lock record:
+    /// see `crate::model_choice::store_has_data`.
+    store_state: Arc<std::sync::Mutex<Option<CachedStoreState>>>,
+}
+
+/// The store-state sidecar as this process knows it.
+#[derive(Clone)]
+enum CachedStoreState {
+    /// A sidecar exists on disk (written by us or a previous process):
+    /// its content is authoritative.
+    Recorded(crate::model_choice::StoreState),
+    /// No sidecar, and this process must not create a pristine one: the
+    /// store predates the sidecar (or its sidecar is unreadable), so it
+    /// is treated as data-bearing with an unknown descriptor.
+    LockedUnknown,
+    /// A fresh store whose pristine sidecar could not be written yet
+    /// (the configured model did not resolve); retried on later calls.
+    FreshUnrecorded,
+}
+
+/// The first-write guard's restart-to-apply refusal.
+///
+/// `guard_first_write` returns this typed error — never a bare string —
+/// so a caller can tell the refusal apart from an ordinary store
+/// failure without matching on the message text. The distinction is
+/// load-bearing: the refusal is actionable operator guidance (a
+/// setup-time model choice was persisted while this process was
+/// running, and a restart applies it), so user-facing surfaces must
+/// show it verbatim instead of mapping it to their generic store-error
+/// message the way every other upsert failure is mapped. Use
+/// [`restart_to_apply_message`] to pull the refusal text out of an
+/// `anyhow::Error` chain.
+#[derive(Debug)]
+pub struct RestartToApplyError {
+    message: String,
+}
+
+impl RestartToApplyError {
+    fn new(message: String) -> Self {
+        Self { message }
+    }
+
+    /// The full refusal text, exactly as it should reach the operator.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for RestartToApplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RestartToApplyError {}
+
+/// The restart-to-apply refusal's text, if `err` is (or wraps) the
+/// first-write guard's refusal; `None` for every other error.
+pub fn restart_to_apply_message(err: &anyhow::Error) -> Option<String> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<RestartToApplyError>())
+        .map(|refusal| refusal.message().to_string())
+}
+
+/// The data-bearing identity refusal.
+///
+/// A store that has recorded data under one embedding model must never
+/// be searched or written under another: the vectors would silently
+/// mix two embedding spaces. Unlike [`RestartToApplyError`] — whose
+/// refusal a restart resolves — this refusal survives a restart with
+/// the same configuration; the operator must restore the recorded
+/// model (or start from a new store; migrating a data-bearing store
+/// is Phase B). The two errors are deliberately distinct types so
+/// callers surface each verbatim and never confuse their remedies.
+/// Use [`embedding_identity_refusal_message`] to pull the refusal text
+/// out of an `anyhow::Error` chain.
+#[derive(Debug)]
+pub struct EmbeddingIdentityRefusal {
+    message: String,
+}
+
+impl EmbeddingIdentityRefusal {
+    pub(crate) fn new(message: String) -> Self {
+        Self { message }
+    }
+
+    /// The refusal between a store's recorded descriptor and the
+    /// descriptor a process would serve instead.
+    pub(crate) fn between(
+        recorded: &crate::traits::EmbeddingDescriptor,
+        serving: &crate::traits::EmbeddingDescriptor,
+    ) -> Self {
+        Self::new(format!(
+            "refusing to open a store that has recorded data: its recorded embedding model is '{}' (provider '{}', {} dims), but this process serves '{}' (provider '{}', {} dims). Searching or storing under a different model would silently mix embedding spaces. Restore the recorded model in embedders.json (or via NEUROSTRATA_MODEL), or start from a new store; migrating a data-bearing store to a new model is Phase B.",
+            recorded.model,
+            recorded.provider,
+            recorded.dims,
+            serving.model,
+            serving.provider,
+            serving.dims
+        ))
+    }
+
+    /// The full refusal text, exactly as it should reach the operator.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for EmbeddingIdentityRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for EmbeddingIdentityRefusal {}
+
+/// The data-bearing identity refusal's text, if `err` is (or wraps)
+/// one; `None` for every other error.
+pub fn embedding_identity_refusal_message(err: &anyhow::Error) -> Option<String> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<EmbeddingIdentityRefusal>())
+        .map(|refusal| refusal.message().to_string())
 }
 
 /// Whether a write is sitting in the log with no checkpoint behind it yet.
@@ -1294,6 +1450,146 @@ impl Drop for LadybugStore {
         }
     }
 }
+/// The configured model's embedding-space descriptor, synthesized from
+/// the config directory and the store's width alone: the factored form
+/// of [`LadybugStore::configured_embedding_descriptor`], so callers that
+/// cannot borrow the store (the first-write flip handle below) reproduce
+/// the identical descriptor.
+fn configured_embedding_descriptor_in(
+    embed_config_dir: &std::path::Path,
+    dimensions: usize,
+) -> Result<crate::traits::EmbeddingDescriptor> {
+    let configured = crate::embed::configured_model_in(embed_config_dir)?;
+    if configured.base_url.is_some() && configured.api_key_env.is_some() {
+        // The entry is one `build_embedder` serves through a
+        // RemoteEmbedder (it branches on exactly this predicate):
+        // synthesize that embedder's descriptor shape, resolving
+        // api_model exactly as `build_embedder` does, so a process
+        // serving the configured remote entry can satisfy S == C.
+        return Ok(crate::traits::EmbeddingDescriptor {
+            provider: "openai-compatible".into(),
+            model: configured
+                .api_model
+                .clone()
+                .unwrap_or_else(|| crate::embed::DEFAULT_REMOTE_API_MODEL.to_string()),
+            revision: "unknown".into(),
+            dims: dimensions,
+            normalization: "unknown".into(),
+            preprocessing: "unknown".into(),
+            distance_metric: "cosine".into(),
+        });
+    }
+    Ok(crate::traits::EmbeddingDescriptor {
+        provider: "fastembed".into(),
+        model: configured.model_name,
+        revision: "onnx".into(),
+        dims: dimensions,
+        normalization: "unknown".into(),
+        preprocessing: "unknown".into(),
+        distance_metric: "cosine".into(),
+    })
+}
+
+/// A clonable handle to everything the first-data sidecar flip touches,
+/// built from `&LadybugStore` at upsert entry so one clone can move into
+/// the `'static` write closure: the flip is then performed by the same
+/// blocking task that commits the write, immediately after the core
+/// MERGE succeeds, whether or not the caller is still waiting (the
+/// write deadline releases the caller, not the query). The flip is
+/// monotonic and idempotent, so the collision-retry loop re-running the
+/// closure is safe.
+#[derive(Clone)]
+struct FirstWriteFlip {
+    store_state: Arc<std::sync::Mutex<Option<CachedStoreState>>>,
+    local_path: PathBuf,
+    serving: Option<crate::traits::EmbeddingDescriptor>,
+    embed_config_dir: PathBuf,
+    dimensions: usize,
+}
+
+impl FirstWriteFlip {
+    /// This handle's view of the store-state sidecar, mirroring
+    /// `LadybugStore::cached_store_state`: the cache is shared with the
+    /// store, and a state the store already loaded is authoritative. A
+    /// cold cache is classified from the sidecar file alone — a
+    /// parseable sidecar is `Recorded`; anything else cannot be a
+    /// pristine state this flip may move, so it reads as `LockedUnknown`
+    /// and the flip no-ops. (The store's own first classification, with
+    /// its fresh-store handling, has always run by upsert entry:
+    /// `guard_first_write` and `check_data_bearing_identity` load it.)
+    fn cached_store_state(&self) -> CachedStoreState {
+        let mut cache = self.store_state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(state) = &*cache {
+            return state.clone();
+        }
+        let state = match crate::model_choice::read_store_state(&self.local_path) {
+            Some(recorded) => CachedStoreState::Recorded(recorded),
+            None => CachedStoreState::LockedUnknown,
+        };
+        *cache = Some(state.clone());
+        state
+    }
+
+    fn set_cached_store_state(&self, state: CachedStoreState) {
+        let mut cache = self.store_state.lock().unwrap_or_else(|e| e.into_inner());
+        *cache = Some(state);
+    }
+
+    /// Flip the sidecar to data-bearing after the first successful
+    /// write. Monotonic: only a pristine state flips, the recorded
+    /// descriptor is kept, and nothing ever flips back. A failed sidecar
+    /// write is logged loudly and the in-memory state still flips, so
+    /// this process keeps treating the store as data-bearing.
+    fn flip_store_state_to_data(&self) {
+        match self.cached_store_state() {
+            CachedStoreState::Recorded(mut recorded) if !recorded.has_data => {
+                recorded.has_data = true;
+                if let Err(e) = crate::model_choice::write_store_state(&self.local_path, &recorded)
+                {
+                    tracing::error!(
+                        "store-state sidecar flip failed after a successful write; the store has data but its sidecar still reads pristine: {e}"
+                    );
+                }
+                self.set_cached_store_state(CachedStoreState::Recorded(recorded));
+            }
+            CachedStoreState::FreshUnrecorded => {
+                // The pristine sidecar could not be written at init;
+                // record the data flip directly. The descriptor is the
+                // serving one when this process has an embedder (the
+                // model that produced the vectors), else the configured
+                // one. A recorded descriptor, once present, is never
+                // rewritten by the flip — this branch runs only when
+                // none exists yet. The serving preference is deliberate
+                // and pinned by test: the flip records the model that
+                // produced the vectors, never a config re-read.
+                let descriptor = match &self.serving {
+                    Some(serving) => Some(serving.clone()),
+                    None => configured_embedding_descriptor_in(
+                        &self.embed_config_dir,
+                        self.dimensions,
+                    )
+                    .ok(),
+                };
+                if let Some(descriptor) = descriptor {
+                    let state = crate::model_choice::StoreState {
+                        version: crate::model_choice::STORE_STATE_VERSION,
+                        has_data: true,
+                        descriptor,
+                    };
+                    if let Err(e) = crate::model_choice::write_store_state(&self.local_path, &state)
+                    {
+                        tracing::error!(
+                            "store-state sidecar flip failed after a successful write; the store has data but no sidecar records it: {e}"
+                        );
+                    }
+                    self.set_cached_store_state(CachedStoreState::Recorded(state));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 impl LadybugStore {
     /// Construct a `LadybugStore` for tests with a small system footprint so
     /// `cargo test` (parallel by default) does not mmap-reserve 8 TiB per
@@ -1340,6 +1636,11 @@ impl LadybugStore {
         initial_config: SystemConfig,
     ) -> Result<Self> {
         let local_path = local_path.into();
+
+        // Captured before the engine creates the file: whether this store
+        // predates this process decides how a missing store-state sidecar
+        // is read (fresh install vs pre-fix store).
+        let db_preexisting = local_path.exists();
 
         // A WAL present at open time means the last process did not close cleanly:
         // a clean close checkpoints and removes it. Keep a copy before the engine
@@ -1450,23 +1751,341 @@ impl LadybugStore {
             dirty: Dirty::default(),
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             schema_ready: std::sync::atomic::AtomicBool::new(false),
-            ontology: Arc::new(arc_swap::ArcSwap::from_pointee(std::collections::BTreeMap::new())),
+            ontology: Arc::new(arc_swap::ArcSwap::from_pointee(
+                std::collections::BTreeMap::new(),
+            )),
             mention_symbol_ids: Arc::new(tokio::sync::RwLock::new(None)),
             lexical: Arc::new(std::sync::RwLock::new(crate::fts::LexicalIndex::new())),
             lexical_loaded: Arc::new(std::sync::RwLock::new(std::collections::BTreeSet::new())),
             metrics: Arc::new(
-                crate::time_series::TimeSeriesStore::new(crate::time_series::SeriesConfig::default())
-                    .with_anomaly_callback(std::sync::Arc::new(|_key, _sample| {})),
+                crate::time_series::TimeSeriesStore::new(
+                    crate::time_series::SeriesConfig::default(),
+                )
+                .with_anomaly_callback(std::sync::Arc::new(|_key, _sample| {})),
             ),
             tantivy_lexical: Arc::new(std::sync::RwLock::new(None)),
             embedding_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            embed_config_dir: crate::embed::config_dir(),
+            serving_descriptor: std::sync::Mutex::new(None),
+            db_preexisting,
+            store_state: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
-    /// The store's own embedding-space identity: it has only the configured
-    /// width plus the process's model selection, so the descriptor carries
-    /// those (the model's identity is what `EmbeddingDescriptor.compatible`
-    /// compares below). Model + width are the load-bearing fields of a space.
+    /// Override the directory the configured embedding model is resolved
+    /// from. Production processes use `crate::embed::config_dir()`; tests
+    /// point the store at a fixture config dir to control which model
+    /// `embedders.json` selects.
+    pub fn with_embed_config_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.embed_config_dir = dir.into();
+        self
+    }
+
+    /// Bind the serving embedder's descriptor (see the field). The
+    /// daemon and task-import construction sites — the paths that build
+    /// an embedder immediately before the store — pass
+    /// `Some(embedder.embedding_descriptor())`; every other path keeps
+    /// the `None` default.
+    pub fn with_serving_descriptor(
+        mut self,
+        descriptor: Option<crate::traits::EmbeddingDescriptor>,
+    ) -> Self {
+        self.serving_descriptor = std::sync::Mutex::new(descriptor);
+        self
+    }
+
+    /// The serving descriptor currently bound to this store, if any
+    /// (see the field). Cloned out of the lock so callers never hold it
+    /// across store-state filesystem work.
+    fn serving_descriptor(&self) -> Option<crate::traits::EmbeddingDescriptor> {
+        self.serving_descriptor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Bind (or replace) the serving descriptor after construction,
+    /// for processes that build their embedder only after the store
+    /// exists — the fallback CLI arms — and must
+    /// call it before the first vector operation, so the store-state
+    /// guard family and the data-bearing identity check key on the
+    /// model that will actually produce this process's vectors.
+    pub fn set_serving_descriptor(&self, descriptor: Option<crate::traits::EmbeddingDescriptor>) {
+        *self
+            .serving_descriptor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = descriptor;
+    }
+
+    /// The embedding-space descriptor of the *configured* model: resolved
+    /// from `embedders.json` through the same effective resolution the
+    /// loader uses (`embed::configured_model_in` — the env-named entry
+    /// when acceptable, otherwise the first entry), never the
+    /// env-or-placeholder shortcut `store_embedding_descriptor` falls back
+    /// to. The shape mirrors the descriptor of the embedder
+    /// `build_embedder` would construct from the entry —
+    /// `FastEmbedder::embedding_descriptor` for a local entry, the
+    /// remote shape for an entry with both `base_url` and
+    /// `api_key_env`; the
+    /// width is this store's, because every production path opens the
+    /// store with the configured model's width and the store's
+    /// FLOAT[width] column is the width its vectors actually have.
+    fn configured_embedding_descriptor(&self) -> Result<crate::traits::EmbeddingDescriptor> {
+        configured_embedding_descriptor_in(&self.embed_config_dir, self.dimensions)
+    }
+
+    /// The first-write flip handle for this store (see [`FirstWriteFlip`]):
+    /// a snapshot of the flip's inputs taken at upsert entry — the shared
+    /// store-state cache, the sidecar path, the serving descriptor this
+    /// process writes under, and the configured-descriptor inputs.
+    fn first_write_flip(&self) -> FirstWriteFlip {
+        FirstWriteFlip {
+            store_state: Arc::clone(&self.store_state),
+            local_path: self.local_path.clone(),
+            serving: self.serving_descriptor(),
+            embed_config_dir: self.embed_config_dir.clone(),
+            dimensions: self.dimensions,
+        }
+    }
+
+    /// Load (once per process) this store's view of the store-state
+    /// sidecar. Pure filesystem reads against a store this process
+    /// already holds open; never opens another store.
+    fn cached_store_state(&self) -> CachedStoreState {
+        let mut cache = self.store_state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(state) = &*cache {
+            return state.clone();
+        }
+        let state = match crate::model_choice::read_store_state(&self.local_path) {
+            Some(recorded) => CachedStoreState::Recorded(recorded),
+            None if !self.db_preexisting
+                && !crate::model_choice::store_state_path(&self.local_path).exists() =>
+            {
+                CachedStoreState::FreshUnrecorded
+            }
+            None => {
+                // A pre-sidecar store opens
+                // exactly as it always has — no refusal can key on a
+                // descriptor that was never recorded — but the Phase B
+                // population should be visible in the logs. Warn only;
+                // no behavior change. (This resolution is cached, so
+                // the warning fires once per store per process.)
+                if self.db_preexisting {
+                    tracing::warn!(
+                        "store at {} has no readable store-state sidecar: it predates the recorded-identity feature, so its embedding identity is unknown and it opens without an identity check; establishing its identity is Phase B migration work",
+                        self.local_path.display()
+                    );
+                }
+                CachedStoreState::LockedUnknown
+            }
+        };
+        *cache = Some(state.clone());
+        state
+    }
+
+    fn set_cached_store_state(&self, state: CachedStoreState) {
+        let mut cache = self.store_state.lock().unwrap_or_else(|e| e.into_inner());
+        *cache = Some(state);
+    }
+
+    /// Maintain the sidecar at a successful `init`, keyed on the
+    /// *serving* descriptor: the
+    /// recorded descriptor is created or rewritten only from the
+    /// serving embedder's own descriptor, only while the store is
+    /// pristine, and only when serving and configured agree at this
+    /// init — the signature of a freshly (re)started process. A config
+    /// re-read never creates, adopts, or rewrites the record: a
+    /// long-lived process that started before a setup pick landed
+    /// adopts nothing, on any number of repeated inits, and a process
+    /// with no serving embedder never moves the record in either
+    /// direction. Data-bearing and pre-fix stores are never written
+    /// here. Best effort: a sidecar failure must not fail init for
+    /// stores the feature never touches, so errors are logged, not
+    /// propagated.
+    fn maintain_store_state(&self) {
+        match self.cached_store_state() {
+            CachedStoreState::Recorded(recorded) if !recorded.has_data => {
+                if let Some(serving) = self.serving_descriptor() {
+                    if serving != recorded.descriptor && self.serving_matches_configured(&serving) {
+                        let state = crate::model_choice::StoreState {
+                            version: crate::model_choice::STORE_STATE_VERSION,
+                            has_data: false,
+                            descriptor: serving.clone(),
+                        };
+                        match crate::model_choice::write_store_state(&self.local_path, &state) {
+                            Ok(()) => {
+                                self.set_cached_store_state(CachedStoreState::Recorded(state))
+                            }
+                            Err(e) => {
+                                tracing::warn!("store-state sidecar update failed: {e}")
+                            }
+                        }
+                    }
+                }
+            }
+            CachedStoreState::FreshUnrecorded => {
+                if let Some(serving) = self.serving_descriptor() {
+                    if self.serving_matches_configured(&serving) {
+                        let state = crate::model_choice::StoreState {
+                            version: crate::model_choice::STORE_STATE_VERSION,
+                            has_data: false,
+                            descriptor: serving.clone(),
+                        };
+                        match crate::model_choice::write_store_state(&self.local_path, &state) {
+                            Ok(()) => {
+                                self.set_cached_store_state(CachedStoreState::Recorded(state))
+                            }
+                            Err(e) => {
+                                tracing::warn!("store-state sidecar write failed: {e}")
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether the serving descriptor equals the currently configured
+    /// descriptor (a fresh `embedders.json` re-read). A resolution
+    /// failure is logged and reads as "no match": adoption is opt-in on
+    /// a positive equality, never on an unknown.
+    fn serving_matches_configured(&self, serving: &crate::traits::EmbeddingDescriptor) -> bool {
+        match self.configured_embedding_descriptor() {
+            Ok(configured) => configured == *serving,
+            Err(e) => {
+                tracing::warn!("configured model did not resolve for the store-state sidecar: {e}");
+                false
+            }
+        }
+    }
+
+    /// The upsert race guard, keyed on the serving descriptor:
+    /// while the store is pristine with a
+    /// recorded descriptor, a write may only land under the model this
+    /// process serves. With a serving descriptor bound, the write
+    /// proceeds iff serving == configured and serving == recorded: a
+    /// setup pick persisted while this process was running moves the
+    /// configured model away from the serving one and is refused with
+    /// the restart-to-apply error, and a recorded descriptor that
+    /// disagrees with the serving one is refused, never healed at write
+    /// time. Without a serving descriptor, the guard falls back
+    /// to the configured-vs-recorded comparison. Stores with data, and
+    /// stores whose state is unknown, are outside the window this
+    /// guard protects. Every refusal is a [`RestartToApplyError`], so
+    /// callers can surface it verbatim.
+    fn guard_first_write(&self) -> Result<()> {
+        if let CachedStoreState::Recorded(recorded) = self.cached_store_state() {
+            if !recorded.has_data {
+                match self.serving_descriptor() {
+                    Some(serving) => {
+                        let current = self.configured_embedding_descriptor()?;
+                        if current != serving {
+                            return Err(RestartToApplyError::new(format!(
+                                "refusing to store data: this process serves embedding model '{}', but the configured model is now '{}' (a setup-time model choice was persisted while this process was running). Restart the daemon (or this process) so the store is opened under the new model before the first write; data is never stored under a model different from the one producing it.",
+                                serving.model,
+                                current.model
+                            ))
+                            .into());
+                        }
+                        if serving != recorded.descriptor {
+                            return Err(RestartToApplyError::new(format!(
+                                "refusing to store data: this store's recorded embedding model is '{}', but this process serves '{}'. Restart the daemon (or this process) so the store's record and the serving model agree before the first write.",
+                                recorded.descriptor.model,
+                                serving.model
+                            ))
+                            .into());
+                        }
+                    }
+                    None => {
+                        let current = self.configured_embedding_descriptor()?;
+                        if current != recorded.descriptor {
+                            return Err(RestartToApplyError::new(format!(
+                                "refusing to store data: this store was opened under embedding model '{}', but the configured model is now '{}' (a setup-time model choice was persisted while this process was running). Restart the daemon (or this process) so the store is opened under the new model before the first write; data is never stored under a model different from the one the store will next be opened with.",
+                                recorded.descriptor.model,
+                                current.model
+                            ))
+                            .into());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The data-bearing identity check: a store
+    /// whose sidecar records data under descriptor R refuses any
+    /// vector operation this process would perform under a different
+    /// serving descriptor S — full-struct inequality, same-width model
+    /// changes included. The refusal keys on S only, never on the
+    /// configured descriptor C: C is a config re-read, not the identity
+    /// of the embedder that produced this process's vectors, and can
+    /// legitimately differ from the model actually loaded when the
+    /// configured name falls back. When
+    /// no serving descriptor is bound there is no serving identity to
+    /// compare, and the check passes: the unbound production paths
+    /// (backup, restore-verify, reports, export, metadata recycling)
+    /// embed nothing. Pristine and pre-sidecar stores are likewise
+    /// outside this check: pristine identity is the first-write
+    /// guard's window, and a pre-sidecar store has no R to key on.
+    fn check_data_bearing_identity(&self) -> Result<()> {
+        if let CachedStoreState::Recorded(recorded) = self.cached_store_state() {
+            if recorded.has_data {
+                if let Some(serving) = self.serving_descriptor() {
+                    if serving != recorded.descriptor {
+                        return Err(EmbeddingIdentityRefusal::between(
+                            &recorded.descriptor,
+                            &serving,
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The descriptor `init` records in the embedding registry, by
+    /// precedence: the serving descriptor S when
+    /// bound (the embedder's own descriptor is the provenance-correct
+    /// record); else the sidecar's recorded descriptor R (an unbound
+    /// open of a recorded store seeds the registry from the store's
+    /// authoritative identity, not from this process's configuration);
+    /// else the configured descriptor C when it resolves (fresh and
+    /// pre-sidecar stores opened unbound); else the legacy placeholder.
+    /// In the canonical local flow adoption already required S == C
+    /// before R was written, so the three coincide; where they
+    /// diverge, S is the truthful record.
+    fn effective_embedding_descriptor(&self) -> crate::traits::EmbeddingDescriptor {
+        if let Some(serving) = self.serving_descriptor() {
+            return serving;
+        }
+        if let CachedStoreState::Recorded(recorded) = self.cached_store_state() {
+            return recorded.descriptor;
+        }
+        if let Ok(configured) = self.configured_embedding_descriptor() {
+            return configured;
+        }
+        self.store_embedding_descriptor()
+    }
+
+    /// Flip the sidecar to data-bearing after the first successful
+    /// upsert. The flip logic lives on [`FirstWriteFlip`] so the
+    /// committing write task performs it (see `upsert`); this entry
+    /// point delegates to a handle built from `&self`.
+    fn flip_store_state_to_data(&self) {
+        self.first_write_flip().flip_store_state_to_data();
+    }
+
+    /// The legacy placeholder identity: the last
+    /// resort of `effective_embedding_descriptor`, reached only when
+    /// neither a serving descriptor, a recorded descriptor, nor a
+    /// resolvable configured descriptor exists. It describes no real
+    /// model — provider "store-registered", model from the
+    /// `NEUROSTRATA_MODEL` env var or "local-fastembed" — and must
+    /// never again be the identity recorded for a store this feature
+    /// created: those always have a serving or recorded descriptor.
     fn store_embedding_descriptor(&self) -> crate::traits::EmbeddingDescriptor {
         crate::traits::EmbeddingDescriptor {
             provider: "store-registered".into(),
@@ -3472,22 +4091,142 @@ impl LadybugStore {
     }
 }
 
+/// Reconcile the physical width of `Memory.embedding` with the width
+/// this process serves, on a store the caller has already armed for
+/// reconciliation (recorded pristine, or fresh and unrecorded — see
+/// `VectorStore::init`). The physical width is read from the engine
+/// catalog (`CALL table_info('Memory')` — rows of
+/// (id, name, type, default, primary key); the embedding row's type is
+/// rendered `FLOAT[n]`), never inferred from the sidecar: the engine
+/// is the only witness that can attest both the column's width and
+/// the table's row count. A width mismatch is reconciled only when
+/// the engine attests the table is empty, by dropping `Memory` and
+/// its five rel tables and recreating them from the caller's DDL
+/// strings (the rel tables go first: they reference `Memory`). The
+/// narrower alternative — `ALTER TABLE Memory DROP embedding` plus
+/// `ALTER TABLE … ADD embedding FLOAT[n]` — was spiked first and
+/// rejected on evidence: the DDL succeeds, but the engine then
+/// segfaults on the production MERGE upsert against the re-added
+/// column, so the recreated table (fresh, contiguous property ids)
+/// is the mechanism the spike proved. A pristine-labelled table that
+/// is not empty is the stale-label residual class: the open is
+/// refused with a plain error naming the inconsistency, and nothing
+/// is altered. An unparseable or missing physical width is likewise
+/// an error — fail closed, never a guess.
+fn reconcile_pristine_embedding_width(
+    conn: &Connection,
+    dimensions: usize,
+    create_node_table: &str,
+    create_rel_tables: &[&str],
+) -> Result<()> {
+    let mut physical: Option<usize> = None;
+    for row in conn.query("CALL table_info('Memory') RETURN *")? {
+        let name = match row.get(1) {
+            Some(lbug::Value::String(s)) => s.as_str(),
+            _ => continue,
+        };
+        if name != "embedding" {
+            continue;
+        }
+        let ty = match row.get(2) {
+            Some(lbug::Value::String(s)) => s.clone(),
+            other => {
+                anyhow::bail!(
+                    "cannot reconcile the embedding width: the Memory table's embedding property has an unreadable catalog type ({other:?})"
+                )
+            }
+        };
+        physical = Some(
+            ty.strip_prefix("FLOAT[")
+                .and_then(|rest| rest.strip_suffix(']'))
+                .and_then(|digits| digits.parse::<usize>().ok())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "cannot reconcile the embedding width: the Memory table's embedding property type '{ty}' is not a FLOAT[width] column"
+                    )
+                })?,
+        );
+    }
+    let physical = physical.ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot reconcile the embedding width: the Memory table has no embedding property in the engine catalog"
+        )
+    })?;
+    if physical == dimensions {
+        return Ok(());
+    }
+
+    let mut count_rows = conn.query("MATCH (m:Memory) RETURN count(m)")?;
+    let rows = match count_rows.next() {
+        Some(row) => match row.get(0) {
+            Some(lbug::Value::Int64(n)) => *n,
+            other => {
+                anyhow::bail!(
+                    "cannot reconcile the embedding width: the Memory row count came back unreadable ({other:?})"
+                )
+            }
+        },
+        None => {
+            anyhow::bail!(
+                "cannot reconcile the embedding width: the Memory row count query returned no rows"
+            )
+        }
+    };
+    if rows > 0 {
+        anyhow::bail!(
+            "refusing to reconcile the embedding width of a store recorded as pristine: the Memory table already holds {rows} row(s), its embedding column is FLOAT[{physical}], and this process serves FLOAT[{dimensions}]; the recorded pristine state is inconsistent with the table's contents, so the store is left unchanged — open it under its recorded model, or investigate the stale store-state sidecar"
+        );
+    }
+
+    // The table is engine-attested empty, and a pristine store's rel
+    // tables are empty by construction (edges require Memory nodes),
+    // so dropping and recreating loses nothing.
+    for table in ["RELATES_TO", "CONTAINS", "GOVERNS", "EXTRACTED_FROM", "DEPENDS_ON", "Memory"] {
+        conn.query(&format!("DROP TABLE {table}"))?;
+    }
+    conn.query(create_node_table)?;
+    for ddl in create_rel_tables {
+        conn.query(ddl)?;
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl VectorStore for LadybugStore {
     async fn init(&self, namespace: &str) -> Result<()> {
+        // A data-bearing store refuses a
+        // bound serving descriptor different from its recorded one,
+        // before any schema DDL or vector work.
+        self.check_data_bearing_identity()?;
         // Composite Recommendation #11: verify the embedding-space identity on
         // every init (including the schema-ready fast path) so an incompatible
-        // descriptor is rejected before any vector lands.
+        // descriptor is rejected before any vector lands. The recorded
+        // descriptor is the effective one (serving, else recorded,
+        // else configured, else the legacy placeholder).
         self.verify_or_record_embedding_descriptor(
             namespace,
-            &self.store_embedding_descriptor(),
+            &self.effective_embedding_descriptor(),
         )?;
 
         if self.schema_ready.load(std::sync::atomic::Ordering::Acquire) {
+            // A previous init in this process already succeeded; the
+            // sidecar maintenance is cached and idempotent.
+            self.maintain_store_state();
             return Ok(());
         }
 
         let dimensions = self.dimensions;
+        // Width reconciliation is armed only for stores the identity
+        // system manages as pristine: recorded pristine, or fresh and
+        // not yet recorded. A data-bearing store's mismatched open is
+        // already refused above, and a pre-sidecar (LockedUnknown)
+        // store keeps today's behavior exactly — its width backstop
+        // stays at the engine, at vector use.
+        let reconcile_width = match self.cached_store_state() {
+            CachedStoreState::Recorded(recorded) => !recorded.has_data,
+            CachedStoreState::FreshUnrecorded => true,
+            CachedStoreState::LockedUnknown => false,
+        };
         // Use write_with_deadline so the write lock is held INSIDE the
         // spawn_blocking closure (see R5). Holding an async lock across
         // with_conn releases it on timeout while the C++ call is still running.
@@ -3514,12 +4253,26 @@ impl VectorStore for LadybugStore {
 
             // F7: dependency edges (directed).
             let create_depends_table = "CREATE REL TABLE DEPENDS_ON (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING, origin STRING)";
-            for ddl in [create_rel_table, create_contains_table, create_governs_table, create_extracted_table, create_depends_table] {
+            let create_rel_tables = [create_rel_table, create_contains_table, create_governs_table, create_extracted_table, create_depends_table];
+            for ddl in create_rel_tables {
                 if let Err(e) = conn.query(ddl) {
                     if !e.to_string().contains("already exists") {
                         return Err(e.into());
                     }
                 }
+            }
+
+            // Reconcile the pristine store's physical vector width
+            // with the serving width before the sidecar maintenance
+            // after this closure can adopt the serving descriptor: a
+            // descriptor is never adopted over an unreconciled schema.
+            if reconcile_width {
+                reconcile_pristine_embedding_width(
+                    conn,
+                    dimensions,
+                    &create_node_table,
+                    &create_rel_tables,
+                )?;
             }
 
             // RDF projection (Phase 1): idempotent migration for DBs created before
@@ -3638,6 +4391,9 @@ impl VectorStore for LadybugStore {
         if outcome.is_ok() {
             self.schema_ready
                 .store(true, std::sync::atomic::Ordering::Release);
+            // First successful init: record the store's pristine state
+            // (or adopt a new configured descriptor while pristine).
+            self.maintain_store_state();
         }
 
         // Creating the tables is itself a write worth flushing.
@@ -3669,6 +4425,24 @@ impl VectorStore for LadybugStore {
         if namespace.trim().is_empty() {
             anyhow::bail!("namespace must be non-empty");
         }
+        // First-write race guard: on a pristine store, refuse the first
+        // write if the configured model changed since this process
+        // recorded the store's descriptor (a setup pick landed while the
+        // store is open). Checked before any engine write, so a refused
+        // upsert lands nothing.
+        self.guard_first_write()?;
+        // The same entry point refuses a
+        // write under a serving descriptor different from a
+        // data-bearing store's recorded one — the vector paths that
+        // never init (the fallback CLI's direct upserts) are covered
+        // here rather than at init.
+        self.check_data_bearing_identity()?;
+
+        // The first-data flip handle, snapshotted at entry: one clone
+        // moves into the write closure below, so the task that commits
+        // the first write records the transition itself.
+        let first_write_flip = self.first_write_flip();
+
         // Every upsert is one sample of the MemoryCount series for the
         // namespace; anomalies surface through the rolling detector.
         self.metrics.record(
@@ -3968,6 +4742,15 @@ impl VectorStore for LadybugStore {
             );
 
             conn.query(&insert_query)?;
+
+            // The core MERGE has landed, so this write's data is in the
+            // store: record the first-data transition here, in the
+            // committing task, before the best-effort edge bookkeeping.
+            // The caller may already have been released by the write
+            // deadline; the transition must not depend on what the
+            // caller observed. Monotonic and idempotent, so a
+            // collision-retry re-run of this closure is safe.
+            first_write_flip.flip_store_state_to_data();
 
             // Emit shape warnings after successful row write.
             for w in &shape_warnings {
@@ -4308,6 +5091,10 @@ impl VectorStore for LadybugStore {
         .await;
         if outcome.is_ok() {
             self.lexical_apply_doc(lexical_doc);
+            // No caller-side first-data flip: the committing task
+            // already recorded the transition inside the write closure
+            // (see above), so it is recorded even when this caller was
+            // released by the deadline before the write landed.
         }
         outcome
     }
@@ -4886,6 +5673,21 @@ impl VectorStore for LadybugStore {
             std::fs::copy(&wal, dir.join("ladybug.store.wal")).map_err(|e| {
                 anyhow::anyhow!(
                     "could not copy the write-ahead log into the snapshot: {}",
+                    e
+                )
+            })?;
+        }
+        // The store-state sidecar rides along too, under
+        // the snapshot's store name. Without it a restored store has
+        // no recorded identity — it reads as a pre-sidecar store and
+        // silently exits the identity protection the sidecar exists
+        // to provide. Absent sidecar (a pre-feature store) snapshots
+        // exactly as before.
+        let sidecar = crate::model_choice::store_state_path(&source);
+        if sidecar.exists() {
+            std::fs::copy(&sidecar, dir.join("ladybug.store.store-state.json")).map_err(|e| {
+                anyhow::anyhow!(
+                    "could not copy the store-state sidecar into the snapshot: {}",
                     e
                 )
             })?;
@@ -14067,6 +14869,1577 @@ eurostrata\src\daemon.rs",
             "oversized neighbor content is truncated with indicator"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- The store-state sidecar (pristine-store predicate) ---
+    //
+    // The sidecar beside the db file is the store-authored record the
+    // setup-time model choice keys on: `init` records a pristine store
+    // with the configured model's descriptor, the first successful
+    // `upsert` flips it to data-bearing, and the flip is monotonic.
+
+    struct StoreStateFixture {
+        root: std::path::PathBuf,
+        db: std::path::PathBuf,
+        config_dir: std::path::PathBuf,
+    }
+
+    fn write_embedders_config(config_dir: &std::path::Path, model: &str) {
+        std::fs::write(
+            config_dir.join("embedders.json"),
+            format!("[{{\"model_name\":\"{model}\",\"dimensions\":4}}]"),
+        )
+        .expect("write fixture embedders.json");
+    }
+
+    /// A remote embedders.json entry at the fixture width: base_url
+    /// and api_key_env both set — the predicate `build_embedder`
+    /// branches on — with `api_model` present or absent.
+    fn write_remote_embedders_config(config_dir: &std::path::Path, api_model: Option<&str>) {
+        let api_model_field = match api_model {
+            Some(model) => format!(",\"api_model\":\"{model}\""),
+            None => String::new(),
+        };
+        std::fs::write(
+            config_dir.join("embedders.json"),
+            format!(
+                "[{{\"model_name\":\"RemoteEntry\",\"dimensions\":4,\"base_url\":\"http://127.0.0.1:9/v1\",\"api_key_env\":\"NS_TEST_REMOTE_KEY\"{api_model_field}}}]"
+            ),
+        )
+        .expect("write fixture remote embedders.json");
+    }
+
+    /// A temp root holding one store db plus a config dir whose
+    /// embedders.json names `model` — the configured model the store
+    /// resolves through the `embed::configured_model_in` seam.
+    fn store_state_fixture(tag: &str, model: &str) -> StoreStateFixture {
+        let root =
+            std::env::temp_dir().join(format!("ns-storestate-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create fixture root");
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).expect("create fixture config dir");
+        write_embedders_config(&config_dir, model);
+        StoreStateFixture {
+            db: root.join("ladybug.db"),
+            root,
+            config_dir,
+        }
+    }
+
+    fn read_sidecar(db: &std::path::Path) -> serde_json::Value {
+        let content = std::fs::read_to_string(crate::model_choice::store_state_path(db))
+            .expect("sidecar exists");
+        serde_json::from_str(&content).expect("sidecar parses")
+    }
+
+    /// NEUROSTRATA_MODEL would override the file's first entry; the
+    /// file-based tests pin it out of the way and restore it after.
+    fn without_model_env() -> Option<String> {
+        let previous = std::env::var("NEUROSTRATA_MODEL").ok();
+        std::env::remove_var("NEUROSTRATA_MODEL");
+        previous
+    }
+
+    fn restore_model_env(previous: Option<String>) {
+        match previous {
+            Some(value) => std::env::set_var("NEUROSTRATA_MODEL", value),
+            None => std::env::remove_var("NEUROSTRATA_MODEL"),
+        }
+    }
+
+    fn store_state_payload() -> MemoryPayload {
+        retired_test_payload("fact", "owner", json!({}))
+    }
+
+    /// The serving descriptor of a process that built its embedder for
+    /// `model` at the fixture width: the shape
+    /// `FastEmbedder::embedding_descriptor` produces for the model the
+    /// fixture's `embedders.json` selects, which is also the shape
+    /// `configured_embedding_descriptor` synthesizes for the same model.
+    fn serving_descriptor_for(model: &str) -> crate::traits::EmbeddingDescriptor {
+        serving_descriptor_dims(model, 4)
+    }
+
+    /// [`serving_descriptor_for`] at an explicit width.
+    fn serving_descriptor_dims(model: &str, dims: usize) -> crate::traits::EmbeddingDescriptor {
+        crate::traits::EmbeddingDescriptor {
+            provider: "fastembed".into(),
+            model: model.into(),
+            revision: "onnx".into(),
+            dims,
+            normalization: "unknown".into(),
+            preprocessing: "unknown".into(),
+            distance_metric: "cosine".into(),
+        }
+    }
+
+    /// The legacy placeholder descriptor `store_embedding_descriptor`
+    /// produces with `NEUROSTRATA_MODEL` unset.
+    fn placeholder_descriptor(dims: usize) -> crate::traits::EmbeddingDescriptor {
+        crate::traits::EmbeddingDescriptor {
+            provider: "store-registered".into(),
+            model: "local-fastembed".into(),
+            revision: "store-lifetime".into(),
+            dims,
+            normalization: "unknown".into(),
+            preprocessing: "unknown".into(),
+            distance_metric: "cosine".into(),
+        }
+    }
+
+    /// A remote embedder's descriptor: the shape
+    /// `RemoteEmbedder::embedding_descriptor` produces, and the shape a
+    /// matching remote configured entry synthesizes.
+    fn remote_descriptor_for(model: &str) -> crate::traits::EmbeddingDescriptor {
+        crate::traits::EmbeddingDescriptor {
+            provider: "openai-compatible".into(),
+            model: model.into(),
+            revision: "unknown".into(),
+            dims: 4,
+            normalization: "unknown".into(),
+            preprocessing: "unknown".into(),
+            distance_metric: "cosine".into(),
+        }
+    }
+
+    /// A data-bearing fixture: a store recorded under ModelA with one
+    /// row landed, its instance dropped.
+    async fn data_bearing_store_fixture(tag: &str) -> StoreStateFixture {
+        let fx = store_state_fixture(tag, "ModelA");
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        store.init("probe").await.expect("init");
+        store
+            .upsert(
+                "probe",
+                "m1",
+                vec![0.1, 0.2, 0.3, 0.4],
+                store_state_payload(),
+            )
+            .await
+            .expect("seed upsert");
+        assert!(
+            crate::model_choice::store_has_data(&fx.db),
+            "the fixture store is data-bearing"
+        );
+        drop(store);
+        fx
+    }
+
+    #[tokio::test]
+    async fn store_state_sidecar_records_pristine_then_flips_on_first_upsert() {
+        let previous = without_model_env();
+        let fx = store_state_fixture("flip", "ModelA");
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        store.init("probe").await.expect("init");
+        assert!(
+            !crate::model_choice::store_has_data(&fx.db),
+            "init on a fresh store records a pristine sidecar"
+        );
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["has_data"], json!(false));
+        assert_eq!(sidecar["descriptor"]["model"], json!("ModelA"));
+
+        store
+            .upsert("probe", "m1", vec![0.0; 4], store_state_payload())
+            .await
+            .expect("first upsert");
+        assert!(
+            crate::model_choice::store_has_data(&fx.db),
+            "the first successful upsert flips has_data"
+        );
+        assert_eq!(read_sidecar(&fx.db)["has_data"], json!(true));
+        drop(store);
+
+        // A second instance on the same path reads the recorded state.
+        let store2 = LadybugStore::for_testing(&fx.db, 4)
+            .expect("reopen temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        store2.init("probe").await.expect("re-init");
+        assert!(crate::model_choice::store_has_data(&fx.db));
+        drop(store2);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn store_state_failed_upsert_does_not_flip() {
+        let previous = without_model_env();
+        let fx = store_state_fixture("failed-upsert", "ModelA");
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        store.init("probe").await.expect("init");
+        assert!(!crate::model_choice::store_has_data(&fx.db));
+        // Wrong-width vector: the Memory table's FLOAT[4] column rejects it.
+        let failed = store
+            .upsert("probe", "bad", vec![0.0; 3], store_state_payload())
+            .await;
+        assert!(
+            failed.is_err(),
+            "a wrong-width upsert must fail at the engine"
+        );
+        assert!(
+            !crate::model_choice::store_has_data(&fx.db),
+            "a failed upsert must not flip has_data"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn upsert_times_out_to_caller_but_committing_task_records_first_data() {
+        // The finding's scenario: a first write that outlives the
+        // caller's deadline inside its committing task. The deadline
+        // releases the caller, not the query — the blocking task keeps
+        // running and its MERGE lands — so the first-data transition
+        // must be recorded by that task, not by the caller.
+        //
+        // The slowdown is the write closure's own edge bookkeeping:
+        // thousands of declared-but-missing edge targets keep the
+        // committing task busy for seconds after the core MERGE lands
+        // (measured ~4.6 s per 2,000 targets on the gate VM; 4,000 are
+        // declared here), against a 1 s caller deadline. Holding the
+        // store's write turn to queue the write instead does not
+        // reproduce the scenario at this HEAD: upsert's pre-write reads
+        // take the same turn through `with_conn` with no deadline, so a
+        // held turn deadlocks the upsert before its write task exists,
+        // and a write still queued when its deadline fires is dropped
+        // with the timed future, never committed.
+        let previous = without_model_env();
+        let fx = store_state_fixture("flip-timeout", "ModelA");
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        store.init("probe").await.expect("init");
+        assert!(
+            !crate::model_choice::store_has_data(&fx.db),
+            "init on a fresh store records a pristine sidecar"
+        );
+        assert_eq!(read_sidecar(&fx.db)["has_data"], json!(false));
+
+        let mut payload = store_state_payload();
+        payload.metadata = json!({
+            "related_to": (0..4000)
+                .map(|i| format!("missing-target-{i}"))
+                .collect::<Vec<_>>(),
+        });
+        let previous_timeout = std::env::var("NEUROSTRATA_WRITE_TIMEOUT_SECS").ok();
+        std::env::set_var("NEUROSTRATA_WRITE_TIMEOUT_SECS", "1");
+        let timed_out = store.upsert("probe", "m1", vec![0.0; 4], payload).await;
+        // write_timeout() is read at invocation, so restoring the var
+        // now cannot affect the already-running task.
+        match previous_timeout {
+            Some(value) => std::env::set_var("NEUROSTRATA_WRITE_TIMEOUT_SECS", value),
+            None => std::env::remove_var("NEUROSTRATA_WRITE_TIMEOUT_SECS"),
+        }
+        let err = timed_out.expect_err("the slow first write must time out to the caller");
+        assert!(
+            err.to_string().contains("the database is busy"),
+            "the caller must see the deadline error: {err}"
+        );
+
+        // The committing task is still running its edge bookkeeping;
+        // its MERGE has landed, so the sidecar must flip without the
+        // caller ever having observed success.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut flipped = false;
+        while std::time::Instant::now() < deadline {
+            if let Some(state) = crate::model_choice::read_store_state(&fx.db) {
+                if state.has_data {
+                    flipped = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            flipped,
+            "the committing task must flip has_data after its write lands, even though the caller timed out"
+        );
+        let landed = store.get("probe", "m1").await.expect("get");
+        assert!(landed.is_some(), "the timed-out write actually landed");
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn store_state_has_data_is_monotonic_across_delete_and_reinit() {
+        let previous = without_model_env();
+        let fx = store_state_fixture("monotonic", "ModelA");
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        store.init("probe").await.expect("init");
+        store
+            .upsert("probe", "m1", vec![0.0; 4], store_state_payload())
+            .await
+            .expect("upsert");
+        assert!(crate::model_choice::store_has_data(&fx.db));
+
+        store.delete("probe", "m1").await.expect("delete");
+        assert!(
+            crate::model_choice::store_has_data(&fx.db),
+            "deleting the only memory must not reset has_data: a store that held data stays identity-locked even when emptied"
+        );
+        store.init("probe").await.expect("re-init same instance");
+        assert!(crate::model_choice::store_has_data(&fx.db));
+        drop(store);
+
+        let store2 = LadybugStore::for_testing(&fx.db, 4)
+            .expect("reopen temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        store2.init("probe").await.expect("re-init new instance");
+        assert!(crate::model_choice::store_has_data(&fx.db));
+        assert_eq!(read_sidecar(&fx.db)["has_data"], json!(true));
+        drop(store2);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn store_state_upsert_refused_when_configured_model_changed_while_pristine() {
+        // The guard-only path: the config changes and `upsert` is called
+        // directly, with no intervening `init`. This does NOT cover the
+        // init-mediated path — the live write half always re-inits
+        // first, which is where config-keyed adoption disarmed this
+        // guard; that path is covered by
+        // store_state_same_instance_reinit_after_pick_does_not_adopt_and_upsert_refuses.
+        let previous = without_model_env();
+        let fx = store_state_fixture("race", "ModelA");
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        store.init("probe").await.expect("init");
+        assert_eq!(read_sidecar(&fx.db)["descriptor"]["model"], json!("ModelA"));
+
+        // A pick lands while this process holds the pristine store open:
+        // embedders.json now selects a different model.
+        write_embedders_config(&fx.config_dir, "ModelB");
+        let refused = store
+            .upsert("probe", "m1", vec![0.0; 4], store_state_payload())
+            .await;
+        let err = refused
+            .expect_err("an upsert under a changed configured model must be refused, not landed");
+        assert!(
+            err.to_string().contains("Restart the daemon"),
+            "the refusal must be the restart-to-apply error: {err}"
+        );
+        assert!(
+            !crate::model_choice::store_has_data(&fx.db),
+            "a refused write leaves the store pristine"
+        );
+        let gone = store.get("probe", "m1").await.expect("get");
+        assert!(gone.is_none(), "no data lands under the stale model");
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn store_state_same_instance_reinit_after_pick_does_not_adopt_and_upsert_refuses() {
+        // Regression, at the exact step the live write path
+        // performs: the pre-pick daemon's add re-inits the
+        // store (embed_dedup_and_upsert calls init before embedding),
+        // and under config-keyed adoption that re-init rewrote the
+        // recorded descriptor to the picked model, disarming the guard
+        // for the write that followed. Serving-keyed adoption must
+        // leave the record untouched, and the write must refuse.
+        let previous = without_model_env();
+        let fx = store_state_fixture("reinit-after-pick", "ModelA");
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        store.init("probe").await.expect("init");
+        assert_eq!(read_sidecar(&fx.db)["descriptor"]["model"], json!("ModelA"));
+        assert_eq!(read_sidecar(&fx.db)["has_data"], json!(false));
+
+        // The pick lands while this process holds the store open.
+        write_embedders_config(&fx.config_dir, "ModelB");
+        // The intervening re-init the write half always performs.
+        store.init("probe").await.expect("re-init same instance");
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["has_data"], json!(false));
+        assert_eq!(
+            sidecar["descriptor"]["model"],
+            json!("ModelA"),
+            "a same-instance re-init after a pick must not adopt the new configured model"
+        );
+
+        let refused = store
+            .upsert("probe", "m1", vec![0.0; 4], store_state_payload())
+            .await;
+        let err = refused.expect_err("the pre-pick process's write must be refused, not landed");
+        assert!(
+            err.to_string().contains("Restart the daemon"),
+            "the refusal must be the restart-to-apply error: {err}"
+        );
+        assert!(
+            err.to_string().contains("ModelA") && err.to_string().contains("ModelB"),
+            "the refusal must name the serving and configured models: {err}"
+        );
+        // The refusal carries the RestartToApplyError
+        // identity, so user-facing surfaces can extract and surface it
+        // verbatim instead of a generic store-error message.
+        let extracted = restart_to_apply_message(&err)
+            .expect("the guard's refusal must be the typed restart-to-apply error");
+        assert_eq!(extracted, err.to_string());
+        assert!(
+            !crate::model_choice::store_has_data(&fx.db),
+            "a refused write leaves the store pristine"
+        );
+        let gone = store.get("probe", "m1").await.expect("get");
+        assert!(gone.is_none(), "no data lands under the stale model");
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["has_data"], json!(false));
+        assert_eq!(sidecar["descriptor"]["model"], json!("ModelA"));
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[test]
+    fn restart_to_apply_message_matches_only_the_typed_refusal() {
+        // Extraction sees through context layers a caller may add
+        // above the store.
+        let wrapped = anyhow::Error::new(RestartToApplyError::new(
+            "refusing to store data: restart".to_string(),
+        ))
+        .context("while storing");
+        assert_eq!(
+            restart_to_apply_message(&wrapped).as_deref(),
+            Some("refusing to store data: restart")
+        );
+        // Ordinary errors are not refusals.
+        assert!(restart_to_apply_message(&anyhow::anyhow!("store exploded")).is_none());
+    }
+
+    #[tokio::test]
+    async fn store_state_post_pick_instance_adopts_serving_descriptor_and_first_write_passes() {
+        let previous = without_model_env();
+        let fx = store_state_fixture("reopen-new-model", "ModelA");
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        store.init("probe").await.expect("init");
+        assert_eq!(read_sidecar(&fx.db)["descriptor"]["model"], json!("ModelA"));
+        drop(store);
+
+        // The pick is in place before this process starts, and this
+        // process serves the picked model (it built its embedder after
+        // the pick): serving == configured at its first init, so it
+        // adopts the serving descriptor, and the first write under it
+        // proceeds.
+        write_embedders_config(&fx.config_dir, "ModelB");
+        let store2 = LadybugStore::for_testing(&fx.db, 4)
+            .expect("reopen temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelB")));
+        store2
+            .init("probe")
+            .await
+            .expect("init under the new model");
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["has_data"], json!(false));
+        assert_eq!(
+            sidecar["descriptor"]["model"],
+            json!("ModelB"),
+            "a pristine store opened under a new model records that model"
+        );
+        store2
+            .upsert("probe", "m1", vec![0.0; 4], store_state_payload())
+            .await
+            .expect("first upsert under the recorded model succeeds");
+        assert!(crate::model_choice::store_has_data(&fx.db));
+        assert_eq!(read_sidecar(&fx.db)["descriptor"]["model"], json!("ModelB"));
+        drop(store2);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[test]
+    fn configured_descriptor_for_remote_entry_matches_remote_serving_shape() {
+        let previous = without_model_env();
+        let fx = store_state_fixture("remote-configured", "ModelA");
+        write_remote_embedders_config(&fx.config_dir, Some("RemoteModel"));
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        let configured = store
+            .configured_embedding_descriptor()
+            .expect("the remote entry resolves");
+        assert_eq!(
+            configured,
+            remote_descriptor_for("RemoteModel"),
+            "a remote configured entry synthesizes the remote serving shape"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+
+        // Without api_model, the synthesis resolves the same default
+        // model build_embedder constructs the remote embedder with.
+        let fx2 = store_state_fixture("remote-configured-default", "ModelA");
+        write_remote_embedders_config(&fx2.config_dir, None);
+        let store2 = LadybugStore::for_testing(&fx2.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx2.config_dir);
+        let configured2 = store2
+            .configured_embedding_descriptor()
+            .expect("the remote entry without api_model resolves");
+        assert_eq!(
+            configured2,
+            remote_descriptor_for("text-embedding-3-small"),
+            "an api_model-absent remote entry synthesizes the default remote model"
+        );
+        drop(store2);
+        let _ = std::fs::remove_dir_all(&fx2.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn remote_switch_on_pristine_store_adopts_and_first_write_passes() {
+        let previous = without_model_env();
+        let fx = store_state_fixture("remote-switch", "ModelA");
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        store.init("probe").await.expect("init");
+        assert_eq!(read_sidecar(&fx.db)["descriptor"]["model"], json!("ModelA"));
+        assert!(!crate::model_choice::store_has_data(&fx.db));
+        drop(store);
+
+        // The config is rewritten to a same-width remote entry and the
+        // next process serves that remote embedder: its serving
+        // descriptor must equal the configured synthesis, so the
+        // pristine store adopts the remote descriptor at init and the
+        // first write under it proceeds.
+        write_remote_embedders_config(&fx.config_dir, Some("RemoteModel"));
+        let remote = remote_descriptor_for("RemoteModel");
+        let store2 = LadybugStore::for_testing(&fx.db, 4)
+            .expect("reopen temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(remote.clone()));
+        store2.init("probe").await.expect("init under remote");
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["has_data"], json!(false));
+        assert_eq!(
+            sidecar["descriptor"]["provider"],
+            json!("openai-compatible"),
+            "init adopts the remote descriptor into the sidecar"
+        );
+        assert_eq!(sidecar["descriptor"]["model"], json!("RemoteModel"));
+        assert!(
+            !crate::model_choice::store_has_data(&fx.db),
+            "adoption keeps the store pristine"
+        );
+        store2
+            .upsert("probe", "m1", vec![0.0; 4], store_state_payload())
+            .await
+            .expect("first upsert under the remote model succeeds");
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["has_data"], json!(true));
+        assert_eq!(
+            sidecar["descriptor"]["provider"],
+            json!("openai-compatible"),
+            "the flip records the remote descriptor"
+        );
+        assert_eq!(sidecar["descriptor"]["model"], json!("RemoteModel"));
+        drop(store2);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn store_state_sidecar_records_configured_model_not_placeholder() {
+        // NEUROSTRATA_MODEL is unset (pinned out by without_model_env).
+        // The serving descriptor bound here is the one a daemon builds
+        // from the embedders.json entry — FastEmbedder's descriptor for
+        // the configured model — and the record must be that descriptor
+        // verbatim, never the "local-fastembed" placeholder the
+        // in-memory registry records.
+        let previous = without_model_env();
+        let fx = store_state_fixture("provenance", "FileModel");
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("FileModel")));
+        store.init("probe").await.expect("init");
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["descriptor"]["model"], json!("FileModel"));
+        assert_eq!(sidecar["descriptor"]["provider"], json!("fastembed"));
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn store_state_non_serving_open_never_adopts() {
+        let previous = without_model_env();
+        let fx = store_state_fixture("non-serving", "ModelA");
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        store.init("probe").await.expect("init");
+        assert_eq!(read_sidecar(&fx.db)["descriptor"]["model"], json!("ModelA"));
+        drop(store);
+
+        // A non-serving open (the backup / restore-verify / report
+        // shape: no embedder is ever built, so no serving descriptor is
+        // bound) under a changed configuration must not move the
+        // record, however often it inits.
+        write_embedders_config(&fx.config_dir, "ModelB");
+        let opener = LadybugStore::for_testing(&fx.db, 4)
+            .expect("reopen temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        opener.init("probe").await.expect("init");
+        opener.init("probe").await.expect("re-init");
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["has_data"], json!(false));
+        assert_eq!(
+            sidecar["descriptor"]["model"],
+            json!("ModelA"),
+            "a process with no serving embedder never adopts"
+        );
+        drop(opener);
+        let _ = std::fs::remove_dir_all(&fx.root);
+
+        // And a fresh store opened without a serving embedder records
+        // nothing at all.
+        let fx2 = store_state_fixture("non-serving-fresh", "ModelA");
+        let fresh = LadybugStore::for_testing(&fx2.db, 4)
+            .expect("open fresh database")
+            .with_embed_config_dir(&fx2.config_dir);
+        fresh.init("probe").await.expect("init");
+        assert!(
+            !crate::model_choice::store_state_path(&fx2.db).exists(),
+            "a non-serving open of a fresh store records no descriptor"
+        );
+        drop(fresh);
+        let _ = std::fs::remove_dir_all(&fx2.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn store_state_serving_config_mismatch_at_open_does_not_adopt() {
+        let previous = without_model_env();
+        let fx = store_state_fixture("mismatch-at-open", "ModelA");
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        store.init("probe").await.expect("init");
+        assert_eq!(read_sidecar(&fx.db)["descriptor"]["model"], json!("ModelA"));
+        drop(store);
+
+        // The pick lands before the next process starts, but that
+        // process still serves the old model: serving != configured at
+        // its first init, so it adopts nothing, and its write refuses.
+        write_embedders_config(&fx.config_dir, "ModelB");
+        let stale = LadybugStore::for_testing(&fx.db, 4)
+            .expect("reopen temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        stale.init("probe").await.expect("init");
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["has_data"], json!(false));
+        assert_eq!(
+            sidecar["descriptor"]["model"],
+            json!("ModelA"),
+            "a serving/configured mismatch at open must not adopt"
+        );
+        let refused = stale
+            .upsert("probe", "m1", vec![0.0; 4], store_state_payload())
+            .await;
+        let err = refused.expect_err("the mismatched process's write must be refused");
+        assert!(
+            err.to_string().contains("Restart the daemon"),
+            "the refusal must be the restart-to-apply error: {err}"
+        );
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["has_data"], json!(false));
+        assert_eq!(sidecar["descriptor"]["model"], json!("ModelA"));
+        drop(stale);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn store_state_guard_refuses_serving_config_record_mismatches() {
+        // Guard-level triples (serving, configured, recorded), each
+        // state built on disk by a serving instance, then faced by a
+        // second instance whose upsert — with no intervening init —
+        // must refuse. The guard never rewrites the record.
+        let previous = without_model_env();
+        let cases: [(&str, &str, &str, &str); 3] = [
+            // A process serving the old model after a pick landed.
+            ("triple-pick-landed", "ModelB", "ModelA", "ModelA"),
+            // The record is never trusted over the serving descriptor.
+            ("triple-record-over-serving", "ModelA", "ModelA", "ModelB"),
+            // The post-adoption shape: record and config agree on
+            // the new model, the process still serves the old one.
+            ("triple-post-adoption", "ModelA", "ModelB", "ModelB"),
+        ];
+        for (tag, serving, configured, recorded) in cases {
+            let fx = store_state_fixture(tag, recorded);
+            let recorder = LadybugStore::for_testing(&fx.db, 4)
+                .expect("open temp database")
+                .with_embed_config_dir(&fx.config_dir)
+                .with_serving_descriptor(Some(serving_descriptor_for(recorded)));
+            recorder.init("probe").await.expect("init");
+            assert_eq!(read_sidecar(&fx.db)["descriptor"]["model"], json!(recorded));
+            drop(recorder);
+
+            write_embedders_config(&fx.config_dir, configured);
+            let store = LadybugStore::for_testing(&fx.db, 4)
+                .expect("reopen temp database")
+                .with_embed_config_dir(&fx.config_dir)
+                .with_serving_descriptor(Some(serving_descriptor_for(serving)));
+            // No init on this instance: the guard is evaluated at
+            // upsert entry, against the recorded state as loaded.
+            let refused = store
+                .upsert("probe", "m1", vec![0.0; 4], store_state_payload())
+                .await;
+            let err = refused.expect_err("the guard must refuse every disagreement triple");
+            assert!(
+                err.to_string().contains("Restart the daemon"),
+                "{tag}: the refusal must be the restart-to-apply error: {err}"
+            );
+            let sidecar = read_sidecar(&fx.db);
+            assert_eq!(sidecar["has_data"], json!(false), "{tag}");
+            assert_eq!(
+                sidecar["descriptor"]["model"],
+                json!(recorded),
+                "{tag}: a refused write leaves the record untouched"
+            );
+            drop(store);
+            let _ = std::fs::remove_dir_all(&fx.root);
+        }
+        restore_model_env(previous);
+    }
+
+    // --- Data-bearing identity refusal, registry seeding,
+    // pre-sidecar disposition, fallback binding, flip provenance ---
+
+    #[test]
+    fn embedding_identity_refusal_message_matches_only_the_typed_refusal() {
+        let recorded = serving_descriptor_for("ModelA");
+        let serving = serving_descriptor_for("ModelB");
+        let wrapped = anyhow::Error::new(EmbeddingIdentityRefusal::between(&recorded, &serving))
+            .context("while opening");
+        let extracted = embedding_identity_refusal_message(&wrapped)
+            .expect("the typed refusal extracts through context layers");
+        assert!(extracted.contains("'ModelA'") && extracted.contains("'ModelB'"));
+        assert!(embedding_identity_refusal_message(&anyhow::anyhow!("store exploded")).is_none());
+        // The two refusal types never extract as each other.
+        let restart = anyhow::Error::new(RestartToApplyError::new("restart".to_string()));
+        assert!(embedding_identity_refusal_message(&restart).is_none());
+        assert!(restart_to_apply_message(&wrapped).is_none());
+    }
+
+    #[tokio::test]
+    async fn setup_shortlist_same_width_switch_is_refused() {
+        // The setup pair at its real
+        // width. FP32 and Q are both 768, so only an identity check —
+        // never the width backstop — can refuse this switch.
+        let previous = without_model_env();
+        let fp32_dims = crate::embed::default_acceptable_embedders()
+            .iter()
+            .find(|e| e.model_name == "NomicEmbedTextV15")
+            .expect("the default list carries the FP32 model")
+            .dimensions;
+        let q = &crate::model_choice::candidates()[0];
+        assert_eq!(q.model_name, "NomicEmbedTextV15Q");
+        assert_eq!(
+            fp32_dims, q.dimensions,
+            "the pair must be same-width for this test to mean anything"
+        );
+        let dims = fp32_dims;
+
+        let fx = store_state_fixture("a5-pair-switch", "NomicEmbedTextV15");
+        std::fs::write(
+            fx.config_dir.join("embedders.json"),
+            format!("[{{\"model_name\":\"NomicEmbedTextV15\",\"dimensions\":{dims}}}]"),
+        )
+        .expect("write FP32 fixture config");
+        let store = LadybugStore::for_testing(&fx.db, dims)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_dims("NomicEmbedTextV15", dims)));
+        store.init("probe").await.expect("init");
+        store
+            .upsert("probe", "m1", vec![0.1; 768], store_state_payload())
+            .await
+            .expect("seed upsert under the FP32 model");
+        let sidecar_before =
+            std::fs::read(crate::model_choice::store_state_path(&fx.db)).expect("read sidecar");
+        assert_eq!(
+            read_sidecar(&fx.db)["descriptor"]["model"],
+            json!("NomicEmbedTextV15")
+        );
+        drop(store);
+
+        // The same store reopened under the quantized pick.
+        std::fs::write(
+            fx.config_dir.join("embedders.json"),
+            format!("[{{\"model_name\":\"NomicEmbedTextV15Q\",\"dimensions\":{dims}}}]"),
+        )
+        .expect("write Q fixture config");
+        let reopened = LadybugStore::for_testing(&fx.db, dims)
+            .expect("reopen temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_dims("NomicEmbedTextV15Q", dims)));
+        let err = reopened
+            .init("probe")
+            .await
+            .expect_err("a same-width model switch against recorded data must be refused");
+        let message = embedding_identity_refusal_message(&err)
+            .expect("the refusal must be the typed identity refusal");
+        assert!(
+            message.contains("'NomicEmbedTextV15'") && message.contains("'NomicEmbedTextV15Q'"),
+            "the refusal names the recorded and serving models: {message}"
+        );
+        assert_eq!(
+            std::fs::read(crate::model_choice::store_state_path(&fx.db)).expect("re-read sidecar"),
+            sidecar_before,
+            "a refused open leaves the sidecar byte-identical"
+        );
+        // The init-less write path on the refused instance refuses too.
+        let err = reopened
+            .upsert("probe", "m2", vec![0.1; 768], store_state_payload())
+            .await
+            .expect_err("an upsert on the refused instance must refuse");
+        assert!(embedding_identity_refusal_message(&err).is_some());
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn data_bearing_reopen_under_recorded_model_succeeds() {
+        // The refusal must not fire on the legitimate path.
+        let previous = without_model_env();
+        let fx = data_bearing_store_fixture("a5-legit-reopen").await;
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("reopen temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        store
+            .init("probe")
+            .await
+            .expect("init under the recorded model");
+        store
+            .upsert(
+                "probe",
+                "m2",
+                vec![0.1, 0.2, 0.3, 0.4],
+                store_state_payload(),
+            )
+            .await
+            .expect("upsert under the recorded model");
+        let found = store
+            .search("probe", vec![0.1, 0.2, 0.3, 0.4], 5, false, false)
+            .await
+            .expect("vector search under the recorded model");
+        assert!(!found.is_empty(), "the seeded rows are searchable");
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn data_bearing_different_width_switch_refuses_with_identity_error() {
+        // The identity refusal precedes the width backstop — a
+        // different-width switch reports the identity error, not an
+        // engine/FLOAT error.
+        let previous = without_model_env();
+        let fx = data_bearing_store_fixture("a5-width-switch").await;
+        write_embedders_config(&fx.config_dir, "ModelB");
+        let store = LadybugStore::for_testing(&fx.db, 8)
+            .expect("reopen temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_dims("ModelB", 8)));
+        let err = store
+            .init("probe")
+            .await
+            .expect_err("a different-width switch must be refused");
+        let message = embedding_identity_refusal_message(&err)
+            .expect("the refusal must be the identity error, not an engine error");
+        assert!(
+            message.contains("refusing to open a store that has recorded data"),
+            "{message}"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn data_bearing_remote_recorded_store_reopens_under_same_remote_serving() {
+        // R recorded from a remote serving descriptor. A
+        // config-keyed refusal would compare the local configured
+        // descriptor against the remote record and lock the owner out;
+        // the serving-keyed check accepts the identical remote S, and
+        // the unbound (backup-shaped) open.
+        let previous = without_model_env();
+        let fx = store_state_fixture("a5-remote-record", "ModelA");
+        let blank = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        blank.init("probe").await.expect("init creates the schema");
+        drop(blank);
+        let remote = remote_descriptor_for("RemoteModel");
+        crate::model_choice::write_store_state(
+            &fx.db,
+            &crate::model_choice::StoreState {
+                version: crate::model_choice::STORE_STATE_VERSION,
+                has_data: true,
+                descriptor: remote.clone(),
+            },
+        )
+        .expect("record the remote identity");
+
+        let bound = LadybugStore::for_testing(&fx.db, 4)
+            .expect("reopen temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(remote.clone()));
+        bound
+            .init("probe")
+            .await
+            .expect("the identical remote serving descriptor opens its own store");
+        bound
+            .upsert(
+                "probe",
+                "m1",
+                vec![0.1, 0.2, 0.3, 0.4],
+                store_state_payload(),
+            )
+            .await
+            .expect("a write under the recorded remote identity lands");
+        drop(bound);
+
+        let unbound = LadybugStore::for_testing(&fx.db, 4)
+            .expect("reopen temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        unbound
+            .init("probe")
+            .await
+            .expect("an unbound open of a remote-recorded store succeeds");
+        drop(unbound);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn data_bearing_unbound_backup_and_report_opens_are_never_refused() {
+        // The S == None allow-list under a changed config —
+        // backup (construct, no init, export) and direct_report (init,
+        // no serving descriptor) both succeed and never move R.
+        let previous = without_model_env();
+        let fx = data_bearing_store_fixture("a5-unbound-opens").await;
+        let sidecar_before =
+            std::fs::read(crate::model_choice::store_state_path(&fx.db)).expect("read sidecar");
+        write_embedders_config(&fx.config_dir, "ModelB");
+
+        let backup = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        let out = fx.root.join("backup-out");
+        backup
+            .export_database(&out.to_string_lossy())
+            .await
+            .expect("the backup open is never refused");
+        drop(backup);
+        assert_eq!(
+            std::fs::read(crate::model_choice::store_state_path(&fx.db)).expect("re-read sidecar"),
+            sidecar_before,
+            "backup never moves the recorded descriptor"
+        );
+
+        let report = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        report
+            .init("probe")
+            .await
+            .expect("the report open is never refused");
+        drop(report);
+        assert_eq!(
+            std::fs::read(crate::model_choice::store_state_path(&fx.db)).expect("re-read sidecar"),
+            sidecar_before,
+            "a report open never moves the recorded descriptor"
+        );
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn data_bearing_initless_vector_paths_refuse_and_unbound_recycle_passes() {
+        // The vector paths that never init — fallback Add
+        // (upsert directly) and Chat Ask (search_with_domain) — refuse
+        // under a mismatched serving descriptor; an unbound upsert of
+        // a vector read back from the store itself (NormalizeMetadata's
+        // shape) succeeds under a changed config.
+        let previous = without_model_env();
+        let fx = data_bearing_store_fixture("a5-initless-paths").await;
+
+        let add = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelB")));
+        let err = add
+            .upsert(
+                "probe",
+                "m2",
+                vec![0.1, 0.2, 0.3, 0.4],
+                store_state_payload(),
+            )
+            .await
+            .expect_err("an init-less upsert under a different model must refuse");
+        assert!(embedding_identity_refusal_message(&err).is_some(), "{err}");
+        drop(add);
+
+        let chat = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelB")));
+        let err = chat
+            .search_with_domain(
+                "probe",
+                vec![0.1, 0.2, 0.3, 0.4],
+                5,
+                false,
+                false,
+                &[],
+                None,
+                true,
+            )
+            .await
+            .expect_err("an init-less vector search under a different model must refuse");
+        assert!(embedding_identity_refusal_message(&err).is_some(), "{err}");
+        drop(chat);
+
+        write_embedders_config(&fx.config_dir, "ModelB");
+        let normalize = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        let (vector, payload) = normalize
+            .get("probe", "m1")
+            .await
+            .expect("get the stored row")
+            .expect("the seeded row exists");
+        normalize
+            .upsert("probe", "m1", vector, payload)
+            .await
+            .expect("recycling a store-read vector unbound succeeds under a changed config");
+        drop(normalize);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn registry_records_serving_descriptor_when_bound() {
+        // A bound init records S in the registry — S verifies,
+        // the legacy placeholder does not.
+        let previous = without_model_env();
+        let fx = store_state_fixture("a5-registry-serving", "ModelA");
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        store.init("probe").await.expect("init");
+        store
+            .verify_or_record_embedding_descriptor("probe", &serving_descriptor_for("ModelA"))
+            .expect("the serving descriptor verifies against the registry");
+        assert!(
+            store
+                .verify_or_record_embedding_descriptor("probe", &placeholder_descriptor(4))
+                .is_err(),
+            "the registry holds the serving descriptor, not the placeholder"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn registry_seeds_from_recorded_descriptor_when_unbound() {
+        // An unbound init of a recorded store seeds the
+        // registry from R — R verifies, the (changed) configured
+        // descriptor does not.
+        let previous = without_model_env();
+        let fx = data_bearing_store_fixture("a5-registry-recorded").await;
+        write_embedders_config(&fx.config_dir, "ModelB");
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("reopen temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        store
+            .init("probe")
+            .await
+            .expect("the unbound open succeeds (allow-list)");
+        store
+            .verify_or_record_embedding_descriptor("probe", &serving_descriptor_for("ModelA"))
+            .expect("the recorded descriptor verifies against the registry");
+        assert!(
+            store
+                .verify_or_record_embedding_descriptor("probe", &serving_descriptor_for("ModelB"))
+                .is_err(),
+            "the registry holds the recorded descriptor, not the configured one"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn feature_created_store_never_records_local_fastembed_placeholder() {
+        // With NEUROSTRATA_MODEL unset, the placeholder the old
+        // init recorded ("local-fastembed") must not verify after a
+        // bound init of a feature-created store.
+        let previous = without_model_env();
+        let fx = store_state_fixture("a5-registry-no-placeholder", "ModelA");
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        store.init("probe").await.expect("init");
+        assert!(
+            store
+                .verify_or_record_embedding_descriptor("probe", &placeholder_descriptor(4))
+                .is_err(),
+            "a feature-created store never records the local-fastembed placeholder"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn locked_unknown_opens_exactly_as_today() {
+        // A pre-sidecar store (db predates this process, no
+        // sidecar ever written) opens, writes, and searches under a
+        // changed config exactly as it did before the feature — and
+        // no sidecar is backfilled, at open or at first write.
+        let previous = without_model_env();
+        let fx = store_state_fixture("a5-locked-unknown", "ModelA");
+        let creator = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        creator.init("probe").await.expect("init");
+        drop(creator);
+        assert!(
+            !crate::model_choice::store_state_path(&fx.db).exists(),
+            "the pre-sidecar fixture carries no sidecar"
+        );
+
+        write_embedders_config(&fx.config_dir, "ModelB");
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("reopen temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        store
+            .init("probe")
+            .await
+            .expect("a pre-sidecar store opens as it always has");
+        store
+            .upsert(
+                "probe",
+                "m1",
+                vec![0.1, 0.2, 0.3, 0.4],
+                store_state_payload(),
+            )
+            .await
+            .expect("writes land as they always have");
+        let found = store
+            .search("probe", vec![0.1, 0.2, 0.3, 0.4], 5, false, false)
+            .await
+            .expect("search works as it always has");
+        assert!(!found.is_empty());
+        assert!(
+            !crate::model_choice::store_state_path(&fx.db).exists(),
+            "no sidecar is backfilled for a pre-sidecar store — establishing its identity is Phase B"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn locked_unknown_width_change_fails_at_the_engine_not_the_identity_check() {
+        // The width backstop is unchanged for pre-sidecar
+        // stores — a different width fails at vector use with the
+        // engine's error, never with the identity refusal.
+        let previous = without_model_env();
+        let fx = store_state_fixture("a5-locked-unknown-width", "ModelA");
+        let creator = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        creator.init("probe").await.expect("init");
+        drop(creator);
+
+        let store = LadybugStore::for_testing(&fx.db, 8)
+            .expect("reopen temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        store
+            .init("probe")
+            .await
+            .expect("init succeeds: the backstop is at vector use, as today");
+        let err = store
+            .upsert("probe", "m1", vec![0.1; 8], store_state_payload())
+            .await
+            .expect_err("the FLOAT[4] column rejects an 8-wide vector");
+        assert!(
+            embedding_identity_refusal_message(&err).is_none(),
+            "a pre-sidecar width failure is not the identity refusal: {err}"
+        );
+        assert!(restart_to_apply_message(&err).is_none(), "{err}");
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn pristine_store_reconciles_width_on_different_width_adoption() {
+        // A pristine store created under the default-width model
+        // adopts a different-width pick end-to-end: init reconciles
+        // the physical FLOAT column to the serving width (the engine
+        // attests the table is empty) before the descriptor is
+        // adopted, so the first write under the pick lands.
+        let previous = without_model_env();
+        let fx = store_state_fixture("fwidth-reconcile", "NomicEmbedTextV15");
+        std::fs::write(
+            fx.config_dir.join("embedders.json"),
+            "[{\"model_name\":\"NomicEmbedTextV15\",\"dimensions\":768}]",
+        )
+        .expect("write 768 fixture config");
+        let creator = LadybugStore::for_testing(&fx.db, 768)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_dims("NomicEmbedTextV15", 768)));
+        creator.init("probe").await.expect("init");
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["has_data"], json!(false));
+        assert_eq!(sidecar["descriptor"]["model"], json!("NomicEmbedTextV15"));
+        assert_eq!(sidecar["descriptor"]["dims"], json!(768));
+        drop(creator);
+
+        std::fs::write(
+            fx.config_dir.join("embedders.json"),
+            "[{\"model_name\":\"BGESmallENV15Q\",\"dimensions\":384}]",
+        )
+        .expect("write 384 fixture config");
+        let store = LadybugStore::for_testing(&fx.db, 384)
+            .expect("reopen temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_dims("BGESmallENV15Q", 384)));
+        store
+            .init("probe")
+            .await
+            .expect("init adopts the different-width pick on a pristine store");
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["has_data"], json!(false));
+        assert_eq!(sidecar["descriptor"]["model"], json!("BGESmallENV15Q"));
+        assert_eq!(sidecar["descriptor"]["dims"], json!(384));
+
+        store
+            .upsert("probe", "m1", vec![0.1; 384], store_state_payload())
+            .await
+            .expect("a 384-wide upsert lands after width reconciliation");
+        let found = store
+            .search("probe", vec![0.1; 384], 5, false, false)
+            .await
+            .expect("search under the reconciled width");
+        assert!(!found.is_empty(), "the reconciled store reads its row back");
+        assert_eq!(read_sidecar(&fx.db)["has_data"], json!(true));
+
+        let err = store
+            .upsert("probe", "m2", vec![0.1; 768], store_state_payload())
+            .await
+            .expect_err("the reconciled FLOAT[384] column rejects a 768-wide vector");
+        assert!(
+            err.to_string().contains("Expected: 384"),
+            "the old width is rejected by the engine at the new width: {err}"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn pristine_labelled_store_with_rows_refuses_width_reconciliation() {
+        // The stale-label state (the F1 residual class): the sidecar
+        // says pristine but the table holds a row. Reconciliation
+        // must refuse the mismatched open with a truthful error and
+        // leave the store byte-untouched — never alter a table the
+        // engine attests is not empty.
+        let previous = without_model_env();
+        let fx = store_state_fixture("fwidth-stale-label", "ModelA");
+        std::fs::write(
+            fx.config_dir.join("embedders.json"),
+            "[{\"model_name\":\"ModelA\",\"dimensions\":768}]",
+        )
+        .expect("write 768 fixture config");
+        let creator = LadybugStore::for_testing(&fx.db, 768)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_dims("ModelA", 768)));
+        creator.init("probe").await.expect("init");
+        creator
+            .upsert("probe", "m1", vec![0.1; 768], store_state_payload())
+            .await
+            .expect("seed upsert");
+        assert_eq!(read_sidecar(&fx.db)["has_data"], json!(true));
+        drop(creator);
+
+        // Hand-rewrite the sidecar to the stale pristine label.
+        crate::model_choice::write_store_state(
+            &fx.db,
+            &crate::model_choice::StoreState {
+                version: crate::model_choice::STORE_STATE_VERSION,
+                has_data: false,
+                descriptor: serving_descriptor_dims("ModelA", 768),
+            },
+        )
+        .expect("rewrite the sidecar to the stale pristine label");
+        let sidecar_before =
+            std::fs::read(crate::model_choice::store_state_path(&fx.db)).expect("read sidecar");
+
+        std::fs::write(
+            fx.config_dir.join("embedders.json"),
+            "[{\"model_name\":\"ModelB\",\"dimensions\":384}]",
+        )
+        .expect("write 384 fixture config");
+        let store = LadybugStore::for_testing(&fx.db, 384)
+            .expect("reopen temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_dims("ModelB", 384)));
+        let err = store
+            .init("probe")
+            .await
+            .expect_err("a pristine-labelled store with rows refuses width reconciliation");
+        let message = err.to_string();
+        assert!(
+            message.contains("pristine") && message.contains("768") && message.contains("384"),
+            "the error names the recorded-pristine inconsistency and both widths: {message}"
+        );
+        assert!(
+            embedding_identity_refusal_message(&err).is_none(),
+            "the reconciliation refusal is a plain error, not the identity refusal: {err}"
+        );
+        assert!(restart_to_apply_message(&err).is_none(), "{err}");
+        assert_eq!(
+            std::fs::read(crate::model_choice::store_state_path(&fx.db)).expect("re-read sidecar"),
+            sidecar_before,
+            "a refused reconciliation leaves the sidecar byte-identical"
+        );
+        drop(store);
+
+        // The schema is untouched: the store still opens and writes
+        // under its recorded width.
+        std::fs::write(
+            fx.config_dir.join("embedders.json"),
+            "[{\"model_name\":\"ModelA\",\"dimensions\":768}]",
+        )
+        .expect("restore 768 fixture config");
+        let store = LadybugStore::for_testing(&fx.db, 768)
+            .expect("reopen temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_dims("ModelA", 768)));
+        store
+            .init("probe")
+            .await
+            .expect("the store still opens under its recorded model");
+        store
+            .upsert("probe", "m2", vec![0.1; 768], store_state_payload())
+            .await
+            .expect("a 768-wide upsert still lands: the column was never altered");
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn set_serving_descriptor_binds_post_construction() {
+        // The fallback binding setter — a store constructed
+        // unbound refuses after being bound to a different model, and
+        // passes after being bound to the recorded one.
+        let previous = without_model_env();
+        let fx = data_bearing_store_fixture("a5-setter").await;
+
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("reopen temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        store.set_serving_descriptor(Some(serving_descriptor_for("ModelB")));
+        let err = store
+            .upsert(
+                "probe",
+                "m2",
+                vec![0.1, 0.2, 0.3, 0.4],
+                store_state_payload(),
+            )
+            .await
+            .expect_err("a post-construction binding keys the write check");
+        assert!(embedding_identity_refusal_message(&err).is_some(), "{err}");
+        let err = store
+            .search_with_domain(
+                "probe",
+                vec![0.1, 0.2, 0.3, 0.4],
+                5,
+                false,
+                false,
+                &[],
+                None,
+                true,
+            )
+            .await
+            .expect_err("a post-construction binding keys the search check");
+        assert!(embedding_identity_refusal_message(&err).is_some(), "{err}");
+        drop(store);
+
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("reopen temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        store.set_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        store
+            .upsert(
+                "probe",
+                "m2",
+                vec![0.1, 0.2, 0.3, 0.4],
+                store_state_payload(),
+            )
+            .await
+            .expect("binding the recorded model passes the write check");
+        store
+            .search("probe", vec![0.1, 0.2, 0.3, 0.4], 5, false, false)
+            .await
+            .expect("binding the recorded model passes the search check");
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn fresh_unrecorded_flip_prefers_the_serving_descriptor() {
+        // A FreshUnrecorded store's
+        // flip records the serving descriptor bound after init — the
+        // model that produced the vectors — not the configured one.
+        let previous = without_model_env();
+        let fx = store_state_fixture("a5-flip-prefers-serving", "ModelA");
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        store.init("probe").await.expect("init");
+        assert!(
+            !crate::model_choice::store_state_path(&fx.db).exists(),
+            "an unbound init of a fresh store records nothing"
+        );
+        store.set_serving_descriptor(Some(serving_descriptor_for("ModelServed")));
+        store
+            .upsert(
+                "probe",
+                "m1",
+                vec![0.1, 0.2, 0.3, 0.4],
+                store_state_payload(),
+            )
+            .await
+            .expect("the pristine guard does not cover FreshUnrecorded stores");
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["has_data"], json!(true));
+        assert_eq!(
+            sidecar["descriptor"]["model"],
+            json!("ModelServed"),
+            "the flip records the serving descriptor, not the configured one"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn backup_restore_round_trip_preserves_store_state_sidecar() {
+        // A snapshot that does not carry the sidecar
+        // restores a store with no recorded identity — silently
+        // LockedUnknown, outside the identity refusal's protection.
+        // The round trip must preserve Recorded{has_data, R}, and the
+        // identity refusal must still fire on the restored store.
+        let previous = without_model_env();
+        let fx = data_bearing_store_fixture("a5-backup-round-trip").await;
+        let opener = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        let out = fx.root.join("snapshot");
+        opener
+            .export_database(&out.to_string_lossy())
+            .await
+            .expect("backup");
+        drop(opener);
+        assert!(
+            out.join("ladybug.store.store-state.json").exists(),
+            "the snapshot carries the store-state sidecar"
+        );
+        let report = crate::storage::snapshot::verify_snapshot(&out).expect("verify the snapshot");
+        assert!(
+            report.valid,
+            "the snapshot verifies with the sidecar aboard"
+        );
+
+        // The restore shape: the file copies the Restore arm performs
+        // (db, WAL, sidecar) into a new path, then the store opens.
+        let restored_dir = fx.root.join("restored");
+        std::fs::create_dir_all(&restored_dir).expect("create restore dir");
+        let restored_db = restored_dir.join("ladybug.db");
+        std::fs::copy(out.join("ladybug.store"), &restored_db).expect("copy the db");
+        let snapshot_wal = out.join("ladybug.store.wal");
+        if snapshot_wal.exists() {
+            let mut target_wal = restored_db.clone().into_os_string();
+            target_wal.push(".wal");
+            std::fs::copy(&snapshot_wal, std::path::PathBuf::from(target_wal))
+                .expect("copy the WAL");
+        }
+        std::fs::copy(
+            out.join("ladybug.store.store-state.json"),
+            crate::model_choice::store_state_path(&restored_db),
+        )
+        .expect("copy the sidecar");
+        let state = crate::model_choice::read_store_state(&restored_db)
+            .expect("the restored store keeps its recorded identity");
+        assert!(state.has_data);
+        assert_eq!(state.descriptor, serving_descriptor_for("ModelA"));
+
+        let refused = LadybugStore::for_testing(&restored_db, 4)
+            .expect("open restored database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelB")));
+        let err = refused
+            .init("probe")
+            .await
+            .expect_err("the identity refusal still fires on the restored store");
+        assert!(embedding_identity_refusal_message(&err).is_some(), "{err}");
+        drop(refused);
+
+        let ok = LadybugStore::for_testing(&restored_db, 4)
+            .expect("open restored database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        ok.init("probe")
+            .await
+            .expect("the restored store opens under its recorded model");
+        drop(ok);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
     }
 }
 

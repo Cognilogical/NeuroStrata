@@ -2610,10 +2610,17 @@ pub(crate) async fn embed_dedup_and_upsert(
     use crate::judgment::policy::{DedupDecision, DedupHint, MemoryWriteReport};
     use crate::traits::{DedupCandidateScope, RawDistanceQuery};
 
-    store
-        .init(namespace)
-        .await
-        .map_err(|_| "Failed to initialize table.".to_string())?;
+    store.init(namespace).await.map_err(|e| {
+        // The store's data-bearing identity refusal is
+        // actionable operator guidance, not a store failure: pass its
+        // full text to the caller instead of the generic mapping every
+        // other init error gets — the same verbatim-surface pattern
+        // the upsert mapping below applies to the guard's refusal.
+        match crate::store::ladybug::embedding_identity_refusal_message(&e) {
+            Some(message) => message,
+            None => "Failed to initialize table.".to_string(),
+        }
+    })?;
     let vector = emb
         .embed(&payload.content)
         .await
@@ -2882,7 +2889,14 @@ pub(crate) async fn embed_dedup_and_upsert(
         .await
         .map_err(|e| {
             tracing::warn!("store.upsert failed in handle_add_memory for '{namespace}': {e}");
-            "Failed to store memory in database.".to_string()
+            // The store's restart-to-apply refusal is
+            // actionable operator guidance, not a store failure: pass
+            // its full text to the caller instead of the generic
+            // mapping every other upsert error gets.
+            match crate::store::ladybug::restart_to_apply_message(&e) {
+                Some(message) => message,
+                None => "Failed to store memory in database.".to_string(),
+            }
         })?;
 
     // Learning-loop capture is opt-in via NEUROSTRATA_LEARNING_DIR so unit
@@ -9421,6 +9435,334 @@ mod tests {
             v.iter().any(|x| x.fract() != 0.0),
             "at least one element must be a non-integer float for ARRAY_DISTANCE: {v:?}"
         );
+    }
+
+    /// A stub embedder serving ModelA: its descriptor is the one a
+    /// process that built its embedder under the ModelA configuration
+    /// carries, matching the descriptor the store records for it.
+    struct ModelAServingEmbedder;
+
+    #[async_trait::async_trait]
+    impl Embedder for ModelAServingEmbedder {
+        async fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+            // Same non-integer-float construction as StubEmbedder.
+            let mut v = vec![0.0f32; 4];
+            for (i, b) in text.bytes().enumerate() {
+                v[i % 4] += b as f32;
+            }
+            for (i, x) in v.iter_mut().enumerate() {
+                *x += (i as f32 + 1.0) * 0.001;
+            }
+            Ok(v)
+        }
+        fn dimensions(&self) -> usize {
+            4
+        }
+        fn embedder_id(&self) -> &str {
+            "ModelA"
+        }
+        fn embedding_descriptor(&self) -> crate::traits::EmbeddingDescriptor {
+            crate::traits::EmbeddingDescriptor {
+                provider: "fastembed".to_string(),
+                model: "ModelA".to_string(),
+                revision: "onnx".to_string(),
+                dims: 4,
+                normalization: "unknown".to_string(),
+                preprocessing: "unknown".to_string(),
+                distance_metric: "cosine".to_string(),
+            }
+        }
+    }
+
+    /// The live write half one level up: a daemon that
+    /// started before a setup pick landed serves ModelA; when its add
+    /// path runs after the pick (init -> embed -> upsert), the write
+    /// must refuse, land no row, and leave the store's record at
+    /// {pristine, ModelA} — the silent FP32-under-Q mix must not
+    /// recur through the real pipeline.
+    #[tokio::test]
+    async fn add_write_half_in_same_process_after_pick_refuses() {
+        use crate::store::LadybugStore;
+        let previous = std::env::var("NEUROSTRATA_MODEL").ok();
+        std::env::remove_var("NEUROSTRATA_MODEL");
+
+        let root = std::env::temp_dir().join(format!(
+            "ns-write-half-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let write_config = |model: &str| {
+            std::fs::write(
+                config_dir.join("embedders.json"),
+                format!("[{{\"model_name\":\"{model}\",\"dimensions\":4}}]"),
+            )
+            .unwrap();
+        };
+        write_config("ModelA");
+        let db_path = root.join("ladybug.db");
+
+        let concrete = Arc::new(
+            LadybugStore::for_testing(&db_path, 4)
+                .expect("open temp database")
+                .with_embed_config_dir(&config_dir)
+                .with_serving_descriptor(Some(ModelAServingEmbedder.embedding_descriptor())),
+        );
+        let store: Arc<dyn VectorStore> = concrete.clone();
+        let emb: Arc<dyn Embedder> = Arc::new(ModelAServingEmbedder);
+        store.init("probe").await.expect("init");
+        let sidecar = |db: &std::path::Path| -> serde_json::Value {
+            let content =
+                std::fs::read_to_string(crate::model_choice::store_state_path(db)).unwrap();
+            serde_json::from_str(&content).unwrap()
+        };
+        assert_eq!(sidecar(&db_path)["has_data"], serde_json::json!(false));
+        assert_eq!(
+            sidecar(&db_path)["descriptor"]["model"],
+            serde_json::json!("ModelA")
+        );
+
+        // The pick lands while this process holds the store open.
+        write_config("ModelB");
+        let incoming = payload("a memory written after the pick");
+        let res = embed_dedup_and_upsert(&store, &emb, "probe", &incoming, None).await;
+        assert!(
+            res.is_err(),
+            "the pre-pick process's write must be refused through the write half: {res:?}"
+        );
+        let rows = concrete
+            .list("probe", None, None)
+            .await
+            .expect("list after refusal");
+        assert!(rows.is_empty(), "a refused write lands no row: {rows:?}");
+        assert_eq!(sidecar(&db_path)["has_data"], serde_json::json!(false));
+        assert_eq!(
+            sidecar(&db_path)["descriptor"]["model"],
+            serde_json::json!("ModelA"),
+            "the record stays with the serving model"
+        );
+
+        drop(concrete);
+        let _ = std::fs::remove_dir_all(&root);
+        match previous {
+            Some(value) => std::env::set_var("NEUROSTRATA_MODEL", value),
+            None => std::env::remove_var("NEUROSTRATA_MODEL"),
+        }
+    }
+
+    /// The guard's refusal is actionable operator
+    /// guidance, and the write half's generic store-error mapping must
+    /// not swallow it. The caller of the add path receives the full
+    /// restart-to-apply text — the serving model, the configured model,
+    /// and the restart instruction — not "Failed to store memory in
+    /// database.". The regression this pins: the refusal fired and
+    /// no data landed, but the MCP caller
+    /// saw only the generic string.
+    #[tokio::test]
+    async fn add_write_half_refusal_reaches_caller_with_restart_to_apply_text() {
+        use crate::store::LadybugStore;
+        let previous = std::env::var("NEUROSTRATA_MODEL").ok();
+        std::env::remove_var("NEUROSTRATA_MODEL");
+
+        let root = std::env::temp_dir().join(format!(
+            "ns-write-half-msg-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let write_config = |model: &str| {
+            std::fs::write(
+                config_dir.join("embedders.json"),
+                format!("[{{\"model_name\":\"{model}\",\"dimensions\":4}}]"),
+            )
+            .unwrap();
+        };
+        write_config("ModelA");
+        let db_path = root.join("ladybug.db");
+
+        let store: Arc<dyn VectorStore> = Arc::new(
+            LadybugStore::for_testing(&db_path, 4)
+                .expect("open temp database")
+                .with_embed_config_dir(&config_dir)
+                .with_serving_descriptor(Some(ModelAServingEmbedder.embedding_descriptor())),
+        );
+        let emb: Arc<dyn Embedder> = Arc::new(ModelAServingEmbedder);
+        store.init("probe").await.expect("init");
+
+        // The pick lands while this process holds the store open.
+        write_config("ModelB");
+        let incoming = payload("a memory written after the pick");
+        let err = embed_dedup_and_upsert(&store, &emb, "probe", &incoming, None)
+            .await
+            .expect_err("the pre-pick process's write must be refused");
+        assert!(
+            err.contains("Restart the daemon"),
+            "the caller must see the restart instruction, got: {err}"
+        );
+        assert!(
+            err.contains("'ModelA'") && err.contains("'ModelB'"),
+            "the caller must see the serving and configured models, got: {err}"
+        );
+        assert!(
+            !err.contains("Failed to store memory in database."),
+            "the guard refusal must not be mapped to the generic store error, got: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        match previous {
+            Some(value) => std::env::set_var("NEUROSTRATA_MODEL", value),
+            None => std::env::remove_var("NEUROSTRATA_MODEL"),
+        }
+    }
+
+    /// An embedder whose vectors never match the store's width: every
+    /// upsert through it fails inside the engine — an ordinary store
+    /// error with no guard involvement.
+    struct WrongWidthEmbedder;
+
+    #[async_trait::async_trait]
+    impl Embedder for WrongWidthEmbedder {
+        async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            Ok(vec![0.5; 3])
+        }
+        fn dimensions(&self) -> usize {
+            3
+        }
+    }
+
+    /// Control case: an upsert error that is NOT the guard's
+    /// refusal keeps the generic caller message exactly. Only the
+    /// restart-to-apply refusal is surfaced verbatim.
+    #[tokio::test]
+    async fn add_write_half_non_guard_upsert_error_keeps_generic_message() {
+        use crate::store::LadybugStore;
+        let previous = std::env::var("NEUROSTRATA_MODEL").ok();
+        std::env::remove_var("NEUROSTRATA_MODEL");
+
+        let root = std::env::temp_dir().join(format!(
+            "ns-write-half-generic-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("embedders.json"),
+            "[{\"model_name\":\"ModelA\",\"dimensions\":4}]",
+        )
+        .unwrap();
+        let db_path = root.join("ladybug.db");
+
+        // No serving descriptor and no pick: the store stays pristine
+        // and unrecorded, so the first-write guard cannot fire. The
+        // 3-wide vector against the store's FLOAT[4] column is the
+        // only failure in play.
+        let store: Arc<dyn VectorStore> = Arc::new(
+            LadybugStore::for_testing(&db_path, 4)
+                .expect("open temp database")
+                .with_embed_config_dir(&config_dir),
+        );
+        let emb: Arc<dyn Embedder> = Arc::new(WrongWidthEmbedder);
+        store.init("probe").await.expect("init");
+
+        let incoming = payload("a memory whose vector has the wrong width");
+        let err = embed_dedup_and_upsert(&store, &emb, "probe", &incoming, None)
+            .await
+            .expect_err("a wrong-width upsert must fail");
+        assert_eq!(
+            err, "Failed to store memory in database.",
+            "a non-guard upsert error keeps the generic caller message"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        match previous {
+            Some(value) => std::env::set_var("NEUROSTRATA_MODEL", value),
+            None => std::env::remove_var("NEUROSTRATA_MODEL"),
+        }
+    }
+
+    /// The write half's init mapping
+    /// must not swallow the store's data-bearing identity refusal into
+    /// "Failed to initialize table." — the refusal is actionable
+    /// operator guidance and reaches the caller verbatim, the way the
+    /// guard's restart-to-apply refusal does at the upsert mapping.
+    #[tokio::test]
+    async fn add_write_half_init_identity_refusal_reaches_caller_verbatim() {
+        use crate::store::LadybugStore;
+        let previous = std::env::var("NEUROSTRATA_MODEL").ok();
+        std::env::remove_var("NEUROSTRATA_MODEL");
+
+        let root = std::env::temp_dir().join(format!(
+            "ns-write-half-identity-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("embedders.json"),
+            "[{\"model_name\":\"ModelA\",\"dimensions\":4}]",
+        )
+        .unwrap();
+        let db_path = root.join("ladybug.db");
+
+        // A data-bearing store recorded under ModelA.
+        let seed = LadybugStore::for_testing(&db_path, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&config_dir)
+            .with_serving_descriptor(Some(ModelAServingEmbedder.embedding_descriptor()));
+        seed.init("probe").await.expect("init");
+        seed.upsert(
+            "probe",
+            "m1",
+            vec![0.1, 0.2, 0.3, 0.4],
+            payload("a memory recorded under ModelA"),
+        )
+        .await
+        .expect("seed upsert");
+        drop(seed);
+
+        // A process serving ModelB runs the write half: its init
+        // refuses before any embedding happens.
+        let model_b = crate::traits::EmbeddingDescriptor {
+            provider: "fastembed".to_string(),
+            model: "ModelB".to_string(),
+            revision: "onnx".to_string(),
+            dims: 4,
+            normalization: "unknown".to_string(),
+            preprocessing: "unknown".to_string(),
+            distance_metric: "cosine".to_string(),
+        };
+        let store: Arc<dyn VectorStore> = Arc::new(
+            LadybugStore::for_testing(&db_path, 4)
+                .expect("reopen temp database")
+                .with_embed_config_dir(&config_dir)
+                .with_serving_descriptor(Some(model_b)),
+        );
+        let emb: Arc<dyn Embedder> = Arc::new(ModelAServingEmbedder);
+        let err = embed_dedup_and_upsert(&store, &emb, "probe", &payload("a late write"), None)
+            .await
+            .expect_err("the write half must refuse at init under a different model");
+        assert!(
+            err.contains("refusing to open a store that has recorded data"),
+            "the caller must see the identity refusal, got: {err}"
+        );
+        assert!(
+            err.contains("'ModelA'") && err.contains("'ModelB'"),
+            "the caller must see the recorded and serving models, got: {err}"
+        );
+        assert!(
+            !err.contains("Failed to initialize table."),
+            "the identity refusal must not be mapped to the generic init error, got: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        match previous {
+            Some(value) => std::env::set_var("NEUROSTRATA_MODEL", value),
+            None => std::env::remove_var("NEUROSTRATA_MODEL"),
+        }
     }
 
     /// A round-trip through the store preserves the fractional part, so a

@@ -174,6 +174,104 @@ never kill it -- writes that only reached the WAL are discarded if the process
 dies before a checkpoint. Any stdio proxy started by an MCP client
 holds the installed binary too, and has to stop for the same reason.
 
+### Choosing the embedding model at setup
+
+On a fresh install, while the store is still empty, the first interactive
+command offers a one-time choice of embedding model. Daemon and serving
+processes never prompt: when the built-in default configuration is first
+materialized they only record that a choice is pending, and the next
+interactive command surfaces it. The offer presents the top three candidates
+in the table below. Keeping the built-in default, `NomicEmbedTextV15`, is one
+of the outcomes: explicitly declining the offer — or never being asked —
+leaves the default in place, and a declined install is not asked again. (An
+answer that is neither a pick nor a decline leaves the choice pending for the
+next interactive command.)
+
+The pick is recorded in `embedders.json` in the configuration directory, as
+the first entry, followed by the built-in default entry. The choice is
+one-way once data exists. The offer renders this warning verbatim:
+
+> This choice is permanent for this database: the store refuses any other model once data exists. Changing later requires a new database.
+
+| Model | Dimensions | Context limit | ONNX file size |
+| :--- | ---: | ---: | ---: |
+| `NomicEmbedTextV15Q` | 768 | 8,192 tokens | 137,296,292 bytes (130.9 MiB) |
+| `BGESmallENV15Q` | 384 | 512 tokens | 66,465,124 bytes (63.4 MiB) |
+| `SnowflakeArcticEmbedMQ` | 768 | 512 tokens | 110,084,023 bytes (105.0 MiB) |
+| `BGESmallENV15` | 384 | 512 tokens | 133,093,490 bytes (126.9 MiB) |
+| `BGEBaseENV15Q` | 768 | 512 tokens | 217,824,172 bytes (207.7 MiB) |
+
+`NomicEmbedTextV15Q` is the standard default's model, int8-quantized, with
+dimensions and context unchanged; `BGESmallENV15Q` is the smallest download.
+For every 512-token candidate the offer also renders this warning verbatim:
+
+> This model's context is 512 tokens. About 6% of the items in a measured reference store exceed that and would be embedded truncated — silently, and permanently for those items.
+
+The precise figure behind that "about 6%" is 6.08% (18 of 296) of the
+reference store's memories exceeding 512 tokens.
+
+#### Measured example figures
+
+Measured on a 7.9 GiB CPU-only VM against a ~1,400-memory store, 2026-11, on a development build; your figures will differ. These are example figures
+from one machine, not a ranking of the candidates.
+
+- **Resident memory:** after a batch, `NomicEmbedTextV15Q` ran at 330/332 MiB
+  against the FP32 default's 947/938 MiB — a measured saving of 606 MiB (the
+  smaller of two paired deltas, 617 MiB and 606 MiB).
+- **Embedding drift (60 texts):** FP32-to-quantized mean cosine
+  0.948 for `NomicEmbedTextV15Q`; top-5 overlap against FP32 was 0.873 for
+  `NomicEmbedTextV15Q` and 0.667 for `BGESmallENV15Q`.
+- **Recall (30 blind-judged queries):** FP32 22/30,
+  `NomicEmbedTextV15Q` 23/30. The one-query difference sits well inside the
+  ±0.214 noise band, so it is not evidence that either model recalls better.
+- **Not measured:** `SnowflakeArcticEmbedMQ` — resident memory and recall
+  were not measured. `BGESmallENV15Q` — resident memory was not measured.
+  `BGESmallENV15` and `BGEBaseENV15Q` — neither resident memory nor quality
+  was measured.
+
+#### How the configured model is resolved
+
+Resolution is unchanged by the setup choice; it is stated here because it is
+what makes the choice durable. Each process resolves its model in this order:
+
+1. `NEUROSTRATA_MODEL`, when it names an entry in the acceptable-embedder
+   list (case-insensitively). A value that names no acceptable entry is
+   ignored and resolution falls through — it is not an error.
+2. The first entry of `embedders.json` — the user-edited file, in which a
+   setup pick is written first.
+3. The built-in default (`NomicEmbedTextV15`) — used when the file is absent
+   or an empty list, and as the in-memory fallback when the file cannot be
+   parsed.
+
+#### Idle unload (develop branch only)
+
+`NEUROSTRATA_EMBEDDER_IDLE_UNLOAD_SECS` is a capability of the develop
+branch; it is not a feature of this build, and setting it here has no effect.
+On the develop branch it unloads the embedder session after that many seconds
+idle; the session is dropped and reloaded on the next embedding access rather
+than by a timer while the daemon sits idle. Unset or `0` means off. To use it
+there, the variable must be set in the environment of the path that starts
+the daemon — setting it in a client shell afterwards changes nothing — and a
+running daemon's setting can be checked by inspecting the daemon process's
+environment (on Linux, its `/proc/<pid>/environ`). Honestly: measured in
+2026-11 on a development build, in the same measurement series as the figures
+above, it released no resident memory while idle — drops of 0 MiB and −1 MiB
+across two idle windows — and resident memory grew across reload cycles
+(921 MiB loaded, 1,637 MiB after the first reload, 2,263 MiB after the
+second).
+
+#### If `embedders.json` is corrupted
+
+If `embedders.json` is corrupted or otherwise unparseable, the loader falls
+back to the built-in default in memory without overwriting the file. If that
+default's identity differs from the model the store recorded, a store with
+recorded data then refuses to open under the different model identity. The
+store itself is undamaged. To recover: restore `embedders.json` with the store's recorded model as the first entry (an entry carrying `model_name` and
+`dimensions`, plus its `model_sha256` pin if the entry was setup-written),
+then start again. Backups and restores preserve the store's recorded model
+identity, so a restored store opens under the same model it was backed up
+with.
+
 ---
 
 ## Windows quirks
