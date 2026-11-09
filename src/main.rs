@@ -4232,6 +4232,7 @@ async fn run() -> anyhow::Result<()> {
                     } => {
                         let embedder = build_embedder()?;
                         bind_fallback_serving_descriptor(&vector_store, &embedder);
+                        vector_store.init(&namespace).await?;
                         let dir = cli_ingest_root(&dir);
                         let dir_path = std::path::Path::new(&dir);
                         let schema_str = if let Some(path) = schema_path {
@@ -4514,6 +4515,7 @@ async fn run() -> anyhow::Result<()> {
                     } => {
                         let embedder = build_embedder()?;
                         bind_fallback_serving_descriptor(&vector_store, &embedder);
+                        vector_store.init(&namespace).await?;
                         let vector = embedder.embed(&content).await?;
                         let payload = crate::traits::MemoryPayload {
                             content: content.clone(),

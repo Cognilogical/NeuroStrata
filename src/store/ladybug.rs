@@ -16802,6 +16802,92 @@ eurostrata\src\daemon.rs",
         let _ = std::fs::remove_dir_all(&fx.root);
         restore_model_env(previous);
     }
+
+    #[tokio::test]
+    async fn pristine_add_sequence_with_init_adopts_and_writes() {
+        // N3: the fallback `add` arm's sequence, at store level (the
+        // arm itself is a CLI match arm and not unit-testable in
+        // place). Seed a pristine store recorded under the default
+        // model, then land the pick in the config — the post-pick,
+        // daemon-down state the finding files.
+        let previous = without_model_env();
+        let fx = store_state_fixture("n3-add-sequence", "ModelA");
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        store.init("probe").await.expect("init");
+        assert_eq!(read_sidecar(&fx.db)["descriptor"]["model"], json!("ModelA"));
+        assert_eq!(read_sidecar(&fx.db)["has_data"], json!(false));
+        drop(store);
+
+        write_embedders_config(&fx.config_dir, "ModelB");
+
+        // The shipped arm's shape — construct, bind the serving (pick)
+        // descriptor, upsert, with no init anywhere in the sequence:
+        // adoption lives only in init's maintenance, so the guard's
+        // restart-to-apply refusal fires on every invocation and the
+        // sidecar never moves. Two fresh instances, mirroring two
+        // invocations of the shipped CLI arm. This half pins *why*
+        // the arm carries the init call.
+        for _ in 0..2 {
+            let shipped = LadybugStore::for_testing(&fx.db, 4)
+                .expect("open temp database")
+                .with_embed_config_dir(&fx.config_dir)
+                .with_serving_descriptor(Some(serving_descriptor_for("ModelB")));
+            let refused = shipped
+                .upsert("probe", "m1", vec![0.0; 4], store_state_payload())
+                .await;
+            let err = refused
+                .expect_err("the shipped add sequence's write must be refused, not landed");
+            assert!(
+                restart_to_apply_message(&err).is_some(),
+                "the refusal must be the restart-to-apply error: {err}"
+            );
+            drop(shipped);
+        }
+        assert!(
+            !crate::model_choice::store_has_data(&fx.db),
+            "the refused writes leave the store pristine"
+        );
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["has_data"], json!(false));
+        assert_eq!(
+            sidecar["descriptor"]["model"],
+            json!("ModelA"),
+            "the shipped sequence never adopts the pick"
+        );
+
+        // The fixed arm's shape — construct, bind serving(pick), init,
+        // upsert: init's maintenance adopts the pick into the pristine
+        // record, the guard passes, and the write lands under it.
+        let fixed = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelB")));
+        fixed
+            .init("probe")
+            .await
+            .expect("init under the picked model");
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["has_data"], json!(false));
+        assert_eq!(
+            sidecar["descriptor"]["model"],
+            json!("ModelB"),
+            "init in the add sequence adopts the pick on the pristine store"
+        );
+        fixed
+            .upsert("probe", "m1", vec![0.0; 4], store_state_payload())
+            .await
+            .expect("the add sequence's upsert succeeds after init");
+        assert!(crate::model_choice::store_has_data(&fx.db));
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["has_data"], json!(true));
+        assert_eq!(sidecar["descriptor"]["model"], json!("ModelB"));
+        drop(fixed);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
 }
 
 impl LadybugStore {
