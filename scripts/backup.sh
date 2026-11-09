@@ -8,10 +8,11 @@
 # entirely:
 #   1. systemctl --user stop neurostrata  (graceful shutdown + checkpoint)
 #   2. lsof-verify no holders
-#   3. Raw `cp` the db file (plus its store-state sidecar, when present)
+#   3. Raw `cp` the db file (plus its store-state sidecar, when present,
+#      and its WAL when the daemon was not running — step 4c below)
 #   4. md5-verify the copies
 #   5. Prune old backups (keep N most recent; a pruned backup's sidecar
-#      companion is deleted with it)
+#      and WAL companions are deleted with it)
 #   6. systemctl --user start neurostrata
 #
 # Source DB is never touched. Failure modes are: bad backup (md5 mismatch)
@@ -28,6 +29,21 @@
 # it — so the recovered store keeps its recorded identity. A backup
 # without a companion (a pre-feature store with no sidecar) restores
 # exactly as before: no recorded identity (LockedUnknown), unchanged.
+#
+# WAL companion: the checkpoint guarantee above comes from the systemd
+# stop. On the daemon-inactive path (daemon not running — direct copy)
+# there is no checkpoint, so after an unclean shutdown the WAL at
+# <db path>.wal may hold the only copy of recent writes. When the
+# daemon was NOT running at backup time and that WAL exists, step 4c
+# copies it alongside the backup as db-<timestamp>.wal and md5-verifies
+# it the same way, under the same failure contract as steps 4/4b. A
+# daemon-inactive backup may therefore carry a db-<timestamp>.wal
+# companion; to recover, place it at <target db path>.wal alongside
+# the db file (and the sidecar companion at its documented place
+# above), so the recovered store replays exactly the writes the backup
+# captured. When the daemon WAS running, its graceful stop
+# checkpointed the WAL into the main db file, so those backups carry
+# no WAL companion and restore exactly as before.
 #
 # Assumes the daemon is managed by systemd (neurostrata-mcp setup installs
 # the service). If you ran `neurostrata-mcp daemon &` ad-hoc, the stop/start
@@ -154,14 +170,42 @@ else
     log "no store-state sidecar at $SIDECAR_PATH — backup carries no recorded identity"
 fi
 
+# 4c. Copy the WAL as the backup's companion — only when the daemon was
+# NOT running at backup time. A running daemon's graceful stop (step 2)
+# checkpointed the WAL into the main db file, so its backup needs no
+# WAL companion. On the daemon-inactive path there was no checkpoint:
+# after an unclean shutdown the WAL may hold the only copy of recent
+# writes, and a backup that silently drops it loses them — a bad
+# backup, under the same failure contract as steps 4/4b.
+WAL_PATH="$DB_PATH.wal"
+WAL_COMPANION_FILE="$BACKUP_FILE.wal"
+
+if ! $DAEMON_WAS_RUNNING && [ -f "$WAL_PATH" ]; then
+    if ! cp -p "$WAL_PATH" "$WAL_COMPANION_FILE"; then
+        rm -f "$BACKUP_FILE" "$COMPANION_FILE" "$WAL_COMPANION_FILE"
+        die "wal cp failed — bad backup deleted, source untouched" 7
+    fi
+    SRC_WAL_MD5=$(md5sum "$WAL_PATH" | awk '{print $1}')
+    DST_WAL_MD5=$(md5sum "$WAL_COMPANION_FILE" | awk '{print $1}')
+
+    if [ "$SRC_WAL_MD5" != "$DST_WAL_MD5" ]; then
+        rm -f "$BACKUP_FILE" "$COMPANION_FILE" "$WAL_COMPANION_FILE"
+        die "wal md5 mismatch: src=$SRC_WAL_MD5 dst=$DST_WAL_MD5 — bad backup deleted, source untouched" 8
+    fi
+
+    log "wal OK: $WAL_COMPANION_FILE (md5=$SRC_WAL_MD5)"
+elif ! $DAEMON_WAS_RUNNING; then
+    log "no WAL at $WAL_PATH — backup carries no uncheckpointed writes"
+fi
+
 # 5. Prune old backups (pair-aware: companions are not backups in their
-# own right — count/select only db-* files without the sidecar suffix,
-# and delete a pruned backup's companion with it)
+# own right — count/select only db-* files without the sidecar or WAL
+# suffix, and delete a pruned backup's companions with it)
 if [ "$MAX_BACKUPS" -gt 0 ]; then
-    PRUNE_COUNT=$(ls -1t "$BACKUP_DIR"/db-* 2>/dev/null | grep -v '\.store-state\.json$' | wc -l)
+    PRUNE_COUNT=$(ls -1t "$BACKUP_DIR"/db-* 2>/dev/null | grep -v -e '\.store-state\.json$' -e '\.wal$' | wc -l)
     if [ "$PRUNE_COUNT" -gt "$MAX_BACKUPS" ]; then
-        ls -1t "$BACKUP_DIR"/db-* 2>/dev/null | grep -v '\.store-state\.json$' | tail -n +$((MAX_BACKUPS + 1)) | while IFS= read -r OLD_BACKUP; do
-            rm -f "$OLD_BACKUP" "$OLD_BACKUP.store-state.json"
+        ls -1t "$BACKUP_DIR"/db-* 2>/dev/null | grep -v -e '\.store-state\.json$' -e '\.wal$' | tail -n +$((MAX_BACKUPS + 1)) | while IFS= read -r OLD_BACKUP; do
+            rm -f "$OLD_BACKUP" "$OLD_BACKUP.store-state.json" "$OLD_BACKUP.wal"
         done
         log "pruned $((PRUNE_COUNT - MAX_BACKUPS)) old backup(s), keeping $MAX_BACKUPS"
     fi
