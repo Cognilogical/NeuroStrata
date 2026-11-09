@@ -246,6 +246,18 @@ fn resolve_snapshot_dir(model_dir: &Path, model_name: &str, pinned_sha: &str) ->
         if named.is_dir() {
             return Ok(named);
         }
+        // Task A5, Decision 5(i): a refs/main that reads successfully
+        // but names a missing snapshot is fail-closed — the ref is
+        // present and authoritative, so falling through to enumeration
+        // would verify a snapshot the ref does not name. Only a
+        // genuinely unreadable refs/main (absent file) falls through
+        // to the exactly-one-snapshot rule below.
+        return Err(anyhow!(
+            "Embedder supply-chain error: model '{}' refs/main names snapshot '{}', which is not in the cache; refusing to verify a different snapshot (pinned SHA: {}).",
+            model_name,
+            rev.trim(),
+            pinned_sha
+        ));
     }
     let mut snapshots: Vec<PathBuf> = match fs::read_dir(&snapshots_dir) {
         Ok(entries) => entries
@@ -957,6 +969,73 @@ mod tests {
                 .unwrap_err();
         assert!(err.to_string().contains("checksum mismatch"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_model_checksum_refuses_dangling_refs_main() {
+        // Task A5, Decision 5(i): a refs/main that reads successfully
+        // but names a snapshot directory that does not exist is a
+        // fail-closed case. Falling through to snapshot enumeration
+        // would verify whichever snapshot happens to be present
+        // instead of the one the ref names.
+        let dir = fresh_cache_dir("dangling-ref");
+        fixture_snapshot_file(
+            &dir,
+            "nomic-ai/nomic-embed-text-v1.5",
+            "onnx/model.onnx",
+            b"fp32-weights",
+        );
+        let model_dir = dir.join("models--nomic-ai--nomic-embed-text-v1.5");
+        std::fs::create_dir_all(model_dir.join("refs")).unwrap();
+        std::fs::write(model_dir.join("refs").join("main"), "missingrev").unwrap();
+        let err = verify_model_checksum(
+            &dir,
+            &EmbeddingModel::NomicEmbedTextV15,
+            &sha256_hex(b"fp32-weights"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("refs/main"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_model_checksum_follows_a_valid_refs_main() {
+        // Control for the dangling-ref refusal: a refs/main naming an
+        // existing snapshot selects exactly that snapshot.
+        let dir = fresh_cache_dir("valid-ref");
+        let bytes = b"fp32-weights";
+        fixture_snapshot_file(
+            &dir,
+            "nomic-ai/nomic-embed-text-v1.5",
+            "onnx/model.onnx",
+            bytes,
+        );
+        let model_dir = dir.join("models--nomic-ai--nomic-embed-text-v1.5");
+        std::fs::create_dir_all(model_dir.join("refs")).unwrap();
+        std::fs::write(model_dir.join("refs").join("main"), "testrev").unwrap();
+        verify_model_checksum(&dir, &EmbeddingModel::NomicEmbedTextV15, &sha256_hex(bytes))
+            .expect("a valid refs/main selects its snapshot");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pin_gate_refuses_a_pinless_shortlist_entry() {
+        // Task A5 §6 F3 (Decision 5(iii), OUT — pinned): the loader
+        // backfills only the FP32 default's pin, so a hand-authored
+        // shortlist entry without one reaches this gate pinless and
+        // is refused with the actionable error. Extending the
+        // backfill is a deliberate future change to this test and to
+        // `hand_authored_shortlist_entry_without_pin_is_not_backfilled`.
+        let entry = AcceptableEmbedder {
+            model_name: "NomicEmbedTextV15Q".to_string(),
+            dimensions: 768,
+            base_url: None,
+            api_key_env: None,
+            api_model: None,
+            model_sha256: None,
+        };
+        let err = pinned_sha_for(&entry).unwrap_err();
+        assert!(err.to_string().contains("no pinned SHA-256"), "{err}");
     }
 
     #[test]
