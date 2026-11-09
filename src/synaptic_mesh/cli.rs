@@ -726,7 +726,13 @@ mod tests {
             "remove_pointer must target ctx.project_root, not the process cwd"
         );
         assert!(
-            reply.contains("/proj/.NeuroStrata/synaptic-mesh-ref"),
+            reply.contains(
+                &Path::new("/proj")
+                    .join(".NeuroStrata")
+                    .join("synaptic-mesh-ref")
+                    .display()
+                    .to_string()
+            ),
             "reply: {reply}"
         );
         assert!(reply.to_lowercase().contains("left"), "reply: {reply}");

@@ -3517,8 +3517,10 @@ impl crate::traits::AsAny for RecordingStore {
         std::fs::create_dir_all(&root).unwrap();
         let sneaky = root.join("new").join("..").join("..").join("escape");
         let err = check_caller_path(&sneaky, &root, &[]).expect_err("a `..` remainder refuses");
+        // Windows resolves `new\..` lexically, so the escape is caught by
+        // the containment check instead of the unresolvable-remainder check.
         assert!(
-            err.contains("cannot be resolved"),
+            err.contains("cannot be resolved") || err.contains("outside the project root"),
             "the refusal says which check failed: {err}"
         );
     }
