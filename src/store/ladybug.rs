@@ -1224,6 +1224,50 @@ enum CachedStoreState {
     FreshUnrecorded,
 }
 
+/// The first-write guard's restart-to-apply refusal (Task A4b-fix3).
+///
+/// `guard_first_write` returns this typed error — never a bare string —
+/// so a caller can tell the refusal apart from an ordinary store
+/// failure without matching on the message text. The distinction is
+/// load-bearing: the refusal is actionable operator guidance (a
+/// setup-time model choice was persisted while this process was
+/// running, and a restart applies it), so user-facing surfaces must
+/// show it verbatim instead of mapping it to their generic store-error
+/// message the way every other upsert failure is mapped. Use
+/// [`restart_to_apply_message`] to pull the refusal text out of an
+/// `anyhow::Error` chain.
+#[derive(Debug)]
+pub struct RestartToApplyError {
+    message: String,
+}
+
+impl RestartToApplyError {
+    fn new(message: String) -> Self {
+        Self { message }
+    }
+
+    /// The full refusal text, exactly as it should reach the operator.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for RestartToApplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RestartToApplyError {}
+
+/// The restart-to-apply refusal's text, if `err` is (or wraps) the
+/// first-write guard's refusal; `None` for every other error.
+pub fn restart_to_apply_message(err: &anyhow::Error) -> Option<String> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<RestartToApplyError>())
+        .map(|refusal| refusal.message().to_string())
+}
+
 /// Whether a write is sitting in the log with no checkpoint behind it yet.
 ///
 /// `take` clears and reports in one step so a write landing mid-checkpoint is
@@ -1672,7 +1716,8 @@ impl LadybugStore {
     /// time. Without a serving descriptor (G-2), the guard falls back
     /// to the configured-vs-recorded comparison. Stores with data, and
     /// stores whose state is unknown, are outside the window this
-    /// guard protects.
+    /// guard protects. Every refusal is a [`RestartToApplyError`], so
+    /// callers can surface it verbatim (Task A4b-fix3).
     fn guard_first_write(&self) -> Result<()> {
         if let CachedStoreState::Recorded(recorded) = self.cached_store_state() {
             if !recorded.has_data {
@@ -1680,28 +1725,31 @@ impl LadybugStore {
                     Some(serving) => {
                         let current = self.configured_embedding_descriptor()?;
                         if current != *serving {
-                            anyhow::bail!(
+                            return Err(RestartToApplyError::new(format!(
                                 "refusing to store data: this process serves embedding model '{}', but the configured model is now '{}' (a setup-time model choice was persisted while this process was running). Restart the daemon (or this process) so the store is opened under the new model before the first write; data is never stored under a model different from the one producing it.",
                                 serving.model,
                                 current.model
-                            );
+                            ))
+                            .into());
                         }
                         if *serving != recorded.descriptor {
-                            anyhow::bail!(
+                            return Err(RestartToApplyError::new(format!(
                                 "refusing to store data: this store's recorded embedding model is '{}', but this process serves '{}'. Restart the daemon (or this process) so the store's record and the serving model agree before the first write.",
                                 recorded.descriptor.model,
                                 serving.model
-                            );
+                            ))
+                            .into());
                         }
                     }
                     None => {
                         let current = self.configured_embedding_descriptor()?;
                         if current != recorded.descriptor {
-                            anyhow::bail!(
+                            return Err(RestartToApplyError::new(format!(
                                 "refusing to store data: this store was opened under embedding model '{}', but the configured model is now '{}' (a setup-time model choice was persisted while this process was running). Restart the daemon (or this process) so the store is opened under the new model before the first write; data is never stored under a model different from the one the store will next be opened with.",
                                 recorded.descriptor.model,
                                 current.model
-                            );
+                            ))
+                            .into());
                         }
                     }
                 }
@@ -14643,6 +14691,12 @@ eurostrata\src\daemon.rs",
             err.to_string().contains("ModelA") && err.to_string().contains("ModelB"),
             "the refusal must name the serving and configured models: {err}"
         );
+        // Task A4b-fix3: the refusal carries the RestartToApplyError
+        // identity, so user-facing surfaces can extract and surface it
+        // verbatim instead of a generic store-error message.
+        let extracted = restart_to_apply_message(&err)
+            .expect("the guard's refusal must be the typed restart-to-apply error");
+        assert_eq!(extracted, err.to_string());
         assert!(
             !crate::model_choice::store_has_data(&fx.db),
             "a refused write leaves the store pristine"
@@ -14655,6 +14709,23 @@ eurostrata\src\daemon.rs",
         drop(store);
         let _ = std::fs::remove_dir_all(&fx.root);
         restore_model_env(previous);
+    }
+
+    #[test]
+    fn restart_to_apply_message_matches_only_the_typed_refusal() {
+        use anyhow::Context as _;
+        // Extraction sees through context layers a caller may add
+        // above the store.
+        let wrapped = anyhow::Error::new(RestartToApplyError::new(
+            "refusing to store data: restart".to_string(),
+        ))
+        .context("while storing");
+        assert_eq!(
+            restart_to_apply_message(&wrapped).as_deref(),
+            Some("refusing to store data: restart")
+        );
+        // Ordinary errors are not refusals.
+        assert!(restart_to_apply_message(&anyhow::anyhow!("store exploded")).is_none());
     }
 
     #[tokio::test]
