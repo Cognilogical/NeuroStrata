@@ -70,16 +70,18 @@ impl SemanticEvaluator {
         payload: &str,
         limit: usize,
     ) -> Result<Vec<BehavioralRule>> {
-        let vector = self.embedder.embed(payload).await?;
+        // The embedding only picks candidates; the trigger match below runs on
+        // the full payload. A whole-file edit does not need to be embedded
+        // whole.
+        let vector = self.embedder.embed(embed_input(payload)).await?;
 
-        // The store's row-class flags belong to the general search path's
-        // contract. The guard asks for everything in its own namespace and
-        // applies its own rule filter below (the `guard_rule` metadata
-        // fields), so a change to the store's contract cannot silently change
-        // which rules the guard is able to see.
+        // Only rule rows can become guard rules, so the scan is limited to
+        // those types instead of ranking the whole namespace (every AST
+        // symbol and doc section) and discarding all but a few rows.
+        let rule_types: Vec<String> = RULE_MEMORY_TYPES.iter().map(|t| t.to_string()).collect();
         let mut combined = self
             .store
-            .search(&self.namespace, vector.clone(), limit, true, true)
+            .search_by_types(&self.namespace, vector.clone(), limit, &rule_types)
             .await?;
 
         let mut seen_ids: std::collections::HashSet<String> =
@@ -113,7 +115,7 @@ impl SemanticEvaluator {
             }
             if let Ok(global_search) = self
                 .store
-                .search("global", vector, limit, true, true)
+                .search_by_types("global", vector, limit, &rule_types)
                 .await
             {
                 for row in global_search {
@@ -176,6 +178,17 @@ impl SemanticEvaluator {
             .context("Failed to record the rule hit")?;
 
         Ok(())
+    }
+}
+
+/// The most of a payload the guard embeds to pick rule candidates.
+const MAX_EMBED_CHARS: usize = 2000;
+
+/// The leading part of `payload` the guard embeds, cut on a char boundary.
+fn embed_input(payload: &str) -> &str {
+    match payload.char_indices().nth(MAX_EMBED_CHARS) {
+        Some((end, _)) => &payload[..end],
+        None => payload,
     }
 }
 
@@ -293,6 +306,17 @@ mod tests {
     /// rule-type filter. A rule row below `MIN_CONSTRAINT_SIMILARITY` must not
     /// become a match, or loosely related memories would fire the guard as
     /// false positives.
+    #[test]
+    fn embed_input_is_bounded_and_cuts_on_a_char_boundary() {
+        assert_eq!(embed_input("short"), "short");
+        let long = "é".repeat(MAX_EMBED_CHARS + 50);
+        let cut = embed_input(&long);
+        assert_eq!(cut.chars().count(), MAX_EMBED_CHARS);
+        assert!(long.starts_with(cut));
+        let exact = "a".repeat(MAX_EMBED_CHARS);
+        assert_eq!(embed_input(&exact), exact);
+    }
+
     #[test]
     fn low_similarity_rule_rows_do_not_match() {
         let rows = vec![

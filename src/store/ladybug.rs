@@ -2415,7 +2415,7 @@ impl LadybugStore {
     /// that gave up released the turn while its statement was still running,
     /// and the next writer promptly opened a second one against an engine that
     /// already had one. That is how a single stalled write became five in a row
-    /// (bead neurostrata-4nk): each waited its 30s, gave up, and handed the
+    ///: each waited its 30s, gave up, and handed the
     /// turn to the next. Held by the task, the turn is released when the work
     /// actually finishes, so a caller giving up costs a wait instead.
     async fn write_with_deadline<T, F>(&self, what: &'static str, f: F) -> Result<T>
@@ -5599,6 +5599,89 @@ impl VectorStore for LadybugStore {
         )
         .await?;
         Ok(outcome.results)
+    }
+
+    async fn search_by_types(
+        &self,
+        namespace: &str,
+        vector: Vec<f32>,
+        limit: usize,
+        memory_types: &[String],
+    ) -> Result<Vec<SearchResult>> {
+        if memory_types.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let namespace = namespace.to_string();
+        let memory_types = memory_types.to_vec();
+        self.with_conn(move |conn| {
+            let safe_ns = escape_ladybug_string(&namespace);
+            let vec_str = format!(
+                "[{}]",
+                vector
+                    .iter()
+                    .map(|f| {
+                        let s = format!("{}", f);
+                        if s.contains('.') || s.contains('e') || s.contains('E') {
+                            s
+                        } else {
+                            format!("{}.0", s)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            let type_list = memory_types
+                .iter()
+                .map(|t| format!("'{}'", escape_ladybug_string(t)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let now = chrono::Utc::now().timestamp();
+            // Over-fetch so rows dropped below (retired, archived, conflicting)
+            // do not leave the caller short.
+            let query = format!(
+                "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.memory_type IN [{}] RETURN m.id, array_distance(m.embedding, {}) AS dist, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata ORDER BY dist ASC, m.id ASC LIMIT {}",
+                safe_ns,
+                type_list,
+                vec_str,
+                limit.saturating_mul(4)
+            );
+            let mut out: Vec<SearchResult> = Vec::new();
+            for row in conn.query(&query)? {
+                let distance: f32 = match &row[1] {
+                    lbug::Value::Float(f) if f.is_finite() && *f >= 0.0 => *f,
+                    lbug::Value::Double(d) if d.is_finite() && *d >= 0.0 => *d as f32,
+                    _ => continue,
+                };
+                let metadata_str = format!("{}", row[8]);
+                let metadata = parse_metadata_or_warn(&metadata_str, "metadata");
+                if is_retired_at(&metadata, now)
+                    || is_archived(&metadata)
+                    || is_mesh_conflicting(&metadata)
+                    || crate::registry::is_registry_row(&metadata)
+                {
+                    continue;
+                }
+                out.push(SearchResult {
+                    id: format!("{}", row[0]),
+                    score: distance,
+                    payload: MemoryPayload {
+                        content: format!("{}", row[2]),
+                        user_id: format!("{}", row[3]),
+                        memory_type: format!("{}", row[4]),
+                        agent_name: Some(format!("{}", row[5])),
+                        location: format!("{}", row[6]),
+                        location_lines: format!("{}", row[7]),
+                        metadata,
+                    },
+                    evidence: None,
+                });
+                if out.len() >= limit {
+                    break;
+                }
+            }
+            Ok(out)
+        })
+        .await
     }
 
     async fn search_with_domain(
@@ -9249,7 +9332,7 @@ impl crate::traits::IntakeStore for LadybugStore {
 /// `STARTED` minus `FINISHED` is how many engine calls are inside lbug right
 /// now. If that number climbs and does not come down, a deadline that could not
 /// cancel its statement has left the work running, which is the hypothesis these
-/// were added to test (bead neurostrata-4nk).
+/// were added to test.
 pub static ENGINE_CALLS_STARTED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub static ENGINE_CALLS_FINISHED: std::sync::atomic::AtomicU64 =
@@ -11258,7 +11341,7 @@ eurostrata\src\daemon.rs",
     /// Value::List, so this came back empty every time. Nothing caught it
     /// because search never returns a vector: it computes array_distance in the
     /// engine. Only the read-modify-write callers saw it, and they wrote the
-    /// empty vector straight back (bead neurostrata-vbj).
+    /// empty vector straight back.
     #[tokio::test]
     async fn get_reads_back_the_embedding_it_stored() {
         let dir = std::env::temp_dir().join(format!("ns-embed-{}", uuid::Uuid::new_v4()));
@@ -11466,6 +11549,45 @@ eurostrata\src\daemon.rs",
 
         assert!(ids.contains(&"live-rule".to_string()), "{:?}", ids);
         assert!(!ids.contains(&"retired-rule".to_string()), "{:?}", ids);
+    }
+
+    #[tokio::test]
+    async fn search_by_types_returns_only_the_asked_types_nearest_first() {
+        let store = retired_test_store().await;
+        let rows: [(&str, &str, [f32; 4], serde_json::Value); 5] = [
+            ("near-rule", "rule", [0.9, 0.1, 0.1, 0.1], json!({})),
+            ("far-rule", "rule", [0.1, 0.9, 0.1, 0.1], json!({})),
+            ("guard", "guard_rule", [0.5, 0.5, 0.1, 0.1], json!({})),
+            ("closest-fact", "fact", [0.9, 0.1, 0.1, 0.1], json!({})),
+            ("retired-rule", "rule", [0.9, 0.1, 0.1, 0.1], json!({ "valid_to": 1 })),
+        ];
+        for (id, kind, vec, meta) in rows {
+            store
+                .upsert("probe", id, vec.to_vec(), retired_test_payload(kind, "agent", meta))
+                .await
+                .unwrap();
+        }
+
+        let types = vec!["rule".to_string(), "guard_rule".to_string()];
+        let ids: Vec<String> = store
+            .search_by_types("probe", vec![0.9, 0.1, 0.1, 0.1], 5, &types)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+
+        assert_eq!(ids.first().map(String::as_str), Some("near-rule"), "{ids:?}");
+        assert!(ids.contains(&"guard".to_string()) && ids.contains(&"far-rule".to_string()), "{ids:?}");
+        assert!(!ids.contains(&"closest-fact".to_string()), "other types never appear: {ids:?}");
+        assert!(!ids.contains(&"retired-rule".to_string()), "retired rows are dropped: {ids:?}");
+
+        let limited = store
+            .search_by_types("probe", vec![0.9, 0.1, 0.1, 0.1], 1, &types)
+            .await
+            .unwrap();
+        assert_eq!(limited.len(), 1);
+        assert!(store.search_by_types("probe", vec![0.9; 4], 5, &[]).await.unwrap().is_empty());
     }
 
     #[tokio::test]
