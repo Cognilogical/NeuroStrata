@@ -893,7 +893,7 @@ fn bind_fallback_serving_descriptor(
     }
 }
 
-/// Prepare the fallback store for a write arm (Add, Edit): bind the
+/// Prepare the fallback store for a write arm (Add, Edit, Ingest): bind the
 /// serving descriptor, then initialize the store under it.
 ///
 /// `init` is the step that runs the store-state maintenance
@@ -2930,6 +2930,106 @@ mod tests {
             None => std::env::remove_var("NEUROSTRATA_MODEL"),
         }
     }
+
+    /// Regression test for the Ingest arm of the issue #75 class
+    /// (class census follow-up to Task 4): the daemon-stopped fallback
+    /// `ingest` on a store recorded pristine under the default model,
+    /// after the user configured a different model. Ingest writes via
+    /// `ingest_directory` -> `vector_store.upsert`, the same guarded
+    /// entry point as Add/Edit, so it needs the same bind+init
+    /// preparation before any guarded write. This test exercises the
+    /// arm's call-sequence contract at the helper seam (the arms are
+    /// not invocable through `run()`): prepare via
+    /// `prepare_fallback_write_store`, then a guarded upsert exactly
+    /// as ingest performs it.
+    #[tokio::test]
+    async fn fallback_ingest_on_pristine_store_adopts_configured_model_and_writes() {
+        let previous = std::env::var("NEUROSTRATA_MODEL").ok();
+        std::env::remove_var("NEUROSTRATA_MODEL");
+        let root =
+            std::env::temp_dir().join(format!("ns-fallback-ingest-adopt-{}", uuid::Uuid::new_v4()));
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let write_config = |model: &str| {
+            std::fs::write(
+                config_dir.join("embedders.json"),
+                format!("[{{\"model_name\":\"{model}\",\"dimensions\":4}}]"),
+            )
+            .unwrap();
+        };
+        let db_path = root.join("ladybug.db");
+        let sidecar = |db: &std::path::Path| -> serde_json::Value {
+            let content =
+                std::fs::read_to_string(crate::model_choice::store_state_path(db)).unwrap();
+            serde_json::from_str(&content).unwrap()
+        };
+
+        write_config("ModelA");
+        let seed = LadybugStore::for_testing(&db_path, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&config_dir)
+            .with_serving_descriptor(Some(crate::traits::EmbeddingDescriptor {
+                provider: "fastembed".to_string(),
+                model: "ModelA".to_string(),
+                revision: "onnx".to_string(),
+                dims: 4,
+                normalization: "unknown".to_string(),
+                preprocessing: "unknown".to_string(),
+                distance_metric: "cosine".to_string(),
+            }));
+        seed.init("probe").await.expect("seed init");
+        assert_eq!(sidecar(&db_path)["has_data"], serde_json::json!(false));
+        assert_eq!(
+            sidecar(&db_path)["descriptor"]["model"],
+            serde_json::json!("ModelA")
+        );
+        drop(seed);
+
+        write_config("ModelB");
+        let vector_store: Arc<dyn VectorStore> = Arc::new(
+            LadybugStore::for_testing(&db_path, 4)
+                .expect("reopen temp database")
+                .with_embed_config_dir(&config_dir),
+        );
+        let embedder: Arc<dyn crate::traits::Embedder> = Arc::new(FallbackModelBEmbedder);
+        prepare_fallback_write_store(&vector_store, &embedder, "probe")
+            .await
+            .expect("the fallback write preparation inits the store under the serving model");
+        let vector = embedder
+            .embed("a node ingested while the daemon is stopped")
+            .await
+            .expect("embed");
+        let payload = crate::traits::MemoryPayload {
+            content: "a node ingested while the daemon is stopped".to_string(),
+            memory_type: "fact".to_string(),
+            location: String::new(),
+            user_id: "system".to_string(),
+            agent_name: Some("NeuroStrata".to_string()),
+            location_lines: String::new(),
+            metadata: serde_json::json!({}),
+        };
+        vector_store
+            .upsert("probe", "fallback-ingest-m1", vector, payload)
+            .await
+            .expect("the fallback ingest must adopt the pristine record and proceed");
+        assert_eq!(
+            sidecar(&db_path)["descriptor"]["model"],
+            serde_json::json!("ModelB"),
+            "the pristine record is adopted to the configured model"
+        );
+        assert_eq!(sidecar(&db_path)["has_data"], serde_json::json!(true));
+        let found = vector_store
+            .search("probe", vec![0.1, 0.2, 0.3, 0.4], 5, false, false)
+            .await
+            .expect("search under the adopted model");
+        assert!(!found.is_empty(), "the ingested row is searchable");
+        drop(vector_store);
+        let _ = std::fs::remove_dir_all(&root);
+        match previous {
+            Some(value) => std::env::set_var("NEUROSTRATA_MODEL", value),
+            None => std::env::remove_var("NEUROSTRATA_MODEL"),
+        }
+    }
 }
 
 /// Where every CLI HTTP call goes. A constant because `bus-metrics` names it
@@ -4503,7 +4603,8 @@ async fn run() -> anyhow::Result<()> {
                         dry_run_mode: _,
                     } => {
                         let embedder = build_embedder()?;
-                        bind_fallback_serving_descriptor(&vector_store, &embedder);
+                        prepare_fallback_write_store(&vector_store, &embedder, &namespace)
+                            .await?;
                         let dir = cli_ingest_root(&dir);
                         let dir_path = std::path::Path::new(&dir);
                         let schema_str = if let Some(path) = schema_path {
