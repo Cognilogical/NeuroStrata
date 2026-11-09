@@ -68,6 +68,36 @@ pub fn has_source(metadata: &Value) -> bool {
         .unwrap_or(false)
 }
 
+/// The part of one generation row that ingest reads: enough to compare file
+/// hashes, check the version stamp and carry the row forward by id. Never the
+/// row's content or the rest of its metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerationRow {
+    pub id: String,
+    pub memory_type: String,
+    /// The file the row came from.
+    pub location: String,
+    pub file_sha256: Option<String>,
+    /// `metadata.ingest_version`, or empty when the row has none.
+    pub ingest_version: String,
+}
+
+impl GenerationRow {
+    pub fn from_payload(id: String, payload: &MemoryPayload) -> Self {
+        Self::from_parts(id, payload.memory_type.clone(), payload.location.clone(), &payload.metadata)
+    }
+
+    pub fn from_parts(id: String, memory_type: String, location: String, metadata: &Value) -> Self {
+        Self {
+            id,
+            memory_type,
+            location,
+            file_sha256: metadata.get("file_sha256").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            ingest_version: metadata.get("ingest_version").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        }
+    }
+}
+
 /// Represents a search result from the vector database
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SearchResult {
@@ -463,6 +493,25 @@ pub trait VectorStore: Send + Sync + AsAny {
     /// ~100 MB per call on a large namespace.
     async fn list_pinned(&self, namespace: &str) -> Result<Vec<SearchResult>> {
         self.list(namespace, None, None).await
+    }
+
+    /// What ingest needs to know about each row of one generation, without the
+    /// row's content or full metadata.
+    ///
+    /// Ingest reads the previous generation twice (to decide whether anything
+    /// changed, and to carry unchanged rows forward). It used to call `list`,
+    /// which hands back every reachable row with its full text, and keep only
+    /// the rows of one generation. That cost ~100 MB per call on a large
+    /// namespace against ~10 MB for the part ingest uses.
+    /// Stores that can narrow in the engine override this; the default lists
+    /// the whole namespace, as ingest did before.
+    async fn generation_summary(&self, namespace: &str, generation: u64) -> Result<Vec<GenerationRow>> {
+        let rows = self.list(namespace, None, None).await?;
+        Ok(rows
+            .into_iter()
+            .filter(|r| crate::parser::ingest::split_scoped_id(&r.id).is_some_and(|(_, g, _)| g == generation))
+            .map(|r| GenerationRow::from_payload(r.id, &r.payload))
+            .collect())
     }
 
     /// Get a specific memory by its ID, returning its vector and payload
