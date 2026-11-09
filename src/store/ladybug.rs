@@ -5432,6 +5432,21 @@ impl VectorStore for LadybugStore {
                 )
             })?;
         }
+        // Task A5 (F2): the store-state sidecar rides along too, under
+        // the snapshot's store name. Without it a restored store has
+        // no recorded identity — it reads as a pre-sidecar store and
+        // silently exits the identity protection the sidecar exists
+        // to provide. Absent sidecar (a pre-feature store) snapshots
+        // exactly as before.
+        let sidecar = crate::model_choice::store_state_path(&source);
+        if sidecar.exists() {
+            std::fs::copy(&sidecar, dir.join("ladybug.store.store-state.json")).map_err(|e| {
+                anyhow::anyhow!(
+                    "could not copy the store-state sidecar into the snapshot: {}",
+                    e
+                )
+            })?;
+        }
         let manifest = serde_json::json!({
             "format": "neurostrata-snapshot",
             "version": 1,
@@ -15757,6 +15772,80 @@ eurostrata\src\daemon.rs",
             "the flip records the serving descriptor, not the configured one"
         );
         drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn backup_restore_round_trip_preserves_store_state_sidecar() {
+        // Task A5, F2: a snapshot that does not carry the sidecar
+        // restores a store with no recorded identity — silently
+        // LockedUnknown, outside the identity refusal's protection.
+        // The round trip must preserve Recorded{has_data, R}, and the
+        // identity refusal must still fire on the restored store.
+        let previous = without_model_env();
+        let fx = data_bearing_store_fixture("a5-backup-round-trip").await;
+        let opener = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        let out = fx.root.join("snapshot");
+        opener
+            .export_database(&out.to_string_lossy())
+            .await
+            .expect("backup");
+        drop(opener);
+        assert!(
+            out.join("ladybug.store.store-state.json").exists(),
+            "the snapshot carries the store-state sidecar"
+        );
+        let report = crate::storage::snapshot::verify_snapshot(&out).expect("verify the snapshot");
+        assert!(
+            report.valid,
+            "the snapshot verifies with the sidecar aboard"
+        );
+
+        // The restore shape: the file copies the Restore arm performs
+        // (db, WAL, sidecar) into a new path, then the store opens.
+        let restored_dir = fx.root.join("restored");
+        std::fs::create_dir_all(&restored_dir).expect("create restore dir");
+        let restored_db = restored_dir.join("ladybug.db");
+        std::fs::copy(out.join("ladybug.store"), &restored_db).expect("copy the db");
+        let snapshot_wal = out.join("ladybug.store.wal");
+        if snapshot_wal.exists() {
+            let mut target_wal = restored_db.clone().into_os_string();
+            target_wal.push(".wal");
+            std::fs::copy(&snapshot_wal, std::path::PathBuf::from(target_wal))
+                .expect("copy the WAL");
+        }
+        std::fs::copy(
+            out.join("ladybug.store.store-state.json"),
+            crate::model_choice::store_state_path(&restored_db),
+        )
+        .expect("copy the sidecar");
+        let state = crate::model_choice::read_store_state(&restored_db)
+            .expect("the restored store keeps its recorded identity");
+        assert!(state.has_data);
+        assert_eq!(state.descriptor, serving_descriptor_for("ModelA"));
+
+        let refused = LadybugStore::for_testing(&restored_db, 4)
+            .expect("open restored database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelB")));
+        let err = refused
+            .init("probe")
+            .await
+            .expect_err("the identity refusal still fires on the restored store");
+        assert!(embedding_identity_refusal_message(&err).is_some(), "{err}");
+        drop(refused);
+
+        let ok = LadybugStore::for_testing(&restored_db, 4)
+            .expect("open restored database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        ok.init("probe")
+            .await
+            .expect("the restored store opens under its recorded model");
+        drop(ok);
         let _ = std::fs::remove_dir_all(&fx.root);
         restore_model_env(previous);
     }

@@ -176,6 +176,12 @@ pub struct SnapshotChecksums {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wal_sha256: Option<String>,
     pub manifest_sha256: String,
+    /// The store-state sidecar's checksum (Task A5, F2): present only
+    /// when the snapshot carries `ladybug.store.store-state.json`, so
+    /// snapshots written before sidecar carriage (and their checksum
+    /// files) deserialize and verify exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_state_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -307,11 +313,18 @@ pub fn write_checksums(dir: &Path) -> Result<SnapshotChecksums, SnapshotError> {
         None
     };
     let manifest_sha = sha256_file(&manifest)?;
+    let sidecar = dir.join("ladybug.store.store-state.json");
+    let store_state_sha = if sidecar.exists() {
+        Some(sha256_file(&sidecar)?)
+    } else {
+        None
+    };
 
     let checksums = SnapshotChecksums {
         ladybug_store_sha256: ladybug_sha,
         wal_sha256: wal_sha,
         manifest_sha256: manifest_sha,
+        store_state_sha256: store_state_sha,
     };
 
     let checksums_path = dir.join("checksums.json");
@@ -402,6 +415,29 @@ pub fn verify_snapshot(dir: &Path) -> Result<SnapshotVerifyReport, SnapshotError
                 file: "ladybug.store.wal".into(),
                 expected: checksums.wal_sha256.clone().unwrap_or_default(),
                 actual: computed_wal,
+            });
+        }
+    }
+
+    // The store-state sidecar, under the same rule as the WAL: a
+    // snapshot that carries one (or whose checksums name one) must
+    // produce it intact; a snapshot with neither verifies as before.
+    let sidecar = dir.join("ladybug.store.store-state.json");
+    let sidecar_mentioned = checksums.store_state_sha256.is_some() || sidecar.exists();
+    if sidecar_mentioned {
+        if !sidecar.exists() {
+            return Err(SnapshotError::ChecksumMismatch {
+                file: "ladybug.store.store-state.json".into(),
+                expected: checksums.store_state_sha256.clone().unwrap_or_default(),
+                actual: "<missing>".into(),
+            });
+        }
+        let computed_sidecar = sha256_file(&sidecar)?;
+        if Some(&computed_sidecar) != checksums.store_state_sha256.as_ref() {
+            return Err(SnapshotError::ChecksumMismatch {
+                file: "ladybug.store.store-state.json".into(),
+                expected: checksums.store_state_sha256.clone().unwrap_or_default(),
+                actual: computed_sidecar,
             });
         }
     }
@@ -558,6 +594,48 @@ mod tests {
         assert!(report.valid);
         assert_eq!(report.dir, d);
         assert!(report.error.is_none());
+    }
+
+    #[test]
+    fn checksums_cover_the_store_state_sidecar() {
+        // Task A5 (F2): the snapshot carries the store-state sidecar,
+        // and the checksums cover it — a tampered sidecar must fail
+        // verification like any other snapshot member. Snapshots
+        // without a sidecar (older backups) carry no sidecar checksum
+        // and verify exactly as before.
+        let d = temp_dir("sidecar-checksum");
+        write_store(&d);
+        let mut manifest = File::create(d.join("manifest.json")).unwrap();
+        let content = format!(
+            "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\"}}",
+            SNAPSHOT_FORMAT, SNAPSHOT_VERSION
+        );
+        manifest.write_all(content.as_bytes()).unwrap();
+        fs::write(d.join("ladybug.store.store-state.json"), b"{\"version\":1}").unwrap();
+        let checksums = write_checksums(&d).unwrap();
+        assert!(
+            checksums.store_state_sha256.is_some(),
+            "a present sidecar is checksummed"
+        );
+        let report = verify_snapshot(&d).unwrap();
+        assert!(report.valid);
+        fs::write(d.join("ladybug.store.store-state.json"), b"{\"version\":2}").unwrap();
+        let result = verify_snapshot(&d);
+        assert!(
+            matches!(result, Err(SnapshotError::ChecksumMismatch { .. })),
+            "a tampered sidecar fails verification: {result:?}"
+        );
+
+        let d2 = temp_dir("sidecar-absent");
+        write_store(&d2);
+        let mut manifest = File::create(d2.join("manifest.json")).unwrap();
+        manifest.write_all(content.as_bytes()).unwrap();
+        let checksums = write_checksums(&d2).unwrap();
+        assert!(
+            checksums.store_state_sha256.is_none(),
+            "an absent sidecar carries no checksum"
+        );
+        assert!(verify_snapshot(&d2).unwrap().valid);
     }
 
     #[test]

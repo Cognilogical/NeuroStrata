@@ -3378,6 +3378,19 @@ async fn run() -> anyhow::Result<()> {
                     target_wal.push(".wal");
                     std::fs::copy(&wal, std::path::PathBuf::from(target_wal))?;
                 }
+                // Task A5 (F2): the snapshot's store-state sidecar
+                // restores to the target's sidecar path, so the
+                // restored store keeps its recorded identity.
+                // Snapshots written before sidecar carriage have none
+                // and restore exactly as they always have.
+                let snapshot_sidecar =
+                    std::path::Path::new(&dir).join("ladybug.store.store-state.json");
+                if snapshot_sidecar.exists() {
+                    std::fs::copy(
+                        &snapshot_sidecar,
+                        crate::model_choice::store_state_path(&target),
+                    )?;
+                }
 
                 // Opened only after the copy, to verify the restored store
                 // reads back and to report what it holds.
