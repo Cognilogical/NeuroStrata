@@ -3945,12 +3945,22 @@ async fn run() -> anyhow::Result<()> {
                             std::process::exit(1);
                         }
                         let embedder = build_embedder()?;
+                        let store = LadybugStore::new(
+                            config.db_path.to_string_lossy().to_string(),
+                            embed::configured_dimensions()?,
+                        )?;
+                        // A failed first import returns before the
+                        // importer's own init can record anything
+                        // (unreadable input; the fresh DB's missing
+                        // schema at its first list); record the birth
+                        // identity now, while the store is still
+                        // unbound, so the created DB is not born
+                        // sidecar-less. (The fallback group and the
+                        // Backup arm take the same step at their
+                        // constructions.)
+                        store.record_birth_identity();
                         let vector_store: Arc<dyn VectorStore> = Arc::new(
-                            LadybugStore::new(
-                                config.db_path.to_string_lossy().to_string(),
-                                embed::configured_dimensions()?,
-                            )?
-                            .with_serving_descriptor(Some(embedder.embedding_descriptor())),
+                            store.with_serving_descriptor(Some(embedder.embedding_descriptor())),
                         );
                         let res = match crate::task::import_beads(
                             vector_store.clone(),

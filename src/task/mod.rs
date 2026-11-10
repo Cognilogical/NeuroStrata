@@ -7928,6 +7928,135 @@ impl crate::traits::AsAny for ListHidingStore {
         summary
     }
 
+    /// C3-3: the daemon-stopped `task import` arm constructs its store
+    /// and hands it to `import_beads`, which reads the input and lists
+    /// before its own init — both failure paths return before any
+    /// sidecar maintenance, so without the arm's birth step the created
+    /// DB is born sidecar-less (LockedUnknown). The arm records the
+    /// birth identity on the concrete store between construction and
+    /// binding; this test pins that shipped sequence against the real
+    /// importer, keeping the pre-fix sequence as the first half so the
+    /// defect stays documented at sequence level.
+    #[tokio::test]
+    async fn import_failures_after_the_birth_step_leave_a_recorded_store() {
+        use crate::store::ladybug::LadybugStore;
+
+        fn fixture(
+            tag: &str,
+        ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+            let root = std::env::temp_dir()
+                .join(format!("ns-task-import-birth-{tag}-{}", uuid::Uuid::new_v4()));
+            let config_dir = root.join("config");
+            std::fs::create_dir_all(&config_dir).expect("create fixture config dir");
+            std::fs::write(
+                config_dir.join("embedders.json"),
+                "[{\"model_name\":\"ModelA\",\"dimensions\":4}]",
+            )
+            .expect("write fixture embedders.json");
+            let db = root.join("ladybug.db");
+            (root, config_dir, db)
+        }
+
+        fn arm_store(
+            config_dir: &std::path::Path,
+            db: &std::path::Path,
+            birth_step: bool,
+        ) -> Arc<dyn VectorStore> {
+            let store = LadybugStore::for_testing(db.to_path_buf(), 4)
+                .expect("construct the store")
+                .with_embed_config_dir(config_dir.to_path_buf());
+            if birth_step {
+                store.record_birth_identity();
+            }
+            Arc::new(store.with_serving_descriptor(Some(
+                crate::traits::EmbeddingDescriptor {
+                    provider: "fastembed".into(),
+                    model: "ModelA".into(),
+                    revision: "onnx".into(),
+                    dims: 4,
+                    normalization: "unknown".into(),
+                    preprocessing: "unknown".into(),
+                    distance_metric: "cosine".into(),
+                },
+            )))
+        }
+
+        let missing_input =
+            std::env::temp_dir().join(format!("beads-missing-{}.jsonl", uuid::Uuid::new_v4()));
+
+        // Half 1 — the pre-fix arm sequence (no birth step): an
+        // unreadable input leaves a created DB with no sidecar.
+        let (root, config_dir, db) = fixture("pre-fix");
+        let store = arm_store(&config_dir, &db, false);
+        let err = import_beads(store, emb(), "proj", &missing_input.to_string_lossy())
+            .await
+            .expect_err("an unreadable input fails the import");
+        assert!(err.contains("could not read"), "error: {err}");
+        assert!(db.exists(), "the failed import still created the DB");
+        assert!(
+            crate::model_choice::read_store_state(&db).is_none(),
+            "without the birth step the created store is born sidecar-less"
+        );
+        std::fs::remove_dir_all(&root).ok();
+
+        // Half 2 — the shipped sequence: the same failure, but the
+        // store is born recorded under the configured descriptor.
+        let (root, config_dir, db) = fixture("unreadable");
+        let store = arm_store(&config_dir, &db, true);
+        let err = import_beads(
+            store.clone(),
+            emb(),
+            "proj",
+            &missing_input.to_string_lossy(),
+        )
+        .await
+        .expect_err("an unreadable input fails the import");
+        assert!(err.contains("could not read"), "error: {err}");
+        let state = crate::model_choice::read_store_state(&db)
+            .expect("the birth step recorded the store before the importer ran");
+        assert!(!state.has_data, "the recorded store is pristine");
+        assert_eq!(state.descriptor.model, "ModelA");
+        assert!(
+            !crate::model_choice::store_has_data(&db),
+            "a pristine recorded store does not void the pending choice"
+        );
+
+        // Composition: the birth record does not impede the importer's
+        // own init-and-write flow — after the importer's init step the
+        // real import succeeds on the same store, and the first write
+        // flips the record to data-bearing.
+        store
+            .init("proj")
+            .await
+            .expect("bound init adopts the birth record");
+        let summary = import_fixture(&store, "proj").await;
+        assert_eq!(summary.created, 2);
+        assert!(
+            crate::model_choice::store_has_data(&db),
+            "the imported rows flipped the record to data-bearing"
+        );
+        std::fs::remove_dir_all(&root).ok();
+
+        // Half 3 — the shipped sequence against a readable input on a
+        // fresh schema-less store: the importer's list fails before
+        // its init, and the store is still born recorded.
+        let (root, config_dir, db) = fixture("schema-less");
+        let store = arm_store(&config_dir, &db, true);
+        let path =
+            std::env::temp_dir().join(format!("beads-{}.jsonl", uuid::Uuid::new_v4()));
+        std::fs::write(&path, BEADS_FIXTURE).unwrap();
+        let err = import_beads(store, emb(), "proj", &path.to_string_lossy())
+            .await
+            .expect_err("the schema-less list fails the import");
+        assert!(err.contains("could not list"), "error: {err}");
+        let state = crate::model_choice::read_store_state(&db)
+            .expect("the birth step recorded the store before the importer ran");
+        assert!(!state.has_data, "the recorded store is pristine");
+        assert_eq!(state.descriptor.model, "ModelA");
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[tokio::test]
     async fn import_maps_closed_issues_to_grandfathered_done_tasks() {
         let store = store_with_namespace("proj").await;
