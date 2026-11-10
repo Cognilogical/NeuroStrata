@@ -307,6 +307,23 @@ fn hash_file_sha256(path: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+/// The model `FastEmbedder` loads when the configured name cannot be
+/// resolved: the loader's deliberate fallback (see `FastEmbedder::new`).
+pub(crate) const LOADER_FALLBACK_MODEL_NAME: &str = "NomicEmbedTextV15";
+
+/// The name of the model the loader actually serves for a configured
+/// name: the name itself when `EmbeddingModel` resolves it, and the
+/// fallback model when it cannot. This is the name resolution
+/// `FastEmbedder::new` performs, exposed so identity comparisons that
+/// ask what a restart under the current configuration would serve
+/// resolve the configured name the same way the loader does.
+pub(crate) fn loaded_model_name(configured_name: &str) -> &str {
+    match EmbeddingModel::from_str(configured_name) {
+        Ok(_) => configured_name,
+        Err(_) => LOADER_FALLBACK_MODEL_NAME,
+    }
+}
+
 /// Local fastembed-backed embedding provider.
 pub struct FastEmbedder {
     model: Arc<Mutex<TextEmbedding>>,
@@ -326,12 +343,13 @@ impl FastEmbedder {
             Ok(m) => (m, target_model.model_name.clone(), target_model.dimensions),
             Err(_) => {
                 tracing::warn!(
-                    "Unknown embedding model '{}', falling back to NomicEmbedTextV15 (768 dims)",
-                    target_model.model_name
+                    "Unknown embedding model '{}', falling back to {} (768 dims)",
+                    target_model.model_name,
+                    LOADER_FALLBACK_MODEL_NAME
                 );
                 (
                     EmbeddingModel::NomicEmbedTextV15,
-                    "NomicEmbedTextV15".to_string(),
+                    LOADER_FALLBACK_MODEL_NAME.to_string(),
                     768,
                 )
             }

@@ -2134,10 +2134,29 @@ impl LadybugStore {
             // never captured (init ran unbound) or no longer equals
             // the serving one — and keeps the flip's serving
             // preference.
+            // The refusal requires the configuration to have moved
+            // away from the serving descriptor AND a restart under
+            // the current configuration to serve something different
+            // from it: a configured name the loader cannot resolve
+            // serves the fallback model, so an unchanged unrecognized
+            // name is not a configuration that moved — the serving
+            // descriptor bound at init IS what a restart would serve,
+            // and refusing would brick the store behind a remedy
+            // (restart) that cannot change anything. Resolving the
+            // configured name through the loader keeps the refusal
+            // exact for every configuration that did move: a name that
+            // resolves names itself, byte-identical to the configured
+            // descriptor, and a configuration reverted to the serving
+            // name verbatim is exempt on the first condition alone.
             if let Some(Some(bound_at_init)) = self.serving_bound_at_init() {
                 if self.serving_descriptor() == Some(bound_at_init.clone()) {
                     let current = self.configured_embedding_descriptor()?;
-                    if current != bound_at_init {
+                    let mut restart_serving = current.clone();
+                    if restart_serving.provider == "fastembed" {
+                        restart_serving.model =
+                            crate::embed::loaded_model_name(&restart_serving.model).to_string();
+                    }
+                    if current != bound_at_init && restart_serving != bound_at_init {
                         return Err(RestartToApplyError::new(format!(
                             "refusing to store data: this process serves embedding model '{}', resolved when it started, but the configured model is now '{}' (a setup-time model choice was persisted while this process was starting). Restart the daemon (or this process) so the store is opened under the configured model before the first write; data is never stored under a model different from the one producing it.",
                             bound_at_init.model,
@@ -16778,6 +16797,92 @@ eurostrata\src\daemon.rs",
             sidecar["descriptor"]["model"],
             json!("ModelA"),
             "the flip records the serving descriptor after the revert"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn loader_fallback_first_write_lands_and_records_serving() {
+        // C3-5: the configured name is one the loader cannot resolve,
+        // so FastEmbedder deliberately falls back to NomicEmbedTextV15
+        // and the serving descriptor names the loaded (fallback)
+        // model, while the configured descriptor keeps the
+        // unrecognized name verbatim. The configuration never changed,
+        // so the startup-race guard must not refuse the first write
+        // with its mid-start-pick message: a restart under the same
+        // configuration serves the same fallback model. The write
+        // lands and the flip records the serving descriptor — the
+        // pre-cycle-2 behavior for this population.
+        let previous = without_model_env();
+        let fx = store_state_fixture("c35-loader-fallback", "UnrecognizedModel");
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("NomicEmbedTextV15")));
+        store.init("probe").await.expect("init");
+        assert!(
+            !crate::model_choice::store_state_path(&fx.db).exists(),
+            "init records nothing: serving (the fallback) != configured (unrecognized)"
+        );
+        store
+            .upsert(
+                "probe",
+                "m1",
+                vec![0.1, 0.2, 0.3, 0.4],
+                store_state_payload(),
+            )
+            .await
+            .expect("the fallback-served first write lands: the configuration never changed");
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["has_data"], json!(true));
+        assert_eq!(
+            sidecar["descriptor"]["model"],
+            json!("NomicEmbedTextV15"),
+            "the flip records the serving (fallback) descriptor"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn loader_fallback_process_still_refuses_a_genuine_pick() {
+        // C3-5, the other provenance: the same fallback-served
+        // process, but the configuration is then rewritten to name a
+        // resolvable different model — a genuine pick. The
+        // startup-race arm still refuses: the exemption keys on what
+        // the current configuration resolves to, not on the process
+        // being fallback-served.
+        let previous = without_model_env();
+        let fx = store_state_fixture("c35-fallback-genuine-pick", "UnrecognizedModel");
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("NomicEmbedTextV15")));
+        store.init("probe").await.expect("init");
+        assert!(
+            !crate::model_choice::store_state_path(&fx.db).exists(),
+            "init records nothing: serving (the fallback) != configured (unrecognized)"
+        );
+        write_embedders_config(&fx.config_dir, "BGESmallENV15Q");
+        let err = store
+            .upsert(
+                "probe",
+                "m1",
+                vec![0.1, 0.2, 0.3, 0.4],
+                store_state_payload(),
+            )
+            .await
+            .expect_err("a genuine pick during a fallback-served start is still refused");
+        assert!(
+            restart_to_apply_message(&err).is_some(),
+            "the refusal is the restart-to-apply error: {err}"
+        );
+        assert!(
+            !crate::model_choice::store_state_path(&fx.db).exists(),
+            "no sidecar exists after the refused write"
         );
         drop(store);
         let _ = std::fs::remove_dir_all(&fx.root);
