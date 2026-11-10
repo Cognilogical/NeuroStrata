@@ -45,6 +45,16 @@
 # checkpointed the WAL into the main db file, so those backups carry
 # no WAL companion and restore exactly as before.
 #
+# Backup-set unit invariant: a backup is a unit — the db file plus
+# the companions (sidecar, WAL) this run produces under one timestamp
+# name. The timestamp has second resolution, so two runs in the same
+# second into the same directory reuse one destination name and the
+# step-4 cp overwrites the db in place. A reused destination must
+# never mix the current run's db with a previous run's companions:
+# steps 4b/4c therefore remove the destination sidecar / WAL companion
+# whenever the current run does not produce one, so the surviving set
+# is exactly the set the current run captured.
+#
 # Assumes the daemon is managed by systemd (neurostrata-mcp setup installs
 # the service). If you ran `neurostrata-mcp daemon &` ad-hoc, the stop/start
 # here will fail — run `neurostrata-mcp setup` once to install the service.
@@ -167,6 +177,14 @@ if [ -f "$SIDECAR_PATH" ]; then
 
     log "sidecar OK: $COMPANION_FILE (md5=$SRC_SIDECAR_MD5)"
 else
+    # Unit invariant (see header): on a reused destination name, a
+    # companion left by an earlier run must not survive into a backup
+    # whose source has no sidecar — it would lend this db a recorded
+    # identity it did not have at backup time.
+    if [ -f "$COMPANION_FILE" ]; then
+        rm -f "$COMPANION_FILE"
+        log "removed stale sidecar companion $COMPANION_FILE — destination reused, current backup carries no recorded identity"
+    fi
     log "no store-state sidecar at $SIDECAR_PATH — backup carries no recorded identity"
 fi
 
@@ -195,7 +213,24 @@ if ! $DAEMON_WAS_RUNNING && [ -f "$WAL_PATH" ]; then
 
     log "wal OK: $WAL_COMPANION_FILE (md5=$SRC_WAL_MD5)"
 elif ! $DAEMON_WAS_RUNNING; then
+    # Unit invariant (see header): on a reused destination name, a WAL
+    # companion left by an earlier run must not survive into a backup
+    # whose source has no WAL — restoring it would replay unrelated
+    # writes against this run's db.
+    if [ -f "$WAL_COMPANION_FILE" ]; then
+        rm -f "$WAL_COMPANION_FILE"
+        log "removed stale WAL companion $WAL_COMPANION_FILE — destination reused, current backup carries no uncheckpointed writes"
+    fi
     log "no WAL at $WAL_PATH — backup carries no uncheckpointed writes"
+else
+    # Daemon was running: its checkpoint means this run carries no WAL
+    # companion, so the same unit invariant applies — a WAL companion
+    # left at a reused destination by an earlier daemon-inactive run
+    # must not survive into this backup.
+    if [ -f "$WAL_COMPANION_FILE" ]; then
+        rm -f "$WAL_COMPANION_FILE"
+        log "removed stale WAL companion $WAL_COMPANION_FILE — destination reused, daemon-running backup carries no WAL companion"
+    fi
 fi
 
 # 5. Prune old backups (pair-aware: companions are not backups in their

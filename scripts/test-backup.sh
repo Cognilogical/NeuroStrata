@@ -21,6 +21,11 @@
 #   5. Failure contract: a sidecar-only verify failure (step 4b) exits
 #      non-zero, deletes BOTH the backup db and its companion, and
 #      leaves the source db and source sidecar byte-untouched.
+#   6. Backup-name reuse: two daemon-inactive runs in the same second
+#      (same timestamp, same destination directory) — the second run
+#      overwrites the db, and companions the second run does not
+#      produce (source WAL and sidecar both removed between runs)
+#      must not survive from the first run.
 #
 # How to run: scripts/test-backup.sh
 #   Exits 0 and prints a PASS summary when every assertion holds; exits
@@ -371,4 +376,91 @@ cmp -s "$S5/expected.sidecar" "$S5/store/store.db.store-state.json" \
     || fail "scenario 5: source sidecar bytes changed"
 pass "scenario 5: source sidecar is byte-untouched"
 
-echo "PASS: all $CHECKS checks passed (backup sidecar + WAL carry + pair-aware pruning + sidecar failure contract)"
+# --- Scenario 6: backup-name reuse drops stale companions ---------------
+# backup.sh names backups with second-resolution timestamps, so two
+# runs in the same second share a destination. Shim `date` to a fixed
+# stamp for the backup-name call only (log() also calls date, with a
+# different format, and must delegate to the real date). Run 1 carries
+# both companions; run 2's source has neither a WAL nor a sidecar, so
+# its backup set must carry neither either — a companion left over
+# from run 1 would pair run 2's db with run 1's unrelated writes /
+# identity on restore.
+echo "== scenario 6: backup-name reuse (same-second double run)"
+S6="$WORK/s6"
+CONFIG6="$(make_store "$S6/store" 1 1)"
+
+DATE_SHIM_DIR="$WORK/date-shim"
+mkdir -p "$DATE_SHIM_DIR"
+cat > "$DATE_SHIM_DIR/date" <<'EOF'
+#!/usr/bin/env bash
+# Fixed stamp for the backup-name format; delegate everything else to
+# the real date (first date on PATH outside this shim's own directory).
+if [ "${1:-}" = "+%Y%m%d-%H%M%S" ]; then
+    printf '20990102-030405\n'
+    exit 0
+fi
+self_dir="$(cd "$(dirname "$0")" && pwd)"
+OLDIFS="$IFS"; IFS=:
+for d in $PATH; do
+    [ "$d" = "$self_dir" ] && continue
+    if [ -x "$d/date" ]; then IFS="$OLDIFS"; exec "$d/date" "$@"; fi
+done
+IFS="$OLDIFS"
+exit 127
+EOF
+chmod +x "$DATE_SHIM_DIR/date"
+
+if ! run_backup_path "$DATE_SHIM_DIR" "$CONFIG6" "$S6/backups" 7; then
+    cat "$WORK/last-run.log" >&2
+    fail "scenario 6: first backup.sh run exited non-zero (see log above)"
+fi
+pass "scenario 6: first run exits 0"
+
+BACKUP6="$S6/backups/db-20990102-030405"
+[ -f "$BACKUP6" ] \
+    || fail "scenario 6: first run did not create the fixed-stamp backup $BACKUP6"
+pass "scenario 6: first run creates the fixed-stamp backup"
+
+cmp -s "$S6/store/store.db" "$BACKUP6" \
+    || fail "scenario 6: first backup bytes differ from fixture db"
+pass "scenario 6: first backup is byte-identical to the fixture db"
+
+[ -f "$BACKUP6.wal" ] \
+    || fail "scenario 6: first run WAL companion $BACKUP6.wal missing"
+pass "scenario 6: first run WAL companion exists"
+
+cmp -s "$S6/store/store.db.wal" "$BACKUP6.wal" \
+    || fail "scenario 6: first run WAL companion bytes differ from fixture WAL"
+pass "scenario 6: first run WAL companion is byte-identical to the fixture WAL"
+
+cmp -s "$S6/store/store.db.store-state.json" "$BACKUP6.store-state.json" \
+    || fail "scenario 6: first run sidecar companion missing or bytes differ"
+pass "scenario 6: first run sidecar companion is byte-identical to the fixture sidecar"
+
+# Change the source: new db bytes, no WAL, no sidecar.
+printf 'fixture-db-bytes-run2\n' > "$S6/store/store.db"
+rm -f "$S6/store/store.db.wal" "$S6/store/store.db.store-state.json"
+
+if ! run_backup_path "$DATE_SHIM_DIR" "$CONFIG6" "$S6/backups" 7; then
+    cat "$WORK/last-run.log" >&2
+    fail "scenario 6: second backup.sh run exited non-zero (see log above)"
+fi
+pass "scenario 6: second run (same stamp, same dir) exits 0"
+
+[ "$(count_backups "$S6/backups")" = "1" ] \
+    || fail "scenario 6: expected exactly 1 backup after reuse, found $(count_backups "$S6/backups")"
+pass "scenario 6: exactly one backup file exists after reuse"
+
+cmp -s "$S6/store/store.db" "$BACKUP6" \
+    || fail "scenario 6: reused backup does not hold the second run's db bytes"
+pass "scenario 6: reused backup holds the second run's db bytes"
+
+[ ! -e "$BACKUP6.wal" ] \
+    || fail "scenario 6: stale WAL companion from the first run survived the second run"
+pass "scenario 6: no WAL companion survives a run that produced none"
+
+[ ! -e "$BACKUP6.store-state.json" ] \
+    || fail "scenario 6: stale sidecar companion from the first run survived the second run"
+pass "scenario 6: no sidecar companion survives a run that produced none"
+
+echo "PASS: all $CHECKS checks passed (backup sidecar + WAL carry + pair-aware pruning + sidecar failure contract + backup-name reuse)"
