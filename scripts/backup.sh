@@ -55,6 +55,14 @@
 # whenever the current run does not produce one, so the surviving set
 # is exactly the set the current run captured.
 #
+# Scope of that invariant: it is enforced by the steps 4b/4c cleanup
+# on runs that complete steps 4–4c successfully. It is not a
+# construction guarantee — a run that fails or is interrupted
+# mid-copy can leave a mixed set (and the in-place step-4 cp can
+# already have overwritten a prior good backup), and orphaned
+# companions are never pruned. Building the set under temp names
+# and renaming it into place is tracked in #93.
+#
 # Assumes the daemon is managed by systemd (neurostrata-mcp setup installs
 # the service). If you ran `neurostrata-mcp daemon &` ad-hoc, the stop/start
 # here will fail — run `neurostrata-mcp setup` once to install the service.
