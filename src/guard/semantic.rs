@@ -14,6 +14,11 @@ use std::sync::Arc;
 /// validate call into a false-positive rejection.
 pub const MIN_CONSTRAINT_SIMILARITY: f32 = 0.25;
 
+/// The store reports each row's distance (lower is closer), so the similarity
+/// floor is applied as a maximum distance, the same mapping the normative
+/// search slots use (`similarity = 1 - distance`).
+const MAX_CONSTRAINT_DISTANCE: f32 = 1.0 - MIN_CONSTRAINT_SIMILARITY;
+
 /// The memory-type families the guard treats as rules. `guard_rule` is what
 /// `add_constraint` writes; `rule` is the vocabulary's generic rule type, so
 /// rules seeded through the normal memory surface stay visible to the guard.
@@ -184,14 +189,16 @@ fn embed_input(payload: &str) -> &str {
 
 /// Turn raw search rows into guard rules, dropping every row that either
 /// cannot prove it is a rule (rule types only) or sits below the similarity
-/// cutoff (`MIN_CONSTRAINT_SIMILARITY`). A pure pass over the search results so
-/// the cutoff behaviour is testable without a vector store.
+/// cutoff (`MIN_CONSTRAINT_SIMILARITY`). `SearchResult::score` is a distance
+/// (lower is closer), so a row passes when its distance is at most
+/// `MAX_CONSTRAINT_DISTANCE`. A pure pass over the search results so the
+/// cutoff behaviour is testable without a vector store.
 pub(crate) fn rules_from_rows(
     search_results: Vec<crate::traits::SearchResult>,
 ) -> Vec<BehavioralRule> {
     search_results
         .into_iter()
-        .filter(|result| (result.score as f32) >= MIN_CONSTRAINT_SIMILARITY)
+        .filter(|result| (result.score as f32) <= MAX_CONSTRAINT_DISTANCE)
         .filter(|result| RULE_MEMORY_TYPES.contains(&result.payload.memory_type.as_str()))
         .filter_map(|result| {
             // A rule row whose metadata is incomplete is not a rule: it is
@@ -210,12 +217,10 @@ pub(crate) fn rules_from_rows(
 
 /// Adds the listed `guard_rule` rows to `combined`. A listed guard rule is
 /// always eligible, whatever its distance to the payload: the trigger match
-/// that follows decides whether it fires. A rule the typed search already
-/// returned keeps its row but takes the listing's score. Search scores are
-/// distances, and a very close rule (distance below the cutoff) would
-/// otherwise be dropped by `rules_from_rows`, which the listing used to
-/// prevent before typed search made it likely that the nearest rule is already
-/// in `combined`.
+/// that follows decides whether it fires. Search scores are distances, so a
+/// listed rule is given distance 0.0 (the closest possible), which clears
+/// `rules_from_rows`. A rule the typed search already returned keeps its row
+/// but takes that distance too.
 fn merge_listed_rules(
     combined: &mut Vec<crate::traits::SearchResult>,
     seen_ids: &mut std::collections::HashSet<String>,
@@ -223,10 +228,10 @@ fn merge_listed_rules(
 ) {
     for mut row in listed {
         if seen_ids.insert(row.id.clone()) {
-            row.score = row.score.max(1.0);
+            row.score = 0.0;
             combined.push(row);
         } else if let Some(existing) = combined.iter_mut().find(|r| r.id == row.id) {
-            existing.score = existing.score.max(1.0);
+            existing.score = 0.0;
         }
     }
 }
@@ -357,19 +362,59 @@ mod tests {
         );
     }
 
+    /// The real store's typed search scores rows by L2 distance (lower is
+    /// closer). A rule whose embedding equals the query is distance 0 and must
+    /// survive the floor; a rule far from the query must not.
+    #[tokio::test]
+    async fn typed_search_distances_are_read_as_distances_by_the_floor() {
+        use crate::store::ladybug::LadybugStore;
+        use crate::traits::VectorStore;
+
+        let dir = std::env::temp_dir().join(format!("ns-guard-floor-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("create the schema");
+
+        let payload = |id: &str| rule_row(id, 0.0, "rule").payload;
+        store
+            .upsert("probe", "rule-near", vec![0.9, 0.1, 0.1, 0.1], payload("rule-near"))
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "rule-far", vec![-0.9, -0.1, -0.1, -0.1], payload("rule-far"))
+            .await
+            .unwrap();
+
+        let types = vec!["rule".to_string(), "guard_rule".to_string()];
+        let found = store
+            .search_by_types("probe", vec![0.9, 0.1, 0.1, 0.1], 5, &types)
+            .await
+            .unwrap();
+        let near = found.iter().find(|r| r.id == "rule-near").expect("near row");
+        assert_eq!(near.score, 0.0, "the store reports a distance, not a similarity");
+
+        let ids: Vec<String> = rules_from_rows(found).into_iter().map(|r| r.id).collect();
+        assert_eq!(
+            ids,
+            vec!["rule-near".to_string()],
+            "the identical rule must survive the floor and the opposite one must not: {ids:?}"
+        );
+    }
+
     #[test]
     fn low_similarity_rule_rows_do_not_match() {
+        // Scores are distances: lower is closer, and a row passes while its
+        // distance is at most MAX_CONSTRAINT_DISTANCE.
         let rows = vec![
-            // A live rule that cleared the cutoff: the only row that survives.
-            rule_row("rule-high", 0.9, "guard_rule"),
-            // Same rule content, but the embedding is barely related — the
+            // A close rule that cleared the cutoff.
+            rule_row("rule-high", 0.1, "guard_rule"),
+            // Same rule content, but the embedding is barely related: the
             // vector search still returned it, the cutoff must drop it.
-            rule_row("rule-low", MIN_CONSTRAINT_SIMILARITY - 0.01, "guard_rule"),
+            rule_row("rule-low", MAX_CONSTRAINT_DISTANCE + 0.01, "guard_rule"),
             // Exactly at the floor: the cutoff is inclusive.
-            rule_row("rule-at-floor", MIN_CONSTRAINT_SIMILARITY, "guard_rule"),
-            // A high-scoring row that is not a rule at all (a fact, a task
+            rule_row("rule-at-floor", MAX_CONSTRAINT_DISTANCE, "guard_rule"),
+            // A very close row that is not a rule at all (a fact, a task
             // result, anything the namespace picked up) must never fire.
-            rule_row("not-a-rule", 0.99, "fact"),
+            rule_row("not-a-rule", 0.01, "fact"),
         ];
 
         let rules = rules_from_rows(rows);
