@@ -8,10 +8,11 @@
 # entirely:
 #   1. systemctl --user stop neurostrata  (graceful shutdown + checkpoint)
 #   2. lsof-verify no holders
-#   3. Raw `cp` the db file (plus its store-state sidecar, when present)
+#   3. Raw `cp` the db file (plus its store-state sidecar, when present,
+#      and its WAL when the daemon was not running — step 4c below)
 #   4. md5-verify the copies
 #   5. Prune old backups (keep N most recent; a pruned backup's sidecar
-#      companion is deleted with it)
+#      and WAL companions are deleted with it)
 #   6. systemctl --user start neurostrata
 #
 # Source DB is never touched. Failure modes are: bad backup (md5 mismatch)
@@ -28,6 +29,39 @@
 # it — so the recovered store keeps its recorded identity. A backup
 # without a companion (a pre-feature store with no sidecar) restores
 # exactly as before: no recorded identity (LockedUnknown), unchanged.
+#
+# WAL companion: the checkpoint guarantee above comes from the systemd
+# stop. On the daemon-inactive path (daemon not running — direct copy)
+# there is no checkpoint, so after an unclean shutdown the WAL at
+# <db path>.wal may hold the only copy of recent writes. When the
+# daemon was NOT running at backup time and that WAL exists, step 4c
+# copies it alongside the backup as db-<timestamp>.wal and md5-verifies
+# it the same way, under the same failure contract as steps 4/4b. A
+# daemon-inactive backup may therefore carry a db-<timestamp>.wal
+# companion; to recover, place it at <target db path>.wal alongside
+# the db file (and the sidecar companion at its documented place
+# above), so the recovered store replays exactly the writes the backup
+# captured. When the daemon WAS running, its graceful stop
+# checkpointed the WAL into the main db file, so those backups carry
+# no WAL companion and restore exactly as before.
+#
+# Backup-set unit invariant: a backup is a unit — the db file plus
+# the companions (sidecar, WAL) this run produces under one timestamp
+# name. The timestamp has second resolution, so two runs in the same
+# second into the same directory reuse one destination name and the
+# step-4 cp overwrites the db in place. A reused destination must
+# never mix the current run's db with a previous run's companions:
+# steps 4b/4c therefore remove the destination sidecar / WAL companion
+# whenever the current run does not produce one, so the surviving set
+# is exactly the set the current run captured.
+#
+# Scope of that invariant: it is enforced by the steps 4b/4c cleanup
+# on runs that complete steps 4–4c successfully. It is not a
+# construction guarantee — a run that fails or is interrupted
+# mid-copy can leave a mixed set (and the in-place step-4 cp can
+# already have overwritten a prior good backup), and orphaned
+# companions are never pruned. Building the set under temp names
+# and renaming it into place is tracked in #93.
 #
 # Assumes the daemon is managed by systemd (neurostrata-mcp setup installs
 # the service). If you ran `neurostrata-mcp daemon &` ad-hoc, the stop/start
@@ -151,17 +185,70 @@ if [ -f "$SIDECAR_PATH" ]; then
 
     log "sidecar OK: $COMPANION_FILE (md5=$SRC_SIDECAR_MD5)"
 else
+    # Unit invariant (see header): on a reused destination name, a
+    # companion left by an earlier run must not survive into a backup
+    # whose source has no sidecar — it would lend this db a recorded
+    # identity it did not have at backup time.
+    if [ -f "$COMPANION_FILE" ]; then
+        rm -f "$COMPANION_FILE"
+        log "removed stale sidecar companion $COMPANION_FILE — destination reused, current backup carries no recorded identity"
+    fi
     log "no store-state sidecar at $SIDECAR_PATH — backup carries no recorded identity"
 fi
 
+# 4c. Copy the WAL as the backup's companion — only when the daemon was
+# NOT running at backup time. A running daemon's graceful stop (step 2)
+# checkpointed the WAL into the main db file, so its backup needs no
+# WAL companion. On the daemon-inactive path there was no checkpoint:
+# after an unclean shutdown the WAL may hold the only copy of recent
+# writes, and a backup that silently drops it loses them — a bad
+# backup, under the same failure contract as steps 4/4b.
+WAL_PATH="$DB_PATH.wal"
+WAL_COMPANION_FILE="$BACKUP_FILE.wal"
+
+if ! $DAEMON_WAS_RUNNING && [ -f "$WAL_PATH" ]; then
+    if ! cp -p "$WAL_PATH" "$WAL_COMPANION_FILE"; then
+        rm -f "$BACKUP_FILE" "$COMPANION_FILE" "$WAL_COMPANION_FILE"
+        die "wal cp failed — bad backup deleted, source untouched" 7
+    fi
+    SRC_WAL_MD5=$(md5sum "$WAL_PATH" | awk '{print $1}')
+    DST_WAL_MD5=$(md5sum "$WAL_COMPANION_FILE" | awk '{print $1}')
+
+    if [ "$SRC_WAL_MD5" != "$DST_WAL_MD5" ]; then
+        rm -f "$BACKUP_FILE" "$COMPANION_FILE" "$WAL_COMPANION_FILE"
+        die "wal md5 mismatch: src=$SRC_WAL_MD5 dst=$DST_WAL_MD5 — bad backup deleted, source untouched" 8
+    fi
+
+    log "wal OK: $WAL_COMPANION_FILE (md5=$SRC_WAL_MD5)"
+elif ! $DAEMON_WAS_RUNNING; then
+    # Unit invariant (see header): on a reused destination name, a WAL
+    # companion left by an earlier run must not survive into a backup
+    # whose source has no WAL — restoring it would replay unrelated
+    # writes against this run's db.
+    if [ -f "$WAL_COMPANION_FILE" ]; then
+        rm -f "$WAL_COMPANION_FILE"
+        log "removed stale WAL companion $WAL_COMPANION_FILE — destination reused, current backup carries no uncheckpointed writes"
+    fi
+    log "no WAL at $WAL_PATH — backup carries no uncheckpointed writes"
+else
+    # Daemon was running: its checkpoint means this run carries no WAL
+    # companion, so the same unit invariant applies — a WAL companion
+    # left at a reused destination by an earlier daemon-inactive run
+    # must not survive into this backup.
+    if [ -f "$WAL_COMPANION_FILE" ]; then
+        rm -f "$WAL_COMPANION_FILE"
+        log "removed stale WAL companion $WAL_COMPANION_FILE — destination reused, daemon-running backup carries no WAL companion"
+    fi
+fi
+
 # 5. Prune old backups (pair-aware: companions are not backups in their
-# own right — count/select only db-* files without the sidecar suffix,
-# and delete a pruned backup's companion with it)
+# own right — count/select only db-* files without the sidecar or WAL
+# suffix, and delete a pruned backup's companions with it)
 if [ "$MAX_BACKUPS" -gt 0 ]; then
-    PRUNE_COUNT=$(ls -1t "$BACKUP_DIR"/db-* 2>/dev/null | grep -v '\.store-state\.json$' | wc -l)
+    PRUNE_COUNT=$(ls -1t "$BACKUP_DIR"/db-* 2>/dev/null | grep -v -e '\.store-state\.json$' -e '\.wal$' | wc -l)
     if [ "$PRUNE_COUNT" -gt "$MAX_BACKUPS" ]; then
-        ls -1t "$BACKUP_DIR"/db-* 2>/dev/null | grep -v '\.store-state\.json$' | tail -n +$((MAX_BACKUPS + 1)) | while IFS= read -r OLD_BACKUP; do
-            rm -f "$OLD_BACKUP" "$OLD_BACKUP.store-state.json"
+        ls -1t "$BACKUP_DIR"/db-* 2>/dev/null | grep -v -e '\.store-state\.json$' -e '\.wal$' | tail -n +$((MAX_BACKUPS + 1)) | while IFS= read -r OLD_BACKUP; do
+            rm -f "$OLD_BACKUP" "$OLD_BACKUP.store-state.json" "$OLD_BACKUP.wal"
         done
         log "pruned $((PRUNE_COUNT - MAX_BACKUPS)) old backup(s), keeping $MAX_BACKUPS"
     fi

@@ -893,6 +893,34 @@ fn bind_fallback_serving_descriptor(
     }
 }
 
+/// Prepare the fallback store for a write arm (Add, Edit, Ingest): bind the
+/// serving descriptor, then initialize the store under it.
+///
+/// `init` is the step that runs the store-state maintenance
+/// (`maintain_store_state`): on a store recorded pristine under a
+/// different model, it adopts the serving descriptor when serving
+/// matches the configuration — which is exactly the descriptor a
+/// fallback arm binds, because it built its embedder from the
+/// configuration. Without this step the write arms dispatched
+/// straight to `upsert`, whose first-write guard refuses a pristine
+/// store whose recorded descriptor differs from serving with
+/// restart guidance this path could never satisfy: re-running the
+/// command bound and upserted again, still with no init, so the
+/// demanded adoption never occurred (issue #75). The daemon write
+/// half has always ordered its work this way
+/// (`embed_dedup_and_upsert` inits before it embeds or upserts);
+/// the fallback write arms now follow the same pattern. Read arms
+/// deliberately do not use this helper: they gain no init side
+/// effects they do not have today.
+async fn prepare_fallback_write_store(
+    vector_store: &Arc<dyn VectorStore>,
+    embedder: &Arc<dyn crate::traits::Embedder>,
+    namespace: &str,
+) -> anyhow::Result<()> {
+    bind_fallback_serving_descriptor(vector_store, embedder);
+    vector_store.init(namespace).await
+}
+
 /// Whether some process holds the daemon lock right now.
 fn daemon_holds_lock(db_path: &std::path::Path) -> bool {
     // Read-only status probes must not create the lock file: open_daemon_lock
@@ -2658,6 +2686,493 @@ mod tests {
 
         assert!(gate_verify_daemon(None, own).is_err());
     }
+
+    /// An embedder serving ModelB at the fixture width: its descriptor
+    /// is the shape `FastEmbedder::embedding_descriptor` produces for
+    /// the ModelB entry, matching the descriptor the store synthesizes
+    /// for the same configured entry.
+    struct FallbackModelBEmbedder;
+
+    #[async_trait::async_trait]
+    impl crate::traits::Embedder for FallbackModelBEmbedder {
+        async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            Ok(vec![0.1, 0.2, 0.3, 0.4])
+        }
+        fn dimensions(&self) -> usize {
+            4
+        }
+        fn embedder_id(&self) -> &str {
+            "ModelB"
+        }
+        fn embedding_descriptor(&self) -> crate::traits::EmbeddingDescriptor {
+            crate::traits::EmbeddingDescriptor {
+                provider: "fastembed".to_string(),
+                model: "ModelB".to_string(),
+                revision: "onnx".to_string(),
+                dims: 4,
+                normalization: "unknown".to_string(),
+                preprocessing: "unknown".to_string(),
+                distance_metric: "cosine".to_string(),
+            }
+        }
+    }
+
+    /// Regression test for issue #75 (Codex finding T6 on PR #66): the
+    /// daemon-stopped fallback `add` on a store recorded pristine
+    /// under the default model, after the user configured a different
+    /// model. The fallback process serves the configured model, so
+    /// the pristine record must be adopted in this process and the
+    /// add must proceed — re-running `add` must not loop on the
+    /// guard's restart guidance forever.
+    #[tokio::test]
+    async fn fallback_add_on_pristine_store_adopts_configured_model_and_writes() {
+        let previous = std::env::var("NEUROSTRATA_MODEL").ok();
+        std::env::remove_var("NEUROSTRATA_MODEL");
+        let root =
+            std::env::temp_dir().join(format!("ns-fallback-add-adopt-{}", uuid::Uuid::new_v4()));
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let write_config = |model: &str| {
+            std::fs::write(
+                config_dir.join("embedders.json"),
+                format!("[{{\"model_name\":\"{model}\",\"dimensions\":4}}]"),
+            )
+            .unwrap();
+        };
+        let db_path = root.join("ladybug.db");
+        let sidecar = |db: &std::path::Path| -> serde_json::Value {
+            let content =
+                std::fs::read_to_string(crate::model_choice::store_state_path(db)).unwrap();
+            serde_json::from_str(&content).unwrap()
+        };
+
+        // The store as the daemon left it: recorded pristine under
+        // the default model (ModelA here).
+        write_config("ModelA");
+        let seed = LadybugStore::for_testing(&db_path, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&config_dir)
+            .with_serving_descriptor(Some(crate::traits::EmbeddingDescriptor {
+                provider: "fastembed".to_string(),
+                model: "ModelA".to_string(),
+                revision: "onnx".to_string(),
+                dims: 4,
+                normalization: "unknown".to_string(),
+                preprocessing: "unknown".to_string(),
+                distance_metric: "cosine".to_string(),
+            }));
+        seed.init("probe").await.expect("seed init");
+        assert_eq!(sidecar(&db_path)["has_data"], serde_json::json!(false));
+        assert_eq!(
+            sidecar(&db_path)["descriptor"]["model"],
+            serde_json::json!("ModelA")
+        );
+        drop(seed);
+
+        // The user configured ModelB; the daemon is stopped, so the
+        // fallback arm runs: it constructs its store unbound, builds
+        // the configured embedder, and binds its descriptor.
+        write_config("ModelB");
+        let vector_store: Arc<dyn VectorStore> = Arc::new(
+            LadybugStore::for_testing(&db_path, 4)
+                .expect("reopen temp database")
+                .with_embed_config_dir(&config_dir),
+        );
+        let embedder: Arc<dyn crate::traits::Embedder> = Arc::new(FallbackModelBEmbedder);
+        prepare_fallback_write_store(&vector_store, &embedder, "probe")
+            .await
+            .expect("the fallback write preparation inits the store under the serving model");
+        let vector = embedder
+            .embed("a memory added while the daemon is stopped")
+            .await
+            .expect("embed");
+        let payload = crate::traits::MemoryPayload {
+            content: "a memory added while the daemon is stopped".to_string(),
+            memory_type: "fact".to_string(),
+            location: String::new(),
+            user_id: "system".to_string(),
+            agent_name: Some("NeuroStrata".to_string()),
+            location_lines: String::new(),
+            metadata: serde_json::json!({}),
+        };
+        vector_store
+            .upsert("probe", "fallback-m1", vector, payload)
+            .await
+            .expect("the fallback add must adopt the pristine record and proceed");
+        assert_eq!(
+            sidecar(&db_path)["descriptor"]["model"],
+            serde_json::json!("ModelB"),
+            "the pristine record is adopted to the configured model"
+        );
+        assert_eq!(sidecar(&db_path)["has_data"], serde_json::json!(true));
+        let found = vector_store
+            .search("probe", vec![0.1, 0.2, 0.3, 0.4], 5, false, false)
+            .await
+            .expect("search under the adopted model");
+        assert!(!found.is_empty(), "the added row is searchable");
+        drop(vector_store);
+        let _ = std::fs::remove_dir_all(&root);
+        match previous {
+            Some(value) => std::env::set_var("NEUROSTRATA_MODEL", value),
+            None => std::env::remove_var("NEUROSTRATA_MODEL"),
+        }
+    }
+
+    /// The sibling fallback Edit arm shares the Add arm's shape —
+    /// bind a serving descriptor, then write through `edit_memory`'s
+    /// `upsert` with no init — so it shares the defect on any store
+    /// whose recorded state is still pristine when its upsert runs
+    /// (here: a row-bearing store whose sidecar still reads pristine,
+    /// the stale-label state the store-state tests construct by hand).
+    /// Its upsert is the same guard's subject, so the arm prepares
+    /// its store through the same helper and the edit proceeds after
+    /// the pristine record is adopted.
+    #[tokio::test]
+    async fn fallback_edit_on_pristine_labelled_store_adopts_and_edits() {
+        let previous = std::env::var("NEUROSTRATA_MODEL").ok();
+        std::env::remove_var("NEUROSTRATA_MODEL");
+        let root =
+            std::env::temp_dir().join(format!("ns-fallback-edit-adopt-{}", uuid::Uuid::new_v4()));
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let write_config = |model: &str| {
+            std::fs::write(
+                config_dir.join("embedders.json"),
+                format!("[{{\"model_name\":\"{model}\",\"dimensions\":4}}]"),
+            )
+            .unwrap();
+        };
+        let db_path = root.join("ladybug.db");
+        let descriptor = |model: &str| crate::traits::EmbeddingDescriptor {
+            provider: "fastembed".to_string(),
+            model: model.to_string(),
+            revision: "onnx".to_string(),
+            dims: 4,
+            normalization: "unknown".to_string(),
+            preprocessing: "unknown".to_string(),
+            distance_metric: "cosine".to_string(),
+        };
+        let payload = |content: &str| crate::traits::MemoryPayload {
+            content: content.to_string(),
+            memory_type: "fact".to_string(),
+            location: String::new(),
+            user_id: "system".to_string(),
+            agent_name: Some("NeuroStrata".to_string()),
+            location_lines: String::new(),
+            metadata: serde_json::json!({}),
+        };
+
+        write_config("ModelA");
+        let seed = LadybugStore::for_testing(&db_path, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&config_dir)
+            .with_serving_descriptor(Some(descriptor("ModelA")));
+        seed.init("probe").await.expect("seed init");
+        seed.upsert("probe", "m1", vec![0.1, 0.2, 0.3, 0.4], payload("original"))
+            .await
+            .expect("seed upsert");
+        drop(seed);
+        // The stale label: the sidecar reads pristine under ModelA
+        // although the table holds the seeded row.
+        crate::model_choice::write_store_state(
+            &db_path,
+            &crate::model_choice::StoreState {
+                version: crate::model_choice::STORE_STATE_VERSION,
+                has_data: false,
+                descriptor: descriptor("ModelA"),
+            },
+        )
+        .expect("rewrite the sidecar to the pristine label");
+
+        write_config("ModelB");
+        let vector_store: Arc<dyn VectorStore> = Arc::new(
+            LadybugStore::for_testing(&db_path, 4)
+                .expect("reopen temp database")
+                .with_embed_config_dir(&config_dir),
+        );
+        let embedder: Arc<dyn crate::traits::Embedder> = Arc::new(FallbackModelBEmbedder);
+        prepare_fallback_write_store(&vector_store, &embedder, "probe")
+            .await
+            .expect("the fallback write preparation inits the store under the serving model");
+        let outcome = crate::server::edit_memory(
+            &*vector_store,
+            &*embedder,
+            "probe",
+            "m1",
+            "probe",
+            "edited",
+            "",
+        )
+        .await
+        .expect("the fallback edit must adopt the pristine record and proceed");
+        assert!(
+            matches!(outcome, crate::server::EditOutcome::Edited),
+            "the seeded row is edited: {outcome:?}"
+        );
+        let (_, edited) = vector_store
+            .get("probe", "m1")
+            .await
+            .expect("get the edited row")
+            .expect("the edited row exists");
+        assert_eq!(edited.content, "edited");
+        let content = std::fs::read_to_string(crate::model_choice::store_state_path(&db_path))
+            .expect("sidecar exists");
+        let sidecar: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            sidecar["descriptor"]["model"],
+            serde_json::json!("ModelB"),
+            "the pristine record is adopted to the configured model"
+        );
+        drop(vector_store);
+        let _ = std::fs::remove_dir_all(&root);
+        match previous {
+            Some(value) => std::env::set_var("NEUROSTRATA_MODEL", value),
+            None => std::env::remove_var("NEUROSTRATA_MODEL"),
+        }
+    }
+
+    /// Regression test for the Ingest arm of the issue #75 class
+    /// (class census follow-up to Task 4): the daemon-stopped fallback
+    /// `ingest` on a store recorded pristine under the default model,
+    /// after the user configured a different model. Ingest writes via
+    /// `ingest_directory` -> `vector_store.upsert`, the same guarded
+    /// entry point as Add/Edit, so it needs the same bind+init
+    /// preparation before any guarded write. This test exercises the
+    /// arm's call-sequence contract at the helper seam (the arms are
+    /// not invocable through `run()`): prepare via
+    /// `prepare_fallback_write_store`, then a guarded upsert exactly
+    /// as ingest performs it.
+    #[tokio::test]
+    async fn fallback_ingest_on_pristine_store_adopts_configured_model_and_writes() {
+        let previous = std::env::var("NEUROSTRATA_MODEL").ok();
+        std::env::remove_var("NEUROSTRATA_MODEL");
+        let root =
+            std::env::temp_dir().join(format!("ns-fallback-ingest-adopt-{}", uuid::Uuid::new_v4()));
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let write_config = |model: &str| {
+            std::fs::write(
+                config_dir.join("embedders.json"),
+                format!("[{{\"model_name\":\"{model}\",\"dimensions\":4}}]"),
+            )
+            .unwrap();
+        };
+        let db_path = root.join("ladybug.db");
+        let sidecar = |db: &std::path::Path| -> serde_json::Value {
+            let content =
+                std::fs::read_to_string(crate::model_choice::store_state_path(db)).unwrap();
+            serde_json::from_str(&content).unwrap()
+        };
+
+        write_config("ModelA");
+        let seed = LadybugStore::for_testing(&db_path, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&config_dir)
+            .with_serving_descriptor(Some(crate::traits::EmbeddingDescriptor {
+                provider: "fastembed".to_string(),
+                model: "ModelA".to_string(),
+                revision: "onnx".to_string(),
+                dims: 4,
+                normalization: "unknown".to_string(),
+                preprocessing: "unknown".to_string(),
+                distance_metric: "cosine".to_string(),
+            }));
+        seed.init("probe").await.expect("seed init");
+        assert_eq!(sidecar(&db_path)["has_data"], serde_json::json!(false));
+        assert_eq!(
+            sidecar(&db_path)["descriptor"]["model"],
+            serde_json::json!("ModelA")
+        );
+        drop(seed);
+
+        write_config("ModelB");
+        let vector_store: Arc<dyn VectorStore> = Arc::new(
+            LadybugStore::for_testing(&db_path, 4)
+                .expect("reopen temp database")
+                .with_embed_config_dir(&config_dir),
+        );
+        let embedder: Arc<dyn crate::traits::Embedder> = Arc::new(FallbackModelBEmbedder);
+        prepare_fallback_write_store(&vector_store, &embedder, "probe")
+            .await
+            .expect("the fallback write preparation inits the store under the serving model");
+        let vector = embedder
+            .embed("a node ingested while the daemon is stopped")
+            .await
+            .expect("embed");
+        let payload = crate::traits::MemoryPayload {
+            content: "a node ingested while the daemon is stopped".to_string(),
+            memory_type: "fact".to_string(),
+            location: String::new(),
+            user_id: "system".to_string(),
+            agent_name: Some("NeuroStrata".to_string()),
+            location_lines: String::new(),
+            metadata: serde_json::json!({}),
+        };
+        vector_store
+            .upsert("probe", "fallback-ingest-m1", vector, payload)
+            .await
+            .expect("the fallback ingest must adopt the pristine record and proceed");
+        assert_eq!(
+            sidecar(&db_path)["descriptor"]["model"],
+            serde_json::json!("ModelB"),
+            "the pristine record is adopted to the configured model"
+        );
+        assert_eq!(sidecar(&db_path)["has_data"], serde_json::json!(true));
+        let found = vector_store
+            .search("probe", vec![0.1, 0.2, 0.3, 0.4], 5, false, false)
+            .await
+            .expect("search under the adopted model");
+        assert!(!found.is_empty(), "the ingested row is searchable");
+        drop(vector_store);
+        let _ = std::fs::remove_dir_all(&root);
+        match previous {
+            Some(value) => std::env::set_var("NEUROSTRATA_MODEL", value),
+            None => std::env::remove_var("NEUROSTRATA_MODEL"),
+        }
+    }
+
+    fn restore_copy_fixture(
+        tag: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let root =
+            std::env::temp_dir().join(format!("ns-restore-copy-{}-{}", tag, uuid::Uuid::new_v4()));
+        let snapshot_dir = root.join("snapshot");
+        let target = root.join("target").join("ladybug.store");
+        std::fs::create_dir_all(&snapshot_dir).unwrap();
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(snapshot_dir.join("ladybug.store"), b"snapshot-db").unwrap();
+        (root, snapshot_dir, target)
+    }
+
+    fn restore_target_wal_path(target: &std::path::Path) -> std::path::PathBuf {
+        let mut wal = target.as_os_str().to_os_string();
+        wal.push(".wal");
+        std::path::PathBuf::from(wal)
+    }
+
+    #[test]
+    fn restore_copy_drops_orphan_target_wal_and_sidecar_when_snapshot_has_none() {
+        let (root, snapshot_dir, target) = restore_copy_fixture("orphans");
+        // The target DB file is absent (the Restore arm's guard passes),
+        // but the old store's WAL and sidecar were left behind as orphans.
+        let target_wal = restore_target_wal_path(&target);
+        let target_sidecar = crate::model_choice::store_state_path(&target);
+        std::fs::write(&target_wal, b"orphan-wal").unwrap();
+        std::fs::write(&target_sidecar, b"orphan-sidecar").unwrap();
+
+        copy_snapshot_into_place(&snapshot_dir, &target).expect("restore copy");
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"snapshot-db");
+        assert!(
+            !target_wal.exists(),
+            "the orphan target WAL must not survive a restore whose snapshot has none"
+        );
+        assert!(
+            !target_sidecar.exists(),
+            "the orphan target sidecar must not survive a restore whose snapshot has none"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restore_copy_overwrites_orphan_target_wal_and_sidecar_from_snapshot() {
+        let (root, snapshot_dir, target) = restore_copy_fixture("overwrite");
+        std::fs::write(snapshot_dir.join("ladybug.store.wal"), b"snapshot-wal").unwrap();
+        std::fs::write(
+            snapshot_dir.join("ladybug.store.store-state.json"),
+            b"snapshot-sidecar",
+        )
+        .unwrap();
+        let target_wal = restore_target_wal_path(&target);
+        let target_sidecar = crate::model_choice::store_state_path(&target);
+        std::fs::write(&target_wal, b"orphan-wal").unwrap();
+        std::fs::write(&target_sidecar, b"orphan-sidecar").unwrap();
+
+        copy_snapshot_into_place(&snapshot_dir, &target).expect("restore copy");
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"snapshot-db");
+        assert_eq!(std::fs::read(&target_wal).unwrap(), b"snapshot-wal");
+        assert_eq!(std::fs::read(&target_sidecar).unwrap(), b"snapshot-sidecar");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restore_copy_without_snapshot_wal_or_sidecar_and_no_orphans_succeeds() {
+        let (root, snapshot_dir, target) = restore_copy_fixture("plain");
+
+        copy_snapshot_into_place(&snapshot_dir, &target).expect("restore copy");
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"snapshot-db");
+        assert!(!restore_target_wal_path(&target).exists());
+        assert!(!crate::model_choice::store_state_path(&target).exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn restore_verify_fixture(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        // Built the way export builds a snapshot: a ladybug.store file,
+        // a manifest.json carrying the snapshot format/version, and a
+        // checksums.json written by write_checksums over the actual
+        // bytes (which also writes the manifest.json.zst copy). No WAL
+        // and no sidecar are written, so their checksums are absent —
+        // verify_snapshot treats an absent, unmentioned WAL (and
+        // sidecar) as not part of the snapshot.
+        let root = std::env::temp_dir().join(format!(
+            "ns-restore-verify-{}-{}",
+            tag,
+            uuid::Uuid::new_v4()
+        ));
+        let snapshot_dir = root.join("snapshot");
+        std::fs::create_dir_all(&snapshot_dir).unwrap();
+        std::fs::write(snapshot_dir.join("ladybug.store"), b"snapshot-db").unwrap();
+        std::fs::write(
+            snapshot_dir.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\"}}",
+                crate::storage::snapshot::SNAPSHOT_FORMAT,
+                crate::storage::snapshot::SNAPSHOT_VERSION
+            ),
+        )
+        .unwrap();
+        crate::storage::snapshot::write_checksums(&snapshot_dir).unwrap();
+        (root, snapshot_dir)
+    }
+
+    #[test]
+    fn restore_verify_accepts_valid_snapshot() {
+        let (root, snapshot_dir) = restore_verify_fixture("valid");
+
+        ensure_snapshot_verified(&snapshot_dir).expect("a valid snapshot verifies");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restore_verify_rejects_tampered_store_bytes() {
+        let (root, snapshot_dir) = restore_verify_fixture("tampered");
+        std::fs::write(snapshot_dir.join("ladybug.store"), b"tampered-db").unwrap();
+
+        let result = ensure_snapshot_verified(&snapshot_dir);
+
+        assert!(
+            result.is_err(),
+            "store bytes that no longer match checksums.json must fail verification"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restore_verify_rejects_missing_manifest() {
+        let (root, snapshot_dir) = restore_verify_fixture("no-manifest");
+        std::fs::remove_file(snapshot_dir.join("manifest.json")).unwrap();
+
+        let result = ensure_snapshot_verified(&snapshot_dir);
+
+        assert!(
+            result.is_err(),
+            "a snapshot with no manifest.json must fail verification"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 /// Where every CLI HTTP call goes. A constant because `bus-metrics` names it
@@ -2826,6 +3341,83 @@ fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
             }
         })
         .build()?)
+}
+
+/// Verify a snapshot directory before a restore copies anything from it.
+///
+/// Export writes `manifest.json` and `checksums.json` precisely so an
+/// import can check them; restoring without this call would import a
+/// tampered or corrupt snapshot — including its store-state sidecar, a
+/// checksummed member — as recorded identity with no integrity check.
+/// Err carries the verification error, or the report's error text when
+/// verification completed but judged the snapshot invalid.
+fn ensure_snapshot_verified(dir: &std::path::Path) -> anyhow::Result<()> {
+    match crate::storage::verify_snapshot(dir) {
+        Ok(report) if report.valid => Ok(()),
+        Ok(report) => Err(anyhow::anyhow!(
+            "{}",
+            report
+                .error
+                .unwrap_or_else(|| "snapshot is not valid".to_string())
+        )),
+        Err(e) => Err(anyhow::anyhow!("{}", e)),
+    }
+}
+
+/// Copy a snapshot's files into place for a restore: the store file, its
+/// WAL when the snapshot carries one, and its store-state sidecar when it
+/// carries one. Extracted from the Restore arm so the copy logic is
+/// testable without driving the whole CLI.
+fn copy_snapshot_into_place(
+    snapshot_dir: &std::path::Path,
+    target: &std::path::Path,
+) -> anyhow::Result<()> {
+    let snapshot = snapshot_dir.join("ladybug.store");
+    std::fs::copy(&snapshot, target)?;
+    let mut wal = snapshot.clone().into_os_string();
+    wal.push(".wal");
+    let wal = std::path::PathBuf::from(wal);
+    let mut target_wal = target.as_os_str().to_os_string();
+    target_wal.push(".wal");
+    let target_wal = std::path::PathBuf::from(target_wal);
+    if wal.exists() {
+        std::fs::copy(&wal, &target_wal)?;
+    } else if target_wal.exists() {
+        // The target DB file was absent (the Restore arm refuses an
+        // existing one), but an old store's WAL can be left behind at
+        // the target path as an orphan. It must not survive into the
+        // restored store, or the engine would replay it against a
+        // store it never belonged to (the issue-#76 hazard class,
+        // fixed for export but not restore). Removal is loud: a
+        // directory at the WAL path is an error, not a silent pass.
+        std::fs::remove_file(&target_wal).map_err(|e| {
+            anyhow::anyhow!(
+                "could not remove the stale write-ahead log at the restore target: {}",
+                e
+            )
+        })?;
+    }
+    // The snapshot's store-state sidecar
+    // restores to the target's sidecar path, so the
+    // restored store keeps its recorded identity.
+    // Snapshots written before sidecar carriage have none
+    // and restore exactly as they always have — except that an
+    // orphan sidecar left at the target path is removed, for the
+    // same reason as the WAL above: the restored store must not
+    // inherit the old store's recorded identity.
+    let snapshot_sidecar = snapshot_dir.join("ladybug.store.store-state.json");
+    let target_sidecar = crate::model_choice::store_state_path(target);
+    if snapshot_sidecar.exists() {
+        std::fs::copy(&snapshot_sidecar, &target_sidecar)?;
+    } else if target_sidecar.exists() {
+        std::fs::remove_file(&target_sidecar).map_err(|e| {
+            anyhow::anyhow!(
+                "could not remove the stale store-state sidecar at the restore target: {}",
+                e
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn main() -> anyhow::Result<()> {
@@ -3369,28 +3961,11 @@ async fn run() -> anyhow::Result<()> {
                     );
                     std::process::exit(1);
                 }
-                std::fs::copy(&snapshot, &target)?;
-                let mut wal = snapshot.clone().into_os_string();
-                wal.push(".wal");
-                let wal = std::path::PathBuf::from(wal);
-                if wal.exists() {
-                    let mut target_wal = target.clone().into_os_string();
-                    target_wal.push(".wal");
-                    std::fs::copy(&wal, std::path::PathBuf::from(target_wal))?;
+                if let Err(e) = ensure_snapshot_verified(std::path::Path::new(&dir)) {
+                    eprintln!("Snapshot verification failed: {}", e);
+                    std::process::exit(1);
                 }
-                // The snapshot's store-state sidecar
-                // restores to the target's sidecar path, so the
-                // restored store keeps its recorded identity.
-                // Snapshots written before sidecar carriage have none
-                // and restore exactly as they always have.
-                let snapshot_sidecar =
-                    std::path::Path::new(&dir).join("ladybug.store.store-state.json");
-                if snapshot_sidecar.exists() {
-                    std::fs::copy(
-                        &snapshot_sidecar,
-                        crate::model_choice::store_state_path(&target),
-                    )?;
-                }
+                copy_snapshot_into_place(std::path::Path::new(&dir), &target)?;
 
                 // Opened only after the copy, to verify the restored store
                 // reads back and to report what it holds.
@@ -4231,7 +4806,8 @@ async fn run() -> anyhow::Result<()> {
                         dry_run_mode: _,
                     } => {
                         let embedder = build_embedder()?;
-                        bind_fallback_serving_descriptor(&vector_store, &embedder);
+                        prepare_fallback_write_store(&vector_store, &embedder, &namespace)
+                            .await?;
                         let dir = cli_ingest_root(&dir);
                         let dir_path = std::path::Path::new(&dir);
                         let schema_str = if let Some(path) = schema_path {
@@ -4513,7 +5089,8 @@ async fn run() -> anyhow::Result<()> {
                         location,
                     } => {
                         let embedder = build_embedder()?;
-                        bind_fallback_serving_descriptor(&vector_store, &embedder);
+                        prepare_fallback_write_store(&vector_store, &embedder, &namespace)
+                            .await?;
                         let vector = embedder.embed(&content).await?;
                         let payload = crate::traits::MemoryPayload {
                             content: content.clone(),
@@ -4538,7 +5115,8 @@ async fn run() -> anyhow::Result<()> {
                         location,
                     } => {
                         let embedder = build_embedder()?;
-                        bind_fallback_serving_descriptor(&vector_store, &embedder);
+                        prepare_fallback_write_store(&vector_store, &embedder, &namespace)
+                            .await?;
                         match crate::server::edit_memory(
                             &*vector_store,
                             &*embedder,
