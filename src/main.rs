@@ -912,6 +912,30 @@ fn record_birth_identity(vector_store: &Arc<dyn VectorStore>) {
     }
 }
 
+/// Restore one conditional snapshot companion (the write-ahead log,
+/// the store-state sidecar) to its place beside the restore target,
+/// mirroring the snapshot: the restored store carries exactly the
+/// companions its snapshot has — no more, no fewer. When the
+/// snapshot carries the file it is copied over whatever the target
+/// slot holds; when it does not, a companion left at the target by
+/// a previous store is removed, so the restored store is never
+/// governed by a record (or a write-ahead log) its snapshot never
+/// contained. This is the restore-side dual of the mirror rule
+/// `export_database` applies at the source. A removal failure
+/// propagates, like a copy failure: a restore that cannot make the
+/// target truthful does not proceed.
+fn restore_snapshot_companion(
+    snapshot_path: &std::path::Path,
+    target_path: &std::path::Path,
+) -> std::io::Result<()> {
+    if snapshot_path.exists() {
+        std::fs::copy(snapshot_path, target_path)?;
+    } else if target_path.exists() {
+        std::fs::remove_file(target_path)?;
+    }
+    Ok(())
+}
+
 /// Whether some process holds the daemon lock right now.
 fn daemon_holds_lock(db_path: &std::path::Path) -> bool {
     // Read-only status probes must not create the lock file: open_daemon_lock
@@ -2677,6 +2701,168 @@ mod tests {
 
         assert!(gate_verify_daemon(None, own).is_err());
     }
+
+    /// A scratch area for the restore-companion tests: a snapshot
+    /// directory and a target directory under one temp root.
+    fn restore_mirror_scratch(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "ns-restore-mirror-{}-{}",
+            tag,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let snapshot_dir = root.join("snapshot");
+        let target_dir = root.join("target");
+        std::fs::create_dir_all(&snapshot_dir).expect("snapshot dir");
+        std::fs::create_dir_all(&target_dir).expect("target dir");
+        (root, snapshot_dir, target_dir)
+    }
+
+    fn restore_mirror_descriptor(model: &str) -> crate::traits::EmbeddingDescriptor {
+        crate::traits::EmbeddingDescriptor {
+            provider: "fastembed".to_string(),
+            model: model.to_string(),
+            revision: "onnx".to_string(),
+            dims: 4,
+            normalization: "unknown".to_string(),
+            preprocessing: "unknown".to_string(),
+            distance_metric: "cosine".to_string(),
+        }
+    }
+
+    fn restore_mirror_wal_path(db: &std::path::Path) -> std::path::PathBuf {
+        let mut wal = db.to_path_buf().into_os_string();
+        wal.push(".wal");
+        std::path::PathBuf::from(wal)
+    }
+
+    /// C3-2 (the verifier's repro, inverted): a legacy snapshot —
+    /// a DB file and no sidecar — restored into a target whose DB
+    /// was deleted but whose sidecar remains must not leave the
+    /// restored store governed by the previous store's record.
+    #[test]
+    fn restore_mirrors_sidecar_absence_over_a_stale_target_record() {
+        let (root, snapshot_dir, target_dir) = restore_mirror_scratch("sidecar-absence");
+        // The snapshot: a real store's DB file, no sidecar (legacy).
+        let snapshot_db = snapshot_dir.join("ladybug.store");
+        {
+            let _store = crate::store::ladybug::LadybugStore::for_testing(&snapshot_db, 4)
+                .expect("construct the snapshot store");
+        }
+        assert!(snapshot_db.exists());
+        assert!(!crate::model_choice::store_state_path(&snapshot_db).exists());
+
+        // The target: no DB, but a stale sidecar from a previous store.
+        let target_db = target_dir.join("ladybug.store");
+        let stale = crate::model_choice::StoreState {
+            version: crate::model_choice::STORE_STATE_VERSION,
+            has_data: true,
+            descriptor: restore_mirror_descriptor("ModelS"),
+        };
+        crate::model_choice::write_store_state(&target_db, &stale).expect("plant the stale sidecar");
+        assert_eq!(
+            crate::model_choice::read_store_state(&target_db)
+                .expect("the stale record reads back")
+                .descriptor
+                .model,
+            "ModelS"
+        );
+
+        // The arm's steps, in order: DB copy, WAL companion, sidecar companion.
+        std::fs::copy(&snapshot_db, &target_db).expect("copy the DB");
+        restore_snapshot_companion(
+            &restore_mirror_wal_path(&snapshot_db),
+            &restore_mirror_wal_path(&target_db),
+        )
+        .expect("WAL companion step");
+        restore_snapshot_companion(
+            &snapshot_dir.join("ladybug.store.store-state.json"),
+            &crate::model_choice::store_state_path(&target_db),
+        )
+        .expect("sidecar companion step");
+
+        assert!(
+            !crate::model_choice::store_state_path(&target_db).exists(),
+            "the stale sidecar must be removed when the snapshot carries none"
+        );
+        assert!(
+            crate::model_choice::read_store_state(&target_db).is_none(),
+            "the restored store must not be governed by the stale record"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// C3-2, the presence direction: a sidecar the snapshot carries
+    /// still restores onto the target, byte-identical — the mirror
+    /// rule must not over-remove.
+    #[test]
+    fn restore_copies_a_sidecar_the_snapshot_carries() {
+        let (root, snapshot_dir, target_dir) = restore_mirror_scratch("sidecar-presence");
+        let snapshot_db = snapshot_dir.join("ladybug.store");
+        std::fs::write(&snapshot_db, b"snapshot db bytes").expect("write the snapshot DB");
+        let recorded = crate::model_choice::StoreState {
+            version: crate::model_choice::STORE_STATE_VERSION,
+            has_data: true,
+            descriptor: restore_mirror_descriptor("ModelR"),
+        };
+        crate::model_choice::write_store_state(&snapshot_db, &recorded)
+            .expect("write the snapshot sidecar");
+
+        let target_db = target_dir.join("ladybug.store");
+        std::fs::copy(&snapshot_db, &target_db).expect("copy the DB");
+        restore_snapshot_companion(
+            &snapshot_dir.join("ladybug.store.store-state.json"),
+            &crate::model_choice::store_state_path(&target_db),
+        )
+        .expect("sidecar companion step");
+
+        let target_sidecar = crate::model_choice::store_state_path(&target_db);
+        assert!(target_sidecar.exists(), "the carried sidecar restores");
+        assert_eq!(
+            std::fs::read(&target_sidecar).expect("read the target sidecar"),
+            std::fs::read(snapshot_dir.join("ladybug.store.store-state.json"))
+                .expect("read the snapshot sidecar"),
+            "the restored sidecar is byte-identical to the snapshot's"
+        );
+        assert_eq!(
+            crate::model_choice::read_store_state(&target_db)
+                .expect("the restored record reads back")
+                .descriptor
+                .model,
+            "ModelR"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// C3-2, the second companion: the write-ahead log mirrors in
+    /// both directions — a stale target WAL is removed when the
+    /// snapshot has none, and a carried WAL is copied byte-identical.
+    #[test]
+    fn restore_mirrors_wal_absence_and_presence() {
+        let (root, snapshot_dir, target_dir) = restore_mirror_scratch("wal");
+        let snapshot_db = snapshot_dir.join("ladybug.store");
+        let target_db = target_dir.join("ladybug.store");
+        let snapshot_wal = restore_mirror_wal_path(&snapshot_db);
+        let target_wal = restore_mirror_wal_path(&target_db);
+
+        // Absence: stale target WAL, snapshot without one.
+        std::fs::write(&target_wal, b"stale wal bytes").expect("plant the stale WAL");
+        restore_snapshot_companion(&snapshot_wal, &target_wal).expect("WAL companion step");
+        assert!(
+            !target_wal.exists(),
+            "the stale WAL must be removed when the snapshot carries none"
+        );
+
+        // Presence: snapshot with a WAL, clean target.
+        std::fs::write(&snapshot_wal, b"snapshot wal bytes").expect("write the snapshot WAL");
+        restore_snapshot_companion(&snapshot_wal, &target_wal).expect("WAL companion step");
+        assert_eq!(
+            std::fs::read(&target_wal).expect("read the target WAL"),
+            b"snapshot wal bytes",
+            "the carried WAL restores byte-identical"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 /// Where every CLI HTTP call goes. A constant because `bus-metrics` names it
@@ -3394,27 +3580,32 @@ async fn run() -> anyhow::Result<()> {
                     std::process::exit(1);
                 }
                 std::fs::copy(&snapshot, &target)?;
+                // The snapshot's companions restore under the mirror
+                // rule (see `restore_snapshot_companion`): the
+                // write-ahead log and the store-state sidecar are
+                // copied when the snapshot carries them and removed
+                // from the target when it does not, so a legacy
+                // snapshot restored into a previously used path is
+                // not replayed under, or governed by, a previous
+                // store's companions.
                 let mut wal = snapshot.clone().into_os_string();
                 wal.push(".wal");
                 let wal = std::path::PathBuf::from(wal);
-                if wal.exists() {
-                    let mut target_wal = target.clone().into_os_string();
-                    target_wal.push(".wal");
-                    std::fs::copy(&wal, std::path::PathBuf::from(target_wal))?;
-                }
-                // The snapshot's store-state sidecar
-                // restores to the target's sidecar path, so the
-                // restored store keeps its recorded identity.
-                // Snapshots written before sidecar carriage have none
-                // and restore exactly as they always have.
+                let mut target_wal = target.clone().into_os_string();
+                target_wal.push(".wal");
+                restore_snapshot_companion(&wal, &std::path::PathBuf::from(target_wal))?;
+                // The snapshot's store-state sidecar restores to the
+                // target's sidecar path, so the restored store keeps
+                // its recorded identity; a snapshot written before
+                // sidecar carriage has none, and any sidecar the
+                // target path still holds from a previous store is
+                // removed instead of being inherited.
                 let snapshot_sidecar =
                     std::path::Path::new(&dir).join("ladybug.store.store-state.json");
-                if snapshot_sidecar.exists() {
-                    std::fs::copy(
-                        &snapshot_sidecar,
-                        crate::model_choice::store_state_path(&target),
-                    )?;
-                }
+                restore_snapshot_companion(
+                    &snapshot_sidecar,
+                    &crate::model_choice::store_state_path(&target),
+                )?;
 
                 // Opened only after the copy, to verify the restored store
                 // reads back and to report what it holds.
