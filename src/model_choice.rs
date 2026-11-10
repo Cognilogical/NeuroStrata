@@ -100,11 +100,16 @@ use std::path::{Path, PathBuf};
 /// refuses (a model was already chosen by use — see [`store_has_data`]; a
 /// pristine store, whose file a bare daemon start creates before any data
 /// exists, does not refuse); an existing `embedders.json` that parses to
-/// anything other than exactly the built-in default refuses, byte-identical;
-/// an unparseable existing file refuses (the writer never repairs a file it
-/// cannot classify, even though the loader tolerates one by ignoring it).
-/// The one replaceable existing file is the exact built-in default a first
-/// daemon start materializes before any data is recorded.
+/// anything other than the empty list or exactly the built-in default
+/// refuses, byte-identical; an unparseable existing file refuses (the
+/// writer never repairs a file it cannot classify, even though the loader
+/// tolerates one by ignoring it). The replaceable existing files are the
+/// exact built-in default a first daemon start materializes before any
+/// data is recorded, and an empty list — which the loader itself treats
+/// as the default (materializing the default over it) and the offer
+/// boundary already qualifies; the writer applies the same
+/// allowable-file rule as the offer boundary, so a state the system
+/// offers the choice on can always accept the pick.
 pub fn write_initial_embedders_file(
     config_dir: &Path,
     choice: &ModelChoice,
@@ -139,7 +144,9 @@ fn write_initial_embedders_file_inner(
             )
         })?;
         let default = default_acceptable_embedders();
-        if serde_json::to_value(&existing)? != serde_json::to_value(&default)? {
+        if !existing.is_empty()
+            && serde_json::to_value(&existing)? != serde_json::to_value(&default)?
+        {
             anyhow::bail!(
                 "refusing to overwrite {}: its embedder list is not the built-in default",
                 target.display()
@@ -910,6 +917,49 @@ mod tests {
             before,
             "a refused write must leave the file byte-identical"
         );
+    }
+
+    #[test]
+    fn empty_embedder_list_is_replaceable_by_the_choice_writer() {
+        // C3-4: the offer boundary qualifies an empty embedder list
+        // (the loader treats it as the built-in default), so the
+        // writer must accept the same state — pre-fix it refused with
+        // "its embedder list is not the built-in default" and the
+        // pick made at the offered prompt could never be written.
+        let (tmp, config_dir) = fresh_config_dir("empty-list-writer");
+        let target = config_dir.join("embedders.json");
+        fs::write(&target, "[]\n").expect("pre-write empty-list file");
+        let db_path = tmp.path().join("neurostrata.db");
+        write_initial_embedders_file(&config_dir, bge_small_q(), &db_path)
+            .expect("an empty embedder list is replaceable by the choice writer");
+        let entries = get_acceptable_embedders_in(&config_dir).expect("loader reads the file");
+        assert_eq!(entries[0].model_name, "BGESmallENV15Q");
+        assert_eq!(entries[0].dimensions, 384);
+    }
+
+    #[test]
+    fn empty_embedder_list_pick_surfaces_and_clears_the_marker() {
+        // C3-4, the surfacing half of the verifier's repro: with an
+        // empty embedder list in place, a pending choice surfaces, the
+        // pick persists, and the marker clears. Pre-fix the writer's
+        // refusal propagated out of the surfacing, the marker survived
+        // unusable, and the file stayed `[]`.
+        let (tmp, config_dir) = fresh_config_dir("empty-list-surface");
+        fs::write(config_dir.join("embedders.json"), "[]\n").expect("pre-write empty-list file");
+        record_pending_choice(&config_dir);
+        let db_path = tmp.path().join("neurostrata.db");
+        let outcome = surface_pending_choice(&config_dir, &db_path, true, &mut |_offer| {
+            ChoiceResponse::Pick(0)
+        })
+        .expect("the pick surfaces without a writer refusal");
+        let picked = candidates()[0].model_name;
+        assert_eq!(outcome, PendingChoiceOutcome::Chosen(picked));
+        assert!(
+            !pending_choice_path(&config_dir).exists(),
+            "a persisted pick clears the pending marker"
+        );
+        let entries = get_acceptable_embedders_in(&config_dir).expect("loader reads the file");
+        assert_eq!(entries[0].model_name, picked);
     }
 
     #[test]
