@@ -1667,8 +1667,10 @@ impl LockedUnknownStamp {
     /// empty check but before the stamp, landing under a
     /// `has_data: false` record its first-write flip cannot move
     /// (the flip no-ops on `LockedUnknown`). Fail-closed: a false
-    /// attestation stamps nothing, and an attestation error
-    /// propagates before any stamp is considered.
+    /// attestation stamps nothing, and an attestation
+    /// query-execution error downgrades to that same `false`, so
+    /// nothing is stamped; only the width leg's drop/recreate DDL
+    /// errors propagate.
     fn attest_and_stamp(
         &self,
         conn: &Connection,
