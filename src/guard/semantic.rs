@@ -320,6 +320,34 @@ mod tests {
         );
     }
 
+    /// A generic `rule` row is not a `guard_rule`, so the guard listing never
+    /// returns it: it can only reach the guard through typed search. With the
+    /// mock reporting distances like the real store, that path is exercised.
+    #[tokio::test]
+    async fn a_rule_row_reaches_the_guard_only_through_typed_search() {
+        use crate::guard::testkit::{MockStore, StubEmbedder};
+        use crate::traits::{Embedder, VectorStore};
+
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        let payload = rule_row("seeded-rule", 0.0, "rule").payload;
+        store
+            .upsert("guard", "seeded-rule", vec![0.0; 4], payload)
+            .await
+            .expect("seeding a rule row must succeed");
+
+        let matcher = SemanticEvaluator::new(store, embedder, "guard");
+        let rules = matcher
+            .match_constraints("docker run attempted", 5)
+            .await
+            .expect("matching constraints must succeed");
+
+        assert!(
+            rules.iter().any(|r| r.id == "seeded-rule"),
+            "a rule row found by typed search must survive the distance floor: {rules:?}"
+        );
+    }
+
     /// Composite Rec #4: row conversion applies the similarity cutoff and the
     /// rule-type filter. A rule row below `MIN_CONSTRAINT_SIMILARITY` must not
     /// become a match, or loosely related memories would fire the guard as
