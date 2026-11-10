@@ -2149,7 +2149,12 @@ impl LadybugStore {
     /// `write_with_deadline` closure executes inside the turn, so no
     /// writer turn of this instance ends between the attestation and
     /// the stamp, and the stamp is never consumed from a result
-    /// parked across the turn boundary.
+    /// parked across the turn boundary. That guarantee is scoped to
+    /// writers sharing this instance's turn: `write_lock` is
+    /// per-`Self`, so a second `LadybugStore` instance co-open on
+    /// the same database is outside it. Whether co-open is possible
+    /// at all is unproven in-tree; the cross-instance residual is
+    /// tracked in #92 (probe-first).
     ///
     /// The helper's width leg is safe both ways: for a still-empty
     /// store the width was already reconciled by the first
@@ -4854,7 +4859,12 @@ impl VectorStore for LadybugStore {
             // findings SA-F1 + N1). That fresh attestation and the
             // stamp it gates execute as one unit inside a single
             // writer's turn, so the window cannot reopen between the
-            // stamp step's own check and its record.
+            // stamp step's own check and its record — for writers
+            // sharing this instance's turn. A writer in a second,
+            // co-open instance shares no turn with this one, so the
+            // guarantee does not extend to it; whether such co-open
+            // is even possible is unproven, and the cross-instance
+            // residual is tracked in #92.
             if locked_unknown_attested_empty.load(std::sync::atomic::Ordering::Acquire) {
                 self.reattest_and_upgrade_empty_locked_unknown_store_state(dimensions)
                     .await;
