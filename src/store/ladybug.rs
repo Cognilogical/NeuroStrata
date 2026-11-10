@@ -1599,6 +1599,135 @@ impl FirstWriteFlip {
     }
 }
 
+/// A clonable handle to everything the LockedUnknown provenance
+/// stamp touches, built from `&LadybugStore` at stamp-step entry so
+/// one clone can move into the `'static` write closure: the
+/// attestation and the stamp are then performed by the same blocking
+/// task, inside the same writer's turn (see
+/// `LadybugStore::reattest_and_upgrade_empty_locked_unknown_store_state`).
+/// Mirrors [`FirstWriteFlip`], the handle that lets the committing
+/// write task perform the first-data flip: a transition whose
+/// decision is made under a writer's turn must be executed in that
+/// turn, not by the caller after the turn has been released.
+#[derive(Clone)]
+struct LockedUnknownStamp {
+    store_state: Arc<std::sync::Mutex<Option<CachedStoreState>>>,
+    local_path: PathBuf,
+    serving: Option<crate::traits::EmbeddingDescriptor>,
+    embed_config_dir: PathBuf,
+    dimensions: usize,
+}
+
+impl LockedUnknownStamp {
+    /// This handle's view of the store-state sidecar, mirroring
+    /// `FirstWriteFlip::cached_store_state`: the cache is shared
+    /// with the store, and a state the store already loaded is
+    /// authoritative. (The stamp step's callers have always loaded
+    /// the cache by entry: `init` classifies the store to compute
+    /// the upgrade candidacy before the stamp step runs.)
+    fn cached_store_state(&self) -> CachedStoreState {
+        let mut cache = self.store_state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(state) = &*cache {
+            return state.clone();
+        }
+        let state = match crate::model_choice::read_store_state(&self.local_path) {
+            Some(recorded) => CachedStoreState::Recorded(recorded),
+            None => CachedStoreState::LockedUnknown,
+        };
+        *cache = Some(state.clone());
+        state
+    }
+
+    fn set_cached_store_state(&self, state: CachedStoreState) {
+        let mut cache = self.store_state.lock().unwrap_or_else(|e| e.into_inner());
+        *cache = Some(state);
+    }
+
+    /// Whether the serving descriptor equals the currently
+    /// configured descriptor, mirroring
+    /// `LadybugStore::serving_matches_configured` on this handle's
+    /// snapshot of the configured-descriptor inputs. A resolution
+    /// failure is logged and reads as "no match".
+    fn serving_matches_configured(&self, serving: &crate::traits::EmbeddingDescriptor) -> bool {
+        match configured_embedding_descriptor_in(&self.embed_config_dir, self.dimensions) {
+            Ok(configured) => configured == *serving,
+            Err(e) => {
+                tracing::warn!("configured model did not resolve for the store-state sidecar: {e}");
+                false
+            }
+        }
+    }
+
+    /// Attest emptiness from the engine and, iff the engine attests
+    /// the table empty, record the pristine sidecar — as one unit.
+    /// This is the whole decision-and-transition of the #74
+    /// LockedUnknown provenance upgrade, and it runs only inside the
+    /// stamp step's writer turn: splitting the stamp out of the turn
+    /// would reopen the window in which a write commits after the
+    /// empty check but before the stamp, landing under a
+    /// `has_data: false` record its first-write flip cannot move
+    /// (the flip no-ops on `LockedUnknown`). Fail-closed: a false
+    /// attestation stamps nothing, and an attestation error
+    /// propagates before any stamp is considered.
+    fn attest_and_stamp(
+        &self,
+        conn: &Connection,
+        dimensions: usize,
+        create_node_table: &str,
+        create_rel_tables: &[&str],
+    ) -> Result<()> {
+        let attested_empty = reconcile_empty_locked_unknown_width(
+            conn,
+            dimensions,
+            create_node_table,
+            create_rel_tables,
+        )?;
+        if attested_empty {
+            self.stamp_pristine_identity();
+        }
+        Ok(())
+    }
+
+    /// Record the pristine sidecar for a LockedUnknown store the
+    /// engine attested empty in this same writer's turn (issue #74),
+    /// under the serving descriptor bound when the stamp step was
+    /// entered. This is the recovery for fresh-store provenance lost
+    /// across a non-serving open (or a refused first write): the bare
+    /// DB file such an open leaves behind makes the store classify
+    /// LockedUnknown, which no other path upgrades. The gates are
+    /// deliberately narrow — the cached state is still
+    /// LockedUnknown, a serving descriptor is bound, and serving
+    /// matches the configuration (the same positive equality the
+    /// FreshUnrecorded arm of `maintain_store_state` requires) — and
+    /// the caller attested emptiness from the engine in this same
+    /// turn, so a genuine pre-sidecar store with data is never
+    /// recorded here. Best effort, like `maintain_store_state`: a
+    /// sidecar failure is logged, not propagated, and the cached
+    /// state stays LockedUnknown so a later init can retry.
+    fn stamp_pristine_identity(&self) {
+        if !matches!(self.cached_store_state(), CachedStoreState::LockedUnknown) {
+            return;
+        }
+        let Some(serving) = &self.serving else {
+            return;
+        };
+        if !self.serving_matches_configured(serving) {
+            return;
+        }
+        let state = crate::model_choice::StoreState {
+            version: crate::model_choice::STORE_STATE_VERSION,
+            has_data: false,
+            descriptor: serving.clone(),
+        };
+        match crate::model_choice::write_store_state(&self.local_path, &state) {
+            Ok(()) => self.set_cached_store_state(CachedStoreState::Recorded(state)),
+            Err(e) => {
+                tracing::warn!("store-state sidecar write failed: {e}")
+            }
+        }
+    }
+}
+
 impl LadybugStore {
     /// Construct a `LadybugStore` for tests with a small system footprint so
     /// `cargo test` (parallel by default) does not mmap-reserve 8 TiB per
@@ -1862,6 +1991,21 @@ impl LadybugStore {
         }
     }
 
+    /// The LockedUnknown stamp handle for this store (see
+    /// [`LockedUnknownStamp`]): a snapshot of the stamp's inputs
+    /// taken at stamp-step entry — the shared store-state cache, the
+    /// sidecar path, the serving descriptor this process is bound
+    /// with, and the configured-descriptor inputs.
+    fn locked_unknown_stamp(&self) -> LockedUnknownStamp {
+        LockedUnknownStamp {
+            store_state: Arc::clone(&self.store_state),
+            local_path: self.local_path.clone(),
+            serving: self.serving_descriptor(),
+            embed_config_dir: self.embed_config_dir.clone(),
+            dimensions: self.dimensions,
+        }
+    }
+
     /// Load (once per process) this store's view of the store-state
     /// sidecar. Pure filesystem reads against a store this process
     /// already holds open; never opens another store.
@@ -1974,95 +2118,52 @@ impl LadybugStore {
         }
     }
 
-    /// Record the pristine sidecar for a LockedUnknown store the
-    /// engine attested empty during this `init` (issue #74), under
-    /// this process's serving descriptor. This is the recovery for
-    /// fresh-store provenance lost across a non-serving open (or a
-    /// refused first write): the bare DB file such an open leaves
-    /// behind makes the store classify LockedUnknown, which no other
-    /// path upgrades. The gates are deliberately narrow — the cached
-    /// state is still LockedUnknown, a serving descriptor is bound,
-    /// and serving matches the configuration (the same positive
-    /// equality the FreshUnrecorded arm of `maintain_store_state`
-    /// requires) — and the caller attested emptiness from the engine
-    /// under the writer's turn, so a genuine pre-sidecar store with
-    /// data is never recorded here. Best effort, like
-    /// `maintain_store_state`: a sidecar failure is logged, not
-    /// propagated, and the cached state stays LockedUnknown so a
-    /// later init can retry.
-    fn upgrade_empty_locked_unknown_store_state(&self) {
-        if !matches!(self.cached_store_state(), CachedStoreState::LockedUnknown) {
-            return;
-        }
-        let Some(serving) = self.serving_descriptor() else {
-            return;
-        };
-        if !self.serving_matches_configured(&serving) {
-            return;
-        }
-        let state = crate::model_choice::StoreState {
-            version: crate::model_choice::STORE_STATE_VERSION,
-            has_data: false,
-            descriptor: serving,
-        };
-        match crate::model_choice::write_store_state(&self.local_path, &state) {
-            Ok(()) => self.set_cached_store_state(CachedStoreState::Recorded(state)),
-            Err(e) => {
-                tracing::warn!("store-state sidecar write failed: {e}")
-            }
-        }
-    }
-
-    /// The stamp step of the #74 LockedUnknown provenance upgrade,
-    /// re-attesting emptiness at stamp time (overseer panel
-    /// condition 3, findings SA-F1 + N1).
+    /// The stamp step of the #74 LockedUnknown provenance upgrade:
+    /// emptiness is attested and the pristine sidecar is stamped as
+    /// one unit inside a single writer's turn (overseer panel
+    /// condition 3, findings SA-F1 + N1, and the split-turn follow-up
+    /// finding).
     ///
     /// The first attestation happens inside `init`'s schema closure,
-    /// under that instance's writer's turn; the stamp itself runs
-    /// after the closure returns, and stamping alone re-checks only
-    /// cached state + serving == configured — never emptiness again.
-    /// A write landing between the attestation and the stamp would
-    /// therefore be stamped over as if the store were pristine. Two
-    /// shapes reach that window: an intra-instance write from a
-    /// primed non-canonical writer, and — needing no priming at
-    /// all — a write from a second `LadybugStore` instance on the
-    /// same database, whose `write_lock` is a different per-Self
-    /// lock and so shares no turn with this instance. Re-attesting
-    /// inside a fresh writer's turn at stamp time closes both: the
-    /// stamp lands only when the engine still attests the table
-    /// empty at that moment, with the same DDL the schema closure
-    /// used (see [`memory_table_ddl`]).
+    /// under that instance's writer's turn; a write landing after it
+    /// — from a primed non-canonical writer in this instance, or,
+    /// needing no priming at all, from a second `LadybugStore`
+    /// instance on the same database, whose `write_lock` is a
+    /// different per-Self lock — must never be stamped over as if
+    /// the store were pristine. An earlier shape of this step
+    /// re-attested inside a fresh writer's turn but executed the
+    /// stamp itself after `.await` returned, with the turn already
+    /// released: a queued write could commit after the empty check
+    /// but before the stamp, its first-write flip no-ops on
+    /// `LockedUnknown`, and the stamp then recorded `has_data: false`
+    /// over the populated store. The step now hands the whole
+    /// decision-and-transition to
+    /// [`LockedUnknownStamp::attest_and_stamp`], which the
+    /// `write_with_deadline` closure executes inside the turn, so no
+    /// writer turn of this instance ends between the attestation and
+    /// the stamp, and the stamp is never consumed from a result
+    /// parked across the turn boundary.
     ///
-    /// The helper's width leg on this second call is safe both
-    /// ways: for a still-empty store the width was already
-    /// reconciled by the first attestation, so the physical width
-    /// already matches and nothing is dropped; if rows landed in
-    /// the window, the helper's row-count check returns `false`
-    /// before any drop/recreate is considered.
+    /// The helper's width leg is safe both ways: for a still-empty
+    /// store the width was already reconciled by the first
+    /// attestation, so the physical width already matches and
+    /// nothing is dropped; if rows landed in the window, the
+    /// helper's row-count check returns `false` before any
+    /// drop/recreate is considered.
     ///
-    /// Fail-closed and best-effort, matching the stamp's existing
-    /// contract: a false re-attestation or a failed turn leaves the
-    /// store unstamped and LockedUnknown, and `init` still succeeds
-    /// — a later init can retry the upgrade.
+    /// Fail-closed and best-effort, matching the stamp's contract: a
+    /// false attestation or a failed turn stamps nothing, a sidecar
+    /// failure is logged inside the stamp and never propagated, and
+    /// `init` still succeeds — the store stays LockedUnknown, so a
+    /// later init can retry the upgrade.
     async fn reattest_and_upgrade_empty_locked_unknown_store_state(&self, dimensions: usize) {
         let (create_node_table, create_rel_tables) = memory_table_ddl(dimensions);
-        let reattested_empty = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let reattested_flag = reattested_empty.clone();
-        let outcome = self
+        let stamp = self.locked_unknown_stamp();
+        let _ = self
             .write_with_deadline("re-attesting an empty LockedUnknown store", move |conn| {
-                let attested_empty = reconcile_empty_locked_unknown_width(
-                    conn,
-                    dimensions,
-                    &create_node_table,
-                    &create_rel_tables,
-                )?;
-                reattested_flag.store(attested_empty, std::sync::atomic::Ordering::Release);
-                Ok(())
+                stamp.attest_and_stamp(conn, dimensions, &create_node_table, &create_rel_tables)
             })
             .await;
-        if outcome.is_ok() && reattested_empty.load(std::sync::atomic::Ordering::Acquire) {
-            self.upgrade_empty_locked_unknown_store_state();
-        }
     }
 
     /// Whether the serving descriptor equals the currently configured
@@ -4725,7 +4826,8 @@ impl VectorStore for LadybugStore {
                 .store(true, std::sync::atomic::Ordering::Release);
             // Issue #74: an engine-attested empty LockedUnknown store
             // first records its pristine identity under the serving
-            // descriptor (see `upgrade_empty_locked_unknown_store_state`);
+            // descriptor (see
+            // `reattest_and_upgrade_empty_locked_unknown_store_state`);
             // the general maintenance below then proceeds as for any
             // recorded-pristine store.
             //
@@ -4739,7 +4841,10 @@ impl VectorStore for LadybugStore {
             // and the stamp alone re-checks only cached state and
             // serving == configured, so it would record a pristine
             // identity over live data (overseer panel condition 3,
-            // findings SA-F1 + N1).
+            // findings SA-F1 + N1). That fresh attestation and the
+            // stamp it gates execute as one unit inside a single
+            // writer's turn, so the window cannot reopen between the
+            // stamp step's own check and its record.
             if locked_unknown_attested_empty.load(std::sync::atomic::Ordering::Acquire) {
                 self.reattest_and_upgrade_empty_locked_unknown_store_state(dimensions)
                     .await;
@@ -16678,6 +16783,199 @@ eurostrata\src\daemon.rs",
             matches!(store.cached_store_state(), CachedStoreState::LockedUnknown),
             "the cached state stays LockedUnknown when the re-attestation finds rows"
         );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn locked_unknown_stamp_step_attests_and_stamps_in_one_turn() {
+        // Split-turn follow-up finding: condition 3's re-attestation
+        // (above) closed the attestation→stamp window at init level,
+        // but the stamp step itself still executed the stamp AFTER
+        // its re-attestation's writer turn had been released,
+        // consuming a bool parked across the turn boundary: a write
+        // committing in between — its first-write flip no-ops on
+        // LockedUnknown — was recorded over as `has_data: false`.
+        // The fix moves the stamp into the turn:
+        // `LockedUnknownStamp::attest_and_stamp` is the single unit
+        // the turn's closure executes.
+        //
+        // Seam disclosure (the condition-3 precedent): a
+        // deterministic interleave *inside* the turn is not
+        // constructible — no hook runs between the attestation and
+        // the stamp within the turn, which is precisely the property
+        // the fix relies on — so this pins behavior at the seam the
+        // fix creates, the attest-and-stamp unit itself, driven here
+        // through `with_conn` (which holds the same write turn the
+        // production closure runs under):
+        //   * on a store with a landed row the unit stamps nothing;
+        //   * on an empty store the unit ALONE stamps the pristine
+        //     sidecar and moves the cached state — nothing runs
+        //     after it. Re-splitting the stamp out of the unit (the
+        //     pre-fix shape: attest in the turn, stamp after the
+        //     `.await` from a parked flag) fails the empty-store leg,
+        //     because the unit then leaves the store unstamped.
+        let previous = without_model_env();
+
+        // Row leg: the state the window produces — LockedUnknown,
+        // serving == configured, a row landed (cross-instance, as in
+        // the condition-3 test).
+        let fx = store_state_fixture("p1-stamp-turn-row", "ModelA");
+        let creator = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        creator.init("probe").await.expect("init");
+        drop(creator);
+        let writer = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        writer.init("probe").await.expect("init");
+        writer
+            .upsert(
+                "probe",
+                "m1",
+                vec![0.1, 0.2, 0.3, 0.4],
+                store_state_payload(),
+            )
+            .await
+            .expect("the second instance's write lands");
+        drop(writer);
+        assert!(
+            !crate::model_choice::store_state_path(&fx.db).exists(),
+            "the landed write backfills no sidecar"
+        );
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("reopen temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        assert!(
+            matches!(store.cached_store_state(), CachedStoreState::LockedUnknown),
+            "precondition: the stamping instance classifies LockedUnknown"
+        );
+        let stamp = store.locked_unknown_stamp();
+        let (create_node_table, create_rel_tables) = memory_table_ddl(4);
+        store
+            .with_conn(move |conn| {
+                stamp.attest_and_stamp(conn, 4, &create_node_table, &create_rel_tables)
+            })
+            .await
+            .expect("the attest-and-stamp unit runs and attests without error");
+        assert!(
+            !crate::model_choice::store_state_path(&fx.db).exists(),
+            "the unit must not record a pristine sidecar over a landed row"
+        );
+        assert!(
+            matches!(store.cached_store_state(), CachedStoreState::LockedUnknown),
+            "the cached state stays LockedUnknown when the unit's attestation finds rows"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+
+        // Empty leg: the unit alone — invoked exactly once, with no
+        // post-turn stamp after it — records the pristine identity.
+        let fx = store_state_fixture("p1-stamp-turn-empty", "ModelA");
+        let creator = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        creator.init("probe").await.expect("init");
+        drop(creator);
+        assert!(
+            !crate::model_choice::store_state_path(&fx.db).exists(),
+            "the pre-sidecar fixture carries no sidecar"
+        );
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("reopen temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        assert!(
+            matches!(store.cached_store_state(), CachedStoreState::LockedUnknown),
+            "precondition: the stamping instance classifies LockedUnknown"
+        );
+        let stamp = store.locked_unknown_stamp();
+        let (create_node_table, create_rel_tables) = memory_table_ddl(4);
+        store
+            .with_conn(move |conn| {
+                stamp.attest_and_stamp(conn, 4, &create_node_table, &create_rel_tables)
+            })
+            .await
+            .expect("the attest-and-stamp unit runs and attests without error");
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["has_data"], json!(false));
+        assert_eq!(sidecar["descriptor"]["model"], json!("ModelA"));
+        match store.cached_store_state() {
+            CachedStoreState::Recorded(recorded) => {
+                assert!(!recorded.has_data);
+                assert_eq!(recorded.descriptor, serving_descriptor_for("ModelA"));
+            }
+            _ => panic!("the unit moves the cached state to Recorded(pristine)"),
+        }
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn locked_unknown_concurrent_upsert_never_lands_under_a_pristine_stamp() {
+        // The window at the production seam: the stamp step and an
+        // upsert from the SAME instance race for the instance's
+        // writer turn — the queued-upsert shape the split-turn
+        // finding names. Whichever order the turns run in, the
+        // outcome must never be a row sitting under a
+        // `has_data: false` record:
+        //   * upsert first: its flip no-ops on LockedUnknown, and
+        //     the stamp step's in-turn attestation then finds the
+        //     row and stamps nothing (no sidecar at all);
+        //   * stamp first: the store is Recorded pristine when the
+        //     upsert commits, and its first-write flip moves the
+        //     record to `has_data: true` in the committing turn.
+        // Both orders are sound, so the invariant below — never a
+        // pristine record over a landed row — holds deterministically
+        // with the stamp inside the turn.
+        let previous = without_model_env();
+        let fx = store_state_fixture("p1-stamp-window", "ModelA");
+        let creator = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        creator.init("probe").await.expect("init");
+        drop(creator);
+        assert!(
+            !crate::model_choice::store_state_path(&fx.db).exists(),
+            "the pre-sidecar fixture carries no sidecar"
+        );
+
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("reopen temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        assert!(
+            matches!(store.cached_store_state(), CachedStoreState::LockedUnknown),
+            "precondition: the stamping instance classifies LockedUnknown"
+        );
+        let stamp_step = store.reattest_and_upgrade_empty_locked_unknown_store_state(4);
+        let write = store.upsert(
+            "probe",
+            "m1",
+            vec![0.1, 0.2, 0.3, 0.4],
+            store_state_payload(),
+        );
+        let (_, written) = tokio::join!(stamp_step, write);
+        written.expect("the racing upsert succeeds in either turn order");
+        let (_, landed) = store
+            .get("probe", "m1")
+            .await
+            .expect("read the raced row back")
+            .expect("the raced row landed");
+        assert_eq!(landed.content, store_state_payload().content);
+        if crate::model_choice::store_state_path(&fx.db).exists() {
+            let sidecar = read_sidecar(&fx.db);
+            assert_eq!(
+                sidecar["has_data"],
+                json!(true),
+                "a landed row must never sit under a pristine (has_data: false) record"
+            );
+            assert_eq!(sidecar["descriptor"]["model"], json!("ModelA"));
+        }
         drop(store);
         let _ = std::fs::remove_dir_all(&fx.root);
         restore_model_env(previous);
