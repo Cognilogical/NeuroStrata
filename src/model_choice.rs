@@ -100,11 +100,15 @@ use std::path::{Path, PathBuf};
 /// refuses (a model was already chosen by use — see [`store_has_data`]; a
 /// pristine store, whose file a bare daemon start creates before any data
 /// exists, does not refuse); an existing `embedders.json` that parses to
-/// anything other than exactly the built-in default refuses, byte-identical;
-/// an unparseable existing file refuses (the writer never repairs a file it
-/// cannot classify, even though the loader tolerates one by ignoring it).
-/// The one replaceable existing file is the exact built-in default a first
-/// daemon start materializes before any data is recorded.
+/// anything other than the empty list or exactly the built-in default
+/// refuses, byte-identical; an unparseable existing file refuses (the
+/// writer never repairs a file it cannot classify, even though the loader
+/// tolerates one by ignoring it). The replaceable existing files are the
+/// exact built-in default a first daemon start materializes before any
+/// data is recorded, and an empty list — which the loader itself treats
+/// as the default and the offer boundary already qualifies; the writer
+/// applies the same allowable-file rule as the offer boundary, so a state
+/// the system offers the choice on can always accept the pick.
 pub fn write_initial_embedders_file(
     config_dir: &Path,
     choice: &ModelChoice,
@@ -138,10 +142,9 @@ fn write_initial_embedders_file_inner(
                 target.display()
             )
         })?;
-        let default = default_acceptable_embedders();
-        if serde_json::to_value(&existing)? != serde_json::to_value(&default)? {
+        if !embedders_entries_qualify(&existing) {
             anyhow::bail!(
-                "refusing to overwrite {}: its embedder list is not the built-in default",
+                "refusing to overwrite {}: its embedder list is neither empty nor the built-in default",
                 target.display()
             );
         }
@@ -399,6 +402,15 @@ fn clear_pending_choice(config_dir: &Path) {
     let _ = fs::remove_file(pending_choice_path(config_dir));
 }
 
+/// The one allowable-file rule for an existing `embedders.json`, shared
+/// by the offer boundary and the choice writer: a parsed embedder list
+/// qualifies when it is empty or exactly the built-in default.
+fn embedders_entries_qualify(entries: &[AcceptableEmbedder]) -> bool {
+    entries.is_empty()
+        || serde_json::to_value(entries).ok()
+            == serde_json::to_value(default_acceptable_embedders()).ok()
+}
+
 /// Whether the `embedders.json` state in `config_dir` still qualifies for
 /// a first-run offer: the file is absent, an empty list, or exactly the
 /// built-in default. An unparseable file is operator-present — it never
@@ -414,10 +426,7 @@ fn embedders_file_qualifies_for_offer(config_dir: &Path) -> bool {
     let Ok(entries) = serde_json::from_str::<Vec<AcceptableEmbedder>>(&content) else {
         return false;
     };
-    if entries.is_empty() {
-        return true;
-    }
-    serde_json::to_value(&entries).ok() == serde_json::to_value(default_acceptable_embedders()).ok()
+    embedders_entries_qualify(&entries)
 }
 
 /// The offer condition: the store has recorded no data yet (the same
@@ -910,6 +919,94 @@ mod tests {
             before,
             "a refused write must leave the file byte-identical"
         );
+    }
+
+    #[test]
+    fn empty_embedder_list_is_replaceable_by_the_choice_writer() {
+        // The offer boundary qualifies an empty embedder list (the
+        // loader treats it as the built-in default), so the writer must
+        // accept the same state — otherwise the pick made at the offered
+        // prompt could never be written.
+        let (tmp, config_dir) = fresh_config_dir("empty-list-writer");
+        let target = config_dir.join("embedders.json");
+        fs::write(&target, "[]\n").expect("pre-write empty-list file");
+        let db_path = tmp.path().join("neurostrata.db");
+        write_initial_embedders_file(&config_dir, bge_small_q(), &db_path)
+            .expect("an empty embedder list is replaceable by the choice writer");
+        let entries = get_acceptable_embedders_in(&config_dir).expect("loader reads the file");
+        assert_eq!(entries[0].model_name, "BGESmallENV15Q");
+        assert_eq!(entries[0].dimensions, 384);
+    }
+
+    #[test]
+    fn empty_embedder_list_pick_surfaces_and_clears_the_marker() {
+        // The surfacing half: with an empty embedder list in place, a
+        // pending choice surfaces, the pick persists, and the marker
+        // clears.
+        let (tmp, config_dir) = fresh_config_dir("empty-list-surface");
+        fs::write(config_dir.join("embedders.json"), "[]\n").expect("pre-write empty-list file");
+        record_pending_choice(&config_dir);
+        let db_path = tmp.path().join("neurostrata.db");
+        let outcome = surface_pending_choice(&config_dir, &db_path, true, &mut |_offer| {
+            ChoiceResponse::Pick(0)
+        })
+        .expect("the pick surfaces without a writer refusal");
+        let picked = candidates()[0].model_name;
+        assert_eq!(outcome, PendingChoiceOutcome::Chosen(picked));
+        assert!(
+            !pending_choice_path(&config_dir).exists(),
+            "a persisted pick clears the pending marker"
+        );
+        let entries = get_acceptable_embedders_in(&config_dir).expect("loader reads the file");
+        assert_eq!(entries[0].model_name, picked);
+    }
+
+    #[test]
+    fn offer_and_writer_agree_on_embedders_file_states() {
+        // One shared rule decides which existing embedders files may be
+        // replaced: absent, empty, or exactly the built-in default
+        // qualify; a non-default list and an unparseable file do not.
+        // For every state, a file the offer qualifies must accept the
+        // pick, and a file it does not qualify must refuse it.
+        let default_json =
+            serde_json::to_string_pretty(&default_acceptable_embedders()).expect("serialize");
+        let cases: [(&str, Option<String>, bool); 5] = [
+            ("absent", None, true),
+            ("empty", Some("[]\n".to_string()), true),
+            ("exact-default", Some(default_json), true),
+            (
+                "non-default",
+                Some(
+                    "[{\"model_name\":\"SnowflakeArcticEmbedMQ\",\"dimensions\":768}]\n"
+                        .to_string(),
+                ),
+                false,
+            ),
+            ("unparseable", Some("{not json".to_string()), false),
+        ];
+        for (tag, contents, expected) in cases {
+            let (tmp, config_dir) = fresh_config_dir(&format!("agree-{tag}"));
+            if let Some(contents) = contents {
+                fs::write(config_dir.join("embedders.json"), contents)
+                    .expect("pre-write embedders file");
+            }
+            let offered = embedders_file_qualifies_for_offer(&config_dir);
+            assert_eq!(
+                offered, expected,
+                "offer qualification is wrong for the {tag} embedders file state"
+            );
+            let db_path = tmp.path().join("neurostrata.db");
+            let writer_ok =
+                write_initial_embedders_file(&config_dir, bge_small_q(), &db_path).is_ok();
+            assert_eq!(
+                writer_ok, expected,
+                "writer acceptance is wrong for the {tag} embedders file state"
+            );
+            assert_eq!(
+                offered, writer_ok,
+                "offer and writer disagree on the {tag} embedders file state"
+            );
+        }
     }
 
     #[test]
