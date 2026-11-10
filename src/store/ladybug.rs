@@ -1705,7 +1705,12 @@ impl LockedUnknownStamp {
     /// turn, so a genuine pre-sidecar store with data is never
     /// recorded here. Best effort, like `maintain_store_state`: a
     /// sidecar failure is logged, not propagated, and the cached
-    /// state stays LockedUnknown so a later init can retry.
+    /// state stays LockedUnknown. A later init can retry the
+    /// upgrade only from a fresh process or instance, and only
+    /// while no write has landed: within this instance the latch
+    /// is already set when the stamp step runs, the schema-ready
+    /// fast path never re-enters this step, and the first write
+    /// seals the store under an unrecorded identity (#91).
     fn stamp_pristine_identity(&self) {
         if !matches!(self.cached_store_state(), CachedStoreState::LockedUnknown) {
             return;
@@ -2156,8 +2161,11 @@ impl LadybugStore {
     /// Fail-closed and best-effort, matching the stamp's contract: a
     /// false attestation or a failed turn stamps nothing, a sidecar
     /// failure is logged inside the stamp and never propagated, and
-    /// `init` still succeeds — the store stays LockedUnknown, so a
-    /// later init can retry the upgrade.
+    /// `init` still succeeds — the store stays LockedUnknown. That
+    /// is not a retry promise for this instance: `schema_ready`
+    /// latched before this step ran and the fast path never
+    /// re-enters it, so only a fresh process or instance, with no
+    /// intervening write, can retry the upgrade (#91).
     async fn reattest_and_upgrade_empty_locked_unknown_store_state(&self, dimensions: usize) {
         let (create_node_table, create_rel_tables) = memory_table_ddl(dimensions);
         let stamp = self.locked_unknown_stamp();
