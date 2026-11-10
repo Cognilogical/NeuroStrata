@@ -9,7 +9,7 @@ Welcome to the official documentation for **NeuroStrata** — the single-binary 
 | Document | Description |
 | :--- | :--- |
 | [**Main README (`../README.md`)**](../README.md) | 60-second quickstart, zero-touch installation, and high-level system overview. |
-| [**Complete Feature & Benefit Catalog (`FEATURES.md`)**](FEATURES.md) | Exhaustive inventory of v1.17.0 features, MCP tools, and codebase module mappings. |
+| [**Complete Feature & Benefit Catalog (`FEATURES.md`)**](FEATURES.md) | Exhaustive inventory of v1.17.2 features, MCP tools, and codebase module mappings. |
 | [**Building from Source (`BUILDING.md`)**](BUILDING.md) | Toolchain prerequisites (Rust, CMake, C++20) and cross-platform build scripts (`scripts/build.sh`, `scripts/build.ps1`). |
 | [**Visual Interface & Obsidian Guide (`UI_GUIDE.md`)**](UI_GUIDE.md) | Using the 3D/2D SynapticGraph Web UI and the Task Board. (The Obsidian NeuroVault sync is planned, not implemented — see `ops/obsidian.md`.) |
 
