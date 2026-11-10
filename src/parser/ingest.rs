@@ -397,8 +397,12 @@ fn run_producer(
     std::collections::HashSet<String>,
     std::collections::HashMap<String, String>,
     std::collections::HashMap<String, Vec<String>>,
+    std::collections::HashMap<String, String>,
 )> {
     let mut current_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Node type per visited path, so a path that changed type (a file
+    // replaced by a directory) is not mistaken for an untouched one.
+    let mut current_kinds: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut current_hashes: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     let mut raw_imports: std::collections::HashMap<String, Vec<String>> =
@@ -518,6 +522,7 @@ fn run_producer(
         // Every visited path is recorded so carry-forward can decide whether a
         // previous row still belongs to the current tree.
         current_paths.insert(node_path.clone());
+        current_kinds.insert(node_path.clone(), mem_type.to_string());
 
         // Every file's bytes are read once and hashed so `file_sha256` is
         // captured on file and markdown nodes too, not only on parseable code
@@ -707,7 +712,7 @@ fn run_producer(
             resolved.insert(src, targets);
         }
     }
-    Ok((current_paths, current_hashes, resolved))
+    Ok((current_paths, current_hashes, resolved, current_kinds))
 }
 /// Stamps the per-node `relative_path` onto a copy of the shared source
 /// identity. The identity is otherwise identical across a tree, but the path
@@ -1039,7 +1044,9 @@ pub async fn ingest_directory(
     // Every directory, file and markdown node of the previous generation, so a
     // walk that finds exactly these paths and re-reads none of them can leave
     // that generation active instead of copying it.
-    let mut prev_node_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Kept with each node's type: a file replaced by a directory at the same
+    // path is a change even though no file was read.
+    let mut prev_node_kinds: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     if prev_gen > 0 {
         // Only this generation's rows, and only the fields read below: the
         // full `list` carried every row's text and cost ~100 MB per call on a
@@ -1053,7 +1060,7 @@ pub async fn ingest_directory(
                     };
                     if gen != prev_gen { continue; }
                     if matches!(r.memory_type.as_str(), "directory" | "file" | "markdown") {
-                        prev_node_paths.insert(r.location.clone());
+                        prev_node_kinds.insert(r.location.clone(), r.memory_type.clone());
                     }
                     if let Some(h) = r.file_sha256 {
                         prev_file_map.insert(tail.to_string(), h);
@@ -1142,12 +1149,14 @@ pub async fn ingest_directory(
     // stays reachable, and this one's half-built tree is discarded.
     let mut current_hashes = std::collections::HashMap::new();
     let mut current_paths = std::collections::HashSet::new();
+    let mut current_kinds: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut dependency_map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
     let mut content_items = usize::MAX;
     let failure: Option<anyhow::Error> = match (consumer_result, producer_result) {
-        (Ok(items), Ok(Ok((paths, hashes, deps)))) => {
+        (Ok(items), Ok(Ok((paths, hashes, deps, kinds)))) => {
             content_items = items;
             current_paths = paths;
+            current_kinds = kinds;
             current_hashes = hashes;
             dependency_map = deps;
             None
@@ -1179,7 +1188,7 @@ pub async fn ingest_directory(
     let unchanged = prev_gen > 0
         && !force_reparse
         && content_items == 0
-        && current_paths == prev_node_paths;
+        && current_kinds == prev_node_kinds;
     if unchanged {
         if let Err(abort) = vector_store
             .abort_generation(namespace, &source_key, generation)
@@ -1727,6 +1736,42 @@ mod tests {
                 .is_some(),
             "and the previous ingest is still there"
         );
+    }
+
+    /// A file replaced by an empty directory at the same path re-reads no
+    /// file and visits the same path, but it is a change: the old file and its
+    /// symbols must not stay active.
+    #[tokio::test]
+    async fn a_file_replaced_by_a_directory_publishes_a_new_generation() {
+        let tmp = std::env::temp_dir().join(format!("ns-type-change-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        std::fs::write(tmp.join("thing.rs"), "fn main() {}").expect("write test file");
+
+        let db = std::env::temp_dir().join(format!("ns-type-change-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("test-ns").await.expect("create the schema");
+        let schema =
+            ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        let ingest = || {
+            ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "test-ns", None, &[])
+        };
+
+        ingest().await.expect("first ingest");
+        let key = source_key_for(&tmp);
+        assert_eq!(store.active_generation("test-ns", &key).await.expect("read"), 1);
+
+        std::fs::remove_file(tmp.join("thing.rs")).expect("remove the file");
+        std::fs::create_dir(tmp.join("thing.rs")).expect("create a directory at the same path");
+        ingest().await.expect("second ingest");
+        assert_eq!(
+            store.active_generation("test-ns", &key).await.expect("read"),
+            2,
+            "a path that changed from a file to a directory publishes a new generation"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&db);
     }
 
     #[tokio::test]
