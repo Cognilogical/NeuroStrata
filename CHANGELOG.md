@@ -4,6 +4,26 @@ All notable changes to the NeuroStrata project will be documented in this file.
 
 ---
 
+## [1.17.2] - 2026-11-10
+
+> The changes below were first published as the **v1.17.1** pre-release (2026-11-10), a tag cut without a version bump, so its binary reports `1.17.0`. 1.17.2 carries the same code with the version and changelog corrected.
+
+### Added
+
+- **Embedding model choice at initial setup (`src/model_choice.rs`, `src/embed.rs`, `src/main.rs`, `src/store/ladybug.rs`, `scripts/backup.sh`, `#66`).** On a fresh install the first interactive command offers a one-time choice among measured embedding-model candidates, with byte-exact file sizes, a permanence warning and a 512-token-context warning where it applies; the daemon never prompts and declining keeps the default. The pick is written atomically to `embedders.json` (choice first, with the candidate's pinned SHA-256) and the writer refuses if the store already holds data or a non-default `embedders.json` exists. The store now maintains a `ladybug.db.store-state.json` sidecar recording whether it holds data and the descriptor of the model that produced its vectors; backup and restore (including the scheduled `scripts/backup.sh`, which carries a `db-<timestamp>.store-state.json` companion with pair-aware pruning) keep it with the store. A store with recorded data refuses open/init, upsert and vector search under a different model, same-width switches included, and a daemon pre-flight refuses a doomed start before the engine opens or a model downloads. A pristine store has its vector column width reconciled to the picked model only after the engine attests the table is empty. `verify_model_checksum` now hashes the exact file fastembed loads. Existing stores have no sidecar and open exactly as before; offline migration to a different model is not included.
+
+### Fixed
+
+- **Store-identity defects left in the merged #66 (`src/store/ladybug.rs`, `src/main.rs`, `scripts/backup.sh`, `#78`, closing `#73`, `#74`, `#75`, `#76`).** `guard_first_write` did not cover `FreshUnrecorded` stores (`#73`); fresh-store provenance was lost across non-serving opens, so an attested-empty `LockedUnknown` store opened with serving == configured now gains a recorded pristine identity at init while data-bearing legacy stores behave exactly as before (`#74`); the daemon-stopped fallback `Add`, `Edit` and `Ingest` arms never initialized the store (`#75`); and `export_database` left a stale destination sidecar and WAL on snapshot-directory reuse (`#76`). Each fix carries a regression test that fails on the pre-fix tree. `scripts/test-backup.sh` adds 18 checks for the backup sidecar carry. Recording identity for legacy (pre-sidecar) stores is tracked in `#77` and is not part of this release.
+- **The stdio MCP proxy snapshotted the daemon bearer token once and could hold no credential forever (`src/server.rs`, `src/daemon.rs`, `src/main.rs`, `#64`).** `proxy_client()` installed `daemon.token` as a default `Authorization` header at construction; if the file did not exist yet (a slow first start while the embedding model loads), every forwarded `/mcp` request 401ed until the proxy was restarted, and a rotated token stranded a running proxy the same way. `proxy_client()` is now credential-free and `forward_mcp_request()` resolves the token on each attempt, so a token that appears late or is rotated takes effect on the next request.
+
+### Changed
+
+- **`lbug` (LadybugDB) 0.20.4 → 0.22.3 (`Cargo.toml`, `Cargo.lock`, `src/store/ladybug.rs`, `src/traits.rs`, `scripts/backup.sh`, `#67`).** Only `lbug` changed version in the lockfile apart from eight Windows-only `windows-sys` edge re-points (0.59.0 → 0.61.2). The binding-layer diff is additive-only for the APIs NeuroStrata calls. This bump makes no claim about the engine abort tracked in LadybugDB #1536.
+- **CI and release builds pin the engine archive (`.github/workflows/ci.yml`, `nightly.yml`, `release.yml`, `#71`).** `LBUG_VERSION: "0.22.3"` is set on every build/test job so the engine downloaded by the lbug build script matches the crate version in `Cargo.lock`; move it whenever the crate version changes.
+
+---
+
 ## [1.17.0] - 2026-11-07
 
 ### Added

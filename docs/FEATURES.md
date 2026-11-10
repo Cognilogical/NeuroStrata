@@ -1,4 +1,4 @@
-# NeuroStrata — Complete Feature & Benefit Catalog (v1.17.0)
+# NeuroStrata — Complete Feature & Benefit Catalog (v1.17.2)
 
 > Every capability in NeuroStrata exists to solve a concrete failure mode of AI coding agents: **amnesia across chats**, **ignored prompt rules**, **blind file edits without architectural context**, **blank-brain subagents**, and **unfinished work pushed to git**. Below is the complete inventory of NeuroStrata's features, what each one does for you, and where it lives in the codebase.
 

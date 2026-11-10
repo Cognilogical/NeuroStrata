@@ -2,7 +2,7 @@
 name: neurostrata
 description: "Manage the 3-Tier Memory Architecture (Global, Domain, Task), Central Executive Task Machine, Automatic Graph-First Exploration, and Subagent Context Propagation. Replaces legacy MEMORY.md and bd remember."
 ---
-# NeuroStrata (v1.17.0 — Tri-Strata Memory, Central Executive & Graph-First Architecture)
+# NeuroStrata (v1.17.2 — Tri-Strata Memory, Central Executive & Graph-First Architecture)
 
 ## Overview
 NeuroStrata (`neurostrata-mcp`, `neurostrata-lf3p`) is a single compiled Rust binary housing an embedded vector, property graph, full-text, and W3C RDF/SPARQL 1.1/SHACL engine (LadybugDB + Tantivy + `oxrdf`/`oxttl` + `spargebra`/`spareval` + `shacl` + Laya). It completely replaces `MEMORY.md`, local markdown TODO lists, `TodoWrite`, and deprecated `bd` commands with binary-enforced task and memory gates.
