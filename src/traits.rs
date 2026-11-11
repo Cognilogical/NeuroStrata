@@ -330,36 +330,6 @@ pub trait VectorStore: Send + Sync + AsAny {
         include_archived: bool,
     ) -> Result<Vec<SearchResult>>;
 
-    /// Closest memories of the given `memory_types` only. For callers that
-    /// keep a few rows of known types and discard the rest (the guard's rule
-    /// lookup), so the general `search` path's expansion work is not paid for
-    /// nothing.
-    ///
-    /// `score` is the raw L2 distance, lower is closer. A store with a typed
-    /// query (the Ladybug store) returns only vector-ranked rows of those
-    /// types: no graph expansion, no usage or feedback boosts, archived,
-    /// retired, mesh-conflicting, registry and superseded-generation rows
-    /// dropped, one row per logical id.
-    ///
-    /// The default is only an approximation: `search` with a wider budget,
-    /// filtered to the types, so it can carry expansion rows and boosted
-    /// scores. A test that relies on the raw-distance contract needs a store
-    /// that overrides this.
-    async fn search_by_types(
-        &self,
-        namespace: &str,
-        vector: Vec<f32>,
-        limit: usize,
-        memory_types: &[String],
-    ) -> Result<Vec<SearchResult>> {
-        let mut rows = self
-            .search(namespace, vector, limit.saturating_mul(10).max(limit), true, true)
-            .await?;
-        rows.retain(|r| memory_types.iter().any(|t| t == &r.payload.memory_type));
-        rows.truncate(limit);
-        Ok(rows)
-    }
-
     /// Unboosted raw-distance dedup candidate query. Returns up to `query.limit`
     /// active domain-memory candidates ordered by the unboosted distance metric.
     /// Default: empty (stores that cannot filter stay honest).
@@ -397,7 +367,7 @@ pub trait VectorStore: Send + Sync + AsAny {
     /// target that did not exist yet simply produced nothing. Ingestion deletes
     /// and re-creates every code node, taking those edges with it -- and the
     /// rules pointing at that code are not rewritten, so the links stay lost
-    /// until something replays them.
+    /// until something replays them (bead neurostrata-sij).
     async fn relink_edges(&self, namespace: &str, source_key: &str) -> Result<usize>;
 
     /// Begin a staged ingestion: allocate a fresh generation for this namespace

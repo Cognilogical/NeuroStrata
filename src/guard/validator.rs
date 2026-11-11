@@ -51,7 +51,7 @@ impl GuardValidator {
         );
 
         // Step 1: Semantic evaluation - find matching behavioral rules
-        let matching_rules = match self.semantic.evaluate(payload).await {
+        let matching_rules = match self.semantic.candidate_rules().await {
             Ok(rules) => rules,
             Err(e) => {
                 tracing::error!("Semantic evaluation failed: {}", e);
@@ -67,7 +67,7 @@ impl GuardValidator {
 
         // Step 2: Work out which of the candidate rules actually FIRED.
         //
-        // The semantic evaluator returns the top-N vector neighbours: a
+        // The semantic evaluator returns every rule the guard could act on: a
         // candidate list, not a verdict. A rule fires when it is live (not
         // deprecated) and its trigger pattern matches the action. Recording
         // the candidates as "triggered" made the persisted signal a lie -- it
@@ -243,9 +243,9 @@ impl GuardValidator {
 
     /// List all rules in the guard namespace
     pub async fn list_rules(&self) -> Result<Vec<BehavioralRule>, String> {
-        // Use a broad query to get all rules
+        // Every candidate rule in this namespace and `global`.
         self.semantic
-            .match_constraints("rule constraint behavioral", 100)
+            .candidate_rules()
             .await
             .map_err(|e| format!("Failed to list rules: {}", e))
     }

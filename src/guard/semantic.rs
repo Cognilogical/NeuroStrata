@@ -1,26 +1,35 @@
-//! Semantic evaluator using LadyBugDB for vector search
+//! Semantic evaluator over the behavioral rules stored in LadyBugDB.
 //!
 //! Validates actions against behavioral rules stored as memories in the 'guard' namespace.
-//! Each rule is embedded and stored with memory_type="guard_rule".
+//! Each rule is embedded and stored with memory_type="guard_rule". Embedding a rule when
+//! it is written keeps it searchable by the general search surfaces; the guard itself
+//! reads rules by listing them (see `candidate_rules`), not by vector search.
 
 use crate::guard::models::BehavioralRule;
-use crate::traits::{Embedder, MemoryPayload, VectorStore};
+use crate::traits::{Embedder, MemoryPayload, SearchResult, VectorStore};
 use anyhow::{Context, Result};
+use std::collections::HashSet;
 use std::sync::Arc;
 
-/// Composite Rec #4: the farthest a rule row may sit from the payload and
-/// still be acted on by the semantic guard. Vector search returns nearest
-/// neighbours, not matches, so a loosely related rule beyond this cutoff must
-/// never turn a validate call into a false-positive rejection.
-///
-/// The unit is the store's raw L2 distance (lower is closer, 0.0 identical),
-/// the value `search_by_types` returns, taken before any ranking boost. It is
-/// not a similarity and not bounded by 1.0. For unit-length embeddings
-/// L2 distance squared is 2 * (1 - cosine), so 0.75 is a cosine of about 0.72:
-/// stricter than a similarity of 0.25 would suggest, and it narrows which
-/// generic `rule` rows the semantic step surfaces. The value 0.75 is a
-/// maintainer-level choice and its false-positive rate has not been measured.
-const MAX_CONSTRAINT_DISTANCE: f32 = 0.75;
+// There is deliberately no similarity or distance floor here.
+//
+// Composite Rec #4 (docs/designs/2026-10-24-composite-improvement-recommendations.md)
+// asked for a calibrated max-distance cutoff so that a loosely related rule,
+// returned only because vector search returns neighbours rather than matches,
+// could not turn a validate call into a false rejection. The floor that was
+// added for it (`MIN_CONSTRAINT_SIMILARITY`, 0.25) was compared against the
+// store's L2 *distance*, so it dropped the closest rules and kept the farthest.
+//
+// Calibrating a cutoff against a snapshot of a real store, with its real
+// embedder and file-edit payloads taken from its git history (measurements in
+// PR #106), showed it cannot work as asked: a cutoff in the correct direction
+// at 0.75 admitted almost no candidate (0.00 and 0.10 rules per call for the
+// two payload forms tried), and rules that govern a file were not closer to
+// the payload than other rules. It also protected nothing, because a rule
+// fires only when its own `trigger_pattern` occurs in the payload (the other
+// half of Rec #4, kept), so a loosely related candidate cannot cause a false
+// rejection. This file now lists the candidates instead of ranking them; see
+// `candidate_rules`.
 
 /// The memory-type families the guard treats as rules. `guard_rule` is what
 /// `add_constraint` writes; `rule` is the vocabulary's generic rule type, so
@@ -72,67 +81,85 @@ impl SemanticEvaluator {
         Ok(())
     }
 
-    /// Find matching rules for a given payload using vector similarity
-    pub async fn match_constraints(
-        &self,
-        payload: &str,
-        limit: usize,
-    ) -> Result<Vec<BehavioralRule>> {
-        // The embedding only picks candidates; the trigger match below runs on
-        // the full payload. A whole-file edit does not need to be embedded
-        // whole.
-        let vector = self.embedder.embed(embed_input(payload)).await?;
-
-        // Only rule rows can become guard rules, so the scan is limited to
-        // those types instead of ranking the whole namespace (every AST
-        // symbol and doc section) and discarding all but a few rows.
-        let rule_types: Vec<String> = RULE_MEMORY_TYPES.iter().map(|t| t.to_string()).collect();
-        let mut combined = self
-            .store
-            .search_by_types(&self.namespace, vector.clone(), limit, &rule_types)
-            .await?;
-
-        let mut seen_ids: std::collections::HashSet<String> =
-            combined.iter().map(|r| r.id.clone()).collect();
-
-        if let Ok(listed) = self
-            .store
-            .list(&self.namespace, None, Some("guard_rule"))
-            .await
-        {
-            merge_listed_rules(&mut combined, &mut seen_ids, listed);
+    /// Every rule the guard could act on, from this namespace and `global`.
+    ///
+    /// The candidates are the rule rows themselves, not the nearest vector
+    /// neighbours of the payload.
+    ///
+    /// Why: whether a rule fires is decided by its `trigger_pattern` alone
+    /// (`GuardValidator::matches_trigger`). How close the rule's text sits to
+    /// the payload never reaches a verdict; it only decided whether the rule
+    /// was offered to the trigger match at all. Firing can only grow with the
+    /// candidate set, so any nearest-neighbour cut (the top few rows, or a
+    /// distance floor) can only lose enforcement: a rule outside it did not
+    /// fire even when its trigger was in the payload. Nearness is also a poor
+    /// ranking here. On a snapshot of a real store, rules that govern a file
+    /// were no closer to a payload about that file than other rules
+    /// (measurements in PR #106), so a cut did not preferentially keep the
+    /// relevant ones.
+    ///
+    /// Behaviour change: a rule the old cut left out, whose trigger occurs in
+    /// the payload, now fires. That is the enforcement the rule asked for, but
+    /// a store holding such rules will see rejections it did not see before.
+    ///
+    /// Cost: one listing per rule type per namespace. It grows with the number
+    /// of `rule` and `guard_rule` rows, not with the size of the namespace, and
+    /// it projects no embedding column, unlike the general `search` call this
+    /// replaces, which ranks every row in the namespace by distance.
+    ///
+    /// The guard applies its own row filter (`is_live_rule_row`, then the
+    /// guard fields in `rules_from_rows`) instead of passing the store's
+    /// row-class flags, as that `search` call did with `include_tasks` and
+    /// `include_archived` both true. A change to the general search path's
+    /// contract therefore cannot silently change which rules the guard is able
+    /// to see. Archived rows are still candidates, as they were before: that
+    /// call asked for them.
+    ///
+    /// A store failure listing this namespace is an error, so the validator
+    /// rejects instead of passing with fewer rules than exist. A failure
+    /// listing `global` is logged and the namespace's own rules still apply.
+    pub async fn candidate_rules(&self) -> Result<Vec<BehavioralRule>> {
+        let now = chrono::Utc::now().timestamp();
+        let own = self.namespace.as_str();
+        let mut namespaces = vec![own];
+        if own != "global" {
+            namespaces.push("global");
         }
 
-        if self.namespace != "global" {
-            if let Ok(global_listed) = self
-                .store
-                .list("global", None, Some("guard_rule"))
-                .await
-            {
-                merge_listed_rules(&mut combined, &mut seen_ids, global_listed);
-            }
-            if let Ok(global_search) = self
-                .store
-                .search_by_types("global", vector, limit, &rule_types)
-                .await
-            {
-                for row in global_search {
+        let mut rows: Vec<SearchResult> = Vec::new();
+        let mut seen_ids: HashSet<String> = HashSet::new();
+        for namespace in namespaces {
+            for memory_type in RULE_MEMORY_TYPES {
+                let listed = match self.store.list(namespace, None, Some(memory_type)).await {
+                    Ok(listed) => listed,
+                    Err(e) if namespace == own => {
+                        return Err(e.context(format!(
+                            "could not list {memory_type} rows in '{namespace}'"
+                        )));
+                    }
+                    Err(e) => {
+                        tracing::warn!("guard could not list {memory_type} rows in '{namespace}': {e}");
+                        continue;
+                    }
+                };
+                for row in listed {
+                    // The replaced `search` call dropped retired, conflicting
+                    // and registry rows before returning them, so `rule` rows
+                    // keep that behaviour here. `guard_rule` rows were always
+                    // taken from a plain listing with no such filter, so a
+                    // retired `guard_rule` still fires. That is unchanged and
+                    // is a separate decision from this one.
+                    if memory_type == "rule" && !is_live_rule_row(&row.payload.metadata, now) {
+                        continue;
+                    }
                     if seen_ids.insert(row.id.clone()) {
-                        combined.push(row);
+                        rows.push(row);
                     }
                 }
             }
         }
 
-        let rules = rules_from_rows(combined);
-
-        Ok(rules)
-    }
-
-    /// Evaluate whether a payload violates any constraints
-    pub async fn evaluate(&self, payload: &str) -> Result<Vec<BehavioralRule>> {
-        // Return top 3 matching rules
-        self.match_constraints(payload, 3).await
+        Ok(rules_from_rows(rows))
     }
 
     /// Record one firing of a rule: bump its persisted `hit_count` by one.
@@ -179,37 +206,21 @@ impl SemanticEvaluator {
     }
 }
 
-/// The most of a payload the guard embeds to pick rule candidates.
-const MAX_EMBED_CHARS: usize = 2000;
-
-/// The leading part of `payload` the guard embeds, cut on a char boundary.
-fn embed_input(payload: &str) -> &str {
-    match payload.char_indices().nth(MAX_EMBED_CHARS) {
-        Some((end, _)) => &payload[..end],
-        None => payload,
-    }
+/// Whether a `rule` row is live: not retired, not an unresolved mesh conflict
+/// and not a registry row. These are the row classes the general search drops
+/// before a row can be returned, which the guard's earlier `search` call
+/// relied on and a plain listing does not do.
+fn is_live_rule_row(metadata: &serde_json::Value, now: i64) -> bool {
+    !crate::store::ladybug::is_retired_at(metadata, now)
+        && !crate::synaptic_mesh::conflict::is_conflicting_metadata(metadata)
+        && !crate::registry::is_registry_row(metadata)
 }
 
-/// Turn raw search rows into guard rules, dropping every row that either
-/// cannot prove it is a rule (rule types only) or sits beyond the distance
-/// cutoff. `SearchResult::score` is a raw distance (lower is closer), so a row
-/// passes when its distance is at most `MAX_CONSTRAINT_DISTANCE`. A pure pass
-/// over the search results so the cutoff behaviour is testable without a
-/// vector store.
-///
-/// Two deliberate differences from the general `search` this lookup replaced:
-/// the floor sees the raw distance, so a row whose usage or feedback boost
-/// would have pulled it under the cutoff is no longer admitted; and a rule is
-/// reached by vector rank among rule rows only, never through a graph edge or
-/// an inferred relation, and only by the first `MAX_EMBED_CHARS` of the
-/// payload. Listed `guard_rule` rows are exempt from all three through
-/// `merge_listed_rules`.
-pub(crate) fn rules_from_rows(
-    search_results: Vec<crate::traits::SearchResult>,
-) -> Vec<BehavioralRule> {
-    search_results
-        .into_iter()
-        .filter(|result| (result.score as f32) <= MAX_CONSTRAINT_DISTANCE)
+/// Turn listed rows into guard rules, dropping every row that cannot prove it
+/// is a rule: wrong memory type, or missing any of the guard fields. A pure
+/// pass over the rows so the filtering is testable without a store.
+pub(crate) fn rules_from_rows(rows: Vec<SearchResult>) -> Vec<BehavioralRule> {
+    rows.into_iter()
         .filter(|result| RULE_MEMORY_TYPES.contains(&result.payload.memory_type.as_str()))
         .filter_map(|result| {
             // A rule row whose metadata is incomplete is not a rule: it is
@@ -224,27 +235,6 @@ pub(crate) fn rules_from_rows(
             })
         })
         .collect()
-}
-
-/// Adds the listed `guard_rule` rows to `combined`. A listed guard rule is
-/// always eligible, whatever its distance to the payload: the trigger match
-/// that follows decides whether it fires. Search scores are distances, so a
-/// listed rule is given distance 0.0 (the closest possible), which clears
-/// `rules_from_rows`. A rule the typed search already returned keeps its row
-/// but takes that distance too.
-fn merge_listed_rules(
-    combined: &mut Vec<crate::traits::SearchResult>,
-    seen_ids: &mut std::collections::HashSet<String>,
-    listed: Vec<crate::traits::SearchResult>,
-) {
-    for mut row in listed {
-        if seen_ids.insert(row.id.clone()) {
-            row.score = 0.0;
-            combined.push(row);
-        } else if let Some(existing) = combined.iter_mut().find(|r| r.id == row.id) {
-            existing.score = 0.0;
-        }
-    }
 }
 
 /// Extract the rule fields from one search row's metadata. `None` means the
@@ -318,153 +308,130 @@ mod tests {
             .expect("storing a guard rule must succeed");
 
         let rules = matcher
-            .match_constraints("docker run attempted", 5)
+            .candidate_rules()
             .await
-            .expect("matching constraints must succeed");
+            .expect("listing candidate rules must succeed");
 
         assert!(
             rules
                 .iter()
                 .any(|r| r.id == "rule-podman"
                     && r.constraint_text == "always use podman, never docker"),
-            "stored guard rule must be retrievable via match_constraints, got: {rules:?}"
+            "stored guard rule must be a candidate, got: {rules:?}"
         );
     }
 
-    /// A generic `rule` row is not a `guard_rule`, so the guard listing never
-    /// returns it: it can only reach the guard through typed search. With the
-    /// mock reporting distances like the real store, that path is exercised.
-    #[tokio::test]
-    async fn a_rule_row_reaches_the_guard_only_through_typed_search() {
-        use crate::guard::testkit::{MockStore, StubEmbedder};
-        use crate::traits::{Embedder, VectorStore};
+    async fn seed(
+        store: &Arc<dyn VectorStore>,
+        namespace: &str,
+        id: &str,
+        memory_type: &str,
+        metadata: serde_json::Value,
+    ) {
+        let mut payload = rule_row(id, 0.0, memory_type).payload;
+        payload.metadata = metadata;
+        store
+            .upsert(namespace, id, vec![0.0; 4], payload)
+            .await
+            .expect("seeding a row must succeed");
+    }
 
+    fn guard_fields(id: &str, trigger: &str) -> serde_json::Value {
+        json!({
+            "id": id, "version": 1, "rule_class": "blocking",
+            "trigger_pattern": trigger, "hit_count": 0, "status": "active",
+        })
+    }
+
+    async fn candidates(store: Arc<dyn VectorStore>, namespace: &str) -> Vec<String> {
+        use crate::guard::testkit::StubEmbedder;
+        let mut ids: Vec<String> = SemanticEvaluator::new(store, Arc::new(StubEmbedder), namespace)
+            .candidate_rules()
+            .await
+            .expect("listing candidate rules must succeed")
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// The reason candidates are listed rather than ranked: a `rule` row that
+    /// carries guard fields must be offered to the trigger match however many
+    /// other rules there are and however far its text is from the payload. A
+    /// vector cut (top 3, or a distance floor) offered it only by luck.
+    #[tokio::test]
+    async fn a_rule_row_with_guard_fields_is_a_candidate_among_many_other_rules() {
+        use crate::guard::testkit::MockStore;
         let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
-        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder);
-        let payload = rule_row("seeded-rule", 0.0, "rule").payload;
-        store
-            .upsert("guard", "seeded-rule", vec![0.0; 4], payload)
-            .await
-            .expect("seeding a rule row must succeed");
+        for i in 0..40 {
+            seed(&store, "guard", &format!("plain-{i}"), "rule", json!({})).await;
+        }
+        seed(&store, "guard", "seeded-rule", "rule", guard_fields("seeded-rule", "docker")).await;
+        seed(&store, "guard", "listed-guard", "guard_rule", guard_fields("listed-guard", "rm -rf")).await;
 
-        let matcher = SemanticEvaluator::new(store, embedder, "guard");
-        let rules = matcher
-            .match_constraints("docker run attempted", 5)
-            .await
-            .expect("matching constraints must succeed");
-
-        assert!(
-            rules.iter().any(|r| r.id == "seeded-rule"),
-            "a rule row found by typed search must survive the distance floor: {rules:?}"
-        );
-    }
-
-    /// Composite Rec #4: row conversion applies the distance cutoff and the
-    /// rule-type filter. A rule row beyond `MAX_CONSTRAINT_DISTANCE` must not
-    /// become a match, or loosely related memories would fire the guard as
-    /// false positives.
-    #[test]
-    fn embed_input_is_bounded_and_cuts_on_a_char_boundary() {
-        assert_eq!(embed_input("short"), "short");
-        let long = "é".repeat(MAX_EMBED_CHARS + 50);
-        let cut = embed_input(&long);
-        assert_eq!(cut.chars().count(), MAX_EMBED_CHARS);
-        assert!(long.starts_with(cut));
-        let exact = "a".repeat(MAX_EMBED_CHARS);
-        assert_eq!(embed_input(&exact), exact);
-    }
-
-    /// Typed search returns the closest rules with their distance as the
-    /// score. A guard rule that is also in the listing must stay eligible even
-    /// when it is the closest match (distance below the cutoff).
-    #[test]
-    fn a_listed_guard_rule_stays_eligible_when_typed_search_already_returned_it() {
-        let mut combined = vec![
-            // The nearest rule: distance 0.05, so below the cutoff.
-            rule_row("rule-near", 0.05, "guard_rule"),
-        ];
-        let mut seen: std::collections::HashSet<String> =
-            combined.iter().map(|r| r.id.clone()).collect();
-        // The listing returns every guard rule, including the near one, with
-        // the store's own score of 0.
-        let listed = vec![rule_row("rule-near", 0.0, "guard_rule"), rule_row("rule-other", 0.0, "guard_rule")];
-
-        merge_listed_rules(&mut combined, &mut seen, listed);
-
-        let rules = rules_from_rows(combined);
-        let mut ids: Vec<&str> = rules.iter().map(|r| r.id.as_str()).collect();
-        ids.sort_unstable();
         assert_eq!(
-            ids,
-            vec!["rule-near", "rule-other"],
-            "the nearest guard rule must not be dropped by the distance cutoff: {ids:?}"
+            candidates(store, "guard").await,
+            vec!["listed-guard".to_string(), "seeded-rule".to_string()],
+            "rows without guard fields are skipped, every row with them is offered"
         );
     }
 
-    /// The real store's typed search scores rows by L2 distance (lower is
-    /// closer). A rule whose embedding equals the query is distance 0 and must
-    /// survive the floor; a rule far from the query must not.
+    /// Rows the replaced `search` call dropped before it could return them
+    /// stay out: a retired rule must not start firing because the guard now
+    /// lists instead of searching.
     #[tokio::test]
-    async fn typed_search_distances_are_read_as_distances_by_the_floor() {
-        use crate::store::ladybug::LadybugStore;
-        use crate::traits::VectorStore;
+    async fn retired_conflicting_and_registry_rule_rows_are_not_candidates() {
+        use crate::guard::testkit::MockStore;
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        let with = |extra: serde_json::Value| {
+            let mut m = guard_fields("x", "docker");
+            for (k, v) in extra.as_object().unwrap() {
+                m[k] = v.clone();
+            }
+            m
+        };
+        seed(&store, "guard", "live", "rule", with(json!({}))).await;
+        seed(&store, "guard", "retired", "rule", with(json!({ "valid_to": 1 }))).await;
+        seed(&store, "guard", "conflicting", "rule", with(json!({ "mesh": { "conflict": true } }))).await;
 
-        let dir = std::env::temp_dir().join(format!("ns-guard-floor-{}", uuid::Uuid::new_v4()));
-        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
-        store.init("probe").await.expect("create the schema");
+        let ids = candidates(store, "guard").await;
+        assert_eq!(ids, vec!["x".to_string()], "only the live row's guard id remains: {ids:?}");
+    }
 
-        let payload = |id: &str| rule_row(id, 0.0, "rule").payload;
-        store
-            .upsert("probe", "rule-near", vec![0.9, 0.1, 0.1, 0.1], payload("rule-near"))
-            .await
-            .unwrap();
-        store
-            .upsert("probe", "rule-far", vec![-0.9, -0.1, -0.1, -0.1], payload("rule-far"))
-            .await
-            .unwrap();
+    #[tokio::test]
+    async fn global_rules_apply_in_every_namespace_without_repeating() {
+        use crate::guard::testkit::MockStore;
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        seed(&store, "global", "g-rule", "rule", guard_fields("g-rule", "docker")).await;
+        seed(&store, "global", "g-guard", "guard_rule", guard_fields("g-guard", "rm -rf")).await;
+        seed(&store, "proj", "p-rule", "rule", guard_fields("p-rule", "force")).await;
 
-        let types = vec!["rule".to_string(), "guard_rule".to_string()];
-        let found = store
-            .search_by_types("probe", vec![0.9, 0.1, 0.1, 0.1], 5, &types)
-            .await
-            .unwrap();
-        let near = found.iter().find(|r| r.id == "rule-near").expect("near row");
-        assert_eq!(near.score, 0.0, "the store reports a distance, not a similarity");
-
-        let ids: Vec<String> = rules_from_rows(found).into_iter().map(|r| r.id).collect();
         assert_eq!(
-            ids,
-            vec!["rule-near".to_string()],
-            "the identical rule must survive the floor and the opposite one must not: {ids:?}"
+            candidates(store.clone(), "proj").await,
+            vec!["g-guard".to_string(), "g-rule".to_string(), "p-rule".to_string()]
+        );
+        assert_eq!(
+            candidates(store, "global").await,
+            vec!["g-guard".to_string(), "g-rule".to_string()],
+            "the global namespace is listed once, not twice"
         );
     }
 
+    /// Row conversion keeps rule types with complete guard fields and nothing
+    /// else, and does not look at the score: there is no distance floor.
     #[test]
-    fn low_similarity_rule_rows_do_not_match() {
-        // Scores are distances: lower is closer, and a row passes while its
-        // distance is at most MAX_CONSTRAINT_DISTANCE.
+    fn rows_convert_by_type_and_fields_not_by_score() {
         let rows = vec![
-            // A close rule that cleared the cutoff.
-            rule_row("rule-high", 0.1, "guard_rule"),
-            // Same rule content, but the embedding is barely related: the
-            // vector search still returned it, the cutoff must drop it.
-            rule_row("rule-low", MAX_CONSTRAINT_DISTANCE + 0.01, "guard_rule"),
-            // Exactly at the floor: the cutoff is inclusive.
-            rule_row("rule-at-floor", MAX_CONSTRAINT_DISTANCE, "guard_rule"),
-            // A very close row that is not a rule at all (a fact, a task
-            // result, anything the namespace picked up) must never fire.
-            rule_row("not-a-rule", 0.01, "fact"),
+            rule_row("near", 0.0, "guard_rule"),
+            rule_row("far", 9.0, "guard_rule"),
+            rule_row("not-a-rule", 0.0, "fact"),
         ];
 
         let rules = rules_from_rows(rows);
 
         let ids: Vec<&str> = rules.iter().map(|r| r.id.as_str()).collect();
-        assert_eq!(
-            ids,
-            vec!["rule-high", "rule-at-floor"],
-            "only rules that clear the cutoff survive: {ids:?}"
-        );
-        // The surviving rows still carry their parsed rule fields.
+        assert_eq!(ids, vec!["near", "far"], "score never decides: {ids:?}");
         assert_eq!(rules[0].trigger_pattern, "docker");
         assert_eq!(rules[0].status, "active");
     }

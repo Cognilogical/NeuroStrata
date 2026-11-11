@@ -136,8 +136,7 @@ impl VectorStore for MockStore {
             .take(limit)
             .map(|r| SearchResult {
                 id: r.id.clone(),
-                // A distance, like the real store's: 0.0 is the closest match.
-                score: 0.0,
+                score: 1.0,
                 payload: r.payload.clone(),
                 evidence: Some(vec![crate::traits::SearchEvidence {
                     kind: crate::traits::EvidenceKind::DirectMatch,
@@ -189,8 +188,7 @@ impl VectorStore for MockStore {
 
             let sr = SearchResult {
                 id: r.id.clone(),
-                // A distance, like the real store's: 0.0 is the closest match.
-                score: 0.0,
+                score: 1.0,
                 payload: r.payload.clone(),
                 evidence: Some(vec![crate::traits::SearchEvidence {
                     kind: crate::traits::EvidenceKind::DirectMatch,

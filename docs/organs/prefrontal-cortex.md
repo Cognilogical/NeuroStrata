@@ -13,9 +13,10 @@ Candidate Action ("docker compose up -d")
        │
        ▼
 ┌──────────────────────────────────────────────────────────┐
-│ 1. FastEmbed ONNX Vector Encoding + Lexical Pattern Scan │
+│ 1. List Candidate Rules: `rule` + `guard_rule` rows with │
+│    the guard fields, in the project and `global`         │
 ├──────────────────────────────────────────────────────────┤
-│ 2. Match Against Active `rule` Nodes & `guard_rule` Spec │
+│ 2. Fire Each Rule Whose `trigger_pattern` Matches        │
 ├──────────────────────────────────────────────────────────┤
 │ 3. Optional Podman-Sandboxed Dry-Run Verification        │
 └──────────────────────────────────────────────────────────┘
@@ -61,11 +62,13 @@ NeuroStrata prevents "paper rules": if a memory claims `enforcement: "ENFORCED"`
 
 ---
 
-## 3. Dual-Stage Evaluation: Pattern + Semantic Similarity
+## 3. Candidate Rules and Trigger Matching
 
-The Prefrontal Cortex combines two complementary checks:
-1. **Deterministic Trigger Matching:** Each learned rule carries a `trigger_pattern`; the guard fires the rule when that pattern appears (case-insensitively) in the action type or in the payload. There is **no built-in list of banned binaries or destructive flags** — `rm -rf /`, `git push --force` and `DROP TABLE` are caught only if a rule's trigger pattern matches them.
-2. **Semantic Vector Similarity:** Encodes the candidate action description and compares it against high-salience `rule` embeddings in LadybugDB. Even if an action rephrases a prohibited operation, semantic proximity surfaces the governing constraint.
+Evaluation has two steps, and only the second decides a verdict:
+1. **Candidate listing:** the guard lists every `guard_rule` row and every `rule` row that carries the guard fields (`id`, `version`, `rule_class`, `trigger_pattern`, `hit_count`, `status`), in the project namespace and in `global`. A `rule` row without those fields is skipped. Retired, mesh-conflicting and registry `rule` rows are skipped. The candidates are not ranked or cut by how close their text is to the action: the payload is not embedded.
+2. **Deterministic Trigger Matching:** Each candidate rule carries a `trigger_pattern`; the guard fires the rule when that pattern appears (case-insensitively) in the action type or in the payload. There is **no built-in list of banned binaries or destructive flags** — `rm -rf /`, `git push --force` and `DROP TABLE` are caught only if a rule's trigger pattern matches them.
+
+An action that rephrases a prohibited operation without containing a rule's trigger pattern is **not** caught by the guard. Semantic closeness between a rule's text and the action plays no part in a verdict. To cover several phrasings, list them as `|`-separated branches in one `trigger_pattern` (for example `docker|dockerd`).
 
 ---
 
