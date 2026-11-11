@@ -17030,9 +17030,10 @@ eurostrata\src\daemon.rs",
 
     /// Leave `rows` Memory writes in an uncheckpointed WAL beside
     /// `db`, then corrupt the WAL in place. The writes are made
-    /// through a raw engine handle that is deliberately leaked
-    /// (`mem::forget`): a clean drop would checkpoint the WAL into
-    /// the main file, and the rows must exist *only* in the WAL.
+    /// through a raw engine handle closed with
+    /// `force_checkpoint_on_close=false`: a default close would
+    /// checkpoint the WAL into the main file, and the rows must exist
+    /// *only* in the WAL.
     /// With `delete_rows`, each row is deleted again inside the same
     /// WAL, so the table the WAL describes is genuinely empty.
     /// Corrupting every WAL byte makes the verified replay fail with
@@ -17058,8 +17059,13 @@ eurostrata\src\daemon.rs",
                 .expect("delete the seeded row inside the same WAL");
             }
         }
-        std::mem::forget(conn);
-        std::mem::forget(raw);
+        // Close normally but skip the checkpoint the destructor would
+        // otherwise run, so the rows stay only in the WAL and the engine's
+        // file lock is released (a leaked handle keeps it on Windows).
+        conn.query("CALL force_checkpoint_on_close=false")
+            .expect("turn off the checkpoint on close");
+        drop(conn);
+        drop(raw);
         let mut wal_os = db.to_path_buf().into_os_string();
         wal_os.push(".wal");
         let wal = std::path::PathBuf::from(wal_os);
