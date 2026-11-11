@@ -8,16 +8,19 @@ use crate::traits::{Embedder, MemoryPayload, VectorStore};
 use anyhow::{Context, Result};
 use std::sync::Arc;
 
-/// Composite Rec #4: the similarity floor a rule row must clear before the
-/// semantic guard may act on it. Vector search returns nearest neighbours —
-/// not matches — so a loosely related rule below this cutoff must never turn a
-/// validate call into a false-positive rejection.
-pub const MIN_CONSTRAINT_SIMILARITY: f32 = 0.25;
-
-/// The store reports each row's distance (lower is closer), so the similarity
-/// floor is applied as a maximum distance, the same mapping the normative
-/// search slots use (`similarity = 1 - distance`).
-const MAX_CONSTRAINT_DISTANCE: f32 = 1.0 - MIN_CONSTRAINT_SIMILARITY;
+/// Composite Rec #4: the farthest a rule row may sit from the payload and
+/// still be acted on by the semantic guard. Vector search returns nearest
+/// neighbours, not matches, so a loosely related rule beyond this cutoff must
+/// never turn a validate call into a false-positive rejection.
+///
+/// The unit is the store's raw L2 distance (lower is closer, 0.0 identical),
+/// the value `search_by_types` returns, taken before any ranking boost. It is
+/// not a similarity and not bounded by 1.0. For unit-length embeddings
+/// L2 distance squared is 2 * (1 - cosine), so 0.75 is a cosine of about 0.72:
+/// stricter than a similarity of 0.25 would suggest, and it narrows which
+/// generic `rule` rows the semantic step surfaces. The value 0.75 is a
+/// maintainer-level choice and its false-positive rate has not been measured.
+const MAX_CONSTRAINT_DISTANCE: f32 = 0.75;
 
 /// The memory-type families the guard treats as rules. `guard_rule` is what
 /// `add_constraint` writes; `rule` is the vocabulary's generic rule type, so
@@ -188,11 +191,19 @@ fn embed_input(payload: &str) -> &str {
 }
 
 /// Turn raw search rows into guard rules, dropping every row that either
-/// cannot prove it is a rule (rule types only) or sits below the similarity
-/// cutoff (`MIN_CONSTRAINT_SIMILARITY`). `SearchResult::score` is a distance
-/// (lower is closer), so a row passes when its distance is at most
-/// `MAX_CONSTRAINT_DISTANCE`. A pure pass over the search results so the
-/// cutoff behaviour is testable without a vector store.
+/// cannot prove it is a rule (rule types only) or sits beyond the distance
+/// cutoff. `SearchResult::score` is a raw distance (lower is closer), so a row
+/// passes when its distance is at most `MAX_CONSTRAINT_DISTANCE`. A pure pass
+/// over the search results so the cutoff behaviour is testable without a
+/// vector store.
+///
+/// Two deliberate differences from the general `search` this lookup replaced:
+/// the floor sees the raw distance, so a row whose usage or feedback boost
+/// would have pulled it under the cutoff is no longer admitted; and a rule is
+/// reached by vector rank among rule rows only, never through a graph edge or
+/// an inferred relation, and only by the first `MAX_EMBED_CHARS` of the
+/// payload. Listed `guard_rule` rows are exempt from all three through
+/// `merge_listed_rules`.
 pub(crate) fn rules_from_rows(
     search_results: Vec<crate::traits::SearchResult>,
 ) -> Vec<BehavioralRule> {
@@ -348,8 +359,8 @@ mod tests {
         );
     }
 
-    /// Composite Rec #4: row conversion applies the similarity cutoff and the
-    /// rule-type filter. A rule row below `MIN_CONSTRAINT_SIMILARITY` must not
+    /// Composite Rec #4: row conversion applies the distance cutoff and the
+    /// rule-type filter. A rule row beyond `MAX_CONSTRAINT_DISTANCE` must not
     /// become a match, or loosely related memories would fire the guard as
     /// false positives.
     #[test]
