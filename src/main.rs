@@ -13,6 +13,7 @@ mod digital_twin;
 mod domain;
 mod embed;
 mod fts;
+mod procmem;
 mod gliner;
 mod graphql;
 mod kge;
@@ -74,7 +75,12 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Start NeuroStrata in daemon-only mode
-    Daemon,
+    Daemon {
+        /// Record the memory growth log and sampler (`~/.config/neurostrata/memory-growth.log`).
+        /// Off by default; `NEUROSTRATA_PROFILE=1` does the same for a daemon an IDE starts.
+        #[arg(long)]
+        profile: bool,
+    },
 
     /// List all active namespaces
     Namespaces,
@@ -3579,11 +3585,14 @@ async fn run() -> anyhow::Result<()> {
         // only ever records a pending choice; it is surfaced here, at
         // interactive dispatch, before the command runs — never on the
         // daemon/serving path, and not on the way to shutting down.
-        if !matches!(command, Commands::Daemon | Commands::Shutdown) {
+        if !matches!(command, Commands::Daemon { .. } | Commands::Shutdown) {
             surface_pending_model_choice();
         }
         match command {
-            Commands::Daemon => {
+            Commands::Daemon { profile } => {
+                if profile {
+                    procmem::enable_profile();
+                }
                 println!("NeuroStrata MCP Server initializing in DAEMON-ONLY mode...");
                 let config = Config::from_default_path()?;
                 // Pre-flight: refuse a data-bearing store under a
@@ -5200,7 +5209,7 @@ async fn run() -> anyhow::Result<()> {
                         }
                     }
                     // Handled above, before the database is ever opened.
-                    Commands::Daemon
+                    Commands::Daemon { .. }
                     | Commands::Shutdown
                     | Commands::Run { .. }
                     | Commands::SynapticMesh { .. }
