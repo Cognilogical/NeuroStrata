@@ -1168,8 +1168,10 @@ pub struct LadybugStore {
     /// Compiled ontology index per namespace (domain DAG, aliases, sub-properties).
     /// Swapped on `refresh_ontology`; read lock-free via ArcSwap.
     ontology: Arc<arc_swap::ArcSwap<std::collections::BTreeMap<String, crate::rdf::OntologyIndex>>>,
-    /// Cached active-generation symbol ids for mention detection.
-    mention_symbol_ids: Arc<tokio::sync::RwLock<Option<(std::collections::HashSet<u64>, std::sync::Arc<Vec<String>>)>>>,
+    /// Cached active-generation symbol ids for mention detection, per
+    /// namespace. A generation counter is per namespace, so two namespaces can
+    /// share a generation set; the namespace is part of the key.
+    mention_symbol_ids: Arc<tokio::sync::RwLock<std::collections::HashMap<String, (std::collections::HashSet<u64>, std::sync::Arc<Vec<String>>)>>>,
     /// Lazily built in-house lexical index, partitioned by namespace.
     lexical: Arc<std::sync::RwLock<crate::fts::LexicalIndex>>,
     /// Namespaces whose lexical partition is loaded. A namespace absent here is
@@ -1903,7 +1905,7 @@ impl LadybugStore {
             ontology: Arc::new(arc_swap::ArcSwap::from_pointee(
                 std::collections::BTreeMap::new(),
             )),
-            mention_symbol_ids: Arc::new(tokio::sync::RwLock::new(None)),
+            mention_symbol_ids: Arc::new(tokio::sync::RwLock::new(Default::default())),
             lexical: Arc::new(std::sync::RwLock::new(crate::fts::LexicalIndex::new())),
             lexical_loaded: Arc::new(std::sync::RwLock::new(std::collections::BTreeSet::new())),
             metrics: Arc::new(
@@ -2415,7 +2417,7 @@ impl LadybugStore {
     /// that gave up released the turn while its statement was still running,
     /// and the next writer promptly opened a second one against an engine that
     /// already had one. That is how a single stalled write became five in a row
-    /// (bead neurostrata-4nk): each waited its 30s, gave up, and handed the
+    ///: each waited its 30s, gave up, and handed the
     /// turn to the next. Held by the task, the turn is released when the work
     /// actually finishes, so a caller giving up costs a wait instead.
     async fn write_with_deadline<T, F>(&self, what: &'static str, f: F) -> Result<T>
@@ -3424,7 +3426,7 @@ impl LadybugStore {
         let gens = self.active_generations_public(namespace).await;
         {
             let guard = self.mention_symbol_ids.read().await;
-            if let Some((cached_gens, vec)) = guard.as_ref() {
+            if let Some((cached_gens, vec)) = guard.get(namespace) {
                 if *cached_gens == gens {
                     return vec.clone();
                 }
@@ -3432,7 +3434,7 @@ impl LadybugStore {
         }
         let vec = std::sync::Arc::new(self.symbol_ids(namespace).await);
         let mut guard = self.mention_symbol_ids.write().await;
-        *guard = Some((gens, vec.clone()));
+        guard.insert(namespace.to_string(), (gens, vec.clone()));
         vec
     }
 
@@ -9249,7 +9251,7 @@ impl crate::traits::IntakeStore for LadybugStore {
 /// `STARTED` minus `FINISHED` is how many engine calls are inside lbug right
 /// now. If that number climbs and does not come down, a deadline that could not
 /// cancel its statement has left the work running, which is the hypothesis these
-/// were added to test (bead neurostrata-4nk).
+/// were added to test.
 pub static ENGINE_CALLS_STARTED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub static ENGINE_CALLS_FINISHED: std::sync::atomic::AtomicU64 =
@@ -11258,7 +11260,7 @@ eurostrata\src\daemon.rs",
     /// Value::List, so this came back empty every time. Nothing caught it
     /// because search never returns a vector: it computes array_distance in the
     /// engine. Only the read-modify-write callers saw it, and they wrote the
-    /// empty vector straight back (bead neurostrata-vbj).
+    /// empty vector straight back.
     #[tokio::test]
     async fn get_reads_back_the_embedding_it_stored() {
         let dir = std::env::temp_dir().join(format!("ns-embed-{}", uuid::Uuid::new_v4()));
@@ -11466,6 +11468,39 @@ eurostrata\src\daemon.rs",
 
         assert!(ids.contains(&"live-rule".to_string()), "{:?}", ids);
         assert!(!ids.contains(&"retired-rule".to_string()), "{:?}", ids);
+    }
+
+    /// The mention symbol cache is keyed by the generation set alone, and a
+    /// generation counter is per namespace, so two namespaces that each
+    /// published generation 1 share the key {1}. The second namespace was then
+    /// served the first one's symbol ids, and a rule could record mentions of
+    /// another project's symbols.
+    #[tokio::test]
+    async fn mention_symbol_ids_are_scoped_to_their_namespace() {
+        let store = retired_test_store().await;
+        for namespace in ["probe", "other"] {
+            let id = crate::parser::ingest::generation_scoped_id(namespace, 1, "src/lib.rs");
+            store
+                .upsert(
+                    namespace,
+                    &id,
+                    vec![0.5; 4],
+                    retired_test_payload("file", "auto-ingestor", json!({})),
+                )
+                .await
+                .unwrap();
+            store.publish_generation(namespace, PROBE_SOURCE, 1).await.unwrap();
+        }
+
+        let first = store.mention_symbol_ids("probe").await;
+        let second = store.mention_symbol_ids("other").await;
+
+        assert_eq!(first.as_slice(), ["probe::1::src/lib.rs".to_string()], "{first:?}");
+        assert_eq!(
+            second.as_slice(),
+            ["other::1::src/lib.rs".to_string()],
+            "the second namespace must see its own symbols, not the first one's: {second:?}"
+        );
     }
 
     #[tokio::test]
