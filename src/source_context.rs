@@ -149,15 +149,26 @@ fn is_valid_marker_directory(marker: &Path) -> bool {
     {
         return false;
     }
-    let Ok(metadata) = std::fs::metadata(marker) else {
+    // `symlink_metadata` does not follow the final component: a marker that is
+    // itself a symlink could point anywhere, so exports must not trust it.
+    // Symlinked *parents* are fine (macOS `/var` -> `/private/var`, `/tmp`), so
+    // canonicalize the parent and compare the canonical marker to it instead of
+    // requiring the caller's spelling to already be canonical.
+    let Ok(metadata) = std::fs::symlink_metadata(marker) else {
         return false;
     };
-    if !metadata.is_dir() {
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return false;
     }
-    std::fs::canonicalize(marker)
-        .map(|canonical| canonical.as_path() == marker)
-        .unwrap_or(false)
+    let Some(parent) = marker.parent() else {
+        return false;
+    };
+    let (Ok(canonical_marker), Ok(canonical_parent)) =
+        (std::fs::canonicalize(marker), std::fs::canonicalize(parent))
+    else {
+        return false;
+    };
+    canonical_marker == canonical_parent.join(".NeuroStrata")
 }
 
 fn is_absolute_location(location: &str, path: &Path) -> bool {
@@ -460,15 +471,73 @@ mod tests {
     }
 
     #[test]
-    fn preserves_stored_path_for_noncanonical_registry_marker() {
+    fn resolves_noncanonical_registry_marker_inside_the_same_project() {
         let temp = temp_root("noncanonical-registry");
         let project_root = temp.join("project");
         let marker = project(&project_root);
         fs::create_dir_all(project_root.join("nested")).unwrap();
         let noncanonical = project_root.join("nested/../.NeuroStrata");
         assert!(noncanonical.is_dir());
-        assert_ne!(fs::canonicalize(&noncanonical).unwrap(), noncanonical);
-        let contexts = HashMap::from([("source".to_string(), noncanonical)]);
+        assert_ne!(std::fs::canonicalize(&noncanonical).unwrap(), noncanonical);
+        let contexts = HashMap::from([("source".to_string(), noncanonical.clone())]);
+
+        let expected = noncanonical
+            .parent()
+            .unwrap()
+            .join("src/lib.rs")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            export_absolute_path(
+                "src/lib.rs",
+                "/stored/lib.rs",
+                &refs("src/lib.rs", &["source"]),
+                &contexts,
+                None
+            ),
+            expected
+        );
+        assert!(marker.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolves_marker_through_a_symlinked_project_root() {
+        // macOS `/var` -> `/private/var` and `/tmp` -> `/private/tmp` are the
+        // common case; a symlinked project root must still resolve to the real
+        // project, not fall back to the stored absolute path.
+        let temp = temp_root("symlinked-root");
+        let real_root = temp.join("project");
+        project(&real_root);
+        let alias = temp.join("project-alias");
+        std::os::unix::fs::symlink(&real_root, &alias).unwrap();
+        let marker = alias.join(".NeuroStrata");
+        let contexts = HashMap::from([("source".to_string(), marker)]);
+
+        let expected = alias.join("src/lib.rs").to_string_lossy().into_owned();
+        assert_eq!(
+            export_absolute_path(
+                "src/lib.rs",
+                "/stored/lib.rs",
+                &refs("src/lib.rs", &["source"]),
+                &contexts,
+                None
+            ),
+            expected
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_marker_that_is_itself_a_symlink() {
+        let temp = temp_root("symlinked-marker");
+        let project_root = temp.join("project");
+        let elsewhere = temp.join("elsewhere");
+        let real_marker = project(&elsewhere);
+        fs::create_dir_all(&project_root).unwrap();
+        let linked_marker = project_root.join(".NeuroStrata");
+        std::os::unix::fs::symlink(&real_marker, &linked_marker).unwrap();
+        let contexts = HashMap::from([("source".to_string(), linked_marker)]);
 
         assert_eq!(
             export_absolute_path(
@@ -480,7 +549,6 @@ mod tests {
             ),
             "/stored/lib.rs"
         );
-        assert!(marker.is_dir());
     }
 
     #[test]
