@@ -595,10 +595,18 @@ mod tests {
         }
 
         let (status, breadcrumbs) = run_child(OVERFLOW_TEST_NAME);
+        // A worker-thread stack overflow faults on the guard page; macOS
+        // arm64 reports that as SIGBUS, Linux as SIGSEGV. Both are the
+        // handler catching the overflow, which is what this pins.
+        let (expected_signal, expected_name) = if cfg!(target_os = "macos") {
+            (libc::SIGBUS, "SIGBUS")
+        } else {
+            (libc::SIGSEGV, "SIGSEGV")
+        };
         assert_eq!(
             status.signal(),
-            Some(libc::SIGSEGV),
-            "the child must still die of SIGSEGV: {status:?}"
+            Some(expected_signal),
+            "the child must still die of {expected_name}: {status:?}"
         );
         assert_eq!(
             breadcrumbs.len(),
@@ -606,7 +614,7 @@ mod tests {
             "exactly one breadcrumb should have been written: {breadcrumbs:?}"
         );
         assert!(
-            breadcrumbs[0].1.contains("SIGSEGV"),
+            breadcrumbs[0].1.contains(expected_name),
             "the report names the signal: {}",
             breadcrumbs[0].1
         );
