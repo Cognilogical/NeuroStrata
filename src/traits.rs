@@ -483,6 +483,15 @@ pub trait VectorStore: Send + Sync + AsAny {
             .collect())
     }
 
+    /// Rows whose metadata mentions `pinned`: a superset of the pinned rows,
+    /// for callers that only want those and would discard the rest. Stores
+    /// that can narrow in the engine override this; the default lists the
+    /// whole namespace. Listing everything to find a few pinned rows cost
+    /// ~100 MB per call on a large namespace.
+    async fn list_pinned(&self, namespace: &str) -> Result<Vec<SearchResult>> {
+        self.list(namespace, None, None).await
+    }
+
     /// Get a specific memory by its ID, returning its vector and payload
     async fn get(&self, namespace: &str, id: &str) -> Result<Option<(Vec<f32>, MemoryPayload)>>;
 
