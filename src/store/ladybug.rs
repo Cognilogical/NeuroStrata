@@ -1240,6 +1240,12 @@ enum CachedStoreState {
     /// A fresh store whose pristine sidecar could not be written yet
     /// (the configured model did not resolve); retried on later calls.
     FreshUnrecorded,
+    /// A sidecar is present but unparseable (corrupt, unreadable, or a
+    /// version this build does not understand): a recorded identity
+    /// exists but cannot be verified, so identity-consulting opens
+    /// refuse. Distinct from `LockedUnknown`, which is absence — a
+    /// corrupt sidecar must never be attested over or cured silently.
+    Unparseable(String),
 }
 
 /// The first-write guard's restart-to-apply refusal.
@@ -1521,19 +1527,26 @@ impl FirstWriteFlip {
     /// `LadybugStore::cached_store_state`: the cache is shared with the
     /// store, and a state the store already loaded is authoritative. A
     /// cold cache is classified from the sidecar file alone — a
-    /// parseable sidecar is `Recorded`; anything else cannot be a
+    /// parseable sidecar is `Recorded`; an absent one cannot be a
     /// pristine state this flip may move, so it reads as `LockedUnknown`
-    /// and the flip no-ops. (The store's own first classification, with
-    /// its fresh-store handling, has always run by upsert entry:
-    /// `guard_first_write` and `check_data_bearing_identity` load it.)
+    /// and the flip no-ops; a present-but-unparseable one reads as
+    /// `Unparseable`, which the flip likewise never rewrites. (The
+    /// store's own first classification, with its fresh-store handling,
+    /// has always run by upsert entry: `guard_first_write` and
+    /// `check_data_bearing_identity` load it.)
     fn cached_store_state(&self) -> CachedStoreState {
         let mut cache = self.store_state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(state) = &*cache {
             return state.clone();
         }
         let state = match crate::model_choice::read_store_state(&self.local_path) {
-            Some(recorded) => CachedStoreState::Recorded(recorded),
-            None => CachedStoreState::LockedUnknown,
+            crate::model_choice::StoreStateRead::Recorded(recorded) => {
+                CachedStoreState::Recorded(recorded)
+            }
+            crate::model_choice::StoreStateRead::Unparseable(reason) => {
+                CachedStoreState::Unparseable(reason)
+            }
+            crate::model_choice::StoreStateRead::Absent => CachedStoreState::LockedUnknown,
         };
         *cache = Some(state.clone());
         state
@@ -1622,17 +1635,25 @@ impl LockedUnknownStamp {
     /// This handle's view of the store-state sidecar, mirroring
     /// `FirstWriteFlip::cached_store_state`: the cache is shared
     /// with the store, and a state the store already loaded is
-    /// authoritative. (The stamp step's callers have always loaded
-    /// the cache by entry: `init` classifies the store to compute
-    /// the upgrade candidacy before the stamp step runs.)
+    /// authoritative. A present-but-unparseable sidecar classifies as
+    /// `Unparseable`, never `LockedUnknown`, so the stamp's
+    /// `LockedUnknown` gate can never attest over it. (The stamp
+    /// step's callers have always loaded the cache by entry: `init`
+    /// classifies the store to compute the upgrade candidacy before
+    /// the stamp step runs.)
     fn cached_store_state(&self) -> CachedStoreState {
         let mut cache = self.store_state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(state) = &*cache {
             return state.clone();
         }
         let state = match crate::model_choice::read_store_state(&self.local_path) {
-            Some(recorded) => CachedStoreState::Recorded(recorded),
-            None => CachedStoreState::LockedUnknown,
+            crate::model_choice::StoreStateRead::Recorded(recorded) => {
+                CachedStoreState::Recorded(recorded)
+            }
+            crate::model_choice::StoreStateRead::Unparseable(reason) => {
+                CachedStoreState::Unparseable(reason)
+            }
+            crate::model_choice::StoreStateRead::Absent => CachedStoreState::LockedUnknown,
         };
         *cache = Some(state.clone());
         state
@@ -2022,13 +2043,19 @@ impl LadybugStore {
             return state.clone();
         }
         let state = match crate::model_choice::read_store_state(&self.local_path) {
-            Some(recorded) => CachedStoreState::Recorded(recorded),
-            None if !self.db_preexisting
-                && !crate::model_choice::store_state_path(&self.local_path).exists() =>
+            crate::model_choice::StoreStateRead::Recorded(recorded) => {
+                CachedStoreState::Recorded(recorded)
+            }
+            crate::model_choice::StoreStateRead::Unparseable(reason) => {
+                CachedStoreState::Unparseable(reason)
+            }
+            crate::model_choice::StoreStateRead::Absent
+                if !self.db_preexisting
+                    && !crate::model_choice::store_state_path(&self.local_path).exists() =>
             {
                 CachedStoreState::FreshUnrecorded
             }
-            None => {
+            crate::model_choice::StoreStateRead::Absent => {
                 // A pre-sidecar store opens
                 // exactly as it always has — no refusal can key on a
                 // descriptor that was never recorded — but the Phase B
@@ -2298,7 +2325,22 @@ impl LadybugStore {
     /// embed nothing. Pristine and pre-sidecar stores are likewise
     /// outside this check: pristine identity is the first-write
     /// guard's window, and a pre-sidecar store has no R to key on.
+    /// A present-but-unparseable sidecar is the one state that
+    /// refuses even unbound here: no R can be read from it, yet one
+    /// was recorded, so this check — the funnel every
+    /// identity-consulting entry point passes through — fails closed
+    /// instead of treating the store as unrecorded. Paths that never
+    /// call this check consult no recorded identity and are unaffected.
     fn check_data_bearing_identity(&self) -> Result<()> {
+        // A present-but-unparseable sidecar refuses regardless of the
+        // bound serving descriptor and regardless of has_data — both
+        // are unknowable — before any other identity reasoning.
+        if let CachedStoreState::Unparseable(reason) = self.cached_store_state() {
+            return Err(crate::model_choice::store_state_unparseable_error(
+                &self.local_path,
+                &reason,
+            ));
+        }
         if let CachedStoreState::Recorded(recorded) = self.cached_store_state() {
             if recorded.has_data {
                 if let Some(serving) = self.serving_descriptor() {
@@ -4641,6 +4683,10 @@ impl VectorStore for LadybugStore {
                 CachedStoreState::Recorded(recorded) => !recorded.has_data,
                 CachedStoreState::FreshUnrecorded => true,
                 CachedStoreState::LockedUnknown => false,
+                // Unreachable in practice — the identity check at
+                // init entry already refused — but an unparseable
+                // sidecar never arms reconciliation.
+                CachedStoreState::Unparseable(_) => false,
             };
         // Issue #74: a LockedUnknown classification is ambiguous — it
         // covers both a genuine pre-sidecar store and a fresh store
@@ -15657,7 +15703,9 @@ eurostrata\src\daemon.rs",
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut flipped = false;
         while std::time::Instant::now() < deadline {
-            if let Some(state) = crate::model_choice::read_store_state(&fx.db) {
+            if let crate::model_choice::StoreStateRead::Recorded(state) =
+                crate::model_choice::read_store_state(&fx.db)
+            {
                 if state.has_data {
                     flipped = true;
                     break;
@@ -16451,6 +16499,167 @@ eurostrata\src\daemon.rs",
             .await
             .expect("recycling a store-read vector unbound succeeds under a changed config");
         drop(normalize);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn unparseable_sidecar_refuses_init_and_is_not_reclassified() {
+        let previous = without_model_env();
+        let fx = store_state_fixture("unparseable-init", "ModelA");
+        // A valid pristine sidecar exists before the store is built;
+        // the cache is lazy, so corrupting it after construction —
+        // before the first identity-consulting call — is what init
+        // must classify.
+        crate::model_choice::write_store_state(
+            &fx.db,
+            &crate::model_choice::StoreState {
+                version: crate::model_choice::STORE_STATE_VERSION,
+                has_data: false,
+                descriptor: serving_descriptor_for("ModelA"),
+            },
+        )
+        .expect("write the pristine sidecar");
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        std::fs::write(crate::model_choice::store_state_path(&fx.db), "{not json")
+            .expect("corrupt the sidecar");
+        let sidecar_before =
+            std::fs::read(crate::model_choice::store_state_path(&fx.db)).expect("read sidecar");
+        let err = store
+            .init("probe")
+            .await
+            .expect_err("an unparseable sidecar must refuse init");
+        let message = err.to_string();
+        assert!(
+            message.contains("refusing to open the store at")
+                && message.contains("unparseable")
+                && message.contains("cannot be parsed"),
+            "the init refusal is the unparseable-sidecar refusal: {message}"
+        );
+        assert!(
+            matches!(store.cached_store_state(), CachedStoreState::Unparseable(_)),
+            "an unparseable sidecar must not be reclassified as LockedUnknown"
+        );
+        assert_eq!(
+            std::fs::read(crate::model_choice::store_state_path(&fx.db)).expect("re-read sidecar"),
+            sidecar_before,
+            "a refused init leaves the sidecar byte-identical"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn wrong_version_sidecar_refuses_init_and_is_not_stamped_over() {
+        let previous = without_model_env();
+        // The fixture's sidecar is created by a prior, dropped
+        // instance; the test store below never inits before the
+        // rewrite, so its cache is cold when it classifies version 999.
+        let fx = data_bearing_store_fixture("wrong-version-init").await;
+        let mut sidecar = read_sidecar(&fx.db);
+        sidecar["version"] = json!(999);
+        std::fs::write(
+            crate::model_choice::store_state_path(&fx.db),
+            serde_json::to_string_pretty(&sidecar).expect("serialize sidecar"),
+        )
+        .expect("rewrite the sidecar at version 999");
+        let sidecar_before =
+            std::fs::read(crate::model_choice::store_state_path(&fx.db)).expect("read sidecar");
+        // Serving equals configured — the shape that, if the corrupt
+        // sidecar were misclassified LockedUnknown, would be a
+        // candidate for the attest-and-stamp upgrade.
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        let err = store
+            .init("probe")
+            .await
+            .expect_err("a wrong-version sidecar must refuse init");
+        assert!(
+            err.to_string().contains("unsupported store-state version"),
+            "the init refusal names the version problem: {err}"
+        );
+        assert!(
+            matches!(store.cached_store_state(), CachedStoreState::Unparseable(_)),
+            "a wrong-version sidecar must not be reclassified as LockedUnknown"
+        );
+        assert_eq!(
+            std::fs::read(crate::model_choice::store_state_path(&fx.db)).expect("re-read sidecar"),
+            sidecar_before,
+            "a refused init must not stamp over the wrong-version sidecar"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn unparseable_sidecar_refuses_upsert_without_init() {
+        let previous = without_model_env();
+        let fx = data_bearing_store_fixture("unparseable-upsert").await;
+        // No serving descriptor and never init'ed: the unbound
+        // fallback shape. The sidecar is corrupted before this
+        // instance's first identity-consulting call (cold cache).
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        let valid_sidecar =
+            std::fs::read(crate::model_choice::store_state_path(&fx.db)).expect("read sidecar");
+        std::fs::write(crate::model_choice::store_state_path(&fx.db), "{not json")
+            .expect("corrupt the sidecar");
+        let sidecar_before =
+            std::fs::read(crate::model_choice::store_state_path(&fx.db)).expect("read sidecar");
+        let err = store
+            .upsert(
+                "probe",
+                "m2",
+                vec![0.1, 0.2, 0.3, 0.4],
+                store_state_payload(),
+            )
+            .await
+            .expect_err("an unparseable sidecar must refuse an init-less upsert");
+        let message = err.to_string();
+        assert!(
+            message.contains("refusing to open the store at") && message.contains("unparseable"),
+            "the upsert refusal is the unparseable-sidecar refusal: {message}"
+        );
+        assert_eq!(
+            std::fs::read(crate::model_choice::store_state_path(&fx.db)).expect("re-read sidecar"),
+            sidecar_before,
+            "a refused upsert leaves the sidecar byte-identical"
+        );
+        drop(store);
+        // Cure the sidecar and open a fresh instance (the refused
+        // instance's classification is cached), then read the actual
+        // stored state: the refused upsert must have written no row.
+        std::fs::write(crate::model_choice::store_state_path(&fx.db), valid_sidecar)
+            .expect("cure the sidecar");
+        let cured = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        cured.init("probe").await.expect("init after the cure");
+        assert!(
+            cured
+                .get("probe", "m1")
+                .await
+                .expect("get the seeded row")
+                .is_some(),
+            "the seeded row is present, so the namespace read is live"
+        );
+        assert!(
+            cured
+                .get("probe", "m2")
+                .await
+                .expect("get the refused row")
+                .is_none(),
+            "a refused upsert must not have written row m2"
+        );
+        drop(cured);
         let _ = std::fs::remove_dir_all(&fx.root);
         restore_model_env(previous);
     }
@@ -17949,8 +18158,11 @@ eurostrata\src\daemon.rs",
             crate::model_choice::store_state_path(&restored_db),
         )
         .expect("copy the sidecar");
-        let state = crate::model_choice::read_store_state(&restored_db)
-            .expect("the restored store keeps its recorded identity");
+        let crate::model_choice::StoreStateRead::Recorded(state) =
+            crate::model_choice::read_store_state(&restored_db)
+        else {
+            panic!("the restored store keeps its recorded identity");
+        };
         assert!(state.has_data);
         assert_eq!(state.descriptor, serving_descriptor_for("ModelA"));
 
@@ -18101,7 +18313,10 @@ eurostrata\src\daemon.rs",
             "the restore lands no sidecar from the reused snapshot"
         );
         assert!(
-            crate::model_choice::read_store_state(&restored_db).is_none(),
+            matches!(
+                crate::model_choice::read_store_state(&restored_db),
+                crate::model_choice::StoreStateRead::Absent
+            ),
             "the restored store has no recorded identity"
         );
         let _ = std::fs::remove_dir_all(&fx.root);
