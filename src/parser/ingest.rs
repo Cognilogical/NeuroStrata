@@ -1051,10 +1051,6 @@ pub async fn ingest_directory(
     // directory of the same name keeps its path.
     let mut prev_node_kinds: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
-    // The `node_set` each of those nodes was stamped with. A re-ingest under a
-    // different node set changes metadata on every node without touching a file.
-    let mut prev_node_sets: std::collections::HashSet<Option<Vec<String>>> =
-        std::collections::HashSet::new();
     if prev_gen > 0 {
         match vector_store.list(namespace, None, None).await {
             Ok(rows) => {
@@ -1068,20 +1064,6 @@ pub async fn ingest_directory(
                     if matches!(r.payload.memory_type.as_str(), "directory" | "file" | "markdown") {
                         prev_node_kinds
                             .insert(r.payload.location.clone(), r.payload.memory_type.clone());
-                        // A row without a readable `node_set` is recorded as
-                        // unknown (None), which never equals the current set.
-                        let stamped = r
-                            .payload
-                            .metadata
-                            .get("node_set")
-                            .and_then(|v| v.as_array())
-                            .map(|a| {
-                                let mut v: Vec<String> =
-                                    a.iter().filter_map(|s| s.as_str().map(String::from)).collect();
-                                v.sort();
-                                v
-                            });
-                        prev_node_sets.insert(stamped);
                     }
                     let hash = r.payload.metadata.get("file_sha256").and_then(|v| v.as_str()).map(|s| s.to_string());
                     if let Some(h) = hash {
@@ -1206,21 +1188,25 @@ pub async fn ingest_directory(
 
     // Nothing to publish: no file or section was read again, and the walk found
     // exactly the nodes the active generation already holds (same paths, each
-    // of the same kind, stamped with the same node set), so a new generation
-    // would be a copy of it. Keep the active one, discard the staged directory
-    // nodes, and go on to the steps that do not depend on it.
+    // of the same kind), so a new generation would be a copy of it. Keep the
+    // active one, discard the staged directory nodes, and go on to the steps
+    // that do not depend on it.
     //
     // The kinds matter because `content_items` does not count directory nodes:
     // a file replaced by an empty directory at the same path stages no content,
     // and comparing paths alone would call that unchanged and keep serving the
     // deleted file's node, symbols and sections.
-    let current_node_set: std::collections::HashSet<Option<Vec<String>>> =
-        std::collections::HashSet::from([Some(node_set.clone())]);
+    //
+    // The `node_set` stamped on the nodes is deliberately not compared. A node
+    // that is carried forward keeps the stamp it was first staged with, and
+    // only directory nodes are staged again, so after a node-set change the
+    // previous generation holds mixed stamps and a comparison would call every
+    // later ingest a change. Making a node-set change visible here would mean
+    // re-stamping carried nodes, which is a separate change.
     let unchanged = prev_gen > 0
         && !force_reparse
         && content_items == 0
-        && current_kinds == prev_node_kinds
-        && prev_node_sets == current_node_set;
+        && current_kinds == prev_node_kinds;
     if unchanged {
         if let Err(abort) = vector_store
             .abort_generation(namespace, &source_key, generation)
@@ -2283,27 +2269,6 @@ mod tests {
             .map(|r| r.id)
             .collect();
         assert!(leftovers.is_empty(), "the deleted file's rows are not served: {leftovers:?}");
-        std::fs::remove_dir_all(&tmp).ok();
-        std::fs::remove_dir_all(&db).ok();
-    }
-
-    /// The node set is stamped on every node, so changing it changes every
-    /// node's metadata even though no file did.
-    #[tokio::test]
-    async fn a_different_node_set_is_a_change() {
-        let (tmp, db, store, schema) = kind_fixture("node-set").await;
-        std::fs::write(tmp.join("a.rs"), "pub fn a() {}").expect("write file");
-        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", None, &[])
-            .await
-            .expect("first ingest");
-        let key = source_key_for(&tmp);
-        let gen1 = store.active_generation("probe", &key).await.expect("gen1");
-
-        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", None, &["docs".to_string()])
-            .await
-            .expect("second ingest");
-        let gen2 = store.active_generation("probe", &key).await.expect("gen2");
-        assert!(gen2 > gen1, "a changed node set must publish: {gen1} then {gen2}");
         std::fs::remove_dir_all(&tmp).ok();
         std::fs::remove_dir_all(&db).ok();
     }
