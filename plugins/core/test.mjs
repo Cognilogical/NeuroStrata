@@ -4,6 +4,20 @@ import http from "node:http";
 import { readFileSync, mkdirSync, writeFileSync, rmSync, mkdtempSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { execFileSync as execFileSyncTop } from "node:child_process";
+
+// Windows cannot execute a .sh file directly (EFTYPE) and cannot symlink a
+// private tool directory, so the hook runs through bash there with the ambient
+// PATH (Git for Windows puts bash and the coreutils on it).
+function runHook(hookPath, opts) {
+  if (process.platform !== "win32") return execFileSyncTop(hookPath, [], opts);
+  return execFileSyncTop("bash", [hookPath], { ...opts, env: { ...process.env, ...opts.env, PATH: process.env.PATH } });
+}
+
+// Git for Windows checks scripts out with CRLF, which bash refuses.
+function hookSource() {
+  return readFileSync(new URL("../../scripts/hooks/pre-commit", import.meta.url), "utf8").replace(/\r\n/g, "\n");
+}
 import {
   resolveConfig,
   resolveProjectRoot,
@@ -1238,11 +1252,11 @@ describe("native task tool tracking + hook registration + pre-commit awk fallbac
       execFileSync("git", ["add", "src/file one.rs"], { cwd: repoDir });
 
       const hookPath = join(repoDir, "pre-commit-test.sh");
-      writeFileSync(hookPath, readFileSync(new URL("../../scripts/hooks/pre-commit", import.meta.url), "utf8"));
+      writeFileSync(hookPath, hookSource());
       chmodSync(hookPath, 0o755);
 
       // Run 1: populates empty queries array with "src/file one.rs"
-      execFileSync(hookPath, [], {
+      runHook(hookPath, {
         cwd: repoDir,
         env: { PATH: binDir, HOME: repoDir },
       });
@@ -1255,7 +1269,7 @@ describe("native task tool tracking + hook registration + pre-commit awk fallbac
       // Run 2: stages second file with '&' and appends to populated queries array
       writeFileSync(join(repoDir, "src", "a&b.rs"), "fn b() {}\n");
       execFileSync("git", ["add", "src/a&b.rs"], { cwd: repoDir });
-      execFileSync(hookPath, [], {
+      runHook(hookPath, {
         cwd: repoDir,
         env: { PATH: binDir, HOME: repoDir },
       });
@@ -1267,7 +1281,7 @@ describe("native task tool tracking + hook registration + pre-commit awk fallbac
 
       // Run 3: legacy compact single-line empty-array ledger `{"namespace":"app","queries":[]}`
       writeFileSync(ledgerPath, '{"namespace":"app","queries":[]}');
-      execFileSync(hookPath, [], {
+      runHook(hookPath, {
         cwd: repoDir,
         env: { PATH: binDir, HOME: repoDir },
       });
@@ -1277,7 +1291,7 @@ describe("native task tool tracking + hook registration + pre-commit awk fallbac
 
       // Run 4: legacy top-level array ledger `[{"ts":1,"tool":"legacy","query":"old.rs"}]`
       writeFileSync(ledgerPath, '[{"ts":1,"tool":"legacy","query":"old.rs"}]');
-      execFileSync(hookPath, [], {
+      runHook(hookPath, {
         cwd: repoDir,
         env: { PATH: binDir, HOME: repoDir },
       });
@@ -1797,11 +1811,11 @@ describe("round-6: task_update title invalidation, AST summary formatting, dev s
       execFileSync("git", ["add", "src/test.rs"], { cwd: repoDir });
 
       const hookPath = join(repoDir, "pre-commit-test.sh");
-      writeFileSync(hookPath, readFileSync(new URL("../../scripts/hooks/pre-commit", import.meta.url), "utf8"));
+      writeFileSync(hookPath, hookSource());
       chmodSync(hookPath, 0o755);
 
       // Run 1: populate ledger with bare path
-      execFileSync(hookPath, [], { cwd: repoDir, env: { PATH: binDir, HOME: repoDir } });
+      runHook(hookPath, { cwd: repoDir, env: { PATH: binDir, HOME: repoDir } });
 
       let ledgerPath = join(repoDir, ".NeuroStrata", "session_queries.json");
       let ledger = JSON.parse(readFileSync(ledgerPath, "utf8"));
@@ -1817,7 +1831,7 @@ describe("round-6: task_update title invalidation, AST summary formatting, dev s
       // Stage another file and run - should not warn about src/test.rs (already in ledger in any format)
       writeFileSync(join(repoDir, "src", "another.rs"), "fn b() {}\n");
       execFileSync("git", ["add", "src/another.rs"], { cwd: repoDir });
-      execFileSync(hookPath, [], { cwd: repoDir, env: { PATH: binDir, HOME: repoDir } });
+      runHook(hookPath, { cwd: repoDir, env: { PATH: binDir, HOME: repoDir } });
 
       // Should not have warning for src/test.rs
       ledger = JSON.parse(readFileSync(ledgerPath, "utf8"));
@@ -1884,7 +1898,8 @@ describe("round-8: Codex apply_patch extraction, decoded ledger matching, and ba
     }
   });
 
-  it("pre-commit matches JSON-escaped unicode/quote paths and appends missing files in one write", async () => {
+  // A file name containing a double quote cannot exist on Windows.
+  it("pre-commit matches JSON-escaped unicode/quote paths and appends missing files in one write", { skip: process.platform === "win32" && "file names cannot contain a double quote on Windows" }, async () => {
     const { execFileSync } = await import("node:child_process");
     const { mkdtempSync, symlinkSync, chmodSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
@@ -1899,7 +1914,7 @@ describe("round-8: Codex apply_patch extraction, decoded ledger matching, and ba
       execFileSync("git", ["add", "src/café.rs", "src/quote\"file.rs", "src/a.rs", "src/b.rs"], { cwd: repoDir });
 
       const hookPath = join(repoDir, "pre-commit-test.sh");
-      writeFileSync(hookPath, readFileSync(new URL("../../scripts/hooks/pre-commit", import.meta.url), "utf8"));
+      writeFileSync(hookPath, hookSource());
       chmodSync(hookPath, 0o755);
 
       mkdirSync(join(repoDir, ".NeuroStrata"), { recursive: true });
