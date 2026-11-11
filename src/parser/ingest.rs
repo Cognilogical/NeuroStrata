@@ -397,8 +397,15 @@ fn run_producer(
     std::collections::HashSet<String>,
     std::collections::HashMap<String, String>,
     std::collections::HashMap<String, Vec<String>>,
+    std::collections::HashMap<String, String>,
 )> {
     let mut current_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // What kind of node each visited path is (`directory`, `file` or
+    // `markdown`). A path alone cannot say whether the previous generation's
+    // node at that path is still the right one: a file replaced by a directory
+    // of the same name, or the reverse, keeps the path and changes the node.
+    let mut current_kinds: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     let mut current_hashes: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     let mut raw_imports: std::collections::HashMap<String, Vec<String>> =
@@ -518,6 +525,7 @@ fn run_producer(
         // Every visited path is recorded so carry-forward can decide whether a
         // previous row still belongs to the current tree.
         current_paths.insert(node_path.clone());
+        current_kinds.insert(node_path.clone(), mem_type.to_string());
 
         // Every file's bytes are read once and hashed so `file_sha256` is
         // captured on file and markdown nodes too, not only on parseable code
@@ -707,7 +715,7 @@ fn run_producer(
             resolved.insert(src, targets);
         }
     }
-    Ok((current_paths, current_hashes, resolved))
+    Ok((current_paths, current_hashes, resolved, current_kinds))
 }
 /// Stamps the per-node `relative_path` onto a copy of the shared source
 /// identity. The identity is otherwise identical across a tree, but the path
@@ -736,8 +744,14 @@ async fn run_consumer(
     source_identity: serde_json::Value,
     ingest_version: &str,
     node_set: &[String],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<usize> {
+    // Items that are not a bare directory node: a file, section or symbol was
+    // read again, so this walk changed something.
+    let mut content_items = 0usize;
     while let Some(item) = rx.recv().await {
+        if !matches!(&item, IngestItem::NodeUpsert { mem_type, .. } if mem_type == "directory") {
+            content_items += 1;
+        }
         match item {
             IngestItem::NodeUpsert {
                 node_id,
@@ -964,7 +978,7 @@ async fn run_consumer(
     }
     }
 
-    Ok(())
+    Ok(content_items)
 }
 
 pub async fn ingest_directory(
@@ -1030,26 +1044,36 @@ pub async fn ingest_directory(
     // Build prev_file_map: node_path -> file_sha256 for files in prev gen.
     let mut prev_file_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut prev_stamps: Vec<String> = Vec::new();
+    // Every directory, file and markdown node of the previous generation with
+    // its kind, so a walk that finds exactly these nodes (same path, same kind)
+    // and re-reads none of them can leave that generation active instead of
+    // copying it. Paths alone are not enough: a file replaced by an empty
+    // directory of the same name keeps its path.
+    let mut prev_node_kinds: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     if prev_gen > 0 {
-        match vector_store.list(namespace, None, None).await {
+        // Only this generation's rows, and only the fields read below: the
+        // full `list` carried every row's text and cost ~100 MB per call on a
+        // large namespace.
+        match vector_store.generation_summary(namespace, prev_gen).await {
             Ok(rows) => {
                 for r in rows {
-                    let id = r.id.clone();
-                    let (_ns, gen, tail) = match crate::parser::ingest::split_scoped_id(&id) {
+                    let (_ns, gen, tail) = match crate::parser::ingest::split_scoped_id(&r.id) {
                         Some(x) => x,
                         None => continue,
                     };
                     if gen != prev_gen { continue; }
-                    let hash = r.payload.metadata.get("file_sha256").and_then(|v| v.as_str()).map(|s| s.to_string());
-                    if let Some(h) = hash {
-                        prev_file_map.insert(tail.to_string(), h.clone());
+                    if matches!(r.memory_type.as_str(), "directory" | "file" | "markdown") {
+                        prev_node_kinds.insert(r.location.clone(), r.memory_type.clone());
                     }
-                    let stamp = r.payload.metadata.get("ingest_version").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    prev_stamps.push(stamp);
+                    if let Some(h) = r.file_sha256 {
+                        prev_file_map.insert(tail.to_string(), h);
+                    }
+                    prev_stamps.push(r.ingest_version);
                 }
             }
             Err(e) => {
-                tracing::warn!("vector_store.list failed while building prev_file_map for '{namespace}': {e}");
+                tracing::warn!("vector_store.generation_summary failed while building prev_file_map for '{namespace}': {e}");
             }
         }
     }
@@ -1129,17 +1153,21 @@ pub async fn ingest_directory(
     // stays reachable, and this one's half-built tree is discarded.
     let mut current_hashes = std::collections::HashMap::new();
     let mut current_paths = std::collections::HashSet::new();
+    let mut current_kinds: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut dependency_map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    let mut content_items = usize::MAX;
     let failure: Option<anyhow::Error> = match (consumer_result, producer_result) {
-        (Ok(()), Ok(Ok((paths, hashes, deps)))) => {
+        (Ok(items), Ok(Ok((paths, hashes, deps, kinds)))) => {
+            content_items = items;
             current_paths = paths;
             current_hashes = hashes;
             dependency_map = deps;
+            current_kinds = kinds;
             None
         }
         (Err(e), _) => Some(e),
-        (Ok(()), Ok(Err(e))) => Some(e),
-        (Ok(()), Err(e)) => Some(anyhow::anyhow!("ingest producer panicked: {}", e)),
+        (Ok(_), Ok(Err(e))) => Some(e),
+        (Ok(_), Err(e)) => Some(anyhow::anyhow!("ingest producer panicked: {}", e)),
     };
     if let Some(e) = failure {
         if let Err(abort) = vector_store
@@ -1157,13 +1185,50 @@ pub async fn ingest_directory(
         return Err(e);
     }
 
+    // Nothing to publish: no file or section was read again, and the walk found
+    // exactly the nodes the active generation already holds (same paths, each
+    // of the same kind), so a new generation would be a copy of it. Keep the
+    // active one, discard the staged directory nodes, and go on to the steps
+    // that do not depend on it.
+    //
+    // The kinds matter because `content_items` does not count directory nodes:
+    // a file replaced by an empty directory at the same path stages no content,
+    // and comparing paths alone would call that unchanged and keep serving the
+    // deleted file's node, symbols and sections.
+    //
+    // The `node_set` stamped on the nodes is deliberately not compared. A node
+    // that is carried forward keeps the stamp it was first staged with, and
+    // only directory nodes are staged again, so after a node-set change the
+    // previous generation holds mixed stamps and a comparison would call every
+    // later ingest a change. Making a node-set change visible here would mean
+    // re-stamping carried nodes, which is a separate change.
+    let unchanged = prev_gen > 0
+        && !force_reparse
+        && content_items == 0
+        && current_kinds == prev_node_kinds;
+    if unchanged {
+        if let Err(abort) = vector_store
+            .abort_generation(namespace, &source_key, generation)
+            .await
+        {
+            tracing::warn!(
+                "could not discard the empty staging generation {} of namespace {}: {}",
+                generation, namespace, abort
+            );
+        }
+        println!(
+            "Namespace {} is unchanged since generation {}; kept it active",
+            namespace, prev_gen
+        );
+    }
+
     // Carry forward unchanged nodes from the previous generation so the
     // new generation contains the full tree without re-embedding.
     // A forced re-parse (version trip) stages every current node itself, so
     // no previous row is carried in that mode.
-    if prev_gen > 0 && !force_reparse {
+    if prev_gen > 0 && !force_reparse && !unchanged {
         let mut carried = 0usize;
-        let rows = match vector_store.list(namespace, None, None).await {
+        let rows = match vector_store.generation_summary(namespace, prev_gen).await {
             Ok(rows) => rows,
             Err(e) => {
                 tracing::warn!(
@@ -1183,8 +1248,8 @@ pub async fn ingest_directory(
             // The row's `location` is the file it came from (stamped at
             // ingest time), which survives `#` in file names unlike
             // splitting the symbol id.
-            let file_path = r.payload.location.clone();
-            let hash = r.payload.metadata.get("file_sha256").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let file_path = r.location.clone();
+            let hash = r.file_sha256.clone();
             // Carry a previous row only when its file is still present with
             // the same bytes, or (for no-hash rows) when the path is still
             // visited. Deleted files and stale symbols drop out.
@@ -1197,6 +1262,19 @@ pub async fn ingest_directory(
                 false
             };
             if !carry { continue; }
+            // A carried node and the node staged for this generation get the
+            // same scoped id when they share a path, so carrying a row whose
+            // kind no longer matches the path would overwrite the staged node
+            // with the old one: a directory turned file would be put back as a
+            // directory, and the next ingest would repeat it. Directory rows
+            // carry no hash, so the hash test above cannot catch this.
+            let row_kind = r.memory_type.as_str();
+            let current_kind = current_kinds.get(&file_path).map(String::as_str);
+            let is_node_row = matches!(row_kind, "directory" | "file" | "markdown");
+            if is_node_row && current_kind != Some(row_kind) { continue; }
+            // Symbols and sections belong to a file; none of them survive the
+            // path becoming a directory.
+            if !is_node_row && current_kind == Some("directory") { continue; }
             match vector_store.get(namespace, &id).await {
                 Ok(Some((vec, mut payload))) => {
                     let old_gen_str = format!("{}{}{}{}", namespace, crate::parser::generation::NAMESPACE_SEPARATOR, prev_gen, crate::parser::generation::NAMESPACE_SEPARATOR);
@@ -1235,7 +1313,7 @@ pub async fn ingest_directory(
     }
 
     // Stamp DEPENDS_ON targets onto file nodes (best-effort, warn-first).
-    for (src_path, targets) in &dependency_map {
+    for (src_path, targets) in dependency_map.iter().filter(|_| !unchanged) {
         let src_id = crate::parser::ingest::generation_scoped_id(namespace, generation, src_path);
         match vector_store.get(namespace, &src_id).await {
             Ok(Some((vec, mut payload))) => {
@@ -1263,10 +1341,13 @@ pub async fn ingest_directory(
 
     // Atomically flip the active pointer onto this generation. Only now are its
     // nodes reachable; the previous generation remains as history.
-    if let Err(e) = vector_store
-        .publish_generation(namespace, &source_key, generation)
-        .await
-    {
+    if let Err(e) = if unchanged {
+        Ok(())
+    } else {
+        vector_store
+            .publish_generation(namespace, &source_key, generation)
+            .await
+    } {
         // Publication failed: abort the staged generation so its rows do not
         // leak as orphaned staging (same cleanup as the failure branch above).
         if let Err(abort) = vector_store
@@ -2090,6 +2171,107 @@ mod tests {
         std::fs::remove_dir_all(&db).ok();
     }
 
+    async fn kind_fixture(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, Arc<dyn VectorStore>, ParserSchema) {
+        let tmp = std::env::temp_dir().join(format!("ns-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        let db = std::env::temp_dir().join(format!("ns-{tag}-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("probe").await.expect("create the schema");
+        let schema = ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        (tmp, db, store, schema)
+    }
+
+    /// A directory replaced by a file of the same name must publish the file
+    /// node. The old directory row has no hash, so carry-forward used to copy
+    /// it over the staged file node (same scoped id) and the next ingest read
+    /// the path as a directory again.
+    #[tokio::test]
+    async fn a_directory_replaced_by_a_file_publishes_the_file_node() {
+        let (tmp, db, store, schema) = kind_fixture("dir-to-file").await;
+        std::fs::create_dir_all(tmp.join("thing")).expect("create directory");
+        std::fs::write(tmp.join("thing").join("inner.txt"), "inner").expect("write inner");
+        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", None, &[])
+            .await
+            .expect("first ingest");
+        let key = source_key_for(&tmp);
+        let gen1 = store.active_generation("probe", &key).await.expect("gen1");
+
+        std::fs::remove_dir_all(tmp.join("thing")).expect("remove directory");
+        std::fs::write(tmp.join("thing"), "now a file").expect("write file");
+        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", None, &[])
+            .await
+            .expect("second ingest");
+        let gen2 = store.active_generation("probe", &key).await.expect("gen2");
+        assert!(gen2 > gen1, "a path that changed kind is a change: {gen1} then {gen2}");
+
+        let (_, node) = store
+            .get("probe", &generation_scoped_id("probe", gen2, "thing"))
+            .await
+            .expect("read")
+            .expect("the path has a node in the new generation");
+        assert_eq!(node.memory_type, "file", "the published node is the file, not the old directory");
+        assert!(node.metadata.get("file_sha256").is_some(), "and it carries the file's hash");
+        assert!(
+            store
+                .get("probe", &generation_scoped_id("probe", gen2, "thing/inner.txt"))
+                .await
+                .expect("read")
+                .is_none(),
+            "the old directory's child is not carried into the new generation"
+        );
+
+        // The state must be stable: a third ingest of the same tree changes nothing.
+        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", None, &[])
+            .await
+            .expect("third ingest");
+        let gen3 = store.active_generation("probe", &key).await.expect("gen3");
+        assert_eq!(gen3, gen2, "the file node is now the previous generation, so nothing changed");
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    /// A file replaced by an empty directory stages no content, so only the
+    /// node kind tells the ingest anything changed. Comparing paths alone left
+    /// the deleted file's node, symbols and sections served as live.
+    #[tokio::test]
+    async fn a_file_replaced_by_an_empty_directory_is_a_change() {
+        let (tmp, db, store, schema) = kind_fixture("file-to-dir").await;
+        std::fs::write(tmp.join("thing.rs"), "pub fn gone() {}").expect("write file");
+        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", None, &[])
+            .await
+            .expect("first ingest");
+        let key = source_key_for(&tmp);
+        let gen1 = store.active_generation("probe", &key).await.expect("gen1");
+
+        std::fs::remove_file(tmp.join("thing.rs")).expect("remove file");
+        std::fs::create_dir_all(tmp.join("thing.rs")).expect("create directory");
+        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", None, &[])
+            .await
+            .expect("second ingest");
+        let gen2 = store.active_generation("probe", &key).await.expect("gen2");
+        assert!(gen2 > gen1, "a path that changed kind is a change: {gen1} then {gen2}");
+
+        let (_, node) = store
+            .get("probe", &generation_scoped_id("probe", gen2, "thing.rs"))
+            .await
+            .expect("read")
+            .expect("the path has a node in the new generation");
+        assert_eq!(node.memory_type, "directory");
+        let leftovers: Vec<String> = store
+            .list("probe", None, None)
+            .await
+            .expect("list")
+            .into_iter()
+            .filter(|r| split_scoped_id(&r.id).map(|(_, g, _)| g == gen2).unwrap_or(false))
+            .filter(|r| r.payload.location == "thing.rs" && r.payload.memory_type != "directory")
+            .map(|r| r.id)
+            .collect();
+        assert!(leftovers.is_empty(), "the deleted file's rows are not served: {leftovers:?}");
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
     #[tokio::test]
     async fn pre_migration_generation_re_parses_and_stamps_every_row() {
         let tmp = std::env::temp_dir().join(format!("ns-premig-{}", uuid::Uuid::new_v4()));
@@ -2155,6 +2337,111 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    /// The slim per-generation read must hand ingest exactly the rows `list`
+    /// used to, minus the content.
+    #[tokio::test]
+    async fn generation_summary_matches_the_rows_list_gave_ingest() {
+        use crate::traits::GenerationRow;
+        let tmp = std::env::temp_dir().join(format!("ns-gensum-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        std::fs::write(tmp.join("a.rs"), "fn a() {}\nfn b() {}").expect("write file");
+        std::fs::write(tmp.join("notes.md"), "# Title\n\nbody\n").expect("write file");
+        let db = std::env::temp_dir().join(format!("ns-gensum-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("probe").await.expect("create the schema");
+        let schema = ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+
+        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", None, &[])
+            .await
+            .expect("first ingest");
+        // A second ingest after a change leaves a superseded generation behind.
+        std::fs::write(tmp.join("a.rs"), "fn a() {}\nfn c() {}").expect("edit file");
+        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", None, &[])
+            .await
+            .expect("second ingest");
+        let gen = store.active_generation("probe", &source_key_for(&tmp)).await.expect("read");
+
+        let mut got = store.generation_summary("probe", gen).await.expect("summary");
+        let mut want: Vec<GenerationRow> = store
+            .list("probe", None, None)
+            .await
+            .expect("list")
+            .into_iter()
+            .filter(|r| crate::parser::ingest::split_scoped_id(&r.id).is_some_and(|(_, g, _)| g == gen))
+            .map(|r| GenerationRow::from_payload(r.id, &r.payload))
+            .collect();
+        got.sort_by(|a, b| a.id.cmp(&b.id));
+        want.sort_by(|a, b| a.id.cmp(&b.id));
+        assert!(got.len() > 2, "the active generation has directory, file and symbol rows");
+        assert_eq!(got, want, "same rows, same fields, as the full listing gave");
+        assert!(got.iter().any(|r| r.file_sha256.is_some()), "file rows carry their hash");
+        assert!(got.iter().all(|r| !r.ingest_version.is_empty()), "every current row is stamped");
+
+        let stale = store.generation_summary("probe", gen + 1000).await.expect("summary");
+        assert!(stale.is_empty(), "a generation that is not active yields nothing");
+
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    /// Two sources in one namespace. The generation counter is per namespace
+    /// (see `begin_generation`), so two sources never share a generation
+    /// number, but they do interleave: here source a is ingested, then source
+    /// b, then source a again, which supersedes a's first generation. For each
+    /// generation number the summary has to give the rows the full listing
+    /// does, and only the rows of the source that owns it.
+    #[tokio::test]
+    async fn generation_summary_matches_list_for_two_sources_in_one_namespace() {
+        use crate::traits::GenerationRow;
+        let (tmp_a, db, store, schema) = kind_fixture("gensum-two-a").await;
+        let tmp_b = std::env::temp_dir().join(format!("ns-gensum-two-b-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp_b).expect("create second source");
+        std::fs::write(tmp_a.join("a.rs"), "fn a() {}").expect("write a");
+        std::fs::write(tmp_b.join("b.rs"), "fn b() {}").expect("write b");
+
+        ingest_directory(&tmp_a, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", None, &[])
+            .await
+            .expect("ingest source a");
+        ingest_directory(&tmp_b, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", None, &[])
+            .await
+            .expect("ingest source b");
+        std::fs::write(tmp_a.join("a.rs"), "fn a() {}\nfn a2() {}").expect("edit a");
+        ingest_directory(&tmp_a, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", None, &[])
+            .await
+            .expect("re-ingest source a");
+        let gen_a = store.active_generation("probe", &source_key_for(&tmp_a)).await.expect("gen a");
+        let gen_b = store.active_generation("probe", &source_key_for(&tmp_b)).await.expect("gen b");
+        assert_eq!((gen_b, gen_a), (2, 3), "b took the second number, a's re-ingest the third");
+
+        for gen in 1..=3u64 {
+            let mut got = store.generation_summary("probe", gen).await.expect("summary");
+            let mut want: Vec<GenerationRow> = store
+                .list("probe", None, None)
+                .await
+                .expect("list")
+                .into_iter()
+                .filter(|r| crate::parser::ingest::split_scoped_id(&r.id).is_some_and(|(_, g, _)| g == gen))
+                .map(|r| GenerationRow::from_payload(r.id, &r.payload))
+                .collect();
+            got.sort_by(|a, b| a.id.cmp(&b.id));
+            want.sort_by(|a, b| a.id.cmp(&b.id));
+            assert_eq!(got, want, "generation {gen}: same rows as the full listing");
+        }
+        let first = store.generation_summary("probe", 1).await.expect("summary of generation 1");
+        let second = store.generation_summary("probe", 2).await.expect("summary of generation 2");
+        let third = store.generation_summary("probe", 3).await.expect("summary of generation 3");
+        assert!(first.is_empty(), "a's superseded first generation yields nothing");
+        assert!(second.iter().all(|r| r.location != "a.rs"), "b's generation holds none of a's files");
+        assert!(third.iter().all(|r| r.location != "b.rs"), "a's generation holds none of b's files");
+        assert!(second.iter().any(|r| r.location == "b.rs"), "b's file is read");
+        assert!(third.iter().any(|r| r.location == "a.rs"), "a's file is read");
+
+        std::fs::remove_dir_all(&tmp_a).ok();
+        std::fs::remove_dir_all(&tmp_b).ok();
         std::fs::remove_dir_all(&db).ok();
     }
 
@@ -2315,10 +2602,11 @@ use super::x;"#;
         assert_ne!(wm.get("source_digest").and_then(|v| v.as_str()).unwrap_or(""), "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "source_digest must not be empty hash");
         assert!(wm.get("last_enriched_at").is_some(), "last_enriched_at");
 
-        // Second ingest with unchanged files -> generation 2, carries forward unchanged nodes.
+        // Second ingest with unchanged files keeps generation 1 active: a new
+        // generation would be a copy of it.
         ingest_directory(&tmp, &schema, embedder.clone(), store.clone(), "f2", None, &[]).await.expect("second");
         let gen2 = store.active_generation("f2", &source_key).await.unwrap();
-        assert!(gen2 > gen1, "second ingest produces newer generation");
+        assert_eq!(gen2, gen1, "an unchanged tree keeps the active generation");
         // Watermark updated (same fingerprint if schema unchanged, updated digest if files same).
         let (_vec2, payload2) = store.get("f2", &registry_id).await.unwrap().expect("registry row 2");
         let meta2 = payload2.metadata.as_object().expect("meta2");
@@ -2328,6 +2616,20 @@ use super::x;"#;
         // Modify file -> re-embeds changed file; old generation superseded.
         std::fs::write(tmp.join("hello.rs"), "pub fn hello_new() {}").unwrap();
         ingest_directory(&tmp, &schema, embedder.clone(), store.clone(), "f2", None, &[]).await.expect("modified");
+        let gen3 = store.active_generation("f2", &source_key).await.unwrap();
+        assert!(gen3 > gen2, "a changed file publishes a newer generation");
+
+        // A new file, with no change to any existing one, also publishes.
+        std::fs::write(tmp.join("added.rs"), "pub fn added() {}").unwrap();
+        ingest_directory(&tmp, &schema, embedder.clone(), store.clone(), "f2", None, &[]).await.expect("added");
+        let gen4 = store.active_generation("f2", &source_key).await.unwrap();
+        assert!(gen4 > gen3, "an added file publishes a newer generation");
+
+        // So does a deleted one.
+        std::fs::remove_file(tmp.join("added.rs")).unwrap();
+        ingest_directory(&tmp, &schema, embedder.clone(), store.clone(), "f2", None, &[]).await.expect("deleted");
+        let gen5 = store.active_generation("f2", &source_key).await.unwrap();
+        assert!(gen5 > gen4, "a deleted file publishes a newer generation");
     }
 }
 /// Dry-run ingest: walk the tree and produce a report without writing or

@@ -2924,6 +2924,29 @@ pub(crate) fn is_active_scoped_row(
     if keep { Some(id.to_string()) } else { None }
 }
 
+/// A namespace's active generations, read once, for deciding which rows a
+/// reader may see. Wraps `active_generations_by_source_of` and
+/// `is_active_scoped_row` so a reader does not carry their three loose values
+/// and a seven-argument call (`list_rows`, `generation_summary`).
+pub(crate) struct ActiveGenerations {
+    by_source: HashMap<String, i64>,
+    active_set: std::collections::HashSet<i64>,
+    max_code_gen: Option<i64>,
+}
+
+impl ActiveGenerations {
+    pub(crate) fn read(conn: &Connection, namespace: &str) -> Self {
+        let (by_source, active_set, max_code_gen) = active_generations_by_source_of(conn, namespace);
+        Self { by_source, active_set, max_code_gen }
+    }
+
+    /// Same rule as `is_active_scoped_row`: false for a row of a superseded
+    /// generation or another namespace.
+    pub(crate) fn reaches(&self, id: &str, namespace: &str, memory_type: &str, metadata: &Value) -> bool {
+        is_active_scoped_row(id, namespace, memory_type, metadata, &self.by_source, &self.active_set, self.max_code_gen).is_some()
+    }
+}
+
 /// Normative memory types that the recall path reserves result slots for.
 /// Stated once here so the search ranker and the task gate can agree on the
 /// same predicate (see the FEATURE-4 provenance contract in `src/traits.rs`).
@@ -6586,6 +6609,50 @@ impl VectorStore for LadybugStore {
                 ids.push(format!("{}", row[0]));
             }
             Ok(ids)
+        })
+        .await
+    }
+
+    /// One generation's rows, narrowed by id prefix in the engine and reduced
+    /// to what ingest reads. Same reachability rule as `list` (a row of a
+    /// superseded generation or another namespace is skipped), but the row's
+    /// content is never fetched and its metadata is parsed, summarised and
+    /// dropped one row at a time. Separate from `list_rows` on purpose: that
+    /// one backs `list` and `list_pinned` and must keep returning full rows.
+    async fn generation_summary(&self, namespace: &str, generation: u64) -> Result<Vec<crate::traits::GenerationRow>> {
+        let namespace = namespace.to_string();
+        self.with_conn(move |conn| {
+            let active = ActiveGenerations::read(conn, &namespace);
+            let prefix = crate::parser::ingest::generation_scoped_id(&namespace, generation, "");
+            let query = format!(
+                "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id STARTS WITH '{}' RETURN m.id, m.memory_type, m.location, m.metadata",
+                escape_ladybug_string(&namespace),
+                escape_ladybug_string(&prefix)
+            );
+            let mut result = conn.query(&query)?;
+            let mut out = Vec::new();
+            while let Some(row) = result.next() {
+                let id: String = format!("{}", row[0]);
+                let memory_type: String = format!("{}", row[1]);
+                let location: String = format!("{}", row[2]);
+                let metadata_str: String = format!("{}", row[3]);
+                // The same warning `list` gives for a row whose metadata does not
+                // parse; the row is then read as having none.
+                let metadata: Value = match serde_json::from_str(&metadata_str) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if !metadata_str.trim().is_empty() {
+                            tracing::warn!("corrupt metadata JSON in store row: {e}");
+                        }
+                        Value::Null
+                    }
+                };
+                if !active.reaches(&id, &namespace, &memory_type, &metadata) {
+                    continue;
+                }
+                out.push(crate::traits::GenerationRow::from_parts(id, memory_type, location, &metadata));
+            }
+            Ok(out)
         })
         .await
     }
