@@ -9443,7 +9443,7 @@ fn is_retired(metadata: &Value) -> bool {
 
 /// Timestamp-aware variant so callers that fetch many rows in one pass can
 /// capture `now` once instead of calling Utc::now() per row.
-fn is_retired_at(metadata: &Value, now: i64) -> bool {
+pub(crate) fn is_retired_at(metadata: &Value, now: i64) -> bool {
     match metadata.get("valid_to") {
         Some(valid_to) if !valid_to.is_null() => valid_to.as_i64().unwrap_or(0) <= now,
         _ => false,
