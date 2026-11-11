@@ -5611,10 +5611,16 @@ impl VectorStore for LadybugStore {
         if memory_types.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
+        // The same fail-closed gate every vector search passes through: after
+        // a model switch the stored vectors and this query live in different
+        // spaces, and the distances ranked below would be meaningless.
+        self.check_data_bearing_identity()?;
         let namespace = namespace.to_string();
         let memory_types = memory_types.to_vec();
         self.with_conn(move |conn| {
             let safe_ns = escape_ladybug_string(&namespace);
+            let (by_source, active_set, max_code_gen) =
+                active_generations_by_source_of(conn, &namespace);
             let type_list = memory_types
                 .iter()
                 .map(|t| format!("'{}'", escape_ladybug_string(t)))
@@ -5642,6 +5648,7 @@ impl VectorStore for LadybugStore {
             // uses. A single `m.id IN [...]` query over the same rows was
             // measured at +286 MB, so it is not a keyed read.
             let mut ranked: Vec<SearchResult> = Vec::new();
+            let mut best_by_bare: HashMap<String, (u64, usize)> = HashMap::new();
             for id in &candidate_ids {
                 let query = format!(
                     "MATCH (m:Memory) WHERE m.id = '{}' RETURN m.id, m.embedding, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata",
@@ -5669,20 +5676,55 @@ impl VectorStore for LadybugStore {
                 {
                     continue;
                 }
-                ranked.push(SearchResult {
-                    id: format!("{}", row[0]),
+                let id = format!("{}", row[0]);
+                let memory_type = format!("{}", row[4]);
+                // A superseded generation, or another namespace's scoped row,
+                // must not fire or take a limit slot.
+                if is_active_scoped_row(
+                    &id,
+                    &namespace,
+                    &memory_type,
+                    &metadata,
+                    &by_source,
+                    &active_set,
+                    max_code_gen,
+                )
+                .is_none()
+                {
+                    continue;
+                }
+                let sr = SearchResult {
+                    id: id.clone(),
                     score: distance,
                     payload: MemoryPayload {
                         content: format!("{}", row[2]),
                         user_id: format!("{}", row[3]),
-                        memory_type: format!("{}", row[4]),
+                        memory_type,
                         agent_name: Some(format!("{}", row[5])),
                         location: format!("{}", row[6]),
                         location_lines: format!("{}", row[7]),
                         metadata,
                     },
                     evidence: None,
-                });
+                };
+                // One logical id across active generations: keep the highest,
+                // as search does. Unscoped rows are never deduplicated.
+                if let Some(bare) = bare_id_of(&id) {
+                    let gen = split_scoped_id(&id).map(|(_, g, _)| g as u64).unwrap_or(0);
+                    match best_by_bare.get(&bare) {
+                        Some(&(existing_gen, idx)) if gen > existing_gen => {
+                            ranked[idx] = sr;
+                            best_by_bare.insert(bare, (gen, idx));
+                        }
+                        Some(_) => {}
+                        None => {
+                            best_by_bare.insert(bare, (gen, ranked.len()));
+                            ranked.push(sr);
+                        }
+                    }
+                } else {
+                    ranked.push(sr);
+                }
             }
             // Nearest first; the id breaks ties as the engine query did.
             ranked.sort_by(|a, b| {
@@ -11625,6 +11667,85 @@ eurostrata\src\daemon.rs",
     }
 
     #[tokio::test]
+    async fn search_by_types_skips_superseded_generations_and_keeps_one_row_per_logical_id() {
+        let store = retired_test_store().await;
+        let query_vec = vec![1.0f32, 0.0, 0.0, 0.0];
+        let types = vec!["code_ast".to_string(), "rule".to_string()];
+
+        assert_eq!(store.begin_generation("probe", "source-a").await.unwrap(), 1);
+        let gen1_id = crate::parser::ingest::generation_scoped_id("probe", 1, "src/a.rs");
+        store
+            .upsert(
+                "probe",
+                &gen1_id,
+                query_vec.clone(),
+                retired_test_payload("code_ast", "auto-ingestor", json!({ "source_key": "source-a" })),
+            )
+            .await
+            .unwrap();
+        store.publish_generation("probe", "source-a", 1).await.unwrap();
+
+        assert_eq!(store.begin_generation("probe", "source-a").await.unwrap(), 2);
+        let gen2_id = crate::parser::ingest::generation_scoped_id("probe", 2, "src/a.rs");
+        store
+            .upsert(
+                "probe",
+                &gen2_id,
+                query_vec.clone(),
+                retired_test_payload("code_ast", "auto-ingestor", json!({ "source_key": "source-a" })),
+            )
+            .await
+            .unwrap();
+        store.publish_generation("probe", "source-a", 2).await.unwrap();
+        store
+            .upsert(
+                "probe",
+                "normative-rule",
+                query_vec.clone(),
+                retired_test_payload("rule", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+
+        let ids: Vec<String> = store
+            .search_by_types("probe", query_vec, 10, &types)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert!(ids.contains(&gen2_id), "the active generation answers: {ids:?}");
+        assert!(!ids.contains(&gen1_id), "a superseded generation never fires: {ids:?}");
+        assert!(ids.contains(&"normative-rule".to_string()), "unscoped rows pass: {ids:?}");
+        assert_eq!(ids.len(), 2, "one row per logical id, no limit slot lost: {ids:?}");
+    }
+
+    #[tokio::test]
+    async fn search_by_types_drops_archived_rows_unlike_the_list_merge() {
+        // Decision, not an accident: a tombstoned rule is not enforced by the
+        // semantic lookup. The earlier `search` call passed include_archived
+        // true; this pins the new behaviour so a change to it is deliberate.
+        let store = retired_test_store().await;
+        for (id, meta) in [
+            ("live-rule", json!({})),
+            ("archived-rule", json!({ "archived": true })),
+        ] {
+            store
+                .upsert("probe", id, vec![1.0, 0.0, 0.0, 0.0], retired_test_payload("rule", "agent", meta))
+                .await
+                .unwrap();
+        }
+        let ids: Vec<String> = store
+            .search_by_types("probe", vec![1.0, 0.0, 0.0, 0.0], 10, &["rule".to_string()])
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(ids, vec!["live-rule".to_string()]);
+    }
+
+    #[tokio::test]
     async fn search_stable_tie_order() {
         let store = retired_test_store().await;
         // Two live rows with identical embeddings; order should be deterministic.
@@ -16383,6 +16504,13 @@ eurostrata\src\daemon.rs",
             .upsert("probe", "m2", vec![0.1; 768], store_state_payload())
             .await
             .expect_err("an upsert on the refused instance must refuse");
+        assert!(embedding_identity_refusal_message(&err).is_some());
+        // So does the typed scan the guard runs: ranking vectors from another
+        // embedding space would decide on meaningless distances.
+        let err = reopened
+            .search_by_types("probe", vec![0.1; 768], 5, &["rule".to_string()])
+            .await
+            .expect_err("search_by_types on the refused instance must refuse");
         assert!(embedding_identity_refusal_message(&err).is_some());
         drop(reopened);
         let _ = std::fs::remove_dir_all(&fx.root);
