@@ -337,8 +337,8 @@ fn slugify(s: &str) -> String {
 /// they must be cheap and must not block.
 pub trait IngestObserver: Send + Sync {
     fn file_ingested(&self, path: &str, symbols: usize);
-    fn file_skipped(&self, path: &str) {
-        tracing::debug!("ingest skipped file: {path}");
+    fn file_skipped(&self, path: &str, reason: &str) {
+        tracing::debug!("ingest skipped file: {path} ({reason})");
     }
     fn relinked(&self, edges: usize);
     /// Called once per run when the previous generation's `ingest_version`
@@ -372,12 +372,27 @@ enum IngestItem {
         /// SHA-256 of the file bytes, shared by every symbol in the file.
         file_sha256: String,
     },
+    /// A document the secret scanner refused: skipped whole, reported
+    /// through the observer. Carries the file's display path and the
+    /// scanner's reason — never the secret itself.
+    SkippedFile {
+        path_display: String,
+        reason: String,
+    },
     /// Embedded markdown sections.
     DocSections {
         node_path: String,
         sections: Vec<DocSection>,
         file_sha256: String,
     },
+}
+
+/// Secret scan over a document's text, run in the producer as the file is
+/// read — before any part of the document reaches the store. The verdict
+/// text is the reason the skip reports.
+fn scan_for_ingest(text: &str) -> Option<String> {
+    crate::secrets::scan_entry_point(text, &serde_json::json!({}), "ingest")
+        .map(|r| r.to_string())
 }
 
 /// Blocking producer: walks the directory tree, reads files, parses ASTs,
@@ -555,7 +570,7 @@ fn run_producer(
                 if let Some(prev_hash) = prev_file_map.get(&node_path) {
                     if prev_hash == file_sha256.as_deref().unwrap_or("") {
                         if let Some(obs) = &observer {
-                            obs.file_skipped(&path_str);
+                            obs.file_skipped(&path_str, "unchanged");
                         }
                         // Record the current hash so unchanged rows can be carried.
                         if let Some(h) = file_sha256.as_deref() {
@@ -569,6 +584,23 @@ fn run_producer(
         // Record the current hash for every file the walk visits.
         if let Some(h) = file_sha256.as_deref() {
             current_hashes.insert(node_path.clone(), h.to_string());
+        }
+
+        // Before its node goes out, a parseable file's text meets the secret
+        // scanner first, and a document that trips it is skipped whole — no
+        // file node, no symbols, no sections — with the skip reported through
+        // the consumer. The scan runs over the bytes already read above, so
+        // what is scanned is exactly what is parsed and stored.
+        if let Some(text) = &content {
+            if let Some(reason) = scan_for_ingest(text) {
+                if let Err(e) = tx.blocking_send(IngestItem::SkippedFile {
+                    path_display: path_str.to_string(),
+                    reason,
+                }) {
+                    return Err(anyhow::anyhow!("ingest consumer dropped: {}", e));
+                }
+                continue;
+            }
         }
 
         // Apply backpressure: if the channel is full, block until space is
@@ -911,6 +943,15 @@ async fn run_consumer(
                     if let Some(observer) = &observer {
                         observer.file_ingested(&path_display, symbols_stored);
                     }
+                }
+            }
+            IngestItem::SkippedFile {
+                path_display,
+                reason,
+            } => {
+                println!("Skipped {} during ingest: {}", path_display, reason);
+                if let Some(observer) = &observer {
+                    observer.file_skipped(&path_display, &reason);
                 }
             }
         IngestItem::DocSections {
@@ -1998,7 +2039,7 @@ mod tests {
         struct Recorder(std::sync::Mutex<(usize, usize)>); // (skipped, gate trips)
         impl IngestObserver for Recorder {
             fn file_ingested(&self, _path: &str, _symbols: usize) {}
-            fn file_skipped(&self, _path: &str) {
+            fn file_skipped(&self, _path: &str, _reason: &str) {
                 self.0.lock().unwrap().0 += 1;
             }
             fn relinked(&self, _edges: usize) {}
@@ -2129,7 +2170,7 @@ mod tests {
         struct Rec(std::sync::Mutex<usize>);
         impl IngestObserver for Rec {
             fn file_ingested(&self, _p: &str, _s: usize) {}
-            fn file_skipped(&self, _p: &str) {}
+            fn file_skipped(&self, _p: &str, _r: &str) {}
             fn relinked(&self, _e: usize) {}
             fn version_gate_tripped(&self, _p: &str, _c: &str) {
                 *self.0.lock().unwrap() += 1;
@@ -2192,7 +2233,7 @@ mod tests {
         struct Rec(std::sync::Mutex<usize>);
         impl IngestObserver for Rec {
             fn file_ingested(&self, _p: &str, _s: usize) {}
-            fn file_skipped(&self, _p: &str) {}
+            fn file_skipped(&self, _p: &str, _r: &str) {}
             fn relinked(&self, _e: usize) {}
             fn version_gate_tripped(&self, _p: &str, _c: &str) {
                 *self.0.lock().unwrap() += 1;
@@ -2328,6 +2369,139 @@ use super::x;"#;
         // Modify file -> re-embeds changed file; old generation superseded.
         std::fs::write(tmp.join("hello.rs"), "pub fn hello_new() {}").unwrap();
         ingest_directory(&tmp, &schema, embedder.clone(), store.clone(), "f2", None, &[]).await.expect("modified");
+    }
+
+    /// Records the documents the walk skipped, so a test asserts on the
+    /// report rather than on what the walk printed.
+    struct SkipRecorder {
+        skipped: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    }
+
+    impl IngestObserver for SkipRecorder {
+        fn file_ingested(&self, _path: &str, _symbols: usize) {}
+
+        fn relinked(&self, _edges: usize) {}
+
+        fn file_skipped(&self, path: &str, reason: &str) {
+            self.skipped
+                .lock()
+                .expect("recorder lock")
+                .push((path.to_string(), reason.to_string()));
+        }
+    }
+
+    /// PAR-03: a document whose text trips the scanner is skipped whole — no
+    /// file node, no symbols — and reported with the scanner's reason, while
+    /// the rest of the walk proceeds.
+    #[tokio::test]
+    async fn par03_secret_in_ingest_is_refused() {
+        let tmp = std::env::temp_dir().join(format!("ns-ingest-secret-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        std::fs::write(tmp.join("good.rs"), "fn clean() {}").expect("write clean file");
+        // Built at runtime so no secret-shaped literal sits in the source.
+        let secret = format!("ghp_{}", "Ab1".repeat(12));
+        let evil_source = format!("fn leak() {{\n    let key = \"{}\";\n}}\n", secret);
+        std::fs::write(tmp.join("evil.rs"), &evil_source).expect("write leaking file");
+
+        let db =
+            std::env::temp_dir().join(format!("ns-ingest-secret-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("test-ns").await.expect("create the schema");
+
+        let skipped = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observer: Arc<dyn IngestObserver> = Arc::new(SkipRecorder {
+            skipped: skipped.clone(),
+        });
+
+        let schema =
+            ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        let outcome = ingest_directory(
+            &tmp,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "test-ns",
+            Some(observer),
+            &[],
+        )
+        .await;
+        assert!(
+            outcome.is_ok(),
+            "the walk proceeds past the skipped document: {:?}",
+            outcome.err()
+        );
+
+        // The clean document landed whole.
+        let good_sym = generation_scoped_id(
+            "test-ns",
+            1,
+            &symbol_id("good.rs", "functions", "clean", &sha256_hex("fn clean() {}".as_bytes())),
+        );
+        assert!(
+            store
+                .get("test-ns", &good_sym)
+                .await
+                .expect("read back")
+                .is_some(),
+            "clean symbol was stored"
+        );
+
+        // The tripping document contributed nothing: no file node, no symbol.
+        let evil_node = generation_scoped_id("test-ns", 1, "evil.rs");
+        assert!(
+            store
+                .get("test-ns", &evil_node)
+                .await
+                .expect("read back")
+                .is_none(),
+            "skipped document's file node was not stored"
+        );
+        let evil_sym = generation_scoped_id(
+            "test-ns",
+            1,
+            &symbol_id(
+                "evil.rs",
+                "functions",
+                "leak",
+                &sha256_hex(evil_source.as_bytes()),
+            ),
+        );
+        assert!(
+            store
+                .get("test-ns", &evil_sym)
+                .await
+                .expect("read back")
+                .is_none(),
+            "skipped document's symbol was not stored"
+        );
+
+        // And the skip was reported with the file and the scanner's reason.
+        let skipped = skipped.lock().expect("recorder lock");
+        assert_eq!(skipped.len(), 1, "exactly one skip reported: {:?}", *skipped);
+        assert!(
+            skipped[0].0.ends_with("evil.rs"),
+            "skip names the file: {}",
+            skipped[0].0
+        );
+        assert!(
+            skipped[0].1.contains("ERROR [SECURITY]"),
+            "skip carries the scanner verdict: {}",
+            skipped[0].1
+        );
+        assert!(
+            skipped[0].1.contains("github_pat"),
+            "skip carries the scanner category: {}",
+            skipped[0].1
+        );
+        assert!(
+            !skipped[0].1.contains(&secret),
+            "skip must not echo the secret: {}",
+            skipped[0].1
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
     }
 }
 /// Dry-run ingest: walk the tree and produce a report without writing or

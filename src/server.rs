@@ -7779,6 +7779,13 @@ pub(crate) enum MetadataOutcome {
     Ingested,
 }
 
+/// Secret scan over replacement metadata values, in the add_memory refusal
+/// shape. Setting metadata is a store write, so the values meet the same
+/// scanner before anything is read or written.
+fn scan_for_set_metadata(metadata: &serde_json::Value) -> Option<String> {
+    crate::secrets::scan_entry_point("", metadata, "set_metadata").map(|r| r.to_string())
+}
+
 /// Update metadata on an existing memory without changing its ID or content.
 ///
 /// This is the operator's surgical path for fixing metadata issues (like missing
@@ -7789,6 +7796,10 @@ pub(crate) async fn set_metadata(
     id: &str,
     new_metadata: serde_json::Value,
 ) -> anyhow::Result<MetadataOutcome> {
+    if let Some(rejection) = scan_for_set_metadata(&new_metadata) {
+        return Err(anyhow::anyhow!("{}", rejection));
+    }
+
     let (vector, mut payload) = match store.get(namespace, id).await? {
         Some(found) => found,
         None => return Ok(MetadataOutcome::NotFound),
@@ -11875,6 +11886,35 @@ mod tests {
 
         let after = store.list("probe", None, None).await.unwrap().len();
         assert_eq!(before, after, "no memory should be stored after rejection");
+    }
+
+    // ── Secret rejection on set_metadata prevents the write ─────────────
+
+    #[tokio::test]
+    async fn par03_secret_in_set_metadata_is_refused() {
+        let (store, id) = store_with_one_rule("probe").await;
+        let (_, before) = store.get("probe", &id).await.unwrap().unwrap();
+        // Built at runtime so no secret-shaped literal sits in the source.
+        let secret = format!("ghp_{}", "Ab1".repeat(12));
+
+        let err = set_metadata(
+            &*store,
+            "probe",
+            &id,
+            serde_json::json!({ "note": format!("the token is {}", secret) }),
+        )
+        .await
+        .expect_err("a secret in replacement metadata must be refused");
+        let refused = err.to_string();
+        assert!(refused.contains("ERROR [SECURITY]"), "got {}", refused);
+        assert!(refused.contains("github_pat"), "got {}", refused);
+        assert!(!refused.contains(&secret), "the refusal must not echo the secret");
+
+        let (_, payload) = store.get("probe", &id).await.unwrap().unwrap();
+        assert_eq!(
+            payload.metadata, before.metadata,
+            "the refused write left the stored metadata untouched"
+        );
     }
 
     // ── Snapshot handler: fallible encoding (Task 2) ───────────────────
