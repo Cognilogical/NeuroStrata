@@ -1283,15 +1283,22 @@ pub async fn ingest_directory(
     // new generation contains the full tree without re-embedding.
     // A forced re-parse (version trip) stages every current node itself, so
     // no previous row is carried in that mode.
+    //
+    // A failed carry is not a partial carry: unchanged files are skipped by
+    // the producer, so this pass is their only route into the new generation.
+    // Publishing past a failure here would flip the active pointer onto a tree
+    // with holes in it, so the first carry error (summary, fetch or re-stage)
+    // aborts the staging generation exactly like a staging failure above.
     if prev_gen > 0 && !force_reparse && !unchanged {
         let mut carried = 0usize;
+        let mut carry_failure: Option<anyhow::Error> = None;
         let rows = match vector_store.generation_summary(namespace, prev_gen).await {
             Ok(rows) => rows,
             Err(e) => {
-                tracing::warn!(
+                carry_failure = Some(anyhow::anyhow!(
                     "carry-forward: could not list previous-generation rows of namespace {}: {}",
                     namespace, e
-                );
+                ));
                 Vec::new()
             }
         };
@@ -1352,19 +1359,45 @@ pub async fn ingest_directory(
                     });
                     let new_id = crate::parser::ingest::generation_scoped_id(namespace, generation, &tail);
                     if let Err(e) = vector_store.upsert(namespace, &new_id, vec, payload).await {
-                        tracing::warn!(
+                        carry_failure = Some(anyhow::anyhow!(
                             "carry-forward: failed to re-stage node {} into generation {}: {}",
                             new_id, generation, e
-                        );
-                    } else {
-                        carried += 1;
+                        ));
+                        break;
                     }
+                    carried += 1;
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    tracing::warn!("carry-forward: vector_store.get failed for node {id}: {e}");
+                    carry_failure = Some(anyhow::anyhow!(
+                        "carry-forward: vector_store.get failed for node {id}: {e}"
+                    ));
+                    break;
                 }
             }
+        }
+        if let Some(e) = carry_failure {
+            if let Err(abort) = vector_store
+                .abort_generation(namespace, &source_key, generation)
+                .await
+            {
+                eprintln!(
+                    "Failed to abort staging generation {} of namespace {}: {}",
+                    generation, namespace, abort
+                );
+            }
+            if let Err(e) = crate::registry::enrichment_fail(
+                &vector_store,
+                Some(&embedder),
+                namespace,
+                "ingest",
+                &e.to_string(),
+            )
+            .await
+            {
+                tracing::warn!("enrichment registry update failed: {e}");
+            }
+            return Err(e);
         }
         println!("Carried forward {} unchanged nodes", carried);
     }
@@ -2925,6 +2958,341 @@ use super::x;"#;
         );
 
         std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    /// Which carry-forward store call a `CarryFailingStore` fault hits.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum CarryFault {
+        Upsert,
+        Get,
+        List,
+    }
+
+    /// Delegating store double whose carry-forward store calls fail while
+    /// `fail` is set, so a test can break the carry-forward pass -- the
+    /// previous-generation list, the row fetch, or the re-stage upsert --
+    /// that runs between staging and publication and is an unchanged file's
+    /// only route into the new generation.
+    struct CarryFailingStore {
+        inner: Arc<dyn VectorStore>,
+        fail: std::sync::atomic::AtomicBool,
+        fault: CarryFault,
+        /// Only re-stage upserts whose scoped id carries this tail marker
+        /// fail: the consumer also upserts the generation-scoped source node
+        /// on every ingest, and failing that one would abort the ingest in
+        /// `run_consumer` instead of exercising the carry-forward pass.
+        upsert_marker: &'static str,
+    }
+
+    impl CarryFailingStore {
+        fn armed(&self, fault: CarryFault) -> bool {
+            self.fault == fault && self.fail.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl crate::traits::AsAny for CarryFailingStore {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl VectorStore for CarryFailingStore {
+        async fn init(&self, namespace: &str) -> anyhow::Result<()> {
+            self.inner.init(namespace).await
+        }
+
+        async fn upsert(
+            &self,
+            namespace: &str,
+            id: &str,
+            vector: Vec<f32>,
+            payload: MemoryPayload,
+        ) -> anyhow::Result<crate::traits::UpsertReport> {
+            // Only re-staging a carried row into a later generation fails;
+            // unscoped bookkeeping writes are never disturbed.
+            if self.armed(CarryFault::Upsert)
+                && id.contains(self.upsert_marker)
+                && matches!(split_scoped_id(id), Some((_, gen, _)) if gen >= 2)
+            {
+                anyhow::bail!("injected carry upsert failure (test double)");
+            }
+            self.inner.upsert(namespace, id, vector, payload).await
+        }
+
+        async fn search(
+            &self,
+            namespace: &str,
+            vector: Vec<f32>,
+            limit: usize,
+            include_tasks: bool,
+            include_archived: bool,
+        ) -> anyhow::Result<Vec<crate::traits::SearchResult>> {
+            self.inner
+                .search(namespace, vector, limit, include_tasks, include_archived)
+                .await
+        }
+
+        async fn delete(&self, namespace: &str, id: &str) -> anyhow::Result<()> {
+            self.inner.delete(namespace, id).await
+        }
+
+        async fn clear_ingested(&self, namespace: &str) -> anyhow::Result<()> {
+            self.inner.clear_ingested(namespace).await
+        }
+
+        async fn relink_edges(
+            &self,
+            namespace: &str,
+            source_key: &str,
+        ) -> anyhow::Result<usize> {
+            self.inner.relink_edges(namespace, source_key).await
+        }
+
+        async fn begin_generation(
+            &self,
+            namespace: &str,
+            source_key: &str,
+        ) -> anyhow::Result<u64> {
+            self.inner.begin_generation(namespace, source_key).await
+        }
+
+        async fn publish_generation(
+            &self,
+            namespace: &str,
+            source_key: &str,
+            generation: u64,
+        ) -> anyhow::Result<()> {
+            self.inner
+                .publish_generation(namespace, source_key, generation)
+                .await
+        }
+
+        async fn abort_generation(
+            &self,
+            namespace: &str,
+            source_key: &str,
+            generation: u64,
+        ) -> anyhow::Result<()> {
+            self.inner
+                .abort_generation(namespace, source_key, generation)
+                .await
+        }
+
+        async fn active_generation(
+            &self,
+            namespace: &str,
+            source_key: &str,
+        ) -> anyhow::Result<u64> {
+            self.inner.active_generation(namespace, source_key).await
+        }
+
+        async fn generation_nodes(
+            &self,
+            namespace: &str,
+            generation: u64,
+        ) -> anyhow::Result<Vec<String>> {
+            self.inner.generation_nodes(namespace, generation).await
+        }
+
+        async fn list(
+            &self,
+            namespace: &str,
+            user_id: Option<&str>,
+            memory_type: Option<&str>,
+        ) -> anyhow::Result<Vec<crate::traits::SearchResult>> {
+            if self.armed(CarryFault::List) {
+                anyhow::bail!("injected carry list failure (test double)");
+            }
+            self.inner.list(namespace, user_id, memory_type).await
+        }
+
+        async fn get(
+            &self,
+            namespace: &str,
+            id: &str,
+        ) -> anyhow::Result<Option<(Vec<f32>, MemoryPayload)>> {
+            // The only generation-scoped fetches in the ingest flow are the
+            // carry-forward pass and the DEPENDS_ON stamping after it; the
+            // carry fetch is the first of them.
+            if self.armed(CarryFault::Get) && split_scoped_id(id).is_some() {
+                anyhow::bail!("injected carry get failure (test double)");
+            }
+            self.inner.get(namespace, id).await
+        }
+
+        async fn relocate(
+            &self,
+            id: &str,
+            from: &str,
+            to: &str,
+        ) -> anyhow::Result<crate::traits::RelocateOutcome> {
+            self.inner.relocate(id, from, to).await
+        }
+
+        async fn list_namespaces(&self) -> anyhow::Result<Vec<String>> {
+            self.inner.list_namespaces().await
+        }
+
+        async fn export_graph(
+            &self,
+            include_retired: bool,
+            include_archived: bool,
+            project_contexts: &std::collections::HashMap<String, std::path::PathBuf>,
+            anchor_override: Option<&crate::source_context::ScopedAnchorOverride>,
+        ) -> anyhow::Result<serde_json::Value> {
+            self.inner
+                .export_graph(include_retired, include_archived, project_contexts, anchor_override)
+                .await
+        }
+
+        async fn increment_access_count(&self, namespace: &str, id: &str) -> anyhow::Result<()> {
+            self.inner.increment_access_count(namespace, id).await
+        }
+
+        async fn export_database(&self, dir: &str) -> anyhow::Result<()> {
+            self.inner.export_database(dir).await
+        }
+
+        async fn checkpoint(&self) -> anyhow::Result<()> {
+            self.inner.checkpoint().await
+        }
+    }
+
+    /// Shared driver for the carry-fault tests: publish generation 1 of a
+    /// one-file directory, arm one carry-forward fault, then ingest the
+    /// unchanged directory again. The unchanged file is skipped by the
+    /// producer, so the carry-forward pass is its only route into generation
+    /// 2 -- exactly the route the fault breaks.
+    async fn ingest_twice_with_carry_fault(
+        fault: CarryFault,
+    ) -> (
+        anyhow::Result<()>,
+        Arc<dyn VectorStore>,
+        String,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let db = std::env::temp_dir().join(format!("ns-carry-db-{}", uuid::Uuid::new_v4()));
+        let inner: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        let failing = Arc::new(CarryFailingStore {
+            inner: inner.clone(),
+            fail: std::sync::atomic::AtomicBool::new(false),
+            fault,
+            upsert_marker: "hello.rs",
+        });
+        let store: Arc<dyn VectorStore> = failing.clone();
+        store.init("carry-ns").await.expect("create the schema");
+
+        let dir = std::env::temp_dir().join(format!("ns-carry-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        std::fs::write(dir.join("hello.rs"), "fn main() {}").expect("write file");
+        let schema =
+            ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        let source_key = source_key_for(&dir);
+
+        ingest_directory(
+            &dir,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "carry-ns",
+            None,
+            &[],
+        )
+        .await
+        .expect("first ingest publishes generation 1");
+        assert_eq!(
+            inner
+                .active_generation("carry-ns", &source_key)
+                .await
+                .expect("read"),
+            1,
+            "the first ingest publishes generation 1"
+        );
+
+        failing
+            .fail
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let outcome = ingest_directory(
+            &dir,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "carry-ns",
+            None,
+            &[],
+        )
+        .await;
+        (outcome, inner, source_key, dir, db)
+    }
+
+    /// The assertions every carry fault must satisfy: the ingest fails naming
+    /// the carry-forward failure, and generation 1 stays active with its file
+    /// node reachable -- nothing is published over a hole.
+    fn assert_carry_fault_aborted(outcome: anyhow::Result<()>) -> anyhow::Error {
+        let err = outcome.expect_err("a failed carry-forward step must fail the ingest");
+        assert!(
+            format!("{}", err).contains("carry-forward"),
+            "the error names the carry-forward failure: {}",
+            err
+        );
+        err
+    }
+
+    async fn assert_generation_1_survives(inner: &Arc<dyn VectorStore>, source_key: &str) {
+        assert_eq!(
+            inner
+                .active_generation("carry-ns", source_key)
+                .await
+                .expect("read"),
+            1,
+            "the previous generation stays active after a failed carry"
+        );
+        let gen1_id = generation_scoped_id("carry-ns", 1, "hello.rs");
+        assert!(
+            inner
+                .get("carry-ns", &gen1_id)
+                .await
+                .expect("read")
+                .is_some(),
+            "generation 1's file node remains reachable"
+        );
+    }
+
+    #[tokio::test]
+    async fn par04_failed_carry_forward_upsert_aborts_the_ingest() {
+        let (outcome, inner, source_key, dir, db) =
+            ingest_twice_with_carry_fault(CarryFault::Upsert).await;
+        assert_carry_fault_aborted(outcome);
+        assert_generation_1_survives(&inner, &source_key).await;
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn par04_failed_carry_forward_list_aborts_the_ingest() {
+        // Largest blast radius: a failed list of the previous generation's
+        // rows used to carry nothing at all and still publish.
+        let (outcome, inner, source_key, dir, db) =
+            ingest_twice_with_carry_fault(CarryFault::List).await;
+        assert_carry_fault_aborted(outcome);
+        assert_generation_1_survives(&inner, &source_key).await;
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn par04_failed_carry_forward_get_aborts_the_ingest() {
+        // At the row fetch: a failed get used to drop that node from the new
+        // generation and still publish.
+        let (outcome, inner, source_key, dir, db) =
+            ingest_twice_with_carry_fault(CarryFault::Get).await;
+        assert_carry_fault_aborted(outcome);
+        assert_generation_1_survives(&inner, &source_key).await;
+        std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&db).ok();
     }
 }
