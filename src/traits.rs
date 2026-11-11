@@ -330,13 +330,21 @@ pub trait VectorStore: Send + Sync + AsAny {
         include_archived: bool,
     ) -> Result<Vec<SearchResult>>;
 
-    /// Closest memories of the given `memory_types` only: one vector scan, no
-    /// graph expansion, no ranking boosts. For callers that keep a few rows of
-    /// known types and discard the rest (the guard's rule lookup), so the
-    /// general `search` path's expansion work is not paid for nothing.
+    /// Closest memories of the given `memory_types` only. For callers that
+    /// keep a few rows of known types and discard the rest (the guard's rule
+    /// lookup), so the general `search` path's expansion work is not paid for
+    /// nothing.
     ///
-    /// Default: `search` with a wider budget, filtered to the types. Stores
-    /// with a typed query override it.
+    /// `score` is the raw L2 distance, lower is closer. A store with a typed
+    /// query (the Ladybug store) returns only vector-ranked rows of those
+    /// types: no graph expansion, no usage or feedback boosts, archived,
+    /// retired, mesh-conflicting, registry and superseded-generation rows
+    /// dropped, one row per logical id.
+    ///
+    /// The default is only an approximation: `search` with a wider budget,
+    /// filtered to the types, so it can carry expansion rows and boosted
+    /// scores. A test that relies on the raw-distance contract needs a store
+    /// that overrides this.
     async fn search_by_types(
         &self,
         namespace: &str,
