@@ -492,7 +492,8 @@ pub async fn collect_golden_rules(
     if namespace != "global" {
         let proj_rows: Vec<SearchResult> = match local_memories {
             Some(slice) => slice.to_vec(),
-            None => store.list(namespace, None, None).await.unwrap_or_default(),
+            // Only pinned rows qualify here, so ask the store for those.
+            None => store.list_pinned(namespace).await.unwrap_or_default(),
         };
         for r in proj_rows {
             if !is_active_golden_candidate(&r) {
@@ -937,25 +938,36 @@ pub async fn record_graph_query(
     query_hint: &str,
 ) {
     let ns = crate::server::resolve_namespace(store, namespace).await;
-    let Ok(rows) = store.list(&ns, None, None).await else {
+    // This runs on every graph-first lookup. It used to list the WHOLE
+    // namespace each time (+50 to +300 MB per call in the daemon log); name only the rows it needs: the task rows, the
+    // registry row by its fixed id, and directory rows only when the registry
+    // row has no project root.
+    let Ok(rows) = store.list(&ns, None, Some("task")).await else {
         return;
     };
     let now = chrono::Utc::now().timestamp();
     let entry_str = format!("{}:{}", tool_name, query_hint.chars().take(80).collect::<String>());
     let mut project_root: Option<String> = None;
-    for r in &rows {
-        if project_root.is_none() && crate::registry::is_registry_row(&r.payload.metadata) {
-            if let Some(p) = r.payload.metadata.get("project_root").and_then(|v| v.as_str()) {
+    if let Ok(Some((_, registry))) = store.get(&ns, &crate::registry::registry_row_id(&ns)).await {
+        if crate::registry::is_registry_row(&registry.metadata) {
+            if let Some(p) = registry.metadata.get("project_root").and_then(|v| v.as_str()) {
                 project_root = Some(p.to_string());
             }
         }
-        if project_root.is_none() && r.payload.memory_type == "directory" {
-            if let Some(p) = r.payload.metadata.get("absolute_path").and_then(|v| v.as_str()) {
-                if std::path::Path::new(p).join(".git").exists() {
-                    project_root = Some(p.to_string());
+    }
+    if project_root.is_none() {
+        if let Ok(dirs) = store.list(&ns, None, Some("directory")).await {
+            for d in &dirs {
+                if let Some(p) = d.payload.metadata.get("absolute_path").and_then(|v| v.as_str()) {
+                    if std::path::Path::new(p).join(".git").exists() {
+                        project_root = Some(p.to_string());
+                        break;
+                    }
                 }
             }
         }
+    }
+    for r in &rows {
         if gate::is_task(r) && gate::task_status(r) == Status::InProgress {
             if let Ok(Some((vec, mut payload))) = store.get(&ns, &r.id).await {
                 let obj = task_obj_mut(&mut payload);
@@ -1725,7 +1737,10 @@ pub async fn handle_task_list(args: Value, store: Arc<dyn VectorStore>) -> Strin
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let memories = match store.list(&namespace, None, None).await {
+    // Task rows only: the listing and the blocker statuses both read tasks and
+    // nothing else, and listing the whole namespace grew the daemon ~100 MB per
+    // call.
+    let memories = match store.list(&namespace, None, Some("task")).await {
         Ok(m) => m,
         Err(e) => {
             return format!(
