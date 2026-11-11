@@ -973,8 +973,43 @@ async fn search_inner(
             // hydrated to real content) joins the result set. Empty-stub rows
             // carry no content and are never merged, so reasoning cannot
             // invent a result.
+            //
+            // Admission applies the same predicates the preceding passes
+            // apply, because `ReasoningAdapter::execute` returns a hydrated
+            // row for the query itself whenever the query equals a memory
+            // id, even with no ontology expansion — an unfiltered merge
+            // would hand back rows every preceding pass excluded: retired
+            // and mesh-conflicting rows, registry rows, archived rows and
+            // task / structural row classes (gated by the same escape
+            // hatches), and rows outside the requested domains.
             for inferred in inferred_results {
                 if inferred.payload.content.is_empty() {
+                    continue;
+                }
+                let metadata_val = &inferred.payload.metadata;
+                if is_retired_at(metadata_val, now) {
+                    continue;
+                }
+                if !include_archived && is_archived(metadata_val) {
+                    continue;
+                }
+                if is_mesh_conflicting(metadata_val) {
+                    continue;
+                }
+                if crate::registry::is_registry_row(metadata_val) {
+                    continue;
+                }
+                if !include_tasks && inferred.payload.memory_type == "task" {
+                    continue;
+                }
+                if STRUCTURAL_MEMORY_TYPES.contains(&inferred.payload.memory_type.as_str()) {
+                    continue;
+                }
+                if !domain_keys.is_empty()
+                    && !crate::domain::domain_keys(metadata_val)
+                        .iter()
+                        .any(|k| domain_keys.contains(k))
+                {
                     continue;
                 }
                 if results.iter().any(|existing| existing.id == inferred.id) {
@@ -4030,6 +4065,19 @@ impl LadybugStore {
             if doc.archived {
                 meta.insert("archived".to_string(), Value::Number(1.into()));
             }
+            // Preserve the exclusion flags lexical_doc decided: upsert_memory
+            // re-derives them from payload metadata via is_registry_row /
+            // is_conflicting_metadata, so dropping them here would index rows
+            // the rebuild path (full payloads) correctly excludes.
+            if doc.registry {
+                meta.insert(
+                    "domain_registry".to_string(),
+                    serde_json::json!({"domains": []}),
+                );
+            }
+            if doc.conflicting {
+                meta.insert("mesh".to_string(), serde_json::json!({"conflict": true}));
+            }
             let payload = MemoryPayload {
                 content: doc.content.clone(),
                 user_id: doc.user_id.clone(),
@@ -4283,8 +4331,36 @@ impl LadybugStore {
                 if !include_tasks && payload.memory_type == "task" {
                     continue;
                 }
-                let vis = crate::rebac::extract_visible_to(&payload.metadata);
-                if !crate::rebac::allowed(principal, &payload.user_id, "viewer", &vis) {
+                // Defense in depth: never surface an archived row when the
+                // caller excluded archived rows, even if its index entry
+                // predates the tombstone fix. Bool/int-tolerant, matching
+                // lexical::archived_flag (duplicated inline per convention).
+                if !include_archived {
+                    let archived = match payload.metadata.get("archived") {
+                        Some(v) if v.as_bool() == Some(true) => true,
+                        Some(v) => v.as_i64().map(|n| n != 0).unwrap_or(false),
+                        None => false,
+                    };
+                    if archived {
+                        continue;
+                    }
+                }
+                // Defense in depth: registry and mesh-conflicting rows are
+                // excluded at index time, but a stale index entry must not
+                // surface them either (the in-house engine's doc_visible
+                // rejects both classes on every read).
+                if is_registry_row(&payload.metadata) || is_mesh_conflicting(&payload.metadata) {
+                    continue;
+                }
+                // Defense in depth: never surface a retired row, even if its
+                // index entry predates the valid_to handling. Uses the
+                // is_retired_at predicate defined in this module: a non-null
+                // valid_to that does not parse as an integer reads as 0,
+                // i.e. retired.
+                if is_retired_at(&payload.metadata, chrono::Utc::now().timestamp()) {
+                    continue;
+                }
+                if !crate::rebac::can_read_memory(principal, &payload.user_id, &payload.metadata) {
                     continue;
                 }
                 candidates.push(crate::traits::SearchResult {
@@ -10037,6 +10113,330 @@ eurostrata\src\daemon.rs",
         let reopened = LadybugStore::for_testing(&db, 4).unwrap();
         reopened.init("probe").await.unwrap();
         assert_contract(&reopened, &cases, "cold load").await;
+    }
+
+    fn tantivy_exclusion_payload(content: &str, metadata: Value) -> MemoryPayload {
+        MemoryPayload {
+            content: content.to_string(),
+            user_id: "tester".to_string(),
+            memory_type: "fact".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata,
+        }
+    }
+
+    #[tokio::test]
+    async fn par02_tantivy_upsert_path_excludes_registry_and_conflicting_rows() {
+        // lexical_apply_doc rebuilds a payload from the LexicalDoc before
+        // calling upsert_memory; the registry/conflicting flags decided in
+        // lexical_doc must survive that reconstruction, or excluded rows are
+        // indexed and surface in Tantivy search until the next rebuild.
+        let store = retired_test_store().await;
+        *store.tantivy_lexical.write().unwrap() =
+            Some(crate::lexical::TantivyLexicalIndex::open_in_ram().unwrap());
+
+        let registry_payload = tantivy_exclusion_payload(
+            "zebratoken registry row",
+            crate::registry::registry_metadata(&["auth".to_string()]),
+        );
+        let conflicting_payload = tantivy_exclusion_payload(
+            "zebratoken conflicting row",
+            json!({"mesh": {"conflict": true}}),
+        );
+        let clean_payload = tantivy_exclusion_payload("zebratoken clean row", json!({}));
+
+        store.lexical_apply_doc(LadybugStore::lexical_doc("probe", "registry-row", &registry_payload));
+        store.lexical_apply_doc(LadybugStore::lexical_doc("probe", "conflicting-row", &conflicting_payload));
+        store.lexical_apply_doc(LadybugStore::lexical_doc("probe", "clean-row", &clean_payload));
+
+        let guard = store.tantivy_lexical.read().unwrap();
+        let idx = guard.as_ref().expect("tantivy open");
+        let hits = idx.search("probe", "zebratoken", 10, true, true, None).unwrap();
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert!(ids.contains(&"clean-row"), "clean row must be indexed, got: {ids:?}");
+        assert!(
+            !ids.contains(&"registry-row"),
+            "registry row must not be indexed via the upsert path, got: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"conflicting-row"),
+            "mesh-conflicting row must not be indexed via the upsert path, got: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn par02_tantivy_hydration_excludes_registry_and_conflicting_rows() {
+        // Defense in depth at hydration: a stale index entry whose stored
+        // row is a registry or mesh-conflicting row must not surface from
+        // search_tantivy_lexical even when the entry carries no exclusion
+        // metadata.
+        let store = retired_test_store().await;
+        let registry_payload = tantivy_exclusion_payload(
+            "zebratoken registry row",
+            crate::registry::registry_metadata(&["auth".to_string()]),
+        );
+        let conflicting_payload = tantivy_exclusion_payload(
+            "zebratoken conflicting row",
+            json!({"mesh": {"conflict": true}}),
+        );
+        let clean_payload = tantivy_exclusion_payload("zebratoken clean row", json!({}));
+        // Store rows first (Tantivy not yet open, so nothing indexes live).
+        store.upsert("probe", "registry-row", vec![0.0; 4], registry_payload.clone()).await.unwrap();
+        store.upsert("probe", "conflicting-row", vec![0.0; 4], conflicting_payload.clone()).await.unwrap();
+        store.upsert("probe", "clean-row", vec![0.0; 4], clean_payload.clone()).await.unwrap();
+
+        // Seed a stale index: same ids/content, exclusion metadata stripped.
+        let idx = crate::lexical::TantivyLexicalIndex::open_in_ram().unwrap();
+        for (id, payload) in [
+            ("registry-row", &registry_payload),
+            ("conflicting-row", &conflicting_payload),
+            ("clean-row", &clean_payload),
+        ] {
+            let mut stale = payload.clone();
+            stale.metadata = json!({});
+            idx.upsert_memory("probe", id, &stale).unwrap();
+        }
+        *store.tantivy_lexical.write().unwrap() = Some(idx);
+
+        let outcome = store
+            .search_tantivy_lexical("probe", "zebratoken", 10, false, false, &[], "tester")
+            .await
+            .unwrap();
+        let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&"clean-row"), "clean row must surface, got: {ids:?}");
+        assert!(
+            !ids.contains(&"registry-row"),
+            "registry row must not surface from tantivy search, got: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"conflicting-row"),
+            "mesh-conflicting row must not surface from tantivy search, got: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn par02_tantivy_hydration_excludes_retired_rows() {
+        // A stale Tantivy entry (exclusion metadata stripped) must not
+        // surface rows retired under is_retired_at semantics: valid_to 0 and
+        // unparseable non-null valid_to both read as retired.
+        let store = retired_test_store().await;
+        let zero_payload = tantivy_exclusion_payload("retiretoken zero row", json!({"valid_to": 0}));
+        let soon_payload = tantivy_exclusion_payload("retiretoken soon row", json!({"valid_to": "soon"}));
+        let clean_payload = tantivy_exclusion_payload("retiretoken clean row", json!({}));
+        for (id, payload) in [
+            ("retired-zero", &zero_payload),
+            ("retired-soon", &soon_payload),
+            ("clean-row", &clean_payload),
+        ] {
+            store.upsert("probe", id, vec![1.0, 0.0, 0.0, 0.0], payload.clone()).await.unwrap();
+        }
+        // Control: the vector/domain path already excludes both retired rows.
+        let control = store
+            .search_with_domain("probe", vec![1.0, 0.0, 0.0, 0.0], 10, false, false, &[], None, false)
+            .await
+            .unwrap();
+        let control_ids: Vec<&str> = control.results.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            control_ids.contains(&"clean-row"),
+            "control must surface the clean row, got: {control_ids:?}"
+        );
+        assert!(
+            !control_ids.contains(&"retired-zero") && !control_ids.contains(&"retired-soon"),
+            "control must exclude both retired rows, got: {control_ids:?}"
+        );
+        // Seed a stale Tantivy index: same ids/content, metadata stripped.
+        let idx = crate::lexical::TantivyLexicalIndex::open_in_ram().unwrap();
+        for (id, payload) in [
+            ("retired-zero", &zero_payload),
+            ("retired-soon", &soon_payload),
+            ("clean-row", &clean_payload),
+        ] {
+            let mut stale = payload.clone();
+            stale.metadata = json!({});
+            idx.upsert_memory("probe", id, &stale).unwrap();
+        }
+        *store.tantivy_lexical.write().unwrap() = Some(idx);
+        let outcome = store
+            .search_tantivy_lexical("probe", "retiretoken", 10, false, false, &[], "tester")
+            .await
+            .unwrap();
+        let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&"clean-row"), "clean row must surface, got: {ids:?}");
+        assert!(!ids.contains(&"retired-zero"), "valid_to:0 row must not surface, got: {ids:?}");
+        assert!(!ids.contains(&"retired-soon"), "valid_to:\"soon\" row must not surface, got: {ids:?}");
+    }
+
+    #[tokio::test]
+    async fn par02_tantivy_hydration_respects_archive_escape_hatch() {
+        let store = retired_test_store().await;
+        let archived_payload = tantivy_exclusion_payload("archivetoken old row", json!({"archived": true}));
+        let clean_payload = tantivy_exclusion_payload("archivetoken new row", json!({}));
+        for (id, payload) in [("archived-row", &archived_payload), ("clean-row", &clean_payload)] {
+            store.upsert("probe", id, vec![0.0; 4], payload.clone()).await.unwrap();
+        }
+        // Stale entries: metadata stripped, so the index itself cannot know
+        // the row is archived; hydration must consult the stored row.
+        let idx = crate::lexical::TantivyLexicalIndex::open_in_ram().unwrap();
+        for (id, payload) in [("archived-row", &archived_payload), ("clean-row", &clean_payload)] {
+            let mut stale = payload.clone();
+            stale.metadata = json!({});
+            idx.upsert_memory("probe", id, &stale).unwrap();
+        }
+        *store.tantivy_lexical.write().unwrap() = Some(idx);
+
+        let hidden = store
+            .search_tantivy_lexical("probe", "archivetoken", 10, false, false, &[], "tester")
+            .await
+            .unwrap();
+        let hidden_ids: Vec<&str> = hidden.results.iter().map(|r| r.id.as_str()).collect();
+        assert!(hidden_ids.contains(&"clean-row"), "clean row must surface, got: {hidden_ids:?}");
+        assert!(
+            !hidden_ids.contains(&"archived-row"),
+            "archived row must not surface by default, got: {hidden_ids:?}"
+        );
+
+        let shown = store
+            .search_tantivy_lexical("probe", "archivetoken", 10, false, true, &[], "tester")
+            .await
+            .unwrap();
+        let shown_ids: Vec<&str> = shown.results.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            shown_ids.contains(&"archived-row"),
+            "include_archived must admit the archived row, got: {shown_ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn par02_tantivy_hydration_uses_metadata_owner_for_acl() {
+        // The hydration ACL check derives the owner canonically
+        // (can_read_memory): an empty payload user_id with metadata user_id
+        // alice is alice's row, even though its ACL names only carol.
+        let store = retired_test_store().await;
+        let mut payload = tantivy_exclusion_payload(
+            "a1token metadata owner row",
+            json!({"user_id": "alice", "visible_to": [{"principal": "carol", "role": "viewer"}]}),
+        );
+        payload.user_id = String::new();
+        store.upsert("probe", "metadata-owner-row", vec![0.0; 4], payload.clone()).await.unwrap();
+        let idx = crate::lexical::TantivyLexicalIndex::open_in_ram().unwrap();
+        idx.upsert_memory("probe", "metadata-owner-row", &payload).unwrap();
+        *store.tantivy_lexical.write().unwrap() = Some(idx);
+        for (principal, expected) in [("alice", true), ("admin", true), ("carol", true), ("bob", false), ("eve", false)] {
+            let outcome = store
+                .search_tantivy_lexical("probe", "a1token", 10, false, false, &[], principal)
+                .await
+                .unwrap();
+            let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
+            assert_eq!(
+                ids.contains(&"metadata-owner-row"),
+                expected,
+                "principal {principal:?} hydration decision, got: {ids:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn par02_inferred_merge_excludes_rows_hidden_from_vector_passes() {
+        // ReasoningAdapter::execute returns a hydrated row for the query
+        // itself when the query equals a memory id, even with no ontology
+        // expansion. The exact/vector passes exclude archived, retired,
+        // task, registry, mesh-conflicting and structural rows (and, under a
+        // domain filter, other-domain rows); the inferred merge must apply
+        // the same predicates or those rows leak back in.
+        let store = retired_test_store().await;
+        let vec4 = vec![0.1; 4];
+        // Anchor primary: at equal distance it sorts first (id ASC), so with
+        // limit 1 it is the only primary and every row below can surface
+        // only through the inferred merge.
+        store
+            .upsert("probe", "a-anchor", vec4.clone(), retired_test_payload("fact", "agent", json!({"domain": "auth"})))
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "archived-row", vec4.clone(), retired_test_payload("fact", "agent", json!({"archived": true})))
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "retired-row", vec4.clone(), retired_test_payload("fact", "agent", json!({"valid_to": 1})))
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "task-row", vec4.clone(), retired_test_payload("task", "agent", json!({})))
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "registry-row", vec4.clone(), retired_test_payload("fact", "agent", crate::registry::registry_metadata(&["auth".to_string()])))
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "conflicting-row", vec4.clone(), retired_test_payload("fact", "agent", json!({"mesh": {"conflict": true}})))
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "structural-row", vec4.clone(), retired_test_payload("file", "agent", json!({})))
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "other-domain-row", vec4.clone(), retired_test_payload("fact", "agent", json!({"domain": "database"})))
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "z-clean-row", vec4.clone(), retired_test_payload("fact", "agent", json!({})))
+            .await
+            .unwrap();
+
+        for excluded in ["archived-row", "retired-row", "task-row", "registry-row", "conflicting-row", "structural-row"] {
+            let outcome = store
+                .search_with_domain("probe", vec4.clone(), 1, false, false, &[], Some(excluded), false)
+                .await
+                .unwrap();
+            let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
+            assert!(ids.contains(&"a-anchor"), "anchor primary must surface for {excluded}, got: {ids:?}");
+            assert!(
+                !ids.contains(&excluded),
+                "inferred merge must not surface {excluded}, got: {ids:?}"
+            );
+        }
+
+        // Domain predicate: under an "auth" filter, a database-domain row
+        // queried by id must not re-enter through the inferred merge.
+        let outcome = store
+            .search_with_domain("probe", vec4.clone(), 1, false, false, &["auth".to_string()], Some("other-domain-row"), false)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            !ids.contains(&"other-domain-row"),
+            "inferred merge must not surface a domain-mismatched row, got: {ids:?}"
+        );
+
+        // Positive control: a clean row surfaces through the inferred merge
+        // (limit 1 kept it out of the primaries).
+        let outcome = store
+            .search_with_domain("probe", vec4.clone(), 1, false, false, &[], Some("z-clean-row"), false)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            ids.contains(&"z-clean-row"),
+            "clean row must surface via the inferred merge, got: {ids:?}"
+        );
+
+        // The escape hatches still govern the inferred merge: with
+        // include_tasks / include_archived set, those rows are admitted.
+        for (id, include_tasks, include_archived) in [("task-row", true, false), ("archived-row", false, true)] {
+            let outcome = store
+                .search_with_domain("probe", vec4.clone(), 1, include_tasks, include_archived, &[], Some(id), false)
+                .await
+                .unwrap();
+            let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
+            assert!(
+                ids.contains(&id),
+                "{id} must surface via the inferred merge when its escape hatch is set, got: {ids:?}"
+            );
+        }
     }
 
     #[tokio::test]
