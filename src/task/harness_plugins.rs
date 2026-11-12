@@ -584,14 +584,41 @@ fn wire_harness_config(
                             h_obj.entry("PreToolUse").or_insert_with(|| {
                                 json!([{
                                     "matcher": "Read|Write|Edit|MultiEdit|Bash|Task",
-                                    "hooks": [{ "type": "command", "command": cmd }]
+                                    "hooks": [{ "type": "command", "command": cmd.clone() }]
                                 }])
                             });
                             h_obj.entry("Stop").or_insert_with(|| {
                                 json!([{
-                                    "hooks": [{ "type": "command", "command": cmd }]
+                                    "hooks": [{ "type": "command", "command": cmd.clone() }]
                                 }])
                             });
+                            // Repair commands written by an older installer that
+                            // embedded a Windows verbatim path. Only rewrite our
+                            // own hook commands; user hooks are left untouched.
+                            for entries in h_obj.values_mut() {
+                                if let Some(arr) = entries.as_array_mut() {
+                                    for entry in arr {
+                                        if let Some(hooks) = entry
+                                            .get_mut("hooks")
+                                            .and_then(|v| v.as_array_mut())
+                                        {
+                                            for hook in hooks {
+                                                let is_ours = hook
+                                                    .get("command")
+                                                    .and_then(|v| v.as_str())
+                                                    .map(|c| {
+                                                        c.contains("NEUROSTRATA_NAMESPACE=")
+                                                            || c.contains(".NeuroStrata/plugins/")
+                                                    })
+                                                    .unwrap_or(false);
+                                                if is_ours {
+                                                    hook["command"] = Value::String(cmd.clone());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                     return write_json_if_changed(&cfg_path, &doc);
@@ -692,6 +719,84 @@ mod tests {
         let settings = std::fs::read_to_string(tmp.path().join(".claude/settings.local.json"))
             .expect("settings.local.json");
         assert!(!settings.contains(r"\\\\?\\"), "verbatim path in hook command");
+    }
+
+    #[test]
+    fn wired_paths_are_plain_for_every_harness() {
+        let cases = [
+            ("opencode", ".opencode/neurostrata-plugin.json"),
+            ("claude", ".claude/settings.local.json"),
+            ("hermes", ".hermes/plugins/neurostrata.json"),
+            ("codex", ".codex/plugins/neurostrata.json"),
+            ("openclaw", ".openclaw/plugins/neurostrata.json"),
+            ("github-cli", ".NeuroStrata/plugins/github-cli/copilot-extension.json"),
+        ];
+        for (harness, cfg_rel) in cases {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let report = auto_install_detected_plugins(tmp.path(), "TestProj", Some(harness));
+            assert!(report["ok"].as_bool().unwrap_or(true), "{harness} install report");
+            let cfg = tmp.path().join(cfg_rel);
+            assert!(cfg.exists(), "{harness} config missing at {}", cfg.display());
+            let raw = std::fs::read_to_string(&cfg).expect("read harness config");
+            assert!(
+                !raw.contains(r"\\?\") && !raw.contains(r"\\\\?\\"),
+                "{harness} config leaked a verbatim path: {raw}"
+            );
+            let runner = report["installed_plugins"]
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(|p| p.get("cli_hook_runner"))
+                .and_then(|v| v.as_str());
+            if let Some(runner) = runner {
+                assert!(!runner.starts_with(r"\\?\"), "{harness} runner is verbatim: {runner}");
+            }
+        }
+    }
+
+    #[test]
+    fn repairs_an_existing_verbatim_hook_command_without_touching_user_hooks() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".claude")).expect("create .claude");
+        let old = json!({
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "Read",
+                        "hooks": [{
+                            "type": "command",
+                            "command": "NEUROSTRATA_NAMESPACE=TestProj node \"\\\\\\\\?\\\\C:\\\\old\\\\index.js\""
+                        }]
+                    },
+                    {
+                        "matcher": "Bash",
+                        "hooks": [{ "type": "command", "command": "echo user-hook" }]
+                    }
+                ]
+            }
+        });
+        std::fs::write(
+            tmp.path().join(".claude/settings.local.json"),
+            serde_json::to_string_pretty(&old).unwrap(),
+        )
+        .expect("write old settings");
+
+        let _ = auto_install_detected_plugins(tmp.path(), "TestProj", Some("claude"));
+        let raw = std::fs::read_to_string(tmp.path().join(".claude/settings.local.json"))
+            .expect("read settings");
+        assert!(!raw.contains(r"\\?\"), "old verbatim hook was not repaired: {raw}");
+        assert!(raw.contains("echo user-hook"), "user hook must be preserved: {raw}");
+        let doc: Value = serde_json::from_str(&raw).expect("parse settings");
+        let commands: Vec<&str> = doc["hooks"]["PreToolUse"]
+            .as_array()
+            .expect("PreToolUse array")
+            .iter()
+            .flat_map(|entry| entry["hooks"].as_array().into_iter().flatten())
+            .filter_map(|hook| hook["command"].as_str())
+            .collect();
+        assert!(
+            commands.iter().any(|c| c.contains("NEUROSTRATA_NAMESPACE=TestProj node")),
+            "our repaired hook is present: {commands:?}"
+        );
     }
 
     #[test]
