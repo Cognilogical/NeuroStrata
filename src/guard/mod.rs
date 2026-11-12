@@ -1,8 +1,10 @@
 //! Guard module - behavioral constraint validation
 //!
 //! Provenance: a standalone guard engine folded into NeuroStrata — decision
-//! record in docs/architecture/. Semantic action validation using vector similarity
-//! against stored behavioral rules. Uses LadyBugDB instead of LanceDB.
+//! record in docs/architecture/. Action validation against stored behavioral
+//! rules: the candidate rules are listed, and each fires when its trigger pattern
+//! matches the action (no vector similarity decides a verdict; see
+//! `semantic::SemanticEvaluator::candidate_rules`). Uses LadyBugDB instead of LanceDB.
 
 pub mod fsm;
 pub mod models;
