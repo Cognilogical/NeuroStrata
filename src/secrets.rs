@@ -148,6 +148,11 @@ const MAX_SCAN_BYTES: usize = 256_000;
 /// Overlap between scan chunks so a token that straddles a chunk boundary is
 /// still seen whole. Provider tokens are far shorter than this.
 const SCAN_CHUNK_OVERLAP: usize = 64 * 1024;
+/// Carry a little context across a line boundary so a key on one line and its
+/// value on the next are still scanned together. Tokens themselves never span
+/// a newline, so this is small; the 64 KB overlap is only for long single
+/// lines with no boundary to use.
+const SCAN_CONTEXT_CARRY: usize = 4 * 1024;
 
 /// A value captured next to a secret-like key is a source expression, not a
 /// credential literal, when it is unquoted and shaped like code. Skipping
@@ -155,19 +160,12 @@ const SCAN_CHUNK_OVERLAP: usize = 64 * 1024;
 /// quoted literals and plain opaque values still go through the password
 /// check.
 fn looks_like_code_expression(value: &str) -> bool {
+    // Only strong source markers: paths and calls. Punctuation that can occur
+    // in a config value (`!`, `?`, braces) is not enough to call it code.
     value.contains("::")
         || value.contains("->")
         || value.contains("=>")
-        || value.contains('(')
-        || value.contains(')')
-        || value.contains('{')
-        || value.contains('}')
-        || value.contains('[')
-        || value.contains(']')
-        || value.contains('?')
-        || value.contains('!')
-        || value.starts_with('&')
-        || value.starts_with('*')
+        || (value.contains('(') && value.contains(')'))
 }
 
 impl SecretScanner {
@@ -260,7 +258,10 @@ impl SecretScanner {
                 break;
             }
             if used_newline {
-                start = end;
+                // Keep a little context so `key =` at the end of one chunk and
+                // its value on the next line still form a kv_re match.
+                let next = end.saturating_sub(SCAN_CONTEXT_CARRY);
+                start = if next > start { next } else { end };
             } else {
                 let next = end.saturating_sub(SCAN_CHUNK_OVERLAP);
                 start = if next > start { next } else { end };
@@ -346,9 +347,11 @@ impl SecretScanner {
                 continue;
             }
 
+            // The capture stops at `;`, so a quoted value containing `;` has no
+            // closing quote at `m.end()`; the opening quote is the reliable
+            // marker that this is a literal.
             let quoted = cap.get(2).map(|m| {
                 matches!(text[..m.start()].chars().last(), Some('"') | Some('\''))
-                    && matches!(text[m.end()..].chars().next(), Some('"') | Some('\''))
             }).unwrap_or(false);
             if !quoted && looks_like_code_expression(value) {
                 continue;
@@ -1090,6 +1093,37 @@ mod tests {
         text.push_str(&"y".repeat(1_000));
         let rejection = SecretScanner::scan_str(&text, "content").expect("long JWT detected");
         assert_eq!(rejection.category, "jwt");
+    }
+
+    #[test]
+    fn plaintext_config_values_with_punctuation_are_still_detected() {
+        for text in [
+            "password=hunter2!",
+            "password = \"hunter2!;\"",
+            "api_key=abc(def",
+        ] {
+            let rejection = SecretScanner::scan_str(text, "content")
+                .unwrap_or_else(|| panic!("plaintext credential must be detected: {text}"));
+            assert!(
+                rejection.category == "password" || rejection.category == "high_entropy_secret",
+                "unexpected category for {text}: {}",
+                rejection.category
+            );
+        }
+    }
+
+    #[test]
+    fn multiline_assignment_across_a_chunk_boundary_is_detected() {
+        // The first chunk ends on the newline after `password =`; the value is
+        // on the next line and must still be associated with its key.
+        let mut text = "x".repeat(MAX_SCAN_BYTES - 100);
+        text.push_str("let password =\n");
+        text.push_str(&" ".repeat(200));
+        text.push_str("\"hunter2\";\n");
+        text.push_str(&" ".repeat(1_000));
+        let rejection =
+            SecretScanner::scan_str(&text, "content").expect("multiline assignment detected");
+        assert_eq!(rejection.category, "password");
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────
