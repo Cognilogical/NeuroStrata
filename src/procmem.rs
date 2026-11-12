@@ -5,11 +5,17 @@
 //! current and peak figures; `CallGuard` wraps one MCP tool call and appends a
 //! JSON line to `memory-growth.log` when the call left the process at least
 //! `NEUROSTRATA_RSS_LOG_MB` (default 50) larger than it found it. After a day
-//! of normal use that file names the calls that drive growth.
+//! of normal use that file names the calls that may drive growth. Background
+//! growth and a neighbor that began before the window are still not
+//! attributable to the call being logged.
 //!
 //! Calls run concurrently, so a line records `in_flight`: when it is above 1,
 //! the growth may belong to a neighboring call and the line says
 //! `"approximate": true`.
+//!
+//! Platforms: Windows, Linux and macOS report current RSS. Other Unix systems
+//! report peak only (`rss_mb` is null), so the per-call growth log cannot fire
+//! there; `status_json` exposes `rss_available` so callers can tell.
 //!
 //! Opt-in: the log and the sampler run only with `neurostrata-mcp daemon
 //! --profile` or `NEUROSTRATA_PROFILE=1`. The resident figure in
@@ -164,6 +170,7 @@ pub fn status_json() -> serde_json::Value {
     serde_json::json!({
         "rss_mb": mb(s.rss_bytes),
         "peak_rss_mb": mb(s.peak_bytes),
+        "rss_available": s.rss_bytes.is_some(),
         "growth_log": log_path().to_string_lossy(),
         "growth_log_threshold_mb": threshold_mb(),
     })
@@ -215,10 +222,17 @@ fn log_path() -> PathBuf {
 }
 
 /// True when `after` is at least `threshold_mb` above `before`. Unknown
-/// figures never count as growth.
+/// figures never count as growth. A threshold of 0 disables the per-call log
+/// (the sampler still runs); an extreme value saturates instead of wrapping to
+/// a tiny threshold and logging everything.
 fn grew(before: Option<u64>, after: Option<u64>, threshold_mb: u64) -> bool {
+    if threshold_mb == 0 {
+        return false;
+    }
     match (before, after) {
-        (Some(b), Some(a)) => a.saturating_sub(b) >= threshold_mb * MB,
+        (Some(b), Some(a)) => {
+            a.saturating_sub(b) >= threshold_mb.saturating_mul(MB)
+        }
         _ => false,
     }
 }
@@ -392,6 +406,45 @@ mod tests {
     }
 
     #[test]
+    fn zero_threshold_disables_and_extreme_saturates() {
+        assert!(!grew(Some(0), Some(u64::MAX), 0), "0 disables the per-call log");
+        assert!(
+            !grew(Some(0), Some(MB), u64::MAX),
+            "an extreme threshold saturates instead of wrapping"
+        );
+        assert!(grew(Some(0), Some(50 * MB), 50));
+    }
+
+    #[test]
+    fn concurrent_appends_do_not_lose_or_interleave_lines() {
+        let path = std::env::temp_dir().join(format!(
+            "procmem-concurrent-{}-{}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut handles = Vec::new();
+        for i in 0..16 {
+            let path = path.clone();
+            handles.push(std::thread::spawn(move || {
+                append(&path, &format!("{{\"n\":{i}}}"));
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 16, "no line lost: {text}");
+        for line in lines {
+            serde_json::from_str::<serde_json::Value>(line).expect("each line is whole JSON");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn this_platform_reports_a_resident_set() {
         let s = sample();
         #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
@@ -476,6 +529,7 @@ mod tests {
         assert_eq!(v["snapshots"], 3);
         let p = &v["process"];
         assert!(p.get("rss_mb").is_some() && p.get("peak_rss_mb").is_some());
+        assert!(p.get("rss_available").is_some(), "callers can tell whether rss is live");
         assert!(p["growth_log"].as_str().unwrap().ends_with("memory-growth.log"));
         assert!(p["growth_log_threshold_mb"].as_u64().unwrap() > 0);
     }
