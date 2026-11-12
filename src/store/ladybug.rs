@@ -1460,8 +1460,14 @@ fn with_buffer_pool(cfg: SystemConfig) -> SystemConfig {
     if mb == 0 {
         cfg
     } else {
-        cfg.buffer_pool_size(mb * 1024 * 1024)
+        cfg.buffer_pool_size(buffer_pool_bytes(mb))
     }
+}
+
+/// Convert MB to the engine's byte count without wrapping. An absurd configured
+/// value saturates; it must never wrap to 0 and silently disable the cap.
+fn buffer_pool_bytes(mb: u64) -> u64 {
+    mb.saturating_mul(1024 * 1024)
 }
 
 /// An engine error that says the buffer pool was too small, with what to do
@@ -1482,6 +1488,13 @@ fn explain_engine_error(e: anyhow::Error) -> anyhow::Error {
 #[cfg(test)]
 mod buffer_pool_tests {
     use super::*;
+
+    #[test]
+    fn a_huge_value_saturates_instead_of_wrapping_to_zero() {
+        assert_eq!(buffer_pool_bytes(384), 384 * 1024 * 1024);
+        assert_eq!(buffer_pool_bytes(u64::MAX), u64::MAX);
+        assert_ne!(buffer_pool_bytes(u64::MAX), 0);
+    }
 
     #[test]
     fn the_config_value_is_used_when_the_environment_says_nothing() {
