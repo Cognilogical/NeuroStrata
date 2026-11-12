@@ -103,6 +103,17 @@ pub fn record_latency_sample(plan_ms: f64, upsert_ms: f64) {
     }
 }
 
+/// Test-only reset for the process-wide latency windows. The composed
+/// retention gate reads these windows, so a test that deliberately records an
+/// over-budget sample must restore the empty state before the next test.
+#[cfg(test)]
+pub(crate) fn clear_latency_windows() {
+    window_guard(&PLAN_SAMPLES).clear();
+    window_guard(&UPSERT_SAMPLES).clear();
+    LAST_PLAN_MS.store(0.0f64.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    LAST_UPSERT_MS.store(0.0f64.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
 pub fn retention_gate(receipt_exists: bool) -> bool {
     // Budget verified over the rolling evidence windows (the degenerate
     // empty window reads as 0.0, which must always verify — the gate never
@@ -330,6 +341,34 @@ mod tests {
     fn retention_gate_fails_when_either_budget_is_exceeded() {
         assert!(!retention_gate_with(true, 150.0, 0.0));
         assert!(!retention_gate_with(true, 0.0, 150.0));
+    }
+
+    /// P2 from the panel review: exercise the composed public function, not
+    /// only its private helpers. A retained receipt with an over-budget
+    /// latency window must fail; a composition that drops the budget check
+    /// (returns only `receipt_is_retained`) stays green on the helper tests
+    /// but fails here.
+    #[test]
+    fn verify_task_receipt_retention_composes_budget_and_receipt() {
+        let _guard = slots_lock();
+        clear_latency_windows();
+        let mut store = crate::receipts::store::ReceiptStore::new();
+        store.record(crate::receipts::store::Receipt {
+            session_id: "s".into(),
+            task_id: "t".into(),
+            event_id: "e".into(),
+            outcome: "completed".into(),
+            exposed_ids: vec![],
+            worktree: String::new(),
+            head_sha: String::new(),
+            dirty_tree_hash: String::new(),
+        });
+        // Empty windows verify, and the receipt is retained.
+        assert!(verify_task_receipt_retention(&store, "s", "t", "e"));
+        // The same retained receipt now fails because the budget is exceeded.
+        record_latency_sample(150.0, 0.0);
+        assert!(!verify_task_receipt_retention(&store, "s", "t", "e"));
+        clear_latency_windows();
     }
 
     #[test]
