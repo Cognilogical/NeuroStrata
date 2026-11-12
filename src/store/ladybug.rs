@@ -3962,16 +3962,10 @@ impl LadybugStore {
         });
         doc.archived = is_archived(metadata);
         doc.user_id = payload.user_id.clone();
-        doc.visible_to = metadata
-            .get("visible_to")
-            .and_then(|v| v.as_array())
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter_map(|entry| entry.as_str().map(|s| s.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
+        // Canonical ACL extraction (string and {principal, role} entries, with
+        // the fail-closed sentinel for wholly malformed arrays). A string-only
+        // parse here made object-only ACLs look unrestricted to lexical search.
+        doc.visible_to = crate::rebac::extract_visible_to(metadata);
         doc.domains = crate::domain::domain_keys(metadata);
         doc.structural = STRUCTURAL_MEMORY_TYPES.contains(&payload.memory_type.as_str());
         doc.registry = crate::registry::is_registry_row(metadata);
@@ -9906,6 +9900,97 @@ eurostrata\src\daemon.rs",
             location_lines: String::new(),
             metadata,
         }
+    }
+
+    #[tokio::test]
+    async fn par01_lexical_object_acl_denies_unauthorized() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("acl.lbug"), 4).unwrap();
+        store.init("probe").await.unwrap();
+        let mut payload = retired_test_payload(
+            "rule",
+            "owner",
+            json!({"visible_to": [{"principal": "alice", "role": "viewer"}]}),
+        );
+        payload.content = "parityneedle confidential memory".to_string();
+        store.upsert("probe", "private", vec![0.0; 4], payload).await.unwrap();
+
+        for principal in ["alice", "owner", "admin"] {
+            let hits = store
+                .search_lexical("probe", "parityneedle", 10, false, false, &[], principal, 0)
+                .await.unwrap().results;
+            assert_eq!(hits.len(), 1, "allowed reader {principal} must retain retrieval");
+            assert_eq!(hits[0].id, "private");
+            assert_eq!(hits[0].payload.content, "parityneedle confidential memory");
+        }
+        for principal in ["bob", ""] {
+            let hits = store
+                .search_lexical("probe", "parityneedle", 10, false, false, &[], principal, 0)
+                .await.unwrap().results;
+            assert!(hits.is_empty(), "object ACL must deny unauthorized principal {principal:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn par01_lexical_acl_compatibility_matrix() {
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("acl.lbug");
+        let store = LadybugStore::for_testing(&db, 4).unwrap();
+        store.init("probe").await.unwrap();
+        // Load the empty index first, so upserts must update an already loaded index.
+        assert!(store.search_lexical("probe", "parityneedle", 100, false, false, &[], "admin", 0)
+            .await.unwrap().results.is_empty());
+        let cases: Vec<(&str, Value, &[&str])> = vec![
+            ("object-viewer", json!({"visible_to": [{"principal": "alice", "role": "viewer"}]}), &["alice"]),
+            ("object-editor", json!({"visible_to": [{"principal": "alice", "role": "editor"}]}), &["alice"]),
+            ("object-owner", json!({"visible_to": [{"principal": "alice", "role": "owner"}]}), &["alice"]),
+            ("object-default", json!({"visible_to": [{"principal": "alice"}]}), &["alice"]),
+            ("object-unknown-role", json!({"visible_to": [{"principal": "alice", "role": "unknown"}]}), &["alice"]),
+            ("string", json!({"visible_to": ["bob"]}), &["bob"]),
+            ("mixed", json!({"visible_to": ["bob", {"principal": "alice", "role": "editor"}, 42]}), &["alice", "bob"]),
+            ("malformed-number", json!({"visible_to": [42]}), &[]),
+            ("malformed-object", json!({"visible_to": [{"role": "viewer"}, {"principal": 42}, null]}), &[]),
+            ("partial-object", json!({"visible_to": [null, {"principal": "alice"}]}), &["alice"]),
+            ("partial-string", json!({"visible_to": [42, "bob"]}), &["bob"]),
+            ("wildcard-string", json!({"visible_to": ["*"]}), &["*"]),
+            ("wildcard-object", json!({"visible_to": [{"principal": "*", "role": "editor"}]}), &["*"]),
+            ("empty", json!({"visible_to": []}), &["*"]),
+            ("absent", json!({}), &["*"]),
+            ("legacy-null", json!({"visible_to": null}), &["*"]),
+            ("legacy-nonarray", json!({"visible_to": 42}), &["*"]),
+        ];
+        for (id, metadata, _) in &cases {
+            let mut payload = retired_test_payload("rule", "owner", metadata.clone());
+            payload.content = "parityneedle confidential memory".to_string();
+            store.upsert("probe", id, vec![0.0; 4], payload).await.unwrap();
+        }
+
+        async fn assert_contract(store: &LadybugStore, cases: &[(&str, Value, &[&str])], phase: &str) {
+            for principal in ["owner", "admin", "alice", "bob", "malice", "eve", ""] {
+                let expected: std::collections::BTreeSet<_> = cases.iter()
+                    .filter(|(_, _, readers)| !principal.is_empty()
+                        && (matches!(principal, "owner" | "admin")
+                            || readers.contains(&"*") || readers.contains(&principal)))
+                    .map(|(id, _, _)| id.to_string()).collect();
+                let hits = store.search_lexical("probe", "parityneedle", 100, false, false, &[], principal, 0)
+                    .await.unwrap().results;
+                let actual: std::collections::BTreeSet<_> = hits.iter().map(|hit| hit.id.clone()).collect();
+                assert_eq!(actual, expected, "in-house {phase}, principal {principal:?}");
+                assert!(hits.iter().all(|hit| hit.payload.content == "parityneedle confidential memory"));
+                let tantivy = store.search_tantivy_lexical("probe", "parityneedle", 100, false, false, &[], principal)
+                    .await.unwrap().results;
+                let tantivy_ids: std::collections::BTreeSet<_> = tantivy.iter().map(|hit| hit.id.clone()).collect();
+                assert_eq!(tantivy_ids, expected, "Tantivy hydration {phase}, principal {principal:?}");
+            }
+        }
+
+        assert_contract(&store, &cases, "incremental").await;
+        assert_eq!(store.rebuild_lexical_index(Some("probe")).await.unwrap(), cases.len());
+        assert_contract(&store, &cases, "rebuilt").await;
+        drop(store);
+        let reopened = LadybugStore::for_testing(&db, 4).unwrap();
+        reopened.init("probe").await.unwrap();
+        assert_contract(&reopened, &cases, "cold load").await;
     }
 
     #[tokio::test]
