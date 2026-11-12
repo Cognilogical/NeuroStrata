@@ -170,28 +170,69 @@ fn looks_like_code_expression(value: &str) -> bool {
 
 /// A value captured next to a secret-like key may be a Rust type annotation
 /// (`api_key: String`, `token: Option<PathBuf>`) rather than a credential.
-fn looks_like_type_annotation(value: &str) -> bool {
-    let v = value.trim();
-    if v.is_empty() {
-        return false;
-    }
-    if v.starts_with('&') || v.starts_with('[') || v.starts_with("dyn ") {
-        return true;
-    }
-    if v.contains('<') && v.contains('>') {
-        return true;
-    }
+fn is_known_type_name(value: &str) -> bool {
     const TYPES: &[&str] = &[
         "String", "str", "bool", "usize", "u64", "u32", "u16", "u8", "i64", "i32",
         "i16", "i8", "f64", "f32", "PathBuf", "Path", "Option", "Result", "Vec",
         "Arc", "Rc", "Box", "Mutex", "RwLock", "SecretString",
     ];
     TYPES.iter().any(|ty| {
-        v == *ty
-            || v.strip_prefix(ty)
+        value == *ty
+            || value
+                .strip_prefix(ty)
                 .map(|rest| rest.starts_with('<') || rest.starts_with("::"))
                 .unwrap_or(false)
     })
+}
+
+fn looks_like_type_annotation(value: &str) -> bool {
+    let v = value.trim();
+    if v.is_empty() {
+        return false;
+    }
+    if v.contains('<') && v.contains('>') {
+        return true;
+    }
+    if let Some(rest) = v.strip_prefix('&') {
+        let mut rest = rest.trim_start();
+        if let Some(after_quote) = rest.strip_prefix('\'') {
+            rest = after_quote
+                .split_once(' ')
+                .map(|(_, r)| r.trim_start())
+                .unwrap_or(after_quote);
+        }
+        rest = rest.strip_prefix("mut ").unwrap_or(rest);
+        if let Some(inner) = rest.strip_prefix('[') {
+            return inner
+                .split([';', ']'])
+                .next()
+                .map(|t| is_known_type_name(t.trim()))
+                .unwrap_or(false);
+        }
+        if let Some(dynamic) = rest.strip_prefix("dyn ") {
+            return dynamic
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_uppercase())
+                .unwrap_or(false);
+        }
+        return is_known_type_name(rest);
+    }
+    if let Some(inner) = v.strip_prefix('[') {
+        return inner
+            .split([';', ']'])
+            .next()
+            .map(|t| is_known_type_name(t.trim()))
+            .unwrap_or(false);
+    }
+    if let Some(dynamic) = v.strip_prefix("dyn ") {
+        return dynamic
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_uppercase())
+            .unwrap_or(false);
+    }
+    is_known_type_name(v)
 }
 
 impl SecretScanner {
@@ -379,8 +420,20 @@ impl SecretScanner {
             let quoted = cap.get(2).map(|m| {
                 matches!(text[..m.start()].chars().last(), Some('"') | Some('\''))
             }).unwrap_or(false);
+            // Type annotations use `:`. A config value after `=` (for example
+            // `password=&hunter2!`) is never a type annotation, even if it
+            // starts with a reference sigil.
+            let type_context = cap
+                .get(1)
+                .zip(cap.get(2))
+                .map(|(key, val)| {
+                    let sep = text[key.end()..val.start()].trim();
+                    sep.starts_with(':') && !sep.starts_with("::")
+                })
+                .unwrap_or(false);
             if !quoted
-                && (looks_like_code_expression(value) || looks_like_type_annotation(value))
+                && (looks_like_code_expression(value)
+                    || (type_context && looks_like_type_annotation(value)))
             {
                 continue;
             }
@@ -1144,6 +1197,9 @@ mod tests {
             "password=hunter2!",
             "password = \"hunter2!;\"",
             "api_key=abc(def",
+            "password=&hunter2!",
+            "password=[hunter2]",
+            "password: &hunter2!",
         ] {
             let rejection = SecretScanner::scan_str(text, "content")
                 .unwrap_or_else(|| panic!("plaintext credential must be detected: {text}"));
