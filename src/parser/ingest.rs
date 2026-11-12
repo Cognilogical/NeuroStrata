@@ -1217,7 +1217,6 @@ pub async fn ingest_directory(
         (Ok(items), Ok(Ok((paths, hashes, deps, kinds)))) => {
             content_items = items;
             current_paths = paths;
-            current_kinds = kinds;
             current_hashes = hashes;
             dependency_map = deps;
             current_kinds = kinds;
