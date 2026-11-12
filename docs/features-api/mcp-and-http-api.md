@@ -17,6 +17,8 @@
 - `neurostrata_find_references` — locate referenced entities.
 - `neurostrata_find_duplicate_candidates` — locate duplicate memory candidates.
 
+`neurostrata_memories_for_file` (and the file part of `neurostrata_context_plan`) accepts an absolute file path as well as one relative to the ingested root. An absolute path is made relative to the caller's `project_root` when it contains the file, else to the nearest ancestor that holds `.git` (a directory, or the `.git` file of a linked worktree), else to the namespace's registered project root. When both the registered root and a `.git` root contain the file, the deeper one is used. When the namespace has a registered root, a file in another repository is left as given and matches nothing. A relative path is used as given. The response still echoes `path`; for an absolute path it adds `resolved_path` and `resolved_from` (`project_root`, `marker`, `registry_root` or `outside`). `project_root` still selects the ingest generation; a root found by the lookup does not.
+
 ## Central Executive Task & Procedure Tools
 
 - `neurostrata_task_create` — create a new task.

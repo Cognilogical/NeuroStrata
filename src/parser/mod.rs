@@ -1,5 +1,6 @@
 pub mod generation;
 pub mod ingest;
+pub mod lookup_path;
 pub mod schema;
 pub mod scip;
 

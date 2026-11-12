@@ -2097,11 +2097,14 @@ async fn handle_context_plan(
             .downcast_ref::<crate::store::LadybugStore>();
         if let Some(ls) = ladybug {
             for fp in &requested_files {
+                // Same resolution as neurostrata_memories_for_file, so an
+                // absolute file path reaches the relative locations it names.
+                let lookup = lookup_path_for(&store, effective_ns, fp, None).await;
                 match ls
                     .memories_for_file(
                         effective_ns,
                         None,
-                        fp,
+                        &lookup.path,
                         None,
                         true,
                         &crate::graph_read::memories_for_file::DEFAULT_MEMORY_TYPES
@@ -2502,6 +2505,26 @@ pub async fn start_mcp_proxy(origin: DaemonOrigin) -> io::Result<()> {
     Ok(())
 }
 
+/// The path a file lookup queries the store with. A relative path is returned
+/// as given, without touching the store or the disk; an absolute one is made
+/// relative to the caller's `project_root`, the nearest `.git` ancestor (a
+/// linked worktree's `.git` file included), or the namespace's registered
+/// root (see `crate::parser::lookup_path`).
+async fn lookup_path_for(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    path: &str,
+    project_root: Option<&str>,
+) -> crate::parser::lookup_path::LookupPath {
+    use crate::parser::lookup_path::{is_absolute_lookup_path, resolve_lookup_path};
+    let registry_root = if is_absolute_lookup_path(path) {
+        crate::registry::cached_project_root(store, namespace).await
+    } else {
+        None
+    };
+    resolve_lookup_path(path, project_root, registry_root.as_deref())
+}
+
 /// The `neurostrata_memories_for_file` handler. Returns a JSON object carrying
 /// `memories` (possibly empty) and `unsupported` -- an explicit flag, because a
 /// backend without graph-read must never be mistaken for "no rules apply".
@@ -2557,10 +2580,17 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
     // therefore the active generation) the query resolves against -- the same
     // key ingestion derives from the directory it walks. Absent a root, the
     // store falls back to the most recently published generation.
-    let source: Option<String> = arguments
-        .get("project_root")
-        .and_then(|p| p.as_str())
+    let project_root = arguments.get("project_root").and_then(|p| p.as_str());
+    let source: Option<String> = project_root
         .map(|root| crate::parser::ingest::source_key_for(std::path::Path::new(root)));
+
+    // Stored locations are relative; hooks send the absolute path of the file
+    // being touched. The root derived here only relativizes the path -- it is
+    // never used as `source`, so a worktree that was never ingested cannot pin
+    // an empty generation.
+    let lookup = lookup_path_for(&store, &namespace, path, project_root).await;
+    let original_path = path;
+    let path = lookup.path.as_str();
 
     // The graph-read capability is optional per backend: only LadybugStore
     // implements it (spec §4.6). Anything else answers `unsupported` -- never
@@ -2571,7 +2601,7 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
         return serde_json::json!({
             "memories": [],
             "unsupported": true,
-            "path": path,
+            "path": original_path,
         })
         .to_string();
     };
@@ -2594,8 +2624,14 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
             let mut response = serde_json::json!({
                 "memories": hits,
                 "unsupported": false,
-                "path": path,
+                "path": original_path,
             });
+            // An absolute path says what it was looked up as, so a miss on a
+            // file outside every known root is visible rather than silent.
+            if lookup.source != crate::parser::lookup_path::RootSource::Relative {
+                response["resolved_path"] = serde_json::Value::String(lookup.path.clone());
+                response["resolved_from"] = serde_json::json!(lookup.source.as_str());
+            }
             let include_ast_edges = arguments
                 .get("include_ast_edges")
                 .and_then(|v| v.as_bool())
@@ -2639,7 +2675,7 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
         Err(e) => serde_json::json!({
             "memories": [],
             "unsupported": false,
-            "path": path,
+            "path": original_path,
             "error": e.to_string(),
         })
         .to_string(),
@@ -12733,6 +12769,100 @@ mod tests {
             related_ids(&text).iter().all(|id| id != "mem-related"),
             "related_memories must omit excluded neighbor mem-related: {text}"
         );
+    }
+
+    /// Hooks send the absolute path of the file being touched (Claude Code's
+    /// `tool_input.file_path`); stored locations are relative. Before the
+    /// lookup relativized the path, an absolute path matched nothing, so no
+    /// file memory was ever delivered. Covers the main checkout, a linked
+    /// worktree under `.claude/worktrees/`, a relative path (unchanged), and a
+    /// file in another repository (must not borrow this namespace's memories).
+    #[tokio::test]
+    async fn memories_for_file_resolves_an_absolute_path_to_the_governing_memory() {
+        let (store, rule_id) = store_with_one_rule("probe").await;
+        let lb = crate::traits::VectorStore::as_any(store.as_ref())
+            .downcast_ref::<crate::store::ladybug::LadybugStore>()
+            .expect("ladybug store");
+        let edge_rule_id = rule_id.clone();
+        lb.with_conn(move |conn| {
+            let rule_id = edge_rule_id;
+            conn.query(
+                "CREATE (m:Memory {id: 'src/lib.rs', namespace: 'probe', content: 'c', user_id: 'u', memory_type: 'file', agent_name: 'a', location: 'src/lib.rs', location_lines: '', metadata: '{}', embedding: [0.0,0.0,0.0,0.0]})"
+            )?;
+            conn.query(&format!(
+                "MERGE (a:Memory {{id: '{rule_id}'}}), (b:Memory {{id: 'src/lib.rs'}}) MERGE (a)-[r:GOVERNS {{source: 'test', valid_from: 0, valid_to: 0, generation: 0, extractor: 'test', evidence_id: 'e', origin: 'local'}}]->(b)"
+            ))?;
+            Ok(())
+        })
+        .await
+        .expect("seed file + edge");
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let base = dunce::canonicalize(tmp.path()).expect("canonical temp dir");
+        let root = base.join("example-project");
+        std::fs::create_dir_all(root.join(".git").join("worktrees").join("agent-1")).unwrap();
+        let worktree = root.join(".claude").join("worktrees").join("agent-1");
+        std::fs::create_dir_all(worktree.join("src")).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                root.join(".git").join("worktrees").join("agent-1").to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let other = base.join("other-repo");
+        std::fs::create_dir_all(other.join(".git")).unwrap();
+
+        let lookup = |path: String| {
+            let store = store.clone();
+            async move {
+                let text = handle_memories_for_file(
+                    serde_json::json!({ "namespace": "probe", "path": path }),
+                    store,
+                )
+                .await;
+                serde_json::from_str::<Value>(&text).expect("valid JSON")
+            }
+        };
+        let ids = |parsed: &Value| -> Vec<String> {
+            parsed["memories"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(str::to_string))
+                .collect()
+        };
+
+        let in_checkout = root.join("src").join("lib.rs").to_string_lossy().to_string();
+        let in_worktree = worktree.join("src").join("lib.rs").to_string_lossy().to_string();
+        for path in [
+            in_checkout.clone(),
+            in_checkout.replace('\\', "/"),
+            in_worktree.clone(),
+            "src/lib.rs".to_string(),
+        ] {
+            let parsed = lookup(path.clone()).await;
+            assert!(ids(&parsed).contains(&rule_id), "{path} -> {parsed}");
+            assert_eq!(parsed["path"], serde_json::json!(path), "the caller's path is echoed");
+        }
+        let parsed = lookup(in_worktree.clone()).await;
+        assert_eq!(parsed["resolved_path"], serde_json::json!("src/lib.rs"));
+        assert_eq!(parsed["resolved_from"], serde_json::json!("marker"));
+        assert!(lookup("src/lib.rs".into()).await.get("resolved_path").is_none());
+
+        // Once the namespace knows its root, a file in another repository is
+        // left as it was: same relative name, different project.
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        crate::registry::cache_project_root(&store, Some(&emb), "probe", &root.to_string_lossy())
+            .await;
+        let stranger = other.join("src").join("lib.rs").to_string_lossy().to_string();
+        let parsed = lookup(stranger.clone()).await;
+        assert!(ids(&parsed).is_empty(), "{parsed}");
+        assert_eq!(parsed["resolved_from"], serde_json::json!("outside"));
+        // ...while the worktree of the registered checkout still resolves.
+        assert!(ids(&lookup(in_worktree).await).contains(&rule_id));
     }
 
     #[tokio::test]
