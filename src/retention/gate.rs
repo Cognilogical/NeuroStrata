@@ -103,11 +103,29 @@ pub fn record_latency_sample(plan_ms: f64, upsert_ms: f64) {
     }
 }
 
+/// Test-only reset for the process-wide latency windows. The composed
+/// retention gate reads these windows, so a test that deliberately records an
+/// over-budget sample must restore the empty state before the next test.
+#[cfg(test)]
+pub(crate) fn clear_latency_windows() {
+    window_guard(&PLAN_SAMPLES).clear();
+    window_guard(&UPSERT_SAMPLES).clear();
+    LAST_PLAN_MS.store(0.0f64.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    LAST_UPSERT_MS.store(0.0f64.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
 pub fn retention_gate(receipt_exists: bool) -> bool {
     // Budget verified over the rolling evidence windows (the degenerate
     // empty window reads as 0.0, which must always verify — the gate never
     // fails on "no evidence yet"), not assertedly "passing" on broken inputs.
-    if !budget_verified(current_p95_plan_ms(), current_p95_upsert_ms()) {
+    retention_gate_with(receipt_exists, current_p95_plan_ms(), current_p95_upsert_ms())
+}
+
+/// The gate decision over explicit p95 values. Split out so the decision can
+/// be exercised without the process-wide latency windows, which accumulate
+/// samples from every caller in the process.
+fn retention_gate_with(receipt_exists: bool, p95_plan_ms: f64, p95_upsert_ms: f64) -> bool {
+    if !budget_verified(p95_plan_ms, p95_upsert_ms) {
         return false;
     }
     receipt_exists // retention requires receipt present
@@ -128,6 +146,18 @@ pub fn verify_task_receipt_retention(
     task_id: &str,
     event_id: &str,
 ) -> bool {
+    retention_gate(receipt_is_retained(store, session_id, task_id, event_id))
+}
+
+/// Whether the receipt is present and, when bound, still matches its
+/// worktree. Records the latency samples the gate's budget check reads, but
+/// does not consult them itself.
+fn receipt_is_retained(
+    store: &crate::receipts::store::ReceiptStore,
+    session_id: &str,
+    task_id: &str,
+    event_id: &str,
+) -> bool {
     // The receipt lookup and the worktree re-verification are the
     // store-state analogue of the plan and upsert legs: every production
     // verification feeds a real sample into the gate's latency slots so the
@@ -139,18 +169,18 @@ pub fn verify_task_receipt_retention(
     // production path (`is_empty` alone would leave it dead_code).
     if store.is_empty() || store.len() == 0 {
         record_latency_sample(plan_start.elapsed().as_secs_f64() * 1000.0, 0.0);
-        return retention_gate(false);
+        return false;
     }
     let Some(stored) = store.get(session_id, task_id, event_id) else {
         record_latency_sample(plan_start.elapsed().as_secs_f64() * 1000.0, 0.0);
-        return retention_gate(false); // failed retention: receipt is gone
+        return false; // failed retention: receipt is gone
     };
     if stored.worktree.is_empty() {
         record_latency_sample(plan_start.elapsed().as_secs_f64() * 1000.0, 0.0);
         // Presence-only receipt: nothing further to verify against the
-        // worktree, but the gate still verifies the AC5 budget over the
+        // worktree; the caller's gate still checks the AC5 budget over the
         // rolling evidence windows rather than passing unconditionally.
-        return retention_gate(true); // receipt present; gate re-checks AC5 budget
+        return true;
     }
     let upsert_start = std::time::Instant::now();
     let (head_sha, dirty_tree_hash) =
@@ -163,7 +193,7 @@ pub fn verify_task_receipt_retention(
     // Every production verification reads the last-observed slots the
     // recording step just filled (AO-11) so they are genuinely readable.
     let _last = last_observed_latencies_ms();
-    retention_gate(current)
+    current
 }
 
 #[cfg(test)]
@@ -297,17 +327,32 @@ mod tests {
         assert_ne!(plan, 0, "plan slot never read (AO-11)");
         assert_ne!(upsert, 0, "upsert slot never read (AO-11)");
     }
+    // The tests below assert on the gate decision and on receipt retention
+    // separately, over explicit values. Going through the process-wide latency
+    // windows would let one slow sample from any other test (a `git` spawn on
+    // a loaded Windows host easily exceeds 100ms) fail them.
     #[test]
     fn retention_gate_requires_receipt() {
-        assert!(retention_gate(true));
-        assert!(!retention_gate(false));
+        assert!(retention_gate_with(true, 0.0, 0.0));
+        assert!(!retention_gate_with(false, 0.0, 0.0));
     }
 
     #[test]
-    fn verify_task_receipt_retention_needs_recorded_receipt() {
+    fn retention_gate_fails_when_either_budget_is_exceeded() {
+        assert!(!retention_gate_with(true, 150.0, 0.0));
+        assert!(!retention_gate_with(true, 0.0, 150.0));
+    }
+
+    /// P2 from the panel review: exercise the composed public function, not
+    /// only its private helpers. A retained receipt with an over-budget
+    /// latency window must fail; a composition that drops the budget check
+    /// (returns only `receipt_is_retained`) stays green on the helper tests
+    /// but fails here.
+    #[test]
+    fn verify_task_receipt_retention_composes_budget_and_receipt() {
         let _guard = slots_lock();
+        clear_latency_windows();
         let mut store = crate::receipts::store::ReceiptStore::new();
-        assert!(!verify_task_receipt_retention(&store, "s", "t", "e"));
         store.record(crate::receipts::store::Receipt {
             session_id: "s".into(),
             task_id: "t".into(),
@@ -318,8 +363,31 @@ mod tests {
             head_sha: String::new(),
             dirty_tree_hash: String::new(),
         });
+        // Empty windows verify, and the receipt is retained.
         assert!(verify_task_receipt_retention(&store, "s", "t", "e"));
-        assert!(!verify_task_receipt_retention(&store, "s", "t", "other"));
+        // The same retained receipt now fails because the budget is exceeded.
+        record_latency_sample(150.0, 0.0);
+        assert!(!verify_task_receipt_retention(&store, "s", "t", "e"));
+        clear_latency_windows();
+    }
+
+    #[test]
+    fn verify_task_receipt_retention_needs_recorded_receipt() {
+        let _guard = slots_lock();
+        let mut store = crate::receipts::store::ReceiptStore::new();
+        assert!(!receipt_is_retained(&store, "s", "t", "e"));
+        store.record(crate::receipts::store::Receipt {
+            session_id: "s".into(),
+            task_id: "t".into(),
+            event_id: "e".into(),
+            outcome: "completed".into(),
+            exposed_ids: vec![],
+            worktree: String::new(),
+            head_sha: String::new(),
+            dirty_tree_hash: String::new(),
+        });
+        assert!(receipt_is_retained(&store, "s", "t", "e"));
+        assert!(!receipt_is_retained(&store, "s", "t", "other"));
     }
 
     #[test]
@@ -340,7 +408,7 @@ mod tests {
         });
         // Unreadable worktree reports ("none", "clean"), so a receipt bound to
         // anything else is stale.
-        assert!(!verify_task_receipt_retention(&store, "s", "t", "e"));
+        assert!(!receipt_is_retained(&store, "s", "t", "e"));
 
         let (expected_sha, expected_dirty) =
             crate::task::receipt::compute_worktree_state(std::path::Path::new(
@@ -358,6 +426,6 @@ mod tests {
             head_sha: expected_sha,
             dirty_tree_hash: expected_dirty,
         });
-        assert!(verify_task_receipt_retention(&store, "s", "t", "e2"));
+        assert!(receipt_is_retained(&store, "s", "t", "e2"));
     }
 }
