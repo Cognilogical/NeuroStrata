@@ -379,11 +379,17 @@ mod tests {
         let hash = hex::encode(Sha256::digest(&archive));
 
         // Write a registry pointing at the local archive.
-        let registry_json = format!(
-            r#"{{"version":"test","models":[{{"name":"laya-test","url":"file://{}","sha256":"{}","path":"model.onnx","files":["model.onnx"]}}]}}"#,
-            archive_path.display(),
-            hash
-        );
+        let registry_json = serde_json::json!({
+            "version": "test",
+            "models": [{
+                "name": "laya-test",
+                "url": format!("file://{}", archive_path.display()),
+                "sha256": hash,
+                "path": "model.onnx",
+                "files": ["model.onnx"]
+            }]
+        })
+        .to_string();
         std::fs::write(tmp.join("registry.json"), registry_json).unwrap();
 
         let out = fetch_from_registry("laya-test", &tmp).unwrap();

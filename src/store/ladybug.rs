@@ -10588,7 +10588,7 @@ eurostrata\src\daemon.rs",
                 .unwrap();
             assert_eq!(
                 node["absolute_path"],
-                expected_root.join("src/lib.rs").to_string_lossy().as_ref()
+                expected_root.join("src").join("lib.rs").to_string_lossy().as_ref()
             );
             assert_eq!(node["metadata"]["refs"][0]["provider_data"]["opaque"], true);
             assert_eq!(
@@ -15290,6 +15290,7 @@ eurostrata\src\daemon.rs",
     /// alternate stack. The Rust standard library gives a thread 8192 bytes
     /// of it, which is too small -- the handler would fault inside itself
     /// and the breadcrumb would be lost.
+    #[cfg(unix)]
     #[tokio::test]
     async fn the_engine_thread_has_an_alternate_stack_the_handler_can_run_on() {
         // The size the handler asks for, measured on this thread.
