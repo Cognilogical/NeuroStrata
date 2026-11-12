@@ -2413,7 +2413,10 @@ use super::x;"#;
     async fn par03_secret_in_ingest_is_refused() {
         let tmp = std::env::temp_dir().join(format!("ns-ingest-secret-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).expect("create temp dir");
-        std::fs::write(tmp.join("good.rs"), "fn clean() {}").expect("write clean file");
+        // Secret-named fields with type annotations are ordinary source, not
+        // credentials; they must still ingest.
+        let good_source = "struct Config { api_key: String, token: String }\nfn clean() {}";
+        std::fs::write(tmp.join("good.rs"), good_source).expect("write clean file");
         // Built at runtime so no secret-shaped literal sits in the source.
         let secret = format!("ghp_{}", "Ab1".repeat(12));
         let evil_source = format!("fn leak() {{\n    let key = \"{}\";\n}}\n", secret);
@@ -2449,6 +2452,15 @@ use super::x;"#;
         );
 
         // The clean document landed whole.
+        let good_node = generation_scoped_id("test-ns", 1, "good.rs");
+        assert!(
+            store
+                .get("test-ns", &good_node)
+                .await
+                .expect("read back")
+                .is_some(),
+            "clean file with secret-named typed fields was stored"
+        );
         let good_sym = generation_scoped_id(
             "test-ns",
             1,

@@ -168,6 +168,32 @@ fn looks_like_code_expression(value: &str) -> bool {
         || (value.contains('(') && value.contains(')'))
 }
 
+/// A value captured next to a secret-like key may be a Rust type annotation
+/// (`api_key: String`, `token: Option<PathBuf>`) rather than a credential.
+fn looks_like_type_annotation(value: &str) -> bool {
+    let v = value.trim();
+    if v.is_empty() {
+        return false;
+    }
+    if v.starts_with('&') || v.starts_with('[') || v.starts_with("dyn ") {
+        return true;
+    }
+    if v.contains('<') && v.contains('>') {
+        return true;
+    }
+    const TYPES: &[&str] = &[
+        "String", "str", "bool", "usize", "u64", "u32", "u16", "u8", "i64", "i32",
+        "i16", "i8", "f64", "f32", "PathBuf", "Path", "Option", "Result", "Vec",
+        "Arc", "Rc", "Box", "Mutex", "RwLock", "SecretString",
+    ];
+    TYPES.iter().any(|ty| {
+        v == *ty
+            || v.strip_prefix(ty)
+                .map(|rest| rest.starts_with('<') || rest.starts_with("::"))
+                .unwrap_or(false)
+    })
+}
+
 impl SecretScanner {
     /// Build the scanner. Returns `Err` if a regex fails to compile.
     fn build() -> Result<Self, regex::Error> {
@@ -353,7 +379,9 @@ impl SecretScanner {
             let quoted = cap.get(2).map(|m| {
                 matches!(text[..m.start()].chars().last(), Some('"') | Some('\''))
             }).unwrap_or(false);
-            if !quoted && looks_like_code_expression(value) {
+            if !quoted
+                && (looks_like_code_expression(value) || looks_like_type_annotation(value))
+            {
                 continue;
             }
 
@@ -1068,6 +1096,21 @@ mod tests {
         assert!(
             SecretScanner::scan_str(text, "content").is_none(),
             "source expressions are not credential literals"
+        );
+    }
+
+    #[test]
+    fn source_type_annotations_are_not_probed_as_passwords() {
+        let text = "struct Config {\n\
+                    api_key: String,\n\
+                    token: String,\n\
+                    path: Option<PathBuf>,\n\
+                    secret: &'a str,\n\
+                    bytes: [u8; 32],\n\
+                    }";
+        assert!(
+            SecretScanner::scan_str(text, "content").is_none(),
+            "type annotations are not credential values"
         );
     }
 
