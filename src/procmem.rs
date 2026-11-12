@@ -103,18 +103,45 @@ pub fn sample() -> Sample {
     Sample { rss_bytes: kb("VmRSS:"), peak_bytes: kb("VmHWM:") }
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(target_os = "macos")]
+pub fn sample() -> Sample {
+    // mach_task_basic_info gives both the current resident size and its
+    // high-water mark; getrusage's ru_maxrss is peak-only, which made the
+    // per-call growth log dead on macOS (the delta needs two current figures).
+    let mut info: libc::mach_task_basic_info = unsafe { std::mem::zeroed() };
+    let mut count: libc::mach_msg_type_number_t = libc::MACH_TASK_BASIC_INFO_COUNT;
+    // SAFETY: `info` is a correctly sized, writable mach_task_basic_info and
+    // `count` is its word count; mach_task_self() is a pseudo-port.
+    let kr = unsafe {
+        libc::task_info(
+            libc::mach_task_self(),
+            libc::MACH_TASK_BASIC_INFO,
+            &mut info as *mut _ as libc::task_info_t,
+            &mut count,
+        )
+    };
+    if kr != 0 {
+        return Sample::default();
+    }
+    Sample {
+        rss_bytes: Some(info.resident_size),
+        peak_bytes: Some(info.resident_size_max),
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux"), not(target_os = "macos")))]
 pub fn sample() -> Sample {
     // No current figure without platform-specific calls; the peak is what
-    // getrusage offers. ru_maxrss is bytes on macOS and kilobytes elsewhere.
+    // getrusage offers. ru_maxrss is kilobytes on these BSDs.
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
     // SAFETY: `usage` is a valid, writable rusage.
     if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
         return Sample::default();
     }
-    let raw = usage.ru_maxrss as u64;
-    let peak = if cfg!(target_os = "macos") { raw } else { raw * 1024 };
-    Sample { rss_bytes: None, peak_bytes: Some(peak) }
+    Sample {
+        rss_bytes: None,
+        peak_bytes: Some(usage.ru_maxrss as u64 * 1024),
+    }
 }
 
 #[cfg(not(any(windows, unix)))]
@@ -267,7 +294,12 @@ async fn run_sampler(
     }
 }
 
+static LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn append(path: &std::path::Path, line: &str) {
+    // Rotation and append are one critical section: concurrent calls must not
+    // rename the file one is writing to or interleave a partial line.
+    let _guard = LOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -296,7 +328,8 @@ impl CallGuard {
         Self {
             tool: tool.to_string(),
             namespace: namespace.map(str::to_string),
-            before: sample(),
+            // Disabled profiling must not pay for a syscall per call.
+            before: if profile_enabled() { sample() } else { Sample::default() },
         }
     }
 }
@@ -304,8 +337,11 @@ impl CallGuard {
 impl Drop for CallGuard {
     fn drop(&mut self) {
         let in_flight = IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+        if !profile_enabled() {
+            return;
+        }
         let after = sample();
-        if profile_enabled() && grew(self.before.rss_bytes, after.rss_bytes, threshold_mb()) {
+        if grew(self.before.rss_bytes, after.rss_bytes, threshold_mb()) {
             append(
                 &log_path(),
                 &line(&self.tool, self.namespace.as_deref(), self.before, after, in_flight),
@@ -330,7 +366,7 @@ mod tests {
     #[test]
     fn this_platform_reports_a_resident_set() {
         let s = sample();
-        #[cfg(any(windows, target_os = "linux"))]
+        #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
         {
             assert!(s.rss_bytes.unwrap_or(0) > 0, "no resident set reported: {s:?}");
             assert!(s.peak_bytes.unwrap_or(0) >= s.rss_bytes.unwrap_or(0));
