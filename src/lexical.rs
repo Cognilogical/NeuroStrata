@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use tantivy::collector::TopDocs;
-use tantivy::query::QueryParser;
-use tantivy::schema::{Field as TantivyField, Schema, STORED, STRING, TEXT, FAST, INDEXED, Value as TantivyValue};
+use tantivy::query::{BooleanQuery, ConstScoreQuery, Occur, QueryParser, RangeQuery, TermQuery};
+use tantivy::schema::{Field as TantivyField, IndexRecordOption, Schema, STORED, STRING, TEXT, FAST, INDEXED, Value as TantivyValue};
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 
 use crate::traits::{MemoryPayload};
@@ -23,6 +23,31 @@ pub fn tokenize_code_for_tantivy(text: &str) -> String {
         tokens.push(lower_raw);
     }
     tokens.join(" ")
+}
+
+/// Neutralize a tokenized query for Tantivy's `QueryParser`: quote-wrap every
+/// whitespace-separated term so user text is parsed as literal phrases, never
+/// as query syntax.
+///
+/// Tantivy's grammar parses a double-quoted string as one literal whose
+/// contents may contain any character except an unescaped `"`; a `\` escapes
+/// the next character. The parser then runs the field tokenizer over the
+/// literal exactly as it does for a bare term — a literal tokenizing to one
+/// term stays a term query, several terms become the same phrase query a bare
+/// multi-token literal produced — so per-field boosts and matching semantics
+/// are unchanged, while `:`, `(`, `)`, leading `+`/`-`, unbalanced quotes, `^`,
+/// `~`, `/` etc. inside the quotes can no longer be read as field references,
+/// grouping, occur operators, boosts, fuzzy markers or regex delimiters.
+/// Without this, the raw full-text token appended by
+/// [`tokenize_code_for_tantivy`] (e.g. `std::sync::mutex`) reached
+/// `parse_query` as syntax and the search failed with a propagated parse error
+/// instead of returning matches.
+fn quote_tokenized_query(tokenized: &str) -> String {
+    tokenized
+        .split_whitespace()
+        .map(|term| format!("\"{}\"", term.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[derive(Debug, Clone)]
@@ -292,8 +317,33 @@ impl TantivyLexicalIndex {
 
     /// Rebuild from slice (namespace, id, payload) — commit once (§4).
     pub fn rebuild(&self, rows: &[(String, String, MemoryPayload)]) -> Result<usize> {
+        self.rebuild_scoped(rows, None)
+    }
+
+    /// Rebuild, optionally scoped to a single namespace — commit once (§4).
+    ///
+    /// When `namespace` is `Some(ns)`, only that namespace's documents are
+    /// deleted before inserting `rows` (partition replace); every other
+    /// namespace's documents survive. When `None`, the whole index is replaced,
+    /// exactly as [`Self::rebuild`] has always done. A scoped rebuild must never
+    /// wipe other namespaces: `search_tantivy_lexical` lazily initializes with a
+    /// single-namespace rebuild, and namespaces whose documents were wiped would
+    /// never re-trigger initialization.
+    pub fn rebuild_scoped(
+        &self,
+        rows: &[(String, String, MemoryPayload)],
+        namespace: Option<&str>,
+    ) -> Result<usize> {
         if let Some(w) = self.writer.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-            w.delete_all_documents()?;
+            match namespace {
+                Some(ns) => {
+                    let term = Term::from_field_text(self.namespace_f, ns);
+                    w.delete_term(term);
+                }
+                None => {
+                    w.delete_all_documents()?;
+                }
+            }
             let mut indexed = 0usize;
             for (ns, id, payload) in rows {
                 if Self::is_excluded(payload) {
@@ -349,13 +399,76 @@ impl TantivyLexicalIndex {
         parser.set_field_boost(self.symbol_f, 2.0);
         parser.set_field_boost(self.location_f, 1.5);
 
-        let tokenized_query = tokenize_code_for_tantivy(query_str);
+        let tokenized_query = quote_tokenized_query(&tokenize_code_for_tantivy(query_str));
         let parsed = parser.parse_query(&tokenized_query)?;
+
+        // Apply the row filters inside the query, before TopDocs collects:
+        // filtering afterwards lets higher-scoring rows from other namespaces
+        // (or excluded tasks / archived / retired rows) exhaust fetch_limit
+        // and starve matches that would have survived the filters. The per-hit
+        // checks below stay as defense in depth.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let visible_at = as_of.unwrap_or(now);
+        // tantivy 0.27 has no Occur::Filter; a Must clause wrapped in a
+        // zero-score ConstScoreQuery filters without touching BM25 ranking.
+        fn filter(query: Box<dyn tantivy::query::Query>) -> (Occur, Box<dyn tantivy::query::Query>) {
+            (Occur::Must, Box::new(ConstScoreQuery::new(query, 0.0)))
+        }
+        let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = vec![
+            (Occur::Must, parsed),
+            filter(Box::new(TermQuery::new(
+                Term::from_field_text(self.namespace_f, namespace),
+                IndexRecordOption::Basic,
+            ))),
+            // Not yet retired at the visible moment: valid_to unset (0) or
+            // strictly after it. Mirrors the per-hit validity check below.
+            filter(Box::new(BooleanQuery::new(vec![
+                (
+                    Occur::Should,
+                    Box::new(TermQuery::new(
+                        Term::from_field_i64(self.valid_to_f, 0),
+                        IndexRecordOption::Basic,
+                    )) as Box<dyn tantivy::query::Query>,
+                ),
+                (
+                    Occur::Should,
+                    Box::new(RangeQuery::new(
+                        std::ops::Bound::Excluded(Term::from_field_i64(self.valid_to_f, visible_at)),
+                        std::ops::Bound::Unbounded,
+                    )) as Box<dyn tantivy::query::Query>,
+                ),
+            ]))),
+        ];
+        if let Some(ts) = as_of {
+            clauses.push(filter(Box::new(RangeQuery::new(
+                std::ops::Bound::Unbounded,
+                std::ops::Bound::Included(Term::from_field_i64(self.valid_from_f, ts)),
+            ))));
+        }
+        if !include_tasks {
+            clauses.push((
+                Occur::MustNot,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.memory_type_f, "task"),
+                    IndexRecordOption::Basic,
+                )),
+            ));
+        }
+        if !include_archived {
+            clauses.push(filter(Box::new(RangeQuery::new(
+                std::ops::Bound::Included(Term::from_field_i64(self.archived_f, 0)),
+                std::ops::Bound::Included(Term::from_field_i64(self.archived_f, 0)),
+            ))));
+        }
+        let filtered_query = BooleanQuery::new(clauses);
 
         let fetch_limit = (limit.max(1) * 8) as usize;
         let searcher = self.reader.searcher();
         let top_docs = TopDocs::with_limit(fetch_limit).order_by_score();
-        let hits: Vec<(f32, tantivy::DocAddress)> = searcher.search(&parsed, &top_docs)?;
+        let hits: Vec<(f32, tantivy::DocAddress)> = searcher.search(&filtered_query, &top_docs)?;
 
         let mut candidates: Vec<TantivyHit> = Vec::with_capacity(hits.len());
         for (score, doc_address) in hits {
@@ -534,6 +647,170 @@ mod tests {
             "expected full memory id, got ids: {:?}",
             hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn par10_code_tokens_are_literal() {
+        // The exact qualified symbol must return Ok WITH the seeded row; an
+        // error-swallowing fix that returns Ok(empty) fails this oracle.
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        let mutex = dummy_payload("guarded by a mutex lock", Some("std::sync::Mutex"));
+        idx.upsert_memory("ns", "mutex-row", &mutex).unwrap();
+        let path = dummy_payload("path token target row", Some("foo::bar::Baz"));
+        idx.upsert_memory("ns", "path-row", &path).unwrap();
+        let quoted = dummy_payload("say hello loudly", None);
+        idx.upsert_memory("ns", "quote-row", &quoted).unwrap();
+
+        for (query, expected) in [
+            ("std::sync::Mutex", "mutex-row"),
+            ("foo::bar::Baz", "path-row"),
+            ("Mutex:", "mutex-row"),
+            ("(Mutex", "mutex-row"),
+            ("say \"hello", "quote-row"),
+            ("+Mutex", "mutex-row"),
+            ("-Mutex", "mutex-row"),
+        ] {
+            let hits = idx
+                .search("ns", query, 10, true, true, None)
+                .unwrap_or_else(|e| panic!("query {query:?} must not error: {e}"));
+            assert!(
+                hits.iter().any(|h| h.id == expected),
+                "query {query:?} must return {expected}, got: {:?}",
+                hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn par10_operator_tokens_are_literal() {
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        let p = dummy_payload("fish and chips or peas supper", None);
+        idx.upsert_memory("ns", "bool-row", &p).unwrap();
+        for query in ["AND", "chips OR peas"] {
+            let hits = idx
+                .search("ns", query, 10, true, true, None)
+                .unwrap_or_else(|e| panic!("query {query:?} must not error: {e}"));
+            assert!(
+                hits.iter().any(|h| h.id == "bool-row"),
+                "query {query:?} must return the seeded row, got: {:?}",
+                hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn par10_query_edge_cases() {
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        let p = dummy_payload("café naïve sharedtoken", None);
+        idx.upsert_memory("ns", "unicode-row", &p).unwrap();
+        for query in ["", "   ", "\"", "\\", "café::naïve", "a\nb", "term^2", "term~1"] {
+            let hits = idx
+                .search("ns", query, 10, true, true, None)
+                .unwrap_or_else(|e| panic!("query {query:?} must not error: {e}"));
+            assert!(hits.is_empty() || hits.iter().all(|h| h.namespace == "ns"));
+        }
+        let zero = idx.search("ns", "sharedtoken", 0, true, true, None).unwrap();
+        assert!(zero.is_empty(), "limit zero returns no rows");
+    }
+
+    fn payload_typed(content: &str, memory_type: &str) -> MemoryPayload {
+        let mut p = dummy_payload(content, None);
+        p.memory_type = memory_type.to_string();
+        p
+    }
+
+    #[test]
+    fn par10_hidden_rows_cannot_starve_the_page() {
+        // fetch_limit is limit*8: with limit=2 the collector takes the top 16
+        // hits globally. Filtering only afterwards lets 24 higher-scoring
+        // foreign rows exhaust that window.
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        for i in 0..24 {
+            let p = payload_typed("sharedtoken sharedtoken sharedtoken", "memory");
+            idx.upsert_memory("A", &format!("a{i}"), &p).unwrap();
+        }
+        let b = payload_typed(
+            "sharedtoken diluted by many unrelated filler words that lengthen this document considerably beyond the others",
+            "memory",
+        );
+        idx.upsert_memory("B", "b1", &b).unwrap();
+
+        let hits = idx.search("B", "sharedtoken", 2, true, true, None).unwrap();
+        assert!(
+            hits.iter().any(|h| h.id == "b1"),
+            "namespace B match must be collected even when A outscores it, got: {:?}",
+            hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+        );
+
+        // Same starvation shape for excluded task rows in one namespace.
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        for i in 0..24 {
+            let p = payload_typed("sharedtoken sharedtoken sharedtoken", "task");
+            idx.upsert_memory("ns", &format!("t{i}"), &p).unwrap();
+        }
+        let m = payload_typed(
+            "sharedtoken diluted by many unrelated filler words that lengthen this document considerably beyond the others",
+            "memory",
+        );
+        idx.upsert_memory("ns", "m1", &m).unwrap();
+
+        let hits = idx.search("ns", "sharedtoken", 2, false, true, None).unwrap();
+        assert!(
+            hits.iter().any(|h| h.id == "m1"),
+            "non-task match must be collected even when excluded tasks outscore it, got: {:?}",
+            hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn par10_as_of_boundary_matches_per_hit_rule() {
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        let mut p = dummy_payload("boundary sharedtoken", None);
+        p.metadata = json!({"valid_from": 0, "valid_to": 100, "archived": 0});
+        idx.upsert_memory("ns", "boundary-row", &p).unwrap();
+
+        let active = idx.search("ns", "sharedtoken", 10, true, true, Some(99)).unwrap();
+        assert!(active.iter().any(|h| h.id == "boundary-row"));
+        let retired = idx.search("ns", "sharedtoken", 10, true, true, Some(100)).unwrap();
+        assert!(
+            !retired.iter().any(|h| h.id == "boundary-row"),
+            "valid_to == as_of is retired"
+        );
+    }
+
+    #[test]
+    fn par10_rebuild_scoped_preserves_other_namespaces() {
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        let seed = vec![
+            ("A".to_string(), "a1".to_string(), dummy_payload("alpha oldtoken", None)),
+            ("B".to_string(), "b1".to_string(), dummy_payload("bravo uniquetoken", None)),
+        ];
+        assert_eq!(idx.rebuild(&seed).unwrap(), 2);
+
+        let new_a = vec![(
+            "A".to_string(),
+            "a2".to_string(),
+            dummy_payload("alpha newtoken", None),
+        )];
+        assert_eq!(idx.rebuild_scoped(&new_a, Some("A")).unwrap(), 1);
+
+        let b_hits = idx.search("B", "uniquetoken", 10, true, true, None).unwrap();
+        assert!(
+            b_hits.iter().any(|h| h.id == "b1"),
+            "namespace B rows must survive a scoped rebuild of A, got: {:?}",
+            b_hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+        );
+        let a_old = idx.search("A", "oldtoken", 10, true, true, None).unwrap();
+        assert!(!a_old.iter().any(|h| h.id == "a1"), "scoped rebuild replaces A's old rows");
+        let a_new = idx.search("A", "newtoken", 10, true, true, None).unwrap();
+        assert!(a_new.iter().any(|h| h.id == "a2"));
+
+        let only_c = vec![("C".to_string(), "c1".to_string(), dummy_payload("charlie fresh token", None))];
+        assert_eq!(idx.rebuild_scoped(&only_c, None).unwrap(), 1);
+        let b_hits = idx.search("B", "uniquetoken", 10, true, true, None).unwrap();
+        assert!(b_hits.is_empty(), "unscoped rebuild replaces every namespace");
+        let c_hits = idx.search("C", "charlie fresh", 10, true, true, None).unwrap();
+        assert!(c_hits.iter().any(|h| h.id == "c1"));
     }
 
     #[test]

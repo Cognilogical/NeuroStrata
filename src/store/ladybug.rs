@@ -4495,7 +4495,7 @@ impl LadybugStore {
         let indexed = {
             let guard = self.tantivy_lexical.read().unwrap_or_else(|e| e.into_inner());
             let idx = guard.as_ref().expect("tantivy open");
-            idx.rebuild(&rows_data)?
+            idx.rebuild_scoped(&rows_data, namespace)?
         };
         Ok((indexed, crate::lexical::INDEX_VERSION.to_string()))
     }
