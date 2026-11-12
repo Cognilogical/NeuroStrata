@@ -147,7 +147,28 @@ const MAX_DEPTH: usize = 8;
 const MAX_SCAN_BYTES: usize = 256_000;
 /// Overlap between scan chunks so a token that straddles a chunk boundary is
 /// still seen whole. Provider tokens are far shorter than this.
-const SCAN_CHUNK_OVERLAP: usize = 4_096;
+const SCAN_CHUNK_OVERLAP: usize = 64 * 1024;
+
+/// A value captured next to a secret-like key is a source expression, not a
+/// credential literal, when it is unquoted and shaped like code. Skipping
+/// these avoids treating `let token = read_token();` as a password while
+/// quoted literals and plain opaque values still go through the password
+/// check.
+fn looks_like_code_expression(value: &str) -> bool {
+    value.contains("::")
+        || value.contains("->")
+        || value.contains("=>")
+        || value.contains('(')
+        || value.contains(')')
+        || value.contains('{')
+        || value.contains('}')
+        || value.contains('[')
+        || value.contains(']')
+        || value.contains('?')
+        || value.contains('!')
+        || value.starts_with('&')
+        || value.starts_with('*')
+}
 
 impl SecretScanner {
     /// Build the scanner. Returns `Err` if a regex fails to compile.
@@ -219,14 +240,31 @@ impl SecretScanner {
             if end <= start {
                 break;
             }
+            // Prefer a line boundary: a JWT or provider token never spans a
+            // newline, so ending the chunk at one keeps the whole candidate in
+            // the next chunk regardless of its length.
+            let mut used_newline = false;
+            if end < text.len() {
+                if let Some(nl) = text[start..end].rfind('\n') {
+                    let candidate = start + nl + 1;
+                    if candidate - start > MAX_SCAN_BYTES / 2 {
+                        end = candidate;
+                        used_newline = true;
+                    }
+                }
+            }
             if let Some(r) = self.scan_inner(&text[start..end], location) {
                 return Some(r);
             }
             if end == text.len() {
                 break;
             }
-            let next = end.saturating_sub(SCAN_CHUNK_OVERLAP);
-            start = if next > start { next } else { end };
+            if used_newline {
+                start = end;
+            } else {
+                let next = end.saturating_sub(SCAN_CHUNK_OVERLAP);
+                start = if next > start { next } else { end };
+            }
             while start < text.len() && !text.is_char_boundary(start) {
                 start += 1;
             }
@@ -305,6 +343,14 @@ impl SecretScanner {
             let value_lower = value.to_ascii_lowercase();
 
             if is_placeholder(&value_lower) {
+                continue;
+            }
+
+            let quoted = cap.get(2).map(|m| {
+                matches!(text[..m.start()].chars().last(), Some('"') | Some('\''))
+                    && matches!(text[m.end()..].chars().next(), Some('"') | Some('\''))
+            }).unwrap_or(false);
+            if !quoted && looks_like_code_expression(value) {
                 continue;
             }
 
@@ -1009,6 +1055,41 @@ mod tests {
         text.push_str(&"b".repeat(10_000));
         let rejection = SecretScanner::scan_str(&text, "content").expect("secret detected");
         assert_eq!(rejection.category, "github_pat");
+    }
+
+    #[test]
+    fn source_assignments_from_functions_are_not_secrets() {
+        let text = "let token = read_token();\n\
+                    let password = generate_password();\n\
+                    let key = crate::daemon::read_token_file(path).await?;";
+        assert!(
+            SecretScanner::scan_str(text, "content").is_none(),
+            "source expressions are not credential literals"
+        );
+    }
+
+    #[test]
+    fn quoted_password_literal_is_still_detected() {
+        let text = "let password = \"s3cr3t-value\";";
+        let rejection = SecretScanner::scan_str(text, "content").expect("quoted literal");
+        assert_eq!(rejection.category, "password");
+    }
+
+    #[test]
+    fn long_jwt_across_a_line_boundary_is_detected() {
+        let header = base64_encode(br#"{"alg":"HS256","typ":"JWT"}"#);
+        // The payload is far longer than the old 4 KB overlap; a line-aware
+        // chunk boundary must keep the whole token in one scan.
+        let payload = format!("eyJ{}", "A".repeat(200_000));
+        let sig = "B".repeat(200);
+        let jwt = format!("{header}.{payload}.{sig}");
+        let mut text = "x".repeat(MAX_SCAN_BYTES - 100);
+        text.push('\n');
+        text.push_str(&jwt);
+        text.push('\n');
+        text.push_str(&"y".repeat(1_000));
+        let rejection = SecretScanner::scan_str(&text, "content").expect("long JWT detected");
+        assert_eq!(rejection.category, "jwt");
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────
