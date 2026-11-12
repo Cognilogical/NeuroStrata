@@ -1202,8 +1202,9 @@ fn classify_merge(
                 }
             }
             // supersede + content edit: replacement authoritative; the losing
-            // edit is preserved as a new record (handled by the caller).
-            Active if content_changed => MergeDecision::SupersedeWinsPreserveEdit,
+            // edit (whether on an active or archived revision) is preserved as
+            // a new record (handled by the caller).
+            Active | Archived if content_changed => MergeDecision::SupersedeWinsPreserveEdit,
             // restore (or archive) of a retired id is refused, never stomped.
             _ => MergeDecision::Refuse("superseded; rejected stale restore".to_string()),
         };
@@ -1217,9 +1218,9 @@ fn classify_merge(
     // Live -> superseded is always legal.
     if cand_state == Superseded {
         // supersede + content edit (reverse direction): the incoming
-        // supersession is authoritative, the local edit is preserved as a new
-        // record.
-        if local_state == Active && content_changed {
+        // supersession is authoritative, the local edit (active or archived)
+        // is preserved as a new record.
+        if matches!(local_state, Active | Archived) && content_changed {
             return MergeDecision::SupersedeWinsPreserveEdit;
         }
         return MergeDecision::Apply;
@@ -1271,6 +1272,89 @@ fn classify_merge(
         };
     }
     MergeDecision::Skip
+}
+
+/// Canonical merge-decision tag names mirroring the Lean 4 truth table
+/// (`proofs/NeuroStrata`): the single canonical string each [`MergeDecision`]
+/// outcome maps to, consumed by the Rust↔Lean parity suite (task
+/// `neurostrata-ngd9`).
+const PARITY_REPLACED_BY_A: Uuid = Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_0001);
+const PARITY_REPLACED_BY_B: Uuid = Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_0002);
+
+/// Classify one synthetic `(local, candidate)` merge pair over the parity
+/// inputs and return the canonical Lean-parity tag for the decision.
+///
+/// `same_superseded_by` / `content_changed` / `concurrent` are the finite
+/// parity dimensions (replacement identity, content divergence, genuine
+/// divergence); the pair is evaluated through the real [`classify_merge`] so
+/// the tag can never drift from the production table.
+pub fn classify_merge_parity_tag(
+    local_state: LifecycleState,
+    cand_state: LifecycleState,
+    same_superseded_by: bool,
+    content_changed: bool,
+    concurrent: bool,
+) -> &'static str {
+    let cand_text = if content_changed { "edited" } else { "base" };
+    let cand = MeshRecord {
+        schema_version: MESH_RECORD_SCHEMA_VERSION.to_string(),
+        id: Uuid::new_v4(),
+        namespace: "probe".to_string(),
+        memory_type: "rule".to_string(),
+        lifecycle: Lifecycle {
+            state: cand_state,
+            created_at: chrono::Utc::now(),
+            created_by: "node-peer-1".to_string(),
+            superseded_by: if cand_state == LifecycleState::Superseded {
+                Some(PARITY_REPLACED_BY_A)
+            } else {
+                None
+            },
+            archived_at: None,
+            tombstoned_at: None,
+        },
+        content: json!({ "text": cand_text }),
+        metadata: json!({ "eligibility": "shareable", "trust": "untrusted" }),
+        rdf: None,
+        relationships: vec![],
+        update_id: Uuid::new_v4(),
+        origin_mesh_epoch: 1,
+        trust: Trust::Untrusted,
+        signature: None,
+        signer_did: None,
+        public_key: None,
+        patch: None,
+    };
+    let local_superseded_by = if local_state == LifecycleState::Superseded {
+        Some(if same_superseded_by { PARITY_REPLACED_BY_A } else { PARITY_REPLACED_BY_B })
+    } else {
+        None
+    };
+    let decision = classify_merge(local_state, local_superseded_by, "base", &cand, concurrent);
+    match decision {
+        MergeDecision::Apply => "apply",
+        MergeDecision::ApplyCombination(_) => "apply_combination_archive_edit",
+        MergeDecision::Skip => "skip",
+        MergeDecision::Refuse(reason) => {
+            if reason.contains("tombstone") {
+                "refuse_tombstone_wins"
+            } else if reason.contains("superseded") {
+                "refuse_stale_restore"
+            } else {
+                "refuse_illegal_transition"
+            }
+        }
+        MergeDecision::Conflict(reason) => {
+            if reason == "two different replacements" {
+                "conflict_two_replacements"
+            } else if reason == "restore + archive" {
+                "conflict_restore_archive"
+            } else {
+                "conflict_incompatible_edits"
+            }
+        }
+        MergeDecision::SupersedeWinsPreserveEdit => "supersede_wins_preserve_edit",
+    }
 }
 
 /// The current lifecycle state of a mesh-owned row, read from its
@@ -6102,6 +6186,104 @@ mod tests {
                 MergeDecision::Refuse(_)
             ),
             "tombstoned -> active refused"
+        );
+    }
+
+    /// Task 1 of the Lean4 formal-verification series (`neurostrata-ngd9`): the
+    /// `Superseded` + `Archived` concurrent-edit pairs must preserve the losing
+    /// edit (`SupersedeWinsPreserveEdit`), and `classify_merge_parity_tag` must
+    /// expose the canonical Lean truth-table tag for each decision.
+    #[test]
+    fn supersede_and_archived_preserve_edit_and_parity_tags() {
+        let u1 = Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_0001);
+
+        // Superseded local + archived candidate + content edit → preserve edit.
+        let archived_cand = record_at(Uuid::new_v4(), LifecycleState::Archived, None, "edited");
+        assert_eq!(
+            classify_merge(LifecycleState::Superseded, Some(u1), "orig", &archived_cand, true),
+            MergeDecision::SupersedeWinsPreserveEdit
+        );
+        // Archived local + superseded candidate + content edit → preserve edit.
+        let superseded_cand = record_at(Uuid::new_v4(), LifecycleState::Superseded, Some(u1), "orig");
+        assert_eq!(
+            classify_merge(LifecycleState::Archived, None, "edited", &superseded_cand, true),
+            MergeDecision::SupersedeWinsPreserveEdit
+        );
+        // Same content on a retired id is a stale restore: refused, never applied.
+        assert_eq!(
+            classify_merge(
+                LifecycleState::Superseded,
+                Some(u1),
+                "same",
+                &record_at(Uuid::new_v4(), LifecycleState::Archived, None, "same"),
+                true
+            ),
+            MergeDecision::Refuse("superseded; rejected stale restore".to_string())
+        );
+        // Same content on an archived row with a superseding candidate: apply.
+        assert_eq!(
+            classify_merge(
+                LifecycleState::Archived,
+                None,
+                "same",
+                &record_at(Uuid::new_v4(), LifecycleState::Superseded, Some(u1), "same"),
+                true
+            ),
+            MergeDecision::Apply
+        );
+
+        // Parity tags: one canonical string per merge decision.
+        assert_eq!(
+            classify_merge_parity_tag(
+                LifecycleState::Superseded,
+                LifecycleState::Archived,
+                true,
+                true,
+                true
+            ),
+            "supersede_wins_preserve_edit"
+        );
+        assert_eq!(
+            classify_merge_parity_tag(
+                LifecycleState::Archived,
+                LifecycleState::Superseded,
+                true,
+                true,
+                true
+            ),
+            "supersede_wins_preserve_edit"
+        );
+        assert_eq!(
+            classify_merge_parity_tag(LifecycleState::Active, LifecycleState::Tombstoned, true, false, false),
+            "apply"
+        );
+        assert_eq!(
+            classify_merge_parity_tag(LifecycleState::Active, LifecycleState::Archived, true, true, true),
+            "apply_combination_archive_edit"
+        );
+        assert_eq!(
+            classify_merge_parity_tag(LifecycleState::Superseded, LifecycleState::Superseded, true, false, true),
+            "skip"
+        );
+        assert_eq!(
+            classify_merge_parity_tag(LifecycleState::Tombstoned, LifecycleState::Active, true, false, true),
+            "refuse_tombstone_wins"
+        );
+        assert_eq!(
+            classify_merge_parity_tag(LifecycleState::Superseded, LifecycleState::Archived, true, false, true),
+            "refuse_stale_restore"
+        );
+        assert_eq!(
+            classify_merge_parity_tag(LifecycleState::Superseded, LifecycleState::Superseded, false, false, true),
+            "conflict_two_replacements"
+        );
+        assert_eq!(
+            classify_merge_parity_tag(LifecycleState::Active, LifecycleState::Archived, true, false, true),
+            "conflict_restore_archive"
+        );
+        assert_eq!(
+            classify_merge_parity_tag(LifecycleState::Active, LifecycleState::Active, true, true, true),
+            "conflict_incompatible_edits"
         );
     }
 
