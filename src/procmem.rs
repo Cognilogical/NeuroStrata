@@ -31,6 +31,10 @@ const DEFAULT_SAMPLE_SECS: u64 = 600;
 static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 /// Tool calls begun since the last time-series row.
 static CALLS: AtomicU64 = AtomicU64::new(0);
+/// Monotonic count of calls that have begun, never reset. A guard whose value
+/// changed before it dropped overlapped with another call even if that call
+/// had already finished by the time the guard's drop sampled `IN_FLIGHT`.
+static CALL_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Sample {
@@ -219,7 +223,18 @@ fn grew(before: Option<u64>, after: Option<u64>, threshold_mb: u64) -> bool {
     }
 }
 
-fn line(tool: &str, namespace: Option<&str>, before: Sample, after: Sample, in_flight: usize) -> String {
+fn overlapped_since(epoch_at_begin: u64, current_epoch: u64) -> bool {
+    current_epoch > epoch_at_begin
+}
+
+fn line(
+    tool: &str,
+    namespace: Option<&str>,
+    before: Sample,
+    after: Sample,
+    in_flight: usize,
+    overlapped: bool,
+) -> String {
     serde_json::json!({
         "kind": "call",
         "ts": now_secs(),
@@ -234,7 +249,7 @@ fn line(tool: &str, namespace: Option<&str>, before: Sample, after: Sample, in_f
         "peak_rss_mb": mb(after.peak_bytes),
         "in_flight": in_flight,
         // Process-wide RSS: a neighboring call may own part of the delta.
-        "approximate": in_flight > 1,
+        "approximate": in_flight > 1 || overlapped,
     })
     .to_string()
 }
@@ -319,17 +334,20 @@ pub struct CallGuard {
     tool: String,
     namespace: Option<String>,
     before: Sample,
+    epoch_at_begin: u64,
 }
 
 impl CallGuard {
     pub fn begin(tool: &str, namespace: Option<&str>) -> Self {
         IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
         CALLS.fetch_add(1, Ordering::Relaxed);
+        let epoch_at_begin = CALL_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
         Self {
             tool: tool.to_string(),
             namespace: namespace.map(str::to_string),
             // Disabled profiling must not pay for a syscall per call.
             before: if profile_enabled() { sample() } else { Sample::default() },
+            epoch_at_begin,
         }
     }
 }
@@ -341,10 +359,20 @@ impl Drop for CallGuard {
             return;
         }
         let after = sample();
+        // A call that began and finished while this one ran already left
+        // IN_FLIGHT, but its allocation may be part of this delta.
+        let overlapped = overlapped_since(self.epoch_at_begin, CALL_EPOCH.load(Ordering::SeqCst));
         if grew(self.before.rss_bytes, after.rss_bytes, threshold_mb()) {
             append(
                 &log_path(),
-                &line(&self.tool, self.namespace.as_deref(), self.before, after, in_flight),
+                &line(
+                    &self.tool,
+                    self.namespace.as_deref(),
+                    self.before,
+                    after,
+                    in_flight,
+                    overlapped,
+                ),
             );
         }
     }
@@ -379,7 +407,7 @@ mod tests {
         let before = Sample { rss_bytes: Some(1000 * MB), peak_bytes: Some(1000 * MB) };
         let after = Sample { rss_bytes: Some(1300 * MB), peak_bytes: Some(1300 * MB) };
         let v: serde_json::Value =
-            serde_json::from_str(&line("neurostrata_search_memory", Some("example-project"), before, after, 2)).unwrap();
+            serde_json::from_str(&line("neurostrata_search_memory", Some("example-project"), before, after, 2, false)).unwrap();
         assert_eq!(v["tool"], "neurostrata_search_memory");
         assert_eq!(v["namespace"], "example-project");
         assert_eq!(v["delta_mb"], 300);
@@ -387,10 +415,16 @@ mod tests {
     }
 
     #[test]
+    fn a_call_that_finished_during_another_is_still_overlap() {
+        assert!(!overlapped_since(7, 7), "no other call began");
+        assert!(overlapped_since(7, 8), "another call began, even if it finished");
+    }
+
+    #[test]
     fn overlapping_calls_are_marked_approximate() {
         let s = Sample { rss_bytes: Some(MB), peak_bytes: Some(MB) };
-        let solo: serde_json::Value = serde_json::from_str(&line("t", None, s, s, 1)).unwrap();
-        let busy: serde_json::Value = serde_json::from_str(&line("t", None, s, s, 2)).unwrap();
+        let solo: serde_json::Value = serde_json::from_str(&line("t", None, s, s, 1, false)).unwrap();
+        let busy: serde_json::Value = serde_json::from_str(&line("t", None, s, s, 2, false)).unwrap();
         assert_eq!(solo["approximate"], false);
         assert_eq!(busy["approximate"], true);
     }
@@ -416,7 +450,7 @@ mod tests {
     #[test]
     fn unknown_figures_are_null_not_zero() {
         let v: serde_json::Value =
-            serde_json::from_str(&line("t", None, Sample::default(), Sample::default(), 1)).unwrap();
+            serde_json::from_str(&line("t", None, Sample::default(), Sample::default(), 1, false)).unwrap();
         assert!(v["rss_after_mb"].is_null());
         assert!(v["delta_mb"].is_null());
         assert!(v["namespace"].is_null());
