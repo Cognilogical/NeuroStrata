@@ -12,7 +12,7 @@ mod generation;
 #[path = "../../src/parser/schema.rs"]
 mod schema;
 
-use generation::{ingest_version, version_gate_tripped, PARSER_LOGIC_VERSION};
+use generation::{ingest_version, sha256_hex, version_gate_tripped, PARSER_LOGIC_VERSION};
 use schema::ParserSchema;
 
 fn schema_json(a_first: bool) -> String {
@@ -47,7 +47,22 @@ fn ingest_version_changes_with_logic_version_or_fingerprint() {
     assert_eq!(v, ingest_version("abc123"));
     assert_ne!(v, ingest_version("def456"));
     assert!(v.chars().all(|c| c.is_ascii_hexdigit()));
-    assert_eq!(PARSER_LOGIC_VERSION, 2);
+    assert_eq!(PARSER_LOGIC_VERSION, 3);
+}
+
+#[test]
+fn secret_rejection_bump_invalidates_v2_stamps() {
+    // PAR-03: indexes written before the markdown/secret-scan fix carry a v2
+    // stamp and would otherwise take the unchanged-hash carry path. The bump
+    // must make every v2 stamp trip the gate and force a re-parse.
+    let fp = "abc123";
+    let v2 = sha256_hex(format!("v2:{fp}").as_bytes());
+    let current = ingest_version(fp);
+    assert!(
+        version_gate_tripped(Some(&v2), &current),
+        "a v2 stamp must re-parse after the secret-rejection bump"
+    );
+    assert!(!version_gate_tripped(Some(&current), &current));
 }
 
 #[test]
