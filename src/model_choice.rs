@@ -250,35 +250,59 @@ pub(crate) fn store_state_path(db_path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-enum StoreStateFile {
+/// How the store-state sidecar reads: a recorded state, no sidecar at
+/// all, or a sidecar that is present but cannot be trusted. Absence and
+/// unparseability must stay distinct — absence is legitimate (fresh and
+/// pre-feature stores), while a present-but-unparseable sidecar means a
+/// recorded identity exists but cannot be verified, so every open path
+/// that consults recorded identity refuses on it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum StoreStateRead {
+    Recorded(StoreState),
     Absent,
-    Present(StoreState),
-    Unparseable,
+    Unparseable(String),
 }
 
-fn read_store_state_file(db_path: &Path) -> StoreStateFile {
+fn read_store_state_file(db_path: &Path) -> StoreStateRead {
     let path = store_state_path(db_path);
-    let Ok(content) = fs::read_to_string(&path) else {
-        // A read failure on a file that exists (permissions, a directory)
-        // is not absence: fail closed.
-        return if path.exists() {
-            StoreStateFile::Unparseable
-        } else {
-            StoreStateFile::Absent
-        };
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(e) if path.exists() => {
+            // A read failure on a file that exists (permissions, a
+            // directory) is not absence: fail closed.
+            return StoreStateRead::Unparseable(format!("it cannot be read: {e}"));
+        }
+        Err(_) => return StoreStateRead::Absent,
     };
     match serde_json::from_str::<StoreState>(&content) {
-        Ok(state) => StoreStateFile::Present(state),
-        Err(_) => StoreStateFile::Unparseable,
+        Ok(state) if state.version != STORE_STATE_VERSION => StoreStateRead::Unparseable(format!(
+            "unsupported store-state version {} (this build expects version {})",
+            state.version, STORE_STATE_VERSION
+        )),
+        Ok(state) => StoreStateRead::Recorded(state),
+        Err(e) => {
+            StoreStateRead::Unparseable(format!("it cannot be parsed as store-state JSON: {e}"))
+        }
     }
 }
 
-/// The recorded state, when a parseable sidecar exists.
-pub(crate) fn read_store_state(db_path: &Path) -> Option<StoreState> {
-    match read_store_state_file(db_path) {
-        StoreStateFile::Present(state) => Some(state),
-        _ => None,
-    }
+/// The store-state sidecar's classification: recorded, absent, or
+/// present-but-unparseable.
+pub(crate) fn read_store_state(db_path: &Path) -> StoreStateRead {
+    read_store_state_file(db_path)
+}
+
+/// The one refusal for a present-but-unparseable sidecar, shared by
+/// every open path that consults recorded identity so the wording
+/// cannot drift between them. The refusal never writes: the file is
+/// the operator's evidence and may be repairable.
+pub(crate) fn store_state_unparseable_error(db_path: &Path, reason: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "refusing to open the store at {}: its store-state sidecar at {} is present but unparseable ({}); its recorded embedding identity cannot be verified. Repair or restore the sidecar, or start from a new store. The file was left untouched.",
+        db_path.display(),
+        store_state_path(db_path).display(),
+        reason
+    )
 }
 
 /// Write the sidecar atomically (the same temp + fsync + rename pattern
@@ -297,9 +321,9 @@ pub(crate) fn write_store_state(db_path: &Path, state: &StoreState) -> anyhow::R
 /// certainly never recorded anything.
 pub(crate) fn store_has_data(db_path: &Path) -> bool {
     match read_store_state_file(db_path) {
-        StoreStateFile::Present(state) => state.has_data,
-        StoreStateFile::Unparseable => true,
-        StoreStateFile::Absent => db_path.exists(),
+        StoreStateRead::Recorded(state) => state.has_data,
+        StoreStateRead::Unparseable(_) => true,
+        StoreStateRead::Absent => db_path.exists(),
     }
 }
 
@@ -331,8 +355,16 @@ pub(crate) fn store_is_pristine(db_path: &Path) -> bool {
 pub(crate) fn check_daemon_open_identity(db_path: &Path, config_dir: &Path) -> anyhow::Result<()> {
     use std::str::FromStr;
 
-    let Some(state) = read_store_state(db_path) else {
-        return Ok(());
+    // An unparseable sidecar refuses first, before the has_data early
+    // return and before config resolution: its recorded identity
+    // cannot be verified, so no configuration — commensurate or not —
+    // may open this store.
+    let state = match read_store_state(db_path) {
+        StoreStateRead::Recorded(state) => state,
+        StoreStateRead::Absent => return Ok(()),
+        StoreStateRead::Unparseable(reason) => {
+            return Err(store_state_unparseable_error(db_path, &reason));
+        }
     };
     if !state.has_data {
         return Ok(());
@@ -1675,5 +1707,222 @@ mod tests {
             entries[0].model_sha256.is_none(),
             "the loader must not backfill a shortlist entry's pin"
         );
+    }
+
+    #[test]
+    fn unparseable_sidecar_refuses_daemon_preflight() {
+        let previous = std::env::var("NEUROSTRATA_MODEL").ok();
+        std::env::remove_var("NEUROSTRATA_MODEL");
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store_dir = tmp.path().join("store");
+        fs::create_dir_all(&store_dir).expect("create store dir");
+        let db_path = store_dir.join("ladybug.db");
+        write_bare_db(&db_path);
+        fs::write(sidecar_path_for(&db_path), "{not json").expect("write unparseable sidecar");
+        let (_cfg_tmp, config_dir) = fresh_config_dir("unparseable-preflight");
+        let before = dir_snapshot(&store_dir);
+        let err = check_daemon_open_identity(&db_path, &config_dir)
+            .expect_err("an unparseable sidecar must refuse the daemon pre-flight");
+        let message = err.to_string();
+        assert!(
+            message.contains(&sidecar_path_for(&db_path).display().to_string()),
+            "the refusal names the sidecar path: {message}"
+        );
+        assert!(
+            message.contains("unparseable"),
+            "the refusal says the sidecar is unparseable: {message}"
+        );
+        assert!(
+            message.contains("cannot be parsed"),
+            "the refusal gives the parse reason: {message}"
+        );
+        assert_eq!(
+            dir_snapshot(&store_dir),
+            before,
+            "a refused pre-flight leaves the store directory byte-identical"
+        );
+        match previous {
+            Some(value) => std::env::set_var("NEUROSTRATA_MODEL", value),
+            None => std::env::remove_var("NEUROSTRATA_MODEL"),
+        }
+    }
+
+    #[test]
+    fn wrong_version_sidecar_refuses_daemon_preflight() {
+        let previous = std::env::var("NEUROSTRATA_MODEL").ok();
+        std::env::remove_var("NEUROSTRATA_MODEL");
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store_dir = tmp.path().join("store");
+        fs::create_dir_all(&store_dir).expect("create store dir");
+        let db_path = store_dir.join("ladybug.db");
+        write_bare_db(&db_path);
+        // Pristine on purpose: the refusal must not depend on has_data.
+        let wrong_version = STORE_STATE_VERSION + 1;
+        let content = format!(
+            "{{\"version\": {wrong_version}, \"has_data\": false, \"descriptor\": {{\"provider\": \"fastembed\", \"model\": \"NomicEmbedTextV15\", \"revision\": \"onnx\", \"dims\": 768, \"normalization\": \"unknown\", \"preprocessing\": \"unknown\", \"distance_metric\": \"cosine\"}}}}"
+        );
+        fs::write(sidecar_path_for(&db_path), content).expect("write wrong-version sidecar");
+        let (_cfg_tmp, config_dir) = fresh_config_dir("wrong-version-preflight");
+        let before = dir_snapshot(&store_dir);
+        let err = check_daemon_open_identity(&db_path, &config_dir)
+            .expect_err("a wrong-version sidecar must refuse the daemon pre-flight");
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!(
+                "unsupported store-state version {}",
+                STORE_STATE_VERSION + 1
+            )),
+            "the refusal names the recorded version: {message}"
+        );
+        assert!(
+            message.contains(&format!("expects version {STORE_STATE_VERSION}")),
+            "the refusal names the expected version: {message}"
+        );
+        assert_eq!(
+            dir_snapshot(&store_dir),
+            before,
+            "a refused pre-flight leaves the store directory byte-identical"
+        );
+        match previous {
+            Some(value) => std::env::set_var("NEUROSTRATA_MODEL", value),
+            None => std::env::remove_var("NEUROSTRATA_MODEL"),
+        }
+    }
+
+    fn write_wrong_version_sidecar(db_path: &Path, has_data: bool) {
+        let wrong_version = STORE_STATE_VERSION + 1;
+        let content = format!(
+            "{{\"version\": {wrong_version}, \"has_data\": {has_data}, \"descriptor\": {{\"provider\": \"fastembed\", \"model\": \"NomicEmbedTextV15\", \"revision\": \"onnx\", \"dims\": 768, \"normalization\": \"unknown\", \"preprocessing\": \"unknown\", \"distance_metric\": \"cosine\"}}}}"
+        );
+        fs::write(sidecar_path_for(db_path), content).expect("write wrong-version sidecar");
+    }
+
+    #[test]
+    fn read_store_state_distinguishes_absent_recorded_and_unparseable() {
+        let (tmp, _config_dir) = fresh_config_dir("read-state-distinguishes");
+        let db_path = tmp.path().join("ladybug.db");
+        assert_eq!(
+            read_store_state(&db_path),
+            StoreStateRead::Absent,
+            "no files at all reads as absent"
+        );
+        write_sidecar(&db_path, false);
+        match read_store_state(&db_path) {
+            StoreStateRead::Recorded(state) => {
+                assert!(!state.has_data, "the recorded sidecar is pristine");
+            }
+            other => panic!("a valid sidecar reads as recorded, got {other:?}"),
+        }
+        fs::write(sidecar_path_for(&db_path), "{not json").expect("write corrupt sidecar");
+        assert!(
+            matches!(read_store_state(&db_path), StoreStateRead::Unparseable(_)),
+            "a corrupt sidecar reads as unparseable, not absent"
+        );
+        write_wrong_version_sidecar(&db_path, false);
+        match read_store_state(&db_path) {
+            StoreStateRead::Unparseable(reason) => {
+                assert!(
+                    reason.contains("version"),
+                    "the wrong-version reason names the version: {reason}"
+                );
+            }
+            other => panic!("a wrong-version sidecar reads as unparseable, got {other:?}"),
+        }
+        // A missing `version` field fails the StoreState parse, so it
+        // lands in the parse arm — not the version arm.
+        let descriptor = "\"descriptor\": {\"provider\": \"fastembed\", \"model\": \"NomicEmbedTextV15\", \"revision\": \"onnx\", \"dims\": 768, \"normalization\": \"unknown\", \"preprocessing\": \"unknown\", \"distance_metric\": \"cosine\"}";
+        fs::write(
+            sidecar_path_for(&db_path),
+            format!("{{\"has_data\": false, {descriptor}}}"),
+        )
+        .expect("write sidecar with no version field");
+        match read_store_state(&db_path) {
+            StoreStateRead::Unparseable(reason) => {
+                assert!(
+                    reason.contains("cannot be parsed"),
+                    "a missing version field gives the parse reason: {reason}"
+                );
+                assert!(
+                    !reason.contains("unsupported store-state version"),
+                    "a missing version field must not give the version reason: {reason}"
+                );
+            }
+            other => panic!("a versionless sidecar reads as unparseable, got {other:?}"),
+        }
+        // A `version` of the wrong JSON type (a string) likewise
+        // fails the parse and lands in the parse arm.
+        fs::write(
+            sidecar_path_for(&db_path),
+            format!("{{\"version\": \"1\", \"has_data\": false, {descriptor}}}"),
+        )
+        .expect("write sidecar with a string version field");
+        match read_store_state(&db_path) {
+            StoreStateRead::Unparseable(reason) => {
+                assert!(
+                    reason.contains("cannot be parsed"),
+                    "a string version field gives the parse reason: {reason}"
+                );
+                assert!(
+                    !reason.contains("unsupported store-state version"),
+                    "a string version field must not give the version reason: {reason}"
+                );
+            }
+            other => panic!("a string-version sidecar reads as unparseable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn store_has_data_stays_fail_closed_for_unparseable_and_wrong_version() {
+        let (tmp, _config_dir) = fresh_config_dir("has-data-fail-closed");
+        let db_path = tmp.path().join("ladybug.db");
+        assert!(!store_has_data(&db_path), "nothing on disk: no data");
+        assert!(store_is_pristine(&db_path));
+        write_sidecar(&db_path, false);
+        assert!(
+            !store_has_data(&db_path),
+            "a valid pristine sidecar: no data"
+        );
+        assert!(store_is_pristine(&db_path));
+        write_sidecar(&db_path, true);
+        assert!(store_has_data(&db_path), "a valid data sidecar: data");
+        assert!(!store_is_pristine(&db_path));
+        fs::write(sidecar_path_for(&db_path), "{not json").expect("write corrupt sidecar");
+        assert!(
+            store_has_data(&db_path),
+            "an unparseable sidecar means data"
+        );
+        assert!(!store_is_pristine(&db_path));
+        write_wrong_version_sidecar(&db_path, false);
+        assert!(
+            store_has_data(&db_path),
+            "a wrong-version sidecar means data, whatever its flag says"
+        );
+        assert!(!store_is_pristine(&db_path));
+    }
+
+    #[test]
+    fn writer_and_offer_fail_closed_with_wrong_version_sidecar() {
+        let (tmp, config_dir) = fresh_config_dir("fail-closed-wrong-version");
+        write_default_file(&config_dir);
+        record_pending_choice(&config_dir);
+        let db_path = tmp.path().join("ladybug.db");
+        write_bare_db(&db_path);
+        write_wrong_version_sidecar(&db_path, false);
+        let result = write_initial_embedders_file(&config_dir, bge_small_q(), &db_path);
+        assert!(result.is_err(), "a wrong-version sidecar must refuse");
+        let entries = get_acceptable_embedders_in(&config_dir).expect("loader reads the file");
+        assert_eq!(
+            serde_json::to_value(&entries).expect("serialize entries"),
+            serde_json::to_value(default_acceptable_embedders()).expect("serialize default"),
+            "a refused write leaves the default embedders file, with no pick created"
+        );
+        let called = std::cell::Cell::new(false);
+        let outcome = surface_pending_choice(&config_dir, &db_path, true, &mut |_| {
+            called.set(true);
+            ChoiceResponse::Pick(0)
+        })
+        .expect("surface");
+        assert_eq!(outcome, PendingChoiceOutcome::Voided);
+        assert!(!called.get(), "a wrong-version sidecar is never offered");
     }
 }
