@@ -184,6 +184,12 @@ pub fn configured_dimensions() -> Result<usize> {
 /// Token ceiling for one embedding. Roughly covers MAX_SYMBOL_CHARS of source
 const MAX_EMBED_TOKENS: usize = 2048;
 
+/// Arena allocation is disabled by default; `NEUROSTRATA_EMBED_ARENA=1`
+/// restores the previous behavior for operators who measured a benefit.
+fn arena_disabled_for(value: Option<&str>) -> bool {
+    value != Some("1")
+}
+
 /// The pin gate `FastEmbedder::new` applies to the configured model: a
 /// local entry without a pinned SHA-256 fails closed, so a hand-authored
 /// or setup-written entry can never load unverified.
@@ -353,12 +359,21 @@ impl FastEmbedder {
         // (NomicEmbedTextV15 handles 8192), and truncates silently. Anything above
         // what ingestion actually stores per symbol is wasted, so this is set to
         // match MAX_SYMBOL_CHARS in src/parser/ingest.rs -- change the two together.
-        let model = TextEmbedding::try_new(
-            TextInitOptions::new(model_enum.clone())
-                .with_cache_dir(cache_dir.clone())
-                .with_max_length(MAX_EMBED_TOKENS)
-                .with_show_download_progress(true),
-        )?;
+        // The CPU arena keeps the largest buffer any input ever needed.
+        // Texts here are embedded one at a time at their own length, so the
+        // arena ratchets up and never gives it back. This applies to every
+        // local embedding (ingest, daemon queries, MCP calls), not only
+        // ingest. Set NEUROSTRATA_EMBED_ARENA=1 to keep the previous
+        // default; any other value (or unset) disables the arena.
+        let mut init = TextInitOptions::new(model_enum.clone())
+            .with_cache_dir(cache_dir.clone())
+            .with_max_length(MAX_EMBED_TOKENS);
+        if arena_disabled_for(std::env::var("NEUROSTRATA_EMBED_ARENA").ok().as_deref()) {
+            init = init.with_execution_providers(vec![ort::ep::CPU::default()
+                .with_arena_allocator(false)
+                .build()]);
+        }
+        let model = TextEmbedding::try_new(init.with_show_download_progress(true))?;
 
         // Supply-chain verification: the configured entry must carry a
         // pinned SHA-256, and the file fastembed actually loaded (the
@@ -644,6 +659,13 @@ pub fn build_embedder() -> Result<Arc<dyn Embedder>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn arena_default_is_disabled_with_an_explicit_opt_in() {
+        assert!(super::arena_disabled_for(None));
+        assert!(super::arena_disabled_for(Some("0")));
+        assert!(!super::arena_disabled_for(Some("1")));
+    }
+
     use super::*;
 
     /// Read one full HTTP request (headers + declared body) off the socket,
