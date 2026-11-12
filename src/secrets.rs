@@ -145,6 +145,9 @@ const PLACEHOLDER_PATTERNS: &[&str] = &[
 const MAX_DEPTH: usize = 8;
 /// Maximum total characters scanned per top-level call.
 const MAX_SCAN_BYTES: usize = 256_000;
+/// Overlap between scan chunks so a token that straddles a chunk boundary is
+/// still seen whole. Provider tokens are far shorter than this.
+const SCAN_CHUNK_OVERLAP: usize = 4_096;
 
 impl SecretScanner {
     /// Build the scanner. Returns `Err` if a regex fails to compile.
@@ -196,13 +199,39 @@ impl SecretScanner {
     /// disabled, `Some(Rejection)` with category + location on detection.
     pub fn scan_str(text: &str, location: &str) -> Option<Rejection> {
         let scanner = Self::instance();
-        if text.len() > MAX_SCAN_BYTES {
-            return Some(Rejection {
-                location: location.to_string(),
-                category: "oversized_input",
-            });
+        scanner.scan_chunked(text, location)
+    }
+
+    /// Scan arbitrarily large text in overlapping chunks. A whole-file
+    /// rejection for size would silently discard large clean source files
+    /// (this repository's `src/server.rs` is ~684 KB); secrets are found
+    /// where they are, and a clean large file is admitted.
+    fn scan_chunked(&self, text: &str, location: &str) -> Option<Rejection> {
+        if text.len() <= MAX_SCAN_BYTES {
+            return self.scan_inner(text, location);
         }
-        scanner.scan_inner(text, location)
+        let mut start = 0usize;
+        while start < text.len() {
+            let mut end = (start + MAX_SCAN_BYTES).min(text.len());
+            while end > start && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            if end <= start {
+                break;
+            }
+            if let Some(r) = self.scan_inner(&text[start..end], location) {
+                return Some(r);
+            }
+            if end == text.len() {
+                break;
+            }
+            let next = end.saturating_sub(SCAN_CHUNK_OVERLAP);
+            start = if next > start { next } else { end };
+            while start < text.len() && !text.is_char_boundary(start) {
+                start += 1;
+            }
+        }
+        None
     }
 
     /// Scan a JSON value recursively (metadata leaves), returning the first
@@ -959,6 +988,27 @@ mod tests {
         // While single placeholder tokens are still allowed.
         assert!(SecretScanner::scan_str("<your-api-key>", "content").is_none());
         assert!(SecretScanner::scan_str("${API_KEY}", "content").is_none());
+    }
+
+    // ── Large inputs ────────────────────────────────────────────────────
+
+    #[test]
+    fn large_clean_text_is_scanned_not_rejected_for_size() {
+        let text = "a".repeat(MAX_SCAN_BYTES + 10_000);
+        assert!(
+            SecretScanner::scan_str(&text, "content").is_none(),
+            "a clean file larger than the chunk size must not be rejected as oversized"
+        );
+    }
+
+    #[test]
+    fn large_text_with_a_secret_across_a_chunk_boundary_is_detected() {
+        let mut text = "a".repeat(MAX_SCAN_BYTES - 10);
+        // Built at runtime so no secret-shaped literal sits in the source.
+        text.push_str(&format!(" ghp_{}", "Ab1".repeat(12)));
+        text.push_str(&"b".repeat(10_000));
+        let rejection = SecretScanner::scan_str(&text, "content").expect("secret detected");
+        assert_eq!(rejection.category, "github_pat");
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────
