@@ -51,6 +51,8 @@ const PARSE_ERROR: i64 = -32700;
 /// The request was JSON-RPC, and answering it failed here rather than at the
 /// far end.
 const INTERNAL_ERROR: i64 = -32603;
+/// The method does not exist on this server.
+const METHOD_NOT_FOUND: i64 = -32601;
 
 /// Appends a daemon-memory advisory to tool-call error text when it matches
 /// known buffer-pool / OOM diagnostics, case-insensitively. Idempotent if the
@@ -124,6 +126,9 @@ pub async fn process_mcp_request(
         "notifications/initialized" => {
             serde_json::json!({})
         }
+        // MCP liveness check: an empty result, not an error.
+        "ping" => serde_json::to_value(JsonRpcResponse::success(id.clone(), serde_json::json!({})))
+            .unwrap_or_else(|_| serde_json::json!({})),
         "tools/list" => {
             let mut result = serde_json::json!({
                 "tools": [
@@ -1853,7 +1858,16 @@ pub async fn process_mcp_request(
                 })
             })
         }
-        _ => serde_json::json!({}),
+        // A method this server does not implement (Claude Code probes with
+        // `server/discover`) gets a JSON-RPC error carrying the request's id,
+        // so the client stops waiting at once. A notification (no id) is never
+        // answered: `handle_mcp` drops the reply.
+        _ => serde_json::to_value(JsonRpcResponse::failure(
+            id.clone(),
+            METHOD_NOT_FOUND,
+            format!("Method not found: {}", request.method),
+        ))
+        .unwrap_or_else(|_| serde_json::json!({})),
     }
 }
 
@@ -14735,6 +14749,47 @@ mod tests {
             suffix.contains("\"a\""),
             "should use the shorter path that fits"
         );
+    }
+
+    /// A method this server does not implement is a JSON-RPC method-not-found
+    /// error carrying the request's id; `ping` is an empty result. Both used
+    /// to be a bare `{}` with no `jsonrpc` and no `id`.
+    #[tokio::test]
+    async fn unknown_methods_are_method_not_found_with_the_request_id() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+        let call = |method: &str, id: Value| JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(id),
+            method: method.to_string(),
+            params: None,
+        };
+        let (bus, _seen) = recording_bus();
+        let response = process_mcp_request(
+            call("server/discover", serde_json::json!(41)),
+            Arc::new(StubEmbedder),
+            store.clone(),
+            ingests.clone(),
+            None,
+            bus.clone(),
+        )
+        .await;
+        assert_eq!(response["jsonrpc"], serde_json::json!("2.0"), "{response}");
+        assert_eq!(response["id"], serde_json::json!(41), "{response}");
+        assert_eq!(response["error"]["code"], serde_json::json!(METHOD_NOT_FOUND), "{response}");
+        assert!(response.get("result").is_none(), "{response}");
+
+        let response = process_mcp_request(
+            call("ping", serde_json::json!("p")),
+            Arc::new(StubEmbedder),
+            store,
+            ingests,
+            None,
+            bus,
+        )
+        .await;
+        assert_eq!(response["id"], serde_json::json!("p"), "{response}");
+        assert_eq!(response["result"], serde_json::json!({}), "{response}");
     }
 
     /// The mesh dispatch arm is the only production route from the wire to
