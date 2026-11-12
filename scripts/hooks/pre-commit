@@ -17,6 +17,21 @@ if [ -z "$NAMESPACE" ]; then
     NAMESPACE=$(basename "$ROOT")
 fi
 
+# Windows roots (`C:/...`) compare case-insensitively, like the file system.
+# Only ASCII letters are folded, the same way in bash, node and python, so a
+# file name spelled identically on both sides always matches.
+FOLD=0
+case "$ROOT" in
+    [A-Za-z]:*) FOLD=1 ;;
+esac
+fold_case() {
+    if [ "$FOLD" = "1" ]; then
+        printf '%s' "$1" | LC_ALL=C tr 'A-Z' 'a-z'
+    else
+        printf '%s' "$1"
+    fi
+}
+
 # ── Collect staged file paths (excluding .NeuroStrata/ internal files) ───────
 StagedFiles=()
 while IFS= read -r -d '' file; do
@@ -35,9 +50,12 @@ if [ "${#StagedFiles[@]}" -eq 0 ]; then
 fi
 
 # ── Path normalization for ledger matching ─────────────────────────────────
-# $file from git diff is repo-relative (e.g. `pkg/auth/handler.go`), but the
-# ledger may have recorded `"$ROOT/$file"` (absolute), `"./$file"` (dot-slash),
-# or the bare `"$file"`. Match all three spellings.
+# $file from git diff is repo-relative (e.g. `pkg/auth/handler.go`). A ledger
+# entry may carry `path` (already project-relative, written by newer daemons;
+# preferred), or only the raw `query`: `"$ROOT/$file"` as an absolute path,
+# with `/` or `\`, `\\?\` or Git Bash `/c/` prefixes and any
+# drive-letter case on Windows, `"./$file"`, or the bare `"$file"`. All of them
+# are reduced to the repo-relative form below.
 normalize_rel_path() {
     local p="$1"
     p="${p#"$ROOT"/}"
@@ -54,26 +72,39 @@ dump_ledger_paths() {
     if [ ! -f "$LEDGER" ]; then
         return 0
     fi
-    export LEDGER ROOT
+    export LEDGER ROOT FOLD
     if command -v node >/dev/null 2>&1; then
         node -e '
           const fs = require("fs");
           const ledger = process.env.LEDGER;
-          const root = process.env.ROOT || "";
+          const win = process.env.FOLD === "1";
+          const fold = (s) => (win ? s.replace(/[A-Z]/g, (c) => c.toLowerCase()) : s);
+          // C:\x | C:/x | \\?\C:\x | /c/x (Windows only) -> C:/x ; no trailing /
+          const normAbs = (p) => {
+            p = p.replace(/\\/g, "/").replace(/^\/\/[?.]\//, "");
+            const m = win ? /^\/([A-Za-z])(\/.*)?$/.exec(p) : null;
+            if (m) p = m[1] + ":" + (m[2] || "/");
+            return p.length > 1 ? p.replace(/\/+$/, "") : p;
+          };
+          const roots = [process.env.ROOT].filter(Boolean).map(normAbs);
           let parsed;
           try { parsed = JSON.parse(fs.readFileSync(ledger, "utf8")); } catch { process.exit(0); }
           const queries = Array.isArray(parsed) ? parsed : (parsed && Array.isArray(parsed.queries) ? parsed.queries : []);
           const out = new Set();
-          const norm = (p) => {
-            if (typeof p !== "string" || !p) return;
-            if (root && (p === root || p.startsWith(root + "/"))) p = p.slice(root.length).replace(/^\//, "");
+          const norm = (raw) => {
+            if (typeof raw !== "string" || !raw) return;
+            let p = normAbs(raw);
+            for (const r of roots) {
+              if (fold(p) === fold(r)) return;
+              if (fold(p).startsWith(fold(r) + "/")) { p = p.slice(r.length + 1); break; }
+            }
+            if (/^[A-Za-z]:\//.test(p) || p.startsWith("/")) return; // another project
             while (p.startsWith("./")) p = p.slice(2);
-            if (p.endsWith("/")) p = p.slice(0, -1);
-            if (p) out.add(p);
+            if (p) out.add(fold(p));
           };
           for (const q of queries) {
             if (!q || typeof q !== "object") continue;
-            norm(q.query);
+            if (typeof q.path === "string" && q.path) norm(q.path); else norm(q.query);
             for (const k of ["domains", "governed_prefixes"]) {
               if (Array.isArray(q[k])) q[k].forEach(norm);
             }
@@ -82,11 +113,20 @@ dump_ledger_paths() {
         ' 2>/dev/null || true
     elif command -v python3 >/dev/null 2>&1; then
         python3 -c '
-import json, os, sys
+import json, os, re, sys
 ledger = os.environ["LEDGER"]
-root = os.environ.get("ROOT") or ""
+win = os.environ.get("FOLD") == "1"
+def fold(s):
+    return re.sub(r"[A-Z]", lambda m: m.group(0).lower(), s) if win else s
+def norm_abs(p):
+    p = re.sub(r"^//[?.]/", "", p.replace("\\", "/"))
+    m = re.match(r"^/([A-Za-z])(/.*)?$", p) if win else None
+    if m:
+        p = m.group(1) + ":" + (m.group(2) or "/")
+    return p.rstrip("/") if len(p) > 1 else p
+roots = [norm_abs(r) for r in (os.environ.get("ROOT"),) if r]
 try:
-    with open(ledger) as f:
+    with open(ledger, encoding="utf-8") as f:
         parsed = json.load(f)
 except Exception:
     sys.exit(0)
@@ -94,20 +134,29 @@ queries = parsed if isinstance(parsed, list) else (parsed.get("queries") if isin
 if not isinstance(queries, list):
     queries = []
 out = set()
-def norm(p):
-    if not isinstance(p, str) or not p:
+def norm(raw):
+    if not isinstance(raw, str) or not raw:
         return
-    if root and (p == root or p.startswith(root + "/")):
-        p = p[len(root):].lstrip("/")
+    p = norm_abs(raw)
+    for r in roots:
+        if fold(p) == fold(r):
+            return
+        if fold(p).startswith(fold(r) + "/"):
+            p = p[len(r) + 1:]
+            break
+    if re.match(r"^[A-Za-z]:/", p) or p.startswith("/"):
+        return
     while p.startswith("./"):
         p = p[2:]
-    p = p.rstrip("/")
     if p:
-        out.add(p)
+        out.add(fold(p))
 for q in queries:
     if not isinstance(q, dict):
         continue
-    norm(q.get("query"))
+    if isinstance(q.get("path"), str) and q.get("path"):
+        norm(q.get("path"))
+    else:
+        norm(q.get("query"))
     for k in ("domains", "governed_prefixes"):
         v = q.get(k)
         if isinstance(v, list):
@@ -124,7 +173,7 @@ LEDGER_PATHS=$(dump_ledger_paths)
 ledger_has_file() {
     local rel="$1"
     if [ -n "$LEDGER_PATHS" ]; then
-        printf '%s\n' "$LEDGER_PATHS" | grep -qxF "$rel"
+        printf '%s\n' "$LEDGER_PATHS" | grep -qxF "$(fold_case "$rel")"
         return $?
     fi
     [ -f "$LEDGER" ] || return 1
@@ -136,7 +185,7 @@ ledger_has_file() {
 ledger_has_dir() {
     local rel_dir="${1%/}"
     if [ -n "$LEDGER_PATHS" ]; then
-        printf '%s\n' "$LEDGER_PATHS" | grep -qxF "$rel_dir"
+        printf '%s\n' "$LEDGER_PATHS" | grep -qxF "$(fold_case "$rel_dir")"
         return $?
     fi
     [ -f "$LEDGER" ] || return 1
@@ -184,7 +233,7 @@ for raw_file in "${StagedFiles[@]}"; do
     file=$(normalize_rel_path "$raw_file")
     [ -z "$file" ] && continue
     if [ -n "$LEDGER_PATHS" ]; then
-        if printf '%s\n' "$LEDGER_PATHS" | grep -qxF "$file"; then
+        if printf '%s\n' "$LEDGER_PATHS" | grep -qxF "$(fold_case "$file")"; then
             continue
         fi
     fi
