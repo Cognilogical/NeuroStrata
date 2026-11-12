@@ -3108,6 +3108,17 @@ use super::x;"#;
             self.inner.list(namespace, user_id, memory_type).await
         }
 
+        async fn generation_summary(
+            &self,
+            namespace: &str,
+            generation: u64,
+        ) -> anyhow::Result<Vec<crate::traits::GenerationRow>> {
+            if self.armed(CarryFault::List) {
+                anyhow::bail!("injected carry summary failure (test double)");
+            }
+            self.inner.generation_summary(namespace, generation).await
+        }
+
         async fn get(
             &self,
             namespace: &str,
@@ -3213,6 +3224,9 @@ use super::x;"#;
             "the first ingest publishes generation 1"
         );
 
+        // Make the namespace changed so the carry pass runs; `hello.rs` itself
+        // is unchanged and is the row the fault injection targets.
+        std::fs::write(dir.join("other.rs"), "fn other() {}").expect("write changed file");
         failing
             .fail
             .store(true, std::sync::atomic::Ordering::SeqCst);
