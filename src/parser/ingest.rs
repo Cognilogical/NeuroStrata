@@ -2699,9 +2699,9 @@ use super::x;"#;
     }
 
     /// Memory probe, not a correctness test: ingests `NS_PROBE_DIR` twice into a
-    /// store opened the way the daemon opens it (default engine config, no
-    /// capped buffer pool) so peak working set can be read from outside the
-    /// process. Run:
+    /// store opened the way the daemon opens it (default 384 MB buffer-pool cap;
+    /// set `NEUROSTRATA_BUFFER_POOL_MB=0` to measure the engine default) so peak
+    /// working set can be read from outside the process. Run:
     ///   NS_PROBE_DIR=<dir> cargo test --bin neurostrata-mcp ingest_memory_probe -- --ignored --nocapture
     #[tokio::test]
     #[ignore]
@@ -2724,6 +2724,10 @@ use super::x;"#;
             ingest_directory(&dir, &schema, embedder.clone(), store.clone(), "probe", None, &[]).await.expect("ingest");
             println!("PROBE pass {pass} done in {:?}", t.elapsed());
         }
+        // The probe owns a throwaway store; leave no multi-hundred-MB
+        // directory behind after a measurement.
+        drop(store);
+        let _ = std::fs::remove_dir_all(&db);
     }
 
     /// F2 incremental ingest + F12 watermark.
