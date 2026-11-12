@@ -3,15 +3,72 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { readFileSync, mkdirSync, writeFileSync, rmSync, mkdtempSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, isAbsolute } from "node:path";
 import { execFileSync as execFileSyncTop } from "node:child_process";
 
-// Windows cannot execute a .sh file directly (EFTYPE) and cannot symlink a
-// private tool directory, so the hook runs through bash there with the ambient
-// PATH (Git for Windows puts bash and the coreutils on it).
+// Windows cannot execute a .sh file directly (EFTYPE). Production hook
+// execution uses git's own shell, so resolve Git Bash through `git
+// --exec-path` rather than trusting an ambient `bash` (a stock Git for
+// Windows install does not put bash.exe on PATH, and PATH order can bind the
+// WSL launcher, which cannot open a raw Windows path).
+function resolveGitBash() {
+  try {
+    const execPath = execFileSyncTop("git", ["--exec-path"], { encoding: "utf8" }).trim();
+    const candidates = [
+      join(execPath, "..", "..", "bin", "bash.exe"),
+      join(execPath, "..", "..", "usr", "bin", "bash.exe"),
+      join(execPath, "..", "..", "..", "bin", "bash.exe"),
+    ];
+    return candidates.find((candidate) => existsSync(candidate)) || null;
+  } catch {
+    return null;
+  }
+}
+const GIT_BASH = process.platform === "win32" ? resolveGitBash() : null;
+
+function winHookSkip() {
+  return process.platform === "win32" && !GIT_BASH
+    ? "Git Bash not found via git --exec-path; hook tests need git's shell"
+    : false;
+}
+
+// Essentials Windows processes need; the caller's PATH is preserved exactly
+// so the restricted tool directory the tests construct remains the subject
+// environment.
+const WIN_ENV_ESSENTIALS = [
+  "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP",
+  "USERPROFILE", "APPDATA", "LOCALAPPDATA",
+];
+
 function runHook(hookPath, opts) {
   if (process.platform !== "win32") return execFileSyncTop(hookPath, [], opts);
-  return execFileSyncTop("bash", [hookPath], { ...opts, env: { ...process.env, ...opts.env, PATH: process.env.PATH } });
+  if (!GIT_BASH) {
+    const err = new Error("Git Bash not found; cannot execute the hook on Windows");
+    err.code = "ENOENT_GIT_BASH";
+    throw err;
+  }
+  const env = {};
+  for (const key of WIN_ENV_ESSENTIALS) {
+    if (process.env[key] !== undefined) env[key] = process.env[key];
+  }
+  Object.assign(env, opts.env || {});
+  if (env.PATH === undefined && process.env.PATH) env.PATH = process.env.PATH;
+  return execFileSyncTop(GIT_BASH, [hookPath], { ...opts, env });
+}
+
+// On macOS /usr/bin/git is a shim that needs xcrun on PATH; the hook tests
+// deliberately restrict PATH to the fake bin directory, so link the real
+// binary instead of the shim.
+function toolPath(cmd) {
+  if (process.platform === "darwin" && cmd === "git") {
+    try {
+      return execFileSyncTop("xcrun", ["-f", "git"], { encoding: "utf8" }).trim();
+    } catch {}
+    for (const candidate of ["/opt/homebrew/bin/git", "/usr/local/bin/git"]) {
+      if (existsSync(candidate)) return candidate;
+    }
+  }
+  return cmd;
 }
 
 // Git for Windows checks scripts out with CRLF, which bash refuses.
@@ -1230,7 +1287,7 @@ describe("native task tool tracking + hook registration + pre-commit awk fallbac
     resetClientForTesting();
   });
 
-  it("pre-commit awk fallback handles filenames with spaces and & and produces valid comma-separated JSON", async () => {
+  it("pre-commit awk fallback handles filenames with spaces and & and produces valid comma-separated JSON", { skip: winHookSkip() }, async () => {
     const { execFileSync } = await import("node:child_process");
     const { mkdtempSync, symlinkSync, chmodSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
@@ -1239,8 +1296,11 @@ describe("native task tool tracking + hook registration + pre-commit awk fallbac
     try {
       for (const cmd of ["bash", "sh", "git", "grep", "sed", "awk", "date", "mkdir", "printf", "mktemp", "mv", "rm", "dirname", "basename", "head", "pwd"]) {
         for (const prefix of ["/usr/bin", "/bin"]) {
+          const source = toolPath(cmd);
+          const candidate = isAbsolute(source) ? source : join(prefix, source);
+          if (!existsSync(candidate)) continue;
           try {
-            symlinkSync(join(prefix, cmd), join(binDir, cmd));
+            symlinkSync(candidate, join(binDir, cmd));
             break;
           } catch {}
         }
@@ -1792,7 +1852,7 @@ describe("round-6: task_update title invalidation, AST summary formatting, dev s
     }
   });
 
-  it("pre-commit ledger matching handles ./<path> and $ROOT/<path> without warning", async () => {
+  it("pre-commit ledger matching handles ./<path> and $ROOT/<path> without warning", { skip: winHookSkip() }, async () => {
     const { execFileSync } = await import("node:child_process");
     const { mkdtempSync, symlinkSync, chmodSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
@@ -1801,7 +1861,10 @@ describe("round-6: task_update title invalidation, AST summary formatting, dev s
     try {
       for (const cmd of ["bash", "sh", "git", "grep", "sed", "awk", "date", "mkdir", "printf", "mktemp", "mv", "rm", "dirname", "basename", "head", "pwd"]) {
         for (const prefix of ["/usr/bin", "/bin"]) {
-          try { symlinkSync(join(prefix, cmd), join(binDir, cmd)); break; } catch {}
+          const source = toolPath(cmd);
+          const candidate = isAbsolute(source) ? source : join(prefix, source);
+          if (!existsSync(candidate)) continue;
+          try { symlinkSync(candidate, join(binDir, cmd)); break; } catch {}
         }
       }
 
@@ -1899,7 +1962,7 @@ describe("round-8: Codex apply_patch extraction, decoded ledger matching, and ba
   });
 
   // A file name containing a double quote cannot exist on Windows.
-  it("pre-commit matches JSON-escaped unicode/quote paths and appends missing files in one write", { skip: process.platform === "win32" && "file names cannot contain a double quote on Windows" }, async () => {
+  it("pre-commit matches JSON-escaped unicode/quote paths and appends missing files in one write", { skip: winHookSkip() || (process.platform === "win32" && "file names cannot contain a double quote on Windows") }, async () => {
     const { execFileSync } = await import("node:child_process");
     const { mkdtempSync, symlinkSync, chmodSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
