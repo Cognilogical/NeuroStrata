@@ -338,7 +338,13 @@ fn slugify(s: &str) -> String {
 pub trait IngestObserver: Send + Sync {
     fn file_ingested(&self, path: &str, symbols: usize);
     fn file_skipped(&self, path: &str, reason: &str) {
-        tracing::debug!("ingest skipped file: {path} ({reason})");
+        // Security skips are operator-visible at info; the per-file
+        // "unchanged" skip stays at debug so a large tree is not spammed.
+        if reason.contains("ERROR [SECURITY]") {
+            tracing::info!("ingest skipped file: {path} ({reason})");
+        } else {
+            tracing::debug!("ingest skipped file: {path} ({reason})");
+        }
     }
     fn relinked(&self, edges: usize);
     /// Called once per run when the previous generation's `ingest_version`
@@ -586,12 +592,22 @@ fn run_producer(
             current_hashes.insert(node_path.clone(), h.to_string());
         }
 
-        // Before its node goes out, a parseable file's text meets the secret
-        // scanner first, and a document that trips it is skipped whole — no
-        // file node, no symbols, no sections — with the skip reported through
-        // the consumer. The scan runs over the bytes already read above, so
-        // what is scanned is exactly what is parsed and stored.
-        if let Some(text) = &content {
+        // Before its node goes out, a file's text meets the secret scanner
+        // first, and a document that trips it is skipped whole — no file node,
+        // no symbols, no sections — with the skip reported through the
+        // consumer. The scan runs over the bytes already read above, so what
+        // is scanned is exactly what is parsed and stored. Markdown has no
+        // tree-sitter grammar, so its text comes from raw_bytes rather than
+        // `content`; without this arm a credential in a .md file reached the
+        // doc-section embedding path unscanned.
+        let scan_text = match (&content, &raw_bytes) {
+            (Some(text), _) => Some(text.clone()),
+            (None, Some(bytes)) if mem_type == "markdown" => {
+                Some(String::from_utf8_lossy(bytes).to_string())
+            }
+            _ => None,
+        };
+        if let Some(text) = &scan_text {
             if let Some(reason) = scan_for_ingest(text) {
                 if let Err(e) = tx.blocking_send(IngestItem::SkippedFile {
                     path_display: path_str.to_string(),
@@ -2492,6 +2508,100 @@ use super::x;"#;
         assert!(
             skipped[0].1.contains("github_pat"),
             "skip carries the scanner category: {}",
+            skipped[0].1
+        );
+        assert!(
+            !skipped[0].1.contains(&secret),
+            "skip must not echo the secret: {}",
+            skipped[0].1
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    /// PAR-03 / C10: markdown has no tree-sitter grammar, so its bytes must be
+    /// scanned independently of grammar availability. A credential in a .md
+    /// file contributes no file node and no doc sections.
+    #[tokio::test]
+    async fn par03_secret_in_markdown_is_refused() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ns-ingest-md-secret-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        // Built at runtime so no secret-shaped literal sits in the source.
+        let secret = format!("ghp_{}", "Ab1".repeat(12));
+        let md = format!("# Notes\n\nkey: {}\n", secret);
+        std::fs::write(tmp.join("guide.md"), &md).expect("write leaking markdown");
+
+        let db = std::env::temp_dir().join(format!(
+            "ns-ingest-md-secret-db-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"),
+        );
+        store.init("test-ns").await.expect("create the schema");
+
+        let skipped = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observer: Arc<dyn IngestObserver> = Arc::new(SkipRecorder {
+            skipped: skipped.clone(),
+        });
+        let schema =
+            ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        let outcome = ingest_directory(
+            &tmp,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "test-ns",
+            Some(observer),
+            &[],
+        )
+        .await;
+        assert!(
+            outcome.is_ok(),
+            "the walk proceeds past the skipped markdown: {:?}",
+            outcome.err()
+        );
+
+        let file_id = generation_scoped_id("test-ns", 1, "guide.md");
+        assert!(
+            store
+                .get("test-ns", &file_id)
+                .await
+                .expect("read back")
+                .is_none(),
+            "skipped markdown's file node was not stored"
+        );
+        for section in parse_markdown_sections(&md) {
+            let sid = generation_scoped_id(
+                "test-ns",
+                1,
+                &format!("guide.md#section:{}@{}", section.slug, section.sha256),
+            );
+            assert!(
+                store
+                    .get("test-ns", &sid)
+                    .await
+                    .expect("read back")
+                    .is_none(),
+                "skipped markdown section was not stored: {}",
+                section.slug
+            );
+        }
+
+        let skipped = skipped.lock().expect("recorder lock");
+        assert_eq!(skipped.len(), 1, "exactly one skip reported: {:?}", *skipped);
+        assert!(
+            skipped[0].0.ends_with("guide.md"),
+            "skip names the file: {}",
+            skipped[0].0
+        );
+        assert!(
+            skipped[0].1.contains("ERROR [SECURITY]"),
+            "skip carries the scanner verdict: {}",
             skipped[0].1
         );
         assert!(
