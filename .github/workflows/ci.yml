@@ -165,6 +165,13 @@ jobs:
         shell: bash
         run: bash scripts/check-include-str-targets.sh
 
+      - name: Install Lean 4 toolchain (elan)
+        shell: bash
+        run: |
+          curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain "$(tr -d '[:space:]' < proofs/lean-toolchain)"
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          "$HOME/.elan/bin/lake" --dir proofs build
+
       - name: Test
         shell: bash
         run: cargo test --locked -- --test-threads=1

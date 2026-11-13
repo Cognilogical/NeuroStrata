@@ -22,6 +22,7 @@
 //! v1 keeps due-logic thin: every non-lapsed procedure is due, and only the
 //! day-cadence trigger gets a real `next_due`.
 
+use crate::formal_kernel::{procedure_is_lapsed, procedure_is_untrusted, KernelProcedureTrust};
 use crate::traits::{SearchResult, VectorStore};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -64,10 +65,10 @@ fn fire_lock(key: &str) -> Arc<tokio::sync::Mutex<()>> {
 /// absent or explicitly null never lapses, and a value that is not an integer
 /// reads as 0 (long expired) rather than as "expires in the far future".
 pub(crate) fn is_lapsed(metadata: &Value, now: i64) -> bool {
-    match metadata.get("valid_to") {
-        Some(v) => !v.is_null() && v.as_i64().unwrap_or(0) <= now,
-        None => false,
-    }
+    let vt = metadata
+        .get("valid_to")
+        .and_then(|v| if v.is_null() { None } else { Some(v.as_i64().unwrap_or(0)) });
+    procedure_is_lapsed(vt, now)
 }
 
 /// The iteration budget. `None` is unbounded — and so is a value that cannot
@@ -139,11 +140,18 @@ fn has_import_provenance(metadata: &Value) -> bool {
 ///   fire: for a mesh-sourced row, a missing stamp is missing evidence,
 ///   not authorship.
 fn is_untrusted(metadata: &Value) -> bool {
-    match metadata.get("trust").and_then(|v| v.as_str()) {
-        Some("untrusted") => true,
-        Some("trusted") | Some("promoted") | Some("local") => false,
-        _ => has_import_provenance(metadata),
-    }
+    let k_trust = metadata
+        .get("trust")
+        .and_then(|v| v.as_str())
+        .map(|s| match s {
+            "untrusted" => KernelProcedureTrust::Untrusted,
+            "trusted" => KernelProcedureTrust::Trusted,
+            "promoted" => KernelProcedureTrust::Promoted,
+            "local" => KernelProcedureTrust::Local,
+            _ => KernelProcedureTrust::AbsentOrUnknown,
+        })
+        .unwrap_or(KernelProcedureTrust::AbsentOrUnknown);
+    procedure_is_untrusted(k_trust, has_import_provenance(metadata))
 }
 
 /// Stamp a locally created procedure row as locally authored. Every
@@ -513,7 +521,7 @@ pub async fn handle_procedure_perform(arguments: Value, store: Arc<dyn VectorSto
     if is_lapsed(&metadata, now) {
         return reply(false, true, false, budget, count, pointer_before, "lapsed");
     }
-    if budget == Some(0) {
+    if matches!(budget, Some(b) if b <= 0) {
         return reply(false, false, true, budget, count, pointer_before, "spent");
     }
 
@@ -790,6 +798,34 @@ mod tests {
             json!(3),
             "the refusal is not a fourth performance"
         );
+    }
+
+    /// A negative budget is as spent as zero: the row reports spent, the
+    /// refusal is not a performance, and nothing is rewritten — a corrupted
+    /// row must not be able to slip past the spent gate by going negative.
+    #[tokio::test]
+    async fn negative_remaining_fires_is_refused_as_spent_and_never_decrements() {
+        let store = empty_store("probe").await;
+        seed(
+            &store,
+            "probe",
+            "proc-negative",
+            "procedure",
+            json!({ "trigger": "session-start", "remaining_fires": -1, "performance_count": 4 }),
+        )
+        .await;
+
+        let reply: Value = serde_json::from_str(
+            &handle_procedure_perform(json!({ "id": "proc-negative" }), store.clone()).await,
+        )
+        .expect("json");
+        assert_eq!(reply["performed"], json!(false), "{}", reply);
+        assert_eq!(reply["spent"], json!(true));
+        assert_eq!(reply["reason"], json!("spent"));
+
+        let meta = stored(&store, "probe", "proc-negative").await.metadata;
+        assert_eq!(meta["remaining_fires"], json!(-1));
+        assert_eq!(meta["performance_count"], json!(4));
     }
 
     /// An unbounded budget stays unbounded: no key is invented and an explicit

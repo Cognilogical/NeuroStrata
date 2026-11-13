@@ -15,6 +15,7 @@ pub mod precheck;
 pub mod receipt;
 pub mod wiring;
 
+use crate::formal_kernel::{evaluate_claim_decision, KernelClaimDecision};
 use crate::judgment::DeduplicationChecker;
 use crate::traits::{Embedder, GraphRead, MemoryPayload, SearchResult, VectorStore};
 use crate::store::LadybugStore;
@@ -744,7 +745,8 @@ pub async fn build_task_graph_context(
         "### NeuroStrata Task & Graph Context (PASTE INTO ALL SUBAGENT PROMPTS)\n\
          - Namespace: `{}` | Task ID: `{}` | Goal: {}\n\
          - Auto-Retrieved Governing Rules & Graph Nodes:\n{}{}\n\
-         - Mandatory Graph-First Lookup Rule: Before editing any file, check whether its path and governing memory IDs (`mem-...`) are already listed under `### NeuroStrata Task & Graph Context` in your prompt. For any file you touch that is NOT listed in that block, call `neurostrata_memories_for_file` first (or `neurostrata_related` / `neurostrata_search_memory` with `include_related: true` / `neurostrata_sparql_query`).",
+         - Mandatory Graph-First Lookup Rule: Before editing any file, check whether its path and governing memory IDs (`mem-...`) are already listed under `### NeuroStrata Task & Graph Context` in your prompt. For any file you touch that is NOT listed in that block, call `neurostrata_memories_for_file` first (or `neurostrata_related` / `neurostrata_search_memory` with `include_related: true` / `neurostrata_sparql_query`).\
+         \n- Formal Verification Reflex: When adding or modifying a state machine, gate, sovereignty/ACL check, CRDT/merge rule, lease/claim rule, or conservation invariant, evaluate whether to extract the pure decision into `src/formal_kernel.rs`, prove its theorems in `proofs/NeuroStrata/*.lean` (zero `sorry`/`axiom`), and extend `tests/lean_parity_test.rs`.",
         namespace, task_id, payload.content, hits_block, bridges_prompt
     );
     (auto_retrieved_context, subagent_prompt)
@@ -1280,9 +1282,21 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
 
     let mut note = "claim".to_string();
 
-    match from {
-        // Re-claiming what this session already holds is idempotent.
-        Status::InProgress if holder == session => {
+    let k_status = from.to_kernel();
+    let same_session = holder == session;
+    let mut age: Option<i64> = None;
+    if from == Status::InProgress && !same_session {
+        let now = chrono::Utc::now().timestamp();
+        age = gate::age_secs(task.payload.metadata.get("task"), &["updated_at", "created_at"], now);
+        if age.is_none() {
+            tracing::warn!(
+                "task {} in_progress claim has missing/invalid updated_at timestamp; treating claim as stale",
+                id
+            );
+        }
+    }
+    match evaluate_claim_decision(k_status, same_session, age, gate::STALE_AFTER_SECS) {
+        KernelClaimDecision::IdempotentSameSession => {
             let body = json!({
                 "id": id,
                 "namespace": namespace,
@@ -1293,34 +1307,18 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
             });
             return encode(&body);
         }
-        Status::InProgress => {
-            let now = chrono::Utc::now().timestamp();
-            let age = gate::age_secs(
-                task.payload.metadata.get("task"),
-                &["updated_at", "created_at"],
-                now,
+        KernelClaimDecision::RefuseLiveHolder => {
+            let age_val = age.unwrap_or(0);
+            return format!(
+                "ERROR: task {} is claimed by {} (session '{}') and that claim is live (last update {}s ago). Two live sessions on one task duplicate work: ask them to release it (neurostrata_task_update with status 'open'), or claim it yourself after {} minutes without an update.",
+                id,
+                holder_assignee,
+                holder,
+                age_val,
+                gate::STALE_AFTER_SECS / 60
             );
-            // Live = updated within the staleness window. Stale = the holder
-            // probably went away, so the claim is up for grabs (section 5.3).
-            let live = age
-                .map(|a| a <= gate::STALE_AFTER_SECS)
-                .unwrap_or_else(|| {
-                    tracing::warn!(
-                        "task {} in_progress claim has missing/invalid updated_at timestamp; treating claim as stale",
-                        id
-                    );
-                    false
-                });
-            if live {
-                return format!(
-                    "ERROR: task {} is claimed by {} (session '{}') and that claim is live (last update {}s ago). Two live sessions on one task duplicate work: ask them to release it (neurostrata_task_update with status 'open'), or claim it yourself after {} minutes without an update.",
-                    id,
-                    holder_assignee,
-                    holder,
-                    age.unwrap_or(0),
-                    gate::STALE_AFTER_SECS / 60
-                );
-            }
+        }
+        KernelClaimDecision::TakeoverStaleHolder => {
             let release_reason = if holder.is_empty() {
                 "release: the holder never recorded a session".to_string()
             } else {
@@ -1349,8 +1347,8 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
             }
             note = format!("claim (took over a stale claim by {})", holder_assignee);
         }
-        Status::Open => {}
-        Status::Blocked | Status::Done => {
+        KernelClaimDecision::ClaimFromOpen => {}
+        KernelClaimDecision::DelegateToFsm => {
             // No special-casing: apply() below returns the legal set from
             // here, which teaches the machine instead of guessing intent.
         }
@@ -2565,6 +2563,7 @@ pub fn snapshot_prefix(memories: &[SearchResult]) -> String {
     let mut out = String::from("Zero-Action Start: claim or create a task before editing.\n");
     out.push_str("Task recognition: a statement of future/deferred work ('TODO:', 'we should also', 'later we need to', 'remaining work:', ...) is a task, not a note — capture it with neurostrata_task_create.\n");
     out.push_str("Graph-First & Subagent Propagation: before blind grep/glob or editing files, query neurostrata_memories_for_file, neurostrata_related, neurostrata_search_memory (include_related: true), or neurostrata_sparql_query for GOVERNS/DEPENDS_ON/calls/imports edges. Write this into your session plan and paste the `subagent_prompt_injection` block from neurostrata_task_claim into EVERY subagent prompt you spawn.\n");
+    out.push_str("Formal Verification Reflex: when adding or modifying a state machine, gate, sovereignty/ACL rule, CRDT/merge rule, lease/claim rule, or conservation invariant, evaluate whether to factor the pure decision into src/formal_kernel.rs, prove its invariants in proofs/NeuroStrata/*.lean (zero sorry/axiom), and add parity rows in tests/lean_parity_test.rs.\n");
     if claimed.is_empty() && ready.is_empty() {
         out.push_str("No tasks are claimed or ready in this namespace.\n");
         return out;

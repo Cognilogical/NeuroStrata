@@ -44,6 +44,9 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::conflict::{self, ConflictKind};
+
+use crate::formal_kernel::{evaluate_import_precheck, KernelImportPrecheck};
+
 use super::manifest::Trust;
 use super::record::{
     Lifecycle, LifecycleState, MeshRecord, Relationship, RdfBlock, MESH_RECORD_SCHEMA_VERSION,
@@ -1172,7 +1175,6 @@ fn classify_merge(
     cand: &MeshRecord,
     concurrent: bool,
 ) -> MergeDecision {
-    use LifecycleState::*;
     let cand_state = cand.lifecycle.state;
     let cand_sup = cand.lifecycle.superseded_by;
     let content_changed = local_content != content_text(cand);
@@ -1561,18 +1563,23 @@ async fn apply_one(
         Err(e) => return Disposition::Ignored(format!("store read failed for {id}: {e}")),
     };
 
+    let existing_update_id = existing.as_ref().and_then(|(_, payload)| mesh_update_id_of(&payload.metadata));
+    let same_update_id = existing_update_id.as_deref() == Some(&record.update_id.to_string());
+
+    match evaluate_import_precheck(existing.is_some(), existing_update_id.is_some(), same_update_id) {
+        KernelImportPrecheck::SkipSameUpdateId => return Disposition::Skipped,
+        KernelImportPrecheck::RefusePrivateSovereign => {
+            return Disposition::Ignored(format!(
+                "private memory owns id {id} — never overwritten, never deleted"
+            ));
+        }
+        KernelImportPrecheck::FreshInsert => {}
+        KernelImportPrecheck::ProceedMeshMerge => {}
+    }
+
+    // Mesh-owned row at another revision: gate the transition.
     if let Some((vector, payload)) = existing {
-        match mesh_update_id_of(&payload.metadata) {
-            Some(accepted) if accepted == record.update_id.to_string() => {
-                return Disposition::Skipped;
-            }
-            None => {
-                return Disposition::Ignored(format!(
-                    "private memory owns id {id} — never overwritten, never deleted"
-                ));
-            }
-            // Mesh-owned row at another revision: gate the transition.
-            Some(accepted) => {
+        let accepted = existing_update_id.as_deref().unwrap();
                 let Some((local_state, local_superseded_by)) = local_mesh_state(&payload.metadata)
                 else {
                     return Disposition::Ignored(format!(
@@ -1699,8 +1706,6 @@ async fn apply_one(
                     }
                     MergeDecision::Apply => {}
                 }
-            }
-        }
     }
 
     apply_effective(

@@ -37,6 +37,13 @@ path = "tests/context/freshness_test.rs"
 name = "staged_publication_test"
 path = "tests/ingest/staged_publication_test.rs"
 
+# Task 5 (lean4-formal-verification): Rust -> Lean parity + Aeneas extractability
+# contract. Compiles the crate-free formal kernel from its real path (see the
+# file's module comment) because the crate ships a binary target only.
+[[test]]
+name = "lean_parity_test"
+path = "tests/lean_parity_test.rs"
+
 # emrz: version-gated re-parse contract. Compiles the crate-free schema and
 # generation helpers from their real paths.
 [[test]]
