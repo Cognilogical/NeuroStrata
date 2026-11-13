@@ -442,6 +442,20 @@ pub async fn start_daemon(
     vector_store: Arc<dyn VectorStore>,
     deduplication_config: Option<DeduplicationConfig>,
 ) -> anyhow::Result<()> {
+    // Auto-install detected CLI/terminal harness plugins fail-soft at startup
+    // over the startup root and every configured project context directory, so
+    // existing workspaces are upgraded immediately on daemon boot. This runs
+    // here and not in `start_daemon_on` because the in-process test daemons
+    // start there: they would write `.claude/` and `.NeuroStrata/plugins/`
+    // into the directory `cargo test` runs in and into every configured
+    // project.
+    let startup_root = resolve_project_root();
+    let _ = crate::task::harness_plugins::auto_install_detected_plugins(&startup_root, "", None);
+    if let Ok(cfg) = crate::config::Config::load() {
+        for dir in cfg.project_contexts.values() {
+            let _ = crate::task::harness_plugins::auto_install_detected_plugins(dir, "", None);
+        }
+    }
     // The port the MCP proxy and CLI hardcode; changing it changes the wire
     // contract, so production never does. Tests pass an ephemeral address to
     // `start_daemon_on` directly.
@@ -992,16 +1006,7 @@ pub(crate) async fn start_daemon_on(
     // pull triggers (spec §Triggers): fail-soft, timeout-capped spawns.
     wire_mesh_publish(&bus, vector_store.clone(), embedder.clone());
 
-    // Auto-install detected CLI/terminal harness plugins fail-soft at startup
-    // over the startup root and every configured project context directory, so
-    // existing workspaces are upgraded immediately on daemon boot.
     let startup_root = resolve_project_root();
-    let _ = crate::task::harness_plugins::auto_install_detected_plugins(&startup_root, "", None);
-    if let Ok(cfg) = crate::config::Config::load() {
-        for dir in cfg.project_contexts.values() {
-            let _ = crate::task::harness_plugins::auto_install_detected_plugins(dir, "", None);
-        }
-    }
 
     // Kept here as well as in the state, because stopping has to wait for it.
     let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
@@ -3215,6 +3220,31 @@ impl crate::traits::AsAny for RecordingStore {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("lib.rs"), "pub fn t2r_marker() {}\n").unwrap();
         dir
+    }
+
+    /// The in-process test daemon must not install harness plugins into the
+    /// root it serves. That root is the directory `cargo test` runs in unless
+    /// a test names another, so an install here leaves `.claude/` and
+    /// `.NeuroStrata/plugins/` in the developer's checkout. A `.claude/`
+    /// directory in the scratch root makes the Claude harness count as
+    /// detected without any environment variable.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_daemon_does_not_install_plugins_into_its_root() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = scratch_root("no-plugin-install");
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        let (base, client, daemon, _credential_guard) = spawn_daemon_serving(&root).await;
+        stop_daemon(&client, &base, daemon).await;
+        assert!(
+            !root.join(".NeuroStrata").exists(),
+            "the test daemon wrote .NeuroStrata/ into {}",
+            root.display()
+        );
+        assert!(
+            !root.join(".claude").join("settings.local.json").exists(),
+            "the test daemon wrote .claude/settings.local.json into {}",
+            root.display()
+        );
     }
 
     /// Task 2 re-file (J6): a caller-named backup destination outside the
