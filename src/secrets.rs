@@ -160,12 +160,41 @@ const SCAN_CONTEXT_CARRY: usize = 4 * 1024;
 /// quoted literals and plain opaque values still go through the password
 /// check.
 fn looks_like_code_expression(value: &str) -> bool {
-    // Only strong source markers: paths and calls. Punctuation that can occur
-    // in a config value (`!`, `?`, braces) is not enough to call it code.
+    // Only strong source markers: paths, calls, member/index chains, and the
+    // literal keywords that occur in code. Punctuation that can occur in a
+    // config value (`!`, `?`, braces) is not enough to call it code.
     value.contains("::")
         || value.contains("->")
         || value.contains("=>")
         || (value.contains('(') && value.contains(')'))
+        || matches!(value, "None" | "true" | "false")
+        || value.starts_with("self.")
+        || value.starts_with("&self.")
+        || value.starts_with("process.env.")
+        || (value.contains('[') && !value.starts_with('[') && !value.contains(']'))
+        || (!value.starts_with("eyJ") && looks_like_member_chain(value))
+}
+
+/// `self.token`, `response.token`, `process.env.SECRET` are member chains; a
+/// password such as `p@ss.w0rd` is not because a segment contains `@`.
+fn looks_like_member_chain(value: &str) -> bool {
+    if !value.contains('.') {
+        return false;
+    }
+    let mut saw_alpha = false;
+    for segment in value.split('.') {
+        if segment.is_empty()
+            || !segment
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return false;
+        }
+        if let Some(first) = segment.chars().next() {
+            saw_alpha |= first.is_ascii_alphabetic();
+        }
+    }
+    saw_alpha
 }
 
 /// A value captured next to a secret-like key may be a Rust type annotation
@@ -353,15 +382,6 @@ impl SecretScanner {
                 location: location.to_string(),
                 category: "oversized_input",
             });
-        }
-
-        let lower = text.to_ascii_lowercase();
-
-        // --- Placeholder exclusion (fast check before regex) ---
-        // Check the whole text first: inputs like "changeme" or "<placeholder>"
-        // should be rejected as a whole without regex parsing.
-        if is_placeholder(&lower) {
-            return None;
         }
 
         // --- JWT detection ---
@@ -1223,6 +1243,44 @@ mod tests {
         let rejection =
             SecretScanner::scan_str(&text, "content").expect("multiline assignment detected");
         assert_eq!(rejection.category, "password");
+    }
+
+    #[test]
+    fn secret_source_expression_matrix() {
+        for clean in [
+            "let token = self.token;",
+            "token=None",
+            "const secret = process.env.SECRET;",
+            "// token = None",
+            "let value = parts[0];",
+            "let token = response.token;",
+            "struct Cfg { api_key: &self.api_key }",
+        ] {
+            assert!(
+                SecretScanner::scan_str(clean, "content").is_none(),
+                "clean source shape was rejected: {clean}"
+            );
+        }
+        for literal in [
+            "let password = \"hunter2!\";",
+            "// password = \"hunter2!\"",
+            "PASSWORD=hunter2!",
+        ] {
+            assert!(
+                SecretScanner::scan_str(literal, "content").is_some(),
+                "credential literal was accepted: {literal}"
+            );
+        }
+    }
+
+    #[test]
+    fn placeholder_wrapped_token_rejected() {
+        let token = format!("ghp_{}", "Ab1".repeat(12));
+        for wrapped in [format!("<{token}>"), format!("${{{token}}}")] {
+            let rejection = SecretScanner::scan_str(&wrapped, "content")
+                .unwrap_or_else(|| panic!("wrapped token accepted: {wrapped}"));
+            assert_eq!(rejection.category, "github_pat");
+        }
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────

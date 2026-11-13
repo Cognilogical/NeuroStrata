@@ -9,7 +9,7 @@
       "tests": [
         "secrets::tests::secret_source_expression_matrix",
         "secrets::tests::placeholder_wrapped_token_rejected",
-        "parser::ingest::tests::ingest_skip_count_reported",
+        "ingest_jobs::tests::progress_counts_skipped_files_without_echoing_a_secret",
         "parser::ingest::tests::clean_markdown_ingests"
       ],
       "thresholds": {

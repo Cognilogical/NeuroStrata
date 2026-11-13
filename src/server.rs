@@ -4556,12 +4556,18 @@ async fn handle_ingest_directory(
                     &RecursionToken::root(),
                 );
             }
+            let skipped = if progress.files_skipped > 0 {
+                format!(", {} skipped", progress.files_skipped)
+            } else {
+                String::new()
+            };
             format!(
-                "Successfully ingested AST from {} into namespace '{}': {} files, {} symbols, {} declared edges relinked.",
+                "Successfully ingested AST from {} into namespace '{}': {} files, {} symbols{}; {} declared edges relinked.",
                 dir_path,
                 namespace,
                 progress.files_ingested,
                 progress.symbols_ingested,
+                skipped,
                 progress
                     .relinked_edges
                     .map(|n| n.to_string())

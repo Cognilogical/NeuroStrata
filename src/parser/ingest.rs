@@ -3056,6 +3056,34 @@ use super::x;"#;
         std::fs::remove_dir_all(&db).ok();
     }
 
+    #[tokio::test]
+    async fn clean_markdown_ingests() {
+        let tmp = std::env::temp_dir().join(format!("ns-md-clean-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        let md = "# Notes\n\nclean documentation without credentials\n";
+        std::fs::write(tmp.join("guide.md"), md).expect("write clean markdown");
+        let db = std::env::temp_dir().join(format!("ns-md-clean-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("test-ns").await.expect("create the schema");
+        let schema = ParserSchema::load(include_str!("../schema.json")).expect("schema");
+        ingest_directory(
+            &tmp,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "test-ns",
+            None,
+            &[],
+        )
+        .await
+        .expect("clean markdown ingests");
+        let node = generation_scoped_id("test-ns", 1, "guide.md");
+        assert!(store.get("test-ns", &node).await.expect("read").is_some());
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
     /// Which carry-forward store call a `CarryFailingStore` fault hits.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum CarryFault {
