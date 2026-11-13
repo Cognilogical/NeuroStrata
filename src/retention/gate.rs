@@ -1,6 +1,8 @@
 //! AC5 budget verification / retention gate (Tasks 8-14 consolidated pass).
 //! p95 <100ms verified for plan + upsert; receipt retention + Lock 2 gate enforced.
 
+use crate::formal_kernel::{evaluate_retention_gate, KernelRetentionVerdict};
+
 pub fn budget_verified(p95_plan_ms: f64, p95_upsert_ms: f64) -> bool {
     p95_plan_ms < 100.0 && p95_upsert_ms < 100.0
 }
@@ -125,10 +127,16 @@ pub fn retention_gate(receipt_exists: bool) -> bool {
 /// be exercised without the process-wide latency windows, which accumulate
 /// samples from every caller in the process.
 fn retention_gate_with(receipt_exists: bool, p95_plan_ms: f64, p95_upsert_ms: f64) -> bool {
-    if !budget_verified(p95_plan_ms, p95_upsert_ms) {
-        return false;
-    }
-    receipt_exists // retention requires receipt present
+    matches!(
+        evaluate_retention_gate(
+            budget_verified(p95_plan_ms, p95_upsert_ms),
+            true,
+            receipt_exists,
+            false,
+            true,
+        ),
+        KernelRetentionVerdict::Retained
+    )
 }
 
 /// AC5 for one recorded task receipt: the receipt must still be retrievable

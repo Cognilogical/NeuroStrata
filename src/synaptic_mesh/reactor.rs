@@ -518,12 +518,13 @@ impl MeshReactor {
 }
 
 fn task_status_rank(status: &str) -> u8 {
-    match status {
-        "done" => 3,
-        "in_progress" => 2,
-        "blocked" => 1,
-        _ => 0,
-    }
+    let k_status = match status {
+        "done" => crate::formal_kernel::KernelTaskStatus::Done,
+        "in_progress" => crate::formal_kernel::KernelTaskStatus::InProgress,
+        "blocked" => crate::formal_kernel::KernelTaskStatus::Blocked,
+        _ => crate::formal_kernel::KernelTaskStatus::Open,
+    };
+    crate::formal_kernel::task_status_rank(k_status)
 }
 
 fn merge_task_json(existing: &serde_json::Value, incoming: &serde_json::Value) -> serde_json::Value {

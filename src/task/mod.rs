@@ -15,6 +15,7 @@ pub mod precheck;
 pub mod receipt;
 pub mod wiring;
 
+use crate::formal_kernel::{evaluate_claim_decision, KernelClaimDecision};
 use crate::judgment::DeduplicationChecker;
 use crate::traits::{Embedder, GraphRead, MemoryPayload, SearchResult, VectorStore};
 use crate::store::LadybugStore;
@@ -1280,9 +1281,21 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
 
     let mut note = "claim".to_string();
 
-    match from {
-        // Re-claiming what this session already holds is idempotent.
-        Status::InProgress if holder == session => {
+    let k_status = from.to_kernel();
+    let same_session = holder == session;
+    let mut age: Option<i64> = None;
+    if from == Status::InProgress && !same_session {
+        let now = chrono::Utc::now().timestamp();
+        age = gate::age_secs(task.payload.metadata.get("task"), &["updated_at", "created_at"], now);
+        if age.is_none() {
+            tracing::warn!(
+                "task {} in_progress claim has missing/invalid updated_at timestamp; treating claim as stale",
+                id
+            );
+        }
+    }
+    match evaluate_claim_decision(k_status, same_session, age, gate::STALE_AFTER_SECS) {
+        KernelClaimDecision::IdempotentSameSession => {
             let body = json!({
                 "id": id,
                 "namespace": namespace,
@@ -1293,34 +1306,18 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
             });
             return encode(&body);
         }
-        Status::InProgress => {
-            let now = chrono::Utc::now().timestamp();
-            let age = gate::age_secs(
-                task.payload.metadata.get("task"),
-                &["updated_at", "created_at"],
-                now,
+        KernelClaimDecision::RefuseLiveHolder => {
+            let age_val = age.unwrap_or(0);
+            return format!(
+                "ERROR: task {} is claimed by {} (session '{}') and that claim is live (last update {}s ago). Two live sessions on one task duplicate work: ask them to release it (neurostrata_task_update with status 'open'), or claim it yourself after {} minutes without an update.",
+                id,
+                holder_assignee,
+                holder,
+                age_val,
+                gate::STALE_AFTER_SECS / 60
             );
-            // Live = updated within the staleness window. Stale = the holder
-            // probably went away, so the claim is up for grabs (section 5.3).
-            let live = age
-                .map(|a| a <= gate::STALE_AFTER_SECS)
-                .unwrap_or_else(|| {
-                    tracing::warn!(
-                        "task {} in_progress claim has missing/invalid updated_at timestamp; treating claim as stale",
-                        id
-                    );
-                    false
-                });
-            if live {
-                return format!(
-                    "ERROR: task {} is claimed by {} (session '{}') and that claim is live (last update {}s ago). Two live sessions on one task duplicate work: ask them to release it (neurostrata_task_update with status 'open'), or claim it yourself after {} minutes without an update.",
-                    id,
-                    holder_assignee,
-                    holder,
-                    age.unwrap_or(0),
-                    gate::STALE_AFTER_SECS / 60
-                );
-            }
+        }
+        KernelClaimDecision::TakeoverStaleHolder => {
             let release_reason = if holder.is_empty() {
                 "release: the holder never recorded a session".to_string()
             } else {
@@ -1349,8 +1346,8 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
             }
             note = format!("claim (took over a stale claim by {})", holder_assignee);
         }
-        Status::Open => {}
-        Status::Blocked | Status::Done => {
+        KernelClaimDecision::ClaimFromOpen => {}
+        KernelClaimDecision::DelegateToFsm => {
             // No special-casing: apply() below returns the legal set from
             // here, which teaches the machine instead of guessing intent.
         }

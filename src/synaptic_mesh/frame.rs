@@ -10,6 +10,7 @@ use crate::did::{
     canonical_signing_bytes, decode_base58btc, decode_base64, encode_base58btc, encode_base64,
     public_key_from_did, sign, signer_did, verify,
 };
+use crate::formal_kernel::{evaluate_sovereignty_gate, KernelSovereigntyDecision};
 use crate::synaptic_mesh::record::MeshRecord;
 
 /// Maximum wire frame size (1 MiB).
@@ -295,21 +296,22 @@ pub fn validate_egress_candidate(
     memory_type: &str,
     metadata: &serde_json::Value,
 ) -> Result<(), SovereigntyGateError> {
-    if !PERMITTED_MESH_MEMORY_TYPES.contains(&memory_type) {
-        return Err(SovereigntyGateError::ForbiddenMemoryType(
-            memory_type.to_string(),
-        ));
-    }
+    let permitted_memory_type = PERMITTED_MESH_MEMORY_TYPES.contains(&memory_type);
     let eligibility = metadata
         .get("eligibility")
         .and_then(|v| v.as_str())
         .unwrap_or("private");
-    if eligibility != "shareable" {
-        return Err(SovereigntyGateError::NotShareable(format!(
+    let is_shareable = eligibility == "shareable";
+    match evaluate_sovereignty_gate(permitted_memory_type, is_shareable, false, true, true) {
+        KernelSovereigntyDecision::Allow => Ok(()),
+        KernelSovereigntyDecision::ForbiddenMemoryType => Err(SovereigntyGateError::ForbiddenMemoryType(
+            memory_type.to_string(),
+        )),
+        KernelSovereigntyDecision::NotShareable => Err(SovereigntyGateError::NotShareable(format!(
             "eligibility is '{eligibility}', required 'shareable'"
-        )));
+        ))),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 /// Recursively inspect a JSON tree for any forbidden node-local procedure runtime counter key.

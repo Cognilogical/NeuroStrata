@@ -318,3 +318,324 @@ pub const fn classify_merge_decision_tag(d: KernelMergeDecision) -> &'static str
         SupersedeWinsPreserveEdit => "supersede_wins_preserve_edit",
     }
 }
+
+/// Task claim decision: idempotency, live-holder refusal, stale takeover, or FSM delegation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelClaimDecision {
+    IdempotentSameSession,
+    RefuseLiveHolder,
+    TakeoverStaleHolder,
+    ClaimFromOpen,
+    DelegateToFsm,
+}
+
+/// Classifies a task-claim attempt into the five kernel branches.
+pub const fn evaluate_claim_decision(
+    status: KernelTaskStatus,
+    same_session: bool,
+    age_secs: Option<i64>,
+    stale_after_secs: i64,
+) -> KernelClaimDecision {
+    match status {
+        KernelTaskStatus::InProgress if same_session => KernelClaimDecision::IdempotentSameSession,
+        KernelTaskStatus::InProgress => match age_secs {
+            Some(age) if age <= stale_after_secs => KernelClaimDecision::RefuseLiveHolder,
+            _ => KernelClaimDecision::TakeoverStaleHolder,
+        },
+        KernelTaskStatus::Open => KernelClaimDecision::ClaimFromOpen,
+        KernelTaskStatus::Blocked | KernelTaskStatus::Done => KernelClaimDecision::DelegateToFsm,
+    }
+}
+
+/// Tag string for a task-claim decision: "idempotent_same_session", "refuse_live_holder",
+/// "takeover_stale_holder", "claim_from_open", "delegate_to_fsm".
+pub const fn claim_decision_tag(d: KernelClaimDecision) -> &'static str {
+    match d {
+        KernelClaimDecision::IdempotentSameSession => "idempotent_same_session",
+        KernelClaimDecision::RefuseLiveHolder => "refuse_live_holder",
+        KernelClaimDecision::TakeoverStaleHolder => "takeover_stale_holder",
+        KernelClaimDecision::ClaimFromOpen => "claim_from_open",
+        KernelClaimDecision::DelegateToFsm => "delegate_to_fsm",
+    }
+}
+
+/// Sovereignty decision: allow / forbidden memory type / not shareable / forbidden runtime
+/// counter / unauthorized recipient / private row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelSovereigntyDecision {
+    Allow,
+    ForbiddenMemoryType,
+    NotShareable,
+    ForbiddenRuntimeCounter,
+    UnauthorizedRecipient,
+}
+
+/// Evaluates the 5-gate sovereignty rule over egress/inbound candidates.
+pub const fn evaluate_sovereignty_gate(
+    permitted_memory_type: bool,
+    is_shareable: bool,
+    has_runtime_counter: bool,
+    acl_empty: bool,
+    recipient_in_acl: bool,
+) -> KernelSovereigntyDecision {
+    if !permitted_memory_type {
+        KernelSovereigntyDecision::ForbiddenMemoryType
+    } else if !is_shareable {
+        KernelSovereigntyDecision::NotShareable
+    } else if has_runtime_counter {
+        KernelSovereigntyDecision::ForbiddenRuntimeCounter
+    } else if !acl_empty && !recipient_in_acl {
+        KernelSovereigntyDecision::UnauthorizedRecipient
+    } else {
+        KernelSovereigntyDecision::Allow
+    }
+}
+
+/// Tag string for a sovereignty decision: "allow", "forbidden_memory_type", "not_shareable",
+/// "forbidden_runtime_counter", "unauthorized_recipient".
+pub const fn sovereignty_decision_tag(d: KernelSovereigntyDecision) -> &'static str {
+    match d {
+        KernelSovereigntyDecision::Allow => "allow",
+        KernelSovereigntyDecision::ForbiddenMemoryType => "forbidden_memory_type",
+        KernelSovereigntyDecision::NotShareable => "not_shareable",
+        KernelSovereigntyDecision::ForbiddenRuntimeCounter => "forbidden_runtime_counter",
+        KernelSovereigntyDecision::UnauthorizedRecipient => "unauthorized_recipient",
+    }
+}
+
+/// Import precheck decision over an existing-row idempotency sweep.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelImportPrecheck {
+    FreshInsert,
+    SkipSameUpdateId,
+    RefusePrivateSovereign,
+    ProceedMeshMerge,
+}
+
+/// Classifies a candidate import against the existing row state.
+pub const fn evaluate_import_precheck(
+    row_exists: bool,
+    has_mesh_provenance: bool,
+    same_update_id: bool,
+) -> KernelImportPrecheck {
+    if !row_exists {
+        KernelImportPrecheck::FreshInsert
+    } else if !has_mesh_provenance {
+        KernelImportPrecheck::RefusePrivateSovereign
+    } else if same_update_id {
+        KernelImportPrecheck::SkipSameUpdateId
+    } else {
+        KernelImportPrecheck::ProceedMeshMerge
+    }
+}
+
+/// Tag string for an import precheck decision: "fresh_insert", "skip_same_update_id",
+/// "refuse_private_sovereign", "proceed_mesh_merge".
+pub const fn import_precheck_tag(d: KernelImportPrecheck) -> &'static str {
+    match d {
+        KernelImportPrecheck::FreshInsert => "fresh_insert",
+        KernelImportPrecheck::SkipSameUpdateId => "skip_same_update_id",
+        KernelImportPrecheck::RefusePrivateSovereign => "refuse_private_sovereign",
+        KernelImportPrecheck::ProceedMeshMerge => "proceed_mesh_merge",
+    }
+}
+
+/// Procedure trust level for a procedurally-firing kernel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelProcedureTrust {
+    Untrusted,
+    Trusted,
+    Promoted,
+    Local,
+    AbsentOrUnknown,
+}
+
+impl KernelProcedureTrust {
+    pub const ALL: [KernelProcedureTrust; 5] = [
+        KernelProcedureTrust::Untrusted,
+        KernelProcedureTrust::Trusted,
+        KernelProcedureTrust::Promoted,
+        KernelProcedureTrust::Local,
+        KernelProcedureTrust::AbsentOrUnknown,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            KernelProcedureTrust::Untrusted => "untrusted",
+            KernelProcedureTrust::Trusted => "trusted",
+            KernelProcedureTrust::Promoted => "promoted",
+            KernelProcedureTrust::Local => "local",
+            KernelProcedureTrust::AbsentOrUnknown => "absent",
+        }
+    }
+}
+
+/// True when a procedure firing is untrusted (no trusted/promoted/local stamp).
+pub const fn procedure_is_untrusted(trust: KernelProcedureTrust, has_import_provenance: bool) -> bool {
+    match trust {
+        KernelProcedureTrust::Untrusted => true,
+        KernelProcedureTrust::Trusted | KernelProcedureTrust::Promoted | KernelProcedureTrust::Local => false,
+        KernelProcedureTrust::AbsentOrUnknown => has_import_provenance,
+    }
+}
+
+/// True when a procedure firing is lapsed (inclusive of the deadline).
+pub const fn procedure_is_lapsed(valid_to: Option<i64>, now: i64) -> bool {
+    match valid_to {
+        Some(deadline) => deadline <= now,
+        None => false,
+    }
+}
+
+/// Outcome of a procedure fire attempt against its rehearsal budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelProcedureFireOutcome {
+    RefuseUntrusted,
+    RefuseLapsed,
+    RefuseSpent,
+    Fired {
+        remaining_fires: Option<u64>,
+        performance_count: u64,
+    },
+}
+
+/// Evaluates the procedure fire order: untrusted → lapsed → spent → fired.
+pub const fn evaluate_procedure_fire(
+    trust: KernelProcedureTrust,
+    has_import_provenance: bool,
+    valid_to: Option<i64>,
+    now: i64,
+    remaining_fires: Option<u64>,
+    performance_count: u64,
+) -> KernelProcedureFireOutcome {
+    if procedure_is_untrusted(trust, has_import_provenance) {
+        KernelProcedureFireOutcome::RefuseUntrusted
+    } else if procedure_is_lapsed(valid_to, now) {
+        KernelProcedureFireOutcome::RefuseLapsed
+    } else {
+        match remaining_fires {
+            Some(0) => KernelProcedureFireOutcome::RefuseSpent,
+            Some(b) => KernelProcedureFireOutcome::Fired {
+                remaining_fires: Some(b - 1),
+                performance_count: performance_count.saturating_add(1),
+            },
+            None => KernelProcedureFireOutcome::Fired {
+                remaining_fires: None,
+                performance_count: performance_count.saturating_add(1),
+            },
+        }
+    }
+}
+
+/// Tag string for a procedure fire outcome: "refuse_untrusted", "refuse_lapsed", "refuse_spent",
+/// "fired_bounded", "fired_unbounded".
+pub const fn procedure_fire_tag(o: KernelProcedureFireOutcome) -> &'static str {
+    match o {
+        KernelProcedureFireOutcome::RefuseUntrusted => "refuse_untrusted",
+        KernelProcedureFireOutcome::RefuseLapsed => "refuse_lapsed",
+        KernelProcedureFireOutcome::RefuseSpent => "refuse_spent",
+        KernelProcedureFireOutcome::Fired {
+            remaining_fires: Some(_),
+            ..
+        } => "fired_bounded",
+        KernelProcedureFireOutcome::Fired {
+            remaining_fires: None,
+            ..
+        } => "fired_unbounded",
+    }
+}
+
+/// Task status join semilattice rank helper (monotone max-rank join).
+pub const fn task_status_rank(status: KernelTaskStatus) -> u8 {
+    match status {
+        KernelTaskStatus::Done => 3,
+        KernelTaskStatus::InProgress => 2,
+        KernelTaskStatus::Blocked => 1,
+        KernelTaskStatus::Open => 0,
+    }
+}
+
+/// Join task status via the max-rank semilattice (LWW cell).
+pub const fn join_task_status(a: KernelTaskStatus, b: KernelTaskStatus) -> KernelTaskStatus {
+    if task_status_rank(a) >= task_status_rank(b) {
+        a
+    } else {
+        b
+    }
+}
+
+/// Sequence continuity decision across twin-CRDT merges.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelSeqDecision {
+    DuplicateIgnore,
+    ApplyAndAdvance,
+    BufferOutOfOrder,
+}
+
+/// Evaluates sequence continuity: duplicates ignored, out-of-order buffered, in-order applied.
+pub const fn evaluate_seq_continuity(
+    already_seen: bool,
+    expected_seq: u64,
+    frame_seq: u64,
+) -> KernelSeqDecision {
+    if already_seen || frame_seq < expected_seq {
+        KernelSeqDecision::DuplicateIgnore
+    } else if frame_seq > expected_seq {
+        KernelSeqDecision::BufferOutOfOrder
+    } else {
+        KernelSeqDecision::ApplyAndAdvance
+    }
+}
+
+/// Tag string for a sequence continuity decision: "duplicate_ignore", "apply_and_advance",
+/// "buffer_out_of_order".
+pub const fn seq_decision_tag(d: KernelSeqDecision) -> &'static str {
+    match d {
+        KernelSeqDecision::DuplicateIgnore => "duplicate_ignore",
+        KernelSeqDecision::ApplyAndAdvance => "apply_and_advance",
+        KernelSeqDecision::BufferOutOfOrder => "buffer_out_of_order",
+    }
+}
+
+/// Retention verdict: over-latency / store-empty / receipt-missing / worktree-moved / retained.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelRetentionVerdict {
+    Retained,
+    FailedOverBudget,
+    FailedStoreEmpty,
+    FailedReceiptMissing,
+    FailedWorktreeMoved,
+}
+
+/// Evaluates the retention gate: latency budget + store non-empty + receipt + worktree binding.
+pub const fn evaluate_retention_gate(
+    within_latency_budget: bool,
+    store_non_empty: bool,
+    receipt_found: bool,
+    worktree_bound: bool,
+    worktree_matches: bool,
+) -> KernelRetentionVerdict {
+    if !within_latency_budget {
+        KernelRetentionVerdict::FailedOverBudget
+    } else if !store_non_empty {
+        KernelRetentionVerdict::FailedStoreEmpty
+    } else if !receipt_found {
+        KernelRetentionVerdict::FailedReceiptMissing
+    } else if worktree_bound && !worktree_matches {
+        KernelRetentionVerdict::FailedWorktreeMoved
+    } else {
+        KernelRetentionVerdict::Retained
+    }
+}
+
+/// Tag string for a retention verdict: "retained", "failed_over_budget", "failed_store_empty",
+/// "failed_receipt_missing", "failed_worktree_moved".
+pub const fn retention_verdict_tag(v: KernelRetentionVerdict) -> &'static str {
+    match v {
+        KernelRetentionVerdict::Retained => "retained",
+        KernelRetentionVerdict::FailedOverBudget => "failed_over_budget",
+        KernelRetentionVerdict::FailedStoreEmpty => "failed_store_empty",
+        KernelRetentionVerdict::FailedReceiptMissing => "failed_receipt_missing",
+        KernelRetentionVerdict::FailedWorktreeMoved => "failed_worktree_moved",
+    }
+}
