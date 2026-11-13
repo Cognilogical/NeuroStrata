@@ -10818,7 +10818,19 @@ async fn handle_supersede_memory(
         // should point back, not a stale forward link.
         obj.remove("superseded_by");
         obj.insert("valid_from".to_string(), serde_json::json!(now));
-        obj.insert("access_count".to_string(), serde_json::json!(0));
+        // The correction keeps the old row's usage. Starting it at zero would
+        // rank the corrected text below siblings the old row outranked, in
+        // memories_for_file (access_count is a sort key) and in search (usage
+        // boost).
+        let inherited_access_count = old_payload
+            .metadata
+            .get("access_count")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        obj.insert(
+            "access_count".to_string(),
+            serde_json::json!(inherited_access_count),
+        );
         obj.insert("supersedes".to_string(), serde_json::json!(id));
         // Transfer a scheduled future expiry to the replacement so the
         // replacement inherits the old row's deadline rather than silently
@@ -19006,6 +19018,74 @@ mod tests {
                 .map(|v| v.is_null())
                 .unwrap_or(true),
             "the replacement is current, not history"
+        );
+    }
+
+    /// A correction is the same memory with better words. Resetting its usage
+    /// to zero would rank it below siblings the old row outranked, in
+    /// memories_for_file (access_count is a sort key) and in search (usage
+    /// boost), so the corrected text would surface less than the wrong one did.
+    #[tokio::test]
+    async fn superseding_keeps_the_access_count_and_the_rank() {
+        let (store, old_id) = store_with_one_rule("probe").await;
+        let (vector, mut old) = store.get("probe", &old_id).await.unwrap().unwrap();
+        old.metadata = serde_json::json!({ "access_count": 7, "governs": ["src/lib.rs"] });
+        store.upsert("probe", &old_id, vector, old).await.unwrap();
+
+        let sibling_id = uuid::Uuid::new_v4().to_string();
+        let mut sibling = payload("prefer small commits");
+        sibling.metadata = serde_json::json!({ "access_count": 3, "governs": ["src/lib.rs"] });
+        let sibling_vector = StubEmbedder.embed("prefer small commits").await.unwrap();
+        store
+            .upsert("probe", &sibling_id, sibling_vector, sibling)
+            .await
+            .unwrap();
+
+        // The ids memories_for_file returns for src/lib.rs, in rank order.
+        let ranked = |store: Arc<dyn VectorStore>| async move {
+            let text = handle_memories_for_file(
+                serde_json::json!({
+                    "namespace": "probe",
+                    "path": "src/lib.rs",
+                    "include_ast_edges": false,
+                }),
+                store,
+            )
+            .await;
+            let parsed: Value = serde_json::from_str(&text).expect("valid JSON");
+            parsed["memories"]
+                .as_array()
+                .unwrap_or_else(|| panic!("memories list: {text}"))
+                .iter()
+                .map(|m| m["id"].as_str().expect("hit id").to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ranked(store.clone()).await,
+            vec![old_id.clone(), sibling_id.clone()]
+        );
+
+        let reply = handle_supersede_memory(
+            serde_json::json!({ "id": old_id, "namespace": "probe", "content": "always use podman 5" }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+            quiet_bus(),
+        )
+        .await;
+        assert!(reply.starts_with("Superseded"), "got {}", reply);
+        let new_id = new_id_from(&reply);
+
+        let (_, replacement) = store.get("probe", &new_id).await.unwrap().unwrap();
+        assert_eq!(
+            replacement.metadata["access_count"],
+            serde_json::json!(7),
+            "the replacement keeps the old row's access_count"
+        );
+
+        assert_eq!(
+            ranked(store.clone()).await,
+            vec![new_id, sibling_id],
+            "the replacement ranks where the old row ranked"
         );
     }
 
