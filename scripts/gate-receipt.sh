@@ -31,9 +31,10 @@ else
   [ -n "$pr" ] || { echo "usage: gate-receipt.sh --pr <n> | --reviews-file <path>" >&2; exit 2; }
   repo=$(gh repo view --json nameWithOwner -q .nameWithOwner)
   entries=$(
+    # Reviews and comments only. The PR body often describes the gate itself
+    # ("one receipt per CHANGES-NEEDED marker") and must not count as a marker.
     gh api "repos/$repo/pulls/$pr/reviews" --jq '.[] | {body:(.body // ""), author_association:(.author_association // "NONE")}' 2>/dev/null || true
     gh api "repos/$repo/issues/$pr/comments" --jq '.[] | {body:(.body // ""), author_association:(.author_association // "NONE")}' 2>/dev/null || true
-    gh api "repos/$repo/pulls/$pr" --jq '{body:(.body // ""), author_association:(.author_association // "NONE")}' 2>/dev/null || true
   )
 fi
 

@@ -16,9 +16,10 @@ posted as `COMMENTED` therefore cannot block a merge.
 
 ## Gate receipt
 
-A review that says `CHANGES-NEEDED`, `CHANGES NEEDED`, `DO-NOT-MERGE`, or
-`DO NOT MERGE` is a gating marker. Each marker needs one receipt in a review,
-comment, or PR body:
+A review or comment that says `CHANGES-NEEDED`, `CHANGES NEEDED`,
+`DO-NOT-MERGE`, or `DO NOT MERGE` is a gating marker. The PR body is not
+scanned: it often describes the gate itself. Each marker needs one receipt in a
+review or comment:
 
 - `fixed@<sha>` — the finding is fixed at that commit;
 - `filed #<issue>` — the finding is tracked in an issue;
