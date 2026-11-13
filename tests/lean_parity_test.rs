@@ -7,7 +7,7 @@
 //! Three contracts:
 //! 1. the kernel compiles standalone with zero `--extern` flags (Aeneas/Charon
 //!    extractability precondition);
-//! 2. the exhaustive 211-row truth table produced by the Rust kernel equals the
+//! 2. the exhaustive 389-row truth table produced by the Rust kernel equals the
 //!    one emitted by `lake --dir proofs exe neurostrata-proofs`;
 //! 3. no Lean proof source carries a `sorry` placeholder or an `axiom`.
 
@@ -21,7 +21,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use formal_kernel::{
-    classify_merge_decision_tag, epoch_gate_tag, lifecycle_can_transition, task_step_tag,
+    classify_merge_decision_tag, claim_decision_tag, evaluate_claim_decision,
+    evaluate_import_precheck, evaluate_procedure_fire, evaluate_retention_gate,
+    evaluate_seq_continuity, evaluate_sovereignty_gate, epoch_gate_tag,
+    import_precheck_tag, join_task_status, lifecycle_can_transition, procedure_fire_tag,
+    retention_verdict_tag, seq_decision_tag, sovereignty_decision_tag, task_step_tag,
+    KernelProcedureTrust,
 };
 
 /// The statuses in the exact order used by `proofs/Main.lean`.
@@ -53,10 +58,10 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// Generates the canonical 211-line truth table in `proofs/Main.lean` order:
-/// 64 `TASK_FSM` + 16 `LIFECYCLE` + 128 `MESH_MERGE` + 3 `EPOCH_GATE`.
+/// Generates the canonical 389-line truth table in `proofs/Main.lean` order:
+/// 64 `TASK_FSM` + 16 `LIFECYCLE` + 128 `MESH_MERGE` + 3 `EPOCH_GATE` + 24 `TASK_CLAIM` + 32 `SOVEREIGNTY_GATE` + 8 `IMPORT_PRECHECK` + 60 `PROCEDURE_FIRE` + 16 `TWIN_CRDT_STATUS` + 6 `TWIN_CRDT_SEQ` + 32 `RETENTION_GATE`.
 fn generate_rust_truth_table() -> Vec<String> {
-    let mut lines: Vec<String> = Vec::with_capacity(211);
+    let mut lines: Vec<String> = Vec::with_capacity(389);
 
     for &from in TASK_STATUSES.iter() {
         for &to in TASK_STATUSES.iter() {
@@ -123,8 +128,147 @@ fn generate_rust_truth_table() -> Vec<String> {
         ));
     }
 
+    // TASK_CLAIM: 24 rows (4 statuses × 2 same_session × 3 age cases)
+    let age_cases: [(&str, Option<i64>); 3] = [("none", None), ("live", Some(1800)), ("stale", Some(3601))];
+    for &status in TASK_STATUSES.iter() {
+        for &same_session in [false, true].iter() {
+            for &(age_label, age_secs) in age_cases.iter() {
+                let tag = claim_decision_tag(evaluate_claim_decision(status, same_session, age_secs, 3600));
+                lines.push(format!(
+                    "TASK_CLAIM|{}|{}|{}|{}",
+                    status.as_str(),
+                    bool_str(same_session),
+                    age_label,
+                    tag
+                ));
+            }
+        }
+    }
+
+    // SOVEREIGNTY_GATE: 32 rows (5 booleans)
+    for &perm in [false, true].iter() {
+        for &shareable in [false, true].iter() {
+            for &counter in [false, true].iter() {
+                for &acl_empty in [false, true].iter() {
+                    for &in_acl in [false, true].iter() {
+                        let tag = sovereignty_decision_tag(evaluate_sovereignty_gate(perm, shareable, counter, acl_empty, in_acl));
+                        lines.push(format!(
+                            "SOVEREIGNTY_GATE|{}|{}|{}|{}|{}|{}",
+                            bool_str(perm),
+                            bool_str(shareable),
+                            bool_str(counter),
+                            bool_str(acl_empty),
+                            bool_str(in_acl),
+                            tag
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // IMPORT_PRECHECK: 8 rows (3 booleans)
+    for &row_exists in [false, true].iter() {
+        for &has_prov in [false, true].iter() {
+            for &same_upd in [false, true].iter() {
+                let tag = import_precheck_tag(evaluate_import_precheck(row_exists, has_prov, same_upd));
+                lines.push(format!(
+                    "IMPORT_PRECHECK|{}|{}|{}|{}",
+                    bool_str(row_exists),
+                    bool_str(has_prov),
+                    bool_str(same_upd),
+                    tag
+                ));
+            }
+        }
+    }
+
+    // PROCEDURE_FIRE: 60 rows (5 trusts × 2 imported × 2 lapsed × 3 budgets)
+    let trusts = [
+        KernelProcedureTrust::Untrusted,
+        KernelProcedureTrust::Trusted,
+        KernelProcedureTrust::Promoted,
+        KernelProcedureTrust::Local,
+        KernelProcedureTrust::AbsentOrUnknown,
+    ];
+    let lapsed_cases: [(&str, Option<i64>); 2] = [("live", None), ("lapsed", Some(1000))];
+    let budget_cases: [(&str, Option<u64>); 3] = [("unbounded", None), ("zero", Some(0)), ("two", Some(2))];
+    for &trust in trusts.iter() {
+        for &imported in [false, true].iter() {
+            for &(lapsed_label, valid_to) in lapsed_cases.iter() {
+                for &(budget_label, remaining) in budget_cases.iter() {
+                    let tag = procedure_fire_tag(evaluate_procedure_fire(
+                        trust,
+                        imported,
+                        valid_to,
+                        1000,
+                        remaining,
+                        0,
+                    ));
+                    lines.push(format!(
+                        "PROCEDURE_FIRE|{}|{}|{}|{}|{}",
+                        trust.as_str(),
+                        bool_str(imported),
+                        lapsed_label,
+                        budget_label,
+                        tag
+                    ));
+                }
+            }
+        }
+    }
+
+    // TWIN_CRDT_STATUS: 16 rows (4×4 statuses)
+    for &a in TASK_STATUSES.iter() {
+        for &b in TASK_STATUSES.iter() {
+            let joined = join_task_status(a, b);
+            lines.push(format!(
+                "TWIN_CRDT_STATUS|{}|{}|{}",
+                a.as_str(),
+                b.as_str(),
+                joined.as_str()
+            ));
+        }
+    }
+
+    // TWIN_CRDT_SEQ: 6 rows (2 already_seen × 3 seq)
+    for &already_seen in [false, true].iter() {
+        for &seq in [1u64, 2, 3].iter() {
+            let tag = seq_decision_tag(evaluate_seq_continuity(already_seen, 2, seq));
+            lines.push(format!(
+                "TWIN_CRDT_SEQ|{}|{}|{}",
+                bool_str(already_seen),
+                seq,
+                tag
+            ));
+        }
+    }
+
+    // RETENTION_GATE: 32 rows (5 booleans)
+    for &budget in [false, true].iter() {
+        for &non_empty in [false, true].iter() {
+            for &found in [false, true].iter() {
+                for &bound in [false, true].iter() {
+                    for &matches_wt in [false, true].iter() {
+                        let tag = retention_verdict_tag(evaluate_retention_gate(budget, non_empty, found, bound, matches_wt));
+                        lines.push(format!(
+                            "RETENTION_GATE|{}|{}|{}|{}|{}|{}",
+                            bool_str(budget),
+                            bool_str(non_empty),
+                            bool_str(found),
+                            bool_str(bound),
+                            bool_str(matches_wt),
+                            tag
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     lines
 }
+
 
 /// Locates the `lake` binary: PATH first, then the elan default install dir.
 fn find_lake() -> Option<PathBuf> {
@@ -173,12 +317,14 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
     let rust_lines = generate_rust_truth_table();
     assert_eq!(
         rust_lines.len(),
-        211,
-        "expected 211 canonical lines (64+16+128+3)"
+        389,
+        "expected 389 canonical lines (64+16+128+3+24+32+8+60+16+6+32)"
     );
 
     // Section-count verification: 64 TASK_FSM + 16 LIFECYCLE + 128 MESH_MERGE
-    // + 3 EPOCH_GATE, matching the exact generation order in `proofs/Main.lean`.
+    // + 3 EPOCH_GATE + 24 TASK_CLAIM + 32 SOVEREIGNTY_GATE + 8 IMPORT_PRECHECK
+    // + 60 PROCEDURE_FIRE + 16 TWIN_CRDT_STATUS + 6 TWIN_CRDT_SEQ + 32 RETENTION_GATE,
+    // matching the exact generation order in `proofs/Main.lean`.
     let section_counts = rust_lines
         .iter()
         .fold(HashMap::new(), |mut acc, line| {
@@ -204,6 +350,41 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
         *section_counts.get("EPOCH_GATE").unwrap_or(&0),
         3,
         "expected 3 EPOCH_GATE rows"
+    );
+    assert_eq!(
+        *section_counts.get("TASK_CLAIM").unwrap_or(&0),
+        24,
+        "expected 24 TASK_CLAIM rows"
+    );
+    assert_eq!(
+        *section_counts.get("SOVEREIGNTY_GATE").unwrap_or(&0),
+        32,
+        "expected 32 SOVEREIGNTY_GATE rows"
+    );
+    assert_eq!(
+        *section_counts.get("IMPORT_PRECHECK").unwrap_or(&0),
+        8,
+        "expected 8 IMPORT_PRECHECK rows"
+    );
+    assert_eq!(
+        *section_counts.get("PROCEDURE_FIRE").unwrap_or(&0),
+        60,
+        "expected 60 PROCEDURE_FIRE rows"
+    );
+    assert_eq!(
+        *section_counts.get("TWIN_CRDT_STATUS").unwrap_or(&0),
+        16,
+        "expected 16 TWIN_CRDT_STATUS rows"
+    );
+    assert_eq!(
+        *section_counts.get("TWIN_CRDT_SEQ").unwrap_or(&0),
+        6,
+        "expected 6 TWIN_CRDT_SEQ rows"
+    );
+    assert_eq!(
+        *section_counts.get("RETENTION_GATE").unwrap_or(&0),
+        32,
+        "expected 32 RETENTION_GATE rows"
     );
 
     let lake = find_lake().expect("lake not found on PATH or ~/.elan/bin/lake; install elan to run Lean parity tests");
@@ -259,6 +440,20 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
         "MESH_MERGE|archived|superseded|false|false|true|apply",
         "TASK_FSM|open|done|true|false|err_extraction_required",
         "TASK_FSM|in_progress|done|true|false|err_extraction_required",
+        "TASK_CLAIM|in_progress|true|live|idempotent_same_session",
+        "TASK_CLAIM|in_progress|false|live|refuse_live_holder",
+        "TASK_CLAIM|in_progress|false|stale|takeover_stale_holder",
+        "SOVEREIGNTY_GATE|true|false|false|true|true|not_shareable",
+        "SOVEREIGNTY_GATE|true|true|true|true|true|forbidden_runtime_counter",
+        "IMPORT_PRECHECK|true|false|false|refuse_private_sovereign",
+        "PROCEDURE_FIRE|absent|true|live|two|refuse_untrusted",
+        "PROCEDURE_FIRE|local|false|lapsed|two|refuse_lapsed",
+        "PROCEDURE_FIRE|local|false|live|zero|refuse_spent",
+        "PROCEDURE_FIRE|local|false|live|two|fired_bounded",
+        "TWIN_CRDT_STATUS|blocked|in_progress|in_progress",
+        "TWIN_CRDT_SEQ|false|3|buffer_out_of_order",
+        "RETENTION_GATE|true|true|true|true|false|failed_worktree_moved",
+        "RETENTION_GATE|true|true|true|true|true|retained",
     ] {
         assert!(
             rust_lines.iter().any(|l| l == expected),
