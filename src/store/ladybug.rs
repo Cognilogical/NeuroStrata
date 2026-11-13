@@ -3050,6 +3050,20 @@ fn emit_write_shape_warning(namespace: &str, id: &str, warning: &WriteShapeWarni
 /// Edge-array metadata keys the namespace hygiene repair checks.
 const HYGIENE_EDGE_KEYS: [&str; 6] = ["governs", "related_to", "relates_to", "contained_by", "extracted_from", "depends_on"];
 
+/// The error a partially-completed repair returns. It carries the committed
+/// counts so the caller can report what landed while still refusing to mark
+/// the run complete.
+fn hygiene_partial_error(
+    namespace: &str,
+    shape: usize,
+    dangling: usize,
+    failed_chunks: usize,
+) -> anyhow::Error {
+    anyhow::anyhow!(
+        "hygiene repair for '{namespace}' completed partially: {shape} shape and {dangling} dangling updates committed, {failed_chunks} chunk(s) failed; the run is not complete"
+    )
+}
+
 /// What `repair_namespace_hygiene` needs to know about one row. Content is
 /// reduced to "is it blank", the only thing the repair asks of it.
 struct HygieneRow {
@@ -4558,10 +4572,28 @@ impl LadybugStore {
     /// turn and several lookups per row for every row (about 193 s on the same
     /// namespace). Readers share the
     /// writer's lock, so keep every turn short.
+    ///
+    /// # Partial success
+    ///
+    /// Each 25-row chunk is its own write turn. A failed chunk does not abort
+    /// the run: the chunks that committed keep their counts, the failure is
+    /// logged with those counts, and the run ends with `Err` carrying the
+    /// partial totals. A caller must not treat `Err` as "nothing happened":
+    /// use the counts in the message for reporting, and leave any completion
+    /// marker (the doctor's `last_run_version`) unchanged so the repair is
+    /// retried.
     pub async fn repair_namespace_hygiene(&self, namespace: &str) -> Result<(usize, usize)> {
         const PAGE: usize = 500;
+        self.repair_namespace_hygiene_with_page(namespace, PAGE).await
+    }
+
+    async fn repair_namespace_hygiene_with_page(
+        &self,
+        namespace: &str,
+        page_size: usize,
+    ) -> Result<(usize, usize)> {
         const RESOLVE_CHUNK: usize = 50;
-        const REPAIR_CHUNK: usize = 25;
+        anyhow::ensure!(page_size > 0, "hygiene repair page size must be positive");
         let namespace = namespace.to_string();
 
         // 1. Pages of rows, ordered by id.
@@ -4576,7 +4608,7 @@ impl LadybugStore {
                         "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id > '{}' RETURN m.id, m.memory_type, m.location, m.content, m.metadata ORDER BY m.id LIMIT {}",
                         escape_ladybug_string(&ns),
                         escape_ladybug_string(&after),
-                        PAGE
+                        page_size
                     );
                     let mut res = conn.query(&query)?;
                     let mut out = Vec::new();
@@ -4601,7 +4633,7 @@ impl LadybugStore {
                 .await?;
             let Some((tail, _)) = page.last() else { break };
             last = tail.id.clone();
-            let full = page.len() == PAGE;
+            let full = page.len() == page_size;
             for (row, archived) in page {
                 if archived {
                     continue;
@@ -4690,19 +4722,71 @@ impl LadybugStore {
         // the rows and everything they are planned from. Nothing planned
         // earlier is trusted at write time, so a row edited, or a target
         // published, since the read cannot be repaired from a stale copy.
-        let mut shape_updates = 0usize;
-        let mut dangling_updates = 0usize;
-        for chunk in candidates.chunks(REPAIR_CHUNK) {
-            let (ns_w, ids) = (namespace.clone(), chunk.to_vec());
-            let (shape, dangling) = self
-                .write_with_deadline("repairing namespace hygiene", move |conn| {
-                    hygiene_repair_chunk(conn, &ns_w, &ids)
-                })
-                .await?;
-            shape_updates += shape;
-            dangling_updates += dangling;
+        let (shape_updates, dangling_updates, failed_chunks) =
+            self.run_hygiene_chunks(&namespace, &candidates).await?;
+        if failed_chunks > 0 {
+            return Err(hygiene_partial_error(
+                &namespace,
+                shape_updates,
+                dangling_updates,
+                failed_chunks,
+            ));
         }
         Ok((shape_updates, dangling_updates))
+    }
+
+    /// Run the candidate chunks, one write turn each, continuing past a failed
+    /// chunk. Returns `(shape_updates, dangling_updates, failed_chunks)`.
+    ///
+    /// A chunk failure is never swallowed: the caller reports the partial
+    /// counts and refuses to mark the repair complete, so the next run retries
+    /// the rows the failed chunk still needs.
+    async fn run_hygiene_chunks(
+        &self,
+        namespace: &str,
+        ids: &[String],
+    ) -> Result<(usize, usize, usize)> {
+        self.run_hygiene_chunks_with(namespace, ids, |ns, chunk| async move {
+            self.write_with_deadline("repairing namespace hygiene", move |conn| {
+                hygiene_repair_chunk(conn, &ns, &chunk)
+            })
+            .await
+        })
+        .await
+    }
+
+    /// The chunk-runner seam. Production passes the real write-turn closure;
+    /// tests inject a failing chunk without a broken engine.
+    async fn run_hygiene_chunks_with<F, Fut>(
+        &self,
+        namespace: &str,
+        ids: &[String],
+        mut run: F,
+    ) -> Result<(usize, usize, usize)>
+    where
+        F: FnMut(String, Vec<String>) -> Fut,
+        Fut: std::future::Future<Output = Result<(usize, usize)>>,
+    {
+        const REPAIR_CHUNK: usize = 25;
+        let total = ids.chunks(REPAIR_CHUNK).count();
+        let (mut shape, mut dangling, mut failed) = (0usize, 0usize, 0usize);
+        for (index, chunk) in ids.chunks(REPAIR_CHUNK).enumerate() {
+            match run(namespace.to_string(), chunk.to_vec()).await {
+                Ok((sh, da)) => {
+                    shape += sh;
+                    dangling += da;
+                }
+                Err(e) => {
+                    failed += 1;
+                    tracing::warn!(
+                        "hygiene repair chunk {}/{} failed for '{namespace}': {e}; keeping {shape} shape / {dangling} dangling updates from earlier chunks",
+                        index + 1,
+                        total
+                    );
+                }
+            }
+        }
+        Ok((shape, dangling, failed))
     }
 
     /// Advisory shape warnings for every row in the namespace (F18). Never blocks.
@@ -16969,6 +17053,92 @@ eurostrata\src\daemon.rs",
         let row = rows.iter().find(|r| r.id == "declarer").expect("row survives");
         assert_eq!(row.payload.metadata["related_to"], json!(["target-row-al"]), "one id starts with it");
         assert_eq!(row.payload.metadata["archived_refs"], json!(["target-row"]), "two ids start with it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// G1: a failed chunk must not discard the counts from chunks that
+    /// committed, and the run must keep going.
+    #[tokio::test]
+    async fn chunk_failure_keeps_prior_counts() {
+        let dir = std::env::temp_dir().join(format!("ns-chunk-fail-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("init");
+        let ids: Vec<String> = (0..60).map(|i| format!("row-{i:02}")).collect();
+        let calls = std::cell::Cell::new(0usize);
+        let (shape, dangling, failed) = store
+            .run_hygiene_chunks_with("probe", &ids, |_ns, chunk| {
+                let index = calls.get();
+                calls.set(index + 1);
+                async move {
+                    if index == 1 {
+                        Err(anyhow::anyhow!("injected chunk failure"))
+                    } else {
+                        Ok((chunk.len(), 1usize))
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            (shape, dangling, failed),
+            (35, 2, 1),
+            "25-row chunks: chunk 2 fails, chunks 1 and 3 keep their counts"
+        );
+    }
+
+    /// G1: the public result reports the committed totals while still
+    /// returning an error, so the caller can log and retry.
+    #[test]
+    fn repair_partial_counts_are_reported() {
+        let message = hygiene_partial_error("probe", 7, 3, 2).to_string();
+        assert!(
+            message.contains("7 shape and 3 dangling updates committed"),
+            "{message}"
+        );
+        assert!(message.contains("2 chunk(s) failed"), "{message}");
+        assert!(message.contains("not complete"), "{message}");
+    }
+
+    /// G4: the candidate pass pages by id. Pin the cursor with a page smaller
+    /// than the namespace and a row that needs repair after the first page.
+    #[tokio::test]
+    async fn hygiene_paging_pin() {
+        let dir = std::env::temp_dir().join(format!("ns-page-pin-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("init");
+        let v = vec![0.1, 0.2, 0.3, 0.4];
+        for id in ["a", "b", "c", "d"] {
+            store
+                .upsert("probe", id, v.clone(), retired_test_payload("fact", "agent", json!({})))
+                .await
+                .unwrap();
+        }
+        store
+            .upsert(
+                "probe",
+                "z-needs-repair",
+                v.clone(),
+                retired_test_payload("rule", "agent", json!({"source": "N/A"})),
+            )
+            .await
+            .unwrap();
+
+        let (shape, _) = store
+            .repair_namespace_hygiene_with_page("probe", 2)
+            .await
+            .unwrap();
+        assert!(shape >= 1, "the page cursor skipped the row after page one");
+
+        let rows = store.list_memories("probe", None, None).await.unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r.id == "z-needs-repair")
+            .expect("row survives");
+        assert_eq!(
+            row.payload.metadata.get("source"),
+            Some(&json!("legacy-rule")),
+            "the last-page row was repaired"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
