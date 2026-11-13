@@ -164,6 +164,22 @@ fn path_key(p: &str) -> String {
     }
 }
 
+/// Whether two paths name the same file: equal [`path_key`]s, or, when the
+/// spellings differ but both exist, equal canonical forms. `path_key` folds
+/// ASCII case only, so this catches a case-only rename with non-ASCII letters
+/// (`Pröj` vs `PRÖJ`) on a case-insensitive volume, and 8.3 short names.
+/// This duplicates the comparison rule of a shared paths module
+/// (`relative_to_on_disk`) until one lands upstream; move it there then.
+fn same_path_on_disk(a: &str, b: &str) -> bool {
+    if path_key(a) == path_key(b) {
+        return true;
+    }
+    match (dunce::canonicalize(a), dunce::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// Whether a hook's runner path may be pointed at the installer's runner:
 /// it already names the installer's own runner (in any spelling), or nothing
 /// exists there. A runner that exists anywhere else is someone's own install,
@@ -178,7 +194,7 @@ fn runner_is_replaceable(old_path: &str, project_root: &Path, abs_runner: &str) 
     }
     // A relative runner is resolved by the hook's cwd, the project root.
     let candidate = project_root.join(old_path);
-    if path_key(&candidate.to_string_lossy()) == path_key(abs_runner) {
+    if same_path_on_disk(&candidate.to_string_lossy(), abs_runner) {
         return true;
     }
     // Only a definite "not found" counts as missing; an unreadable path is
@@ -1022,6 +1038,36 @@ mod tests {
         let commands = hook_commands(&cfg);
         assert_eq!(commands.len(), 3, "{commands:?}");
         assert!(commands.iter().all(|c| *c == want), "own verbatim runner not repaired: {commands:?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn repairs_the_installers_own_runner_spelled_with_other_non_ascii_case() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project = tmp.path().join("Pröj");
+        std::fs::create_dir_all(project.join(".claude")).expect("create .claude");
+        let report = auto_install_detected_plugins(&project, "TestProj", Some("claude"));
+        let abs_runner = report["installed_plugins"][0]["cli_hook_runner"]
+            .as_str()
+            .expect("cli_hook_runner")
+            .to_string();
+        assert!(abs_runner.contains("Pröj"), "runner under the project: {abs_runner}");
+        // Same file on a case-insensitive volume, but not equal after ASCII
+        // case folding.
+        let other_case = format!(r"\\?\{}", abs_runner.replace("Pröj", "PRÖJ"));
+        assert!(Path::new(&other_case).exists(), "volume is case-insensitive: {other_case}");
+        let cfg = project.join(".claude/settings.local.json");
+        std::fs::write(
+            &cfg,
+            serde_json::to_string_pretty(&settings_with_runner(&other_case)).unwrap(),
+        )
+        .expect("write settings");
+
+        let _ = auto_install_detected_plugins(&project, "TestProj", Some("claude"));
+        let want = format!("NEUROSTRATA_NAMESPACE=TestProj node \"{abs_runner}\"");
+        let commands = hook_commands(&cfg);
+        assert_eq!(commands.len(), 3, "{commands:?}");
+        assert!(commands.iter().all(|c| *c == want), "own runner in other case not repaired: {commands:?}");
     }
 
     #[test]
