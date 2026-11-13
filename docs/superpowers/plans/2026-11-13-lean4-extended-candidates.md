@@ -13,7 +13,7 @@
 - `src/formal_kernel.rs` MUST remain zero-dependency (`core`/`std` primitives only) and compile standalone via `rustc -D warnings --edition=2021 --crate-type=lib src/formal_kernel.rs` (`bash proofs/scripts/extract-aeneas.sh`).
 - Zero external Lean dependencies (`Init` stdlib only, no Mathlib).
 - Zero `sorry` or `axiom` declarations anywhere in `proofs/`.
-- `lake --dir proofs exe neurostrata-proofs` and `tests/lean_parity_test.rs` must match 1-for-1 across all 392 truth-table rows (`211` existing + `181` new = `392`).
+- `lake --dir proofs exe neurostrata-proofs` and `tests/lean_parity_test.rs` must match 1-for-1 across all 389 truth-table rows (`211` existing + `178` new = `389`).
 
 ---
 
@@ -405,7 +405,7 @@
 
 ---
 
-### Task 3: Extend `proofs/Main.lean` and `tests/lean_parity_test.rs` to 392-Row Truth-Table Parity
+### Task 3: Extend `proofs/Main.lean` and `tests/lean_parity_test.rs` to 389-Row Truth-Table Parity
 
 **Files:**
 - Modify: `proofs/Main.lean`
