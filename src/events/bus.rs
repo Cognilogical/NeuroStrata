@@ -475,6 +475,43 @@ async fn dispatch(
                         "subscriber abandoned after {}ms timeout",
                         SUBSCRIBER_TIMEOUT.as_millis()
                     );
+                    if sub.retry_on_timeout() {
+                        // The subscriber's flip outlives a transient stall:
+                        // one bounded recovery attempt at 4x the fast-path
+                        // budget, after the timeout metrics above have
+                        // already recorded the truth of the first attempt.
+                        let retry = tokio::time::timeout(
+                            SUBSCRIBER_TIMEOUT * 4,
+                            AssertUnwindSafe(sub.handle(&event, &RecursionToken::new(), &ctx))
+                                .catch_unwind(),
+                        )
+                        .await;
+                        match retry {
+                            Ok(Ok(Ok(()))) => {}
+                            Ok(Ok(Err(err))) => {
+                                metrics.subscriber_failures.fetch_add(1, Ordering::Relaxed);
+                                tracing::warn!(
+                                    subscriber = sub.name(),
+                                    "subscriber retry after timeout failed: {err:#}"
+                                );
+                            }
+                            Ok(Err(payload)) => {
+                                metrics.subscriber_panics.fetch_add(1, Ordering::Relaxed);
+                                let text = panic_text(payload.as_ref());
+                                tracing::warn!(
+                                    subscriber = sub.name(),
+                                    "subscriber panicked on retry after timeout: {text}"
+                                );
+                            }
+                            Err(_) => {
+                                tracing::warn!(
+                                    subscriber = sub.name(),
+                                    "subscriber retry after timeout also ran past {}ms",
+                                    (SUBSCRIBER_TIMEOUT * 4).as_millis()
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -489,7 +526,7 @@ async fn dispatch(
 mod tests {
     use super::*;
     use crate::events::SubscriberError;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     /// Counts `Created` pulses. The plainest possible proof that the
     /// dispatcher invoked a subscriber, and how many times.
@@ -769,6 +806,75 @@ mod tests {
             tokio::time::sleep(self.delay).await;
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn retry_on_timeout_subscriber_lands_flip_after_initial_timeout() {
+        /// Sleeps 300ms on its first invocation -- long enough to be
+        /// abandoned by the dispatcher's fast-path timeout -- and succeeds in
+        /// 10ms on the retry. The first attempt's `handle` is cancelled, not
+        /// resumed, so the state flip only lands if the dispatcher retries.
+        struct SlowFirstFlip {
+            calls: Arc<AtomicUsize>,
+            flipped: Arc<AtomicBool>,
+        }
+
+        #[async_trait]
+        impl MemorySubscriber for SlowFirstFlip {
+            fn name(&self) -> &'static str {
+                "slow_first_flip"
+            }
+
+            fn retry_on_timeout(&self) -> bool {
+                true
+            }
+
+            async fn handle(
+                &self,
+                _event: &ThalamicPulse,
+                _token: &RecursionToken,
+                _ctx: &SubscriberContext<'_>,
+            ) -> Result<(), SubscriberError> {
+                let call = self.calls.fetch_add(1, Ordering::AcqRel);
+                if call == 0 {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                } else {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    self.flipped.store(true, Ordering::Release);
+                }
+                Ok(())
+            }
+        }
+
+        let bus = ThalamicBus::new(16);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let flipped = Arc::new(AtomicBool::new(false));
+        bus.register(Box::new(SlowFirstFlip {
+            calls: calls.clone(),
+            flipped: flipped.clone(),
+        }));
+        bus.emit(
+            ThalamicPulse::Created {
+                id: "x".into(),
+                namespace: "n".into(),
+                kind: "task".into(),
+            },
+            &RecursionToken::root(),
+        );
+        // 250ms fast-path abandon + the retry's 10ms + scheduling slack.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let m = bus.metrics();
+        assert_eq!(
+            m.subscriber_timeouts, 1,
+            "the first attempt is still counted and published as a timeout: {m:?}"
+        );
+        assert_eq!(m.dispatcher_handled, 1, "one pulse, one dispatch: {m:?}");
+        assert!(
+            flipped.load(Ordering::Acquire),
+            "the retry under the extended budget landed the flip"
+        );
+        assert_eq!(calls.load(Ordering::Acquire), 2, "first attempt plus exactly one retry");
     }
 
     #[tokio::test]

@@ -8772,12 +8772,11 @@ mod tests {
         crate::daemon::credential_file_test_lock()
     }
 
-    /// The real daemon token path. `crate::daemon::token_config_dir` is
-    /// private, so this mirrors its construction -- the same way
-    /// daemon.rs's own tests locate the file.
+    /// The real daemon token path. Delegates to the daemon module's single
+    /// source of truth: `NEUROSTRATA_TOKEN_DIR` and, under `cargo test`, a
+    /// process-scoped temp directory, instead of the operator's home config.
     fn daemon_token_path() -> std::path::PathBuf {
-        let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
-        home.join(".config").join("neurostrata").join("daemon.token")
+        crate::daemon::token_path()
     }
 
     /// Writes a token file atomically at 0600 on Unix: the bytes go to

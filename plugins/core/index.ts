@@ -1505,6 +1505,49 @@ export function getTrackingState() {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// Daemon memory advisory (#140)
+// ──────────────────────────────────────────────────────────────────────
+
+/** Structured marker the daemon writes on its error/diagnostic channel when
+ *  it reports buffer-pool / RSS pressure. Memory payloads and tool-result
+ *  rows never carry it, so matching it can never misfire on user content. */
+export const DAEMON_MEMORY_ADVICE_MARKER = "NEUROSTRATA_ADVICE[daemon_memory]";
+
+/** One advisory per session per window: repeated pressure is one message,
+ *  not one per errored request. */
+const ADVISORY_THROTTLE_MS = 10 * 60 * 1000;
+
+let advisoryLastShown = 0;
+
+export function resetAdvisoryStateForTesting(): void {
+  advisoryLastShown = 0;
+}
+
+/** Pull the daemon memory advisory out of the error/diagnostic channel.
+ * Only text carrying the marker is inspected — memory payloads and result
+ * rows are never matched, so a memory that merely discusses
+ * `NEUROSTRATA_BUFFER_POOL_SIZE` cannot synthesize an advisory. Returns the
+ * guidance string once per 10-minute window, or `null` when already shown
+ * or absent. */
+export function extractDaemonMemoryAdvisory(
+  errorChannelText: string | null | undefined,
+  nowMs: number = Date.now(),
+): string | null {
+  if (!errorChannelText || !errorChannelText.includes(DAEMON_MEMORY_ADVICE_MARKER)) {
+    return null;
+  }
+  if (advisoryLastShown > 0 && nowMs - advisoryLastShown < ADVISORY_THROTTLE_MS) {
+    return null;
+  }
+  advisoryLastShown = nowMs;
+  return [
+    "[NeuroStrata — DAEMON MEMORY ADVISORY]",
+    "The daemon reports buffer-pool or RSS pressure.",
+    "Raise NEUROSTRATA_BUFFER_POOL_SIZE (or the daemon's configured buffer pool) and restart the daemon; repeated advisories are suppressed for 10 minutes.",
+  ].join(" ");
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Epoch-tracked session hooks (context / compaction)
 // ──────────────────────────────────────────────────────────────────────
 

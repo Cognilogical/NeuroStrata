@@ -131,6 +131,12 @@ pub trait MemorySubscriber: Send + Sync {
         token: &RecursionToken,
         ctx: &SubscriberContext<'_>,
     ) -> Result<(), SubscriberError>;
+
+    /// Whether the dispatcher should retry this subscriber once with a
+    /// recovery timeout when the 250ms fast-path budget expires (#168).
+    fn retry_on_timeout(&self) -> bool {
+        false
+    }
 }
 
 /// What the bus lost or had to interrupt, published on the backpressure watch

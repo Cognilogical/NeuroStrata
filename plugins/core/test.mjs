@@ -127,6 +127,9 @@ import {
   postTurnCandidates,
   extractConceptualBridges,
   persistConceptualBridges,
+  DAEMON_MEMORY_ADVICE_MARKER,
+  resetAdvisoryStateForTesting,
+  extractDaemonMemoryAdvisory,
 } from "./dist/index.js";
 
 // ──────────────────────────────────────────────────────────────────────
@@ -2538,5 +2541,46 @@ describe("Task 1.1: execute.after V2 result mutation (via hook registration)", (
       server.close();
       resetClientForTesting();
     }
+  });
+});
+
+describe("daemon memory advisory (#140)", () => {
+  beforeEach(() => {
+    resetAdvisoryStateForTesting();
+  });
+
+  it("extracts the advisory from an error channel carrying the marker and throttles repeats for 10 minutes", () => {
+    const text = `${DAEMON_MEMORY_ADVICE_MARKER} buffer pool exhausted; daemon RSS at 90%`;
+    const showAt = 1_000_000;
+    const first = extractDaemonMemoryAdvisory(text, showAt);
+    assert.notEqual(first, null, "a marked error channel yields the advisory");
+    assert.match(first, /DAEMON MEMORY ADVISORY/);
+    assert.match(first, /NEUROSTRATA_BUFFER_POOL_SIZE/);
+
+    const withinWindow = extractDaemonMemoryAdvisory(text, showAt + 9 * 60 * 1000);
+    assert.equal(withinWindow, null, "repeats inside the 10-minute window are throttled");
+
+    const afterWindow = extractDaemonMemoryAdvisory(text, showAt + 11 * 60 * 1000);
+    assert.notEqual(afterWindow, null, "after the window the advisory shows again");
+  });
+
+  it("ignores memory payload content without the marker", () => {
+    resetAdvisoryStateForTesting();
+    // Mentioning the knob, or the word buffer pool, is not the daemon's advisory.
+    assert.equal(extractDaemonMemoryAdvisory("NEUROSTRATA_BUFFER_POOL_SIZE is too small for my data", 5_000_000), null);
+    assert.equal(extractDaemonMemoryAdvisory("buffer pool pressure described in a memory", 6_000_000), null);
+    assert.equal(extractDaemonMemoryAdvisory(null), null);
+    assert.equal(extractDaemonMemoryAdvisory(undefined), null);
+    assert.equal(extractDaemonMemoryAdvisory(""), null);
+  });
+
+  it("resetAdvisoryStateForTesting clears a still-live throttle window", () => {
+    resetAdvisoryStateForTesting();
+    const text = `${DAEMON_MEMORY_ADVICE_MARKER} buffer pool exhausted`;
+    const first = extractDaemonMemoryAdvisory(text, 10_000_000);
+    assert.notEqual(first, null);
+    assert.equal(extractDaemonMemoryAdvisory(text, 10_000_001), null);
+    resetAdvisoryStateForTesting();
+    assert.notEqual(extractDaemonMemoryAdvisory(text, 10_000_002), null);
   });
 });

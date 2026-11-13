@@ -62,6 +62,14 @@ impl MemorySubscriber for ExportFreshnessDirty {
         "export_freshness_dirty"
     }
 
+    /// The flip is the bookkeeping losing its signal, not the write behind it:
+    /// a transient >250ms stall must not leave the committed export reported
+    /// clean. The dispatcher retries once with an extended budget before it
+    /// writes the timeout off (#168).
+    fn retry_on_timeout(&self) -> bool {
+        true
+    }
+
     async fn handle(
         &self,
         event: &ThalamicPulse,

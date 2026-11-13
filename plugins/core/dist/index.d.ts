@@ -41,19 +41,19 @@ export type ResolvedConfig = PluginConfig;
  *  3. discoverProjectNamespace(cwd)
  * Never falls back to a hardcoded "NeuroStrata".
  */
-export declare function resolveConfig(pluginConfig?: unknown, cwd?: any): PluginConfig;
+export declare function resolveConfig(pluginConfig?: unknown, cwd?: string): PluginConfig;
 /**
  * Walk up from resolve(startDir) to the filesystem root looking for `.git`
  * (dir or file) or `.NeuroStrata`; return the directory containing it, or
  * resolve(startDir) if none found.
  */
-export declare function findProjectRoot(startDir?: any): string;
+export declare function findProjectRoot(startDir?: string): string;
 /**
  * 1. Walk up to findProjectRoot(startDir) checking <dir>/.NeuroStrata/session_queries.json;
  *    if it parses as JSON with a non-empty string .namespace, return it trimmed.
  * 2. Otherwise return basename(findProjectRoot(startDir)) || "default".
  */
-export declare function discoverProjectNamespace(startDir?: any): string;
+export declare function discoverProjectNamespace(startDir?: string): string;
 /**
  * Resolve the project root from an OpenCode V2 host context, falling back
  * through ctx fields to process.cwd(). Priority:
@@ -300,6 +300,18 @@ export declare function getTrackingState(): {
     activeSessionId: string | null;
     mutationsSinceNote: number;
 };
+/** Structured marker the daemon writes on its error/diagnostic channel when
+ *  it reports buffer-pool / RSS pressure. Memory payloads and tool-result
+ *  rows never carry it, so matching it can never misfire on user content. */
+export declare const DAEMON_MEMORY_ADVICE_MARKER = "NEUROSTRATA_ADVICE[daemon_memory]";
+export declare function resetAdvisoryStateForTesting(): void;
+/** Pull the daemon memory advisory out of the error/diagnostic channel.
+ * Only text carrying the marker is inspected — memory payloads and result
+ * rows are never matched, so a memory that merely discusses
+ * `NEUROSTRATA_BUFFER_POOL_SIZE` cannot synthesize an advisory. Returns the
+ * guidance string once per 10-minute window, or `null` when already shown
+ * or absent. */
+export declare function extractDaemonMemoryAdvisory(errorChannelText: string | null | undefined, nowMs?: number): string | null;
 export interface SessionEpochState {
     epoch: number;
     baselineInjectedEpoch: number;
