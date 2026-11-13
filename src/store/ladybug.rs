@@ -1213,6 +1213,15 @@ pub struct LadybugStore {
     /// rebuilt from the database on the next query; mutations are no-ops until
     /// then because the database is the source of truth.
     lexical_loaded: Arc<std::sync::RwLock<std::collections::BTreeSet<String>>>,
+    /// Bumped whenever the lexical view is invalidated by a pointer flip or
+    /// abort. A load that fetched documents before the bump must not install
+    /// them after it, or it would resurrect the superseded generation and
+    /// mark the namespace loaded.
+    lexical_epoch: std::sync::atomic::AtomicU64,
+    /// Serialises Tantivy snapshot installation with pointer-change refresh,
+    /// so a rebuild that fetched the pre-publish rows cannot replace the
+    /// post-publish namespace after the refresh has installed it.
+    lexical_refresh_lock: tokio::sync::Mutex<()>,
     /// In-memory ring-buffer & rolling aggregate time-series metrics store.
     pub metrics: Arc<crate::time_series::TimeSeriesStore>,
     /// Optional disk-backed Tantivy full-text index, opened lazily.
@@ -2170,6 +2179,8 @@ impl LadybugStore {
             mention_symbol_ids: Arc::new(tokio::sync::RwLock::new(Default::default())),
             lexical: Arc::new(std::sync::RwLock::new(crate::fts::LexicalIndex::new())),
             lexical_loaded: Arc::new(std::sync::RwLock::new(std::collections::BTreeSet::new())),
+            lexical_epoch: std::sync::atomic::AtomicU64::new(0),
+            lexical_refresh_lock: tokio::sync::Mutex::new(()),
             metrics: Arc::new(
                 crate::time_series::TimeSeriesStore::new(
                     crate::time_series::SeriesConfig::default(),
@@ -3652,7 +3663,9 @@ pub(crate) fn active_generations_by_source_of(
 /// - Unscoped rows (`split_scoped_id == None`) — normative `rule`/`fact`/
 ///   `decision`/`procedure` and legacy AST ids — are always kept.
 /// - Scoped rows are kept only against their owning source's active
-///   generation; `doc_section` rows fall back to the namespace's `docs`
+///   generation. The source is `metadata.source_key`, else the ingest
+///   identity's `worktree_id`; a source with no pointer falls back to the
+///   namespace set. `doc_section` rows fall back to the namespace's `docs`
 ///   pointer (or any active doc generation when no pointer exists).
 /// - Deduplication of equal `bare_id` across active generations (keep highest
 ///   `gen`) is the caller's job; this predicate is stateless per row.
@@ -3661,6 +3674,26 @@ pub(crate) fn is_active_scoped_row(
     namespace: &str,
     memory_type: &str,
     metadata: &Value,
+    by_source: &HashMap<String, i64>,
+    active_set: &std::collections::HashSet<i64>,
+    max_non_doc_gen: Option<i64>,
+) -> Option<String> {
+    is_active_scoped_row_with_source(
+        id,
+        namespace,
+        memory_type,
+        row_source_key(metadata),
+        by_source,
+        active_set,
+        max_non_doc_gen,
+    )
+}
+
+fn is_active_scoped_row_with_source(
+    id: &str,
+    namespace: &str,
+    memory_type: &str,
+    source_key: Option<&str>,
     by_source: &HashMap<String, i64>,
     active_set: &std::collections::HashSet<i64>,
     _max_non_doc_gen: Option<i64>,
@@ -3677,9 +3710,15 @@ pub(crate) fn is_active_scoped_row(
         // No generation table entries yet: nothing is superseded.
         return Some(id.to_string());
     }
-    let keep = if let Some(source_key) = metadata.get("source_key").and_then(|v| v.as_str()) {
-        // Explicit source pointer: the row must equal that source's active gen.
-        by_source.get(source_key).is_some_and(|&active| active == gen_i)
+    let keep = if let Some(source_key) = source_key {
+        // Explicit source pointer: the row must equal that source's active
+        // generation. A source with no pointer (a pre-source-split store
+        // whose single namespace pointer is keyed by the empty source) falls
+        // back to the namespace set, exactly as a row without a stamp does.
+        match by_source.get(source_key) {
+            Some(&active) => active == gen_i,
+            None => active_set.contains(&gen_i),
+        }
     } else if memory_type == "doc_section" {
         // `doc_section` rows without an explicit `source_key`: match the docs
         // pointer when present, otherwise any active doc generation.
@@ -3715,8 +3754,61 @@ impl ActiveGenerations {
     /// Same rule as `is_active_scoped_row`: false for a row of a superseded
     /// generation or another namespace.
     pub(crate) fn reaches(&self, id: &str, namespace: &str, memory_type: &str, metadata: &Value) -> bool {
-        is_active_scoped_row(id, namespace, memory_type, metadata, &self.by_source, &self.active_set, self.max_code_gen).is_some()
+        self.reaches_source(id, namespace, memory_type, row_source_key(metadata))
     }
+
+    /// The predicate with the row's source already resolved. Lexical documents
+    /// carry the source (from the ingest identity) instead of full metadata.
+    pub(crate) fn reaches_source(
+        &self,
+        id: &str,
+        namespace: &str,
+        memory_type: &str,
+        source_key: Option<&str>,
+    ) -> bool {
+        is_active_scoped_row_with_source(
+            id,
+            namespace,
+            memory_type,
+            source_key,
+            &self.by_source,
+            &self.active_set,
+            self.max_code_gen,
+        )
+        .is_some()
+    }
+
+    /// No pointer rows at all: `is_active_scoped_row` keeps every scoped row
+    /// (nothing can be superseded yet), so no query-level filter may run.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.by_source.is_empty() && self.active_set.is_empty()
+    }
+
+    /// The namespace's active generations as the `u64` values the Tantivy
+    /// generation field stores. Used as the query-level superset filter.
+    pub(crate) fn active_generations_u64(&self) -> HashSet<u64> {
+        self.active_set
+            .iter()
+            .filter(|&&generation| generation > 0)
+            .map(|&generation| generation as u64)
+            .collect()
+    }
+}
+
+/// The source a row belongs to, for the generation predicate: the explicit
+/// `source_key` when a writer set one, else the ingest identity's worktree
+/// (the same value `parser::ingest::source_key_for` stores in the pointer
+/// table), else `None` (the namespace-set fallback).
+pub(crate) fn row_source_key(metadata: &Value) -> Option<&str> {
+    metadata
+        .get("source_key")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            metadata
+                .get("source_identity")
+                .and_then(|v| v.get("worktree_id"))
+                .and_then(|v| v.as_str())
+        })
 }
 
 /// Normative memory types that the recall path reserves result slots for.
@@ -4703,7 +4795,11 @@ impl LadybugStore {
             if v.is_null() { None } else { Some(v.as_i64().unwrap_or(0)) }
         });
         doc.archived = is_archived(metadata);
-        doc.user_id = payload.user_id.clone();
+        // PAR-02 B4 owner parity: the vector route resolves the owner as
+        // user_id, then metadata.user_id / mesh / lifecycle. Using the raw
+        // payload field here made a row with an empty user_id and a metadata
+        // owner unowned on the lexical route only.
+        doc.user_id = crate::rebac::extract_resource_owner(&payload.user_id, metadata);
         // Canonical ACL extraction (string and {principal, role} entries, with
         // the fail-closed sentinel for wholly malformed arrays). A string-only
         // parse here made object-only ACLs look unrestricted to lexical search.
@@ -4712,6 +4808,13 @@ impl LadybugStore {
         doc.structural = STRUCTURAL_MEMORY_TYPES.contains(&payload.memory_type.as_str());
         doc.registry = crate::registry::is_registry_row(metadata);
         doc.conflicting = is_mesh_conflicting(metadata);
+        // #149: the id carries the staged generation; the source identity
+        // carries the worktree whose pointer governs it. Both are absent on
+        // legacy/unscoped rows, which stay visible.
+        doc.generation = split_scoped_id(id)
+            .map(|(_, generation, _)| generation)
+            .unwrap_or(0);
+        doc.source_key = row_source_key(metadata).unwrap_or_default().to_string();
         doc
     }
 
@@ -4755,6 +4858,17 @@ impl LadybugStore {
             if let Err(e) = idx.upsert_memory(&doc.namespace, &doc.id, &payload) {
                 tracing::warn!("tantivy upsert_memory failed for {}:{}: {e}", doc.namespace, doc.id);
             }
+        }
+        // A scoped write can stage an unpublished row or update an active one
+        // (archive, metadata, content). Rather than resolving the pointer on
+        // every ingest write, drop the in-memory partition: the next read
+        // reloads the active view from the database. Staged rows therefore
+        // never rank, and an active row's new payload is picked up. The
+        // Tantivy copy is written either way; its query filter runs before
+        // TopDocs collects.
+        if doc.generation != 0 {
+            self.invalidate_inhouse_lexical(&doc.namespace);
+            return;
         }
         let loaded = self
             .lexical_loaded
@@ -4818,50 +4932,85 @@ impl LadybugStore {
             return Ok(());
         }
 
-        let namespace_owned = namespace.to_string();
-        let docs = self
-            .with_conn(move |conn| {
-                let safe_ns = escape_ladybug_string(&namespace_owned);
-                let query = format!(
-                    "MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, m.content, m.user_id, m.memory_type, m.location, m.metadata",
-                    safe_ns
-                );
-                let rows = conn.query(&query)?;
-                let mut docs = Vec::new();
-                for row in rows {
-                    let id: String = format!("{}", row[0]);
-                    let content: String = format!("{}", row[1]);
-                    let user_id: String = format!("{}", row[2]);
-                    let memory_type: String = format!("{}", row[3]);
-                    let location: String = format!("{}", row[4]);
-                    let metadata_str: String = format!("{}", row[5]);
-                    let metadata: Value =
-                        parse_metadata_or_warn(&metadata_str, "metadata");
-                    let payload = MemoryPayload {
-                        content,
-                        user_id,
-                        memory_type,
-                        agent_name: None,
-                        location,
-                        location_lines: String::new(),
-                        metadata,
-                    };
-                    docs.push(Self::lexical_doc(&namespace_owned, &id, &payload));
-                }
-                Ok(docs)
-            })
-            .await?;
+        // A publish/abort can land while the fetch is in flight. The epoch is
+        // bumped before the cache is cleared, and re-checked under the index
+        // lock, so a load that raced an invalidation cannot install the
+        // superseded generation nor mark the namespace loaded.
+        for _ in 0..2 {
+            let epoch = self
+                .lexical_epoch
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let namespace_owned = namespace.to_string();
+            let docs = self
+                .with_conn(move |conn| {
+                    let safe_ns = escape_ladybug_string(&namespace_owned);
+                    let query = format!(
+                        "MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, m.content, m.user_id, m.memory_type, m.location, m.metadata",
+                        safe_ns
+                    );
+                    let rows = conn.query(&query)?;
+                    // #149: load only rows the active pointers still reach.
+                    let active = ActiveGenerations::read(conn, &namespace_owned);
+                    let mut docs = Vec::new();
+                    for row in rows {
+                        let id: String = format!("{}", row[0]);
+                        let content: String = format!("{}", row[1]);
+                        let user_id: String = format!("{}", row[2]);
+                        let memory_type: String = format!("{}", row[3]);
+                        let location: String = format!("{}", row[4]);
+                        let metadata_str: String = format!("{}", row[5]);
+                        let metadata: Value =
+                            parse_metadata_or_warn(&metadata_str, "metadata");
+                        let payload = MemoryPayload {
+                            content,
+                            user_id,
+                            memory_type,
+                            agent_name: None,
+                            location,
+                            location_lines: String::new(),
+                            metadata,
+                        };
+                        let doc = Self::lexical_doc(&namespace_owned, &id, &payload);
+                        let source =
+                            (!doc.source_key.is_empty()).then_some(doc.source_key.as_str());
+                        if !active.reaches_source(
+                            &doc.id,
+                            &namespace_owned,
+                            &doc.memory_type,
+                            source,
+                        ) {
+                            continue;
+                        }
+                        docs.push(doc);
+                    }
+                    Ok(docs)
+                })
+                .await?;
 
-        {
-            let mut index = self.lexical.write().unwrap_or_else(|e| e.into_inner());
-            for doc in docs {
-                index.add(doc);
+            {
+                let mut index = self.lexical.write().unwrap_or_else(|e| e.into_inner());
+                if self
+                    .lexical_epoch
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    != epoch
+                {
+                    // Invalidated mid-load: fetch the active view again.
+                    continue;
+                }
+                for doc in docs {
+                    index.add(doc);
+                }
+                self.lexical_loaded
+                    .write()
+                    .expect("lexical loaded lock")
+                    .insert(namespace.to_string());
             }
+            return Ok(());
         }
-        self.lexical_loaded
-            .write()
-            .expect("lexical loaded lock")
-            .insert(namespace.to_string());
+
+        // Two invalidations in a row: leave the partition unloaded so the next
+        // read retries; this call degrades to "no in-house hits", never stale
+        // ones.
         Ok(())
     }
 
@@ -4904,6 +5053,18 @@ impl LadybugStore {
 
     /// Rebuild the disk-backed Tantivy lexical index from stored Memory rows.
     pub async fn rebuild_tantivy_lexical(&self, namespace: Option<&str>) -> Result<(usize, String)> {
+        let _guard = self.lexical_refresh_lock.lock().await;
+        self.rebuild_tantivy_lexical_locked(namespace).await
+    }
+
+    /// The rebuild body. Callers must hold `lexical_refresh_lock`: it
+    /// serialises the fetch/install with `publish_generation`'s refresh, so a
+    /// rebuild that read the pre-publish rows cannot replace the namespace
+    /// after the refresh installed the new generation.
+    async fn rebuild_tantivy_lexical_locked(
+        &self,
+        namespace: Option<&str>,
+    ) -> Result<(usize, String)> {
         self.init("default").await?;
         let ns_opt = namespace.map(|s| s.to_string());
         let rows_data = self
@@ -4917,6 +5078,9 @@ impl LadybugStore {
                 };
                 let rows = conn.query(&query)?;
                 let mut out = Vec::new();
+                // #149: index only rows the active pointers still reach. The
+                // snapshot is per namespace; a whole-store rebuild reuses it.
+                let mut snapshots: HashMap<String, ActiveGenerations> = HashMap::new();
                 for row in rows {
                     let ns: String = format!("{}", row[0]);
                     let id: String = format!("{}", row[1]);
@@ -4942,6 +5106,13 @@ impl LadybugStore {
                         location_lines,
                         metadata,
                     };
+                    let active = snapshots
+                        .entry(ns.clone())
+                        .or_insert_with(|| ActiveGenerations::read(conn, &ns));
+                    let source = row_source_key(&payload.metadata);
+                    if !active.reaches_source(&id, &ns, &payload.memory_type, source) {
+                        continue;
+                    }
                     out.push((ns, id, payload));
                 }
                 Ok(out)
@@ -4955,6 +5126,49 @@ impl LadybugStore {
             idx.rebuild_scoped(&rows_data, namespace)?
         };
         Ok((indexed, crate::lexical::INDEX_VERSION.to_string()))
+    }
+
+    /// #149 C3: drop the namespace's cached lexical view and rebuild it from
+    /// the rows the new pointer reaches.
+    ///
+    /// Best-effort by design: the graph flip already committed, and every
+    /// lexical read re-checks the row's generation against the pointers, so a
+    /// failed refresh delays index hygiene but cannot surface a stale row. The
+    /// next load/rebuild retries.
+    async fn refresh_lexical_after_pointer_change(&self, namespace: &str) {
+        // Hold the refresh lock across invalidation and rebuild: a concurrent
+        // rebuild that fetched the pre-publish rows waits here instead of
+        // replacing the namespace after the refresh completes.
+        let _guard = self.lexical_refresh_lock.lock().await;
+        self.invalidate_inhouse_lexical(namespace);
+        let tantivy_open = self
+            .tantivy_lexical
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some();
+        if tantivy_open {
+            if let Err(e) = self
+                .rebuild_tantivy_lexical_locked(Some(namespace))
+                .await
+            {
+                tracing::warn!("lexical refresh after publish failed for {namespace}: {e}");
+            }
+        }
+    }
+
+    /// Drop a namespace's in-memory partition. Bumps the epoch before
+    /// clearing so a load that fetched before this point sees the new epoch
+    /// under the index lock and refetches instead of marking the namespace
+    /// loaded with superseded or stale documents.
+    fn invalidate_inhouse_lexical(&self, namespace: &str) {
+        self.lexical_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut index = self.lexical.write().unwrap_or_else(|e| e.into_inner());
+        index.clear_namespace(namespace);
+        self.lexical_loaded
+            .write()
+            .expect("lexical loaded lock")
+            .remove(namespace);
     }
 
     /// Search using the disk-backed Tantivy lexical index, hydrating payloads from LadybugDB.
@@ -4972,16 +5186,32 @@ impl LadybugStore {
         if self.tantivy_lexical.read().unwrap_or_else(|e| e.into_inner()).is_none() {
             let _ = self.rebuild_tantivy_lexical(Some(namespace)).await?;
         }
+        // #149: read the pointers once for the whole page, then use the same
+        // snapshot for the query clause (no stale row consumes a slot) and
+        // for hydration (per-source re-check).
+        let ns_owned = namespace.to_string();
+        let active = self
+            .with_conn(move |conn| Ok(ActiveGenerations::read(conn, &ns_owned)))
+            .await?;
+        // With no pointer rows, the predicate keeps every scoped row, so the
+        // query filter must be skipped too: passing an empty set would admit
+        // only generation 0 and make those rows unsearchable.
+        let active_set = if active.is_empty() {
+            None
+        } else {
+            Some(active.active_generations_u64())
+        };
         let hits = {
             let guard = self.tantivy_lexical.read().unwrap_or_else(|e| e.into_inner());
             let idx = guard.as_ref().expect("tantivy open");
-            idx.search(
+            idx.search_with_active_generations(
                 namespace,
                 query,
                 limit.max(1) * 4,
                 include_tasks,
                 include_archived,
                 None,
+                active_set.as_ref(),
             )?
         };
         let mut candidates = Vec::new();
@@ -4993,6 +5223,17 @@ impl LadybugStore {
                 continue;
             }
             if let Some((_, payload)) = self.get(namespace, &hit.id).await? {
+                // #149 C2.4: a superseded or still-staged row must not surface
+                // even when the index entry is stale. The row's own source
+                // decides, so two worktrees sharing a namespace stay separate.
+                if !active.reaches_source(
+                    &hit.id,
+                    namespace,
+                    &payload.memory_type,
+                    row_source_key(&payload.metadata),
+                ) {
+                    continue;
+                }
                 if !include_tasks && payload.memory_type == "task" {
                     continue;
                 }
@@ -6591,6 +6832,13 @@ impl VectorStore for LadybugStore {
         fuzzy_max_distance: usize,
     ) -> Result<crate::traits::LexicalSearchOutcome> {
         self.ensure_lexical_loaded(namespace).await?;
+        // #149 C2.4: the in-memory partition is filtered at load, but a row
+        // staged after that load (or left by a failed refresh) is re-checked
+        // against the pointers on hydration.
+        let ns_owned = namespace.to_string();
+        let active = self
+            .with_conn(move |conn| Ok(ActiveGenerations::read(conn, &ns_owned)))
+            .await?;
         self.refresh_ontology(namespace).await;
         let ontology = self.get_ontology(namespace);
         // Domain ontology expansion: expand domain slugs before filtering
@@ -6627,6 +6875,14 @@ impl VectorStore for LadybugStore {
             let Some((_, payload)) = self.get(namespace, &hit.id).await? else {
                 continue;
             };
+            if !active.reaches_source(
+                &hit.id,
+                namespace,
+                &payload.memory_type,
+                row_source_key(&payload.metadata),
+            ) {
+                continue;
+            }
             results.push(SearchResult {
                 id: hit.id,
                 score: hit.score,
@@ -7427,6 +7683,7 @@ impl VectorStore for LadybugStore {
         generation: u64,
     ) -> Result<()> {
         let namespace = namespace.to_string();
+        let refresh_ns = namespace.clone();
         let source_key = source_key.to_string();
         self.write_with_deadline("publishing a staging generation", move |conn| {
             let safe_ns = escape_ladybug_string(&namespace);
@@ -7448,7 +7705,9 @@ impl VectorStore for LadybugStore {
             conn.query(&write)?;
             Ok(())
         })
-        .await
+        .await?;
+        self.refresh_lexical_after_pointer_change(&refresh_ns).await;
+        Ok(())
     }
 
     async fn abort_generation(
@@ -7458,6 +7717,7 @@ impl VectorStore for LadybugStore {
         generation: u64,
     ) -> Result<()> {
         let namespace = namespace.to_string();
+        let refresh_ns = namespace.clone();
         let source_key = source_key.to_string();
         self.write_with_deadline("aborting a staging generation", move |conn| {
             // A staged node's id is `ns::<generation>::<path>`, so every row of
@@ -7484,7 +7744,10 @@ impl VectorStore for LadybugStore {
             conn.query(&clear)?;
             Ok(())
         })
-        .await
+        .await?;
+        self.refresh_lexical_after_pointer_change(&refresh_ns)
+            .await;
+        Ok(())
     }
 
     async fn active_generation(&self, namespace: &str, source_key: &str) -> Result<u64> {
@@ -19889,6 +20152,515 @@ eurostrata\src\daemon.rs",
         let _ = std::fs::remove_dir_all(&fx.root);
         let _ = std::fs::remove_dir_all(&fx2.root);
         restore_model_env(previous);
+    }
+
+    fn generation_payload(content: &str, source: &str, extra: Value) -> MemoryPayload {
+        let mut metadata = serde_json::Map::new();
+        metadata.insert(
+            "source_identity".to_string(),
+            json!({"worktree_id": source}),
+        );
+        if let Value::Object(fields) = extra {
+            for (key, value) in fields {
+                metadata.insert(key, value);
+            }
+        }
+        MemoryPayload {
+            content: content.to_string(),
+            user_id: "ingest-owner".to_string(),
+            memory_type: "memory".to_string(),
+            agent_name: None,
+            location: "/src/a.rs".to_string(),
+            location_lines: String::new(),
+            metadata: Value::Object(metadata),
+        }
+    }
+
+    /// Stage `rows` (path, content) as one generation and publish it. Returns
+    /// the generation the store allocated.
+    async fn publish_fixture_generation(
+        store: &LadybugStore,
+        namespace: &str,
+        source: &str,
+        rows: &[(&str, &str)],
+    ) -> u64 {
+        let generation = store.begin_generation(namespace, source).await.unwrap();
+        for (path, content) in rows {
+            let id = crate::parser::ingest::generation_scoped_id(namespace, generation, path);
+            store
+                .upsert(
+                    namespace,
+                    &id,
+                    vec![0.0; 4],
+                    generation_payload(content, source, json!({})),
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .publish_generation(namespace, source, generation)
+            .await
+            .unwrap();
+        generation
+    }
+
+    fn result_ids(results: &[SearchResult]) -> Vec<String> {
+        results.iter().map(|result| result.id.clone()).collect()
+    }
+
+    #[tokio::test]
+    async fn lexical_search_returns_only_active_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("gen.lbug"), 4).unwrap();
+        store.init("gen").await.unwrap();
+
+        let first = publish_fixture_generation(
+            &store,
+            "gen",
+            PROBE_SOURCE,
+            &[("src/a.rs", "lexgenneedle stale generation")],
+        )
+        .await;
+        // Warm both caches on generation 1, so the second publish must
+        // invalidate a loaded in-memory partition and an open Tantivy index.
+        let warm_id = crate::parser::ingest::generation_scoped_id("gen", first, "src/a.rs");
+        let warm_inhouse = store
+            .search_lexical("gen", "lexgenneedle", 10, false, false, &[], "admin", 0)
+            .await
+            .unwrap()
+            .results;
+        assert_eq!(result_ids(&warm_inhouse), vec![warm_id.clone()]);
+        let warm_tantivy = store
+            .search_tantivy_lexical("gen", "lexgenneedle", 10, false, false, &[], "admin")
+            .await
+            .unwrap()
+            .results;
+        assert_eq!(result_ids(&warm_tantivy), vec![warm_id]);
+
+        let second = publish_fixture_generation(
+            &store,
+            "gen",
+            PROBE_SOURCE,
+            &[("src/a.rs", "lexgenneedle current generation")],
+        )
+        .await;
+        assert_ne!(first, second, "the fixture must produce two generations");
+        let expected = crate::parser::ingest::generation_scoped_id("gen", second, "src/a.rs");
+
+        let inhouse = store
+            .search_lexical("gen", "lexgenneedle", 10, false, false, &[], "admin", 0)
+            .await
+            .unwrap()
+            .results;
+        assert_eq!(
+            result_ids(&inhouse),
+            vec![expected.clone()],
+            "in-house lexical must return exactly the current row"
+        );
+
+        let tantivy = store
+            .search_tantivy_lexical("gen", "lexgenneedle", 10, false, false, &[], "admin")
+            .await
+            .unwrap()
+            .results;
+        assert_eq!(
+            result_ids(&tantivy),
+            vec![expected],
+            "Tantivy lexical must return exactly the current row"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleted_path_absent_from_lexical() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("deleted.lbug"), 4).unwrap();
+        store.init("gen").await.unwrap();
+
+        publish_fixture_generation(
+            &store,
+            "gen",
+            PROBE_SOURCE,
+            &[
+                ("src/kept.rs", "keptfileneedle still here"),
+                ("src/gone.rs", "gonefileneedle removed later"),
+            ],
+        )
+        .await;
+        // Load generation 1 into both caches before it is superseded.
+        let warm = store
+            .search_tantivy_lexical("gen", "gonefileneedle", 10, false, false, &[], "admin")
+            .await
+            .unwrap()
+            .results;
+        assert_eq!(warm.len(), 1, "fixture generation 1 must contain the file");
+        let warm_inhouse = store
+            .search_lexical("gen", "gonefileneedle", 10, false, false, &[], "admin", 0)
+            .await
+            .unwrap()
+            .results;
+        assert_eq!(warm_inhouse.len(), 1);
+
+        let second = publish_fixture_generation(
+            &store,
+            "gen",
+            PROBE_SOURCE,
+            &[("src/kept.rs", "keptfileneedle still here")],
+        )
+        .await;
+
+        let inhouse_gone = store
+            .search_lexical("gen", "gonefileneedle", 10, false, false, &[], "admin", 0)
+            .await
+            .unwrap()
+            .results;
+        assert!(
+            inhouse_gone.is_empty(),
+            "in-house lexical still returns a deleted file: {:?}",
+            result_ids(&inhouse_gone)
+        );
+        let tantivy_gone = store
+            .search_tantivy_lexical("gen", "gonefileneedle", 10, false, false, &[], "admin")
+            .await
+            .unwrap()
+            .results;
+        assert!(
+            tantivy_gone.is_empty(),
+            "Tantivy lexical still returns a deleted file: {:?}",
+            result_ids(&tantivy_gone)
+        );
+
+        let expected = crate::parser::ingest::generation_scoped_id("gen", second, "src/kept.rs");
+        let kept = store
+            .search_tantivy_lexical("gen", "keptfileneedle", 10, false, false, &[], "admin")
+            .await
+            .unwrap()
+            .results;
+        assert_eq!(result_ids(&kept), vec![expected]);
+    }
+
+    #[tokio::test]
+    async fn secret_skipped_absent_from_lexical() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("secret.lbug"), 4).unwrap();
+        store.init("gen").await.unwrap();
+
+        publish_fixture_generation(
+            &store,
+            "gen",
+            PROBE_SOURCE,
+            &[
+                ("src/clean.rs", "cleanfileneedle harmless"),
+                ("src/leaked.rs", "leakedsecretneedle scanner would skip this row"),
+            ],
+        )
+        .await;
+        // Load both caches on the generation that still carries the row.
+        let warm = store
+            .search_lexical("gen", "leakedsecretneedle", 10, false, false, &[], "admin", 0)
+            .await
+            .unwrap()
+            .results;
+        assert_eq!(warm.len(), 1, "fixture generation 1 must carry the row");
+        let warm_tantivy = store
+            .search_tantivy_lexical("gen", "leakedsecretneedle", 10, false, false, &[], "admin")
+            .await
+            .unwrap()
+            .results;
+        assert_eq!(warm_tantivy.len(), 1);
+        // The re-ingest skips the secret-bearing file entirely: it is absent
+        // from the new generation, exactly as the pre-PAR-03 purge intends.
+        publish_fixture_generation(
+            &store,
+            "gen",
+            PROBE_SOURCE,
+            &[("src/clean.rs", "cleanfileneedle harmless")],
+        )
+        .await;
+
+        let inhouse = store
+            .search_lexical("gen", "leakedsecretneedle", 10, false, false, &[], "admin", 0)
+            .await
+            .unwrap()
+            .results;
+        assert!(
+            inhouse.is_empty(),
+            "in-house lexical still serves a secret-bearing superseded row: {:?}",
+            result_ids(&inhouse)
+        );
+        let tantivy = store
+            .search_tantivy_lexical("gen", "leakedsecretneedle", 10, false, false, &[], "admin")
+            .await
+            .unwrap()
+            .results;
+        assert!(
+            tantivy.is_empty(),
+            "Tantivy lexical still serves a secret-bearing superseded row: {:?}",
+            result_ids(&tantivy)
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_row_without_any_pointer_stays_searchable() {
+        // No IngestGeneration row exists at all: nothing has been superseded,
+        // so the predicate keeps scoped rows. The Tantivy query must not turn
+        // that into "generation 0 only".
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("nopointer.lbug"), 4).unwrap();
+        store.init("gen").await.unwrap();
+        let id = crate::parser::ingest::generation_scoped_id("gen", 1, "src/a.rs");
+        store
+            .upsert(
+                "gen",
+                &id,
+                vec![0.0; 4],
+                generation_payload("nopointerneedle scoped row", "worktree-x", json!({})),
+            )
+            .await
+            .unwrap();
+
+        let inhouse = store
+            .search_lexical("gen", "nopointerneedle", 10, false, false, &[], "admin", 0)
+            .await
+            .unwrap()
+            .results;
+        assert_eq!(result_ids(&inhouse), vec![id.clone()]);
+        let tantivy = store
+            .search_tantivy_lexical("gen", "nopointerneedle", 10, false, false, &[], "admin")
+            .await
+            .unwrap()
+            .results;
+        assert_eq!(
+            result_ids(&tantivy),
+            vec![id],
+            "a scoped row with no pointer must stay searchable on both routes"
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_rows_cannot_starve_the_inhouse_page() {
+        // Warm the in-house partition on generation 1, then stage a batch of
+        // higher-scoring generation-2 rows without publishing. Limit 1 must
+        // still return the active row: staged rows enter the in-memory index
+        // only through the filtered loader, and the Tantivy query excludes
+        // them before TopDocs collects.
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("staged.lbug"), 4).unwrap();
+        store.init("gen").await.unwrap();
+        let first = publish_fixture_generation(
+            &store,
+            "gen",
+            PROBE_SOURCE,
+            &[("src/active.rs", "stagedstarveneedle active row")],
+        )
+        .await;
+        let active_id = crate::parser::ingest::generation_scoped_id("gen", first, "src/active.rs");
+        let warm = store
+            .search_lexical("gen", "stagedstarveneedle", 1, false, false, &[], "admin", 0)
+            .await
+            .unwrap()
+            .results;
+        assert_eq!(result_ids(&warm), vec![active_id.clone()]);
+
+        let second = store.begin_generation("gen", PROBE_SOURCE).await.unwrap();
+        for i in 0..20 {
+            let id =
+                crate::parser::ingest::generation_scoped_id("gen", second, &format!("src/staged-{i}.rs"));
+            store
+                .upsert(
+                    "gen",
+                    &id,
+                    vec![0.0; 4],
+                    generation_payload(
+                        "stagedstarveneedle stagedstarveneedle stagedstarveneedle stagedstarveneedle stagedstarveneedle",
+                        PROBE_SOURCE,
+                        json!({}),
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+
+        let inhouse = store
+            .search_lexical("gen", "stagedstarveneedle", 1, false, false, &[], "admin", 0)
+            .await
+            .unwrap()
+            .results;
+        assert_eq!(
+            result_ids(&inhouse),
+            vec![active_id.clone()],
+            "unpublished staged rows must not consume the in-house page"
+        );
+        let tantivy = store
+            .search_tantivy_lexical("gen", "stagedstarveneedle", 1, false, false, &[], "admin")
+            .await
+            .unwrap()
+            .results;
+        assert_eq!(
+            result_ids(&tantivy),
+            vec![active_id],
+            "unpublished staged rows must not consume the Tantivy page"
+        );
+    }
+
+    #[tokio::test]
+    async fn archiving_an_active_scoped_row_refreshes_the_inhouse_cache() {
+        // The archive handler upserts the tombstone on the row's current id.
+        // A scoped write must not be silently skipped by the cache, or the
+        // loaded in-memory doc keeps saying "not archived".
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("archive.lbug"), 4).unwrap();
+        store.init("gen").await.unwrap();
+        let generation = publish_fixture_generation(
+            &store,
+            "gen",
+            PROBE_SOURCE,
+            &[("src/a.rs", "archiveneedle visible row")],
+        )
+        .await;
+        let id = crate::parser::ingest::generation_scoped_id("gen", generation, "src/a.rs");
+
+        let warm = store
+            .search_lexical("gen", "archiveneedle", 10, false, false, &[], "admin", 0)
+            .await
+            .unwrap()
+            .results;
+        assert_eq!(result_ids(&warm), vec![id.clone()]);
+
+        store
+            .upsert(
+                "gen",
+                &id,
+                vec![0.0; 4],
+                generation_payload(
+                    "archiveneedle visible row",
+                    PROBE_SOURCE,
+                    json!({"archived": true}),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let live = store
+            .search_lexical("gen", "archiveneedle", 10, false, false, &[], "admin", 0)
+            .await
+            .unwrap()
+            .results;
+        assert!(
+            live.is_empty(),
+            "an archived scoped row must leave the default in-house page: {:?}",
+            result_ids(&live)
+        );
+        let archived = store
+            .search_lexical("gen", "archiveneedle", 10, false, true, &[], "admin", 0)
+            .await
+            .unwrap()
+            .results;
+        assert_eq!(
+            result_ids(&archived),
+            vec![id],
+            "include_archived must still find the row"
+        );
+
+        let tantivy = store
+            .search_tantivy_lexical("gen", "archiveneedle", 10, false, false, &[], "admin")
+            .await
+            .unwrap()
+            .results;
+        assert!(tantivy.is_empty(), "Tantivy must agree the row is archived");
+    }
+
+    #[tokio::test]
+    async fn legacy_namespace_pointer_without_source_stamp_stays_visible() {
+        // Pre-source-split store: the only pointer is keyed by the empty
+        // source (`source_key = ''`), while rows still carry the ingest
+        // worktree identity. Those rows must keep reading; hiding them would
+        // make an upgrade look like data loss.
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("legacy.lbug"), 4).unwrap();
+        store.init("legacy").await.unwrap();
+        let generation = store.begin_generation("legacy", "worktree-x").await.unwrap();
+        let id = crate::parser::ingest::generation_scoped_id("legacy", generation, "src/a.rs");
+        store
+            .upsert(
+                "legacy",
+                &id,
+                vec![0.0; 4],
+                generation_payload("legacypointerneedle still readable", "worktree-x", json!({})),
+            )
+            .await
+            .unwrap();
+        // The legacy namespace-wide pointer, keyed by the empty source.
+        store
+            .publish_generation("legacy", "", generation)
+            .await
+            .unwrap();
+
+        let inhouse = store
+            .search_lexical("legacy", "legacypointerneedle", 10, false, false, &[], "admin", 0)
+            .await
+            .unwrap()
+            .results;
+        assert_eq!(
+            result_ids(&inhouse),
+            vec![id.clone()],
+            "a legacy namespace pointer must keep its rows visible"
+        );
+        let tantivy = store
+            .search_tantivy_lexical("legacy", "legacypointerneedle", 10, false, false, &[], "admin")
+            .await
+            .unwrap()
+            .results;
+        assert_eq!(result_ids(&tantivy), vec![id]);
+    }
+
+    #[tokio::test]
+    async fn lexical_owner_parity() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("owner.lbug"), 4).unwrap();
+        store.init("probe").await.unwrap();
+
+        // Empty payload owner, metadata owner alice, ACL that names only bob.
+        // The vector route lets alice in as owner; the lexical routes must too.
+        let mut payload = retired_test_payload(
+            "rule",
+            "",
+            json!({"user_id": "alice", "visible_to": ["bob"]}),
+        );
+        payload.content = "ownerparityneedle".to_string();
+        store
+            .upsert("probe", "owned-by-metadata", vec![0.0; 4], payload)
+            .await
+            .unwrap();
+
+        for (principal, expected) in [("alice", 1), ("bob", 1), ("eve", 0)] {
+            let inhouse = store
+                .search_lexical("probe", "ownerparityneedle", 10, false, false, &[], principal, 0)
+                .await
+                .unwrap()
+                .results;
+            let tantivy = store
+                .search_tantivy_lexical("probe", "ownerparityneedle", 10, false, false, &[], principal)
+                .await
+                .unwrap()
+                .results;
+            assert_eq!(
+                inhouse.len(),
+                expected,
+                "in-house owner verdict for {principal}: {:?}",
+                result_ids(&inhouse)
+            );
+            assert_eq!(
+                tantivy.len(),
+                expected,
+                "Tantivy owner verdict for {principal}: {:?}",
+                result_ids(&tantivy)
+            );
+            assert_eq!(
+                result_ids(&inhouse),
+                result_ids(&tantivy),
+                "both lexical routes must agree for {principal}"
+            );
+        }
     }
 }
 

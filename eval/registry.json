@@ -40,12 +40,19 @@
         "cargo test --locked --bin neurostrata-mcp store::ladybug::tests -- --test-threads=1"
       ],
       "tests": [
-        "lexical::tests::lexical_search_returns_only_active_generation",
-        "lexical::tests::deleted_path_absent_from_lexical",
-        "lexical::tests::secret_skipped_absent_from_lexical",
-        "lexical::tests::validity_boundary_parity",
+        "store::ladybug::tests::lexical_search_returns_only_active_generation",
+        "store::ladybug::tests::deleted_path_absent_from_lexical",
+        "store::ladybug::tests::secret_skipped_absent_from_lexical",
         "store::ladybug::tests::lexical_owner_parity",
-        "store::ladybug::tests::rebuild_scoped_rejects_foreign_namespace"
+        "store::ladybug::tests::legacy_namespace_pointer_without_source_stamp_stays_visible",
+        "store::ladybug::tests::scoped_row_without_any_pointer_stays_searchable",
+        "store::ladybug::tests::staged_rows_cannot_starve_the_inhouse_page",
+        "lexical::tests::validity_boundary_parity",
+        "lexical::tests::rebuild_scoped_rejects_foreign_namespace",
+        "lexical::tests::e1_code_token_breadth",
+        "lexical::tests::e3_seeded_unicode_returns",
+        "lexical::tests::archived_and_validity_starvation",
+        "store::ladybug::tests::archiving_an_active_scoped_row_refreshes_the_inhouse_cache"
       ],
       "thresholds": {
         "unexpected_current_ids": 0,
