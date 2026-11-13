@@ -11,7 +11,10 @@
         "secrets::tests::secret_source_expression_matrix",
         "secrets::tests::placeholder_wrapped_token_rejected",
         "ingest_jobs::tests::progress_counts_skipped_files_without_echoing_a_secret",
-        "parser::ingest::tests::clean_markdown_ingests"
+        "parser::ingest::tests::clean_markdown_ingests",
+        "secrets::tests::metadata_key_carrying_a_secret_is_detected",
+        "secrets::tests::oversized_metadata_leaf_has_a_distinct_reason",
+        "secrets::tests::single_line_token_straddling_a_chunk_boundary_is_detected"
       ],
       "thresholds": {
         "clean_shapes_no_false_skip": 20,
