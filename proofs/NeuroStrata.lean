@@ -2,3 +2,8 @@ import NeuroStrata.TaskMachine
 import NeuroStrata.TaskGate
 import NeuroStrata.SynapticMesh
 import NeuroStrata.DomainRegistry
+import NeuroStrata.TaskClaim
+import NeuroStrata.Sovereignty
+import NeuroStrata.Procedure
+import NeuroStrata.TwinCrdt
+import NeuroStrata.Retention
