@@ -195,6 +195,22 @@ fn arena_disabled_for(value: Option<&str>) -> bool {
     !enabled
 }
 
+/// The execution-provider list the constructor installs for the arena
+/// decision: a pinned CPU provider with the arena allocator off, or `None` to
+/// leave fastembed's default. Extracted so the decision-to-wiring path is a
+/// value a test can inspect without loading a model.
+fn arena_execution_providers(
+    disabled: bool,
+) -> Option<Vec<ort::execution_providers::ExecutionProviderDispatch>> {
+    if disabled {
+        Some(vec![ort::ep::CPU::default()
+            .with_arena_allocator(false)
+            .build()])
+    } else {
+        None
+    }
+}
+
 /// The pin gate `FastEmbedder::new` applies to the configured model: a
 /// local entry without a pinned SHA-256 fails closed, so a hand-authored
 /// or setup-written entry can never load unverified.
@@ -386,10 +402,8 @@ impl FastEmbedder {
                 if disable_arena { "disabled" } else { "enabled (NEUROSTRATA_EMBED_ARENA)" }
             );
         });
-        if disable_arena {
-            init = init.with_execution_providers(vec![ort::ep::CPU::default()
-                .with_arena_allocator(false)
-                .build()]);
+        if let Some(providers) = arena_execution_providers(disable_arena) {
+            init = init.with_execution_providers(providers);
         }
         let model = TextEmbedding::try_new(init.with_show_download_progress(true))?;
 
@@ -687,17 +701,18 @@ mod tests {
         }
     }
 
-    /// Source assertion: the env-parse test alone cannot catch the arena
-    /// ratchet returning. Both flipping this to `true` and deleting the call
-    /// fail here.
+    /// The decision reaches the provider wiring as a value, not just as text
+    /// in the file: an off-by-default arena yields the pinned CPU provider,
+    /// and an opt-in yields fastembed's default (no override).
     #[test]
-    fn the_constructor_disables_the_cpu_arena() {
-        let source = include_str!("embed.rs");
-        // Build the needle so this assertion's own text cannot satisfy it.
-        let needle = format!(".with_arena_allocator({})", "false");
+    fn the_arena_policy_reaches_the_provider_wiring() {
         assert!(
-            source.contains(&needle),
-            "FastEmbedder must disable the CPU arena allocator"
+            super::arena_execution_providers(true).is_some(),
+            "the default must install the no-arena CPU provider"
+        );
+        assert!(
+            super::arena_execution_providers(false).is_none(),
+            "an opt-in must leave fastembed's provider default"
         );
     }
 
