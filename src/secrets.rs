@@ -160,19 +160,31 @@ const SCAN_CONTEXT_CARRY: usize = 4 * 1024;
 /// quoted literals and plain opaque values still go through the password
 /// check.
 fn looks_like_code_expression(value: &str) -> bool {
-    // Only strong source markers: paths, calls, member/index chains, and the
-    // literal keywords that occur in code. Punctuation that can occur in a
-    // config value (`!`, `?`, braces) is not enough to call it code.
+    // Only strong source markers: paths, calls, member/index chains. These are
+    // applied only when the key sits in a source-code statement; a config
+    // value such as `password=correct.horse` is not a member chain exemption.
     value.contains("::")
         || value.contains("->")
         || value.contains("=>")
         || (value.contains('(') && value.contains(')'))
-        || matches!(value, "None" | "true" | "false")
         || value.starts_with("self.")
         || value.starts_with("&self.")
         || value.starts_with("process.env.")
         || (value.contains('[') && !value.starts_with('[') && !value.contains(']'))
         || (!value.starts_with("eyJ") && looks_like_member_chain(value))
+}
+
+/// True when the key begins a source statement/comment, so code-shaped values
+/// can be exempted without exempting the same shapes in a `.env` file.
+fn source_statement_prefix(text: &str, key_start: usize) -> bool {
+    let line_start = text[..key_start].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let prefix = text[line_start..key_start].trim_start();
+    [
+        "let ", "const ", "var ", "return ", "if ", "match ", "for ", "while ",
+        "pub ", "fn ", "struct ", "enum ", "impl ", "type ", "//", "#",
+    ]
+    .iter()
+    .any(|p| prefix.starts_with(p))
 }
 
 /// `self.token`, `response.token`, `process.env.SECRET` are member chains; a
@@ -451,8 +463,15 @@ impl SecretScanner {
                     sep.starts_with(':') && !sep.starts_with("::")
                 })
                 .unwrap_or(false);
+            let source_context = cap
+                .get(1)
+                .map(|key| source_statement_prefix(text, key.start()))
+                .unwrap_or(false);
+            let literal_keyword = matches!(value, "None" | "true" | "false")
+                || value.starts_with("&self.");
             if !quoted
-                && (looks_like_code_expression(value)
+                && (literal_keyword
+                    || (source_context && looks_like_code_expression(value))
                     || (type_context && looks_like_type_annotation(value)))
             {
                 continue;
@@ -1265,6 +1284,8 @@ mod tests {
             "let password = \"hunter2!\";",
             "// password = \"hunter2!\"",
             "PASSWORD=hunter2!",
+            "password=correct.horse",
+            "PASSWORD=hunter2[abc",
         ] {
             assert!(
                 SecretScanner::scan_str(literal, "content").is_some(),
