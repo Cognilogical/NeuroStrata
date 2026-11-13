@@ -18,6 +18,12 @@ JSON
 cat > "$tmp/contributor-fixed.json" <<'JSON'
 [{"author_association":"CONTRIBUTOR","body":"DO-NOT-MERGE\nfixed@deadbeef"}]
 JSON
+cat > "$tmp/multi-one-line.json" <<'JSON'
+[{"author_association":"CONTRIBUTOR","body":"CHANGES-NEEDED DO-NOT-MERGE\nfixed@deadbeef"}]
+JSON
+cat > "$tmp/multi-both.json" <<'JSON'
+[{"author_association":"CONTRIBUTOR","body":"CHANGES-NEEDED DO-NOT-MERGE\nfixed@deadbeef fixed@cafebabe"}]
+JSON
 
 if bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/fail.txt" >/dev/null 2>&1; then
   echo "FAIL: marker without receipt passed" >&2
@@ -28,6 +34,11 @@ bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/clean.txt" >/dev/null
 bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/two.txt" >/dev/null
 bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/maintainer-ruling.json" >/dev/null
 bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/contributor-fixed.json" >/dev/null
+bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/multi-both.json" >/dev/null
+if bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/multi-one-line.json" >/dev/null 2>&1; then
+  echo "FAIL: two markers on one line were cleared by one receipt" >&2
+  exit 1
+fi
 if bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/outsider-ruling.json" >/dev/null 2>&1; then
   echo "FAIL: a non-maintainer ruled: cleared a marker" >&2
   exit 1

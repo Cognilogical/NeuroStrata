@@ -39,9 +39,9 @@ else
 fi
 
 all_text=$(printf '%s\n' "$entries" | jq -r '.body' 2>/dev/null || true)
-markers=$(printf '%s\n' "$all_text" | grep -Eic 'CHANGES[-_ ]?NEEDED|DO[-_ ]?NOT[-_ ]?MERGE' || true)
-fixed_filed=$(printf '%s\n' "$all_text" | grep -Eic 'fixed@[0-9a-f]{7,}|filed[[:space:]]+#[0-9]+' || true)
-ruled=$(printf '%s\n' "$entries" | jq -r 'select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR") | .body' 2>/dev/null | grep -Eic 'ruled:' || true)
+markers=$(printf '%s\n' "$all_text" | grep -Eoi 'CHANGES[-_ ]?NEEDED|DO[-_ ]?NOT[-_ ]?MERGE' | wc -l | tr -d ' ' || true)
+fixed_filed=$(printf '%s\n' "$all_text" | grep -Eoi 'fixed@[0-9a-f]{7,}|filed[[:space:]]+#[0-9]+' | wc -l | tr -d ' ' || true)
+ruled=$(printf '%s\n' "$entries" | jq -r 'select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR") | .body' 2>/dev/null | grep -Eoi 'ruled:' | wc -l | tr -d ' ' || true)
 markers=${markers:-0}
 fixed_filed=${fixed_filed:-0}
 ruled=${ruled:-0}

@@ -14,7 +14,10 @@ pub fn projected_reindex_bytes(store_bytes: u64) -> u64 {
 /// free space than the projected staging copy. The path is the store file; the
 /// check uses its parent directory.
 pub fn check_free_space(store_path: &Path, projected_bytes: u64) -> Result<()> {
-    let dir = store_path.parent().unwrap_or(store_path);
+    let dir = store_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let available = fs2::available_space(dir)
         .with_context(|| format!("upgrade preflight: cannot read free space for {}", dir.display()))?;
     if available < projected_bytes {
@@ -54,5 +57,11 @@ mod tests {
         let dir = std::env::temp_dir();
         let store = dir.join("ns-preflight-test.lbug");
         check_free_space(&store, 1).expect("one byte is available");
+    }
+
+    #[test]
+    fn a_relative_store_path_uses_the_current_directory() {
+        check_free_space(Path::new("ns-preflight-relative.lbug"), 1)
+            .expect("a relative path resolves to the current directory");
     }
 }
