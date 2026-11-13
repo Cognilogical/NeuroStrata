@@ -632,6 +632,21 @@ describe("extractRepoFilePaths", () => {
     const dups = extractRepoFilePaths("a/b.ts a/b.ts c/d.ts");
     assert.deepEqual(dups, ["a/b.ts", "c/d.ts"]);
   });
+
+  it("extracts paths from a sentence, normalizing ./ prefixes, ignoring URLs", () => {
+    const out = extractRepoFilePaths(
+      "Edited src/store/ladybug.rs, ./plugins/core/index.ts, and .github/workflows/ci.yml. Ignore https://example.com/foo/bar.ts",
+    );
+    assert.deepEqual(out, ["src/store/ladybug.rs", "plugins/core/index.ts", ".github/workflows/ci.yml"]);
+  });
+
+  it("adversarial ReDoS input completes in < 50 ms and returns []", () => {
+    const start = performance.now();
+    const out = extractRepoFilePaths("a/".repeat(25000) + "!");
+    const elapsed = performance.now() - start;
+    assert.deepEqual(out, []);
+    assert.ok(elapsed < 50, `extractRepoFilePaths took ${elapsed}ms on adversarial input, expected < 50ms`);
+  });
 });
 
 describe("enrichAndInjectSubagentPrompt", () => {

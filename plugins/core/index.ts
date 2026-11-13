@@ -1285,14 +1285,51 @@ export function injectSubagentPrompt(
   return true;
 }
 
+// Allowed file extensions for repo-relative path extraction. Final segment of
+// a candidate path must carry one of these (case-insensitive) to count.
+const ALLOWED_PATH_EXTENSIONS: ReadonlySet<string> = new Set([
+  "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "go", "java", "kt",
+  "c", "cc", "cpp", "h", "hpp", "cs", "rb", "php", "swift", "scala", "sql",
+  "sh", "bash", "zsh", "json", "toml", "yaml", "yml", "md", "html", "css",
+  "scss", "vue", "svelte", "proto", "graphql", "nix", "lua", "zig", "ex", "exs",
+]);
+
 export function extractRepoFilePaths(promptText: string): string[] {
-  const regex = /(?:[A-Za-z0-9_.-]+\/)+[A-Za-z0-9_.-]+\.[A-Za-z0-9]+/g;
+  // Linear-time token scanner: match contiguous path-character runs, then
+  // validate each candidate. Avoids polynomial backtracking of a nested
+  // quantifier regex on adversarial input such as "a/".repeat(N) + "!".
+  const tokenPattern = /[A-Za-z0-9._/-]+/g;
   const out: string[] = [];
   const seen = new Set<string>();
   let match: RegExpExecArray | null;
-  while ((match = regex.exec(promptText))) {
-    const token = match[0];
-    if (token.startsWith("http://") || token.startsWith("https://")) continue;
+  while ((match = tokenPattern.exec(promptText))) {
+    const raw = match[0];
+    let start = match.index;
+    // Skip runs immediately preceded by "://" (URL bodies).
+    if (start >= 3 && promptText.slice(start - 3, start) === "://") continue;
+    let token = raw;
+    // Trim leading "./" or "/".
+    for (;;) {
+      if (token.startsWith("./")) { token = token.slice(2); start += 2; continue; }
+      if (token.startsWith("/")) { token = token.slice(1); start += 1; continue; }
+      break;
+    }
+    // Trim trailing "." or "/".
+    for (;;) {
+      if (token.endsWith(".") || token.endsWith("/")) { token = token.slice(0, -1); continue; }
+      break;
+    }
+    // A run such as "//example.com/foo/bar.ts" trimmed past its slashes now
+    // begins right after "://", so re-check with the adjusted offset.
+    if (start >= 3 && promptText.slice(start - 3, start) === "://") continue;
+    if (!token.includes("/")) continue;
+    const segments = token.split("/");
+    if (segments.some((seg) => seg.length === 0 || seg === "..")) continue;
+    const finalSegment = segments[segments.length - 1];
+    const extMatch = /\.[A-Za-z0-9]{1,8}$/.exec(finalSegment);
+    if (!extMatch) continue;
+    const ext = extMatch[0].slice(1).toLowerCase();
+    if (!ALLOWED_PATH_EXTENSIONS.has(ext)) continue;
     if (!seen.has(token)) {
       seen.add(token);
       out.push(token);
