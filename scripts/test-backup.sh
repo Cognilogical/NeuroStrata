@@ -26,6 +26,13 @@
 #      overwrites the db, and companions the second run does not
 #      produce (source WAL and sidecar both removed between runs)
 #      must not survive from the first run.
+#   7. Failed retry on a reused same-second destination: a retry whose
+#      companion copy fails exits non-zero and leaves the prior good
+#      backup set — db, sidecar, WAL — byte-identical, with no .tmp-*
+#      litter.
+#   8. Filename-timestamp pruning: an older-named backup with a newer
+#      mtime is still pruned, and orphaned companions / staged .tmp-*
+#      leftovers are removed.
 #
 # How to run: scripts/test-backup.sh
 #   Exits 0 and prints a PASS summary when every assertion holds; exits
@@ -240,9 +247,10 @@ cmp -s "$S3/store/store.db.store-state.json" "$BACKUP3.store-state.json" \
 pass "scenario 3: sidecar companion exists and is byte-identical to the fixture sidecar"
 
 # --- Scenario 4: pair-aware pruning ---------------------------------------
-# backup.sh selects prune victims with `ls -1t` (mtime, newest first),
-# so seeded backups get both old names and old, name-ordered mtimes;
-# seeded names can then never collide with the new run's timestamp.
+# backup.sh selects prune victims by filename timestamp
+# (db-YYYYMMDD-HHMMSS, `sort -r`), so seeded backups get both old names
+# and old, name-ordered mtimes; seeded names can then never collide
+# with the new run's timestamp.
 echo "== scenario 4: pair-aware pruning (MAX_BACKUPS=2)"
 S4="$WORK/s4"
 CONFIG4="$(make_store "$S4/store" 1)"
@@ -349,7 +357,7 @@ dest=""
 for a in "$@"; do dest="$a"; done
 "$real_cp" "$@" || exit $?
 case "$dest" in
-    *.store-state.json) printf 'x' >> "$dest" ;;
+    *.store-state.json*) printf 'x' >> "$dest" ;;
 esac
 EOF
 chmod +x "$CP_SHIM_DIR/cp"
@@ -463,4 +471,157 @@ pass "scenario 6: no WAL companion survives a run that produced none"
     || fail "scenario 6: stale sidecar companion from the first run survived the second run"
 pass "scenario 6: no sidecar companion survives a run that produced none"
 
-echo "PASS: all $CHECKS checks passed (backup sidecar + WAL carry + pair-aware pruning + sidecar failure contract + backup-name reuse)"
+# --- Scenario 7: failed retry preserves the prior same-second set ---------
+# The timestamp has second resolution, so a retry can reuse the exact
+# destination name of a good prior backup. A retry that fails after
+# staging (its WAL companion copy fails, via a cp shim) must commit
+# nothing: the prior backup's db, sidecar, and WAL stay byte-identical,
+# and no .tmp-* litter remains.
+echo "== scenario 7: failed retry on a reused same-second destination"
+S7="$WORK/s7"
+CONFIG7="$(make_store "$S7/store" 1 1)"
+
+if ! run_backup_path "$DATE_SHIM_DIR" "$CONFIG7" "$S7/backups" 7; then
+    cat "$WORK/last-run.log" >&2
+    fail "scenario 7: first backup.sh run exited non-zero (see log above)"
+fi
+pass "scenario 7: first run exits 0"
+
+BACKUP7="$S7/backups/db-20990102-030405"
+[ -f "$BACKUP7" ] \
+    || fail "scenario 7: first run did not create the fixed-stamp backup $BACKUP7"
+cp -p "$BACKUP7" "$S7/expected.db"
+cp -p "$BACKUP7.store-state.json" "$S7/expected.sidecar"
+cp -p "$BACKUP7.wal" "$S7/expected.wal"
+
+# New writes land in the source between the two runs.
+printf 'fixture-db-bytes-run2\n' > "$S7/store/store.db"
+
+CP_FAIL_WAL_SHIM_DIR="$WORK/cp-fail-wal-shim"
+mkdir -p "$CP_FAIL_WAL_SHIM_DIR"
+cat > "$CP_FAIL_WAL_SHIM_DIR/cp" <<'EOF'
+#!/usr/bin/env bash
+# Delegate to the real cp, then refuse the staged WAL companion: the
+# staged destination always carries the run's .tmp-$$ suffix.
+self_dir="$(cd "$(dirname "$0")" && pwd)"
+real_cp=""
+OLDIFS="$IFS"; IFS=:
+for d in $PATH; do
+    [ "$d" = "$self_dir" ] && continue
+    if [ -x "$d/cp" ]; then real_cp="$d/cp"; break; fi
+done
+IFS="$OLDIFS"
+[ -n "$real_cp" ] || exit 127
+dest=""
+for a in "$@"; do dest="$a"; done
+case "$dest" in
+    *.wal.tmp-*) echo "simulated wal companion copy failure: $dest" >&2; exit 1 ;;
+esac
+"$real_cp" "$@" || exit $?
+EOF
+chmod +x "$CP_FAIL_WAL_SHIM_DIR/cp"
+
+if run_backup_path "$CP_FAIL_WAL_SHIM_DIR:$DATE_SHIM_DIR" "$CONFIG7" "$S7/backups" 7; then
+    cat "$WORK/last-run.log" >&2
+    fail "scenario 7: backup.sh exited 0 on a staged WAL companion failure (see log above)"
+fi
+pass "scenario 7: retry exits non-zero on the staged WAL companion failure"
+
+cmp -s "$S7/expected.db" "$BACKUP7" \
+    || fail "scenario 7: the prior good backup db was disturbed by the failed retry"
+pass "scenario 7: prior good backup db byte-identical after the failed retry"
+cmp -s "$S7/expected.sidecar" "$BACKUP7.store-state.json" \
+    || fail "scenario 7: the prior good backup's sidecar companion was disturbed"
+pass "scenario 7: prior good sidecar companion byte-identical after the failed retry"
+cmp -s "$S7/expected.wal" "$BACKUP7.wal" \
+    || fail "scenario 7: the prior good backup's WAL companion was disturbed"
+pass "scenario 7: prior good WAL companion byte-identical after the failed retry"
+
+tmp_litter=0
+shopt -s nullglob
+for tmp in "$S7/backups"/*.tmp-*; do
+    [ -e "$tmp" ] || continue
+    echo "scenario 7: staged leftover $tmp survived the failed retry" >&2
+    tmp_litter=1
+done
+shopt -u nullglob
+[ "$tmp_litter" = "0" ] \
+    || fail "scenario 7: failed retry left .tmp-* litter in the backup dir"
+pass "scenario 7: no .tmp-* litter remains after the failed retry"
+
+# --- Scenario 8: filename-timestamp pruning + orphan cleanup --------------
+# Pruning selects victims by the db-YYYYMMDD-HHMMSS filename, not by mtime:
+# the oldest-named backup below carries the NEWEST mtime, so an
+# mtime-ordered prune would wrongly keep it. Orphan companions (no base
+# db-* file) and staged .tmp-* leftovers are swept by the same step.
+echo "== scenario 8: pruning by filename timestamp; orphan companions removed"
+S8="$WORK/s8"
+CONFIG8="$(make_store "$S8/store" 1)"
+mkdir -p "$S8/backups"
+seed8() { # seed8 <name> <touch-date> <with_companion:0|1>
+    printf 'seeded backup %s\n' "$1" > "$S8/backups/$1"
+    touch -d "$2" "$S8/backups/$1"
+    if [ "$3" = "1" ]; then
+        printf '{"seeded":true}\n' > "$S8/backups/$1.store-state.json"
+        touch -d "$2" "$S8/backups/$1.store-state.json"
+    fi
+}
+seed8 db-20000101-000001 "2000-01-01 00:00:01" 1
+seed8 db-20000102-000002 "2000-01-02 00:00:02" 1
+seed8 db-20000103-000003 "2000-01-03 00:00:03" 1
+seed8 db-20000104-000004 "2000-01-04 00:00:04" 1
+# Invert the mtime story: the oldest-named backup gets the newest mtime.
+touch -d "2020-05-05 00:00:00" "$S8/backups/db-20000101-000001"
+touch -d "2000-01-01 00:00:00" "$S8/backups/db-20000104-000004"
+# Orphan companions whose base backups no longer exist.
+printf 'orphan sidecar\n' > "$S8/backups/db-20000100-000000.store-state.json"
+printf 'orphan wal\n' > "$S8/backups/db-20000100-000000.wal"
+# A staged leftover from an interrupted run.
+printf 'staged leftover\n' > "$S8/backups/db-20000101-000001.tmp-999999"
+
+if ! run_backup "$CONFIG8" "$S8/backups" 2; then
+    cat "$WORK/last-run.log" >&2
+    fail "scenario 8: backup.sh exited non-zero (see log above)"
+fi
+pass "scenario 8: backup.sh exits 0"
+
+[ -f "$S8/backups/db-20000104-000004" ] \
+    || fail "scenario 8: newest-named backup should survive pruning despite the oldest mtime"
+pass "scenario 8: newest-named backup survives despite the oldest mtime"
+[ ! -e "$S8/backups/db-20000101-000001" ] \
+    || fail "scenario 8: oldest-named backup with the newest mtime should have been pruned"
+pass "scenario 8: oldest-named backup pruned despite the newest mtime"
+[ "$(count_backups "$S8/backups")" = "2" ] \
+    || fail "scenario 8: expected 2 backups after pruning, found $(count_backups "$S8/backups")"
+pass "scenario 8: exactly MAX_BACKUPS (2) backups remain"
+for pruned in db-20000101-000001 db-20000102-000002 db-20000103-000003; do
+    [ ! -e "$S8/backups/$pruned.store-state.json" ] \
+        || fail "scenario 8: pruned backup $pruned left its companion behind"
+done
+pass "scenario 8: pruned backups' companions are gone"
+[ ! -e "$S8/backups/db-20000100-000000.store-state.json" ] \
+    || fail "scenario 8: orphan sidecar companion survived"
+[ ! -e "$S8/backups/db-20000100-000000.wal" ] \
+    || fail "scenario 8: orphan WAL companion survived"
+pass "scenario 8: orphan companions of vanished backups are removed"
+[ ! -e "$S8/backups/db-20000101-000001.tmp-999999" ] \
+    || fail "scenario 8: staged .tmp-* leftover survived"
+pass "scenario 8: staged .tmp-* leftovers are removed"
+
+NEW8=""
+shopt -s nullglob
+for f in "$S8/backups"/db-*; do
+    case "$f" in
+        *.store-state.json|*.wal|*.tmp-*) ;;
+        db-20000104-000004) ;;
+        *) NEW8="$f" ;;
+    esac
+done
+shopt -u nullglob
+[ -n "$NEW8" ] \
+    || fail "scenario 8: the new run's backup is missing"
+[ -f "$NEW8.store-state.json" ] \
+    || fail "scenario 8: the new run's backup lost its sidecar companion"
+pass "scenario 8: the new run's backup carries its sidecar companion"
+
+echo "PASS: all $CHECKS checks passed (backup sidecar + WAL carry + pair-aware pruning + sidecar failure contract + backup-name reuse + failed-retry preservation + filename-timestamp pruning)"

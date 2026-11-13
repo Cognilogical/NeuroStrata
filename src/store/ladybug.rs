@@ -6201,6 +6201,23 @@ fn reconcile_pristine_embedding_width(
     Ok(())
 }
 
+impl LadybugStore {
+    /// The snapshot retention budget `export_database` prunes with. The
+    /// operator override `NEUROSTRATA_SNAPSHOT_RETENTION_COUNT` wins over
+    /// the hygiene config, floored at one snapshot: a configured count below
+    /// the config's five must be honoured, not raised to it (issue #89).
+    pub(crate) fn configured_snapshot_retention_count() -> usize {
+        std::env::var("NEUROSTRATA_SNAPSHOT_RETENTION_COUNT")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .unwrap_or_else(|| {
+                crate::storage::snapshot::StorageHygieneConfig::default()
+                    .snapshot_retention_count
+            })
+            .max(1)
+    }
+}
+
 #[async_trait]
 impl VectorStore for LadybugStore {
     async fn init(&self, namespace: &str) -> Result<()> {
@@ -7813,23 +7830,74 @@ impl VectorStore for LadybugStore {
         // std::__format on a dangling string_view). Revalidated on lbug
         // 0.22.3: EXPORT DATABASE of a fixture store succeeded (Linux
         // x86_64); the file copy below remains the snapshot mechanism.
+        //
+        // The turn is held across the CHECKPOINT and every file copy, so a
+        // writer of this process cannot interleave a write between the
+        // flush and the copies (issue #95). It cannot travel through
+        // `with_conn`: that takes `write_lock` itself, and tokio's Mutex
+        // is not reentrant — so the turn is acquired here, handed to the
+        // blocking task through `write_owning_turn`, and kept for the
+        // copies below. An external writer (another process, or the same
+        // store without this instance's lock) can still mutate the source
+        // mid-copy; the metadata bracket on the copy catches that.
+        let mut turn = Arc::clone(&self.write_lock).lock_owned().await;
         let started = std::time::Instant::now();
-        let checkpoint_result: Result<()> = self
-            .with_conn(move |conn| {
-                conn.query("CHECKPOINT")?;
-                Ok(())
-            })
-            .await;
+        let checkpoint_result: Result<()> = {
+            let (returned, outcome) = Self::write_owning_turn(
+                self.db.clone(),
+                turn,
+                |conn| {
+                    conn.query("CHECKPOINT")?;
+                    Ok(())
+                },
+            )
+            .await?;
+            turn = returned;
+            outcome
+        };
         crate::storage::snapshot::record_checkpoint_outcome(
             started.elapsed().as_millis() as u64,
             checkpoint_result.is_ok(),
         );
         checkpoint_result?;
+        // Still held: no writer of this process reaches the copies below.
+        let _write_guard = turn;
 
         std::fs::create_dir_all(&dir)?;
         let target = dir.join("ladybug.store");
-        std::fs::copy(&source, &target)
-            .map_err(|e| anyhow::anyhow!("could not copy {:?} into the snapshot: {}", source, e))?;
+        // Bracket the copy with the source's (len, mtime): an external
+        // writer mutating the file between the stat calls means the copy
+        // is torn, so retry once and abort the snapshot if it still
+        // changes (issue #95).
+        let mut copy_attempts = 0;
+        loop {
+            let before = std::fs::metadata(&source).map_err(|e| {
+                anyhow::anyhow!(
+                    "could not stat {:?} before the snapshot copy: {}",
+                    source,
+                    e
+                )
+            })?;
+            std::fs::copy(&source, &target).map_err(|e| {
+                anyhow::anyhow!("could not copy {:?} into the snapshot: {}", source, e)
+            })?;
+            let after = std::fs::metadata(&source).map_err(|e| {
+                anyhow::anyhow!(
+                    "could not stat {:?} after the snapshot copy: {}",
+                    source,
+                    e
+                )
+            })?;
+            if (before.len(), before.modified().ok()) == (after.len(), after.modified().ok()) {
+                break;
+            }
+            copy_attempts += 1;
+            if copy_attempts > 1 {
+                return Err(anyhow::anyhow!(
+                    "source store changed during export_database copy"
+                ));
+            }
+        }
         // A WAL left behind after the checkpoint rides along, so a restore
         // replays it exactly as the engine would have.
         let mut wal = source.clone().into_os_string();
@@ -7904,9 +7972,7 @@ impl VectorStore for LadybugStore {
         // hardcoded constant) so the operator-facing limit and the prune
         // behaviour cannot drift apart.
         if let Some(parent) = dir.parent() {
-            let keep = crate::storage::snapshot::StorageHygieneConfig::default()
-                .snapshot_retention_count
-                .max(5);
+            let keep = Self::configured_snapshot_retention_count();
             let expired = crate::storage::snapshot::select_expired_snapshots(parent, keep);
             if let Ok(expired) = expired {
                 if !expired.is_empty() {
@@ -11194,6 +11260,118 @@ mod tests {
             out.join("manifest.json").exists(),
             "the snapshot carries a manifest"
         );
+    }
+
+    #[test]
+    fn configured_snapshot_retention_count_honors_small_and_zero_values() {
+        let previous = std::env::var("NEUROSTRATA_SNAPSHOT_RETENTION_COUNT").ok();
+        let default_keep = crate::storage::snapshot::StorageHygieneConfig::default()
+            .snapshot_retention_count;
+
+        std::env::set_var("NEUROSTRATA_SNAPSHOT_RETENTION_COUNT", "2");
+        assert_eq!(
+            LadybugStore::configured_snapshot_retention_count(),
+            2,
+            "a configured retention below five is honoured, not raised to it"
+        );
+        std::env::set_var("NEUROSTRATA_SNAPSHOT_RETENTION_COUNT", "0");
+        assert_eq!(
+            LadybugStore::configured_snapshot_retention_count(),
+            1,
+            "zero is floored at one snapshot"
+        );
+        std::env::set_var("NEUROSTRATA_SNAPSHOT_RETENTION_COUNT", "not-a-number");
+        assert_eq!(
+            LadybugStore::configured_snapshot_retention_count(),
+            default_keep,
+            "an unparseable override falls back to the hygiene config"
+        );
+
+        match previous {
+            Some(value) => std::env::set_var("NEUROSTRATA_SNAPSHOT_RETENTION_COUNT", value),
+            None => std::env::remove_var("NEUROSTRATA_SNAPSHOT_RETENTION_COUNT"),
+        }
+        assert_eq!(
+            LadybugStore::configured_snapshot_retention_count(),
+            default_keep,
+            "without an override the hygiene config default applies"
+        );
+    }
+
+    #[tokio::test]
+    async fn export_database_prunes_to_the_configured_retention_count() {
+        // Issue #89: the operator-configured retention must reach the
+        // prune step even when it is below the five the old code clamped
+        // to, so the oldest snapshots expire at the configured count.
+        let previous_retention = std::env::var("NEUROSTRATA_SNAPSHOT_RETENTION_COUNT").ok();
+        let previous_prune = std::env::var("NEUROSTRATA_PRUNE_SNAPSHOTS").ok();
+        std::env::set_var("NEUROSTRATA_SNAPSHOT_RETENTION_COUNT", "2");
+        std::env::set_var("NEUROSTRATA_PRUNE_SNAPSHOTS", "1");
+
+        let root = std::env::temp_dir().join(format!(
+            "lbug-export-retention-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("store.db");
+        let store = LadybugStore::for_testing(db.to_string_lossy().to_string(), 4)
+            .expect("open temp database");
+        store.init("retention-probe").await.expect("init");
+
+        // Three planted snapshots, ordered oldest to newest by created_at;
+        // each is prune-eligible in the select step (name + manifest).
+        for (index, created_at) in [
+            "2000-01-01T00:00:00Z",
+            "2000-01-02T00:00:00Z",
+            "2000-01-03T00:00:00Z",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let planted = root.join(format!("snapshot-planted-{index}"));
+            std::fs::create_dir_all(&planted).unwrap();
+            std::fs::write(
+                planted.join("manifest.json"),
+                format!(
+                    r#"{{"format":"neurostrata-snapshot","version":1,"created_at":"{created_at}","source":"fixture","bytes":1}}"#
+                ),
+            )
+            .unwrap();
+        }
+
+        let out = root.join("snapshot-exported");
+        store
+            .export_database(&out.to_string_lossy())
+            .await
+            .expect("export into the planted snapshot directory");
+        drop(store);
+
+        let mut remaining: Vec<String> = std::fs::read_dir(&root)
+            .expect("read the snapshot root")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("snapshot-"))
+            .collect();
+        remaining.sort();
+        assert_eq!(
+            remaining,
+            vec![
+                "snapshot-exported".to_string(),
+                "snapshot-planted-2".to_string()
+            ],
+            "retention 2 keeps the fresh export and the newest planted snapshot"
+        );
+
+        match previous_retention {
+            Some(value) => std::env::set_var("NEUROSTRATA_SNAPSHOT_RETENTION_COUNT", value),
+            None => std::env::remove_var("NEUROSTRATA_SNAPSHOT_RETENTION_COUNT"),
+        }
+        match previous_prune {
+            Some(value) => std::env::set_var("NEUROSTRATA_PRUNE_SNAPSHOTS", value),
+            None => std::env::remove_var("NEUROSTRATA_PRUNE_SNAPSHOTS"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
