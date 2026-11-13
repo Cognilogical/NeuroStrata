@@ -181,6 +181,11 @@ pub const REMINDER_WIRES: &[Reminder] = &[
         fires_on: "before-edit",
         text: "subagents start with zero memory context: paste the subagent_prompt_injection block from neurostrata_task_claim into EVERY subagent prompt you spawn",
     },
+    Reminder {
+        id: "formal-lean-verification-check",
+        fires_on: "during-work",
+        text: "when adding or modifying a state machine, gate, sovereignty/ACL rule, CRDT/merge rule, lease/claim rule, or conservation invariant, evaluate whether to factor the pure decision into src/formal_kernel.rs, prove its invariants in proofs/NeuroStrata/*.lean (zero sorry/axiom), and add parity rows in tests/lean_parity_test.rs",
+    },
 ];
 
 /// Every id a rule may name in its `guard` field (A6). A dangling guard is

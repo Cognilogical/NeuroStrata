@@ -745,7 +745,8 @@ pub async fn build_task_graph_context(
         "### NeuroStrata Task & Graph Context (PASTE INTO ALL SUBAGENT PROMPTS)\n\
          - Namespace: `{}` | Task ID: `{}` | Goal: {}\n\
          - Auto-Retrieved Governing Rules & Graph Nodes:\n{}{}\n\
-         - Mandatory Graph-First Lookup Rule: Before editing any file, check whether its path and governing memory IDs (`mem-...`) are already listed under `### NeuroStrata Task & Graph Context` in your prompt. For any file you touch that is NOT listed in that block, call `neurostrata_memories_for_file` first (or `neurostrata_related` / `neurostrata_search_memory` with `include_related: true` / `neurostrata_sparql_query`).",
+         - Mandatory Graph-First Lookup Rule: Before editing any file, check whether its path and governing memory IDs (`mem-...`) are already listed under `### NeuroStrata Task & Graph Context` in your prompt. For any file you touch that is NOT listed in that block, call `neurostrata_memories_for_file` first (or `neurostrata_related` / `neurostrata_search_memory` with `include_related: true` / `neurostrata_sparql_query`).\
+         \n- Formal Verification Reflex: When adding or modifying a state machine, gate, sovereignty/ACL check, CRDT/merge rule, lease/claim rule, or conservation invariant, evaluate whether to extract the pure decision into `src/formal_kernel.rs`, prove its theorems in `proofs/NeuroStrata/*.lean` (zero `sorry`/`axiom`), and extend `tests/lean_parity_test.rs`.",
         namespace, task_id, payload.content, hits_block, bridges_prompt
     );
     (auto_retrieved_context, subagent_prompt)
@@ -2562,6 +2563,7 @@ pub fn snapshot_prefix(memories: &[SearchResult]) -> String {
     let mut out = String::from("Zero-Action Start: claim or create a task before editing.\n");
     out.push_str("Task recognition: a statement of future/deferred work ('TODO:', 'we should also', 'later we need to', 'remaining work:', ...) is a task, not a note — capture it with neurostrata_task_create.\n");
     out.push_str("Graph-First & Subagent Propagation: before blind grep/glob or editing files, query neurostrata_memories_for_file, neurostrata_related, neurostrata_search_memory (include_related: true), or neurostrata_sparql_query for GOVERNS/DEPENDS_ON/calls/imports edges. Write this into your session plan and paste the `subagent_prompt_injection` block from neurostrata_task_claim into EVERY subagent prompt you spawn.\n");
+    out.push_str("Formal Verification Reflex: when adding or modifying a state machine, gate, sovereignty/ACL rule, CRDT/merge rule, lease/claim rule, or conservation invariant, evaluate whether to factor the pure decision into src/formal_kernel.rs, prove its invariants in proofs/NeuroStrata/*.lean (zero sorry/axiom), and add parity rows in tests/lean_parity_test.rs.\n");
     if claimed.is_empty() && ready.is_empty() {
         out.push_str("No tasks are claimed or ready in this namespace.\n");
         return out;

@@ -521,7 +521,7 @@ pub async fn handle_procedure_perform(arguments: Value, store: Arc<dyn VectorSto
     if is_lapsed(&metadata, now) {
         return reply(false, true, false, budget, count, pointer_before, "lapsed");
     }
-    if budget == Some(0) {
+    if matches!(budget, Some(b) if b <= 0) {
         return reply(false, false, true, budget, count, pointer_before, "spent");
     }
 
@@ -798,6 +798,34 @@ mod tests {
             json!(3),
             "the refusal is not a fourth performance"
         );
+    }
+
+    /// A negative budget is as spent as zero: the row reports spent, the
+    /// refusal is not a performance, and nothing is rewritten — a corrupted
+    /// row must not be able to slip past the spent gate by going negative.
+    #[tokio::test]
+    async fn negative_remaining_fires_is_refused_as_spent_and_never_decrements() {
+        let store = empty_store("probe").await;
+        seed(
+            &store,
+            "probe",
+            "proc-negative",
+            "procedure",
+            json!({ "trigger": "session-start", "remaining_fires": -1, "performance_count": 4 }),
+        )
+        .await;
+
+        let reply: Value = serde_json::from_str(
+            &handle_procedure_perform(json!({ "id": "proc-negative" }), store.clone()).await,
+        )
+        .expect("json");
+        assert_eq!(reply["performed"], json!(false), "{}", reply);
+        assert_eq!(reply["spent"], json!(true));
+        assert_eq!(reply["reason"], json!("spent"));
+
+        let meta = stored(&store, "probe", "proc-negative").await.metadata;
+        assert_eq!(meta["remaining_fires"], json!(-1));
+        assert_eq!(meta["performance_count"], json!(4));
     }
 
     /// An unbounded budget stays unbounded: no key is invented and an explicit
