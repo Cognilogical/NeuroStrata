@@ -327,38 +327,13 @@ impl MeshReactor {
                     .cognitive_records
                     .lock()
                     .map_err(|_| ReactorApplyError::Storage("cognitive_records lock".into()))?;
-                if let Some(existing) = store.get(&rec_id) {
+                if let Some(existing) = store.get(&rec_id).cloned() {
                     if existing.update_id == record.update_id {
+                        self.commit_accepted_frame(&frame, key)?;
                         return Ok(ReactorApplyOutcome::NoOpDuplicate);
                     }
-                    let local_k = match existing.lifecycle.state {
-                        crate::synaptic_mesh::record::LifecycleState::Active => {
-                            crate::formal_kernel::KernelLifecycleState::Active
-                        }
-                        crate::synaptic_mesh::record::LifecycleState::Archived => {
-                            crate::formal_kernel::KernelLifecycleState::Archived
-                        }
-                        crate::synaptic_mesh::record::LifecycleState::Superseded => {
-                            crate::formal_kernel::KernelLifecycleState::Superseded
-                        }
-                        crate::synaptic_mesh::record::LifecycleState::Tombstoned => {
-                            crate::formal_kernel::KernelLifecycleState::Tombstoned
-                        }
-                    };
-                    let cand_k = match record.lifecycle.state {
-                        crate::synaptic_mesh::record::LifecycleState::Active => {
-                            crate::formal_kernel::KernelLifecycleState::Active
-                        }
-                        crate::synaptic_mesh::record::LifecycleState::Archived => {
-                            crate::formal_kernel::KernelLifecycleState::Archived
-                        }
-                        crate::synaptic_mesh::record::LifecycleState::Superseded => {
-                            crate::formal_kernel::KernelLifecycleState::Superseded
-                        }
-                        crate::synaptic_mesh::record::LifecycleState::Tombstoned => {
-                            crate::formal_kernel::KernelLifecycleState::Tombstoned
-                        }
-                    };
+                    let local_k = existing.lifecycle.state.to_kernel();
+                    let cand_k = record.lifecycle.state.to_kernel();
                     let content_changed = existing.content != record.content;
                     let explicit_supersede = record.lifecycle.superseded_by
                         == Some(existing.update_id)
@@ -374,22 +349,108 @@ impl MeshReactor {
                         content_changed,
                         concurrent,
                     );
-                    if merge_decision != crate::formal_kernel::KernelMergeDecision::Apply {
-                        conflict::register_conflict(
-                            &self.conflicts_dir,
-                            &frame.namespace,
-                            &rec_id,
-                            &record.update_id.to_string(),
-                            "concurrent mesh update_id divergence",
-                            ConflictKind::Unresolved,
-                            record,
-                        )
-                        .map_err(|e| ReactorApplyError::Storage(e.to_string()))?;
-                        self.commit_accepted_frame(&frame, key)?;
-                        return Ok(ReactorApplyOutcome::ConflictPreserved { id: rec_id });
+                    match merge_decision {
+                        crate::formal_kernel::KernelMergeDecision::Apply => {
+                            store.insert(rec_id, record.clone());
+                        }
+                        crate::formal_kernel::KernelMergeDecision::ApplyCombinationArchiveEdit => {
+                            let edited_content = if existing.lifecycle.state
+                                == crate::synaptic_mesh::record::LifecycleState::Archived
+                            {
+                                record.content.clone()
+                            } else {
+                                existing.content.clone()
+                            };
+                            let archived_at = record
+                                .lifecycle
+                                .archived_at
+                                .or(existing.lifecycle.archived_at)
+                                .or_else(|| Some(Utc::now()));
+                            let mut combined = record.clone();
+                            combined.content = edited_content;
+                            combined.lifecycle.state =
+                                crate::synaptic_mesh::record::LifecycleState::Archived;
+                            combined.lifecycle.archived_at = archived_at;
+                            store.insert(rec_id, combined);
+                        }
+                        crate::formal_kernel::KernelMergeDecision::SupersedeWinsPreserveEdit => {
+                            let losing_edit = if existing.lifecycle.state
+                                == crate::synaptic_mesh::record::LifecycleState::Superseded
+                            {
+                                record.clone()
+                            } else {
+                                store.insert(rec_id.clone(), record.clone());
+                                existing.clone()
+                            };
+                            conflict::register_conflict(
+                                &self.conflicts_dir,
+                                &frame.namespace,
+                                &rec_id,
+                                &losing_edit.update_id.to_string(),
+                                "supersede wins; concurrent edit preserved",
+                                ConflictKind::Preserved,
+                                &losing_edit,
+                            )
+                            .map_err(|e| ReactorApplyError::Storage(e.to_string()))?;
+                            let mut preserved = losing_edit;
+                            preserved.id = uuid::Uuid::new_v4();
+                            preserved.update_id = uuid::Uuid::new_v4();
+                            preserved.signature = None;
+                            preserved.public_key = None;
+                            preserved.signer_did = None;
+                            preserved.lifecycle.state =
+                                crate::synaptic_mesh::record::LifecycleState::Active;
+                            preserved.lifecycle.superseded_by = None;
+                            preserved.lifecycle.archived_at = None;
+                            preserved.lifecycle.tombstoned_at = None;
+                            if !preserved.relationships.iter().any(|r| {
+                                r.kind == "references" && r.target == existing.id
+                            }) {
+                                preserved.relationships.push(
+                                    crate::synaptic_mesh::record::Relationship {
+                                        kind: "references".to_string(),
+                                        target: existing.id,
+                                    },
+                                );
+                            }
+                            store.insert(preserved.id.to_string(), preserved);
+                        }
+                        crate::formal_kernel::KernelMergeDecision::Skip
+                        | crate::formal_kernel::KernelMergeDecision::RefuseTombstoneWins
+                        | crate::formal_kernel::KernelMergeDecision::RefuseStaleRestore
+                        | crate::formal_kernel::KernelMergeDecision::RefuseIllegalTransition => {
+                            self.commit_accepted_frame(&frame, key)?;
+                            return Ok(ReactorApplyOutcome::NoOpDuplicate);
+                        }
+                        crate::formal_kernel::KernelMergeDecision::ConflictTwoReplacements
+                        | crate::formal_kernel::KernelMergeDecision::ConflictRestoreArchive
+                        | crate::formal_kernel::KernelMergeDecision::ConflictIncompatibleEdits => {
+                            let reason = match merge_decision {
+                                crate::formal_kernel::KernelMergeDecision::ConflictTwoReplacements => {
+                                    "two different replacements"
+                                }
+                                crate::formal_kernel::KernelMergeDecision::ConflictRestoreArchive => {
+                                    "restore + archive"
+                                }
+                                _ => "incompatible content edits",
+                            };
+                            conflict::register_conflict(
+                                &self.conflicts_dir,
+                                &frame.namespace,
+                                &rec_id,
+                                &record.update_id.to_string(),
+                                reason,
+                                ConflictKind::Unresolved,
+                                record,
+                            )
+                            .map_err(|e| ReactorApplyError::Storage(e.to_string()))?;
+                            self.commit_accepted_frame(&frame, key)?;
+                            return Ok(ReactorApplyOutcome::ConflictPreserved { id: rec_id });
+                        }
                     }
+                } else {
+                    store.insert(rec_id, record.clone());
                 }
-                store.insert(rec_id, record.clone());
                 ReactorApplyOutcome::Applied
             }
             MeshPayloadKind::TaskDelta {
@@ -1164,5 +1225,258 @@ mod tests {
             .cloned()
             .expect("the shared record is stored");
         assert_eq!(stored.lifecycle.state, LifecycleState::Archived);
+    }
+
+    #[tokio::test]
+    async fn reactor_dispatches_archive_edit_supersede_edit_skip_and_tombstone_refuse() {
+        let psk = [0x78u8; 32];
+        let tmp = tempfile::tempdir().unwrap();
+        let outbox_a = Arc::new(Outbox::open(&tmp.path().join("a4.outbox")).unwrap());
+        let outbox_b = Arc::new(Outbox::open(&tmp.path().join("b4.outbox")).unwrap());
+        let trans_a = P2pMeshTransport::bind("127.0.0.1:0", "m1".into(), 1, psk, outbox_a.clone())
+            .await
+            .unwrap();
+        let trans_b = P2pMeshTransport::bind("127.0.0.1:0", "m1".into(), 1, psk, outbox_b.clone())
+            .await
+            .unwrap();
+
+        let (pkey_a, did_a, _) = generate_keypair().unwrap();
+        let (pkey_b, did_b, _) = generate_keypair().unwrap();
+        let conflicts_b = tmp.path().join("b4.conflicts");
+
+        let reactor_a = MeshReactor::new(
+            "m1".into(),
+            1,
+            did_a.clone(),
+            pkey_a,
+            outbox_a,
+            trans_a,
+            Arc::new(AttentionFilter::new()),
+            tmp.path().join("a4.conflicts"),
+        );
+        let reactor_b = MeshReactor::new(
+            "m1".into(),
+            1,
+            did_b.clone(),
+            pkey_b,
+            outbox_b,
+            trans_b,
+            Arc::new(AttentionFilter::new()),
+            conflicts_b.clone(),
+        );
+
+        let mk_record = |id: Uuid, state: LifecycleState, update_id: Uuid, content: serde_json::Value| {
+            MeshRecord {
+                schema_version: MESH_RECORD_SCHEMA_VERSION.into(),
+                id,
+                namespace: "ns".into(),
+                memory_type: "rule".into(),
+                lifecycle: Lifecycle {
+                    state,
+                    created_at: Utc::now(),
+                    created_by: did_a.clone(),
+                    superseded_by: None,
+                    archived_at: None,
+                    tombstoned_at: None,
+                },
+                content,
+                metadata: serde_json::json!({ "eligibility": "shareable" }),
+                rdf: None,
+                relationships: vec![],
+                update_id,
+                origin_mesh_epoch: 1,
+                trust: Trust::Trusted,
+                signature: None,
+                signer_did: Some(did_a.clone()),
+                public_key: None,
+                patch: None,
+            }
+        };
+        let publish = |record: MeshRecord| {
+            let reactor = &reactor_a;
+            async move {
+                reactor
+                    .publish_payload(
+                        "ns",
+                        vec![],
+                        MeshPayloadKind::CognitiveDelta {
+                            record,
+                            rdf_patch: String::new(),
+                            concept_iris: vec![],
+                            file_targets: vec![],
+                        },
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // 1. Skip: idempotent same state + same content, different update_id ->
+        //    NoOpDuplicate, no conflict artifact.
+        let skip_id = Uuid::new_v4();
+        let frame_skip_1 = publish(mk_record(
+            skip_id,
+            LifecycleState::Active,
+            Uuid::new_v4(),
+            serde_json::json!("skip rule"),
+        ))
+        .await;
+        assert_eq!(
+            reactor_b.apply_inbound_frame(frame_skip_1, 1000).await.unwrap(),
+            ReactorApplyOutcome::Applied
+        );
+        let frame_skip_2 = publish(mk_record(
+            skip_id,
+            LifecycleState::Active,
+            Uuid::new_v4(),
+            serde_json::json!("skip rule"),
+        ))
+        .await;
+        assert_eq!(
+            reactor_b.apply_inbound_frame(frame_skip_2, 1000).await.unwrap(),
+            ReactorApplyOutcome::NoOpDuplicate
+        );
+        assert_eq!(
+            crate::synaptic_mesh::conflict::load_overlay(&conflicts_b)
+                .conflicts
+                .len(),
+            0,
+            "Skip must not register a conflict artifact"
+        );
+
+        // 2. ApplyCombinationArchiveEdit: Archived local + Active incoming with
+        //    edited content -> Applied, stored record stays Archived with the edit.
+        let combo_id = Uuid::new_v4();
+        let mut rec_combo_archived = mk_record(
+            combo_id,
+            LifecycleState::Archived,
+            Uuid::new_v4(),
+            serde_json::json!("combo rule"),
+        );
+        rec_combo_archived.lifecycle.archived_at = Some(Utc::now());
+        let frame_combo_1 = publish(rec_combo_archived).await;
+        assert_eq!(
+            reactor_b.apply_inbound_frame(frame_combo_1, 1000).await.unwrap(),
+            ReactorApplyOutcome::Applied
+        );
+        let frame_combo_2 = publish(mk_record(
+            combo_id,
+            LifecycleState::Active,
+            Uuid::new_v4(),
+            serde_json::json!("combo rule EDITED"),
+        ))
+        .await;
+        assert_eq!(
+            reactor_b.apply_inbound_frame(frame_combo_2, 1000).await.unwrap(),
+            ReactorApplyOutcome::Applied
+        );
+        {
+            let store = reactor_b.cognitive_records.lock().expect("cognitive_records lock");
+            let stored = store.get(&combo_id.to_string()).expect("combo record stored");
+            assert_eq!(stored.lifecycle.state, LifecycleState::Archived);
+            assert_eq!(stored.content, serde_json::json!("combo rule EDITED"));
+        }
+
+        // 3. SupersedeWinsPreserveEdit: Active local + incoming Superseded with
+        //    edited content -> Applied, original id goes Superseded, losing edit
+        //    preserved as a new Active record referencing the original id, and a
+        //    Preserved (not Unresolved) conflict entry is registered.
+        let sw_id = Uuid::new_v4();
+        let sw_update_1 = Uuid::new_v4();
+        let frame_sw_1 = publish(mk_record(
+            sw_id,
+            LifecycleState::Active,
+            sw_update_1,
+            serde_json::json!("supersede rule v1"),
+        ))
+        .await;
+        assert_eq!(
+            reactor_b.apply_inbound_frame(frame_sw_1, 1000).await.unwrap(),
+            ReactorApplyOutcome::Applied
+        );
+        let mut rec_sw_superseded = mk_record(
+            sw_id,
+            LifecycleState::Superseded,
+            Uuid::new_v4(),
+            serde_json::json!("supersede rule v2 EDITED"),
+        );
+        rec_sw_superseded.lifecycle.superseded_by = Some(sw_update_1);
+        let frame_sw_2 = publish(rec_sw_superseded).await;
+        assert_eq!(
+            reactor_b.apply_inbound_frame(frame_sw_2, 1000).await.unwrap(),
+            ReactorApplyOutcome::Applied
+        );
+        {
+            let store = reactor_b.cognitive_records.lock().expect("cognitive_records lock");
+            let stored = store.get(&sw_id.to_string()).expect("sw record stored");
+            assert_eq!(stored.lifecycle.state, LifecycleState::Superseded);
+            let preserved = store
+                .values()
+                .find(|r| {
+                    r.id != sw_id
+                        && r.lifecycle.state == LifecycleState::Active
+                        && r.content == serde_json::json!("supersede rule v1")
+                })
+                .expect("losing edit preserved as a new Active record");
+            assert!(preserved.relationships.iter().any(|r| {
+                r.kind == "references" && r.target == sw_id
+            }));
+        }
+        let overlay = crate::synaptic_mesh::conflict::load_overlay(&conflicts_b);
+        assert!(overlay
+            .conflicts
+            .iter()
+            .any(|e| e.id == sw_id.to_string() && e.kind == ConflictKind::Preserved));
+        assert_eq!(
+            overlay
+                .conflicts
+                .iter()
+                .filter(|e| e.kind == ConflictKind::Unresolved)
+                .count(),
+            0,
+            "SupersedeWinsPreserveEdit must not register an Unresolved conflict"
+        );
+
+        // 4. RefuseTombstoneWins: Tombstoned local + incoming Active ->
+        //    NoOpDuplicate, stored record stays Tombstoned, no conflict artifact.
+        let tomb_id = Uuid::new_v4();
+        let mut rec_tomb = mk_record(
+            tomb_id,
+            LifecycleState::Tombstoned,
+            Uuid::new_v4(),
+            serde_json::json!("tomb rule"),
+        );
+        rec_tomb.lifecycle.tombstoned_at = Some(Utc::now());
+        let frame_tomb_1 = publish(rec_tomb).await;
+        assert_eq!(
+            reactor_b.apply_inbound_frame(frame_tomb_1, 1000).await.unwrap(),
+            ReactorApplyOutcome::Applied
+        );
+        let frame_tomb_2 = publish(mk_record(
+            tomb_id,
+            LifecycleState::Active,
+            Uuid::new_v4(),
+            serde_json::json!("tomb rule"),
+        ))
+        .await;
+        assert_eq!(
+            reactor_b.apply_inbound_frame(frame_tomb_2, 1000).await.unwrap(),
+            ReactorApplyOutcome::NoOpDuplicate
+        );
+        {
+            let store = reactor_b.cognitive_records.lock().expect("cognitive_records lock");
+            let stored = store.get(&tomb_id.to_string()).expect("tomb record stored");
+            assert_eq!(stored.lifecycle.state, LifecycleState::Tombstoned);
+        }
+        let overlay = crate::synaptic_mesh::conflict::load_overlay(&conflicts_b);
+        assert_eq!(
+            overlay
+                .conflicts
+                .iter()
+                .filter(|e| e.id == tomb_id.to_string())
+                .count(),
+            0,
+            "RefuseTombstoneWins must not write a conflict artifact"
+        );
     }
 }
