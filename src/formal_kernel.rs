@@ -142,16 +142,9 @@ impl KernelLifecycleState {
 /// Matches the 7 allowed edges from `src/synaptic_mesh/record.rs:159-172`.
 pub const fn lifecycle_can_transition(from: KernelLifecycleState, to: KernelLifecycleState) -> bool {
     use KernelLifecycleState::*;
-    match (from, to) {
-        (Active, Archived) => true,
-        (Archived, Active) => true,
-        (Active, Superseded) => true,
-        (Archived, Superseded) => true,
-        (Active, Tombstoned) => true,
-        (Archived, Tombstoned) => true,
-        (Superseded, Tombstoned) => true,
-        _ => false,
-    }
+    matches!((from, to), (Active, Archived) | (Archived, Active) | (Active, Superseded)
+        | (Archived, Superseded) | (Active, Tombstoned) | (Archived, Tombstoned)
+        | (Superseded, Tombstoned))
 }
 
 /// Returns true if the state is terminal (no forward transitions except tombstoning).

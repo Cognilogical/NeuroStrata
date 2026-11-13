@@ -162,11 +162,11 @@ theorem no_silent_edit_drop_on_supersede : ∀ (sameSup concurrent : Bool),
   intro s k
   cases s <;> cases k <;> decide
 
-theorem archive_edit_commutativity : ∀ (sameSup : Bool),
-    classifyMerge .archived .active sameSup true true = .applyCombinationArchiveEdit ∧
-    classifyMerge .active .archived sameSup true true = .applyCombinationArchiveEdit := by
-  intro s
-  cases s <;> decide
+theorem archive_edit_commutativity : ∀ (sameSup concurrent : Bool),
+    classifyMerge .archived .active sameSup true concurrent = .applyCombinationArchiveEdit ∧
+    classifyMerge .active .archived sameSup true concurrent = .applyCombinationArchiveEdit := by
+  intro s k
+  cases s <;> cases k <;> decide
 
 theorem classifyMerge_concurrent_symmetry : ∀ (a b : LifecycleState) (sameSup contentChanged : Bool),
     resolveOutcome a b (classifyMerge a b sameSup contentChanged true) = resolveOutcome b a (classifyMerge b a sameSup contentChanged true) := by
