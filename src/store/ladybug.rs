@@ -6828,6 +6828,56 @@ impl VectorStore for LadybugStore {
         outcome
     }
 
+    /// CAS-by-write-turn: the read and the write happen inside one turn, and
+    /// the store's single-writer lock serialises it against every other writer
+    /// (in-process and, via the database file lock, cross-process). Concurrent
+    /// rule firings therefore serialize instead of losing increments between a
+    /// separate get and upsert.
+    async fn increment_metadata_counter(
+        &self,
+        namespace: &str,
+        id: &str,
+        key: &str,
+    ) -> Result<()> {
+        let namespace = namespace.to_string();
+        let id = id.to_string();
+        let key = key.to_string();
+        self.write_with_deadline("recording a metadata counter", move |conn| {
+            let safe_ns = escape_ladybug_string(&namespace);
+            let safe_id = escape_ladybug_string(&id);
+            let read = format!(
+                "MATCH (m:Memory) WHERE m.id = '{safe_id}' AND m.namespace = '{safe_ns}' RETURN m.metadata"
+            );
+            let mut rows = conn.query(&read)?;
+            let Some(row) = rows.next() else {
+                return Ok(());
+            };
+            let metadata_str = format!("{}", row[0]);
+            let mut metadata: Value = serde_json::from_str(&metadata_str)
+                .unwrap_or_else(|_| serde_json::json!({}));
+            if !metadata.is_object() {
+                anyhow::bail!(
+                    "memory '{id}' carries metadata that is not an object"
+                );
+            }
+            let hits = metadata
+                .get(&key)
+                .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f.max(0.0) as u64)))
+                .unwrap_or(0);
+            if let Some(obj) = metadata.as_object_mut() {
+                obj.insert(key.clone(), serde_json::json!(hits + 1));
+            }
+            let safe_meta =
+                escape_ladybug_string(&serde_json::to_string(&metadata)?);
+            let write = format!(
+                "MATCH (m:Memory) WHERE m.id = '{safe_id}' AND m.namespace = '{safe_ns}' SET m.metadata = '{safe_meta}'"
+            );
+            conn.query(&write)?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn search(
         &self,
         namespace: &str,

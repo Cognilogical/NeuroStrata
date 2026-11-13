@@ -64,11 +64,14 @@
     },
     "guard-3000": {
       "commands": [
-        "cargo test --locked --bin neurostrata-mcp guard:: -- --test-threads=1"
+        "cargo test --locked --bin neurostrata-mcp guard::semantic::tests -- --test-threads=1"
       ],
       "tests": [
-        "guard::tests::three_thousand_rules_within_budget",
-        "guard::tests::listing_cap_is_honored"
+        "guard::semantic::tests::three_thousand_rules_within_budget",
+        "guard::semantic::tests::listing_cap_is_honored",
+        "guard::semantic::tests::concurrent_hit_counts_are_not_lost",
+        "guard::semantic::tests::listing_cap_counts_parsed_rules_not_rows",
+        "guard::semantic::tests::listing_cap_refuses_above_the_cap_of_parsed_rules"
       ],
       "thresholds": {
         "rules": 3000,
