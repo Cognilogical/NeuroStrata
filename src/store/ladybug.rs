@@ -3605,24 +3605,140 @@ fn active_generation_of(conn: &Connection, namespace: &str) -> u64 {
 /// published. Read surfaces (`list`, `export_graph`) drop rows from a
 /// superseded generation against this set.
 fn active_generations_of(conn: &Connection, namespace: &str) -> std::collections::HashSet<u64> {
+    match active_generations_checked(conn, namespace) {
+        Ok(gens) => gens,
+        Err(e) => {
+            tracing::warn!("active_generations_of query failed: {e}");
+            std::collections::HashSet::new()
+        }
+    }
+}
+
+/// Fallible active-generation read for destructive operations.
+///
+/// A read surface can degrade to "no generations" when the query fails; a
+/// delete cannot: an empty set would make every generation look superseded.
+/// `delete_generation`/`prune_generations` use this and propagate the error.
+fn active_generations_checked(
+    conn: &Connection,
+    namespace: &str,
+) -> Result<std::collections::HashSet<u64>> {
     let query = format!(
         "MATCH (g:IngestGeneration) WHERE g.namespace = '{}' AND g.active_generation > 0 RETURN g.active_generation",
         escape_ladybug_string(namespace)
     );
     let mut gens = std::collections::HashSet::new();
-    match conn.query(&query) {
-        Ok(rows) => {
-            for row in rows {
-                if let Ok(g) = format!("{}", row[0]).parse::<i64>() {
-                    if g > 0 {
-                        gens.insert(g as u64);
-                    }
+    for row in conn.query(&query)? {
+        if let Ok(g) = format!("{}", row[0]).parse::<i64>() {
+            if g > 0 {
+                gens.insert(g as u64);
+            }
+        }
+    }
+    Ok(gens)
+}
+
+/// Each source's recorded previous generation (the rollback target).
+fn previous_generations_of(
+    conn: &Connection,
+    namespace: &str,
+) -> Result<std::collections::HashSet<u64>> {
+    let query = format!(
+        "MATCH (g:IngestGeneration) WHERE g.namespace = '{}' RETURN g.previous_generation",
+        escape_ladybug_string(namespace)
+    );
+    let mut gens = std::collections::HashSet::new();
+    for row in conn.query(&query)? {
+        if let Ok(g) = format!("{}", row[0]).parse::<i64>() {
+            if g > 0 {
+                gens.insert(g as u64);
+            }
+        }
+    }
+    Ok(gens)
+}
+
+/// Published source pointers: `(source_key, active_generation,
+/// previous_generation)`. `previous_generation` is 0 for a store upgraded from
+/// before the column existed, or for a source that has published once.
+fn ingest_pointers_of(
+    conn: &Connection,
+    namespace: &str,
+) -> Result<Vec<(String, u64, u64)>> {
+    let query = format!(
+        "MATCH (g:IngestGeneration) WHERE g.namespace = '{}' AND g.active_generation > 0 RETURN g.source_key, g.active_generation, g.previous_generation",
+        escape_ladybug_string(namespace)
+    );
+    let mut out = Vec::new();
+    for row in conn.query(&query)? {
+        let source = format!("{}", row[0]);
+        let active = format!("{}", row[1]).parse::<i64>().unwrap_or(0).max(0) as u64;
+        let previous = format!("{}", row[2]).parse::<i64>().unwrap_or(0).max(0) as u64;
+        if active > 0 {
+            out.push((source, active, previous));
+        }
+    }
+    Ok(out)
+}
+
+/// The generations an ingest has allocated but not published or aborted.
+///
+/// One `StagingGeneration` row per in-flight ingest, so overlapping ingests of
+/// one source are both protected (a scalar on the pointer row would lose the
+/// older one). Publish/abort delete only their own generation's row. A staged
+/// generation is not superseded, so retention must never prune it: the ingest
+/// would publish a pointer onto deleted rows.
+fn staging_generations_of(
+    conn: &Connection,
+    namespace: &str,
+) -> Result<std::collections::HashSet<u64>> {
+    staging_generations_at(conn, namespace, chrono::Utc::now().timestamp())
+}
+
+/// A staging marker older than this is treated as abandoned: the process died
+/// between `begin_generation` and publish/abort. Long enough for a real
+/// ingest, short enough that a crash does not make a generation unprunable
+/// forever.
+pub(crate) const STAGING_TTL_SECS: i64 = 24 * 60 * 60;
+
+fn staging_generations_at(
+    conn: &Connection,
+    namespace: &str,
+    now: i64,
+) -> Result<std::collections::HashSet<u64>> {
+    let query = format!(
+        "MATCH (s:StagingGeneration) WHERE s.namespace = '{}' RETURN s.generation, s.base_generation, s.created_at",
+        escape_ladybug_string(namespace)
+    );
+    let mut gens = std::collections::HashSet::new();
+    for row in conn.query(&query)? {
+        let created_at = format!("{}", row[2]).parse::<i64>().unwrap_or(0);
+        if now.saturating_sub(created_at) > STAGING_TTL_SECS {
+            continue;
+        }
+        for index in [0usize, 1usize] {
+            if let Ok(g) = format!("{}", row[index]).parse::<i64>() {
+                if g > 0 {
+                    gens.insert(g as u64);
                 }
             }
         }
-        Err(e) => { tracing::warn!("active_generations_of query failed: {e}"); }
     }
-    gens
+    Ok(gens)
+}
+
+fn clear_abandoned_staging(
+    conn: &Connection,
+    namespace: &str,
+    now: i64,
+) -> Result<()> {
+    let cutoff = now.saturating_sub(STAGING_TTL_SECS);
+    let query = format!(
+        "MATCH (s:StagingGeneration) WHERE s.namespace = '{}' AND s.created_at < {cutoff} DELETE s",
+        escape_ladybug_string(namespace)
+    );
+    conn.query(&query)?;
+    Ok(())
 }
 
 /// The active generation per source plus the namespace-wide active set and the
@@ -4289,6 +4405,249 @@ impl LadybugStore {
                 tracing::warn!("active generations query failed for '{ns_label}': {e}");
                 Default::default()
             })
+    }
+
+    /// Delete every row of one superseded generation in `namespace`.
+    ///
+    /// # Rollback constraint
+    ///
+    /// The active generation of each source is the pointer's target, and the
+    /// generation immediately before it is the rollback target if a publish is
+    /// reversed. This API refuses the active generation outright (move the
+    /// pointer first) and [`Self::prune_generations`] always retains every
+    /// active generation plus the newest `keep` generations, so the default
+    /// keep of 2 leaves the rollback target intact. Deleting a *previous*
+    /// generation through this method is possible only by naming it
+    /// explicitly; callers that need rollback must not do that.
+    pub async fn delete_generation(&self, namespace: &str, generation: u64) -> Result<usize> {
+        // Explicit operator purge: the caller may intentionally remove a
+        // previous generation, so the rollback-target protection is off here.
+        self.delete_generation_inner(namespace, generation, false)
+            .await
+    }
+
+    /// Prune's delete: re-checks the rollback target inside the write turn.
+    /// A concurrent publish can make the caller's pointer snapshot stale
+    /// between selection and deletion.
+    async fn delete_generation_protected(
+        &self,
+        namespace: &str,
+        generation: u64,
+    ) -> Result<usize> {
+        self.delete_generation_inner(namespace, generation, true)
+            .await
+    }
+
+    async fn delete_generation_inner(
+        &self,
+        namespace: &str,
+        generation: u64,
+        protect_previous: bool,
+    ) -> Result<usize> {
+        if generation == 0 {
+            anyhow::bail!("generation 0 is not generation-scoped");
+        }
+        let namespace_owned = namespace.to_string();
+        self.write_with_deadline("pruning a superseded generation", move |conn| {
+            // Both checks run INSIDE the write turn. A publication or rollback
+            // (`publish_generation`) takes the same writer lock, so it cannot
+            // move the pointer between the check and the delete. The checked
+            // read propagates a query failure instead of treating it as "no
+            // active generations", which would make every generation look
+            // superseded.
+            let active = active_generations_checked(conn, &namespace_owned)?;
+            if active.contains(&generation) {
+                anyhow::bail!(
+                    "refusing to delete generation {generation} of '{namespace_owned}': it is active for a source; move the pointer first (it is the rollback target)"
+                );
+            }
+            let staging = staging_generations_of(conn, &namespace_owned)?;
+            if staging.contains(&generation) {
+                anyhow::bail!(
+                    "refusing to delete generation {generation} of '{namespace_owned}': an ingest is still staging it; publish or abort it first"
+                );
+            }
+            if protect_previous {
+                let previous = previous_generations_of(conn, &namespace_owned)?;
+                if previous.contains(&generation) {
+                    anyhow::bail!(
+                        "refusing to prune generation {generation} of '{namespace_owned}': it is a source's rollback target; use the explicit delete API to purge it"
+                    );
+                }
+            }
+            let safe_ns = escape_ladybug_string(&namespace_owned);
+            let prefix =
+                crate::parser::ingest::generation_scoped_id(&namespace_owned, generation, "");
+            let safe_prefix = escape_ladybug_string(&prefix);
+            let count_query = format!(
+                "MATCH (m:Memory) WHERE m.namespace = '{safe_ns}' AND m.id STARTS WITH '{safe_prefix}' RETURN count(m)"
+            );
+            let count = conn
+                .query(&count_query)?
+                .next()
+                .map(|row| format!("{}", row[0]).parse::<i64>().unwrap_or(0).max(0) as usize)
+                .unwrap_or(0);
+            if count == 0 {
+                return Ok(0);
+            }
+            let delete_query = format!(
+                "MATCH (m:Memory) WHERE m.namespace = '{safe_ns}' AND m.id STARTS WITH '{safe_prefix}' DETACH DELETE m"
+            );
+            conn.query(&delete_query)?;
+            Ok(count)
+        })
+        .await
+    }
+
+    /// Prune superseded generations, keeping every active generation, every
+    /// per-source previous generation (the rollback target), every staging
+    /// generation, and the newest `keep` generations (clamped to 2).
+    ///
+    /// Returns the number of rows deleted. Generation numbers are
+    /// namespace-wide across sources, so the newest-`keep` window alone cannot
+    /// protect a quiet source's rollback target; the pointer rows record each
+    /// source's previous generation and it is retained explicitly.
+    pub async fn prune_generations(&self, namespace: &str, keep: usize) -> Result<usize> {
+        let keep = keep.max(2);
+        // A failed pointer read must fail the prune, not read as "nothing
+        // active" (which would make every generation look superseded).
+        let ns_for_pointers = namespace.to_string();
+        let pointers = self
+            .with_conn(move |conn| ingest_pointers_of(conn, &ns_for_pointers))
+            .await?;
+        let active: std::collections::HashSet<u64> = pointers
+            .iter()
+            .filter(|(_, active, _)| *active > 0)
+            .map(|(_, active, _)| *active)
+            .collect();
+        // A store upgraded from before `previous_generation` existed has no
+        // recorded rollback targets. Recover them from the retained rows'
+        // source identities rather than pruning a source's history on the
+        // first run after the upgrade.
+        let needs_backfill = pointers.iter().any(|(_, active, previous)| {
+            *active > 0 && *previous == 0
+        });
+
+        let ns_scan = namespace.to_string();
+        let (generations, by_source) = self
+            .with_conn(move |conn| {
+                let safe_ns = escape_ladybug_string(&ns_scan);
+                let base = format!(
+                    "{}{}",
+                    ns_scan,
+                    crate::parser::ingest::NAMESPACE_SEPARATOR
+                );
+                let safe_base = escape_ladybug_string(&base);
+                let query = if needs_backfill {
+                    format!(
+                        "MATCH (m:Memory) WHERE m.namespace = '{safe_ns}' AND m.id STARTS WITH '{safe_base}' RETURN m.id, m.metadata"
+                    )
+                } else {
+                    format!(
+                        "MATCH (m:Memory) WHERE m.namespace = '{safe_ns}' AND m.id STARTS WITH '{safe_base}' RETURN m.id"
+                    )
+                };
+                let mut rows = conn.query(&query)?;
+                let mut generations = std::collections::BTreeSet::new();
+                let mut by_source: HashMap<String, std::collections::BTreeSet<u64>> =
+                    HashMap::new();
+                while let Some(row) = rows.next() {
+                    let id = format!("{}", row[0]);
+                    let Some((_, generation, _)) = split_scoped_id(&id) else {
+                        continue;
+                    };
+                    generations.insert(generation);
+                    if needs_backfill {
+                        let metadata = parse_metadata_or_warn(
+                            &format!("{}", row[1]),
+                            "metadata",
+                        );
+                        if let Some(source) = row_source_key(&metadata) {
+                            if !source.is_empty() {
+                                by_source
+                                    .entry(source.to_string())
+                                    .or_default()
+                                    .insert(generation);
+                            }
+                        }
+                    }
+                }
+                Ok((generations, by_source))
+            })
+            .await?;
+        if generations.is_empty() {
+            return Ok(0);
+        }
+
+        // A crash between begin and publish/abort leaves a marker behind. Clear
+        // markers past the TTL first so an abandoned generation does not stay
+        // unprunable forever; the live set below then excludes generations
+        // whose ingest is genuinely still running.
+        let ns_cleanup = namespace.to_string();
+        self.write_with_deadline("clearing abandoned staging markers", move |conn| {
+            clear_abandoned_staging(conn, &ns_cleanup, chrono::Utc::now().timestamp())
+        })
+        .await?;
+        let ns_for_staging = namespace.to_string();
+        let staging = self
+            .with_conn(move |conn| staging_generations_of(conn, &ns_for_staging))
+            .await?;
+        let mut retained: std::collections::BTreeSet<u64> =
+            active.into_iter().collect();
+        // A generation being staged is not superseded yet: pruning it would
+        // leave the in-flight ingest to publish a pointer onto deleted rows.
+        retained.extend(staging);
+        // The newest-two window is namespace-wide, but rollback is per source:
+        // retain each source's previous generation explicitly, or a quiet
+        // source's rollback target could fall outside the window. For an
+        // upgraded store without the recorded value, take the highest retained
+        // generation below that source's active one from the row scan.
+        let mut backfill: Vec<(String, u64)> = Vec::new();
+        for (source, active, previous) in &pointers {
+            if *previous > 0 {
+                retained.insert(*previous);
+            } else if let Some(history) = by_source.get(source) {
+                if let Some(generation) = history.range(..*active).next_back() {
+                    retained.insert(*generation);
+                    backfill.push((source.clone(), *generation));
+                }
+            }
+        }
+        // Persist the recovered targets before deleting, with a CAS on
+        // `previous_generation = 0`: a concurrent publish that recorded a
+        // fresher value wins, and the delete-time recheck then sees whichever
+        // value is current.
+        if !backfill.is_empty() {
+            let ns_backfill = namespace.to_string();
+            self.write_with_deadline("recording recovered rollback targets", move |conn| {
+                for (source, generation) in backfill.iter() {
+                    let key = crate::parser::ingest::generation_key(&ns_backfill, source);
+                    let query = format!(
+                        "MATCH (g:IngestGeneration) WHERE g.id = '{}' AND g.previous_generation = 0 SET g.previous_generation = {}",
+                        escape_ladybug_string(&key),
+                        generation
+                    );
+                    conn.query(&query)?;
+                }
+                Ok(())
+            })
+            .await?;
+        }
+        for generation in generations.iter().rev().take(keep) {
+            retained.insert(*generation);
+        }
+        let prune: Vec<u64> = generations
+            .iter()
+            .filter(|generation| !retained.contains(generation))
+            .copied()
+            .collect();
+        let mut deleted = 0usize;
+        for generation in prune {
+            deleted += self
+                .delete_generation_protected(namespace, generation)
+                .await?;
+        }
+        Ok(deleted)
     }
 
     pub async fn symbol_ids(&self, namespace: &str) -> Vec<String> {
@@ -6064,10 +6423,23 @@ impl VectorStore for LadybugStore {
                     tracing::warn!("schema DDL table creation failed: {e}");
                 }
             }
+            // One row per in-flight staging generation. A scalar marker on the
+            // pointer row cannot represent two overlapping ingests of one
+            // source: the second `begin_generation` would overwrite the first
+            // and leave it unprotected from pruning.
+            let create_staging_table = "CREATE NODE TABLE StagingGeneration (id STRING, namespace STRING, source_key STRING, generation INT64, base_generation INT64, created_at INT64, PRIMARY KEY (id))";
+            if let Err(e) = conn.query(create_staging_table) {
+                if format!("{e}").to_lowercase().contains("already exists") {
+                    tracing::debug!("schema DDL query note: {e}");
+                } else {
+                    tracing::warn!("schema DDL table creation failed: {e}");
+                }
+            }
             for stmt in [
                 "ALTER TABLE IngestGeneration ADD source_key STRING",
                 "ALTER TABLE IngestGeneration ADD active_generation INT64",
                 "ALTER TABLE IngestGeneration ADD counter INT64",
+                "ALTER TABLE IngestGeneration ADD previous_generation INT64",
             ] {
                 if let Err(e) = conn.query(stmt) {
                     tracing::debug!("schema DDL query note: {e}");
@@ -7805,6 +8177,39 @@ impl VectorStore for LadybugStore {
             );
             conn.query(&pointer)?;
 
+            // Each overlapping ingest gets its own staging row; retention
+            // protects them all until each publishes or aborts. The base (the
+            // active generation this ingest will carry forward from) is
+            // protected too: another ingest can publish newer generations
+            // before this one finishes, and carry-forward still reads the base.
+            let pointer_id = escape_ladybug_string(&crate::parser::ingest::generation_key(
+                &namespace,
+                &source_key,
+            ));
+            let read_active = format!(
+                "MATCH (g:IngestGeneration) WHERE g.id = '{pointer_id}' RETURN g.active_generation"
+            );
+            let base = conn
+                .query(&read_active)?
+                .next()
+                .map(|row| format!("{}", row[0]).parse::<i64>().unwrap_or(0).max(0) as u64)
+                .unwrap_or(0);
+            let staging_id = format!(
+                "{}::{}",
+                crate::parser::ingest::generation_key(&namespace, &source_key),
+                next
+            );
+            let staging = format!(
+                "MERGE (s:StagingGeneration {{id: '{}'}}) SET s.namespace = '{}', s.source_key = '{}', s.generation = {}, s.base_generation = {}, s.created_at = {}",
+                escape_ladybug_string(&staging_id),
+                safe_ns,
+                safe_sk,
+                next,
+                base,
+                chrono::Utc::now().timestamp()
+            );
+            conn.query(&staging)?;
+
             Ok(next)
         })
         .await
@@ -7825,18 +8230,31 @@ impl VectorStore for LadybugStore {
             // The flip is one statement on this source's pointer row: the active
             // pointer moves to `generation` and the previous generation's rows
             // stay as history. Another source's pointer is untouched.
+            let pointer_id = escape_ladybug_string(&crate::parser::ingest::generation_key(
+                &namespace,
+                &source_key,
+            ));
+            // The value the pointer holds now is this source's rollback
+            // target. Reading it in the same turn as the flip makes the pair
+            // (active, previous) one atomic update.
+            let read_active = format!(
+                "MATCH (g:IngestGeneration) WHERE g.id = '{pointer_id}' RETURN g.active_generation"
+            );
+            let previous = conn
+                .query(&read_active)?
+                .next()
+                .map(|row| format!("{}", row[0]).parse::<i64>().unwrap_or(0).max(0) as u64)
+                .unwrap_or(0);
             let write = format!(
-                "MERGE (g:IngestGeneration {{id: '{}'}}) ON CREATE SET g.namespace = '{}', g.source_key = '{}', g.counter = 0, g.active_generation = {} ON MATCH SET g.active_generation = {}",
-                escape_ladybug_string(&crate::parser::ingest::generation_key(
-                    &namespace,
-                    &source_key
-                )),
-                safe_ns,
-                safe_sk,
-                generation,
-                generation
+                "MERGE (g:IngestGeneration {{id: '{pointer_id}'}}) ON CREATE SET g.namespace = '{safe_ns}', g.source_key = '{safe_sk}', g.counter = 0, g.active_generation = {generation}, g.previous_generation = {previous} ON MATCH SET g.active_generation = {generation}, g.previous_generation = {previous}"
             );
             conn.query(&write)?;
+            // Only this generation's staging row: an overlapping ingest's
+            // row must stay protected.
+            let clear_staging = format!(
+                "MATCH (s:StagingGeneration) WHERE s.namespace = '{safe_ns}' AND s.source_key = '{safe_sk}' AND s.generation = {generation} DELETE s"
+            );
+            conn.query(&clear_staging)?;
             Ok(())
         })
         .await?;
@@ -7879,6 +8297,15 @@ impl VectorStore for LadybugStore {
                 generation
             );
             conn.query(&clear)?;
+            // Remove this generation's staging row (and only that one), so
+            // retention is free to prune the discarded rows.
+            let clear_staging = format!(
+                "MATCH (s:StagingGeneration) WHERE s.namespace = '{}' AND s.source_key = '{}' AND s.generation = {} DELETE s",
+                escape_ladybug_string(&namespace),
+                escape_ladybug_string(&source_key),
+                generation
+            );
+            conn.query(&clear_staging)?;
             Ok(())
         })
         .await?;
@@ -20933,6 +21360,518 @@ eurostrata\src\daemon.rs",
         assert!(
             store.get("other", foreign_id).await.unwrap().is_some(),
             "a foreign row with the same id prefix survives the abort"
+        );
+    }
+
+    /// Retention keeps the active generation and the one before it (the
+    /// rollback target), and prunes older history.
+    #[tokio::test]
+    async fn retention_keeps_active_and_previous() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("retention.lbug"), 4).unwrap();
+        store.init("gen").await.unwrap();
+        let mut generations = Vec::new();
+        for content in ["first generation", "second generation", "third generation"] {
+            generations.push(
+                publish_fixture_generation(
+                    &store,
+                    "gen",
+                    PROBE_SOURCE,
+                    &[("src/a.rs", content)],
+                )
+                .await,
+            );
+        }
+        let id = |generation: u64| {
+            crate::parser::ingest::generation_scoped_id("gen", generation, "src/a.rs")
+        };
+
+        let deleted = store.prune_generations("gen", 2).await.unwrap();
+        assert!(deleted > 0, "the oldest generation has rows to prune");
+        assert!(
+            store.get("gen", &id(generations[0])).await.unwrap().is_none(),
+            "the superseded generation is gone"
+        );
+        assert!(
+            store.get("gen", &id(generations[1])).await.unwrap().is_some(),
+            "the previous generation stays as the rollback target"
+        );
+        assert!(
+            store.get("gen", &id(generations[2])).await.unwrap().is_some(),
+            "the active generation stays"
+        );
+        assert_eq!(
+            store.prune_generations("gen", 2).await.unwrap(),
+            0,
+            "a second prune has nothing older than the retained pair"
+        );
+    }
+
+    /// The prune/delete API is namespace-scoped, like abort.
+    #[tokio::test]
+    async fn delete_generation_is_namespace_scoped() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("delete-gen.lbug"), 4).unwrap();
+        store.init("gen").await.unwrap();
+        let first = publish_fixture_generation(
+            &store,
+            "gen",
+            PROBE_SOURCE,
+            &[("src/a.rs", "first generation")],
+        )
+        .await;
+        publish_fixture_generation(
+            &store,
+            "gen",
+            PROBE_SOURCE,
+            &[("src/a.rs", "second generation")],
+        )
+        .await;
+
+        let foreign_id =
+            crate::parser::ingest::generation_scoped_id("gen", first, "src/foreign.rs");
+        store
+            .upsert(
+                "other",
+                &foreign_id,
+                vec![0.0; 4],
+                retired_test_payload("fact", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+
+        let deleted = store.delete_generation("gen", first).await.unwrap();
+        assert!(deleted > 0, "the superseded generation is deleted");
+        assert!(
+            store
+                .get("gen", &crate::parser::ingest::generation_scoped_id("gen", first, "src/a.rs"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store.get("other", &foreign_id).await.unwrap().is_some(),
+            "a foreign row with the same prefix survives"
+        );
+    }
+
+    /// An in-flight staged generation is not superseded: deleting it would
+    /// leave the ingest to publish a pointer onto deleted rows.
+    #[tokio::test]
+    async fn delete_generation_refuses_an_in_progress_staging_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("staging-delete.lbug"), 4).unwrap();
+        store.init("gen").await.unwrap();
+        let staged = store.begin_generation("gen", PROBE_SOURCE).await.unwrap();
+        let id = crate::parser::ingest::generation_scoped_id("gen", staged, "src/a.rs");
+        store
+            .upsert(
+                "gen",
+                &id,
+                vec![0.0; 4],
+                retired_test_payload("fact", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+
+        let err = store.delete_generation("gen", staged).await.unwrap_err();
+        assert!(
+            err.to_string().contains("still staging"),
+            "the refusal names the in-flight ingest: {err}"
+        );
+        assert!(
+            store.get("gen", &id).await.unwrap().is_some(),
+            "the staged rows survive"
+        );
+        store.abort_generation("gen", PROBE_SOURCE, staged).await.unwrap();
+    }
+
+    /// Retention retains a staging generation even when newer generations push
+    /// it out of the newest-`keep` window.
+    #[tokio::test]
+    async fn retention_keeps_an_in_progress_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("staging-retain.lbug"), 4).unwrap();
+        store.init("gen").await.unwrap();
+        publish_fixture_generation(
+            &store,
+            "gen",
+            "source-a",
+            &[("src/a.rs", "source a generation one")],
+        )
+        .await;
+        let staged = store.begin_generation("gen", "source-a").await.unwrap();
+        let staged_id = crate::parser::ingest::generation_scoped_id("gen", staged, "src/a.rs");
+        store
+            .upsert(
+                "gen",
+                &staged_id,
+                vec![0.0; 4],
+                generation_payload("source a generation two", "source-a", json!({})),
+            )
+            .await
+            .unwrap();
+        // Push the staged generation out of the newest-two window.
+        for (source, path) in [("source-b", "src/b.rs"), ("source-c", "src/c.rs")] {
+            let generation = store.begin_generation("gen", source).await.unwrap();
+            let id = crate::parser::ingest::generation_scoped_id("gen", generation, path);
+            store
+                .upsert(
+                    "gen",
+                    &id,
+                    vec![0.0; 4],
+                    generation_payload("other source", source, json!({})),
+                )
+                .await
+                .unwrap();
+            store
+                .publish_generation("gen", source, generation)
+                .await
+                .unwrap();
+        }
+
+        let deleted = store.prune_generations("gen", 2).await.unwrap();
+        assert_eq!(deleted, 0, "every generation here is active or staged");
+        assert!(
+            store.get("gen", &staged_id).await.unwrap().is_some(),
+            "the staging generation is retained"
+        );
+        store.abort_generation("gen", "source-a", staged).await.unwrap();
+    }
+
+    /// Two overlapping ingests of one source each hold a staging row; pruning
+    /// must protect both, not just the most recent marker.
+    #[tokio::test]
+    async fn retention_keeps_every_overlapping_staging_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("overlap-staging.lbug"), 4).unwrap();
+        store.init("gen").await.unwrap();
+
+        let first = store.begin_generation("gen", "source-a").await.unwrap();
+        let second = store.begin_generation("gen", "source-a").await.unwrap();
+        assert_ne!(first, second, "two ingests allocate different numbers");
+        let mut staged_ids = Vec::new();
+        for (generation, path) in [(first, "src/a1.rs"), (second, "src/a2.rs")] {
+            let id = crate::parser::ingest::generation_scoped_id("gen", generation, path);
+            store
+                .upsert(
+                    "gen",
+                    &id,
+                    vec![0.0; 4],
+                    generation_payload("overlapping ingest", "source-a", json!({})),
+                )
+                .await
+                .unwrap();
+            staged_ids.push(id);
+        }
+        // Push both staging numbers out of the newest-two window.
+        for (source, path) in [("source-b", "src/b.rs"), ("source-c", "src/c.rs")] {
+            let generation = store.begin_generation("gen", source).await.unwrap();
+            let id = crate::parser::ingest::generation_scoped_id("gen", generation, path);
+            store
+                .upsert(
+                    "gen",
+                    &id,
+                    vec![0.0; 4],
+                    generation_payload("other source", source, json!({})),
+                )
+                .await
+                .unwrap();
+            store
+                .publish_generation("gen", source, generation)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            store.prune_generations("gen", 2).await.unwrap(),
+            0,
+            "every active/staging generation is retained"
+        );
+        for id in &staged_ids {
+            assert!(
+                store.get("gen", id).await.unwrap().is_some(),
+                "overlapping staging generation survives: {id}"
+            );
+        }
+        store.abort_generation("gen", "source-a", first).await.unwrap();
+        store.abort_generation("gen", "source-a", second).await.unwrap();
+    }
+
+    /// An in-flight ingest reads the generation that was active when it began.
+    /// Protecting only its staging number would let a newer publish push that
+    /// base outside the window and prune rows carry-forward still needs.
+    #[tokio::test]
+    async fn retention_keeps_the_base_of_an_in_flight_ingest() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("staging-base.lbug"), 4).unwrap();
+        store.init("gen").await.unwrap();
+        let base = publish_fixture_generation(
+            &store,
+            "gen",
+            "source-a",
+            &[("src/a.rs", "base generation")],
+        )
+        .await;
+        // A slow ingest stages generation 2 from base generation 1.
+        let slow = store.begin_generation("gen", "source-a").await.unwrap();
+        let slow_id = crate::parser::ingest::generation_scoped_id("gen", slow, "src/a.rs");
+        store
+            .upsert(
+                "gen",
+                &slow_id,
+                vec![0.0; 4],
+                generation_payload("slow ingest", "source-a", json!({})),
+            )
+            .await
+            .unwrap();
+        // Another ingest for the same source publishes 3 and then 4.
+        publish_fixture_generation(&store, "gen", "source-a", &[("src/a.rs", "three")]).await;
+        publish_fixture_generation(&store, "gen", "source-a", &[("src/a.rs", "four")]).await;
+
+        assert_eq!(
+            store.prune_generations("gen", 2).await.unwrap(),
+            0,
+            "the slow ingest's base and staging generation are retained"
+        );
+        assert!(
+            store
+                .get(
+                    "gen",
+                    &crate::parser::ingest::generation_scoped_id("gen", base, "src/a.rs")
+                )
+                .await
+                .unwrap()
+                .is_some(),
+            "the base generation survives for carry-forward"
+        );
+        assert!(store.get("gen", &slow_id).await.unwrap().is_some());
+        store.abort_generation("gen", "source-a", slow).await.unwrap();
+    }
+
+    /// A marker left by a process that died between begin and publish/abort is
+    /// recovered after the TTL so its generation can be pruned again.
+    #[tokio::test]
+    async fn prune_recovers_abandoned_staging_markers() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("abandoned-staging.lbug"), 4).unwrap();
+        store.init("gen").await.unwrap();
+        let abandoned = store.begin_generation("gen", "source-a").await.unwrap();
+        let abandoned_id =
+            crate::parser::ingest::generation_scoped_id("gen", abandoned, "src/a.rs");
+        store
+            .upsert(
+                "gen",
+                &abandoned_id,
+                vec![0.0; 4],
+                generation_payload("abandoned ingest", "source-a", json!({})),
+            )
+            .await
+            .unwrap();
+        // Age the marker past the TTL, as a crash plus a day would.
+        let aged = chrono::Utc::now().timestamp() - STAGING_TTL_SECS - 60;
+        store
+            .with_conn(move |conn| {
+                conn.query(&format!(
+                    "MATCH (s:StagingGeneration) WHERE s.namespace = 'gen' SET s.created_at = {aged}"
+                ))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        // Push the abandoned number outside the newest-two window.
+        for (source, path) in [("source-b", "src/b.rs"), ("source-c", "src/c.rs")] {
+            let generation = store.begin_generation("gen", source).await.unwrap();
+            let id = crate::parser::ingest::generation_scoped_id("gen", generation, path);
+            store
+                .upsert(
+                    "gen",
+                    &id,
+                    vec![0.0; 4],
+                    generation_payload("published", source, json!({})),
+                )
+                .await
+                .unwrap();
+            store
+                .publish_generation("gen", source, generation)
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            store.prune_generations("gen", 2).await.unwrap() > 0,
+            "the abandoned generation is pruned"
+        );
+        assert!(store.get("gen", &abandoned_id).await.unwrap().is_none());
+        let remaining = store
+            .with_conn(|conn| {
+                let mut rows = conn
+                    .query("MATCH (s:StagingGeneration) WHERE s.namespace = 'gen' RETURN count(s)")?;
+                Ok(rows.next().map(|r| format!("{}", r[0])).unwrap_or_default())
+            })
+            .await
+            .unwrap();
+        assert_eq!(remaining, "0", "the abandoned marker is removed");
+    }
+
+    /// Rollback is per source: a quiet source's previous generation can fall
+    /// outside the namespace-wide newest-two window and must still be kept.
+    #[tokio::test]
+    async fn retention_keeps_each_sources_previous_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("per-source-prev.lbug"), 4).unwrap();
+        store.init("gen").await.unwrap();
+
+        let a1 = publish_fixture_generation(
+            &store,
+            "gen",
+            "source-a",
+            &[("src/a.rs", "source a generation one")],
+        )
+        .await;
+        publish_fixture_generation(
+            &store,
+            "gen",
+            "source-b",
+            &[("src/b.rs", "source b generation two")],
+        )
+        .await;
+        // A publishes again: its previous generation is a1, which the
+        // namespace-wide newest-two window would otherwise prune.
+        publish_fixture_generation(
+            &store,
+            "gen",
+            "source-a",
+            &[("src/a.rs", "source a generation three")],
+        )
+        .await;
+
+        let deleted = store.prune_generations("gen", 2).await.unwrap();
+        assert_eq!(
+            deleted, 0,
+            "active and per-source previous generations are all retained"
+        );
+        assert!(
+            store
+                .get(
+                    "gen",
+                    &crate::parser::ingest::generation_scoped_id("gen", a1, "src/a.rs")
+                )
+                .await
+                .unwrap()
+                .is_some(),
+            "source A's rollback target survives the namespace-wide window"
+        );
+    }
+
+    /// An upgraded store has no recorded `previous_generation`. The prune
+    /// recovers each source's rollback target from the retained rows instead
+    /// of deleting history the first time it runs.
+    #[tokio::test]
+    async fn prune_backfills_previous_for_upgraded_stores() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("upgrade-prev.lbug"), 4).unwrap();
+        store.init("gen").await.unwrap();
+        let a1 = publish_fixture_generation(&store, "gen", "source-a", &[("src/a.rs", "a one")]).await;
+        publish_fixture_generation(&store, "gen", "source-a", &[("src/a.rs", "a two")]).await;
+        publish_fixture_generation(&store, "gen", "source-b", &[("src/b.rs", "b three")]).await;
+        publish_fixture_generation(&store, "gen", "source-b", &[("src/b.rs", "b four")]).await;
+
+        // The upgrade: the new column exists but is empty for every pointer.
+        let pointers = "MATCH (g:IngestGeneration) WHERE g.namespace = 'gen' SET g.previous_generation = 0";
+        store
+            .with_conn(|conn| {
+                conn.query(pointers)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let deleted = store.prune_generations("gen", 2).await.unwrap();
+        assert_eq!(
+            deleted, 0,
+            "the fallback retains source A's rollback target (generation {a1})"
+        );
+        assert!(
+            store
+                .get(
+                    "gen",
+                    &crate::parser::ingest::generation_scoped_id("gen", a1, "src/a.rs")
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// Prune's delete rechecks the rollback target inside its own write turn;
+    /// the explicit delete API still permits an operator purge.
+    #[tokio::test]
+    async fn prune_rechecks_previous_targets_inside_the_write() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("recheck-prev.lbug"), 4).unwrap();
+        store.init("gen").await.unwrap();
+        let previous = publish_fixture_generation(
+            &store,
+            "gen",
+            PROBE_SOURCE,
+            &[("src/a.rs", "generation one")],
+        )
+        .await;
+        publish_fixture_generation(&store, "gen", PROBE_SOURCE, &[("src/a.rs", "generation two")])
+            .await;
+        let previous_id =
+            crate::parser::ingest::generation_scoped_id("gen", previous, "src/a.rs");
+
+        let err = store
+            .delete_generation_protected("gen", previous)
+            .await
+            .expect_err("prune must not remove a rollback target");
+        assert!(
+            err.to_string().contains("rollback target"),
+            "the refusal names the protected target: {err}"
+        );
+        assert!(
+            store.get("gen", &previous_id).await.unwrap().is_some(),
+            "the rollback target survives the protected delete"
+        );
+
+        assert!(
+            store.delete_generation("gen", previous).await.unwrap() > 0,
+            "the explicit delete API still purges a previous generation"
+        );
+        assert!(store.get("gen", &previous_id).await.unwrap().is_none());
+    }
+
+    /// The API documents and enforces the rollback constraint: the active
+    /// generation cannot be deleted, and the refusal names the rollback target.
+    #[tokio::test]
+    async fn rollback_constraint_documented() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("rollback.lbug"), 4).unwrap();
+        store.init("gen").await.unwrap();
+        let active = publish_fixture_generation(
+            &store,
+            "gen",
+            PROBE_SOURCE,
+            &[("src/a.rs", "only generation")],
+        )
+        .await;
+
+        let err = store.delete_generation("gen", active).await.unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("active"), "{message}");
+        assert!(
+            message.contains("rollback target"),
+            "the refusal states why the active generation is protected: {message}"
+        );
+        assert_eq!(
+            store
+                .active_generation("gen", PROBE_SOURCE)
+                .await
+                .unwrap(),
+            active,
+            "the pointer is untouched"
         );
     }
 }
