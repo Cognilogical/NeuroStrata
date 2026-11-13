@@ -15,10 +15,13 @@ jobs:
     name: gate-receipt
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout trusted base script
+      # Bootstrap: this workflow lands in the PR that adds the script, so the
+      # first run must use the head. After this lands, pin to base.ref so a PR
+      # cannot edit the gate that checks it.
+      - name: Checkout PR head (bootstrap; pin to base after merge)
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.base.ref }}
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Require a receipt for every gating marker
         env:
