@@ -346,6 +346,33 @@ pub trait VectorStore: Send + Sync + AsAny {
         payload: MemoryPayload,
     ) -> Result<UpsertReport>;
 
+    /// Atomically increment an integer metadata counter on one row.
+    ///
+    /// The default is a read-modify-write, which is only safe when callers
+    /// cannot overlap. Stores with a single-writer lock override it with one
+    /// turn, so concurrent increments serialize instead of losing updates.
+    async fn increment_metadata_counter(
+        &self,
+        namespace: &str,
+        id: &str,
+        key: &str,
+    ) -> Result<()> {
+        let Some((vector, mut payload)) = self.get(namespace, id).await? else {
+            return Ok(());
+        };
+        if !payload.metadata.is_object() {
+            anyhow::bail!("memory '{id}' carries metadata that is not an object");
+        }
+        let hits = payload
+            .metadata
+            .get(key)
+            .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f.max(0.0) as u64)))
+            .unwrap_or(0);
+        payload.metadata[key] = serde_json::json!(hits + 1);
+        self.upsert(namespace, id, vector, payload).await?;
+        Ok(())
+    }
+
     /// Search for the closest memories to a given vector.
     ///
     /// Returns up to `limit` recall-eligible primary matches PLUS their bounded
