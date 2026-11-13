@@ -182,3 +182,110 @@ jobs:
       - name: Test wasm crate
         shell: bash
         run: cargo test -p neurostrata-wasm --locked -- --test-threads=1
+
+      # The self-test runs the binary tests, so it belongs where the target is
+      # already built rather than in a fresh job that would compile it again.
+      - name: Remediation eval self-test
+        shell: bash
+        run: bash scripts/test-remediation-eval.sh
+
+  # Full binary suite on the other two platforms, report-only: a platform
+  # regression shows up on the PR without blocking the merge on a runner this
+  # project cannot reproduce locally. The ubuntu test job above is the gate.
+  test-report:
+    name: test (${{ matrix.os }}, report-only)
+    runs-on: ${{ matrix.os }}
+    env:
+      LBUG_VERSION: "0.22.3"
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-15]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Toolchain versions
+        shell: bash
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Verify build prerequisites
+        shell: bash
+        run: |
+          cmake --version || {
+            echo "::error::CMake is required to build lbug (LadybugDB) but was not found on this runner."
+            exit 1
+          }
+
+      - name: Configure vendored OpenSSL build (Windows)
+        if: startsWith(matrix.os, 'windows')
+        shell: bash
+        run: |
+          echo "OPENSSL_SRC_PERL=C:/Strawberry/perl/bin/perl.exe" >> "$GITHUB_ENV"
+          echo "C:/Program Files/NASM" >> "$GITHUB_PATH"
+
+      - name: Guard include_str targets
+        shell: bash
+        run: bash scripts/check-include-str-targets.sh
+
+      # Release profile: the Windows debug static library exceeds the 4 GiB
+      # limit this project already works around in the build job.
+      #
+      # Report-only is a step-level continue-on-error: a job-level one is not
+      # a GitHub Actions feature, and without this a platform failure would
+      # turn the check red on every PR even though the ubuntu gate decides.
+      - name: Test (report-only)
+        id: platform_tests
+        continue-on-error: true
+        shell: bash
+        run: cargo test --release --locked --bin neurostrata-mcp -- --test-threads=1
+
+      - name: Report platform test outcome
+        if: steps.platform_tests.outcome == 'failure'
+        shell: bash
+        run: |
+          echo "::warning::${{ matrix.os }} test suite failed; this leg is report-only and the ubuntu gate decides"
+
+  # The harness plugin is JavaScript the Rust binary embeds and runs. Its suite
+  # includes the restricted-PATH hook tests, which only execute on Windows when
+  # Git Bash is present -- a GitHub Windows runner has it. Run the suite on both
+  # so that path is covered rather than skipped by the ubuntu-only gate.
+  plugins:
+    name: plugins (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Node version
+        shell: bash
+        run: node --version
+
+      # From the repository root: the suite resolves plugins/... and
+      # scripts/... relative to the working directory.
+      - name: Test
+        shell: bash
+        run: node --test plugins/core/test.mjs
+
+  # The backup script's sidecar/WAL carry and pruning are shell behavior, not
+  # Rust behavior; test them where they run.
+  scripts:
+    name: scripts (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Backup script tests
+        shell: bash
+        run: bash scripts/test-backup.sh
+
+      - name: Gate receipt self-test
+        shell: bash
+        run: bash scripts/test-gate-receipt.sh

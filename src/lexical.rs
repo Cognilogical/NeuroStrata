@@ -13,7 +13,10 @@ use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Te
 
 use crate::traits::{MemoryPayload};
 
-pub const INDEX_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-tantivy-v1");
+// v2 adds the `generation` field. An index written by v1 has no such field,
+// so opening it under this schema would panic on `get_field("generation")`;
+// the version file makes the upgrade clear and rebuild instead.
+pub const INDEX_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-tantivy-v2");
 
 /// Code-aware pre-tokenization for Tantivy (whitespace-separated sub-tokens + full lowercased text).
 pub fn tokenize_code_for_tantivy(text: &str) -> String {
@@ -80,7 +83,13 @@ pub struct TantivyLexicalIndex {
     pub memory_type_f: TantivyField,
     pub valid_from_f: TantivyField,
     pub valid_to_f: TantivyField,
+    /// `1` when the row carries a `valid_to` (even `0`), `0` when absent.
+    /// `valid_to` alone cannot distinguish "no expiry" from "retired at 0".
+    pub has_valid_to_f: TantivyField,
     pub archived_f: TantivyField,
+    /// Staged-ingestion generation; `0` for rows that are not generation
+    /// scoped. See `docs/superpowers/specs/2026-11-12-lexical-generation-contract.md`.
+    pub generation_f: TantivyField,
 }
 
 impl TantivyLexicalIndex {
@@ -96,8 +105,19 @@ impl TantivyLexicalIndex {
         schema_builder.add_text_field("memory_type", STRING | STORED);
         schema_builder.add_i64_field("valid_from", INDEXED | FAST | STORED);
         schema_builder.add_i64_field("valid_to", INDEXED | FAST | STORED);
+        schema_builder.add_i64_field("has_valid_to", INDEXED | FAST | STORED);
         schema_builder.add_i64_field("archived", INDEXED | FAST | STORED);
+        schema_builder.add_i64_field("generation", INDEXED | FAST | STORED);
         schema_builder.build()
+    }
+
+    /// The generation carried by a row id: `ns::<generation>::<path>` -> the
+    /// middle segment, otherwise `0` for unscoped rows. Mirrors the store's
+    /// `split_scoped_id`, which is the single source of truth for the shape.
+    fn generation_of_id(id: &str) -> i64 {
+        crate::parser::generation::split_scoped_id(id)
+            .map(|(_, generation, _)| generation as i64)
+            .unwrap_or(0)
     }
 
     /// Open a RAM index (unit tests / ephemeral fallback); no directory persistence.
@@ -115,7 +135,9 @@ impl TantivyLexicalIndex {
         let memory_type_f = schema.get_field("memory_type").expect("memory_type field");
         let valid_from_f = schema.get_field("valid_from").expect("valid_from field");
         let valid_to_f = schema.get_field("valid_to").expect("valid_to field");
+        let has_valid_to_f = schema.get_field("has_valid_to").expect("has_valid_to field");
         let archived_f = schema.get_field("archived").expect("archived field");
+        let generation_f = schema.get_field("generation").expect("generation field");
         Ok(Self {
             index,
             writer: Mutex::new(Some(writer)),
@@ -123,7 +145,7 @@ impl TantivyLexicalIndex {
             dirty: AtomicBool::new(false),
             index_dir: None,
             id_f, memory_id_f, namespace_f, content_f, symbol_f, location_f,
-            memory_type_f, valid_from_f, valid_to_f, archived_f,
+            memory_type_f, valid_from_f, valid_to_f, has_valid_to_f, archived_f, generation_f,
         })
     }
 
@@ -192,7 +214,9 @@ impl TantivyLexicalIndex {
         let memory_type_f = schema.get_field("memory_type").expect("memory_type");
         let valid_from_f = schema.get_field("valid_from").expect("valid_from");
         let valid_to_f = schema.get_field("valid_to").expect("valid_to");
+        let has_valid_to_f = schema.get_field("has_valid_to").expect("has_valid_to");
         let archived_f = schema.get_field("archived").expect("archived");
+        let generation_f = schema.get_field("generation").expect("generation");
 
         Ok(Self {
             index,
@@ -201,7 +225,7 @@ impl TantivyLexicalIndex {
             dirty: AtomicBool::new(false),
             index_dir: Some(path_for_index),
             id_f, memory_id_f, namespace_f, content_f, symbol_f, location_f,
-            memory_type_f, valid_from_f, valid_to_f, archived_f,
+            memory_type_f, valid_from_f, valid_to_f, has_valid_to_f, archived_f, generation_f,
         })
     }
 
@@ -288,8 +312,20 @@ impl TantivyLexicalIndex {
         doc.add_i64(self.valid_from_f, valid_from);
         let valid_to: i64 = payload.metadata.get("valid_to").and_then(|v| v.as_i64()).unwrap_or(0);
         doc.add_i64(self.valid_to_f, valid_to);
+        let has_valid_to: i64 = if payload
+            .metadata
+            .get("valid_to")
+            .map(|v| !v.is_null())
+            .unwrap_or(false)
+        {
+            1
+        } else {
+            0
+        };
+        doc.add_i64(self.has_valid_to_f, has_valid_to);
         let archived: i64 = if payload.metadata.get("archived").and_then(|v| v.as_i64()).unwrap_or(0) != 0 { 1 } else { 0 };
         doc.add_i64(self.archived_f, archived);
+        doc.add_i64(self.generation_f, Self::generation_of_id(id));
 
         if let Some(w) = self.writer.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             w.add_document(doc)?;
@@ -349,6 +385,16 @@ impl TantivyLexicalIndex {
                 if Self::is_excluded(payload) {
                     continue;
                 }
+                // F5: a scoped rebuild replaces one namespace; it must never
+                // insert a row that belongs to another one under this scope.
+                if let Some(scope) = namespace {
+                    if ns != scope {
+                        tracing::warn!(
+                            "scoped lexical rebuild for '{scope}' skipped a row from '{ns}': {id}"
+                        );
+                        continue;
+                    }
+                }
                 let composite = Self::composite_key(ns, id);
                 let mut doc = TantivyDocument::default();
                 doc.add_text(self.id_f, &composite);
@@ -363,8 +409,20 @@ impl TantivyLexicalIndex {
                 doc.add_i64(self.valid_from_f, valid_from);
                 let valid_to: i64 = payload.metadata.get("valid_to").and_then(|v| v.as_i64()).unwrap_or(0);
                 doc.add_i64(self.valid_to_f, valid_to);
+                let has_valid_to: i64 = if payload
+                    .metadata
+                    .get("valid_to")
+                    .map(|v| !v.is_null())
+                    .unwrap_or(false)
+                {
+                    1
+                } else {
+                    0
+                };
+                doc.add_i64(self.has_valid_to_f, has_valid_to);
                 let archived: i64 = if payload.metadata.get("archived").and_then(|v| v.as_i64()).unwrap_or(0) != 0 { 1 } else { 0 };
                 doc.add_i64(self.archived_f, archived);
+                doc.add_i64(self.generation_f, Self::generation_of_id(id));
                 w.add_document(doc)?;
                 indexed += 1;
             }
@@ -377,7 +435,11 @@ impl TantivyLexicalIndex {
         }
     }
 
-    /// Search (§4 / §5.4).
+    /// Search (§4 / §5.4), without a generation filter.
+    ///
+    /// Production callers use [`Self::search_with_active_generations`] so
+    /// superseded staged rows never reach the page; this wrapper keeps the
+    /// unfiltered unit-test surface.
     pub fn search(
         &self,
         namespace: &str,
@@ -386,6 +448,33 @@ impl TantivyLexicalIndex {
         include_tasks: bool,
         include_archived: bool,
         as_of: Option<i64>,
+    ) -> Result<Vec<TantivyHit>> {
+        self.search_with_active_generations(
+            namespace,
+            query_str,
+            limit,
+            include_tasks,
+            include_archived,
+            as_of,
+            None,
+        )
+    }
+
+    /// Search, optionally restricting generation-scoped rows to the active
+    /// generations of `namespace` (`None` = no generation filter).
+    ///
+    /// The filter is a zero-score `Must` clause, so a superseded or staged row
+    /// cannot consume a TopDocs slot. The per-hit check stays as defense in
+    /// depth, exactly like the namespace/archive/validity filters.
+    pub fn search_with_active_generations(
+        &self,
+        namespace: &str,
+        query_str: &str,
+        limit: usize,
+        include_tasks: bool,
+        include_archived: bool,
+        as_of: Option<i64>,
+        active_generations: Option<&std::collections::HashSet<u64>>,
     ) -> Result<Vec<TantivyHit>> {
         if self.dirty.load(Ordering::SeqCst) {
             self.reader.reload()?;
@@ -428,8 +517,10 @@ impl TantivyLexicalIndex {
             filter(Box::new(BooleanQuery::new(vec![
                 (
                     Occur::Should,
+                    // No expiry: the row has no `valid_to` at all. An explicit
+                    // `valid_to = 0` is a present, past timestamp and retires.
                     Box::new(TermQuery::new(
-                        Term::from_field_i64(self.valid_to_f, 0),
+                        Term::from_field_i64(self.has_valid_to_f, 0),
                         IndexRecordOption::Basic,
                     )) as Box<dyn tantivy::query::Query>,
                 ),
@@ -463,6 +554,29 @@ impl TantivyLexicalIndex {
                 std::ops::Bound::Included(Term::from_field_i64(self.archived_f, 0)),
             ))));
         }
+        if let Some(active) = active_generations {
+            // Generation 0 is "not generation scoped" and always visible;
+            // scoped rows must name a generation that is active for at least
+            // one source in this namespace. The per-source check happens on
+            // hydration, where the row's source is known.
+            let mut should: Vec<(Occur, Box<dyn tantivy::query::Query>)> = vec![(
+                Occur::Should,
+                Box::new(TermQuery::new(
+                    Term::from_field_i64(self.generation_f, 0),
+                    IndexRecordOption::Basic,
+                )),
+            )];
+            for generation in active {
+                should.push((
+                    Occur::Should,
+                    Box::new(TermQuery::new(
+                        Term::from_field_i64(self.generation_f, *generation as i64),
+                        IndexRecordOption::Basic,
+                    )),
+                ));
+            }
+            clauses.push(filter(Box::new(BooleanQuery::new(should))));
+        }
         let filtered_query = BooleanQuery::new(clauses);
 
         let fetch_limit = (limit.max(1) * 8) as usize;
@@ -494,19 +608,33 @@ impl TantivyLexicalIndex {
             if archived != 0 && !include_archived {
                 continue;
             }
-            // Validity filter
-            let vf_val = retrieved.get_first(self.valid_from_f);
-            let vt_val = retrieved.get_first(self.valid_to_f);
-            let valid_from = vf_val.as_ref().and_then(|v| v.as_i64()).unwrap_or(0);
-            let valid_to = vt_val.as_ref().and_then(|v| v.as_i64()).unwrap_or(0);
-            if let Some(ts) = as_of {
-                if valid_from > ts || (valid_to != 0 && valid_to <= ts) {
+            // Generation filter (defense in depth; the query clause above
+            // already drops the row before the page is collected).
+            if let Some(active) = active_generations {
+                let gen_val = retrieved.get_first(self.generation_f);
+                let generation = gen_val.as_ref().and_then(|v| v.as_i64()).unwrap_or(0);
+                if generation != 0 && !active.contains(&(generation.max(0) as u64)) {
                     continue;
                 }
-            } else {
-                if valid_to != 0 {
-                    continue; // active only at current time when no as_of
+            }
+            // Validity filter (F1): presence-based, exactly like the query
+            // clause above and the in-house `doc_visible`. A row with no
+            // `valid_to` never retires; a present one retires once it is at or
+            // before the visible moment (`valid_to == 0` included).
+            let vf_val = retrieved.get_first(self.valid_from_f);
+            let vt_val = retrieved.get_first(self.valid_to_f);
+            let hvt_val = retrieved.get_first(self.has_valid_to_f);
+            let valid_from = vf_val.as_ref().and_then(|v| v.as_i64()).unwrap_or(0);
+            let valid_to = vt_val.as_ref().and_then(|v| v.as_i64()).unwrap_or(0);
+            let has_valid_to = hvt_val.as_ref().and_then(|v| v.as_i64()).unwrap_or(0) != 0;
+            let visible_at = as_of.unwrap_or(now);
+            if let Some(ts) = as_of {
+                if valid_from > ts {
+                    continue;
                 }
+            }
+            if has_valid_to && valid_to <= visible_at {
+                continue;
             }
 
             // Derive id (composite stripped to memory id) so the caller gets
@@ -553,10 +681,12 @@ mod tests {
             agent_name: None,
             location: "/src/lib.rs".to_string(),
             location_lines: "1-10".to_string(),
+            // No `valid_to` at all: "no expiry". A present 0 is a real past
+            // timestamp and retires (see `has_valid_to` in the schema).
             metadata: if let Some(s) = symbol {
-                json!({"symbol": s, "valid_from": 100, "valid_to": 0, "archived": 0})
+                json!({"symbol": s, "valid_from": 100, "archived": 0})
             } else {
-                json!({"valid_from": 100, "valid_to": 0, "archived": 0})
+                json!({"valid_from": 100, "archived": 0})
             },
         }
     }
@@ -823,5 +953,219 @@ mod tests {
             assert_eq!(h.namespace, "ns");
         }
         assert!(idx.index_dir().is_none());
+    }
+
+    fn visibility_options(now: i64, as_of: Option<i64>) -> crate::fts::SearchOptions {
+        crate::fts::SearchOptions {
+            now,
+            as_of,
+            include_tasks: true,
+            include_archived: true,
+            principal: "reader".to_string(),
+            domains: Vec::new(),
+            fuzzy_max_distance: 0,
+            limit: 10,
+        }
+    }
+
+    fn validity_doc(valid_to: Option<i64>) -> crate::fts::LexicalDoc {
+        let mut doc = crate::fts::LexicalDoc::new(
+            "validity",
+            "ns",
+            "memory",
+            "validityparityneedle",
+        );
+        doc.user_id = "reader".to_string();
+        doc.valid_to = valid_to;
+        doc
+    }
+
+    /// F1 (#127): the Tantivy query clause and the per-hit rule (and the
+    /// in-house `doc_visible`) must agree at the `as_of` boundary, so a hidden
+    /// row can never consume a page slot while being vetoed afterwards.
+    #[test]
+    fn validity_boundary_parity() {
+        let now = chrono::Utc::now().timestamp();
+        let cases: Vec<(Option<i64>, bool)> = vec![
+            (None, true),
+            // Presence, not sign: an explicitly present 0 is a past timestamp.
+            (Some(0), false),
+            (Some(now + 100), true),
+            (Some(now - 100), false),
+        ];
+
+        // In-house engine verdict.
+        for (valid_to, expected) in &cases {
+            let doc = validity_doc(*valid_to);
+            let visible = crate::fts::doc_visible(&doc, &visibility_options(now, None));
+            assert_eq!(
+                visible, *expected,
+                "in-house as_of=None valid_to={valid_to:?}"
+            );
+        }
+
+        // Tantivy engine verdict, with the same rows.
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        for (valid_to, _) in &cases {
+            let mut payload = dummy_payload("validityparityneedle", None);
+            payload.metadata = match valid_to {
+                None => json!({"valid_from": 0, "archived": 0}),
+                Some(value) => json!({"valid_from": 0, "valid_to": value, "archived": 0}),
+            };
+            let id = match valid_to {
+                None => "none",
+                Some(0) => "zero",
+                Some(value) if *value > now => "future",
+                Some(_) => "past",
+            };
+            idx.upsert_memory("ns", id, &payload).unwrap();
+        }
+        let hits = idx.search("ns", "validityparityneedle", 10, true, true, None).unwrap();
+        let returned: std::collections::BTreeSet<String> =
+            hits.iter().map(|h| h.id.clone()).collect();
+        assert_eq!(
+            returned,
+            ["future", "none"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<std::collections::BTreeSet<_>>(),
+            "Tantivy as_of=None: a future valid_to stays visible; a present 0 retires"
+        );
+
+        // The same agreement at an explicit as_of: valid_to == ts is retired.
+        let boundary = idx
+            .search("ns", "validityparityneedle", 10, true, true, Some(now))
+            .unwrap();
+        let ids: std::collections::BTreeSet<String> =
+            boundary.iter().map(|h| h.id.clone()).collect();
+        assert_eq!(
+            ids,
+            ["future", "none"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<std::collections::BTreeSet<_>>(),
+            "Tantivy as_of=now: a present 0 and the boundary row are retired"
+        );
+        assert!(
+            !crate::fts::doc_visible(&validity_doc(Some(now)), &visibility_options(now, Some(now))),
+            "in-house as_of=now retires valid_to == now"
+        );
+    }
+
+    /// #127 F2 / E1: ordinary code tokens are literal, not query syntax.
+    #[test]
+    fn e1_code_token_breadth() {
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        let tokens = ["foo<T>", "a(b)", "x+y", "path/to/file", "C++"];
+        for (i, token) in tokens.iter().enumerate() {
+            let id = format!("code-{i}");
+            idx.upsert_memory("ns", &id, &dummy_payload(token, None)).unwrap();
+        }
+        for (i, token) in tokens.iter().enumerate() {
+            let hits = idx.search("ns", token, 10, true, true, None).unwrap();
+            let expected = format!("code-{i}");
+            assert!(
+                hits.iter().any(|h| h.id == expected),
+                "literal token {token:?} must return {expected}, got {:?}",
+                hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// #127 F2 / E3: the seeded unicode row is asserted present, not merely
+    /// "no row outside the namespace".
+    #[test]
+    fn e3_seeded_unicode_returns() {
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        idx.upsert_memory(
+            "ns",
+            "unicode-row",
+            &dummy_payload("café::naïve unicodeneedle", None),
+        )
+        .unwrap();
+        let hits = idx.search("ns", "café::naïve", 10, true, true, None).unwrap();
+        assert!(
+            hits.iter().any(|h| h.id == "unicode-row"),
+            "the seeded unicode row must match its own query, got {:?}",
+            hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    /// #127 F2: archived and retired rows that match a query must not exhaust
+    /// the page (fetch_limit = limit * 8).
+    #[test]
+    fn archived_and_validity_starvation() {
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        for i in 0..40 {
+            let mut archived = dummy_payload("archivestarve archivestarve archivestarve", None);
+            archived.metadata = json!({"valid_from": 0, "archived": 1});
+            idx.upsert_memory("ns", &format!("archived-{i}"), &archived)
+                .unwrap();
+
+            let mut retired = dummy_payload("validitystarve validitystarve validitystarve", None);
+            retired.metadata = json!({"valid_from": 0, "valid_to": 1, "archived": 0});
+            idx.upsert_memory("ns", &format!("retired-{i}"), &retired)
+                .unwrap();
+        }
+        let visible = dummy_payload(
+            "archivestarve diluted by unrelated filler words that lengthen this document considerably",
+            None,
+        );
+        idx.upsert_memory("ns", "visible-archived", &visible).unwrap();
+        let visible = dummy_payload(
+            "validitystarve diluted by unrelated filler words that lengthen this document considerably",
+            None,
+        );
+        idx.upsert_memory("ns", "visible-validity", &visible).unwrap();
+
+        // limit 5 -> fetch_window 40; 40 hidden rows would fill it without
+        // query-level filtering.
+        let archived_hits = idx
+            .search("ns", "archivestarve", 5, true, false, None)
+            .unwrap();
+        assert!(
+            archived_hits.iter().any(|h| h.id == "visible-archived"),
+            "a visible row must survive an archived flood, got {:?}",
+            archived_hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+        );
+        let validity_hits = idx
+            .search("ns", "validitystarve", 5, true, true, None)
+            .unwrap();
+        assert!(
+            validity_hits.iter().any(|h| h.id == "visible-validity"),
+            "a visible row must survive a retired flood, got {:?}",
+            validity_hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    /// #127 F5: a scoped rebuild must never insert a row from another
+    /// namespace under the scoped namespace.
+    #[test]
+    fn rebuild_scoped_rejects_foreign_namespace() {
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        let rows = vec![
+            (
+                "ns".to_string(),
+                "inside".to_string(),
+                dummy_payload("scopedneedle inside", None),
+            ),
+            (
+                "other".to_string(),
+                "outside".to_string(),
+                dummy_payload("scopedneedle outside", None),
+            ),
+        ];
+        assert_eq!(idx.rebuild_scoped(&rows, Some("ns")).unwrap(), 1);
+
+        let inside = idx.search("ns", "scopedneedle", 10, true, true, None).unwrap();
+        assert!(inside.iter().any(|h| h.id == "inside"));
+        let outside = idx
+            .search("other", "scopedneedle", 10, true, true, None)
+            .unwrap();
+        assert!(
+            outside.is_empty(),
+            "a foreign row was indexed under the scoped rebuild: {:?}",
+            outside.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+        );
     }
 }

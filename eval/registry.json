@@ -1,0 +1,184 @@
+{
+  "version": 1,
+  "suites": {
+    "secret-precision": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp secrets::tests -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp parser::ingest::tests -- --test-threads=1 --skip ingest_memory_probe",
+        "cargo test --locked --bin neurostrata-mcp ingest_jobs::tests -- --test-threads=1"
+      ],
+      "tests": [
+        "secrets::tests::secret_source_expression_matrix",
+        "secrets::tests::placeholder_wrapped_token_rejected",
+        "ingest_jobs::tests::progress_counts_skipped_files_without_echoing_a_secret",
+        "parser::ingest::tests::clean_markdown_ingests",
+        "secrets::tests::metadata_key_carrying_a_secret_is_detected",
+        "secrets::tests::oversized_metadata_leaf_has_a_distinct_reason",
+        "secrets::tests::single_line_token_straddling_a_chunk_boundary_is_detected"
+      ],
+      "thresholds": {
+        "clean_shapes_no_false_skip": 20,
+        "seeded_secrets_rejected": 12,
+        "wrapped_tokens_rejected": 2,
+        "comment_config_literals_rejected": 2,
+        "ignored": 0
+      }
+    },
+    "ingest-skip": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp parser::ingest::tests -- --test-threads=1 --skip ingest_memory_probe"
+      ],
+      "tests": [
+        "parser::ingest::tests::skipped_fixture_does_not_force_new_generation"
+      ],
+      "thresholds": {
+        "unchanged_ingests": 5,
+        "generation_count": 1,
+        "ignored": 0
+      }
+    },
+    "lexical-generation": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp lexical::tests -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests -- --test-threads=1"
+      ],
+      "tests": [
+        "store::ladybug::tests::lexical_search_returns_only_active_generation",
+        "store::ladybug::tests::deleted_path_absent_from_lexical",
+        "store::ladybug::tests::secret_skipped_absent_from_lexical",
+        "store::ladybug::tests::lexical_owner_parity",
+        "store::ladybug::tests::legacy_namespace_pointer_without_source_stamp_stays_visible",
+        "store::ladybug::tests::scoped_row_without_any_pointer_stays_searchable",
+        "store::ladybug::tests::staged_rows_cannot_starve_the_inhouse_page",
+        "lexical::tests::validity_boundary_parity",
+        "lexical::tests::rebuild_scoped_rejects_foreign_namespace",
+        "lexical::tests::e1_code_token_breadth",
+        "lexical::tests::e3_seeded_unicode_returns",
+        "lexical::tests::archived_and_validity_starvation",
+        "store::ladybug::tests::archiving_an_active_scoped_row_refreshes_the_inhouse_cache"
+      ],
+      "thresholds": {
+        "unexpected_current_ids": 0,
+        "deleted_rows": 0,
+        "secret_skipped_rows": 0,
+        "route_id_sets_equal": 1,
+        "ignored": 0
+      }
+    },
+    "guard-3000": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp guard::semantic::tests -- --test-threads=1"
+      ],
+      "tests": [
+        "guard::semantic::tests::three_thousand_rules_within_budget",
+        "guard::semantic::tests::listing_cap_is_honored",
+        "guard::semantic::tests::concurrent_hit_counts_are_not_lost",
+        "guard::semantic::tests::listing_cap_counts_parsed_rules_not_rows",
+        "guard::semantic::tests::listing_cap_refuses_above_the_cap_of_parsed_rules"
+      ],
+      "thresholds": {
+        "rules": 3000,
+        "p95_ms": 750,
+        "max_ratio_to_100_rules": 2.0,
+        "listing_cap": 5000,
+        "ignored": 0
+      }
+    },
+    "store-growth": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp parser::ingest::tests -- --test-threads=1 --skip ingest_memory_probe"
+      ],
+      "tests": [
+        "parser::ingest::tests::store_growth_bounded_over_unchanged_ingests"
+      ],
+      "thresholds": {
+        "unchanged_ingests": 5,
+        "max_bytes_over_baseline_percent": 10,
+        "generation_count": 1,
+        "ignored": 0
+      }
+    },
+    "hygiene-repair": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp server::tests::caller_does_not_advance_on_error -- --test-threads=1"
+      ],
+      "tests": [
+        "store::ladybug::tests::chunk_failure_keeps_prior_counts",
+        "store::ladybug::tests::repair_partial_counts_are_reported",
+        "store::ladybug::tests::hygiene_paging_pin",
+        "server::tests::caller_does_not_advance_on_error"
+      ],
+      "thresholds": {
+        "partial_counts_reported": 1,
+        "failed_chunks_swallowed": 0,
+        "watermark_advanced_on_error": 0,
+        "ignored": 0
+      }
+    },
+    "metadata-owner": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp set_metadata_ -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp lexical_owner_parity -- --test-threads=1"
+      ],
+      "tests": [
+        "server::tests::set_metadata_denies_a_viewer",
+        "server::tests::set_metadata_allows_an_editor_to_fix_provenance",
+        "server::tests::set_metadata_denies_an_editor_rewriting_visibility",
+        "server::tests::set_metadata_allows_the_owner_to_rewrite_visibility",
+        "server::tests::set_metadata_denies_an_editor_promoting_a_role",
+        "server::tests::set_metadata_allows_admin_to_rewrite_ownership",
+        "store::ladybug::tests::lexical_owner_parity"
+      ],
+      "thresholds": {
+        "viewer_denied": 1,
+        "editor_acl_denied": 1,
+        "owner_allowed": 1,
+        "ignored": 0
+      }
+    },
+    "ingest-correctness": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp parser::ingest::tests -- --test-threads=1 --skip ingest_memory_probe",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests -- --test-threads=1"
+      ],
+      "tests": [
+        "parser::ingest::tests::transient_summary_failure_forces_reparse",
+        "store::ladybug::tests::abort_generation_scoped_to_namespace",
+        "parser::ingest::tests::read_failure_aborts_generation",
+        "parser::ingest::tests::read_ingest_file_rejects_a_directory",
+        "parser::ingest::tests::file_to_directory_asserts_old_rows_dead"
+      ],
+      "thresholds": {
+        "stale_rows_in_current_generation": 0,
+        "foreign_rows_deleted": 0,
+        "unreadable_file_published": 0,
+        "ignored": 0
+      }
+    },
+    "generation-retention": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests -- --test-threads=1"
+      ],
+      "tests": [
+        "store::ladybug::tests::retention_keeps_active_and_previous",
+        "store::ladybug::tests::delete_generation_is_namespace_scoped",
+        "store::ladybug::tests::rollback_constraint_documented",
+        "store::ladybug::tests::delete_generation_refuses_an_in_progress_staging_generation",
+        "store::ladybug::tests::retention_keeps_an_in_progress_generation",
+        "store::ladybug::tests::retention_keeps_each_sources_previous_generation",
+        "store::ladybug::tests::prune_backfills_previous_for_upgraded_stores",
+        "store::ladybug::tests::prune_rechecks_previous_targets_inside_the_write",
+        "store::ladybug::tests::retention_keeps_every_overlapping_staging_generation",
+        "store::ladybug::tests::retention_keeps_the_base_of_an_in_flight_ingest",
+        "store::ladybug::tests::prune_recovers_abandoned_staging_markers"
+      ],
+      "thresholds": {
+        "retained_generations": 2,
+        "active_generations_pruned": 0,
+        "foreign_rows_deleted": 0,
+        "ignored": 0
+      }
+    }
+  }
+}

@@ -23,8 +23,76 @@ permissions:
   contents: write
 
 jobs:
+  # A release is a claim that the tagged commit is the version it names and
+  # that its tests pass. Both are checked before any platform builds, so a
+  # mismatched tag or a red suite cannot publish binaries.
+  verify:
+    name: Version and test receipt
+    runs-on: ubuntu-latest
+    env:
+      LBUG_VERSION: "0.22.3"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - name: Tag matches Cargo.toml
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          tag="${{ inputs.tag || github.ref_name }}"
+          if [ -z "$version" ]; then
+            echo "::error::could not read the package version from Cargo.toml"
+            exit 1
+          fi
+          if [ "v$version" != "$tag" ]; then
+            echo "::error::tag '$tag' does not match Cargo.toml version '$version'"
+            exit 1
+          fi
+          echo "Tag $tag matches Cargo.toml version $version"
+
+      - name: Toolchain versions
+        shell: bash
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Verify build prerequisites
+        shell: bash
+        run: |
+          cmake --version || {
+            echo "::error::CMake is required to build lbug (LadybugDB) but was not found on this runner."
+            exit 1
+          }
+
+      - name: Test receipt
+        shell: bash
+        run: |
+          cargo test --locked --bin neurostrata-mcp -- --test-threads=1
+          # The receipt records the commit the checkout produced for the tag,
+          # not github.sha: on workflow_dispatch that is the branch tip, which
+          # can differ from the ref the job checked out.
+          commit=$(git rev-parse HEAD)
+          {
+            echo "neurostrata release test receipt"
+            echo "tag=${{ inputs.tag || github.ref_name }}"
+            echo "commit=$commit"
+            echo "command=cargo test --locked --bin neurostrata-mcp -- --test-threads=1"
+            echo "finished=$(date -u +%FT%TZ)"
+          } > test-receipt.txt
+
+      - name: Upload test receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-receipt
+          path: test-receipt.txt
+          if-no-files-found: error
+          retention-days: 30
+
   build:
     name: ${{ matrix.archive }}
+    needs: verify
     runs-on: ${{ matrix.os }}
     env:
       # LBUG_VERSION pins the engine archive the lbug build script

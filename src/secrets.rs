@@ -160,12 +160,58 @@ const SCAN_CONTEXT_CARRY: usize = 4 * 1024;
 /// quoted literals and plain opaque values still go through the password
 /// check.
 fn looks_like_code_expression(value: &str) -> bool {
-    // Only strong source markers: paths and calls. Punctuation that can occur
-    // in a config value (`!`, `?`, braces) is not enough to call it code.
+    // Strong source markers: path/call syntax and code-only roots. A config
+    // value such as `password=correct.horse` does not qualify; member chains
+    // and index expressions need a source-statement prefix, below.
     value.contains("::")
         || value.contains("->")
         || value.contains("=>")
         || (value.contains('(') && value.contains(')'))
+        || value.starts_with("self.")
+        || value.starts_with("&self.")
+        || value.starts_with("process.env.")
+}
+
+/// Member chains and index expressions are exempt only inside a source
+/// statement: `let token = response.token` yes, `password=correct.horse` no.
+fn looks_like_source_reference(value: &str) -> bool {
+    (!value.starts_with("eyJ") && looks_like_member_chain(value))
+        || (value.contains('[') && !value.starts_with('[') && !value.contains(']'))
+}
+
+/// True when the key begins a source statement/comment, so code-shaped values
+/// can be exempted without exempting the same shapes in a `.env` file.
+fn source_statement_prefix(text: &str, key_start: usize) -> bool {
+    let line_start = text[..key_start].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let prefix = text[line_start..key_start].trim_start();
+    [
+        "let ", "const ", "var ", "return ", "if ", "match ", "for ", "while ",
+        "pub ", "fn ", "struct ", "enum ", "impl ", "type ",
+    ]
+    .iter()
+    .any(|p| prefix.starts_with(p))
+}
+
+/// `self.token`, `response.token`, `process.env.SECRET` are member chains; a
+/// password such as `p@ss.w0rd` is not because a segment contains `@`.
+fn looks_like_member_chain(value: &str) -> bool {
+    if !value.contains('.') {
+        return false;
+    }
+    let mut saw_alpha = false;
+    for segment in value.split('.') {
+        if segment.is_empty()
+            || !segment
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return false;
+        }
+        if let Some(first) = segment.chars().next() {
+            saw_alpha |= first.is_ascii_alphabetic();
+        }
+    }
+    saw_alpha
 }
 
 /// A value captured next to a secret-like key may be a Rust type annotation
@@ -355,15 +401,6 @@ impl SecretScanner {
             });
         }
 
-        let lower = text.to_ascii_lowercase();
-
-        // --- Placeholder exclusion (fast check before regex) ---
-        // Check the whole text first: inputs like "changeme" or "<placeholder>"
-        // should be rejected as a whole without regex parsing.
-        if is_placeholder(&lower) {
-            return None;
-        }
-
         // --- JWT detection ---
         if let Some(cat) = self.detect_jwt(text) {
             return Some(Rejection {
@@ -431,8 +468,16 @@ impl SecretScanner {
                     sep.starts_with(':') && !sep.starts_with("::")
                 })
                 .unwrap_or(false);
+            let source_context = cap
+                .get(1)
+                .map(|key| source_statement_prefix(text, key.start()))
+                .unwrap_or(false);
+            let literal_keyword = matches!(value, "None" | "true" | "false")
+                || value.starts_with("&self.");
             if !quoted
-                && (looks_like_code_expression(value)
+                && (literal_keyword
+                    || looks_like_code_expression(value)
+                    || (source_context && looks_like_source_reference(value))
                     || (type_context && looks_like_type_annotation(value)))
             {
                 continue;
@@ -470,6 +515,13 @@ impl SecretScanner {
             });
         }
         match value {
+            // A metadata leaf over the scanner's window cannot be scanned as
+            // one string; say so distinctly instead of reporting a generic
+            // oversized input, so the caller can fix the field it names.
+            Value::String(s) if s.len() > MAX_SCAN_BYTES => Some(Rejection {
+                location: location.to_string(),
+                category: "oversized_metadata",
+            }),
             Value::String(s) => self.scan_inner(s, location),
             Value::Array(arr) => {
                 for (i, item) in arr.iter().enumerate() {
@@ -488,6 +540,15 @@ impl SecretScanner {
                     } else {
                         format!("{}.{}", location, key)
                     };
+                    // A key is user-controlled too: `{"ghp_…": "x"}` is a
+                    // credential the value scan would never see. The location
+                    // names the field's position without echoing the key: a
+                    // rejection is logged and returned to the caller, so it
+                    // must not repeat the credential.
+                    let key_loc = format!("{location}.<key>");
+                    if let Some(r) = self.scan_inner(key, &key_loc) {
+                        return Some(r);
+                    }
                     if let Some(r) = self.scan_value_inner(val, &loc, depth + 1) {
                         return Some(r);
                     }
@@ -1044,6 +1105,52 @@ mod tests {
         assert_eq!(r.category, "password");
     }
 
+    /// A credential can be the key, not only a value.
+    #[test]
+    fn metadata_key_carrying_a_secret_is_detected() {
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef123456".to_string(),
+            json!("benign"),
+        );
+        let r = SecretScanner::scan_value(&Value::Object(map), "metadata").unwrap();
+        assert_eq!(r.category, "github_pat");
+        assert!(r.location.contains("<key>"), "the location names the key: {}", r.location);
+        assert!(
+            !r.to_string().contains("ghp_"),
+            "the rejection must not echo the credential-bearing key: {r}"
+        );
+    }
+
+    /// A metadata leaf over the scan window has its own reason, so the caller
+    /// can fix the named field instead of seeing a generic oversized input.
+    #[test]
+    fn oversized_metadata_leaf_has_a_distinct_reason() {
+        let meta = json!({ "note": "a".repeat(MAX_SCAN_BYTES + 1) });
+        let r = SecretScanner::scan_value(&meta, "metadata").unwrap();
+        assert_eq!(r.category, "oversized_metadata");
+        assert_eq!(r.location, "metadata.note");
+    }
+
+    /// A long single line has no newline to chunk on; the overlap must still
+    /// contain a token that straddles the scan boundary whole. A JWT needs all
+    /// three segments, so a split at the boundary cannot be rescued by any
+    /// other detector.
+    #[test]
+    fn single_line_token_straddling_a_chunk_boundary_is_detected() {
+        let header = base64_encode(br#"{"alg":"HS256","typ":"JWT"}"#);
+        let payload = base64_encode(br#"{"sub":"1234567890","name":"John"}"#);
+        let jwt = format!("{}.{}.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c", header, payload);
+        let mut text = "a".repeat(MAX_SCAN_BYTES - 10);
+        text.push_str(&jwt);
+        assert!(
+            text.len() > MAX_SCAN_BYTES,
+            "the fixture crosses the chunk window"
+        );
+        let r = SecretScanner::scan_str(&text, "content").unwrap();
+        assert_eq!(r.category, "jwt");
+    }
+
     #[test]
     fn overly_deep_metadata_rejected() {
         let mut v = json!({ "leaf": "fine" });
@@ -1223,6 +1330,50 @@ mod tests {
         let rejection =
             SecretScanner::scan_str(&text, "content").expect("multiline assignment detected");
         assert_eq!(rejection.category, "password");
+    }
+
+    #[test]
+    fn secret_source_expression_matrix() {
+        for clean in [
+            "let token = self.token;",
+            "token=None",
+            "const secret = process.env.SECRET;",
+            "// token = None",
+            "let value = parts[0];",
+            "let token = response.token;",
+            "struct Cfg { api_key: &self.api_key }",
+            "    token: normalize_query_token(&stem),",
+            "    secret: process.env.SECRET,",
+        ] {
+            assert!(
+                SecretScanner::scan_str(clean, "content").is_none(),
+                "clean source shape was rejected: {clean}"
+            );
+        }
+        for literal in [
+            "let password = \"hunter2!\";",
+            "// password = \"hunter2!\"",
+            "PASSWORD=hunter2!",
+            "password=correct.horse",
+            "PASSWORD=hunter2[abc",
+            "// password=correct.horse",
+            "# password=hunter2[abc",
+        ] {
+            assert!(
+                SecretScanner::scan_str(literal, "content").is_some(),
+                "credential literal was accepted: {literal}"
+            );
+        }
+    }
+
+    #[test]
+    fn placeholder_wrapped_token_rejected() {
+        let token = format!("ghp_{}", "Ab1".repeat(12));
+        for wrapped in [format!("<{token}>"), format!("${{{token}}}")] {
+            let rejection = SecretScanner::scan_str(&wrapped, "content")
+                .unwrap_or_else(|| panic!("wrapped token accepted: {wrapped}"));
+            assert_eq!(rejection.category, "github_pat");
+        }
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────

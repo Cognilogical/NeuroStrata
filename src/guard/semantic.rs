@@ -36,6 +36,36 @@ use std::sync::Arc;
 /// rules seeded through the normal memory surface stay visible to the guard.
 const RULE_MEMORY_TYPES: [&str; 2] = ["rule", "guard_rule"];
 
+/// The most rules one evaluation will enforce.
+///
+/// The listing has no page limit of its own, so this is the guard's stated
+/// ceiling: above it the evaluation is refused rather than silently truncated,
+/// because enforcing a subset would be a policy hole. 5,000 is far above any
+/// namespace measured here (3,000 is the sizing probe) and well below the
+/// point where a single validation pass stops being bounded.
+pub(crate) const MAX_GUARD_RULES: usize = 5_000;
+
+/// Refuse to enforce more than [`MAX_GUARD_RULES`] rules.
+fn enforce_rule_cap(namespace: &str, count: usize) -> Result<()> {
+    if count > MAX_GUARD_RULES {
+        anyhow::bail!(
+            "refusing to enforce '{namespace}': {count} rules exceed the {MAX_GUARD_RULES}-rule cap; retire rules or split the namespace"
+        );
+    }
+    Ok(())
+}
+
+/// Convert listed rows to enforceable rules and apply the cap to that set.
+///
+/// The order matters: the listing returns every `rule`/`guard_rule` row, and
+/// most `rule` memories are not guard rules (they lack the guard fields).
+/// Capping the raw rows would let ordinary memory growth disable validation.
+fn rules_within_cap(namespace: &str, rows: Vec<SearchResult>) -> Result<Vec<BehavioralRule>> {
+    let rules = rules_from_rows(rows);
+    enforce_rule_cap(namespace, rules.len())?;
+    Ok(rules)
+}
+
 pub struct SemanticEvaluator {
     store: Arc<dyn VectorStore>,
     embedder: Arc<dyn Embedder>,
@@ -159,7 +189,10 @@ impl SemanticEvaluator {
             }
         }
 
-        Ok(rules_from_rows(rows))
+        // Count the rules the guard can enforce, not every listed row: a
+        // namespace with many generic `rule` memories (or any other row type
+        // the listing returns) must not trip the cap when few are enforceable.
+        rules_within_cap(own, rows)
     }
 
     /// Record one firing of a rule: bump its persisted `hit_count` by one.
@@ -172,7 +205,7 @@ impl SemanticEvaluator {
     /// back with the vector it already had: the rule keeps its embedding and
     /// its identity, and only the counter moves.
     pub async fn increment_hit_count(&self, rule_id: &str) -> Result<()> {
-        let (target_ns, vector, mut payload) =
+        let (target_ns, _vector, payload) =
             if let Some((v, p)) = self.store.get(&self.namespace, rule_id).await? {
                 (self.namespace.as_str(), v, p)
             } else if self.namespace != "global" {
@@ -190,15 +223,12 @@ impl SemanticEvaluator {
             anyhow::bail!("rule {rule_id} carries metadata that is not an object");
         }
 
-        let hits = payload
-            .metadata
-            .get("hit_count")
-            .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f.max(0.0) as u64)))
-            .unwrap_or(0);
-        payload.metadata["hit_count"] = serde_json::json!(hits + 1);
-
+        // The increment is one write turn in the store, so two validators
+        // firing the same rule serialize instead of overwriting each other's
+        // read (the old get/modify/upsert pair lost updates). The resolution
+        // above only names the namespace; the counter itself is atomic.
         self.store
-            .upsert(target_ns, rule_id, vector, payload)
+            .increment_metadata_counter(target_ns, rule_id, "hit_count")
             .await
             .context("Failed to record the rule hit")?;
 
@@ -416,6 +446,153 @@ mod tests {
             vec!["g-guard".to_string(), "g-rule".to_string()],
             "the global namespace is listed once, not twice"
         );
+    }
+
+    /// The guard's stated ceiling: at the cap it enforces, above it it
+    /// refuses rather than truncating the rule set.
+    #[test]
+    fn listing_cap_is_honored() {
+        assert!(enforce_rule_cap("probe", MAX_GUARD_RULES).is_ok());
+        let err = enforce_rule_cap("probe", MAX_GUARD_RULES + 1)
+            .expect_err("over the cap must refuse");
+        let message = err.to_string();
+        assert!(message.contains("exceed the"), "{message}");
+        assert!(message.contains(&MAX_GUARD_RULES.to_string()), "{message}");
+    }
+
+    /// The cap counts parsed guard rules, not listed rows: ordinary `rule`
+    /// memories without guard fields must not disable the guard.
+    #[test]
+    fn listing_cap_counts_parsed_rules_not_rows() {
+        // One enforceable rule plus far more generic rows than the cap.
+        let mut rows: Vec<SearchResult> = Vec::new();
+        let mut generic = rule_row("generic", 0.0, "rule");
+        generic.payload.metadata = json!({"note": "not a guard rule"});
+        rows.push(rule_row("enforceable", 0.0, "guard_rule"));
+        rows.extend(std::iter::repeat_n(generic, MAX_GUARD_RULES + 10));
+
+        let rules = rules_within_cap("probe", rows)
+            .expect("many non-guard rules must not trip the cap");
+        assert_eq!(rules.len(), 1, "only the guard-shaped row survives conversion");
+    }
+
+    /// Above the cap of actually enforceable rules the guard still refuses.
+    #[test]
+    fn listing_cap_refuses_above_the_cap_of_parsed_rules() {
+        let rows: Vec<SearchResult> = (0..=MAX_GUARD_RULES)
+            .map(|i| rule_row(&format!("rule-{i}"), 0.0, "guard_rule"))
+            .collect();
+        let err = rules_within_cap("probe", rows).expect_err("over the cap must refuse");
+        assert!(err.to_string().contains("exceed the"), "{err}");
+    }
+
+    /// Concurrent firings of the same rule must not lose increments: the
+    /// store's read-modify-write is one write turn, not a separate get and
+    /// upsert.
+    #[tokio::test]
+    async fn concurrent_hit_counts_are_not_lost() {
+        use crate::guard::testkit::StubEmbedder;
+        use crate::traits::{Embedder, VectorStore};
+
+        let dir = std::env::temp_dir().join(format!("ns-hit-count-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database"),
+        );
+        store.init("guard").await.expect("init");
+        let payload = MemoryPayload {
+            content: "always use podman".to_string(),
+            user_id: "guard".to_string(),
+            memory_type: "guard_rule".to_string(),
+            agent_name: Some("neurostrata-guard".to_string()),
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: json!({
+                "id": "rule-concurrent",
+                "version": 1,
+                "rule_class": "blocking",
+                "trigger_pattern": "docker",
+                "hit_count": 0,
+                "status": "active",
+            }),
+        };
+        store
+            .upsert("guard", "rule-concurrent", vec![0.0; 4], payload)
+            .await
+            .expect("seed the rule");
+
+        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        let evaluator = Arc::new(SemanticEvaluator::new(store.clone(), embedder, "guard"));
+        let mut handles = Vec::new();
+        for _ in 0..25 {
+            let evaluator = evaluator.clone();
+            handles.push(tokio::spawn(async move {
+                evaluator.increment_hit_count("rule-concurrent").await
+            }));
+        }
+        for handle in handles {
+            handle.await.expect("task joins").expect("increment succeeds");
+        }
+
+        let (_, payload) = store
+            .get("guard", "rule-concurrent")
+            .await
+            .expect("read")
+            .expect("the rule survives");
+        assert_eq!(
+            payload.metadata["hit_count"],
+            json!(25),
+            "every concurrent firing is counted exactly once"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Sizing probe: 3,000 rules must still be listed and converted well
+    /// inside the 750 ms budget the guard-3000 suite names.
+    #[tokio::test]
+    async fn three_thousand_rules_within_budget() {
+        use crate::guard::testkit::StubEmbedder;
+        use crate::traits::{Embedder, VectorStore};
+
+        let dir = std::env::temp_dir().join(format!("ns-guard-3000-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database"),
+        );
+        store.init("guard").await.expect("init");
+        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        let evaluator = SemanticEvaluator::new(store.clone(), embedder, "guard");
+
+        for i in 0..3_000u32 {
+            let payload = MemoryPayload {
+                content: format!("rule {i}: always use podman"),
+                user_id: "guard".to_string(),
+                memory_type: "guard_rule".to_string(),
+                agent_name: Some("neurostrata-guard".to_string()),
+                location: String::new(),
+                location_lines: String::new(),
+                metadata: json!({
+                    "id": format!("rule-{i}"),
+                    "version": 1,
+                    "rule_class": "blocking",
+                    "trigger_pattern": "docker",
+                    "hit_count": 0,
+                    "status": "active",
+                }),
+            };
+            store
+                .upsert("guard", &format!("rule-{i}"), vec![0.0; 4], payload)
+                .await
+                .expect("seed a rule");
+        }
+
+        let started = std::time::Instant::now();
+        let rules = evaluator.candidate_rules().await.expect("list 3,000 rules");
+        let elapsed = started.elapsed();
+        assert_eq!(rules.len(), 3_000, "every rule is listed");
+        assert!(
+            elapsed < std::time::Duration::from_millis(750),
+            "3,000-rule listing took {elapsed:?}, budget 750 ms"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Row conversion keeps rule types with complete guard fields and nothing

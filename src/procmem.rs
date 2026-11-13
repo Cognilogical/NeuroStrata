@@ -209,11 +209,31 @@ fn profile_enabled() -> bool {
         )
 }
 
+/// Parse the per-call growth threshold. An unset value uses the default; a
+/// value that is present but not a number is reported rather than silently
+/// replaced, so an operator who mistyped the knob can see why the log stayed
+/// at the default.
+fn parse_threshold(value: Option<&str>) -> Result<u64, String> {
+    match value {
+        None => Ok(DEFAULT_THRESHOLD_MB),
+        Some(raw) => raw.trim().parse::<u64>().map_err(|e| {
+            format!(
+                "NEUROSTRATA_RSS_LOG_MB='{raw}' is not a whole number of megabytes ({e}); using {DEFAULT_THRESHOLD_MB}"
+            )
+        }),
+    }
+}
+
 fn threshold_mb() -> u64 {
-    std::env::var("NEUROSTRATA_RSS_LOG_MB")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_THRESHOLD_MB)
+    match parse_threshold(std::env::var("NEUROSTRATA_RSS_LOG_MB").ok().as_deref()) {
+        Ok(value) => value,
+        Err(warning) => {
+            // The binary installs no tracing subscriber, so `tracing::warn!`
+            // would vanish; operator diagnostics go to stderr.
+            eprintln!("warning: {warning}");
+            DEFAULT_THRESHOLD_MB
+        }
+    }
 }
 
 fn log_path() -> PathBuf {
@@ -315,7 +335,9 @@ async fn run_sampler(
 ) {
     loop {
         let calls = CALLS.swap(0, Ordering::Relaxed);
-        append(&path, &sample_line(sample(), calls, IN_FLIGHT.load(Ordering::SeqCst)));
+        if let Err(e) = append(&path, &sample_line(sample(), calls, IN_FLIGHT.load(Ordering::SeqCst))) {
+            eprintln!("warning: memory growth log write failed for {}: {e}", path.display());
+        }
         tokio::select! {
             _ = tokio::time::sleep(every) => {}
             _ = stop.changed() => break,
@@ -325,21 +347,28 @@ async fn run_sampler(
 
 static LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn append(path: &std::path::Path, line: &str) {
+/// Append one line to the growth log.
+///
+/// Errors are returned, not swallowed: the caller warns. A log the process
+/// cannot write to is a missing diagnostic, and silently dropping it hides the
+/// very growth the file exists to show.
+fn append(path: &std::path::Path, line: &str) -> std::io::Result<()> {
     // Rotation and append are one critical section: concurrent calls must not
     // rename the file one is writing to or interleave a partial line.
     let _guard = LOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        std::fs::create_dir_all(dir)?;
     }
     if std::fs::metadata(path).map(|m| m.len() > MAX_LOG_BYTES).unwrap_or(false) {
         let mut rolled = path.as_os_str().to_owned();
         rolled.push(".1");
-        let _ = std::fs::rename(path, PathBuf::from(rolled));
+        if let Err(e) = std::fs::rename(path, PathBuf::from(rolled)) {
+            // Losing the rotation is not losing the line: try the append.
+            eprintln!("warning: could not rotate {}: {e}", path.display());
+        }
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(f, "{line}");
-    }
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(f, "{line}")
 }
 
 /// Wraps one tool call. Created before the handler runs; on drop it samples
@@ -377,8 +406,9 @@ impl Drop for CallGuard {
         // IN_FLIGHT, but its allocation may be part of this delta.
         let overlapped = overlapped_since(self.epoch_at_begin, CALL_EPOCH.load(Ordering::SeqCst));
         if grew(self.before.rss_bytes, after.rss_bytes, threshold_mb()) {
-            append(
-                &log_path(),
+            let log_path = log_path();
+            if let Err(e) = append(
+                &log_path,
                 &line(
                     &self.tool,
                     self.namespace.as_deref(),
@@ -387,7 +417,12 @@ impl Drop for CallGuard {
                     in_flight,
                     overlapped,
                 ),
-            );
+            ) {
+                eprintln!(
+                    "warning: memory growth log write failed for {}: {e}",
+                    log_path.display()
+                );
+            }
         }
     }
 }
@@ -405,6 +440,18 @@ mod tests {
         assert!(!grew(Some(100 * MB), None, 50));
     }
 
+    /// A mistyped threshold is reported and falls back; zero is a valid
+    /// "disable the per-call log" value.
+    #[test]
+    fn invalid_rss_threshold_is_reported_not_swallowed() {
+        assert_eq!(parse_threshold(None).unwrap(), DEFAULT_THRESHOLD_MB);
+        assert_eq!(parse_threshold(Some("0")).unwrap(), 0);
+        assert_eq!(parse_threshold(Some(" 25 ")).unwrap(), 25);
+        let err = parse_threshold(Some("fifty")).expect_err("not a number");
+        assert!(err.contains("not a whole number"), "{err}");
+        assert!(err.contains("fifty"), "the bad value is named: {err}");
+    }
+
     #[test]
     fn zero_threshold_disables_and_extreme_saturates() {
         assert!(!grew(Some(0), Some(u64::MAX), 0), "0 disables the per-call log");
@@ -413,6 +460,23 @@ mod tests {
             "an extreme threshold saturates instead of wrapping"
         );
         assert!(grew(Some(0), Some(50 * MB), 50));
+    }
+
+    /// A log the process cannot write is reported, not silently dropped.
+    #[test]
+    fn growth_log_write_failure_is_surfaced() {
+        let dir = std::env::temp_dir().join(format!(
+            "procmem-fail-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Opening a directory as the append target fails on every platform.
+        assert!(append(&dir, "{\"n\":1}").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -429,7 +493,7 @@ mod tests {
         for i in 0..16 {
             let path = path.clone();
             handles.push(std::thread::spawn(move || {
-                append(&path, &format!("{{\"n\":{i}}}"));
+                append(&path, &format!("{{\"n\":{i}}}")).expect("append");
             }));
         }
         for h in handles {
@@ -515,7 +579,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("memory-growth.log");
         std::fs::write(&path, vec![b'x'; (MAX_LOG_BYTES + 1) as usize]).unwrap();
-        append(&path, "{\"fresh\":true}");
+        append(&path, "{\"fresh\":true}").expect("append");
         assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), "{\"fresh\":true}");
         assert!(dir.join("memory-growth.log.1").exists());
         let _ = std::fs::remove_dir_all(&dir);

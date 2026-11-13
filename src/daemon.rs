@@ -1657,7 +1657,10 @@ async fn handle_set_metadata(
     Json(req): Json<SetMetadataReq>,
 ) -> Result<&'static str, (axum::http::StatusCode, String)> {
     let namespace = crate::server::resolve_namespace(&state.vector_store, &req.namespace).await;
-    match crate::server::set_metadata(&*state.vector_store, &namespace, &req.id, req.metadata).await
+    // The daemon is bearer-authenticated per user, so its caller is the local
+    // operator: the same admin default the CLI uses.
+    match crate::server::set_metadata(&*state.vector_store, &namespace, &req.id, req.metadata, "admin")
+        .await
     {
         Ok(crate::server::MetadataOutcome::Updated) => Ok("OK"),
         Ok(crate::server::MetadataOutcome::NotFound) => {
