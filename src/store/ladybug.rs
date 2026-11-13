@@ -7805,11 +7805,14 @@ impl VectorStore for LadybugStore {
         let source_key = source_key.to_string();
         self.write_with_deadline("aborting a staging generation", move |conn| {
             // A staged node's id is `ns::<generation>::<path>`, so every row of
-            // this generation shares the prefix. Nothing else matches it, and
-            // the previous generation is untouched.
+            // this generation shares the prefix. The namespace predicate keeps
+            // a foreign row whose id happens to start with that prefix (a
+            // namespace containing the separator, a corrupt import) out of the
+            // delete. The previous generation is untouched.
             let prefix = crate::parser::ingest::generation_scoped_id(&namespace, generation, "");
             let query = format!(
-                "MATCH (m:Memory) WHERE m.id STARTS WITH '{}' DETACH DELETE m",
+                "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id STARTS WITH '{}' DETACH DELETE m",
+                escape_ladybug_string(&namespace),
                 escape_ladybug_string(&prefix)
             );
             conn.query(&query)?;
@@ -7848,7 +7851,8 @@ impl VectorStore for LadybugStore {
         self.with_conn(move |conn| {
             let prefix = crate::parser::ingest::generation_scoped_id(&namespace, generation, "");
             let query = format!(
-                "MATCH (m:Memory) WHERE m.id STARTS WITH '{}' RETURN m.id",
+                "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id STARTS WITH '{}' RETURN m.id",
+                escape_ladybug_string(&namespace),
                 escape_ladybug_string(&prefix)
             );
             let mut rows = conn.query(&query)?;
@@ -20831,6 +20835,55 @@ eurostrata\src\daemon.rs",
                 "both lexical routes must agree for {principal}"
             );
         }
+    }
+
+    /// Abort is namespace-scoped: a foreign row whose id happens to start with
+    /// the aborted prefix (a namespace containing the separator, a corrupt
+    /// import) is neither listed nor deleted.
+    #[tokio::test]
+    async fn abort_generation_scoped_to_namespace() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("abort.lbug"), 4).unwrap();
+        store.init("gen").await.unwrap();
+        let foreign_id = "gen::1::src/foreign.rs";
+        store
+            .upsert(
+                "other",
+                foreign_id,
+                vec![0.0; 4],
+                retired_test_payload("fact", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+
+        let generation = store.begin_generation("gen", "src").await.unwrap();
+        let staged_id =
+            crate::parser::ingest::generation_scoped_id("gen", generation, "src/a.rs");
+        store
+            .upsert(
+                "gen",
+                &staged_id,
+                vec![0.0; 4],
+                retired_test_payload("fact", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+
+        let nodes = store.generation_nodes("gen", generation).await.unwrap();
+        assert_eq!(nodes, vec![staged_id.clone()], "only this namespace's rows");
+
+        store
+            .abort_generation("gen", "src", generation)
+            .await
+            .unwrap();
+        assert!(
+            store.get("gen", &staged_id).await.unwrap().is_none(),
+            "the staged row is discarded"
+        );
+        assert!(
+            store.get("other", foreign_id).await.unwrap().is_some(),
+            "a foreign row with the same id prefix survives the abort"
+        );
     }
 }
 

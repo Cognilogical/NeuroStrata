@@ -130,6 +130,25 @@
         "owner_allowed": 1,
         "ignored": 0
       }
+    },
+    "ingest-correctness": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp parser::ingest::tests -- --test-threads=1 --skip ingest_memory_probe",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests -- --test-threads=1"
+      ],
+      "tests": [
+        "parser::ingest::tests::transient_summary_failure_forces_reparse",
+        "store::ladybug::tests::abort_generation_scoped_to_namespace",
+        "parser::ingest::tests::read_failure_aborts_generation",
+        "parser::ingest::tests::read_ingest_file_rejects_a_directory",
+        "parser::ingest::tests::file_to_directory_asserts_old_rows_dead"
+      ],
+      "thresholds": {
+        "stale_rows_in_current_generation": 0,
+        "foreign_rows_deleted": 0,
+        "unreadable_file_published": 0,
+        "ignored": 0
+      }
     }
   }
 }
