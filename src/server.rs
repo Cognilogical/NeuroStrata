@@ -7831,15 +7831,46 @@ fn scan_for_set_metadata(metadata: &serde_json::Value) -> Option<String> {
     crate::secrets::scan_entry_point("", metadata, "set_metadata").map(|r| r.to_string())
 }
 
+/// Whether replacing `existing` with `replacement` would change who may read
+/// the row: the canonical owner or the ACL. `set_metadata` replaces the whole
+/// metadata document, so "add a note" and "hand the row to bob" arrive through
+/// the same argument; this is the distinction the write gate needs.
+fn metadata_changes_ownership(
+    user_id: &str,
+    existing: &serde_json::Value,
+    replacement: &serde_json::Value,
+) -> bool {
+    if crate::rebac::extract_resource_owner(user_id, existing)
+        != crate::rebac::extract_resource_owner(user_id, replacement)
+    {
+        return true;
+    }
+    // Roles matter: keeping the same principals while promoting one from
+    // viewer to editor changes who may write. Compare the role-bearing ACL,
+    // order-insensitively (a pure reordering is not an authorization change).
+    let mut before = crate::rebac::extract_acl_with_roles(existing);
+    let mut after = crate::rebac::extract_acl_with_roles(replacement);
+    before.sort();
+    after.sort();
+    before != after
+}
+
 /// Update metadata on an existing memory without changing its ID or content.
 ///
 /// This is the operator's surgical path for fixing metadata issues (like missing
 /// provenance) without creating a new memory ID or breaking existing references.
+///
+/// `principal` is the authenticated caller (the local CLI/daemon surface passes
+/// `"admin"`, the same default the other local write paths use). A caller that
+/// could not write the row is refused. Replacing the document also replaces the
+/// fields ReBAC trusts, so changing the canonical owner or the ACL requires the
+/// current owner or an admin: an editor may fix provenance, not grant reads.
 pub(crate) async fn set_metadata(
     store: &dyn VectorStore,
     namespace: &str,
     id: &str,
     new_metadata: serde_json::Value,
+    principal: &str,
 ) -> anyhow::Result<MetadataOutcome> {
     if let Some(rejection) = scan_for_set_metadata(&new_metadata) {
         return Err(anyhow::anyhow!("{}", rejection));
@@ -7852,6 +7883,20 @@ pub(crate) async fn set_metadata(
     if payload.user_id == "auto-ingestor" || id.contains(crate::parser::ingest::NAMESPACE_SEPARATOR)
     {
         return Ok(MetadataOutcome::Ingested);
+    }
+
+    if !crate::rebac::can_write_memory(principal, &payload.user_id, &payload.metadata) {
+        return Err(anyhow::anyhow!(
+            "access denied by ReBAC policy: '{principal}' may not update metadata on '{id}'"
+        ));
+    }
+    if metadata_changes_ownership(&payload.user_id, &payload.metadata, &new_metadata) {
+        let owner = crate::rebac::extract_resource_owner(&payload.user_id, &payload.metadata);
+        if principal != "admin" && principal != owner {
+            return Err(anyhow::anyhow!(
+                "access denied by ReBAC policy: only the owner or an admin may change ownership or visibility of '{id}'"
+            ));
+        }
     }
 
     payload.metadata = new_metadata;
@@ -11973,6 +12018,7 @@ mod tests {
             "probe",
             &id,
             serde_json::json!({ "note": format!("the token is {}", secret) }),
+            "admin",
         )
         .await
         .expect_err("a secret in replacement metadata must be refused");
@@ -11986,6 +12032,149 @@ mod tests {
             payload.metadata, before.metadata,
             "the refused write left the stored metadata untouched"
         );
+    }
+
+    /// A row owned by `owner`, with `metadata` already in place.
+    async fn store_with_owned_row(
+        owner: &str,
+        metadata: Value,
+    ) -> (Arc<dyn VectorStore>, String) {
+        let dir = std::env::temp_dir().join(format!("ns-metadata-acl-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database"),
+        );
+        store.init("probe").await.expect("create the schema");
+        let id = "acl-row".to_string();
+        let mut p = payload("metadata authorization probe");
+        p.user_id = owner.to_string();
+        p.metadata = metadata;
+        store
+            .upsert("probe", &id, StubEmbedder.embed("metadata authorization probe").await.unwrap(), p)
+            .await
+            .expect("seed the owned row");
+        (store, id)
+    }
+
+    /// A viewer cannot rewrite metadata at all.
+    #[tokio::test]
+    async fn set_metadata_denies_a_viewer() {
+        let acl = serde_json::json!([{"principal": "bob", "role": "viewer"}]);
+        let (store, id) = store_with_owned_row("alice", serde_json::json!({ "visible_to": acl })).await;
+        let err = set_metadata(
+            &*store,
+            "probe",
+            &id,
+            serde_json::json!({ "visible_to": acl, "note": "viewer edit" }),
+            "bob",
+        )
+        .await
+        .expect_err("a viewer must not write metadata");
+        assert!(err.to_string().contains("access denied"), "{err}");
+    }
+
+    /// An editor may fix provenance, keeping the row's visibility as it was.
+    #[tokio::test]
+    async fn set_metadata_allows_an_editor_to_fix_provenance() {
+        let acl = serde_json::json!([{"principal": "bob", "role": "editor"}]);
+        let (store, id) =
+            store_with_owned_row("alice", serde_json::json!({ "visible_to": acl })).await;
+        let outcome = set_metadata(
+            &*store,
+            "probe",
+            &id,
+            serde_json::json!({ "visible_to": acl, "provenance": "src/lib.rs" }),
+            "bob",
+        )
+        .await
+        .expect("an editor may change non-ownership metadata");
+        assert_eq!(outcome, MetadataOutcome::Updated);
+    }
+
+    /// An editor cannot grant themselves reads by replacing the ACL.
+    #[tokio::test]
+    async fn set_metadata_denies_an_editor_rewriting_visibility() {
+        let (store, id) = store_with_owned_row(
+            "alice",
+            serde_json::json!({"visible_to": [{"principal": "bob", "role": "editor"}]}),
+        )
+        .await;
+        let err = set_metadata(
+            &*store,
+            "probe",
+            &id,
+            serde_json::json!({ "visible_to": ["*"] }),
+            "bob",
+        )
+        .await
+        .expect_err("only the owner or an admin may change visibility");
+        assert!(err.to_string().contains("only the owner or an admin"), "{err}");
+    }
+
+    /// An ACL editor cannot promote a principal's role: the principals are
+    /// unchanged, so the ACL-only comparison must still see the role change.
+    #[tokio::test]
+    async fn set_metadata_denies_an_editor_promoting_a_role() {
+        let (store, id) = store_with_owned_row(
+            "alice",
+            serde_json::json!({
+                "visible_to": [
+                    {"principal": "bob", "role": "editor"},
+                    {"principal": "carol", "role": "viewer"}
+                ]
+            }),
+        )
+        .await;
+        let err = set_metadata(
+            &*store,
+            "probe",
+            &id,
+            serde_json::json!({
+                "visible_to": [
+                    {"principal": "bob", "role": "editor"},
+                    {"principal": "carol", "role": "editor"}
+                ]
+            }),
+            "bob",
+        )
+        .await
+        .expect_err("a role promotion needs the owner or an admin");
+        assert!(err.to_string().contains("only the owner or an admin"), "{err}");
+    }
+
+    /// The owner may hand the row to someone else.
+    #[tokio::test]
+    async fn set_metadata_allows_the_owner_to_rewrite_visibility() {
+        let (store, id) = store_with_owned_row(
+            "alice",
+            serde_json::json!({"visible_to": [{"principal": "alice", "role": "owner"}]}),
+        )
+        .await;
+        let outcome = set_metadata(
+            &*store,
+            "probe",
+            &id,
+            serde_json::json!({ "user_id": "alice", "visible_to": ["bob"] }),
+            "alice",
+        )
+        .await
+        .expect("the owner may change visibility");
+        assert_eq!(outcome, MetadataOutcome::Updated);
+    }
+
+    /// The local admin default may rewrite ownership.
+    #[tokio::test]
+    async fn set_metadata_allows_admin_to_rewrite_ownership() {
+        let (store, id) = store_with_owned_row("alice", serde_json::json!({})).await;
+        let outcome = set_metadata(
+            &*store,
+            "probe",
+            &id,
+            serde_json::json!({ "user_id": "bob", "visible_to": ["bob"] }),
+            "admin",
+        )
+        .await
+        .expect("admin may change ownership");
+        assert_eq!(outcome, MetadataOutcome::Updated);
     }
 
     // ── Snapshot handler: fallible encoding (Task 2) ───────────────────

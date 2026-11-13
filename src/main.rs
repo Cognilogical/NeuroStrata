@@ -5190,6 +5190,7 @@ async fn run() -> anyhow::Result<()> {
                             &namespace,
                             &id,
                             new_metadata,
+                            "admin",
                         )
                         .await?
                         {
