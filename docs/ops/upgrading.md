@@ -1,6 +1,18 @@
-# Upgrading NeuroStrata — Zero-Touch Lifecycle & Schema Migration
+# Upgrading NeuroStrata — Lifecycle & Schema Migration
 
-Upgrading NeuroStrata requires **zero manual database migrations or config edits**. The binary and your agent handle the entire upgrade automatically.
+Schema and config defaults are upgraded automatically. **Upgrading from ≤1.17.x is not zero-touch for the index:** parser logic version 3 forces one full reparse/re-embed so pre-fix rows pass through the secret scanner and the type-change logic.
+
+## Upgrade from ≤1.17.x (one-time reparse)
+
+- **Disk:** the old generation stays active while the new one stages, so plan for about **2× the store size** in free space. The ingest preflight refuses to start when the filesystem cannot hold the projection.
+- **Time:** one full walk of every ingested directory, plus embedding and relink. Large stores take proportionally longer.
+- **Pool:** the default buffer-pool cap is 384 MB (`storage_hygiene.buffer_pool_mb`); a reparse stages roughly twice the rows. Raise it or set `NEUROSTRATA_BUFFER_POOL_MB=0` to let the engine size it if a large store hits a pool-full error.
+- **Rollback:** keep a store backup before the upgrade. The previous generation remains readable until the new one publishes; a failed reparse aborts staging and leaves the old generation active.
+- **Secrets:** rows indexed before the fix are re-scanned. A file that trips the scanner is skipped and reported; check `files_skipped` after the first post-upgrade ingest.
+
+After this one-time reparse, later upgrades return to the automatic path below.
+
+## How automatic upgrades work
 
 ## How Zero-Touch Upgrades Work
 

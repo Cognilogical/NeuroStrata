@@ -1166,6 +1166,33 @@ pub async fn ingest_directory(
             obs.version_gate_tripped(warn_prev, &current_version);
         }
         tracing::warn!(prev = warn_prev, current = %current_version, "ingest version changed; re-parsing all files");
+        // A reparse stages a second copy before it publishes. Refuse on a
+        // host that cannot hold it rather than failing halfway through.
+        if let Some(store) = crate::traits::VectorStore::as_any(vector_store.as_ref())
+            .downcast_ref::<crate::store::ladybug::LadybugStore>()
+        {
+            let store_path = store.local_path();
+            let store_bytes = std::fs::metadata(store_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let projected = crate::storage::preflight::projected_reindex_bytes(store_bytes);
+            if let Err(e) = crate::storage::preflight::check_free_space(store_path, projected) {
+                // Record the failed upgrade before returning: the registry is
+                // the only trace the operator/doctor has of a refused reparse.
+                if let Err(record) = crate::registry::enrichment_fail(
+                    &vector_store,
+                    Some(&embedder),
+                    namespace,
+                    "ingest",
+                    &e.to_string(),
+                )
+                .await
+                {
+                    tracing::warn!("enrichment registry update failed: {record}");
+                }
+                return Err(e);
+            }
+        }
     }
 
     let (tx, rx) = mpsc::channel::<IngestItem>(256);

@@ -1,0 +1,88 @@
+{
+  "version": 1,
+  "suites": {
+    "secret-precision": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp secrets::tests -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp parser::ingest::tests -- --test-threads=1 --skip ingest_memory_probe"
+      ],
+      "tests": [
+        "secrets::tests::secret_source_expression_matrix",
+        "secrets::tests::placeholder_wrapped_token_rejected",
+        "parser::ingest::tests::ingest_skip_count_reported",
+        "parser::ingest::tests::clean_markdown_ingests"
+      ],
+      "thresholds": {
+        "clean_shapes_no_false_skip": 20,
+        "seeded_secrets_rejected": 12,
+        "wrapped_tokens_rejected": 2,
+        "comment_config_literals_rejected": 2,
+        "ignored": 0
+      }
+    },
+    "ingest-skip": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp parser::ingest::tests -- --test-threads=1 --skip ingest_memory_probe"
+      ],
+      "tests": [
+        "parser::ingest::tests::skipped_fixture_does_not_force_new_generation"
+      ],
+      "thresholds": {
+        "unchanged_ingests": 5,
+        "generation_count": 1,
+        "ignored": 0
+      }
+    },
+    "lexical-generation": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp lexical::tests -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests -- --test-threads=1"
+      ],
+      "tests": [
+        "lexical::tests::lexical_search_returns_only_active_generation",
+        "lexical::tests::deleted_path_absent_from_lexical",
+        "lexical::tests::secret_skipped_absent_from_lexical",
+        "lexical::tests::validity_boundary_parity",
+        "store::ladybug::tests::lexical_owner_parity",
+        "store::ladybug::tests::rebuild_scoped_rejects_foreign_namespace"
+      ],
+      "thresholds": {
+        "unexpected_current_ids": 0,
+        "deleted_rows": 0,
+        "secret_skipped_rows": 0,
+        "route_id_sets_equal": 1,
+        "ignored": 0
+      }
+    },
+    "guard-3000": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp guard:: -- --test-threads=1"
+      ],
+      "tests": [
+        "guard::tests::three_thousand_rules_within_budget",
+        "guard::tests::listing_cap_is_honored"
+      ],
+      "thresholds": {
+        "rules": 3000,
+        "p95_ms": 750,
+        "max_ratio_to_100_rules": 2.0,
+        "listing_cap": 5000,
+        "ignored": 0
+      }
+    },
+    "store-growth": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp parser::ingest::tests -- --test-threads=1 --skip ingest_memory_probe"
+      ],
+      "tests": [
+        "parser::ingest::tests::store_growth_bounded_over_unchanged_ingests"
+      ],
+      "thresholds": {
+        "unchanged_ingests": 5,
+        "max_bytes_over_baseline_percent": 10,
+        "generation_count": 1,
+        "ignored": 0
+      }
+    }
+  }
+}
