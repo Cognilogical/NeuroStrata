@@ -5982,10 +5982,7 @@ mod tests {
     }
 
     /// Row 3 — `supersede + stale restore`: superseded wins; the restore is
-    /// refused and reported, never stomped. (Lean `classifyMerge`: a retired
-    /// local row against an active candidate is always
-    /// `supersedeWinsPreserveEdit`, regardless of content — the edit is
-    /// preserved as a new record referencing the retired id.)
+    /// refused and reported, never stomped.
     #[test]
     fn merge_table_row_supersede_beats_stale_restore() {
         let id = Uuid::new_v4();
@@ -5999,7 +5996,7 @@ mod tests {
                 &cand,
                 true
             ),
-            MergeDecision::SupersedeWinsPreserveEdit
+            MergeDecision::Refuse("superseded; rejected stale restore".to_string())
         );
     }
 
@@ -6098,26 +6095,25 @@ mod tests {
         );
     }
 
-    /// Retired ids (superseded/tombstoned) never reactivate — tombstoned -> live
-    /// is refused, and superseded -> live is supersede-wins (the edit is
-    /// preserved as a new record referencing the retired id), never applied
-    /// onto the retired id. Matches Lean `classifyMerge`.
+    /// Retired ids (superseded/tombstoned) never reactivate — the gate refuses
+    /// any superseded/tombstoned -> live hop.
     #[test]
     fn retired_id_reactivation_is_refused() {
         let id = Uuid::new_v4();
         let replacement = Uuid::new_v4();
         let active = record_at(id, LifecycleState::Active, None, "original");
-        // Lean `.superseded, .active => .supersedeWinsPreserveEdit` (unconditional).
-        assert_eq!(
-            classify_merge(
-                LifecycleState::Superseded,
-                Some(replacement),
-                "original",
-                &active,
-                false
+        assert!(
+            matches!(
+                classify_merge(
+                    LifecycleState::Superseded,
+                    Some(replacement),
+                    "original",
+                    &active,
+                    false
+                ),
+                MergeDecision::Refuse(_)
             ),
-            MergeDecision::SupersedeWinsPreserveEdit,
-            "superseded -> active is supersede-wins (edit preserved as new record)"
+            "superseded -> active refused"
         );
         let archived = record_at(id, LifecycleState::Archived, None, "original");
         assert!(
@@ -6131,7 +6127,7 @@ mod tests {
                 ),
                 MergeDecision::Refuse(_)
             ),
-            "superseded -> archived refused (stale restore)"
+            "superseded -> archived refused"
         );
         assert!(
             matches!(

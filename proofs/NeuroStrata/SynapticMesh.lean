@@ -21,11 +21,11 @@ def isTerminal : LifecycleState → Bool
 @[simp]
 def canTransitionTo (fromState toState : LifecycleState) : Bool :=
   match fromState, toState with
-  | .active, .active => true
   | .active, .archived => true
-  | .active, .superseded => true
-  | .active, .tombstoned => true
   | .archived, .active => true
+  | .active, .superseded => true
+  | .archived, .superseded => true
+  | .active, .tombstoned => true
   | .archived, .tombstoned => true
   | .superseded, .tombstoned => true
   | _, _ => false
@@ -87,11 +87,11 @@ def classifyMerge (localState candState : LifecycleState) (sameSupersededBy cont
   | .archived, .superseded =>
       if contentChanged then .supersedeWinsPreserveEdit else .apply
   | .superseded, .active =>
-      .supersedeWinsPreserveEdit
+      if contentChanged then .supersedeWinsPreserveEdit else .refuseStaleRestore
   | .superseded, .archived =>
       if contentChanged then .supersedeWinsPreserveEdit else .refuseStaleRestore
   | .active, .superseded =>
-      .supersedeWinsPreserveEdit
+      if contentChanged then .supersedeWinsPreserveEdit else .apply
   | .archived, .active =>
       if contentChanged then
         if canTransitionTo localState candState || canTransitionTo candState localState

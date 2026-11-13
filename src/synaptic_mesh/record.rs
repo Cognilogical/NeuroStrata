@@ -211,14 +211,13 @@ mod tests {
     #[test]
     fn transitions_match_spec_table() {
         use LifecycleState::*;
-        // Allowed transitions from §"Lifecycle state machine" (Lean
-        // `canTransitionTo`: proofs/NeuroStrata/SynapticMesh.lean).
+        // Allowed transitions from §"Lifecycle state machine".
         let allowed: &[(LifecycleState, LifecycleState)] = &[
-            (Active, Active),
             (Active, Archived),
-            (Active, Superseded),
-            (Active, Tombstoned),
             (Archived, Active),
+            (Active, Superseded),
+            (Archived, Superseded),
+            (Active, Tombstoned),
             (Archived, Tombstoned),
             (Superseded, Tombstoned),
         ];
@@ -261,9 +260,9 @@ mod tests {
         // forbidden. A retired ID must get a new linked ID, not be revived.
         assert!(!LifecycleState::Superseded.can_transition_to(LifecycleState::Active));
         assert!(!LifecycleState::Tombstoned.can_transition_to(LifecycleState::Active));
-        // Self-transitions are forbidden except the Lean no-op active→active.
-        assert!(LifecycleState::Active.can_transition_to(LifecycleState::Active));
+        // Self-transitions are also forbidden (would be a no-op anyway).
         for s in [
+            LifecycleState::Active,
             LifecycleState::Archived,
             LifecycleState::Superseded,
             LifecycleState::Tombstoned,
