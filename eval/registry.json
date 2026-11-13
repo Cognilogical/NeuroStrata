@@ -152,6 +152,30 @@
         "unreadable_file_published": 0,
         "ignored": 0
       }
+    },
+    "generation-retention": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests -- --test-threads=1"
+      ],
+      "tests": [
+        "store::ladybug::tests::retention_keeps_active_and_previous",
+        "store::ladybug::tests::delete_generation_is_namespace_scoped",
+        "store::ladybug::tests::rollback_constraint_documented",
+        "store::ladybug::tests::delete_generation_refuses_an_in_progress_staging_generation",
+        "store::ladybug::tests::retention_keeps_an_in_progress_generation",
+        "store::ladybug::tests::retention_keeps_each_sources_previous_generation",
+        "store::ladybug::tests::prune_backfills_previous_for_upgraded_stores",
+        "store::ladybug::tests::prune_rechecks_previous_targets_inside_the_write",
+        "store::ladybug::tests::retention_keeps_every_overlapping_staging_generation",
+        "store::ladybug::tests::retention_keeps_the_base_of_an_in_flight_ingest",
+        "store::ladybug::tests::prune_recovers_abandoned_staging_markers"
+      ],
+      "thresholds": {
+        "retained_generations": 2,
+        "active_generations_pruned": 0,
+        "foreign_rows_deleted": 0,
+        "ignored": 0
+      }
     }
   }
 }
