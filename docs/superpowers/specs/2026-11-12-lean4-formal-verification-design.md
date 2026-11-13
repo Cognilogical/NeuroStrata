@@ -3,7 +3,7 @@
 - **Date:** 2026-11-12
 - **Task:** `neurostrata-ngd9`
 - **Status:** Draft (Pending User Spec Review)
-- **Targets:** `proofs/` (new Lean 4 Lake package), `src/task/machine.rs`, `src/task/gate.rs`, `src/synaptic_mesh/record.rs`, `src/synaptic_mesh/import.rs`, `src/registry.rs`, `tests/lean_parity_test.rs`
+- **Targets:** `src/formal_kernel.rs` (new zero-dependency Charon/Aeneas-extractable Rust kernel), `proofs/` (new Lean 4 Lake package + `proofs/scripts/extract-aeneas.sh`), `src/main.rs`, `src/task/machine.rs`, `src/task/gate.rs`, `src/synaptic_mesh/record.rs`, `src/synaptic_mesh/import.rs`, `src/registry.rs`, `tests/lean_parity_test.rs`
 
 ---
 
@@ -32,19 +32,34 @@ This specification defines a standalone Lean 4 formal verification package (`pro
 
 ---
 
-## 3. Architecture & Directory Layout
+## 3. Architecture & Directory Layout: Aeneas Kernel + Lean 4 Lake Suite
 
-We adopt **Approach A**: a standalone Lean 4 Lake package in `proofs/` paired with an exhaustive finite-state truth-table parity test in `tests/lean_parity_test.rs`.
+We adopt a **Hybrid Aeneas + Lean 4 Architecture**:
+1. **Aeneas-Compliant Pure Rust Kernel (`src/formal_kernel.rs`)**:
+   - Following the Aeneas functional translation methodology (https://lean-lang.org/use-cases/aeneas/) and NeuroStrata's crate-free module pattern (`src/fts/mod.rs`), we factor out the pure algebraic state machines into `src/formal_kernel.rs`.
+   - `src/formal_kernel.rs` uses **zero external crates** (no `serde_json`, `chrono`, `uuid`, `anyhow`, `lbug`, or `crate::*` imports) and stays strictly within the Charon/Aeneas supported safe Rust subset (`Copy` algebraic enums/structs, `bool`, `u32`, `i64`, `Option`, `Result`, total pattern matching, no interior mutability or trait objects).
+   - It compiles standalone as a crate root via `rustc --edition=2021 --crate-type=lib src/formal_kernel.rs` (and `charon` -> LLBC -> `aeneas -backend lean`).
+   - Production modules (`src/task/machine.rs`, `src/task/gate.rs`, `src/synaptic_mesh/record.rs`, `src/synaptic_mesh/import.rs`) delegate their pure transition, retirement, lifecycle, epoch-gate, and merge-classification decisions directly to `crate::formal_kernel`.
+2. **Standalone Lean 4 Lake Package (`proofs/`) + Aeneas Extraction Script (`proofs/scripts/extract-aeneas.sh`)**:
+   - Proves the mathematical theorems over the pure functional translation of `src/formal_kernel.rs` and the bounded graph traversals.
+   - `proofs/scripts/extract-aeneas.sh` validates standalone compilation of `src/formal_kernel.rs` and invokes `charon` + `aeneas -backend lean` (locally or via `podman` image `ghcr.io/aeneasverif/aeneas`) when available.
+3. **Exhaustive Parity & Extractability Gate (`tests/lean_parity_test.rs`)**:
+   - Compiles `#[path = "../src/formal_kernel.rs"] mod formal_kernel;` directly (matching `tests/fts/lexical_test.rs`), verifies standalone `rustc --crate-type=lib src/formal_kernel.rs` compilation with zero `--extern` flags (guaranteeing Aeneas extractability never regresses), and asserts 100% truth-table equivalence against `lake --dir proofs exe neurostrata-proofs`.
 
 ```text
+src/
+└── formal_kernel.rs                # Zero-dep Charon/Aeneas-compliant pure Rust kernel
 proofs/
-├── lean-toolchain                  # Pinned Lean 4 release (leanprover/lean4:v4.15.0 or latest stable installed by elan)
+├── lean-toolchain                  # Pinned Lean 4 release (leanprover/lean4:v4.15.0)
 ├── lakefile.lean                   # Zero-external-dependency Lake config (stdlib only, no Mathlib)
-├── NeuroStrata.lean                # Root module importing all four formalization modules + CLI JSON/table dump
+├── Main.lean                       # Executable truth-table emitter (211 canonical lines)
+├── NeuroStrata.lean                # Root module importing all four formalization modules
+├── scripts/
+│   └── extract-aeneas.sh           # Standalone rustc check + Charon/Aeneas LLBC->Lean4 extractor
 └── NeuroStrata/
-    ├── TaskMachine.lean            # Formal model & theorems for src/task/machine.rs
-    ├── TaskGate.lean               # Formal model & theorems for src/task/gate.rs
-    ├── SynapticMesh.lean           # Formal model & theorems for src/synaptic_mesh/{record,import}.rs
+    ├── TaskMachine.lean            # Formal model & theorems for formal_kernel / src/task/machine.rs
+    ├── TaskGate.lean               # Formal model & theorems for formal_kernel / src/task/gate.rs
+    ├── SynapticMesh.lean           # Formal model & theorems for formal_kernel / src/synaptic_mesh/
     └── DomainRegistry.lean         # Formal model & theorems for src/registry.rs
 ```
 
