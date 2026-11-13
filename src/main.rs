@@ -1975,6 +1975,7 @@ mod tests {
     /// A plain `cargo test` builds the test harness, not the CLI bin; CI builds
     /// the bin first. Build it on demand here, then let the caller skip with a
     /// clear message if the toolchain cannot produce it.
+    #[cfg(unix)]
     fn t4_ensure_cli_binary() -> Option<std::path::PathBuf> {
         let bin = t4_cli_binary();
         if bin.is_file() {
