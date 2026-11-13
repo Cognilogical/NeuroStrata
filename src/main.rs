@@ -3062,6 +3062,129 @@ mod tests {
         }
     }
 
+    /// Regression test for the issue #96 P8-1 / #85 arm class: the
+    /// daemon-down fallback `SetMetadata` and `Archive` arms mutate the
+    /// store through `set_metadata` / `archive_memory`, both of which
+    /// write via `upsert` — the same guarded entry point Add, Edit, and
+    /// Ingest already prepare for. On a store whose recorded state is
+    /// stale (here: a row-bearing store whose sidecar still reads
+    /// pristine under the pre-switch model), the guard refuses the
+    /// write with restart guidance this path could never satisfy. The
+    /// arms now build their embedder and call `prepare_fallback_write_store`
+    /// before any mutation, so this test exercises the arm's
+    /// call-sequence contract at the helper seam (the arms are not
+    /// invocable through `run()`): prepare via the helper, then the
+    /// guarded metadata write and the guarded archive exactly as the
+    /// arms perform them.
+    #[tokio::test]
+    async fn fallback_write_arms_prepare_store_before_mutating() {
+        let previous = std::env::var("NEUROSTRATA_MODEL").ok();
+        std::env::remove_var("NEUROSTRATA_MODEL");
+        let root =
+            std::env::temp_dir().join(format!("ns-fallback-write-arms-{}", uuid::Uuid::new_v4()));
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let write_config = |model: &str| {
+            std::fs::write(
+                config_dir.join("embedders.json"),
+                format!("[{{\"model_name\":\"{model}\",\"dimensions\":4}}]"),
+            )
+            .unwrap();
+        };
+        let db_path = root.join("ladybug.db");
+        let descriptor = |model: &str| crate::traits::EmbeddingDescriptor {
+            provider: "fastembed".to_string(),
+            model: model.to_string(),
+            revision: "onnx".to_string(),
+            dims: 4,
+            normalization: "unknown".to_string(),
+            preprocessing: "unknown".to_string(),
+            distance_metric: "cosine".to_string(),
+        };
+        let payload = |content: &str| crate::traits::MemoryPayload {
+            content: content.to_string(),
+            memory_type: "fact".to_string(),
+            location: String::new(),
+            user_id: "system".to_string(),
+            agent_name: Some("NeuroStrata".to_string()),
+            location_lines: String::new(),
+            metadata: serde_json::json!({}),
+        };
+
+        write_config("ModelA");
+        let seed = LadybugStore::for_testing(&db_path, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&config_dir)
+            .with_serving_descriptor(Some(descriptor("ModelA")));
+        seed.init("probe").await.expect("seed init");
+        seed.upsert("probe", "m1", vec![0.1, 0.2, 0.3, 0.4], payload("original"))
+            .await
+            .expect("seed upsert");
+        drop(seed);
+        // The stale label: the sidecar reads pristine under ModelA
+        // although the table holds the seeded row.
+        crate::model_choice::write_store_state(
+            &db_path,
+            &crate::model_choice::StoreState {
+                version: crate::model_choice::STORE_STATE_VERSION,
+                has_data: false,
+                descriptor: descriptor("ModelA"),
+            },
+        )
+        .expect("rewrite the sidecar to the pristine label");
+
+        write_config("ModelB");
+        let vector_store: Arc<dyn VectorStore> = Arc::new(
+            LadybugStore::for_testing(&db_path, 4)
+                .expect("reopen temp database")
+                .with_embed_config_dir(&config_dir),
+        );
+        let embedder: Arc<dyn crate::traits::Embedder> = Arc::new(FallbackModelBEmbedder);
+        prepare_fallback_write_store(&vector_store, &embedder, "probe")
+            .await
+            .expect("the fallback write preparation inits the store under the serving model");
+        let outcome = crate::server::set_metadata(
+            &*vector_store,
+            "probe",
+            "m1",
+            serde_json::json!({ "k": "v" }),
+            "admin",
+        )
+        .await
+        .expect("the fallback SetMetadata arm must adopt the pristine record and proceed");
+        assert!(
+            matches!(outcome, crate::server::MetadataOutcome::Updated),
+            "the metadata write lands: {outcome:?}"
+        );
+        let (_, row) = vector_store
+            .get("probe", "m1")
+            .await
+            .expect("read the updated row")
+            .expect("the row exists");
+        assert_eq!(
+            row.metadata.get("k").and_then(serde_json::Value::as_str),
+            Some("v"),
+            "the fallback SetMetadata write survives the metadata round-trip"
+        );
+        let bus = Arc::new(crate::events::ThalamicBus::new(crate::daemon::BUS_CAPACITY));
+        let archive = crate::handlers::archive_memory::archive_memory(
+            serde_json::json!({ "namespace": "probe", "id": "m1" }),
+            vector_store.clone(),
+            bus,
+        )
+        .await;
+        assert!(
+            archive.is_archived(),
+            "the fallback Archive arm must retire the row the same metadata write left behind: {archive:?}"
+        );
+        drop(vector_store);
+        let _ = std::fs::remove_dir_all(&root);
+        match previous {
+            Some(value) => std::env::set_var("NEUROSTRATA_MODEL", value),
+            None => std::env::remove_var("NEUROSTRATA_MODEL"),
+        }
+    }
+
     fn restore_copy_fixture(
         tag: &str,
     ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
@@ -4956,6 +5079,9 @@ async fn run() -> anyhow::Result<()> {
                         }
                     }
                     Commands::NormalizeMetadata { namespace } => {
+                        let embedder = build_embedder()?;
+                        prepare_fallback_write_store(&vector_store, &embedder, &namespace)
+                            .await?;
                         use crate::store::ladybug::KnownIds;
                         let all = vector_store.list(&namespace, None, None).await?;
                         let ingested_ids: Vec<String> = all
@@ -5053,6 +5179,9 @@ async fn run() -> anyhow::Result<()> {
                         println!("Memory deleted successfully.");
                     }
                     Commands::Archive { namespace, id } => {
+                        let embedder = build_embedder()?;
+                        prepare_fallback_write_store(&vector_store, &embedder, &namespace)
+                            .await?;
                         // The same handler `neurostrata_archive_memory` calls,
                         // so the CLI and the tool cannot disagree about what
                         // "archived" means. It needs a bus to announce the
@@ -5183,6 +5312,9 @@ async fn run() -> anyhow::Result<()> {
                         id,
                         metadata,
                     } => {
+                        let embedder = build_embedder()?;
+                        prepare_fallback_write_store(&vector_store, &embedder, &namespace)
+                            .await?;
                         let new_metadata: serde_json::Value = serde_json::from_str(&metadata)
                             .map_err(|e| anyhow::anyhow!("Invalid JSON metadata: {}", e))?;
                         match crate::server::set_metadata(

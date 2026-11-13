@@ -190,7 +190,15 @@ fn write_file_atomically(
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "embedders.json".to_string());
-    let tmp = dir.join(format!(".{file_name}.tmp-{}", std::process::id()));
+    static ATOMIC_WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // #92: the pid alone cannot separate two atomic writes racing inside
+    // one process (the daemon and its in-process fallback arms share a
+    // pid), so the temp name also carries a process-wide sequence number.
+    let tmp = dir.join(format!(
+        ".{file_name}.tmp-{}-{}",
+        std::process::id(),
+        ATOMIC_WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let staged = (|| -> anyhow::Result<()> {
         let mut file = fs::File::create(&tmp)
             .with_context(|| format!("failed to create temp file {}", tmp.display()))?;
@@ -1267,14 +1275,48 @@ mod tests {
         let target = config_dir.join("embedders.json");
         let before = fs::read(&target).expect("read default file");
         record_pending_choice(&config_dir);
-        // Sabotage the writer's temp path (the writer's documented temp name) so
-        // the persist fails after staging begins.
-        let tmp_blocker = config_dir.join(format!(".embedders.json.tmp-{}", std::process::id()));
-        fs::create_dir(&tmp_blocker).expect("create temp blocker dir");
+        // Sabotage the persist so it fails after staging begins. #92's
+        // per-write sequence number makes the old temp-name blocker (a
+        // directory at `.embedders.json.tmp-<pid>`) unmatchable, so the
+        // failure moves to the write's own layer: on Unix the staging
+        // directory itself refuses new files; elsewhere the rename's
+        // landing target refuses to be replaced.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = fs::metadata(&config_dir).expect("meta config dir").permissions();
+            let mut readonly = perms.clone();
+            readonly.set_mode(0o500);
+            fs::set_permissions(&config_dir, readonly).expect("make config dir readonly");
+        }
+        #[cfg(not(unix))]
+        {
+            let perms = fs::metadata(&target).expect("meta target").permissions();
+            let mut landing_blocked = perms.clone();
+            landing_blocked.set_readonly(true);
+            fs::set_permissions(&target, landing_blocked).expect("block the rename landing");
+        }
         let db_path = tmp.path().join("neurostrata.db");
         let result = surface_pending_choice(&config_dir, &db_path, true, &mut |_| {
             ChoiceResponse::Pick(0)
         });
+        // Restore writability before any assertion can fail and leave
+        // the tempdir undeletable.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = fs::metadata(&config_dir).expect("meta config dir").permissions();
+            let mut writable = perms.clone();
+            writable.set_mode(0o700);
+            fs::set_permissions(&config_dir, writable).expect("restore config dir writable");
+        }
+        #[cfg(not(unix))]
+        {
+            let perms = fs::metadata(&target).expect("meta target").permissions();
+            let mut landing_open = perms.clone();
+            landing_open.set_readonly(false);
+            fs::set_permissions(&target, landing_open).expect("unblock the rename landing");
+        }
         assert!(result.is_err(), "a failed persist must surface as an error");
         assert_eq!(
             fs::read(&target).expect("re-read file"),
@@ -1924,5 +1966,56 @@ mod tests {
         .expect("surface");
         assert_eq!(outcome, PendingChoiceOutcome::Voided);
         assert!(!called.get(), "a wrong-version sidecar is never offered");
+    }
+
+    #[test]
+    fn write_file_atomically_concurrent_same_process_safety() {
+        // #92: the temp name used to key on the pid alone, so every
+        // concurrent caller in one process staged into the same
+        // `.tmp-<pid>` file and clobbered each other (the daemon and
+        // its in-process fallback arms share a pid). Threads racing
+        // `write_store_state` at the same sidecar path must all
+        // succeed, and the file left behind must parse as one whole
+        // state — never a splice of two.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("ladybug.db");
+        fs::write(&db_path, b"db").expect("seed bare db");
+        let state = |i: u64| StoreState {
+            version: STORE_STATE_VERSION,
+            has_data: i % 2 == 0,
+            descriptor: crate::traits::EmbeddingDescriptor {
+                provider: "fastembed".to_string(),
+                model: format!("Model{i}"),
+                revision: "onnx".to_string(),
+                dims: 4,
+                normalization: "unknown".to_string(),
+                preprocessing: "unknown".to_string(),
+                distance_metric: "cosine".to_string(),
+            },
+        };
+        let mut handles = Vec::new();
+        for i in 0..16u64 {
+            let db_path = db_path.clone();
+            handles.push(std::thread::spawn(move || {
+                write_store_state(&db_path, &state(i))
+                    .expect("concurrent sidecar write succeeds without ENOENT or corruption");
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("writer thread did not panic");
+        }
+        let final_state = match read_store_state_file(&db_path) {
+            StoreStateRead::Recorded(state) => state,
+            other => panic!("the sidecar holds one whole recorded state, got {other:?}"),
+        };
+        assert_eq!(final_state.version, STORE_STATE_VERSION);
+        let written_i: u64 = final_state
+            .descriptor
+            .model
+            .strip_prefix("Model")
+            .and_then(|rest| rest.parse().ok())
+            .expect("the final sidecar is one whole written state, not a splice");
+        assert!(written_i < 16);
+        assert_eq!(final_state.has_data, written_i % 2 == 0);
     }
 }
