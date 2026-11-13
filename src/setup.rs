@@ -154,6 +154,8 @@ fn daemon_unit_template(bin: &Path) -> String {
          Restart=on-failure\n\
          RestartSec=5\n\
          Nice=10\n\
+         # NEUROSTRATA_PROFILE=1 logs resident-memory samples from the daemon.\n\
+         # Environment=NEUROSTRATA_PROFILE=1\n\
          # Logs: journalctl --user -u neurostrata -n 50\n\
          \n\
          [Install]\n\
@@ -279,6 +281,10 @@ fn macos_daemon_plist(bin: &Path) -> String {
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
+  <!-- Set NEUROSTRATA_PROFILE to 1 to log resident-memory samples. -->
+  <key>EnvironmentVariables</key><dict>
+    <key>NEUROSTRATA_PROFILE</key><string>0</string>
+  </dict>
   <key>StandardErrorPath</key><string>/tmp/neurostrata-daemon.log</string>
   <key>StandardOutPath</key><string>/tmp/neurostrata-daemon.log</string>
   <key>ProcessType</key><string>Interactive</string>
@@ -387,6 +393,19 @@ fn run_setup_windows(bin: &Path, script: &Path, repo: &Path) -> Result<SetupRepo
     if !restart_status.success() {
         anyhow::bail!("nssm set Restart exited with {:?}", restart_status.code());
     }
+    // Profile sampling is off by default; record the knob on the service so an
+    // operator can flip it in services.msc / nssm without rediscovering it.
+    if let Err(e) = std::process::Command::new(&nssm_exe)
+        .args([
+            "set",
+            service_name,
+            "AppEnvironmentExtra",
+            "NEUROSTRATA_PROFILE=0",
+        ])
+        .status()
+    {
+        eprintln!("note: could not record NEUROSTRATA_PROFILE on the service: {e}");
+    }
 
     let start_status = std::process::Command::new(&nssm_exe)
         .args(["start", service_name])
@@ -483,4 +502,28 @@ fn wait_for_healthy_windows(timeout_secs: u64) -> Result<bool> {
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
     anyhow::bail!("daemon did not become healthy within {}s", timeout_secs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The generated systemd unit documents the memory-profile knob instead of
+    /// leaving an operator to find it in the docs.
+    #[test]
+    fn daemon_unit_template_names_the_profile_knob() {
+        let unit = daemon_unit_template(Path::new("/usr/local/bin/neurostrata-mcp"));
+        assert!(unit.contains("ExecStart=/usr/local/bin/neurostrata-mcp daemon"));
+        assert!(unit.contains("NEUROSTRATA_PROFILE"), "{unit}");
+    }
+
+    /// The launchd agent carries an explicit off value (an explicit value is
+    /// how a plist documents an environment variable) and the comment names the
+    /// switch.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_plist_names_the_profile_knob() {
+        let plist = macos_daemon_plist(Path::new("/usr/local/bin/neurostrata-mcp"));
+        assert!(plist.contains("NEUROSTRATA_PROFILE"), "{plist}");
+    }
 }
