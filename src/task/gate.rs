@@ -118,10 +118,10 @@ pub fn is_task(result: &SearchResult) -> bool {
 /// refuses to forgive. A row the gate still judges is at least still
 /// visible in `task_list`.
 pub(crate) fn is_retired(metadata: &Value, now: i64) -> bool {
-    metadata
-        .get("valid_to")
-        .and_then(Value::as_i64)
-        .is_some_and(|valid_to| valid_to <= now)
+    crate::formal_kernel::is_retired_at(
+        metadata.get("valid_to").and_then(Value::as_i64),
+        now,
+    )
 }
 
 /// The chain bound: a namespace is written by many hands, so a loop in the

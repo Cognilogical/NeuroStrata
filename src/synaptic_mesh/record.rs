@@ -148,36 +148,28 @@ pub struct Relationship {
 
 impl LifecycleState {
     /// Returns true iff `self -> next` is an allowed transition per the spec
-    /// §"Lifecycle state machine" rules:
-    ///
-    /// - active -> archived (reversible)
-    /// - archived -> active (observing the archived revision)
-    /// - active/archived -> superseded (terminal)
-    /// - any -> tombstoned (terminal)
-    /// - retired IDs never reactivate (the spec rule: `superseded -> active`
-    ///   and `tombstoned -> active` are forbidden)
+    /// §"Lifecycle state machine" rules. Delegates to the pure kernel function.
     pub fn can_transition_to(self, next: LifecycleState) -> bool {
-        use LifecycleState::*;
-        match (self, next) {
-            (Active, Archived) => true,
-            (Archived, Active) => true,
-            (Active, Superseded) => true,
-            (Archived, Superseded) => true,
-            (Active, Tombstoned) => true,
-            (Archived, Tombstoned) => true,
-            (Superseded, Tombstoned) => true,
-            // All other transitions are forbidden.
-            _ => false,
-        }
+        let self_kernel = self.to_kernel();
+        let next_kernel = next.to_kernel();
+        crate::formal_kernel::lifecycle_can_transition(self_kernel, next_kernel)
     }
 
     /// Returns true iff this state is terminal (no further forward
     /// transitions allowed except tombstoning, which is the only escape).
+    /// Delegates to the pure kernel function.
     pub fn is_terminal(self) -> bool {
-        // Tombstoned is terminal. Superseded is terminal but allows one
-        // last hop to tombstoned. So "terminal" here means "no forward
-        // progress possible without tombstoning."
-        matches!(self, LifecycleState::Tombstoned)
+        crate::formal_kernel::lifecycle_is_terminal(self.to_kernel())
+    }
+
+    /// Converts to the kernel's `KernelLifecycleState` for formal-verification wiring.
+    pub fn to_kernel(self) -> crate::formal_kernel::KernelLifecycleState {
+        match self {
+            LifecycleState::Active => crate::formal_kernel::KernelLifecycleState::Active,
+            LifecycleState::Archived => crate::formal_kernel::KernelLifecycleState::Archived,
+            LifecycleState::Superseded => crate::formal_kernel::KernelLifecycleState::Superseded,
+            LifecycleState::Tombstoned => crate::formal_kernel::KernelLifecycleState::Tombstoned,
+        }
     }
 }
 

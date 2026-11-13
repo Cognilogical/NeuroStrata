@@ -6,6 +6,7 @@ mod buffer;
 mod compression;
 mod config;
 mod context;
+mod formal_kernel;
 mod crash;
 mod daemon;
 mod did;

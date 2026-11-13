@@ -37,6 +37,15 @@ impl Status {
             _ => None,
         }
     }
+
+    pub fn to_kernel(self) -> crate::formal_kernel::KernelTaskStatus {
+        match self {
+            Status::Open => crate::formal_kernel::KernelTaskStatus::Open,
+            Status::InProgress => crate::formal_kernel::KernelTaskStatus::InProgress,
+            Status::Blocked => crate::formal_kernel::KernelTaskStatus::Blocked,
+            Status::Done => crate::formal_kernel::KernelTaskStatus::Done,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,23 +176,30 @@ pub fn apply(task: &Task, to: Status, ctx: &Ctx) -> Result<Task, TransitionError
         .filter(|e| e.from == from)
         .map(|e| e.to)
         .collect();
-    let edge = TABLE
-        .iter()
-        .find(|e| e.from == from && e.to == to)
-        .ok_or(TransitionError::Illegal { from, to, legal })?;
 
-    match edge.guard {
-        Guard::None => {}
-        Guard::RequireReason if ctx.reason.trim().is_empty() => {
-            return Err(TransitionError::MissingReason { from, to });
+    // Pure decision delegated to the Aeneas-extractable kernel. The edge
+    // guard, the legality check, and the unclaim boolean all come from the
+    // single source of truth in `formal_kernel`; `TABLE` above stays intact
+    // for the legality-error message and its test.
+    let outcome = crate::formal_kernel::task_step(
+        from.to_kernel(),
+        to.to_kernel(),
+        !ctx.reason.trim().is_empty(),
+        ctx.extraction_edge_exists,
+    )
+    .map_err(|err| match err {
+        crate::formal_kernel::KernelTaskStepError::Illegal => {
+            TransitionError::Illegal { from, to, legal }
         }
-        Guard::ExtractionRequired if !ctx.extraction_edge_exists => {
-            return Err(TransitionError::ExtractionRequired {
+        crate::formal_kernel::KernelTaskStepError::MissingReason => {
+            TransitionError::MissingReason { from, to }
+        }
+        crate::formal_kernel::KernelTaskStepError::ExtractionRequired => {
+            TransitionError::ExtractionRequired {
                 id: task.id.clone(),
-            });
+            }
         }
-        Guard::RequireReason | Guard::ExtractionRequired => {}
-    }
+    })?;
 
     let mut payload = task.payload.clone();
     if !payload.metadata.is_object() {
@@ -207,7 +223,7 @@ pub fn apply(task: &Task, to: Status, ctx: &Ctx) -> Result<Task, TransitionError
     // carries no live claim, so the InProgress -> Open edge itself clears the
     // holder's marks. (Only unclaim: reopening a Done row is not a claim, and
     // Done rows may still say who finished them.)
-    if from == Status::InProgress && to == Status::Open {
+    if outcome.clear_claim {
         task_obj.remove("assignee");
         task_obj.remove("session_id");
     }

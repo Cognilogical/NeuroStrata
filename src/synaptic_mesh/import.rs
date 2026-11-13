@@ -974,13 +974,14 @@ fn validate_parsed_record(
 ///   future, so a validator refuses what it does not understand rather than
 ///   silently accepting it.
 pub fn epoch_gate(candidate_epoch: u32, manifest_epoch: u32) -> Result<(), String> {
-    use std::cmp::Ordering::{Equal, Greater, Less};
-    match candidate_epoch.cmp(&manifest_epoch) {
-        Equal => Ok(()),
-        Less => Err(format!(
+    use crate::formal_kernel::epoch_gate_decision;
+    use crate::formal_kernel::KernelEpochDecision;
+    match epoch_gate_decision(candidate_epoch, manifest_epoch) {
+        KernelEpochDecision::Apply => Ok(()),
+        KernelEpochDecision::QuarantineOld => Err(format!(
             "old-epoch record (origin_mesh_epoch {candidate_epoch} < manifest epoch {manifest_epoch}); quarantined, not replayed"
         )),
-        Greater => Err(format!(
+        KernelEpochDecision::RefuseFuture => Err(format!(
             "future-epoch record (origin_mesh_epoch {candidate_epoch} > manifest epoch {manifest_epoch}); refused, not understood"
         )),
     }
@@ -1175,103 +1176,52 @@ fn classify_merge(
     let cand_state = cand.lifecycle.state;
     let cand_sup = cand.lifecycle.superseded_by;
     let content_changed = local_content != content_text(cand);
+    // Derive the boolean the kernel expects: same superseded-by target.
+    let same_superseded_by = local_superseded_by == cand_sup;
 
-    // Tombstone is terminal: deletion wins over every stale update, and the
-    // deleted content is never re-served nor retained in a conflict artifact.
-    if local_state.is_terminal() {
-        return match cand_state {
-            Tombstoned => MergeDecision::Skip,
-            _ => {
-                MergeDecision::Refuse("tombstone wins; deleted content is never served".to_string())
-            }
-        };
-    }
+    // Pure kernel decision (zero external dependencies).
+    let kernel = crate::formal_kernel::classify_merge_decision(
+        local_state.to_kernel(),
+        cand_state.to_kernel(),
+        same_superseded_by,
+        content_changed,
+        concurrent,
+    );
 
-    // A retired (superseded) id never reactivates — can_transition_to refuses
-    // every superseded -> live hop. The merge table's supersede rows branch
-    // from this one gate.
-    if local_state == Superseded {
-        return match cand_state {
-            // Tombstone wins even over a retired id.
-            Tombstoned => MergeDecision::Apply,
-            Superseded => {
-                if cand_sup != local_superseded_by {
-                    MergeDecision::Conflict("two different replacements")
-                } else {
-                    MergeDecision::Skip
-                }
-            }
-            // supersede + content edit: replacement authoritative; the losing
-            // edit (whether on an active or archived revision) is preserved as
-            // a new record (handled by the caller).
-            Active | Archived if content_changed => MergeDecision::SupersedeWinsPreserveEdit,
-            // restore (or archive) of a retired id is refused, never stomped.
-            _ => MergeDecision::Refuse("superseded; rejected stale restore".to_string()),
-        };
-    }
-
-    // Incoming tombstone always wins over a live row.
-    if cand_state == Tombstoned {
-        return MergeDecision::Apply;
-    }
-
-    // Live -> superseded is always legal.
-    if cand_state == Superseded {
-        // supersede + content edit (reverse direction): the incoming
-        // supersession is authoritative, the local edit (active or archived)
-        // is preserved as a new record.
-        if matches!(local_state, Active | Archived) && content_changed {
-            return MergeDecision::SupersedeWinsPreserveEdit;
+    // Map the 10 KernelMergeDecision variants back to the 6 MergeDecision
+    // variants with their exact existing reason strings.
+    match kernel {
+        crate::formal_kernel::KernelMergeDecision::Apply => MergeDecision::Apply,
+        crate::formal_kernel::KernelMergeDecision::ApplyCombinationArchiveEdit => {
+            MergeDecision::ApplyCombination(
+                "archive + edit; edited content stays archived",
+            )
         }
-        return MergeDecision::Apply;
-    }
-
-    // Both live (active/archived): gate the state change through the spec
-    // transition table, then overlay the merge-table combinations.
-    if cand_state != local_state {
-        // A legal transition gate in at least one direction is the
-        // precondition for ANY combination overlay — `archive + edit`
-        // only ever pairs Active with Archived, both of which connect
-        // through the state machine. When neither direction is legal the
-        // pair is a candidate-state the gate cannot accept at all
-        // (e.g. two live states a future vocabulary might introduce), and
-        // the merge table must refuse before decorating the decision.
-        let any_direction_legal = local_state.can_transition_to(cand_state)
-            || cand_state.can_transition_to(local_state);
-        if content_changed {
-            return if any_direction_legal {
-                MergeDecision::ApplyCombination(
-                    "archive + edit; edited content stays archived",
-                )
-            } else {
-                MergeDecision::Refuse(format!(
-                    "illegal transition {local_state} -> {cand_state}"
-                ))
-            };
+        crate::formal_kernel::KernelMergeDecision::Skip => MergeDecision::Skip,
+        crate::formal_kernel::KernelMergeDecision::RefuseTombstoneWins => {
+            MergeDecision::Refuse("tombstone wins; deleted content is never served".to_string())
         }
-        // Same content, one side archived and the other restored: the spec's
-        // "restore + archive" pair — unresolved only when concurrent.
-        if concurrent {
-            return MergeDecision::Conflict("restore + archive");
+        crate::formal_kernel::KernelMergeDecision::RefuseStaleRestore => {
+            MergeDecision::Refuse("superseded; rejected stale restore".to_string())
         }
-        // The single gate every applied lifecycle change passes through.
-        return if local_state.can_transition_to(cand_state) {
-            MergeDecision::Apply
-        } else {
-            MergeDecision::Refuse(format!("illegal transition {local_state} -> {cand_state}"))
-        };
-    }
-
-    // Same live state: a content change is a forward edit (apply) or, when
-    // the two versions diverged, an incompatible-edit conflict.
-    if content_changed {
-        return if concurrent {
+        crate::formal_kernel::KernelMergeDecision::RefuseIllegalTransition => {
+            MergeDecision::Refuse(format!(
+                "illegal transition {local_state} -> {cand_state}"
+            ))
+        }
+        crate::formal_kernel::KernelMergeDecision::ConflictTwoReplacements => {
+            MergeDecision::Conflict("two different replacements")
+        }
+        crate::formal_kernel::KernelMergeDecision::ConflictRestoreArchive => {
+            MergeDecision::Conflict("restore + archive")
+        }
+        crate::formal_kernel::KernelMergeDecision::ConflictIncompatibleEdits => {
             MergeDecision::Conflict("incompatible content edits")
-        } else {
-            MergeDecision::Apply
-        };
+        }
+        crate::formal_kernel::KernelMergeDecision::SupersedeWinsPreserveEdit => {
+            MergeDecision::SupersedeWinsPreserveEdit
+        }
     }
-    MergeDecision::Skip
 }
 
 /// Canonical merge-decision tag names mirroring the Lean 4 truth table
