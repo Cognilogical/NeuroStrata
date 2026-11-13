@@ -30,12 +30,18 @@ if [ -n "$fixture" ]; then
 else
   [ -n "$pr" ] || { echo "usage: gate-receipt.sh --pr <n> | --reviews-file <path>" >&2; exit 2; }
   repo=$(gh repo view --json nameWithOwner -q .nameWithOwner)
-  entries=$(
-    # Reviews and comments only. The PR body often describes the gate itself
-    # ("one receipt per CHANGES-NEEDED marker") and must not count as a marker.
-    gh api "repos/$repo/pulls/$pr/reviews" --jq '.[] | {body:(.body // ""), author_association:(.author_association // "NONE")}' 2>/dev/null || true
-    gh api "repos/$repo/issues/$pr/comments" --jq '.[] | {body:(.body // ""), author_association:(.author_association // "NONE")}' 2>/dev/null || true
-  )
+  # Reviews and comments only. The PR body often describes the gate itself
+  # ("one receipt per CHANGES-NEEDED marker") and must not count as a marker.
+  # Fail closed: unavailable evidence is not clearance.
+  reviews=$(gh api "repos/$repo/pulls/$pr/reviews" --paginate --jq '.[] | {body:(.body // ""), author_association:(.author_association // "NONE")}') || {
+    echo "gate-receipt: cannot fetch reviews for #$pr" >&2
+    exit 1
+  }
+  comments=$(gh api "repos/$repo/issues/$pr/comments" --paginate --jq '.[] | {body:(.body // ""), author_association:(.author_association // "NONE")}') || {
+    echo "gate-receipt: cannot fetch comments for #$pr" >&2
+    exit 1
+  }
+  entries=$(printf '%s\n%s\n' "$reviews" "$comments")
 fi
 
 all_text=$(printf '%s\n' "$entries" | jq -r '.body' 2>/dev/null || true)
