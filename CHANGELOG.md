@@ -4,6 +4,28 @@ All notable changes to the NeuroStrata project will be documented in this file.
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **Remediation eval registry and release gate (`eval/registry.json`, `scripts/remediation-eval.sh`, `scripts/gate-receipt.sh`, `.github/workflows/gate-receipt.yml`, `#151`).** Named suites run the tests that back each remediation claim and emit a JSON verdict; the gate receipt refuses to clear a review marker until the fix is present at the reviewed head, and a maintainer ruling is required otherwise. The v3 upgrade preflight refuses a reparse the host cannot hold (2× projection) and records `enrichment_fail` before returning.
+- **Lexical active-generation visibility (`src/lexical.rs`, `src/fts/mod.rs`, `src/store/ladybug.rs`, `#149`).** Both lexical routes carry the staged generation and source, reject superseded/deleted/secret-skipped rows in the query, at hydration, and after publish/abort, and invalidate the cached view when the pointer moves. Legacy no-pointer stores stay readable. Owner resolution is canonical on both routes.
+- **Generation retention API (`delete_generation`, `prune_generations`, `#148`).** Namespace-scoped deletes refuse active and in-flight generations; pruning keeps active, per-source previous (rollback), staging and base generations, recovering upgraded stores and abandoned markers.
+
+### Fixed
+
+- **Secret scanner precision and skipped-file reporting (`src/secrets.rs`, `src/parser/ingest.rs`, `src/ingest_jobs.rs`, `#147`).** Source expressions, comments and config literals are distinguished correctly; provider tokens, JWTs and placeholder-wrapped tokens still reject; metadata keys are scanned; oversized metadata names the field; the single-line chunker boundary is pinned. Ingest reports `files_skipped` and bounded reasons, and a never-indexed skipped file no longer forces a new generation (`#148a`).
+- **Ingest correctness (`src/parser/ingest.rs`, `src/store/ladybug.rs`, `#142` follow-ups).** A transient generation-summary failure forces a full re-parse; abort/generation listing are namespace-scoped; an unreadable file aborts instead of publishing without its bytes; the file→directory kind change is pinned.
+- **Hygiene repair failure isolation (`src/store/ladybug.rs`, `src/server.rs`, `#142`).** Chunk failures keep the counts already committed, report the partial totals, and do not advance the doctor's `last_run_version`, so the retry runs again.
+- **`set_metadata` authorization (`src/server.rs`, `src/daemon.rs`, `src/main.rs`).** The replace re-checks write access and requires the owner or admin to change the canonical owner or ACL (including role-only changes).
+- **Guard `hit_count` atomicity and rule cap (`src/guard/`, `src/traits.rs`, `#114`).** The counter increments in one write turn, so concurrent firings are not lost; the guard refuses above 5,000 enforceable rules and has a 3,000-rule sizing probe.
+
+### Upgrading
+
+- **From ≤1.17.x**, the parser-version bump forces one full reparse/re-embed (2× store free space; the preflight refuses otherwise). See `docs/ops/upgrading.md` for disk, pool, rollback and `files_skipped` guidance. A pre-1.17.3 lexical index is rebuilt once (`INDEX_VERSION` v2).
+
+---
+
 ## [1.17.2] - 2026-11-10
 
 > The changes below were first published as the **v1.17.1** pre-release (2026-11-10), a tag cut without a version bump, so its binary reports `1.17.0`. 1.17.2 carries the same code with the version and changelog corrected.
