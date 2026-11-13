@@ -206,50 +206,49 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
         "expected 3 EPOCH_GATE rows"
     );
 
-    // Live Lean CLI comparison: run `lake --dir proofs exe neurostrata-proofs`
-    // whenever lake is available (PATH or ~/.elan/bin/lake). On a Rust-only CI
-    // runner without elan, the deterministic assertions above already validate
-    // the 211-row parity contract, so we skip the live comparison instead of failing.
-    if let Some(lake) = find_lake() {
-        let root = repo_root();
-        let output = Command::new(&lake)
-            .arg("--dir")
-            .arg("proofs")
-            .arg("exe")
-            .arg("neurostrata-proofs")
-            .current_dir(&root)
-            .output()
-            .expect("failed to run lake --dir proofs exe neurostrata-proofs");
-        assert!(
-            output.status.success(),
-            "lake exited non-zero: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+    let lake = find_lake().expect("lake not found on PATH or ~/.elan/bin/lake; install elan to run Lean parity tests");
+    let root = repo_root();
+    let build_status = Command::new(&lake)
+        .arg("--dir")
+        .arg("proofs")
+        .arg("build")
+        .current_dir(&root)
+        .status()
+        .expect("failed to run lake --dir proofs build");
+    assert!(build_status.success(), "lake --dir proofs build exited non-zero");
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let lean_lines: Vec<String> = stdout
-            .lines()
-            .map(str::trim_end)
-            .filter(|l| !l.is_empty())
-            .map(str::to_string)
-            .collect();
+    let output = Command::new(&lake)
+        .arg("--dir")
+        .arg("proofs")
+        .arg("exe")
+        .arg("neurostrata-proofs")
+        .current_dir(&root)
+        .output()
+        .expect("failed to run lake --dir proofs exe neurostrata-proofs");
+    assert!(
+        output.status.success(),
+        "lake exited non-zero: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
-        assert_eq!(
-            lean_lines.len(),
-            rust_lines.len(),
-            "line count mismatch: rust={} lean={}",
-            rust_lines.len(),
-            lean_lines.len()
-        );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lean_lines: Vec<String> = stdout
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
 
-        for (idx, (r, l)) in rust_lines.iter().zip(lean_lines.iter()).enumerate() {
-            assert_eq!(r, l, "line {} mismatch:\n  rust: {}\n  lean: {}", idx, r, l);
-        }
-    } else {
-        eprintln!(
-            "[lean parity] lake not found on PATH or ~/.elan/bin/lake; skipping live Lean CLI comparison \
-             (deterministic Rust assertions above already validate the 211-row truth table)"
-        );
+    assert_eq!(
+        lean_lines.len(),
+        rust_lines.len(),
+        "line count mismatch: rust={} lean={}",
+        rust_lines.len(),
+        lean_lines.len()
+    );
+
+    for (idx, (r, l)) in rust_lines.iter().zip(lean_lines.iter()).enumerate() {
+        assert_eq!(r, l, "line {} mismatch:\n  rust: {}\n  lean: {}", idx, r, l);
     }
 
     // Review-focus rows pinned explicitly so a regression names itself.
