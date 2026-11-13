@@ -91,6 +91,24 @@
         "generation_count": 1,
         "ignored": 0
       }
+    },
+    "hygiene-repair": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp server::tests::caller_does_not_advance_on_error -- --test-threads=1"
+      ],
+      "tests": [
+        "store::ladybug::tests::chunk_failure_keeps_prior_counts",
+        "store::ladybug::tests::repair_partial_counts_are_reported",
+        "store::ladybug::tests::hygiene_paging_pin",
+        "server::tests::caller_does_not_advance_on_error"
+      ],
+      "thresholds": {
+        "partial_counts_reported": 1,
+        "failed_chunks_swallowed": 0,
+        "watermark_advanced_on_error": 0,
+        "ignored": 0
+      }
     }
   }
 }

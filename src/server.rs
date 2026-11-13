@@ -3807,6 +3807,32 @@ pub async fn handle_task_candidates(
     }
 }
 
+/// Whether the doctor may stamp `last_run_version` after the automatic
+/// namespace hygiene repair.
+///
+/// A partial repair returns `Err` with the committed counts. Stamping the
+/// version would suppress the only retry path until the next release, so the
+/// caller must leave the marker unchanged and report the error instead.
+fn hygiene_allows_version_advance(result: &anyhow::Result<(usize, usize)>) -> bool {
+    match result {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!(
+                "namespace hygiene auto-upgrade did not complete; last_run_version will not advance: {e}"
+            );
+            false
+        }
+    }
+}
+
+/// Stamp the doctor's completion marker only when `allowed`. Kept separate so
+/// the "do not advance on a failed repair" rule is testable without a store.
+fn apply_doctor_version(state: &mut Value, version: &str, allowed: bool) {
+    if allowed {
+        state["last_run_version"] = serde_json::json!(version);
+    }
+}
+
 async fn handle_get_snapshot(
     arguments: Value,
     store: Arc<dyn VectorStore>,
@@ -4182,6 +4208,7 @@ async fn handle_get_snapshot(
         || (now_ts - last_run_ts) > 7 * 86400;
 
     let mut doctor_report: Option<String> = None;
+    let mut hygiene_ok = true;
     if trigger {
         let known = crate::store::ladybug::KnownIds::new(all_memories.iter().map(|m| m.id.as_str()));
         let mut unqualified_ingested = 0usize;
@@ -4215,13 +4242,20 @@ async fn handle_get_snapshot(
             if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref())
                 .downcast_ref::<crate::store::ladybug::LadybugStore>()
             {
-                if let Ok((shape_fixes, dangling_fixes)) = ls.repair_namespace_hygiene(namespace).await {
-                    if shape_fixes > 0 || dangling_fixes > 0 {
-                        findings.push(format!(
-                            "  auto-upgraded namespace hygiene (v{} -> v{}): {} shape fixes, {} dangling fixes",
-                            last_run_version, current_version, shape_fixes, dangling_fixes
-                        ));
+                let repair = ls.repair_namespace_hygiene(namespace).await;
+                hygiene_ok = hygiene_allows_version_advance(&repair);
+                match repair {
+                    Ok((shape_fixes, dangling_fixes)) => {
+                        if shape_fixes > 0 || dangling_fixes > 0 {
+                            findings.push(format!(
+                                "  auto-upgraded namespace hygiene (v{} -> v{}): {} shape fixes, {} dangling fixes",
+                                last_run_version, current_version, shape_fixes, dangling_fixes
+                            ));
+                        }
                     }
+                    Err(e) => findings.push(format!(
+                        "  namespace hygiene auto-upgrade did not complete and will be retried: {e}"
+                    )),
                 }
             }
         }
@@ -4322,7 +4356,7 @@ async fn handle_get_snapshot(
     // Update doctor_state.
     doctor_state["session_counter"] = serde_json::json!(session_counter);
     if trigger {
-        doctor_state["last_run_version"] = serde_json::json!(current_version);
+        apply_doctor_version(&mut doctor_state, current_version, hygiene_ok);
         doctor_state["last_run_ts"] = serde_json::json!(now_ts);
         doctor_state["configured_wires"] = serde_json::json!(crate::task::wiring::known_wire_ids());
         doctor_state["configured_fires_on"] = serde_json::json!(crate::task::wiring::VALID_FIRES_ON);
@@ -8628,6 +8662,32 @@ mod tests {
     use super::*;
     use crate::events::{RecursionToken, ThalamicBus, ThalamicPulse};
     use crate::guard::testkit::MockStore;
+
+    /// G3: a failed/partial hygiene repair must not advance the doctor's
+    /// completion marker, so the only automatic retry path runs again.
+    #[test]
+    fn caller_does_not_advance_on_error() {
+        let err: anyhow::Result<(usize, usize)> = Err(anyhow::anyhow!(
+            "hygiene repair completed partially: 2 shape and 1 dangling updates committed, 1 chunk(s) failed"
+        ));
+        assert!(!hygiene_allows_version_advance(&err));
+
+        let mut state = serde_json::json!({"last_run_version": "1.0.0"});
+        apply_doctor_version(
+            &mut state,
+            "1.1.0",
+            hygiene_allows_version_advance(&err),
+        );
+        assert_eq!(
+            state["last_run_version"],
+            serde_json::json!("1.0.0"),
+            "a failed repair leaves the marker unchanged"
+        );
+
+        assert!(hygiene_allows_version_advance(&Ok((0, 0))));
+        apply_doctor_version(&mut state, "1.1.0", true);
+        assert_eq!(state["last_run_version"], serde_json::json!("1.1.0"));
+    }
 
     /// The TriG converter groups canonical N-Quads by graph term, keeps
     /// literal objects (spaces, escapes) intact, and routes quadruples
