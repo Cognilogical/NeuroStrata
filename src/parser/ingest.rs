@@ -384,6 +384,10 @@ enum IngestItem {
     SkippedFile {
         path_display: String,
         reason: String,
+        /// The previous generation had rows for this path. Such a skip is a
+        /// change (the old rows must not stay active); a never-indexed skip is
+        /// not.
+        had_previous: bool,
     },
     /// Embedded markdown sections.
     DocSections {
@@ -617,9 +621,20 @@ fn run_producer(
         };
         if let Some(text) = &scan_text {
             if let Some(reason) = scan_for_ingest(text) {
+                // A never-indexed skip is not a change: exclude it from the
+                // current walk so the unchanged fast path still applies. A
+                // path that had previous rows is a change; leave it in the
+                // sets so the generation advances and the old rows do not
+                // stay active.
+                let had_previous = prev_file_map.contains_key(&node_path);
+                if !had_previous {
+                    current_paths.remove(&node_path);
+                    current_kinds.remove(&node_path);
+                }
                 if let Err(e) = tx.blocking_send(IngestItem::SkippedFile {
                     path_display: path_str.to_string(),
                     reason,
+                    had_previous,
                 }) {
                     return Err(anyhow::anyhow!("ingest consumer dropped: {}", e));
                 }
@@ -797,8 +812,12 @@ async fn run_consumer(
     // read again, so this walk changed something.
     let mut content_items = 0usize;
     while let Some(item) = rx.recv().await {
-        if !matches!(&item, IngestItem::NodeUpsert { mem_type, .. } if mem_type == "directory") {
-            content_items += 1;
+        // A SkippedFile counts only when it replaced previous-generation rows;
+        // a never-indexed skip is not content and must not defeat `unchanged`.
+        match &item {
+            IngestItem::NodeUpsert { mem_type, .. } if mem_type == "directory" => {}
+            IngestItem::SkippedFile { .. } => {}
+            _ => content_items += 1,
         }
         match item {
             IngestItem::NodeUpsert {
@@ -978,7 +997,11 @@ async fn run_consumer(
             IngestItem::SkippedFile {
                 path_display,
                 reason,
+                had_previous,
             } => {
+                if had_previous {
+                    content_items += 1;
+                }
                 println!("Skipped {} during ingest: {}", path_display, reason);
                 if let Some(observer) = &observer {
                     observer.file_skipped(&path_display, &reason);
@@ -3080,6 +3103,57 @@ use super::x;"#;
         .expect("clean markdown ingests");
         let node = generation_scoped_id("test-ns", 1, "guide.md");
         assert!(store.get("test-ns", &node).await.expect("read").is_some());
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    /// A skip for a path that was never indexed is not a change. Without this,
+    /// one permanently rejected fixture forces a full carry on every ingest.
+    #[tokio::test]
+    async fn skipped_fixture_does_not_force_new_generation() {
+        let tmp = std::env::temp_dir().join(format!("ns-skip-unchanged-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        std::fs::write(tmp.join("good.rs"), "fn clean() {}").expect("write clean file");
+        let secret = format!("ghp_{}", "Ab1".repeat(12));
+        std::fs::write(tmp.join("skip.rs"), format!("let key = \"{secret}\";"))
+            .expect("write skipped file");
+        let db = std::env::temp_dir().join(format!(
+            "ns-skip-unchanged-db-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("test-ns").await.expect("create the schema");
+        let schema = ParserSchema::load(include_str!("../schema.json")).expect("schema");
+        let ingest = || {
+            ingest_directory(
+                &tmp,
+                &schema,
+                Arc::new(ZeroEmbedder),
+                store.clone(),
+                "test-ns",
+                None,
+                &[],
+            )
+        };
+        ingest().await.expect("first ingest");
+        let key = source_key_for(&tmp);
+        assert_eq!(
+            store.active_generation("test-ns", &key).await.expect("read"),
+            1
+        );
+        ingest().await.expect("second ingest");
+        assert_eq!(
+            store.active_generation("test-ns", &key).await.expect("read"),
+            1,
+            "a never-indexed skipped fixture must not force a new generation"
+        );
+        let skipped_row = generation_scoped_id("test-ns", 1, "skip.rs");
+        assert!(store
+            .get("test-ns", &skipped_row)
+            .await
+            .expect("read")
+            .is_none());
         std::fs::remove_dir_all(&tmp).ok();
         std::fs::remove_dir_all(&db).ok();
     }
