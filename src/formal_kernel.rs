@@ -139,19 +139,18 @@ impl KernelLifecycleState {
 }
 
 /// Returns true if `from -> to` is an allowed lifecycle transition.
-/// Matches the 7 allowed edges from `src/synaptic_mesh/record.rs:159-172`.
+/// Matches `proofs/NeuroStrata/SynapticMesh.lean:canTransitionTo`.
 pub const fn lifecycle_can_transition(from: KernelLifecycleState, to: KernelLifecycleState) -> bool {
-    use KernelLifecycleState::*;
-    match (from, to) {
-        (Active, Archived) => true,
-        (Archived, Active) => true,
-        (Active, Superseded) => true,
-        (Archived, Superseded) => true,
-        (Active, Tombstoned) => true,
-        (Archived, Tombstoned) => true,
-        (Superseded, Tombstoned) => true,
-        _ => false,
-    }
+    matches!(
+        (from, to),
+        (KernelLifecycleState::Active, KernelLifecycleState::Active)
+            | (KernelLifecycleState::Active, KernelLifecycleState::Archived)
+            | (KernelLifecycleState::Active, KernelLifecycleState::Superseded)
+            | (KernelLifecycleState::Active, KernelLifecycleState::Tombstoned)
+            | (KernelLifecycleState::Archived, KernelLifecycleState::Active)
+            | (KernelLifecycleState::Archived, KernelLifecycleState::Tombstoned)
+            | (KernelLifecycleState::Superseded, KernelLifecycleState::Tombstoned)
+    )
 }
 
 /// Returns true if the state is terminal (no forward transitions except tombstoning).
@@ -220,7 +219,7 @@ pub const fn classify_merge_decision(
     use KernelLifecycleState::*;
     use KernelMergeDecision::*;
 
-    // Terminal (Tombstoned) local state: deletion wins.
+    // Tombstoned local: deletion wins (skip when both tombstoned).
     if lifecycle_is_terminal(local_state) {
         return match cand_state {
             Tombstoned => Skip,
@@ -239,7 +238,8 @@ pub const fn classify_merge_decision(
                     ConflictTwoReplacements
                 }
             }
-            Active | Archived => {
+            Active => SupersedeWinsPreserveEdit,
+            Archived => {
                 if content_changed {
                     SupersedeWinsPreserveEdit
                 } else {
@@ -257,20 +257,20 @@ pub const fn classify_merge_decision(
     // Incoming supersession.
     if matches!(cand_state, Superseded) {
         return match local_state {
-            Active | Archived => {
+            Active => SupersedeWinsPreserveEdit,
+            Archived => {
                 if content_changed {
                     SupersedeWinsPreserveEdit
                 } else {
                     Apply
                 }
             }
-            _ => Apply, // Should not reach here for Superseded local (handled above)
+            _ => Apply,
         };
     }
 
     // Both live (Active/Archived), different states.
-// Since Tombstoned and Superseded were already checked above,
-// the remaining states are Active and Archived only.
+    // Tombstoned and Superseded were handled above, so only Active/Archived remain.
     let different = !((matches!(local_state, Active) && matches!(cand_state, Active))
         || (matches!(local_state, Archived) && matches!(cand_state, Archived)));
     if different {
@@ -285,7 +285,7 @@ pub const fn classify_merge_decision(
             };
         }
 
-        // Same content, one side archived and other restored.
+        // Same content, one side archived and the other restored.
         if concurrent {
             return ConflictRestoreArchive;
         }

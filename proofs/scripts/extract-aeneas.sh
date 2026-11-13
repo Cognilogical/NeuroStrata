@@ -29,7 +29,6 @@ if [ "${USE_PODMAN}" -eq 1 ] || { command -v charon >/dev/null 2>&1 && command -
         aeneas -backend lean /tmp/opencode/formal_kernel.aeneas --out /tmp/opencode/formal_kernel.lean
         echo "[extract-aeneas] Lean 4 translation complete"
     elif [ "${USE_PODMAN}" -eq 1 ]; then
-        echo "[extract-aeneas] --podman passed but no charon/aeneas image configured; skipped translation"
         echo "[extract-aeneas] running in podman container..."
         podman run --rm -v "$REPO_ROOT:/work:Z" -w /work ghcr.io/aeneasverif/aeneas:latest sh -c "charon rustc -- --crate-type=lib src/formal_kernel.rs && aeneas -backend lean formal_kernel.llbc -dest proofs/NeuroStrata"
     fi
