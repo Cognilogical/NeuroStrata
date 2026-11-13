@@ -17,6 +17,7 @@ mcp/neurostrata-mcp
 target/
 .fastembed_cache/
 .NeuroStrata/
+proofs/.lake/
 *.log
 *.pid
 
