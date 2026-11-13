@@ -101,18 +101,11 @@ pub const fn task_step_tag(
     has_reason: bool,
     extraction_edge_exists: bool,
 ) -> &'static str {
-    use KernelTaskStatus::*;
-
-    let guard = match task_edge_guard(from, to) {
-        Some(g) => g,
-        None => return "err_illegal",
-    };
-
-    match guard {
-        KernelGuard::None => "ok",
-        KernelGuard::RequireReason if !has_reason => "err_missing_reason",
-        KernelGuard::ExtractionRequired if !extraction_edge_exists => "err_extraction_required",
-        KernelGuard::RequireReason | KernelGuard::ExtractionRequired => "ok",
+    match task_step(from, to, has_reason, extraction_edge_exists) {
+        Ok(_) => "ok",
+        Err(KernelTaskStepError::Illegal) => "err_illegal",
+        Err(KernelTaskStepError::MissingReason) => "err_missing_reason",
+        Err(KernelTaskStepError::ExtractionRequired) => "err_extraction_required",
     }
 }
 

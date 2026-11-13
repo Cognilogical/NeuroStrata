@@ -1172,7 +1172,6 @@ fn classify_merge(
     cand: &MeshRecord,
     concurrent: bool,
 ) -> MergeDecision {
-    use LifecycleState::*;
     let cand_state = cand.lifecycle.state;
     let cand_sup = cand.lifecycle.superseded_by;
     let content_changed = local_content != content_text(cand);

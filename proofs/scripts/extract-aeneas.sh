@@ -13,7 +13,7 @@ KERNEL_SRC="${REPO_ROOT}/src/formal_kernel.rs"
 RLIB_OUT="/tmp/opencode/libformal_kernel.rlib"
 
 echo "[extract-aeneas] compiling ${KERNEL_SRC} -> ${RLIB_OUT}"
-rustc --edition=2021 --crate-type=lib "${KERNEL_SRC}" -o "${RLIB_OUT}"
+rustc -D warnings --edition=2021 --crate-type=lib "${KERNEL_SRC}" -o "${RLIB_OUT}"
 echo "[extract-aeneas] kernel compiled OK -> ${RLIB_OUT}"
 
 # Optional Lean-4 translation: charon (Rust -> Aeneas IR) then aeneas (IR -> Lean).
@@ -30,6 +30,8 @@ if [ "${USE_PODMAN}" -eq 1 ] || { command -v charon >/dev/null 2>&1 && command -
         echo "[extract-aeneas] Lean 4 translation complete"
     elif [ "${USE_PODMAN}" -eq 1 ]; then
         echo "[extract-aeneas] --podman passed but no charon/aeneas image configured; skipped translation"
+        echo "[extract-aeneas] running in podman container..."
+        podman run --rm -v "$REPO_ROOT:/work:Z" -w /work ghcr.io/aeneasverif/aeneas:latest sh -c "charon rustc -- --crate-type=lib src/formal_kernel.rs && aeneas -backend lean formal_kernel.llbc -dest proofs/NeuroStrata"
     fi
 else
     echo "[extract-aeneas] charon/aeneas not on PATH; skipping Lean 4 translation"
