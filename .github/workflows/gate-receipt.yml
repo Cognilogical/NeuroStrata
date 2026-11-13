@@ -1,0 +1,26 @@
+name: gate-receipt
+
+on:
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  gate-receipt:
+    name: gate-receipt
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout trusted base script
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+
+      - name: Require a receipt for every gating marker
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/gate-receipt.sh --pr "${{ github.event.pull_request.number }}"
