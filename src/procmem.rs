@@ -209,11 +209,31 @@ fn profile_enabled() -> bool {
         )
 }
 
+/// Parse the per-call growth threshold. An unset value uses the default; a
+/// value that is present but not a number is reported rather than silently
+/// replaced, so an operator who mistyped the knob can see why the log stayed
+/// at the default.
+fn parse_threshold(value: Option<&str>) -> Result<u64, String> {
+    match value {
+        None => Ok(DEFAULT_THRESHOLD_MB),
+        Some(raw) => raw.trim().parse::<u64>().map_err(|e| {
+            format!(
+                "NEUROSTRATA_RSS_LOG_MB='{raw}' is not a whole number of megabytes ({e}); using {DEFAULT_THRESHOLD_MB}"
+            )
+        }),
+    }
+}
+
 fn threshold_mb() -> u64 {
-    std::env::var("NEUROSTRATA_RSS_LOG_MB")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_THRESHOLD_MB)
+    match parse_threshold(std::env::var("NEUROSTRATA_RSS_LOG_MB").ok().as_deref()) {
+        Ok(value) => value,
+        Err(warning) => {
+            // The binary installs no tracing subscriber, so `tracing::warn!`
+            // would vanish; operator diagnostics go to stderr.
+            eprintln!("warning: {warning}");
+            DEFAULT_THRESHOLD_MB
+        }
+    }
 }
 
 fn log_path() -> PathBuf {
@@ -316,7 +336,7 @@ async fn run_sampler(
     loop {
         let calls = CALLS.swap(0, Ordering::Relaxed);
         if let Err(e) = append(&path, &sample_line(sample(), calls, IN_FLIGHT.load(Ordering::SeqCst))) {
-            tracing::warn!("memory growth log write failed for {}: {e}", path.display());
+            eprintln!("warning: memory growth log write failed for {}: {e}", path.display());
         }
         tokio::select! {
             _ = tokio::time::sleep(every) => {}
@@ -344,7 +364,7 @@ fn append(path: &std::path::Path, line: &str) -> std::io::Result<()> {
         rolled.push(".1");
         if let Err(e) = std::fs::rename(path, PathBuf::from(rolled)) {
             // Losing the rotation is not losing the line: try the append.
-            tracing::warn!("could not rotate {}: {e}", path.display());
+            eprintln!("warning: could not rotate {}: {e}", path.display());
         }
     }
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
@@ -398,8 +418,8 @@ impl Drop for CallGuard {
                     overlapped,
                 ),
             ) {
-                tracing::warn!(
-                    "memory growth log write failed for {}: {e}",
+                eprintln!(
+                    "warning: memory growth log write failed for {}: {e}",
                     log_path.display()
                 );
             }
@@ -418,6 +438,18 @@ mod tests {
         assert!(!grew(Some(150 * MB), Some(100 * MB), 50), "shrinking is not growth");
         assert!(!grew(None, Some(900 * MB), 50), "an unknown start is not a measurement");
         assert!(!grew(Some(100 * MB), None, 50));
+    }
+
+    /// A mistyped threshold is reported and falls back; zero is a valid
+    /// "disable the per-call log" value.
+    #[test]
+    fn invalid_rss_threshold_is_reported_not_swallowed() {
+        assert_eq!(parse_threshold(None).unwrap(), DEFAULT_THRESHOLD_MB);
+        assert_eq!(parse_threshold(Some("0")).unwrap(), 0);
+        assert_eq!(parse_threshold(Some(" 25 ")).unwrap(), 25);
+        let err = parse_threshold(Some("fifty")).expect_err("not a number");
+        assert!(err.contains("not a whole number"), "{err}");
+        assert!(err.contains("fifty"), "the bad value is named: {err}");
     }
 
     #[test]
