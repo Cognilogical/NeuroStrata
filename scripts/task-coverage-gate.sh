@@ -16,7 +16,14 @@ else
     RANGE="HEAD~1..HEAD"
 fi
 
-CHANGED=$(git diff --name-only "$RANGE" | grep -E '\.md$' || true)
+# Exclude commits already on origin/main when pushing a feature branch that merged main
+EXCLUDE_MAIN=()
+CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+if [ "$CURRENT_BRANCH" != "main" ] && git rev-parse --verify --quiet origin/main >/dev/null 2>&1; then
+    EXCLUDE_MAIN=("^origin/main")
+fi
+
+CHANGED=$(git log --no-merges --name-only --pretty=format: "$RANGE" "${EXCLUDE_MAIN[@]}" | sort -u | grep -E '\.md$' || true)
 
 COUNT=0
 if [ -n "$CHANGED" ]; then
@@ -30,7 +37,7 @@ while IFS= read -r file; do
             echo "task-coverage-gate: untracked work item in $file: $line" >&2
             COUNT=$((COUNT + 1))
         fi
-    done < <(git diff "$RANGE" -- "$file" | grep -E '^\+' | grep -vE '^\+\+\+' | grep -iE '(next move|todo:|todo :|fixme:|action item:|deferred:|open item|follow-up|remaining|next step|we should also|later we need to|still need to|must also fix|need to follow up)' || true)
+    done < <(git log --no-merges -p "$RANGE" "${EXCLUDE_MAIN[@]}" -- "$file" | grep -E '^\+' | grep -vE '^\+\+\+' | grep -iE '(next move|todo:|todo :|fixme:|action item:|deferred:|open item|follow-up|remaining|next step|we should also|later we need to|still need to|must also fix|need to follow up)' || true)
 done <<< "$CHANGED"
 else
     echo "task-coverage-gate: no markdown files changed — markdown check skipped"
