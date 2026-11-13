@@ -20,6 +20,11 @@ All notable changes to the NeuroStrata project will be documented in this file.
 - **`set_metadata` authorization (`src/server.rs`, `src/daemon.rs`, `src/main.rs`).** The replace re-checks write access and requires the owner or admin to change the canonical owner or ACL (including role-only changes).
 - **Guard `hit_count` atomicity and rule cap (`src/guard/`, `src/traits.rs`, `#114`).** The counter increments in one write turn, so concurrent firings are not lost; the guard refuses above 5,000 enforceable rules and has a 3,000-rule sizing probe.
 
+### Changed
+
+- **CI coverage (`.github/workflows/ci.yml`, `plugins/core/test.mjs`, `#165`).** The full binary suite now runs on Windows and macOS report-only (step-level `continue-on-error`, so a platform failure is a warning rather than a red gate); the harness plugin suite, including the restricted-PATH hook tests, runs on Windows (tools resolve through `where`, with a copy fallback when symlink is denied); `test-backup.sh` and the gate-receipt self-test run in CI; the remediation-eval self-test runs in the warm test job.
+- **Hardening (`src/procmem.rs`, `src/embed.rs`, `docs/limitations.md`, `#164`).** A mistyped `NEUROSTRATA_RSS_LOG_MB` is reported to stderr and falls back; the arena decision is a tested value; `docs/limitations.md` records the `hit_count`, `approximate` and search-completeness semantics; `.opencode/` is ignored. Sidecar-deletion attestation and a per-repo hook namespace sentinel are deferred with rulings in the hardening spec.
+
 ### Upgrading
 
 - **From ≤1.17.x**, the parser-version bump forces one full reparse/re-embed (2× store free space; the preflight refuses otherwise). See `docs/ops/upgrading.md` for disk, pool, rollback and `files_skipped` guidance. A pre-1.17.3 lexical index is rebuilt once (`INDEX_VERSION` v2).
