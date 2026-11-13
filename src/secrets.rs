@@ -160,9 +160,9 @@ const SCAN_CONTEXT_CARRY: usize = 4 * 1024;
 /// quoted literals and plain opaque values still go through the password
 /// check.
 fn looks_like_code_expression(value: &str) -> bool {
-    // Only strong source markers: paths, calls, member/index chains. These are
-    // applied only when the key sits in a source-code statement; a config
-    // value such as `password=correct.horse` is not a member chain exemption.
+    // Strong source markers: path/call syntax and code-only roots. A config
+    // value such as `password=correct.horse` does not qualify; member chains
+    // and index expressions need a source-statement prefix, below.
     value.contains("::")
         || value.contains("->")
         || value.contains("=>")
@@ -170,8 +170,13 @@ fn looks_like_code_expression(value: &str) -> bool {
         || value.starts_with("self.")
         || value.starts_with("&self.")
         || value.starts_with("process.env.")
+}
+
+/// Member chains and index expressions are exempt only inside a source
+/// statement: `let token = response.token` yes, `password=correct.horse` no.
+fn looks_like_source_reference(value: &str) -> bool {
+    (!value.starts_with("eyJ") && looks_like_member_chain(value))
         || (value.contains('[') && !value.starts_with('[') && !value.contains(']'))
-        || (!value.starts_with("eyJ") && looks_like_member_chain(value))
 }
 
 /// True when the key begins a source statement/comment, so code-shaped values
@@ -181,7 +186,7 @@ fn source_statement_prefix(text: &str, key_start: usize) -> bool {
     let prefix = text[line_start..key_start].trim_start();
     [
         "let ", "const ", "var ", "return ", "if ", "match ", "for ", "while ",
-        "pub ", "fn ", "struct ", "enum ", "impl ", "type ", "//", "#",
+        "pub ", "fn ", "struct ", "enum ", "impl ", "type ",
     ]
     .iter()
     .any(|p| prefix.starts_with(p))
@@ -471,7 +476,8 @@ impl SecretScanner {
                 || value.starts_with("&self.");
             if !quoted
                 && (literal_keyword
-                    || (source_context && looks_like_code_expression(value))
+                    || looks_like_code_expression(value)
+                    || (source_context && looks_like_source_reference(value))
                     || (type_context && looks_like_type_annotation(value)))
             {
                 continue;
@@ -1274,6 +1280,8 @@ mod tests {
             "let value = parts[0];",
             "let token = response.token;",
             "struct Cfg { api_key: &self.api_key }",
+            "    token: normalize_query_token(&stem),",
+            "    secret: process.env.SECRET,",
         ] {
             assert!(
                 SecretScanner::scan_str(clean, "content").is_none(),
@@ -1286,6 +1294,8 @@ mod tests {
             "PASSWORD=hunter2!",
             "password=correct.horse",
             "PASSWORD=hunter2[abc",
+            "// password=correct.horse",
+            "# password=hunter2[abc",
         ] {
             assert!(
                 SecretScanner::scan_str(literal, "content").is_some(),
