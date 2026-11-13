@@ -2,11 +2,11 @@
 # gate-receipt: fail a PR when a gating review marker has no recorded receipt.
 #
 # A gating marker is CHANGES-NEEDED / CHANGES NEEDED / DO-NOT-MERGE / DO NOT MERGE.
-# A receipt is one of: fixed@<sha>, filed #<issue>, ruled: <reason>.
-# One receipt per marker is required.
+# Receipts: fixed@<sha> and filed #<issue> from anyone; ruled: <reason> only
+# from a maintainer (OWNER / MEMBER / COLLABORATOR). One receipt per marker.
 #
 # Usage: scripts/gate-receipt.sh --pr <n>
-#        scripts/gate-receipt.sh --reviews-file <fixture>
+#        scripts/gate-receipt.sh --reviews-file <plain-text-or-json-fixture>
 set -euo pipefail
 
 pr=""
@@ -19,31 +19,40 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+entries=""
 if [ -n "$fixture" ]; then
   [ -f "$fixture" ] || { echo "no such fixture: $fixture" >&2; exit 2; }
-  text=$(cat "$fixture")
+  if jq -e . "$fixture" >/dev/null 2>&1; then
+    entries=$(jq -c '.[] | {body:(.body // ""), author_association:(.author_association // "NONE")}' "$fixture")
+  else
+    entries=$(jq -cn --rawfile body "$fixture" '{body:$body, author_association:"OWNER"}')
+  fi
 else
   [ -n "$pr" ] || { echo "usage: gate-receipt.sh --pr <n> | --reviews-file <path>" >&2; exit 2; }
   repo=$(gh repo view --json nameWithOwner -q .nameWithOwner)
-  text=$(
-    gh api "repos/$repo/pulls/$pr/reviews" --jq '.[].body' 2>/dev/null || true
-    gh api "repos/$repo/issues/$pr/comments" --jq '.[].body' 2>/dev/null || true
-    gh api "repos/$repo/pulls/$pr" --jq '.body' 2>/dev/null || true
+  entries=$(
+    gh api "repos/$repo/pulls/$pr/reviews" --jq '.[] | {body:(.body // ""), author_association:(.author_association // "NONE")}' 2>/dev/null || true
+    gh api "repos/$repo/issues/$pr/comments" --jq '.[] | {body:(.body // ""), author_association:(.author_association // "NONE")}' 2>/dev/null || true
+    gh api "repos/$repo/pulls/$pr" --jq '{body:(.body // ""), author_association:(.author_association // "NONE")}' 2>/dev/null || true
   )
 fi
 
-markers=$(printf '%s\n' "$text" | grep -Eic 'CHANGES[-_ ]?NEEDED|DO[-_ ]?NOT[-_ ]?MERGE' || true)
-receipts=$(printf '%s\n' "$text" | grep -Eic 'fixed@[0-9a-f]{7,}|filed[[:space:]]+#[0-9]+|ruled:' || true)
+all_text=$(printf '%s\n' "$entries" | jq -r '.body' 2>/dev/null || true)
+markers=$(printf '%s\n' "$all_text" | grep -Eic 'CHANGES[-_ ]?NEEDED|DO[-_ ]?NOT[-_ ]?MERGE' || true)
+fixed_filed=$(printf '%s\n' "$all_text" | grep -Eic 'fixed@[0-9a-f]{7,}|filed[[:space:]]+#[0-9]+' || true)
+ruled=$(printf '%s\n' "$entries" | jq -r 'select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR") | .body' 2>/dev/null | grep -Eic 'ruled:' || true)
 markers=${markers:-0}
-receipts=${receipts:-0}
+fixed_filed=${fixed_filed:-0}
+ruled=${ruled:-0}
+receipts=$((fixed_filed + ruled))
 
 if [ "$markers" -eq 0 ]; then
   echo "gate-receipt: no gating marker"
   exit 0
 fi
 if [ "$receipts" -lt "$markers" ]; then
-  echo "gate-receipt: $markers gating marker(s), $receipts receipt(s)" >&2
-  echo "every marker needs fixed@<sha>, filed #<issue>, or ruled: <reason>" >&2
+  echo "gate-receipt: $markers gating marker(s), $fixed_filed fixed/filed receipt(s), $ruled maintainer ruling(s)" >&2
+  echo "every marker needs fixed@<sha>, filed #<issue>, or a maintainer ruled: <reason>" >&2
   exit 1
 fi
 echo "gate-receipt: $markers marker(s), $receipts receipt(s) — cleared"
