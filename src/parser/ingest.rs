@@ -1176,7 +1176,22 @@ pub async fn ingest_directory(
                 .map(|m| m.len())
                 .unwrap_or(0);
             let projected = crate::storage::preflight::projected_reindex_bytes(store_bytes);
-            crate::storage::preflight::check_free_space(store_path, projected)?;
+            if let Err(e) = crate::storage::preflight::check_free_space(store_path, projected) {
+                // Record the failed upgrade before returning: the registry is
+                // the only trace the operator/doctor has of a refused reparse.
+                if let Err(record) = crate::registry::enrichment_fail(
+                    &vector_store,
+                    Some(&embedder),
+                    namespace,
+                    "ingest",
+                    &e.to_string(),
+                )
+                .await
+                {
+                    tracing::warn!("enrichment registry update failed: {record}");
+                }
+                return Err(e);
+            }
         }
     }
 

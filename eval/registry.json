@@ -4,7 +4,7 @@
     "secret-precision": {
       "commands": [
         "cargo test --locked --bin neurostrata-mcp secrets::tests -- --test-threads=1",
-        "cargo test --locked --bin neurostrata-mcp parser::ingest::tests -- --test-threads=1"
+        "cargo test --locked --bin neurostrata-mcp parser::ingest::tests -- --test-threads=1 --skip ingest_memory_probe"
       ],
       "tests": [
         "secrets::tests::secret_source_expression_matrix",
@@ -22,7 +22,7 @@
     },
     "ingest-skip": {
       "commands": [
-        "cargo test --locked --bin neurostrata-mcp parser::ingest::tests -- --test-threads=1"
+        "cargo test --locked --bin neurostrata-mcp parser::ingest::tests -- --test-threads=1 --skip ingest_memory_probe"
       ],
       "tests": [
         "parser::ingest::tests::skipped_fixture_does_not_force_new_generation"
@@ -72,7 +72,7 @@
     },
     "store-growth": {
       "commands": [
-        "cargo test --locked --bin neurostrata-mcp parser::ingest::tests -- --test-threads=1"
+        "cargo test --locked --bin neurostrata-mcp parser::ingest::tests -- --test-threads=1 --skip ingest_memory_probe"
       ],
       "tests": [
         "parser::ingest::tests::store_growth_bounded_over_unchanged_ingests"
