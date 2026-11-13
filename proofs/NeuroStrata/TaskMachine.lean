@@ -105,99 +105,46 @@ theorem nextState_status (t : TaskState) (toState : Status) : (nextState t toSta
   dsimp [nextState]
   split <;> rfl
 
-theorem apply_ok_eq (t : TaskState) (toState : Status) (ctx : Ctx) (t' : TaskState)
-    (h : apply t toState ctx = .ok t') : t' = nextState t toState := by
-  rcases t with ⟨st, a, b⟩
-  rcases ctx with ⟨hasReason, extractionEdgeExists⟩
-  rcases edgeGuard st toState with
-  | none =>
-    simp_all [edgeGuard, nextState]
-    <;> (try { contradiction }) <;> (try { simp_all })
-  | some .none =>
-    simp_all [edgeGuard, nextState]
-    <;> (try { contradiction }) <;> (try { simp_all })
-  | some .requireReason =>
-    simp_all [edgeGuard, nextState]
-    <;> (try { contradiction }) <;> (try { simp_all })
-  | some .extractionRequired =>
-    simp_all [edgeGuard, nextState]
-    <;> (try { contradiction }) <;> (try { simp_all })
-
 theorem no_self_transitions : ∀ (t : TaskState) (ctx : Ctx),
     ∃ legal, apply t t.status ctx = .error (.illegal t.status t.status legal) := by
   intro t ctx
   rcases t with ⟨st, a, b⟩
   rcases ctx with ⟨hasReason, extractionEdgeExists⟩
-  refine ⟨legalTargets st, _⟩
-  cases st <;> cases hasReason <;> cases extractionEdgeExists
-  simp [apply, edgeGuard, legalTargets] <;> rfl
+  refine ⟨legalTargets st, ?_⟩
+  cases st <;> rfl
 
 theorem lock2_soundness : ∀ (t : TaskState) (toState : Status) (ctx : Ctx) (t' : TaskState),
     apply t toState ctx = .ok t' → t'.status = .done →
     ctx.extractionEdgeExists = true ∧ (t.status = .openState ∨ t.status = .inProgress) := by
-  intro t toState ctx t' hok hdone
-  have hnext : t' = nextState t toState := apply_ok_eq t toState ctx t' hok
-  rw [hnext] at hdone
-  have hts : toState = .done := by
-    have h1 : (nextState t toState).status = toState := nextState_status t toState
-    rw [h1] at hdone
-    exact hdone
-  subst hts
+  intro t toState ctx t'
   rcases t with ⟨st, a, b⟩
-  rcases ctx with ⟨hasReason, extractionEdgeExists⟩
-  cases st <;> cases toState <;> cases hasReason <;> cases extractionEdgeExists
-  simp [apply, edgeGuard, nextState] at hok ⊢
-  <;>
-  (try { contradiction }) <;>
-  (try { simp_all })
+  rcases ctx with ⟨hasR, hasE⟩
+  cases st <;> cases a <;> cases b <;> cases toState <;> cases hasR <;> cases hasE <;> intro hok hdone <;> cases hok <;> cases hdone <;> decide
 
 theorem done_only_reopens_to_open_with_reason : ∀ (t : TaskState) (toState : Status) (ctx : Ctx) (t' : TaskState),
     t.status = .done → apply t toState ctx = .ok t' →
     toState = .openState ∧ ctx.hasReason = true ∧ t'.hasAssignee = t.hasAssignee ∧ t'.hasSession = t.hasSession := by
-  intro t toState ctx t' ht hok
-  have hnext : t' = nextState t toState := apply_ok_eq t toState ctx t' hok
-  rw [hnext] at *
+  intro t toState ctx t'
   rcases t with ⟨st, a, b⟩
-  rcases ctx with ⟨hasReason, extractionEdgeExists⟩
-  simp at ht ⊢
-  subst ht
-  cases toState <;> cases hasReason <;> cases extractionEdgeExists
-  simp [apply, edgeGuard, nextState] at hok ⊢
-  <;>
-  (try { contradiction }) <;>
-  (try { simp_all }) <;>
-  (try { refine ⟨rfl, ?_, ?_, ?_⟩ <;> simp_all })
+  rcases ctx with ⟨hasR, hasE⟩
+  cases st <;> cases a <;> cases b <;> cases toState <;> cases hasR <;> cases hasE <;> intro hst hok <;> cases hst <;> cases hok <;> decide
 
 theorem block_requires_reason : ∀ (t : TaskState) (ctx : Ctx) (t' : TaskState),
     apply t .blocked ctx = .ok t' →
     ctx.hasReason = true ∧ (t.status = .openState ∨ t.status = .inProgress) := by
-  intro t ctx t' hok
-  have hnext : t' = nextState t .blocked := apply_ok_eq t .blocked ctx t' hok
-  rw [hnext] at *
+  intro t ctx t'
   rcases t with ⟨st, a, b⟩
-  rcases ctx with ⟨hasReason, extractionEdgeExists⟩
-  cases st <;> cases hasReason <;> cases extractionEdgeExists
-  simp [apply, edgeGuard, nextState] at hok ⊢
-  <;>
-  (try { contradiction }) <;>
-  (try { simp_all }) <;>
-  (try { refine ⟨by assumption, ?_⟩ <;> simp_all })
+  rcases ctx with ⟨hasR, hasE⟩
+  cases st <;> cases a <;> cases b <;> cases hasR <;> cases hasE <;> intro hok <;> cases hok <;> decide
 
 theorem unclaim_clears_claim_exclusively : ∀ (t : TaskState) (toState : Status) (ctx : Ctx) (t' : TaskState),
     apply t toState ctx = .ok t' →
     (t.status = .inProgress ∧ toState = .openState → t'.hasAssignee = false ∧ t'.hasSession = false) ∧
     (¬(t.status = .inProgress ∧ toState = .openState) → t'.hasAssignee = t.hasAssignee ∧ t'.hasSession = t.hasSession) := by
-  intro t toState ctx t' hok
-  have hnext : t' = nextState t toState := apply_ok_eq t toState ctx t' hok
-  subst hnext
+  intro t toState ctx t'
   rcases t with ⟨st, a, b⟩
-  rcases ctx with ⟨hasReason, extractionEdgeExists⟩
-  cases st <;> cases toState <;> cases hasReason <;> cases extractionEdgeExists
-  dsimp [nextState] at *
-  split_ifs at * <;>
-  (try { simp_all }) <;>
-  (try { contradiction }) <;>
-  (try { constructor <;> intro h <;> simp_all }) <;>
-  (try { tauto })
+  rcases ctx with ⟨hasR, hasE⟩
+  cases st <;> cases a <;> cases b <;> cases toState <;> cases hasR <;> cases hasE <;>
+    intro hok <;> cases hok <;> decide
 
 end NeuroStrata.TaskMachine
