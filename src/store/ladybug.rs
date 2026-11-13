@@ -1649,21 +1649,39 @@ fn unverified_config() -> SystemConfig {
     )
 }
 
+/// The precedence rule for the two WAL knobs, factored out of
+/// [`strict_wal_verification`] so it can be unit-tested without touching
+/// this process's environment (`#82`). `NEUROSTRATA_STRICT_WAL` is
+/// evaluated first: strictness is the fail-closed setting, so an explicit
+/// `1` wins even over `NEUROSTRATA_ALLOW_UNVERIFIED_WAL=1` — with a
+/// warning, because an operator who set both is telling two stories.
+fn strict_wal_verification_from(strict: Option<&str>, allow_unverified: Option<&str>) -> bool {
+    if strict == Some("1") {
+        if allow_unverified == Some("1") {
+            eprintln!(
+                "WARN: both NEUROSTRATA_STRICT_WAL=1 and NEUROSTRATA_ALLOW_UNVERIFIED_WAL=1 are set; NEUROSTRATA_STRICT_WAL=1 takes precedence (failing closed)."
+            );
+        }
+        return true;
+    }
+    if strict == Some("0") {
+        return false;
+    }
+    if allow_unverified == Some("1") {
+        return false;
+    }
+    true
+}
+
 /// Fail closed by default: an unauthenticated WAL is refused rather than
 /// replayed. Set `NEUROSTRATA_STRICT_WAL=0` (or `NEUROSTRATA_ALLOW_UNVERIFIED_WAL=1`)
 /// to opt into the legacy unverified recovery path. The default is strict so a
 /// corrupt or tampered WAL is investigated, not silently recovered.
 fn strict_wal_verification() -> bool {
-    if std::env::var("NEUROSTRATA_ALLOW_UNVERIFIED_WAL")
-        .map(|v| v == "1")
-        .unwrap_or(false)
-    {
-        return false;
-    }
-    match std::env::var("NEUROSTRATA_STRICT_WAL").as_deref() {
-        Ok("0") => false,
-        _ => true,
-    }
+    strict_wal_verification_from(
+        std::env::var("NEUROSTRATA_STRICT_WAL").ok().as_deref(),
+        std::env::var("NEUROSTRATA_ALLOW_UNVERIFIED_WAL").ok().as_deref(),
+    )
 }
 
 fn is_wal_integrity_failure(err: &str) -> bool {
@@ -2075,6 +2093,23 @@ impl LadybugStore {
                 let err_msg = e.to_string();
                 let checksum_mismatch = err_msg.contains("enableChecksums");
                 if checksum_mismatch {
+                    // A checksum-mismatch over a live WAL means the on-disk
+                    // state was written by an incompatible configuration;
+                    // opening it means trusting writes the running session
+                    // cannot authenticate. Strict verification refuses
+                    // outright (#94); the unverified reopen is only kept
+                    // when there is no WAL or the operator opted out.
+                    let mut wal_os = local_path.clone().into_os_string();
+                    wal_os.push(".wal");
+                    let wal_file = std::path::PathBuf::from(wal_os);
+                    let wal_nonempty =
+                        std::fs::metadata(&wal_file).map(|m| m.len() > 0).unwrap_or(false);
+                    if wal_nonempty && strict_wal_verification() {
+                        return Err(anyhow::anyhow!(
+                            "Refusing to open: DB checksum config mismatch ({}) with a non-empty write-ahead log present under strict WAL verification. To open without checksum verification, set NEUROSTRATA_STRICT_WAL=0 (or NEUROSTRATA_ALLOW_UNVERIFIED_WAL=1).",
+                            err_msg
+                        ));
+                    }
                     opened_via_recovery = true;
                     eprintln!("WARN: DB checksum config mismatch; reopening with checksums disabled.");
                     match Database::new(&local_path, unverified_config()) {
@@ -2098,25 +2133,68 @@ impl LadybugStore {
 
                 eprintln!("ERROR: retrying WITHOUT checksum verification to recover those writes. The records replayed this way are NOT authenticated -- if this database may have been tampered with, stop and inspect the preserved copy instead. Set NEUROSTRATA_STRICT_WAL=1 to refuse this fallback.");
 
+                // The unverified replay truncates the WAL to its last good
+                // record, so the pre-replay size must be read before the
+                // open; `preserve_unclean_wal` already kept a copy.
+                let mut replay_os = local_path.clone().into_os_string();
+                replay_os.push(".wal");
+                let pre_replay_wal_bytes = std::fs::metadata(std::path::PathBuf::from(replay_os))
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+
                 match Database::new(&local_path, unverified_config()) {
-                    Ok(db) => {
+                    Ok(unverified_db) => {
                         opened_via_recovery = true;
                         eprintln!("Recovered by replaying the unverified write-ahead log.");
                         // The replay only brought the writes back into memory.
                         // Checkpoint them into the main DB files right away, so
                         // a later crash does not put the same marginal WAL back
                         // in front of the strict verifier.
-                        match Connection::new(&db) {
+                        match Connection::new(&unverified_db) {
                             Ok(conn) => {
                                 if let Err(e) = conn.query("CHECKPOINT;") {
                                     tracing::warn!("WAL recovery CHECKPOINT failed: {e}");
                                 }
+                                // `conn` borrows the unverified handle; dropping
+                                // it here is required before the reopen below.
+                                drop(conn);
                             }
                             Err(e) => {
                                 tracing::warn!("failed to open connection for post-recovery CHECKPOINT: {e}");
                             }
                         }
-                        db
+                        if pre_replay_wal_bytes > 0 {
+                            eprintln!(
+                                "The pre-replay write-ahead log was {pre_replay_wal_bytes} bytes. \
+                                 The preserved copy is kept at <local_path>.wal.unclean.<ts> \
+                                 in case any tail records were truncated by throw_on_wal_replay_failure(false)."
+                            );
+                        }
+                        // #90: never leave the live session on the unverified
+                        // recovery handle (enable_checksums(false),
+                        // throw_on_wal_replay_failure(false)). Drop the
+                        // unverified Database and reopen verified; only a store
+                        // created without checksums in the first place falls
+                        // back to the unverified configuration.
+                        drop(unverified_db);
+                        match Database::new(&local_path, verifying_config()) {
+                            Ok(db) => db,
+                            Err(e) if e.to_string().contains("enableChecksums") => {
+                                eprintln!(
+                                    "WARN: the database was created without checksums; \
+                                     the recovery session stays on the unverified configuration."
+                                );
+                                Database::new(&local_path, unverified_config())
+                                    .map_err(|retry_e| {
+                                        anyhow::anyhow!("Recovery reopen failed: {retry_e}")
+                                    })?
+                            }
+                            Err(e) => {
+                                return Err(anyhow::anyhow!(
+                                    "Recovery reopen with verification failed: {e}"
+                                ))
+                            }
+                        }
                     }
                     Err(retry_e) => {
                         // Unreadable even without verification: set it aside rather
@@ -2195,6 +2273,16 @@ impl LadybugStore {
             opened_via_recovery,
             store_state: Arc::new(std::sync::Mutex::new(None)),
         })
+    }
+
+    /// Whether this store opened through a recovery fallback in
+    /// `with_system_config` — the checksum-mismatch reopen, the
+    /// unverified-WAL replay, or the WAL-discard reopen — rather than
+    /// the normal verified open. A recovery open's view of the store is
+    /// unauthenticated; callers and operators should treat recovered
+    /// opens as degraded provenance.
+    pub fn opened_via_recovery(&self) -> bool {
+        self.opened_via_recovery
     }
 
     /// Override the directory the configured embedding model is resolved
@@ -19914,6 +20002,251 @@ eurostrata\src\daemon.rs",
         restore_wal_env(previous_wal);
         let _ = std::fs::remove_dir_all(&fx.root);
         restore_model_env(previous);
+    }
+
+    /// #82: `NEUROSTRATA_STRICT_WAL=1` wins over
+    /// `NEUROSTRATA_ALLOW_UNVERIFIED_WAL=1`; strictness is the fail-closed
+    /// default when neither knob is set.
+    #[test]
+    fn strict_wal_one_overrides_allow_unverified_wal_one() {
+        assert!(
+            strict_wal_verification_from(Some("1"), Some("1")),
+            "STRICT_WAL=1 must win over ALLOW_UNVERIFIED_WAL=1"
+        );
+        assert!(strict_wal_verification_from(Some("1"), Some("0")));
+        assert!(strict_wal_verification_from(Some("1"), None));
+        assert!(!strict_wal_verification_from(Some("0"), Some("1")));
+        assert!(!strict_wal_verification_from(Some("0"), None));
+        assert!(!strict_wal_verification_from(None, Some("1")));
+        assert!(strict_wal_verification_from(None, None));
+        assert!(strict_wal_verification_from(None, Some("0")));
+        assert!(strict_wal_verification_from(Some(""), None));
+        assert!(!strict_wal_verification_from(Some("0"), Some("0")));
+    }
+
+    /// #94: an `enableChecksums` mismatch over a non-empty WAL refuses to
+    /// open under strict WAL verification instead of silently falling back
+    /// to the unverified configuration; the fallback stays available when
+    /// strict verification is opted out of.
+    #[tokio::test]
+    async fn enable_checksums_mismatch_with_wal_refuses_under_strict_wal() {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-wal-mismatch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("mismatch.lbug");
+
+        // Seed a database written with checksums disabled, leaving rows
+        // only in the WAL, so the WAL header records enableChecksums=0.
+        let seed = SystemConfig::default()
+            .max_db_size(512 * 1024 * 1024)
+            .buffer_pool_size(64 * 1024 * 1024)
+            .enable_checksums(false)
+            .throw_on_wal_replay_failure(true);
+        let raw = Database::new(&db, seed).expect("raw seed open");
+        let conn = Connection::new(&raw).expect("raw connection");
+        conn.query(
+            "CREATE NODE TABLE Memory (id STRING, namespace STRING, content STRING, user_id STRING, memory_type STRING, agent_name STRING, location STRING, location_lines STRING, metadata STRING, embedding FLOAT[8], PRIMARY KEY (id))",
+        )
+        .expect("create the schema");
+        conn.query(
+            "CREATE (m:Memory {id: 'mismatch-1', namespace: 'probe', content: 'wal row', user_id: '', memory_type: 'fact', agent_name: '', location: '', location_lines: '', metadata: '{}', embedding: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]})",
+        )
+        .expect("seed a WAL-only row");
+        conn.query("CALL force_checkpoint_on_close=false")
+            .expect("keep the WAL uncheckpointed");
+        drop(conn);
+        drop(raw);
+        let mut wal_os = db.clone().into_os_string();
+        wal_os.push(".wal");
+        let wal = std::path::PathBuf::from(wal_os);
+        assert!(
+            std::fs::metadata(&wal).map(|m| m.len() > 0).unwrap_or(false),
+            "the seeded store left a non-empty WAL"
+        );
+
+        // Strict verification (the default) refuses the open outright.
+        let previous = (
+            std::env::var("NEUROSTRATA_STRICT_WAL").ok(),
+            std::env::var("NEUROSTRATA_ALLOW_UNVERIFIED_WAL").ok(),
+        );
+        std::env::remove_var("NEUROSTRATA_ALLOW_UNVERIFIED_WAL");
+        std::env::set_var("NEUROSTRATA_STRICT_WAL", "1");
+        match LadybugStore::with_system_config(&db, 4, verifying_config()) {
+            Ok(_) => panic!("strict WAL verification must refuse a checksum mismatch over a live WAL"),
+            Err(err) => {
+                let text = err.to_string();
+                assert!(
+                    text.contains("DB checksum config mismatch"),
+                    "the refusal must name the mismatch: {text}"
+                );
+                assert!(
+                    text.contains("NEUROSTRATA_STRICT_WAL=0"),
+                    "the refusal must name the opt-out: {text}"
+                );
+            }
+        }
+        assert!(
+            wal.exists(),
+            "the refusal leaves the WAL in place for inspection"
+        );
+
+        // Opting out of strict verification keeps the legacy fallback.
+        std::env::set_var("NEUROSTRATA_STRICT_WAL", "0");
+        let store = LadybugStore::with_system_config(&db, 4, verifying_config())
+            .expect("the unverified fallback opens with strict WAL disabled");
+        assert!(
+            store.opened_via_recovery(),
+            "the fallback open records its recovery provenance"
+        );
+        drop(store);
+        match previous.0 {
+            Some(v) => std::env::set_var("NEUROSTRATA_STRICT_WAL", v),
+            None => std::env::remove_var("NEUROSTRATA_STRICT_WAL"),
+        }
+        match previous.1 {
+            Some(v) => std::env::set_var("NEUROSTRATA_ALLOW_UNVERIFIED_WAL", v),
+            None => std::env::remove_var("NEUROSTRATA_ALLOW_UNVERIFIED_WAL"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #69 + #90: the unverified-WAL replay checkpoints the recovered rows
+    /// and then reopens the session under `verifying_config()`, so the
+    /// store never keeps serving an unauthenticated configuration, and the
+    /// pre-replay WAL stays preserved at `.wal.unclean.<ts>`.
+    #[tokio::test]
+    async fn unverified_wal_recovery_reopens_with_verifying_config_after_checkpoint() {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-wal-reopen-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("reopen.lbug");
+        // The schema has to exist before rows can live WAL-only.
+        let previous_model = without_model_env();
+        let embed = root.join("embed");
+        std::fs::create_dir_all(&embed).expect("create the embed config dir");
+        std::fs::write(
+            embed.join("embedders.json"),
+            "[{\"model_name\":\"ModelA\",\"dimensions\":8}]",
+        )
+        .expect("write the fixture embedders.json");
+        let creator = LadybugStore::for_testing(&db, 8)
+            .expect("open temp database")
+            .with_embed_config_dir(&embed);
+        creator.init("probe").await.expect("init");
+        drop(creator);
+        plant_corrupted_uncheckpointed_wal(&db, 6, false);
+
+        let previous_wal = allow_unverified_wal_recovery();
+        let store = LadybugStore::for_testing(&db, 4)
+            .expect("the recovery open succeeds with unverified replay opted in");
+        assert!(
+            store.opened_via_recovery(),
+            "a recovery open records its provenance"
+        );
+        drop(store);
+        restore_wal_env(previous_wal);
+
+        // The post-recovery CHECKPOINT flushed the replayed WAL, so a
+        // verified open of the same files succeeds.
+        let reopened = Database::new(&db, verifying_config())
+            .expect("the post-recovery checkpoint left a verified-clean store");
+        drop(reopened);
+
+        // The pre-replay WAL was preserved before the unverified replay
+        // truncated it.
+        let unclean_kept = std::fs::read_dir(&root)
+            .expect("read the recovery dir")
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().starts_with("reopen.lbug.wal.unclean."));
+        assert!(
+            unclean_kept,
+            "the preserved copy of the pre-replay WAL is kept at .wal.unclean.<ts>"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        restore_model_env(previous_model);
+    }
+
+    /// #86: census guard — every production `Database::new` call site
+    /// funnels through `with_system_config` (the single recovery funnel),
+    /// and the funnel carries all three recovery arms: the strict-gated
+    /// `enableChecksums` reopen, the unverified-WAL replay with its
+    /// verified reopen, and the unreadable-WAL `.corrupted.<ts>` rename.
+    #[test]
+    fn wal_recovery_arms_census_and_corrupted_rename() {
+        let src = include_str!("ladybug.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let fn_start = lines
+            .iter()
+            .position(|l| l.contains("pub fn with_system_config"))
+            .expect("with_system_config is defined");
+        let fn_end = lines
+            .iter()
+            .position(|l| l.contains("pub fn with_embed_config_dir"))
+            .expect("with_embed_config_dir follows with_system_config");
+        let tests_start = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("mod tests {"))
+            .expect("the unit test module is in this file");
+
+        let mut production_sites = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if !line.contains("Database::new") {
+                continue;
+            }
+            let within_funnel = i >= fn_start && i < fn_end;
+            let within_tests = i >= tests_start;
+            assert!(
+                within_funnel || within_tests,
+                "Database::new at line {} is outside the with_system_config recovery funnel and outside the tests module",
+                i + 1
+            );
+            if within_funnel {
+                production_sites.push(i + 1);
+            }
+        }
+        // The initial open plus the recovery arms (checksum-mismatch reopen,
+        // unverified WAL replay, verified reopen, WAL-discard reopen) all
+        // live in the one funnel.
+        assert!(
+            production_sites.len() >= 4,
+            "expected the initial open and the recovery arms in one funnel, found {production_sites:?}"
+        );
+
+        let funnel = lines[fn_start..fn_end].join("\n");
+        // Arm 1 — enableChecksums mismatch, gated by strict WAL verification
+        // when a non-empty WAL is present.
+        assert!(funnel.contains("enableChecksums"), "the enableChecksums arm is in the funnel");
+        assert!(
+            funnel.contains("strict_wal_verification"),
+            "the mismatch arm gates on strict WAL verification"
+        );
+        // Arm 2 — WAL integrity failure: unverified replay, CHECKPOINT, then
+        // a verified reopen.
+        assert!(funnel.contains("unverified_config()"), "the unverified replay arm is in the funnel");
+        assert!(funnel.contains("verifying_config()"), "the funnel reopens under verifying_config()");
+        assert!(funnel.contains("CHECKPOINT;"), "the funnel checkpoints the replayed WAL");
+        // Arm 3 — unreadable WAL: renamed aside to .corrupted.<ts>.
+        assert!(funnel.contains(".corrupted."), "the unreadable-WAL rename arm is in the funnel");
+        assert!(funnel.contains("rename"), "the unreadable WAL is moved aside");
+        // The marginal WAL is preserved before the unverified replay.
+        assert!(
+            funnel.contains("preserve_unclean_wal"),
+            "the pre-replay preservation is in the funnel"
+        );
     }
 
     #[tokio::test]
