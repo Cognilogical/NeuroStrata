@@ -68,6 +68,18 @@ function toolPath(cmd) {
       if (existsSync(candidate)) return candidate;
     }
   }
+  if (process.platform === "win32") {
+    // A POSIX prefix ("/usr/bin") resolves against the current Windows drive
+    // and holds nothing. Ask the system where the tool actually is (Git for
+    // Windows provides the POSIX tools the hook needs).
+    try {
+      const found = execFileSyncTop("where", [cmd], { encoding: "utf8" })
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .find(Boolean);
+      if (found) return found;
+    } catch {}
+  }
   return cmd;
 }
 
@@ -1289,7 +1301,7 @@ describe("native task tool tracking + hook registration + pre-commit awk fallbac
 
   it("pre-commit awk fallback handles filenames with spaces and & and produces valid comma-separated JSON", { skip: winHookSkip() }, async () => {
     const { execFileSync } = await import("node:child_process");
-    const { mkdtempSync, symlinkSync, chmodSync } = await import("node:fs");
+    const { mkdtempSync, symlinkSync, copyFileSync, chmodSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
     const repoDir = mkdtempSync(join(tmpdir(), "ns-precommit-awk-"));
     const binDir = mkdtempSync(join(tmpdir(), "ns-precommit-bin-"));
@@ -1302,7 +1314,14 @@ describe("native task tool tracking + hook registration + pre-commit awk fallbac
           try {
             symlinkSync(candidate, join(binDir, cmd));
             break;
-          } catch {}
+          } catch {
+            // Windows may not permit symlinks for an unprivileged process;
+            // a copy serves the same restricted-PATH purpose.
+            try {
+              copyFileSync(candidate, join(binDir, cmd));
+              break;
+            } catch {}
+          }
         }
       }
 
@@ -1854,7 +1873,7 @@ describe("round-6: task_update title invalidation, AST summary formatting, dev s
 
   it("pre-commit ledger matching handles ./<path> and $ROOT/<path> without warning", { skip: winHookSkip() }, async () => {
     const { execFileSync } = await import("node:child_process");
-    const { mkdtempSync, symlinkSync, chmodSync } = await import("node:fs");
+    const { mkdtempSync, symlinkSync, copyFileSync, chmodSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
     const repoDir = mkdtempSync(join(tmpdir(), "ns-precommit-r6-"));
     const binDir = mkdtempSync(join(tmpdir(), "ns-precommit-bin-"));
@@ -1864,7 +1883,10 @@ describe("round-6: task_update title invalidation, AST summary formatting, dev s
           const source = toolPath(cmd);
           const candidate = isAbsolute(source) ? source : join(prefix, source);
           if (!existsSync(candidate)) continue;
-          try { symlinkSync(candidate, join(binDir, cmd)); break; } catch {}
+          try { symlinkSync(candidate, join(binDir, cmd)); break; }
+          catch {
+            try { copyFileSync(candidate, join(binDir, cmd)); break; } catch {}
+          }
         }
       }
 
@@ -1964,7 +1986,7 @@ describe("round-8: Codex apply_patch extraction, decoded ledger matching, and ba
   // A file name containing a double quote cannot exist on Windows.
   it("pre-commit matches JSON-escaped unicode/quote paths and appends missing files in one write", { skip: winHookSkip() || (process.platform === "win32" && "file names cannot contain a double quote on Windows") }, async () => {
     const { execFileSync } = await import("node:child_process");
-    const { mkdtempSync, symlinkSync, chmodSync } = await import("node:fs");
+    const { mkdtempSync, symlinkSync, copyFileSync, chmodSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
     const repoDir = mkdtempSync(join(tmpdir(), "ns-precommit-r8-"));
     try {
