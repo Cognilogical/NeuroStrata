@@ -515,6 +515,13 @@ impl SecretScanner {
             });
         }
         match value {
+            // A metadata leaf over the scanner's window cannot be scanned as
+            // one string; say so distinctly instead of reporting a generic
+            // oversized input, so the caller can fix the field it names.
+            Value::String(s) if s.len() > MAX_SCAN_BYTES => Some(Rejection {
+                location: location.to_string(),
+                category: "oversized_metadata",
+            }),
             Value::String(s) => self.scan_inner(s, location),
             Value::Array(arr) => {
                 for (i, item) in arr.iter().enumerate() {
@@ -533,6 +540,15 @@ impl SecretScanner {
                     } else {
                         format!("{}.{}", location, key)
                     };
+                    // A key is user-controlled too: `{"ghp_…": "x"}` is a
+                    // credential the value scan would never see. The location
+                    // names the field's position without echoing the key: a
+                    // rejection is logged and returned to the caller, so it
+                    // must not repeat the credential.
+                    let key_loc = format!("{location}.<key>");
+                    if let Some(r) = self.scan_inner(key, &key_loc) {
+                        return Some(r);
+                    }
                     if let Some(r) = self.scan_value_inner(val, &loc, depth + 1) {
                         return Some(r);
                     }
@@ -1087,6 +1103,52 @@ mod tests {
         });
         let r = SecretScanner::scan_value(&meta, "metadata").unwrap();
         assert_eq!(r.category, "password");
+    }
+
+    /// A credential can be the key, not only a value.
+    #[test]
+    fn metadata_key_carrying_a_secret_is_detected() {
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef123456".to_string(),
+            json!("benign"),
+        );
+        let r = SecretScanner::scan_value(&Value::Object(map), "metadata").unwrap();
+        assert_eq!(r.category, "github_pat");
+        assert!(r.location.contains("<key>"), "the location names the key: {}", r.location);
+        assert!(
+            !r.to_string().contains("ghp_"),
+            "the rejection must not echo the credential-bearing key: {r}"
+        );
+    }
+
+    /// A metadata leaf over the scan window has its own reason, so the caller
+    /// can fix the named field instead of seeing a generic oversized input.
+    #[test]
+    fn oversized_metadata_leaf_has_a_distinct_reason() {
+        let meta = json!({ "note": "a".repeat(MAX_SCAN_BYTES + 1) });
+        let r = SecretScanner::scan_value(&meta, "metadata").unwrap();
+        assert_eq!(r.category, "oversized_metadata");
+        assert_eq!(r.location, "metadata.note");
+    }
+
+    /// A long single line has no newline to chunk on; the overlap must still
+    /// contain a token that straddles the scan boundary whole. A JWT needs all
+    /// three segments, so a split at the boundary cannot be rescued by any
+    /// other detector.
+    #[test]
+    fn single_line_token_straddling_a_chunk_boundary_is_detected() {
+        let header = base64_encode(br#"{"alg":"HS256","typ":"JWT"}"#);
+        let payload = base64_encode(br#"{"sub":"1234567890","name":"John"}"#);
+        let jwt = format!("{}.{}.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c", header, payload);
+        let mut text = "a".repeat(MAX_SCAN_BYTES - 10);
+        text.push_str(&jwt);
+        assert!(
+            text.len() > MAX_SCAN_BYTES,
+            "the fixture crosses the chunk window"
+        );
+        let r = SecretScanner::scan_str(&text, "content").unwrap();
+        assert_eq!(r.category, "jwt");
     }
 
     #[test]
