@@ -420,8 +420,12 @@ fn choose_root(
                     return None;
                 }
                 // Another checkout of the same repository: the main checkout
-                // or a sibling worktree, seen from a registered worktree.
+                // or a sibling worktree, seen from a registered worktree. Only
+                // when the registered root is a checkout root: a project
+                // registered at `repo/platform` stores paths below `platform`,
+                // which another checkout's root-relative path would not match.
                 None if same_repo
+                    && home.as_deref().is_some_and(|h| same_location(root, h))
                     && !home.as_deref().is_some_and(|h| same_location(&marker, h)) =>
                 {
                     return by_marker;
@@ -682,6 +686,23 @@ mod tests {
         let file = s(&submodule.join("src").join("lib.rs"));
         let got = resolve_lookup_path(&file, None, Some(&registered));
         assert_eq!(got, LookupPath { path: file.clone(), source: RootSource::Outside });
+    }
+
+    #[test]
+    fn a_project_registered_below_the_git_root_does_not_resolve_other_worktrees() {
+        // Registered at `repo/platform`: stored paths are relative to
+        // `platform`, so a sibling worktree's `platform/x.py` must not
+        // resolve to the repository-relative `platform/x.py`.
+        let (tmp, root, _) = project_with_worktree();
+        let platform = root.join("platform");
+        touch(&platform.join("x.py"));
+        let sibling = canonical(tmp.path()).unwrap().join("example-project-wt");
+        link_worktree(&sibling, &root.join(".git").join("worktrees").join("wt"));
+        for file in [sibling.join("platform").join("x.py"), sibling.join("x.py")] {
+            touch(&file);
+            let got = resolve_lookup_path(&s(&file), None, Some(&s(&platform)));
+            assert_eq!(got, LookupPath { path: s(&file), source: RootSource::Outside });
+        }
     }
 
     #[test]
