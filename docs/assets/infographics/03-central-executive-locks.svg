@@ -49,25 +49,25 @@
       Snapshot + Exclusive Claim
     </text>
 
-    <text x="20" y="168" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
-      1. Agent calls <tspan font-family="monospace" fill="#67e8f9">get_snapshot</tspan> to load
+    <text x="18" y="168" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">
+      1. Calls <tspan font-family="monospace" font-size="10.5" fill="#67e8f9">get_snapshot</tspan> to load
     </text>
-    <text x="20" y="185" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
-      Golden Rules &amp; project constraints.
+    <text x="18" y="185" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">
+      Golden Rules &amp; constraints.
     </text>
 
-    <text x="20" y="213" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
-      2. Claims task via <tspan font-family="monospace" fill="#67e8f9">task_claim</tspan>
+    <text x="18" y="213" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">
+      2. Claims task via <tspan font-family="monospace" font-size="10.5" fill="#67e8f9">task_claim</tspan>
     </text>
-    <text x="20" y="230" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
+    <text x="18" y="230" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">
       (60-min lease prevents collisions).
     </text>
 
-    <text x="20" y="258" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
-      3. Auto-retrieves vector + 1-hop AST
+    <text x="18" y="258" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">
+      3. Auto-retrieves AST context &amp;
     </text>
-    <text x="20" y="275" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
-      context &amp; <tspan font-family="monospace" fill="#67e8f9">subagent_prompt_injection</tspan>.
+    <text x="18" y="275" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">
+      <tspan font-family="monospace" font-size="10.5" fill="#67e8f9">subagent_prompt_injection</tspan>.
     </text>
 
     <rect x="18" y="294" width="219" height="24" rx="6" fill="#164e63"/>
@@ -94,30 +94,30 @@
       Working-Memory Checkpoints
     </text>
 
-    <text x="20" y="168" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
-      1. Before touching any file, calls
+    <text x="18" y="168" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">
+      1. Before editing a file, calls
     </text>
-    <text x="20" y="185" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
-      <tspan font-family="monospace" fill="#fcd34d">memories_for_file</tspan> (blast radius).
-    </text>
-
-    <text x="20" y="213" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
-      2. Every 3–5 mutation steps, pauses
-    </text>
-    <text x="20" y="230" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
-      to append state via <tspan font-family="monospace" fill="#fcd34d">task_update</tspan>.
+    <text x="18" y="185" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">
+      <tspan font-family="monospace" font-size="10.5" fill="#fcd34d">memories_for_file</tspan> (blast radius).
     </text>
 
-    <text x="20" y="258" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
-      3. Lexical detector catches <tspan font-family="monospace" fill="#fcd34d">TODO:</tspan> or
+    <text x="18" y="213" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">
+      2. Every 3–5 mutations, pauses
     </text>
-    <text x="20" y="275" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
-      deferral phrasing &amp; nudges task filing.
+    <text x="18" y="230" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">
+      to append state via <tspan font-family="monospace" font-size="10.5" fill="#fcd34d">task_update</tspan>.
+    </text>
+
+    <text x="18" y="258" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">
+      3. Catches <tspan font-family="monospace" font-size="10.5" fill="#fcd34d">TODO:</tspan> or deferral text
+    </text>
+    <text x="18" y="275" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">
+      &amp; nudges tracked task filing.
     </text>
 
     <rect x="18" y="294" width="219" height="24" rx="6" fill="#78350f"/>
     <text x="127" y="310" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" font-weight="700" fill="#fde68a">
-      🚫 task_update Refuses status:"done"
+      🚫 task_update Refuses "done"
     </text>
   </g>
 
@@ -139,25 +139,25 @@
       Mandatory Memory Extraction
     </text>
 
-    <text x="20" y="168" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
-      1. Only <tspan font-family="monospace" fill="#c4b5fd">task_complete</tspan> can transition
+    <text x="18" y="168" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">
+      1. Only <tspan font-family="monospace" font-size="10.5" fill="#c4b5fd">task_complete</tspan> transitions
     </text>
-    <text x="20" y="185" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
-      a task to <tspan font-family="monospace" fill="#c4b5fd">done</tspan>.
-    </text>
-
-    <text x="20" y="213" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
-      2. Requires an extracted <tspan font-family="monospace" fill="#c4b5fd">[rule]</tspan> or
-    </text>
-    <text x="20" y="230" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
-      <tspan font-family="monospace" fill="#c4b5fd">[fact]</tspan> linked via <tspan font-family="monospace" fill="#c4b5fd">EXTRACTED_FROM</tspan>.
+    <text x="18" y="185" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">
+      a task to <tspan font-family="monospace" font-size="10.5" fill="#c4b5fd">done</tspan>.
     </text>
 
-    <text x="20" y="258" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
-      3. Anchors the new rule to governed
+    <text x="18" y="213" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">
+      2. Requires a <tspan font-family="monospace" font-size="10.5" fill="#c4b5fd">[rule]</tspan> or <tspan font-family="monospace" font-size="10.5" fill="#c4b5fd">[fact]</tspan>
     </text>
-    <text x="20" y="275" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
-      files (<tspan font-family="monospace" fill="#c4b5fd">GOVERNS</tspan>) for future sessions.
+    <text x="18" y="230" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">
+      linked via <tspan font-family="monospace" font-size="10.5" fill="#c4b5fd">EXTRACTED_FROM</tspan>.
+    </text>
+
+    <text x="18" y="258" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">
+      3. Anchors rule to governed files
+    </text>
+    <text x="18" y="275" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">
+      (<tspan font-family="monospace" font-size="10.5" fill="#c4b5fd">GOVERNS</tspan>) for future sessions.
     </text>
 
     <rect x="18" y="294" width="219" height="24" rx="6" fill="#4c1d95"/>
@@ -184,25 +184,25 @@
       Strict Repository Verification
     </text>
 
-    <text x="20" y="168" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
-      1. <tspan font-family="monospace" fill="#6ee7b7">.git/hooks/pre-push</tspan> runs
+    <text x="18" y="168" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">
+      1. <tspan font-family="monospace" font-size="10.5" fill="#6ee7b7">.git/hooks/pre-push</tspan> executes
     </text>
-    <text x="20" y="185" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
-      <tspan font-family="monospace" fill="#6ee7b7">neurostrata-mcp task gate --strict</tspan>.
-    </text>
-
-    <text x="20" y="213" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
-      2. Verifies 0 active <tspan font-family="monospace" fill="#6ee7b7">in_progress</tspan> tasks,
-    </text>
-    <text x="20" y="230" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
-      all <tspan font-family="monospace" fill="#6ee7b7">done</tspan> tasks have memories, 0 stale P0s.
+    <text x="18" y="185" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">
+      <tspan font-family="monospace" font-size="10.5" fill="#6ee7b7">task gate &lt;ns&gt; --strict</tspan>.
     </text>
 
-    <text x="20" y="258" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
+    <text x="18" y="213" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">
+      2. Verifies 0 active <tspan font-family="monospace" font-size="10.5" fill="#6ee7b7">in_progress</tspan>,
+    </text>
+    <text x="18" y="230" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">
+      all <tspan font-family="monospace" font-size="10.5" fill="#6ee7b7">done</tspan> extracted, 0 stale P0s.
+    </text>
+
+    <text x="18" y="258" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">
       3. Mirrors shareable rules to team
     </text>
-    <text x="20" y="275" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
-      via <tspan font-family="monospace" fill="#6ee7b7">SynapticMesh</tspan> automatically.
+    <text x="18" y="275" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">
+      via <tspan font-family="monospace" font-size="10.5" fill="#6ee7b7">SynapticMesh</tspan> automatically.
     </text>
 
     <rect x="18" y="294" width="219" height="24" rx="6" fill="#065f46"/>
@@ -214,11 +214,11 @@
   <!-- SELF-IMPROVING FLYWHEEL LOOP AT BOTTOM -->
   <path d="M 746 442 L 746 535 Q 746 555 726 555 L 182 555 Q 162 555 162 535 L 162 450" fill="none" stroke="url(#feedbackGrad)" stroke-width="3.5" marker-end="url(#arrowCyan)"/>
 
-  <rect x="290" y="528" width="520" height="52" rx="26" fill="#1e1b4b" stroke="#818cf8" stroke-width="2"/>
+  <rect x="230" y="528" width="640" height="52" rx="26" fill="#1e1b4b" stroke="#818cf8" stroke-width="2"/>
   <text x="550" y="550" text-anchor="middle" font-family="system-ui, sans-serif" font-size="13.5" font-weight="800" fill="#e0e7ff">
     ♻️ THE COMPOUNDING COGNITIVE FLYWHEEL
   </text>
-  <text x="550" y="569" text-anchor="middle" font-family="system-ui, sans-serif" font-size="12" fill="#a5b4fc">
-    Extracted rules from Lock 2 immediately surface in Stage 1 (<tspan font-family="monospace">get_snapshot</tspan>) on the next task!
+  <text x="550" y="569" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11.5" fill="#a5b4fc">
+    Extracted rules from Lock 2 immediately surface in Stage 1 (<tspan font-family="monospace" font-size="10.5">get_snapshot</tspan>) on the next task!
   </text>
 </svg>

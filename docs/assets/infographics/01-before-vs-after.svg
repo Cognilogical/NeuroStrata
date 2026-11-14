@@ -55,8 +55,8 @@
       <circle cx="38" cy="39" r="20" fill="#451a22" stroke="#ef4444" stroke-width="1.5"/>
       <text x="38" y="45" text-anchor="middle" font-family="system-ui, sans-serif" font-size="18" font-weight="800" fill="#f87171">1</text>
       <text x="74" y="28" font-family="system-ui, sans-serif" font-size="15" font-weight="700" fill="#fecaca">Session Amnesia &amp; Compaction Wipeout</text>
-      <text x="74" y="49" font-family="system-ui, sans-serif" font-size="12.5" fill="#cbd5e1">Flat <tspan font-family="monospace" fill="#fca5a5">MEMORY.md</tspan> files rot; agent repeats the exact same</text>
-      <text x="74" y="66" font-family="system-ui, sans-serif" font-size="12.5" fill="#cbd5e1">failed experiments after context compaction or new sessions.</text>
+      <text x="74" y="49" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">Flat <tspan font-family="monospace" font-size="11" fill="#fca5a5">MEMORY.md</tspan> files rot; agent repeats the exact same</text>
+      <text x="74" y="66" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">failed experiments after context compaction or new sessions.</text>
     </g>
 
     <!-- Row 2 -->
@@ -65,8 +65,8 @@
       <circle cx="38" cy="39" r="20" fill="#451a22" stroke="#ef4444" stroke-width="1.5"/>
       <text x="38" y="45" text-anchor="middle" font-family="system-ui, sans-serif" font-size="18" font-weight="800" fill="#f87171">2</text>
       <text x="74" y="28" font-family="system-ui, sans-serif" font-size="15" font-weight="700" fill="#fecaca">Blind Grep Loops &amp; Hidden Regressions</text>
-      <text x="74" y="49" font-family="system-ui, sans-serif" font-size="12.5" fill="#cbd5e1">Burns 20+ tool calls grepping text; edits a function without</text>
-      <text x="74" y="66" font-family="system-ui, sans-serif" font-size="12.5" fill="#cbd5e1">seeing callers 3 hops away or governing project rules.</text>
+      <text x="74" y="49" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">Burns 20+ tool calls grepping text; edits functions without</text>
+      <text x="74" y="66" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">seeing callers 3 hops away or governing project rules.</text>
     </g>
 
     <!-- Row 3 -->
@@ -75,8 +75,8 @@
       <circle cx="38" cy="39" r="20" fill="#451a22" stroke="#ef4444" stroke-width="1.5"/>
       <text x="38" y="45" text-anchor="middle" font-family="system-ui, sans-serif" font-size="18" font-weight="800" fill="#f87171">3</text>
       <text x="74" y="28" font-family="system-ui, sans-serif" font-size="15" font-weight="700" fill="#fecaca">Rationalized Prompts &amp; Abandoned TODOs</text>
-      <text x="74" y="49" font-family="system-ui, sans-serif" font-size="12.5" fill="#cbd5e1">Leaves <tspan font-family="monospace" fill="#fca5a5">// TODO: fix later</tspan> stubs, skips verification, and</text>
-      <text x="74" y="66" font-family="system-ui, sans-serif" font-size="12.5" fill="#cbd5e1">marks work "done" without recording what was learned.</text>
+      <text x="74" y="49" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">Leaves <tspan font-family="monospace" font-size="11" fill="#fca5a5">// TODO: fix later</tspan> stubs, skips verification, and</text>
+      <text x="74" y="66" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">marks work "done" without recording what was learned.</text>
     </g>
 
     <!-- Row 4 -->
@@ -85,8 +85,8 @@
       <circle cx="38" cy="39" r="20" fill="#451a22" stroke="#ef4444" stroke-width="1.5"/>
       <text x="38" y="45" text-anchor="middle" font-family="system-ui, sans-serif" font-size="18" font-weight="800" fill="#f87171">4</text>
       <text x="74" y="28" font-family="system-ui, sans-serif" font-size="15" font-weight="700" fill="#fecaca">Blank-Brain Subagents</text>
-      <text x="74" y="49" font-family="system-ui, sans-serif" font-size="12.5" fill="#cbd5e1">Spawned worker/checker subagents start with zero memory</text>
-      <text x="74" y="66" font-family="system-ui, sans-serif" font-size="12.5" fill="#cbd5e1">of architectural rules and immediately violate invariants.</text>
+      <text x="74" y="49" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">Spawned worker/checker subagents start with zero memory</text>
+      <text x="74" y="66" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">of architectural rules and immediately violate invariants.</text>
     </g>
 
     <!-- Row 5 -->
@@ -95,8 +95,8 @@
       <circle cx="38" cy="39" r="20" fill="#451a22" stroke="#ef4444" stroke-width="1.5"/>
       <text x="38" y="45" text-anchor="middle" font-family="system-ui, sans-serif" font-size="18" font-weight="800" fill="#f87171">5</text>
       <text x="74" y="28" font-family="system-ui, sans-serif" font-size="15" font-weight="700" fill="#fecaca">Multi-Service Glue Stacks &amp; Unchecked Edits</text>
-      <text x="74" y="49" font-family="system-ui, sans-serif" font-size="12.5" fill="#cbd5e1">Requires external DB servers &amp; custom scripts, or executes</text>
-      <text x="74" y="66" font-family="system-ui, sans-serif" font-size="12.5" fill="#cbd5e1">risky shell commands directly against the live workspace.</text>
+      <text x="74" y="49" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">Requires external DB servers &amp; custom scripts, or executes</text>
+      <text x="74" y="66" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">risky shell commands directly against the live workspace.</text>
     </g>
   </g>
 
@@ -126,8 +126,8 @@
       <circle cx="38" cy="39" r="20" fill="#1e1b4b" stroke="#818cf8" stroke-width="1.5"/>
       <text x="38" y="45" text-anchor="middle" font-family="system-ui, sans-serif" font-size="18" font-weight="800" fill="#a5b4fc">1</text>
       <text x="74" y="28" font-family="system-ui, sans-serif" font-size="15" font-weight="700" fill="#c7d2fe">Tri-Strata Memory + Negative Exemplars</text>
-      <text x="74" y="49" font-family="system-ui, sans-serif" font-size="12.5" fill="#cbd5e1">Global, Project &amp; Task strata with HNSW/Tantivy/BM25 recall,</text>
-      <text x="74" y="66" font-family="system-ui, sans-serif" font-size="12.5" fill="#cbd5e1">SPARQL 1.1 logic, and failed-attempt immunization.</text>
+      <text x="74" y="49" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">Global, Project &amp; Task strata with HNSW/Tantivy/BM25 recall,</text>
+      <text x="74" y="66" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">SPARQL 1.1 logic, and failed-attempt immunization.</text>
     </g>
 
     <!-- Row 2 (Cyan: AST Blast Radius) -->
@@ -136,8 +136,8 @@
       <circle cx="38" cy="39" r="20" fill="#083344" stroke="#22d3ee" stroke-width="1.5"/>
       <text x="38" y="45" text-anchor="middle" font-family="system-ui, sans-serif" font-size="18" font-weight="800" fill="#67e8f9">2</text>
       <text x="74" y="28" font-family="system-ui, sans-serif" font-size="15" font-weight="700" fill="#a5f3fc">1-Call AST &amp; Rule Blast Radius</text>
-      <text x="74" y="49" font-family="system-ui, sans-serif" font-size="12.5" fill="#cbd5e1">6-language Tree-sitter graph + <tspan font-family="monospace" fill="#67e8f9">memories_for_file</tspan> reveals</text>
-      <text x="74" y="66" font-family="system-ui, sans-serif" font-size="12.5" fill="#cbd5e1">governing rules, callers, callees &amp; impact before editing.</text>
+      <text x="74" y="49" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">6-language Tree-sitter graph + <tspan font-family="monospace" font-size="11" fill="#67e8f9">memories_for_file</tspan> reveals</text>
+      <text x="74" y="66" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">governing rules, callers, callees &amp; impact before editing.</text>
     </g>
 
     <!-- Row 3 (Emerald: 3 Soft Locks) -->
@@ -146,8 +146,8 @@
       <circle cx="38" cy="39" r="20" fill="#064e3b" stroke="#34d399" stroke-width="1.5"/>
       <text x="38" y="45" text-anchor="middle" font-family="system-ui, sans-serif" font-size="18" font-weight="800" fill="#6ee7b7">3</text>
       <text x="74" y="28" font-family="system-ui, sans-serif" font-size="15" font-weight="700" fill="#a7f3d0">Central Executive &amp; 3 Binary Locks</text>
-      <text x="74" y="49" font-family="system-ui, sans-serif" font-size="12.5" fill="#cbd5e1">Zero-Action Start, Breath checkpoints, mandatory rule</text>
-      <text x="74" y="66" font-family="system-ui, sans-serif" font-size="12.5" fill="#cbd5e1">extraction on <tspan font-family="monospace" fill="#6ee7b7">task_complete</tspan>, and strict pre-push git gate.</text>
+      <text x="74" y="49" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">Zero-Action Start, Breath checkpoints, mandatory rule</text>
+      <text x="74" y="66" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">extraction on <tspan font-family="monospace" font-size="11" fill="#6ee7b7">task_complete</tspan>, and strict pre-push git gate.</text>
     </g>
 
     <!-- Row 4 (Pink/Magenta: Subagent Injection) -->
@@ -156,8 +156,8 @@
       <circle cx="38" cy="39" r="20" fill="#500724" stroke="#f472b6" stroke-width="1.5"/>
       <text x="38" y="45" text-anchor="middle" font-family="system-ui, sans-serif" font-size="18" font-weight="800" fill="#f9a8d4">4</text>
       <text x="74" y="28" font-family="system-ui, sans-serif" font-size="15" font-weight="700" fill="#fbcfe8">Auto-Injected Subagent Context &amp; Mesh</text>
-      <text x="74" y="49" font-family="system-ui, sans-serif" font-size="12.5" fill="#cbd5e1">6 harness plugins auto-prepend <tspan font-family="monospace" fill="#f9a8d4">subagent_prompt_injection</tspan></text>
-      <text x="74" y="66" font-family="system-ui, sans-serif" font-size="12.5" fill="#cbd5e1">into every spawned subagent; <tspan font-family="monospace" fill="#f9a8d4">SynapticMesh</tspan> syncs via git.</text>
+      <text x="74" y="49" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">6 harness plugins auto-prepend <tspan font-family="monospace" font-size="11" fill="#f9a8d4">subagent_prompt_injection</tspan></text>
+      <text x="74" y="66" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">into every spawned subagent; <tspan font-family="monospace" font-size="11" fill="#f9a8d4">SynapticMesh</tspan> syncs via git.</text>
     </g>
 
     <!-- Row 5 (Amber: Prefrontal Sandbox & Zero-Touch) -->
@@ -166,8 +166,8 @@
       <circle cx="38" cy="39" r="20" fill="#451a03" stroke="#fbbf24" stroke-width="1.5"/>
       <text x="38" y="45" text-anchor="middle" font-family="system-ui, sans-serif" font-size="18" font-weight="800" fill="#fde68a">5</text>
       <text x="74" y="28" font-family="system-ui, sans-serif" font-size="15" font-weight="700" fill="#fef08a">Podman Dry-Run Sandbox &amp; 1-Sentence Setup</text>
-      <text x="74" y="49" font-family="system-ui, sans-serif" font-size="12.5" fill="#cbd5e1">Rootless <tspan font-family="monospace" fill="#fde68a">podman --network=none</tspan> command dry-runs, Digital</text>
-      <text x="74" y="66" font-family="system-ui, sans-serif" font-size="12.5" fill="#cbd5e1">Twins, and 100% automated harness &amp; hook self-upgrading.</text>
+      <text x="74" y="49" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">Rootless <tspan font-family="monospace" font-size="11" fill="#fde68a">podman --network=none</tspan> command dry-runs, Digital</text>
+      <text x="74" y="66" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">Twins, and 100% automated harness &amp; hook self-upgrading.</text>
     </g>
   </g>
 </svg>

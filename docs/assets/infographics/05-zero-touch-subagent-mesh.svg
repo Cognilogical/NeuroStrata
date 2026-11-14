@@ -26,19 +26,22 @@
   <!-- TOP BAR: 1-SENTENCE ONBOARDING -->
   <g transform="translate(40, 100)">
     <rect width="1120" height="86" rx="14" fill="#131c31" stroke="#38bdf8" stroke-width="2"/>
-    <rect x="22" y="18" width="330" height="50" rx="10" fill="#083344" stroke="#22d3ee" stroke-width="1.5"/>
-    <text x="187" y="38" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" font-weight="700" fill="#67e8f9" letter-spacing="0.6">
+    <rect x="20" y="18" width="346" height="50" rx="10" fill="#083344" stroke="#22d3ee" stroke-width="1.5"/>
+    <text x="193" y="38" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" font-weight="700" fill="#67e8f9" letter-spacing="0.6">
       USER SAYS ONE SENTENCE:
     </text>
-    <text x="187" y="57" text-anchor="middle" font-family="system-ui, sans-serif" font-size="14" font-weight="800" fill="#f8fafc">
+    <text x="193" y="57" text-anchor="middle" font-family="system-ui, sans-serif" font-size="13" font-weight="800" fill="#f8fafc">
       "Initialize NeuroStrata for this project."
     </text>
 
-    <text x="385" y="36" font-family="system-ui, sans-serif" font-size="13" font-weight="700" fill="#e2e8f0">
+    <text x="388" y="30" font-family="system-ui, sans-serif" font-size="13" font-weight="700" fill="#e2e8f0">
       100% Automated Zero-Touch Wiring:
     </text>
-    <text x="385" y="58" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
-      ✓ Detects CLI harness &amp; installs embedded plugin  ·  ✓ Installs <tspan font-family="monospace" fill="#67e8f9">pre-commit</tspan> &amp; <tspan font-family="monospace" fill="#67e8f9">pre-push</tspan> hooks  ·  ✓ Ingests 6-lang AST  ·  ✓ Self-upgrades on snapshot
+    <text x="388" y="51" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">
+      ✓ Detects CLI harness &amp; wires embedded plugin  ·  ✓ Installs <tspan font-family="monospace" font-size="10.5" fill="#67e8f9">pre-commit</tspan> &amp; <tspan font-family="monospace" font-size="10.5" fill="#67e8f9">pre-push</tspan> hooks
+    </text>
+    <text x="388" y="70" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">
+      ✓ Ingests 6-language AST software graph  ·  ✓ Self-upgrades hooks, skills &amp; schema on snapshot
     </text>
   </g>
 
@@ -149,7 +152,7 @@
     <g transform="translate(22, 58)">
       <rect width="276" height="88" rx="10" fill="#0f352c" stroke="#34d399" stroke-width="1.2"/>
       <text x="16" y="26" font-family="system-ui, sans-serif" font-size="13" font-weight="800" fill="#a7f3d0">✓ What Crosses the Mesh</text>
-      <text x="16" y="46" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">• <tspan font-family="monospace" fill="#6ee7b7">eligibility: "shareable"</tspan> rules &amp; facts</text>
+      <text x="16" y="46" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">• Shareable <tspan font-family="monospace" font-size="10.5" fill="#6ee7b7">[rule]</tspan> &amp; <tspan font-family="monospace" font-size="10.5" fill="#6ee7b7">[fact]</tspan> rows</text>
       <text x="16" y="64" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">• Procedure definitions (stripped of</text>
       <text x="16" y="79" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">  local runtime rehearsal counters)</text>
     </g>
@@ -159,13 +162,13 @@
       <text x="16" y="26" font-family="system-ui, sans-serif" font-size="13" font-weight="800" fill="#7dd3fc">🔒 What Stays Strictly Local</text>
       <text x="16" y="46" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">• Private memories &amp; sovereign IDs</text>
       <text x="16" y="64" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">• Tasks, embeddings &amp; AST rows</text>
-      <text x="16" y="79" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">• Runtime counters (<tspan font-family="monospace" fill="#7dd3fc">remaining_fires</tspan>)</text>
+      <text x="16" y="79" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">• Runtime <tspan font-family="monospace" font-size="10.5" fill="#7dd3fc">remaining_fires</tspan> counters</text>
     </g>
 
     <g transform="translate(22, 266)">
       <rect width="276" height="102" rx="10" fill="#0f352c" stroke="#34d399" stroke-width="1.2"/>
       <text x="16" y="26" font-family="system-ui, sans-serif" font-size="13" font-weight="800" fill="#a7f3d0">🛡️ Honesty &amp; Safety Discipline</text>
-      <text x="16" y="46" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">• Standard <tspan font-family="monospace" fill="#6ee7b7">git pull --ff-only</tspan> &amp; push</text>
+      <text x="16" y="46" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">• Standard <tspan font-family="monospace" font-size="10.5" fill="#6ee7b7">git pull --ff-only</tspan> &amp; push</text>
       <text x="16" y="64" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">• Never force-pushes or overwrites</text>
       <text x="16" y="81" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">• Fail-soft queuing when offline</text>
     </g>

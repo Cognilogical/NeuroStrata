@@ -62,10 +62,10 @@
 
     <g transform="translate(20, 356)">
       <rect width="300" height="94" rx="10" fill="#2b1610" stroke="#fbbf24" stroke-width="1.2"/>
-      <text x="14" y="24" font-family="system-ui, sans-serif" font-size="13" font-weight="800" fill="#fcd34d">4. FAILED ATTEMPTS &amp; TASK PROVENANCE</text>
-      <text x="14" y="44" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">Surfaces <tspan font-family="monospace" fill="#fde68a">EXTRACTED_FROM</tspan> task history</text>
-      <text x="14" y="61" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">and Negative Exemplars (<tspan font-family="monospace" fill="#fca5a5">outcome:"failed"</tspan>)</text>
-      <text x="14" y="78" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">so dead-end refactors are never repeated.</text>
+      <text x="14" y="24" font-family="system-ui, sans-serif" font-size="12.5" font-weight="800" fill="#fcd34d">4. FAILED ATTEMPTS &amp; PROVENANCE</text>
+      <text x="14" y="44" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">Surfaces <tspan font-family="monospace" font-size="10.5" fill="#fde68a">EXTRACTED_FROM</tspan> task history</text>
+      <text x="14" y="61" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">and Exemplars (<tspan font-family="monospace" font-size="10.5" fill="#fca5a5">outcome:"failed"</tspan>)</text>
+      <text x="14" y="78" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">so dead-end refactors never repeat.</text>
     </g>
   </g>
 
@@ -124,28 +124,28 @@
     <!-- TOP-RIGHT NODE: UPSTREAM CALLERS -->
     <g transform="translate(497, 62)">
       <rect width="235" height="90" rx="12" fill="#0c2636" stroke="#22d3ee" stroke-width="2"/>
-      <text x="16" y="25" font-family="monospace" font-size="11.5" font-weight="700" fill="#67e8f9">[code_ast] Upstream Callers</text>
-      <text x="16" y="45" font-family="monospace" font-size="11.5" fill="#ecfeff">• src/daemon.rs::dispatch_rpc</text>
-      <text x="16" y="63" font-family="monospace" font-size="11.5" fill="#ecfeff">• plugins/core/index.ts</text>
+      <text x="16" y="25" font-family="monospace" font-size="11" font-weight="700" fill="#67e8f9">[code_ast] Upstream Callers</text>
+      <text x="16" y="45" font-family="monospace" font-size="10.5" fill="#ecfeff">• daemon.rs::dispatch_rpc</text>
+      <text x="16" y="63" font-family="monospace" font-size="10.5" fill="#ecfeff">• plugins/core/index.ts</text>
       <text x="16" y="79" font-family="system-ui, sans-serif" font-size="10.5" fill="#22d3ee">Breakage risk caught pre-edit</text>
     </g>
 
     <!-- BOTTOM-LEFT NODE: NEGATIVE EXEMPLAR & PROVENANCE -->
     <g transform="translate(32, 342)">
       <rect width="235" height="94" rx="12" fill="#2b1610" stroke="#fbbf24" stroke-width="2"/>
-      <text x="16" y="25" font-family="monospace" font-size="11.5" font-weight="700" fill="#fcd34d">[fact] Negative Exemplar</text>
-      <text x="16" y="45" font-family="system-ui, sans-serif" font-size="11.5" fill="#fef3c7">✗ Sync container wait hung MCP</text>
-      <text x="16" y="62" font-family="system-ui, sans-serif" font-size="11.5" fill="#fef3c7">✓ Use async wake + JSONL cache</text>
+      <text x="16" y="25" font-family="monospace" font-size="11" font-weight="700" fill="#fcd34d">[fact] Negative Exemplar</text>
+      <text x="16" y="45" font-family="system-ui, sans-serif" font-size="11" fill="#fef3c7">✗ Sync container wait hung MCP</text>
+      <text x="16" y="62" font-family="system-ui, sans-serif" font-size="11" fill="#fef3c7">✓ Use async wake + JSONL cache</text>
       <text x="16" y="80" font-family="monospace" font-size="10.5" fill="#fbbf24">attempt.outcome = "failed"</text>
     </g>
 
     <!-- BOTTOM-RIGHT NODE: DOWNSTREAM CALLEES -->
     <g transform="translate(497, 342)">
       <rect width="235" height="94" rx="12" fill="#0b2922" stroke="#34d399" stroke-width="2"/>
-      <text x="16" y="25" font-family="monospace" font-size="11.5" font-weight="700" fill="#6ee7b7">[code_ast] Downstream Callees</text>
-      <text x="16" y="45" font-family="monospace" font-size="11.5" fill="#d1fae5">• src/task/mod.rs::collect_golden</text>
-      <text x="16" y="63" font-family="monospace" font-size="11.5" fill="#d1fae5">• src/task/wiring.rs::check_delta</text>
-      <text x="16" y="80" font-family="monospace" font-size="10.5" fill="#34d399">• src/storage.rs::query_stratum</text>
+      <text x="16" y="25" font-family="monospace" font-size="11" font-weight="700" fill="#6ee7b7">[code_ast] Downstream Callees</text>
+      <text x="16" y="45" font-family="monospace" font-size="10.5" fill="#d1fae5">• task/mod.rs::collect_golden</text>
+      <text x="16" y="63" font-family="monospace" font-size="10.5" fill="#d1fae5">• task/wiring.rs::check_delta</text>
+      <text x="16" y="80" font-family="monospace" font-size="10.5" fill="#34d399">• storage.rs::query_stratum</text>
     </g>
   </g>
 </svg>
