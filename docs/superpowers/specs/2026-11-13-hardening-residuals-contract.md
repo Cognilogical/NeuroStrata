@@ -69,7 +69,7 @@ Supersession note: the flip- and delete-sensitivity claims above hold as a resul
 - **P3-5 / X4 & P3-13 / N3:** `docs/limitations.md` documents began-before
   neighbors, background growth, and detached-ingest attribution geometry (`neurostrata-igg4`).
 
-### C5 — Dependabot and CodeQL alert remediation (`neurostrata-57oi`)
+### C5 — Dependabot and CodeQL alert remediation (`neurostrata-57oi`, `neurostrata-911e`)
 
 - **Plugin dependency hygiene (`plugins/core/package.json`, `plugins/openclaw/package-lock.json`):**
   Remove the unused `"vitest": "^1.0.0"` devDependency from `plugins/core/package.json`
@@ -81,6 +81,12 @@ Supersession note: the flip- and delete-sensitivity claims above hold as a resul
   `caller_tag` and remove `msg` interpolation from `assert!` failure strings in
   `tests/guard/validator_test.rs`, eliminating the heuristic taint source and
   sink for CodeQL alerts `#2`–`#5` (`neurostrata-57oi`).
+- **CodeQL `rust/command-line-injection` (`src/guard/sandbox.rs`, `docs/organs/prefrontal-cortex.md`):**
+  Stream the sandbox payload over piped `stdin` to `podman run --rm -i ... alpine:3.21 sh -s`
+  via `sandbox_run_args` and `write_payload_and_wait` instead of passing `payload`
+  as a `sh -c <payload>` command-line argument, eliminating the command-line
+  injection sink for CodeQL alert `#6` and keeping untrusted payloads out of
+  host `argv` (`neurostrata-911e`).
 - **Web UI alert triage:** Dismiss Dependabot alerts on `web-ui/package-lock.json`
   (`#20`–`#26`, `#28`) and `src-tauri/Cargo.lock` (`#15`) while the web interface
    awaits its scheduled revamp (`neurostrata-57oi`).
