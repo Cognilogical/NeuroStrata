@@ -1108,14 +1108,6 @@ export function injectSubagentPrompt(target, namespace, taskId, extraContext) {
     target.prompt = buildSubagentContextHeader(namespace, taskId, extraContext) + raw;
     return true;
 }
-// Allowed file extensions for repo-relative path extraction. Final segment of
-// a candidate path must carry one of these (case-insensitive) to count.
-const ALLOWED_PATH_EXTENSIONS = new Set([
-    "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "go", "java", "kt",
-    "c", "cc", "cpp", "h", "hpp", "cs", "rb", "php", "swift", "scala", "sql",
-    "sh", "bash", "zsh", "json", "toml", "yaml", "yml", "md", "html", "css",
-    "scss", "vue", "svelte", "proto", "graphql", "nix", "lua", "zig", "ex", "exs",
-]);
 export function extractRepoFilePaths(promptText) {
     // Linear-time token scanner: match contiguous path-character runs, then
     // validate each candidate. Avoids polynomial backtracking of a nested
@@ -1160,14 +1152,17 @@ export function extractRepoFilePaths(promptText) {
         if (!token.includes("/"))
             continue;
         const segments = token.split("/");
-        if (segments.some((seg) => seg.length === 0 || seg === ".."))
+        if (segments.some((seg) => seg.length === 0 || seg === "." || seg === ".."))
             continue;
         const finalSegment = segments[segments.length - 1];
         const extMatch = /\.[A-Za-z0-9]{1,8}$/.exec(finalSegment);
         if (!extMatch)
             continue;
-        const ext = extMatch[0].slice(1).toLowerCase();
-        if (!ALLOWED_PATH_EXTENSIONS.has(ext))
+        // Require at least one ASCII letter in the extension so generic file types
+        // (.ttl, .lean, .jsonl, .rs, …) are extracted while numeric version
+        // suffixes such as "release/v1.2" are ignored.
+        const ext = extMatch[0].slice(1);
+        if (!/[A-Za-z]/.test(ext))
             continue;
         if (!seen.has(token)) {
             seen.add(token);
