@@ -1296,7 +1296,6 @@ pub struct LadybugStore {
     /// evidence the store is pristine, and `init` must not run the
     /// LockedUnknown provenance upgrade from it.
     open_provenance: OpenProvenance,
-    opened_via_recovery: bool,
     /// This process's view of the store-state sidecar, loaded on first
     /// use. The sidecar is the setup-time model choice's lock record:
     /// see `crate::model_choice::store_has_data`.
@@ -2186,7 +2185,6 @@ impl LadybugStore {
         // Open with verification first. Only if the WAL fails to authenticate do we
         // consider replaying it unverified, and never quietly.
         let mut open_provenance = OpenProvenance::Verified;
-        let mut opened_via_recovery = false;
         let db = match Database::new(&local_path, initial_config) {
             Ok(db) => db,
             Err(e) => {
@@ -2210,7 +2208,6 @@ impl LadybugStore {
                             err_msg
                         ));
                     }
-                    opened_via_recovery = true;
                     open_provenance = OpenProvenance::ChecksumConfigMismatch;
                     eprintln!("WARN: DB checksum config mismatch; reopening with checksums disabled.");
                     match Database::new(&local_path, unverified_config()) {
@@ -2221,7 +2218,7 @@ impl LadybugStore {
                             // live session runs under verifying_config(). A store
                             // whose main DB was created without checksums keeps
                             // the unverified configuration.
-                            if wal_nonempty {
+                            if !wal_nonempty {
                                 unverified_db
                             } else {
                                 let has_memory_table = match Connection::new(&unverified_db) {
@@ -2259,6 +2256,8 @@ impl LadybugStore {
                         }
                         Err(e2) => return Err(e2.into()),
                     }
+                } else if !is_wal_integrity_failure(&err_msg) {
+                    return Err(e.into());
                 } else {
                     eprintln!(
                     "ERROR: the write-ahead log failed verification: {}",
@@ -2284,7 +2283,6 @@ impl LadybugStore {
 
                 match Database::new(&local_path, unverified_config()) {
                     Ok(unverified_db) => {
-                        opened_via_recovery = true;
                         open_provenance = OpenProvenance::UnverifiedWalReplay;
                         eprintln!("Recovered by replaying the unverified write-ahead log.");
                         // The replay only brought the writes back into memory.
@@ -2481,7 +2479,6 @@ impl LadybugStore {
             serving_descriptor: std::sync::Mutex::new(None),
             db_preexisting,
             open_provenance,
-            opened_via_recovery,
             store_state: Arc::new(std::sync::Mutex::new(None)),
         })
     }
@@ -2493,7 +2490,7 @@ impl LadybugStore {
     /// unauthenticated; callers and operators should treat recovered
     /// opens as degraded provenance.
     pub fn opened_via_recovery(&self) -> bool {
-        self.opened_via_recovery
+        !self.open_provenance.is_verified()
     }
 
     /// Override the directory the configured embedding model is resolved
@@ -19992,7 +19989,9 @@ eurostrata\src\daemon.rs",
         // verifying open at the WAL header check, and the engine
         // falls back to unverified_config() — provenance is
         // unverified and nothing may reconcile or migrate from
-        // this open.
+        // this open. The leaked handle left a non-empty WAL in
+        // place (#94), so the reopen exercises the
+        // NEUROSTRATA_STRICT_WAL=0 opt-in under WAL_ENV_LOCK.
         let fx = store_state_fixture("open-provenance-mismatch", "ModelA");
         let no_checksums = SystemConfig::default()
             .max_db_size(512 * 1024 * 1024)
@@ -20005,8 +20004,12 @@ eurostrata\src\daemon.rs",
             creator.init("probe").await.expect("init");
             std::mem::forget(creator);
         }
+        let _wal_env_serial = WAL_ENV_LOCK.lock().await;
+        let previous_wal = allow_unverified_wal_recovery();
         let reopened = LadybugStore::with_system_config(&fx.db, 4, verifying_config())
             .expect("the checksum-mismatch reopen succeeds");
+        restore_wal_env(previous_wal);
+        drop(_wal_env_serial);
         assert_eq!(
             reopened.open_provenance(),
             OpenProvenance::ChecksumConfigMismatch,
@@ -20984,6 +20987,7 @@ eurostrata\src\daemon.rs",
         drop(creator);
         plant_corrupted_uncheckpointed_wal(&db, 6, false);
 
+        let _wal_env_serial = WAL_ENV_LOCK.lock().await;
         let previous_wal = allow_unverified_wal_recovery();
         let store = LadybugStore::for_testing(&db, 4)
             .expect("the recovery open succeeds with unverified replay opted in");
@@ -20993,6 +20997,7 @@ eurostrata\src\daemon.rs",
         );
         drop(store);
         restore_wal_env(previous_wal);
+        drop(_wal_env_serial);
 
         // The post-recovery CHECKPOINT flushed the replayed WAL, so a
         // verified open of the same files succeeds.
