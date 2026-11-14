@@ -213,7 +213,7 @@ pub async fn project_federated_sparql_dataset_async(
         .unwrap_or_default()
         .as_secs() as i64;
 
-    let structural_types: [&str; 8] = [
+    let structural_types: [&str; 10] = [
         "directory",
         "file",
         "markdown",
@@ -222,6 +222,8 @@ pub async fn project_federated_sparql_dataset_async(
         "community_summary",
         "digital_twin",
         "digital_twin_schema",
+        "action_type",
+        "action_receipt",
     ];
 
     let meta_predicate = crate::rdf::namespace::field_predicate("metadata");

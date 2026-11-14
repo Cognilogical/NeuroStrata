@@ -511,6 +511,7 @@ pub struct ActionEvaluation {
     pub definition: ActionTypeDefinition,
     pub effective_principal: String,
     pub bound_params: BTreeMap<String, serde_json::Value>,
+    #[allow(dead_code)]
     pub rdf_bindings: Vec<(oxrdf::Variable, oxrdf::Term)>,
     pub targets: BTreeMap<String, ActionTargetRecord>,
     pub submission_failures: Vec<ActionSubmissionFailure>,
@@ -760,10 +761,12 @@ pub struct ActionWriteSet {
 
 #[derive(Debug, Clone)]
 pub struct ActionStage {
+    #[allow(dead_code)]
     pub namespace: String,
     pub receipt_id: String,
     pub receipt: ActionReceiptPayload,
     pub write_set: ActionWriteSet,
+    #[allow(dead_code)]
     pub submission_failures: Vec<ActionSubmissionFailure>,
 }
 
@@ -801,6 +804,7 @@ pub enum ActionApplyOutcome {
 }
 
 impl ActionApplyOutcome {
+    #[allow(dead_code)]
     pub fn is_applied(&self) -> bool {
         matches!(self, ActionApplyOutcome::Applied { .. })
     }
@@ -3585,6 +3589,123 @@ pub async fn action_log(
     });
     entries.truncate(effective_limit);
     Ok(entries)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionDefinedOutcome {
+    pub id: String,
+    pub slug: String,
+    pub title: String,
+}
+
+pub async fn define_action(
+    store: &crate::store::ladybug::LadybugStore,
+    namespace: &str,
+    security: &ActionSecurityContext,
+    definition_value: &serde_json::Value,
+    embedder: &dyn crate::traits::Embedder,
+) -> Result<ActionDefinedOutcome, ActionError> {
+    use crate::traits::VectorStore;
+
+    let effective_principal = security.effective_principal();
+    if effective_principal.trim().is_empty() {
+        return Err(ActionError::PermissionDenied(
+            "anonymous principal cannot define action_type".to_string(),
+        ));
+    }
+
+    if !definition_value.is_object() {
+        return Err(ActionError::InvalidDefinition(vec![ShaclViolation {
+            field: "metadata.action_type".to_string(),
+            why: "action_type must be a JSON object".to_string(),
+        }]));
+    }
+
+    let definition: ActionTypeDefinition =
+        serde_json::from_value(definition_value.clone()).map_err(|e| {
+            ActionError::InvalidDefinition(vec![ShaclViolation {
+                field: "metadata.action_type".to_string(),
+                why: format!("invalid action_type schema: {e}"),
+            }])
+        })?;
+
+    let violations = definition.validate_definition();
+    if !violations.is_empty() {
+        return Err(ActionError::InvalidDefinition(violations));
+    }
+
+    let now_ts = next_action_timestamp();
+    store
+        .init(namespace)
+        .await
+        .map_err(|e| ActionError::Storage(e.to_string()))?;
+    let existing = store
+        .list(namespace, None, Some("action_type"))
+        .await
+        .map_err(|e| ActionError::Storage(e.to_string()))?;
+    for row in existing {
+        if row.payload.memory_type != "action_type" || !is_active_payload(&row.payload, now_ts) {
+            continue;
+        }
+        let row_slug = row
+            .payload
+            .metadata
+            .get("action_type")
+            .and_then(|v| v.get("slug"))
+            .and_then(|v| v.as_str());
+        if row_slug == Some(definition.slug.as_str()) {
+            return Err(ActionError::DuplicateActionSlug {
+                namespace: namespace.to_string(),
+                slug: definition.slug.clone(),
+            });
+        }
+    }
+
+    let content = format!(
+        "ActionType '{}' ({}): {}",
+        definition.slug, definition.title, definition.description
+    );
+    let payload = MemoryPayload {
+        content: content.clone(),
+        user_id: effective_principal,
+        memory_type: "action_type".to_string(),
+        agent_name: None,
+        location: String::new(),
+        location_lines: String::new(),
+        metadata: serde_json::json!({
+            "valid_from": now_ts,
+            "action_type": definition,
+        }),
+    };
+
+    let shacl_errs = store
+        .get_ontology(namespace)
+        .validate_strict_post_image(&payload);
+    if !shacl_errs.is_empty() {
+        return Err(ActionError::InvalidDefinition(shacl_errs));
+    }
+
+    let vector = embedder
+        .embed(&content)
+        .await
+        .map_err(|e| ActionError::Storage(format!("embedding failed: {e}")))?;
+    let row_id = format!("action-type-{}-{}", definition.slug, uuid::Uuid::new_v4());
+
+    store
+        .init(namespace)
+        .await
+        .map_err(|e| ActionError::Storage(e.to_string()))?;
+    store
+        .upsert(namespace, &row_id, vector, payload)
+        .await
+        .map_err(|e| ActionError::Storage(e.to_string()))?;
+    store.refresh_ontology(namespace).await;
+
+    Ok(ActionDefinedOutcome {
+        id: row_id,
+        slug: definition.slug,
+        title: definition.title,
+    })
 }
 
 #[cfg(test)]

@@ -437,6 +437,13 @@ enum Commands {
         #[arg(short, long, default_value = "NeuroStrata")]
         namespace: String,
     },
+
+    /// Define, validate, apply, revert, or inspect kinetic Action Types
+    #[command(name = "action")]
+    Action {
+        #[command(subcommand)]
+        action: ActionCommands,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone, PartialEq)]
@@ -597,6 +604,162 @@ pub(crate) enum MetricsCommands {
         #[arg(long, default_value_t = 100)]
         limit: usize,
     },
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+pub(crate) enum ActionCommands {
+    /// Define a new kinetic ActionType in a namespace
+    Define {
+        /// Target namespace
+        namespace: String,
+        /// ActionTypeDefinition JSON object string
+        definition: String,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+    /// Dry-run validate an ActionType invocation without writing
+    Validate {
+        /// Target namespace
+        namespace: String,
+        /// ActionType slug
+        slug: String,
+        /// JSON object of parameters
+        #[arg(long, default_value = "{}")]
+        params: String,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+    /// Execute a kinetic ActionType atomically and record a private receipt
+    Apply {
+        /// Target namespace
+        namespace: String,
+        /// ActionType slug
+        slug: String,
+        /// JSON object of parameters
+        #[arg(long, default_value = "{}")]
+        params: String,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+    /// Revert a previously applied action receipt
+    Revert {
+        /// Target namespace
+        namespace: String,
+        /// Receipt ID to revert
+        receipt_id: String,
+        /// Force revert across newer target versions (requires owner/admin)
+        #[arg(long, default_value_t = false)]
+        force: bool,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+    /// List redacted active action receipts in a namespace
+    Log {
+        /// Target namespace
+        namespace: String,
+        /// Maximum entries to return (default 100, max 1000)
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+}
+
+fn action_command_to_json(action: &ActionCommands) -> anyhow::Result<serde_json::Value> {
+    match action {
+        ActionCommands::Define {
+            namespace,
+            definition,
+            principal,
+        } => {
+            let def_val: serde_json::Value = serde_json::from_str(definition)
+                .map_err(|e| anyhow::anyhow!("Invalid ActionTypeDefinition JSON: {e}"))?;
+            let mut body = serde_json::json!({
+                "namespace": namespace,
+                "action": "define",
+                "definition": def_val,
+            });
+            if let Some(p) = principal {
+                body["principal"] = serde_json::json!(p);
+            }
+            Ok(body)
+        }
+        ActionCommands::Validate {
+            namespace,
+            slug,
+            params,
+            principal,
+        } => {
+            let params_val: serde_json::Value = serde_json::from_str(params)
+                .map_err(|e| anyhow::anyhow!("Invalid params JSON: {e}"))?;
+            let mut body = serde_json::json!({
+                "namespace": namespace,
+                "action": "validate",
+                "slug": slug,
+                "params": params_val,
+            });
+            if let Some(p) = principal {
+                body["principal"] = serde_json::json!(p);
+            }
+            Ok(body)
+        }
+        ActionCommands::Apply {
+            namespace,
+            slug,
+            params,
+            principal,
+        } => {
+            let params_val: serde_json::Value = serde_json::from_str(params)
+                .map_err(|e| anyhow::anyhow!("Invalid params JSON: {e}"))?;
+            let mut body = serde_json::json!({
+                "namespace": namespace,
+                "action": "apply",
+                "slug": slug,
+                "params": params_val,
+            });
+            if let Some(p) = principal {
+                body["principal"] = serde_json::json!(p);
+            }
+            Ok(body)
+        }
+        ActionCommands::Revert {
+            namespace,
+            receipt_id,
+            force,
+            principal,
+        } => {
+            let mut body = serde_json::json!({
+                "namespace": namespace,
+                "action": "revert",
+                "receipt_id": receipt_id,
+                "force": force,
+            });
+            if let Some(p) = principal {
+                body["principal"] = serde_json::json!(p);
+            }
+            Ok(body)
+        }
+        ActionCommands::Log {
+            namespace,
+            limit,
+            principal,
+        } => {
+            let mut body = serde_json::json!({
+                "namespace": namespace,
+                "action": "log",
+                "limit": limit,
+            });
+            if let Some(p) = principal {
+                body["principal"] = serde_json::json!(p);
+            }
+            Ok(body)
+        }
+    }
 }
 
 /// What a health probe actually found.
@@ -2672,6 +2835,110 @@ mod tests {
             "alias broken: {:?}",
             cli.command
         );
+    }
+
+    #[test]
+    fn the_action_commands_parse() {
+        let def = Cli::try_parse_from([
+            "neurostrata-mcp",
+            "action",
+            "define",
+            "MyProj",
+            r#"{"slug":"s","title":"t","description":"d","required_role":"editor","parameters":[],"submission_criteria":[],"effects":[]}"#,
+        ])
+        .expect("action define parses");
+        assert!(matches!(
+            def.command,
+            Some(Commands::Action {
+                action: ActionCommands::Define { .. }
+            })
+        ));
+
+        let val = Cli::try_parse_from([
+            "neurostrata-mcp",
+            "action",
+            "validate",
+            "MyProj",
+            "recalibrate-loop",
+            "--params",
+            r#"{"twin_id":"loop-a"}"#,
+        ])
+        .expect("action validate parses");
+        assert!(matches!(
+            val.command,
+            Some(Commands::Action {
+                action: ActionCommands::Validate { .. }
+            })
+        ));
+
+        let app = Cli::try_parse_from([
+            "neurostrata-mcp",
+            "action",
+            "apply",
+            "MyProj",
+            "recalibrate-loop",
+            "--params",
+            r#"{"twin_id":"loop-a"}"#,
+            "--principal",
+            "alice",
+        ])
+        .expect("action apply parses");
+        assert!(matches!(
+            app.command,
+            Some(Commands::Action {
+                action: ActionCommands::Apply { .. }
+            })
+        ));
+
+        let rev = Cli::try_parse_from([
+            "neurostrata-mcp",
+            "action",
+            "revert",
+            "MyProj",
+            "rec-123",
+            "--force",
+        ])
+        .expect("action revert parses");
+        match rev.command {
+            Some(Commands::Action {
+                action:
+                    ActionCommands::Revert {
+                        namespace,
+                        receipt_id,
+                        force,
+                        ..
+                    },
+            }) => {
+                assert_eq!(namespace, "MyProj");
+                assert_eq!(receipt_id, "rec-123");
+                assert!(force);
+            }
+            other => panic!("expected Action::Revert, got {:?}", other),
+        }
+
+        let log = Cli::try_parse_from([
+            "neurostrata-mcp",
+            "action",
+            "log",
+            "MyProj",
+            "--limit",
+            "25",
+        ])
+        .expect("action log parses");
+        match log.command {
+            Some(Commands::Action {
+                action:
+                    ActionCommands::Log {
+                        namespace,
+                        limit,
+                        ..
+                    },
+            }) => {
+                assert_eq!(namespace, "MyProj");
+                assert_eq!(limit, 25);
+            }
+            other => panic!("expected Action::Log, got {:?}", other),
+        }
     }
 
     /// Step 4's contract, both halves: with a daemon answering, stdout is that
@@ -5198,6 +5465,23 @@ async fn run() -> anyhow::Result<()> {
                             eprintln!("Set-metadata failed: {}", body);
                             std::process::exit(1);
                         }
+                        Commands::Action { action } => {
+                            let req_body = action_command_to_json(action)?;
+                            let res = daemon_http_client()
+                                .post(format!("http://{DAEMON_ADDR}/action"))
+                                .json(&req_body)
+                                .send()
+                                .await
+                                .map_err(|e| anyhow::anyhow!("action request failed: {e}"))?;
+                            let body = res.text().await.unwrap_or_default();
+                            println!("{}", body);
+                            let parsed: serde_json::Value =
+                                serde_json::from_str(&body).unwrap_or_default();
+                            if parsed.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+                                return Ok(());
+                            }
+                            std::process::exit(1);
+                        }
                         _ => {}
                     }
                     eprintln!("CRITICAL ERROR: The NeuroStrata daemon is currently running (likely via OpenCode) and holds the database lock.");
@@ -5304,6 +5588,23 @@ async fn run() -> anyhow::Result<()> {
                         let out =
                             crate::server::handle_graphql_query(&args, vector_store.clone()).await;
                         println!("{}", out);
+                    }
+                    Commands::Action { action } => {
+                        let embedder = build_embedder()?;
+                        bind_fallback_serving_descriptor(&vector_store, &embedder);
+                        let args = action_command_to_json(&action)?;
+                        let out = crate::server::handle_action(
+                            &args,
+                            embedder.clone(),
+                            vector_store.clone(),
+                        )
+                        .await;
+                        println!("{}", out);
+                        let parsed: serde_json::Value =
+                            serde_json::from_str(&out).unwrap_or_default();
+                        if parsed.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                            std::process::exit(1);
+                        }
                     }
                     Commands::Doctor { namespace } => {
                         run_doctor(&read, namespace.as_deref()).await?;

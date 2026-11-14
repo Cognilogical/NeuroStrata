@@ -1091,6 +1091,7 @@ pub(crate) async fn start_daemon_on(
         .route("/storage/status", get(handle_http_storage_status).post(handle_http_storage_status))
         .route("/learning/status", get(handle_http_learning_status))
         .route("/learning/control", post(handle_http_learning_control))
+        .route("/action", post(handle_http_action))
         .route("/shutdown", post(handle_shutdown))
         .with_state(state.clone())
         .layer(axum::middleware::from_fn_with_state(
@@ -2059,6 +2060,22 @@ async fn handle_http_storage_status(
     State(state): State<AppState>,
 ) -> impl axum::response::IntoResponse {
     let body = crate::server::handle_storage_status(state.vector_store.clone()).await;
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+}
+
+async fn handle_http_action(
+    State(state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> impl axum::response::IntoResponse {
+    let body = crate::server::handle_action(
+        &req,
+        state.embedder.clone(),
+        state.vector_store.clone(),
+    )
+    .await;
     (
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         body,
@@ -3865,6 +3882,144 @@ impl crate::traits::AsAny for RecordingStore {
             "the handler answers with the ingest progress: {}",
             out.0
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn daemon_action_route_matches_mcp_and_cli_parses_every_subcommand() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _credential_guard = credential_file_test_lock();
+        let root = scratch_root("daemon-action-parity");
+        std::fs::create_dir_all(&root).unwrap();
+        let db_dir = root.join("db");
+        let lb_store = Arc::new(
+            crate::store::LadybugStore::for_testing(&db_dir, 8).expect("open LadybugStore"),
+        );
+        std::env::set_var(PROJECT_ROOT_ENV, &root);
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap().to_string();
+        drop(probe);
+        let daemon = tokio::spawn(start_daemon_on(
+            addr.clone(),
+            Arc::new(StubEmbedder { dimensions: 8 }),
+            lb_store,
+            None,
+        ));
+        let base = format!("http://{addr}");
+        let bare = reqwest::Client::new();
+        wait_for_serving(&bare, &addr).await;
+        std::env::remove_var(PROJECT_ROOT_ENV);
+        let token_dir = token_config_dir();
+        let token = std::fs::read_to_string(token_dir.join("daemon.token")).unwrap();
+        let operator = std::fs::read_to_string(token_dir.join("operator.token")).unwrap();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token.trim())).unwrap(),
+        );
+        headers.insert(
+            "x-neurostrata-operator",
+            reqwest::header::HeaderValue::from_str(operator.trim()).unwrap(),
+        );
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .unwrap();
+
+        let def_payload = serde_json::json!({
+            "namespace": "daemon-act-ns",
+            "action": "define",
+            "definition": {
+                "slug": "daemon-create-fact",
+                "title": "Daemon Create Fact",
+                "description": "Creates a governed fact via POST /action",
+                "required_role": "editor",
+                "parameters": {
+                    "note": { "param_type": "string", "required": true }
+                },
+                "submission_criteria": [],
+                "effects": [
+                    {
+                        "op": "upsert_memory",
+                        "memory_type": "fact",
+                        "content_template": "Daemon note: {{note}}",
+                        "metadata_template": {}
+                    }
+                ]
+            }
+        });
+
+        let def_res = client
+            .post(format!("{base}/action"))
+            .json(&def_payload)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(def_res.status(), axum::http::StatusCode::OK);
+        let def_json: serde_json::Value = def_res.json().await.unwrap();
+        assert_eq!(def_json["ok"], serde_json::json!(true), "daemon define: {def_json}");
+        assert_eq!(def_json["defined"]["slug"], serde_json::json!("daemon-create-fact"));
+
+        let val_res = client
+            .post(format!("{base}/action"))
+            .json(&serde_json::json!({
+                "namespace": "daemon-act-ns",
+                "action": "validate",
+                "slug": "daemon-create-fact",
+                "params": { "note": "hello" }
+            }))
+            .send()
+            .await
+            .unwrap();
+        let val_json: serde_json::Value = val_res.json().await.unwrap();
+        assert_eq!(val_json["ok"], serde_json::json!(true));
+        assert_eq!(val_json["valid"], serde_json::json!(true));
+
+        let apply_res = client
+            .post(format!("{base}/action"))
+            .json(&serde_json::json!({
+                "namespace": "daemon-act-ns",
+                "action": "apply",
+                "slug": "daemon-create-fact",
+                "params": { "note": "hello" }
+            }))
+            .send()
+            .await
+            .unwrap();
+        let apply_json: serde_json::Value = apply_res.json().await.unwrap();
+        assert_eq!(apply_json["ok"], serde_json::json!(true), "daemon apply: {apply_json}");
+        let receipt_id = apply_json["applied"]["receipt_id"]
+            .as_str()
+            .expect("receipt_id")
+            .to_string();
+
+        let rev_res = client
+            .post(format!("{base}/action"))
+            .json(&serde_json::json!({
+                "namespace": "daemon-act-ns",
+                "action": "revert",
+                "receipt_id": receipt_id
+            }))
+            .send()
+            .await
+            .unwrap();
+        let rev_json: serde_json::Value = rev_res.json().await.unwrap();
+        assert_eq!(rev_json["ok"], serde_json::json!(true), "daemon revert: {rev_json}");
+
+        let log_res = client
+            .post(format!("{base}/action"))
+            .json(&serde_json::json!({
+                "namespace": "daemon-act-ns",
+                "action": "log",
+                "limit": 10
+            }))
+            .send()
+            .await
+            .unwrap();
+        let log_json: serde_json::Value = log_res.json().await.unwrap();
+        assert_eq!(log_json["ok"], serde_json::json!(true));
+        assert_eq!(log_json["entries"].as_array().unwrap().len(), 2);
+
+        stop_daemon(&client, &base, daemon).await;
     }
 }
 

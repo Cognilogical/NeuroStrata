@@ -979,6 +979,25 @@ pub async fn process_mcp_request(
                             },
                             "required": ["namespace"]
                         }
+                    },
+                    {
+                        "name": "neurostrata_action",
+                        "description": "Define, validate, apply, revert, or inspect kinetic Action Types and private action receipts.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "Project namespace." },
+                                "action": { "type": "string", "enum": ["define", "validate", "apply", "revert", "log"], "description": "Action operation to perform." },
+                                "definition": { "type": "object", "description": "ActionTypeDefinition JSON object (required when action is 'define')." },
+                                "slug": { "type": "string", "description": "ActionType slug (required when action is 'validate' or 'apply')." },
+                                "params": { "type": "object", "description": "Typed parameter map for 'validate' or 'apply'." },
+                                "receipt_id": { "type": "string", "description": "Receipt ID to revert (required when action is 'revert')." },
+                                "principal": { "type": "string", "description": "Optional requested principal (honored only for admin callers)." },
+                                "force": { "type": "boolean", "default": false, "description": "Force revert across newer target versions (requires owner/admin)." },
+                                "limit": { "type": "integer", "description": "Maximum log entries to return for 'log' (default 100, max 1000)." }
+                            },
+                            "required": ["namespace", "action"]
+                        }
                     }
                 ]
             });
@@ -1375,6 +1394,9 @@ pub async fn process_mcp_request(
                         }
                         "neurostrata_context_plan" => {
                             result_text = handle_context_plan(&arguments, emb.clone(), store.clone()).await;
+                        }
+                        "neurostrata_action" => {
+                            result_text = handle_action(&arguments, emb.clone(), store.clone()).await;
                         }
                         // SynapticMesh: the handler is a pure string-in/
                         // string-out dispatch (filesystem + git only; no
@@ -5825,6 +5847,250 @@ pub(crate) async fn handle_graphql_query(arguments: &Value, store: Arc<dyn Vecto
     serde_json::to_string(&resp).unwrap_or_else(|e| {
         serde_json::json!({"data":null,"errors":[{"message":e.to_string()}]}).to_string()
     })
+}
+
+pub(crate) async fn handle_action(
+    arguments: &Value,
+    emb: Arc<dyn crate::traits::Embedder>,
+    store: Arc<dyn VectorStore>,
+) -> String {
+    handle_action_with_auth(arguments, "admin", emb, store).await
+}
+
+pub(crate) async fn handle_action_with_auth(
+    arguments: &Value,
+    authenticated_principal: &str,
+    emb: Arc<dyn crate::traits::Embedder>,
+    store: Arc<dyn VectorStore>,
+) -> String {
+    let Some(ns_raw) = arguments
+        .get("namespace")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return serde_json::json!({"ok": false, "error": "namespace required"}).to_string();
+    };
+    let Some(op) = arguments
+        .get("action")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return serde_json::json!({"ok": false, "error": "action required"}).to_string();
+    };
+    let namespace = resolve_namespace(&store, ns_raw).await;
+    let Some(lb_store) =
+        crate::traits::VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::ladybug::LadybugStore>()
+    else {
+        return serde_json::json!({"ok": false, "error": "kinetic actions require LadybugStore backend"}).to_string();
+    };
+
+    let requested_principal = arguments
+        .get("principal")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let resolved_principal = crate::rebac::resolve_principal(
+        authenticated_principal,
+        requested_principal.as_deref(),
+    );
+    let security = crate::rdf::action::ActionSecurityContext {
+        authenticated_principal: authenticated_principal.to_string(),
+        requested_principal: Some(resolved_principal),
+    };
+
+    match op {
+        "define" => {
+            let Some(def_val) = arguments.get("definition") else {
+                return serde_json::json!({
+                    "ok": false,
+                    "action": "define",
+                    "error": "definition object required for action 'define'"
+                })
+                .to_string();
+            };
+            match crate::rdf::action::define_action(
+                lb_store,
+                &namespace,
+                &security,
+                def_val,
+                emb.as_ref(),
+            )
+            .await
+            {
+                Ok(defined) => serde_json::json!({
+                    "ok": true,
+                    "action": "define",
+                    "defined": defined,
+                })
+                .to_string(),
+                Err(e) => serde_json::json!({
+                    "ok": false,
+                    "action": "define",
+                    "error": e.to_string(),
+                })
+                .to_string(),
+            }
+        }
+        "validate" => {
+            let Some(slug) = arguments
+                .get("slug")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return serde_json::json!({
+                    "ok": false,
+                    "action": "validate",
+                    "error": "slug required for action 'validate'"
+                })
+                .to_string();
+            };
+            let params: std::collections::BTreeMap<String, Value> = arguments
+                .get("params")
+                .and_then(|v| v.as_object())
+                .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                .unwrap_or_default();
+            let invocation = crate::rdf::action::ActionInvocation {
+                namespace: namespace.clone(),
+                slug: slug.to_string(),
+                security,
+                params,
+            };
+            match crate::rdf::action::validate_action(lb_store, &invocation).await {
+                Ok(report) => serde_json::json!({
+                    "ok": report.valid,
+                    "action": "validate",
+                    "valid": report.valid,
+                    "action_slug": report.action_slug,
+                    "effective_principal": report.effective_principal,
+                    "failures": report.failures,
+                })
+                .to_string(),
+                Err(e) => serde_json::json!({
+                    "ok": false,
+                    "action": "validate",
+                    "error": e.to_string(),
+                })
+                .to_string(),
+            }
+        }
+        "apply" => {
+            let Some(slug) = arguments
+                .get("slug")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return serde_json::json!({
+                    "ok": false,
+                    "action": "apply",
+                    "error": "slug required for action 'apply'"
+                })
+                .to_string();
+            };
+            let params: std::collections::BTreeMap<String, Value> = arguments
+                .get("params")
+                .and_then(|v| v.as_object())
+                .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                .unwrap_or_default();
+            let invocation = crate::rdf::action::ActionInvocation {
+                namespace: namespace.clone(),
+                slug: slug.to_string(),
+                security,
+                params,
+            };
+            match crate::rdf::action::apply_action(lb_store, &invocation, emb.as_ref()).await {
+                Ok(crate::rdf::action::ActionApplyOutcome::Applied { receipt_id, receipt }) => {
+                    serde_json::json!({
+                        "ok": true,
+                        "action": "apply",
+                        "outcome": "applied",
+                        "applied": {
+                            "receipt_id": receipt_id,
+                            "receipt": receipt,
+                        }
+                    })
+                    .to_string()
+                }
+                Ok(crate::rdf::action::ActionApplyOutcome::Rejected { failures }) => {
+                    serde_json::json!({
+                        "ok": false,
+                        "action": "apply",
+                        "outcome": "rejected",
+                        "submission_failures": failures,
+                    })
+                    .to_string()
+                }
+                Err(e) => serde_json::json!({
+                    "ok": false,
+                    "action": "apply",
+                    "error": e.to_string(),
+                })
+                .to_string(),
+            }
+        }
+        "revert" => {
+            let Some(receipt_id) = arguments
+                .get("receipt_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return serde_json::json!({
+                    "ok": false,
+                    "action": "revert",
+                    "error": "receipt_id required for action 'revert'"
+                })
+                .to_string();
+            };
+            let force = arguments
+                .get("force")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let revert_inv = crate::rdf::action::RevertInvocation {
+                namespace: namespace.clone(),
+                receipt_id: receipt_id.to_string(),
+                security,
+                force,
+            };
+            match crate::rdf::action::revert_action(lb_store, &revert_inv, emb.as_ref()).await {
+                Ok(reverted) => serde_json::json!({
+                    "ok": true,
+                    "action": "revert",
+                    "reverted": reverted,
+                })
+                .to_string(),
+                Err(e) => serde_json::json!({
+                    "ok": false,
+                    "action": "revert",
+                    "error": e.to_string(),
+                })
+                .to_string(),
+            }
+        }
+        "log" => {
+            let limit = arguments
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+                .unwrap_or(crate::rdf::action::DEFAULT_ACTION_LOG_LIMIT);
+            match crate::rdf::action::action_log(lb_store, &namespace, &security, limit).await {
+                Ok(entries) => serde_json::json!({
+                    "ok": true,
+                    "action": "log",
+                    "entries": entries,
+                })
+                .to_string(),
+                Err(e) => serde_json::json!({
+                    "ok": false,
+                    "action": "log",
+                    "error": e.to_string(),
+                })
+                .to_string(),
+            }
+        }
+        other => serde_json::json!({
+            "ok": false,
+            "error": format!("unknown action operation '{other}' (expected define|validate|apply|revert|log)")
+        })
+        .to_string(),
+    }
 }
 
 pub(crate) async fn handle_metrics_query(arguments: &Value, store: Arc<dyn VectorStore>) -> String {
@@ -12640,6 +12906,7 @@ mod tests {
                 "neurostrata_chat_ask",
                 "neurostrata_export_wasm_snapshot",
                 "neurostrata_context_plan",
+                "neurostrata_action",
                 // SynapticMesh: appended by `tools.extend(synaptic_mesh_tool
                 // _definitions())` — this order IS the append order, so it
                 // pins where the mesh module's list enters the surface.
@@ -14904,6 +15171,484 @@ async fn process_mcp_request_injects_and_drains_neuromesh_delta_notices() {
     assert!(
         !text3.contains("[NeuroMesh Δ"),
         "drained notice must not repeat on subsequent call: {text3}"
+    );
+}
+
+#[tokio::test]
+async fn tool_list_and_mcp_dispatch_expose_all_five_action_operations() {
+    let ns = format!("ns-mcp-act-{}", uuid::Uuid::new_v4());
+    let (store, _) = store_with_one_rule(&ns).await;
+    let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+    let (bus, _) = recording_bus();
+
+    // 1. tools/list exposes neurostrata_action with all 5 action enum values
+    let list_req = JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(serde_json::json!(1)),
+        method: "tools/list".to_string(),
+        params: Some(serde_json::json!({})),
+    };
+    let list_resp = process_mcp_request(
+        list_req,
+        Arc::new(StubEmbedder),
+        store.clone(),
+        ingests.clone(),
+        None,
+        bus.clone(),
+    )
+    .await;
+    let tools = list_resp["result"]["tools"].as_array().expect("tools array");
+    let action_tool = tools
+        .iter()
+        .find(|t| t["name"] == "neurostrata_action")
+        .expect("neurostrata_action must be in tools/list");
+    let enum_vals = action_tool["inputSchema"]["properties"]["action"]["enum"]
+        .as_array()
+        .expect("action enum");
+    assert_eq!(
+        enum_vals,
+        &vec![
+            serde_json::json!("define"),
+            serde_json::json!("validate"),
+            serde_json::json!("apply"),
+            serde_json::json!("revert"),
+            serde_json::json!("log"),
+        ]
+    );
+
+    // Seed a digital twin target for the action
+    store
+        .upsert(
+            &ns,
+            "twin-loop-a",
+            vec![0.1, 0.2, 0.3, 0.4],
+            MemoryPayload {
+                content: "Digital twin loop-a v1".to_string(),
+                user_id: "alice".to_string(),
+                memory_type: "digital_twin".to_string(),
+                agent_name: None,
+                location: String::new(),
+                location_lines: String::new(),
+                metadata: serde_json::json!({
+                    "valid_from": 1700000000,
+                    "twin": {
+                        "id": "loop-a",
+                        "version": 1,
+                        "schema_id": "cooling-loop",
+                        "variables": { "temperature": 65.0 }
+                    }
+                }),
+            },
+        )
+        .await
+        .unwrap();
+
+    // 2. Dispatch "define"
+    let def_req = JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(serde_json::json!(2)),
+        method: "tools/call".to_string(),
+        params: Some(serde_json::json!({
+            "name": "neurostrata_action",
+            "arguments": {
+                "namespace": ns,
+                "action": "define",
+                "definition": {
+                    "slug": "recalibrate-cooling-loop",
+                    "title": "Recalibrate Cooling Loop",
+                    "description": "Adjust loop temperature",
+                    "required_role": "editor",
+                    "parameters": {
+                        "twin_id": { "param_type": "twin_id", "required": true },
+                        "target_temp": { "param_type": "f64", "required": true, "min": 10.0, "max": 90.0 }
+                    },
+                    "submission_criteria": [
+                        {
+                            "kind": "twin_var_precondition",
+                            "twin_param": "twin_id",
+                            "variable": "temperature",
+                            "min": 0.0,
+                            "max": 100.0
+                        }
+                    ],
+                    "effects": [
+                        {
+                            "op": "set_twin_state",
+                            "twin_param": "twin_id",
+                            "merge": true,
+                            "variables_from_params": { "temperature": "target_temp" }
+                        }
+                    ]
+                }
+            }
+        })),
+    };
+    let def_resp = process_mcp_request(
+        def_req,
+        Arc::new(StubEmbedder),
+        store.clone(),
+        ingests.clone(),
+        None,
+        bus.clone(),
+    )
+    .await;
+    let def_json: Value = serde_json::from_str(
+        def_resp["result"]["content"][0]["text"].as_str().unwrap(),
+    )
+    .expect("define returns JSON");
+    assert_eq!(def_json["ok"], serde_json::json!(true), "define failed: {def_json}");
+    assert_eq!(def_json["defined"]["slug"], serde_json::json!("recalibrate-cooling-loop"));
+
+    // 3. Dispatch "validate"
+    let val_req = JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(serde_json::json!(3)),
+        method: "tools/call".to_string(),
+        params: Some(serde_json::json!({
+            "name": "neurostrata_action",
+            "arguments": {
+                "namespace": ns,
+                "action": "validate",
+                "slug": "recalibrate-cooling-loop",
+                "params": { "twin_id": "loop-a", "target_temp": 42.5 }
+            }
+        })),
+    };
+    let val_resp = process_mcp_request(
+        val_req,
+        Arc::new(StubEmbedder),
+        store.clone(),
+        ingests.clone(),
+        None,
+        bus.clone(),
+    )
+    .await;
+    let val_json: Value = serde_json::from_str(
+        val_resp["result"]["content"][0]["text"].as_str().unwrap(),
+    )
+    .expect("validate returns JSON");
+    assert_eq!(val_json["ok"], serde_json::json!(true));
+    assert_eq!(val_json["valid"], serde_json::json!(true));
+
+    // 4. Dispatch "apply"
+    let apply_req = JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(serde_json::json!(4)),
+        method: "tools/call".to_string(),
+        params: Some(serde_json::json!({
+            "name": "neurostrata_action",
+            "arguments": {
+                "namespace": ns,
+                "action": "apply",
+                "slug": "recalibrate-cooling-loop",
+                "params": { "twin_id": "loop-a", "target_temp": 42.5 }
+            }
+        })),
+    };
+    let apply_resp = process_mcp_request(
+        apply_req,
+        Arc::new(StubEmbedder),
+        store.clone(),
+        ingests.clone(),
+        None,
+        bus.clone(),
+    )
+    .await;
+    let apply_json: Value = serde_json::from_str(
+        apply_resp["result"]["content"][0]["text"].as_str().unwrap(),
+    )
+    .expect("apply returns JSON");
+    assert_eq!(apply_json["ok"], serde_json::json!(true), "apply failed: {apply_json}");
+    let receipt_id = apply_json["applied"]["receipt_id"]
+        .as_str()
+        .expect("receipt_id")
+        .to_string();
+
+    // 5. Dispatch "revert"
+    let rev_req = JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(serde_json::json!(5)),
+        method: "tools/call".to_string(),
+        params: Some(serde_json::json!({
+            "name": "neurostrata_action",
+            "arguments": {
+                "namespace": ns,
+                "action": "revert",
+                "receipt_id": receipt_id
+            }
+        })),
+    };
+    let rev_resp = process_mcp_request(
+        rev_req,
+        Arc::new(StubEmbedder),
+        store.clone(),
+        ingests.clone(),
+        None,
+        bus.clone(),
+    )
+    .await;
+    let rev_json: Value = serde_json::from_str(
+        rev_resp["result"]["content"][0]["text"].as_str().unwrap(),
+    )
+    .expect("revert returns JSON");
+    assert_eq!(rev_json["ok"], serde_json::json!(true), "revert failed: {rev_json}");
+
+    // 6. Dispatch "log"
+    let log_req = JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(serde_json::json!(6)),
+        method: "tools/call".to_string(),
+        params: Some(serde_json::json!({
+            "name": "neurostrata_action",
+            "arguments": {
+                "namespace": ns,
+                "action": "log",
+                "limit": 10
+            }
+        })),
+    };
+    let log_resp = process_mcp_request(
+        log_req,
+        Arc::new(StubEmbedder),
+        store,
+        ingests,
+        None,
+        bus,
+    )
+    .await;
+    let log_json: Value = serde_json::from_str(
+        log_resp["result"]["content"][0]["text"].as_str().unwrap(),
+    )
+    .expect("log returns JSON");
+    assert_eq!(log_json["ok"], serde_json::json!(true));
+    assert_eq!(log_json["entries"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn define_is_strict_about_schema_and_duplicate_active_slug() {
+    let ns = format!("ns-def-strict-{}", uuid::Uuid::new_v4());
+    let (store, _) = store_with_one_rule(&ns).await;
+    let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+
+    let count_before = store.list(&ns, None, None).await.unwrap().len();
+
+    // 1. Malformed definition (invalid role + empty effects) is strictly rejected with zero writes
+    let bad_out = handle_action(
+        &serde_json::json!({
+            "namespace": ns,
+            "action": "define",
+            "definition": {
+                "slug": "Invalid_Slug",
+                "title": "Bad",
+                "description": "Bad",
+                "required_role": "superadmin",
+                "parameters": {},
+                "submission_criteria": [],
+                "effects": []
+            }
+        }),
+        emb.clone(),
+        store.clone(),
+    )
+    .await;
+    let bad_json: Value = serde_json::from_str(&bad_out).unwrap();
+    assert_eq!(bad_json["ok"], serde_json::json!(false));
+    assert_eq!(
+        store.list(&ns, None, None).await.unwrap().len(),
+        count_before,
+        "malformed define must not write any row"
+    );
+
+    // 2. Valid definition succeeds and compiles into OntologyIndex
+    let valid_def = serde_json::json!({
+        "slug": "strict-create-note",
+        "title": "Strict Create Note",
+        "description": "Creates a fact note",
+        "required_role": "editor",
+        "parameters": {
+            "msg": { "param_type": "string", "required": true }
+        },
+        "submission_criteria": [],
+        "effects": [
+            {
+                "op": "upsert_memory",
+                "memory_type": "fact",
+                "content_template": "Note: {{msg}}",
+                "metadata_template": {}
+            }
+        ]
+    });
+    let ok_out = handle_action(
+        &serde_json::json!({
+            "namespace": ns,
+            "action": "define",
+            "definition": valid_def.clone()
+        }),
+        emb.clone(),
+        store.clone(),
+    )
+    .await;
+    let ok_json: Value = serde_json::from_str(&ok_out).unwrap();
+    assert_eq!(ok_json["ok"], serde_json::json!(true), "valid define failed: {ok_json}");
+
+    // 3. Duplicate active slug is rejected without writing a second row
+    let count_after_first = store.list(&ns, None, None).await.unwrap().len();
+    let dup_out = handle_action(
+        &serde_json::json!({
+            "namespace": ns,
+            "action": "define",
+            "definition": valid_def
+        }),
+        emb,
+        store.clone(),
+    )
+    .await;
+    let dup_json: Value = serde_json::from_str(&dup_out).unwrap();
+    assert_eq!(dup_json["ok"], serde_json::json!(false));
+    assert!(
+        dup_json["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("strict-create-note"),
+        "duplicate slug error must name the slug: {dup_json}"
+    );
+    assert_eq!(
+        store.list(&ns, None, None).await.unwrap().len(),
+        count_after_first,
+        "duplicate active slug define must not write any row"
+    );
+}
+
+#[tokio::test]
+async fn surface_resolves_principal_before_service_and_never_echoes_secret_params() {
+    let ns = format!("ns-surf-sec-{}", uuid::Uuid::new_v4());
+    let (store, _) = store_with_one_rule(&ns).await;
+    let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+
+    // Seed a digital twin where bob is only a viewer and alice is owner
+    store
+        .upsert(
+            &ns,
+            "twin-sec-1",
+            vec![0.1, 0.2, 0.3, 0.4],
+            MemoryPayload {
+                content: "Digital twin sec-loop v1".to_string(),
+                user_id: "alice".to_string(),
+                memory_type: "digital_twin".to_string(),
+                agent_name: None,
+                location: String::new(),
+                location_lines: String::new(),
+                metadata: serde_json::json!({
+                    "valid_from": 1700000000,
+                    "visible_to": [{ "principal": "bob", "role": "viewer" }],
+                    "twin": {
+                        "id": "sec-loop",
+                        "version": 1,
+                        "schema_id": "cooling-loop",
+                        "variables": { "temperature": 65.0 }
+                    }
+                }),
+            },
+        )
+        .await
+        .unwrap();
+
+    // Define an action with a secret parameter and a float parameter with bounds
+    let _ = handle_action(
+        &serde_json::json!({
+            "namespace": ns,
+            "action": "define",
+            "definition": {
+                "slug": "secret-twin-tune",
+                "title": "Secret Twin Tune",
+                "description": "Tune twin with secret token",
+                "required_role": "editor",
+                "parameters": {
+                    "twin_id": { "param_type": "twin_id", "required": true },
+                    "api_secret": { "param_type": "string", "required": true },
+                    "temp": { "param_type": "f64", "required": true, "min": 20.0, "max": 80.0 }
+                },
+                "submission_criteria": [],
+                "effects": [
+                    {
+                        "op": "set_twin_state",
+                        "twin_param": "twin_id",
+                        "merge": true,
+                        "variables_from_params": { "temperature": "temp" }
+                    }
+                ]
+            }
+        }),
+        emb.clone(),
+        store.clone(),
+    )
+    .await;
+
+    let secret_val = "sk-topsecretvalue99999";
+
+    // 1. Non-admin authenticated caller ("bob") attempting to impersonate "admin" is resolved to "bob" and denied
+    let escalation_out = handle_action_with_auth(
+        &serde_json::json!({
+            "namespace": ns,
+            "action": "apply",
+            "slug": "secret-twin-tune",
+            "principal": "admin",
+            "params": {
+                "twin_id": "sec-loop",
+                "api_secret": secret_val,
+                "temp": 45.0
+            }
+        }),
+        "bob",
+        emb.clone(),
+        store.clone(),
+    )
+    .await;
+    assert!(
+        !escalation_out.contains(secret_val),
+        "rejected apply must never echo secret param value: {escalation_out}"
+    );
+    let escalation_json: Value = serde_json::from_str(&escalation_out).unwrap();
+    assert_eq!(escalation_json["ok"], serde_json::json!(false));
+    assert_eq!(
+        escalation_json["submission_failures"][0]["code"],
+        serde_json::json!("rebac_denied")
+    );
+
+    // 2. Authorized apply succeeds, and subsequent log output redacts params and never echoes secret_val
+    let apply_out = handle_action_with_auth(
+        &serde_json::json!({
+            "namespace": ns,
+            "action": "apply",
+            "slug": "secret-twin-tune",
+            "params": {
+                "twin_id": "sec-loop",
+                "api_secret": secret_val,
+                "temp": 45.0
+            }
+        }),
+        "alice",
+        emb.clone(),
+        store.clone(),
+    )
+    .await;
+    let apply_json: Value = serde_json::from_str(&apply_out).unwrap();
+    assert_eq!(apply_json["ok"], serde_json::json!(true));
+
+    let log_out = handle_action_with_auth(
+        &serde_json::json!({
+            "namespace": ns,
+            "action": "log",
+            "limit": 5
+        }),
+        "alice",
+        emb,
+        store,
+    )
+    .await;
+    assert!(
+        !log_out.contains(secret_val),
+        "action log must never echo secret parameter values: {log_out}"
     );
 }
 
