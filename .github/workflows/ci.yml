@@ -47,7 +47,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: Toolchain versions
         shell: bash
@@ -137,7 +137,7 @@ jobs:
       LBUG_VERSION: "0.22.3"
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: Toolchain versions
         shell: bash
@@ -203,7 +203,7 @@ jobs:
         os: [windows-latest, macos-15]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: Toolchain versions
         shell: bash
@@ -261,7 +261,7 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: Node version
         shell: bash
@@ -280,7 +280,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: Backup script tests
         shell: bash

@@ -31,7 +31,7 @@ jobs:
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
       - name: Checkout PR head (bootstrap; pin to base after merge)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha || steps.resolve.outputs.sha }}
 
