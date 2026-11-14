@@ -989,10 +989,27 @@ mod tests {
 
     #[test]
     fn status_json_exposes_profile_enabled_growth_supported_and_role() {
-        let s = status_json_for(sample(), false);
-        assert!(s["profile_enabled"].is_boolean());
-        assert_eq!(s["growth_supported"], s["rss_available"]);
+        // Held for the whole body: the `profile_enabled` expectation is
+        // read from the same process-wide env other tests toggle under
+        // this lock, so an unlocked read could race a toggle.
+        let _env = PROFILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Each key is pinned against an independent expectation, not
+        // against another key: `rss_available` and `growth_supported`
+        // are both derived from `rss_bytes`, so asserting them equal to
+        // each other would pass even if both were wired to the wrong
+        // field. The samples below deliberately split rss from peak so
+        // a wiring to `peak_bytes` fails in both directions.
+        let with_rss = Sample { rss_bytes: Some(100 * MB), peak_bytes: None };
+        let s = status_json_for(with_rss, false);
+        assert_eq!(s["rss_available"], serde_json::json!(true));
+        assert_eq!(s["growth_supported"], serde_json::json!(true));
+        assert_eq!(s["profile_enabled"], serde_json::json!(profile_enabled()));
         assert_eq!(s["role"], "cli");
+        let without_rss = Sample { rss_bytes: None, peak_bytes: Some(100 * MB) };
+        let s = status_json_for(without_rss, false);
+        assert_eq!(s["rss_available"], serde_json::json!(false));
+        assert_eq!(s["growth_supported"], serde_json::json!(false));
+        assert_eq!(s["profile_enabled"], serde_json::json!(profile_enabled()));
         assert_eq!(status_json_for(sample(), true)["role"], "daemon");
         let live = status_json();
         assert!(matches!(live["role"].as_str(), Some("cli" | "daemon")));
