@@ -10,9 +10,12 @@ one named below.
 increment is one store write turn, so concurrent firings serialize and no
 update is lost (`concurrent_hit_counts_are_not_lost`).
 
-- A failed increment is logged and does not change the verdict: the guard's job
-  is the pass/reject decision, and a bookkeeping write failure must not turn a
-  pass into a rejection (or vice versa).
+- A failed increment is reported through `tracing::warn!` and does not change
+  the verdict: this binary installs no tracing subscriber (the same
+  disclosure made below for the RSS knob), so the warning is discarded and in
+  practice the failure is not recorded anywhere. The guard's job is the
+  pass/reject decision, and a bookkeeping write failure must not turn a pass
+  into a rejection (or vice versa).
 - The count answers "how often did this rule fire", not "how often did this
   rule decide the outcome". Several rules can fire on one action; the first
   deterministic reject decides.
