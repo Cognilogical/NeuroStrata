@@ -24735,7 +24735,7 @@ impl LadybugStore {
             .map_err(|e| ActionError::Storage(e.to_string()))?;
 
         let first_write_flip = self.first_write_flip();
-        let now_ts = chrono::Utc::now().timestamp();
+        let now_ts = crate::rdf::action::current_action_timestamp();
         let ontology = self.get_ontology(&ns);
 
         let mut lexical_docs = Vec::with_capacity(batch.writes.len());
