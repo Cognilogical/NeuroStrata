@@ -28,7 +28,7 @@ Contributors (human and AI agents) dogfood NeuroStrata on itself (see [`AGENTS.m
 Follow strict **Red → Green → Refactor** (`test-driven-development` and `verification-before-completion` skills).
 
 - **Rust Binary Crate (`neurostrata-mcp`)**: Build with `scripts/build.sh` (CMake 3.15+ and C++20 `<format>` requirements). Run tests with `cargo test --bin neurostrata-mcp <filter>`.
-- **Embedded Harness Plugins (`plugins/*`)**: `src/task/harness_plugins.rs` embeds `plugins/*/dist/index.js` via `include_str!`. Rebuild `dist/index.js` bundles (`npm run build`) and run `node --test plugins/core/test.mjs` when adapters change.
+- **Embedded Harness Plugins (`plugins/*`)**: `src/task/harness_plugins.rs` embeds `plugins/*/dist/index.js` via `include_str!`. Rebuild `dist/index.js` bundles (`npm run build`) and run both `node --test plugins/core/test.mjs` and the affected adapter test suites (`node --test plugins/<adapter>/test.mjs`, e.g. `plugins/{opencode,claude,codex,github-cli}/test.mjs`) when adapters change.
 - **Lean 4 Formal Verification (`proofs/` & `src/formal_kernel.rs`)**: `src/formal_kernel.rs` is formally verified in Lean 4 (`proofs/NeuroStrata/*.lean`) with zero `sorry` and zero custom `axiom` declarations, enforced by `tests/lean_parity_test.rs` and `scripts/task-coverage-gate.sh`. Any edit to `src/formal_kernel.rs` must update `proofs/` and `tests/lean_parity_test.rs` in the same commit.
 - **Shell Backup & Hook Scripts (`scripts/`)**: Run `bash scripts/test-backup.sh` when modifying `scripts/backup.sh` and `bash scripts/task-coverage-gate.sh` before pushing.
 
@@ -36,7 +36,7 @@ Follow strict **Red → Green → Refactor** (`test-driven-development` and `ver
 
 - **Containers**: Always use `podman` and `podman-compose` (rootless, `--network=none` for sandbox validation). Never use `docker`.
 - **Data Formats**: Prefer strict JSON and JSON Schema over YAML or TOML for configuration and wire payloads.
-- **Database & Daemon Safety**: LadybugDB is a shared local store; never run destructive drop/delete operations against the live database directory, and never let tests touch `~/.config/neurostrata/daemon.token` (tests use `NEUROSTRATA_TOKEN_DIR` or process-scoped temp directories).
+- **Database & Daemon Safety**: LadybugDB is a shared local store; never run destructive drop/delete operations against the live database directory, and never let tests clobber a live `~/.config/neurostrata/daemon.token` (tests must either use an isolated temp config/token path or serialize access with a mutex guard that snapshots and restores any pre-existing `daemon.token`).
 - **Pull Request Workflow**: Keep PRs focused, link the governing issue (`Closes #...`), include contract specs/plans under `docs/superpowers/` when applicable, and ensure CI (`ci.yml`) and pre-push gates pass cleanly.
 
 ## 5. Contributing Guide
