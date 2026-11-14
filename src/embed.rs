@@ -716,10 +716,12 @@ mod tests {
         );
     }
 
-    /// Constructor guard (#164): pins both the provider helper's
-    /// `.with_arena_allocator(false)` call and `FastEmbedder::new`'s
-    /// `init.with_execution_providers(providers)` wiring so neither flipping
-    /// the boolean nor deleting the constructor hook can pass unnoticed.
+    /// Constructor guard (#164): pins the provider helper's arena-off
+    /// setting and the constructor's wiring of the computed provider list
+    /// into the embedding options, so neither flipping the boolean nor
+    /// deleting the constructor hook can pass unnoticed. The wiring
+    /// needles are assembled with `format!` so they do not appear
+    /// verbatim in this test's own source.
     #[test]
     fn the_constructor_disables_the_cpu_arena() {
         let src = include_str!("embed.rs");
@@ -735,12 +737,16 @@ mod tests {
         let ctor_body = src
             .split("let disable_arena =")
             .nth(1)
-            .and_then(|s| s.split("TextEmbedding::try_new(init)").next())
+            .and_then(|s| {
+                s.split("TextEmbedding::try_new(init.with_show_download_progress(true))")
+                    .next()
+            })
             .expect("FastEmbedder::new arena wiring present");
+        let call_needle = format!("arena_execution_providers({})", "disable_arena");
+        let wiring_needle = format!("init.with_execution_providers({})", "providers");
         assert!(
-            ctor_body.contains("arena_execution_providers(disable_arena)")
-                && ctor_body.contains("init.with_execution_providers(providers)"),
-            "FastEmbedder::new must wire arena_execution_providers(disable_arena) into init"
+            ctor_body.contains(&call_needle) && ctor_body.contains(&wiring_needle),
+            "FastEmbedder::new must wire the arena provider decision into the embedding options"
         );
     }
 
