@@ -30,6 +30,7 @@ fn hit(
         explanation: String::new(),
         metadata,
         conceptual_bridges: Vec::new(),
+        linked_files: 0,
     }
 }
 
@@ -107,18 +108,18 @@ fn rank_hits_orders_by_kind_then_type_then_access_count() {
 }
 
 #[test]
-fn rank_hits_breaks_ties_by_access_count_descending() {
+fn rank_hits_breaks_related_ties_by_access_count_descending() {
     let mut hits = vec![
         hit(
             "a",
-            GraphMatchKind::ExactFile,
+            GraphMatchKind::Related,
             "rule",
             1,
             json!({ "enforcement": "ENFORCED" }),
         ),
         hit(
             "b",
-            GraphMatchKind::ExactFile,
+            GraphMatchKind::Related,
             "rule",
             99,
             json!({ "enforcement": "ENFORCED" }),
@@ -127,6 +128,29 @@ fn rank_hits_breaks_ties_by_access_count_descending() {
     rank_hits(&mut hits);
     assert_eq!(hits[0].id, "b");
     assert_eq!(hits[1].id, "a");
+}
+
+#[test]
+fn rank_hits_puts_the_newest_direct_match_first() {
+    let mut hits = vec![
+        hit(
+            "older",
+            GraphMatchKind::ExactFile,
+            "rule",
+            99,
+            json!({ "valid_from": 1_700_000_000 }),
+        ),
+        hit(
+            "newer",
+            GraphMatchKind::ExactFile,
+            "rule",
+            0,
+            json!({ "valid_from": 1_800_000_000 }),
+        ),
+    ];
+    rank_hits(&mut hits);
+    let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+    assert_eq!(ids, vec!["newer", "older"]);
 }
 
 #[test]
