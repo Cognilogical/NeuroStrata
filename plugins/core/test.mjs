@@ -644,12 +644,19 @@ describe("extractRepoFilePaths", () => {
     assert.deepEqual(out, ["src/store/ladybug.rs", "plugins/core/index.ts", ".github/workflows/ci.yml"]);
   });
 
-  it("adversarial ReDoS input completes in < 50 ms and returns []", () => {
-    const start = performance.now();
-    const out = extractRepoFilePaths("a/".repeat(25000) + "!");
-    const elapsed = performance.now() - start;
-    assert.deepEqual(out, []);
-    assert.ok(elapsed < 50, `extractRepoFilePaths took ${elapsed}ms on adversarial input, expected < 50ms`);
+  it("adversarial ReDoS input completes in bounded time and returns []", () => {
+    // Best of several runs: the first call on a cold runner pays JIT and GC
+    // and has been measured at ~55 ms, while the guard against catastrophic
+    // backtracking is about seconds-to-minutes, not tens of milliseconds.
+    const input = "a/".repeat(25000) + "!";
+    let best = Number.POSITIVE_INFINITY;
+    for (let i = 0; i < 5; i += 1) {
+      const start = performance.now();
+      const out = extractRepoFilePaths(input);
+      best = Math.min(best, performance.now() - start);
+      assert.deepEqual(out, []);
+    }
+    assert.ok(best < 50, `extractRepoFilePaths best of 5 was ${best}ms on adversarial input, expected < 50ms`);
   });
 
   it("extracts generic file extensions (.ttl, .lean, .jsonl, .cmake)", () => {
