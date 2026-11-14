@@ -12811,6 +12811,11 @@ mod tests {
             ),
         )
         .unwrap();
+        std::fs::write(
+            root.join(".git").join("worktrees").join("agent-1").join("commondir"),
+            "../..\n",
+        )
+        .unwrap();
         let other = base.join("other-repo");
         std::fs::create_dir_all(other.join(".git")).unwrap();
 

@@ -34,8 +34,9 @@
 //! matches locations exactly, and Windows volumes let a caller spell a file in
 //! any case. A relative path is never rewritten, case included.
 //!
-//! When the namespace has a registered root, a marker root that is neither
-//! inside it, around it, nor a linked worktree of it belongs to some other
+//! When the namespace has a registered root, a marker root that does not share
+//! its common git directory (the main checkout and its linked worktrees do; a
+//! clone or submodule nested inside it does not) belongs to some other
 //! repository: answering with that repository's relative path (`README.md`)
 //! would return this namespace's memories for another project's file, so the
 //! path is left as it was and matches nothing, as before.
@@ -288,32 +289,75 @@ fn with_disk_spelling(path: &str, root: &str, rel: String) -> String {
     relative_to(&file.to_string_lossy(), &root_c.to_string_lossy()).unwrap_or(rel)
 }
 
-/// Whether `worktree` is a linked git worktree of the repository at `root`:
-/// its `.git` is a file whose `gitdir:` points inside `root/.git`.
-pub fn is_linked_worktree_of(worktree: &str, root: &str) -> bool {
-    let dot_git = Path::new(worktree).join(".git");
-    if !dot_git.is_file() {
-        return false;
-    }
-    let Ok(text) = std::fs::read_to_string(&dot_git) else {
-        return false;
-    };
-    let Some(gitdir) = text
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("gitdir:"))
-        .map(str::trim)
-    else {
-        return false;
-    };
-    // `worktree.useRelativePaths` (git 2.48+) writes the gitdir relative to
-    // the worktree.
-    let gitdir = if is_absolute_lookup_path(gitdir) {
-        gitdir.to_string()
+/// `rel` read relative to `base` unless it is absolute already.
+fn joined(base: &Path, rel: &str) -> String {
+    if is_absolute_lookup_path(rel) {
+        rel.to_string()
     } else {
-        Path::new(worktree).join(gitdir).to_string_lossy().to_string()
+        base.join(rel).to_string_lossy().to_string()
+    }
+}
+
+/// The common git directory of the checkout at `checkout`, the one every
+/// linked worktree of a repository shares. A `.git` directory is its own. A
+/// `.git` FILE names its gitdir (`worktree.useRelativePaths`, git 2.48+, writes
+/// it relative to the checkout); a linked worktree's gitdir holds a
+/// `commondir` file naming the shared directory, a submodule's does not, so a
+/// submodule is its own repository.
+fn common_git_dir(checkout: &str) -> Option<String> {
+    let dot_git = Path::new(checkout).join(".git");
+    if dot_git.is_dir() {
+        return Some(dot_git.to_string_lossy().to_string());
+    }
+    let text = std::fs::read_to_string(&dot_git).ok()?;
+    let gitdir = text.lines().find_map(|l| l.trim().strip_prefix("gitdir:"))?.trim();
+    let gitdir = joined(Path::new(checkout), gitdir);
+    match std::fs::read_to_string(Path::new(&gitdir).join("commondir")) {
+        Ok(common) => Some(joined(Path::new(&gitdir), common.trim())),
+        Err(_) => Some(gitdir),
+    }
+}
+
+/// Whether `a` and `b` name the same location: by spelling (`..` resolved,
+/// Windows case-insensitive), else by their canonical forms on this host.
+fn same_location(a: &str, b: &str) -> bool {
+    let lexical = |a: &str, b: &str| match (parse_absolute(a), parse_absolute(b)) {
+        (Some(a), Some(b)) => {
+            a.windows == b.windows
+                && same_component(a.windows, &a.root, &b.root)
+                && a.parts.len() == b.parts.len()
+                && a.parts.iter().zip(&b.parts).all(|(x, y)| same_component(a.windows, x, y))
+        }
+        _ => false,
     };
-    let root_git = format!("{}/.git", root.replace('\\', "/").trim_end_matches('/'));
-    relative_to_on_disk(&gitdir, &root_git).is_some()
+    if lexical(a, b) {
+        return true;
+    }
+    match (host_path(a).and_then(|p| canonical(&p)), host_path(b).and_then(|p| canonical(&p))) {
+        (Some(a), Some(b)) => lexical(&a.to_string_lossy(), &b.to_string_lossy()),
+        _ => false,
+    }
+}
+
+/// The checkout holding the registered `root`: `root` itself when it has a
+/// `.git`, else its nearest ancestor that does (a project registered below
+/// the repository root).
+fn checkout_of(root: &str) -> Option<String> {
+    if Path::new(root).join(".git").exists() {
+        Some(root.to_string())
+    } else {
+        marker_root(root)
+    }
+}
+
+/// Whether the checkouts at `a` and `b` belong to one repository: the main
+/// checkout and its linked worktrees share a common git directory. A nested
+/// independent clone or a submodule has its own, so it is another repository.
+pub fn same_repository(a: &str, b: &str) -> bool {
+    match (common_git_dir(a), common_git_dir(b)) {
+        (Some(a), Some(b)) => same_location(&a, &b),
+        _ => false,
+    }
 }
 
 fn depth(rel: &str) -> usize {
@@ -355,23 +399,36 @@ fn choose_root(
     if let Some(marker) = marker_root(raw) {
         if let Some(marker_rel) = relative_to(raw, &marker) {
             let by_marker = Some((marker.clone(), marker_rel.clone(), RootSource::Marker));
-            match (registry_root, &registry) {
-                (None, _) => return by_marker,
+            let Some(root) = registry_root else {
+                return by_marker;
+            };
+            let home = checkout_of(root);
+            let same_repo = home.as_deref().is_some_and(|h| same_repository(&marker, h));
+            match &registry {
                 // Both contain the file: the deeper root is the more specific
                 // one. A worktree inside the registered checkout is deeper; a
                 // project registered below the repository's `.git` is deeper.
-                (Some(_), Some((reg_root, reg_rel))) => {
-                    return if depth(reg_rel) < depth(&marker_rel) {
-                        Some((reg_root.clone(), reg_rel.clone(), RootSource::RegistryRoot))
-                    } else {
-                        by_marker
-                    };
+                Some((reg_root, reg_rel)) => {
+                    if depth(reg_rel) < depth(&marker_rel) {
+                        return Some((reg_root.clone(), reg_rel.clone(), RootSource::RegistryRoot));
+                    }
+                    if depth(reg_rel) == depth(&marker_rel) || same_repo {
+                        return by_marker;
+                    }
+                    // A clone or submodule nested in the registered checkout
+                    // is another repository: its `src/lib.rs` is not ours.
+                    return None;
                 }
-                // A worktree checked out beside the main checkout.
-                (Some(root), None) if is_linked_worktree_of(&marker, root) => return by_marker,
+                // Another checkout of the same repository: the main checkout
+                // or a sibling worktree, seen from a registered worktree.
+                None if same_repo
+                    && !home.as_deref().is_some_and(|h| same_location(&marker, h)) =>
+                {
+                    return by_marker;
+                }
                 // Another repository's file: answering with its relative path
                 // would hand back this namespace's memories for a stranger.
-                (Some(_), None) => {}
+                None => {}
             }
         }
     }
@@ -516,12 +573,21 @@ mod tests {
         let worktree = root.join(".claude").join("worktrees").join("agent-1");
         touch(&worktree.join("src").join("lib.rs"));
         let gitdir = root.join(".git").join("worktrees").join("agent-1");
+        link_worktree(&worktree, &gitdir);
+        (tmp, root, worktree)
+    }
+
+    /// What `git worktree add` writes: the checkout's `.git` file naming its
+    /// gitdir, and the gitdir's `commondir` pointing back at the shared `.git`.
+    fn link_worktree(worktree: &Path, gitdir: &Path) {
+        std::fs::create_dir_all(gitdir).unwrap();
+        std::fs::create_dir_all(worktree).unwrap();
         std::fs::write(
             worktree.join(".git"),
             format!("gitdir: {}\n", gitdir.to_string_lossy().replace('\\', "/")),
         )
         .unwrap();
-        (tmp, root, worktree)
+        std::fs::write(gitdir.join("commondir"), "../..\n").unwrap();
     }
 
     fn s(p: &Path) -> String {
@@ -556,12 +622,7 @@ mod tests {
         let (tmp, root, _) = project_with_worktree();
         let beside = canonical(tmp.path()).unwrap().join("example-project-wt");
         touch(&beside.join("src").join("lib.rs"));
-        std::fs::create_dir_all(root.join(".git").join("worktrees").join("wt")).unwrap();
-        std::fs::write(
-            beside.join(".git"),
-            format!("gitdir: {}\n", s(&root.join(".git").join("worktrees").join("wt"))),
-        )
-        .unwrap();
+        link_worktree(&beside, &root.join(".git").join("worktrees").join("wt"));
         let got = resolve_lookup_path(&s(&beside.join("src").join("lib.rs")), None, Some(&s(&root)));
         assert_eq!(got, LookupPath { path: "src/lib.rs".into(), source: RootSource::Marker });
     }
@@ -574,6 +635,52 @@ mod tests {
         let file = s(&other.join("src").join("lib.rs"));
         touch(Path::new(&file));
         let got = resolve_lookup_path(&file, None, Some(&s(&root)));
+        assert_eq!(got, LookupPath { path: file.clone(), source: RootSource::Outside });
+    }
+
+    #[test]
+    fn a_clone_or_submodule_nested_in_the_registered_checkout_is_another_repository() {
+        let (_tmp, root, worktree) = project_with_worktree();
+        // An independent clone with its own `.git` directory.
+        let clone = root.join("vendor").join("other");
+        std::fs::create_dir_all(clone.join(".git")).unwrap();
+        // A submodule: a `.git` file into `.git/modules/<name>`, which has no
+        // `commondir`, so it is not a linked worktree of the registered root.
+        let submodule = root.join("vendor").join("sub");
+        let modules = root.join(".git").join("modules").join("sub");
+        std::fs::create_dir_all(&modules).unwrap();
+        std::fs::create_dir_all(&submodule).unwrap();
+        std::fs::write(submodule.join(".git"), format!("gitdir: {}\n", s(&modules))).unwrap();
+        for dir in [&clone, &submodule] {
+            let file = s(&dir.join("src").join("lib.rs"));
+            touch(Path::new(&file));
+            let got = resolve_lookup_path(&file, None, Some(&s(&root)));
+            assert_eq!(got, LookupPath { path: file.clone(), source: RootSource::Outside });
+        }
+        // A linked worktree in the same place still resolves.
+        let got = resolve_lookup_path(&s(&worktree.join("src").join("lib.rs")), None, Some(&s(&root)));
+        assert_eq!(got, LookupPath { path: "src/lib.rs".into(), source: RootSource::Marker });
+    }
+
+    #[test]
+    fn a_registered_worktree_resolves_the_main_checkout_and_its_siblings() {
+        let (tmp, root, worktree) = project_with_worktree();
+        let sibling = canonical(tmp.path()).unwrap().join("example-project-wt");
+        touch(&sibling.join("src").join("lib.rs"));
+        link_worktree(&sibling, &root.join(".git").join("worktrees").join("wt"));
+        let registered = s(&worktree);
+        for checkout in [&root, &sibling] {
+            let got = resolve_lookup_path(&s(&checkout.join("src").join("lib.rs")), None, Some(&registered));
+            assert_eq!(got, LookupPath { path: "src/lib.rs".into(), source: RootSource::Marker });
+        }
+        // A submodule of the main checkout is still another repository.
+        let submodule = root.join("vendor").join("sub");
+        let modules = root.join(".git").join("modules").join("sub");
+        std::fs::create_dir_all(&modules).unwrap();
+        touch(&submodule.join("src").join("lib.rs"));
+        std::fs::write(submodule.join(".git"), format!("gitdir: {}\n", s(&modules))).unwrap();
+        let file = s(&submodule.join("src").join("lib.rs"));
+        let got = resolve_lookup_path(&file, None, Some(&registered));
         assert_eq!(got, LookupPath { path: file.clone(), source: RootSource::Outside });
     }
 
