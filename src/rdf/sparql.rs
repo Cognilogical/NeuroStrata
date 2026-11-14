@@ -401,134 +401,145 @@ pub async fn execute_sparql_query_with_config(
     // Prepare and evaluate with QueryEvaluator (custom functions registered);
     // federated SERVICE endpoints get the HTTP default handler with the
     // federation security model (allowlist + loopback/HTTPS validation).
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    let evaluator = if !service_endpoints.is_empty() {
-        let handler = crate::rdf::federation::HttpServiceHandler {
-            config: crate::rdf::federation::FederationConfig {
-                timeout_ms: config.timeout_ms,
-                max_solutions: config.max_solutions,
-                max_dataset_quads: config.max_dataset_quads,
-                ..Default::default()
-            },
-        };
-        evaluator_with_custom_functions_and_service(meta_arc.clone(), now, handler)
-    } else {
-        evaluator_with_custom_functions(meta_arc, now)
-    };
-
     // Timeout budget: the engine's cancellation token preempts a query that
     // runs past `timeout_ms` (between evaluation steps) instead of merely
     // reporting overrun afterwards. The flag records whether the budget was
     // actually consumed, so the caller can distinguish "timed out" from a
     // query that finished within budget.
     let cancel_token = spareval::CancellationToken::new();
-    let evaluator = evaluator.with_cancellation_token(cancel_token.clone());
     let timed_out_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let timeout_ms = config.timeout_ms;
     let timer_handle = tokio::spawn({
         let timed_out_flag = timed_out_flag.clone();
+        let cancel_token = cancel_token.clone();
         async move {
             tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)).await;
             timed_out_flag.store(true, std::sync::atomic::Ordering::SeqCst);
             cancel_token.cancel();
         }
     });
-    let mut prepared = evaluator.prepare(&query);
-    // Default-graph union semantics: a query over the default graph sees every
-    // projected quad regardless of which named graph it lives in. Quads are
-    // inserted once (in their named graph) by project_sparql_dataset_with_meta_async,
-    // and the union handles the default graph — no double insert.
-    prepared.dataset_mut().set_default_graph_as_union();
-    let results = match prepared.execute(&dataset) {
-        Ok(r) => r,
-        Err(e) => {
-            timer_handle.abort();
-            return Err(format!("SPARQL evaluation error: {}", e));
-        }
-    };
 
-    // Serialize results
-    let mut output = Vec::new();
-    let serializer = QueryResultsSerializer::from_format(format);
+    let cancel_token_for_blocking = cancel_token.clone();
+    let timed_out_flag_for_blocking = timed_out_flag.clone();
+    let eval_join = tokio::task::spawn_blocking(move || -> Result<(String, usize, bool, bool), String> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let evaluator = if !service_endpoints.is_empty() {
+            let handler = crate::rdf::federation::HttpServiceHandler {
+                config: crate::rdf::federation::FederationConfig {
+                    timeout_ms: config.timeout_ms,
+                    max_solutions: config.max_solutions,
+                    max_dataset_quads: config.max_dataset_quads,
+                    ..Default::default()
+                },
+            };
+            evaluator_with_custom_functions_and_service(meta_arc.clone(), now, handler)
+        } else {
+            evaluator_with_custom_functions(meta_arc, now)
+        };
+        let evaluator = evaluator.with_cancellation_token(cancel_token_for_blocking);
 
-    // Extract variables before take() (wrapper loses variables())
-    let results_vars: Vec<Variable> = match &results {
-        spareval::QueryResults::Solutions(sol_iter) => sol_iter.variables().to_vec(),
-        _ => Vec::new(),
-    };
+        // Default-graph union semantics: a query over the default graph sees every
+        // projected quad regardless of which named graph it lives in. Quads are
+        // inserted once (in their named graph) by project_sparql_dataset_with_meta_async,
+        // and the union handles the default graph — no double insert.
+        let mut prepared = evaluator.prepare(&query);
+        prepared.dataset_mut().set_default_graph_as_union();
+        let results = match prepared.execute(&dataset) {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(format!("SPARQL evaluation error: {}", e));
+            }
+        };
 
-    let mut solution_count: usize = 0;
-    let mut timed_out = false;
-    let mut truncated = false;
+        // Serialize results
+        let mut output = Vec::new();
+        let serializer = QueryResultsSerializer::from_format(format);
 
-    match results {
-        spareval::QueryResults::Boolean(b) => {
-            serializer
-                .serialize_boolean_to_writer(&mut output, b)
-                .map_err(|e| format!("serialize boolean: {}", e))?;
-        }
-        spareval::QueryResults::Solutions(solutions) => {
-            // Take one extra solution to detect truncation: a query returning
-            // exactly `max_solutions` rows must not be reported as truncated.
-            let mut collected: Vec<_> = Vec::new();
-            for item in solutions.take(config.max_solutions + 1) {
-                match item {
-                    Ok(sol) => collected.push(sol),
-                    Err(e) => {
-                        if timed_out_flag.load(std::sync::atomic::Ordering::SeqCst) {
-                            // Cancellation consumed the timeout budget mid-iteration.
-                            timed_out = true;
-                            break;
+        // Extract variables before take() (wrapper loses variables())
+        let results_vars: Vec<Variable> = match &results {
+            spareval::QueryResults::Solutions(sol_iter) => sol_iter.variables().to_vec(),
+            _ => Vec::new(),
+        };
+
+        let mut solution_count: usize = 0;
+        let mut timed_out = false;
+        let mut truncated = false;
+
+        match results {
+            spareval::QueryResults::Boolean(b) => {
+                serializer
+                    .serialize_boolean_to_writer(&mut output, b)
+                    .map_err(|e| format!("serialize boolean: {}", e))?;
+            }
+            spareval::QueryResults::Solutions(solutions) => {
+                // Take one extra solution to detect truncation: a query returning
+                // exactly `max_solutions` rows must not be reported as truncated.
+                let mut collected: Vec<_> = Vec::new();
+                for item in solutions.take(config.max_solutions + 1) {
+                    match item {
+                        Ok(sol) => collected.push(sol),
+                        Err(e) => {
+                            if timed_out_flag_for_blocking.load(std::sync::atomic::Ordering::SeqCst) {
+                                // Cancellation consumed the timeout budget mid-iteration.
+                                timed_out = true;
+                                break;
+                            }
+                            return Err(format!("evaluation error: {}", e));
                         }
-                        return Err(format!("evaluation error: {}", e));
                     }
                 }
-            }
 
-            truncated = collected.len() > config.max_solutions;
-            if truncated {
-                collected.truncate(config.max_solutions);
-            }
-
-            let mut serializer_solutions =
-                serializer
-                    .serialize_solutions_to_writer(&mut output, results_vars)
-                    .map_err(|e| format!("serialize solutions start: {}", e))?;
-            for sol in &collected {
-                serializer_solutions
-                    .serialize(sol)
-                    .map_err(|e| format!("serialize solution: {}", e))?;
-            }
-            solution_count = collected.len();
-            serializer_solutions.finish()
-                .map_err(|e| format!("serialize finish: {}", e))?;
-        }
-        spareval::QueryResults::Graph(triples) => {
-            // CONSTRUCT/DESCRIBE: serialize triples as N-Triples.
-            for triple in triples {
-                if timed_out_flag.load(std::sync::atomic::Ordering::SeqCst) {
-                    timed_out = true;
-                    break;
+                truncated = collected.len() > config.max_solutions;
+                if truncated {
+                    collected.truncate(config.max_solutions);
                 }
-                let t = triple.map_err(|e| format!("graph evaluation error: {}", e))?;
-                output.extend_from_slice(format!("{} .\n", t).as_bytes());
-                solution_count += 1;
+
+                let mut serializer_solutions =
+                    serializer
+                        .serialize_solutions_to_writer(&mut output, results_vars)
+                        .map_err(|e| format!("serialize solutions start: {}", e))?;
+                for sol in &collected {
+                    serializer_solutions
+                        .serialize(sol)
+                        .map_err(|e| format!("serialize solution: {}", e))?;
+                }
+                solution_count = collected.len();
+                serializer_solutions.finish()
+                    .map_err(|e| format!("serialize finish: {}", e))?;
+            }
+            spareval::QueryResults::Graph(triples) => {
+                // CONSTRUCT/DESCRIBE: serialize triples as N-Triples.
+                for triple in triples {
+                    if timed_out_flag_for_blocking.load(std::sync::atomic::Ordering::SeqCst) {
+                        timed_out = true;
+                        break;
+                    }
+                    let t = triple.map_err(|e| format!("graph evaluation error: {}", e))?;
+                    output.extend_from_slice(format!("{} .\n", t).as_bytes());
+                    solution_count += 1;
+                }
             }
         }
-    }
+
+        let results_string = String::from_utf8(output)
+            .map_err(|e| format!("UTF-8 error: {}", e))?;
+        let timed_out = timed_out || timed_out_flag_for_blocking.load(std::sync::atomic::Ordering::SeqCst);
+
+        Ok((results_string, solution_count, truncated, timed_out))
+    })
+    .await;
 
     // Evaluation finished: stop the timer so a completed query neither leaks
     // the sleep task nor races with the timed-out flag afterwards.
     timer_handle.abort();
 
-    let results_string = String::from_utf8(output)
-        .map_err(|e| format!("UTF-8 error: {}", e))?;
-    let timed_out = timed_out || timed_out_flag.load(std::sync::atomic::Ordering::SeqCst);
-
-    Ok((results_string, solution_count, truncated, timed_out))
+    match eval_join {
+        Ok(inner) => inner,
+        Err(e) => Err(format!("SPARQL evaluation task panicked: {e}")),
+    }
 }
 
 /// Global configuration for SPARQL execution, honoring optional environment
@@ -834,5 +845,45 @@ mod tests {
             gen2_quads + rule_quads,
             "each memory projects once; no duplication"
         );
+    }
+
+    #[tokio::test]
+    async fn test_execute_sparql_query_with_config_blocking_pool() {
+        use crate::traits::{MemoryPayload, VectorStore};
+        let tmp = std::env::temp_dir().join(format!("ns-sparql-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = crate::store::ladybug::LadybugStore::for_testing(&tmp, 4).expect("store");
+        store.init("test-sparql-cfg").await.unwrap();
+        let payload = MemoryPayload {
+            content: "SPARQL config projection fact".to_string(),
+            user_id: "u1".to_string(),
+            memory_type: "fact".to_string(),
+            agent_name: None,
+            location: "src/rdf/sparql.rs".to_string(),
+            location_lines: "1".to_string(),
+            metadata: serde_json::json!({"domain": "retrieval"}),
+        };
+        store
+            .upsert("test-sparql-cfg", "mem-1", vec![0.1, 0.2, 0.3, 0.4], payload)
+            .await
+            .unwrap();
+
+        let config = get_sparql_config();
+        let (serialized, count, truncated, timed_out) = execute_sparql_query_with_config(
+            &store,
+            "test-sparql-cfg",
+            "SELECT ?s ?p ?o WHERE { ?s ?p ?o }",
+            QueryResultsFormat::Json,
+            false,
+            false,
+            config,
+        )
+        .await
+        .expect("sparql query with config succeeds");
+        assert!(count > 0, "expected projected triples");
+        assert!(!truncated);
+        assert!(!timed_out);
+        assert!(serialized.contains("urn:neurostrata:memory:mem-1"));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
