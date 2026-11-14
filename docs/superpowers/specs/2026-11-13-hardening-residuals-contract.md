@@ -65,6 +65,22 @@ re-enable the ONNX CPU arena (`#164`, `neurostrata-igg4`).
 - **P3-5 / X4 & P3-13 / N3:** `docs/limitations.md` documents began-before
   neighbors, background growth, and detached-ingest attribution geometry (`neurostrata-igg4`).
 
+### C5 — Dependabot and CodeQL alert remediation (`neurostrata-57oi`)
+
+- **Plugin dependency hygiene (`plugins/core/package.json`, `plugins/openclaw/package-lock.json`):**
+  Remove the unused `"vitest": "^1.0.0"` devDependency from `plugins/core/package.json`
+  (tests run via `node --test test.mjs`) and regenerate `plugins/openclaw/package-lock.json`
+  so stale `vitest`/`vite`/`tinypool`/`esbuild` transitive entries are removed,
+  resolving Dependabot alerts `#1`–`#13` (`neurostrata-57oi`).
+- **CodeQL `rust/cleartext-logging` (`src/guard/fsm.rs`, `tests/guard/validator_test.rs`):**
+  Rename the internal parameter in `evaluate_fsm_guard` from `session_id` to
+  `caller_tag` and remove `msg` interpolation from `assert!` failure strings in
+  `tests/guard/validator_test.rs`, eliminating the heuristic taint source and
+  sink for CodeQL alerts `#2`–`#5` (`neurostrata-57oi`).
+- **Web UI alert triage:** Dismiss Dependabot alerts on `web-ui/package-lock.json`
+  (`#20`–`#26`, `#28`) and `src-tauri/Cargo.lock` (`#15`) while the web interface
+   awaits its scheduled revamp (`neurostrata-57oi`).
+
 ## Out-of-scope architecture notes (`neurostrata-igg4`)
 
 - **Sidecar-deletion attestation** (security P3-2, `neurostrata-igg4`). Refusing

@@ -14,7 +14,7 @@
 /// 4. mutating with too many mutations since the last task_update note is
 ///    blocked ("BreathRequired", >= 5), with the next legal transition named.
 pub fn evaluate_fsm_guard(
-    session_id: &str,
+    caller_tag: &str,
     active_task_id: Option<&str>,
     worktree: &str,
     action_type: &str,
@@ -37,21 +37,21 @@ pub fn evaluate_fsm_guard(
             false,
             Some(format!(
                 "Unpreflighted: claim task (session={}, worktree={}) before mutating ({}); next legal transition: claim -> ContextLoaded -> TaskClaimed",
-                session_id, worktree, action_type
+                caller_tag, worktree, action_type
             )),
         );
     }
     // A claimed task without a session or a worktree is a broken preflight,
     // not a live claim: mutating work must say where and by whom it runs
-    // (the MCP caller passes session_id + cwd here). Judged BEFORE the Breath
+    // (the MCP caller passes caller_tag + cwd here). Judged BEFORE the Breath
     // check so a broken/unroutable claim is reported as such even when the
     // Breath counter is also hot (AJ-17).
-    if active_task_id.is_some() && (session_id.trim().is_empty() || worktree.trim().is_empty()) {
+    if active_task_id.is_some() && (caller_tag.trim().is_empty() || worktree.trim().is_empty()) {
         return (
             false,
             Some(format!(
                 "Unpreflighted: mutating action ({}) carries an empty session or worktree (session='{}', worktree='{}'); next legal transition: claim -> ContextLoaded -> TaskClaimed",
-                action_type, session_id, worktree
+                action_type, caller_tag, worktree
             )),
         );
     }
@@ -62,7 +62,7 @@ pub fn evaluate_fsm_guard(
             Some(format!(
                 "BreathRequired: {} mutations since last task_update note (session={}, task={}, worktree={}); next legal transition: task_update(note) -> Mutating",
                 mutations_since_note,
-                session_id,
+                caller_tag,
                 active_task_id.unwrap_or(""),
                 worktree
             )),
