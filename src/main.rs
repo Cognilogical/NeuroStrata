@@ -277,6 +277,10 @@ enum Commands {
     Backup {
         /// Directory to write the backup into. Must not already exist
         dir: String,
+
+        /// Copy the database and WAL files directly without opening or checkpointing the store
+        #[arg(long)]
+        no_open: bool,
     },
 
     /// Report daemon and store state without touching anything
@@ -4339,10 +4343,11 @@ async fn run() -> anyhow::Result<()> {
                     }
                 }
             }
-            Commands::Backup { dir } => {
-                // The database is single-writer. When a daemon holds it, ask the
-                // daemon to do the work rather than fighting it for the lock.
-                if daemon_running {
+            Commands::Backup { dir, no_open } => {
+                // The database is single-writer. When a daemon holds it and
+                // `--no-open` was not requested, ask the daemon to do the work
+                // rather than fighting it for the lock.
+                if daemon_running && !no_open {
                     // /backup is destructive-class: bearer + operator (DR-5).
                     let res = daemon_operator_client()
                         .post("http://127.0.0.1:34343/backup")
@@ -4360,17 +4365,44 @@ async fn run() -> anyhow::Result<()> {
                 }
 
                 let config = Config::from_default_path()?;
-                if daemon_busy(probe, daemon_holds_lock(&config.db_path)) {
+                if !no_open && daemon_busy(probe, daemon_holds_lock(&config.db_path)) {
                     eprintln!("{}", DAEMON_BUSY_MESSAGE);
                     std::process::exit(1);
                 }
+                if no_open {
+                    LadybugStore::export_database_files(
+                        &config.db_path,
+                        std::path::Path::new(&dir),
+                    )?;
+                    println!("Backed up to {} (no-open file copy)", dir);
+                    return Ok(());
+                }
                 // The width opens the store; exporting never embeds anything.
-                let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
+                // If strict WAL verification refuses to open the store (#196),
+                // fall back to a no-open file-copy snapshot so the operator can
+                // still capture a verified backup before recovery.
+                match LadybugStore::new(
                     config.db_path.to_string_lossy().to_string(),
                     embed::configured_dimensions()?,
-                )?);
-                vector_store.export_database(&dir).await?;
-                println!("Backed up to {}", dir);
+                ) {
+                    Ok(store) => {
+                        let vector_store: Arc<dyn VectorStore> = Arc::new(store);
+                        vector_store.export_database(&dir).await?;
+                        println!("Backed up to {}", dir);
+                    }
+                    Err(e) if e.to_string().contains("Refusing to open:") => {
+                        eprintln!(
+                            "WARN: store open refused by strict WAL verification ({}); falling back to --no-open file-copy backup so the unrecovered store and WAL are captured intact.",
+                            e
+                        );
+                        LadybugStore::export_database_files(
+                            &config.db_path,
+                            std::path::Path::new(&dir),
+                        )?;
+                        println!("Backed up to {} (no-open file copy)", dir);
+                    }
+                    Err(e) => return Err(e),
+                }
                 return Ok(());
             }
             Commands::Restore { dir, into } => {
@@ -4959,6 +4991,40 @@ async fn run() -> anyhow::Result<()> {
                     return Ok(());
                 }
 
+                // `storage status` and `storage verify-snapshot` are path-only
+                // filesystem inspections (spec 2026-10-28-tdb2-storage-hygiene-design.md)
+                // and must run without opening `LadybugStore` so they remain
+                // available when strict WAL verification refuses an open or
+                // when a daemon holds the lock (#196).
+                if let Commands::Storage { action } = other {
+                    match action {
+                        StorageCommands::Status => {
+                            let out = crate::server::handle_storage_status_from_config();
+                            println!("{}", out);
+                        }
+                        StorageCommands::VerifySnapshot { dir } => {
+                            match crate::storage::verify_snapshot(std::path::Path::new(&dir)) {
+                                Ok(report) => {
+                                    if report.valid {
+                                        println!("Verified snapshot in {}: valid", dir);
+                                    } else {
+                                        eprintln!(
+                                            "Snapshot verification failed: {:?}",
+                                            report.error
+                                        );
+                                        std::process::exit(1);
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("Snapshot verification failed: {}", e);
+                                    std::process::exit(1);
+                                }
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+
                 if daemon_running {
                     // Read-only graph export is not a store mutation: it rides
                     // the daemon like backup does, instead of demanding a
@@ -5145,10 +5211,32 @@ async fn run() -> anyhow::Result<()> {
                     eprintln!("{}", DAEMON_BUSY_MESSAGE);
                     std::process::exit(1);
                 }
-                let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
+                let vector_store: Arc<dyn VectorStore> = match LadybugStore::new(
                     config.db_path.to_string_lossy().to_string(),
                     embed::configured_dimensions()?,
-                )?);
+                ) {
+                    Ok(store) => Arc::new(store),
+                    Err(e) => {
+                        if matches!(other, Commands::Doctor { .. }) {
+                            let status = crate::storage::compute_storage_status(
+                                &config.db_path,
+                                &config.storage_hygiene,
+                            );
+                            eprintln!(
+                                "Doctor: store at {:?} could not be opened: {}",
+                                config.db_path, e
+                            );
+                            eprintln!(
+                                "Storage diagnostics (no-open): store_bytes={}, wal_bytes={}, wal_recovery_artifact_count={}, wal_recovery_artifact_bytes={}",
+                                status.store_bytes,
+                                status.wal_bytes,
+                                status.wal_recovery_artifact_count,
+                                status.wal_recovery_artifact_bytes,
+                            );
+                        }
+                        return Err(e);
+                    }
+                };
                 let read = ReadSource::Direct(vector_store.clone());
 
                 // CLI fallback: hook hygiene against the CWD git root (daemon down).
@@ -5159,32 +5247,7 @@ async fn run() -> anyhow::Result<()> {
                 }
 
                 match other {
-                    Commands::Storage { action } => match action {
-                        StorageCommands::Status => {
-                            let out =
-                                crate::server::handle_storage_status(vector_store.clone()).await;
-                            println!("{}", out);
-                        }
-                        StorageCommands::VerifySnapshot { dir } => {
-                            match crate::storage::verify_snapshot(std::path::Path::new(&dir)) {
-                                Ok(report) => {
-                                    if report.valid {
-                                        println!("Verified snapshot in {}: valid", dir);
-                                    } else {
-                                        eprintln!(
-                                            "Snapshot verification failed: {:?}",
-                                            report.error
-                                        );
-                                        std::process::exit(1);
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("Snapshot verification failed: {}", e);
-                                    std::process::exit(1);
-                                }
-                            }
-                        }
-                    },
+                    Commands::Storage { .. } => unreachable!("handled before store open"),
                     Commands::Chat { action } => match action {
                         ChatCommands::Ask {
                             namespace,

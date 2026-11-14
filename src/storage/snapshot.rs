@@ -61,6 +61,119 @@ pub struct StorageStatus {
     /// degraded provenance. Defaults to `false`.
     #[serde(default)]
     pub opened_via_recovery: bool,
+    /// Which recovery arm opened the store (`checksum_config_mismatch`,
+    /// `unverified_wal_replay`, or `discarded_unreadable_wal`) when opened via
+    /// recovery (#194).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_provenance: Option<String>,
+    /// Number of preserved `.wal.unclean.*` / `.wal.corrupted.*` recovery
+    /// artifacts sitting beside the store (#195).
+    #[serde(default)]
+    pub wal_recovery_artifact_count: usize,
+    /// Total bytes across all preserved `.wal.unclean.*` / `.wal.corrupted.*`
+    /// recovery artifacts sitting beside the store (#195).
+    #[serde(default)]
+    pub wal_recovery_artifact_bytes: u64,
+}
+
+static RECOVERY_PROVENANCE_BY_PATH: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, String>>,
+> = std::sync::OnceLock::new();
+
+/// Record (or clear when `None`) the recovery provenance for `store_path` (#194).
+pub fn record_recovery_provenance(store_path: &Path, provenance: Option<&str>) {
+    let map = RECOVERY_PROVENANCE_BY_PATH
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    match provenance {
+        Some(kind) => {
+            guard.insert(store_path.to_path_buf(), kind.to_string());
+        }
+        None => {
+            guard.remove(store_path);
+        }
+    }
+}
+
+/// Look up any recorded recovery provenance for `store_path` (#194).
+pub fn recorded_recovery_provenance(store_path: &Path) -> Option<String> {
+    let map = RECOVERY_PROVENANCE_BY_PATH
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    guard.get(store_path).cloned()
+}
+
+/// Whether `candidate_name` is a WAL recovery artifact (`.wal.unclean.*`,
+/// `.wal.checkpoint.unclean.*`, or `.wal.corrupted.*`) belonging to
+/// `store_file_name` (#195).
+pub fn is_wal_recovery_artifact_name(store_file_name: &str, candidate_name: &str) -> bool {
+    if store_file_name.is_empty() {
+        return false;
+    }
+    let Some(rest) = candidate_name.strip_prefix(store_file_name) else {
+        return false;
+    };
+    rest.starts_with(".wal.unclean.")
+        || rest.starts_with(".wal.checkpoint.unclean.")
+        || rest.starts_with(".wal.corrupted.")
+        || rest.starts_with(".wal.checkpoint.corrupted.")
+}
+
+/// List regular WAL recovery artifact files (`path`, `bytes`, `mtime`) beside
+/// `store_path`, refusing symlinks and directories (#193, #195).
+pub fn list_wal_recovery_artifacts(
+    store_path: &Path,
+) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
+    let Some(store_name) = store_path.file_name().and_then(|n| n.to_str()) else {
+        return Vec::new();
+    };
+    let parent = store_path.parent().unwrap_or_else(|| Path::new("."));
+    let Ok(entries) = fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if !is_wal_recovery_artifact_name(store_name, name_str) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+            continue;
+        }
+        let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+        out.push((path, meta.len(), mtime));
+    }
+    out.sort_by(|a, b| {
+        b.2.cmp(&a.2).then_with(|| {
+            b.0.file_name()
+                .unwrap_or_default()
+                .cmp(a.0.file_name().unwrap_or_default())
+        })
+    });
+    out
+}
+
+/// Prune WAL recovery artifacts beside `store_path` beyond `keep` (clamped to
+/// at least 1), returning the removed paths (#195).
+pub fn prune_wal_recovery_artifacts(store_path: &Path, keep: usize) -> Vec<PathBuf> {
+    let keep = keep.max(1);
+    let artifacts = list_wal_recovery_artifacts(store_path);
+    let mut removed = Vec::new();
+    if artifacts.len() > keep {
+        for (path, _, _) in &artifacts[keep..] {
+            if fs::remove_file(path).is_ok() {
+                removed.push(path.clone());
+            }
+        }
+    }
+    removed
 }
 
 /// Duration of the most recent checkpoint, in milliseconds. Cross-task record
@@ -100,7 +213,15 @@ pub fn compute_storage_status(
     let mut wal_os = store_path.as_os_str().to_os_string();
     wal_os.push(".wal");
     let wal_path = PathBuf::from(wal_os);
-    let wal_bytes = fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+    let mut ckpt_wal_os = store_path.as_os_str().to_os_string();
+    ckpt_wal_os.push(".wal.checkpoint");
+    let ckpt_wal_path = PathBuf::from(ckpt_wal_os);
+    let wal_bytes = fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0)
+        + fs::metadata(&ckpt_wal_path).map(|m| m.len()).unwrap_or(0);
+    let wal_artifacts = list_wal_recovery_artifacts(store_path);
+    let wal_recovery_artifact_count = wal_artifacts.len();
+    let wal_recovery_artifact_bytes: u64 = wal_artifacts.iter().map(|(_, len, _)| *len).sum();
+    let recovery_provenance = recorded_recovery_provenance(store_path);
     let snapshot_dir = store_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -186,7 +307,10 @@ pub fn compute_storage_status(
         },
         checkpoint_failures: CHECKPOINT_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
         snapshot_export_dir: snapshot_dir.display().to_string(),
-        opened_via_recovery: false,
+        opened_via_recovery: recovery_provenance.is_some(),
+        recovery_provenance,
+        wal_recovery_artifact_count,
+        wal_recovery_artifact_bytes,
     }
 }
 

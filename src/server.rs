@@ -5710,6 +5710,24 @@ pub(crate) async fn handle_provenance_for(arguments: &Value, store: Arc<dyn Vect
     }
 }
 
+pub(crate) fn handle_storage_status_from_config() -> String {
+    let cfg = crate::config::Config::from_default_path();
+    if let Err(e) = &cfg {
+        tracing::warn!("Config::from_default_path failed in storage_status, using defaults: {e}");
+    }
+    let cfg = cfg.ok();
+    let hygiene_cfg = cfg
+        .as_ref()
+        .map(|c| c.storage_hygiene.clone())
+        .unwrap_or_default();
+    let db_path = cfg
+        .as_ref()
+        .map(|c| std::path::PathBuf::from(c.db_path.clone()))
+        .unwrap_or_else(|| std::path::PathBuf::from(".NeuroStrata/db"));
+    let status = crate::storage::compute_storage_status(&db_path, &hygiene_cfg);
+    crate::procmem::status_with_process_memory(&status)
+}
+
 pub(crate) async fn handle_storage_status(store: Arc<dyn VectorStore>) -> String {
     // One load backs both consumers (the hygiene config and the non-Ladybug
     // db_path fallback); a failure is warned once instead of once per branch.
@@ -5722,10 +5740,16 @@ pub(crate) async fn handle_storage_status(store: Arc<dyn VectorStore>) -> String
         .as_ref()
         .map(|c| c.storage_hygiene.clone())
         .unwrap_or_default();
+    let opened_via_recovery = store.opened_via_recovery();
     if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::LadybugStore>() {
         let status = crate::storage::compute_storage_status(ls.local_path(), &hygiene_cfg);
         let status = crate::storage::snapshot::StorageStatus {
-            opened_via_recovery: ls.opened_via_recovery(),
+            opened_via_recovery,
+            recovery_provenance: ls
+                .open_provenance()
+                .recovery_kind_slug()
+                .map(str::to_string)
+                .or(status.recovery_provenance),
             ..status
         };
         return crate::procmem::status_with_process_memory(&status);
@@ -5735,6 +5759,10 @@ pub(crate) async fn handle_storage_status(store: Arc<dyn VectorStore>) -> String
         .map(|c| std::path::PathBuf::from(c.db_path.clone()))
         .unwrap_or_else(|| std::path::PathBuf::from(".NeuroStrata/db"));
     let status = crate::storage::compute_storage_status(&db_path, &hygiene_cfg);
+    let status = crate::storage::snapshot::StorageStatus {
+        opened_via_recovery: opened_via_recovery || status.opened_via_recovery,
+        ..status
+    };
     crate::procmem::status_with_process_memory(&status)
 }
 
