@@ -2,7 +2,7 @@ import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { readFileSync, mkdirSync, writeFileSync, rmSync, mkdtempSync, existsSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, homedir } from "node:os";
 import { join, isAbsolute } from "node:path";
 import { execFileSync as execFileSyncTop } from "node:child_process";
 
@@ -127,6 +127,10 @@ import {
   postTurnCandidates,
   extractConceptualBridges,
   persistConceptualBridges,
+  DAEMON_MEMORY_ADVICE_MARKER,
+  resetAdvisoryStateForTesting,
+  extractDaemonMemoryAdvisory,
+  daemonTokenPath,
 } from "./dist/index.js";
 
 // ──────────────────────────────────────────────────────────────────────
@@ -2538,5 +2542,64 @@ describe("Task 1.1: execute.after V2 result mutation (via hook registration)", (
       server.close();
       resetClientForTesting();
     }
+  });
+});
+
+describe("daemonTokenPath honors NEUROSTRATA_TOKEN_DIR", () => {
+  it("uses env var when set and restores default when unset", () => {
+    const old = process.env.NEUROSTRATA_TOKEN_DIR;
+    process.env.NEUROSTRATA_TOKEN_DIR = "/tmp/custom-token-dir";
+    assert.equal(daemonTokenPath(), "/tmp/custom-token-dir");
+    delete process.env.NEUROSTRATA_TOKEN_DIR;
+    assert.equal(daemonTokenPath(), join(homedir(), ".config", "neurostrata", "daemon.token"));
+    if (old !== undefined) process.env.NEUROSTRATA_TOKEN_DIR = old;
+  });
+  it("trims whitespace", () => {
+    const old = process.env.NEUROSTRATA_TOKEN_DIR;
+    process.env.NEUROSTRATA_TOKEN_DIR = "   /tmp/custom-token-dir   ";
+    assert.equal(daemonTokenPath(), "/tmp/custom-token-dir");
+    if (old !== undefined) process.env.NEUROSTRATA_TOKEN_DIR = old;
+    else delete process.env.NEUROSTRATA_TOKEN_DIR;
+  });
+});
+
+describe("daemon memory advisory (#140)", () => {
+  beforeEach(() => {
+    resetAdvisoryStateForTesting();
+  });
+
+  it("extracts the advisory from an error channel carrying the marker and throttles repeats for 10 minutes", () => {
+    const text = `${DAEMON_MEMORY_ADVICE_MARKER} buffer pool exhausted; daemon RSS at 90%`;
+    const showAt = 1_000_000;
+    const first = extractDaemonMemoryAdvisory(text, showAt);
+    assert.notEqual(first, null, "a marked error channel yields the advisory");
+    assert.match(first, /DAEMON MEMORY ADVISORY/);
+    assert.match(first, /NEUROSTRATA_BUFFER_POOL_MB/);
+
+    const withinWindow = extractDaemonMemoryAdvisory(text, showAt + 9 * 60 * 1000);
+    assert.equal(withinWindow, null, "repeats inside the 10-minute window are throttled");
+
+    const afterWindow = extractDaemonMemoryAdvisory(text, showAt + 11 * 60 * 1000);
+    assert.notEqual(afterWindow, null, "after the window the advisory shows again");
+  });
+
+  it("ignores memory payload content without the marker", () => {
+    resetAdvisoryStateForTesting();
+    // Mentioning the knob, or the word buffer pool, is not the daemon's advisory.
+    assert.equal(extractDaemonMemoryAdvisory("NEUROSTRATA_BUFFER_POOL_MB is too small for my data", 5_000_000), null);
+    assert.equal(extractDaemonMemoryAdvisory("buffer pool pressure described in a memory", 6_000_000), null);
+    assert.equal(extractDaemonMemoryAdvisory(null), null);
+    assert.equal(extractDaemonMemoryAdvisory(undefined), null);
+    assert.equal(extractDaemonMemoryAdvisory(""), null);
+  });
+
+  it("resetAdvisoryStateForTesting clears a still-live throttle window", () => {
+    resetAdvisoryStateForTesting();
+    const text = `${DAEMON_MEMORY_ADVICE_MARKER} buffer pool exhausted`;
+    const first = extractDaemonMemoryAdvisory(text, 10_000_000);
+    assert.notEqual(first, null);
+    assert.equal(extractDaemonMemoryAdvisory(text, 10_000_001), null);
+    resetAdvisoryStateForTesting();
+    assert.notEqual(extractDaemonMemoryAdvisory(text, 10_000_002), null);
   });
 });
