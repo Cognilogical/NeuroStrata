@@ -160,6 +160,13 @@ pub struct ObjectViewResponse {
    - Match `ActionTypeDefinition`s (`undx`) from `OntologyIndex` whose target parameter accepts `row.memory_type`, `schema_id`, or any interface in `implemented_interfaces`, and check `authorized` + `preconditions_met`.
    - Record graph query via `crate::task::record_graph_query` (`src/server.rs:2033`).
 
+### 5.3 Formal Verification Alignment (`KineticAction.lean`, `ScenarioOverlay.lean`, `TwinInterface.lean`)
+
+`neurostrata_object_view` is a pure read-only composition over three formally verified state algebras in `src/formal_kernel.rs`:
+1. **Scenario CoW Visibility (`ScenarioOverlay.lean`):** When `scenario_id` is supplied, every hydrated section (`object`, `links`, `governance`, `twin_state`, `available_actions`) resolves row visibility via the proved `resolve_scenario_row` precedence rule (`staged_upsert` > `staged_retired` > `live_present`).
+2. **Digital Twin Interface & Reducer Evaluation (`TwinInterface.lean`):** When `twin_state` is present, interface bounds and derived reducers are evaluated via the total, division-by-zero-free `intersect_var_bounds` and `evaluate_reducer_total` kernel semantics.
+3. **Available Action Legal-Move Probing (`KineticAction.lean`):** Each candidate action's `authorized` and `preconditions_met` flags in `available_actions` follow the proved `evaluate_action_gate` conjunction (`principal_authorized ∧ params_valid ∧ sparql_ask_passed ∧ twin_bounds_passed ∧ post_shacl_passed`).
+
 ## 6. Risks & Mitigations
 
 | Risk | Mitigation |

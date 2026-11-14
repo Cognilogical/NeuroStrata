@@ -318,7 +318,51 @@ git add src/server.rs src/daemon.rs src/main.rs
 git commit -m "feat(api): expose kinetic actions through MCP daemon and CLI"
 ```
 
-### Task 8: Documentation, Full Gates & Independent Verification
+### Task 8: Lean 4 Formal Verification (`src/formal_kernel.rs`, `proofs/NeuroStrata/KineticAction.lean`, `tests/lean_parity_test.rs`)
+
+**Files:**
+- Modify: `src/formal_kernel.rs`, `proofs/NeuroStrata.lean`, `proofs/Main.lean`, `tests/lean_parity_test.rs`
+- Create: `proofs/NeuroStrata/KineticAction.lean`
+
+**Interfaces:**
+- Adds pure Aeneas-compliant `const fn` kernel functions in `src/formal_kernel.rs`:
+  - `evaluate_action_gate(principal_authorized: bool, params_valid: bool, sparql_ask_passed: bool, twin_bounds_passed: bool, post_shacl_passed: bool) -> ActionGateDecision`
+  - `evaluate_action_revert(receipt_state: ActionReceiptState, head_cas_matches: bool, force_requested: bool, caller_is_owner_or_admin: bool, caller_is_editor_or_above: bool) -> ActionRevertDecision`
+  - `evaluate_action_task_effect(current: TaskStatus, requested: ActionTaskTargetStatus) -> Result<TaskStatus, MachineError>`
+  - `is_action_memory_shareable(kind: ActionMemoryKind, explicit_shareable: bool) -> bool`
+- Wires `src/rdf/action.rs` gate, revert, task-effect, and shareability checks to delegate to `crate::formal_kernel::*`.
+
+- [ ] **Step 1: Write failing parity tests in `tests/lean_parity_test.rs`**
+
+Add exhaustive truth-table row generation in `tests/lean_parity_test.rs` (32 `action_gate` rows, 32 `action_revert` rows, 16 `action_task_effect` rows, 4 `action_shareable` rows = 84 rows).
+
+- [ ] **Step 2: Verify RED**
+
+Run: `cargo test --locked --test lean_parity_test -- --nocapture`
+Expected: compile failure because `evaluate_action_gate`, `evaluate_action_revert`, `evaluate_action_task_effect`, and `is_action_memory_shareable` are not yet in `src/formal_kernel.rs`.
+
+- [ ] **Step 3: Implement Rust formal kernel functions, Lean 4 theorems, and parity CLI emitters**
+
+Add the four `const fn` models to `src/formal_kernel.rs`, author `proofs/NeuroStrata/KineticAction.lean` with theorems `action_gate_sound`, `action_revert_no_double_revert`, `action_revert_stale_head_requires_privileged_force`, `action_task_effect_never_reaches_done`, and `action_receipt_never_shareable` (zero `sorry`), import `NeuroStrata.KineticAction` in `proofs/NeuroStrata.lean`, and emit the 84 rows in `proofs/Main.lean`.
+
+- [ ] **Step 4: Verify GREEN**
+
+Run:
+```bash
+rustc --edition=2021 --crate-type=lib src/formal_kernel.rs -o /tmp/opencode/libformal_kernel.rlib
+lake --dir proofs build
+cargo test --locked --test lean_parity_test -- --nocapture
+```
+Expected: standalone `formal_kernel.rs` compiles with zero external dependencies, `lake --dir proofs build` succeeds with zero `sorry`, and all parity rows (389 baseline + 84 `KineticAction` = 473 rows) PASS.
+
+- [ ] **Step 5: Commit after git-mutation confirmation**
+
+```bash
+git add src/formal_kernel.rs src/rdf/action.rs proofs/NeuroStrata.lean proofs/NeuroStrata/KineticAction.lean proofs/Main.lean tests/lean_parity_test.rs
+git commit -m "feat(proofs): add Lean 4 KineticAction formal verification and parity suite"
+```
+
+### Task 9: Documentation, Full Gates & Independent Verification
 
 **Files:**
 - Modify: `AGENTS.md`
@@ -326,7 +370,7 @@ git commit -m "feat(api): expose kinetic actions through MCP daemon and CLI"
 
 - [ ] **Step 1: Add missing acceptance regression tests before documentation**
 
-Map each spec acceptance item 1–10 to its named test above; add any missing test first and verify it fails for the intended reason. Include a mixed multi-effect action, raw warn-first compatibility, all rejection paths, all inverses, forced revert, redaction, and MCP/daemon/CLI parity.
+Map each spec acceptance item 1–11 to its named test above; add any missing test first and verify it fails for the intended reason. Include a mixed multi-effect action, raw warn-first compatibility, all rejection paths, all inverses, forced revert, redaction, MCP/daemon/CLI parity, and Lean 4 parity.
 
 - [ ] **Step 2: Update operational documentation**
 
@@ -335,6 +379,8 @@ Document strict-vs-warn-first boundaries, trusted principal model, offline crite
 - [ ] **Step 3: Run complete verification**
 
 ```bash
+rustc --edition=2021 --crate-type=lib src/formal_kernel.rs -o /tmp/opencode/libformal_kernel.rlib
+lake --dir proofs build
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
@@ -342,11 +388,11 @@ if cargo tree --locked | grep -E '^(oxirs-core|scirs2|horned-owl) | (oxirs-core|
 git diff --check
 ```
 
-Expected: all commands exit 0; baseline 1603 unit tests plus integration suites remain green with new action tests.
+Expected: all commands exit 0; baseline unit tests, Lean 4 proofs, parity suite, and integration suites remain green with new action tests.
 
 - [ ] **Step 4: Request fresh `checker-free` verification**
 
-Provide spec, plan, complete diff, and command outputs. Require source-grounded confirmation of every acceptance criterion, privacy claim, atomic rollback/CAS claim, and no unrelated `.agents/skills/neurostrata/SKILL.md` inclusion. Fix findings through TDD and rerun affected plus full gates.
+Provide spec, plan, complete diff, and command outputs. Require source-grounded confirmation of every acceptance criterion, privacy claim, atomic rollback/CAS claim, Lean 4 proof & parity coverage, and no unrelated `.agents/skills/neurostrata/SKILL.md` inclusion. Fix findings through TDD and rerun affected plus full gates.
 
 - [ ] **Step 5: Commit, integrate, complete, and push after explicit confirmation**
 

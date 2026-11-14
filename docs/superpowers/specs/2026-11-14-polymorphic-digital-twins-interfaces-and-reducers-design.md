@@ -116,6 +116,22 @@ pub struct TwinSchema {
     - `Min` / `Max`: $\min v_i$ / $\max v_i$ (`None` omitted if empty).
   - Return `derived_variables: BTreeMap<String, f64>` alongside stored `variables`.
 
+### 5.4 Formal Verification (`src/formal_kernel.rs`, `proofs/NeuroStrata/TwinInterface.lean`, `tests/lean_parity_test.rs`)
+
+Interface bound tightening (covariance) and total derived-property reducer evaluation are extracted into `src/formal_kernel.rs` and formally proved in `proofs/NeuroStrata/TwinInterface.lean`:
+
+1. **Pure Kernel Functions (`src/formal_kernel.rs`):**
+   - `pub const fn intersect_var_bounds(iface_min: i64, iface_max: i64, twin_min: i64, twin_max: i64) -> Result<(i64, i64), TwinBoundError>`
+     - Computes `eff_min = max(iface_min, twin_min)` and `eff_max = min(iface_max, twin_max)`, rejecting inverted intervals (`InvertedInterfaceBounds`, `InvertedTwinBounds`, `DisjointBounds`) and enforcing covariant bound tightening (`eff_min >= iface_min && eff_max <= iface_max`).
+   - `pub const fn evaluate_reducer_total(op: ReducerOpKind, count: u32, sum_val: i64, min_val: i64, max_val: i64, any_out_of_bounds: bool) -> ReducerEvalOutcome`
+     - Total, division-by-zero-free reducer kernel over integer-scaled fixed-point state (`Count`, `Sum`, `Min`, `Max`, `Avg`, `AllInBounds`, `AnyOutOfBounds`), returning deterministic zero/empty defaults when `count == 0`.
+2. **Lean 4 Theorems (`proofs/NeuroStrata/TwinInterface.lean`):**
+   - `intersect_bounds_tightens_interface`: whenever `intersect_var_bounds imin imax tmin tmax = .ok (emin, emax)`, `imin ≤ emin ∧ emin ≤ emax ∧ emax ≤ imax`.
+   - `intersect_bounds_commutative`: `intersect_var_bounds a b c d` and `intersect_var_bounds c d a b` yield identical valid intervals `(emin, emax)`.
+   - `reducer_eval_total_on_empty`: when `count = 0`, `evaluate_reducer_total` never divides by zero and returns a deterministic finite value (`0` for numeric reducers, `true` for `AllInBounds`, `false` for `AnyOutOfBounds`).
+3. **Exhaustive Parity (`tests/lean_parity_test.rs`):**
+   - Verifies representative interval intersections and all 7 `ReducerOpKind` variants across empty (`count = 0`) and populated (`count > 0`) inputs against `lake --dir proofs exe neurostrata-proofs`.
+
 ## 6. Risks & Mitigations
 
 | Risk | Mitigation |
@@ -130,6 +146,7 @@ pub struct TwinSchema {
 2. Querying `SELECT ?twin WHERE { ?twin a <urn:neurostrata:interface:thermal-asset> }` via `neurostrata_sparql_query` returns all active `cooling-pump` and `chiller-unit` twins.
 3. Defining a `PropertyReducerSpec` (`agg: Sum`, `relation: "CONTAINS"`, `source_variable: "power_kw"`) on a `cooling-loop` parent schema linked via `CONTAINS` to 3 `cooling-pump` twins (`power_kw = 10.0, 15.5, 20.0`) returns `derived_variables["total_power_kw"] == 45.5`.
 4. All existing `digital_twin` and Wave 39b (`neurostrata-0x39`) tests pass without modification.
+5. `proofs/NeuroStrata/TwinInterface.lean` builds cleanly with zero `sorry`, and `cargo test --locked --test lean_parity_test` passes all `TwinInterface` parity rows.
 
 ## 8. Next Step
 

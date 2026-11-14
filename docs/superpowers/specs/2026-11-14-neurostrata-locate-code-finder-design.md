@@ -116,6 +116,7 @@ pub struct LocateResponse {
 ### 4.3 Graph-First Ledger Integration (`src/server.rs` & Harness Plugins)
 
 - In `src/server.rs`, invoke `crate::task::record_graph_query(&store, &namespace, "neurostrata_locate", Some(path), project_root)` (`src/server.rs:2033`) for each returned `locations[].path` (incrementing `task.graph_queries_count` and recording all returned paths into `.NeuroStrata/session_queries.json`), and add `"neurostrata_locate"` to the graph-query tool list in `plugins/core/index.ts`.
+- **Library Reuse & Formal Alignment (Rule `227984e4-780c-4fe4-a44c-286d7d14eabf`):** `neurostrata_locate` reuses `TantivyLexicalIndex` (`tantivy`, MIT) and the formally verified `HybridSlots` (`allocate_hybrid_slots` in `src/formal_kernel.rs` / `proofs/NeuroStrata/HybridSlots.lean`) candidate ranking pipeline from `neurostrata-5xjo` rather than duplicating tokenization or ranking logic.
 
 ## 5. Risks & Mitigations
 

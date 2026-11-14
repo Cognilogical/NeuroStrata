@@ -100,6 +100,19 @@ Replace the flat `reserve_normative_slots` truncation on hybrid/vector results (
   - `mode`: `"hybrid" | "vector" | "lexical" | "lexical-inhouse"` (default `"hybrid"`).
   - Pass `include_code_ast` through to `search_tantivy_lexical` (`src/store/ladybug.rs:5618`) and `TantivyLexicalIndex::search_with_active_generations`.
 
+### 4.5 Library Reuse (Rule `227984e4-780c-4fe4-a44c-286d7d14eabf`) & Formal Verification (`proofs/NeuroStrata/HybridSlots.lean`)
+
+1. **Library Reuse:**
+   - Leverage `tantivy::tokenizer` (`TextAnalyzer`, `LowerCaser`, `RemoveLongFilter`, and composable `TokenStream` filters in the existing MIT-licensed `tantivy` crate) rather than maintaining a separate parallel lexical index.
+2. **Formal Verification (`src/formal_kernel.rs`, `proofs/NeuroStrata/HybridSlots.lean`, `tests/lean_parity_test.rs`):**
+   - Extract the pure slot-allocation arithmetic into `src/formal_kernel.rs`:
+     - `pub const fn allocate_hybrid_slots(limit: u32, avail_normative: u32, avail_expansion: u32, avail_other: u32) -> HybridSlotAllocation`
+   - Prove in `proofs/NeuroStrata/HybridSlots.lean`:
+     - `hybrid_slots_never_exceed_limit`: `alloc.normative_taken + alloc.expansion_taken + alloc.remaining_taken ≤ limit`.
+     - `hybrid_slots_never_exceed_available`: each pool's allocation is bounded by its available candidate count (`normative_taken ≤ avail_normative`, `expansion_taken ≤ avail_expansion`).
+     - `hybrid_slots_guarantees_expansion_when_available`: whenever `limit ≥ 4 ∧ avail_expansion ≥ 1`, `alloc.expansion_taken ≥ 1`.
+   - Verify exhaustive parity in `tests/lean_parity_test.rs` against `lake --dir proofs exe neurostrata-proofs`.
+
 ## 5. Risks & Mitigations
 
 | Risk | Mitigation |
@@ -116,6 +129,7 @@ Replace the flat `reserve_normative_slots` truncation on hybrid/vector results (
 3. When `limit >= 4` and a query matches `>= limit` normative primary memories **plus** at least one active 1-hop `GOVERNS` or `RELATES_TO` expanded memory, the final truncated `results` (`len == limit`) retains at least `expansion_slot_limit(limit)` expanded neighbor(s) instead of dropping all expansions.
 4. `neurostrata_search_memory` with `include_code_ast: false` returns zero `code_ast` or `doc_section` rows from Tantivy even though those rows are present in the Tantivy index.
 5. `cargo test --locked` passes all existing `search_*` and `lexical_*` tests plus new RRF and expansion-quota regression tests.
+6. `proofs/NeuroStrata/HybridSlots.lean` builds cleanly with zero `sorry`, and `cargo test --locked --test lean_parity_test` passes all `HybridSlots` parity rows.
 
 ## 7. Next Step
 

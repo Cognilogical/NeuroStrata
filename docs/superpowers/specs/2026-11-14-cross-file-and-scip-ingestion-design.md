@@ -2,7 +2,7 @@
 
 **Date:** 2026-11-14
 > Status: DRAFT — tracked under Epic `neurostrata-mtqx`, Feature Task `neurostrata-rbde` (Spec Task `neurostrata-sttv`).
-**Approach:** Two-Tier Architecture — Tier 1 upgrades zero-dependency Tree-sitter ingestion (`src/parser/ingest.rs`) with a pre-publish workspace symbol resolution pass using `dependency_map` (`src/parser/ingest.rs:1285, 1477`); Tier 2 adds SCIP (`scip.proto`) compiler index ingestion (`neurostrata_ingest_scip`) for exact cross-file/cross-crate definitions, references, and trait/interface implementations.
+**Approach:** Two-Tier Architecture — Tier 1 upgrades built-in Tree-sitter ingestion (`src/parser/ingest.rs`) with a pre-publish workspace symbol resolution pass using `dependency_map` (`src/parser/ingest.rs:1285, 1477`); Tier 2 adds SCIP (`scip.proto`) compiler index ingestion (`neurostrata_ingest_scip`) using the official license-compatible `scip` / `prost` crates for exact cross-file/cross-crate definitions, references, and trait/interface implementations.
 
 ## 1. Problem
 
@@ -31,7 +31,7 @@ NeuroStrata's AST call graph (`DEPENDS_ON` edges on `code_ast` rows) currently h
 
 ## 2. Goals
 
-1. **Tier 1 — Zero-Dependency Cross-File Tree-Sitter Call Graph (`src/parser/ingest.rs`):**
+1. **Tier 1 — Built-In Cross-File Tree-Sitter Call Graph (`src/parser/ingest.rs`):**
    - Upgrade call extraction from raw byte scanning to AST-guided call extraction (`extract_ast_calls`), skipping comments and string literals and preserving optional `qualifier` (`module::func` / `Type::method`) alongside bare `callee_name`.
    - Persist `unresolved_calls: Vec<String>` on staged `code_ast` rows during `run_consumer` (`src/parser/ingest.rs:881-961`).
    - In the pre-publish stamping pass (`src/parser/ingest.rs:1476-1502`)—where **both** newly parsed symbols and carried-forward unchanged symbols (`lines 1363-1474`) are present in `generation` and `dependency_map` (`src_file -> Vec<imported_file>`) is available—build a `WorkspaceSymbolTable` and resolve cross-file `calls` (`depends_on`) in priority order:
@@ -39,7 +39,7 @@ NeuroStrata's AST call graph (`DEPENDS_ON` edges on `code_ast` rows) currently h
      2. Imported-file symbol match (symbols defined in files listed in `dependency_map[caller_file]` or 1-hop `mod.rs` / `index.ts` re-exports).
      3. Unambiguous workspace-wide symbol match (when exactly one symbol in `generation` bears that bare name and it is not in `COMMON_STD_IDENTIFIERS`).
 2. **Tier 2 — SCIP Compiler-Grade Index Ingestion (`src/parser/scip.rs` + `neurostrata_ingest_scip`):**
-   - Add `prost` (or a self-contained protobuf wire decoder for the 6 `scip.proto` message types) to parse standard `index.scip` files.
+   - Evaluate and adopt the official license-compatible `scip` crate (`Apache-2.0`) and/or `prost` (`Apache-2.0`) per Rule `227984e4-780c-4fe4-a44c-286d7d14eabf` to parse standard `index.scip` protobuf files rather than hand-rolling a protobuf wire decoder.
    - Map SCIP `Document`s and `SymbolInformation` definitions onto NeuroStrata's generation-scoped `file` and `code_ast` nodes, storing the canonical SCIP moniker in `metadata.scip_symbol` and signature documentation in `content`.
    - Map SCIP `Occurrence`s (`SymbolRoles::Definition`, references) and `Relationship`s (`is_implementation`, `is_reference`) into exact cross-file `DEPENDS_ON` edges (`calls`, `implements`, `references`) with `edge_sources` provenance (`extractor: "scip"`, exact line/column span).
 3. **Preserve Generation Staging, Caller-Path Security, and Mesh Isolation:**
@@ -79,8 +79,8 @@ NeuroStrata's AST call graph (`DEPENDS_ON` edges on `code_ast` rows) currently h
 
 ### 4.2 Tier 2: SCIP Protobuf Reader in `src/parser/scip.rs`
 
-1. **Prerequisite Dependency / Wire Decoder:**
-   - Add `prost = "0.13"` to `Cargo.toml` (or implement a zero-dep varint/length-delimited reader in `src/parser/scip.rs` for the 6 `scip.proto` message types: `Index`, `Metadata`, `Document`, `SymbolInformation`, `Relationship`, `Occurrence`).
+1. **Library Reuse & Dependency Selection (Rule `227984e4-780c-4fe4-a44c-286d7d14eabf`):**
+   - Add the official Sourcegraph `scip` crate (`Apache-2.0`) and/or `prost = "0.13"` (`Apache-2.0`) to `Cargo.toml` to decode `scip.proto` messages (`Index`, `Metadata`, `Document`, `SymbolInformation`, `Relationship`, `Occurrence`) and parse SCIP symbol monikers directly rather than writing a bespoke protobuf wire decoder.
 2. **SCIP Moniker to NeuroStrata Node Mapping:**
    - For each `Document` (`relative_path`, `occurrences`, `symbols`):
      - Reject paths escaping `project_root` (`..`, absolute paths, or symlinks).

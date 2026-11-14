@@ -178,6 +178,28 @@ pub enum ActionEffectTemplate {
 - **MCP Tool (`src/server.rs`):** `neurostrata_action({ namespace, action: "define" | "validate" | "apply" | "revert" | "log", definition?, slug?, params?, receipt_id?, principal?, force?, limit? })`. `define` requires `definition` (an `ActionTypeDefinition` JSON object); `force` defaults to `false` and is honored only for an `owner`/`admin` revert; `limit` bounds `log` results.
 - **Daemon & CLI (`src/daemon.rs`, `src/main.rs`):** `POST /action` and `neurostrata-mcp action <define|validate|apply|revert|log>` call the same application service as MCP. `log` returns only active receipt versions, newest first, bounded by `limit` (default 100, maximum 1000), and redacts params, before/after content, and template values; full private receipt payloads remain available only through authorized local storage/SPARQL reads.
 
+### 5.4 Formal Verification (`src/formal_kernel.rs`, `proofs/NeuroStrata/KineticAction.lean`, `tests/lean_parity_test.rs`)
+
+Because kinetic `Action Types` introduce a security-critical submission gate, a bitemporal CAS revert state machine, and a `TransitionTask` effect that must never bypass Lock 2 (`neurostrata_task_complete`), its pure decision algebra is extracted into the zero-dependency Aeneas-compliant kernel (`src/formal_kernel.rs`) and formally proved in Lean 4 (`proofs/NeuroStrata/KineticAction.lean`, imported by `proofs/NeuroStrata.lean`):
+
+1. **Pure Kernel Functions (`src/formal_kernel.rs`):**
+   - `pub const fn evaluate_action_gate(principal_authorized: bool, params_valid: bool, sparql_ask_passed: bool, twin_bounds_passed: bool, post_shacl_passed: bool) -> ActionGateDecision`
+     - Returns `ActionGateDecision::Allow` iff all five predicates hold; returns the deterministic first-failing `Reject*` variant otherwise.
+   - `pub const fn evaluate_action_revert(receipt_state: ActionReceiptState, head_cas_matches: bool, force_requested: bool, caller_is_owner_or_admin: bool, caller_is_editor_or_above: bool) -> ActionRevertDecision`
+     - Models `Active` vs. `AlreadyReverted` receipts, active-head CAS verification, and forced-revert privilege gating (`RevertCommit`, `ForcedRevertCommit`, `RejectAlreadyReverted`, `RejectPermissionDenied`, `RejectStaleHeadConflict`).
+   - `pub const fn evaluate_action_task_effect(current: TaskStatus, requested: ActionTaskTargetStatus) -> Result<TaskStatus, MachineError>`
+     - Proves that `ActionEffectTemplate::TransitionTask` only permits transitions to `Open`, `InProgress`, or `Blocked` and unconditionally rejects `Done` (`DoneRequiresComplete`), preserving Lock 2 memory-extraction invariants.
+   - `pub const fn is_action_memory_shareable(kind: ActionMemoryKind, explicit_shareable: bool) -> bool`
+     - Proves `ActionMemoryKind::ActionReceipt` is unconditionally private (`false`) regardless of caller metadata, while `ActionMemoryKind::ActionType` is shareable iff `explicit_shareable == true`.
+2. **Lean 4 Theorems (`proofs/NeuroStrata/KineticAction.lean`):**
+   - `action_gate_sound`: `evaluate_action_gate ... = .allow ↔ (principal_authorized ∧ params_valid ∧ sparql_ask_passed ∧ twin_bounds_passed ∧ post_shacl_passed)`.
+   - `action_revert_no_double_revert`: `evaluate_action_revert .alreadyReverted cas force admin editor = .rejectAlreadyReverted`.
+   - `action_revert_stale_head_requires_privileged_force`: when `head_cas_matches = false`, `evaluate_action_revert` never commits unless `force_requested = true ∧ caller_is_owner_or_admin = true`.
+   - `action_task_effect_never_reaches_done`: `∀ s req, evaluate_action_task_effect s req ≠ .ok .done`.
+   - `action_receipt_never_shareable`: `∀ b, is_action_memory_shareable .actionReceipt b = false`.
+3. **Exhaustive Parity (`tests/lean_parity_test.rs`):**
+   - Enumerates all $2^5 = 32$ `evaluate_action_gate` rows, all $2 \times 2^4 = 32$ `evaluate_action_revert` rows, all $4 \times 4 = 16$ `evaluate_action_task_effect` rows, and all $2 \times 2 = 4$ `is_action_memory_shareable` rows against `lake --dir proofs exe neurostrata-proofs`.
+
 ## 6. Risks & Mitigations
 
 | Risk | Mitigation |
@@ -198,6 +220,7 @@ pub enum ActionEffectTemplate {
 8. Raw malformed `action_type` ingest remains warn-first and uncompiled; strict `define` rejects it. Typed ASK parameters containing quotes or SPARQL syntax cannot alter query structure.
 9. Non-admin principal impersonation, viewer execution, and non-owner/non-admin forced revert fail closed. Forced owner/admin revert is audited and preserves later history through new versions.
 10. Receipts remain private, absent from mesh import/export/outbox and default recall; `log` is bounded, deterministic, and redacted. MCP, daemon, and CLI expose identical structured outcomes.
+11. `rustc --edition=2021 --crate-type=lib src/formal_kernel.rs` compiles standalone with zero external crates, `lake --dir proofs build` verifies `NeuroStrata/KineticAction.lean` with zero `sorry`, and `cargo test --locked --test lean_parity_test` passes all 84 KineticAction truth-table rows.
 
 ## 8. Next Step
 

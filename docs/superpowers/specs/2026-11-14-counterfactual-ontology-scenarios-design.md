@@ -123,6 +123,22 @@ When evaluating SPARQL or SHACL on `scenario_id`:
 - **Daemon Endpoint:** `POST /scenario`.
 - **CLI Subcommand:** `neurostrata-mcp scenario <create|stage-twin|apply-action|eval|diff|commit|drop|list>`.
 
+### 5.5 Formal Verification (`src/formal_kernel.rs`, `proofs/NeuroStrata/ScenarioOverlay.lean`, `tests/lean_parity_test.rs`)
+
+The Copy-on-Write (CoW) overlay read precedence and optimistic CAS commit gate are extracted into `src/formal_kernel.rs` and proved in `proofs/NeuroStrata/ScenarioOverlay.lean`:
+
+1. **Pure Kernel Functions (`src/formal_kernel.rs`):**
+   - `pub const fn resolve_scenario_row(live_present: bool, staged_retired: bool, staged_upsert: bool) -> ScenarioRowVisibility`
+     - Formalizes the CoW precedence rule: `staged_retired` masks `live_present` (`HiddenRetired`), `staged_upsert` overrides both (`VisibleStaged`), and otherwise visibility equals `live_present` (`VisibleLive` / `Absent`).
+   - `pub const fn evaluate_scenario_commit(expired: bool, all_base_fingerprints_match: bool, rebac_authorized: bool, enforce_shacl: bool, shacl_violation_count: u32) -> ScenarioCommitDecision`
+     - Returns `ScenarioCommitDecision::CommitAllowed` iff `!expired && all_base_fingerprints_match && rebac_authorized && (!enforce_shacl || shacl_violation_count == 0)`.
+2. **Lean 4 Theorems (`proofs/NeuroStrata/ScenarioOverlay.lean`):**
+   - `scenario_upsert_overrides_retirement_and_live`: staging a replacement upsert after retiring a row yields `VisibleStaged`; retiring without replacement yields `HiddenRetired`.
+   - `scenario_commit_cas_sound`: `evaluate_scenario_commit ... = .commitAllowed → all_base_fingerprints_match = true ∧ expired = false ∧ rebac_authorized = true`.
+   - `scenario_commit_shacl_gate`: when `enforce_shacl = true` and `shacl_violation_count > 0`, `evaluate_scenario_commit` never returns `.commitAllowed`.
+3. **Exhaustive Parity (`tests/lean_parity_test.rs`):**
+   - Verifies all $2^3 = 8$ `resolve_scenario_row` cases and all $2^4 \times 3 = 48$ `evaluate_scenario_commit` cases against the Lean executable.
+
 ## 6. Risks & Mitigations
 
 | Risk | Mitigation |
@@ -138,6 +154,7 @@ When evaluating SPARQL or SHACL on `scenario_id`:
 3. Calling `neurostrata_scenario({ action: "diff" })` returns the exact `TwinDelta` (`old` vs `new`), `added_ids`, `retired_ids`, and any `TwinWarning` / `ShaclViolation` warnings.
 4. If a base row touched by the scenario is concurrently modified in the live store before `commit`, `neurostrata_scenario({ action: "commit" })` refuses the commit with `base_conflicts: [id]` and leaves live state intact.
 5. When no base conflict exists, `neurostrata_scenario({ action: "commit" })` atomically persists the staged changes to `LadybugStore` and removes the temporary scenario.
+6. `proofs/NeuroStrata/ScenarioOverlay.lean` builds cleanly with zero `sorry`, and `cargo test --locked --test lean_parity_test` passes all 56 `ScenarioOverlay` parity rows.
 
 ## 8. Next Step
 

@@ -111,6 +111,19 @@ Given the set of touched symbol nodes $M = \{s_1, \dots, s_k\}$ and the induced 
 5. **Unchanged Caller Blast Radius:**
    - Query 1-hop incoming `DEPENDS_ON` edges from symbols $u \notin M$ to $v \in M$. Attach up to `max_blast_radius_callers` to `v.unchanged_callers`.
 
+### 4.3 Library Reuse (Rule `227984e4-780c-4fe4-a44c-286d7d14eabf`) & Formal Verification (`proofs/NeuroStrata/DiffTour.lean`)
+
+1. **Library Reuse:**
+   - Evaluate and adopt license-compatible crates (`unidiff` / `patch`, MIT/Apache-2.0) for unified diff hunk parsing and `petgraph` (`MIT OR Apache-2.0`) for Tarjan SCC condensation and topological sorting (`petgraph::algo::tarjan_scc`, `petgraph::algo::toposort`) rather than hand-rolling a regex diff parser or custom SCC graph traversal.
+2. **Formal Verification (`src/formal_kernel.rs`, `proofs/NeuroStrata/DiffTour.lean`, `tests/lean_parity_test.rs`):**
+   - Extract the 4-stage stop classifier into `src/formal_kernel.rs`:
+     - `pub const fn classify_tour_stop(is_test_or_doc: bool, is_foundation_kind_or_path: bool, is_entrypoint_path: bool, in_degree_in_diff: u32, out_degree_in_diff: u32) -> TourStopCategory`
+   - Prove in `proofs/NeuroStrata/DiffTour.lean`:
+     - `diff_tour_classification_total_and_disjoint`: every symbol/hunk maps to exactly one `TourStopCategory` (`Foundations` = 1, `CoreLogic` = 2, `SurfaceAndCallers` = 3, `TestsAndDocs` = 4).
+     - `diff_tour_tests_always_stop_4`: `is_test_or_doc = true → classify_tour_stop ... = .testsAndDocs`.
+     - `diff_tour_foundations_precede_core_and_surface`: non-test foundation symbols (`is_foundation_kind_or_path = true` or pure dependency sinks `in_degree > 0 ∧ out_degree = 0`) always classify as `.foundations` (Stop 1).
+   - Verify exhaustive parity in `tests/lean_parity_test.rs` across all combinations of boolean flags and degree classes (`0`, `>0`) against `lake --dir proofs exe neurostrata-proofs`.
+
 ## 5. Risks & Mitigations
 
 | Risk | Mitigation |
@@ -125,6 +138,7 @@ Given the set of touched symbol nodes $M = \{s_1, \dots, s_k\}$ and the induced 
 2. When `fn callee()` in `src/b.rs` is modified by the diff and `fn caller()` in `src/a.rs` calls `callee()` but is **not** in the diff, `TourItem` for `callee()` lists `src/a.rs::caller` in `unchanged_callers`.
 3. Every active `GOVERNS` rule and failed `attempt` covering any touched file or ancestor directory appears in `DiffTourResponse.governing_rules` / `failed_attempts` and is linked from the corresponding `TourItem.governing_rule_ids`.
 4. Universal Core (`src/graph_read/` and `src/store/`) contains zero VCS subprocess invocations per Rule `905f5ca4-b0b0-4d41-936c-73c4babd983d`.
+5. `proofs/NeuroStrata/DiffTour.lean` builds cleanly with zero `sorry`, and `cargo test --locked --test lean_parity_test` passes all `DiffTour` parity rows.
 
 ## 7. Next Step
 

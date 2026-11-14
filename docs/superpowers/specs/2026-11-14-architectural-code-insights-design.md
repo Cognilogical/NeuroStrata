@@ -94,6 +94,8 @@ pub struct InsightSeriesReport {
    - When `neurostrata_insights` is called with `action: "series"` and `backfill_points > 1` over `[from_ts, to_ts]`:
      - If `MemoryMetric` already holds persisted samples in `[from_ts, to_ts]`, merge them via `store.metrics.range(...)` (`src/time_series.rs:320`).
      - For bitemporal normative insights, evaluate at each step timestamp $t_i = \text{from\_ts} + i \cdot \Delta t$ by filtering memories where `valid_from <= t_i && (valid_to.is_none() || valid_to > t_i)`.
+4. **Library Reuse & Formal Alignment (Rule `227984e4-780c-4fe4-a44c-286d7d14eabf`):**
+   - Reuse `oxigraph` (`MIT OR Apache-2.0`) for SPARQL bitemporal `ns:validAt` insights, `tantivy` (`MIT`) for lexical code insights, and `TimeSeriesStore` (`src/time_series.rs`); private registry storage (`metadata.insight_definitions` on `registry_row`) obeys the formally verified `SynapticMesh` private-sovereignty invariants in `proofs/NeuroStrata/SynapticMesh.lean`.
 
 ## 5. Risks & Mitigations
 
