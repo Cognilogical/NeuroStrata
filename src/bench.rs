@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use anyhow::Context;
+
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -189,7 +191,7 @@ pub fn compare_receipts(
     max_regression_pct: f64,
 ) -> BaselineComparison {
     let mut suites = Vec::new();
-    let mut passed = true;
+    let mut passed = !current.suites.is_empty();
     for cur in &current.suites {
         if let Some(base) = baseline.suites.iter().find(|b| b.name == cur.name) {
             let p50_delta_pct = if base.p50_ms > 0.0 {
@@ -215,6 +217,18 @@ pub fn compare_receipts(
                 current_p95_ms: cur.p95_ms,
                 p95_delta_pct,
                 regressed,
+            });
+        } else {
+            passed = false;
+            suites.push(SuiteDiff {
+                name: cur.name.clone(),
+                baseline_p50_ms: 0.0,
+                current_p50_ms: cur.p50_ms,
+                p50_delta_pct: 100.0,
+                baseline_p95_ms: 0.0,
+                current_p95_ms: cur.p95_ms,
+                p95_delta_pct: 100.0,
+                regressed: true,
             });
         }
     }
@@ -243,6 +257,19 @@ pub fn record_receipt_metrics(
             BTreeMap::new(),
         );
     }
+}
+
+pub async fn persist_receipt_metrics_to_store(
+    receipt: &PerfReceipt,
+    store: &crate::store::ladybug::LadybugStore,
+    namespace: &str,
+) -> anyhow::Result<usize> {
+    record_receipt_metrics(receipt, store.metrics(), namespace);
+    let written = store.flush_metrics().await?;
+    if crate::traits::VectorStore::is_dirty(store) {
+        crate::traits::VectorStore::checkpoint(store).await?;
+    }
+    Ok(written)
 }
 
 fn git_output(args: &[&str]) -> Option<String> {
@@ -427,22 +454,48 @@ pub async fn run_benchmarks(cfg: &BenchConfig) -> anyhow::Result<PerfReceipt> {
     };
 
     if let Some(path) = &cfg.baseline {
-        if let Ok(raw) = std::fs::read_to_string(path) {
-            if let Ok(base) = serde_json::from_str::<PerfReceipt>(&raw) {
-                receipt.comparison = Some(compare_receipts(&receipt, &base, cfg.max_regression_pct));
-            }
-        }
+        let raw = std::fs::read_to_string(path).with_context(|| {
+            format!("failed to read benchmark baseline receipt from {}", path.display())
+        })?;
+        let base: PerfReceipt = serde_json::from_str(&raw).with_context(|| {
+            format!("failed to parse benchmark baseline receipt from {}", path.display())
+        })?;
+        receipt.comparison = Some(compare_receipts(&receipt, &base, cfg.max_regression_pct));
     }
 
     if let Some(path) = &cfg.output {
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!("failed to create output directory {}", parent.display())
+                })?;
+            }
         }
-        let _ = std::fs::write(path, serde_json::to_string_pretty(&receipt).unwrap_or_default());
+        let serialized = serde_json::to_string_pretty(&receipt)
+            .context("failed to serialize benchmark receipt")?;
+        std::fs::write(path, serialized).with_context(|| {
+            format!("failed to write benchmark receipt to {}", path.display())
+        })?;
     }
 
     if let Some(ns) = &cfg.record_metrics {
         record_receipt_metrics(&receipt, crate::time_series::global_store(), ns);
+        let db_path = if let Ok(val) = std::env::var("NEUROSTRATA_BENCH_METRICS_DB") {
+            if !val.trim().is_empty() {
+                PathBuf::from(val)
+            } else {
+                crate::config::Config::from_default_path()?.db_path
+            }
+        } else {
+            crate::config::Config::from_default_path()?.db_path
+        };
+        let dims = crate::embed::configured_dimensions().unwrap_or(64).max(1);
+        let store = crate::store::ladybug::LadybugStore::new(
+            db_path.to_string_lossy().to_string(),
+            dims,
+        )
+        .with_context(|| format!("failed to open metrics store at {}", db_path.display()))?;
+        persist_receipt_metrics_to_store(&receipt, &store, ns).await?;
     }
 
     Ok(receipt)
@@ -557,5 +610,130 @@ mod tests {
         record_receipt_metrics(&receipt, &store, "ns");
         assert!(!store.list_keys("ns").is_empty());
         let _ = cfg;
+    }
+
+    #[test]
+    fn compare_receipts_fails_when_requested_suite_missing_from_baseline() {
+        let base = PerfReceipt {
+            schema_version: 1,
+            timestamp: "t".into(),
+            git_sha: "a".into(),
+            git_branch: "main".into(),
+            pkg_version: "1".into(),
+            os: "linux".into(),
+            arch: "x86".into(),
+            cpu_parallelism: 1,
+            rss_before_mb: 0.0,
+            rss_after_mb: 0.0,
+            peak_rss_mb: 0.0,
+            rss_delta_mb: 0.0,
+            suites: vec![],
+            comparison: None,
+        };
+        let mut cur = base.clone();
+        cur.suites = vec![SuiteReceipt {
+            name: "ingest".into(),
+            iterations: 1,
+            items_per_iter: 1,
+            p50_ms: 5.0,
+            p95_ms: 5.0,
+            p99_ms: 5.0,
+            mean_ms: 5.0,
+            min_ms: 5.0,
+            max_ms: 5.0,
+            ops_per_sec: 200.0,
+        }];
+        let cmp = compare_receipts(&cur, &base, 20.0);
+        assert!(!cmp.passed);
+        assert_eq!(cmp.suites.len(), 1);
+        assert!(cmp.suites[0].regressed);
+        assert_eq!(cmp.suites[0].baseline_p50_ms, 0.0);
+    }
+
+    #[tokio::test]
+    async fn run_benchmarks_errors_on_missing_or_invalid_baseline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("nope.json");
+        let cfg = BenchConfig {
+            suite: BenchSuite::All,
+            iterations: 1,
+            output: None,
+            baseline: Some(missing.clone()),
+            max_regression_pct: 20.0,
+            fail_on_regression: false,
+            record_metrics: None,
+        };
+        assert!(run_benchmarks(&cfg).await.is_err());
+
+        let bad = tmp.path().join("bad.json");
+        std::fs::write(&bad, "not json").unwrap();
+        let cfg2 = BenchConfig {
+            suite: BenchSuite::All,
+            iterations: 1,
+            output: None,
+            baseline: Some(bad),
+            max_regression_pct: 20.0,
+            fail_on_regression: false,
+            record_metrics: None,
+        };
+        assert!(run_benchmarks(&cfg2).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn run_benchmarks_errors_on_unwritable_output_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("outdir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = BenchConfig {
+            suite: BenchSuite::All,
+            iterations: 1,
+            output: Some(dir),
+            baseline: None,
+            max_regression_pct: 20.0,
+            fail_on_regression: false,
+            record_metrics: None,
+        };
+        assert!(run_benchmarks(&cfg).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn persist_receipt_metrics_to_store_flushes_to_ladybug() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::store::ladybug::LadybugStore::for_testing(tmp.path().join("store"), 8)
+            .expect("store");
+        let receipt = PerfReceipt {
+            schema_version: 1,
+            timestamp: "t".into(),
+            git_sha: "a".into(),
+            git_branch: "main".into(),
+            pkg_version: "1".into(),
+            os: "linux".into(),
+            arch: "x86".into(),
+            cpu_parallelism: 1,
+            rss_before_mb: 0.0,
+            rss_after_mb: 0.0,
+            peak_rss_mb: 0.0,
+            rss_delta_mb: 0.0,
+            suites: vec![SuiteReceipt {
+                name: "ingest".into(),
+                iterations: 1,
+                items_per_iter: 1,
+                p50_ms: 5.0,
+                p95_ms: 5.0,
+                p99_ms: 5.0,
+                mean_ms: 5.0,
+                min_ms: 5.0,
+                max_ms: 5.0,
+                ops_per_sec: 200.0,
+            }],
+            comparison: None,
+        };
+        let written = persist_receipt_metrics_to_store(&receipt, &store, "ns").await.unwrap();
+        assert!(written > 0);
+        let samples = store
+            .query_db_metrics("ns", crate::time_series::MetricKind::EnrichmentLatencyMs, "ingest", None, None, 10)
+            .await
+            .unwrap();
+        assert!(!samples.is_empty());
     }
 }

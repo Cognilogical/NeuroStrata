@@ -648,8 +648,30 @@ impl RemoteEmbedder {
             );
         }
         let mut by_index: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
-        for item in data {
-            let index = item["index"].as_u64().unwrap_or(0) as usize;
+        for (pos, item) in data.iter().enumerate() {
+            let index = match item.get("index") {
+                Some(v) if !v.is_null() => {
+                    let idx = v
+                        .as_u64()
+                        .ok_or_else(|| anyhow!("remote embedding contained invalid non-integer index"))?
+                        as usize;
+                    if idx >= by_index.len() {
+                        anyhow::bail!(
+                            "remote embedding index {} out of bounds for batch of {}",
+                            idx,
+                            by_index.len()
+                        );
+                    }
+                    idx
+                }
+                _ => pos,
+            };
+            if by_index[index].is_some() {
+                anyhow::bail!(
+                    "remote embedding batch contained duplicate entry for index {}",
+                    index
+                );
+            }
             let arr = item["embedding"].as_array().context("Missing embedding in response")?;
             if arr.is_empty() {
                 anyhow::bail!("remote embedding was empty");
@@ -671,9 +693,7 @@ impl RemoteEmbedder {
                     embedding.len()
                 );
             }
-            if index < by_index.len() {
-                by_index[index] = Some(embedding);
-            }
+            by_index[index] = Some(embedding);
         }
         Ok(by_index
             .into_iter()
@@ -933,6 +953,38 @@ mod tests {
         .unwrap();
         let v = embedder.embed("hello").await.unwrap();
         assert_eq!(v, vec![0.25f32, 0.5, 0.75, 1.0]);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_embedder_batch_preserves_order_without_index() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let _ = read_http_request(&mut sock).await;
+            let body = r#"{"data":[{"embedding":[1.0,2.0,3.0,4.0]},{"embedding":[5.0,6.0,7.0,8.0]}]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            use tokio::io::AsyncWriteExt;
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+        });
+        let embedder = RemoteEmbedder::new(
+            format!("http://{}", addr),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            4,
+        )
+        .unwrap();
+        let v = embedder
+            .embed_batch(&["a".to_string(), "b".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(v, vec![vec![1.0f32, 2.0, 3.0, 4.0], vec![5.0, 6.0, 7.0, 8.0]]);
         server.await.unwrap();
     }
 
