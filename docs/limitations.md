@@ -31,12 +31,13 @@ include allocation from a neighboring call that began inside the window. When
 process delta, but the attribution to that call is not exact.
 
 - **P3-5 / X4 — began-before & background growth (`neurostrata-igg4`):** A call
-  that began before the window and is no longer in flight when the guarded call
-  finishes (and finished before the guarded call began) is not attributable to
-  the logged call. Background growth — periodic checkpoints, background tasks,
-  or allocator page retention — is captured by `"kind": "sample"` and
-  `"kind": "sampler"` time-series rows rather than a single `"kind": "call"`
-  row.
+  whose delta includes growth from a neighbour that began before the window
+  and finished before this call began is emitted with `"approximate": false`:
+  the epoch check catches only calls that began inside the window, so that
+  growth is misattributed to the logged call while the line claims exactness.
+  Background growth — periodic checkpoints, background tasks, or allocator
+  page retention — is captured by `"kind": "sample"` and `"kind": "sampler"`
+  time-series rows rather than a single `"kind": "call"` row.
 - **P3-7 / X6b — `Drop` synchronous I/O waiver (`neurostrata-igg4`):**
   Accepted as a deliberate waiver. The sampler offloads periodic log writes
   to `tokio::task::spawn_blocking`, while `CallGuard::drop` performs its
