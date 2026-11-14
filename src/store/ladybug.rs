@@ -9375,7 +9375,11 @@ fn edge_hits_from_rows(
         if !memory_types.is_empty() && !memory_types.iter().any(|t| t == &memory_type) {
             continue;
         }
-        if is_archived(&metadata) || is_retired_at(&metadata, now) || is_mesh_conflicting(&metadata)
+        // The domain registry row is bookkeeping, not guidance for any file.
+        if is_archived(&metadata)
+            || is_retired_at(&metadata, now)
+            || is_mesh_conflicting(&metadata)
+            || is_registry_row(&metadata)
         {
             continue;
         }
@@ -13259,6 +13263,42 @@ eurostrata\src\daemon.rs",
             .expect("the related memory surfaces: {:?}");
         assert_eq!(hit.match_kind, GraphMatchKind::Related);
         assert!(hit.explanation.contains("relates to"));
+    }
+
+    /// The domain registry row is bookkeeping: even when it is linked to a
+    /// file, it is not served as a memory for that file.
+    #[tokio::test]
+    async fn the_domain_registry_row_never_surfaces_for_a_file() {
+        let store = retired_test_store().await;
+        let mut file_payload = retired_test_payload("file", "auto-ingestor", json!({}));
+        file_payload.location = "src/a.rs".to_string();
+        store
+            .upsert("probe", "probe::src/a.rs", vec![0.0; 4], file_payload)
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "registry-row",
+                vec![0.0; 4],
+                retired_test_payload(
+                    "fact",
+                    "agent",
+                    json!({ "domain_registry": { "domains": [] }, "related_to": ["probe::src/a.rs"] }),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let hits = store
+            .memories_for_file("probe", None, "src/a.rs", None, true, &["fact".to_string()], &[], 5)
+            .await
+            .expect("graph read succeeds");
+        assert!(
+            hits.iter().all(|h| h.id != "registry-row"),
+            "the registry row is not a file memory: {:?}",
+            hits.iter().map(|h| &h.id).collect::<Vec<_>>()
+        );
     }
 
     /// The `related` traversal reaches a depth-2 neighbour through a real
