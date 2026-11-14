@@ -416,6 +416,31 @@ fn read_ingest_file(path: &std::path::Path) -> anyhow::Result<Vec<u8>> {
     })
 }
 
+/// Compile every tree-sitter query a schema declares into an `Arc` cache keyed
+/// by `language:query_name`. The producer then looks patterns up per file
+/// instead of recompiling them per file; invalid patterns are skipped and
+/// logged here, so the per-file pass never sees them.
+fn compile_language_queries(schema: &ParserSchema) -> HashMap<String, std::sync::Arc<Query>> {
+    let mut compiled = HashMap::new();
+    for (lang_name, lang_schema) in &schema.languages {
+        let ts_lang = match get_language(lang_name) {
+            Some(l) => l,
+            None => continue,
+        };
+        for (query_name, query_str) in &lang_schema.queries {
+            match Query::new(&ts_lang, query_str) {
+                Ok(q) => {
+                    compiled.insert(format!("{lang_name}:{query_name}"), std::sync::Arc::new(q));
+                }
+                Err(e) => {
+                    tracing::warn!("Invalid tree-sitter query for {lang_name}: {e}");
+                }
+            }
+        }
+    }
+    compiled
+}
+
 /// Blocking producer: walks the directory tree, reads files, parses ASTs,
 /// and streams owned results through `tx`. Runs on the blocking thread pool
 /// so filesystem I/O never stalls the async runtime.
@@ -471,6 +496,10 @@ fn run_producer(
     let walker = WalkBuilder::new(&dir_path).build();
 
     let mut unreadable = 0usize;
+
+    // One compiled tree-sitter query per schema entry per run, instead of
+    // recompiling the pattern for every file the walk reaches.
+    let compiled_queries = compile_language_queries(&schema);
 
     for result in walker {
         let entry = match result {
@@ -701,13 +730,12 @@ fn run_producer(
             let lang_schema = &schema.languages[&lang_name];
             let mut pending: Vec<SymbolRow> = Vec::new();
 
-            for (query_name, query_str) in &lang_schema.queries {
-                let query = match Query::new(&ts_lang, query_str) {
-                    Ok(q) => q,
-                    Err(e) => {
-                        tracing::warn!("Invalid tree-sitter query for {lang_name}: {e}");
-                        continue;
-                    }
+            for (query_name, _query_str) in &lang_schema.queries {
+                let query_key = format!("{lang_name}:{query_name}");
+                let query: &Query = match compiled_queries.get(&query_key) {
+                    Some(q) => q.as_ref(),
+                    // Invalid patterns were skipped and logged by the compile pass.
+                    None => continue,
                 };
 
                 let mut cursor = QueryCursor::new();
@@ -896,16 +924,37 @@ async fn run_consumer(
                         )
                     })
                     .collect();
-                for symbol in symbols {
-                    let summary = format!(
-                        "{} {} in {}\nlines {}-{}\n\n{}",
-                        symbol.kind,
-                        symbol.name,
-                        node_path,
-                        symbol.start_line,
-                        symbol.end_line,
-                        symbol.body
-                    );
+                if !symbols.is_empty() {
+                    let summaries: Vec<String> = symbols
+                        .iter()
+                        .map(|s| {
+                            format!(
+                                "{} {} in {}\nlines {}-{}\n\n{}",
+                                s.kind,
+                                s.name,
+                                node_path,
+                                s.start_line,
+                                s.end_line,
+                                s.body
+                            )
+                        })
+                        .collect();
+                    let embeddings = embedder
+                        .embed_batch(&summaries)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("failed to embed symbol batch: {}", e))?;
+                    if embeddings.len() != summaries.len() {
+                        anyhow::bail!(
+                            "embedder returned {} embeddings for {} symbols",
+                            embeddings.len(),
+                            summaries.len()
+                        );
+                    }
+                    for ((symbol, summary), embedding) in symbols
+                        .into_iter()
+                        .zip(summaries)
+                        .zip(embeddings)
+                    {
                     let id = generation_scoped_id(
                         namespace,
                         generation,
@@ -973,15 +1022,8 @@ async fn run_consumer(
                     // An embed or store failure aborts the staging generation:
                     // swallowing it here would hand back a graph whose symbols
                     // are silently missing, which is exactly the half-built
-                    // tree staged publication exists to prevent.
-                    let embedding = embedder.embed(&summary).await.map_err(|e| {
-                        anyhow::anyhow!(
-                            "failed to embed symbol {} from {}: {}",
-                            symbol.name,
-                            path_display,
-                            e
-                        )
-                    })?;
+                    // tree staged publication exists to prevent. The batch
+                    // embed above already failed the run before any row landed.
                     vector_store
                         .upsert(namespace, &id, embedding, payload)
                         .await
@@ -993,7 +1035,8 @@ async fn run_consumer(
                                 e
                             )
                         })?;
-                    symbols_stored += 1;
+                        symbols_stored += 1;
+                    }
                 }
 
                 if symbols_stored > 0 {
@@ -1021,7 +1064,27 @@ async fn run_consumer(
             sections,
             file_sha256,
         } => {
-            for section in sections {
+            if !sections.is_empty() {
+                let summaries: Vec<String> = sections
+                    .iter()
+                    .map(|section| format!("{}\n\n{}", section.heading, section.text))
+                    .collect();
+                let embeddings = embedder
+                    .embed_batch(&summaries)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("failed to embed doc section batch: {}", e))?;
+                if embeddings.len() != summaries.len() {
+                    anyhow::bail!(
+                        "embedder returned {} embeddings for {} doc sections",
+                        embeddings.len(),
+                        summaries.len()
+                    );
+                }
+                for ((section, summary), embedding) in sections
+                    .into_iter()
+                    .zip(summaries)
+                    .zip(embeddings)
+                {
                 let id = generation_scoped_id(
                     namespace,
                     generation,
@@ -1044,7 +1107,6 @@ async fn run_consumer(
                 metadata.insert("source_identity".to_string(), with_relative_path(&source_identity, &node_path));
                 metadata.insert("index_generation".to_string(), serde_json::json!(generation));
 
-                let summary = format!("{}\n\n{}", section.heading, section.text);
                 let payload = MemoryPayload {
                     content: summary.clone(),
                     location: node_path.clone(),
@@ -1055,13 +1117,11 @@ async fn run_consumer(
                     agent_name: Some("neurostrata-mcp-ingestor".to_string()),
                 };
 
-                let embedding = embedder.embed(&summary).await.map_err(|e| {
-                    anyhow::anyhow!("failed to embed doc section {}: {}", section.heading, e)
-                })?;
                 vector_store
                     .upsert(namespace, &id, embedding, payload)
                     .await
                     .map_err(|e| anyhow::anyhow!("failed to store doc section {}: {}", id, e))?;
+                }
             }
         }
     }
@@ -3739,6 +3799,117 @@ use super::x;"#;
                 .map(|r| r.id.clone())
                 .collect::<Vec<_>>()
         );
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    /// Records every embed_batch payload so tests can observe how the
+    /// consumer batches symbol and doc-section embeddings.
+    struct BatchRecordingEmbedder {
+        batch_calls: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for BatchRecordingEmbedder {
+        async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            Ok(vec![0.0; 4])
+        }
+
+        async fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+            self.batch_calls.lock().unwrap().push(texts.to_vec());
+            Ok(texts.iter().map(|_| vec![0.0; 4]).collect())
+        }
+
+        fn dimensions(&self) -> usize {
+            4
+        }
+    }
+
+    fn batch_recording_embedder() -> (Arc<dyn Embedder>, Arc<std::sync::Mutex<Vec<Vec<String>>>>) {
+        let batch_calls = Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+        let embedder: Arc<dyn Embedder> = Arc::new(BatchRecordingEmbedder {
+            batch_calls: Arc::clone(&batch_calls),
+        });
+        (embedder, batch_calls)
+    }
+
+    /// The producer compiles one tree-sitter query per schema entry up front
+    /// instead of recompiling the pattern for every file.
+    #[test]
+    fn compile_language_queries_compiles_every_configured_query() {
+        let schema = ParserSchema::load(
+            r#"{"languages":{"rust":{"extensions":["rs"],"queries":{"functions":"(function_item name: (identifier) @name) @func"}}}}"#,
+        )
+        .expect("the fixture schema parses");
+        let compiled = compile_language_queries(&schema);
+        assert!(
+            compiled.contains_key("rust:functions"),
+            "the compiled cache is keyed by language:query, got {compiled:?}"
+        );
+    }
+
+    /// One file carrying several symbols is embedded as a single batch, not one
+    /// embed call per symbol.
+    #[tokio::test]
+    async fn ingest_batches_multi_symbol_files_into_one_embed_batch() {
+        let tmp = std::env::temp_dir().join(format!("ns-batch-symbols-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        std::fs::write(tmp.join("lib.rs"), "pub fn alpha() {}\npub fn beta() {}\n").expect("write rust file");
+        let db = std::env::temp_dir().join(format!("ns-batch-symbols-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("batch-ns").await.expect("create the schema");
+        let (embedder, batch_calls) = batch_recording_embedder();
+        let schema = ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        ingest_directory(&tmp, &schema, embedder, store.clone(), "batch-ns", None, &[])
+            .await
+            .expect("ingest batches the multi-symbol file");
+
+        let batches = batch_calls.lock().unwrap();
+        assert_eq!(batches.len(), 1, "one file with symbols is one batch: {batches:?}");
+        assert_eq!(batches[0].len(), 2, "both symbols share one batch: {batches:?}");
+        assert!(
+            batches[0][0].contains("alpha"),
+            "the batch carries the first symbol: {}",
+            batches[0][0]
+        );
+        assert!(
+            batches[0][1].contains("beta"),
+            "the batch carries the second symbol: {}",
+            batches[0][1]
+        );
+        drop(batches);
+
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    /// One markdown file carrying several sections is embedded as a single
+    /// batch.
+    #[tokio::test]
+    async fn ingest_batches_markdown_sections_into_one_embed_batch() {
+        let tmp = std::env::temp_dir().join(format!("ns-batch-md-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        std::fs::write(
+            tmp.join("guide.md"),
+            "# Guide\n\nIntro.\n\n## Setup\n\nSetup.\n\n## Usage\n\nUsage.",
+        )
+        .expect("write markdown");
+        let db = std::env::temp_dir().join(format!("ns-batch-md-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("batch-ns").await.expect("create the schema");
+        let (embedder, batch_calls) = batch_recording_embedder();
+        let schema = ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        ingest_directory(&tmp, &schema, embedder, store.clone(), "batch-ns", None, &[])
+            .await
+            .expect("ingest batches the multi-section markdown");
+
+        let batches = batch_calls.lock().unwrap();
+        assert_eq!(batches.len(), 1, "one markdown file is one batch: {batches:?}");
+        assert_eq!(batches[0].len(), 3, "all sections share one batch: {batches:?}");
+        drop(batches);
+
         std::fs::remove_dir_all(&tmp).ok();
         std::fs::remove_dir_all(&db).ok();
     }
