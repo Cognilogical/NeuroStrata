@@ -277,21 +277,25 @@ fn parse_threshold(value: Option<&str>) -> Result<u64, String> {
 }
 
 /// Tracks which invalid `NEUROSTRATA_RSS_LOG_MB` values have already been
-/// reported, so a mistyped knob warns once instead of on every call.
-static WARNED_INVALID_THRESHOLD: std::sync::Mutex<Option<String>> =
-    std::sync::Mutex::new(None);
+/// reported, so a mistyped knob warns once per distinct value instead of on
+/// every call.
+static WARNED_INVALID_THRESHOLD: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
-/// Returns `true` the first time `raw` is seen, `false` on every repeat. The
-/// caller decides whether to act on it; this helper only dedupes.
+/// Returns `true` the first time `raw` is inserted into `set`, `false` on
+/// every repeat — including when the same value returns after a different
+/// one. The caller decides whether to act on it; this helper only dedupes.
+fn should_warn_once(
+    set: &std::sync::Mutex<std::collections::HashSet<String>>,
+    raw: &str,
+) -> bool {
+    let mut warned = set.lock().unwrap_or_else(|e| e.into_inner());
+    warned.insert(raw.to_string())
+}
+
 fn should_warn_invalid_threshold(raw: &str) -> bool {
-    let mut warned =
-        WARNED_INVALID_THRESHOLD.lock().unwrap_or_else(|e| e.into_inner());
-    if warned.as_deref() == Some(raw) {
-        false
-    } else {
-        *warned = Some(raw.to_string());
-        true
-    }
+    should_warn_once(&WARNED_INVALID_THRESHOLD, raw)
 }
 
 fn threshold_mb_uncached() -> u64 {
@@ -969,10 +973,11 @@ mod tests {
 
     #[test]
     fn invalid_threshold_warning_fires_once_per_value() {
-        *WARNED_INVALID_THRESHOLD.lock().unwrap() = None;
+        WARNED_INVALID_THRESHOLD.lock().unwrap().clear();
         assert!(should_warn_invalid_threshold("not-a-number"));
         assert!(!should_warn_invalid_threshold("not-a-number"));
         assert!(should_warn_invalid_threshold("another-bad-value"));
+        assert!(!should_warn_invalid_threshold("not-a-number"));
     }
 
     /// Serializes the tests that toggle `NEUROSTRATA_PROFILE`: the
