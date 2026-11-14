@@ -1586,6 +1586,10 @@ fn stop_checkpoints_after_pool_failure(
     if let Err(e) = conn.query("CALL auto_checkpoint=false") {
         tracing::warn!("could not turn off the engine's auto-checkpoint: {e}");
     }
+    // The engine also checkpoints when the database closes.
+    if let Err(e) = conn.query("CALL force_checkpoint_on_close=false") {
+        tracing::warn!("could not turn off the engine's checkpoint on close: {e}");
+    }
     eprintln!(
         "WARNING: a checkpoint ran out of buffer pool. Each failed attempt leaves pages behind in \
          ladybug.db, so checkpoints are off until restart; writes still reach the write-ahead log. \
@@ -1789,6 +1793,14 @@ mod buffer_pool_tests {
         assert_eq!(failed_checkpoints, 8, "the WAL fit the pool; nothing was tested");
         assert!(failed_writes <= 1, "{failed_writes} writes hit a failing post-commit checkpoint");
         assert!(grown < 1024 * 1024, "ladybug.db grew {grown} bytes over failed checkpoints");
+
+        // Closing must not retry it either: the engine checkpoints on close
+        // unless told not to.
+        let at_stop = size();
+        drop(store);
+        let on_close = size() as i64 - at_stop as i64;
+        eprintln!("close changed ladybug.db by {on_close} bytes");
+        assert_eq!(on_close, 0, "closing the store retried the checkpoint");
     }
 }
 
