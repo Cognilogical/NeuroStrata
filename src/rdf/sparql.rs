@@ -542,6 +542,97 @@ pub async fn execute_sparql_query_with_config(
     }
 }
 
+/// Evaluate an offline bound SPARQL `ASK` query for kinetic `Action Types`.
+///
+/// Enforces:
+/// - Read-only `Query::Ask` (rejects `SELECT`, `CONSTRUCT`, `DESCRIBE`, and updates)
+/// - Zero `SERVICE` federation clauses
+/// - `max_algebra_nodes`, `max_dataset_quads`, and `timeout_ms` budgets
+/// - Post-parse variable binding via `PreparedQuery::substitute_variable`
+pub async fn execute_action_ask(
+    store: &crate::store::ladybug::LadybugStore,
+    namespace: &str,
+    query_str: &str,
+    bindings: &[(Variable, oxrdf::Term)],
+    config: SparqlConfig,
+) -> Result<bool, String> {
+    let query = crate::rdf::action::validate_sparql_ask_syntax_and_budget(
+        query_str,
+        config.max_algebra_nodes,
+    )?;
+
+    if config.timeout_ms == 0 {
+        return Err("SPARQL ASK timed out (timeout_ms budget is 0)".to_string());
+    }
+
+    let (dataset, meta_map) =
+        project_sparql_dataset_with_meta_async(namespace, false, false, store).await?;
+    if dataset.len() > config.max_dataset_quads {
+        return Err(format!(
+            "SPARQL ASK dataset exceeded max_dataset_quads budget ({} > {})",
+            dataset.len(),
+            config.max_dataset_quads
+        ));
+    }
+
+    let meta_arc = std::sync::Arc::new(meta_map);
+    let bindings_owned: Vec<(Variable, oxrdf::Term)> = bindings.to_vec();
+    let cancel_token = spareval::CancellationToken::new();
+    let timed_out_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let timeout_ms = config.timeout_ms;
+    let timer_handle = tokio::spawn({
+        let timed_out_flag = timed_out_flag.clone();
+        let cancel_token = cancel_token.clone();
+        async move {
+            tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)).await;
+            timed_out_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            cancel_token.cancel();
+        }
+    });
+
+    let cancel_token_for_blocking = cancel_token.clone();
+    let timed_out_flag_for_blocking = timed_out_flag.clone();
+    let eval_join = tokio::task::spawn_blocking(move || -> Result<bool, String> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let evaluator = evaluator_with_custom_functions(meta_arc, now)
+            .with_cancellation_token(cancel_token_for_blocking);
+        let mut prepared = evaluator.prepare(&query);
+        for (var, term) in &bindings_owned {
+            prepared = prepared.substitute_variable(var.clone(), term.clone());
+        }
+        prepared.dataset_mut().set_default_graph_as_union();
+
+        match prepared.execute(&dataset) {
+            Ok(spareval::QueryResults::Boolean(b)) => {
+                if timed_out_flag_for_blocking.load(std::sync::atomic::Ordering::SeqCst) {
+                    Err("SPARQL ASK timed out".to_string())
+                } else {
+                    Ok(b)
+                }
+            }
+            Ok(_) => Err("SPARQL action query did not return a boolean ASK result".to_string()),
+            Err(e) => {
+                if timed_out_flag_for_blocking.load(std::sync::atomic::Ordering::SeqCst) {
+                    Err("SPARQL ASK timed out".to_string())
+                } else {
+                    Err(format!("SPARQL ASK evaluation error: {e}"))
+                }
+            }
+        }
+    })
+    .await;
+
+    timer_handle.abort();
+
+    match eval_join {
+        Ok(inner) => inner,
+        Err(e) => Err(format!("SPARQL ASK task panicked: {e}")),
+    }
+}
+
 /// Global configuration for SPARQL execution, honoring optional environment
 /// overrides (`NEUROSTRATA_SPARQL_TIMEOUT_MS`, `NEUROSTRATA_SPARQL_MAX_SOLUTIONS`,
 /// `NEUROSTRATA_SPARQL_MAX_DATASET_QUADS`, `NEUROSTRATA_SPARQL_MAX_ALGEBRA_NODES`).
