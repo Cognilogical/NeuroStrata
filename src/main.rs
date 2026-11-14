@@ -1542,6 +1542,99 @@ mod tests {
     use super::*;
 
     #[test]
+    fn copy_snapshot_into_place_is_failure_atomic_and_cleans_up_on_error() {
+        // Issue #87: a companion copy that fails midway must not leave the
+        // store file at the target — the restore is staged, committed only
+        // as a whole set, and the staged files are removed on error.
+        let root = std::env::temp_dir()
+            .join(format!("mcp-restore-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let snapshot = root.join("snapshot");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join("ladybug.store"), b"store-bytes").unwrap();
+        // A directory where the WAL companion should be: fs::copy of it
+        // fails, after the store file copy already succeeded.
+        std::fs::create_dir_all(snapshot.join("ladybug.store.wal")).unwrap();
+
+        let target = root.join("restored");
+        let err = copy_snapshot_into_place(&snapshot, &target)
+            .expect_err("copying a directory as the WAL companion fails");
+        assert!(
+            !target.exists(),
+            "no partial store is left at the target after a failed companion copy: {err}"
+        );
+        let mut target_wal = target.as_os_str().to_os_string();
+        target_wal.push(".wal");
+        assert!(
+            !std::path::Path::new(&target_wal).exists(),
+            "no staged WAL survives a failed companion copy"
+        );
+        assert!(
+            !root.join(format!(
+                "restored.restore-tmp-{}",
+                std::process::id()
+            ))
+            .exists(),
+            "the staged store copy is removed on failure"
+        );
+        assert!(
+            !root.join(format!(
+                "restored.wal.restore-tmp-{}",
+                std::process::id()
+            ))
+            .exists(),
+            "the staged WAL copy is removed on failure"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn copy_snapshot_into_place_refuses_sidecar_directory_and_preserves_target_wal() {
+        // Issue #95: a pre-existing target_wal file and a target_sidecar
+        // directory must not leave a half-committed target. The sidecar
+        // directory blocks the commit, so the call fails before target is
+        // touched, the pre-existing WAL is preserved intact, and the target
+        // file is absent.
+        let root = std::env::temp_dir().join(format!(
+            "mcp-restore-sidecar-dir-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let snapshot = root.join("snapshot");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join("ladybug.store"), b"store-bytes").unwrap();
+
+        let target = root.join("restored");
+        let target_wal = root.join("restored.wal");
+        std::fs::write(&target_wal, b"preexisting-wal").unwrap();
+        let target_sidecar = crate::model_choice::store_state_path(&target);
+        std::fs::create_dir_all(&target_sidecar).unwrap();
+
+        let err = copy_snapshot_into_place(&snapshot, &target)
+            .expect_err("a directory at the sidecar path blocks the commit");
+        assert!(
+            !target.exists(),
+            "the target store file must be absent when the sidecar path is a directory: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&target_wal).unwrap(),
+            b"preexisting-wal",
+            "the pre-existing target WAL must survive the refusal intact"
+        );
+        assert!(
+            !root.join(format!(
+                "restored.restore-tmp-{}",
+                std::process::id()
+            ))
+            .exists(),
+            "the staged store copy is removed on refusal"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn a_mistyped_subcommand_is_an_error_not_an_execution() {
         let parsed = Cli::try_parse_from(["neurostrata-mcp", "lsit"]);
         assert!(
@@ -3523,55 +3616,172 @@ fn ensure_snapshot_verified(dir: &std::path::Path) -> anyhow::Result<()> {
 /// WAL when the snapshot carries one, and its store-state sidecar when it
 /// carries one. Extracted from the Restore arm so the copy logic is
 /// testable without driving the whole CLI.
+///
+/// The copies are staged at temporary sibling paths (`<target>.restore-tmp-<pid>`)
+/// and renamed into place only after the whole set copied: a companion
+/// copy that fails must not leave the store file (or a half-written
+/// companion) at the target, and a failed restore must not trample a
+/// pre-existing store's companions (issue #87).
 fn copy_snapshot_into_place(
     snapshot_dir: &std::path::Path,
     target: &std::path::Path,
 ) -> anyhow::Result<()> {
+    let pid = std::process::id();
+    let stage_path = |suffix: &str| {
+        let mut staged = target.as_os_str().to_os_string();
+        staged.push(suffix);
+        std::path::PathBuf::from(staged)
+    };
+    let staged_store = stage_path(&format!(".restore-tmp-{pid}"));
+    let staged_wal = stage_path(&format!(".wal.restore-tmp-{pid}"));
+    let staged_sidecar = stage_path(&format!(".store-state.json.restore-tmp-{pid}"));
+    // On any failure the staged set is removed as a unit and nothing at
+    // the target paths is touched.
+    let cleanup_staged = |produced_wal: bool, produced_sidecar: bool| {
+        let _ = std::fs::remove_file(&staged_store);
+        if produced_wal {
+            let _ = std::fs::remove_file(&staged_wal);
+        }
+        if produced_sidecar {
+            let _ = std::fs::remove_file(&staged_sidecar);
+        }
+    };
+
     let snapshot = snapshot_dir.join("ladybug.store");
-    std::fs::copy(&snapshot, target)?;
+    if let Err(e) = std::fs::copy(&snapshot, &staged_store) {
+        cleanup_staged(false, false);
+        return Err(e.into());
+    }
     let mut wal = snapshot.clone().into_os_string();
     wal.push(".wal");
     let wal = std::path::PathBuf::from(wal);
-    let mut target_wal = target.as_os_str().to_os_string();
-    target_wal.push(".wal");
-    let target_wal = std::path::PathBuf::from(target_wal);
+    let mut produced_wal = false;
     if wal.exists() {
-        std::fs::copy(&wal, &target_wal)?;
-    } else if target_wal.exists() {
-        // The target DB file was absent (the Restore arm refuses an
-        // existing one), but an old store's WAL can be left behind at
-        // the target path as an orphan. It must not survive into the
-        // restored store, or the engine would replay it against a
-        // store it never belonged to (the issue-#76 hazard class,
-        // fixed for export but not restore). Removal is loud: a
-        // directory at the WAL path is an error, not a silent pass.
-        std::fs::remove_file(&target_wal).map_err(|e| {
-            anyhow::anyhow!(
-                "could not remove the stale write-ahead log at the restore target: {}",
-                e
-            )
-        })?;
+        if let Err(e) = std::fs::copy(&wal, &staged_wal) {
+            cleanup_staged(true, false);
+            return Err(e.into());
+        }
+        produced_wal = true;
     }
-    // The snapshot's store-state sidecar
-    // restores to the target's sidecar path, so the
-    // restored store keeps its recorded identity.
-    // Snapshots written before sidecar carriage have none
-    // and restore exactly as they always have — except that an
-    // orphan sidecar left at the target path is removed, for the
-    // same reason as the WAL above: the restored store must not
-    // inherit the old store's recorded identity.
     let snapshot_sidecar = snapshot_dir.join("ladybug.store.store-state.json");
-    let target_sidecar = crate::model_choice::store_state_path(target);
+    let mut produced_sidecar = false;
     if snapshot_sidecar.exists() {
-        std::fs::copy(&snapshot_sidecar, &target_sidecar)?;
-    } else if target_sidecar.exists() {
-        std::fs::remove_file(&target_sidecar).map_err(|e| {
+        if let Err(e) = std::fs::copy(&snapshot_sidecar, &staged_sidecar) {
+            cleanup_staged(produced_wal, true);
+            return Err(e.into());
+        }
+        produced_sidecar = true;
+    }
+
+    // Every staged copy succeeded: the set commits now. The commit is
+    // rollback-safe (issue #95): if a rename fails after an earlier one
+    // succeeded, the partially moved target files are removed and any
+    // pre-existing companions stashed in Step A are restored, so the
+    // target is left exactly as it was before this call. Stale
+    // companions the snapshot does not carry are removed by moving them
+    // aside in Step A and discarding them in Step C — not before, so a
+    // failed restore keeps whatever happened to sit at the companion
+    // paths.
+    let target_wal = {
+        let mut path = target.as_os_str().to_os_string();
+        path.push(".wal");
+        std::path::PathBuf::from(path)
+    };
+    let target_sidecar = crate::model_choice::store_state_path(target);
+
+    // Step A: stash any pre-existing orphan companions aside, and refuse
+    // a directory at either path BEFORE touching target. A directory at
+    // the WAL or sidecar path means remove_file/rename cannot succeed, so
+    // the commit would fail partway and leave target half-committed.
+    let prev_wal = target.with_extension(format!("wal.prev-tmp-{pid}"));
+    if target_wal.exists() {
+        if target_wal.is_dir() {
+            cleanup_staged(produced_wal, produced_sidecar);
+            return Err(anyhow::anyhow!(
+                "the restore target's write-ahead log path is a directory: {}",
+                target_wal.display()
+            ));
+        }
+        if let Err(e) = std::fs::rename(&target_wal, &prev_wal) {
+            cleanup_staged(produced_wal, produced_sidecar);
+            return Err(anyhow::anyhow!(
+                "could not move the existing write-ahead log out of the way: {}",
+                e
+            ));
+        }
+    }
+    let prev_sidecar =
+        target.with_extension(format!("store-state.json.prev-tmp-{pid}"));
+    if target_sidecar.exists() {
+        if target_sidecar.is_dir() {
+            // Restore the stashed WAL (if any) before bailing: the
+            // pre-existing target_wal must survive a sidecar-directory
+            // refusal untouched.
+            if prev_wal.exists() {
+                let _ = std::fs::rename(&prev_wal, &target_wal);
+            }
+            cleanup_staged(produced_wal, produced_sidecar);
+            return Err(anyhow::anyhow!(
+                "the restore target's store-state sidecar path is a directory: {}",
+                target_sidecar.display()
+            ));
+        }
+        if let Err(e) = std::fs::rename(&target_sidecar, &prev_sidecar) {
+            if prev_wal.exists() {
+                let _ = std::fs::rename(&prev_wal, &target_wal);
+            }
+            cleanup_staged(produced_wal, produced_sidecar);
+            return Err(anyhow::anyhow!(
+                "could not move the existing store-state sidecar out of the way: {}",
+                e
+            ));
+        }
+    }
+
+    // Step B: commit the staged set with full rollback on error.
+    let rollback_commit = || {
+        // Remove any target files created by a partial commit.
+        let _ = std::fs::remove_file(target);
+        if produced_wal {
+            let _ = std::fs::remove_file(&target_wal);
+        }
+        if produced_sidecar {
+            let _ = std::fs::remove_file(&target_sidecar);
+        }
+        // Restore stashed companions, if any.
+        if prev_wal.exists() {
+            let _ = std::fs::rename(&prev_wal, &target_wal);
+        }
+        if prev_sidecar.exists() {
+            let _ = std::fs::rename(&prev_sidecar, &target_sidecar);
+        }
+        cleanup_staged(produced_wal, produced_sidecar);
+    };
+
+    std::fs::rename(&staged_store, target).map_err(|e| {
+        rollback_commit();
+        anyhow::anyhow!("could not move the staged store into place: {}", e)
+    })?;
+    if produced_wal {
+        std::fs::rename(&staged_wal, &target_wal).map_err(|e| {
+            rollback_commit();
+            anyhow::anyhow!("could not move the staged write-ahead log into place: {}", e)
+        })?;
+    }
+    if produced_sidecar {
+        std::fs::rename(&staged_sidecar, &target_sidecar).map_err(|e| {
+            rollback_commit();
             anyhow::anyhow!(
-                "could not remove the stale store-state sidecar at the restore target: {}",
+                "could not move the staged store-state sidecar into place: {}",
                 e
             )
         })?;
     }
+
+    // Step C: the commit succeeded; the stashed companions are now
+    // superseded by the new set, so discard them.
+    let _ = std::fs::remove_file(&prev_wal);
+    let _ = std::fs::remove_file(&prev_sidecar);
     Ok(())
 }
 
@@ -4127,10 +4337,29 @@ async fn run() -> anyhow::Result<()> {
 
                 // Opened only after the copy, to verify the restored store
                 // reads back and to report what it holds.
-                let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
+                let vector_store: Arc<dyn VectorStore> = match LadybugStore::new(
                     target.to_string_lossy().to_string(),
                     embed::configured_dimensions()?,
-                )?);
+                ) {
+                    Ok(store) => Arc::new(store),
+                    Err(e) => {
+                        // The snapshot verified, but the store it placed
+                        // will not open — leaving it at the target would
+                        // park an unopenable store where a live one was
+                        // expected. Roll the copy back entirely so a
+                        // failed restore leaves the target absent (issue
+                        // #87); the snapshot itself is untouched and the
+                        // restore can be retried.
+                        let _ = std::fs::remove_file(&target);
+                        let mut target_wal = target.as_os_str().to_os_string();
+                        target_wal.push(".wal");
+                        let _ = std::fs::remove_file(std::path::PathBuf::from(target_wal));
+                        let _ = std::fs::remove_file(
+                            crate::model_choice::store_state_path(&target),
+                        );
+                        return Err(e);
+                    }
+                };
 
                 let namespaces = match vector_store.list_namespaces().await {
                     Ok(n) => n,
