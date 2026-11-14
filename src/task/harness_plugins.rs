@@ -142,18 +142,77 @@ fn plain_abs_path(path: &Path) -> String {
         .to_string()
 }
 
-/// Rewrite only the path of an installer-generated runner command. A command
-/// shaped `NEUROSTRATA_NAMESPACE=<ns> node "<runner>"` whose runner basename
-/// matches the installer's runner is ours; a custom hook that merely carries
-/// the namespace environment variable is not, and is left untouched.
 fn path_basename(p: &str) -> Option<&str> {
     p.rsplit(['/', '\\']).find(|s| !s.is_empty())
 }
 
+/// One spelling of a path for equality checks: the verbatim prefix dropped,
+/// `\` turned into `/`, and ASCII case folded when it starts with a drive
+/// letter (Windows compares paths case-insensitively). Plain string work, so
+/// Windows spellings compare the same way when the tests run on Unix.
+fn path_key(p: &str) -> String {
+    let p = match p.strip_prefix(r"\\?\UNC\") {
+        Some(rest) => format!(r"\\{rest}"),
+        None => p.strip_prefix(r"\\?\").unwrap_or(p).to_string(),
+    };
+    let p = p.replace('\\', "/");
+    let b = p.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        p.to_ascii_lowercase()
+    } else {
+        p
+    }
+}
+
+/// Whether two paths name the same file: equal [`path_key`]s, or, when the
+/// spellings differ but both exist, equal canonical forms. `path_key` folds
+/// ASCII case only, so this catches a case-only rename with non-ASCII letters
+/// (`Pröj` vs `PRÖJ`) on a case-insensitive volume, and 8.3 short names.
+/// This duplicates the comparison rule of a shared paths module
+/// (`relative_to_on_disk`) until one lands upstream; move it there then.
+fn same_path_on_disk(a: &str, b: &str) -> bool {
+    if path_key(a) == path_key(b) {
+        return true;
+    }
+    match (dunce::canonicalize(a), dunce::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Whether a hook's runner path may be pointed at the installer's runner:
+/// it already names the installer's own runner (in any spelling), or nothing
+/// exists there. A runner that exists anywhere else is someone's own install,
+/// and so is a path the shell expands (`$VAR`, `%VAR%`, `~`), which cannot be
+/// checked from here.
+fn runner_is_replaceable(old_path: &str, project_root: &Path, abs_runner: &str) -> bool {
+    if path_key(old_path) == path_key(abs_runner) {
+        return true;
+    }
+    if old_path.contains(['$', '%']) || old_path.starts_with('~') {
+        return false;
+    }
+    // A relative runner is resolved by the hook's cwd, the project root.
+    let candidate = project_root.join(old_path);
+    if same_path_on_disk(&candidate.to_string_lossy(), abs_runner) {
+        return true;
+    }
+    // Only a definite "not found" counts as missing; an unreadable path is
+    // left alone.
+    matches!(candidate.try_exists(), Ok(false))
+}
+
+/// Rewrite only the path of an installer-generated runner command. A command
+/// shaped `NEUROSTRATA_NAMESPACE=<ns> node "<runner>"` whose runner basename
+/// matches the installer's runner, and whose runner is the installer's own or
+/// is missing, is ours to repair. A custom hook that merely carries the
+/// namespace environment variable, or runs a `cli-hook.mjs` installed
+/// elsewhere, is left untouched.
 fn repair_installer_hook_command(
     command: &str,
     namespace: &str,
     abs_runner: &str,
+    project_root: &Path,
 ) -> Option<String> {
     let prefix = format!("NEUROSTRATA_NAMESPACE={namespace} node \"");
     let rest = command.strip_prefix(&prefix)?;
@@ -163,6 +222,9 @@ fn repair_installer_hook_command(
     // Windows separators are legal in a verbatim path even when the test
     // that exercises this runs on Unix, so do not use platform Path parsing.
     if path_basename(old_path) != path_basename(abs_runner) {
+        return None;
+    }
+    if !runner_is_replaceable(old_path, project_root, abs_runner) {
         return None;
     }
     Some(format!("{prefix}{abs_runner}\"{suffix}"))
@@ -620,7 +682,9 @@ fn wire_harness_config(
                             });
                             // Repair commands written by an older installer that
                             // embedded a Windows verbatim path. Only rewrite our
-                            // own hook commands; user hooks are left untouched.
+                            // own hook commands; user hooks, including ones that
+                            // run a cli-hook.mjs installed elsewhere, are left
+                            // untouched.
                             for entries in h_obj.values_mut() {
                                 if let Some(arr) = entries.as_array_mut() {
                                     for entry in arr {
@@ -637,6 +701,7 @@ fn wire_harness_config(
                                                             command,
                                                             namespace,
                                                             abs_runner,
+                                                            project_root,
                                                         )
                                                     {
                                                         hook["command"] =
@@ -874,6 +939,173 @@ mod tests {
                     && c.ends_with('"')),
             "our repaired hook is present: {commands:?}"
         );
+    }
+
+    /// Settings whose PreToolUse, Stop and SessionStart hooks all run
+    /// `NEUROSTRATA_NAMESPACE=TestProj node "<runner>"`.
+    fn settings_with_runner(runner: &str) -> Value {
+        let cmd = format!("NEUROSTRATA_NAMESPACE=TestProj node \"{runner}\"");
+        json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Read|Write|Edit|MultiEdit|Bash|Task",
+                    "hooks": [{ "type": "command", "command": cmd }]
+                }],
+                "SessionStart": [{ "hooks": [{ "type": "command", "command": cmd }] }],
+                "Stop": [{ "hooks": [{ "type": "command", "command": cmd }] }]
+            }
+        })
+    }
+
+    fn hook_commands(cfg: &Path) -> Vec<String> {
+        let doc: Value =
+            serde_json::from_str(&std::fs::read_to_string(cfg).expect("read settings"))
+                .expect("parse settings");
+        doc["hooks"]
+            .as_object()
+            .expect("hooks object")
+            .values()
+            .flat_map(|entries| entries.as_array().cloned().unwrap_or_default())
+            .flat_map(|entry| entry["hooks"].as_array().cloned().unwrap_or_default())
+            .filter_map(|hook| hook["command"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn leaves_a_custom_existing_runner_outside_the_project_byte_identical() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(project.join(".claude")).expect("create .claude");
+        let custom_dir = tmp.path().join("plugins-local/claude");
+        std::fs::create_dir_all(&custom_dir).expect("create custom plugin dir");
+        let custom_runner = custom_dir.join("cli-hook.mjs");
+        std::fs::write(&custom_runner, "// custom runner\n").expect("write custom runner");
+        // Forward slashes, the way a hand-written Windows hook usually spells it.
+        let runner = custom_runner.to_string_lossy().replace('\\', "/");
+        let cfg = project.join(".claude/settings.local.json");
+        let before = serde_json::to_string_pretty(&settings_with_runner(&runner)).unwrap();
+        std::fs::write(&cfg, &before).expect("write settings");
+
+        let _ = auto_install_detected_plugins(&project, "TestProj", Some("claude"));
+        let after = std::fs::read_to_string(&cfg).expect("read settings");
+        assert_eq!(after, before, "custom hook commands were rewritten");
+    }
+
+    #[test]
+    fn repairs_a_runner_path_that_no_longer_exists() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".claude")).expect("create .claude");
+        let gone = tmp.path().join("moved-away/cli-hook.mjs");
+        let cfg = tmp.path().join(".claude/settings.local.json");
+        std::fs::write(
+            &cfg,
+            serde_json::to_string_pretty(&settings_with_runner(&gone.to_string_lossy())).unwrap(),
+        )
+        .expect("write settings");
+
+        let report = auto_install_detected_plugins(tmp.path(), "TestProj", Some("claude"));
+        let abs_runner = report["installed_plugins"][0]["cli_hook_runner"]
+            .as_str()
+            .expect("cli_hook_runner");
+        let want = format!("NEUROSTRATA_NAMESPACE=TestProj node \"{abs_runner}\"");
+        let commands = hook_commands(&cfg);
+        assert_eq!(commands.len(), 3, "{commands:?}");
+        assert!(commands.iter().all(|c| *c == want), "missing runner not repaired: {commands:?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn repairs_the_installers_own_runner_in_verbatim_form() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".claude")).expect("create .claude");
+        // First install puts the runner on disk and reports where it is.
+        let report = auto_install_detected_plugins(tmp.path(), "TestProj", Some("claude"));
+        let abs_runner = report["installed_plugins"][0]["cli_hook_runner"]
+            .as_str()
+            .expect("cli_hook_runner")
+            .to_string();
+        assert!(Path::new(&abs_runner).exists(), "runner written: {abs_runner}");
+        let cfg = tmp.path().join(".claude/settings.local.json");
+        let verbatim = format!(r"\\?\{abs_runner}");
+        std::fs::write(
+            &cfg,
+            serde_json::to_string_pretty(&settings_with_runner(&verbatim)).unwrap(),
+        )
+        .expect("write settings");
+
+        let _ = auto_install_detected_plugins(tmp.path(), "TestProj", Some("claude"));
+        let want = format!("NEUROSTRATA_NAMESPACE=TestProj node \"{abs_runner}\"");
+        let commands = hook_commands(&cfg);
+        assert_eq!(commands.len(), 3, "{commands:?}");
+        assert!(commands.iter().all(|c| *c == want), "own verbatim runner not repaired: {commands:?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn repairs_the_installers_own_runner_spelled_with_other_non_ascii_case() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project = tmp.path().join("Pröj");
+        std::fs::create_dir_all(project.join(".claude")).expect("create .claude");
+        let report = auto_install_detected_plugins(&project, "TestProj", Some("claude"));
+        let abs_runner = report["installed_plugins"][0]["cli_hook_runner"]
+            .as_str()
+            .expect("cli_hook_runner")
+            .to_string();
+        assert!(abs_runner.contains("Pröj"), "runner under the project: {abs_runner}");
+        // Same file on a case-insensitive volume, but not equal after ASCII
+        // case folding.
+        let other_case = format!(r"\\?\{}", abs_runner.replace("Pröj", "PRÖJ"));
+        assert!(Path::new(&other_case).exists(), "volume is case-insensitive: {other_case}");
+        let cfg = project.join(".claude/settings.local.json");
+        std::fs::write(
+            &cfg,
+            serde_json::to_string_pretty(&settings_with_runner(&other_case)).unwrap(),
+        )
+        .expect("write settings");
+
+        let _ = auto_install_detected_plugins(&project, "TestProj", Some("claude"));
+        let want = format!("NEUROSTRATA_NAMESPACE=TestProj node \"{abs_runner}\"");
+        let commands = hook_commands(&cfg);
+        assert_eq!(commands.len(), 3, "{commands:?}");
+        assert!(commands.iter().all(|c| *c == want), "own runner in other case not repaired: {commands:?}");
+    }
+
+    #[test]
+    fn runner_is_replaceable_matches_the_installers_own_path_in_any_spelling() {
+        let own = r"C:\proj\.NeuroStrata\plugins\claude\cli-hook.mjs";
+        let root = Path::new(r"C:\proj");
+        for spelling in [
+            own,
+            r"\\?\C:\proj\.NeuroStrata\plugins\claude\cli-hook.mjs",
+            "C:/proj/.NeuroStrata/plugins/claude/cli-hook.mjs",
+            "c:/proj/.NeuroStrata/plugins/claude/cli-hook.mjs",
+            r"c:\PROJ\.neurostrata\plugins\claude\cli-hook.mjs",
+        ] {
+            assert!(runner_is_replaceable(spelling, root, own), "{spelling}");
+        }
+        assert_eq!(
+            path_key(r"\\?\UNC\server\share\cli-hook.mjs"),
+            path_key(r"\\server\share\cli-hook.mjs")
+        );
+
+        // An existing runner elsewhere is someone's own install.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let custom = tmp.path().join("cli-hook.mjs");
+        std::fs::write(&custom, "").expect("write custom runner");
+        let own_here = tmp.path().join("project/.NeuroStrata/plugins/claude/cli-hook.mjs");
+        assert!(!runner_is_replaceable(
+            &custom.to_string_lossy(),
+            &tmp.path().join("project"),
+            &own_here.to_string_lossy(),
+        ));
+        // Shell-expanded paths cannot be checked, so they are left alone.
+        for expanded in [
+            "$CLAUDE_PROJECT_DIR/hooks/cli-hook.mjs",
+            "%USERPROFILE%/hooks/cli-hook.mjs",
+            "~/hooks/cli-hook.mjs",
+        ] {
+            assert!(!runner_is_replaceable(expanded, tmp.path(), &own_here.to_string_lossy()), "{expanded}");
+        }
     }
 
     #[test]

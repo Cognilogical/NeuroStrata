@@ -1176,6 +1176,35 @@ let incomplete = result_count >= fetch_limit;
     Ok(outcome)
 }
 
+/// How this process opened the database (`#84`): the open
+/// provenance decides whether the engine's width/emptiness view can be
+/// trusted for reconciliation and provenance upgrades.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenProvenance {
+    /// Opened through the normal verified path — the engine's view
+    /// of the store is authenticated.
+    Verified,
+    /// Reopened after a checksum-config mismatch (checksums
+    /// disabled): the view is not replay-verified.
+    ChecksumConfigMismatch,
+    /// Reopened with verification disabled to replay an unverified
+    /// WAL: rows that lived only in the WAL are not authenticated.
+    UnverifiedWalReplay,
+    /// The unreadable WAL was set aside (`.corrupted.<ts>`) and the
+    /// database reopened verified: some writes were discarded.
+    DiscardedUnreadableWal,
+}
+
+impl OpenProvenance {
+    /// Whether the open went through the normal verified path. Width
+    /// reconciliation and the `LockedUnknown` empty-store upgrade
+    /// gate on this: a recovery open's engine view is
+    /// unauthenticated.
+    pub fn is_verified(self) -> bool {
+        matches!(self, Self::Verified)
+    }
+}
+
 pub struct LadybugStore {
     local_path: PathBuf,
     dimensions: usize,
@@ -1258,15 +1287,15 @@ pub struct LadybugStore {
     /// a sidecar-less store that predates it is a pre-fix store whose
     /// data state is unknowable from outside (fail-closed).
     db_preexisting: bool,
-    /// Whether this process opened the database through a recovery
-    /// path in `with_system_config` — the checksum-mismatch reopen,
-    /// the unverified-WAL replay, or the WAL-discard reopen — rather
-    /// than the normal verified open. A recovery open's view of the
-    /// store is unauthenticated: rows that lived only in the WAL can
-    /// present as absent, so an apparently empty table on such an
-    /// open is not evidence the store is pristine, and `init` must
-    /// not run the LockedUnknown provenance upgrade from it.
-    opened_via_recovery: bool,
+    /// How this process opened the database — the normal verified open,
+    /// or one of the three recovery paths in `with_system_config` (the
+    /// checksum-mismatch reopen, the unverified-WAL replay, or the
+    /// WAL-discard reopen). A non-verified open's view of the store is
+    /// unauthenticated: rows that lived only in the WAL can present as
+    /// absent, so an apparently empty table on such an open is not
+    /// evidence the store is pristine, and `init` must not run the
+    /// LockedUnknown provenance upgrade from it.
+    open_provenance: OpenProvenance,
     /// This process's view of the store-state sidecar, loaded on first
     /// use. The sidecar is the setup-time model choice's lock record:
     /// see `crate::model_choice::store_has_data`.
@@ -2008,6 +2037,75 @@ impl LockedUnknownStamp {
     }
 }
 
+/// The Phase B migration handle for a data-bearing LockedUnknown
+/// store (#77): a snapshot of the migration's inputs taken at entry
+/// — the shared store-state cache, the sidecar path, the serving
+/// descriptor this process is bound to, and the store's width — so
+/// the whole decision-and-transition (attest rows > 0 AND physical
+/// width == dimensions from the engine, then record the
+/// `has_data: true` identity) runs as one unit inside a single
+/// writer's turn, exactly as [`LockedUnknownStamp`] does for the
+/// pristine upgrade.
+#[derive(Clone)]
+struct LockedUnknownMigration {
+    store_state: Arc<std::sync::Mutex<Option<CachedStoreState>>>,
+    local_path: PathBuf,
+    serving: crate::traits::EmbeddingDescriptor,
+    dimensions: usize,
+}
+
+impl LockedUnknownMigration {
+    /// Attest data-bearing identity from the engine and, iff the
+    /// engine attests `Memory` holds rows AND its physical embedding
+    /// width equals the serving width, record the `has_data: true`
+    /// sidecar and move the cache to `Recorded`. A zero-row table, a
+    /// width mismatch, an unreadable catalog, or an unexecutable
+    /// attestation reads as `false` (nothing recorded, store left
+    /// exactly as found — the LockedUnknown classification persists
+    /// for a later verified open or migration attempt); only the
+    /// writer's turn itself fails outward. A sidecar write failure
+    /// is logged and reads as `false`, like the stamp.
+    fn migrate_data_bearing(&self, conn: &Connection) -> Result<bool> {
+        // An attestation query that fails to execute mints no identity:
+        // downgrade to the same refusal as any other negative
+        // attestation, with the failure logged (the stamp's policy).
+        let facts = match inspect_memory_embedding_and_count(conn) {
+            Ok(facts) => facts,
+            Err(e) => {
+                tracing::warn!(
+                    "data-bearing attestation could not execute ({e}); leaving the store as found"
+                );
+                return Ok(false);
+            }
+        };
+        let Some(physical) = facts.physical_width() else {
+            return Ok(false);
+        };
+        let Some(rows) = facts.row_count() else {
+            return Ok(false);
+        };
+        if rows == 0 || physical != self.dimensions {
+            return Ok(false);
+        }
+        let state = crate::model_choice::StoreState {
+            version: crate::model_choice::STORE_STATE_VERSION,
+            has_data: true,
+            descriptor: self.serving.clone(),
+        };
+        match crate::model_choice::write_store_state(&self.local_path, &state) {
+            Ok(()) => {
+                let mut cache = self.store_state.lock().unwrap_or_else(|e| e.into_inner());
+                *cache = Some(CachedStoreState::Recorded(state));
+                Ok(true)
+            }
+            Err(e) => {
+                tracing::warn!("store-state sidecar write failed: {e}");
+                Ok(false)
+            }
+        }
+    }
+}
+
 impl LadybugStore {
     /// Construct a `LadybugStore` for tests with a small system footprint so
     /// `cargo test` (parallel by default) does not mmap-reserve 8 TiB per
@@ -2068,14 +2166,14 @@ impl LadybugStore {
 
         // Open with verification first. Only if the WAL fails to authenticate do we
         // consider replaying it unverified, and never quietly.
-        let mut opened_via_recovery = false;
+        let mut open_provenance = OpenProvenance::Verified;
         let db = match Database::new(&local_path, initial_config) {
             Ok(db) => db,
             Err(e) => {
                 let err_msg = e.to_string();
                 let checksum_mismatch = err_msg.contains("enableChecksums");
                 if checksum_mismatch {
-                    opened_via_recovery = true;
+                    open_provenance = OpenProvenance::ChecksumConfigMismatch;
                     eprintln!("WARN: DB checksum config mismatch; reopening with checksums disabled.");
                     match Database::new(&local_path, unverified_config()) {
                         Ok(db) => db,
@@ -2100,7 +2198,7 @@ impl LadybugStore {
 
                 match Database::new(&local_path, unverified_config()) {
                     Ok(db) => {
-                        opened_via_recovery = true;
+                        open_provenance = OpenProvenance::UnverifiedWalReplay;
                         eprintln!("Recovered by replaying the unverified write-ahead log.");
                         // The replay only brought the writes back into memory.
                         // Checkpoint them into the main DB files right away, so
@@ -2155,7 +2253,7 @@ impl LadybugStore {
                             dropped_bytes
                         );
                         eprintln!("ERROR: they were kept at {:?} -- do not delete it if those writes mattered.", corrupted_file);
-                        opened_via_recovery = true;
+                        open_provenance = OpenProvenance::DiscardedUnreadableWal;
                         // No WAL left to verify at this point.
                         Database::new(&local_path, verifying_config()).map_err(|last_e| {
                             anyhow::anyhow!("Retry failed after discarding the WAL: {}", last_e)
@@ -2192,7 +2290,7 @@ impl LadybugStore {
             embed_config_dir: crate::embed::config_dir(),
             serving_descriptor: std::sync::Mutex::new(None),
             db_preexisting,
-            opened_via_recovery,
+            open_provenance,
             store_state: Arc::new(std::sync::Mutex::new(None)),
         })
     }
@@ -2227,6 +2325,13 @@ impl LadybugStore {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// How this process opened the database (see the field). Width
+    /// reconciliation and the LockedUnknown provenance upgrade gate
+    /// on [`OpenProvenance::is_verified`].
+    pub fn open_provenance(&self) -> OpenProvenance {
+        self.open_provenance
     }
 
     /// Bind (or replace) the serving descriptor after construction,
@@ -2349,8 +2454,8 @@ impl LadybugStore {
     /// stores the feature never touches, so errors are logged, not
     /// propagated.
     ///
-    /// The recorded-pristine adoption never runs on a recovery open
-    /// (`opened_via_recovery`): the recorded descriptor is only
+    /// The recorded-pristine adoption never runs on a non-verified
+    /// open (`open_provenance`): the recorded descriptor is only
     /// rewritten from evidence a verified open produced, and on a
     /// recovery open the sidecar's `has_data=false` claim is the
     /// sole basis for adoption while the engine's view of the store
@@ -2363,7 +2468,7 @@ impl LadybugStore {
     fn maintain_store_state(&self) {
         match self.cached_store_state() {
             CachedStoreState::Recorded(recorded)
-                if !recorded.has_data && !self.opened_via_recovery =>
+                if !recorded.has_data && self.open_provenance.is_verified() =>
             {
                 if let Some(serving) = self.serving_descriptor() {
                     if serving != recorded.descriptor && self.serving_matches_configured(&serving) {
@@ -2460,6 +2565,53 @@ impl LadybugStore {
                 stamp.attest_and_stamp(conn, dimensions, &create_node_table, &create_rel_tables)
             })
             .await;
+    }
+
+    /// Phase B explicit migration for a data-bearing `LockedUnknown`
+    /// store (#77): a legacy store whose sidecar was never recorded,
+    /// whose table holds rows, whose physical embedding width equals
+    /// the width this process serves, and whose serving descriptor
+    /// matches the configured one, records a `has_data: true`
+    /// identity so the store enters `Recorded` data-bearing
+    /// protection instead of opening unverified forever.
+    ///
+    /// Gated on a `Verified` open (`open_provenance.is_verified()`):
+    /// a recovery open's engine view is unauthenticated, so it
+    /// attests nothing (panel condition 1). The gate and the whole
+    /// decision-and-transition run inside one writer's turn — the
+    /// attestation (`rows > 0` AND physical `FLOAT[width] ==
+    /// self.dimensions`) and the sidecar write are a single unit, so
+    /// no writer of this instance can land between them. A
+    /// `LockedUnknown` store with an empty table, a width mismatch,
+    /// an unbound or configuration-mismatched serving descriptor, or
+    /// a non-`Verified` open is left exactly as found with
+    /// `Ok(false)`; only the writer's turn itself fails outward. A
+    /// sidecar write failure is logged and reads as `Ok(false)`.
+    pub async fn migrate_locked_unknown_data_bearing_store_state(&self) -> Result<bool> {
+        if !self.open_provenance.is_verified() {
+            return Ok(false);
+        }
+        if !matches!(self.cached_store_state(), CachedStoreState::LockedUnknown) {
+            return Ok(false);
+        }
+        let Some(serving) = self.serving_descriptor() else {
+            return Ok(false);
+        };
+        if !self.serving_matches_configured(&serving) {
+            return Ok(false);
+        }
+        let migration = LockedUnknownMigration {
+            store_state: Arc::clone(&self.store_state),
+            local_path: self.local_path.clone(),
+            serving,
+            dimensions: self.dimensions,
+        };
+        let outcome = self
+            .write_with_deadline("migrating a data-bearing LockedUnknown store", move |conn| {
+                migration.migrate_data_bearing(conn)
+            })
+            .await?;
+        Ok(outcome)
     }
 
     /// Whether the serving descriptor equals the currently configured
@@ -5997,6 +6149,94 @@ fn memory_table_ddl(dimensions: usize) -> (String, [&'static str; 5]) {
     )
 }
 
+/// The raw catalog facts the two width reconciliations consult
+/// (#83): exactly what the engine returned. `embedding` is the
+/// `embedding` property's catalog type cell (None when the table has
+/// no such property); `count` is the count cell of the first row of
+/// `MATCH (m:Memory) RETURN count(m)` (None when that query returned
+/// no row). Query-execution errors propagate unchanged — value-shape
+/// interpretation is each wrapper's policy, so the fail-open
+/// (LockedUnknown) and fail-closed (recorded pristine) wrappers keep
+/// their exact messages and downgrade/refusal decisions.
+struct MemoryCatalogFacts {
+    embedding: Option<lbug::Value>,
+    count: Option<lbug::Value>,
+}
+
+impl MemoryCatalogFacts {
+    /// The physical embedding width when the catalog attests a
+    /// `FLOAT[width]` column; any other shape reads as none.
+    fn physical_width(&self) -> Option<usize> {
+        match self.embedding.as_ref() {
+            Some(lbug::Value::String(ty)) => ty
+                .strip_prefix("FLOAT[")
+                .and_then(|rest| rest.strip_suffix(']'))
+                .and_then(|digits| digits.parse::<usize>().ok()),
+            _ => None,
+        }
+    }
+
+    /// The attested row count when the count query returned an Int64
+    /// cell.
+    fn row_count(&self) -> Option<i64> {
+        match self.count.as_ref() {
+            Some(lbug::Value::Int64(n)) => Some(*n),
+            _ => None,
+        }
+    }
+}
+
+/// The shared catalog inspection both width-reconcile paths perform
+/// (#83): `CALL table_info('Memory') RETURN *` for the `embedding`
+/// property's catalog type, then `MATCH (m:Memory) RETURN count(m)`
+/// for the attested row count. Execution errors propagate — the
+/// wrapper decides whether they downgrade or refuse.
+fn inspect_memory_embedding_and_count(conn: &Connection) -> Result<MemoryCatalogFacts> {
+    let mut embedding: Option<lbug::Value> = None;
+    for row in conn.query("CALL table_info('Memory') RETURN *")? {
+        let name = match row.get(1) {
+            Some(lbug::Value::String(s)) => s.as_str(),
+            _ => continue,
+        };
+        if name != "embedding" {
+            continue;
+        }
+        embedding = row.get(2).cloned();
+    }
+    let mut count_rows = conn.query("MATCH (m:Memory) RETURN count(m)")?;
+    let count = count_rows.next().and_then(|row| row.get(0).cloned());
+    Ok(MemoryCatalogFacts { embedding, count })
+}
+
+/// The shared drop/recreate write leg both width reconciliations
+/// perform (#83): drop the `Memory` node table and its five rel
+/// tables and recreate them from the caller's DDL strings (the rel
+/// tables reference `Memory`, so they go first). Safe only on an
+/// engine-attested empty table — edges require Memory nodes, so
+/// both callers attest emptiness before invoking it.
+/// Failures propagate: the schema may have been altered.
+fn drop_and_recreate_memory_schema(
+    conn: &Connection,
+    create_node_table: &str,
+    create_rel_tables: &[&str],
+) -> Result<()> {
+    for table in [
+        "RELATES_TO",
+        "CONTAINS",
+        "GOVERNS",
+        "EXTRACTED_FROM",
+        "DEPENDS_ON",
+        "Memory",
+    ] {
+        conn.query(&format!("DROP TABLE {table}"))?;
+    }
+    conn.query(create_node_table)?;
+    for ddl in create_rel_tables {
+        conn.query(ddl)?;
+    }
+    Ok(())
+}
+
 /// The LockedUnknown counterpart of
 /// [`reconcile_pristine_embedding_width`] (issue #74): attest from the
 /// engine whether the Memory table is empty, reconciling its physical
@@ -6018,61 +6258,26 @@ fn reconcile_empty_locked_unknown_width(
     create_node_table: &str,
     create_rel_tables: &[&str],
 ) -> Result<bool> {
-    let mut physical: Option<usize> = None;
     // A query-EXECUTION failure attests nothing either: downgrade
     // it to the same leave-as-found `false` as an unreadable width
     // below — this helper never refuses an open (panel condition 2,
     // finding P4-F3). The failure is logged, so a store whose
     // attestation persistently fails is distinguishable from a
     // healthy legacy store.
-    let table_info = match conn.query("CALL table_info('Memory') RETURN *") {
-        Ok(rows) => rows,
+    let facts = match inspect_memory_embedding_and_count(conn) {
+        Ok(facts) => facts,
         Err(e) => {
             tracing::warn!(
-                "provenance attestation could not execute (table_info query failed: {e}); leaving the store as found"
+                "provenance attestation could not execute ({e}); leaving the store as found"
             );
             return Ok(false);
         }
     };
-    for row in table_info {
-        let name = match row.get(1) {
-            Some(lbug::Value::String(s)) => s.as_str(),
-            _ => continue,
-        };
-        if name != "embedding" {
-            continue;
-        }
-        let ty = match row.get(2) {
-            Some(lbug::Value::String(s)) => s.clone(),
-            _ => return Ok(false),
-        };
-        physical = ty
-            .strip_prefix("FLOAT[")
-            .and_then(|rest| rest.strip_suffix(']'))
-            .and_then(|digits| digits.parse::<usize>().ok());
-    }
-    let Some(physical) = physical else {
+    let Some(physical) = facts.physical_width() else {
         return Ok(false);
     };
-
-    // Same downgrade as the table-info query above: an
-    // unexecutable count attests nothing, so leave as found —
-    // with the failure logged, as above.
-    let mut count_rows = match conn.query("MATCH (m:Memory) RETURN count(m)") {
-        Ok(rows) => rows,
-        Err(e) => {
-            tracing::warn!(
-                "provenance attestation could not execute (row-count query failed: {e}); leaving the store as found"
-            );
-            return Ok(false);
-        }
-    };
-    let rows = match count_rows.next() {
-        Some(row) => match row.get(0) {
-            Some(lbug::Value::Int64(n)) => *n,
-            _ => return Ok(false),
-        },
-        None => return Ok(false),
+    let Some(rows) = facts.row_count() else {
+        return Ok(false);
     };
     if rows > 0 {
         return Ok(false);
@@ -6083,20 +6288,7 @@ fn reconcile_empty_locked_unknown_width(
         // Memory rows has no rel rows either (edges require Memory
         // nodes), so dropping and recreating loses nothing — the
         // same mechanism the pristine reconciliation proved.
-        for table in [
-            "RELATES_TO",
-            "CONTAINS",
-            "GOVERNS",
-            "EXTRACTED_FROM",
-            "DEPENDS_ON",
-            "Memory",
-        ] {
-            conn.query(&format!("DROP TABLE {table}"))?;
-        }
-        conn.query(create_node_table)?;
-        for ddl in create_rel_tables {
-            conn.query(ddl)?;
-        }
+        drop_and_recreate_memory_schema(conn, create_node_table, create_rel_tables)?;
     }
     Ok(true)
 }
@@ -6129,53 +6321,40 @@ fn reconcile_pristine_embedding_width(
     create_node_table: &str,
     create_rel_tables: &[&str],
 ) -> Result<()> {
-    let mut physical: Option<usize> = None;
-    for row in conn.query("CALL table_info('Memory') RETURN *")? {
-        let name = match row.get(1) {
-            Some(lbug::Value::String(s)) => s.as_str(),
-            _ => continue,
-        };
-        if name != "embedding" {
-            continue;
+    let facts = inspect_memory_embedding_and_count(conn)?;
+    let ty = match facts.embedding {
+        Some(lbug::Value::String(ty)) => ty,
+        Some(other) => {
+            anyhow::bail!(
+                "cannot reconcile the embedding width: the Memory table's embedding property has an unreadable catalog type ({other:?})"
+            )
         }
-        let ty = match row.get(2) {
-            Some(lbug::Value::String(s)) => s.clone(),
-            other => {
-                anyhow::bail!(
-                    "cannot reconcile the embedding width: the Memory table's embedding property has an unreadable catalog type ({other:?})"
-                )
-            }
-        };
-        physical = Some(
-            ty.strip_prefix("FLOAT[")
-                .and_then(|rest| rest.strip_suffix(']'))
-                .and_then(|digits| digits.parse::<usize>().ok())
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "cannot reconcile the embedding width: the Memory table's embedding property type '{ty}' is not a FLOAT[width] column"
-                    )
-                })?,
-        );
-    }
-    let physical = physical.ok_or_else(|| {
-        anyhow::anyhow!(
-            "cannot reconcile the embedding width: the Memory table has no embedding property in the engine catalog"
-        )
-    })?;
+        None => {
+            anyhow::bail!(
+                "cannot reconcile the embedding width: the Memory table has no embedding property in the engine catalog"
+            )
+        }
+    };
+    let physical = ty
+        .strip_prefix("FLOAT[")
+        .and_then(|rest| rest.strip_suffix(']'))
+        .and_then(|digits| digits.parse::<usize>().ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot reconcile the embedding width: the Memory table's embedding property type '{ty}' is not a FLOAT[width] column"
+            )
+        })?;
     if physical == dimensions {
         return Ok(());
     }
 
-    let mut count_rows = conn.query("MATCH (m:Memory) RETURN count(m)")?;
-    let rows = match count_rows.next() {
-        Some(row) => match row.get(0) {
-            Some(lbug::Value::Int64(n)) => *n,
-            other => {
-                anyhow::bail!(
-                    "cannot reconcile the embedding width: the Memory row count came back unreadable ({other:?})"
-                )
-            }
-        },
+    let rows = match facts.count {
+        Some(lbug::Value::Int64(n)) => n,
+        Some(other) => {
+            anyhow::bail!(
+                "cannot reconcile the embedding width: the Memory row count came back unreadable ({other:?})"
+            )
+        }
         None => {
             anyhow::bail!(
                 "cannot reconcile the embedding width: the Memory row count query returned no rows"
@@ -6191,14 +6370,33 @@ fn reconcile_pristine_embedding_width(
     // The table is engine-attested empty, and a pristine store's rel
     // tables are empty by construction (edges require Memory nodes),
     // so dropping and recreating loses nothing.
-    for table in ["RELATES_TO", "CONTAINS", "GOVERNS", "EXTRACTED_FROM", "DEPENDS_ON", "Memory"] {
-        conn.query(&format!("DROP TABLE {table}"))?;
-    }
-    conn.query(create_node_table)?;
-    for ddl in create_rel_tables {
-        conn.query(ddl)?;
-    }
+    drop_and_recreate_memory_schema(conn, create_node_table, create_rel_tables)?;
     Ok(())
+}
+
+impl LadybugStore {
+    /// The snapshot retention budget `export_database` prunes with. The
+    /// operator override `NEUROSTRATA_SNAPSHOT_RETENTION_COUNT` wins over
+    /// the hygiene config, floored at one snapshot: a configured count below
+    /// the config's five must be honoured, not raised to it (issue #89).
+    /// An unset or unparseable override falls through to the hygiene
+    /// config loaded from the default `config.json` path, so the persisted
+    /// `storage_hygiene.snapshot_retention_count` is honoured.
+    pub(crate) fn configured_snapshot_retention_count() -> usize {
+        std::env::var("NEUROSTRATA_SNAPSHOT_RETENTION_COUNT")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .unwrap_or_else(|| {
+                crate::config::Config::from_default_path()
+                    .ok()
+                    .map(|c| c.storage_hygiene.snapshot_retention_count)
+                    .unwrap_or_else(|| {
+                        crate::storage::snapshot::StorageHygieneConfig::default()
+                            .snapshot_retention_count
+                    })
+            })
+            .max(1)
+    }
 }
 
 #[async_trait]
@@ -6222,6 +6420,38 @@ impl VectorStore for LadybugStore {
             // A previous init in this process already succeeded; the
             // sidecar maintenance is cached and idempotent.
             self.maintain_store_state();
+            // #91, #81: a LockedUnknown store whose first init ran
+            // before `serving` was bound, or suffered a transient
+            // sidecar write error, would stay unrecorded forever
+            // within this instance (the latch never re-enters the
+            // stamp step, and the first write seals the store under
+            // an unrecorded identity). Retry the upgrade here:
+            // only when serving is bound, matches the
+            // configuration, and the open is verified. The stamp
+            // step re-attests emptiness from the engine before
+            // stamping, so a store with rows never gets a pristine
+            // sidecar recorded over them.
+            if matches!(self.cached_store_state(), CachedStoreState::LockedUnknown)
+                && self.open_provenance.is_verified()
+                && self
+                    .serving_descriptor()
+                    .map(|serving| self.serving_matches_configured(&serving))
+                    .unwrap_or(false)
+            {
+                self.reattest_and_upgrade_empty_locked_unknown_store_state(self.dimensions)
+                    .await;
+            }
+            // #77: the empty-upgrade retry attests nothing for a
+            // store the engine attests data-bearing; record the
+            // `has_data: true` identity when it holds (rows > 0,
+            // physical width == dimensions, serving == configured,
+            // verified open) so a legacy data-bearing LockedUnknown
+            // store enters Recorded identity protection from this
+            // open rather than never. The migration re-checks every
+            // gate itself, so this is a cheap no-op otherwise.
+            if let Err(e) = self.migrate_locked_unknown_data_bearing_store_state().await {
+                tracing::warn!("data-bearing LockedUnknown migration failed during init: {e}");
+            }
             return Ok(());
         }
 
@@ -6235,14 +6465,14 @@ impl VectorStore for LadybugStore {
         //
         // The arming is also gated on this process having opened the
         // database through the normal verified path: on a recovery
-        // open (`opened_via_recovery`) the engine's width/emptiness
+        // open (`open_provenance`) the engine's width/emptiness
         // view is unauthenticated — WAL-only rows can present as
         // absent, so the `count(m)` the reconciliation reads can be
         // stale — and reconciliation is disarmed rather than allowed
         // to drop/recreate a recorded-pristine store's tables from
         // that view; a later verified open reconciles as today
         // (overseer panel condition 1, findings AC-F1/SA-F2).
-        let reconcile_width = !self.opened_via_recovery
+        let reconcile_width = self.open_provenance.is_verified()
             && match self.cached_store_state() {
                 CachedStoreState::Recorded(recorded) => !recorded.has_data,
                 CachedStoreState::FreshUnrecorded => true,
@@ -6268,14 +6498,14 @@ impl VectorStore for LadybugStore {
         //
         // The candidate is also gated on this process having opened
         // the database through the normal verified path: on a
-        // recovery open (`opened_via_recovery`) the engine's empty
+        // non-verified open (`open_provenance`) the engine's empty
         // attestation is unauthenticated — WAL-only rows can present
         // as absent — so the upgrade never runs, the store stays
         // LockedUnknown, and a later verified open can still upgrade
         // it (panel condition 1, finding P1-F1).
         let locked_unknown_upgrade_candidate =
             matches!(self.cached_store_state(), CachedStoreState::LockedUnknown)
-                && !self.opened_via_recovery
+                && self.open_provenance.is_verified()
                 && match self.serving_descriptor() {
                     Some(serving) => self.serving_matches_configured(&serving),
                     None => false,
@@ -6491,6 +6721,19 @@ impl VectorStore for LadybugStore {
             if locked_unknown_attested_empty.load(std::sync::atomic::Ordering::Acquire) {
                 self.reattest_and_upgrade_empty_locked_unknown_store_state(dimensions)
                     .await;
+            }
+            // Issue #77: a LockedUnknown store that is not attested
+            // empty here is data-bearing or unreadable; for the
+            // former, attest rows > 0 AND physical width ==
+            // dimensions and record the `has_data: true` identity,
+            // so the store enters Recorded protection from this open.
+            // The migration re-checks every gate itself (verified
+            // open, LockedUnknown cached state, serving bound and
+            // matching the configuration, width, and row count), so
+            // this is a no-op after a successful empty upgrade and
+            // on every ineligible open.
+            if let Err(e) = self.migrate_locked_unknown_data_bearing_store_state().await {
+                tracing::warn!("data-bearing LockedUnknown migration failed during init: {e}");
             }
             // First successful init: record the store's pristine state
             // (or adopt a new configured descriptor while pristine).
@@ -7813,23 +8056,74 @@ impl VectorStore for LadybugStore {
         // std::__format on a dangling string_view). Revalidated on lbug
         // 0.22.3: EXPORT DATABASE of a fixture store succeeded (Linux
         // x86_64); the file copy below remains the snapshot mechanism.
+        //
+        // The turn is held across the CHECKPOINT and every file copy, so a
+        // writer of this process cannot interleave a write between the
+        // flush and the copies (issue #95). It cannot travel through
+        // `with_conn`: that takes `write_lock` itself, and tokio's Mutex
+        // is not reentrant — so the turn is acquired here, handed to the
+        // blocking task through `write_owning_turn`, and kept for the
+        // copies below. An external writer (another process, or the same
+        // store without this instance's lock) can still mutate the source
+        // mid-copy; the metadata bracket on the copy catches that.
+        let mut turn = Arc::clone(&self.write_lock).lock_owned().await;
         let started = std::time::Instant::now();
-        let checkpoint_result: Result<()> = self
-            .with_conn(move |conn| {
-                conn.query("CHECKPOINT")?;
-                Ok(())
-            })
-            .await;
+        let checkpoint_result: Result<()> = {
+            let (returned, outcome) = Self::write_owning_turn(
+                self.db.clone(),
+                turn,
+                |conn| {
+                    conn.query("CHECKPOINT")?;
+                    Ok(())
+                },
+            )
+            .await?;
+            turn = returned;
+            outcome
+        };
         crate::storage::snapshot::record_checkpoint_outcome(
             started.elapsed().as_millis() as u64,
             checkpoint_result.is_ok(),
         );
         checkpoint_result?;
+        // Still held: no writer of this process reaches the copies below.
+        let _write_guard = turn;
 
         std::fs::create_dir_all(&dir)?;
         let target = dir.join("ladybug.store");
-        std::fs::copy(&source, &target)
-            .map_err(|e| anyhow::anyhow!("could not copy {:?} into the snapshot: {}", source, e))?;
+        // Bracket the copy with the source's (len, mtime): an external
+        // writer mutating the file between the stat calls means the copy
+        // is torn, so retry once and abort the snapshot if it still
+        // changes (issue #95).
+        let mut copy_attempts = 0;
+        loop {
+            let before = std::fs::metadata(&source).map_err(|e| {
+                anyhow::anyhow!(
+                    "could not stat {:?} before the snapshot copy: {}",
+                    source,
+                    e
+                )
+            })?;
+            std::fs::copy(&source, &target).map_err(|e| {
+                anyhow::anyhow!("could not copy {:?} into the snapshot: {}", source, e)
+            })?;
+            let after = std::fs::metadata(&source).map_err(|e| {
+                anyhow::anyhow!(
+                    "could not stat {:?} after the snapshot copy: {}",
+                    source,
+                    e
+                )
+            })?;
+            if (before.len(), before.modified().ok()) == (after.len(), after.modified().ok()) {
+                break;
+            }
+            copy_attempts += 1;
+            if copy_attempts > 1 {
+                return Err(anyhow::anyhow!(
+                    "source store changed during export_database copy"
+                ));
+            }
+        }
         // A WAL left behind after the checkpoint rides along, so a restore
         // replays it exactly as the engine would have.
         let mut wal = source.clone().into_os_string();
@@ -7904,9 +8198,7 @@ impl VectorStore for LadybugStore {
         // hardcoded constant) so the operator-facing limit and the prune
         // behaviour cannot drift apart.
         if let Some(parent) = dir.parent() {
-            let keep = crate::storage::snapshot::StorageHygieneConfig::default()
-                .snapshot_retention_count
-                .max(5);
+            let keep = Self::configured_snapshot_retention_count();
             let expired = crate::storage::snapshot::select_expired_snapshots(parent, keep);
             if let Ok(expired) = expired {
                 if !expired.is_empty() {
@@ -11194,6 +11486,128 @@ mod tests {
             out.join("manifest.json").exists(),
             "the snapshot carries a manifest"
         );
+    }
+
+    static RETENTION_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn configured_snapshot_retention_count_honors_small_and_zero_values() {
+        let _env_guard = RETENTION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var("NEUROSTRATA_SNAPSHOT_RETENTION_COUNT").ok();
+        let default_keep = crate::config::Config::from_default_path()
+            .ok()
+            .map(|c| c.storage_hygiene.snapshot_retention_count)
+            .unwrap_or_else(|| {
+                crate::storage::snapshot::StorageHygieneConfig::default()
+                    .snapshot_retention_count
+            })
+            .max(1);
+
+        std::env::set_var("NEUROSTRATA_SNAPSHOT_RETENTION_COUNT", "2");
+        assert_eq!(
+            LadybugStore::configured_snapshot_retention_count(),
+            2,
+            "a configured retention below five is honoured, not raised to it"
+        );
+        std::env::set_var("NEUROSTRATA_SNAPSHOT_RETENTION_COUNT", "0");
+        assert_eq!(
+            LadybugStore::configured_snapshot_retention_count(),
+            1,
+            "zero is floored at one snapshot"
+        );
+        std::env::set_var("NEUROSTRATA_SNAPSHOT_RETENTION_COUNT", "not-a-number");
+        assert_eq!(
+            LadybugStore::configured_snapshot_retention_count(),
+            default_keep,
+            "an unparseable override falls back to the hygiene config"
+        );
+
+        match previous {
+            Some(value) => std::env::set_var("NEUROSTRATA_SNAPSHOT_RETENTION_COUNT", value),
+            None => std::env::remove_var("NEUROSTRATA_SNAPSHOT_RETENTION_COUNT"),
+        }
+        assert_eq!(
+            LadybugStore::configured_snapshot_retention_count(),
+            default_keep,
+            "without an override the hygiene config default applies"
+        );
+    }
+
+    #[tokio::test]
+    async fn export_database_prunes_to_the_configured_retention_count() {
+        // Issue #89: the operator-configured retention must reach the
+        // prune step even when it is below the five the old code clamped
+        // to, so the oldest snapshots expire at the configured count.
+        let _env_guard = RETENTION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous_retention = std::env::var("NEUROSTRATA_SNAPSHOT_RETENTION_COUNT").ok();
+        let previous_prune = std::env::var("NEUROSTRATA_PRUNE_SNAPSHOTS").ok();
+        std::env::set_var("NEUROSTRATA_SNAPSHOT_RETENTION_COUNT", "2");
+        std::env::set_var("NEUROSTRATA_PRUNE_SNAPSHOTS", "1");
+
+        let root = std::env::temp_dir().join(format!(
+            "lbug-export-retention-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("store.db");
+        let store = LadybugStore::for_testing(db.to_string_lossy().to_string(), 4)
+            .expect("open temp database");
+        store.init("retention-probe").await.expect("init");
+
+        // Three planted snapshots, ordered oldest to newest by created_at;
+        // each is prune-eligible in the select step (name + manifest).
+        for (index, created_at) in [
+            "2000-01-01T00:00:00Z",
+            "2000-01-02T00:00:00Z",
+            "2000-01-03T00:00:00Z",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let planted = root.join(format!("snapshot-planted-{index}"));
+            std::fs::create_dir_all(&planted).unwrap();
+            std::fs::write(
+                planted.join("manifest.json"),
+                format!(
+                    r#"{{"format":"neurostrata-snapshot","version":1,"created_at":"{created_at}","source":"fixture","bytes":1}}"#
+                ),
+            )
+            .unwrap();
+        }
+
+        let out = root.join("snapshot-exported");
+        store
+            .export_database(&out.to_string_lossy())
+            .await
+            .expect("export into the planted snapshot directory");
+        drop(store);
+
+        let mut remaining: Vec<String> = std::fs::read_dir(&root)
+            .expect("read the snapshot root")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("snapshot-"))
+            .collect();
+        remaining.sort();
+        assert_eq!(
+            remaining,
+            vec![
+                "snapshot-exported".to_string(),
+                "snapshot-planted-2".to_string()
+            ],
+            "retention 2 keeps the fresh export and the newest planted snapshot"
+        );
+
+        match previous_retention {
+            Some(value) => std::env::set_var("NEUROSTRATA_SNAPSHOT_RETENTION_COUNT", value),
+            None => std::env::remove_var("NEUROSTRATA_SNAPSHOT_RETENTION_COUNT"),
+        }
+        match previous_prune {
+            Some(value) => std::env::set_var("NEUROSTRATA_PRUNE_SNAPSHOTS", value),
+            None => std::env::remove_var("NEUROSTRATA_PRUNE_SNAPSHOTS"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -19304,7 +19718,13 @@ eurostrata\src\daemon.rs",
     /// path, with no NeuroStrata schema created unless the body
     /// creates it.
     fn with_attestation_conn(name: &str, body: impl FnOnce(&Connection)) {
-        let root = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        // #88: a UUID suffix, not just the pid, so concurrent test
+        // processes/iterations never share a fixture directory.
+        let root = std::env::temp_dir().join(format!(
+            "{name}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("create the fixture root");
         let db_path = root.join("attestation.db");
@@ -19319,8 +19739,294 @@ eurostrata\src\daemon.rs",
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    const ATTESTATION_NODE_DDL: &str = "CREATE NODE TABLE Memory (id STRING, namespace STRING, content STRING, user_id STRING, memory_type STRING, agent_name STRING, location STRING, location_lines STRING, metadata STRING, embedding FLOAT[4], PRIMARY KEY (id))";
-    const ATTESTATION_REL_DDLS: [&str; 1] = ["CREATE REL TABLE RELATES_TO (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING, origin STRING)"];
+    fn attestation_node_ddl(width: usize) -> String {
+        // Mirrors `memory_table_ddl`: the recreation DDL names the
+        // serving width, so the drop/recreate leg exercised here is
+        // the production one.
+        format!("CREATE NODE TABLE Memory (id STRING, namespace STRING, content STRING, user_id STRING, memory_type STRING, agent_name STRING, location STRING, location_lines STRING, metadata STRING, embedding FLOAT[{width}], PRIMARY KEY (id))")
+    }
+    /// All five production rel tables (#83, #88): the attestation
+    /// fixture mirrors the schema `memory_table_ddl` creates, so the
+    /// drop/recreate leg exercised here is the production one.
+    const ATTESTATION_REL_DDLS: [&str; 5] = [
+        "CREATE REL TABLE RELATES_TO (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING, origin STRING)",
+        "CREATE REL TABLE CONTAINS (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING, origin STRING)",
+        "CREATE REL TABLE GOVERNS (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING, origin STRING)",
+        "CREATE REL TABLE EXTRACTED_FROM (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING, origin STRING)",
+        "CREATE REL TABLE DEPENDS_ON (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING, origin STRING)",
+    ];
+
+    #[tokio::test]
+    async fn open_provenance_variants_gate_reconciliation_and_upgrade() {
+        // #84: only the normal verified open authenticates the
+        // engine's view; every recovery variant is unverified, and
+        // both the width-reconciliation arm and the LockedUnknown
+        // upgrade candidate gate on `is_verified()`.
+        assert!(OpenProvenance::Verified.is_verified());
+        assert!(!OpenProvenance::ChecksumConfigMismatch.is_verified());
+        assert!(!OpenProvenance::UnverifiedWalReplay.is_verified());
+        assert!(!OpenProvenance::DiscardedUnreadableWal.is_verified());
+
+        let previous = without_model_env();
+        let fx = store_state_fixture("open-provenance-normal", "ModelA");
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        assert_eq!(
+            store.open_provenance(),
+            OpenProvenance::Verified,
+            "a normal verified open records Verified provenance"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+
+        // A checksum-config mismatch reopen: the database written
+        // without checksums, left with a WAL behind by an unclean
+        // shutdown (clean closes checkpoint and remove the WAL, so
+        // the fixture simulates the crash with a leak), fails the
+        // verifying open at the WAL header check, and the engine
+        // falls back to unverified_config() — provenance is
+        // unverified and nothing may reconcile or migrate from
+        // this open.
+        let fx = store_state_fixture("open-provenance-mismatch", "ModelA");
+        let no_checksums = SystemConfig::default()
+            .max_db_size(512 * 1024 * 1024)
+            .buffer_pool_size(64 * 1024 * 1024)
+            .throw_on_wal_replay_failure(true)
+            .enable_checksums(false);
+        {
+            let creator = LadybugStore::with_system_config(&fx.db, 4, no_checksums)
+                .expect("open temp database without checksums");
+            creator.init("probe").await.expect("init");
+            std::mem::forget(creator);
+        }
+        let reopened = LadybugStore::with_system_config(&fx.db, 4, verifying_config())
+            .expect("the checksum-mismatch reopen succeeds");
+        assert_eq!(
+            reopened.open_provenance(),
+            OpenProvenance::ChecksumConfigMismatch,
+            "a checksum-config mismatch reopen records its provenance"
+        );
+        assert!(!reopened.open_provenance().is_verified());
+        // The Phase B migration gate: a non-verified open attests
+        // nothing.
+        let migrated = reopened
+            .migrate_locked_unknown_data_bearing_store_state()
+            .await
+            .expect("the migration gate answers");
+        assert!(
+            !migrated,
+            "a ChecksumConfigMismatch open refuses to migrate"
+        );
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[test]
+    fn shared_width_reconcile_and_five_rel_table_uuid_attestation() {
+        // #83, #88, #96 P8-4/P8-5: the attestation fixture mirrors
+        // the production schema — all five rel tables — on a
+        // UUID-unique temp path, and the shared width-reconcile
+        // inspection + drop/recreate helpers reconcile a mismatched
+        // empty table through the whole schema.
+        assert_eq!(
+            ATTESTATION_REL_DDLS.len(),
+            5,
+            "the fixture carries all five production rel tables"
+        );
+        with_attestation_conn("shared-width-reconcile", |conn| {
+            conn.query(&attestation_node_ddl(4)).expect("create Memory");
+            for ddl in ATTESTATION_REL_DDLS {
+                conn.query(ddl).expect("create rel table");
+            }
+            // A width mismatch on an empty table reconciles through
+            // the shared inspection + drop/recreate helpers.
+            let attested = reconcile_empty_locked_unknown_width(
+                conn,
+                8,
+                &attestation_node_ddl(8),
+                &ATTESTATION_REL_DDLS,
+            )
+            .expect("the empty store attests empty");
+            assert!(attested, "the engine attests the table empty");
+            // The recreated schema is at the serving width, and all
+            // five rel tables survived the drop/recreate.
+            let mut widths = Vec::new();
+            for row in conn
+                .query("CALL table_info('Memory') RETURN *")
+                .expect("table_info after reconcile")
+            {
+                if let Some(lbug::Value::String(ty)) = row.get(2) {
+                    widths.push(ty.clone());
+                }
+            }
+            assert!(
+                widths.contains(&"FLOAT[8]".to_string()),
+                "the embedding column was recreated at the serving width: {widths:?}"
+            );
+            for table in ["RELATES_TO", "CONTAINS", "GOVERNS", "EXTRACTED_FROM", "DEPENDS_ON"] {
+                let rows = match conn.query(&format!("CALL table_info('{table}') RETURN *")) {
+                    Ok(rows) => rows,
+                    Err(e) => panic!("table_info for rel table {table} failed: {e}"),
+                };
+                assert!(
+                    rows.into_iter().count() > 0,
+                    "rel table {table} exists after the shared drop/recreate"
+                );
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn schema_ready_fast_path_retries_locked_unknown_upgrade_and_migrates_data_bearing() {
+        // #91, #81: the schema-ready fast path used to return
+        // before the LockedUnknown upgrade could run, so a store
+        // whose first init happened before serving was bound stayed
+        // unrecorded for the life of the instance. The fast path
+        // now retries the upgrade when serving is bound, matches
+        // the configuration, and the open is verified.
+        let previous = without_model_env();
+        let fx = store_state_fixture("fastpath-retry-latched", "ModelA");
+
+        // Creating process: first init binds the schema latch, no
+        // serving descriptor is bound, so nothing is recorded.
+        let opener = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        opener.init("probe").await.expect("init binds the schema latch");
+        drop(opener);
+
+        // Reopen: the db preexists with no sidecar, so the store
+        // classifies LockedUnknown. Its init latches schema_ready
+        // without recording (serving is unbound again).
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("reopen temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        assert!(matches!(
+            store.cached_store_state(),
+            CachedStoreState::LockedUnknown
+        ));
+        store.init("probe").await.expect("init latches schema_ready");
+        assert!(store.schema_ready.load(std::sync::atomic::Ordering::Acquire));
+        assert!(
+            !crate::model_choice::store_state_path(&fx.db).exists(),
+            "no sidecar: serving was unbound at the init"
+        );
+        // Bind serving == configured and re-init on the SAME
+        // instance: the fast path must retry the upgrade, attest
+        // the empty table from the engine, and record the pristine
+        // sidecar.
+        store.set_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        store.init("probe").await.expect("fast-path init retries the upgrade");
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["has_data"], serde_json::json!(false));
+        assert_eq!(sidecar["descriptor"]["model"], serde_json::json!("ModelA"));
+        assert!(
+            matches!(store.cached_store_state(), CachedStoreState::Recorded(ref recorded) if !recorded.has_data),
+            "the fast path upgraded the store to Recorded pristine"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+
+        // #77 Phase B: a data-bearing LockedUnknown store — a row
+        // landed through a non-serving instance, so no sidecar
+        // exists — whose serving matches the configuration and
+        // whose physical width equals the serving width records
+        // has_data: true.
+        let fx = store_state_fixture("fastpath-migrate-data-bearing", "ModelA");
+        let creator = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        creator.init("probe").await.expect("init");
+        drop(creator);
+        let writer = LadybugStore::for_testing(&fx.db, 4)
+            .expect("reopen temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        writer.init("probe").await.expect("init");
+        writer
+            .upsert(
+                "probe",
+                "m1",
+                vec![0.1, 0.2, 0.3, 0.4],
+                store_state_payload(),
+            )
+            .await
+            .expect("the row lands");
+        drop(writer);
+        assert!(
+            !crate::model_choice::store_state_path(&fx.db).exists(),
+            "a landed write backfills no sidecar: the store stays LockedUnknown"
+        );
+        let migrant = LadybugStore::for_testing(&fx.db, 4)
+            .expect("reopen temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        assert!(matches!(
+            migrant.cached_store_state(),
+            CachedStoreState::LockedUnknown
+        ));
+        let migrated = migrant
+            .migrate_locked_unknown_data_bearing_store_state()
+            .await
+            .expect("the migration answers");
+        assert!(
+            migrated,
+            "a data-bearing LockedUnknown store with matching width and serving migrates"
+        );
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["has_data"], serde_json::json!(true));
+        assert_eq!(sidecar["descriptor"]["model"], serde_json::json!("ModelA"));
+        assert!(
+            matches!(migrant.cached_store_state(), CachedStoreState::Recorded(ref recorded) if recorded.has_data),
+            "the cache records the data-bearing identity"
+        );
+        drop(migrant);
+        let _ = std::fs::remove_dir_all(&fx.root);
+
+        // A width mismatch refuses: the physical FLOAT[4] column
+        // does not equal the serving width of 8, so the migration
+        // records nothing and the store stays LockedUnknown.
+        let fx = store_state_fixture("fastpath-migrate-mismatch", "ModelA");
+        let creator = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        creator.init("probe").await.expect("init");
+        drop(creator);
+        let writer = LadybugStore::for_testing(&fx.db, 4)
+            .expect("reopen temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        writer.init("probe").await.expect("init");
+        writer
+            .upsert(
+                "probe",
+                "m1",
+                vec![0.1, 0.2, 0.3, 0.4],
+                store_state_payload(),
+            )
+            .await
+            .expect("the row lands");
+        drop(writer);
+        let mismatched = LadybugStore::for_testing(&fx.db, 8)
+            .expect("reopen at a different serving width")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        let migrated = mismatched
+            .migrate_locked_unknown_data_bearing_store_state()
+            .await
+            .expect("the migration answers");
+        assert!(
+            !migrated,
+            "a width-mismatched store refuses to migrate: physical FLOAT[4] != serving FLOAT[8]"
+        );
+        assert!(
+            !crate::model_choice::store_state_path(&fx.db).exists(),
+            "no sidecar is recorded for a width mismatch"
+        );
+        drop(mismatched);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
 
     #[test]
     fn locked_unknown_attestation_table_info_failure_leaves_store_as_found() {
@@ -19340,7 +20046,7 @@ eurostrata\src\daemon.rs",
             let attested = reconcile_empty_locked_unknown_width(
                 conn,
                 4,
-                ATTESTATION_NODE_DDL,
+                &attestation_node_ddl(4),
                 &ATTESTATION_REL_DDLS,
             );
             assert!(
@@ -19381,7 +20087,7 @@ eurostrata\src\daemon.rs",
             let attested = reconcile_empty_locked_unknown_width(
                 conn,
                 4,
-                ATTESTATION_NODE_DDL,
+                &attestation_node_ddl(4),
                 &ATTESTATION_REL_DDLS,
             );
             assert!(
@@ -19763,6 +20469,14 @@ eurostrata\src\daemon.rs",
     /// Opt this process into the unverified-WAL recovery fallback
     /// (the operator opt-in the WAL-discard/unverified arms require),
     /// returning the previous values for restoration.
+    /// Serializes the env-mutating sections of the three WAL
+    /// recovery tests: they all set NEUROSTRATA_STRICT_WAL=0 and
+    /// restore it afterwards, and a restore racing another test's
+    /// read makes the strict verifier fire on a variable the test
+    /// just set. tokio's mutex so the guard may be held across the
+    /// engine calls inside the guarded section.
+    static WAL_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn allow_unverified_wal_recovery() -> (Option<String>, Option<String>) {
         let previous = (
             std::env::var("NEUROSTRATA_STRICT_WAL").ok(),
@@ -19825,6 +20539,7 @@ eurostrata\src\daemon.rs",
         // The recovery open: serving bound, serving == configured
         // (ModelA at the store's width 4), unverified recovery opted
         // in — exactly the shape that used to stamp the sidecar.
+        let _wal_env_serial = WAL_ENV_LOCK.lock().await;
         let previous_wal = allow_unverified_wal_recovery();
         let store = LadybugStore::for_testing(&fx.db, 4)
             .expect("the recovery open succeeds")
@@ -19888,6 +20603,7 @@ eurostrata\src\daemon.rs",
 
         plant_corrupted_uncheckpointed_wal(&fx.db, 2, true);
 
+        let _wal_env_serial = WAL_ENV_LOCK.lock().await;
         let previous_wal = allow_unverified_wal_recovery();
         let store = LadybugStore::for_testing(&fx.db, 4)
             .expect("the recovery open succeeds")
@@ -19966,6 +20682,7 @@ eurostrata\src\daemon.rs",
         // (ModelB at dims 4), unverified recovery opted in. Init
         // succeeds, but nothing may be reconciled or adopted from
         // the unauthenticated view.
+        let _wal_env_serial = WAL_ENV_LOCK.lock().await;
         let previous_wal = allow_unverified_wal_recovery();
         let store = LadybugStore::for_testing(&fx.db, 4)
             .expect("the recovery open succeeds")

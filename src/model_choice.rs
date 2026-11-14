@@ -174,6 +174,11 @@ fn write_initial_embedders_file_inner(
     Ok(target)
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static INJECT_NEXT_ATOMIC_WRITE_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Write `contents` to `path` atomically: serialize fully to a temp file in
 /// the same directory, fsync it, rename over the target, fsync the
 /// directory. A crash at any point leaves the target absent or holding its
@@ -190,14 +195,26 @@ fn write_file_atomically(
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "embedders.json".to_string());
-    let tmp = dir.join(format!(".{file_name}.tmp-{}", std::process::id()));
+    static ATOMIC_WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // #92: the pid alone cannot separate two atomic writes racing inside
+    // one process (the daemon and its in-process fallback arms share a
+    // pid), so the temp name also carries a process-wide sequence number.
+    let tmp = dir.join(format!(
+        ".{file_name}.tmp-{}-{}",
+        std::process::id(),
+        ATOMIC_WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let staged = (|| -> anyhow::Result<()> {
         let mut file = fs::File::create(&tmp)
             .with_context(|| format!("failed to create temp file {}", tmp.display()))?;
         file.write_all(contents.as_bytes())?;
         file.sync_all()?;
         drop(file);
-        if fail_before_rename {
+        #[cfg(test)]
+        let injected = INJECT_NEXT_ATOMIC_WRITE_FAILURE.with(|flag| flag.replace(false));
+        #[cfg(not(test))]
+        let injected = false;
+        if fail_before_rename || injected {
             anyhow::bail!("injected failure before rename (test seam)");
         }
         fs::rename(&tmp, path).with_context(|| {
@@ -1267,10 +1284,12 @@ mod tests {
         let target = config_dir.join("embedders.json");
         let before = fs::read(&target).expect("read default file");
         record_pending_choice(&config_dir);
-        // Sabotage the writer's temp path (the writer's documented temp name) so
-        // the persist fails after staging begins.
-        let tmp_blocker = config_dir.join(format!(".embedders.json.tmp-{}", std::process::id()));
-        fs::create_dir(&tmp_blocker).expect("create temp blocker dir");
+        // Sabotage the persist so it fails after staging begins, via the
+        // root-safe thread-local failure-injection seam: unlike the old
+        // chmod-0500 trick, this fires even when the test process runs as
+        // root (CAP_DAC_OVERRIDE), and it is isolated from other tests on
+        // parallel threads.
+        INJECT_NEXT_ATOMIC_WRITE_FAILURE.with(|flag| flag.set(true));
         let db_path = tmp.path().join("neurostrata.db");
         let result = surface_pending_choice(&config_dir, &db_path, true, &mut |_| {
             ChoiceResponse::Pick(0)
@@ -1284,6 +1303,19 @@ mod tests {
         assert!(
             pending_choice_path(&config_dir).exists(),
             "a failed persist leaves the marker in place, so the choice is not lost"
+        );
+        let staged_tmp_remaining = fs::read_dir(&config_dir)
+            .expect("read config dir")
+            .filter_map(|entry| entry.ok())
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".embedders.json.tmp-")
+            });
+        assert!(
+            !staged_tmp_remaining,
+            "a failed persist cleans up its staged temp file"
         );
     }
 
@@ -1924,5 +1956,56 @@ mod tests {
         .expect("surface");
         assert_eq!(outcome, PendingChoiceOutcome::Voided);
         assert!(!called.get(), "a wrong-version sidecar is never offered");
+    }
+
+    #[test]
+    fn write_file_atomically_concurrent_same_process_safety() {
+        // #92: the temp name used to key on the pid alone, so every
+        // concurrent caller in one process staged into the same
+        // `.tmp-<pid>` file and clobbered each other (the daemon and
+        // its in-process fallback arms share a pid). Threads racing
+        // `write_store_state` at the same sidecar path must all
+        // succeed, and the file left behind must parse as one whole
+        // state — never a splice of two.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("ladybug.db");
+        fs::write(&db_path, b"db").expect("seed bare db");
+        let state = |i: u64| StoreState {
+            version: STORE_STATE_VERSION,
+            has_data: i % 2 == 0,
+            descriptor: crate::traits::EmbeddingDescriptor {
+                provider: "fastembed".to_string(),
+                model: format!("Model{i}"),
+                revision: "onnx".to_string(),
+                dims: 4,
+                normalization: "unknown".to_string(),
+                preprocessing: "unknown".to_string(),
+                distance_metric: "cosine".to_string(),
+            },
+        };
+        let mut handles = Vec::new();
+        for i in 0..16u64 {
+            let db_path = db_path.clone();
+            handles.push(std::thread::spawn(move || {
+                write_store_state(&db_path, &state(i))
+                    .expect("concurrent sidecar write succeeds without ENOENT or corruption");
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("writer thread did not panic");
+        }
+        let final_state = match read_store_state_file(&db_path) {
+            StoreStateRead::Recorded(state) => state,
+            other => panic!("the sidecar holds one whole recorded state, got {other:?}"),
+        };
+        assert_eq!(final_state.version, STORE_STATE_VERSION);
+        let written_i: u64 = final_state
+            .descriptor
+            .model
+            .strip_prefix("Model")
+            .and_then(|rest| rest.parse().ok())
+            .expect("the final sidecar is one whole written state, not a splice");
+        assert!(written_i < 16);
+        assert_eq!(final_state.has_data, written_i % 2 == 0);
     }
 }

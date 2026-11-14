@@ -100,11 +100,17 @@ export declare class NeuroStrataMCPClient {
     private readonly token;
     private readonly timeoutMs;
     private requestId;
+    /** Daemon memory advisory captured on the last errored tool call, drained by
+     *  the plugin's execute.after handler so the agent sees it as a suffix line
+     *  rather than an opaque throw. Cleared on every callTool. */
+    private pendingDaemonAdvisory;
     constructor(options: {
         endpoint: string;
         token: string | null;
         timeoutMs: number;
     });
+    /** Drain the advisory captured by the last errored callTool, if any. */
+    flushPendingAdvisory(): string | null;
     callTool(name: string, args: unknown): Promise<string>;
     listToolNames(): Promise<string[]>;
     private post;
@@ -300,6 +306,20 @@ export declare function getTrackingState(): {
     activeSessionId: string | null;
     mutationsSinceNote: number;
 };
+/** Structured marker the daemon writes on its error/diagnostic channel when
+ *  it reports buffer-pool / RSS pressure. Memory payloads and tool-result
+ *  rows never carry it, so matching it can never misfire on user content. */
+export declare const DAEMON_MEMORY_ADVICE_MARKER = "NEUROSTRATA_ADVICE[daemon_memory]";
+export declare function resetAdvisoryStateForTesting(): void;
+/** Drain the live client's pending advisory (if any). Returns-and-clears. */
+export declare function flushPendingDaemonAdvisory(): string | null;
+/** Pull the daemon memory advisory out of the error/diagnostic channel.
+ * Only text carrying the marker is inspected — memory payloads and result
+ * rows are never matched, so a memory that merely discusses
+ * `NEUROSTRATA_BUFFER_POOL_MB` cannot synthesize an advisory. Returns the
+ * guidance string once per 10-minute window, or `null` when already shown
+ * or absent. */
+export declare function extractDaemonMemoryAdvisory(errorChannelText: string | null | undefined, nowMs?: number): string | null;
 export interface SessionEpochState {
     epoch: number;
     baselineInjectedEpoch: number;
