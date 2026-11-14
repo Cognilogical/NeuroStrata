@@ -54,6 +54,13 @@ pub struct StorageStatus {
     pub last_checkpoint_duration_ms: Option<u64>,
     pub checkpoint_failures: u32,
     pub snapshot_export_dir: String,
+    /// Whether the store was opened through a WAL recovery fallback
+    /// (checksum-mismatch reopen, unverified-WAL replay, or WAL-discard
+    /// reopen) rather than the normal verified open. A recovered open's
+    /// view of the store is unauthenticated; operators should treat it as
+    /// degraded provenance. Defaults to `false`.
+    #[serde(default)]
+    pub opened_via_recovery: bool,
 }
 
 /// Duration of the most recent checkpoint, in milliseconds. Cross-task record
@@ -179,6 +186,7 @@ pub fn compute_storage_status(
         },
         checkpoint_failures: CHECKPOINT_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
         snapshot_export_dir: snapshot_dir.display().to_string(),
+        opened_via_recovery: false,
     }
 }
 

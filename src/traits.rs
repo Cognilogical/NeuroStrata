@@ -623,6 +623,17 @@ pub trait VectorStore: Send + Sync + AsAny {
     fn is_dirty(&self) -> bool {
         true
     }
+
+    /// Whether this store was opened through a recovery fallback in
+    /// `with_system_config` — the checksum-mismatch reopen, the
+    /// unverified-WAL replay, or the WAL-discard reopen — rather than
+    /// the normal verified open. A recovery open's view of the store is
+    /// unauthenticated; callers and operators should treat recovered
+    /// opens as degraded provenance. Conservative by default: assume a
+    /// normal open.
+    fn opened_via_recovery(&self) -> bool {
+        false
+    }
 }
 
 /// Graph-read capability, exposed beside `VectorStore` rather than folded into
