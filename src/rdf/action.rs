@@ -2457,7 +2457,32 @@ pub async fn stage_action(
         }
     }
 
-    if !submission_failures.is_empty() {
+    let gate_decision = crate::formal_kernel::evaluate_action_gate(
+        !submission_failures.iter().any(|f| f.code == "rebac_denied"),
+        !submission_failures.iter().any(|f| {
+            matches!(
+                f.code.as_str(),
+                "missing_parameter"
+                    | "unknown_parameter"
+                    | "invalid_parameter"
+                    | "target_not_found"
+                    | "template_error"
+                    | "task_transition_failed"
+            )
+        }),
+        !submission_failures
+            .iter()
+            .any(|f| f.code == "sparql_ask_failed" || f.code == "sparql_ask_error"),
+        !submission_failures
+            .iter()
+            .any(|f| f.code == "twin_precondition_failed"),
+        !submission_failures
+            .iter()
+            .any(|f| f.code == "shacl_violation"),
+    );
+    if gate_decision != crate::formal_kernel::ActionGateDecision::Allow
+        || !submission_failures.is_empty()
+    {
         return Err(ActionError::SubmissionRejected(submission_failures));
     }
 
@@ -2676,7 +2701,23 @@ pub async fn revert_action(
     let active_receipt = ActionReceiptPayload::from_payload(&active_receipt_payload)
         .map_err(ActionError::Storage)?;
 
-    if active_receipt.reverted_by_receipt_id.is_some() || active_receipt.reverted_at.is_some() {
+    let receipt_state = if active_receipt.reverted_by_receipt_id.is_some()
+        || active_receipt.reverted_at.is_some()
+    {
+        crate::formal_kernel::ActionReceiptState::AlreadyReverted
+    } else {
+        crate::formal_kernel::ActionReceiptState::Active
+    };
+    if matches!(
+        crate::formal_kernel::evaluate_action_revert(
+            receipt_state,
+            true,
+            invocation.force,
+            true,
+            true,
+        ),
+        crate::formal_kernel::ActionRevertDecision::RejectAlreadyReverted
+    ) {
         return Err(ActionError::AlreadyReverted {
             receipt_id: active_receipt.receipt_id.clone(),
             reverted_by_receipt_id: active_receipt

@@ -7,6 +7,7 @@ open NeuroStrata.Sovereignty
 open NeuroStrata.Procedure
 open NeuroStrata.TwinCrdt
 open NeuroStrata.Retention
+open NeuroStrata.KineticAction
 
 def boolToStr (b : Bool) : String := if b then "true" else "false"
 
@@ -73,3 +74,28 @@ def main : IO Unit := do
           for matchesWt in [false, true] do
             let tag := evaluateRetentionGate budget nonEmpty found bound matchesWt |>.asTag
             IO.println s!"RETENTION_GATE|{boolToStr budget}|{boolToStr nonEmpty}|{boolToStr found}|{boolToStr bound}|{boolToStr matchesWt}|{tag}"
+  for principal in [false, true] do
+    for params in [false, true] do
+      for sparql in [false, true] do
+        for twin in [false, true] do
+          for shacl in [false, true] do
+            let tag := evaluateActionGate principal params sparql twin shacl |>.asTag
+            IO.println s!"ACTION_GATE|{boolToStr principal}|{boolToStr params}|{boolToStr sparql}|{boolToStr twin}|{boolToStr shacl}|{tag}"
+  let receiptStates : List ActionReceiptState := [.active, .alreadyReverted]
+  for rstate in receiptStates do
+    for cas in [false, true] do
+      for force in [false, true] do
+        for ownerAdmin in [false, true] do
+          for editor in [false, true] do
+            let tag := evaluateActionRevert rstate cas force ownerAdmin editor |>.asTag
+            IO.println s!"ACTION_REVERT|{rstate.asStr}|{boolToStr cas}|{boolToStr force}|{boolToStr ownerAdmin}|{boolToStr editor}|{tag}"
+  let targetStatuses : List ActionTaskTargetStatus := [.openState, .inProgress, .blocked, .done]
+  for curr in statuses do
+    for req in targetStatuses do
+      let tag := actionTaskEffectTag (evaluateActionTaskEffect curr req)
+      IO.println s!"ACTION_TASK_EFFECT|{curr.asStr}|{req.asStr}|{tag}"
+  let kinds : List ActionMemoryKind := [.actionType, .actionReceipt]
+  for kind in kinds do
+    for explicit in [false, true] do
+      let shareable := isActionMemoryShareable kind explicit
+      IO.println s!"ACTION_SHAREABLE|{kind.asStr}|{boolToStr explicit}|{boolToStr shareable}"

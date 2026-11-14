@@ -7,3 +7,4 @@ import NeuroStrata.Sovereignty
 import NeuroStrata.Procedure
 import NeuroStrata.TwinCrdt
 import NeuroStrata.Retention
+import NeuroStrata.KineticAction

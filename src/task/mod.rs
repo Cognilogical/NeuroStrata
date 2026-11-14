@@ -320,17 +320,33 @@ pub fn stage_task_transition_at(
 ) -> Result<(String, String, MemoryPayload), String> {
     let target_status = machine::Status::parse(new_status)
         .ok_or_else(|| format!("invalid task status '{new_status}'"))?;
-    if target_status == machine::Status::Done {
-        return Err(
-            "TransitionTask cannot transition to 'done' (Lock 2 requires neurostrata_task_complete)"
-                .to_string(),
-        );
-    }
     let task = machine::Task {
         id: id.to_string(),
         payload: payload.clone(),
     };
     let from_status = task.status();
+    let kernel_req = match target_status {
+        machine::Status::Open => crate::formal_kernel::ActionTaskTargetStatus::Open,
+        machine::Status::InProgress => crate::formal_kernel::ActionTaskTargetStatus::InProgress,
+        machine::Status::Blocked => crate::formal_kernel::ActionTaskTargetStatus::Blocked,
+        machine::Status::Done => crate::formal_kernel::ActionTaskTargetStatus::Done,
+    };
+    match crate::formal_kernel::evaluate_action_task_effect(from_status.to_kernel(), kernel_req) {
+        Ok(_) => {}
+        Err(crate::formal_kernel::ActionTaskEffectError::DoneRequiresComplete) => {
+            return Err(
+                "TransitionTask cannot transition to 'done' (Lock 2 requires neurostrata_task_complete)"
+                    .to_string(),
+            );
+        }
+        Err(crate::formal_kernel::ActionTaskEffectError::IllegalTransition) => {
+            return Err(format!(
+                "illegal task transition: '{}' -> '{}'",
+                from_status.as_str(),
+                target_status.as_str()
+            ));
+        }
+    }
     let ctx = machine::Ctx {
         reason: note.to_string(),
         extraction_edge_exists: false,

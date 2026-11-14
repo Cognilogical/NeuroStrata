@@ -187,8 +187,14 @@ impl MeshOutbox {
             return None;
         }
         if payload.memory_type == "action_receipt"
-            || !is_shareable_memory_type(&payload.memory_type)
+            && !crate::formal_kernel::is_action_memory_shareable(
+                crate::formal_kernel::ActionMemoryKind::ActionReceipt,
+                true,
+            )
         {
+            return None;
+        }
+        if !is_shareable_memory_type(&payload.memory_type) {
             return None;
         }
         // Derived artifacts (KGE vectors, community labels, inferred edges)

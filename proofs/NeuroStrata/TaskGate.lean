@@ -152,6 +152,11 @@ theorem liveSuccessor_two_node_cycle_returns_none (now : Int) :
   intro rA rB
   have hretA : isRetired rA now = true := isRetired_boundary_inclusive rA now rfl
   have hretB : isRetired rB now = true := isRetired_boundary_inclusive rB now rfl
-  simp [liveSuccessor, findRow, hretA, hretB]
+  unfold liveSuccessor
+  simp [findRow, rA, rB, hretA]
+  unfold liveSuccessor
+  simp [findRow, rA, rB, hretB]
+  unfold liveSuccessor
+  simp
 
 end NeuroStrata.TaskGate

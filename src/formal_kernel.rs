@@ -639,3 +639,209 @@ pub const fn retention_verdict_tag(v: KernelRetentionVerdict) -> &'static str {
         KernelRetentionVerdict::FailedWorktreeMoved => "failed_worktree_moved",
     }
 }
+
+/// Decision from the 5-stage kinetic Action submission gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActionGateDecision {
+    Allow,
+    RejectUnauthorized,
+    RejectInvalidParams,
+    RejectSparqlAsk,
+    RejectTwinBounds,
+    RejectPostShacl,
+}
+
+/// Evaluates the kinetic Action submission gate in deterministic fail-closed order:
+/// ReBAC authorization -> typed parameters -> bound SPARQL ASK -> twin precondition bounds -> post-image SHACL.
+pub const fn evaluate_action_gate(
+    principal_authorized: bool,
+    params_valid: bool,
+    sparql_ask_passed: bool,
+    twin_bounds_passed: bool,
+    post_shacl_passed: bool,
+) -> ActionGateDecision {
+    if !principal_authorized {
+        ActionGateDecision::RejectUnauthorized
+    } else if !params_valid {
+        ActionGateDecision::RejectInvalidParams
+    } else if !sparql_ask_passed {
+        ActionGateDecision::RejectSparqlAsk
+    } else if !twin_bounds_passed {
+        ActionGateDecision::RejectTwinBounds
+    } else if !post_shacl_passed {
+        ActionGateDecision::RejectPostShacl
+    } else {
+        ActionGateDecision::Allow
+    }
+}
+
+/// Tag string for an action gate decision.
+pub const fn action_gate_tag(d: ActionGateDecision) -> &'static str {
+    match d {
+        ActionGateDecision::Allow => "allow",
+        ActionGateDecision::RejectUnauthorized => "reject_unauthorized",
+        ActionGateDecision::RejectInvalidParams => "reject_invalid_params",
+        ActionGateDecision::RejectSparqlAsk => "reject_sparql_ask",
+        ActionGateDecision::RejectTwinBounds => "reject_twin_bounds",
+        ActionGateDecision::RejectPostShacl => "reject_post_shacl",
+    }
+}
+
+/// State of the active receipt version being targeted for revert.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActionReceiptState {
+    Active,
+    AlreadyReverted,
+}
+
+impl ActionReceiptState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ActionReceiptState::Active => "active",
+            ActionReceiptState::AlreadyReverted => "already_reverted",
+        }
+    }
+}
+
+/// Decision from the kinetic Action revert gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActionRevertDecision {
+    RevertCommit,
+    ForcedRevertCommit,
+    RejectAlreadyReverted,
+    RejectPermissionDenied,
+    RejectStaleHeadConflict,
+}
+
+/// Evaluates a kinetic Action revert attempt:
+/// 1. Refuses already-reverted receipts unconditionally (no double revert).
+/// 2. Requires owner/admin when `force_requested` is true; otherwise requires editor or owner/admin.
+/// 3. Commits a forced revert when `force_requested` is authorized; otherwise requires `head_cas_matches`.
+pub const fn evaluate_action_revert(
+    receipt_state: ActionReceiptState,
+    head_cas_matches: bool,
+    force_requested: bool,
+    caller_is_owner_or_admin: bool,
+    caller_is_editor_or_above: bool,
+) -> ActionRevertDecision {
+    if matches!(receipt_state, ActionReceiptState::AlreadyReverted) {
+        ActionRevertDecision::RejectAlreadyReverted
+    } else if force_requested {
+        if caller_is_owner_or_admin {
+            ActionRevertDecision::ForcedRevertCommit
+        } else {
+            ActionRevertDecision::RejectPermissionDenied
+        }
+    } else if !(caller_is_editor_or_above || caller_is_owner_or_admin) {
+        ActionRevertDecision::RejectPermissionDenied
+    } else if !head_cas_matches {
+        ActionRevertDecision::RejectStaleHeadConflict
+    } else {
+        ActionRevertDecision::RevertCommit
+    }
+}
+
+/// Tag string for an action revert decision.
+pub const fn action_revert_tag(d: ActionRevertDecision) -> &'static str {
+    match d {
+        ActionRevertDecision::RevertCommit => "revert_commit",
+        ActionRevertDecision::ForcedRevertCommit => "forced_revert_commit",
+        ActionRevertDecision::RejectAlreadyReverted => "reject_already_reverted",
+        ActionRevertDecision::RejectPermissionDenied => "reject_permission_denied",
+        ActionRevertDecision::RejectStaleHeadConflict => "reject_stale_head_conflict",
+    }
+}
+
+/// Requested target task status in an `ActionEffectTemplate::TransitionTask`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActionTaskTargetStatus {
+    Open,
+    InProgress,
+    Blocked,
+    Done,
+}
+
+impl ActionTaskTargetStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ActionTaskTargetStatus::Open => "open",
+            ActionTaskTargetStatus::InProgress => "in_progress",
+            ActionTaskTargetStatus::Blocked => "blocked",
+            ActionTaskTargetStatus::Done => "done",
+        }
+    }
+}
+
+/// Error from evaluating an `ActionEffectTemplate::TransitionTask` transition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActionTaskEffectError {
+    DoneRequiresComplete,
+    IllegalTransition,
+}
+
+/// Evaluates a kinetic `TransitionTask` effect transition.
+/// Unconditionally rejects `Done` (`DoneRequiresComplete`) so Lock 2 (`neurostrata_task_complete`)
+/// can never be bypassed by an ActionType; allows same-status annotation or legal FSM edges
+/// into `Open`, `InProgress`, or `Blocked`.
+pub const fn evaluate_action_task_effect(
+    current: KernelTaskStatus,
+    requested: ActionTaskTargetStatus,
+) -> Result<KernelTaskStatus, ActionTaskEffectError> {
+    let target = match requested {
+        ActionTaskTargetStatus::Open => KernelTaskStatus::Open,
+        ActionTaskTargetStatus::InProgress => KernelTaskStatus::InProgress,
+        ActionTaskTargetStatus::Blocked => KernelTaskStatus::Blocked,
+        ActionTaskTargetStatus::Done => return Err(ActionTaskEffectError::DoneRequiresComplete),
+    };
+    let same_status = matches!(
+        (current, target),
+        (KernelTaskStatus::Open, KernelTaskStatus::Open)
+            | (KernelTaskStatus::InProgress, KernelTaskStatus::InProgress)
+            | (KernelTaskStatus::Blocked, KernelTaskStatus::Blocked)
+    );
+    if same_status || task_edge_guard(current, target).is_some() {
+        Ok(target)
+    } else {
+        Err(ActionTaskEffectError::IllegalTransition)
+    }
+}
+
+/// Tag string for an action task-effect transition outcome.
+pub const fn action_task_effect_tag(
+    res: Result<KernelTaskStatus, ActionTaskEffectError>,
+) -> &'static str {
+    match res {
+        Ok(KernelTaskStatus::Open) => "ok_open",
+        Ok(KernelTaskStatus::InProgress) => "ok_in_progress",
+        Ok(KernelTaskStatus::Blocked) => "ok_blocked",
+        Ok(KernelTaskStatus::Done) => "ok_done",
+        Err(ActionTaskEffectError::DoneRequiresComplete) => "err_done_requires_complete",
+        Err(ActionTaskEffectError::IllegalTransition) => "err_illegal",
+    }
+}
+
+/// Kind of kinetic action memory row for SynapticMesh shareability evaluation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActionMemoryKind {
+    ActionType,
+    ActionReceipt,
+}
+
+impl ActionMemoryKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ActionMemoryKind::ActionType => "action_type",
+            ActionMemoryKind::ActionReceipt => "action_receipt",
+        }
+    }
+}
+
+/// Returns whether a kinetic action memory row is eligible to cross SynapticMesh.
+/// `ActionReceipt` is unconditionally private (`false`); `ActionType` is shareable iff
+/// `explicit_shareable` is `true`.
+pub const fn is_action_memory_shareable(kind: ActionMemoryKind, explicit_shareable: bool) -> bool {
+    match kind {
+        ActionMemoryKind::ActionType => explicit_shareable,
+        ActionMemoryKind::ActionReceipt => false,
+    }
+}

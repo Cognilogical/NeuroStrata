@@ -21,12 +21,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use formal_kernel::{
-    classify_merge_decision_tag, claim_decision_tag, evaluate_claim_decision,
-    evaluate_import_precheck, evaluate_procedure_fire, evaluate_retention_gate,
-    evaluate_seq_continuity, evaluate_sovereignty_gate, epoch_gate_tag,
-    import_precheck_tag, join_task_status, lifecycle_can_transition, procedure_fire_tag,
-    retention_verdict_tag, seq_decision_tag, sovereignty_decision_tag, task_step_tag,
-    KernelProcedureTrust,
+    action_gate_tag, action_revert_tag, action_task_effect_tag, classify_merge_decision_tag,
+    claim_decision_tag, epoch_gate_tag, evaluate_action_gate, evaluate_action_revert,
+    evaluate_action_task_effect, evaluate_claim_decision, evaluate_import_precheck,
+    evaluate_procedure_fire, evaluate_retention_gate, evaluate_seq_continuity,
+    evaluate_sovereignty_gate, import_precheck_tag, is_action_memory_shareable, join_task_status,
+    lifecycle_can_transition, procedure_fire_tag, retention_verdict_tag, seq_decision_tag,
+    sovereignty_decision_tag, task_step_tag, ActionMemoryKind, ActionReceiptState,
+    ActionTaskTargetStatus, KernelProcedureTrust,
 };
 
 /// The statuses in the exact order used by `proofs/Main.lean`.
@@ -266,6 +268,98 @@ fn generate_rust_truth_table() -> Vec<String> {
         }
     }
 
+    // ACTION_GATE: 32 rows (5 booleans)
+    for &principal in [false, true].iter() {
+        for &params in [false, true].iter() {
+            for &sparql in [false, true].iter() {
+                for &twin in [false, true].iter() {
+                    for &shacl in [false, true].iter() {
+                        let tag = action_gate_tag(evaluate_action_gate(
+                            principal, params, sparql, twin, shacl,
+                        ));
+                        lines.push(format!(
+                            "ACTION_GATE|{}|{}|{}|{}|{}|{}",
+                            bool_str(principal),
+                            bool_str(params),
+                            bool_str(sparql),
+                            bool_str(twin),
+                            bool_str(shacl),
+                            tag
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // ACTION_REVERT: 32 rows (2 receipt states × 4 booleans)
+    let receipt_states = [
+        ActionReceiptState::Active,
+        ActionReceiptState::AlreadyReverted,
+    ];
+    for &rstate in receipt_states.iter() {
+        for &cas in [false, true].iter() {
+            for &force in [false, true].iter() {
+                for &owner_admin in [false, true].iter() {
+                    for &editor in [false, true].iter() {
+                        let tag = action_revert_tag(evaluate_action_revert(
+                            rstate,
+                            cas,
+                            force,
+                            owner_admin,
+                            editor,
+                        ));
+                        lines.push(format!(
+                            "ACTION_REVERT|{}|{}|{}|{}|{}|{}",
+                            rstate.as_str(),
+                            bool_str(cas),
+                            bool_str(force),
+                            bool_str(owner_admin),
+                            bool_str(editor),
+                            tag
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // ACTION_TASK_EFFECT: 16 rows (4 current task statuses × 4 requested target statuses)
+    let target_statuses = [
+        ActionTaskTargetStatus::Open,
+        ActionTaskTargetStatus::InProgress,
+        ActionTaskTargetStatus::Blocked,
+        ActionTaskTargetStatus::Done,
+    ];
+    for &curr in TASK_STATUSES.iter() {
+        for &req in target_statuses.iter() {
+            let tag = action_task_effect_tag(evaluate_action_task_effect(curr, req));
+            lines.push(format!(
+                "ACTION_TASK_EFFECT|{}|{}|{}",
+                curr.as_str(),
+                req.as_str(),
+                tag
+            ));
+        }
+    }
+
+    // ACTION_SHAREABLE: 4 rows (2 kinds × 2 explicit_shareable)
+    let kinds = [
+        ActionMemoryKind::ActionType,
+        ActionMemoryKind::ActionReceipt,
+    ];
+    for &kind in kinds.iter() {
+        for &explicit in [false, true].iter() {
+            let shareable = is_action_memory_shareable(kind, explicit);
+            lines.push(format!(
+                "ACTION_SHAREABLE|{}|{}|{}",
+                kind.as_str(),
+                bool_str(explicit),
+                bool_str(shareable)
+            ));
+        }
+    }
+
     lines
 }
 
@@ -317,13 +411,14 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
     let rust_lines = generate_rust_truth_table();
     assert_eq!(
         rust_lines.len(),
-        389,
-        "expected 389 canonical lines (64+16+128+3+24+32+8+60+16+6+32)"
+        473,
+        "expected 473 canonical lines (64+16+128+3+24+32+8+60+16+6+32+32+32+16+4)"
     );
 
     // Section-count verification: 64 TASK_FSM + 16 LIFECYCLE + 128 MESH_MERGE
     // + 3 EPOCH_GATE + 24 TASK_CLAIM + 32 SOVEREIGNTY_GATE + 8 IMPORT_PRECHECK
-    // + 60 PROCEDURE_FIRE + 16 TWIN_CRDT_STATUS + 6 TWIN_CRDT_SEQ + 32 RETENTION_GATE,
+    // + 60 PROCEDURE_FIRE + 16 TWIN_CRDT_STATUS + 6 TWIN_CRDT_SEQ + 32 RETENTION_GATE
+    // + 32 ACTION_GATE + 32 ACTION_REVERT + 16 ACTION_TASK_EFFECT + 4 ACTION_SHAREABLE,
     // matching the exact generation order in `proofs/Main.lean`.
     let section_counts = rust_lines
         .iter()
@@ -385,6 +480,26 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
         *section_counts.get("RETENTION_GATE").unwrap_or(&0),
         32,
         "expected 32 RETENTION_GATE rows"
+    );
+    assert_eq!(
+        *section_counts.get("ACTION_GATE").unwrap_or(&0),
+        32,
+        "expected 32 ACTION_GATE rows"
+    );
+    assert_eq!(
+        *section_counts.get("ACTION_REVERT").unwrap_or(&0),
+        32,
+        "expected 32 ACTION_REVERT rows"
+    );
+    assert_eq!(
+        *section_counts.get("ACTION_TASK_EFFECT").unwrap_or(&0),
+        16,
+        "expected 16 ACTION_TASK_EFFECT rows"
+    );
+    assert_eq!(
+        *section_counts.get("ACTION_SHAREABLE").unwrap_or(&0),
+        4,
+        "expected 4 ACTION_SHAREABLE rows"
     );
 
     let lake = find_lake().expect("lake not found on PATH or ~/.elan/bin/lake; install elan to run Lean parity tests");
@@ -454,6 +569,24 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
         "TWIN_CRDT_SEQ|false|3|buffer_out_of_order",
         "RETENTION_GATE|true|true|true|true|false|failed_worktree_moved",
         "RETENTION_GATE|true|true|true|true|true|retained",
+        "ACTION_GATE|true|true|true|true|true|allow",
+        "ACTION_GATE|false|true|true|true|true|reject_unauthorized",
+        "ACTION_GATE|true|false|true|true|true|reject_invalid_params",
+        "ACTION_GATE|true|true|false|true|true|reject_sparql_ask",
+        "ACTION_GATE|true|true|true|false|true|reject_twin_bounds",
+        "ACTION_GATE|true|true|true|true|false|reject_post_shacl",
+        "ACTION_REVERT|already_reverted|true|true|true|true|reject_already_reverted",
+        "ACTION_REVERT|active|false|false|true|true|reject_stale_head_conflict",
+        "ACTION_REVERT|active|false|true|false|true|reject_permission_denied",
+        "ACTION_REVERT|active|false|true|true|true|forced_revert_commit",
+        "ACTION_REVERT|active|true|false|false|true|revert_commit",
+        "ACTION_TASK_EFFECT|open|done|err_done_requires_complete",
+        "ACTION_TASK_EFFECT|in_progress|done|err_done_requires_complete",
+        "ACTION_TASK_EFFECT|open|in_progress|ok_in_progress",
+        "ACTION_SHAREABLE|action_receipt|true|false",
+        "ACTION_SHAREABLE|action_receipt|false|false",
+        "ACTION_SHAREABLE|action_type|true|true",
+        "ACTION_SHAREABLE|action_type|false|false",
     ] {
         assert!(
             rust_lines.iter().any(|l| l == expected),
