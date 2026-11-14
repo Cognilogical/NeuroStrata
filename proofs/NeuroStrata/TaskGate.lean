@@ -74,7 +74,7 @@ def hasDoneWithoutExtractionViolation (r : Row) (rows : List Row) (now : Int) : 
 theorem isRetired_boundary_inclusive : ∀ (r : Row) (now : Int),
     r.validTo = some now → isRetired r now = true := by
   intro r now hvt
-  simp [isRetired, hvt, Int.le_refl]
+  simp [isRetired, hvt]
 
 theorem isRetired_none_stays_live : ∀ (r : Row) (now : Int),
     r.validTo = none → isRetired r now = false := by
@@ -155,7 +155,7 @@ theorem liveSuccessor_two_node_cycle_returns_none (now : Int) :
   unfold liveSuccessor
   simp [findRow, rA, rB, hretA]
   unfold liveSuccessor
-  simp [findRow, rA, rB, hretB]
+  simp [findRow, rB, hretB]
   unfold liveSuccessor
   simp
 

@@ -232,9 +232,7 @@ impl ActionTypeDefinition {
             if let Some(tmt) = &spec.target_memory_type {
                 if tmt.trim().is_empty() {
                     out.push(ShaclViolation {
-                        field: format!(
-                            "metadata.action_type.parameters.{name}.target_memory_type"
-                        ),
+                        field: format!("metadata.action_type.parameters.{name}.target_memory_type"),
                         why: "target_memory_type must be non-empty when set".to_string(),
                     });
                 }
@@ -307,9 +305,7 @@ impl ActionTypeDefinition {
                     };
                     if bad_min || bad_max || inverted || (min.is_none() && max.is_none()) {
                         out.push(ShaclViolation {
-                            field: format!(
-                                "metadata.action_type.submission_criteria[{i}].bounds"
-                            ),
+                            field: format!("metadata.action_type.submission_criteria[{i}].bounds"),
                             why: "twin precondition requires finite min/max with min <= max"
                                 .to_string(),
                         });
@@ -339,9 +335,9 @@ impl ActionTypeDefinition {
                         });
                     }
                     if variables_from_params.is_empty()
-                        || variables_from_params
-                            .iter()
-                            .any(|(var, p)| var.trim().is_empty() || !self.parameters.contains_key(p))
+                        || variables_from_params.iter().any(|(var, p)| {
+                            var.trim().is_empty() || !self.parameters.contains_key(p)
+                        })
                     {
                         out.push(ShaclViolation {
                             field: format!(
@@ -713,10 +709,9 @@ pub struct ActionReceiptPayload {
 
 impl ActionReceiptPayload {
     pub fn from_payload(payload: &MemoryPayload) -> Result<Self, String> {
-        let raw = payload
-            .metadata
-            .get("action_receipt")
-            .ok_or_else(|| "action_receipt object is required for an action_receipt memory".to_string())?;
+        let raw = payload.metadata.get("action_receipt").ok_or_else(|| {
+            "action_receipt object is required for an action_receipt memory".to_string()
+        })?;
         if !raw.is_object() {
             return Err("action_receipt must be a JSON object".to_string());
         }
@@ -738,10 +733,7 @@ impl ActionReceiptPayload {
                 why: "principal must be non-empty".to_string(),
             });
         }
-        let eligibility = payload
-            .metadata
-            .get("eligibility")
-            .and_then(|v| v.as_str());
+        let eligibility = payload.metadata.get("eligibility").and_then(|v| v.as_str());
         if eligibility != Some("private") {
             out.push(ShaclViolation {
                 field: "metadata.eligibility".to_string(),
@@ -803,8 +795,8 @@ pub enum ActionApplyOutcome {
     },
 }
 
+#[cfg(test)]
 impl ActionApplyOutcome {
-    #[allow(dead_code)]
     pub fn is_applied(&self) -> bool {
         matches!(self, ActionApplyOutcome::Applied { .. })
     }
@@ -1268,13 +1260,14 @@ pub async fn evaluate_action(
                     };
 
                     // Validate target memory_type against spec and referencing effects.
-                    let expected_type = spec.target_memory_type.as_deref().or(
-                        if spec.param_type == "twin_id" {
-                            Some("digital_twin")
-                        } else {
-                            None
-                        },
-                    );
+                    let expected_type =
+                        spec.target_memory_type
+                            .as_deref()
+                            .or(if spec.param_type == "twin_id" {
+                                Some("digital_twin")
+                            } else {
+                                None
+                            });
                     let mut type_ok = true;
                     if let Some(exp) = expected_type {
                         if row_payload.memory_type != exp {
@@ -1409,8 +1402,8 @@ pub async fn evaluate_action(
                     .map(|d| d.slug == definition.slug)
                     .unwrap_or(false)
         }) {
-            let has_explicit_acl = !crate::rebac::extract_acl_with_roles(&def_row.payload.metadata)
-                .is_empty();
+            let has_explicit_acl =
+                !crate::rebac::extract_acl_with_roles(&def_row.payload.metadata).is_empty();
             if targets.is_empty() || has_explicit_acl {
                 if !crate::rebac::can_execute_action_on_row(
                     &effective_principal,
@@ -1700,7 +1693,9 @@ fn render_template_value_inner(
                     return Ok(bound.clone());
                 }
             }
-            Ok(serde_json::Value::String(render_template_string(s, params)?))
+            Ok(serde_json::Value::String(render_template_string(
+                s, params,
+            )?))
         }
         serde_json::Value::Array(items) => {
             let mut out = Vec::with_capacity(items.len());
@@ -1952,10 +1947,7 @@ pub async fn stage_action(
                 }
                 if let Some(meta) = retired_before.metadata.as_object_mut() {
                     meta.insert("valid_to".to_string(), serde_json::json!(now_ts));
-                    meta.insert(
-                        "superseded_by".to_string(),
-                        serde_json::json!(after_row_id),
-                    );
+                    meta.insert("superseded_by".to_string(), serde_json::json!(after_row_id));
                 }
 
                 stage_payload(
@@ -2027,17 +2019,15 @@ pub async fn stage_action(
                     &target_rec.payload,
                 );
 
-                let new_content = match render_template_string(
-                    new_content_template,
-                    &eval.bound_params,
-                ) {
-                    Ok(c) => c,
-                    Err(mut f) => {
-                        f.target = effect_target;
-                        submission_failures.push(f);
-                        continue;
-                    }
-                };
+                let new_content =
+                    match render_template_string(new_content_template, &eval.bound_params) {
+                        Ok(c) => c,
+                        Err(mut f) => {
+                            f.target = effect_target;
+                            submission_failures.push(f);
+                            continue;
+                        }
+                    };
                 let patch_val = match render_template_value(metadata_patch, &eval.bound_params) {
                     Ok(v) => v,
                     Err(mut f) => {
@@ -2840,7 +2830,10 @@ pub async fn revert_action(
         if !invocation.force && !exists_now {
             return Err(ActionError::ConflictWithNewerVersion {
                 receipt_id: active_receipt.receipt_id.clone(),
-                superseded_by: format!("edge_missing:{}-[{}]->{}", ed.source, ed.relation, ed.target),
+                superseded_by: format!(
+                    "edge_missing:{}-[{}]->{}",
+                    ed.source, ed.relation, ed.target
+                ),
             });
         }
 
@@ -2917,13 +2910,9 @@ pub async fn revert_action(
                     .await
                     .map_err(|e| ActionError::Storage(e.to_string()))?
                     .map(|(_v, p)| p);
-                let active_twin_opt = resolve_namespace_target_row(
-                    store,
-                    &invocation.namespace,
-                    &twin_id,
-                    true,
-                )
-                .await?;
+                let active_twin_opt =
+                    resolve_namespace_target_row(store, &invocation.namespace, &twin_id, true)
+                        .await?;
 
                 let Some((head_row_id, head_payload)) = active_twin_opt else {
                     return Err(ActionError::ConflictWithNewerVersion {
@@ -3020,9 +3009,8 @@ pub async fn revert_action(
                         twin_obj.insert("version".to_string(), serde_json::json!(next_version));
                         twin_obj.insert("updated_at".to_string(), serde_json::json!(now_ts));
                     }
-                    if let Some(dt_obj) = meta
-                        .get_mut("digital_twin")
-                        .and_then(|v| v.as_object_mut())
+                    if let Some(dt_obj) =
+                        meta.get_mut("digital_twin").and_then(|v| v.as_object_mut())
                     {
                         dt_obj.insert("version".to_string(), serde_json::json!(next_version));
                         dt_obj.insert(
@@ -3662,8 +3650,8 @@ pub async fn define_action(
         }]));
     }
 
-    let definition: ActionTypeDefinition =
-        serde_json::from_value(definition_value.clone()).map_err(|e| {
+    let definition: ActionTypeDefinition = serde_json::from_value(definition_value.clone())
+        .map_err(|e| {
             ActionError::InvalidDefinition(vec![ShaclViolation {
                 field: "metadata.action_type".to_string(),
                 why: format!("invalid action_type schema: {e}"),
@@ -3836,7 +3824,8 @@ mod tests {
                 },
                 ActionEffectTemplate::SupersedeMemory {
                     target_param: "rule_id".to_string(),
-                    new_content_template: "Updated rule for {{twin_id}} at {{target_temp}}".to_string(),
+                    new_content_template: "Updated rule for {{twin_id}} at {{target_temp}}"
+                        .to_string(),
                     metadata_patch: json!({"source": "recalibrate-cooling-loop"}),
                 },
                 ActionEffectTemplate::UpsertMemory {
@@ -3890,7 +3879,8 @@ mod tests {
                     failure_message: "not ask".to_string(),
                 },
                 SubmissionCriterion::SparqlAsk {
-                    query: "ASK WHERE { SERVICE <https://example.org/sparql> { ?s ?p ?o } }".to_string(),
+                    query: "ASK WHERE { SERVICE <https://example.org/sparql> { ?s ?p ?o } }"
+                        .to_string(),
                     failure_message: "has service".to_string(),
                 },
             ],
@@ -3993,7 +3983,10 @@ mod tests {
         };
 
         let violations = crate::rdf::shacl::validate_memory(&bad_payload);
-        assert!(!violations.is_empty(), "expected SHACL violations on malformed action_type");
+        assert!(
+            !violations.is_empty(),
+            "expected SHACL violations on malformed action_type"
+        );
 
         store
             .upsert("ns-warn", "act-bad", vec![0.1, 0.2, 0.3, 0.4], bad_payload)
@@ -4001,9 +3994,15 @@ mod tests {
             .expect("warn-first raw upsert must not fail");
 
         let stored = store.get("ns-warn", "act-bad").await.unwrap();
-        assert!(stored.is_some(), "malformed raw row should still be stored warn-first");
+        assert!(
+            stored.is_some(),
+            "malformed raw row should still be stored warn-first"
+        );
         let ont = store.get_ontology("ns-warn");
-        assert!(ont.action_types.is_empty(), "malformed action_type must not compile into OntologyIndex");
+        assert!(
+            ont.action_types.is_empty(),
+            "malformed action_type must not compile into OntologyIndex"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -4090,11 +4089,31 @@ mod tests {
             .iter()
             .map(|f| f.code.as_str())
             .collect();
-        assert!(codes.contains(&"unknown_parameter"), "got: {:?}", eval.submission_failures);
-        assert!(codes.contains(&"missing_parameter"), "got: {:?}", eval.submission_failures);
-        assert!(codes.contains(&"non_finite_number"), "got: {:?}", eval.submission_failures);
-        assert!(codes.contains(&"out_of_bounds"), "got: {:?}", eval.submission_failures);
-        assert!(codes.contains(&"invalid_enum_value"), "got: {:?}", eval.submission_failures);
+        assert!(
+            codes.contains(&"unknown_parameter"),
+            "got: {:?}",
+            eval.submission_failures
+        );
+        assert!(
+            codes.contains(&"missing_parameter"),
+            "got: {:?}",
+            eval.submission_failures
+        );
+        assert!(
+            codes.contains(&"non_finite_number"),
+            "got: {:?}",
+            eval.submission_failures
+        );
+        assert!(
+            codes.contains(&"out_of_bounds"),
+            "got: {:?}",
+            eval.submission_failures
+        );
+        assert!(
+            codes.contains(&"invalid_enum_value"),
+            "got: {:?}",
+            eval.submission_failures
+        );
         for f in &eval.submission_failures {
             assert!(!f.message.contains("secret-token-value"));
             assert!(!f.message.contains("turbo-secret"));
@@ -4257,9 +4276,21 @@ mod tests {
         )
         .await
         .unwrap();
-        let codes1: Vec<&str> = eval1.submission_failures.iter().map(|f| f.code.as_str()).collect();
-        assert!(codes1.contains(&"target_not_found"), "got: {:?}", eval1.submission_failures);
-        assert!(codes1.contains(&"target_type_mismatch"), "got: {:?}", eval1.submission_failures);
+        let codes1: Vec<&str> = eval1
+            .submission_failures
+            .iter()
+            .map(|f| f.code.as_str())
+            .collect();
+        assert!(
+            codes1.contains(&"target_not_found"),
+            "got: {:?}",
+            eval1.submission_failures
+        );
+        assert!(
+            codes1.contains(&"target_type_mismatch"),
+            "got: {:?}",
+            eval1.submission_failures
+        );
 
         // 2. Local twin with wrong schema_id and bob (viewer) -> schema mismatch + rebac_denied
         let mut p2 = BTreeMap::new();
@@ -4279,9 +4310,21 @@ mod tests {
         )
         .await
         .unwrap();
-        let codes2: Vec<&str> = eval2.submission_failures.iter().map(|f| f.code.as_str()).collect();
-        assert!(codes2.contains(&"target_schema_mismatch"), "got: {:?}", eval2.submission_failures);
-        assert!(codes2.contains(&"rebac_denied"), "got: {:?}", eval2.submission_failures);
+        let codes2: Vec<&str> = eval2
+            .submission_failures
+            .iter()
+            .map(|f| f.code.as_str())
+            .collect();
+        assert!(
+            codes2.contains(&"target_schema_mismatch"),
+            "got: {:?}",
+            eval2.submission_failures
+        );
+        assert!(
+            codes2.contains(&"rebac_denied"),
+            "got: {:?}",
+            eval2.submission_failures
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -4469,22 +4512,26 @@ mod tests {
 
         // Hostile injection payload attempting to close quotes and inject UNION
         let hostile_text = "\" } UNION { ?s ?p ?o } #";
-        let hostile_term =
-            oxrdf::Term::Literal(oxrdf::Literal::new_simple_literal(hostile_text));
+        let hostile_term = oxrdf::Term::Literal(oxrdf::Literal::new_simple_literal(hostile_text));
 
         let res_false = crate::rdf::sparql::execute_action_ask(
             &store,
             "ns-inj",
             query,
-            &[(target_var.clone(), target_term.clone()), (text_var.clone(), hostile_term)],
+            &[
+                (target_var.clone(), target_term.clone()),
+                (text_var.clone(), hostile_term),
+            ],
             crate::rdf::sparql::SparqlConfig::default(),
         )
         .await
         .expect("bound ASK must succeed without syntax alteration");
-        assert!(!res_false, "hostile text must evaluate to false, not inject UNION");
+        assert!(
+            !res_false,
+            "hostile text must evaluate to false, not inject UNION"
+        );
 
-        let exact_term =
-            oxrdf::Term::Literal(oxrdf::Literal::new_simple_literal("Safe content"));
+        let exact_term = oxrdf::Term::Literal(oxrdf::Literal::new_simple_literal("Safe content"));
         let res_true = crate::rdf::sparql::execute_action_ask(
             &store,
             "ns-inj",
@@ -4527,25 +4574,73 @@ mod tests {
         let cfg = crate::rdf::sparql::SparqlConfig::default();
 
         // 1. Malformed syntax
-        assert!(crate::rdf::sparql::execute_action_ask(&store, "ns-ask", "ASK WHERE { ??? }", &[], cfg.clone()).await.is_err());
+        assert!(crate::rdf::sparql::execute_action_ask(
+            &store,
+            "ns-ask",
+            "ASK WHERE { ??? }",
+            &[],
+            cfg.clone()
+        )
+        .await
+        .is_err());
         // 2. SELECT instead of ASK
-        assert!(crate::rdf::sparql::execute_action_ask(&store, "ns-ask", "SELECT ?s WHERE { ?s ?p ?o }", &[], cfg.clone()).await.is_err());
+        assert!(crate::rdf::sparql::execute_action_ask(
+            &store,
+            "ns-ask",
+            "SELECT ?s WHERE { ?s ?p ?o }",
+            &[],
+            cfg.clone()
+        )
+        .await
+        .is_err());
         // 3. SERVICE clause
-        assert!(crate::rdf::sparql::execute_action_ask(&store, "ns-ask", "ASK WHERE { SERVICE <https://example.com/sparql> { ?s ?p ?o } }", &[], cfg.clone()).await.is_err());
+        assert!(crate::rdf::sparql::execute_action_ask(
+            &store,
+            "ns-ask",
+            "ASK WHERE { SERVICE <https://example.com/sparql> { ?s ?p ?o } }",
+            &[],
+            cfg.clone()
+        )
+        .await
+        .is_err());
         // 4. UPDATE statement
-        assert!(crate::rdf::sparql::execute_action_ask(&store, "ns-ask", "INSERT DATA { <urn:a> <urn:b> <urn:c> }", &[], cfg.clone()).await.is_err());
+        assert!(crate::rdf::sparql::execute_action_ask(
+            &store,
+            "ns-ask",
+            "INSERT DATA { <urn:a> <urn:b> <urn:c> }",
+            &[],
+            cfg.clone()
+        )
+        .await
+        .is_err());
         // 5. Timeout (0ms budget)
         let timeout_cfg = crate::rdf::sparql::SparqlConfig {
             timeout_ms: 0,
             ..cfg.clone()
         };
-        assert!(crate::rdf::sparql::execute_action_ask(&store, "ns-ask", "ASK WHERE { ?s ?p ?o }", &[], timeout_cfg).await.is_err());
+        assert!(crate::rdf::sparql::execute_action_ask(
+            &store,
+            "ns-ask",
+            "ASK WHERE { ?s ?p ?o }",
+            &[],
+            timeout_cfg
+        )
+        .await
+        .is_err());
         // 6. Large algebra (max_algebra_nodes = 0)
         let small_algebra_cfg = crate::rdf::sparql::SparqlConfig {
             max_algebra_nodes: 0,
             ..cfg
         };
-        assert!(crate::rdf::sparql::execute_action_ask(&store, "ns-ask", "ASK WHERE { ?s ?p ?o }", &[], small_algebra_cfg).await.is_err());
+        assert!(crate::rdf::sparql::execute_action_ask(
+            &store,
+            "ns-ask",
+            "ASK WHERE { ?s ?p ?o }",
+            &[],
+            small_algebra_cfg
+        )
+        .await
+        .is_err());
 
         let after_count = store.list("ns-ask", None, None).await.unwrap().len();
         assert_eq!(before_count, after_count, "row count must remain unchanged");
@@ -4790,7 +4885,11 @@ mod tests {
             .await
             .expect("stage_action");
         let after_rows = store.list("ns-stage-twin", None, None).await.unwrap();
-        assert_eq!(before_rows.len(), after_rows.len(), "stage_action must not write to store");
+        assert_eq!(
+            before_rows.len(),
+            after_rows.len(),
+            "stage_action must not write to store"
+        );
 
         assert_eq!(stage.receipt.twin_deltas.len(), 1);
         let td = &stage.receipt.twin_deltas[0];
@@ -4809,10 +4908,7 @@ mod tests {
             .iter()
             .find(|w| w.id == td.after_row_id)
             .expect("new twin row staged");
-        assert_eq!(
-            new_twin_write.payload.metadata["twin"]["version"],
-            json!(2)
-        );
+        assert_eq!(new_twin_write.payload.metadata["twin"]["version"], json!(2));
         assert_eq!(
             new_twin_write.payload.metadata["twin"]["variables"]["temperature"],
             json!(42.5)
@@ -5002,7 +5098,10 @@ mod tests {
             .iter()
             .find(|d| d.kind == "upsert_memory")
             .expect("upsert delta 2");
-        assert!(!upsert_delta2.created, "same-ID replace must set created=false");
+        assert!(
+            !upsert_delta2.created,
+            "same-ID replace must set created=false"
+        );
         assert_eq!(
             serde_json::to_value(upsert_delta2.before_payload.as_ref().unwrap()).unwrap(),
             serde_json::to_value(&stored_existing_upsert).unwrap()
@@ -5114,7 +5213,12 @@ mod tests {
             }),
         };
         store
-            .upsert("ns-stage-edge", "task-1", vec![0.1; 4], orig_task_payload.clone())
+            .upsert(
+                "ns-stage-edge",
+                "task-1",
+                vec![0.1; 4],
+                orig_task_payload.clone(),
+            )
             .await
             .unwrap();
 
@@ -5281,7 +5385,8 @@ mod tests {
 
     #[tokio::test]
     async fn any_staged_shacl_violation_rejects_all_rows_and_receipt_before_write() {
-        let tmp = std::env::temp_dir().join(format!("ns-action-stage-shacl-{}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("ns-action-stage-shacl-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let store = crate::store::ladybug::LadybugStore::for_testing(&tmp, 4).expect("store");
         store.init("ns-stage-shacl").await.unwrap();
@@ -5324,7 +5429,11 @@ mod tests {
             .await
             .unwrap();
 
-        let before_count = store.list("ns-stage-shacl", None, None).await.unwrap().len();
+        let before_count = store
+            .list("ns-stage-shacl", None, None)
+            .await
+            .unwrap()
+            .len();
         let mut params = BTreeMap::new();
         params.insert("text".to_string(), json!("must have source"));
 
@@ -5349,14 +5458,22 @@ mod tests {
             stage_res.is_err(),
             "post-image SHACL violation must reject staging"
         );
-        let after_count = store.list("ns-stage-shacl", None, None).await.unwrap().len();
-        assert_eq!(before_count, after_count, "zero rows written on SHACL rejection");
+        let after_count = store
+            .list("ns-stage-shacl", None, None)
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(
+            before_count, after_count,
+            "zero rows written on SHACL rejection"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[tokio::test]
     async fn action_batch_commits_every_row_edge_and_receipt_together() {
-        let tmp = std::env::temp_dir().join(format!("ns-action-batch-commit-{}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("ns-action-batch-commit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let store = crate::store::ladybug::LadybugStore::for_testing(&tmp, 4).expect("store");
         store.init("ns-batch-commit").await.unwrap();
@@ -5503,12 +5620,23 @@ mod tests {
             .expect("commit_action_batch");
 
         // Verify twin v1 retired, twin v2 active, upsert row created, receipt stored, edge created
-        let (_, twin_v1) = store.get("ns-batch-commit", "twin-row-1").await.unwrap().unwrap();
+        let (_, twin_v1) = store
+            .get("ns-batch-commit", "twin-row-1")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(twin_v1.metadata["valid_to"], json!(1794675600));
         let new_twin_id = &stage.receipt.twin_deltas[0].after_row_id;
-        let (_, twin_v2) = store.get("ns-batch-commit", new_twin_id).await.unwrap().unwrap();
+        let (_, twin_v2) = store
+            .get("ns-batch-commit", new_twin_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(twin_v2.metadata["twin"]["version"], json!(2));
-        assert_eq!(twin_v2.metadata["twin"]["variables"]["temperature"], json!(48.0));
+        assert_eq!(
+            twin_v2.metadata["twin"]["variables"]["temperature"],
+            json!(48.0)
+        );
 
         let (_, receipt_row) = store
             .get("ns-batch-commit", &stage.receipt_id)
@@ -5527,7 +5655,8 @@ mod tests {
 
     #[tokio::test]
     async fn fault_after_first_write_rolls_back_effects_receipt_edges_and_indexes() {
-        let tmp = std::env::temp_dir().join(format!("ns-action-batch-rollback-{}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("ns-action-batch-rollback-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let store = crate::store::ladybug::LadybugStore::for_testing(&tmp, 4).expect("store");
         store.init("ns-batch-rb").await.unwrap();
@@ -5639,16 +5768,34 @@ mod tests {
             .commit_action_batch("ns-batch-rb", stage.write_set.clone())
             .await;
         store.set_action_batch_fail_after_writes(None);
-        assert!(commit_res.is_err(), "injected fault must fail commit_action_batch");
+        assert!(
+            commit_res.is_err(),
+            "injected fault must fail commit_action_batch"
+        );
 
         // Verify rule-1 is still active (valid_to absent), new rule row does not exist, receipt does not exist, edge does not exist
         let post_rows = store.list("ns-batch-rb", None, None).await.unwrap();
-        assert_eq!(pre_rows.len(), post_rows.len(), "row count must match pre-state after rollback");
+        assert_eq!(
+            pre_rows.len(),
+            post_rows.len(),
+            "row count must match pre-state after rollback"
+        );
         let (_, rule1) = store.get("ns-batch-rb", "rule-1").await.unwrap().unwrap();
-        assert!(rule1.metadata.get("valid_to").is_none(), "rule-1 must remain active after rollback");
-        assert!(store.get("ns-batch-rb", &stage.receipt_id).await.unwrap().is_none());
+        assert!(
+            rule1.metadata.get("valid_to").is_none(),
+            "rule-1 must remain active after rollback"
+        );
+        assert!(store
+            .get("ns-batch-rb", &stage.receipt_id)
+            .await
+            .unwrap()
+            .is_none());
         for created_id in &stage.receipt.created_ids {
-            assert!(store.get("ns-batch-rb", created_id).await.unwrap().is_none());
+            assert!(store
+                .get("ns-batch-rb", created_id)
+                .await
+                .unwrap()
+                .is_none());
         }
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -5782,7 +5929,11 @@ mod tests {
             "expected ConflictWithNewerVersion on stale head, got {:?}",
             res
         );
-        assert!(store.get("ns-batch-cas", &stage.receipt_id).await.unwrap().is_none());
+        assert!(store
+            .get("ns-batch-cas", &stage.receipt_id)
+            .await
+            .unwrap()
+            .is_none());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -5860,7 +6011,16 @@ mod tests {
         store.set_action_batch_fail_after_writes(None);
 
         let hits_after_abort = store
-            .search_lexical("ns-batch-idx", "zephyrquartz99", 10, false, false, &[], "alice", 0)
+            .search_lexical(
+                "ns-batch-idx",
+                "zephyrquartz99",
+                10,
+                false,
+                false,
+                &[],
+                "alice",
+                0,
+            )
             .await
             .unwrap();
         assert!(
@@ -5874,7 +6034,16 @@ mod tests {
             .await
             .expect("commit");
         let hits_after_commit = store
-            .search_lexical("ns-batch-idx", "zephyrquartz99", 10, false, false, &[], "alice", 0)
+            .search_lexical(
+                "ns-batch-idx",
+                "zephyrquartz99",
+                10,
+                false,
+                false,
+                &[],
+                "alice",
+                0,
+            )
             .await
             .unwrap();
         assert_eq!(hits_after_commit.results.len(), 1);
@@ -5883,7 +6052,8 @@ mod tests {
 
     #[tokio::test]
     async fn apply_all_effects_then_revert_restores_complete_pre_state() {
-        let tmp = std::env::temp_dir().join(format!("ns-action-apply-revert-{}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("ns-action-apply-revert-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let store = crate::store::ladybug::LadybugStore::for_testing(&tmp, 4).expect("store");
         store.init("ns-all-five").await.unwrap();
@@ -6030,8 +6200,7 @@ mod tests {
         params.insert("temp".to_string(), json!(44.0));
 
         // Pre-seed deterministic upsert row for effect index 3 so we test both created=true (effect 2) and created=false (effect 3)
-        let replaced_upsert_id =
-            deterministic_upsert_id("ns-all-five", "all-five-op", &params, 3);
+        let replaced_upsert_id = deterministic_upsert_id("ns-all-five", "all-five-op", &params, 3);
         store
             .upsert(
                 "ns-all-five",
@@ -6154,17 +6323,28 @@ mod tests {
         .expect("apply_action");
 
         let (receipt_id, receipt) = match apply_out {
-            ActionApplyOutcome::Applied { receipt_id, receipt } => (receipt_id, receipt),
+            ActionApplyOutcome::Applied {
+                receipt_id,
+                receipt,
+            } => (receipt_id, receipt),
             other => panic!("expected Applied, got {other:?}"),
         };
 
         let created_upsert_id = deterministic_upsert_id("ns-all-five", "all-five-op", &params, 2);
         assert!(store
-            .has_edge("ns-all-five", "edge-anchor-rule", "GOVERNS", "fact-fresh-edge")
+            .has_edge(
+                "ns-all-five",
+                "edge-anchor-rule",
+                "GOVERNS",
+                "fact-fresh-edge"
+            )
             .await
             .unwrap());
         let (_, task_after_apply) = store.get("ns-all-five", "task-1").await.unwrap().unwrap();
-        assert_eq!(task_after_apply.metadata["task"]["status"], json!("in_progress"));
+        assert_eq!(
+            task_after_apply.metadata["task"]["status"],
+            json!("in_progress")
+        );
 
         // Now revert via 1-call revert_action
         let rev_out = revert_action(
@@ -6202,7 +6382,11 @@ mod tests {
 
         // 2. Superseded rule: after_id is retired and a restored superseding version has original content
         let sup_after_id = &receipt.superseded_pairs[1].after_id;
-        let (_, sup_after_row) = store.get("ns-all-five", sup_after_id).await.unwrap().unwrap();
+        let (_, sup_after_row) = store
+            .get("ns-all-five", sup_after_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(!is_active_payload(&sup_after_row, i64::MAX / 2));
         let restored_rule_id = sup_after_row.metadata["superseded_by"]
             .as_str()
@@ -6252,7 +6436,12 @@ mod tests {
         );
         assert!(
             !store
-                .has_edge("ns-all-five", "edge-anchor-rule", "GOVERNS", "fact-fresh-edge")
+                .has_edge(
+                    "ns-all-five",
+                    "edge-anchor-rule",
+                    "GOVERNS",
+                    "fact-fresh-edge"
+                )
                 .await
                 .unwrap(),
             "action-created edge must be removed on revert"
@@ -6274,7 +6463,8 @@ mod tests {
 
     #[tokio::test]
     async fn revert_refuses_stale_and_double_revert_without_writes() {
-        let tmp = std::env::temp_dir().join(format!("ns-action-revert-stale-{}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("ns-action-revert-stale-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let store = crate::store::ladybug::LadybugStore::for_testing(&tmp, 4).expect("store");
         store.init("ns-rev-stale").await.unwrap();
@@ -6404,7 +6594,10 @@ mod tests {
             "expected ConflictWithNewerVersion, got {stale_err:?}"
         );
         let rows_after_stale = store.list("ns-rev-stale", None, None).await.unwrap().len();
-        assert_eq!(rows_before_stale, rows_after_stale, "zero writes on stale conflict");
+        assert_eq!(
+            rows_before_stale, rows_after_stale,
+            "zero writes on stale conflict"
+        );
 
         // 2. Reverting receipt2 (the current active head) succeeds
         let rev2 = revert_action(
@@ -6447,7 +6640,10 @@ mod tests {
             }
         );
         let rows_after_double = store.list("ns-rev-stale", None, None).await.unwrap().len();
-        assert_eq!(rows_before_double, rows_after_double, "zero writes on double revert");
+        assert_eq!(
+            rows_before_double, rows_after_double,
+            "zero writes on double revert"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -6563,7 +6759,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let v3_row_id = apply2.receipt().unwrap().twin_deltas[0].after_row_id.clone();
+        let v3_row_id = apply2.receipt().unwrap().twin_deltas[0]
+            .after_row_id
+            .clone();
 
         // 1. Editor bob attempting force=true (even attempting to spoof requested_principal="admin") must be rejected with PermissionDenied and zero writes
         let before_count = store.list("ns-force", None, None).await.unwrap().len();
@@ -6606,12 +6804,22 @@ mod tests {
         .expect("owner forced revert");
 
         assert!(forced_rev.forced);
-        assert_eq!(forced_rev.revert_receipt.forced_by.as_deref(), Some("alice"));
+        assert_eq!(
+            forced_rev.revert_receipt.forced_by.as_deref(),
+            Some("alice")
+        );
         assert!(forced_rev.revert_receipt.forced_at.is_some());
 
         // Intermediate v3 row still exists in storage (retired, not deleted)
-        let (_, v3_row) = store.get("ns-force", &v3_row_id).await.unwrap().expect("v3 preserved");
-        assert_eq!(v3_row.metadata["twin"]["variables"]["temperature"], json!(40.0));
+        let (_, v3_row) = store
+            .get("ns-force", &v3_row_id)
+            .await
+            .unwrap()
+            .expect("v3 preserved");
+        assert_eq!(
+            v3_row.metadata["twin"]["variables"]["temperature"],
+            json!(40.0)
+        );
         assert!(v3_row.metadata.get("valid_to").is_some());
 
         // Active twin is now v4 with restored temperature=65.0
@@ -6713,8 +6921,7 @@ mod tests {
         // Historical apply receipt version r1 must keep its action_receipt object immutable (not mutated in place)
         let (_, r1_after_revert) = store.get("ns-log", &r1_id).await.unwrap().unwrap();
         assert_eq!(
-            r1_after_revert.metadata["action_receipt"],
-            r1_receipt_json_before,
+            r1_after_revert.metadata["action_receipt"], r1_receipt_json_before,
             "historical apply receipt version must never have its action_receipt mutated in place"
         );
         assert!(r1_after_revert.metadata.get("valid_to").is_some());
@@ -6753,7 +6960,11 @@ mod tests {
         assert_eq!(bounded.len(), 2, "limit must bound returned entries");
 
         let full_log = action_log(&store, "ns-log", &sec, 10).await.unwrap();
-        assert_eq!(full_log.len(), 3, "only active receipt versions should appear in log");
+        assert_eq!(
+            full_log.len(),
+            3,
+            "only active receipt versions should appear in log"
+        );
 
         // Verify newest-first ordering by (executed_at, receipt_id) descending
         for pair in full_log.windows(2) {
