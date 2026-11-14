@@ -1333,14 +1333,21 @@ pub async fn process_mcp_request(
                             result_text = handle_graphql_query(&arguments, store.clone()).await;
                         }
                         "neurostrata_kge_train" => {
-                            let namespace = arguments.get("namespace").and_then(|v| v.as_str());
+                            let namespace = arguments.get("namespace").and_then(|v| v.as_str()).map(String::from);
                             let all = arguments.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
                             let epochs = arguments.get("epochs").and_then(|v| v.as_u64()).map(|v| v as u32);
                             let dim = arguments.get("dim").and_then(|v| v.as_u64()).map(|v| v as u32);
                             let kge_weight = arguments.get("kge_weight").and_then(|v| v.as_f64()).map(|v| v as f32);
-                            match crate::kge::cli_train(namespace, all, epochs, dim, kge_weight) {
+                            let train_ns = namespace.clone();
+                            let train_res = tokio::task::spawn_blocking(move || {
+                                crate::kge::cli_train(train_ns.as_deref(), all, epochs, dim, kge_weight)
+                            })
+                            .await
+                            .map_err(|e| anyhow::anyhow!("kge train task panicked: {e}"))
+                            .and_then(|r| r);
+                            match train_res {
                                 Ok(_) => {
-                                    let scope = namespace.unwrap_or("global");
+                                    let scope = namespace.as_deref().unwrap_or("global");
                                     result_text = serde_json::json!({
                                         "ok": true,
                                         "scope": scope,
@@ -6848,7 +6855,7 @@ async fn handle_rebuild_communities(
     store: Arc<dyn VectorStore>,
 ) -> String {
     use crate::community::{
-        detect_communities_with_resolution,
+        detect_communities_with_resolution_async,
         filter_structural_with_access_counts, COMMUNITY_STRUCTURAL_TYPES,
     };
     use crate::store::ladybug::edge_specs;
@@ -6947,7 +6954,7 @@ async fn handle_rebuild_communities(
     // the Leiden run converged to reported alongside the partition. The
     // `resolution` argument flows into LeidenConfig instead of being
     // discarded.
-    let detection = match detect_communities_with_resolution(&edges, resolution) {
+    let detection = match detect_communities_with_resolution_async(edges, resolution).await {
         Ok(result) => result,
         Err(e) => return format!("Community detection failed: {e}"),
     };
