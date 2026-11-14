@@ -9392,6 +9392,7 @@ fn edge_hits_from_rows(
             explanation: format!("{} {}", edge_name, target_id),
             metadata,
             conceptual_bridges: Vec::new(),
+            linked_files: 0,
         });
     }
     Ok(hits)
@@ -9639,10 +9640,51 @@ fn add_metadata_fallback_conn(
                     explanation: format!("declares governs {}", normalized),
                     metadata,
                     conceptual_bridges: Vec::new(),
+                    linked_files: 0,
                 });
                 break;
             }
         }
+    }
+    Ok(())
+}
+
+/// Sets each hit's `linked_files`: the distinct files its `GOVERNS` and
+/// `RELATES_TO` edges reach (a symbol counts as its file, a linked memory as
+/// one). A directory link reaches every file under it, so it counts as ten,
+/// enough for the widest fan-out bucket. One read for all hits.
+fn set_linked_files(conn: &Connection, hits: &mut [MemoryHit]) -> Result<()> {
+    if hits.is_empty() {
+        return Ok(());
+    }
+    let id_list = hits
+        .iter()
+        .map(|h| format!("'{}'", escape_ladybug_string(&h.id)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!(
+        "MATCH (m:Memory)-[:GOVERNS|RELATES_TO]-(t:Memory) WHERE m.id IN [{}] RETURN DISTINCT m.id, t.id, t.location, t.memory_type",
+        id_list
+    );
+    let mut files: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    let mut directories: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut rows = conn.query(&query)?;
+    while let Some(row) = rows.next() {
+        let id = format!("{}", row[0]);
+        let target = format!("{}", row[1]);
+        let location = format!("{}", row[2]);
+        if format!("{}", row[3]) == "directory" {
+            *directories.entry(id).or_default() += 1;
+        } else {
+            let key = if location.is_empty() { target } else { location };
+            files.entry(id).or_default().insert(key);
+        }
+    }
+    for hit in hits.iter_mut() {
+        hit.linked_files = files.get(&hit.id).map_or(0, |s| s.len())
+            + 10 * directories.get(&hit.id).copied().unwrap_or(0);
     }
     Ok(())
 }
@@ -9744,6 +9786,12 @@ impl GraphRead for LadybugStore {
         }
 
         dedup_hits(&mut hits);
+        let mut hits = self
+            .with_conn(move |conn| {
+                set_linked_files(conn, &mut hits)?;
+                Ok(hits)
+            })
+            .await?;
         crate::graph_read::memories_for_file::rank_hits(&mut hits);
         hits.truncate(limit);
 
@@ -13088,6 +13136,59 @@ eurostrata\src\daemon.rs",
         assert!(quads.iter().any(|q| q.predicate.ends_with("#governs")));
         assert!(quads.iter().all(|q| q.graph.as_deref() == Some("urn:neurostrata:graph:probe:domain:gen:1")));
     }
+
+    /// Of two memories that govern the same file, the one linked to fewer
+    /// files ranks first, even when the broader one is newer and more read.
+    #[tokio::test]
+    async fn a_memory_linked_to_fewer_files_ranks_first_for_a_file() {
+        let store = retired_test_store().await;
+        for path in ["src/a.rs", "src/b.rs", "src/c.rs"] {
+            let mut file_payload = retired_test_payload("file", "auto-ingestor", json!({}));
+            file_payload.location = path.to_string();
+            store
+                .upsert("probe", &format!("probe::{path}"), vec![0.0; 4], file_payload)
+                .await
+                .unwrap();
+        }
+        store
+            .upsert(
+                "probe",
+                "broad",
+                vec![0.0; 4],
+                retired_test_payload(
+                    "rule",
+                    "agent",
+                    json!({
+                        "governs": ["probe::src/a.rs", "probe::src/b.rs", "probe::src/c.rs"],
+                        "access_count": 9,
+                        "valid_from": 1_800_000_000,
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "narrow",
+                vec![0.0; 4],
+                retired_test_payload(
+                    "rule",
+                    "agent",
+                    json!({ "governs": ["probe::src/a.rs"], "valid_from": 1_700_000_000 }),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let hits = store
+            .memories_for_file("probe", None, "src/a.rs", None, true, &["rule".to_string()], &[], 5)
+            .await
+            .expect("graph read succeeds");
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(ids, vec!["narrow", "broad"]);
+    }
+
     /// Spec §3.2: an unqualified `GOVERNS` target that resolves to `Missing`
     /// auto-materialises a stub `file` node, so the edge forms immediately.
     #[tokio::test]
