@@ -552,10 +552,23 @@ pub struct CallGuard {
     namespace: Option<String>,
     before: Sample,
     epoch_at_begin: u64,
+    sampler: fn() -> Sample,
 }
 
 impl CallGuard {
     pub fn begin(tool: &str, namespace: Option<&str>) -> Self {
+        Self::begin_with(tool, namespace, sample)
+    }
+
+    /// `begin` with the RSS source named. Production passes `sample`; the
+    /// counting test passes a sampler that records how often the guard
+    /// actually reads the process, which is what pins the disabled path's
+    /// zero-sampling property.
+    pub(crate) fn begin_with(
+        tool: &str,
+        namespace: Option<&str>,
+        sampler: fn() -> Sample,
+    ) -> Self {
         IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
         CALLS.fetch_add(1, Ordering::Relaxed);
         let epoch_at_begin = CALL_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
@@ -564,8 +577,9 @@ impl CallGuard {
             tool: enabled.then(|| tool.to_string()),
             namespace: if enabled { namespace.map(str::to_string) } else { None },
             // Disabled profiling must not pay for a syscall or heap allocation per call.
-            before: if enabled { sample() } else { Sample::default() },
+            before: if enabled { sampler() } else { Sample::default() },
             epoch_at_begin,
+            sampler,
         }
     }
 }
@@ -576,7 +590,7 @@ impl Drop for CallGuard {
         if !profile_enabled() {
             return;
         }
-        let after = sample();
+        let after = (self.sampler)();
         // A call that began and finished while this one ran already left
         // IN_FLIGHT, but its allocation may be part of this delta.
         let overlapped = overlapped_since(self.epoch_at_begin, CALL_EPOCH.load(Ordering::SeqCst));
@@ -723,6 +737,7 @@ mod tests {
 
     #[test]
     fn profiling_is_off_unless_asked_for() {
+        let _env = PROFILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("NEUROSTRATA_PROFILE");
         assert!(!profile_enabled(), "off by default");
         for off in ["0", "off", "false", ""] {
@@ -958,5 +973,44 @@ mod tests {
         assert!(should_warn_invalid_threshold("not-a-number"));
         assert!(!should_warn_invalid_threshold("not-a-number"));
         assert!(should_warn_invalid_threshold("another-bad-value"));
+    }
+
+    /// Serializes the tests that toggle `NEUROSTRATA_PROFILE`: the
+    /// variable is process-wide, so an unguarded toggle in one test can
+    /// flip `profile_enabled()` inside another.
+    static PROFILE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    static COUNTED_SAMPLES: AtomicUsize = AtomicUsize::new(0);
+
+    fn counting_sampler() -> Sample {
+        COUNTED_SAMPLES.fetch_add(1, Ordering::SeqCst);
+        Sample { rss_bytes: Some(100 * MB), peak_bytes: Some(100 * MB) }
+    }
+
+    /// The F-2 pin: the disabled guard must never sample, and the enabled
+    /// guard samples once at begin and once at drop. The fixed figures
+    /// keep `grew` false, so the test writes no growth rows.
+    #[test]
+    fn the_guard_samples_twice_when_enabled_and_never_when_disabled() {
+        let _env = PROFILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("NEUROSTRATA_PROFILE");
+        COUNTED_SAMPLES.store(0, Ordering::SeqCst);
+        let g = CallGuard::begin_with("t", None, counting_sampler);
+        drop(g);
+        assert_eq!(
+            COUNTED_SAMPLES.load(Ordering::SeqCst),
+            0,
+            "disabled profiling never samples"
+        );
+        std::env::set_var("NEUROSTRATA_PROFILE", "1");
+        COUNTED_SAMPLES.store(0, Ordering::SeqCst);
+        let g = CallGuard::begin_with("t", None, counting_sampler);
+        drop(g);
+        assert_eq!(
+            COUNTED_SAMPLES.load(Ordering::SeqCst),
+            2,
+            "one sample at begin, one at drop"
+        );
+        std::env::remove_var("NEUROSTRATA_PROFILE");
     }
 }
