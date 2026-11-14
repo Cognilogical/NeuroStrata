@@ -3967,4 +3967,531 @@ mod tests {
         assert_eq!(before_count, after_count, "zero rows written on SHACL rejection");
         let _ = std::fs::remove_dir_all(&tmp);
     }
+
+    #[tokio::test]
+    async fn action_batch_commits_every_row_edge_and_receipt_together() {
+        let tmp = std::env::temp_dir().join(format!("ns-action-batch-commit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = crate::store::ladybug::LadybugStore::for_testing(&tmp, 4).expect("store");
+        store.init("ns-batch-commit").await.unwrap();
+
+        store
+            .upsert(
+                "ns-batch-commit",
+                "twin-row-1",
+                vec![0.1; 4],
+                MemoryPayload {
+                    content: "Digital twin 'loop-a' v1".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "digital_twin".to_string(),
+                    agent_name: None,
+                    location: "".to_string(),
+                    location_lines: "".to_string(),
+                    metadata: json!({
+                        "valid_from": 1700000000,
+                        "twin": {
+                            "id": "loop-a",
+                            "version": 1,
+                            "schema_id": "cooling-loop",
+                            "variables": { "temperature": 65.0 }
+                        }
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "ns-batch-commit",
+                "rule-1",
+                vec![0.1; 4],
+                MemoryPayload {
+                    content: "Cooling governance rule".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "rule".to_string(),
+                    agent_name: None,
+                    location: "".to_string(),
+                    location_lines: "".to_string(),
+                    metadata: json!({"domain": "ops", "source": "owner 2026-10-01"}),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "ns-batch-commit",
+                "fact-1",
+                vec![0.1; 4],
+                MemoryPayload {
+                    content: "Cooling fact".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: "".to_string(),
+                    location_lines: "".to_string(),
+                    metadata: json!({"domain": "ops"}),
+                },
+            )
+            .await
+            .unwrap();
+
+        store
+            .upsert(
+                "ns-batch-commit",
+                "act-combo",
+                vec![0.1; 4],
+                MemoryPayload {
+                    content: "Action: combo-commit".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "action_type".to_string(),
+                    agent_name: None,
+                    location: "".to_string(),
+                    location_lines: "".to_string(),
+                    metadata: json!({
+                        "action_type": {
+                            "slug": "combo-commit",
+                            "title": "Combo Commit",
+                            "description": "Mutates twin, links edge, upserts fact",
+                            "required_role": "editor",
+                            "parameters": {
+                                "twin_id": { "param_type": "twin_id", "required": true, "target_memory_type": "digital_twin", "target_schema_id": "cooling-loop" },
+                                "rule_id": { "param_type": "memory_id", "required": true, "target_memory_type": "rule" },
+                                "fact_id": { "param_type": "memory_id", "required": true, "target_memory_type": "fact" },
+                                "temp": { "param_type": "f64", "required": true }
+                            },
+                            "submission_criteria": [],
+                            "effects": [
+                                {
+                                    "op": "set_twin_state",
+                                    "twin_param": "twin_id",
+                                    "merge": true,
+                                    "variables_from_params": { "temperature": "temp" }
+                                },
+                                {
+                                    "op": "link_edge",
+                                    "source_param": "rule_id",
+                                    "relation": "GOVERNS",
+                                    "target_param": "fact_id"
+                                },
+                                {
+                                    "op": "upsert_memory",
+                                    "memory_type": "fact",
+                                    "content_template": "Committed temp {{temp}}",
+                                    "metadata_template": { "domain": "ops" }
+                                }
+                            ]
+                        }
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut params = BTreeMap::new();
+        params.insert("twin_id".to_string(), json!("loop-a"));
+        params.insert("rule_id".to_string(), json!("rule-1"));
+        params.insert("fact_id".to_string(), json!("fact-1"));
+        params.insert("temp".to_string(), json!(48.0));
+
+        let eval = evaluate_action(
+            &store,
+            &ActionInvocation {
+                namespace: "ns-batch-commit".to_string(),
+                slug: "combo-commit".to_string(),
+                security: ActionSecurityContext {
+                    authenticated_principal: "alice".to_string(),
+                    requested_principal: None,
+                },
+                params,
+            },
+        )
+        .await
+        .unwrap();
+        let stage = stage_action(&store, eval, &DummyActionEmbedder, 1794675600)
+            .await
+            .expect("stage");
+
+        store
+            .commit_action_batch("ns-batch-commit", stage.write_set.clone())
+            .await
+            .expect("commit_action_batch");
+
+        // Verify twin v1 retired, twin v2 active, upsert row created, receipt stored, edge created
+        let (_, twin_v1) = store.get("ns-batch-commit", "twin-row-1").await.unwrap().unwrap();
+        assert_eq!(twin_v1.metadata["valid_to"], json!(1794675600));
+        let new_twin_id = &stage.receipt.twin_deltas[0].after_row_id;
+        let (_, twin_v2) = store.get("ns-batch-commit", new_twin_id).await.unwrap().unwrap();
+        assert_eq!(twin_v2.metadata["twin"]["version"], json!(2));
+        assert_eq!(twin_v2.metadata["twin"]["variables"]["temperature"], json!(48.0));
+
+        let (_, receipt_row) = store
+            .get("ns-batch-commit", &stage.receipt_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt_row.memory_type, "action_receipt");
+        assert_eq!(receipt_row.metadata["eligibility"], json!("private"));
+
+        assert!(store
+            .has_edge("ns-batch-commit", "rule-1", "GOVERNS", "fact-1")
+            .await
+            .unwrap());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn fault_after_first_write_rolls_back_effects_receipt_edges_and_indexes() {
+        let tmp = std::env::temp_dir().join(format!("ns-action-batch-rollback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = crate::store::ladybug::LadybugStore::for_testing(&tmp, 4).expect("store");
+        store.init("ns-batch-rb").await.unwrap();
+
+        store
+            .upsert(
+                "ns-batch-rb",
+                "rule-1",
+                vec![0.1; 4],
+                MemoryPayload {
+                    content: "Original rule before fault".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "rule".to_string(),
+                    agent_name: None,
+                    location: "".to_string(),
+                    location_lines: "".to_string(),
+                    metadata: json!({"domain": "ops", "source": "owner 2026-10-01"}),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "ns-batch-rb",
+                "fact-1",
+                vec![0.1; 4],
+                MemoryPayload {
+                    content: "Target fact".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: "".to_string(),
+                    location_lines: "".to_string(),
+                    metadata: json!({"domain": "ops"}),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "ns-batch-rb",
+                "act-rb",
+                vec![0.1; 4],
+                MemoryPayload {
+                    content: "Action: rb-action".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "action_type".to_string(),
+                    agent_name: None,
+                    location: "".to_string(),
+                    location_lines: "".to_string(),
+                    metadata: json!({
+                        "action_type": {
+                            "slug": "rb-action",
+                            "title": "Rollback Action",
+                            "description": "Supersedes rule, links edge, upserts fact",
+                            "required_role": "editor",
+                            "parameters": {
+                                "rule_id": { "param_type": "memory_id", "required": true, "target_memory_type": "rule" },
+                                "fact_id": { "param_type": "memory_id", "required": true, "target_memory_type": "fact" }
+                            },
+                            "submission_criteria": [],
+                            "effects": [
+                                {
+                                    "op": "supersede_memory",
+                                    "target_param": "rule_id",
+                                    "new_content_template": "Ghost rule content that must roll back",
+                                    "metadata_patch": { "source": "action rb-action" }
+                                },
+                                {
+                                    "op": "link_edge",
+                                    "source_param": "rule_id",
+                                    "relation": "GOVERNS",
+                                    "target_param": "fact_id"
+                                }
+                            ]
+                        }
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut params = BTreeMap::new();
+        params.insert("rule_id".to_string(), json!("rule-1"));
+        params.insert("fact_id".to_string(), json!("fact-1"));
+
+        let eval = evaluate_action(
+            &store,
+            &ActionInvocation {
+                namespace: "ns-batch-rb".to_string(),
+                slug: "rb-action".to_string(),
+                security: ActionSecurityContext {
+                    authenticated_principal: "alice".to_string(),
+                    requested_principal: None,
+                },
+                params,
+            },
+        )
+        .await
+        .unwrap();
+        let stage = stage_action(&store, eval, &DummyActionEmbedder, 1794675600)
+            .await
+            .expect("stage");
+
+        let pre_rows = store.list("ns-batch-rb", None, None).await.unwrap();
+        // Inject fault after 1 row write inside the transaction
+        store.set_action_batch_fail_after_writes(Some(1));
+        let commit_res = store
+            .commit_action_batch("ns-batch-rb", stage.write_set.clone())
+            .await;
+        store.set_action_batch_fail_after_writes(None);
+        assert!(commit_res.is_err(), "injected fault must fail commit_action_batch");
+
+        // Verify rule-1 is still active (valid_to absent), new rule row does not exist, receipt does not exist, edge does not exist
+        let post_rows = store.list("ns-batch-rb", None, None).await.unwrap();
+        assert_eq!(pre_rows.len(), post_rows.len(), "row count must match pre-state after rollback");
+        let (_, rule1) = store.get("ns-batch-rb", "rule-1").await.unwrap().unwrap();
+        assert!(rule1.metadata.get("valid_to").is_none(), "rule-1 must remain active after rollback");
+        assert!(store.get("ns-batch-rb", &stage.receipt_id).await.unwrap().is_none());
+        for created_id in &stage.receipt.created_ids {
+            assert!(store.get("ns-batch-rb", created_id).await.unwrap().is_none());
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn stale_expected_head_conflicts_before_any_write() {
+        let tmp = std::env::temp_dir().join(format!("ns-action-batch-cas-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = crate::store::ladybug::LadybugStore::for_testing(&tmp, 4).expect("store");
+        store.init("ns-batch-cas").await.unwrap();
+
+        store
+            .upsert(
+                "ns-batch-cas",
+                "twin-row-1",
+                vec![0.1; 4],
+                MemoryPayload {
+                    content: "Digital twin 'loop-a' v1".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "digital_twin".to_string(),
+                    agent_name: None,
+                    location: "".to_string(),
+                    location_lines: "".to_string(),
+                    metadata: json!({
+                        "valid_from": 1700000000,
+                        "twin": {
+                            "id": "loop-a",
+                            "version": 1,
+                            "schema_id": "cooling-loop",
+                            "variables": { "temperature": 65.0 }
+                        }
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "ns-batch-cas",
+                "act-cas",
+                vec![0.1; 4],
+                MemoryPayload {
+                    content: "Action: cas-action".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "action_type".to_string(),
+                    agent_name: None,
+                    location: "".to_string(),
+                    location_lines: "".to_string(),
+                    metadata: json!({
+                        "action_type": {
+                            "slug": "cas-action",
+                            "title": "CAS Action",
+                            "description": "Updates twin",
+                            "required_role": "editor",
+                            "parameters": {
+                                "twin_id": { "param_type": "twin_id", "required": true, "target_memory_type": "digital_twin", "target_schema_id": "cooling-loop" },
+                                "temp": { "param_type": "f64", "required": true }
+                            },
+                            "submission_criteria": [],
+                            "effects": [
+                                {
+                                    "op": "set_twin_state",
+                                    "twin_param": "twin_id",
+                                    "merge": true,
+                                    "variables_from_params": { "temperature": "temp" }
+                                }
+                            ]
+                        }
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut params = BTreeMap::new();
+        params.insert("twin_id".to_string(), json!("loop-a"));
+        params.insert("temp".to_string(), json!(50.0));
+
+        let eval = evaluate_action(
+            &store,
+            &ActionInvocation {
+                namespace: "ns-batch-cas".to_string(),
+                slug: "cas-action".to_string(),
+                security: ActionSecurityContext {
+                    authenticated_principal: "alice".to_string(),
+                    requested_principal: None,
+                },
+                params,
+            },
+        )
+        .await
+        .unwrap();
+        let stage = stage_action(&store, eval, &DummyActionEmbedder, 1794675600)
+            .await
+            .expect("stage");
+
+        // Simulate concurrent writer superseding twin-row-1 before commit_action_batch runs
+        store
+            .upsert(
+                "ns-batch-cas",
+                "twin-row-1",
+                vec![0.1; 4],
+                MemoryPayload {
+                    content: "Digital twin 'loop-a' v1 retired".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "digital_twin".to_string(),
+                    agent_name: None,
+                    location: "".to_string(),
+                    location_lines: "".to_string(),
+                    metadata: json!({
+                        "valid_from": 1700000000,
+                        "valid_to": 1794675500,
+                        "superseded_by": "twin-row-concurrent-v2",
+                        "twin": {
+                            "id": "loop-a",
+                            "version": 1,
+                            "schema_id": "cooling-loop",
+                            "variables": { "temperature": 65.0 }
+                        }
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+
+        let res = store
+            .commit_action_batch("ns-batch-cas", stage.write_set.clone())
+            .await;
+        assert!(
+            matches!(res, Err(ActionError::ConflictWithNewerVersion { .. })),
+            "expected ConflictWithNewerVersion on stale head, got {:?}",
+            res
+        );
+        assert!(store.get("ns-batch-cas", &stage.receipt_id).await.unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn derived_indexes_refresh_only_after_successful_commit() {
+        let tmp = std::env::temp_dir().join(format!("ns-action-batch-idx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = crate::store::ladybug::LadybugStore::for_testing(&tmp, 4).expect("store");
+        store.init("ns-batch-idx").await.unwrap();
+
+        store
+            .upsert(
+                "ns-batch-idx",
+                "act-idx",
+                vec![0.1; 4],
+                MemoryPayload {
+                    content: "Action: idx-action".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "action_type".to_string(),
+                    agent_name: None,
+                    location: "".to_string(),
+                    location_lines: "".to_string(),
+                    metadata: json!({
+                        "action_type": {
+                            "slug": "idx-action",
+                            "title": "Index Action",
+                            "description": "Upserts searchable fact",
+                            "required_role": "editor",
+                            "parameters": {
+                                "token": { "param_type": "string", "required": true }
+                            },
+                            "submission_criteria": [],
+                            "effects": [
+                                {
+                                    "op": "upsert_memory",
+                                    "memory_type": "fact",
+                                    "content_template": "UniqueLexicalToken {{token}}",
+                                    "metadata_template": { "domain": "ops" }
+                                }
+                            ]
+                        }
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut params = BTreeMap::new();
+        params.insert("token".to_string(), json!("zephyrquartz99"));
+
+        let eval = evaluate_action(
+            &store,
+            &ActionInvocation {
+                namespace: "ns-batch-idx".to_string(),
+                slug: "idx-action".to_string(),
+                security: ActionSecurityContext {
+                    authenticated_principal: "alice".to_string(),
+                    requested_principal: None,
+                },
+                params,
+            },
+        )
+        .await
+        .unwrap();
+        let stage = stage_action(&store, eval, &DummyActionEmbedder, 1794675600)
+            .await
+            .expect("stage");
+
+        // 1. Failed commit must not populate lexical index
+        store.set_action_batch_fail_after_writes(Some(1));
+        assert!(store
+            .commit_action_batch("ns-batch-idx", stage.write_set.clone())
+            .await
+            .is_err());
+        store.set_action_batch_fail_after_writes(None);
+
+        let hits_after_abort = store
+            .search_lexical("ns-batch-idx", "zephyrquartz99", 10, false, false, &[], "alice", 0)
+            .await
+            .unwrap();
+        assert!(
+            hits_after_abort.results.is_empty(),
+            "aborted commit must not publish ghost lexical hits"
+        );
+
+        // 2. Successful commit refreshes lexical index
+        store
+            .commit_action_batch("ns-batch-idx", stage.write_set)
+            .await
+            .expect("commit");
+        let hits_after_commit = store
+            .search_lexical("ns-batch-idx", "zephyrquartz99", 10, false, false, &[], "alice", 0)
+            .await
+            .unwrap();
+        assert_eq!(hits_after_commit.results.len(), 1);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

@@ -24684,4 +24684,476 @@ impl LadybugStore {
         })
         .await
     }
+
+    #[cfg(test)]
+    pub fn set_action_batch_fail_after_writes(&self, n: Option<usize>) {
+        let mut map = action_batch_fail_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match n {
+            Some(limit) => {
+                map.insert(self.local_path.clone(), limit);
+            }
+            None => {
+                map.remove(&self.local_path);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn action_batch_fail_limit(&self) -> Option<usize> {
+        action_batch_fail_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&self.local_path)
+            .copied()
+    }
+
+    #[cfg(not(test))]
+    fn action_batch_fail_limit(&self) -> Option<usize> {
+        None
+    }
+
+    /// Atomically commit a staged kinetic `ActionWriteSet` inside a single LadybugDB write turn
+    /// (`BEGIN TRANSACTION` -> ExpectedHead CAS -> row writes + edge mutations -> `COMMIT`,
+    /// with `ROLLBACK` on any failure). Derived FTS and ontology indexes are refreshed only after
+    /// `COMMIT` succeeds.
+    pub async fn commit_action_batch(
+        &self,
+        namespace: &str,
+        mut batch: crate::rdf::action::ActionWriteSet,
+    ) -> std::result::Result<(), crate::rdf::action::ActionError> {
+        use crate::rdf::action::{ActionError, EdgeMutationOp, ExpectedHead};
+
+        let ns = namespace.to_string();
+        if ns.trim().is_empty() {
+            return Err(ActionError::Storage("namespace must be non-empty".to_string()));
+        }
+        self.guard_first_write()
+            .map_err(|e| ActionError::Storage(e.to_string()))?;
+        self.check_data_bearing_identity()
+            .map_err(|e| ActionError::Storage(e.to_string()))?;
+
+        let first_write_flip = self.first_write_flip();
+        let now_ts = chrono::Utc::now().timestamp();
+        let ontology = self.get_ontology(&ns);
+
+        let mut lexical_docs = Vec::with_capacity(batch.writes.len());
+        let mut refresh_ont = false;
+        let rid = crate::registry::registry_row_id(&ns);
+
+        for w in &mut batch.writes {
+            if let Some(topology) = w.payload.metadata.get_mut("topology") {
+                crate::rdf::canonicalize_topology(topology, &ontology);
+            }
+            if w.payload.metadata.is_object() {
+                crate::domain::materialize_facets_bitemporal(
+                    &w.payload.memory_type,
+                    &mut w.payload.metadata,
+                    now_ts,
+                );
+            }
+            if w.payload.memory_type == "action_type" || w.id == rid {
+                refresh_ont = true;
+            }
+            lexical_docs.push(Self::lexical_doc(&ns, &w.id, &w.payload));
+        }
+
+        let fail_after = self.action_batch_fail_limit();
+        let ns_for_tx = ns.clone();
+        let expected_heads = batch.expected_heads;
+        let writes = batch.writes;
+        let edge_deltas = batch.edge_deltas;
+
+        let tx_outcome = self
+            .write_with_deadline("committing a kinetic action batch", move |conn| {
+                conn.query("BEGIN TRANSACTION")?;
+
+                let inner: std::result::Result<(), ActionError> = (|| {
+                    let safe_ns = escape_ladybug_string(&ns_for_tx);
+
+                    // 1. Cross-namespace ID collision check for every row in the write set.
+                    for w in &writes {
+                        let safe_id = escape_ladybug_string(&w.id);
+                        let q = format!(
+                            "MATCH (m:Memory {{id: '{safe_id}'}}) WHERE m.namespace <> '{safe_ns}' RETURN m.namespace LIMIT 1"
+                        );
+                        let mut res = conn
+                            .query(&q)
+                            .map_err(|e| ActionError::Storage(e.to_string()))?;
+                        if let Some(row) = res.next() {
+                            let existing_ns = format!("{}", row[0]);
+                            return Err(ActionError::Storage(format!(
+                                "cross-namespace id collision: memory '{}' belongs to namespace '{}', cannot write into '{}'",
+                                w.id, existing_ns, ns_for_tx
+                            )));
+                        }
+                    }
+
+                    // 2. Re-read and verify every ExpectedHead under the single-writer transaction.
+                    for head in &expected_heads {
+                        match head {
+                            ExpectedHead::ActiveRow {
+                                row_id,
+                                twin_id,
+                                expected_twin_version,
+                                expected_task_status,
+                                expected_updated_at,
+                            } => {
+                                let safe_id = escape_ladybug_string(row_id);
+                                let q = format!(
+                                    "MATCH (m:Memory {{id: '{safe_id}', namespace: '{safe_ns}'}}) RETURN m.metadata LIMIT 1"
+                                );
+                                let mut res = conn
+                                    .query(&q)
+                                    .map_err(|e| ActionError::Storage(e.to_string()))?;
+                                let Some(row) = res.next() else {
+                                    return Err(ActionError::ConflictWithNewerVersion {
+                                        receipt_id: row_id.clone(),
+                                        superseded_by: "missing".to_string(),
+                                    });
+                                };
+                                let meta_str = format!("{}", row[0]);
+                                let meta: Value = serde_json::from_str(&meta_str)
+                                    .unwrap_or_else(|_| serde_json::json!({}));
+                                let dummy_payload = MemoryPayload {
+                                    content: String::new(),
+                                    user_id: String::new(),
+                                    memory_type: String::new(),
+                                    agent_name: None,
+                                    location: String::new(),
+                                    location_lines: String::new(),
+                                    metadata: meta.clone(),
+                                };
+                                if !crate::rdf::action::is_active_payload(&dummy_payload, now_ts) {
+                                    let sup = meta
+                                        .get("superseded_by")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("retired")
+                                        .to_string();
+                                    return Err(ActionError::ConflictWithNewerVersion {
+                                        receipt_id: row_id.clone(),
+                                        superseded_by: sup,
+                                    });
+                                }
+                                if let Some(exp_ver) = expected_twin_version {
+                                    let actual_ver = meta
+                                        .get("twin")
+                                        .and_then(|t| t.get("version"))
+                                        .or_else(|| {
+                                            meta.get("digital_twin")
+                                                .and_then(|t| t.get("version"))
+                                        })
+                                        .and_then(|v| v.as_u64());
+                                    if actual_ver != Some(*exp_ver) {
+                                        return Err(ActionError::ConflictWithNewerVersion {
+                                            receipt_id: row_id.clone(),
+                                            superseded_by: format!("version:{}", actual_ver.unwrap_or(0)),
+                                        });
+                                    }
+                                    if let Some(tid) = twin_id {
+                                        let q_twins = format!(
+                                            "MATCH (m:Memory {{namespace: '{safe_ns}', memory_type: 'digital_twin'}}) RETURN m.id, m.metadata"
+                                        );
+                                        let mut res_twins = conn
+                                            .query(&q_twins)
+                                            .map_err(|e| ActionError::Storage(e.to_string()))?;
+                                        while let Some(trow) = res_twins.next() {
+                                            let other_id = format!("{}", trow[0]);
+                                            if &other_id == row_id {
+                                                continue;
+                                            }
+                                            let other_meta_str = format!("{}", trow[1]);
+                                            let other_meta: Value =
+                                                serde_json::from_str(&other_meta_str)
+                                                    .unwrap_or_else(|_| serde_json::json!({}));
+                                            let other_dummy = MemoryPayload {
+                                                content: String::new(),
+                                                user_id: String::new(),
+                                                memory_type: "digital_twin".to_string(),
+                                                agent_name: None,
+                                                location: String::new(),
+                                                location_lines: String::new(),
+                                                metadata: other_meta.clone(),
+                                            };
+                                            if !crate::rdf::action::is_active_payload(&other_dummy, now_ts) {
+                                                continue;
+                                            }
+                                            let other_tid = other_meta
+                                                .get("twin")
+                                                .and_then(|t| t.get("id"))
+                                                .or_else(|| {
+                                                    other_meta
+                                                        .get("digital_twin")
+                                                        .and_then(|t| t.get("twin_id").or_else(|| t.get("id")))
+                                                })
+                                                .and_then(|v| v.as_str());
+                                            if other_tid == Some(tid.as_str()) {
+                                                let other_ver = other_meta
+                                                    .get("twin")
+                                                    .and_then(|t| t.get("version"))
+                                                    .or_else(|| {
+                                                        other_meta
+                                                            .get("digital_twin")
+                                                            .and_then(|t| t.get("version"))
+                                                    })
+                                                    .and_then(|v| v.as_u64())
+                                                    .unwrap_or(0);
+                                                if other_ver > *exp_ver {
+                                                    return Err(ActionError::ConflictWithNewerVersion {
+                                                        receipt_id: row_id.clone(),
+                                                        superseded_by: other_id,
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some(exp_status) = expected_task_status {
+                                    let actual_status = meta
+                                        .get("task")
+                                        .and_then(|t| t.get("status"))
+                                        .and_then(|v| v.as_str());
+                                    if actual_status != Some(exp_status.as_str()) {
+                                        return Err(ActionError::ConflictWithNewerVersion {
+                                            receipt_id: row_id.clone(),
+                                            superseded_by: actual_status
+                                                .unwrap_or("unknown")
+                                                .to_string(),
+                                        });
+                                    }
+                                }
+                                if let Some(exp_upd) = expected_updated_at {
+                                    let actual_upd = meta
+                                        .get("task")
+                                        .and_then(|t| t.get("updated_at"))
+                                        .and_then(|v| v.as_i64());
+                                    if actual_upd != Some(*exp_upd) {
+                                        return Err(ActionError::ConflictWithNewerVersion {
+                                            receipt_id: row_id.clone(),
+                                            superseded_by: format!(
+                                                "updated_at:{}",
+                                                actual_upd.unwrap_or(0)
+                                            ),
+                                        });
+                                    }
+                                }
+                            }
+                            ExpectedHead::AbsentOrInactive { row_id } => {
+                                let safe_id = escape_ladybug_string(row_id);
+                                let q = format!(
+                                    "MATCH (m:Memory {{id: '{safe_id}', namespace: '{safe_ns}'}}) RETURN m.metadata LIMIT 1"
+                                );
+                                let mut res = conn
+                                    .query(&q)
+                                    .map_err(|e| ActionError::Storage(e.to_string()))?;
+                                if let Some(row) = res.next() {
+                                    let meta_str = format!("{}", row[0]);
+                                    let meta: Value = serde_json::from_str(&meta_str)
+                                        .unwrap_or_else(|_| serde_json::json!({}));
+                                    let dummy_payload = MemoryPayload {
+                                        content: String::new(),
+                                        user_id: String::new(),
+                                        memory_type: String::new(),
+                                        agent_name: None,
+                                        location: String::new(),
+                                        location_lines: String::new(),
+                                        metadata: meta,
+                                    };
+                                    if crate::rdf::action::is_active_payload(&dummy_payload, now_ts) {
+                                        return Err(ActionError::ConflictWithNewerVersion {
+                                            receipt_id: row_id.clone(),
+                                            superseded_by: row_id.clone(),
+                                        });
+                                    }
+                                }
+                            }
+                            ExpectedHead::EdgeState {
+                                source,
+                                relation,
+                                target,
+                                expected_exists,
+                            } => {
+                                if !is_valid_relation_name(relation) {
+                                    return Err(ActionError::Storage(format!(
+                                        "invalid relation '{relation}'"
+                                    )));
+                                }
+                                let q = format!(
+                                    "MATCH (a:Memory {{id: '{}', namespace: '{safe_ns}'}})-[r:{relation}]->(b:Memory {{id: '{}', namespace: '{safe_ns}'}}) RETURN a.id LIMIT 1",
+                                    escape_ladybug_string(source),
+                                    escape_ladybug_string(target)
+                                );
+                                let mut res = conn
+                                    .query(&q)
+                                    .map_err(|e| ActionError::Storage(e.to_string()))?;
+                                let exists = res.next().is_some();
+                                if exists != *expected_exists {
+                                    return Err(ActionError::ConflictWithNewerVersion {
+                                        receipt_id: format!("{source}-[{relation}]->{target}"),
+                                        superseded_by: format!("edge_exists:{exists}"),
+                                    });
+                                }
+                            }
+                        }
+                    }
+
+                    // 3. Apply staged memory writes inside the transaction.
+                    let mut writes_done = 0usize;
+                    for w in &writes {
+                        conn_upsert_action_row(
+                            conn,
+                            &ns_for_tx,
+                            &w.id,
+                            &w.vector,
+                            &w.payload,
+                            now_ts,
+                        )
+                        .map_err(|e| ActionError::Storage(e.to_string()))?;
+                        writes_done += 1;
+                        if fail_after == Some(writes_done) {
+                            return Err(ActionError::Storage(format!(
+                                "injected action batch fault after {writes_done} writes"
+                            )));
+                        }
+                    }
+
+                    // 4. Apply staged edge mutations inside the transaction.
+                    for ed in &edge_deltas {
+                        if !is_valid_relation_name(&ed.relation) {
+                            return Err(ActionError::Storage(format!(
+                                "invalid relation '{}'",
+                                ed.relation
+                            )));
+                        }
+                        let safe_src = escape_ladybug_string(&ed.source);
+                        let safe_dst = escape_ladybug_string(&ed.target);
+                        match ed.op {
+                            EdgeMutationOp::EnsurePresent => {
+                                let q = format!(
+                                    "MATCH (a:Memory {{id: '{safe_src}', namespace: '{safe_ns}'}}), (b:Memory {{id: '{safe_dst}', namespace: '{safe_ns}'}}) MERGE (a)-[r:{}]->(b) ON CREATE SET r.source = '{safe_ns}', r.valid_from = {now_ts}, r.valid_to = 0, r.generation = 0, r.extractor = 'action', r.evidence_id = '{safe_src}' ON MATCH SET r.source = '{safe_ns}', r.valid_from = {now_ts}, r.valid_to = 0, r.extractor = 'action', r.evidence_id = '{safe_src}'",
+                                    ed.relation
+                                );
+                                conn.query(&q)
+                                    .map_err(|e| ActionError::Storage(e.to_string()))?;
+                            }
+                            EdgeMutationOp::Remove => {
+                                let q = format!(
+                                    "MATCH (a:Memory {{id: '{safe_src}', namespace: '{safe_ns}'}})-[r:{}]->(b:Memory {{id: '{safe_dst}', namespace: '{safe_ns}'}}) DELETE r",
+                                    ed.relation
+                                );
+                                conn.query(&q)
+                                    .map_err(|e| ActionError::Storage(e.to_string()))?;
+                            }
+                        }
+                    }
+
+                    Ok(())
+                })();
+
+                match inner {
+                    Ok(()) => {
+                        if let Err(e) = conn.query("COMMIT") {
+                            let _ = conn.query("ROLLBACK");
+                            return Ok(Err(ActionError::Storage(format!(
+                                "transaction commit failed: {e}"
+                            ))));
+                        }
+                        first_write_flip.flip_store_state_to_data();
+                        Ok(Ok(()))
+                    }
+                    Err(action_err) => {
+                        let _ = conn.query("ROLLBACK");
+                        Ok(Err(action_err))
+                    }
+                }
+            })
+            .await
+            .map_err(|e| ActionError::Storage(e.to_string()))?;
+
+        if tx_outcome.is_ok() {
+            for doc in lexical_docs {
+                self.lexical_apply_doc(doc);
+            }
+            if refresh_ont {
+                self.refresh_ontology(&ns).await;
+            }
+        }
+        tx_outcome
+    }
+}
+
+#[cfg(test)]
+fn action_batch_fail_map(
+) -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, usize>> {
+    static MAP: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, usize>>> =
+        std::sync::OnceLock::new();
+    MAP.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn conn_upsert_action_row(
+    conn: &Connection,
+    namespace: &str,
+    id: &str,
+    vector: &[f32],
+    payload: &MemoryPayload,
+    edge_now: i64,
+) -> Result<()> {
+    let safe_id = escape_ladybug_string(id);
+    let safe_ns = escape_ladybug_string(namespace);
+    let safe_content = escape_ladybug_string(&payload.content);
+    let safe_user_id = escape_ladybug_string(&payload.user_id);
+    let safe_memory_type = escape_ladybug_string(&payload.memory_type);
+    let safe_agent_name =
+        escape_ladybug_string(payload.agent_name.as_deref().unwrap_or("unknown"));
+    let safe_location = escape_ladybug_string(&payload.location);
+    let safe_location_lines = escape_ladybug_string(&payload.location_lines);
+    let safe_metadata = escape_ladybug_string(&serde_json::to_string(&payload.metadata)?);
+
+    let vec_str = format!(
+        "[{}]",
+        vector
+            .iter()
+            .map(|f| {
+                let s = format!("{}", f);
+                if s.contains('.') || s.contains('e') || s.contains('E') {
+                    s
+                } else {
+                    format!("{}.0", s)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+
+    let insert_query = format!(
+        "MERGE (m:Memory {{id: '{}'}})
+         ON CREATE SET m.namespace = '{}', m.content = '{}', m.user_id = '{}', m.memory_type = '{}', m.agent_name = '{}', m.location = '{}', m.location_lines = '{}', m.metadata = '{}', m.embedding = {}
+         ON MATCH SET m.content = '{}', m.user_id = '{}', m.memory_type = '{}', m.agent_name = '{}', m.location = '{}', m.location_lines = '{}', m.metadata = '{}', m.embedding = {}",
+        safe_id, safe_ns, safe_content, safe_user_id, safe_memory_type, safe_agent_name, safe_location, safe_location_lines, safe_metadata, vec_str,
+        safe_content, safe_user_id, safe_memory_type, safe_agent_name, safe_location, safe_location_lines, safe_metadata, vec_str
+    );
+    conn.query(&insert_query)?;
+
+    for edge in edge_specs(&payload.metadata) {
+        if !is_valid_relation_name(edge.rel_type) {
+            continue;
+        }
+        if let crate::traits::TargetResolution::Resolved(target) =
+            resolve_target_on_write(conn, namespace, &edge.target_id)
+        {
+            let target_safe = escape_ladybug_string(&target);
+            let (from, to) = if edge.points_at_target {
+                (safe_id.as_str(), target_safe.as_str())
+            } else {
+                (target_safe.as_str(), safe_id.as_str())
+            };
+            let edge_query = format!(
+                "MATCH (a:Memory {{id: '{}'}}), (b:Memory {{id: '{}'}}) MERGE (a)-[r:{}]->(b) ON CREATE SET r.source = '{}', r.valid_from = {}, r.valid_to = 0, r.generation = 0, r.extractor = 'upsert', r.evidence_id = '{}' ON MATCH SET r.source = '{}', r.valid_from = {}, r.extractor = 'upsert', r.evidence_id = '{}'",
+                from, to, edge.rel_type, safe_ns, edge_now, safe_id, safe_ns, edge_now, safe_id
+            );
+            conn.query(&edge_query)?;
+        }
+    }
+    Ok(())
 }
