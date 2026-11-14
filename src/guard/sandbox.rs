@@ -114,22 +114,14 @@ impl SandboxEvaluator {
 
         // Command execution inside ephemeral container
         // --rm : ephemeral
+        // -i / sh -s : stream payload via stdin (never pass untrusted payload in argv)
         // --network=none : isolate
         // -v cwd:/workspace:ro : mount project read-only
         // --tmpfs /tmp : scratch space
+        let mount_arg = format!("-v={}:/workspace:ro", cwd_str);
         let child = Command::new(&engine)
-            .args([
-                "run",
-                "--rm",
-                "--network=none",
-                &format!("-v={}:/workspace:ro", cwd_str),
-                "--tmpfs=/tmp",
-                "-w=/workspace",
-                SANDBOX_IMAGE,
-                "sh",
-                "-c",
-                payload,
-            ])
+            .args(sandbox_run_args(&mount_arg))
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             // Kill the container when the child future is dropped (the
@@ -139,7 +131,11 @@ impl SandboxEvaluator {
             .spawn()?;
 
         // Wait with a strict timeout (e.g., 5 seconds for inline guard)
-        let execution_result = timeout(Duration::from_secs(5), child.wait_with_output()).await;
+        let execution_result = timeout(
+            Duration::from_secs(5),
+            write_payload_and_wait(child, payload),
+        )
+        .await;
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -203,6 +199,40 @@ impl SandboxEvaluator {
     }
 }
 
+/// Fixed CLI arguments for `podman run`. The shell payload is piped over
+/// `stdin` to `sh -s` rather than passed via `-c <payload>` on the process
+/// command line, preventing command-line injection (`rust/command-line-injection`)
+/// and keeping untrusted payloads out of host `argv` / `/proc/<pid>/cmdline`.
+fn sandbox_run_args(mount_arg: &str) -> [&str; 10] {
+    [
+        "run",
+        "--rm",
+        "-i",
+        "--network=none",
+        mount_arg,
+        "--tmpfs=/tmp",
+        "-w=/workspace",
+        SANDBOX_IMAGE,
+        "sh",
+        "-s",
+    ]
+}
+
+async fn write_payload_and_wait(
+    mut child: tokio::process::Child,
+    payload: &str,
+) -> std::io::Result<std::process::Output> {
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        let bytes = payload.as_bytes();
+        if stdin.write_all(bytes).await.is_ok() && !bytes.ends_with(b"\n") {
+            let _ = stdin.write_all(b"\n").await;
+        }
+        let _ = stdin.shutdown().await;
+    }
+    child.wait_with_output().await
+}
+
 /// UTF-8-safe tail slice: never splits a multi-byte codepoint, so indexing
 /// never panics (AJ-5).
 fn safe_utf8_suffix(s: &str, max_bytes: usize) -> &str {
@@ -219,6 +249,60 @@ fn safe_utf8_suffix(s: &str, max_bytes: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sandbox_run_args_streams_script_over_stdin_without_cli_payload() {
+        let args = sandbox_run_args("-v=/tmp/ws:/workspace:ro");
+        assert_eq!(
+            args,
+            [
+                "run",
+                "--rm",
+                "-i",
+                "--network=none",
+                "-v=/tmp/ws:/workspace:ro",
+                "--tmpfs=/tmp",
+                "-w=/workspace",
+                SANDBOX_IMAGE,
+                "sh",
+                "-s",
+            ]
+        );
+        assert!(
+            !args.contains(&"-c"),
+            "sandbox must read payload from stdin via `sh -s`, never `sh -c <payload>`"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_payload_and_wait_streams_to_sh_stdin_and_preserves_status() {
+        let ok_child = Command::new("sh")
+            .arg("-s")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sh -s");
+        let ok_out = write_payload_and_wait(ok_child, "printf 'sandbox-ok'")
+            .await
+            .expect("wait sh -s");
+        assert!(ok_out.status.success());
+        assert_eq!(String::from_utf8_lossy(&ok_out.stdout), "sandbox-ok");
+
+        let fail_child = Command::new("sh")
+            .arg("-s")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn failing sh -s");
+        let fail_out = write_payload_and_wait(fail_child, "echo 'bad' >&2\nexit 7")
+            .await
+            .expect("wait failing sh -s");
+        assert_eq!(fail_out.status.code(), Some(7));
+        assert_eq!(String::from_utf8_lossy(&fail_out.stderr).trim(), "bad");
+    }
 
     #[test]
     fn safe_suffix_no_panic_inside_multibyte_char() {

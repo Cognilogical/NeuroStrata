@@ -169,11 +169,17 @@ fn mb(bytes: Option<u64>) -> serde_json::Value {
 /// The figures `neurostrata_storage_status` reports. Null where the platform
 /// has none, never a made-up zero.
 pub fn status_json() -> serde_json::Value {
-    let s = sample();
+    status_json_for(sample(), IS_DAEMON.load(Ordering::Relaxed))
+}
+
+fn status_json_for(s: Sample, is_daemon: bool) -> serde_json::Value {
     serde_json::json!({
         "rss_mb": mb(s.rss_bytes),
         "peak_rss_mb": mb(s.peak_bytes),
         "rss_available": s.rss_bytes.is_some(),
+        "profile_enabled": profile_enabled(),
+        "growth_supported": s.rss_bytes.is_some(),
+        "role": role_for(is_daemon),
         "growth_log": growth_log_file_name(),
         "growth_log_threshold_mb": threshold_mb(),
     })
@@ -194,6 +200,25 @@ pub fn status_with_process_memory<T: serde::Serialize>(status: &T) -> String {
 
 /// Set by `neurostrata-mcp daemon --profile`.
 static PROFILE: AtomicBool = AtomicBool::new(false);
+
+/// Set once the running process is the long-lived daemon, so status reporting
+/// can tell a real daemon apart from a short-lived CLI computation.
+static IS_DAEMON: AtomicBool = AtomicBool::new(false);
+
+/// Marks the process as the daemon (set by `start_daemon`).
+pub fn mark_daemon_process() {
+    IS_DAEMON.store(true, Ordering::Relaxed);
+}
+
+/// Returns the process role: "daemon" when served by the running daemon, "cli"
+/// when the CLI computes status in-process because the daemon is down.
+fn role_for(is_daemon: bool) -> &'static str {
+    if is_daemon {
+        "daemon"
+    } else {
+        "cli"
+    }
+}
 
 /// Turns profiling on for this process: the growth log and the sampler.
 pub fn enable_profile() {
@@ -251,16 +276,50 @@ fn parse_threshold(value: Option<&str>) -> Result<u64, String> {
     }
 }
 
-fn threshold_mb() -> u64 {
-    match parse_threshold(std::env::var("NEUROSTRATA_RSS_LOG_MB").ok().as_deref()) {
+/// Tracks which invalid `NEUROSTRATA_RSS_LOG_MB` values have already been
+/// reported, so a mistyped knob warns once per distinct value instead of on
+/// every call.
+static WARNED_INVALID_THRESHOLD: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// Returns `true` the first time `raw` is inserted into `set`, `false` on
+/// every repeat — including when the same value returns after a different
+/// one. The caller decides whether to act on it; this helper only dedupes.
+fn should_warn_once(set: &std::sync::Mutex<std::collections::HashSet<String>>, raw: &str) -> bool {
+    let mut warned = set.lock().unwrap_or_else(|e| e.into_inner());
+    warned.insert(raw.to_string())
+}
+
+fn should_warn_invalid_threshold(raw: &str) -> bool {
+    should_warn_once(&WARNED_INVALID_THRESHOLD, raw)
+}
+
+fn threshold_mb_uncached() -> u64 {
+    let raw = std::env::var("NEUROSTRATA_RSS_LOG_MB").ok();
+    match parse_threshold(raw.as_deref()) {
         Ok(value) => value,
         Err(warning) => {
             // The binary installs no tracing subscriber, so `tracing::warn!`
-            // would vanish; operator diagnostics go to stderr.
-            eprintln!("warning: {warning}");
+            // would vanish; operator diagnostics go to stderr. Warn once per
+            // bad value so a hot loop does not spam.
+            if should_warn_invalid_threshold(raw.as_deref().unwrap_or("")) {
+                eprintln!("warning: {warning}");
+            }
             DEFAULT_THRESHOLD_MB
         }
     }
+}
+
+#[cfg(not(test))]
+fn threshold_mb() -> u64 {
+    static THRESHOLD_MB: OnceLock<u64> = OnceLock::new();
+    *THRESHOLD_MB.get_or_init(threshold_mb_uncached)
+}
+
+#[cfg(test)]
+fn threshold_mb() -> u64 {
+    threshold_mb_uncached()
 }
 
 fn log_path() -> PathBuf {
@@ -314,7 +373,7 @@ fn line(
         "rss_before_mb": mb(before.rss_bytes),
         "rss_after_mb": mb(after.rss_bytes),
         "delta_mb": match (before.rss_bytes, after.rss_bytes) {
-            (Some(b), Some(a)) => serde_json::json!((a as i64 - b as i64) / MB as i64),
+            (Some(b), Some(a)) => serde_json::json!((a / MB) as i64 - (b / MB) as i64),
             _ => serde_json::Value::Null,
         },
         "peak_rss_mb": mb(after.peak_bytes),
@@ -376,22 +435,56 @@ pub(crate) fn sample_once_with<F: FnOnce() -> Option<u64>>(
             "ts": now_secs(),
             "prev_rss_mb": mb(Some(prev)),
             "rss_mb": mb(Some(cur)),
-            "delta_mb": (cur as i64 - prev as i64) / MB as i64,
+            "delta_mb": (cur / MB) as i64 - (prev / MB) as i64,
             "in_flight": IN_FLIGHT.load(Ordering::SeqCst),
         })
         .to_string();
         if let Err(e) = append(log_path, &row) {
-            eprintln!("warning: memory growth log write failed for {}: {e}", log_path.display());
+            eprintln!(
+                "warning: memory growth log write failed for {}: {e}",
+                log_path.display()
+            );
         }
     }
     grew
 }
 
+/// Parse the time-series sample interval. An unset value uses the default;
+/// a value that is present but not a number is reported rather than silently
+/// replaced, so an operator who mistyped the knob can see why the sampler
+/// stayed at the default.
+fn parse_sample_interval(value: Option<&str>) -> Result<u64, String> {
+    match value {
+        None => Ok(DEFAULT_SAMPLE_SECS),
+        Some(raw) => raw.trim().parse::<u64>().map_err(|e| {
+            format!(
+                "NEUROSTRATA_RSS_SAMPLE_SECS='{raw}' is not a whole number of seconds ({e}); using {DEFAULT_SAMPLE_SECS}"
+            )
+        }),
+    }
+}
+
+/// Tracks which invalid `NEUROSTRATA_RSS_SAMPLE_SECS` values have already
+/// been reported, so a mistyped knob warns once per distinct value.
+static WARNED_INVALID_INTERVAL: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+fn should_warn_invalid_interval(raw: &str) -> bool {
+    should_warn_once(&WARNED_INVALID_INTERVAL, raw)
+}
+
 fn sample_interval() -> Option<std::time::Duration> {
-    let secs = std::env::var("NEUROSTRATA_RSS_SAMPLE_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_SAMPLE_SECS);
+    let raw = std::env::var("NEUROSTRATA_RSS_SAMPLE_SECS").ok();
+    let secs = match parse_sample_interval(raw.as_deref()) {
+        Ok(value) => value,
+        Err(warning) => {
+            if should_warn_invalid_interval(raw.as_deref().unwrap_or("")) {
+                eprintln!("warning: {warning}");
+            }
+            DEFAULT_SAMPLE_SECS
+        }
+    };
     (secs > 0).then(|| std::time::Duration::from_secs(secs))
 }
 
@@ -414,11 +507,26 @@ async fn run_sampler(
     let mut prev_rss: Option<u64> = None;
     loop {
         let calls = CALLS.swap(0, Ordering::Relaxed);
-        let s = sample();
-        if let Err(e) = append(&path, &sample_line(s, calls, IN_FLIGHT.load(Ordering::SeqCst))) {
-            eprintln!("warning: memory growth log write failed for {}: {e}", path.display());
+        let in_flight = IN_FLIGHT.load(Ordering::SeqCst);
+        let path_for_tick = path.clone();
+        let prev_before = prev_rss;
+        match tokio::task::spawn_blocking(move || {
+            let mut prev = prev_before;
+            let s = sample();
+            if let Err(e) = append(&path_for_tick, &sample_line(s, calls, in_flight)) {
+                eprintln!(
+                    "warning: memory growth log write failed for {}: {e}",
+                    path_for_tick.display()
+                );
+            }
+            sample_once_with(|| s.rss_bytes, &mut prev, threshold_bytes, &path_for_tick);
+            prev
+        })
+        .await
+        {
+            Ok(next_prev) => prev_rss = next_prev,
+            Err(e) => eprintln!("warning: memory sampler tick failed: {e}"),
         }
-        sample_once_with(|| s.rss_bytes, &mut prev_rss, threshold_bytes, &path);
         tokio::select! {
             _ = tokio::time::sleep(every) => {}
             _ = stop.changed() => break,
@@ -434,55 +542,192 @@ static LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// cannot write to is a missing diagnostic, and silently dropping it hides the
 /// very growth the file exists to show.
 fn append(path: &std::path::Path, line: &str) -> std::io::Result<()> {
-    // Rotation and append are one critical section: concurrent calls must not
-    // rename the file one is writing to or interleave a partial line.
     let _guard = LOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    if std::fs::metadata(path).map(|m| m.len() > MAX_LOG_BYTES).unwrap_or(false) {
-        let mut rolled = path.as_os_str().to_owned();
-        rolled.push(".1");
-        if let Err(e) = std::fs::rename(path, PathBuf::from(rolled)) {
-            // Losing the rotation is not losing the line: try the append.
+    let mut rolled = path.as_os_str().to_owned();
+    rolled.push(".1");
+    let rolled = PathBuf::from(rolled);
+    if std::fs::metadata(path)
+        .map(|m| m.len() > MAX_LOG_BYTES)
+        .unwrap_or(false)
+    {
+        if let Err(e) = std::fs::rename(path, &rolled) {
             eprintln!("warning: could not rotate {}: {e}", path.display());
         }
     }
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-    writeln!(f, "{line}")
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)?;
+        if let Err(e) = f.set_permissions(PermissionsExt::from_mode(0o600)) {
+            eprintln!(
+                "warning: could not tighten permissions on {}: {e}",
+                path.display()
+            );
+        }
+        match std::fs::symlink_metadata(&rolled) {
+            Ok(md) if !md.file_type().is_symlink() => {
+                if let Err(e) = std::fs::set_permissions(&rolled, PermissionsExt::from_mode(0o600))
+                {
+                    eprintln!(
+                        "warning: could not tighten permissions on {}: {e}",
+                        rolled.display()
+                    );
+                }
+            }
+            _ => {}
+        }
+        writeln!(f, "{line}")
+    }
+    #[cfg(not(unix))]
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        writeln!(f, "{line}")
+    }
 }
 
 /// Wraps one tool call. Created before the handler runs; on drop it samples
 /// again and logs the call when the process grew past the threshold.
 pub struct CallGuard {
-    tool: String,
+    tool: Option<String>,
     namespace: Option<String>,
     before: Sample,
     epoch_at_begin: u64,
+    sampler: fn() -> Sample,
+    #[cfg(test)]
+    origin_thread: std::thread::ThreadId,
 }
 
 impl CallGuard {
     pub fn begin(tool: &str, namespace: Option<&str>) -> Self {
+        Self::begin_with(tool, namespace, sample)
+    }
+
+    /// `begin` with the RSS source named. Production passes `sample`; the
+    /// counting test passes a sampler that records how often the guard
+    /// actually reads the process, which is what pins the disabled path's
+    /// zero-sampling property.
+    pub(crate) fn begin_with(tool: &str, namespace: Option<&str>, sampler: fn() -> Sample) -> Self {
+        let enabled = profile_enabled();
+        Self::begin_impl(
+            enabled,
+            enabled.then(|| tool.to_string()),
+            if enabled {
+                namespace.map(str::to_string)
+            } else {
+                None
+            },
+            sampler,
+        )
+    }
+
+    /// `begin` with the label built lazily: `label` runs only when
+    /// profiling is enabled, so a call site that formats its label (the
+    /// daemon's `http:<path>`) pays no allocation on the disabled fast
+    /// path. Counting, epoch, sampling, and drop behaviour are identical
+    /// to `begin` — the guard is still created either way.
+    pub fn begin_lazy(label: impl FnOnce() -> String, namespace: Option<&str>) -> Self {
+        let enabled = profile_enabled();
+        Self::begin_impl(
+            enabled,
+            enabled.then(label),
+            if enabled {
+                namespace.map(str::to_string)
+            } else {
+                None
+            },
+            sample,
+        )
+    }
+
+    /// Shared constructor behind `begin_with`/`begin_lazy`. The caller
+    /// resolves `enabled` first and gates the label/namespace strings on
+    /// it, so this only ever stores strings profiling will actually use.
+    fn begin_impl(
+        enabled: bool,
+        tool: Option<String>,
+        namespace: Option<String>,
+        sampler: fn() -> Sample,
+    ) -> Self {
         IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
         CALLS.fetch_add(1, Ordering::Relaxed);
         let epoch_at_begin = CALL_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+        #[cfg(test)]
+        let origin_thread = {
+            let tid = std::thread::current().id();
+            let mut map = IN_FLIGHT_BY_THREAD
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *map.entry(tid).or_insert(0) += 1;
+            tid
+        };
         Self {
-            tool: tool.to_string(),
-            namespace: namespace.map(str::to_string),
-            // Disabled profiling must not pay for a syscall per call.
-            before: if profile_enabled() { sample() } else { Sample::default() },
+            tool,
+            namespace,
+            // Disabled profiling must not pay for a syscall or heap allocation per call.
+            before: if enabled {
+                sampler()
+            } else {
+                Sample::default()
+            },
             epoch_at_begin,
+            sampler,
+            #[cfg(test)]
+            origin_thread,
         }
     }
+}
+
+/// A per-thread counter for CallGuard guards currently in flight, exposed so
+/// the daemon's middleware wiring test can observe whether a guard is active
+/// inside a handler without interference from parallel tests on other threads.
+#[cfg(test)]
+static IN_FLIGHT_BY_THREAD: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<std::thread::ThreadId, usize>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// The number of guards currently in flight on the calling thread, exposed so
+/// the daemon's middleware wiring test can observe whether a guard is active
+/// inside a handler without interference from parallel tests on other threads.
+#[cfg(test)]
+pub(crate) fn in_flight_for_test() -> usize {
+    let tid = std::thread::current().id();
+    IN_FLIGHT_BY_THREAD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&tid)
+        .copied()
+        .unwrap_or(0)
 }
 
 impl Drop for CallGuard {
     fn drop(&mut self) {
         let in_flight = IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+        #[cfg(test)]
+        {
+            let mut map = IN_FLIGHT_BY_THREAD
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(count) = map.get_mut(&self.origin_thread) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    map.remove(&self.origin_thread);
+                }
+            }
+        }
         if !profile_enabled() {
             return;
         }
-        let after = sample();
+        let after = (self.sampler)();
         // A call that began and finished while this one ran already left
         // IN_FLIGHT, but its allocation may be part of this delta.
         let overlapped = overlapped_since(self.epoch_at_begin, CALL_EPOCH.load(Ordering::SeqCst));
@@ -491,7 +736,7 @@ impl Drop for CallGuard {
             if let Err(e) = append(
                 &log_path,
                 &line(
-                    &self.tool,
+                    &self.tool.as_deref().unwrap_or(""),
                     self.namespace.as_deref(),
                     self.before,
                     after,
@@ -533,9 +778,28 @@ mod tests {
         assert!(err.contains("fifty"), "the bad value is named: {err}");
     }
 
+    /// A mistyped sample interval is reported and falls back; zero is a
+    /// valid "turn the sampler off" value.
+    #[test]
+    fn invalid_sample_interval_is_reported_not_swallowed() {
+        assert_eq!(parse_sample_interval(None).unwrap(), DEFAULT_SAMPLE_SECS);
+        assert_eq!(parse_sample_interval(Some("0")).unwrap(), 0);
+        assert_eq!(parse_sample_interval(Some(" 25 ")).unwrap(), 25);
+        let err = parse_sample_interval(Some("fifty")).expect_err("not a number");
+        assert!(err.contains("not a whole number"), "{err}");
+        assert!(err.contains("fifty"), "the bad value is named: {err}");
+        assert!(
+            err.contains("NEUROSTRATA_RSS_SAMPLE_SECS"),
+            "the knob is named: {err}"
+        );
+    }
+
     #[test]
     fn zero_threshold_disables_and_extreme_saturates() {
-        assert!(!grew(Some(0), Some(u64::MAX), 0), "0 disables the per-call log");
+        assert!(
+            !grew(Some(0), Some(u64::MAX), 0),
+            "0 disables the per-call log"
+        );
         assert!(
             !grew(Some(0), Some(MB), u64::MAX),
             "an extreme threshold saturates instead of wrapping"
@@ -615,20 +879,29 @@ mod tests {
     #[test]
     fn a_call_that_finished_during_another_is_still_overlap() {
         assert!(!overlapped_since(7, 7), "no other call began");
-        assert!(overlapped_since(7, 8), "another call began, even if it finished");
+        assert!(
+            overlapped_since(7, 8),
+            "another call began, even if it finished"
+        );
     }
 
     #[test]
     fn overlapping_calls_are_marked_approximate() {
-        let s = Sample { rss_bytes: Some(MB), peak_bytes: Some(MB) };
-        let solo: serde_json::Value = serde_json::from_str(&line("t", None, s, s, 1, false)).unwrap();
-        let busy: serde_json::Value = serde_json::from_str(&line("t", None, s, s, 2, false)).unwrap();
+        let s = Sample {
+            rss_bytes: Some(MB),
+            peak_bytes: Some(MB),
+        };
+        let solo: serde_json::Value =
+            serde_json::from_str(&line("t", None, s, s, 1, false)).unwrap();
+        let busy: serde_json::Value =
+            serde_json::from_str(&line("t", None, s, s, 2, false)).unwrap();
         assert_eq!(solo["approximate"], false);
         assert_eq!(busy["approximate"], true);
     }
 
     #[test]
     fn profiling_is_off_unless_asked_for() {
+        let _env = PROFILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("NEUROSTRATA_PROFILE");
         assert!(!profile_enabled(), "off by default");
         for off in ["0", "off", "false", ""] {
@@ -774,10 +1047,263 @@ mod tests {
 
     #[test]
     fn the_guard_counts_calls_in_flight() {
-        let before = IN_FLIGHT.load(Ordering::SeqCst);
-        let g = CallGuard::begin("t", None);
-        assert_eq!(IN_FLIGHT.load(Ordering::SeqCst), before + 1);
+        assert_eq!(in_flight_for_test(), 0);
+        let g1 = CallGuard::begin("t1", None);
+        assert_eq!(in_flight_for_test(), 1);
+        assert!(IN_FLIGHT.load(Ordering::SeqCst) >= 1);
+        let g2 = CallGuard::begin("t2", None);
+        assert_eq!(in_flight_for_test(), 2);
+        assert!(IN_FLIGHT.load(Ordering::SeqCst) >= 2);
+        drop(g2);
+        assert_eq!(in_flight_for_test(), 1);
+        drop(g1);
+        assert_eq!(in_flight_for_test(), 0);
+    }
+
+    #[test]
+    fn delta_mb_agrees_with_floored_megabyte_columns() {
+        let before = Sample {
+            rss_bytes: Some(100 * MB + 900 * 1024),
+            peak_bytes: None,
+        };
+        let after = Sample {
+            rss_bytes: Some(101 * MB + 100 * 1024),
+            peak_bytes: None,
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&line("t", None, before, after, 1, false)).unwrap();
+        assert_eq!(v["rss_before_mb"], 100);
+        assert_eq!(v["rss_after_mb"], 101);
+        assert_eq!(v["delta_mb"], 1, "delta_mb must equal rss_after_mb - rss_before_mb");
+
+        let dir = std::env::temp_dir().join(format!(
+            "procmem-delta-floor-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("memory-growth.log");
+        let mut prev = Some(100 * MB + 900 * 1024);
+        assert!(sample_once_with(
+            || Some(101 * MB + 100 * 1024),
+            &mut prev,
+            100 * 1024,
+            &path
+        ));
+        let row: serde_json::Value =
+            serde_json::from_str(std::fs::read_to_string(&path).unwrap().trim()).unwrap();
+        assert_eq!(row["prev_rss_mb"], 100);
+        assert_eq!(row["rss_mb"], 101);
+        assert_eq!(row["delta_mb"], 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_json_exposes_profile_enabled_growth_supported_and_role() {
+        // Held for the whole body: the `profile_enabled` expectation is
+        // read from the same process-wide env other tests toggle under
+        // this lock, so an unlocked read could race a toggle.
+        let _env = PROFILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Each key is pinned against an independent expectation, not
+        // against another key: `rss_available` and `growth_supported`
+        // are both derived from `rss_bytes`, so asserting them equal to
+        // each other would pass even if both were wired to the wrong
+        // field. The samples below deliberately split rss from peak so
+        // a wiring to `peak_bytes` fails in both directions.
+        let with_rss = Sample {
+            rss_bytes: Some(100 * MB),
+            peak_bytes: None,
+        };
+        let s = status_json_for(with_rss, false);
+        assert_eq!(s["rss_available"], serde_json::json!(true));
+        assert_eq!(s["growth_supported"], serde_json::json!(true));
+        assert_eq!(s["profile_enabled"], serde_json::json!(profile_enabled()));
+        assert_eq!(s["role"], "cli");
+        let without_rss = Sample {
+            rss_bytes: None,
+            peak_bytes: Some(100 * MB),
+        };
+        let s = status_json_for(without_rss, false);
+        assert_eq!(s["rss_available"], serde_json::json!(false));
+        assert_eq!(s["growth_supported"], serde_json::json!(false));
+        assert_eq!(s["profile_enabled"], serde_json::json!(profile_enabled()));
+        assert_eq!(status_json_for(sample(), true)["role"], "daemon");
+        let live = status_json();
+        assert!(matches!(live["role"].as_str(), Some("cli" | "daemon")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_sets_0600_permissions_on_new_and_existing_logs() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "procmem-perms-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("memory-growth.log");
+        std::fs::write(&path, vec![b'x'; (MAX_LOG_BYTES + 1) as usize]).unwrap();
+        std::fs::set_permissions(&path, PermissionsExt::from_mode(0o644)).unwrap();
+        append(&path, "{\"fresh\":true}").expect("append");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "active log mode must be 0600, got {mode:o}");
+        let rolled = dir.join("memory-growth.log.1");
+        let rolled_mode = std::fs::metadata(&rolled).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            rolled_mode, 0o600,
+            "rotated log mode must be 0600, got {rolled_mode:o}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_tightens_a_pre_existing_log_without_rotating() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "procmem-perms-existing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("memory-growth.log");
+        std::fs::write(&path, "{\"old\":true}\n").unwrap();
+        std::fs::set_permissions(&path, PermissionsExt::from_mode(0o644)).unwrap();
+        append(&path, "{\"fresh\":true}").expect("append");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "active log mode must be 0600, got {mode:o}");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("{\"fresh\":true}"),
+            "the appended line is present: {text}"
+        );
+        assert!(
+            !dir.join("memory-growth.log.1").exists(),
+            "no rotation for a small log"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_tightens_a_pre_existing_rolled_log_without_rotating() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "procmem-perms-rolled-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("memory-growth.log");
+        std::fs::write(&path, "{\"old\":true}\n").unwrap();
+        let rolled = dir.join("memory-growth.log.1");
+        std::fs::write(&rolled, "{\"rolled\":true}\n").unwrap();
+        std::fs::set_permissions(&rolled, PermissionsExt::from_mode(0o644)).unwrap();
+        append(&path, "{\"fresh\":true}").expect("append");
+        let rolled_mode = std::fs::metadata(&rolled).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            rolled_mode, 0o600,
+            "rolled log mode must be 0600, got {rolled_mode:o}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalid_threshold_warning_fires_once_per_value() {
+        WARNED_INVALID_THRESHOLD.lock().unwrap().clear();
+        assert!(should_warn_invalid_threshold("not-a-number"));
+        assert!(!should_warn_invalid_threshold("not-a-number"));
+        assert!(should_warn_invalid_threshold("another-bad-value"));
+        assert!(!should_warn_invalid_threshold("not-a-number"));
+    }
+
+    /// Serializes the tests that toggle `NEUROSTRATA_PROFILE`: the
+    /// variable is process-wide, so an unguarded toggle in one test can
+    /// flip `profile_enabled()` inside another.
+    static PROFILE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    static COUNTED_SAMPLES: AtomicUsize = AtomicUsize::new(0);
+
+    fn counting_sampler() -> Sample {
+        COUNTED_SAMPLES.fetch_add(1, Ordering::SeqCst);
+        Sample {
+            rss_bytes: Some(100 * MB),
+            peak_bytes: Some(100 * MB),
+        }
+    }
+
+    /// The F-2 pin: the disabled guard must never sample, and the enabled
+    /// guard samples once at begin and once at drop. The fixed figures
+    /// keep `grew` false, so the test writes no growth rows.
+    #[test]
+    fn the_guard_samples_twice_when_enabled_and_never_when_disabled() {
+        let _env = PROFILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("NEUROSTRATA_PROFILE");
+        COUNTED_SAMPLES.store(0, Ordering::SeqCst);
+        let g = CallGuard::begin_with("t", None, counting_sampler);
         drop(g);
-        assert_eq!(IN_FLIGHT.load(Ordering::SeqCst), before);
+        assert_eq!(
+            COUNTED_SAMPLES.load(Ordering::SeqCst),
+            0,
+            "disabled profiling never samples"
+        );
+        std::env::set_var("NEUROSTRATA_PROFILE", "1");
+        COUNTED_SAMPLES.store(0, Ordering::SeqCst);
+        let g = CallGuard::begin_with("t", None, counting_sampler);
+        drop(g);
+        assert_eq!(
+            COUNTED_SAMPLES.load(Ordering::SeqCst),
+            2,
+            "one sample at begin, one at drop"
+        );
+        std::env::remove_var("NEUROSTRATA_PROFILE");
+    }
+
+    /// The F-10 lazy-label contract: the label closure runs only when
+    /// profiling is enabled, so the daemon's per-request `format!`
+    /// costs nothing on the disabled fast path. The guard itself is
+    /// created either way (counting is unchanged).
+    #[test]
+    fn begin_lazy_builds_its_label_only_when_profiling_is_enabled() {
+        let _env = PROFILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("NEUROSTRATA_PROFILE");
+        let built = std::cell::Cell::new(false);
+        let g = CallGuard::begin_lazy(
+            || {
+                built.set(true);
+                "lazy".to_string()
+            },
+            None,
+        );
+        assert!(!built.get(), "disabled profiling never builds the label");
+        drop(g);
+        assert!(
+            !built.get(),
+            "dropping a disabled guard builds nothing either"
+        );
+        std::env::set_var("NEUROSTRATA_PROFILE", "1");
+        let g = CallGuard::begin_lazy(
+            || {
+                built.set(true);
+                "lazy".to_string()
+            },
+            None,
+        );
+        assert!(built.get(), "enabled profiling builds the label at begin");
+        drop(g);
+        std::env::remove_var("NEUROSTRATA_PROFILE");
     }
 }

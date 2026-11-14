@@ -36,11 +36,8 @@ fn mutating_action_without_task_claim_blocked_with_transition() {
     let (ok, msg) = evaluate_fsm_guard("s1", None, "w1", "bash rm", true, 0);
     assert!(!ok);
     let msg = msg.expect("blocked mutation must carry a message");
-    assert!(msg.contains("Unpreflighted"), "got: {}", msg);
-    assert!(
-        msg.contains("claim -> ContextLoaded -> TaskClaimed"),
-        "legal transition must be named, got: {msg}"
-    );
+    assert!(msg.contains("Unpreflighted"));
+    assert!(msg.contains("claim -> ContextLoaded -> TaskClaimed"));
 }
 
 #[test]
@@ -55,9 +52,6 @@ fn mutating_action_beyond_breath_threshold_blocked_with_transition() {
     let (ok, msg) = evaluate_fsm_guard("s1", Some("t1"), "w1", "bash rm", true, 5);
     assert!(!ok);
     let msg = msg.expect("breath-required must block with a message");
-    assert!(msg.contains("BreathRequired"), "got: {}", msg);
-    assert!(
-        msg.contains("task_update(note) -> Mutating"),
-        "legal transition must be named, got: {msg}"
-    );
+    assert!(msg.contains("BreathRequired"));
+    assert!(msg.contains("task_update(note) -> Mutating"));
 }

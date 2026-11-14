@@ -76,13 +76,14 @@ An action that rephrases a prohibited operation without containing a rule's trig
 
 For high-risk operations or self-reinforced test checks, the guard subsystem integrates with rootless **Podman** containers to verify command behavior in an ephemeral sandbox without exposing the host filesystem or network.
 
-The sandbox invocation (`src/guard/sandbox.rs`) is exactly:
+The sandbox invocation (`src/guard/sandbox.rs`) is:
 
 ```bash
-podman run --rm --network=none -v=<cwd>:/workspace:ro --tmpfs=/tmp -w=/workspace alpine:3.21 sh -c <payload>
+printf '%s\n' "<payload>" | podman run --rm -i --network=none -v=<cwd>:/workspace:ro --tmpfs=/tmp -w=/workspace alpine:3.21 sh -s
 ```
 
 - `--rm` -- the container is ephemeral; nothing survives the run.
+- `-i` / `sh -s` -- the script payload is piped over standard input rather than passed as a `-c <payload>` command-line argument, keeping untrusted payloads off the host process command line (`neurostrata-911e`).
 - `--network=none` -- no network namespace, so the sandbox cannot phone home.
 - `-v=<cwd>:/workspace:ro` -- the project directory is mounted **read-only**; the sandbox cannot write to the host filesystem. (There is no `--read-only` container flag -- the read-only guarantee comes from the `:ro` mount.)
 - `--tmpfs=/tmp` -- scratch space in memory, so a sandbox that writes to `/tmp` cannot touch the host.

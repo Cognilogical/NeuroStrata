@@ -380,7 +380,6 @@ impl FastEmbedder {
         // (NomicEmbedTextV15 handles 8192), and truncates silently. Anything above
         // what ingestion actually stores per symbol is wasted, so this is set to
         // match MAX_SYMBOL_CHARS in src/parser/ingest.rs -- change the two together.
-        // The CPU arena keeps the largest buffer any input ever needed.
         // Texts here are embedded one at a time at their own length, so the
         // arena ratchets up and never gives it back. This applies to every
         // local embedding (ingest, daemon queries, MCP calls), not only
@@ -878,6 +877,40 @@ mod tests {
         assert!(
             super::arena_execution_providers(false).is_none(),
             "an opt-in must leave fastembed's provider default"
+        );
+    }
+
+    /// Constructor guard (#164): pins the provider helper's arena-off
+    /// setting and the constructor's wiring of the computed provider list
+    /// into the embedding options, so neither flipping the boolean nor
+    /// deleting the constructor hook can pass unnoticed. The wiring
+    /// needles are assembled with `format!` so they do not appear
+    /// verbatim in this test's own source.
+    #[test]
+    fn the_constructor_disables_the_cpu_arena() {
+        let src = include_str!("embed.rs");
+        let helper_body = src
+            .split("fn arena_execution_providers(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("arena_execution_providers present");
+        assert!(
+            helper_body.contains(".with_arena_allocator(false)"),
+            "arena_execution_providers must disable the CPU arena allocator"
+        );
+        let ctor_body = src
+            .split("let disable_arena =")
+            .nth(1)
+            .and_then(|s| {
+                s.split("TextEmbedding::try_new(init.with_show_download_progress(true))")
+                    .next()
+            })
+            .expect("FastEmbedder::new arena wiring present");
+        let call_needle = format!("arena_execution_providers({})", "disable_arena");
+        let wiring_needle = format!("init.with_execution_providers({})", "providers");
+        assert!(
+            ctor_body.contains(&call_needle) && ctor_body.contains(&wiring_needle),
+            "FastEmbedder::new must wire the arena provider decision into the embedding options"
         );
     }
 
