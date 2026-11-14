@@ -10,28 +10,22 @@ Most AI coding tools force an impossible trade-off: either settle for flat markd
 
 **NeuroStrata eliminates that trade-off.**
 
-Packed into **one compiled Rust binary**, NeuroStrata gives your coding agents **six distinct ways to think, remember, plan, and verify work**—combining an embedded vector & property graph database, a six-language Tree-sitter AST software graph, a W3C RDF/SPARQL/SHACL semantic layer with RDFS/OWL closure, three alternative deterministic retrieval surfaces, digital-twin state versioning, and binary-enforced task gates.
+Through **one unified MCP interface**, NeuroStrata gives your coding agents **six distinct ways to think, remember, plan, and verify work**—combining an embedded vector & property graph database, a six-language Tree-sitter AST software graph, a W3C RDF/SPARQL/SHACL semantic layer with RDFS/OWL closure, three alternative deterministic retrieval surfaces, digital-twin state versioning, and binary-enforced task gates.
 
 And here is the best part: **100% of it is automated.** Your agent installs the plugins, wires the hooks, builds the knowledge graph, propagates context to every subagent, enforces its own completion gates, and upgrades itself across versions—**with zero manual configuration from you.**
 
 👉 **[Explore the Complete Feature & Benefit Catalog (`docs/FEATURES.md`)](docs/FEATURES.md)**
 
----
-
-## Visual Overview: NeuroStrata at a Glance
-
 <p align="center">
-  <img src="docs/assets/infographics/hero-six-cognitive-strata.png" alt="NeuroStrata: One MCP Interface, Six Ways to Think" width="49%" />
   <img src="docs/assets/infographics/hero-before-after-agent.png" alt="Ordinary AI Agent vs. NeuroStrata Agent" width="49%" />
+  <img src="docs/assets/infographics/hero-six-cognitive-strata.png" alt="NeuroStrata: One MCP Interface, Six Ways to Think" width="49%" />
 </p>
 
-![Why NeuroStrata — 5-Second Comparison](docs/assets/infographics/01-before-vs-after.svg)
-
-![One MCP Interface, Six Ways to Think](docs/assets/infographics/02-six-cognitive-organs.svg)
-
-
+---
 
 ## How NeuroStrata Helps Your Agents Think (In Every Dimension)
+
+![One MCP Interface, Six Ways to Think](docs/assets/infographics/02-six-cognitive-organs.svg)
 
 ### 1. Associative & Experiential Thinking — *Remember Every Rule, Fix, and Failed Attempt*
 Every time you start a new session, switch worktrees, or compact context, ordinary agents get amnesia. NeuroStrata gives them a persistent **Tri-Strata Memory** (Global, Project Domain, and Task Working Memory):
@@ -127,6 +121,8 @@ When a new version of NeuroStrata ships, replace the binary (`scripts/build.sh` 
 
 
 ## Feature Overview at a Glance
+
+![Why NeuroStrata — 5-Second Comparison](docs/assets/infographics/01-before-vs-after.svg)
 
 > For the complete 12-part breakdown of every subsystem, tool, and code reference, see **[`docs/FEATURES.md`](docs/FEATURES.md)**.
 
