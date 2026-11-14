@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
+use tree_sitter::{Parser, Query, StreamingIterator};
 
 // The id/hash scheme lives in `generation.rs`, a module deliberately free of
 // `crate::` dependencies so an integration test can pin it without a library
@@ -455,7 +455,7 @@ pub(crate) fn ingest_worker_count(total_entries: usize) -> usize {
 
 /// One entry collected during the walk, before any file I/O or parsing.
 #[derive(Clone)]
-pub(crate) struct WalkedEntry {
+struct WalkedEntry {
     pub path: std::path::PathBuf,
     pub path_str: String,
     pub abs_path: String,
@@ -469,7 +469,7 @@ pub(crate) struct WalkedEntry {
 /// The result of processing one `WalkedEntry` on a worker thread. Carries
 /// everything the producer thread needs to replay the original side effects in
 /// deterministic walk order.
-pub(crate) enum ProcessedEntry {
+enum ProcessedEntry {
     Directory,
     UnchangedFile {
         file_sha256: String,
