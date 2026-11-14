@@ -3758,16 +3758,16 @@ impl crate::traits::AsAny for RecordingStore {
             .with_state(state.clone())
             .layer(axum::middleware::from_fn_with_state(state, auth_middleware));
 
-        let drive = |app: Router,
-                     uri: &'static str,
-                     method: axum::http::Method,
-                     auth: bool| async move {
+        let drive = |app: Router, uri: &'static str, method: axum::http::Method, auth: bool| async move {
             let mut builder = axum::http::Request::builder()
                 .method(method)
                 .uri(uri)
                 .header(axum::http::header::HOST, "127.0.0.1");
             if auth {
-                builder = builder.header(axum::http::header::AUTHORIZATION, "Bearer test-daemon-token");
+                builder = builder.header(
+                    axum::http::header::AUTHORIZATION,
+                    "Bearer test-daemon-token",
+                );
             }
             let before = crate::procmem::in_flight_for_test();
             let response = app
@@ -3777,8 +3777,7 @@ impl crate::traits::AsAny for RecordingStore {
             (response.status(), before)
         };
 
-        let (status, before) =
-            drive(app.clone(), "/health", axum::http::Method::GET, false).await;
+        let (status, before) = drive(app.clone(), "/health", axum::http::Method::GET, false).await;
         assert_eq!(status, axum::http::StatusCode::OK);
         assert_eq!(
             seen.lock().unwrap().last().copied(),

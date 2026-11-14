@@ -286,10 +286,7 @@ static WARNED_INVALID_THRESHOLD: std::sync::LazyLock<
 /// Returns `true` the first time `raw` is inserted into `set`, `false` on
 /// every repeat — including when the same value returns after a different
 /// one. The caller decides whether to act on it; this helper only dedupes.
-fn should_warn_once(
-    set: &std::sync::Mutex<std::collections::HashSet<String>>,
-    raw: &str,
-) -> bool {
+fn should_warn_once(set: &std::sync::Mutex<std::collections::HashSet<String>>, raw: &str) -> bool {
     let mut warned = set.lock().unwrap_or_else(|e| e.into_inner());
     warned.insert(raw.to_string())
 }
@@ -443,7 +440,10 @@ pub(crate) fn sample_once_with<F: FnOnce() -> Option<u64>>(
         })
         .to_string();
         if let Err(e) = append(log_path, &row) {
-            eprintln!("warning: memory growth log write failed for {}: {e}", log_path.display());
+            eprintln!(
+                "warning: memory growth log write failed for {}: {e}",
+                log_path.display()
+            );
         }
     }
     grew
@@ -549,7 +549,10 @@ fn append(path: &std::path::Path, line: &str) -> std::io::Result<()> {
     let mut rolled = path.as_os_str().to_owned();
     rolled.push(".1");
     let rolled = PathBuf::from(rolled);
-    if std::fs::metadata(path).map(|m| m.len() > MAX_LOG_BYTES).unwrap_or(false) {
+    if std::fs::metadata(path)
+        .map(|m| m.len() > MAX_LOG_BYTES)
+        .unwrap_or(false)
+    {
         if let Err(e) = std::fs::rename(path, &rolled) {
             eprintln!("warning: could not rotate {}: {e}", path.display());
         }
@@ -563,11 +566,15 @@ fn append(path: &std::path::Path, line: &str) -> std::io::Result<()> {
             .mode(0o600)
             .open(path)?;
         if let Err(e) = f.set_permissions(PermissionsExt::from_mode(0o600)) {
-            eprintln!("warning: could not tighten permissions on {}: {e}", path.display());
+            eprintln!(
+                "warning: could not tighten permissions on {}: {e}",
+                path.display()
+            );
         }
         match std::fs::symlink_metadata(&rolled) {
             Ok(md) if !md.file_type().is_symlink() => {
-                if let Err(e) = std::fs::set_permissions(&rolled, PermissionsExt::from_mode(0o600)) {
+                if let Err(e) = std::fs::set_permissions(&rolled, PermissionsExt::from_mode(0o600))
+                {
                     eprintln!(
                         "warning: could not tighten permissions on {}: {e}",
                         rolled.display()
@@ -580,7 +587,10 @@ fn append(path: &std::path::Path, line: &str) -> std::io::Result<()> {
     }
     #[cfg(not(unix))]
     {
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
         writeln!(f, "{line}")
     }
 }
@@ -604,16 +614,16 @@ impl CallGuard {
     /// counting test passes a sampler that records how often the guard
     /// actually reads the process, which is what pins the disabled path's
     /// zero-sampling property.
-    pub(crate) fn begin_with(
-        tool: &str,
-        namespace: Option<&str>,
-        sampler: fn() -> Sample,
-    ) -> Self {
+    pub(crate) fn begin_with(tool: &str, namespace: Option<&str>, sampler: fn() -> Sample) -> Self {
         let enabled = profile_enabled();
         Self::begin_impl(
             enabled,
             enabled.then(|| tool.to_string()),
-            if enabled { namespace.map(str::to_string) } else { None },
+            if enabled {
+                namespace.map(str::to_string)
+            } else {
+                None
+            },
             sampler,
         )
     }
@@ -628,7 +638,11 @@ impl CallGuard {
         Self::begin_impl(
             enabled,
             enabled.then(label),
-            if enabled { namespace.map(str::to_string) } else { None },
+            if enabled {
+                namespace.map(str::to_string)
+            } else {
+                None
+            },
             sample,
         )
     }
@@ -649,7 +663,11 @@ impl CallGuard {
             tool,
             namespace,
             // Disabled profiling must not pay for a syscall or heap allocation per call.
-            before: if enabled { sampler() } else { Sample::default() },
+            before: if enabled {
+                sampler()
+            } else {
+                Sample::default()
+            },
             epoch_at_begin,
             sampler,
         }
@@ -739,7 +757,10 @@ mod tests {
 
     #[test]
     fn zero_threshold_disables_and_extreme_saturates() {
-        assert!(!grew(Some(0), Some(u64::MAX), 0), "0 disables the per-call log");
+        assert!(
+            !grew(Some(0), Some(u64::MAX), 0),
+            "0 disables the per-call log"
+        );
         assert!(
             !grew(Some(0), Some(MB), u64::MAX),
             "an extreme threshold saturates instead of wrapping"
@@ -819,14 +840,22 @@ mod tests {
     #[test]
     fn a_call_that_finished_during_another_is_still_overlap() {
         assert!(!overlapped_since(7, 7), "no other call began");
-        assert!(overlapped_since(7, 8), "another call began, even if it finished");
+        assert!(
+            overlapped_since(7, 8),
+            "another call began, even if it finished"
+        );
     }
 
     #[test]
     fn overlapping_calls_are_marked_approximate() {
-        let s = Sample { rss_bytes: Some(MB), peak_bytes: Some(MB) };
-        let solo: serde_json::Value = serde_json::from_str(&line("t", None, s, s, 1, false)).unwrap();
-        let busy: serde_json::Value = serde_json::from_str(&line("t", None, s, s, 2, false)).unwrap();
+        let s = Sample {
+            rss_bytes: Some(MB),
+            peak_bytes: Some(MB),
+        };
+        let solo: serde_json::Value =
+            serde_json::from_str(&line("t", None, s, s, 1, false)).unwrap();
+        let busy: serde_json::Value =
+            serde_json::from_str(&line("t", None, s, s, 2, false)).unwrap();
         assert_eq!(solo["approximate"], false);
         assert_eq!(busy["approximate"], true);
     }
@@ -1039,13 +1068,19 @@ mod tests {
         // each other would pass even if both were wired to the wrong
         // field. The samples below deliberately split rss from peak so
         // a wiring to `peak_bytes` fails in both directions.
-        let with_rss = Sample { rss_bytes: Some(100 * MB), peak_bytes: None };
+        let with_rss = Sample {
+            rss_bytes: Some(100 * MB),
+            peak_bytes: None,
+        };
         let s = status_json_for(with_rss, false);
         assert_eq!(s["rss_available"], serde_json::json!(true));
         assert_eq!(s["growth_supported"], serde_json::json!(true));
         assert_eq!(s["profile_enabled"], serde_json::json!(profile_enabled()));
         assert_eq!(s["role"], "cli");
-        let without_rss = Sample { rss_bytes: None, peak_bytes: Some(100 * MB) };
+        let without_rss = Sample {
+            rss_bytes: None,
+            peak_bytes: Some(100 * MB),
+        };
         let s = status_json_for(without_rss, false);
         assert_eq!(s["rss_available"], serde_json::json!(false));
         assert_eq!(s["growth_supported"], serde_json::json!(false));
@@ -1076,7 +1111,10 @@ mod tests {
         assert_eq!(mode, 0o600, "active log mode must be 0600, got {mode:o}");
         let rolled = dir.join("memory-growth.log.1");
         let rolled_mode = std::fs::metadata(&rolled).unwrap().permissions().mode() & 0o777;
-        assert_eq!(rolled_mode, 0o600, "rotated log mode must be 0600, got {rolled_mode:o}");
+        assert_eq!(
+            rolled_mode, 0o600,
+            "rotated log mode must be 0600, got {rolled_mode:o}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1100,8 +1138,14 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "active log mode must be 0600, got {mode:o}");
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("{\"fresh\":true}"), "the appended line is present: {text}");
-        assert!(!dir.join("memory-growth.log.1").exists(), "no rotation for a small log");
+        assert!(
+            text.contains("{\"fresh\":true}"),
+            "the appended line is present: {text}"
+        );
+        assert!(
+            !dir.join("memory-growth.log.1").exists(),
+            "no rotation for a small log"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1125,7 +1169,10 @@ mod tests {
         std::fs::set_permissions(&rolled, PermissionsExt::from_mode(0o644)).unwrap();
         append(&path, "{\"fresh\":true}").expect("append");
         let rolled_mode = std::fs::metadata(&rolled).unwrap().permissions().mode() & 0o777;
-        assert_eq!(rolled_mode, 0o600, "rolled log mode must be 0600, got {rolled_mode:o}");
+        assert_eq!(
+            rolled_mode, 0o600,
+            "rolled log mode must be 0600, got {rolled_mode:o}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1147,7 +1194,10 @@ mod tests {
 
     fn counting_sampler() -> Sample {
         COUNTED_SAMPLES.fetch_add(1, Ordering::SeqCst);
-        Sample { rss_bytes: Some(100 * MB), peak_bytes: Some(100 * MB) }
+        Sample {
+            rss_bytes: Some(100 * MB),
+            peak_bytes: Some(100 * MB),
+        }
     }
 
     /// The F-2 pin: the disabled guard must never sample, and the enabled
@@ -1195,7 +1245,10 @@ mod tests {
         );
         assert!(!built.get(), "disabled profiling never builds the label");
         drop(g);
-        assert!(!built.get(), "dropping a disabled guard builds nothing either");
+        assert!(
+            !built.get(),
+            "dropping a disabled guard builds nothing either"
+        );
         std::env::set_var("NEUROSTRATA_PROFILE", "1");
         let g = CallGuard::begin_lazy(
             || {
