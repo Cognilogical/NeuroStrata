@@ -240,6 +240,17 @@ pub trait Embedder: Send + Sync {
     /// Convert text into a dense vector representation.
     async fn embed(&self, text: &str) -> Result<Vec<f32>>;
 
+    /// Convert many texts into dense vectors, preserving order. The default
+    /// loops the single-text path so embedders without a native batch mode
+    /// still get batch-shaped callers without changing their behaviour.
+    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let mut out = Vec::with_capacity(texts.len());
+        for text in texts {
+            out.push(self.embed(text).await?);
+        }
+        Ok(out)
+    }
+
     /// Get the expected dimension of the embeddings (e.g., 768 for nomic-embed-text)
     fn dimensions(&self) -> usize;
 

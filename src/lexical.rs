@@ -19,6 +19,10 @@ use crate::traits::{MemoryPayload};
 pub const INDEX_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-tantivy-v2");
 
 /// Code-aware pre-tokenization for Tantivy (whitespace-separated sub-tokens + full lowercased text).
+pub fn detect_task_intent(text: &str) -> Vec<crate::task::intent::TaskIntentSignal> {
+    crate::task::intent::detect_task_intents(text)
+}
+
 pub fn tokenize_code_for_tantivy(text: &str) -> String {
     let mut tokens = crate::fts::tokenize_code(text);
     let lower_raw = text.to_lowercase();

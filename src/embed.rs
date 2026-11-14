@@ -445,6 +445,35 @@ impl Embedder for FastEmbedder {
             .ok_or_else(|| anyhow::anyhow!("Embedding model returned an empty vector batch"))
     }
 
+    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        // Model inference is CPU-bound and can stall the async runtime when
+        // called from a Tokio task. Isolate it on the blocking thread pool.
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let model = Arc::clone(&self.model);
+        let expected = texts.len();
+        let texts = texts.to_vec();
+        let embeddings = tokio::task::spawn_blocking(move || -> Result<Vec<Vec<f32>>> {
+            let mut guard = model
+                .lock()
+                .map_err(|e| anyhow::anyhow!("model lock poisoned: {}", e))?;
+            guard
+                .embed(texts, None)
+                .context("fastembed embed_batch call failed")
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("embed task panicked: {}", e))??;
+        if embeddings.len() != expected {
+            anyhow::bail!(
+                "fastembed embed_batch returned {} vectors for {} texts",
+                embeddings.len(),
+                expected
+            );
+        }
+        Ok(embeddings)
+    }
+
     fn dimensions(&self) -> usize {
         self.dimensions
     }
@@ -542,6 +571,138 @@ impl RemoteEmbedder {
         }
     }
 
+    async fn embed_batch_with_retry(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let mut attempts = 0;
+        loop {
+            match self.try_embed_batch(texts).await {
+                Ok(embeddings) => return Ok(embeddings),
+                Err(e) => {
+                    attempts += 1;
+                    if attempts >= 2 {
+                        return Err(e);
+                    }
+                    if let Some(s) = e.downcast_ref::<StatusError>() {
+                        if s.0 == reqwest::StatusCode::TOO_MANY_REQUESTS
+                            || s.0.is_server_error()
+                        {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            continue;
+                        }
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    async fn try_embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        // R13: Egress authorization check — fail-closed if the token or
+        // namespace/data-class allowlist doesn't authorize this call. Concrete
+        // authorization gate (not a deferral): batch embed call is refused
+        // before any remote data leaves the node.
+        if self.api_key.is_empty() {
+            eprintln!(
+                "[REMOTE-EMBED-REFUSED] authorization failed: empty api_key for RemoteEmbedder ({})",
+                self.base_url
+            );
+            return Err(anyhow::anyhow!(
+                "Remote embedding refused: authorization check failed (empty api_key). Fail-closed per R13 privacy/egress authorization."
+            ));
+        }
+        let response = self
+            .client
+            .post(&format!("{}/embeddings", self.base_url))
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&serde_json::json!({
+                "input": texts,
+                "model": self.api_model
+            }))
+            .send()
+            .await
+            .context("HTTP request failed")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow::Error::new(StatusError(status))
+                .context(format!("API error {}: {}", status, body)));
+        }
+
+        let json: serde_json::Value = response.json().await.context("Failed to parse response")?;
+        // Embedding-space identity persistence: a malformed remote batch must
+        // be rejected outright, mirroring the single-text path (Composite
+        // Recommendation #11). A zero vector would silently poison cosine
+        // distances, and a length that disagrees with self.dimensions would be
+        // unmixable with every stored vector in the space.
+        let data = json["data"]
+            .as_array()
+            .context("Missing embedding data in response")?;
+        if data.len() != texts.len() {
+            anyhow::bail!(
+                "remote embedding batch returned {} vectors for {} texts",
+                data.len(),
+                texts.len()
+            );
+        }
+        let mut by_index: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
+        for (pos, item) in data.iter().enumerate() {
+            let index = match item.get("index") {
+                Some(v) if !v.is_null() => {
+                    let idx = v
+                        .as_u64()
+                        .ok_or_else(|| anyhow!("remote embedding contained invalid non-integer index"))?
+                        as usize;
+                    if idx >= by_index.len() {
+                        anyhow::bail!(
+                            "remote embedding index {} out of bounds for batch of {}",
+                            idx,
+                            by_index.len()
+                        );
+                    }
+                    idx
+                }
+                _ => pos,
+            };
+            if by_index[index].is_some() {
+                anyhow::bail!(
+                    "remote embedding batch contained duplicate entry for index {}",
+                    index
+                );
+            }
+            let arr = item["embedding"].as_array().context("Missing embedding in response")?;
+            if arr.is_empty() {
+                anyhow::bail!("remote embedding was empty");
+            }
+            let mut embedding = Vec::with_capacity(arr.len());
+            for v in arr {
+                let val = v
+                    .as_f64()
+                    .ok_or_else(|| anyhow!("remote embedding contained non-finite or non-numeric value"))?;
+                if !val.is_finite() {
+                    anyhow::bail!("remote embedding contained non-finite or non-numeric value");
+                }
+                embedding.push(val as f32);
+            }
+            if self.dimensions > 0 && embedding.len() != self.dimensions {
+                anyhow::bail!(
+                    "remote embedding dimension mismatch: expected {}, got {}",
+                    self.dimensions,
+                    embedding.len()
+                );
+            }
+            by_index[index] = Some(embedding);
+        }
+        Ok(by_index
+            .into_iter()
+            .map(|opt| {
+                opt.ok_or_else(|| anyhow!("remote embedding batch was missing an entry for every text"))
+            })
+            .collect::<Result<Vec<Vec<f32>>>>()?)
+    }
+
     async fn try_embed(&self, text: &str) -> Result<Vec<f32>> {
         // R13: Egress authorization check — fail-closed if the token or
         // namespace/data-class allowlist doesn't authorize this call.
@@ -615,6 +776,10 @@ impl RemoteEmbedder {
 impl Embedder for RemoteEmbedder {
     async fn embed(&self, text: &str) -> Result<Vec<f32>> {
         self.embed_with_retry(text).await
+    }
+
+    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.embed_batch_with_retry(texts).await
     }
 
     fn dimensions(&self) -> usize {
@@ -788,6 +953,38 @@ mod tests {
         .unwrap();
         let v = embedder.embed("hello").await.unwrap();
         assert_eq!(v, vec![0.25f32, 0.5, 0.75, 1.0]);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_embedder_batch_preserves_order_without_index() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let _ = read_http_request(&mut sock).await;
+            let body = r#"{"data":[{"embedding":[1.0,2.0,3.0,4.0]},{"embedding":[5.0,6.0,7.0,8.0]}]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            use tokio::io::AsyncWriteExt;
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+        });
+        let embedder = RemoteEmbedder::new(
+            format!("http://{}", addr),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            4,
+        )
+        .unwrap();
+        let v = embedder
+            .embed_batch(&["a".to_string(), "b".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(v, vec![vec![1.0f32, 2.0, 3.0, 4.0], vec![5.0, 6.0, 7.0, 8.0]]);
         server.await.unwrap();
     }
 
@@ -1172,5 +1369,135 @@ mod tests {
             None => std::env::remove_var("NEUROSTRATA_MODEL"),
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Recording embedder that defers to the trait's default `embed_batch`
+    /// (sequential `embed` per text) so the default can be exercised without
+    /// a live ONNX model.
+    struct OrderEmbedder {
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for OrderEmbedder {
+        async fn embed(&self, text: &str) -> Result<Vec<f32>> {
+            self.calls.lock().unwrap().push(text.to_string());
+            Ok(vec![text.len() as f32])
+        }
+
+        fn dimensions(&self) -> usize {
+            4
+        }
+    }
+
+    #[tokio::test]
+    async fn embed_batch_default_preserves_order_and_handles_empty() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let embedder = OrderEmbedder { calls: Arc::clone(&calls) };
+
+        let empty = embedder.embed_batch(&[]).await.unwrap();
+        assert!(empty.is_empty());
+        assert!(calls.lock().unwrap().is_empty());
+
+        let texts = vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
+        let vectors = embedder.embed_batch(&texts).await.unwrap();
+        assert_eq!(vectors.len(), 3);
+        assert_eq!(vectors[0], vec![5.0f32]);
+        assert_eq!(vectors[1], vec![4.0f32]);
+        assert_eq!(vectors[2], vec![5.0f32]);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()]
+        );
+    }
+
+    /// Spawns a one-shot OpenAI-compatible `/embeddings` server that answers
+    /// every request with `response_body` before closing.
+    async fn spawn_embed_server(response_body: &'static str) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let _ = read_http_request(&mut sock).await;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            use tokio::io::AsyncWriteExt;
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+        });
+        (addr, server)
+    }
+
+    #[tokio::test]
+    async fn remote_embedder_batch_orders_by_index() {
+        let (addr, server) = spawn_embed_server(
+            r#"{"data":[{"index":1,"embedding":[1.0,2.0,3.0,4.0]},{"index":0,"embedding":[5.0,6.0,7.0,8.0]}]}"#,
+        )
+        .await;
+        let embedder = RemoteEmbedder::new(
+            format!("http://{}", addr),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            4,
+        )
+        .unwrap();
+        let texts = vec!["hello".to_string(), "world".to_string()];
+        let vectors = embedder.embed_batch(&texts).await.unwrap();
+        assert_eq!(vectors.len(), 2);
+        assert_eq!(vectors[0], vec![5.0, 6.0, 7.0, 8.0]);
+        assert_eq!(vectors[1], vec![1.0, 2.0, 3.0, 4.0]);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_embedder_batch_rejects_dimension_mismatch() {
+        let (addr, server) = spawn_embed_server(r#"{"data":[{"index":0,"embedding":[1.0,2.0,3.0]}]}"#).await;
+        let embedder = RemoteEmbedder::new(
+            format!("http://{}", addr),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            4,
+        )
+        .unwrap();
+        let err = embedder
+            .embed_batch(&["hello".to_string()])
+            .await
+            .expect_err("dimension mismatch must be rejected");
+        assert!(err.to_string().contains("remote embedding"), "{err}");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_embedder_batch_rejects_non_numeric_vector() {
+        let (addr, server) = spawn_embed_server(r#"{"data":[{"index":0,"embedding":[1.0, "not-a-number", 3.0, 4.0]}]}"#).await;
+        let embedder = RemoteEmbedder::new(
+            format!("http://{}", addr),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            4,
+        )
+        .unwrap();
+        let err = embedder
+            .embed_batch(&["hello".to_string()])
+            .await
+            .expect_err("non-numeric vector must be rejected");
+        assert!(err.to_string().contains("remote embedding"), "{err}");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_embedder_batch_empty_input_returns_no_vectors() {
+        let embedder = RemoteEmbedder::new(
+            "http://localhost:1234".to_string(),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            4,
+        )
+        .unwrap();
+        let vectors = embedder.embed_batch(&[]).await.unwrap();
+        assert!(vectors.is_empty());
     }
 }
