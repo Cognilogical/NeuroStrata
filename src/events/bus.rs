@@ -469,6 +469,7 @@ async fn dispatch(
                 }
                 Err(_elapsed) => {
                     metrics.subscriber_timeouts.fetch_add(1, Ordering::Relaxed);
+                    let name = sub.name().to_string();
                     let _ = bp_tx.send(BackpressureEvent::SubscriberTimeout { name: sub.name() });
                     tracing::warn!(
                         subscriber = sub.name(),
@@ -476,41 +477,44 @@ async fn dispatch(
                         SUBSCRIBER_TIMEOUT.as_millis()
                     );
                     if sub.retry_on_timeout() {
-                        // The subscriber's flip outlives a transient stall:
-                        // one bounded recovery attempt at 4x the fast-path
-                        // budget, after the timeout metrics above have
-                        // already recorded the truth of the first attempt.
-                        let retry = tokio::time::timeout(
-                            SUBSCRIBER_TIMEOUT * 4,
-                            AssertUnwindSafe(sub.handle(&event, &RecursionToken::new(), &ctx))
-                                .catch_unwind(),
-                        )
-                        .await;
-                        match retry {
-                            Ok(Ok(Ok(()))) => {}
-                            Ok(Ok(Err(err))) => {
-                                metrics.subscriber_failures.fetch_add(1, Ordering::Relaxed);
-                                tracing::warn!(
-                                    subscriber = sub.name(),
-                                    "subscriber retry after timeout failed: {err:#}"
-                                );
+                        // Detached recovery task so the dispatcher isn't blocked
+                        // on the 4x budget; the subscriber's flip outlives the
+                        // transient stall.
+                        let sub = Arc::clone(sub);
+                        let event = event.clone();
+                        let metrics = metrics.clone();
+                        let store = store.clone();
+                        let ns = namespace.to_string();
+                        let ts = ts;
+                        let name = name.clone();
+                        tokio::spawn(async move {
+                            let ctx = SubscriberContext { store: store.as_ref(), namespace: &ns, ts };
+                            let retry = tokio::time::timeout(
+                                SUBSCRIBER_TIMEOUT * 4,
+                                AssertUnwindSafe(sub.handle(&event, &RecursionToken::new(), &ctx))
+                                    .catch_unwind(),
+                            )
+                            .await;
+                            match retry {
+                                Ok(Ok(Ok(()))) => {}
+                                Ok(Ok(Err(err))) => {
+                                    metrics.subscriber_failures.fetch_add(1, Ordering::Relaxed);
+                                    tracing::warn!(subscriber = name, "subscriber retry after timeout failed: {err:#}");
+                                }
+                                Ok(Err(payload)) => {
+                                    metrics.subscriber_panics.fetch_add(1, Ordering::Relaxed);
+                                    let text = panic_text(payload.as_ref());
+                                    tracing::warn!(subscriber = name, "subscriber panicked on retry after timeout: {text}");
+                                }
+                                Err(_) => {
+                                    tracing::warn!(
+                                        subscriber = name,
+                                        "subscriber retry after timeout also ran past {}ms",
+                                        (SUBSCRIBER_TIMEOUT * 4).as_millis()
+                                    );
+                                }
                             }
-                            Ok(Err(payload)) => {
-                                metrics.subscriber_panics.fetch_add(1, Ordering::Relaxed);
-                                let text = panic_text(payload.as_ref());
-                                tracing::warn!(
-                                    subscriber = sub.name(),
-                                    "subscriber panicked on retry after timeout: {text}"
-                                );
-                            }
-                            Err(_) => {
-                                tracing::warn!(
-                                    subscriber = sub.name(),
-                                    "subscriber retry after timeout also ran past {}ms",
-                                    (SUBSCRIBER_TIMEOUT * 4).as_millis()
-                                );
-                            }
-                        }
+                        });
                     }
                 }
             }
@@ -837,7 +841,16 @@ mod tests {
             ) -> Result<(), SubscriberError> {
                 let call = self.calls.fetch_add(1, Ordering::AcqRel);
                 if call == 0 {
-                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+                    loop {
+                        if self.flipped.load(Ordering::Acquire) {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        if tokio::time::Instant::now() > deadline {
+                            break;
+                        }
+                    }
                 } else {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                     self.flipped.store(true, Ordering::Release);
