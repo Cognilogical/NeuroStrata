@@ -27,12 +27,38 @@ include allocation from a neighboring call that began inside the window. When
 `in_flight > 1` the line says `"approximate": true`; the figure is still the
 process delta, but the attribution to that call is not exact.
 
+- **P3-5 / X4 — began-before & background growth (`neurostrata-igg4`):** A call
+  that began before the window and is no longer in flight when the guarded call
+  finishes (and finished before the guarded call began) is not attributable to
+  the logged call. Background growth — periodic checkpoints, background tasks,
+  or allocator page retention — is captured by `"kind": "sample"` and
+  `"kind": "sampler"` time-series rows rather than a single `"kind": "call"`
+  row.
+- **P3-7 / X6b — `Drop` synchronous I/O waiver (`neurostrata-igg4`):** The
+  sampler offloads periodic log writes to `tokio::task::spawn_blocking`, while
+  `CallGuard::drop` performs its single-line append synchronously — but only on
+  calls that crossed `NEUROSTRATA_RSS_LOG_MB` when profiling is enabled.
+- **P3-11 / N1 — `calls_since_last` & direct HTTP surface (`neurostrata-igg4`):**
+  `CallGuard` wraps both MCP `tools/call` invocations and authenticated direct
+  HTTP routes (`http:<path>`, excluding `/health` and `/mcp`, which guards at
+  the tool layer), so `calls_since_last` counts MCP tool calls plus direct HTTP
+  requests.
+- **P3-12 / N2 — `process.role` on daemon-down fallback (`neurostrata-igg4`):**
+  `storage_status` includes `process.role` (`"daemon"` when served by the
+  running daemon, `"cli"` when the CLI computes status in-process because the
+  daemon is down) so operators never mistake the short-lived CLI process's RSS
+  for the daemon's.
+- **P3-13 / N3 — detached-ingest attribution geometry (`neurostrata-igg4`):**
+  Detached `/ingest` jobs spawn background work that outlives the initial
+  HTTP/MCP request guard; memory growth during the detached run appears in
+  `"kind": "sample"` / `"kind": "sampler"` rows and any overlapping call's
+  `"approximate": true` window rather than on the initial enqueue call.
 - A call that began before the window is not attributable to the logged call.
 - On platforms that report peak only (`rss_mb: null`), the per-call log cannot
   fire; `storage_status` exposes `rss_available` so a caller can tell.
-- A mistyped `NEUROSTRATA_RSS_LOG_MB` is reported and falls back to the
-  default; `0` disables the per-call log (the sampler still runs). The report
-  goes to stderr: this binary installs no `tracing` subscriber, so a
+- A mistyped `NEUROSTRATA_RSS_LOG_MB` is reported (once per bad value) and falls
+  back to the default; `0` disables the per-call log (the sampler still runs).
+  The report goes to stderr: this binary installs no `tracing` subscriber, so a
   `tracing::warn!` would be discarded.
 
 ## Search results can be incomplete

@@ -121,7 +121,7 @@ pub fn is_qualified(namespace: &str, id: &str) -> bool {
 /// GOVERNS edges match ids by exact string, so a rule an agent wrote against
 /// `src/store/ladybug.rs` could never link to the same file ingested from the
 /// GUI -- and an absolute id does not survive the repository being checked out
-/// anywhere else.
+/// anywhere else (bead neurostrata-fld).
 pub fn node_id_for(root: &Path, path: &Path) -> String {
     // A relative walk already produces the documented form. `ingest ./src <ns>`
     // is the example in CLI-readme.md, and it must keep yielding src/lib.rs --
@@ -1457,6 +1457,7 @@ pub async fn ingest_directory(
                     generation, namespace, abort
                 );
             }
+            // Record carry-forward abort in enrichment registry (bead neurostrata-sij).
             if let Err(e) = crate::registry::enrichment_fail(
                 &vector_store,
                 Some(&embedder),
@@ -2779,6 +2780,7 @@ use super::x;"#;
     async fn ingest_memory_probe() {
         let dir = std::path::PathBuf::from(std::env::var("NS_PROBE_DIR").expect("NS_PROBE_DIR"));
         let db = std::env::temp_dir().join(format!("ns-probe-db-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&db);
         // NS_PROBE_REAL=1 loads the daemon's embedder, so the model and its
         // runtime memory are part of what is measured.
         let embedder: Arc<dyn Embedder> = if std::env::var("NS_PROBE_REAL").is_ok() {
@@ -2798,6 +2800,7 @@ use super::x;"#;
         // The probe owns a throwaway store; leave no multi-hundred-MB
         // directory behind after a measurement.
         drop(store);
+        drop(embedder);
         let _ = std::fs::remove_dir_all(&db);
     }
 

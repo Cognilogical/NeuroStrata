@@ -174,6 +174,9 @@ pub fn status_json() -> serde_json::Value {
         "rss_mb": mb(s.rss_bytes),
         "peak_rss_mb": mb(s.peak_bytes),
         "rss_available": s.rss_bytes.is_some(),
+        "profile_enabled": profile_enabled(),
+        "growth_supported": s.rss_bytes.is_some(),
+        "role": process_role(),
         "growth_log": growth_log_file_name(),
         "growth_log_threshold_mb": threshold_mb(),
     })
@@ -194,6 +197,25 @@ pub fn status_with_process_memory<T: serde::Serialize>(status: &T) -> String {
 
 /// Set by `neurostrata-mcp daemon --profile`.
 static PROFILE: AtomicBool = AtomicBool::new(false);
+
+/// Set once the running process is the long-lived daemon, so status reporting
+/// can tell a real daemon apart from a short-lived CLI computation.
+static IS_DAEMON: AtomicBool = AtomicBool::new(false);
+
+/// Marks the process as the daemon (set by `start_daemon`).
+pub fn mark_daemon_process() {
+    IS_DAEMON.store(true, Ordering::Relaxed);
+}
+
+/// Returns the process role: "daemon" when served by the running daemon, "cli"
+/// when the CLI computes status in-process because the daemon is down.
+pub fn process_role() -> &'static str {
+    if IS_DAEMON.load(Ordering::Relaxed) {
+        "daemon"
+    } else {
+        "cli"
+    }
+}
 
 /// Turns profiling on for this process: the growth log and the sampler.
 pub fn enable_profile() {
@@ -251,16 +273,49 @@ fn parse_threshold(value: Option<&str>) -> Result<u64, String> {
     }
 }
 
-fn threshold_mb() -> u64 {
-    match parse_threshold(std::env::var("NEUROSTRATA_RSS_LOG_MB").ok().as_deref()) {
+/// Tracks which invalid `NEUROSTRATA_RSS_LOG_MB` values have already been
+/// reported, so a mistyped knob warns once instead of on every call.
+static WARNED_INVALID_THRESHOLD: std::sync::Mutex<Option<String>> =
+    std::sync::Mutex::new(None);
+
+/// Returns `true` the first time `raw` is seen, `false` on every repeat. The
+/// caller decides whether to act on it; this helper only dedupes.
+fn should_warn_invalid_threshold(raw: &str) -> bool {
+    let mut warned =
+        WARNED_INVALID_THRESHOLD.lock().unwrap_or_else(|e| e.into_inner());
+    if warned.as_deref() == Some(raw) {
+        false
+    } else {
+        *warned = Some(raw.to_string());
+        true
+    }
+}
+
+fn threshold_mb_uncached() -> u64 {
+    let raw = std::env::var("NEUROSTRATA_RSS_LOG_MB").ok();
+    match parse_threshold(raw.as_deref()) {
         Ok(value) => value,
         Err(warning) => {
             // The binary installs no tracing subscriber, so `tracing::warn!`
-            // would vanish; operator diagnostics go to stderr.
-            eprintln!("warning: {warning}");
+            // would vanish; operator diagnostics go to stderr. Warn once per
+            // bad value so a hot loop does not spam.
+            if should_warn_invalid_threshold(raw.as_deref().unwrap_or("")) {
+                eprintln!("warning: {warning}");
+            }
             DEFAULT_THRESHOLD_MB
         }
     }
+}
+
+#[cfg(not(test))]
+fn threshold_mb() -> u64 {
+    static THRESHOLD_MB: OnceLock<u64> = OnceLock::new();
+    *THRESHOLD_MB.get_or_init(threshold_mb_uncached)
+}
+
+#[cfg(test)]
+fn threshold_mb() -> u64 {
+    threshold_mb_uncached()
 }
 
 fn log_path() -> PathBuf {
@@ -314,7 +369,7 @@ fn line(
         "rss_before_mb": mb(before.rss_bytes),
         "rss_after_mb": mb(after.rss_bytes),
         "delta_mb": match (before.rss_bytes, after.rss_bytes) {
-            (Some(b), Some(a)) => serde_json::json!((a as i64 - b as i64) / MB as i64),
+            (Some(b), Some(a)) => serde_json::json!((a / MB) as i64 - (b / MB) as i64),
             _ => serde_json::Value::Null,
         },
         "peak_rss_mb": mb(after.peak_bytes),
@@ -376,7 +431,7 @@ pub(crate) fn sample_once_with<F: FnOnce() -> Option<u64>>(
             "ts": now_secs(),
             "prev_rss_mb": mb(Some(prev)),
             "rss_mb": mb(Some(cur)),
-            "delta_mb": (cur as i64 - prev as i64) / MB as i64,
+            "delta_mb": (cur / MB) as i64 - (prev / MB) as i64,
             "in_flight": IN_FLIGHT.load(Ordering::SeqCst),
         })
         .to_string();
@@ -414,11 +469,25 @@ async fn run_sampler(
     let mut prev_rss: Option<u64> = None;
     loop {
         let calls = CALLS.swap(0, Ordering::Relaxed);
-        let s = sample();
-        if let Err(e) = append(&path, &sample_line(s, calls, IN_FLIGHT.load(Ordering::SeqCst))) {
-            eprintln!("warning: memory growth log write failed for {}: {e}", path.display());
+        let in_flight = IN_FLIGHT.load(Ordering::SeqCst);
+        let path_for_tick = path.clone();
+        let prev_before = prev_rss;
+        if let Ok(next_prev) = tokio::task::spawn_blocking(move || {
+            let mut prev = prev_before;
+            let s = sample();
+            if let Err(e) = append(&path_for_tick, &sample_line(s, calls, in_flight)) {
+                eprintln!(
+                    "warning: memory growth log write failed for {}: {e}",
+                    path_for_tick.display()
+                );
+            }
+            sample_once_with(|| s.rss_bytes, &mut prev, threshold_bytes, &path_for_tick);
+            prev
+        })
+        .await
+        {
+            prev_rss = next_prev;
         }
-        sample_once_with(|| s.rss_bytes, &mut prev_rss, threshold_bytes, &path);
         tokio::select! {
             _ = tokio::time::sleep(every) => {}
             _ = stop.changed() => break,
@@ -434,28 +503,49 @@ static LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// cannot write to is a missing diagnostic, and silently dropping it hides the
 /// very growth the file exists to show.
 fn append(path: &std::path::Path, line: &str) -> std::io::Result<()> {
-    // Rotation and append are one critical section: concurrent calls must not
-    // rename the file one is writing to or interleave a partial line.
     let _guard = LOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    if std::fs::metadata(path).map(|m| m.len() > MAX_LOG_BYTES).unwrap_or(false) {
-        let mut rolled = path.as_os_str().to_owned();
-        rolled.push(".1");
-        if let Err(e) = std::fs::rename(path, PathBuf::from(rolled)) {
-            // Losing the rotation is not losing the line: try the append.
-            eprintln!("warning: could not rotate {}: {e}", path.display());
+    let mut rolled = path.as_os_str().to_owned();
+    rolled.push(".1");
+    let rolled = PathBuf::from(rolled);
+    let rotation_succeeded = if std::fs::metadata(path).map(|m| m.len() > MAX_LOG_BYTES).unwrap_or(false) {
+        match std::fs::rename(path, &rolled) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("warning: could not rotate {}: {e}", path.display());
+                false
+            }
         }
+    } else {
+        false
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)?;
+        std::fs::set_permissions(path, PermissionsExt::from_mode(0o600))?;
+        if rotation_succeeded {
+            std::fs::set_permissions(&rolled, PermissionsExt::from_mode(0o600))?;
+        }
+        writeln!(f, "{line}")
     }
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-    writeln!(f, "{line}")
+    #[cfg(not(unix))]
+    {
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+        writeln!(f, "{line}")
+    }
 }
 
 /// Wraps one tool call. Created before the handler runs; on drop it samples
 /// again and logs the call when the process grew past the threshold.
 pub struct CallGuard {
-    tool: String,
+    tool: Option<String>,
     namespace: Option<String>,
     before: Sample,
     epoch_at_begin: u64,
@@ -466,11 +556,12 @@ impl CallGuard {
         IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
         CALLS.fetch_add(1, Ordering::Relaxed);
         let epoch_at_begin = CALL_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+        let enabled = profile_enabled();
         Self {
-            tool: tool.to_string(),
-            namespace: namespace.map(str::to_string),
-            // Disabled profiling must not pay for a syscall per call.
-            before: if profile_enabled() { sample() } else { Sample::default() },
+            tool: enabled.then(|| tool.to_string()),
+            namespace: if enabled { namespace.map(str::to_string) } else { None },
+            // Disabled profiling must not pay for a syscall or heap allocation per call.
+            before: if enabled { sample() } else { Sample::default() },
             epoch_at_begin,
         }
     }
@@ -491,7 +582,7 @@ impl Drop for CallGuard {
             if let Err(e) = append(
                 &log_path,
                 &line(
-                    &self.tool,
+                    &self.tool.as_deref().unwrap_or(""),
                     self.namespace.as_deref(),
                     self.before,
                     after,
@@ -779,5 +870,91 @@ mod tests {
         assert_eq!(IN_FLIGHT.load(Ordering::SeqCst), before + 1);
         drop(g);
         assert_eq!(IN_FLIGHT.load(Ordering::SeqCst), before);
+    }
+
+    #[test]
+    fn delta_mb_agrees_with_floored_megabyte_columns() {
+        let before = Sample {
+            rss_bytes: Some(100 * MB + 900 * 1024),
+            peak_bytes: None,
+        };
+        let after = Sample {
+            rss_bytes: Some(101 * MB + 100 * 1024),
+            peak_bytes: None,
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&line("t", None, before, after, 1, false)).unwrap();
+        assert_eq!(v["rss_before_mb"], 100);
+        assert_eq!(v["rss_after_mb"], 101);
+        assert_eq!(v["delta_mb"], 1, "delta_mb must equal rss_after_mb - rss_before_mb");
+
+        let dir = std::env::temp_dir().join(format!(
+            "procmem-delta-floor-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("memory-growth.log");
+        let mut prev = Some(100 * MB + 900 * 1024);
+        assert!(sample_once_with(
+            || Some(101 * MB + 100 * 1024),
+            &mut prev,
+            100 * 1024,
+            &path
+        ));
+        let row: serde_json::Value =
+            serde_json::from_str(std::fs::read_to_string(&path).unwrap().trim()).unwrap();
+        assert_eq!(row["prev_rss_mb"], 100);
+        assert_eq!(row["rss_mb"], 101);
+        assert_eq!(row["delta_mb"], 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_json_exposes_profile_enabled_growth_supported_and_role() {
+        IS_DAEMON.store(false, Ordering::Relaxed);
+        let s = status_json();
+        assert!(s["profile_enabled"].is_boolean());
+        assert_eq!(s["growth_supported"], s["rss_available"]);
+        assert_eq!(s["role"], "cli");
+        mark_daemon_process();
+        assert_eq!(status_json()["role"], "daemon");
+        IS_DAEMON.store(false, Ordering::Relaxed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_sets_0600_permissions_on_new_and_existing_logs() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "procmem-perms-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("memory-growth.log");
+        std::fs::write(&path, vec![b'x'; (MAX_LOG_BYTES + 1) as usize]).unwrap();
+        std::fs::set_permissions(&path, PermissionsExt::from_mode(0o644)).unwrap();
+        append(&path, "{\"fresh\":true}").expect("append");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "active log mode must be 0600, got {mode:o}");
+        let rolled = dir.join("memory-growth.log.1");
+        let rolled_mode = std::fs::metadata(&rolled).unwrap().permissions().mode() & 0o777;
+        assert_eq!(rolled_mode, 0o600, "rotated log mode must be 0600, got {rolled_mode:o}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalid_threshold_warning_fires_once_per_value() {
+        *WARNED_INVALID_THRESHOLD.lock().unwrap() = None;
+        assert!(should_warn_invalid_threshold("not-a-number"));
+        assert!(!should_warn_invalid_threshold("not-a-number"));
+        assert!(should_warn_invalid_threshold("another-bad-value"));
     }
 }

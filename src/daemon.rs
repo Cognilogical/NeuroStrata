@@ -334,6 +334,10 @@ async fn auth_middleware(
         }
     }
 
+    let route_label = (req.uri().path() != "/mcp").then(|| format!("http:{}", req.uri().path()));
+    let _memory_guard = route_label
+        .as_deref()
+        .map(|label| crate::procmem::CallGuard::begin(label, None));
     next.run(req).await
 }
 
@@ -1116,6 +1120,7 @@ pub(crate) async fn start_daemon_on(
     // final checkpoint would then contend with it.
     let (stop_periodic, mut periodic_stopped) = tokio::sync::watch::channel(false);
     // The memory time series stops on the same signal (see procmem).
+    crate::procmem::mark_daemon_process();
     let memory_sampler = crate::procmem::spawn_sampler(periodic_stopped.clone());
     let periodic = tokio::spawn(async move {
         let mut wait = CHECKPOINT_INTERVAL;

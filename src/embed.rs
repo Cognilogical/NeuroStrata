@@ -716,6 +716,34 @@ mod tests {
         );
     }
 
+    /// Constructor guard (#164): pins both the provider helper's
+    /// `.with_arena_allocator(false)` call and `FastEmbedder::new`'s
+    /// `init.with_execution_providers(providers)` wiring so neither flipping
+    /// the boolean nor deleting the constructor hook can pass unnoticed.
+    #[test]
+    fn the_constructor_disables_the_cpu_arena() {
+        let src = include_str!("embed.rs");
+        let helper_body = src
+            .split("fn arena_execution_providers(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("arena_execution_providers present");
+        assert!(
+            helper_body.contains(".with_arena_allocator(false)"),
+            "arena_execution_providers must disable the CPU arena allocator"
+        );
+        let ctor_body = src
+            .split("let disable_arena =")
+            .nth(1)
+            .and_then(|s| s.split("TextEmbedding::try_new(init)").next())
+            .expect("FastEmbedder::new arena wiring present");
+        assert!(
+            ctor_body.contains("arena_execution_providers(disable_arena)")
+                && ctor_body.contains("init.with_execution_providers(providers)"),
+            "FastEmbedder::new must wire arena_execution_providers(disable_arena) into init"
+        );
+    }
+
     use super::*;
 
     /// Read one full HTTP request (headers + declared body) off the socket,
