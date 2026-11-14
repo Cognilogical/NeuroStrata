@@ -196,7 +196,9 @@ impl GlinerEngine {
         }
 
         let session = if model_path.exists() {
-            match Session::builder() {
+            match crate::embed::shared_ort_environment()
+                .and_then(|env| Session::builder(env).map_err(|e| anyhow::anyhow!("{e}")))
+            {
                 Ok(mut builder) => match builder.commit_from_file(&model_path) {
                     Ok(session) => Some(Mutex::new(session)),
                     Err(e) => {

@@ -11,12 +11,9 @@
     "dev": "tsc --project ../core/tsconfig.json && node ../core/bundle-adapter.mjs --watch",
     "test": "node --test test.mjs"
   },
-  "dependencies": {
-    "typescript": "^5.0.0"
-  },
   "devDependencies": {
-    "@types/node": "^22.0.0",
-    "typescript": "^5.6.0"
+    "@types/node": "^26.6.6",
+    "typescript": "~6.0.3"
   },
   "publishConfig": {
     "access": "public"
