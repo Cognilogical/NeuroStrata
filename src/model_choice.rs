@@ -174,6 +174,11 @@ fn write_initial_embedders_file_inner(
     Ok(target)
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static INJECT_NEXT_ATOMIC_WRITE_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Write `contents` to `path` atomically: serialize fully to a temp file in
 /// the same directory, fsync it, rename over the target, fsync the
 /// directory. A crash at any point leaves the target absent or holding its
@@ -205,7 +210,11 @@ fn write_file_atomically(
         file.write_all(contents.as_bytes())?;
         file.sync_all()?;
         drop(file);
-        if fail_before_rename {
+        #[cfg(test)]
+        let injected = INJECT_NEXT_ATOMIC_WRITE_FAILURE.with(|flag| flag.replace(false));
+        #[cfg(not(test))]
+        let injected = false;
+        if fail_before_rename || injected {
             anyhow::bail!("injected failure before rename (test seam)");
         }
         fs::rename(&tmp, path).with_context(|| {
@@ -1275,48 +1284,16 @@ mod tests {
         let target = config_dir.join("embedders.json");
         let before = fs::read(&target).expect("read default file");
         record_pending_choice(&config_dir);
-        // Sabotage the persist so it fails after staging begins. #92's
-        // per-write sequence number makes the old temp-name blocker (a
-        // directory at `.embedders.json.tmp-<pid>`) unmatchable, so the
-        // failure moves to the write's own layer: on Unix the staging
-        // directory itself refuses new files; elsewhere the rename's
-        // landing target refuses to be replaced.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = fs::metadata(&config_dir).expect("meta config dir").permissions();
-            let mut readonly = perms.clone();
-            readonly.set_mode(0o500);
-            fs::set_permissions(&config_dir, readonly).expect("make config dir readonly");
-        }
-        #[cfg(not(unix))]
-        {
-            let perms = fs::metadata(&target).expect("meta target").permissions();
-            let mut landing_blocked = perms.clone();
-            landing_blocked.set_readonly(true);
-            fs::set_permissions(&target, landing_blocked).expect("block the rename landing");
-        }
+        // Sabotage the persist so it fails after staging begins, via the
+        // root-safe thread-local failure-injection seam: unlike the old
+        // chmod-0500 trick, this fires even when the test process runs as
+        // root (CAP_DAC_OVERRIDE), and it is isolated from other tests on
+        // parallel threads.
+        INJECT_NEXT_ATOMIC_WRITE_FAILURE.with(|flag| flag.set(true));
         let db_path = tmp.path().join("neurostrata.db");
         let result = surface_pending_choice(&config_dir, &db_path, true, &mut |_| {
             ChoiceResponse::Pick(0)
         });
-        // Restore writability before any assertion can fail and leave
-        // the tempdir undeletable.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = fs::metadata(&config_dir).expect("meta config dir").permissions();
-            let mut writable = perms.clone();
-            writable.set_mode(0o700);
-            fs::set_permissions(&config_dir, writable).expect("restore config dir writable");
-        }
-        #[cfg(not(unix))]
-        {
-            let perms = fs::metadata(&target).expect("meta target").permissions();
-            let mut landing_open = perms.clone();
-            landing_open.set_readonly(false);
-            fs::set_permissions(&target, landing_open).expect("unblock the rename landing");
-        }
         assert!(result.is_err(), "a failed persist must surface as an error");
         assert_eq!(
             fs::read(&target).expect("re-read file"),
@@ -1326,6 +1303,19 @@ mod tests {
         assert!(
             pending_choice_path(&config_dir).exists(),
             "a failed persist leaves the marker in place, so the choice is not lost"
+        );
+        let staged_tmp_remaining = fs::read_dir(&config_dir)
+            .expect("read config dir")
+            .filter_map(|entry| entry.ok())
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".embedders.json.tmp-")
+            });
+        assert!(
+            !staged_tmp_remaining,
+            "a failed persist cleans up its staged temp file"
         );
     }
 
