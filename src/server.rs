@@ -223,7 +223,7 @@ pub async fn process_mcp_request(
                                 "include_tasks": { "type": "boolean", "description": "Include memory_type 'task' rows in the results. They are excluded by default so task titles do not pollute rule recall." },
                                 "domain": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Optional domain filter. A slug, or a list of slugs. Normalized to lowercase-kebab. A filter that matches nothing is skipped rather than emptying the results, and the report says which happened." },
                                 "exact": { "type": "boolean", "description": "Run a deterministic exact-name pre-pass before the vector scan. Default true." },
-                                "mode": { "type": "string", "enum": ["vector", "lexical", "lexical-inhouse"], "description": "Search track. 'vector' (default) uses embeddings; 'lexical' uses the disk-backed Tantivy full-text engine; 'lexical-inhouse' uses the deterministic in-memory lexical engine." },
+                                "mode": { "type": "string", "enum": ["hybrid", "vector", "lexical", "lexical-inhouse"], "description": "Search track. 'hybrid' (default) fuses HNSW embeddings, code-aware Tantivy BM25, symbol grades, and graph expansion via Reciprocal Rank Fusion; 'vector' uses embeddings with lexical blend; 'lexical' uses the disk-backed Tantivy full-text engine; 'lexical-inhouse' uses the deterministic in-memory lexical engine." },
                                 "principal": { "type": "string", "description": "Resolved authenticated principal for row-level visible_to checks. The local surface defaults to 'admin'." },
                                 "facets": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Filter results by epistemic facet (e.g. failed-attempt, enforced-rule, architecture-decision)." },
                                 "domains": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Filter by domain slug(s) (OR)." },
@@ -7577,10 +7577,14 @@ async fn handle_search_memory(
     let search_mode = arguments
         .get("mode")
         .and_then(|v| v.as_str())
-        .unwrap_or("vector");
-    if search_mode != "vector" && search_mode != "lexical" && search_mode != "lexical-inhouse" {
+        .unwrap_or("hybrid");
+    if search_mode != "hybrid"
+        && search_mode != "vector"
+        && search_mode != "lexical"
+        && search_mode != "lexical-inhouse"
+    {
         return format!(
-            "ERROR [MODE]: unknown search mode '{}'. Use 'vector' (default), 'lexical', or 'lexical-inhouse'.",
+            "ERROR [MODE]: unknown search mode '{}'. Use 'hybrid' (default), 'vector', 'lexical', or 'lexical-inhouse'.",
             search_mode
         );
     }
@@ -7671,7 +7675,7 @@ async fn handle_search_memory(
     if search_mode == "lexical" || search_mode == "lexical-inhouse" {
         let outcome_res = if search_mode == "lexical" {
             if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::LadybugStore>() {
-                ls.search_tantivy_lexical(
+                ls.search_tantivy_lexical_with_options(
                     namespace,
                     &query,
                     FETCH_LIMIT,
@@ -7679,6 +7683,7 @@ async fn handle_search_memory(
                     include_archived,
                     &slugs,
                     principal,
+                    search_filters.include_code_ast,
                 )
                 .await
             } else {
@@ -7840,18 +7845,45 @@ async fn handle_search_memory(
             return format!("Failed to generate embedding for search.: {e}");
         }
     };
-    if let Ok(outcome) = store
-        .search_with_domain(
-                    namespace,
-                    vec,
-                    FETCH_LIMIT,
-                    include_tasks,
-                    include_archived,
-                    &slugs,
-                    Some(query),
-                    exact,
-                )
-                .await
+    let is_ladybug_store = crate::traits::VectorStore::as_any(store.as_ref())
+        .downcast_ref::<crate::store::LadybugStore>()
+        .is_some();
+    let outcome_res = if let Some(ls) =
+        crate::traits::VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::LadybugStore>()
+    {
+        let store_mode = if search_mode == "hybrid" {
+            crate::traits::SearchMode::Hybrid
+        } else {
+            crate::traits::SearchMode::Default
+        };
+        ls.search_hybrid_with_domain(
+            namespace,
+            vec,
+            FETCH_LIMIT,
+            include_tasks,
+            include_archived,
+            search_filters.include_code_ast,
+            &slugs,
+            Some(query),
+            exact,
+            store_mode,
+        )
+        .await
+    } else {
+        store
+            .search_with_domain(
+                namespace,
+                vec,
+                FETCH_LIMIT,
+                include_tasks,
+                include_archived,
+                &slugs,
+                Some(query),
+                exact,
+            )
+            .await
+    };
+    if let Ok(outcome) = outcome_res
             {
                 let mode = outcome.mode;
                 let mut results = outcome.results;
@@ -7896,6 +7928,9 @@ async fn handle_search_memory(
                 // result set and re-score with the documented single rule. Vector-only rows
                 // substitute worst-case lexical distance 1.0; lexical-only rows
                 // substitute worst-case vector distance 1.0.
+                // In 'hybrid' mode on LadybugStore, search_hybrid_with_domain already fused
+                // HNSW + Tantivy + symbol + graph expansion via RRF.
+                if search_mode == "vector" || !is_ladybug_store {
                 let lexical_outcome = store
                     .search_lexical(
                         namespace,
@@ -7981,6 +8016,7 @@ async fn handle_search_memory(
                             .then_with(|| a.id.cmp(&b.id))
                     });
                 }
+                }
                 if let Some(q_ts) = crate::graph_read::temporal::extract_query_timestamp(&query) {
                     for r in &mut results {
                         let boost = crate::graph_read::temporal::temporal_proximity_boost(q_ts, &r.payload.metadata);
@@ -7992,7 +8028,14 @@ async fn handle_search_memory(
                 }
                 // Pre-limit contract: filtering happened against the wider FETCH_LIMIT
                 // candidate set above; truncate to the default page size now.
-                results.truncate(DEFAULT_LIMIT);
+                if search_mode == "hybrid" && is_ladybug_store {
+                    results = crate::store::reserve_normative_and_expansion_slots(
+                        results,
+                        DEFAULT_LIMIT,
+                    );
+                } else {
+                    results.truncate(DEFAULT_LIMIT);
+                }
                 if domain_requested {
                     let single_domain =
                         crate::registry::registry_domain_count(&store, namespace).await <= 1;

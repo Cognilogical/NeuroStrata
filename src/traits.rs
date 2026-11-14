@@ -84,7 +84,12 @@ pub struct GenerationRow {
 
 impl GenerationRow {
     pub fn from_payload(id: String, payload: &MemoryPayload) -> Self {
-        Self::from_parts(id, payload.memory_type.clone(), payload.location.clone(), &payload.metadata)
+        Self::from_parts(
+            id,
+            payload.memory_type.clone(),
+            payload.location.clone(),
+            &payload.metadata,
+        )
     }
 
     pub fn from_parts(id: String, memory_type: String, location: String, metadata: &Value) -> Self {
@@ -92,8 +97,15 @@ impl GenerationRow {
             id,
             memory_type,
             location,
-            file_sha256: metadata.get("file_sha256").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            ingest_version: metadata.get("ingest_version").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            file_sha256: metadata
+                .get("file_sha256")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            ingest_version: metadata
+                .get("ingest_version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
         }
     }
 }
@@ -146,8 +158,7 @@ pub struct SearchEvidence {
 /// so they cannot drift.
 pub fn is_direct_match(evidence: &Option<Vec<SearchEvidence>>) -> bool {
     evidence.as_ref().map_or(false, |evs| {
-        evs.iter()
-            .any(|e| e.kind == EvidenceKind::DirectMatch)
+        evs.iter().any(|e| e.kind == EvidenceKind::DirectMatch)
     })
 }
 
@@ -199,7 +210,6 @@ pub enum RelocateOutcome {
     /// Source and target are the same namespace, so there is nothing to do.
     SameNamespace,
 }
-
 
 /// Embedding-space identity persisted on namespace metadata. Enforcement on
 /// every vector path ensures incompatible spaces are never mixed.
@@ -362,12 +372,7 @@ pub trait VectorStore: Send + Sync + AsAny {
     /// The default is a read-modify-write, which is only safe when callers
     /// cannot overlap. Stores with a single-writer lock override it with one
     /// turn, so concurrent increments serialize instead of losing updates.
-    async fn increment_metadata_counter(
-        &self,
-        namespace: &str,
-        id: &str,
-        key: &str,
-    ) -> Result<()> {
+    async fn increment_metadata_counter(&self, namespace: &str, id: &str, key: &str) -> Result<()> {
         let Some((vector, mut payload)) = self.get(namespace, id).await? else {
             return Ok(());
         };
@@ -489,18 +494,19 @@ pub trait VectorStore: Send + Sync + AsAny {
 
     /// The ids of every node in `generation`. A storage-level primitive for
     /// generation-scoped filtering and tests; the default returns nothing.
-    async fn generation_nodes(
-        &self,
-        _namespace: &str,
-        _generation: u64,
-    ) -> Result<Vec<String>> {
+    async fn generation_nodes(&self, _namespace: &str, _generation: u64) -> Result<Vec<String>> {
         Ok(Vec::new())
     }
 
     /// List all memories, optionally filtered by user_id and/or memory_type.
     /// Pushing filters into the query (rather than filtering in Rust) avoids
     /// deserialising every row in large namespaces (R15).
-    async fn list(&self, namespace: &str, user_id: Option<&str>, memory_type: Option<&str>) -> Result<Vec<SearchResult>>;
+    async fn list(
+        &self,
+        namespace: &str,
+        user_id: Option<&str>,
+        memory_type: Option<&str>,
+    ) -> Result<Vec<SearchResult>>;
 
     /// What ingest needs to know about each row of one generation, without the
     /// row's content or full metadata.
@@ -512,11 +518,18 @@ pub trait VectorStore: Send + Sync + AsAny {
     /// namespace against ~10 MB for the part ingest uses.
     /// Stores that can narrow in the engine override this; the default lists
     /// the whole namespace, as ingest did before.
-    async fn generation_summary(&self, namespace: &str, generation: u64) -> Result<Vec<GenerationRow>> {
+    async fn generation_summary(
+        &self,
+        namespace: &str,
+        generation: u64,
+    ) -> Result<Vec<GenerationRow>> {
         let rows = self.list(namespace, None, None).await?;
         Ok(rows
             .into_iter()
-            .filter(|r| crate::parser::ingest::split_scoped_id(&r.id).is_some_and(|(_, g, _)| g == generation))
+            .filter(|r| {
+                crate::parser::ingest::split_scoped_id(&r.id)
+                    .is_some_and(|(_, g, _)| g == generation)
+            })
             .map(|r| GenerationRow::from_payload(r.id, &r.payload))
             .collect())
     }

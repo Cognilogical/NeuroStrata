@@ -86,12 +86,17 @@ pub const fn task_step(
     match guard {
         KernelGuard::None => {}
         KernelGuard::RequireReason if !has_reason => return Err(MissingReason),
-        KernelGuard::ExtractionRequired if !extraction_edge_exists => return Err(KernelTaskStepError::ExtractionRequired),
+        KernelGuard::ExtractionRequired if !extraction_edge_exists => {
+            return Err(KernelTaskStepError::ExtractionRequired)
+        }
         KernelGuard::RequireReason | KernelGuard::ExtractionRequired => {}
     }
 
     let clear_claim = matches!((from, to), (InProgress, Open));
-    Ok(KernelTaskStepOutcome { next_status: to, clear_claim })
+    Ok(KernelTaskStepOutcome {
+        next_status: to,
+        clear_claim,
+    })
 }
 
 /// Tag string for a task step result: "ok", "err_illegal", "err_missing_reason", "err_extraction_required".
@@ -140,11 +145,21 @@ impl KernelLifecycleState {
 
 /// Returns true if `from -> to` is an allowed lifecycle transition.
 /// Matches the 7 allowed edges from `src/synaptic_mesh/record.rs:159-172`.
-pub const fn lifecycle_can_transition(from: KernelLifecycleState, to: KernelLifecycleState) -> bool {
+pub const fn lifecycle_can_transition(
+    from: KernelLifecycleState,
+    to: KernelLifecycleState,
+) -> bool {
     use KernelLifecycleState::*;
-    matches!((from, to), (Active, Archived) | (Archived, Active) | (Active, Superseded)
-        | (Archived, Superseded) | (Active, Tombstoned) | (Archived, Tombstoned)
-        | (Superseded, Tombstoned))
+    matches!(
+        (from, to),
+        (Active, Archived)
+            | (Archived, Active)
+            | (Active, Superseded)
+            | (Archived, Superseded)
+            | (Active, Tombstoned)
+            | (Archived, Tombstoned)
+            | (Superseded, Tombstoned)
+    )
 }
 
 /// Returns true if the state is terminal (no forward transitions except tombstoning).
@@ -262,8 +277,8 @@ pub const fn classify_merge_decision(
     }
 
     // Both live (Active/Archived), different states.
-// Since Tombstoned and Superseded were already checked above,
-// the remaining states are Active and Archived only.
+    // Since Tombstoned and Superseded were already checked above,
+    // the remaining states are Active and Archived only.
     let different = !((matches!(local_state, Active) && matches!(cand_state, Active))
         || (matches!(local_state, Archived) && matches!(cand_state, Archived)));
     if different {
@@ -471,10 +486,15 @@ impl KernelProcedureTrust {
 }
 
 /// True when a procedure firing is untrusted (no trusted/promoted/local stamp).
-pub const fn procedure_is_untrusted(trust: KernelProcedureTrust, has_import_provenance: bool) -> bool {
+pub const fn procedure_is_untrusted(
+    trust: KernelProcedureTrust,
+    has_import_provenance: bool,
+) -> bool {
     match trust {
         KernelProcedureTrust::Untrusted => true,
-        KernelProcedureTrust::Trusted | KernelProcedureTrust::Promoted | KernelProcedureTrust::Local => false,
+        KernelProcedureTrust::Trusted
+        | KernelProcedureTrust::Promoted
+        | KernelProcedureTrust::Local => false,
         KernelProcedureTrust::AbsentOrUnknown => has_import_provenance,
     }
 }
@@ -843,5 +863,67 @@ pub const fn is_action_memory_shareable(kind: ActionMemoryKind, explicit_shareab
     match kind {
         ActionMemoryKind::ActionType => explicit_shareable,
         ActionMemoryKind::ActionReceipt => false,
+    }
+}
+
+/// Allocation of result slots across reserved primary-normative, reserved graph-expansion,
+/// and general remaining pools (`neurostrata-5xjo`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HybridSlotAllocation {
+    pub normative_taken: u32,
+    pub expansion_taken: u32,
+    pub remaining_taken: u32,
+}
+
+const fn min_u32(a: u32, b: u32) -> u32 {
+    if a <= b {
+        a
+    } else {
+        b
+    }
+}
+
+/// Computes the normative slot quota: `min(3, ceil(limit / 2))` when `limit >= 3`, else `0`.
+pub const fn hybrid_normative_quota(limit: u32) -> u32 {
+    if limit < 3 {
+        0
+    } else {
+        min_u32(3, limit.saturating_add(1) / 2)
+    }
+}
+
+/// Computes the graph-expansion slot quota: `min(4, limit / 4)` when `limit >= 4`, else `0`.
+pub const fn hybrid_expansion_quota(limit: u32) -> u32 {
+    if limit < 4 {
+        0
+    } else {
+        min_u32(4, limit / 4)
+    }
+}
+
+/// Pure slot allocator for two-pool reservation (`reserve_normative_and_expansion_slots`).
+pub const fn allocate_hybrid_slots(
+    limit: u32,
+    avail_normative: u32,
+    avail_expansion: u32,
+    avail_other: u32,
+) -> HybridSlotAllocation {
+    let norm_q = hybrid_normative_quota(limit);
+    let exp_q = hybrid_expansion_quota(limit);
+    let exp_taken = min_u32(exp_q, avail_expansion);
+    let after_exp = limit.saturating_sub(exp_taken);
+    let norm_cap = min_u32(norm_q, after_exp);
+    let norm_taken = min_u32(norm_cap, avail_normative);
+    let rem_slots = after_exp.saturating_sub(norm_taken);
+    let leftover_norm = avail_normative.saturating_sub(norm_taken);
+    let leftover_exp = avail_expansion.saturating_sub(exp_taken);
+    let leftover_pool = leftover_norm
+        .saturating_add(leftover_exp)
+        .saturating_add(avail_other);
+    let rem_taken = min_u32(rem_slots, leftover_pool);
+    HybridSlotAllocation {
+        normative_taken: norm_taken,
+        expansion_taken: exp_taken,
+        remaining_taken: rem_taken,
     }
 }

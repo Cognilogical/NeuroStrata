@@ -43,7 +43,7 @@ fn row_flag_true(value: &lbug::Value) -> bool {
     matches!(value, lbug::Value::Bool(true))
 }
 
-/// Internal search routine shared by `search` and `search_with_domain`.
+/// Internal search routine shared by `search`, `search_with_domain`, and `search_hybrid_with_domain`.
 /// Takes an owned `HashSet<String>` of domain keys (already normalized).
 async fn search_inner(
     store: &LadybugStore,
@@ -52,6 +52,7 @@ async fn search_inner(
     limit: usize,
     include_tasks: bool,
     include_archived: bool,
+    include_code_ast: bool,
     domain_keys: HashSet<String>,
     query_text: Option<String>,
     exact: bool,
@@ -64,7 +65,12 @@ async fn search_inner(
     // Lexical search embeds nothing and does not pass through here.
     store.check_data_bearing_identity()?;
     let search_mode = if std::env::var("NEUROSTRATA_HYBRID_SEARCH")
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(false)
         && search_mode == crate::traits::SearchMode::Default
     {
@@ -105,7 +111,7 @@ async fn search_inner(
             }
         }
         if let Some(ref q) = query_text {
-        // Hydrate reasoning payloads from in-namespace rows so the
+            // Hydrate reasoning payloads from in-namespace rows so the
             // reasoning-backed SearchResult rows carry real MemoryPayloads
             // (content, user_id, memory_type, metadata) instead of empty stubs.
             let hydrate_q = format!(
@@ -160,9 +166,59 @@ async fn search_inner(
                     tracing::warn!("failed to hydrate reasoning payloads: {e}");
                     std::collections::HashMap::new()
                 });
-            let exec_adapter = crate::rdf::reasoning::ReasoningAdapter::new()
-                .with_payloads(hydrated);
+            let exec_adapter =
+                crate::rdf::reasoning::ReasoningAdapter::new().with_payloads(hydrated);
             inferred_results = exec_adapter.execute(&ont_idx, &namespace, q, &[]);
+        }
+    }
+
+    let mut hybrid_lexical_primaries: Vec<SearchResult> = Vec::new();
+    if search_mode == crate::traits::SearchMode::Hybrid {
+        if let Some(ref q) = query_text {
+            if !q.trim().is_empty() {
+                let domain_vec: Vec<String> = domain_keys.iter().cloned().collect();
+                let lex_fetch = (limit.max(5) * 4).max(20);
+                if let Ok(tantivy_out) = store
+                    .search_tantivy_lexical_with_options(
+                        &namespace,
+                        q,
+                        lex_fetch,
+                        include_tasks,
+                        include_archived,
+                        &domain_vec,
+                        "admin",
+                        include_code_ast,
+                    )
+                    .await
+                {
+                    hybrid_lexical_primaries = tantivy_out.results;
+                }
+                if hybrid_lexical_primaries.is_empty() {
+                    if let Ok(fts_out) = store
+                        .search_lexical(
+                            &namespace,
+                            q,
+                            lex_fetch,
+                            include_tasks,
+                            include_archived,
+                            &domain_vec,
+                            "admin",
+                            1,
+                        )
+                        .await
+                    {
+                        hybrid_lexical_primaries = fts_out
+                            .results
+                            .into_iter()
+                            .filter(|r| {
+                                include_code_ast
+                                    || (r.payload.memory_type != "code_ast"
+                                        && r.payload.memory_type != "doc_section")
+                            })
+                            .collect();
+                    }
+                }
+            }
         }
     }
 
@@ -236,6 +292,7 @@ async fn search_inner(
                                 if crate::registry::is_registry_row(&metadata_val) { continue; }
                                 if !domain_keys.is_empty() && !crate::domain::domain_keys(&metadata_val).iter().any(|k| domain_keys.contains(k)) { continue; }
                                 if !include_tasks && memory_type == "task" { continue; }
+                                if !include_code_ast && (memory_type == "code_ast" || memory_type == "doc_section") { continue; }
                                 if STRUCTURAL_MEMORY_TYPES.contains(&memory_type.as_str()) { continue; }
                                 let symbol = metadata_val.get("symbol").and_then(|v| v.as_str()).map(|s| s.to_lowercase());
                                 let location_l = location.to_lowercase();
@@ -294,6 +351,10 @@ async fn search_inner(
             let mut excluded_types = STRUCTURAL_MEMORY_TYPES.iter().map(|s| s.to_string()).collect::<Vec<_>>();
             if !include_tasks {
                 excluded_types.push("task".to_string());
+            }
+            if !include_code_ast {
+                excluded_types.push("code_ast".to_string());
+                excluded_types.push("doc_section".to_string());
             }
             let excluded_types_str = excluded_types
                 .iter()
@@ -499,23 +560,54 @@ async fn search_inner(
                 } else {
                     filtered_primaries.len()
                 };
-                if stop_count >= limit && (limit < 3 || normative_count >= normative_slot_limit(limit)) {
+                let primary_scan_cap = if search_mode == crate::traits::SearchMode::Hybrid {
+                    (limit.max(5) * 4).max(20)
+                } else {
+                    limit
+                };
+                if stop_count >= primary_scan_cap
+                    && (limit < 3 || normative_count >= normative_slot_limit(limit))
+                {
                     break;
                 }
             }
 
+            let active_vec_pool: &[SearchResult] = if domain_keys.is_empty()
+                || (filtered_primaries.is_empty() && !all_primaries.is_empty())
+            {
+                &all_primaries
+            } else {
+                &filtered_primaries
+            };
+            let vec_rank_by_id: std::collections::HashMap<String, (usize, f32)> = active_vec_pool
+                .iter()
+                .enumerate()
+                .map(|(idx, r)| (r.id.clone(), (idx + 1, r.score)))
+                .collect();
+            let lex_rank_by_id: std::collections::HashMap<String, (usize, f32)> =
+                hybrid_lexical_primaries
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, r)| (r.id.clone(), (idx + 1, r.score)))
+                    .collect();
+
             // Determine chosen set and mode, reserving normative slots within `limit`
             // so structural (code_ast/doc_section) primaries cannot crowd out
             // normative rules/facts/decisions/procedures before graph expansion.
+            let primary_keep_cap = if search_mode == crate::traits::SearchMode::Hybrid {
+                (limit.max(5) * 4).max(20)
+            } else {
+                limit
+            };
             let (chosen_primaries, mode) = if domain_keys.is_empty() {
                 // No filter asked for: all rows go to both lists, mode is Vector
-                (reserve_normative_slots(all_primaries, limit), DomainMatchMode::Vector)
+                (reserve_normative_slots(all_primaries, primary_keep_cap), DomainMatchMode::Vector)
             } else if filtered_primaries.is_empty() && !all_primaries.is_empty() {
                 // Filter would empty the candidates: skip it, use unfiltered, mode is Vector
-                (reserve_normative_slots(all_primaries, limit), DomainMatchMode::Vector)
+                (reserve_normative_slots(all_primaries, primary_keep_cap), DomainMatchMode::Vector)
             } else {
                 // Filter applied successfully
-                (reserve_normative_slots(filtered_primaries, limit), DomainMatchMode::Domain)
+                (reserve_normative_slots(filtered_primaries, primary_keep_cap), DomainMatchMode::Domain)
             };
 
             let mut all_primaries_with_exact: Vec<SearchResult> = exact_matches.clone();
@@ -524,8 +616,88 @@ async fn search_inner(
                     all_primaries_with_exact.push(cp);
                 }
             }
-            let primary_ids: Vec<String> = all_primaries_with_exact.iter().map(|r| r.id.clone()).collect();
+            if search_mode == crate::traits::SearchMode::Hybrid {
+                for lp in hybrid_lexical_primaries {
+                    let lp_bare = bare_id_of(&lp.id);
+                    let already_present = all_primaries_with_exact.iter().any(|r| {
+                        r.id == lp.id
+                            || (lp_bare.is_some() && bare_id_of(&r.id) == lp_bare)
+                    });
+                    if !already_present {
+                        all_primaries_with_exact.push(lp);
+                    }
+                }
+                for primary in &mut all_primaries_with_exact {
+                    let has_vec = vec_rank_by_id.contains_key(&primary.id);
+                    let has_lex = lex_rank_by_id.contains_key(&primary.id);
+                    let derivation = match (has_vec, has_lex) {
+                        (true, true) => vec![
+                            "vector".to_string(),
+                            "lexical".to_string(),
+                            "rrf".to_string(),
+                        ],
+                        (false, true) => vec!["lexical".to_string(), "rrf".to_string()],
+                        (true, false) => vec!["vector".to_string(), "rrf".to_string()],
+                        (false, false) => Vec::new(),
+                    };
+                    if !derivation.is_empty() {
+                        if let Some(evs) = primary.evidence.as_mut() {
+                            for ev in evs.iter_mut() {
+                                if ev.kind == crate::traits::EvidenceKind::DirectMatch {
+                                    ev.derivation = derivation.clone();
+                                }
+                            }
+                        } else {
+                            primary.evidence = Some(vec![crate::traits::SearchEvidence {
+                                kind: crate::traits::EvidenceKind::DirectMatch,
+                                path: Vec::new(),
+                                explanation: "This memory matched hybrid retrieval.".to_string(),
+                                derivation,
+                            }]);
+                        }
+                    }
+                }
+            }
+            let primary_rank_by_id: std::collections::HashMap<String, usize> =
+                all_primaries_with_exact
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, r)| {
+                        let best_r =
+                            match (vec_rank_by_id.get(&r.id), lex_rank_by_id.get(&r.id)) {
+                                (Some((vr, _)), Some((lr, _))) => (*vr).min(*lr),
+                                (Some((vr, _)), None) => *vr,
+                                (None, Some((lr, _))) => *lr,
+                                (None, None) => idx + 1,
+                            };
+                        (r.id.clone(), best_r)
+                    })
+                    .collect();
+            let mut sorted_primary_ids: Vec<(usize, String)> = all_primaries_with_exact
+                .iter()
+                .map(|r| {
+                    let rk = primary_rank_by_id.get(&r.id).copied().unwrap_or(999);
+                    (rk, r.id.clone())
+                })
+                .collect();
+            sorted_primary_ids.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            let expansion_seed_cap = if search_mode == crate::traits::SearchMode::Hybrid {
+                limit.max(10)
+            } else {
+                sorted_primary_ids.len()
+            };
+            let primary_ids: Vec<String> = sorted_primary_ids
+                .into_iter()
+                .take(expansion_seed_cap)
+                .map(|(_, id)| id)
+                .collect();
+            let all_primary_id_set: std::collections::HashSet<String> =
+                all_primaries_with_exact.iter().map(|r| r.id.clone()).collect();
             let mut results = all_primaries_with_exact;
+            let mut expansion_meta_by_id: std::collections::HashMap<
+                String,
+                (usize, Option<usize>, f32, f32),
+            > = std::collections::HashMap::new();
 
             // Step 2: Hybrid GraphRAG — directed evidence expansion.
             // Four bounded queries replace the old undirected ones, each using
@@ -541,7 +713,7 @@ async fn search_inner(
 
                 let supported_labels = ["RELATES_TO", "CONTAINS", "GOVERNS", "DEPENDS_ON", "EXTRACTED_FROM"];
                 let primary_set: std::collections::HashSet<&str> =
-                    primary_ids.iter().map(|s| s.as_str()).collect();
+                    all_primary_id_set.iter().map(|s| s.as_str()).collect();
 
                 // One-hop neighbor queries (outgoing and incoming)
                 let neighbor_out_q = format!(
@@ -588,6 +760,8 @@ async fn search_inner(
                     payload: Option<MemoryPayload>,
                     evidence: Vec<crate::traits::SearchEvidence>,
                     primary_sources: std::collections::HashSet<String>,
+                    best_primary_rank: Option<usize>,
+                    best_edge_weight: f32,
                 }
                 let mut by_id: std::collections::HashMap<String, CandidateEntry> =
                     std::collections::HashMap::new();
@@ -613,6 +787,7 @@ async fn search_inner(
                             // Row-class filters for expansion candidates (same as primaries)
                             // Use memory_type column directly, not metadata
                             if !include_tasks && memory_type == "task" { continue; }
+                            if !include_code_ast && (memory_type == "code_ast" || memory_type == "doc_section") { continue; }
                             if !include_archived && is_archived(&metadata_val) { continue; }
                             if is_mesh_conflicting(&metadata_val) { continue; }
                             if crate::registry::is_registry_row(&metadata_val) { continue; }
@@ -643,6 +818,17 @@ async fn search_inner(
                                 });
                             }
                             // Track distinct primary sources for co-occurrence ranking
+                            let p_rank = primary_rank_by_id
+                                .get(&primary_id)
+                                .copied()
+                                .unwrap_or(primary_ids.len() + 1);
+                            entry.best_primary_rank = Some(
+                                entry
+                                    .best_primary_rank
+                                    .map_or(p_rank, |cur| cur.min(p_rank)),
+                            );
+                            let edge_w = crate::graph_read::hybrid::canonical_edge_priority_weight(&relation);
+                            entry.best_edge_weight = entry.best_edge_weight.max(edge_w);
                             entry.primary_sources.insert(primary_id);
                             let mut derivation = Vec::new();
                             if relation == "RELATES_TO" && extractor == "mention-detector" {
@@ -679,6 +865,7 @@ async fn search_inner(
                             // Row-class filters for expansion candidates
                             // Use memory_type column directly, not metadata (same as one-hop fix)
                             if !include_tasks && memory_type == "task" { continue; }
+                            if !include_code_ast && (memory_type == "code_ast" || memory_type == "doc_section") { continue; }
                             if !include_archived && is_archived(&metadata_val) { continue; }
                             if is_mesh_conflicting(&metadata_val) { continue; }
                             if crate::registry::is_registry_row(&metadata_val) { continue; }
@@ -727,6 +914,16 @@ async fn search_inner(
                                 });
                             }
                             // Track distinct primary sources for co-occurrence ranking
+                            let p_rank = primary_rank_by_id
+                                .get(&primary_id)
+                                .copied()
+                                .unwrap_or(primary_ids.len() + 1);
+                            entry.best_primary_rank = Some(
+                                entry
+                                    .best_primary_rank
+                                    .map_or(p_rank, |cur| cur.min(p_rank)),
+                            );
+                            entry.best_edge_weight = entry.best_edge_weight.max(1.0);
                             entry.primary_sources.insert(primary_id);
                             if !entry.evidence.iter().any(|e| e.kind == kind && norm_path(&e.path, &e.kind) == norm) {
                                 entry.evidence.push(crate::traits::SearchEvidence {
@@ -755,6 +952,7 @@ async fn search_inner(
                             if is_retired_at(&metadata_val, now) { continue; }
                             if primary_set.contains(result_id.as_str()) { continue; }
                             if !include_tasks && memory_type == "task" { continue; }
+                            if !include_code_ast && (memory_type == "code_ast" || memory_type == "doc_section") { continue; }
                             if !include_archived && is_archived(&metadata_val) { continue; }
                             if is_mesh_conflicting(&metadata_val) { continue; }
                             if crate::registry::is_registry_row(&metadata_val) { continue; }
@@ -809,6 +1007,16 @@ async fn search_inner(
                                     location, location_lines, metadata: metadata_val,
                                 });
                             }
+                            let p_rank = primary_rank_by_id
+                                .get(&primary_id)
+                                .copied()
+                                .unwrap_or(primary_ids.len() + 1);
+                            entry.best_primary_rank = Some(
+                                entry
+                                    .best_primary_rank
+                                    .map_or(p_rank, |cur| cur.min(p_rank)),
+                            );
+                            entry.best_edge_weight = entry.best_edge_weight.max(1.0);
                             entry.primary_sources.insert(primary_id);
                             if !entry.evidence.iter().any(|e| e.kind == kind && norm_path(&e.path, &e.kind) == norm) {
                                 entry.evidence.push(crate::traits::SearchEvidence {
@@ -844,6 +1052,7 @@ async fn search_inner(
 
                         // Row-class filters for the SIBLING (same as other expansion candidates)
                         if !include_tasks && memory_type == "task" { continue; }
+                        if !include_code_ast && (memory_type == "code_ast" || memory_type == "doc_section") { continue; }
                         if !include_archived && is_archived(&metadata_val) { continue; }
                         if is_mesh_conflicting(&metadata_val) { continue; }
                         if crate::registry::is_registry_row(&metadata_val) { continue; }
@@ -881,6 +1090,16 @@ async fn search_inner(
                             });
                         }
                         // Track distinct primary sources for co-occurrence ranking
+                        let p_rank = primary_rank_by_id
+                            .get(&primary_id)
+                            .copied()
+                            .unwrap_or(primary_ids.len() + 1);
+                        entry.best_primary_rank = Some(
+                            entry
+                                .best_primary_rank
+                                .map_or(p_rank, |cur| cur.min(p_rank)),
+                        );
+                        entry.best_edge_weight = entry.best_edge_weight.max(0.8);
                         entry.primary_sources.insert(primary_id);
                         let norm = norm_path(&edges, &kind);
                         if !entry.evidence.iter().any(|e| e.kind == kind && norm_path(&e.path, &e.kind) == norm) {
@@ -946,6 +1165,13 @@ async fn search_inner(
                             continue;
                         }
                     };
+                    let co_occur_len = entry.primary_sources.len();
+                    let best_p_rank = entry.best_primary_rank;
+                    let best_e_weight = if entry.best_edge_weight > 0.0 {
+                        entry.best_edge_weight
+                    } else {
+                        0.6
+                    };
                     let mut evidence = entry.evidence;
                     // Sort evidence: kind (OneHop < Governs2hop), then path edges
                     evidence.sort_by(|a, b| {
@@ -958,6 +1184,23 @@ async fn search_inner(
                                 .unwrap_or(a.path.len().cmp(&b.path.len()))
                         })
                     });
+                    let hop_decay = if evidence
+                        .iter()
+                        .any(|e| e.kind == crate::traits::EvidenceKind::OneHop)
+                    {
+                        0.85
+                    } else if evidence
+                        .iter()
+                        .any(|e| e.kind == crate::traits::EvidenceKind::EpisodeSibling)
+                    {
+                        0.75
+                    } else {
+                        0.65
+                    };
+                    expansion_meta_by_id.insert(
+                        id.clone(),
+                        (co_occur_len, best_p_rank, best_e_weight, hop_decay),
+                    );
                     evidence.truncate(3);
                     results.push(SearchResult {
                         id: id.clone(),
@@ -1023,8 +1266,10 @@ async fn search_inner(
             // is ascending), so the gain is SUBTRACTED to genuinely pull
             // decisions above equivalently-distant unshaped facts (applied
             // before the final sort so the order reflects it).
-            for r in results.iter_mut() {
-                r.score = (r.score - crate::search::decision_shape_boost(&r.payload.metadata)).max(0.0);
+            if search_mode != crate::traits::SearchMode::Hybrid {
+                for r in results.iter_mut() {
+                    r.score = (r.score - crate::search::decision_shape_boost(&r.payload.metadata)).max(0.0);
+                }
             }
 
             // Final sort: primaries (DirectMatch, real boosted_distance) first,
@@ -1055,56 +1300,73 @@ let incomplete = result_count >= fetch_limit;
             // from vector distance, graph co-occurrence, and symbol match, then
             // sort ASC by the hybrid score with MemoryId ASC tie-break.
             if search_mode == crate::traits::SearchMode::Hybrid {
+                let hybrid_weights = crate::config::Config::from_default_path()
+                    .map(|c| c.hybrid_weights)
+                    .unwrap_or((0.5, 0.3, 0.2));
                 let mut hybrid_results: Vec<SearchResult> = results.clone();
                 for sr in &mut hybrid_results {
-                    // d_vec: feedback gain now sourced from the row's actual
-                    // feedback_score metadata instead of hardcoded 0.0.
-                    let fb_gain = sr.payload.metadata
+                    let fb_gain = sr
+                        .payload
+                        .metadata
                         .get("feedback_score")
                         .and_then(|v| v.as_f64())
                         .unwrap_or(0.0) as f32;
-                    let d_vec = crate::graph_read::hybrid::normalize_vec(sr.score, fb_gain);
-                    // d_graph: co-occurrence from Step 2 primary_sources count.
-                    // At this point in the function the expansion data has been
-                    // consumed, so we approximate with metadata "co_occurrence_count"
-                    // (set during ingestion/search-expansion when available);
-                    // when absent/0, fall back to declared graph edges
-                    // (governs/relates_to/contained_by array lengths) plus
-                    // access_count so d_graph reflects real connectivity.
-                    let co_from_meta = sr.payload.metadata
+                    let vec_info = vec_rank_by_id.get(&sr.id).copied();
+                    let lex_info = lex_rank_by_id.get(&sr.id).copied();
+                    let exp_info = expansion_meta_by_id.get(&sr.id).copied();
+
+                    let co_from_meta = sr
+                        .payload
+                        .metadata
                         .get("co_occurrence_count")
                         .and_then(|v| v.as_i64())
                         .unwrap_or(0);
-                    let co_count = if co_from_meta > 0 {
-                        co_from_meta
+                    let co_count = if let Some((exp_co, _, _, _)) = exp_info {
+                        exp_co as u64
+                    } else if co_from_meta > 0 {
+                        co_from_meta as u64
                     } else {
-                        let declared_edges: usize =
-                            ["governs", "relates_to", "contained_by"]
-                                .iter()
-                                .filter_map(|k| {
-                                    sr.payload.metadata
-                                        .get(*k)
-                                        .and_then(|v| v.as_array())
-                                        .map(|a| a.len())
-                                })
-                                .sum();
-                        let access = sr.payload.metadata
+                        let declared_edges: usize = ["governs", "relates_to", "contained_by"]
+                            .iter()
+                            .filter_map(|k| {
+                                sr.payload
+                                    .metadata
+                                    .get(*k)
+                                    .and_then(|v| v.as_array())
+                                    .map(|a| a.len())
+                            })
+                            .sum();
+                        let access = sr
+                            .payload
+                            .metadata
                             .get("access_count")
                             .and_then(|v| v.as_i64())
                             .unwrap_or(0);
-                        (declared_edges as i64 + access).max(0)
+                        (declared_edges as i64 + access).max(0) as u64
                     };
-                    let d_graph = crate::graph_read::hybrid::normalize_graph(co_count as u64);
-                    // d_sym: compute symbol match grade from query and candidate symbols
+
                     let mut candidate_symbols: Vec<String> = Vec::new();
-                    if let Some(syms) = sr.payload.metadata.get("symbols").and_then(|v| v.as_array()) {
+                    if let Some(sym) = sr.payload.metadata.get("symbol").and_then(|v| v.as_str()) {
+                        candidate_symbols.push(sym.to_string());
+                    }
+                    if let Some(syms) = sr
+                        .payload
+                        .metadata
+                        .get("symbols")
+                        .and_then(|v| v.as_array())
+                    {
                         for s in syms {
                             if let Some(st) = s.as_str() {
                                 candidate_symbols.push(st.to_string());
                             }
                         }
                     }
-                    if let Some(governs) = sr.payload.metadata.get("governs").and_then(|v| v.as_array()) {
+                    if let Some(governs) = sr
+                        .payload
+                        .metadata
+                        .get("governs")
+                        .and_then(|v| v.as_array())
+                    {
                         for g in governs {
                             if let Some(gt) = g.as_str() {
                                 candidate_symbols.push(gt.to_string());
@@ -1119,22 +1381,40 @@ let incomplete = result_count >= fetch_limit;
                         query_text.as_deref().unwrap_or(""),
                         &candidate_symbols,
                     );
-                    let d_sym = crate::graph_read::hybrid::normalize_sym(sym_grade);
-                    let hybrid_weights = crate::config::Config::from_default_path()
-                        .map(|c| c.hybrid_weights)
-                        .unwrap_or((0.5, 0.3, 0.2));
-                    sr.score = crate::graph_read::hybrid::combine(d_vec, d_graph, d_sym, hybrid_weights);
+                    let decision_boost =
+                        crate::search::decision_shape_boost(&sr.payload.metadata);
+                    let (parent_best_rank, edge_priority_weight, hop_decay) =
+                        if let Some((_, p_rank, edge_w, decay)) = exp_info {
+                            (p_rank, edge_w, decay)
+                        } else {
+                            (None, 0.0, 1.0)
+                        };
+                    let ranked_cand = crate::graph_read::hybrid::RankedCandidate {
+                        id: sr.id.clone(),
+                        vec_rank: vec_info.map(|(r, _)| r),
+                        vec_distance: vec_info.map(|(_, d)| d),
+                        lex_rank: lex_info.map(|(r, _)| r),
+                        lex_score: lex_info.map(|(_, s)| s),
+                        sym_grade,
+                        graph_co_occurrence: co_count,
+                        parent_best_rank,
+                        edge_priority_weight,
+                        feedback_gain: fb_gain,
+                    };
+                    sr.score = crate::graph_read::hybrid::compute_rrf_distance(
+                        &ranked_cand,
+                        hybrid_weights,
+                        decision_boost,
+                        hop_decay,
+                    );
                 }
                 // Sort ASC by hybrid score, tie-break MemoryId ASC.
                 hybrid_results.sort_by(|a, b| {
-                    let a_score = a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal);
-                    match a_score {
-                        std::cmp::Ordering::Less => std::cmp::Ordering::Less,
-                        std::cmp::Ordering::Greater => std::cmp::Ordering::Greater,
-                        std::cmp::Ordering::Equal => a.id.cmp(&b.id),
-                    }
+                    a.score
+                        .total_cmp(&b.score)
+                        .then_with(|| a.id.cmp(&b.id))
                 });
-                results = reserve_normative_slots(hybrid_results, limit);
+                results = reserve_normative_and_expansion_slots(hybrid_results, limit);
             }
 
             Ok(DomainSearchOutcome { results, mode, incomplete })
@@ -1247,7 +1527,14 @@ pub struct LadybugStore {
     /// Cached active-generation symbol ids for mention detection, per
     /// namespace. A generation counter is per namespace, so two namespaces can
     /// share a generation set; the namespace is part of the key.
-    mention_symbol_ids: Arc<tokio::sync::RwLock<std::collections::HashMap<String, (std::collections::HashSet<u64>, std::sync::Arc<Vec<String>>)>>>,
+    mention_symbol_ids: Arc<
+        tokio::sync::RwLock<
+            std::collections::HashMap<
+                String,
+                (std::collections::HashSet<u64>, std::sync::Arc<Vec<String>>),
+            >,
+        >,
+    >,
     /// Lazily built in-house lexical index, partitioned by namespace.
     lexical: Arc<std::sync::RwLock<crate::fts::LexicalIndex>>,
     /// Namespaces whose lexical partition is loaded. A namespace absent here is
@@ -1524,7 +1811,9 @@ fn with_buffer_pool(cfg: SystemConfig) -> SystemConfig {
         _ => match crate::config::Config::load() {
             Ok(c) => c.storage_hygiene.buffer_pool_mb,
             Err(e) => {
-                tracing::warn!("could not read the config for buffer_pool_mb, using {default_mb}: {e}");
+                tracing::warn!(
+                    "could not read the config for buffer_pool_mb, using {default_mb}: {e}"
+                );
                 default_mb
             }
         },
@@ -1615,7 +1904,10 @@ fn guarded_checkpoint(conn: &Connection, stopped: &std::sync::atomic::AtomicBool
     if stopped.load(std::sync::atomic::Ordering::Acquire) {
         anyhow::bail!("checkpoint skipped: an earlier one ran out of buffer pool");
     }
-    let result = conn.query("CHECKPOINT").map(|_| ()).map_err(anyhow::Error::from);
+    let result = conn
+        .query("CHECKPOINT")
+        .map(|_| ())
+        .map_err(anyhow::Error::from);
     if let Err(e) = &result {
         stop_checkpoints_after_pool_failure(conn, stopped, e, true);
     }
@@ -1658,7 +1950,10 @@ mod buffer_pool_tests {
         assert!(note.unwrap().contains("floor"));
         let (mb, _) = resolve_buffer_pool_mb(384, Some("96"));
         assert_eq!(mb, MIN_BUFFER_POOL_MB);
-        assert_eq!(resolve_buffer_pool_mb(MIN_BUFFER_POOL_MB, None), (MIN_BUFFER_POOL_MB, None));
+        assert_eq!(
+            resolve_buffer_pool_mb(MIN_BUFFER_POOL_MB, None),
+            (MIN_BUFFER_POOL_MB, None)
+        );
     }
 
     #[test]
@@ -1711,7 +2006,8 @@ mod buffer_pool_tests {
         let cfg = SystemConfig::default()
             .buffer_pool_size(64 * 1024 * 1024)
             .throw_on_wal_replay_failure(true);
-        let store = LadybugStore::with_system_config(&dir.join("ladybug.db"), 768, cfg).expect("open");
+        let store =
+            LadybugStore::with_system_config(&dir.join("ladybug.db"), 768, cfg).expect("open");
         let namespaces = store.list_namespaces().await.expect("namespaces");
         let mut advised = 0;
         for ns in &namespaces {
@@ -1722,7 +2018,10 @@ mod buffer_pool_tests {
                 }
             }
         }
-        assert!(advised > 0, "no search failed with the advice; the pool may be big enough here");
+        assert!(
+            advised > 0,
+            "no search failed with the advice; the pool may be big enough here"
+        );
     }
 
     /// A WAL too large for the pool to checkpoint, as one big relink leaves it:
@@ -1783,7 +2082,11 @@ mod buffer_pool_tests {
         let mut failed_writes = 0;
         for i in 0..8 {
             let q = format!("MATCH (m:M {{id: 'id{i}'}}) SET m.meta = 'small'");
-            if store.with_conn(move |c| c.query(&q).map(|_| ()).map_err(Into::into)).await.is_err() {
+            if store
+                .with_conn(move |c| c.query(&q).map(|_| ()).map_err(Into::into))
+                .await
+                .is_err()
+            {
                 failed_writes += 1;
             }
         }
@@ -1794,15 +2097,28 @@ mod buffer_pool_tests {
             }
             // A backup checkpoints first; it must not retry either.
             let export = root.path().join("export");
-            if store.export_database(export.to_str().unwrap()).await.is_err() {
+            if store
+                .export_database(export.to_str().unwrap())
+                .await
+                .is_err()
+            {
                 failed_checkpoints += 1;
             }
         }
         let grown = size() - before;
         eprintln!("grew {grown} bytes; {failed_writes} writes and {failed_checkpoints} checkpoints failed");
-        assert_eq!(failed_checkpoints, 8, "the WAL fit the pool; nothing was tested");
-        assert!(failed_writes <= 1, "{failed_writes} writes hit a failing post-commit checkpoint");
-        assert!(grown < 1024 * 1024, "ladybug.db grew {grown} bytes over failed checkpoints");
+        assert_eq!(
+            failed_checkpoints, 8,
+            "the WAL fit the pool; nothing was tested"
+        );
+        assert!(
+            failed_writes <= 1,
+            "{failed_writes} writes hit a failing post-commit checkpoint"
+        );
+        assert!(
+            grown < 1024 * 1024,
+            "ladybug.db grew {grown} bytes over failed checkpoints"
+        );
 
         // Closing must not retry it either: the engine checkpoints on close
         // unless told not to.
@@ -1901,7 +2217,9 @@ fn strict_wal_verification_from(strict: Option<&str>, allow_unverified: Option<&
 fn strict_wal_verification() -> bool {
     strict_wal_verification_from(
         std::env::var("NEUROSTRATA_STRICT_WAL").ok().as_deref(),
-        std::env::var("NEUROSTRATA_ALLOW_UNVERIFIED_WAL").ok().as_deref(),
+        std::env::var("NEUROSTRATA_ALLOW_UNVERIFIED_WAL")
+            .ok()
+            .as_deref(),
     )
 }
 
@@ -1939,7 +2257,10 @@ fn copy_regular_file_create_new_0600(
     if src_meta.file_type().is_symlink() || !src_meta.file_type().is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("refusing to copy non-regular or symlink WAL source {:?}", src),
+            format!(
+                "refusing to copy non-regular or symlink WAL source {:?}",
+                src
+            ),
         ));
     }
     if let Ok(dst_meta) = std::fs::symlink_metadata(dst) {
@@ -2047,14 +2368,10 @@ fn preserve_unclean_wal(local_path: &std::path::Path) -> Option<std::path::PathB
     // otherwise create a new `.wal.unclean.<ts>` copy every second (#193).
     // Reuse the latest preserved `.unclean.` artifact if its content matches.
     let existing = crate::storage::snapshot::list_wal_recovery_artifacts(local_path);
-    if let Some((latest_unclean, _, _)) = existing
-        .iter()
-        .rev()
-        .find(|(p, _, _)| {
-            p.file_name()
-                .is_some_and(|n| n.to_string_lossy().contains(".wal.unclean."))
-        })
-    {
+    if let Some((latest_unclean, _, _)) = existing.iter().rev().find(|(p, _, _)| {
+        p.file_name()
+            .is_some_and(|n| n.to_string_lossy().contains(".wal.unclean."))
+    }) {
         if let (Some(src_hash), Some(prev_hash)) = (
             sha256_regular_file(&wal_file),
             sha256_regular_file(latest_unclean),
@@ -2090,7 +2407,9 @@ fn preserve_unclean_wal(local_path: &std::path::Path) -> Option<std::path::PathB
 
 impl Drop for LadybugStore {
     fn drop(&mut self) {
-        let stopped = self.checkpoints_stopped.load(std::sync::atomic::Ordering::Acquire);
+        let stopped = self
+            .checkpoints_stopped
+            .load(std::sync::atomic::Ordering::Acquire);
         if self.dirty.take() && !stopped {
             if let Ok(conn) = Connection::new(&self.db) {
                 if let Err(e) = conn.query("CHECKPOINT;") {
@@ -2221,11 +2540,10 @@ impl FirstWriteFlip {
                 // produced the vectors, never a config re-read.
                 let descriptor = match &self.serving {
                     Some(serving) => Some(serving.clone()),
-                    None => configured_embedding_descriptor_in(
-                        &self.embed_config_dir,
-                        self.dimensions,
-                    )
-                    .ok(),
+                    None => {
+                        configured_embedding_descriptor_in(&self.embed_config_dir, self.dimensions)
+                            .ok()
+                    }
                 };
                 if let Some(descriptor) = descriptor {
                     let state = crate::model_choice::StoreState {
@@ -2600,12 +2918,10 @@ impl LadybugStore {
                     let mut ckpt_os = local_path.clone().into_os_string();
                     ckpt_os.push(".wal.checkpoint");
                     let ckpt_file = std::path::PathBuf::from(ckpt_os);
-                    let pre_replay_active_wal_bytes = std::fs::metadata(&wal_file)
-                        .map(|m| m.len())
-                        .unwrap_or(0);
-                    let pre_replay_ckpt_wal_bytes = std::fs::metadata(&ckpt_file)
-                        .map(|m| m.len())
-                        .unwrap_or(0);
+                    let pre_replay_active_wal_bytes =
+                        std::fs::metadata(&wal_file).map(|m| m.len()).unwrap_or(0);
+                    let pre_replay_ckpt_wal_bytes =
+                        std::fs::metadata(&ckpt_file).map(|m| m.len()).unwrap_or(0);
                     let pre_replay_wal_bytes =
                         pre_replay_active_wal_bytes.saturating_add(pre_replay_ckpt_wal_bytes);
 
@@ -2621,14 +2937,11 @@ impl LadybugStore {
                             // `has_memory_table` misses pre-existing stores whose schema
                             // was already checkpointed into the main DB (#189).
                             let has_memory_table = match Connection::new(&unverified_db) {
-                                Ok(conn) => conn
-                                    .query("MATCH (m:Memory) RETURN count(m);")
-                                    .is_ok(),
+                                Ok(conn) => conn.query("MATCH (m:Memory) RETURN count(m);").is_ok(),
                                 Err(_) => false,
                             };
-                            let post_active_wal_bytes = std::fs::metadata(&wal_file)
-                                .map(|m| m.len())
-                                .unwrap_or(0);
+                            let post_active_wal_bytes =
+                                std::fs::metadata(&wal_file).map(|m| m.len()).unwrap_or(0);
                             let zero_records_replayed = (pre_replay_active_wal_bytes > 0
                                 && wal_file.exists()
                                 && post_active_wal_bytes == 0)
@@ -2734,14 +3047,16 @@ impl LadybugStore {
                                 ));
                             };
 
-                            let wal_meta = std::fs::symlink_metadata(&target_wal).map_err(|err| {
-                                anyhow::anyhow!(
-                                    "Recovery failed: could not stat unreadable WAL {:?}: {}",
-                                    target_wal,
-                                    err
-                                )
-                            })?;
-                            if wal_meta.file_type().is_symlink() || !wal_meta.file_type().is_file() {
+                            let wal_meta =
+                                std::fs::symlink_metadata(&target_wal).map_err(|err| {
+                                    anyhow::anyhow!(
+                                        "Recovery failed: could not stat unreadable WAL {:?}: {}",
+                                        target_wal,
+                                        err
+                                    )
+                                })?;
+                            if wal_meta.file_type().is_symlink() || !wal_meta.file_type().is_file()
+                            {
                                 return Err(anyhow::anyhow!(
                                     "Recovery failed: refusing to move non-regular or symlink WAL {:?}",
                                     target_wal
@@ -3150,9 +3465,10 @@ impl LadybugStore {
             dimensions: self.dimensions,
         };
         let outcome = self
-            .write_with_deadline("migrating a data-bearing LockedUnknown store", move |conn| {
-                migration.migrate_data_bearing(conn)
-            })
+            .write_with_deadline(
+                "migrating a data-bearing LockedUnknown store",
+                move |conn| migration.migrate_data_bearing(conn),
+            )
             .await?;
         Ok(outcome)
     }
@@ -3369,10 +3685,10 @@ impl LadybugStore {
         namespace: &str,
         desc: &crate::traits::EmbeddingDescriptor,
     ) -> Result<()> {
-        let mut registry = self
-            .embedding_registry
-            .lock()
-            .unwrap_or_else(|e| { tracing::warn!("embedding registry lock poisoned: {e}"); e.into_inner() });
+        let mut registry = self.embedding_registry.lock().unwrap_or_else(|e| {
+            tracing::warn!("embedding registry lock poisoned: {e}");
+            e.into_inner()
+        });
         if let Some(existing) = registry.get(namespace) {
             if !existing.compatible(desc) {
                 anyhow::bail!(
@@ -3754,7 +4070,14 @@ fn emit_write_shape_warning(namespace: &str, id: &str, warning: &WriteShapeWarni
 }
 
 /// Edge-array metadata keys the namespace hygiene repair checks.
-const HYGIENE_EDGE_KEYS: [&str; 6] = ["governs", "related_to", "relates_to", "contained_by", "extracted_from", "depends_on"];
+const HYGIENE_EDGE_KEYS: [&str; 6] = [
+    "governs",
+    "related_to",
+    "relates_to",
+    "contained_by",
+    "extracted_from",
+    "depends_on",
+];
 
 /// The error a partially-completed repair returns. It carries the committed
 /// counts so the caller can report what landed while still refusing to mark
@@ -3848,7 +4171,8 @@ impl HygieneView for PrefetchedView {
                 == 1
     }
     fn edge_exists(&self, from: &str, to: &str, rel: &'static str) -> bool {
-        self.existing.contains(&(from.to_string(), to.to_string(), rel))
+        self.existing
+            .contains(&(from.to_string(), to.to_string(), rel))
     }
 }
 
@@ -3996,7 +4320,9 @@ fn plan_hygiene_row(
     let (id, mtype, loc) = (&row.id, &row.mtype, &row.loc);
     let safe = escape_ladybug_string(namespace);
     let mut meta: Value = serde_json::from_str(&row.meta_str).unwrap_or(serde_json::json!({}));
-    if !meta.is_object() { meta = serde_json::json!({}); }
+    if !meta.is_object() {
+        meta = serde_json::json!({});
+    }
     let mut shape_changed = false;
     let mut dangling_changed = false;
     // (a) rule source. A usable source is a non-empty string or object
@@ -4006,7 +4332,11 @@ fn plan_hygiene_row(
         let src = meta.get("source").and_then(|v| v.as_str()).unwrap_or("");
         let usable = crate::traits::has_source(&meta) && src != "N/A";
         if !usable {
-            let val = if !loc.is_empty() && loc != "N/A" { loc.clone() } else { "legacy-rule".to_string() };
+            let val = if !loc.is_empty() && loc != "N/A" {
+                loc.clone()
+            } else {
+                "legacy-rule".to_string()
+            };
             if let Some(obj) = meta.as_object_mut() {
                 obj.insert("source".to_string(), Value::String(val));
                 shape_changed = true;
@@ -4016,16 +4346,31 @@ fn plan_hygiene_row(
     // (a2) procedure trigger repair
     if mtype == "procedure" {
         let trigger = meta.get("trigger").and_then(|v| v.as_str()).unwrap_or("");
-        let is_valid = !trigger.is_empty() && (trigger == "session-start" || trigger == "before-edit" || trigger == "after-mutation" || trigger.starts_with("every-n-sessions:") || trigger.starts_with("every-n-days:"));
+        let is_valid = !trigger.is_empty()
+            && (trigger == "session-start"
+                || trigger == "before-edit"
+                || trigger == "after-mutation"
+                || trigger.starts_with("every-n-sessions:")
+                || trigger.starts_with("every-n-days:"));
         if !is_valid {
             if let Some(obj) = meta.as_object_mut() {
-                obj.insert("trigger".to_string(), Value::String("session-start".to_string()));
+                obj.insert(
+                    "trigger".to_string(),
+                    Value::String("session-start".to_string()),
+                );
                 shape_changed = true;
             }
         }
-        if meta.get("remaining_fires").and_then(|v| v.as_u64()).is_none() {
+        if meta
+            .get("remaining_fires")
+            .and_then(|v| v.as_u64())
+            .is_none()
+        {
             if let Some(obj) = meta.as_object_mut() {
-                obj.insert("remaining_fires".to_string(), Value::Number(serde_json::Number::from(5)));
+                obj.insert(
+                    "remaining_fires".to_string(),
+                    Value::Number(serde_json::Number::from(5)),
+                );
                 shape_changed = true;
             }
         }
@@ -4033,21 +4378,42 @@ fn plan_hygiene_row(
     // (a3) task memory repair: backfill metadata.task defaults
     if mtype == "task" {
         let task_meta = meta.get("task").cloned();
-        let mut task_obj = if let Some(Value::Object(obj)) = task_meta { obj.clone() } else { serde_json::Map::new() };
+        let mut task_obj = if let Some(Value::Object(obj)) = task_meta {
+            obj.clone()
+        } else {
+            serde_json::Map::new()
+        };
         let mut task_changed = false;
-        if !task_obj.contains_key("status") || task_obj.get("status").and_then(|v| v.as_str()).map_or(true, |s| !(s == "open" || s == "in_progress" || s == "blocked" || s == "done")) {
+        if !task_obj.contains_key("status")
+            || task_obj
+                .get("status")
+                .and_then(|v| v.as_str())
+                .map_or(true, |s| {
+                    !(s == "open" || s == "in_progress" || s == "blocked" || s == "done")
+                })
+        {
             task_obj.insert("status".to_string(), Value::String("open".to_string()));
             task_changed = true;
         }
-        if task_obj.get("priority").is_none() || !task_obj.get("priority").map_or(false, |v| v.as_u64().map_or(false, |_| true)) {
-            task_obj.insert("priority".to_string(), Value::Number(serde_json::Number::from(2)));
+        if task_obj.get("priority").is_none()
+            || !task_obj
+                .get("priority")
+                .map_or(false, |v| v.as_u64().map_or(false, |_| true))
+        {
+            task_obj.insert(
+                "priority".to_string(),
+                Value::Number(serde_json::Number::from(2)),
+            );
             task_changed = true;
         }
         if !task_obj.contains_key("task_type") {
             task_obj.insert("task_type".to_string(), Value::String("task".to_string()));
             task_changed = true;
         }
-        if task_changed || meta.get("task").is_none() || !meta.get("task").map_or(false, |v| v.is_object()) {
+        if task_changed
+            || meta.get("task").is_none()
+            || !meta.get("task").map_or(false, |v| v.is_object())
+        {
             if let Some(obj) = meta.as_object_mut() {
                 obj.insert("task".to_string(), Value::Object(task_obj));
                 shape_changed = true;
@@ -4056,27 +4422,64 @@ fn plan_hygiene_row(
     }
     // (a4) blank content: backfill from title, then location, then "legacy"
     let mut content_backfill: Option<String> = None;
-    let structural = matches!(mtype.as_str(), "file" | "directory" | "markdown" | "symbol" | "code_ast" | "doc_section" | "freshness_flag" | "guard_event");
+    let structural = matches!(
+        mtype.as_str(),
+        "file"
+            | "directory"
+            | "markdown"
+            | "symbol"
+            | "code_ast"
+            | "doc_section"
+            | "freshness_flag"
+            | "guard_event"
+    );
     let backfill_text = |meta: &Value| {
-        meta.get("title").and_then(|v| v.as_str()).map(|s| s.to_string()).filter(|s| !s.trim().is_empty())
-            .or_else(|| meta.get("location").and_then(|v| v.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty() && s != "N/A"))
+        meta.get("title")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                meta.get("location")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty() && s != "N/A")
+            })
             .unwrap_or_else(|| "legacy".to_string())
     };
     if row.content_empty && !structural {
         content_backfill = Some(backfill_text(&meta));
     }
-    if (row.content_empty && mtype == "fact") || (row.content_empty && !mtype.is_empty() && mtype != "rule" && mtype != "procedure" && mtype != "task") {
+    if (row.content_empty && mtype == "fact")
+        || (row.content_empty
+            && !mtype.is_empty()
+            && mtype != "rule"
+            && mtype != "procedure"
+            && mtype != "task")
+    {
         content_backfill = Some(backfill_text(&meta));
     }
     // (b) dangling refs in edge arrays, and edges that should exist
-    let mut archived_refs: Vec<String> = meta.get("archived_refs").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()).unwrap_or_default();
+    let mut archived_refs: Vec<String> = meta
+        .get("archived_refs")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
     let mut unresolvable = Vec::new();
     let mut edges: Vec<String> = Vec::new();
     for k in &HYGIENE_EDGE_KEYS {
-        let Some(arr) = meta.get(*k).and_then(|v| v.as_array()).cloned() else { continue };
+        let Some(arr) = meta.get(*k).and_then(|v| v.as_array()).cloned() else {
+            continue;
+        };
         let mut kept = Vec::new();
         for item in &arr {
-            let Some(t) = item.as_str() else { kept.push(item.clone()); continue };
+            let Some(t) = item.as_str() else {
+                kept.push(item.clone());
+                continue;
+            };
             if t == "samples" || t == "total" {
                 unresolvable.push(t.to_string());
                 continue;
@@ -4098,7 +4501,11 @@ fn plan_hygiene_row(
                     "depends_on" => "DEPENDS_ON",
                     _ => "RELATES_TO",
                 };
-                let (from_id, to_id) = if *k == "contained_by" { (t, id.as_str()) } else { (id.as_str(), t) };
+                let (from_id, to_id) = if *k == "contained_by" {
+                    (t, id.as_str())
+                } else {
+                    (id.as_str(), t)
+                };
                 if !view.edge_exists(from_id, to_id, rel_table) {
                     let safe_self = escape_ladybug_string(id);
                     edges.push(format!(
@@ -4118,7 +4525,15 @@ fn plan_hygiene_row(
     if !unresolvable.is_empty() {
         archived_refs.extend(unresolvable);
         if let Some(obj) = meta.as_object_mut() {
-            obj.insert("archived_refs".to_string(), Value::Array(archived_refs.iter().map(|s| Value::String(s.clone())).collect()));
+            obj.insert(
+                "archived_refs".to_string(),
+                Value::Array(
+                    archived_refs
+                        .iter()
+                        .map(|s| Value::String(s.clone()))
+                        .collect(),
+                ),
+            );
         }
         dangling_changed = true;
     }
@@ -4175,7 +4590,11 @@ fn hygiene_target_resolves(conn: &Connection, ns: &str, t: &str) -> Result<bool>
 /// needing repair is skipped, one edited or archived since is judged as it is
 /// now, and one that started needing repair is left for the next run. If any
 /// read fails the plan is discarded and nothing is written.
-fn hygiene_repair_chunk(conn: &Connection, namespace: &str, ids: &[String]) -> Result<(usize, usize)> {
+fn hygiene_repair_chunk(
+    conn: &Connection,
+    namespace: &str,
+    ids: &[String],
+) -> Result<(usize, usize)> {
     let safe_ns = escape_ladybug_string(namespace);
 
     // 1. The rows as they are now, one keyed read each. Archived rows are not
@@ -4209,7 +4628,9 @@ fn hygiene_repair_chunk(conn: &Connection, namespace: &str, ids: &[String]) -> R
         plan_hygiene_row(row, namespace, &view, &mut writes);
     }
     if let Some(failure) = view.failed.borrow().clone() {
-        return Err(anyhow::anyhow!("hygiene repair could not read what it plans from; nothing was written: {failure}"));
+        return Err(anyhow::anyhow!(
+            "hygiene repair could not read what it plans from; nothing was written: {failure}"
+        ));
     }
 
     // 3. Write it.
@@ -4221,7 +4642,13 @@ fn hygiene_repair_chunk(conn: &Connection, namespace: &str, ids: &[String]) -> R
                     tracing::debug!("hygiene edge merge note: {e}");
                 }
             }
-            HygieneWrite::Row { id, meta_q, content_q, shape, dangling } => {
+            HygieneWrite::Row {
+                id,
+                meta_q,
+                content_q,
+                shape,
+                dangling,
+            } => {
                 if let Some(q) = content_q {
                     match conn.query(q) {
                         Err(e) => {
@@ -4277,7 +4704,12 @@ fn active_generation_of_source(conn: &Connection, namespace: &str, source_key: &
             Some(row) => format!("{}", row[0]).parse::<i64>().unwrap_or(0).max(0) as u64,
             None => 0,
         },
-        Err(e) => { tracing::warn!("active_generation_of_source query failed for ({namespace}, {source_key}): {e}"); 0 },
+        Err(e) => {
+            tracing::warn!(
+                "active_generation_of_source query failed for ({namespace}, {source_key}): {e}"
+            );
+            0
+        }
     }
 }
 
@@ -4303,7 +4735,10 @@ fn active_generation_of(conn: &Connection, namespace: &str) -> u64 {
             }
             latest
         }
-        Err(e) => { tracing::warn!("active_generation_of query failed for {namespace}: {e}"); 0 },
+        Err(e) => {
+            tracing::warn!("active_generation_of query failed for {namespace}: {e}");
+            0
+        }
     }
 }
 
@@ -4367,10 +4802,7 @@ fn previous_generations_of(
 /// Published source pointers: `(source_key, active_generation,
 /// previous_generation)`. `previous_generation` is 0 for a store upgraded from
 /// before the column existed, or for a source that has published once.
-fn ingest_pointers_of(
-    conn: &Connection,
-    namespace: &str,
-) -> Result<Vec<(String, u64, u64)>> {
+fn ingest_pointers_of(conn: &Connection, namespace: &str) -> Result<Vec<(String, u64, u64)>> {
     let query = format!(
         "MATCH (g:IngestGeneration) WHERE g.namespace = '{}' AND g.active_generation > 0 RETURN g.source_key, g.active_generation, g.previous_generation",
         escape_ladybug_string(namespace)
@@ -4433,11 +4865,7 @@ fn staging_generations_at(
     Ok(gens)
 }
 
-fn clear_abandoned_staging(
-    conn: &Connection,
-    namespace: &str,
-    now: i64,
-) -> Result<()> {
+fn clear_abandoned_staging(conn: &Connection, namespace: &str, now: i64) -> Result<()> {
     let cutoff = now.saturating_sub(STAGING_TTL_SECS);
     let query = format!(
         "MATCH (s:StagingGeneration) WHERE s.namespace = '{}' AND s.created_at < {cutoff} DELETE s",
@@ -4487,7 +4915,9 @@ pub(crate) fn active_generations_by_source_of(
                 }
             }
         }
-        Err(e) => { tracing::warn!("active_generations_by_source_of query failed: {e}"); }
+        Err(e) => {
+            tracing::warn!("active_generations_by_source_of query failed: {e}");
+        }
     }
     (by_source, active_set, max_non_doc)
 }
@@ -4568,7 +4998,11 @@ fn is_active_scoped_row_with_source(
     } else {
         by_source.iter().any(|(k, &g)| k != "docs" && g == gen_i)
     };
-    if keep { Some(id.to_string()) } else { None }
+    if keep {
+        Some(id.to_string())
+    } else {
+        None
+    }
 }
 
 /// A namespace's active generations, read once, for deciding which rows a
@@ -4583,13 +5017,24 @@ pub(crate) struct ActiveGenerations {
 
 impl ActiveGenerations {
     pub(crate) fn read(conn: &Connection, namespace: &str) -> Self {
-        let (by_source, active_set, max_code_gen) = active_generations_by_source_of(conn, namespace);
-        Self { by_source, active_set, max_code_gen }
+        let (by_source, active_set, max_code_gen) =
+            active_generations_by_source_of(conn, namespace);
+        Self {
+            by_source,
+            active_set,
+            max_code_gen,
+        }
     }
 
     /// Same rule as `is_active_scoped_row`: false for a row of a superseded
     /// generation or another namespace.
-    pub(crate) fn reaches(&self, id: &str, namespace: &str, memory_type: &str, metadata: &Value) -> bool {
+    pub(crate) fn reaches(
+        &self,
+        id: &str,
+        namespace: &str,
+        memory_type: &str,
+        metadata: &Value,
+    ) -> bool {
         self.reaches_source(id, namespace, memory_type, row_source_key(metadata))
     }
 
@@ -4665,6 +5110,117 @@ fn normative_slot_limit(limit: usize) -> usize {
     usize::min(3, limit.div_ceil(2))
 }
 
+/// Graph-expansion slot quota when `limit >= 4`: `(limit / 4).clamp(1, 4)`.
+pub fn expansion_slot_limit(limit: usize) -> usize {
+    if limit < 4 {
+        0
+    } else {
+        (limit / 4).clamp(1, 4)
+    }
+}
+
+/// Two-pool slot reservation (`neurostrata-5xjo` §4.3), backed by the formally
+/// verified `crate::formal_kernel::allocate_hybrid_slots` allocator:
+/// 1. Primary Normative Quota (`normative_slot_limit(limit)`) for `DirectMatch`
+///    normative rows (`rule`, `fact`, `decision`, `procedure`) passing `MAX_NORMATIVE_DISTANCE`.
+/// 2. Graph-Expansion Quota (`expansion_slot_limit(limit)`) for graph-expanded rows
+///    (`OneHop`, `EpisodeSibling`, `Governs2hop`), prioritizing `GOVERNS` edges.
+/// 3. Remaining Slots filled in ascending hybrid distance order across all leftover
+///    candidates, deduplicated by logical ID (`bare_id_of`).
+pub fn reserve_normative_and_expansion_slots(
+    candidates: Vec<SearchResult>,
+    limit: usize,
+) -> Vec<SearchResult> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut deduped: Vec<SearchResult> = Vec::with_capacity(candidates.len());
+    let mut seen_logical: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for r in candidates {
+        let logical = bare_id_of(&r.id).unwrap_or_else(|| r.id.clone());
+        if seen_logical.insert(logical) {
+            deduped.push(r);
+        }
+    }
+
+    let mut normative_primaries: Vec<SearchResult> = Vec::new();
+    let mut expansions: Vec<SearchResult> = Vec::new();
+    let mut other_primaries: Vec<SearchResult> = Vec::new();
+
+    for r in deduped {
+        let is_direct = crate::traits::is_direct_match(&r.evidence);
+        let is_expansion = !is_direct
+            && r.evidence.as_ref().is_some_and(|evs| {
+                evs.iter().any(|e| {
+                    matches!(
+                        e.kind,
+                        crate::traits::EvidenceKind::OneHop
+                            | crate::traits::EvidenceKind::EpisodeSibling
+                            | crate::traits::EvidenceKind::Governs2hop
+                    )
+                })
+            });
+        if is_expansion {
+            expansions.push(r);
+        } else if is_direct
+            && NORMATIVE_MEMORY_TYPES.contains(&r.payload.memory_type.as_str())
+            && r.score <= MAX_NORMATIVE_DISTANCE
+        {
+            normative_primaries.push(r);
+        } else {
+            other_primaries.push(r);
+        }
+    }
+
+    // Prioritize GOVERNS rules and lower hybrid distance within the expansion pool.
+    expansions.sort_by(|a, b| {
+        let a_gov = a.evidence.as_ref().is_some_and(|evs| {
+            evs.iter().any(|e| {
+                e.kind == crate::traits::EvidenceKind::Governs2hop
+                    || e.path.iter().any(|edge| edge.relation == "GOVERNS")
+            })
+        });
+        let b_gov = b.evidence.as_ref().is_some_and(|evs| {
+            evs.iter().any(|e| {
+                e.kind == crate::traits::EvidenceKind::Governs2hop
+                    || e.path.iter().any(|edge| edge.relation == "GOVERNS")
+            })
+        });
+        b_gov
+            .cmp(&a_gov)
+            .then_with(|| a.score.total_cmp(&b.score))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+
+    let alloc = crate::formal_kernel::allocate_hybrid_slots(
+        limit as u32,
+        normative_primaries.len() as u32,
+        expansions.len() as u32,
+        other_primaries.len() as u32,
+    );
+
+    let mut norm_iter = normative_primaries.into_iter();
+    let mut exp_iter = expansions.into_iter();
+    let mut reserved: Vec<SearchResult> = Vec::with_capacity(limit);
+
+    for r in norm_iter.by_ref().take(alloc.normative_taken as usize) {
+        reserved.push(r);
+    }
+    for r in exp_iter.by_ref().take(alloc.expansion_taken as usize) {
+        reserved.push(r);
+    }
+
+    let mut leftover: Vec<SearchResult> = Vec::new();
+    leftover.extend(norm_iter);
+    leftover.extend(other_primaries);
+    leftover.extend(exp_iter);
+    leftover.sort_by(|a, b| a.score.total_cmp(&b.score).then_with(|| a.id.cmp(&b.id)));
+
+    reserved.extend(leftover.into_iter().take(alloc.remaining_taken as usize));
+    reserved.sort_by(|a, b| a.score.total_cmp(&b.score).then_with(|| a.id.cmp(&b.id)));
+    reserved
+}
+
 /// Reserve up to `normative_slot_limit(limit)` slots for normative memories
 /// (`rule`/`fact`/`decision`/`procedure`) that pass `MAX_NORMATIVE_DISTANCE`,
 /// filling remaining slots up to `limit` from `non_normative` (and any leftover
@@ -4714,7 +5270,11 @@ fn all_active_generations(conn: &Connection) -> std::collections::HashSet<(Strin
     match conn.query(query) {
         Ok(rows) => {
             for row in rows {
-                let ns = if let lbug::Value::String(s) = &row[0] { s.clone() } else { continue };
+                let ns = if let lbug::Value::String(s) = &row[0] {
+                    s.clone()
+                } else {
+                    continue;
+                };
                 if let Ok(g) = format!("{}", row[1]).parse::<i64>() {
                     if g > 0 {
                         pairs.insert((ns, g as u64));
@@ -4722,7 +5282,9 @@ fn all_active_generations(conn: &Connection) -> std::collections::HashSet<(Strin
                 }
             }
         }
-        Err(e) => { tracing::warn!("all_active_generations query failed: {e}"); }
+        Err(e) => {
+            tracing::warn!("all_active_generations query failed: {e}");
+        }
     }
     pairs
 }
@@ -4756,9 +5318,7 @@ pub struct KnownIds<'a> {
 impl crate::mention::SymbolIndex for KnownIds<'_> {
     /// The candidate map the detector needs is already memoized on the
     /// index, so it is handed back instead of re-derived per memory.
-    fn cached_candidates(
-        &self,
-    ) -> Option<std::collections::HashMap<String, String>> {
+    fn cached_candidates(&self) -> Option<std::collections::HashMap<String, String>> {
         Some(self.mention_candidates())
     }
 }
@@ -4780,8 +5340,7 @@ impl<'a> KnownIds<'a> {
     }
 
     fn build(ids: impl IntoIterator<Item = &'a str>, active_gen: Option<u64>) -> Self {
-        let mut id_set: std::collections::HashSet<&'a str> =
-            std::collections::HashSet::new();
+        let mut id_set: std::collections::HashSet<&'a str> = std::collections::HashSet::new();
         let mut by_path: std::collections::HashMap<&'a str, Option<&'a str>> =
             std::collections::HashMap::new();
 
@@ -4978,7 +5537,9 @@ fn norm_path(
     edges
         .iter()
         .map(|e| {
-            if *kind == crate::traits::EvidenceKind::OneHop && relations[e.relation.as_str()]["direction"] == "undirected" {
+            if *kind == crate::traits::EvidenceKind::OneHop
+                && relations[e.relation.as_str()]["direction"] == "undirected"
+            {
                 let (a, b) = if e.source <= e.target {
                     (e.source.clone(), e.target.clone())
                 } else {
@@ -5042,7 +5603,10 @@ fn create_missing_edges(
 ) -> Result<usize> {
     let safe_extractor = escape_ladybug_string(extractor);
     if !is_valid_relation_name(rel_type) {
-        anyhow::bail!("invalid relation name for Cypher interpolation: {:?}", rel_type);
+        anyhow::bail!(
+            "invalid relation name for Cypher interpolation: {:?}",
+            rel_type
+        );
     }
     let existing = conn.query(&format!(
         "MATCH (x:Memory)-[:{}]->(y:Memory) RETURN x.id, y.id",
@@ -5104,15 +5668,22 @@ impl LadybugStore {
         self.list(namespace, user_id, memory_type).await
     }
 
-    pub async fn active_generations_public(&self, namespace: &str) -> std::collections::HashSet<u64> {
+    pub async fn active_generations_public(
+        &self,
+        namespace: &str,
+    ) -> std::collections::HashSet<u64> {
         let ns_label = namespace.to_string();
         let namespace = namespace.to_string();
-        self.with_conn(move |conn| Ok(crate::store::ladybug::active_generations_of(conn, &namespace)))
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!("active generations query failed for '{ns_label}': {e}");
-                Default::default()
-            })
+        self.with_conn(move |conn| {
+            Ok(crate::store::ladybug::active_generations_of(
+                conn, &namespace,
+            ))
+        })
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("active generations query failed for '{ns_label}': {e}");
+            Default::default()
+        })
     }
 
     /// Delete every row of one superseded generation in `namespace`.
@@ -5137,11 +5708,7 @@ impl LadybugStore {
     /// Prune's delete: re-checks the rollback target inside the write turn.
     /// A concurrent publish can make the caller's pointer snapshot stale
     /// between selection and deletion.
-    async fn delete_generation_protected(
-        &self,
-        namespace: &str,
-        generation: u64,
-    ) -> Result<usize> {
+    async fn delete_generation_protected(&self, namespace: &str, generation: u64) -> Result<usize> {
         self.delete_generation_inner(namespace, generation, true)
             .await
     }
@@ -5232,9 +5799,9 @@ impl LadybugStore {
         // recorded rollback targets. Recover them from the retained rows'
         // source identities rather than pruning a source's history on the
         // first run after the upgrade.
-        let needs_backfill = pointers.iter().any(|(_, active, previous)| {
-            *active > 0 && *previous == 0
-        });
+        let needs_backfill = pointers
+            .iter()
+            .any(|(_, active, previous)| *active > 0 && *previous == 0);
 
         let ns_scan = namespace.to_string();
         let (generations, by_source) = self
@@ -5300,8 +5867,7 @@ impl LadybugStore {
         let staging = self
             .with_conn(move |conn| staging_generations_of(conn, &ns_for_staging))
             .await?;
-        let mut retained: std::collections::BTreeSet<u64> =
-            active.into_iter().collect();
+        let mut retained: std::collections::BTreeSet<u64> = active.into_iter().collect();
         // A generation being staged is not superseded yet: pruning it would
         // leave the in-flight ingest to publish a pointer onto deleted rows.
         retained.extend(staging);
@@ -5420,9 +5986,18 @@ impl LadybugStore {
             let mut rows: Vec<(String, String)> = Vec::new();
             let now = chrono::Utc::now().timestamp();
             while let Some(row) = res.next() {
-                let id = if let lbug::Value::String(s) = &row[0] { s.clone() } else { continue };
-                let meta = if let lbug::Value::String(s) = &row[1] { s.clone() } else { continue };
-                let parsed_meta: serde_json::Value = serde_json::from_str(&meta).unwrap_or(serde_json::json!({}));
+                let id = if let lbug::Value::String(s) = &row[0] {
+                    s.clone()
+                } else {
+                    continue;
+                };
+                let meta = if let lbug::Value::String(s) = &row[1] {
+                    s.clone()
+                } else {
+                    continue;
+                };
+                let parsed_meta: serde_json::Value =
+                    serde_json::from_str(&meta).unwrap_or(serde_json::json!({}));
                 if is_archived(&parsed_meta) || is_retired_at(&parsed_meta, now) {
                     continue;
                 }
@@ -5436,33 +6011,50 @@ impl LadybugStore {
 
             let mut out: Vec<serde_json::Value> = Vec::new();
             for (declaring_id, meta_str) in &rows {
-                let meta: serde_json::Value = serde_json::from_str(meta_str).unwrap_or(serde_json::json!({}));
+                let meta: serde_json::Value =
+                    serde_json::from_str(meta_str).unwrap_or(serde_json::json!({}));
                 // Skip registry rows.
                 if meta.get("domain_registry").is_some() {
                     continue;
                 }
                 let specs = edge_specs(&meta);
                 for spec in specs {
-                    let mut resolution = if spec.target_id.contains(crate::parser::ingest::NAMESPACE_SEPARATOR) {
+                    let mut resolution = if spec
+                        .target_id
+                        .contains(crate::parser::ingest::NAMESPACE_SEPARATOR)
+                    {
                         match exact_target_exists(conn, &spec.target_id) {
-                            Ok(true) => crate::traits::TargetResolution::Resolved(spec.target_id.clone()),
+                            Ok(true) => {
+                                crate::traits::TargetResolution::Resolved(spec.target_id.clone())
+                            }
                             Ok(false) => {
-                                if let Some(stripped) = spec.target_id.strip_prefix(&format!("{}{}", namespace, crate::parser::ingest::NAMESPACE_SEPARATOR)) {
+                                if let Some(stripped) = spec.target_id.strip_prefix(&format!(
+                                    "{}{}",
+                                    namespace,
+                                    crate::parser::ingest::NAMESPACE_SEPARATOR
+                                )) {
                                     resolve_target_on_write(conn, &namespace, stripped)
                                 } else {
                                     crate::traits::TargetResolution::Missing
                                 }
-                            },
+                            }
                             Err(e) => crate::traits::TargetResolution::Failed(e.to_string()),
                         }
                     } else {
                         resolve_target_on_write(conn, &namespace, &spec.target_id)
                     };
                     // Unambiguous prefix resolution for short (>=7 char) IDs.
-                    if matches!(resolution, crate::traits::TargetResolution::Missing) && spec.target_id.len() >= 7 {
-                        let matches: Vec<String> = known_ids.iter().filter(|id| id.starts_with(&spec.target_id)).cloned().collect();
+                    if matches!(resolution, crate::traits::TargetResolution::Missing)
+                        && spec.target_id.len() >= 7
+                    {
+                        let matches: Vec<String> = known_ids
+                            .iter()
+                            .filter(|id| id.starts_with(&spec.target_id))
+                            .cloned()
+                            .collect();
                         if matches.len() == 1 {
-                            resolution = crate::traits::TargetResolution::Resolved(matches[0].clone());
+                            resolution =
+                                crate::traits::TargetResolution::Resolved(matches[0].clone());
                         }
                     }
                     let reason = match resolution {
@@ -5483,18 +6075,46 @@ impl LadybugStore {
             // Sort by (rel_type, declaring_id, declaration_index, declared_target, reason).
             out.sort_by(|a, b| {
                 let ka = (
-                    a.get("rel_type").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-                    a.get("declaring_id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-                    a.get("declaration_index").and_then(|x| x.as_u64()).unwrap_or(0),
-                    a.get("declared_target").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-                    a.get("reason").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                    a.get("rel_type")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    a.get("declaring_id")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    a.get("declaration_index")
+                        .and_then(|x| x.as_u64())
+                        .unwrap_or(0),
+                    a.get("declared_target")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    a.get("reason")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
                 );
                 let kb = (
-                    b.get("rel_type").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-                    b.get("declaring_id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-                    b.get("declaration_index").and_then(|x| x.as_u64()).unwrap_or(0),
-                    b.get("declared_target").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-                    b.get("reason").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                    b.get("rel_type")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    b.get("declaring_id")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    b.get("declaration_index")
+                        .and_then(|x| x.as_u64())
+                        .unwrap_or(0),
+                    b.get("declared_target")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    b.get("reason")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
                 );
                 ka.cmp(&kb)
             });
@@ -5507,7 +6127,13 @@ impl LadybugStore {
     /// contains `metadata_contains`. The narrowing only drops rows the caller
     /// would discard anyway; every row it returns goes through the same
     /// generation and dedup rules as `list`.
-    pub(crate) async fn list_rows(&self, namespace: &str, user_id: Option<&str>, memory_type: Option<&str>, metadata_contains: Option<&str>) -> Result<Vec<SearchResult>> {
+    pub(crate) async fn list_rows(
+        &self,
+        namespace: &str,
+        user_id: Option<&str>,
+        memory_type: Option<&str>,
+        metadata_contains: Option<&str>,
+    ) -> Result<Vec<SearchResult>> {
         let namespace = namespace.to_string();
         let user_id = user_id.map(|v| v.to_string());
         let memory_type = memory_type.map(|v| v.to_string());
@@ -5651,7 +6277,8 @@ impl LadybugStore {
     /// retried.
     pub async fn repair_namespace_hygiene(&self, namespace: &str) -> Result<(usize, usize)> {
         const PAGE: usize = 500;
-        self.repair_namespace_hygiene_with_page(namespace, PAGE).await
+        self.repair_namespace_hygiene_with_page(namespace, PAGE)
+            .await
     }
 
     async fn repair_namespace_hygiene_with_page(
@@ -5736,7 +6363,8 @@ impl LadybugStore {
                     let mut out = Vec::new();
                     for t in chunk {
                         let exact = exact_target_exists(conn, &t).unwrap_or(false);
-                        let resolved = !exact && hygiene_target_resolves(conn, &ns, &t).unwrap_or(false);
+                        let resolved =
+                            !exact && hygiene_target_resolves(conn, &ns, &t).unwrap_or(false);
                         out.push((t, HygieneTarget { exact, resolved }));
                     }
                     Ok(out)
@@ -5767,7 +6395,11 @@ impl LadybugStore {
 
         // 4. Find the rows that need work. This pass only chooses candidates;
         // it writes nothing, and its plan is thrown away.
-        let view = PrefetchedView { known_ids, targets, existing };
+        let view = PrefetchedView {
+            known_ids,
+            targets,
+            existing,
+        };
         let mut candidates: Vec<String> = Vec::new();
         let mut scratch: Vec<HygieneWrite> = Vec::new();
         for row in &rows {
@@ -5889,17 +6521,25 @@ impl LadybugStore {
                     for item in arr {
                         if let Some(target) = item.as_str() {
                             // resolve target namespace
-                            let (ns, tid) = if target.contains(crate::parser::ingest::NAMESPACE_SEPARATOR) {
-                                let pos = target.find(crate::parser::ingest::NAMESPACE_SEPARATOR).unwrap();
-                                let ns = &target[..pos];
-                                let id = &target[pos + crate::parser::ingest::NAMESPACE_SEPARATOR.len()..];
-                                (ns.to_string(), id.to_string())
-                            } else {
-                                (namespace.to_string(), target.to_string())
-                            };
+                            let (ns, tid) =
+                                if target.contains(crate::parser::ingest::NAMESPACE_SEPARATOR) {
+                                    let pos = target
+                                        .find(crate::parser::ingest::NAMESPACE_SEPARATOR)
+                                        .unwrap();
+                                    let ns = &target[..pos];
+                                    let id = &target
+                                        [pos + crate::parser::ingest::NAMESPACE_SEPARATOR.len()..];
+                                    (ns.to_string(), id.to_string())
+                                } else {
+                                    (namespace.to_string(), target.to_string())
+                                };
                             if let Ok(Some((_, tpayload))) = self.get(&ns, &tid).await {
                                 let target_type = tpayload.memory_type;
-                                if !crate::rdf::shacl::endpoint_role_allowed(rel_type, &source_type, &target_type) {
+                                if !crate::rdf::shacl::endpoint_role_allowed(
+                                    rel_type,
+                                    &source_type,
+                                    &target_type,
+                                ) {
                                     out.push(serde_json::json!({
                                         "id": r.id,
                                         "field": format!("metadata.{}", key),
@@ -5943,7 +6583,11 @@ impl LadybugStore {
         // Align with is_retired_at contract (ladybug.rs:5528): unparseable/non-null
         // valid_to treated as 0 (retired); null → unspecified (active).
         doc.valid_to = metadata.get("valid_to").and_then(|v| {
-            if v.is_null() { None } else { Some(v.as_i64().unwrap_or(0)) }
+            if v.is_null() {
+                None
+            } else {
+                Some(v.as_i64().unwrap_or(0))
+            }
         });
         doc.archived = is_archived(metadata);
         // PAR-02 B4 owner parity: the vector route resolves the owner as
@@ -5970,7 +6614,11 @@ impl LadybugStore {
     }
 
     fn lexical_apply_doc(&self, doc: crate::fts::LexicalDoc) {
-        if let Some(ref idx) = *self.tantivy_lexical.read().unwrap_or_else(|e| e.into_inner()) {
+        if let Some(ref idx) = *self
+            .tantivy_lexical
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+        {
             let mut meta = serde_json::Map::new();
             if !doc.symbol.is_empty() {
                 meta.insert("symbol".to_string(), Value::String(doc.symbol.clone()));
@@ -6007,7 +6655,11 @@ impl LadybugStore {
                 metadata: Value::Object(meta),
             };
             if let Err(e) = idx.upsert_memory(&doc.namespace, &doc.id, &payload) {
-                tracing::warn!("tantivy upsert_memory failed for {}:{}: {e}", doc.namespace, doc.id);
+                tracing::warn!(
+                    "tantivy upsert_memory failed for {}:{}: {e}",
+                    doc.namespace,
+                    doc.id
+                );
             }
         }
         // A scoped write can stage an unpublished row or update an active one
@@ -6021,10 +6673,7 @@ impl LadybugStore {
             self.invalidate_inhouse_lexical(&doc.namespace);
             return;
         }
-        let loaded = self
-            .lexical_loaded
-            .read()
-            .expect("lexical loaded lock");
+        let loaded = self.lexical_loaded.read().expect("lexical loaded lock");
         if !loaded.contains(&doc.namespace) {
             return;
         }
@@ -6036,15 +6685,16 @@ impl LadybugStore {
     }
 
     fn lexical_remove_doc(&self, namespace: &str, id: &str) {
-        if let Some(ref idx) = *self.tantivy_lexical.read().unwrap_or_else(|e| e.into_inner()) {
+        if let Some(ref idx) = *self
+            .tantivy_lexical
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+        {
             if let Err(e) = idx.delete_memory(namespace, id) {
                 tracing::warn!("tantivy delete_memory failed for {namespace}:{id}: {e}");
             }
         }
-        let loaded = self
-            .lexical_loaded
-            .read()
-            .expect("lexical loaded lock");
+        let loaded = self.lexical_loaded.read().expect("lexical loaded lock");
         if !loaded.contains(namespace) {
             return;
         }
@@ -6059,10 +6709,7 @@ impl LadybugStore {
     where
         F: FnMut(&crate::fts::LexicalDoc) -> bool,
     {
-        let loaded = self
-            .lexical_loaded
-            .read()
-            .expect("lexical loaded lock");
+        let loaded = self.lexical_loaded.read().expect("lexical loaded lock");
         if !loaded.contains(namespace) {
             return;
         }
@@ -6071,6 +6718,61 @@ impl LadybugStore {
             .write()
             .expect("lexical index lock")
             .remove_where(namespace, predicate);
+    }
+
+    /// Search with domain expansion, explicit `include_code_ast` gating, and
+    /// configurable `SearchMode` (`Default` vs `Hybrid` RRF).
+    pub async fn search_hybrid_with_domain(
+        &self,
+        namespace: &str,
+        vector: Vec<f32>,
+        limit: usize,
+        include_tasks: bool,
+        include_archived: bool,
+        include_code_ast: bool,
+        domains: &[String],
+        query_text: Option<&str>,
+        exact: bool,
+        search_mode: crate::traits::SearchMode,
+    ) -> Result<DomainSearchOutcome> {
+        self.refresh_ontology(namespace).await;
+        let ontology = self.get_ontology(namespace);
+
+        let mut expanded: HashSet<String> = HashSet::new();
+        let reasoner = crate::rdf::reasoning::ReasoningAdapter::new();
+        for d in domains {
+            if let Some(slug) = ontology.canonical_slug(d) {
+                for e in reasoner.expand_domain(&ontology, &slug) {
+                    expanded.insert(e);
+                }
+            } else if let Some(s) = crate::domain::normalize_domain_slug(d) {
+                expanded.insert(s);
+            }
+        }
+        let domain_keys: HashSet<String> = expanded;
+        let query_owned = query_text.map(|s| s.to_string());
+        let outcome = search_inner(
+            self,
+            namespace,
+            vector,
+            limit,
+            include_tasks,
+            include_archived,
+            include_code_ast,
+            domain_keys,
+            query_owned,
+            exact,
+            search_mode,
+        )
+        .await?;
+        if outcome.incomplete {
+            tracing::debug!(
+                "search_with_domain in '{}' reached fetch_limit ({} results); outcome.incomplete=true",
+                namespace,
+                outcome.results.len()
+            );
+        }
+        Ok(outcome)
     }
 
     async fn ensure_lexical_loaded(&self, namespace: &str) -> Result<()> {
@@ -6088,9 +6790,7 @@ impl LadybugStore {
         // lock, so a load that raced an invalidation cannot install the
         // superseded generation nor mark the namespace loaded.
         for _ in 0..2 {
-            let epoch = self
-                .lexical_epoch
-                .load(std::sync::atomic::Ordering::SeqCst);
+            let epoch = self.lexical_epoch.load(std::sync::atomic::Ordering::SeqCst);
             let namespace_owned = namespace.to_string();
             let docs = self
                 .with_conn(move |conn| {
@@ -6140,11 +6840,7 @@ impl LadybugStore {
 
             {
                 let mut index = self.lexical.write().unwrap_or_else(|e| e.into_inner());
-                if self
-                    .lexical_epoch
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                    != epoch
-                {
+                if self.lexical_epoch.load(std::sync::atomic::Ordering::SeqCst) != epoch {
                     // Invalidated mid-load: fetch the active view again.
                     continue;
                 }
@@ -6180,7 +6876,12 @@ impl LadybugStore {
     }
 
     fn ensure_tantivy_open(&self) -> Result<()> {
-        if self.tantivy_lexical.read().unwrap_or_else(|e| e.into_inner()).is_some() {
+        if self
+            .tantivy_lexical
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        {
             return Ok(());
         }
         let dir = self.tantivy_index_dir();
@@ -6198,12 +6899,18 @@ impl LadybugStore {
         } else {
             crate::lexical::TantivyLexicalIndex::open_or_create(&dir)?
         };
-        *self.tantivy_lexical.write().unwrap_or_else(|e| e.into_inner()) = Some(idx);
+        *self
+            .tantivy_lexical
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(idx);
         Ok(())
     }
 
     /// Rebuild the disk-backed Tantivy lexical index from stored Memory rows.
-    pub async fn rebuild_tantivy_lexical(&self, namespace: Option<&str>) -> Result<(usize, String)> {
+    pub async fn rebuild_tantivy_lexical(
+        &self,
+        namespace: Option<&str>,
+    ) -> Result<(usize, String)> {
         let _guard = self.lexical_refresh_lock.lock().await;
         self.rebuild_tantivy_lexical_locked(namespace).await
     }
@@ -6272,7 +6979,10 @@ impl LadybugStore {
 
         self.ensure_tantivy_open()?;
         let indexed = {
-            let guard = self.tantivy_lexical.read().unwrap_or_else(|e| e.into_inner());
+            let guard = self
+                .tantivy_lexical
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
             let idx = guard.as_ref().expect("tantivy open");
             idx.rebuild_scoped(&rows_data, namespace)?
         };
@@ -6298,10 +7008,7 @@ impl LadybugStore {
             .unwrap_or_else(|e| e.into_inner())
             .is_some();
         if tantivy_open {
-            if let Err(e) = self
-                .rebuild_tantivy_lexical_locked(Some(namespace))
-                .await
-            {
+            if let Err(e) = self.rebuild_tantivy_lexical_locked(Some(namespace)).await {
                 tracing::warn!("lexical refresh after publish failed for {namespace}: {e}");
             }
         }
@@ -6333,8 +7040,38 @@ impl LadybugStore {
         domains: &[String],
         principal: &str,
     ) -> Result<crate::traits::LexicalSearchOutcome> {
+        self.search_tantivy_lexical_with_options(
+            namespace,
+            query,
+            limit,
+            include_tasks,
+            include_archived,
+            domains,
+            principal,
+            true,
+        )
+        .await
+    }
+
+    /// Search using the disk-backed Tantivy lexical index with explicit `include_code_ast` gating.
+    pub async fn search_tantivy_lexical_with_options(
+        &self,
+        namespace: &str,
+        query: &str,
+        limit: usize,
+        include_tasks: bool,
+        include_archived: bool,
+        domains: &[String],
+        principal: &str,
+        include_code_ast: bool,
+    ) -> Result<crate::traits::LexicalSearchOutcome> {
         self.init(namespace).await?;
-        if self.tantivy_lexical.read().unwrap_or_else(|e| e.into_inner()).is_none() {
+        if self
+            .tantivy_lexical
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none()
+        {
             let _ = self.rebuild_tantivy_lexical(Some(namespace)).await?;
         }
         // #149: read the pointers once for the whole page, then use the same
@@ -6353,7 +7090,10 @@ impl LadybugStore {
             Some(active.active_generations_u64())
         };
         let hits = {
-            let guard = self.tantivy_lexical.read().unwrap_or_else(|e| e.into_inner());
+            let guard = self
+                .tantivy_lexical
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
             let idx = guard.as_ref().expect("tantivy open");
             idx.search_with_active_generations(
                 namespace,
@@ -6363,6 +7103,7 @@ impl LadybugStore {
                 include_archived,
                 None,
                 active_set.as_ref(),
+                include_code_ast,
             )?
         };
         let mut candidates = Vec::new();
@@ -6386,6 +7127,11 @@ impl LadybugStore {
                     continue;
                 }
                 if !include_tasks && payload.memory_type == "task" {
+                    continue;
+                }
+                if !include_code_ast
+                    && (payload.memory_type == "code_ast" || payload.memory_type == "doc_section")
+                {
                     continue;
                 }
                 // Defense in depth: never surface an archived row when the
@@ -6959,10 +7705,7 @@ impl LadybugStore {
     /// Used both by `export_database` (after an online `CHECKPOINT`) and by
     /// `neurostrata-mcp backup --no-open` when strict WAL verification refuses
     /// to open the store (`#196`).
-    pub fn export_database_files(
-        source: &std::path::Path,
-        dir: &std::path::Path,
-    ) -> Result<()> {
+    pub fn export_database_files(source: &std::path::Path, dir: &std::path::Path) -> Result<()> {
         std::fs::create_dir_all(dir)?;
         let target = dir.join("ladybug.store");
         // Bracket the copy with the source's (len, mtime): an external
@@ -6982,11 +7725,7 @@ impl LadybugStore {
                 anyhow::anyhow!("could not copy {:?} into the snapshot: {}", source, e)
             })?;
             let after = std::fs::metadata(source).map_err(|e| {
-                anyhow::anyhow!(
-                    "could not stat {:?} after the snapshot copy: {}",
-                    source,
-                    e
-                )
+                anyhow::anyhow!("could not stat {:?} after the snapshot copy: {}", source, e)
             })?;
             if (before.len(), before.modified().ok()) == (after.len(), after.modified().ok()) {
                 break;
@@ -7489,8 +8228,19 @@ impl VectorStore for LadybugStore {
         {
             let ids = self.mention_symbol_ids(&namespace).await;
             let known = crate::store::ladybug::KnownIds::new(ids.iter().map(|s| s.as_str()));
-            for key in ["related_to", "contained_by", "governs", "extracted_from", "depends_on"] {
-                if let Some(arr) = payload.metadata.get(key).and_then(|v| v.as_array()).cloned() {
+            for key in [
+                "related_to",
+                "contained_by",
+                "governs",
+                "extracted_from",
+                "depends_on",
+            ] {
+                if let Some(arr) = payload
+                    .metadata
+                    .get(key)
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                {
                     let mut new_arr = Vec::with_capacity(arr.len());
                     for item in arr {
                         if let Some(s) = item.as_str() {
@@ -7532,7 +8282,9 @@ impl VectorStore for LadybugStore {
         }
         // Stamp topology_original if changed and not already present.
         if !had_topology_original {
-            if let (Some(raw), Some(topo)) = (&raw_topology_original, payload.metadata.get("topology")) {
+            if let (Some(raw), Some(topo)) =
+                (&raw_topology_original, payload.metadata.get("topology"))
+            {
                 // Determine if any field changed.
                 let mut changed = false;
                 if let (Some(raw_obj), Some(topo_obj)) = (raw.as_object(), topo.as_object()) {
@@ -7555,7 +8307,11 @@ impl VectorStore for LadybugStore {
         }
         if payload.metadata.is_object() {
             let now_ts = chrono::Utc::now().timestamp();
-            crate::domain::materialize_facets_bitemporal(&payload.memory_type, &mut payload.metadata, now_ts);
+            crate::domain::materialize_facets_bitemporal(
+                &payload.memory_type,
+                &mut payload.metadata,
+                now_ts,
+            );
         }
 
         // Write-side concept_iri stamping (F20): if metadata.concept_iri absent
@@ -7565,11 +8321,17 @@ impl VectorStore for LadybugStore {
             if let Some(domain_val) = payload.metadata.get("domain").cloned() {
                 let domains: Vec<String> = match &domain_val {
                     serde_json::Value::String(s) => vec![s.clone()],
-                    serde_json::Value::Array(arr) => arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect(),
+                    serde_json::Value::Array(arr) => arr
+                        .iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect(),
                     _ => vec![],
                 };
                 // normalize slugs
-                let mut slugs: Vec<String> = domains.iter().filter_map(|d| crate::domain::normalize_domain_slug(d)).collect();
+                let mut slugs: Vec<String> = domains
+                    .iter()
+                    .filter_map(|d| crate::domain::normalize_domain_slug(d))
+                    .collect();
                 slugs.sort();
                 slugs.dedup();
                 if !slugs.is_empty() {
@@ -7584,12 +8346,16 @@ impl VectorStore for LadybugStore {
                     };
                     let mut iris: Vec<String> = Vec::new();
                     if let Some((_, reg_payload)) = &reg_payload_opt {
-                        let entries = crate::registry::registry_domain_entries(&reg_payload.metadata);
+                        let entries =
+                            crate::registry::registry_domain_entries(&reg_payload.metadata);
                         for slug in &slugs {
                             for e in &entries {
                                 if e.get("slug").and_then(|s| s.as_str()) == Some(slug.as_str()) {
-                                    if let Some(iri) = e.get("concept_iri").and_then(|v| v.as_str()) {
-                                        if !iri.trim().is_empty() && !iris.contains(&iri.to_string()) {
+                                    if let Some(iri) = e.get("concept_iri").and_then(|v| v.as_str())
+                                    {
+                                        if !iri.trim().is_empty()
+                                            && !iris.contains(&iri.to_string())
+                                        {
                                             iris.push(iri.to_string());
                                         }
                                     }
@@ -7608,7 +8374,10 @@ impl VectorStore for LadybugStore {
                         if let Some(cfg) = crate::ontology_grounding::resolve_config(&reg_meta) {
                             match crate::ontology_grounding::load_vocabulary(&cfg.path) {
                                 Ok(vocab) => {
-                                    let v_iris = crate::ontology_grounding::concept_iris_from_vocabulary(&vocab, &slugs);
+                                    let v_iris =
+                                        crate::ontology_grounding::concept_iris_from_vocabulary(
+                                            &vocab, &slugs,
+                                        );
                                     if v_iris.is_empty() {
                                         if cfg.mode == "strict" {
                                             strict_missing = true;
@@ -7657,12 +8426,19 @@ impl VectorStore for LadybugStore {
         if payload.user_id != "auto-ingestor" {
             let ids = self.mention_symbol_ids(&namespace).await;
             let known = crate::store::ladybug::KnownIds::new(ids.iter().map(|s| s.as_str()));
-            let mut mentions = crate::mention::detect_mentions(&payload.content, &payload.location, &known);
+            let mut mentions =
+                crate::mention::detect_mentions(&payload.content, &payload.location, &known);
             mentions.retain(|m| m != &id);
             // Skip symbols already declared via related_to (declared intent wins).
-            if let Some(arr) = payload.metadata.get("related_to").and_then(|v| v.as_array()) {
-                let declared: std::collections::HashSet<String> =
-                    arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+            if let Some(arr) = payload
+                .metadata
+                .get("related_to")
+                .and_then(|v| v.as_array())
+            {
+                let declared: std::collections::HashSet<String> = arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect();
                 mentions.retain(|m| !declared.contains(m));
             }
             if !mentions.is_empty() {
@@ -8139,12 +8915,7 @@ impl VectorStore for LadybugStore {
     /// (in-process and, via the database file lock, cross-process). Concurrent
     /// rule firings therefore serialize instead of losing increments between a
     /// separate get and upsert.
-    async fn increment_metadata_counter(
-        &self,
-        namespace: &str,
-        id: &str,
-        key: &str,
-    ) -> Result<()> {
+    async fn increment_metadata_counter(&self, namespace: &str, id: &str, key: &str) -> Result<()> {
         let namespace = namespace.to_string();
         let id = id.to_string();
         let key = key.to_string();
@@ -8199,6 +8970,7 @@ impl VectorStore for LadybugStore {
             limit,
             include_tasks,
             include_archived,
+            true,
             HashSet::new(),
             None,
             true,
@@ -8219,45 +8991,19 @@ impl VectorStore for LadybugStore {
         query_text: Option<&str>,
         exact: bool,
     ) -> Result<DomainSearchOutcome> {
-        // Refresh the compiled ontology index from the namespace's registry row
-        // (fail-soft: a missing row keeps the previous/empty index).
-        self.refresh_ontology(namespace).await;
-        let ontology = self.get_ontology(namespace);
-
-        let mut expanded: HashSet<String> = HashSet::new();
-        let reasoner = crate::rdf::reasoning::ReasoningAdapter::new();
-        for d in domains {
-            if let Some(slug) = ontology.canonical_slug(d) {
-                for e in reasoner.expand_domain(&ontology, &slug) {
-                    expanded.insert(e);
-                }
-            } else if let Some(s) = crate::domain::normalize_domain_slug(d) {
-                expanded.insert(s);
-            }
-        }
-        let domain_keys: HashSet<String> = expanded;
-        let query_owned = query_text.map(|s| s.to_string());
-        let outcome = search_inner(
-            self,
+        self.search_hybrid_with_domain(
             namespace,
             vector,
             limit,
             include_tasks,
             include_archived,
-            domain_keys,
-            query_owned,
+            true,
+            domains,
+            query_text,
             exact,
             crate::traits::SearchMode::Default,
         )
-        .await?;
-        if outcome.incomplete {
-            tracing::debug!(
-                "search_with_domain in '{}' reached fetch_limit ({} results); outcome.incomplete=true",
-                namespace,
-                outcome.results.len()
-            );
-        }
-        Ok(outcome)
+        .await
     }
 
     async fn search_lexical(
@@ -8350,10 +9096,7 @@ impl VectorStore for LadybugStore {
 
         {
             let mut index = self.lexical.write().unwrap_or_else(|e| e.into_inner());
-            let mut loaded = self
-                .lexical_loaded
-                .write()
-                .expect("lexical loaded lock");
+            let mut loaded = self.lexical_loaded.write().expect("lexical loaded lock");
             for namespace in &namespaces {
                 index.clear_namespace(namespace);
                 loaded.remove(namespace);
@@ -8384,7 +9127,8 @@ impl VectorStore for LadybugStore {
         let scope = query.scope;
         let limit = query.limit;
         let namespace = namespace.to_string();
-        let is_procedure_scope = matches!(scope, crate::traits::DedupCandidateScope::Procedure { .. });
+        let is_procedure_scope =
+            matches!(scope, crate::traits::DedupCandidateScope::Procedure { .. });
         let proc_trigger = match &scope {
             crate::traits::DedupCandidateScope::Procedure { trigger } => Some(trigger.clone()),
             _ => None,
@@ -8538,7 +9282,8 @@ impl VectorStore for LadybugStore {
         exact_content: &str,
         scope: crate::traits::DedupCandidateScope,
     ) -> Result<Vec<crate::traits::ExactContentCandidate>> {
-        let is_procedure_scope = matches!(scope, crate::traits::DedupCandidateScope::Procedure { .. });
+        let is_procedure_scope =
+            matches!(scope, crate::traits::DedupCandidateScope::Procedure { .. });
         let proc_trigger = match &scope {
             crate::traits::DedupCandidateScope::Procedure { trigger } => Some(trigger.clone()),
             _ => None,
@@ -8762,13 +9507,11 @@ impl VectorStore for LadybugStore {
         let started = std::time::Instant::now();
         let stopped = Arc::clone(&self.checkpoints_stopped);
         let checkpoint_result: Result<()> = {
-            let (returned, outcome) = Self::write_owning_turn(
-                self.db.clone(),
-                Arc::clone(&stopped),
-                turn,
-                move |conn| guarded_checkpoint(conn, &stopped),
-            )
-            .await?;
+            let (returned, outcome) =
+                Self::write_owning_turn(self.db.clone(), Arc::clone(&stopped), turn, move |conn| {
+                    guarded_checkpoint(conn, &stopped)
+                })
+                .await?;
             turn = returned;
             outcome
         };
@@ -8784,7 +9527,10 @@ impl VectorStore for LadybugStore {
     }
 
     async fn checkpoint(&self) -> Result<()> {
-        if self.checkpoints_stopped.load(std::sync::atomic::Ordering::Acquire) {
+        if self
+            .checkpoints_stopped
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
             anyhow::bail!(
                 "checkpoint skipped: an earlier one ran out of buffer pool and a retry would grow \
                  ladybug.db; raise NEUROSTRATA_BUFFER_POOL_MB and restart"
@@ -8910,9 +9656,16 @@ impl VectorStore for LadybugStore {
                     &known,
                 );
                 mentions.retain(|m| m != &memory.id);
-                if let Some(arr) = memory.payload.metadata.get("related_to").and_then(|v| v.as_array()) {
-                    let declared: std::collections::HashSet<String> =
-                        arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+                if let Some(arr) = memory
+                    .payload
+                    .metadata
+                    .get("related_to")
+                    .and_then(|v| v.as_array())
+                {
+                    let declared: std::collections::HashSet<String> = arr
+                        .iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect();
                     mentions.retain(|m| !declared.contains(m));
                 }
                 let mut meta = memory.payload.metadata.clone();
@@ -8932,7 +9685,11 @@ impl VectorStore for LadybugStore {
             }
         }
 
-        if wanted.is_empty() && active_paths.is_empty() && mention_pairs.is_empty() && mention_updates.is_empty() {
+        if wanted.is_empty()
+            && active_paths.is_empty()
+            && mention_pairs.is_empty()
+            && mention_updates.is_empty()
+        {
             return Ok(0);
         }
 
@@ -9174,18 +9931,15 @@ impl VectorStore for LadybugStore {
             Ok(())
         })
         .await?;
-        self.refresh_lexical_after_pointer_change(&refresh_ns)
-            .await;
+        self.refresh_lexical_after_pointer_change(&refresh_ns).await;
         Ok(())
     }
 
     async fn active_generation(&self, namespace: &str, source_key: &str) -> Result<u64> {
         let namespace = namespace.to_string();
         let source_key = source_key.to_string();
-        self.with_conn(move |conn| {
-            Ok(active_generation_of_source(conn, &namespace, &source_key))
-        })
-        .await
+        self.with_conn(move |conn| Ok(active_generation_of_source(conn, &namespace, &source_key)))
+            .await
     }
 
     async fn generation_nodes(&self, namespace: &str, generation: u64) -> Result<Vec<String>> {
@@ -9213,7 +9967,11 @@ impl VectorStore for LadybugStore {
     /// content is never fetched and its metadata is parsed, summarised and
     /// dropped one row at a time. Separate from `list_rows` on purpose: that
     /// one backs `list` and `list_pinned` and must keep returning full rows.
-    async fn generation_summary(&self, namespace: &str, generation: u64) -> Result<Vec<crate::traits::GenerationRow>> {
+    async fn generation_summary(
+        &self,
+        namespace: &str,
+        generation: u64,
+    ) -> Result<Vec<crate::traits::GenerationRow>> {
         let namespace = namespace.to_string();
         self.with_conn(move |conn| {
             let active = ActiveGenerations::read(conn, &namespace);
@@ -9251,7 +10009,12 @@ impl VectorStore for LadybugStore {
         .await
     }
 
-    async fn list(&self, namespace: &str, user_id: Option<&str>, memory_type: Option<&str>) -> Result<Vec<SearchResult>> {
+    async fn list(
+        &self,
+        namespace: &str,
+        user_id: Option<&str>,
+        memory_type: Option<&str>,
+    ) -> Result<Vec<SearchResult>> {
         self.list_rows(namespace, user_id, memory_type, None).await
     }
 
@@ -9987,9 +10750,7 @@ fn add_metadata_fallback_conn(
                 Value::Null
             }
         };
-        if is_archived(&metadata)
-            || is_retired_at(&metadata, now)
-            || is_mesh_conflicting(&metadata)
+        if is_archived(&metadata) || is_retired_at(&metadata, now) || is_mesh_conflicting(&metadata)
         {
             continue;
         }
@@ -10182,8 +10943,7 @@ impl GraphRead for LadybugStore {
                     &active_gens,
                 )?;
 
-                let mut hits =
-                    graph_hits_from_edges(conn, &ns, &candidates, &file_ids, &types)?;
+                let mut hits = graph_hits_from_edges(conn, &ns, &candidates, &file_ids, &types)?;
 
                 add_metadata_fallback_conn(
                     conn,
@@ -10220,23 +10980,31 @@ impl GraphRead for LadybugStore {
         for hit in hits.iter_mut() {
             let mut bridges: Vec<crate::graph_read::memories_for_file::ConceptualBridge> =
                 Vec::with_capacity(2);
-            let mut seen_targets: std::collections::HashSet<String> = std::collections::HashSet::new();
-            let relations_vec: Vec<String> = ["GOVERNS", "CONTAINS", "RELATES_TO", "EXTRACTED_FROM", "DEPENDS_ON"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
-            if let Ok(related) = self.related(
-                &namespace,
-                &hit.id,
-                &relations_vec,
-                crate::graph_read::related::Direction::Both,
-                1,
-                &[],
-                50,
-                None,
-                &crate::graph_read::traversal::CrossNamespacePolicy::default(),
-            )
-            .await
+            let mut seen_targets: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            let relations_vec: Vec<String> = [
+                "GOVERNS",
+                "CONTAINS",
+                "RELATES_TO",
+                "EXTRACTED_FROM",
+                "DEPENDS_ON",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+            if let Ok(related) = self
+                .related(
+                    &namespace,
+                    &hit.id,
+                    &relations_vec,
+                    crate::graph_read::related::Direction::Both,
+                    1,
+                    &[],
+                    50,
+                    None,
+                    &crate::graph_read::traversal::CrossNamespacePolicy::default(),
+                )
+                .await
             {
                 let via_ids: Vec<&str> = related
                     .nodes
@@ -10245,27 +11013,40 @@ impl GraphRead for LadybugStore {
                     .map(|n| n.id.as_str())
                     .collect();
                 for via_id in &via_ids {
-                    if bridges.len() >= 2 { break; }
-                    let relations_vec: Vec<String> = ["GOVERNS", "CONTAINS", "RELATES_TO", "EXTRACTED_FROM", "DEPENDS_ON"]
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect();
-                    if let Ok(related2) = self.related(
-                        &namespace,
-                        via_id,
-                        &relations_vec,
-                        crate::graph_read::related::Direction::Both,
-                        1,
-                        &[],
-                        50,
-                        None,
-                        &crate::graph_read::traversal::CrossNamespacePolicy::default(),
-                    )
-                    .await
+                    if bridges.len() >= 2 {
+                        break;
+                    }
+                    let relations_vec: Vec<String> = [
+                        "GOVERNS",
+                        "CONTAINS",
+                        "RELATES_TO",
+                        "EXTRACTED_FROM",
+                        "DEPENDS_ON",
+                    ]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                    if let Ok(related2) = self
+                        .related(
+                            &namespace,
+                            via_id,
+                            &relations_vec,
+                            crate::graph_read::related::Direction::Both,
+                            1,
+                            &[],
+                            50,
+                            None,
+                            &crate::graph_read::traversal::CrossNamespacePolicy::default(),
+                        )
+                        .await
                     {
                         for target_node in &related2.nodes {
-                            if bridges.len() >= 2 { break; }
-                            if target_node.id == hit.id || target_node.id == *via_id { continue; }
+                            if bridges.len() >= 2 {
+                                break;
+                            }
+                            if target_node.id == hit.id || target_node.id == *via_id {
+                                continue;
+                            }
                             if seen_targets.contains(&target_node.id) {
                                 continue;
                             }
@@ -10295,35 +11076,39 @@ impl GraphRead for LadybugStore {
                                     std::collections::HashSet::new();
                                 seed_tokens.extend(crate::task::feature_tokens(&hit.metadata, ""));
                                 if !target_tokens.is_empty() {
-                                    let sim = crate::task::jaccard_similarity(&seed_tokens, &target_tokens);
+                                    let sim = crate::task::jaccard_similarity(
+                                        &seed_tokens,
+                                        &target_tokens,
+                                    );
                                     if sim >= 0.35 {
                                         continue;
                                     }
                                 }
                                 seen_targets.insert(target_node.id.clone());
                                 let target_type = target_payload.memory_type.clone();
-                                let target_summary =
-                                    if target_payload.content.chars().count() > 160 {
-                                        target_payload
-                                            .content
-                                            .chars()
-                                            .take(160)
-                                            .collect::<String>()
-                                    } else {
-                                        target_payload.content.clone()
-                                    };
-                                bridges.push(crate::graph_read::memories_for_file::ConceptualBridge {
-                                    source_id: hit.id.clone(),
-                                    via_id: via_id.to_string(),
-                                    target_id: target_node.id.clone(),
-                                    target_domain: target_domain
-                                        .first()
-                                        .cloned()
-                                        .unwrap_or_default(),
-                                    target_type,
-                                    target_summary,
-                                    path: format!("{} -> {} -> {}", hit.id, via_id, target_node.id),
-                                });
+                                let target_summary = if target_payload.content.chars().count() > 160
+                                {
+                                    target_payload.content.chars().take(160).collect::<String>()
+                                } else {
+                                    target_payload.content.clone()
+                                };
+                                bridges.push(
+                                    crate::graph_read::memories_for_file::ConceptualBridge {
+                                        source_id: hit.id.clone(),
+                                        via_id: via_id.to_string(),
+                                        target_id: target_node.id.clone(),
+                                        target_domain: target_domain
+                                            .first()
+                                            .cloned()
+                                            .unwrap_or_default(),
+                                        target_type,
+                                        target_summary,
+                                        path: format!(
+                                            "{} -> {} -> {}",
+                                            hit.id, via_id, target_node.id
+                                        ),
+                                    },
+                                );
                             }
                         }
                     }
@@ -10442,43 +11227,41 @@ fn fetch_related_subgraph(
         relations
             .iter()
             .map(String::as_str)
-            .filter(|r| crate::graph_read::related::is_allowed_relation(r) || expanded_set.contains(*r))
+            .filter(|r| {
+                crate::graph_read::related::is_allowed_relation(r) || expanded_set.contains(*r)
+            })
             .collect()
     };
 
-    let to_node_spec = |id: String,
-                        memory_type: String,
-                        content: String,
-                        metadata: &Value|
-     -> NodeSpec {
-        let visible = is_active_id(&id, &active_gens)
-            && !is_archived(metadata)
-            && !is_retired_at(metadata, now)
-            && !is_mesh_conflicting(metadata)
-            && !crate::registry::is_registry_row(metadata);
-        NodeSpec {
-            id,
-            memory_type,
-            content,
-            domain: metadata
-                .get("domain")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-            freshness: metadata
-                .get("verification")
-                .and_then(|v| v.get("status"))
-                .and_then(|s| s.as_str())
-                .map(str::to_string),
-            lifecycle: metadata
-                .get("superseded_by")
-                .and_then(|v| v.as_str())
-                .map(|_| "superseded".to_string()),
-            visible,
-        }
-    };
+    let to_node_spec =
+        |id: String, memory_type: String, content: String, metadata: &Value| -> NodeSpec {
+            let visible = is_active_id(&id, &active_gens)
+                && !is_archived(metadata)
+                && !is_retired_at(metadata, now)
+                && !is_mesh_conflicting(metadata)
+                && !crate::registry::is_registry_row(metadata);
+            NodeSpec {
+                id,
+                memory_type,
+                content,
+                domain: metadata
+                    .get("domain")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                freshness: metadata
+                    .get("verification")
+                    .and_then(|v| v.get("status"))
+                    .and_then(|s| s.as_str())
+                    .map(str::to_string),
+                lifecycle: metadata
+                    .get("superseded_by")
+                    .and_then(|v| v.as_str())
+                    .map(|_| "superseded".to_string()),
+                visible,
+            }
+        };
 
-    let mut nodes: std::collections::HashMap<String, NodeSpec> =
-        std::collections::HashMap::new();
+    let mut nodes: std::collections::HashMap<String, NodeSpec> = std::collections::HashMap::new();
     let mut edges: Vec<EdgeSpec> = Vec::new();
 
     // Resolve the seed: an exact id first (memory/task/qualified id), then a
@@ -10535,7 +11318,10 @@ fn fetch_related_subgraph(
                     Value::Null
                 }
             };
-            let prefer = match (candidate.as_ref().map(|c| c.1.as_str()), memory_type.as_str()) {
+            let prefer = match (
+                candidate.as_ref().map(|c| c.1.as_str()),
+                memory_type.as_str(),
+            ) {
                 (_, "file") => true,
                 (Some("file"), _) => false,
                 (Some("symbol"), "directory") => false,
@@ -10547,7 +11333,10 @@ fn fetch_related_subgraph(
         }
         if let Some((id, memory_type, content, metadata)) = candidate {
             seed_id = Some(id.clone());
-            nodes.insert(id.clone(), to_node_spec(id, memory_type, content, &metadata));
+            nodes.insert(
+                id.clone(),
+                to_node_spec(id, memory_type, content, &metadata),
+            );
         }
     }
 
@@ -10607,8 +11396,9 @@ fn fetch_related_subgraph(
                 if !allowed.contains(relation.as_str()) {
                     continue;
                 }
-                let target_ns = crate::graph_read::traversal::extract_namespace_prefix(&neighbor_id)
-                    .unwrap_or(neighbor_ns.as_str());
+                let target_ns =
+                    crate::graph_read::traversal::extract_namespace_prefix(&neighbor_id)
+                        .unwrap_or(neighbor_ns.as_str());
                 if !cross_namespace.is_allowed(namespace, target_ns) {
                     continue;
                 }
@@ -10665,8 +11455,9 @@ fn fetch_related_subgraph(
                 if !allowed.contains(relation.as_str()) {
                     continue;
                 }
-                let target_ns = crate::graph_read::traversal::extract_namespace_prefix(&neighbor_id)
-                    .unwrap_or(neighbor_ns.as_str());
+                let target_ns =
+                    crate::graph_read::traversal::extract_namespace_prefix(&neighbor_id)
+                        .unwrap_or(neighbor_ns.as_str());
                 if !cross_namespace.is_allowed(namespace, target_ns) {
                     continue;
                 }
@@ -10715,7 +11506,10 @@ impl LadybugStore {
 
     fn truncate_neighbor_content(raw: &str) -> (String, bool) {
         let mut chars = raw.chars();
-        let prefix: String = chars.by_ref().take(Self::MAX_NEIGHBOR_CONTENT_CHARS).collect();
+        let prefix: String = chars
+            .by_ref()
+            .take(Self::MAX_NEIGHBOR_CONTENT_CHARS)
+            .collect();
         if chars.next().is_some() {
             (format!("{prefix}\u{2026}"), true)
         } else {
@@ -10733,7 +11527,13 @@ impl LadybugStore {
         }
         let mut compact = serde_json::Map::new();
         if let Some(obj) = meta.as_object() {
-            for key in ["governs", "superseded_by", "symbol_name", "ast_kind", "eligibility"] {
+            for key in [
+                "governs",
+                "superseded_by",
+                "symbol_name",
+                "ast_kind",
+                "eligibility",
+            ] {
                 if let Some(val) = obj.get(key) {
                     compact.insert(key.to_string(), val.clone());
                 }
@@ -11053,8 +11853,7 @@ impl LadybugStore {
                     if content_trunc {
                         entry["truncated"] = Value::Bool(true);
                     }
-                    let entry_bytes =
-                        serde_json::to_string(&entry).map(|s| s.len()).unwrap_or(64);
+                    let entry_bytes = serde_json::to_string(&entry).map(|s| s.len()).unwrap_or(64);
                     if !symbols.is_empty() && ast_bytes + entry_bytes > byte_budget {
                         mark_collection_truncated(
                             "symbols",
@@ -11288,8 +12087,7 @@ impl LadybugStore {
                         "content": location,
                         "path": location,
                     });
-                    let entry_bytes =
-                        serde_json::to_string(&entry).map(|s| s.len()).unwrap_or(64);
+                    let entry_bytes = serde_json::to_string(&entry).map(|s| s.len()).unwrap_or(64);
                     if !importers.is_empty() && ast_bytes + entry_bytes > byte_budget {
                         mark_collection_truncated(
                             "importers",
@@ -11348,8 +12146,7 @@ impl LadybugStore {
                         "content": location,
                         "path": location,
                     });
-                    let entry_bytes =
-                        serde_json::to_string(&entry).map(|s| s.len()).unwrap_or(64);
+                    let entry_bytes = serde_json::to_string(&entry).map(|s| s.len()).unwrap_or(64);
                     if !importers.is_empty() && ast_bytes + entry_bytes > byte_budget {
                         mark_collection_truncated(
                             "importers",
@@ -11372,11 +12169,8 @@ impl LadybugStore {
             }
         }
 
-        let blast_radius_count = symbols.len()
-            + callers.len()
-            + callees.len()
-            + imports.len()
-            + importers.len();
+        let blast_radius_count =
+            symbols.len() + callers.len() + callees.len() + imports.len() + importers.len();
 
         Ok(serde_json::json!({
             "symbols": symbols,
@@ -11533,7 +12327,8 @@ impl crate::traits::IntakeStore for LadybugStore {
     async fn list_receipts(
         &self,
         request: crate::task::intake::ListReceiptsRequest,
-    ) -> Result<crate::task::intake::IntakeListResponse<crate::task::intake::IntakeReceipt>, String> {
+    ) -> Result<crate::task::intake::IntakeListResponse<crate::task::intake::IntakeReceipt>, String>
+    {
         let namespace = request.namespace.clone();
         let limit = request.limit.unwrap_or(50);
         let offset = request.offset.unwrap_or(0);
@@ -11619,7 +12414,8 @@ impl crate::traits::IntakeStore for LadybugStore {
     async fn list_candidates(
         &self,
         request: crate::task::intake::ListCandidatesRequest,
-    ) -> Result<crate::task::intake::IntakeListResponse<crate::task::intake::IntakeCandidate>, String> {
+    ) -> Result<crate::task::intake::IntakeListResponse<crate::task::intake::IntakeCandidate>, String>
+    {
         let namespace = request.namespace.clone();
         let limit = request.limit.unwrap_or(50);
         let offset = request.offset.unwrap_or(0);
@@ -11986,16 +12782,15 @@ pub(crate) fn is_retired_at(metadata: &Value, now: i64) -> bool {
 /// legacy absolute path finds the file it meant.
 fn declared_target_candidates(namespace: &str, active_gen: u64, declared: &str) -> Vec<String> {
     let declared = declared.replace('\\', "/");
-    let mut candidates =
-        vec![crate::parser::ingest::generation_scoped_id(namespace, active_gen, &declared)];
+    let mut candidates = vec![crate::parser::ingest::generation_scoped_id(
+        namespace, active_gen, &declared,
+    )];
     for (cut, _) in declared.match_indices('/') {
         let suffix = &declared[cut + 1..];
         if !suffix.is_empty() {
             candidates.push(suffix.to_string());
             candidates.push(crate::parser::ingest::generation_scoped_id(
-                namespace,
-                active_gen,
-                suffix,
+                namespace, active_gen, suffix,
             ));
         }
     }
@@ -12167,8 +12962,7 @@ mod tests {
             .ok()
             .map(|c| c.storage_hygiene.snapshot_retention_count)
             .unwrap_or_else(|| {
-                crate::storage::snapshot::StorageHygieneConfig::default()
-                    .snapshot_retention_count
+                crate::storage::snapshot::StorageHygieneConfig::default().snapshot_retention_count
             })
             .max(1);
 
@@ -12213,10 +13007,8 @@ mod tests {
         std::env::set_var("NEUROSTRATA_SNAPSHOT_RETENTION_COUNT", "2");
         std::env::set_var("NEUROSTRATA_PRUNE_SNAPSHOTS", "1");
 
-        let root = std::env::temp_dir().join(format!(
-            "lbug-export-retention-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("lbug-export-retention-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let db = root.join("store.db");
@@ -12567,7 +13359,9 @@ eurostrata\src\daemon.rs",
             .verify_or_record_embedding_descriptor("probe", &dims_mismatch)
             .expect_err("dimension mismatch must be rejected");
         assert!(
-            dims_err.to_string().contains("embedding descriptor mismatch"),
+            dims_err
+                .to_string()
+                .contains("embedding descriptor mismatch"),
             "unexpected error: {dims_err}"
         );
 
@@ -12577,7 +13371,9 @@ eurostrata\src\daemon.rs",
             .verify_or_record_embedding_descriptor("probe", &model_mismatch)
             .expect_err("model change must be rejected");
         assert!(
-            model_err.to_string().contains("embedding descriptor mismatch"),
+            model_err
+                .to_string()
+                .contains("embedding descriptor mismatch"),
             "unexpected error: {model_err}"
         );
 
@@ -12611,21 +13407,35 @@ eurostrata\src\daemon.rs",
             json!({"visible_to": [{"principal": "alice", "role": "viewer"}]}),
         );
         payload.content = "parityneedle confidential memory".to_string();
-        store.upsert("probe", "private", vec![0.0; 4], payload).await.unwrap();
+        store
+            .upsert("probe", "private", vec![0.0; 4], payload)
+            .await
+            .unwrap();
 
         for principal in ["alice", "owner", "admin"] {
             let hits = store
                 .search_lexical("probe", "parityneedle", 10, false, false, &[], principal, 0)
-                .await.unwrap().results;
-            assert_eq!(hits.len(), 1, "allowed reader {principal} must retain retrieval");
+                .await
+                .unwrap()
+                .results;
+            assert_eq!(
+                hits.len(),
+                1,
+                "allowed reader {principal} must retain retrieval"
+            );
             assert_eq!(hits[0].id, "private");
             assert_eq!(hits[0].payload.content, "parityneedle confidential memory");
         }
         for principal in ["bob", ""] {
             let hits = store
                 .search_lexical("probe", "parityneedle", 10, false, false, &[], principal, 0)
-                .await.unwrap().results;
-            assert!(hits.is_empty(), "object ACL must deny unauthorized principal {principal:?}");
+                .await
+                .unwrap()
+                .results;
+            assert!(
+                hits.is_empty(),
+                "object ACL must deny unauthorized principal {principal:?}"
+            );
         }
     }
 
@@ -12636,22 +13446,66 @@ eurostrata\src\daemon.rs",
         let store = LadybugStore::for_testing(&db, 4).unwrap();
         store.init("probe").await.unwrap();
         // Load the empty index first, so upserts must update an already loaded index.
-        assert!(store.search_lexical("probe", "parityneedle", 100, false, false, &[], "admin", 0)
-            .await.unwrap().results.is_empty());
+        assert!(store
+            .search_lexical("probe", "parityneedle", 100, false, false, &[], "admin", 0)
+            .await
+            .unwrap()
+            .results
+            .is_empty());
         let cases: Vec<(&str, Value, &[&str])> = vec![
-            ("object-viewer", json!({"visible_to": [{"principal": "alice", "role": "viewer"}]}), &["alice"]),
-            ("object-editor", json!({"visible_to": [{"principal": "alice", "role": "editor"}]}), &["alice"]),
-            ("object-owner", json!({"visible_to": [{"principal": "alice", "role": "owner"}]}), &["alice"]),
-            ("object-default", json!({"visible_to": [{"principal": "alice"}]}), &["alice"]),
-            ("object-unknown-role", json!({"visible_to": [{"principal": "alice", "role": "unknown"}]}), &["alice"]),
+            (
+                "object-viewer",
+                json!({"visible_to": [{"principal": "alice", "role": "viewer"}]}),
+                &["alice"],
+            ),
+            (
+                "object-editor",
+                json!({"visible_to": [{"principal": "alice", "role": "editor"}]}),
+                &["alice"],
+            ),
+            (
+                "object-owner",
+                json!({"visible_to": [{"principal": "alice", "role": "owner"}]}),
+                &["alice"],
+            ),
+            (
+                "object-default",
+                json!({"visible_to": [{"principal": "alice"}]}),
+                &["alice"],
+            ),
+            (
+                "object-unknown-role",
+                json!({"visible_to": [{"principal": "alice", "role": "unknown"}]}),
+                &["alice"],
+            ),
             ("string", json!({"visible_to": ["bob"]}), &["bob"]),
-            ("mixed", json!({"visible_to": ["bob", {"principal": "alice", "role": "editor"}, 42]}), &["alice", "bob"]),
+            (
+                "mixed",
+                json!({"visible_to": ["bob", {"principal": "alice", "role": "editor"}, 42]}),
+                &["alice", "bob"],
+            ),
             ("malformed-number", json!({"visible_to": [42]}), &[]),
-            ("malformed-object", json!({"visible_to": [{"role": "viewer"}, {"principal": 42}, null]}), &[]),
-            ("partial-object", json!({"visible_to": [null, {"principal": "alice"}]}), &["alice"]),
-            ("partial-string", json!({"visible_to": [42, "bob"]}), &["bob"]),
+            (
+                "malformed-object",
+                json!({"visible_to": [{"role": "viewer"}, {"principal": 42}, null]}),
+                &[],
+            ),
+            (
+                "partial-object",
+                json!({"visible_to": [null, {"principal": "alice"}]}),
+                &["alice"],
+            ),
+            (
+                "partial-string",
+                json!({"visible_to": [42, "bob"]}),
+                &["bob"],
+            ),
             ("wildcard-string", json!({"visible_to": ["*"]}), &["*"]),
-            ("wildcard-object", json!({"visible_to": [{"principal": "*", "role": "editor"}]}), &["*"]),
+            (
+                "wildcard-object",
+                json!({"visible_to": [{"principal": "*", "role": "editor"}]}),
+                &["*"],
+            ),
             ("empty", json!({"visible_to": []}), &["*"]),
             ("absent", json!({}), &["*"]),
             ("legacy-null", json!({"visible_to": null}), &["*"]),
@@ -12660,30 +13514,78 @@ eurostrata\src\daemon.rs",
         for (id, metadata, _) in &cases {
             let mut payload = retired_test_payload("rule", "owner", metadata.clone());
             payload.content = "parityneedle confidential memory".to_string();
-            store.upsert("probe", id, vec![0.0; 4], payload).await.unwrap();
+            store
+                .upsert("probe", id, vec![0.0; 4], payload)
+                .await
+                .unwrap();
         }
 
-        async fn assert_contract(store: &LadybugStore, cases: &[(&str, Value, &[&str])], phase: &str) {
+        async fn assert_contract(
+            store: &LadybugStore,
+            cases: &[(&str, Value, &[&str])],
+            phase: &str,
+        ) {
             for principal in ["owner", "admin", "alice", "bob", "malice", "eve", ""] {
-                let expected: std::collections::BTreeSet<_> = cases.iter()
-                    .filter(|(_, _, readers)| !principal.is_empty()
-                        && (matches!(principal, "owner" | "admin")
-                            || readers.contains(&"*") || readers.contains(&principal)))
-                    .map(|(id, _, _)| id.to_string()).collect();
-                let hits = store.search_lexical("probe", "parityneedle", 100, false, false, &[], principal, 0)
-                    .await.unwrap().results;
-                let actual: std::collections::BTreeSet<_> = hits.iter().map(|hit| hit.id.clone()).collect();
-                assert_eq!(actual, expected, "in-house {phase}, principal {principal:?}");
-                assert!(hits.iter().all(|hit| hit.payload.content == "parityneedle confidential memory"));
-                let tantivy = store.search_tantivy_lexical("probe", "parityneedle", 100, false, false, &[], principal)
-                    .await.unwrap().results;
-                let tantivy_ids: std::collections::BTreeSet<_> = tantivy.iter().map(|hit| hit.id.clone()).collect();
-                assert_eq!(tantivy_ids, expected, "Tantivy hydration {phase}, principal {principal:?}");
+                let expected: std::collections::BTreeSet<_> = cases
+                    .iter()
+                    .filter(|(_, _, readers)| {
+                        !principal.is_empty()
+                            && (matches!(principal, "owner" | "admin")
+                                || readers.contains(&"*")
+                                || readers.contains(&principal))
+                    })
+                    .map(|(id, _, _)| id.to_string())
+                    .collect();
+                let hits = store
+                    .search_lexical(
+                        "probe",
+                        "parityneedle",
+                        100,
+                        false,
+                        false,
+                        &[],
+                        principal,
+                        0,
+                    )
+                    .await
+                    .unwrap()
+                    .results;
+                let actual: std::collections::BTreeSet<_> =
+                    hits.iter().map(|hit| hit.id.clone()).collect();
+                assert_eq!(
+                    actual, expected,
+                    "in-house {phase}, principal {principal:?}"
+                );
+                assert!(hits
+                    .iter()
+                    .all(|hit| hit.payload.content == "parityneedle confidential memory"));
+                let tantivy = store
+                    .search_tantivy_lexical(
+                        "probe",
+                        "parityneedle",
+                        100,
+                        false,
+                        false,
+                        &[],
+                        principal,
+                    )
+                    .await
+                    .unwrap()
+                    .results;
+                let tantivy_ids: std::collections::BTreeSet<_> =
+                    tantivy.iter().map(|hit| hit.id.clone()).collect();
+                assert_eq!(
+                    tantivy_ids, expected,
+                    "Tantivy hydration {phase}, principal {principal:?}"
+                );
             }
         }
 
         assert_contract(&store, &cases, "incremental").await;
-        assert_eq!(store.rebuild_lexical_index(Some("probe")).await.unwrap(), cases.len());
+        assert_eq!(
+            store.rebuild_lexical_index(Some("probe")).await.unwrap(),
+            cases.len()
+        );
         assert_contract(&store, &cases, "rebuilt").await;
         drop(store);
         let reopened = LadybugStore::for_testing(&db, 4).unwrap();
@@ -12723,15 +13625,32 @@ eurostrata\src\daemon.rs",
         );
         let clean_payload = tantivy_exclusion_payload("zebratoken clean row", json!({}));
 
-        store.lexical_apply_doc(LadybugStore::lexical_doc("probe", "registry-row", &registry_payload));
-        store.lexical_apply_doc(LadybugStore::lexical_doc("probe", "conflicting-row", &conflicting_payload));
-        store.lexical_apply_doc(LadybugStore::lexical_doc("probe", "clean-row", &clean_payload));
+        store.lexical_apply_doc(LadybugStore::lexical_doc(
+            "probe",
+            "registry-row",
+            &registry_payload,
+        ));
+        store.lexical_apply_doc(LadybugStore::lexical_doc(
+            "probe",
+            "conflicting-row",
+            &conflicting_payload,
+        ));
+        store.lexical_apply_doc(LadybugStore::lexical_doc(
+            "probe",
+            "clean-row",
+            &clean_payload,
+        ));
 
         let guard = store.tantivy_lexical.read().unwrap();
         let idx = guard.as_ref().expect("tantivy open");
-        let hits = idx.search("probe", "zebratoken", 10, true, true, None).unwrap();
+        let hits = idx
+            .search("probe", "zebratoken", 10, true, true, None)
+            .unwrap();
         let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
-        assert!(ids.contains(&"clean-row"), "clean row must be indexed, got: {ids:?}");
+        assert!(
+            ids.contains(&"clean-row"),
+            "clean row must be indexed, got: {ids:?}"
+        );
         assert!(
             !ids.contains(&"registry-row"),
             "registry row must not be indexed via the upsert path, got: {ids:?}"
@@ -12759,9 +13678,28 @@ eurostrata\src\daemon.rs",
         );
         let clean_payload = tantivy_exclusion_payload("zebratoken clean row", json!({}));
         // Store rows first (Tantivy not yet open, so nothing indexes live).
-        store.upsert("probe", "registry-row", vec![0.0; 4], registry_payload.clone()).await.unwrap();
-        store.upsert("probe", "conflicting-row", vec![0.0; 4], conflicting_payload.clone()).await.unwrap();
-        store.upsert("probe", "clean-row", vec![0.0; 4], clean_payload.clone()).await.unwrap();
+        store
+            .upsert(
+                "probe",
+                "registry-row",
+                vec![0.0; 4],
+                registry_payload.clone(),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "conflicting-row",
+                vec![0.0; 4],
+                conflicting_payload.clone(),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "clean-row", vec![0.0; 4], clean_payload.clone())
+            .await
+            .unwrap();
 
         // Seed a stale index: same ids/content, exclusion metadata stripped.
         let idx = crate::lexical::TantivyLexicalIndex::open_in_ram().unwrap();
@@ -12781,7 +13719,10 @@ eurostrata\src\daemon.rs",
             .await
             .unwrap();
         let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
-        assert!(ids.contains(&"clean-row"), "clean row must surface, got: {ids:?}");
+        assert!(
+            ids.contains(&"clean-row"),
+            "clean row must surface, got: {ids:?}"
+        );
         assert!(
             !ids.contains(&"registry-row"),
             "registry row must not surface from tantivy search, got: {ids:?}"
@@ -12798,19 +13739,33 @@ eurostrata\src\daemon.rs",
         // surface rows retired under is_retired_at semantics: valid_to 0 and
         // unparseable non-null valid_to both read as retired.
         let store = retired_test_store().await;
-        let zero_payload = tantivy_exclusion_payload("retiretoken zero row", json!({"valid_to": 0}));
-        let soon_payload = tantivy_exclusion_payload("retiretoken soon row", json!({"valid_to": "soon"}));
+        let zero_payload =
+            tantivy_exclusion_payload("retiretoken zero row", json!({"valid_to": 0}));
+        let soon_payload =
+            tantivy_exclusion_payload("retiretoken soon row", json!({"valid_to": "soon"}));
         let clean_payload = tantivy_exclusion_payload("retiretoken clean row", json!({}));
         for (id, payload) in [
             ("retired-zero", &zero_payload),
             ("retired-soon", &soon_payload),
             ("clean-row", &clean_payload),
         ] {
-            store.upsert("probe", id, vec![1.0, 0.0, 0.0, 0.0], payload.clone()).await.unwrap();
+            store
+                .upsert("probe", id, vec![1.0, 0.0, 0.0, 0.0], payload.clone())
+                .await
+                .unwrap();
         }
         // Control: the vector/domain path already excludes both retired rows.
         let control = store
-            .search_with_domain("probe", vec![1.0, 0.0, 0.0, 0.0], 10, false, false, &[], None, false)
+            .search_with_domain(
+                "probe",
+                vec![1.0, 0.0, 0.0, 0.0],
+                10,
+                false,
+                false,
+                &[],
+                None,
+                false,
+            )
             .await
             .unwrap();
         let control_ids: Vec<&str> = control.results.iter().map(|r| r.id.as_str()).collect();
@@ -12839,23 +13794,42 @@ eurostrata\src\daemon.rs",
             .await
             .unwrap();
         let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
-        assert!(ids.contains(&"clean-row"), "clean row must surface, got: {ids:?}");
-        assert!(!ids.contains(&"retired-zero"), "valid_to:0 row must not surface, got: {ids:?}");
-        assert!(!ids.contains(&"retired-soon"), "valid_to:\"soon\" row must not surface, got: {ids:?}");
+        assert!(
+            ids.contains(&"clean-row"),
+            "clean row must surface, got: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"retired-zero"),
+            "valid_to:0 row must not surface, got: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"retired-soon"),
+            "valid_to:\"soon\" row must not surface, got: {ids:?}"
+        );
     }
 
     #[tokio::test]
     async fn par02_tantivy_hydration_respects_archive_escape_hatch() {
         let store = retired_test_store().await;
-        let archived_payload = tantivy_exclusion_payload("archivetoken old row", json!({"archived": true}));
+        let archived_payload =
+            tantivy_exclusion_payload("archivetoken old row", json!({"archived": true}));
         let clean_payload = tantivy_exclusion_payload("archivetoken new row", json!({}));
-        for (id, payload) in [("archived-row", &archived_payload), ("clean-row", &clean_payload)] {
-            store.upsert("probe", id, vec![0.0; 4], payload.clone()).await.unwrap();
+        for (id, payload) in [
+            ("archived-row", &archived_payload),
+            ("clean-row", &clean_payload),
+        ] {
+            store
+                .upsert("probe", id, vec![0.0; 4], payload.clone())
+                .await
+                .unwrap();
         }
         // Stale entries: metadata stripped, so the index itself cannot know
         // the row is archived; hydration must consult the stored row.
         let idx = crate::lexical::TantivyLexicalIndex::open_in_ram().unwrap();
-        for (id, payload) in [("archived-row", &archived_payload), ("clean-row", &clean_payload)] {
+        for (id, payload) in [
+            ("archived-row", &archived_payload),
+            ("clean-row", &clean_payload),
+        ] {
             let mut stale = payload.clone();
             stale.metadata = json!({});
             idx.upsert_memory("probe", id, &stale).unwrap();
@@ -12867,7 +13841,10 @@ eurostrata\src\daemon.rs",
             .await
             .unwrap();
         let hidden_ids: Vec<&str> = hidden.results.iter().map(|r| r.id.as_str()).collect();
-        assert!(hidden_ids.contains(&"clean-row"), "clean row must surface, got: {hidden_ids:?}");
+        assert!(
+            hidden_ids.contains(&"clean-row"),
+            "clean row must surface, got: {hidden_ids:?}"
+        );
         assert!(
             !hidden_ids.contains(&"archived-row"),
             "archived row must not surface by default, got: {hidden_ids:?}"
@@ -12895,11 +13872,21 @@ eurostrata\src\daemon.rs",
             json!({"user_id": "alice", "visible_to": [{"principal": "carol", "role": "viewer"}]}),
         );
         payload.user_id = String::new();
-        store.upsert("probe", "metadata-owner-row", vec![0.0; 4], payload.clone()).await.unwrap();
+        store
+            .upsert("probe", "metadata-owner-row", vec![0.0; 4], payload.clone())
+            .await
+            .unwrap();
         let idx = crate::lexical::TantivyLexicalIndex::open_in_ram().unwrap();
-        idx.upsert_memory("probe", "metadata-owner-row", &payload).unwrap();
+        idx.upsert_memory("probe", "metadata-owner-row", &payload)
+            .unwrap();
         *store.tantivy_lexical.write().unwrap() = Some(idx);
-        for (principal, expected) in [("alice", true), ("admin", true), ("carol", true), ("bob", false), ("eve", false)] {
+        for (principal, expected) in [
+            ("alice", true),
+            ("admin", true),
+            ("carol", true),
+            ("bob", false),
+            ("eve", false),
+        ] {
             let outcome = store
                 .search_tantivy_lexical("probe", "a1token", 10, false, false, &[], principal)
                 .await
@@ -12927,49 +13914,117 @@ eurostrata\src\daemon.rs",
         // limit 1 it is the only primary and every row below can surface
         // only through the inferred merge.
         store
-            .upsert("probe", "a-anchor", vec4.clone(), retired_test_payload("fact", "agent", json!({"domain": "auth"})))
+            .upsert(
+                "probe",
+                "a-anchor",
+                vec4.clone(),
+                retired_test_payload("fact", "agent", json!({"domain": "auth"})),
+            )
             .await
             .unwrap();
         store
-            .upsert("probe", "archived-row", vec4.clone(), retired_test_payload("fact", "agent", json!({"archived": true})))
+            .upsert(
+                "probe",
+                "archived-row",
+                vec4.clone(),
+                retired_test_payload("fact", "agent", json!({"archived": true})),
+            )
             .await
             .unwrap();
         store
-            .upsert("probe", "retired-row", vec4.clone(), retired_test_payload("fact", "agent", json!({"valid_to": 1})))
+            .upsert(
+                "probe",
+                "retired-row",
+                vec4.clone(),
+                retired_test_payload("fact", "agent", json!({"valid_to": 1})),
+            )
             .await
             .unwrap();
         store
-            .upsert("probe", "task-row", vec4.clone(), retired_test_payload("task", "agent", json!({})))
+            .upsert(
+                "probe",
+                "task-row",
+                vec4.clone(),
+                retired_test_payload("task", "agent", json!({})),
+            )
             .await
             .unwrap();
         store
-            .upsert("probe", "registry-row", vec4.clone(), retired_test_payload("fact", "agent", crate::registry::registry_metadata(&["auth".to_string()])))
+            .upsert(
+                "probe",
+                "registry-row",
+                vec4.clone(),
+                retired_test_payload(
+                    "fact",
+                    "agent",
+                    crate::registry::registry_metadata(&["auth".to_string()]),
+                ),
+            )
             .await
             .unwrap();
         store
-            .upsert("probe", "conflicting-row", vec4.clone(), retired_test_payload("fact", "agent", json!({"mesh": {"conflict": true}})))
+            .upsert(
+                "probe",
+                "conflicting-row",
+                vec4.clone(),
+                retired_test_payload("fact", "agent", json!({"mesh": {"conflict": true}})),
+            )
             .await
             .unwrap();
         store
-            .upsert("probe", "structural-row", vec4.clone(), retired_test_payload("file", "agent", json!({})))
+            .upsert(
+                "probe",
+                "structural-row",
+                vec4.clone(),
+                retired_test_payload("file", "agent", json!({})),
+            )
             .await
             .unwrap();
         store
-            .upsert("probe", "other-domain-row", vec4.clone(), retired_test_payload("fact", "agent", json!({"domain": "database"})))
+            .upsert(
+                "probe",
+                "other-domain-row",
+                vec4.clone(),
+                retired_test_payload("fact", "agent", json!({"domain": "database"})),
+            )
             .await
             .unwrap();
         store
-            .upsert("probe", "z-clean-row", vec4.clone(), retired_test_payload("fact", "agent", json!({})))
+            .upsert(
+                "probe",
+                "z-clean-row",
+                vec4.clone(),
+                retired_test_payload("fact", "agent", json!({})),
+            )
             .await
             .unwrap();
 
-        for excluded in ["archived-row", "retired-row", "task-row", "registry-row", "conflicting-row", "structural-row"] {
+        for excluded in [
+            "archived-row",
+            "retired-row",
+            "task-row",
+            "registry-row",
+            "conflicting-row",
+            "structural-row",
+        ] {
             let outcome = store
-                .search_with_domain("probe", vec4.clone(), 1, false, false, &[], Some(excluded), false)
+                .search_with_domain(
+                    "probe",
+                    vec4.clone(),
+                    1,
+                    false,
+                    false,
+                    &[],
+                    Some(excluded),
+                    false,
+                )
                 .await
                 .unwrap();
             let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
-            assert!(ids.contains(&"a-anchor"), "anchor primary must surface for {excluded}, got: {ids:?}");
+            assert!(
+                ids.contains(&"a-anchor"),
+                "anchor primary must surface for {excluded}, got: {ids:?}"
+            );
             assert!(
                 !ids.contains(&excluded),
                 "inferred merge must not surface {excluded}, got: {ids:?}"
@@ -12979,7 +14034,16 @@ eurostrata\src\daemon.rs",
         // Domain predicate: under an "auth" filter, a database-domain row
         // queried by id must not re-enter through the inferred merge.
         let outcome = store
-            .search_with_domain("probe", vec4.clone(), 1, false, false, &["auth".to_string()], Some("other-domain-row"), false)
+            .search_with_domain(
+                "probe",
+                vec4.clone(),
+                1,
+                false,
+                false,
+                &["auth".to_string()],
+                Some("other-domain-row"),
+                false,
+            )
             .await
             .unwrap();
         let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
@@ -12991,7 +14055,16 @@ eurostrata\src\daemon.rs",
         // Positive control: a clean row surfaces through the inferred merge
         // (limit 1 kept it out of the primaries).
         let outcome = store
-            .search_with_domain("probe", vec4.clone(), 1, false, false, &[], Some("z-clean-row"), false)
+            .search_with_domain(
+                "probe",
+                vec4.clone(),
+                1,
+                false,
+                false,
+                &[],
+                Some("z-clean-row"),
+                false,
+            )
             .await
             .unwrap();
         let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
@@ -13002,9 +14075,20 @@ eurostrata\src\daemon.rs",
 
         // The escape hatches still govern the inferred merge: with
         // include_tasks / include_archived set, those rows are admitted.
-        for (id, include_tasks, include_archived) in [("task-row", true, false), ("archived-row", false, true)] {
+        for (id, include_tasks, include_archived) in
+            [("task-row", true, false), ("archived-row", false, true)]
+        {
             let outcome = store
-                .search_with_domain("probe", vec4.clone(), 1, include_tasks, include_archived, &[], Some(id), false)
+                .search_with_domain(
+                    "probe",
+                    vec4.clone(),
+                    1,
+                    include_tasks,
+                    include_archived,
+                    &[],
+                    Some(id),
+                    false,
+                )
                 .await
                 .unwrap();
             let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
@@ -13164,7 +14248,11 @@ eurostrata\src\daemon.rs",
                 .unwrap();
             assert_eq!(
                 node["absolute_path"],
-                expected_root.join("src").join("lib.rs").to_string_lossy().as_ref()
+                expected_root
+                    .join("src")
+                    .join("lib.rs")
+                    .to_string_lossy()
+                    .as_ref()
             );
             assert_eq!(node["metadata"]["refs"][0]["provider_data"]["opaque"], true);
             assert_eq!(
@@ -13310,7 +14398,10 @@ eurostrata\src\daemon.rs",
             .await
             .unwrap();
 
-        store.relink_edges("probe", PROBE_SOURCE).await.expect("relink");
+        store
+            .relink_edges("probe", PROBE_SOURCE)
+            .await
+            .expect("relink");
 
         assert_eq!(
             governs_edges_from(&store, "live-rule").await,
@@ -13455,15 +14546,18 @@ eurostrata\src\daemon.rs",
     #[tokio::test]
     async fn resolve_candidate_rejects_linked_missing_task() {
         let store = retired_test_store().await;
-        let err = crate::traits::IntakeStore::resolve_candidate(&store, crate::task::intake::ResolveCandidateRequest {
+        let err = crate::traits::IntakeStore::resolve_candidate(
+            &store,
+            crate::task::intake::ResolveCandidateRequest {
                 namespace: "probe".to_string(),
                 candidate_id: "cand-linked-no-task".to_string(),
                 disposition: crate::task::intake::Disposition::Linked,
                 task_id: Some("task-does-not-exist".to_string()),
                 cas_version: 0,
-            })
-            .await
-            .expect_err("linked to a non-existent task must fail");
+            },
+        )
+        .await
+        .expect_err("linked to a non-existent task must fail");
         assert!(
             err.contains("does not refer to an existing task"),
             "unexpected error: {err}"
@@ -13553,7 +14647,9 @@ eurostrata\src\daemon.rs",
             .expect("project");
         assert!(quads.iter().any(|q| q.predicate.ends_with("#content")));
         assert!(quads.iter().any(|q| q.predicate.ends_with("#governs")));
-        assert!(quads.iter().all(|q| q.graph.as_deref() == Some("urn:neurostrata:graph:probe:domain:gen:1")));
+        assert!(quads
+            .iter()
+            .all(|q| q.graph.as_deref() == Some("urn:neurostrata:graph:probe:domain:gen:1")));
     }
 
     /// Of two memories that govern the same file, the one linked to fewer
@@ -13565,7 +14661,12 @@ eurostrata\src\daemon.rs",
             let mut file_payload = retired_test_payload("file", "auto-ingestor", json!({}));
             file_payload.location = path.to_string();
             store
-                .upsert("probe", &format!("probe::{path}"), vec![0.0; 4], file_payload)
+                .upsert(
+                    "probe",
+                    &format!("probe::{path}"),
+                    vec![0.0; 4],
+                    file_payload,
+                )
                 .await
                 .unwrap();
         }
@@ -13601,7 +14702,16 @@ eurostrata\src\daemon.rs",
             .unwrap();
 
         let hits = store
-            .memories_for_file("probe", None, "src/a.rs", None, true, &["rule".to_string()], &[], 5)
+            .memories_for_file(
+                "probe",
+                None,
+                "src/a.rs",
+                None,
+                true,
+                &["rule".to_string()],
+                &[],
+                5,
+            )
             .await
             .expect("graph read succeeds");
         let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
@@ -13626,7 +14736,10 @@ eurostrata\src\daemon.rs",
                 .await
                 .unwrap();
         }
-        store.publish_generation("probe", "source-a", 1).await.unwrap();
+        store
+            .publish_generation("probe", "source-a", 1)
+            .await
+            .unwrap();
 
         for path in ["src/a.rs", "src/b.rs", "src/c.rs"] {
             let mut file_payload = retired_test_payload("file", "auto-ingestor", json!({}));
@@ -13641,7 +14754,10 @@ eurostrata\src\daemon.rs",
                 .await
                 .unwrap();
         }
-        store.publish_generation("probe", "source-a", 2).await.unwrap();
+        store
+            .publish_generation("probe", "source-a", 2)
+            .await
+            .unwrap();
 
         store
             .upsert(
@@ -13712,12 +14828,7 @@ eurostrata\src\daemon.rs",
             let mut file_payload = retired_test_payload("file", "auto-ingestor", json!({}));
             file_payload.location = "src/lib.rs".to_string();
             store
-                .upsert(
-                    ns,
-                    &format!("{ns}::src/lib.rs"),
-                    vec![0.0; 4],
-                    file_payload,
-                )
+                .upsert(ns, &format!("{ns}::src/lib.rs"), vec![0.0; 4], file_payload)
                 .await
                 .unwrap();
         }
@@ -13820,7 +14931,10 @@ eurostrata\src\daemon.rs",
             Some(true)
         );
         assert_eq!(
-            payload.metadata.get("absolute_path").and_then(|v| v.as_str()),
+            payload
+                .metadata
+                .get("absolute_path")
+                .and_then(|v| v.as_str()),
             Some("src/not-ingested.rs")
         );
         assert_eq!(vector, vec![0.0; 4]);
@@ -13840,8 +14954,7 @@ eurostrata\src\daemon.rs",
             .await
             .expect("graph read succeeds");
         assert!(
-            hits.iter()
-                .any(|h| h.id == "rule-governing-unindexed-file"),
+            hits.iter().any(|h| h.id == "rule-governing-unindexed-file"),
             "the governing rule surfaces for the stubbed file: {:?}",
             hits.iter().map(|h| &h.id).collect::<Vec<_>>()
         );
@@ -13977,7 +15090,16 @@ eurostrata\src\daemon.rs",
             .unwrap();
 
         let hits = store
-            .memories_for_file("probe", None, "src/a.rs", None, true, &["fact".to_string()], &[], 5)
+            .memories_for_file(
+                "probe",
+                None,
+                "src/a.rs",
+                None,
+                true,
+                &["fact".to_string()],
+                &[],
+                5,
+            )
             .await
             .expect("graph read succeeds");
         assert!(
@@ -13998,7 +15120,12 @@ eurostrata\src\daemon.rs",
         // Targets first: the write-shape validator refuses edges whose target
         // row does not exist yet.
         store
-            .upsert("probe", "deep", zero.clone(), retired_test_payload("fact", "agent", json!({})))
+            .upsert(
+                "probe",
+                "deep",
+                zero.clone(),
+                retired_test_payload("fact", "agent", json!({})),
+            )
             .await
             .unwrap();
         store
@@ -14068,7 +15195,11 @@ eurostrata\src\daemon.rs",
                 "probe",
                 "rule",
                 vec![0.0; 4],
-                retired_test_payload("rule", "agent", json!({ "governs": ["src/not-ingested.rs"] })),
+                retired_test_payload(
+                    "rule",
+                    "agent",
+                    json!({ "governs": ["src/not-ingested.rs"] }),
+                ),
             )
             .await
             .unwrap();
@@ -14090,9 +15221,15 @@ eurostrata\src\daemon.rs",
             )
             .await
             .unwrap();
-        store.publish_generation("probe", PROBE_SOURCE, 1).await.unwrap();
+        store
+            .publish_generation("probe", PROBE_SOURCE, 1)
+            .await
+            .unwrap();
 
-        store.relink_edges("probe", PROBE_SOURCE).await.expect("relink");
+        store
+            .relink_edges("probe", PROBE_SOURCE)
+            .await
+            .expect("relink");
 
         assert!(
             store.get("probe", &stub_id).await.unwrap().is_none(),
@@ -14123,7 +15260,10 @@ eurostrata\src\daemon.rs",
             )
             .await
             .unwrap();
-        store.publish_generation("probe", PROBE_SOURCE, 1).await.unwrap();
+        store
+            .publish_generation("probe", PROBE_SOURCE, 1)
+            .await
+            .unwrap();
         store
             .upsert(
                 "probe",
@@ -14319,7 +15459,10 @@ eurostrata\src\daemon.rs",
     async fn relinking_replays_every_declaration_once() {
         let store = store_with_two_declarations().await;
 
-        let created = store.relink_edges("probe", PROBE_SOURCE).await.expect("relink");
+        let created = store
+            .relink_edges("probe", PROBE_SOURCE)
+            .await
+            .expect("relink");
         assert_eq!(created, 2, "both declarations name a node that exists");
         assert_eq!(governs_count(&store).await, 2);
     }
@@ -14332,9 +15475,18 @@ eurostrata\src\daemon.rs",
     async fn relinking_twice_creates_nothing_the_second_time() {
         let store = store_with_two_declarations().await;
 
-        assert_eq!(store.relink_edges("probe", PROBE_SOURCE).await.expect("first"), 2);
         assert_eq!(
-            store.relink_edges("probe", PROBE_SOURCE).await.expect("second"),
+            store
+                .relink_edges("probe", PROBE_SOURCE)
+                .await
+                .expect("first"),
+            2
+        );
+        assert_eq!(
+            store
+                .relink_edges("probe", PROBE_SOURCE)
+                .await
+                .expect("second"),
             0,
             "the edges already exist, so none are created"
         );
@@ -14441,7 +15593,13 @@ eurostrata\src\daemon.rs",
             .await
             .expect("seed a memory");
 
-        assert_eq!(store.relink_edges("probe", PROBE_SOURCE).await.expect("relink"), 0);
+        assert_eq!(
+            store
+                .relink_edges("probe", PROBE_SOURCE)
+                .await
+                .expect("relink"),
+            0
+        );
         assert_eq!(governs_count(&store).await, 0);
     }
 
@@ -14455,7 +15613,10 @@ eurostrata\src\daemon.rs",
         let zero = vec![0.0f32; 4];
 
         // Stage and publish generation 1 for source A.
-        assert_eq!(store.begin_generation("probe", "source-a").await.unwrap(), 1);
+        assert_eq!(
+            store.begin_generation("probe", "source-a").await.unwrap(),
+            1
+        );
         let gen1_id = crate::parser::ingest::generation_scoped_id("probe", 1, "src/a.rs");
         store
             .upsert(
@@ -14476,7 +15637,10 @@ eurostrata\src\daemon.rs",
         );
 
         // A second publish of the same source supersedes generation 1.
-        assert_eq!(store.begin_generation("probe", "source-a").await.unwrap(), 2);
+        assert_eq!(
+            store.begin_generation("probe", "source-a").await.unwrap(),
+            2
+        );
         let gen2_id = crate::parser::ingest::generation_scoped_id("probe", 2, "src/a.rs");
         store
             .upsert(
@@ -14499,7 +15663,10 @@ eurostrata\src\daemon.rs",
         // list: only the active generation's row is reachable.
         let listed = store.list("probe", None, None).await.unwrap();
         let listed_ids: Vec<String> = listed.into_iter().map(|r| r.id).collect();
-        assert!(listed_ids.contains(&gen2_id), "the active generation is listed");
+        assert!(
+            listed_ids.contains(&gen2_id),
+            "the active generation is listed"
+        );
         assert!(
             !listed_ids.contains(&gen1_id),
             "the superseded generation is not listed"
@@ -14536,14 +15703,21 @@ eurostrata\src\daemon.rs",
         let query_vec = vec![1.1, 0.0, 0.0, 0.0];
 
         // Generation 1 for source-a: a code_ast row that will be superseded.
-        assert_eq!(store.begin_generation("probe", "source-a").await.unwrap(), 1);
+        assert_eq!(
+            store.begin_generation("probe", "source-a").await.unwrap(),
+            1
+        );
         let gen1_id = crate::parser::ingest::generation_scoped_id("probe", 1, "src/a.rs");
         store
             .upsert(
                 "probe",
                 &gen1_id,
                 zero.clone(),
-                retired_test_payload("code_ast", "auto-ingestor", json!({ "source_key": "source-a" })),
+                retired_test_payload(
+                    "code_ast",
+                    "auto-ingestor",
+                    json!({ "source_key": "source-a" }),
+                ),
             )
             .await
             .unwrap();
@@ -14553,14 +15727,21 @@ eurostrata\src\daemon.rs",
             .unwrap();
 
         // Generation 2 for source-a: same bare_id, supersedes generation 1.
-        assert_eq!(store.begin_generation("probe", "source-a").await.unwrap(), 2);
+        assert_eq!(
+            store.begin_generation("probe", "source-a").await.unwrap(),
+            2
+        );
         let gen2_id = crate::parser::ingest::generation_scoped_id("probe", 2, "src/a.rs");
         store
             .upsert(
                 "probe",
                 &gen2_id,
                 zero.clone(),
-                retired_test_payload("code_ast", "auto-ingestor", json!({ "source_key": "source-a" })),
+                retired_test_payload(
+                    "code_ast",
+                    "auto-ingestor",
+                    json!({ "source_key": "source-a" }),
+                ),
             )
             .await
             .unwrap();
@@ -14618,8 +15799,7 @@ eurostrata\src\daemon.rs",
         // Dedup by bare_id: only one version of src/a.rs appears.
         let a_rs_count = ids.iter().filter(|id| id.ends_with("src/a.rs")).count();
         assert_eq!(
-            a_rs_count,
-            1,
+            a_rs_count, 1,
             "exactly one generation of src/a.rs should appear (dedup by bare_id)"
         );
 
@@ -14641,7 +15821,8 @@ eurostrata\src\daemon.rs",
         // gen 3 must NOT pass simply because docs is at gen 3.
         let _ = store.begin_generation("probe", "docs").await.unwrap();
         store.publish_generation("probe", "docs", 3).await.unwrap();
-        let stale_code_gen3 = crate::parser::ingest::generation_scoped_id("probe", 3, "src/stale.rs");
+        let stale_code_gen3 =
+            crate::parser::ingest::generation_scoped_id("probe", 3, "src/stale.rs");
         store
             .upsert(
                 "probe",
@@ -14670,8 +15851,12 @@ eurostrata\src\daemon.rs",
         // without source_key must NOT be dropped (it matches source-a's active gen
         // 2), and a code_ast row at gen 4 without source_key must be retained
         // (it matches source-b's active gen 4). Both must survive list().
-        assert_eq!(store.begin_generation("probe", "source-b").await.unwrap(), 4);
-        let gen2_no_source_id = crate::parser::ingest::generation_scoped_id("probe", 2, "src/no-source-a.rs");
+        assert_eq!(
+            store.begin_generation("probe", "source-b").await.unwrap(),
+            4
+        );
+        let gen2_no_source_id =
+            crate::parser::ingest::generation_scoped_id("probe", 2, "src/no-source-a.rs");
         store
             .upsert(
                 "probe",
@@ -14681,7 +15866,8 @@ eurostrata\src\daemon.rs",
             )
             .await
             .unwrap();
-        let gen4_no_source_id = crate::parser::ingest::generation_scoped_id("probe", 4, "src/no-source-b.rs");
+        let gen4_no_source_id =
+            crate::parser::ingest::generation_scoped_id("probe", 4, "src/no-source-b.rs");
         store
             .upsert(
                 "probe",
@@ -14691,7 +15877,10 @@ eurostrata\src\daemon.rs",
             )
             .await
             .unwrap();
-        store.publish_generation("probe", "source-b", 4).await.unwrap();
+        store
+            .publish_generation("probe", "source-b", 4)
+            .await
+            .unwrap();
         let listed2 = store.list("probe", None, None).await.unwrap();
         let listed2_ids: Vec<&str> = listed2.iter().map(|r| r.id.as_str()).collect();
         assert!(
@@ -14939,13 +16128,20 @@ eurostrata\src\daemon.rs",
                 )
                 .await
                 .unwrap();
-            store.publish_generation(namespace, PROBE_SOURCE, 1).await.unwrap();
+            store
+                .publish_generation(namespace, PROBE_SOURCE, 1)
+                .await
+                .unwrap();
         }
 
         let first = store.mention_symbol_ids("probe").await;
         let second = store.mention_symbol_ids("other").await;
 
-        assert_eq!(first.as_slice(), ["probe::1::src/lib.rs".to_string()], "{first:?}");
+        assert_eq!(
+            first.as_slice(),
+            ["probe::1::src/lib.rs".to_string()],
+            "{first:?}"
+        );
         assert_eq!(
             second.as_slice(),
             ["other::1::src/lib.rs".to_string()],
@@ -14965,13 +16161,22 @@ eurostrata\src\daemon.rs",
         let store = retired_test_store().await;
         for (id, memory_type, meta) in [
             ("pinned-true", "rule", json!({ "pinned": true })),
-            ("pinned-true-fact", "fact", json!({ "source": "x", "pinned": true })),
+            (
+                "pinned-true-fact",
+                "fact",
+                json!({ "source": "x", "pinned": true }),
+            ),
             ("pinned-false", "rule", json!({ "pinned": false })),
             ("no-key", "rule", json!({})),
             ("other-key", "rule", json!({ "note": "nothing here" })),
         ] {
             store
-                .upsert("probe", id, vec![0.1; 4], retired_test_payload(memory_type, "agent", meta))
+                .upsert(
+                    "probe",
+                    id,
+                    vec![0.1; 4],
+                    retired_test_payload(memory_type, "agent", meta),
+                )
                 .await
                 .unwrap();
         }
@@ -14995,21 +16200,44 @@ eurostrata\src\daemon.rs",
         );
 
         let narrowed_ids: BTreeSet<String> = narrowed.iter().map(|r| r.id.clone()).collect();
-        assert!(narrowed_ids.contains("pinned-false"), "a superset: a pinned:false row mentions the word");
-        assert!(!narrowed_ids.contains("no-key"), "a row with no metadata keys is dropped");
-        assert!(!narrowed_ids.contains("other-key"), "a row that never mentions pinned is dropped");
+        assert!(
+            narrowed_ids.contains("pinned-false"),
+            "a superset: a pinned:false row mentions the word"
+        );
+        assert!(
+            !narrowed_ids.contains("no-key"),
+            "a row with no metadata keys is dropped"
+        );
+        assert!(
+            !narrowed_ids.contains("other-key"),
+            "a row that never mentions pinned is dropped"
+        );
 
         // list_rows with its other filters: type, and a needle that matches nothing.
-        let rules_only = store.list_rows("probe", None, Some("rule"), Some("pinned")).await.unwrap();
-        assert!(rules_only.iter().all(|r| r.payload.memory_type == "rule"), "the type filter still applies");
+        let rules_only = store
+            .list_rows("probe", None, Some("rule"), Some("pinned"))
+            .await
+            .unwrap();
+        assert!(
+            rules_only.iter().all(|r| r.payload.memory_type == "rule"),
+            "the type filter still applies"
+        );
         assert!(rules_only.iter().any(|r| r.id == "pinned-true"));
         assert!(!rules_only.iter().any(|r| r.id == "pinned-true-fact"));
         assert!(
-            store.list_rows("probe", None, None, Some("no-such-word-in-any-row")).await.unwrap().is_empty(),
+            store
+                .list_rows("probe", None, None, Some("no-such-word-in-any-row"))
+                .await
+                .unwrap()
+                .is_empty(),
             "a needle that no row contains returns nothing"
         );
         assert_eq!(
-            store.list_rows("probe", None, None, None).await.unwrap().len(),
+            store
+                .list_rows("probe", None, None, None)
+                .await
+                .unwrap()
+                .len(),
             all.len(),
             "no needle is the same as list"
         );
@@ -17666,8 +18894,8 @@ eurostrata\src\daemon.rs",
                 false,
                 false,
                 &["database".to_string()],
-            None,
-            true,
+                None,
+                true,
             )
             .await
             .unwrap();
@@ -17712,8 +18940,8 @@ eurostrata\src\daemon.rs",
                 false,
                 false,
                 &["database".to_string()],
-            None,
-            true,
+                None,
+                true,
             )
             .await
             .unwrap();
@@ -17755,8 +18983,8 @@ eurostrata\src\daemon.rs",
                 false,
                 false,
                 &["database-access".to_string()],
-            None,
-            true,
+                None,
+                true,
             )
             .await
             .unwrap();
@@ -17821,8 +19049,8 @@ eurostrata\src\daemon.rs",
                 false,
                 false,
                 &["target".to_string()],
-            None,
-            true,
+                None,
+                true,
             )
             .await
             .unwrap();
@@ -17917,8 +19145,8 @@ eurostrata\src\daemon.rs",
                 false,
                 false,
                 &["database".to_string()],
-            None,
-            true,
+                None,
+                true,
             )
             .await
             .unwrap();
@@ -17930,8 +19158,8 @@ eurostrata\src\daemon.rs",
                 false,
                 false,
                 &["database".to_string()],
-            None,
-            true,
+                None,
+                true,
             )
             .await
             .unwrap();
@@ -17958,8 +19186,8 @@ eurostrata\src\daemon.rs",
                 false,
                 false,
                 &["nonexistent".to_string()],
-            None,
-            true,
+                None,
+                true,
             )
             .await
             .unwrap();
@@ -17971,8 +19199,8 @@ eurostrata\src\daemon.rs",
                 false,
                 false,
                 &["nonexistent".to_string()],
-            None,
-            true,
+                None,
+                true,
             )
             .await
             .unwrap();
@@ -17999,8 +19227,8 @@ eurostrata\src\daemon.rs",
                 false,
                 false,
                 &["database-access".to_string()],
-            None,
-            true,
+                None,
+                true,
             )
             .await
             .unwrap();
@@ -18012,8 +19240,8 @@ eurostrata\src\daemon.rs",
                 false,
                 false,
                 &["database-access".to_string()],
-            None,
-            true,
+                None,
+                true,
             )
             .await
             .unwrap();
@@ -18032,7 +19260,16 @@ eurostrata\src\daemon.rs",
 
         // Case D: no filter (empty key set) → mode Vector, all rows returned
         let real_outcome = real
-            .search_with_domain(namespace, query_vec.clone(), 10, false, false, &[], None, true)
+            .search_with_domain(
+                namespace,
+                query_vec.clone(),
+                10,
+                false,
+                false,
+                &[],
+                None,
+                true,
+            )
             .await
             .unwrap();
         let mock_outcome = mock
@@ -18079,7 +19316,16 @@ eurostrata\src\daemon.rs",
 
         // Empty-key branch (domains = &[]): limit = 1 should return exactly 1 row
         let outcome = mock
-            .search_with_domain(namespace, query_vec.clone(), 1, false, false, &[], None, true)
+            .search_with_domain(
+                namespace,
+                query_vec.clone(),
+                1,
+                false,
+                false,
+                &[],
+                None,
+                true,
+            )
             .await
             .unwrap();
         assert_eq!(outcome.mode, DomainMatchMode::Vector);
@@ -18099,8 +19345,8 @@ eurostrata\src\daemon.rs",
                 false,
                 false,
                 &["database".to_string()],
-            None,
-            true,
+                None,
+                true,
             )
             .await
             .unwrap();
@@ -18228,7 +19474,10 @@ eurostrata\src\daemon.rs",
                     results.iter().map(|r| r.id.as_str()).collect::<Vec<_>>()
                 )
             });
-        let evidence = file.evidence.as_ref().expect("the expansion row carries evidence");
+        let evidence = file
+            .evidence
+            .as_ref()
+            .expect("the expansion row carries evidence");
         assert!(
             evidence
                 .iter()
@@ -18440,7 +19689,10 @@ eurostrata\src\daemon.rs",
             .await
             .unwrap();
 
-        let results = store.search("probe", query_vec, 10, false, false).await.unwrap();
+        let results = store
+            .search("probe", query_vec, 10, false, false)
+            .await
+            .unwrap();
         assert!(
             !results.iter().any(|r| r.id == registry_id),
             "the registry row must never appear in search results"
@@ -18449,7 +19701,8 @@ eurostrata\src\daemon.rs",
 
     #[tokio::test]
     async fn refresh_ontology_loads_v2_entries() {
-        let dir = std::env::temp_dir().join(format!("ns-ontology-refresh-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("ns-ontology-refresh-{}", uuid::Uuid::new_v4()));
         let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
         store.init("probe").await.expect("create the schema");
 
@@ -18468,11 +19721,17 @@ eurostrata\src\daemon.rs",
             location_lines: String::new(),
             metadata: crate::registry::registry_metadata_v2(&entries),
         };
-        store.upsert("probe", &registry_id, query_vec, payload).await.unwrap();
+        store
+            .upsert("probe", &registry_id, query_vec, payload)
+            .await
+            .unwrap();
 
         store.refresh_ontology("probe").await;
         let idx = store.get_ontology("probe");
-        assert_eq!(idx.canonical_slug("authentication"), Some("auth".to_string()));
+        assert_eq!(
+            idx.canonical_slug("authentication"),
+            Some("auth".to_string())
+        );
         assert!(idx.expand_domain("auth").contains(&"tls".to_string()));
     }
 
@@ -18484,56 +19743,115 @@ eurostrata\src\daemon.rs",
         let zero = vec![0.1, 0.2, 0.3, 0.4];
 
         // 1. Symbol
-        let mut p_sym = retired_test_payload("fact", "agent", json!({"symbol": "verify_bundle_sha256"}));
+        let mut p_sym =
+            retired_test_payload("fact", "agent", json!({"symbol": "verify_bundle_sha256"}));
         p_sym.content = "Bundle verification helper verify_bundle_sha256".to_string();
-        store.upsert("probe", "m-sym", zero.clone(), p_sym).await.unwrap();
+        store
+            .upsert("probe", "m-sym", zero.clone(), p_sym)
+            .await
+            .unwrap();
 
         // 2. File path
         let mut p_file = retired_test_payload("fact", "agent", json!({}));
         p_file.location = "src/judgment/laya_onnx.rs".to_string();
         p_file.content = "Local ONNX duplicate judgment provider".to_string();
-        store.upsert("probe", "m-file", zero.clone(), p_file).await.unwrap();
+        store
+            .upsert("probe", "m-file", zero.clone(), p_file)
+            .await
+            .unwrap();
 
         // 3. Env var
-        let mut p_env = retired_test_payload("rule", "agent", json!({"env": "NEUROSTRATA_HYBRID_SEARCH", "source": "AGENTS.md"}));
-        p_env.content = "Set NEUROSTRATA_HYBRID_SEARCH in environment to enable hybrid scoring".to_string();
-        store.upsert("probe", "m-env", zero.clone(), p_env).await.unwrap();
+        let mut p_env = retired_test_payload(
+            "rule",
+            "agent",
+            json!({"env": "NEUROSTRATA_HYBRID_SEARCH", "source": "AGENTS.md"}),
+        );
+        p_env.content =
+            "Set NEUROSTRATA_HYBRID_SEARCH in environment to enable hybrid scoring".to_string();
+        store
+            .upsert("probe", "m-env", zero.clone(), p_env)
+            .await
+            .unwrap();
 
         // 4. Error string
-        let mut p_err = retired_test_payload("fact", "agent", json!({"error_code": "ERR_SHACL_CLOSED_WORLD"}));
+        let mut p_err = retired_test_payload(
+            "fact",
+            "agent",
+            json!({"error_code": "ERR_SHACL_CLOSED_WORLD"}),
+        );
         p_err.content = "Validation error ERR_SHACL_CLOSED_WORLD when target missing".to_string();
-        store.upsert("probe", "m-err", zero.clone(), p_err).await.unwrap();
+        store
+            .upsert("probe", "m-err", zero.clone(), p_err)
+            .await
+            .unwrap();
 
         // 5. Quoted phrase
         let mut p_phrase = retired_test_payload("rule", "agent", json!({"source": "AGENTS.md"}));
-        p_phrase.content = "Always enforce zero compile-time feature flags across workspace".to_string();
-        store.upsert("probe", "m-phrase", zero.clone(), p_phrase).await.unwrap();
+        p_phrase.content =
+            "Always enforce zero compile-time feature flags across workspace".to_string();
+        store
+            .upsert("probe", "m-phrase", zero.clone(), p_phrase)
+            .await
+            .unwrap();
 
         for (query, expected_id) in [
             ("verify_bundle_sha256", "m-sym"),
             ("  SRC/JUDGMENT/LAYA_ONNX.RS  ", "m-file"),
             ("NEUROSTRATA_HYBRID_SEARCH", "m-env"),
             ("ERR_SHACL_CLOSED_WORLD", "m-err"),
-            ("Always enforce zero compile-time feature flags across workspace", "m-phrase"),
+            (
+                "Always enforce zero compile-time feature flags across workspace",
+                "m-phrase",
+            ),
         ] {
             let outcome = store
-                .search_with_domain("probe", vec![0.9, 0.0, 0.0, 0.0], 5, false, false, &[], Some(query), true)
+                .search_with_domain(
+                    "probe",
+                    vec![0.9, 0.0, 0.0, 0.0],
+                    5,
+                    false,
+                    false,
+                    &[],
+                    Some(query),
+                    true,
+                )
                 .await
                 .unwrap();
-            let hit = outcome.results.iter().find(|r| r.id == expected_id).expect("exact match found");
-            assert_eq!(hit.score, 0.0, "exact match should have score 0.0 for {}", query);
+            let hit = outcome
+                .results
+                .iter()
+                .find(|r| r.id == expected_id)
+                .expect("exact match found");
+            assert_eq!(
+                hit.score, 0.0,
+                "exact match should have score 0.0 for {}",
+                query
+            );
             assert!(crate::traits::is_direct_match(&hit.evidence));
 
             let lex = store
                 .search_lexical("probe", query.trim(), 5, false, false, &[], "admin", 1)
                 .await
                 .unwrap();
-            assert!(lex.results.iter().any(|r| r.id == expected_id), "lexical hit for {}", query);
+            assert!(
+                lex.results.iter().any(|r| r.id == expected_id),
+                "lexical hit for {}",
+                query
+            );
         }
 
         // Negative probe: non-existent identifier should not get an exact-name 0.0 score
         let neg = store
-            .search_with_domain("probe", vec![0.9, 0.0, 0.0, 0.0], 5, false, false, &[], Some("NON_EXISTENT_SYMBOL_XYZ_999"), true)
+            .search_with_domain(
+                "probe",
+                vec![0.9, 0.0, 0.0, 0.0],
+                5,
+                false,
+                false,
+                &[],
+                Some("NON_EXISTENT_SYMBOL_XYZ_999"),
+                true,
+            )
             .await
             .unwrap();
         assert!(neg.results.iter().all(|r| r.score > 0.0));
@@ -18548,27 +19866,61 @@ eurostrata\src\daemon.rs",
         let v = vec![0.1, 0.2, 0.3, 0.4];
 
         let target = retired_test_payload("fact", "agent", json!({}));
-        store.upsert("probe", "target-node", v.clone(), target).await.unwrap();
+        store
+            .upsert("probe", "target-node", v.clone(), target)
+            .await
+            .unwrap();
 
-        let mut declarer = retired_test_payload("rule", "agent", json!({
-            "governs": ["target-node"],
-            "absolute_path": "src/domain.rs",
-            "file_sha256": "deadbeefcafe"
-        }));
+        let mut declarer = retired_test_payload(
+            "rule",
+            "agent",
+            json!({
+                "governs": ["target-node"],
+                "absolute_path": "src/domain.rs",
+                "file_sha256": "deadbeefcafe"
+            }),
+        );
         declarer.location = "src/domain.rs".to_string();
         declarer.location_lines = "10-25".to_string();
-        store.upsert("probe", "declaring-rule", v.clone(), declarer).await.unwrap();
+        store
+            .upsert("probe", "declaring-rule", v.clone(), declarer)
+            .await
+            .unwrap();
 
-        let fetched = store.get("probe", "declaring-rule").await.unwrap().expect("declaring-rule exists");
-        let edge_sources = fetched.1.metadata.get("edge_sources").and_then(|v| v.as_array()).expect("edge_sources array");
+        let fetched = store
+            .get("probe", "declaring-rule")
+            .await
+            .unwrap()
+            .expect("declaring-rule exists");
+        let edge_sources = fetched
+            .1
+            .metadata
+            .get("edge_sources")
+            .and_then(|v| v.as_array())
+            .expect("edge_sources array");
         assert_eq!(edge_sources.len(), 1);
         let es = &edge_sources[0];
-        assert_eq!(es.get("declaring_id").and_then(|v| v.as_str()), Some("declaring-rule"));
+        assert_eq!(
+            es.get("declaring_id").and_then(|v| v.as_str()),
+            Some("declaring-rule")
+        );
         assert_eq!(es.get("rel_type").and_then(|v| v.as_str()), Some("GOVERNS"));
-        assert_eq!(es.get("resolved_target").and_then(|v| v.as_str()), Some("target-node"));
-        assert_eq!(es.get("logical_target").and_then(|v| v.as_str()), Some("target-node"));
-        assert_eq!(es.get("file").and_then(|v| v.as_str()), Some("src/domain.rs"));
-        assert_eq!(es.get("content_hash").and_then(|v| v.as_str()), Some("deadbeefcafe"));
+        assert_eq!(
+            es.get("resolved_target").and_then(|v| v.as_str()),
+            Some("target-node")
+        );
+        assert_eq!(
+            es.get("logical_target").and_then(|v| v.as_str()),
+            Some("target-node")
+        );
+        assert_eq!(
+            es.get("file").and_then(|v| v.as_str()),
+            Some("src/domain.rs")
+        );
+        assert_eq!(
+            es.get("content_hash").and_then(|v| v.as_str()),
+            Some("deadbeefcafe")
+        );
         assert_eq!(es.get("line_start").and_then(|v| v.as_i64()), Some(10));
         assert_eq!(es.get("line_end").and_then(|v| v.as_i64()), Some(25));
         assert_eq!(es.get("extractor").and_then(|v| v.as_str()), Some("upsert"));
@@ -18583,34 +19935,56 @@ eurostrata\src\daemon.rs",
         let v = vec![0.1, 0.2, 0.3, 0.4];
 
         let valid_target = retired_test_payload("fact", "agent", json!({}));
-        store.upsert("probe", "valid-target", v.clone(), valid_target).await.unwrap();
+        store
+            .upsert("probe", "valid-target", v.clone(), valid_target)
+            .await
+            .unwrap();
 
         // Row with one resolved target, one dangling target, missing rule source, and invalid endpoint role (fact contained_by fact)
-        let declarer = retired_test_payload("rule", "agent", json!({
-            "governs": ["valid-target", "missing-target-xyz"],
-            "contained_by": ["valid-target"]
-        }));
-        store.upsert("probe", "declarer-1", v.clone(), declarer).await.unwrap();
+        let declarer = retired_test_payload(
+            "rule",
+            "agent",
+            json!({
+                "governs": ["valid-target", "missing-target-xyz"],
+                "contained_by": ["valid-target"]
+            }),
+        );
+        store
+            .upsert("probe", "declarer-1", v.clone(), declarer)
+            .await
+            .unwrap();
 
         let dangling = store.dangling_edges("probe").await.unwrap();
         assert!(
-            dangling.iter().any(|d| d.get("declared_target").and_then(|t| t.as_str()) == Some("missing-target-xyz") && d.get("reason").and_then(|r| r.as_str()) == Some("missing")),
+            dangling
+                .iter()
+                .any(|d| d.get("declared_target").and_then(|t| t.as_str())
+                    == Some("missing-target-xyz")
+                    && d.get("reason").and_then(|r| r.as_str()) == Some("missing")),
             "expected missing-target-xyz in dangling_edges: {:?}",
             dangling
         );
         assert!(
-            !dangling.iter().any(|d| d.get("declared_target").and_then(|t| t.as_str()) == Some("valid-target")),
+            !dangling
+                .iter()
+                .any(|d| d.get("declared_target").and_then(|t| t.as_str()) == Some("valid-target")),
             "resolved valid-target must not be in dangling_edges"
         );
 
         let warnings = store.shape_warnings("probe").await;
         assert!(
-            warnings.iter().any(|w| w.get("why").and_then(|r| r.as_str()).map(|s| s.contains("endpoint role mismatch")).unwrap_or(false)),
+            warnings.iter().any(|w| w
+                .get("why")
+                .and_then(|r| r.as_str())
+                .map(|s| s.contains("endpoint role mismatch"))
+                .unwrap_or(false)),
             "expected endpoint role mismatch in shape_warnings: {:?}",
             warnings
         );
         assert!(
-            warnings.iter().any(|w| w.get("field").and_then(|f| f.as_str()) == Some("metadata.source")),
+            warnings
+                .iter()
+                .any(|w| w.get("field").and_then(|f| f.as_str()) == Some("metadata.source")),
             "expected metadata.source SHACL warning in shape_warnings: {:?}",
             warnings
         );
@@ -18629,13 +20003,23 @@ eurostrata\src\daemon.rs",
         store.init("probe").await.expect("init");
         let v = vec![0.1, 0.2, 0.3, 0.4];
 
-        let rule = retired_test_payload("rule", "agent", json!({
-            "source": { "kind": "release-run", "ref": "v1.16.0" },
-        }));
-        store.upsert("probe", "rule-object-source", v.clone(), rule).await.unwrap();
+        let rule = retired_test_payload(
+            "rule",
+            "agent",
+            json!({
+                "source": { "kind": "release-run", "ref": "v1.16.0" },
+            }),
+        );
+        store
+            .upsert("probe", "rule-object-source", v.clone(), rule)
+            .await
+            .unwrap();
 
         let (shape_fixes, _) = store.repair_namespace_hygiene("probe").await.unwrap();
-        assert_eq!(shape_fixes, 0, "an object source is provenance: nothing to repair");
+        assert_eq!(
+            shape_fixes, 0,
+            "an object source is provenance: nothing to repair"
+        );
 
         let rows = store.list_memories("probe", None, None).await.unwrap();
         let row = rows
@@ -18661,17 +20045,30 @@ eurostrata\src\daemon.rs",
         let v = vec![0.1, 0.2, 0.3, 0.4];
 
         let target = retired_test_payload("fact", "agent", json!({}));
-        store.upsert("probe", "target-row", v.clone(), target).await.unwrap();
-        let declarer = retired_test_payload("fact", "agent", json!({
-            "related_to": ["target-row", "no-such-row", "samples"],
-        }));
-        store.upsert("probe", "declarer", v.clone(), declarer).await.unwrap();
+        store
+            .upsert("probe", "target-row", v.clone(), target)
+            .await
+            .unwrap();
+        let declarer = retired_test_payload(
+            "fact",
+            "agent",
+            json!({
+                "related_to": ["target-row", "no-such-row", "samples"],
+            }),
+        );
+        store
+            .upsert("probe", "declarer", v.clone(), declarer)
+            .await
+            .unwrap();
 
         let (_, dangling) = store.repair_namespace_hygiene("probe").await.unwrap();
         assert_eq!(dangling, 1, "one row had refs that resolve to nothing");
 
         let rows = store.list_memories("probe", None, None).await.unwrap();
-        let row = rows.iter().find(|r| r.id == "declarer").expect("row survives");
+        let row = rows
+            .iter()
+            .find(|r| r.id == "declarer")
+            .expect("row survives");
         assert_eq!(row.payload.metadata["related_to"], json!(["target-row"]));
         let archived = row.payload.metadata["archived_refs"].as_array().unwrap();
         assert!(archived.contains(&json!("no-such-row")) && archived.contains(&json!("samples")));
@@ -18689,7 +20086,10 @@ eurostrata\src\daemon.rs",
             })
             .await
             .unwrap();
-        assert!(edge_targets.contains(&"target-row".to_string()), "edges: {edge_targets:?}");
+        assert!(
+            edge_targets.contains(&"target-row".to_string()),
+            "edges: {edge_targets:?}"
+        );
 
         let again = store.repair_namespace_hygiene("probe").await.unwrap();
         assert_eq!(again, (0, 0), "a second pass has nothing left to repair");
@@ -18704,7 +20104,10 @@ eurostrata\src\daemon.rs",
         let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
         store.init("probe").await.expect("init");
         let rule = retired_test_payload("rule", "agent", json!({ "source": "N/A" }));
-        store.upsert("probe", "r1", vec![0.1, 0.2, 0.3, 0.4], rule).await.unwrap();
+        store
+            .upsert("probe", "r1", vec![0.1, 0.2, 0.3, 0.4], rule)
+            .await
+            .unwrap();
 
         // The plan was made from metadata that is no longer what is stored.
         let stale = HygieneRow {
@@ -18732,7 +20135,8 @@ eurostrata\src\daemon.rs",
     /// content someone saved after the read, even when metadata is unchanged.
     #[tokio::test]
     async fn repair_hygiene_content_backfill_is_skipped_when_the_content_was_edited() {
-        let dir = std::env::temp_dir().join(format!("ns-repair-content-cas-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("ns-repair-content-cas-{}", uuid::Uuid::new_v4()));
         let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
         store.init("probe").await.expect("init");
         let payload = |content: &str| MemoryPayload {
@@ -18746,8 +20150,19 @@ eurostrata\src\daemon.rs",
         };
         // `edited` was blank when the repair read it and was edited after;
         // `blank` is still blank.
-        store.upsert("probe", "edited", vec![0.1, 0.2, 0.3, 0.4], payload("a saved correction")).await.unwrap();
-        store.upsert("probe", "blank", vec![0.1, 0.2, 0.3, 0.4], payload("")).await.unwrap();
+        store
+            .upsert(
+                "probe",
+                "edited",
+                vec![0.1, 0.2, 0.3, 0.4],
+                payload("a saved correction"),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "blank", vec![0.1, 0.2, 0.3, 0.4], payload(""))
+            .await
+            .unwrap();
 
         let plan = |id: &str| {
             let read = HygieneRow {
@@ -18760,7 +20175,8 @@ eurostrata\src\daemon.rs",
             };
             let mut writes = Vec::new();
             plan_hygiene_row(&read, "probe", &PrefetchedView::default(), &mut writes);
-            let HygieneWrite::Row { content_q, .. } = writes.pop().expect("a backfill was planned") else {
+            let HygieneWrite::Row { content_q, .. } = writes.pop().expect("a backfill was planned")
+            else {
                 panic!("expected a row write")
             };
             content_q.expect("the blank content is backfilled")
@@ -18768,11 +20184,17 @@ eurostrata\src\daemon.rs",
         let (edited_q, blank_q) = (plan("edited"), plan("blank"));
         let (edited_matched, blank_matched) = store
             .with_conn(move |conn| {
-                Ok((conn.query(&edited_q)?.next().is_some(), conn.query(&blank_q)?.next().is_some()))
+                Ok((
+                    conn.query(&edited_q)?.next().is_some(),
+                    conn.query(&blank_q)?.next().is_some(),
+                ))
             })
             .await
             .unwrap();
-        assert!(!edited_matched, "the backfill must not overwrite an edit made since the read");
+        assert!(
+            !edited_matched,
+            "the backfill must not overwrite an edit made since the read"
+        );
         assert!(blank_matched, "a row that is still blank is backfilled");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -18782,34 +20204,55 @@ eurostrata\src\daemon.rs",
     /// published after the pass, by a path that resolves logically and not by
     /// its literal id, keeps the declaration that names it.
     #[tokio::test]
-    async fn repair_hygiene_chunk_keeps_a_declaration_whose_target_appeared_after_the_candidate_pass() {
-        let dir = std::env::temp_dir().join(format!("ns-repair-chunk-target-{}", uuid::Uuid::new_v4()));
+    async fn repair_hygiene_chunk_keeps_a_declaration_whose_target_appeared_after_the_candidate_pass(
+    ) {
+        let dir =
+            std::env::temp_dir().join(format!("ns-repair-chunk-target-{}", uuid::Uuid::new_v4()));
         let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
         store.init("probe").await.expect("init");
         let v = vec![0.1, 0.2, 0.3, 0.4];
-        let declarer = retired_test_payload("fact", "agent", json!({ "related_to": ["src/new.rs", "no-such-row"] }));
-        store.upsert("probe", "declarer", v.clone(), declarer).await.unwrap();
+        let declarer = retired_test_payload(
+            "fact",
+            "agent",
+            json!({ "related_to": ["src/new.rs", "no-such-row"] }),
+        );
+        store
+            .upsert("probe", "declarer", v.clone(), declarer)
+            .await
+            .unwrap();
 
         // `src/new.rs` is missing when the candidate pass reads; the file is
         // published (as the id `new.rs`) before the write turn runs.
         let target = retired_test_payload("fact", "agent", json!({}));
-        store.upsert("probe", "new.rs", v.clone(), target).await.unwrap();
+        store
+            .upsert("probe", "new.rs", v.clone(), target)
+            .await
+            .unwrap();
 
         let ids = vec!["declarer".to_string()];
         let (_, dangling) = store
             .with_conn(move |conn| hygiene_repair_chunk(conn, "probe", &ids))
             .await
             .unwrap();
-        assert_eq!(dangling, 1, "the row still had one ref that resolves to nothing");
+        assert_eq!(
+            dangling, 1,
+            "the row still had one ref that resolves to nothing"
+        );
 
         let rows = store.list_memories("probe", None, None).await.unwrap();
-        let row = rows.iter().find(|r| r.id == "declarer").expect("row survives");
+        let row = rows
+            .iter()
+            .find(|r| r.id == "declarer")
+            .expect("row survives");
         assert_eq!(
             row.payload.metadata["related_to"],
             json!(["src/new.rs"]),
             "the declaration that now resolves is kept"
         );
-        assert_eq!(row.payload.metadata["archived_refs"], json!(["no-such-row"]));
+        assert_eq!(
+            row.payload.metadata["archived_refs"],
+            json!(["no-such-row"])
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -18818,7 +20261,8 @@ eurostrata\src\daemon.rs",
     /// that is still blank in the same chunk is backfilled.
     #[tokio::test]
     async fn repair_hygiene_chunk_leaves_content_edited_after_the_candidate_pass() {
-        let dir = std::env::temp_dir().join(format!("ns-repair-chunk-content-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("ns-repair-chunk-content-{}", uuid::Uuid::new_v4()));
         let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
         store.init("probe").await.expect("init");
         let payload = |content: &str| MemoryPayload {
@@ -18831,10 +20275,19 @@ eurostrata\src\daemon.rs",
             metadata: json!({}),
         };
         let v = vec![0.1, 0.2, 0.3, 0.4];
-        store.upsert("probe", "edited", v.clone(), payload("")).await.unwrap();
-        store.upsert("probe", "blank", v.clone(), payload("")).await.unwrap();
+        store
+            .upsert("probe", "edited", v.clone(), payload(""))
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "blank", v.clone(), payload(""))
+            .await
+            .unwrap();
         // Someone saves a correction on `edited` after the candidate pass.
-        store.upsert("probe", "edited", v.clone(), payload("a saved correction")).await.unwrap();
+        store
+            .upsert("probe", "edited", v.clone(), payload("a saved correction"))
+            .await
+            .unwrap();
 
         let ids = vec!["edited".to_string(), "blank".to_string()];
         store
@@ -18843,9 +20296,18 @@ eurostrata\src\daemon.rs",
             .unwrap();
 
         let rows = store.list_memories("probe", None, None).await.unwrap();
-        let content_of = |id: &str| rows.iter().find(|r| r.id == id).map(|r| r.payload.content.clone()).unwrap();
+        let content_of = |id: &str| {
+            rows.iter()
+                .find(|r| r.id == id)
+                .map(|r| r.payload.content.clone())
+                .unwrap()
+        };
         assert_eq!(content_of("edited"), "a saved correction");
-        assert_eq!(content_of("blank"), "legacy", "a row that is still blank is backfilled");
+        assert_eq!(
+            content_of("blank"),
+            "legacy",
+            "a row that is still blank is backfilled"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -18854,17 +20316,33 @@ eurostrata\src\daemon.rs",
     /// it reproduces that rule: one match keeps the ref, two archive it.
     #[tokio::test]
     async fn repair_hygiene_chunk_applies_the_unique_prefix_rule() {
-        let dir = std::env::temp_dir().join(format!("ns-repair-chunk-prefix-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("ns-repair-chunk-prefix-{}", uuid::Uuid::new_v4()));
         let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
         store.init("probe").await.expect("init");
         let v = vec![0.1, 0.2, 0.3, 0.4];
         for id in ["target-row-alpha", "target-row-beta"] {
-            store.upsert("probe", id, v.clone(), retired_test_payload("fact", "agent", json!({}))).await.unwrap();
+            store
+                .upsert(
+                    "probe",
+                    id,
+                    v.clone(),
+                    retired_test_payload("fact", "agent", json!({})),
+                )
+                .await
+                .unwrap();
         }
-        let declarer = retired_test_payload("fact", "agent", json!({
-            "related_to": ["target-row-al", "target-row"],
-        }));
-        store.upsert("probe", "declarer", v.clone(), declarer).await.unwrap();
+        let declarer = retired_test_payload(
+            "fact",
+            "agent",
+            json!({
+                "related_to": ["target-row-al", "target-row"],
+            }),
+        );
+        store
+            .upsert("probe", "declarer", v.clone(), declarer)
+            .await
+            .unwrap();
 
         let ids = vec!["declarer".to_string()];
         store
@@ -18873,9 +20351,20 @@ eurostrata\src\daemon.rs",
             .unwrap();
 
         let rows = store.list_memories("probe", None, None).await.unwrap();
-        let row = rows.iter().find(|r| r.id == "declarer").expect("row survives");
-        assert_eq!(row.payload.metadata["related_to"], json!(["target-row-al"]), "one id starts with it");
-        assert_eq!(row.payload.metadata["archived_refs"], json!(["target-row"]), "two ids start with it");
+        let row = rows
+            .iter()
+            .find(|r| r.id == "declarer")
+            .expect("row survives");
+        assert_eq!(
+            row.payload.metadata["related_to"],
+            json!(["target-row-al"]),
+            "one id starts with it"
+        );
+        assert_eq!(
+            row.payload.metadata["archived_refs"],
+            json!(["target-row"]),
+            "two ids start with it"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -18932,7 +20421,12 @@ eurostrata\src\daemon.rs",
         let v = vec![0.1, 0.2, 0.3, 0.4];
         for id in ["a", "b", "c", "d"] {
             store
-                .upsert("probe", id, v.clone(), retired_test_payload("fact", "agent", json!({})))
+                .upsert(
+                    "probe",
+                    id,
+                    v.clone(),
+                    retired_test_payload("fact", "agent", json!({})),
+                )
                 .await
                 .unwrap();
         }
@@ -18972,14 +20466,12 @@ eurostrata\src\daemon.rs",
         store.init("probe").await.expect("init");
         let v = vec![0.1, 0.2, 0.3, 0.4];
 
-        let entries = vec![
-            serde_json::json!({
-                "slug": "auth",
-                "parent": null,
-                "aliases": ["authentication"],
-                "concept_iri": "https://neurostrata.io/concepts/authentication"
-            }),
-        ];
+        let entries = vec![serde_json::json!({
+            "slug": "auth",
+            "parent": null,
+            "aliases": ["authentication"],
+            "concept_iri": "https://neurostrata.io/concepts/authentication"
+        })];
         let registry_id = crate::registry::registry_row_id("probe");
         let reg_payload = MemoryPayload {
             content: crate::registry::registry_content("probe"),
@@ -18990,14 +20482,28 @@ eurostrata\src\daemon.rs",
             location_lines: String::new(),
             metadata: crate::registry::registry_metadata_v2(&entries),
         };
-        store.upsert("probe", &registry_id, v.clone(), reg_payload).await.unwrap();
+        store
+            .upsert("probe", &registry_id, v.clone(), reg_payload)
+            .await
+            .unwrap();
 
         let p = retired_test_payload("rule", "agent", json!({"domain": "auth"}));
-        store.upsert("probe", "auth-rule-1", v.clone(), p).await.unwrap();
+        store
+            .upsert("probe", "auth-rule-1", v.clone(), p)
+            .await
+            .unwrap();
 
-        let fetched = store.get("probe", "auth-rule-1").await.unwrap().expect("exists");
+        let fetched = store
+            .get("probe", "auth-rule-1")
+            .await
+            .unwrap()
+            .expect("exists");
         assert_eq!(
-            fetched.1.metadata.get("concept_iri").and_then(|v| v.as_str()),
+            fetched
+                .1
+                .metadata
+                .get("concept_iri")
+                .and_then(|v| v.as_str()),
             Some("https://neurostrata.io/concepts/authentication")
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -19034,9 +20540,19 @@ eurostrata\src\daemon.rs",
         };
 
         let rows = [
-            seed("mem-rule-a", "src/lib.rs", "rule", r#"{"superseded_by": "mem-rule-c"}"#),
+            seed(
+                "mem-rule-a",
+                "src/lib.rs",
+                "rule",
+                r#"{"superseded_by": "mem-rule-c"}"#,
+            ),
             seed("mem-rule-b", "src/lib.rs", "fact", "{}"),
-            seed("mem-file", "src/lib.rs", "file", r#"{"imports": ["pkg/other.rs", "src/lib.rs"]}"#),
+            seed(
+                "mem-file",
+                "src/lib.rs",
+                "file",
+                r#"{"imports": ["pkg/other.rs", "src/lib.rs"]}"#,
+            ),
             seed("mem-sym-foo", "src/lib.rs#function:foo@1", "symbol", "{}"),
             seed("mem-sym-bar", "src/lib.rs#function:bar@2", "symbol", "{}"),
             seed("mem-sym-x", "other.rs#function:x@3", "symbol", "{}"),
@@ -19082,11 +20598,27 @@ eurostrata\src\daemon.rs",
             .iter()
             .map(|v| v.get("id").and_then(|v| v.as_str()).unwrap())
             .collect();
-        assert_eq!(related.len(), 4, "exactly four related memories: {related:?}");
-        assert!(related_ids.contains(&"mem-sym-foo"), "DEPENDS_ON outgoing: {related:?}");
-        assert!(related_ids.contains(&"mem-sym-bar"), "RELATES_TO outgoing: {related:?}");
-        assert!(related_ids.contains(&"mem-sym-x"), "RELATES_TO incoming: {related:?}");
-        assert!(related_ids.contains(&"mem-rule-c"), "SUPERSEDES target: {related:?}");
+        assert_eq!(
+            related.len(),
+            4,
+            "exactly four related memories: {related:?}"
+        );
+        assert!(
+            related_ids.contains(&"mem-sym-foo"),
+            "DEPENDS_ON outgoing: {related:?}"
+        );
+        assert!(
+            related_ids.contains(&"mem-sym-bar"),
+            "RELATES_TO outgoing: {related:?}"
+        );
+        assert!(
+            related_ids.contains(&"mem-sym-x"),
+            "RELATES_TO incoming: {related:?}"
+        );
+        assert!(
+            related_ids.contains(&"mem-rule-c"),
+            "SUPERSEDES target: {related:?}"
+        );
         let dep_foo = related
             .iter()
             .find(|v| v.get("id").and_then(|v| v.as_str()) == Some("mem-sym-foo"))
@@ -19119,7 +20651,11 @@ eurostrata\src\daemon.rs",
             .iter()
             .map(|v| v.get("id").and_then(|v| v.as_str()).unwrap())
             .collect();
-        assert_eq!(caller_ids.len(), 3, "callers depend on file symbols: {caller_ids:?}");
+        assert_eq!(
+            caller_ids.len(),
+            3,
+            "callers depend on file symbols: {caller_ids:?}"
+        );
         assert!(caller_ids.contains(&"mem-rule-a"));
         assert!(caller_ids.contains(&"mem-sym-foo"));
         assert!(caller_ids.contains(&"mem-sym-x"));
@@ -19131,7 +20667,11 @@ eurostrata\src\daemon.rs",
             .iter()
             .map(|v| v.get("id").and_then(|v| v.as_str()).unwrap())
             .collect();
-        assert_eq!(callee_ids.len(), 1, "callees are file symbols' targets: {callee_ids:?}");
+        assert_eq!(
+            callee_ids.len(),
+            1,
+            "callees are file symbols' targets: {callee_ids:?}"
+        );
         assert!(callee_ids.contains(&"mem-sym-bar"));
 
         let import_paths: Vec<&str> = summary
@@ -19164,7 +20704,9 @@ eurostrata\src\daemon.rs",
             "small neighborhood is not truncated: {summary}"
         );
         assert_eq!(
-            summary.get("related_memories_truncated").and_then(|v| v.as_bool()),
+            summary
+                .get("related_memories_truncated")
+                .and_then(|v| v.as_bool()),
             Some(false),
             "small related_memories is not truncated: {summary}"
         );
@@ -20811,7 +22353,13 @@ eurostrata\src\daemon.rs",
                 widths.contains(&"FLOAT[8]".to_string()),
                 "the embedding column was recreated at the serving width: {widths:?}"
             );
-            for table in ["RELATES_TO", "CONTAINS", "GOVERNS", "EXTRACTED_FROM", "DEPENDS_ON"] {
+            for table in [
+                "RELATES_TO",
+                "CONTAINS",
+                "GOVERNS",
+                "EXTRACTED_FROM",
+                "DEPENDS_ON",
+            ] {
                 let rows = match conn.query(&format!("CALL table_info('{table}') RETURN *")) {
                     Ok(rows) => rows,
                     Err(e) => panic!("table_info for rel table {table} failed: {e}"),
@@ -20840,7 +22388,10 @@ eurostrata\src\daemon.rs",
         let opener = LadybugStore::for_testing(&fx.db, 4)
             .expect("open temp database")
             .with_embed_config_dir(&fx.config_dir);
-        opener.init("probe").await.expect("init binds the schema latch");
+        opener
+            .init("probe")
+            .await
+            .expect("init binds the schema latch");
         drop(opener);
 
         // Reopen: the db preexists with no sidecar, so the store
@@ -20853,8 +22404,13 @@ eurostrata\src\daemon.rs",
             store.cached_store_state(),
             CachedStoreState::LockedUnknown
         ));
-        store.init("probe").await.expect("init latches schema_ready");
-        assert!(store.schema_ready.load(std::sync::atomic::Ordering::Acquire));
+        store
+            .init("probe")
+            .await
+            .expect("init latches schema_ready");
+        assert!(store
+            .schema_ready
+            .load(std::sync::atomic::Ordering::Acquire));
         assert!(
             !crate::model_choice::store_state_path(&fx.db).exists(),
             "no sidecar: serving was unbound at the init"
@@ -20864,7 +22420,10 @@ eurostrata\src\daemon.rs",
         // the empty table from the engine, and record the pristine
         // sidecar.
         store.set_serving_descriptor(Some(serving_descriptor_for("ModelA")));
-        store.init("probe").await.expect("fast-path init retries the upgrade");
+        store
+            .init("probe")
+            .await
+            .expect("fast-path init retries the upgrade");
         let sidecar = read_sidecar(&fx.db);
         assert_eq!(sidecar["has_data"], serde_json::json!(false));
         assert_eq!(sidecar["descriptor"]["model"], serde_json::json!("ModelA"));
@@ -21402,7 +22961,10 @@ eurostrata\src\daemon.rs",
         let mut valid_len = std::fs::metadata(&wal)
             .expect("WAL flushed after prefix sentinel")
             .len() as usize;
-        assert!(valid_len > 25, "prefix transaction must advance WAL beyond 25-byte header");
+        assert!(
+            valid_len > 25,
+            "prefix transaction must advance WAL beyond 25-byte header"
+        );
 
         for i in 0..rows {
             conn.query(&format!(
@@ -21490,7 +23052,7 @@ eurostrata\src\daemon.rs",
     /// Opt this process into the unverified-WAL recovery fallback
     /// (the operator opt-in the WAL-discard/unverified arms require),
     /// returning the previous values for restoration.
-/// Serializes the env-mutating sections of the three WAL
+    /// Serializes the env-mutating sections of the three WAL
     /// recovery tests: they all set NEUROSTRATA_STRICT_WAL=0 and
     /// restore it afterwards, and a restore racing another test's
     /// read makes the strict verifier fire on a variable the test
@@ -21717,7 +23279,9 @@ eurostrata\src\daemon.rs",
         wal_os.push(".wal");
         let wal = std::path::PathBuf::from(wal_os);
         assert!(
-            std::fs::metadata(&wal).map(|m| m.len() > 0).unwrap_or(false),
+            std::fs::metadata(&wal)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false),
             "the seeded store left a non-empty WAL"
         );
 
@@ -21729,7 +23293,9 @@ eurostrata\src\daemon.rs",
         std::env::remove_var("NEUROSTRATA_ALLOW_UNVERIFIED_WAL");
         std::env::set_var("NEUROSTRATA_STRICT_WAL", "1");
         match LadybugStore::with_system_config(&db, 4, verifying_config()) {
-            Ok(_) => panic!("strict WAL verification must refuse a checksum mismatch over a live WAL"),
+            Ok(_) => {
+                panic!("strict WAL verification must refuse a checksum mismatch over a live WAL")
+            }
             Err(err) => {
                 let text = err.to_string();
                 assert!(
@@ -21975,7 +23541,8 @@ eurostrata\src\daemon.rs",
         let wal = std::path::PathBuf::from(wal_os);
         let pre_len = std::fs::metadata(&wal).expect("WAL exists").len();
         assert!(pre_len > 0, "seeded non-empty WAL");
-        std::fs::write(&wal, vec![0xFFu8; pre_len as usize]).expect("corrupt entire WAL from byte 0");
+        std::fs::write(&wal, vec![0xFFu8; pre_len as usize])
+            .expect("corrupt entire WAL from byte 0");
 
         let _wal_env_serial = WAL_ENV_LOCK.lock().await;
         let previous_wal = allow_unverified_wal_recovery();
@@ -21984,7 +23551,9 @@ eurostrata\src\daemon.rs",
         drop(_wal_env_serial);
 
         let err = match res {
-            Ok(_) => panic!("zero-record WAL replay on a pre-existing store must be refused (#189)"),
+            Ok(_) => {
+                panic!("zero-record WAL replay on a pre-existing store must be refused (#189)")
+            }
             Err(e) => e.to_string(),
         };
         assert!(
@@ -22245,7 +23814,10 @@ eurostrata\src\daemon.rs",
                 .permissions()
                 .mode()
                 & 0o777;
-            assert_eq!(mode, 0o600, ".wal.corrupted.<ts> must have 0600 permissions (#193)");
+            assert_eq!(
+                mode, 0o600,
+                ".wal.corrupted.<ts> must have 0600 permissions (#193)"
+            );
         }
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -22280,7 +23852,10 @@ eurostrata\src\daemon.rs",
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&first).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, ".wal.unclean.<ts> must be created with 0600 mode (#193)");
+            assert_eq!(
+                mode, 0o600,
+                ".wal.unclean.<ts> must be created with 0600 mode (#193)"
+            );
         }
 
         // Symlink source WAL must be refused.
@@ -22304,7 +23879,10 @@ eurostrata\src\daemon.rs",
             std::fs::write(&p, format!("payload-{ts}")).unwrap();
         }
         let pruned = crate::storage::snapshot::prune_wal_recovery_artifacts(&db, 3);
-        assert!(pruned.len() >= 5, "should prune older artifacts past keep=3 (#195)");
+        assert!(
+            pruned.len() >= 5,
+            "should prune older artifacts past keep=3 (#195)"
+        );
         let remaining = crate::storage::snapshot::list_wal_recovery_artifacts(&db);
         assert_eq!(
             remaining.len(),
@@ -22370,7 +23948,10 @@ eurostrata\src\daemon.rs",
             &db,
             &crate::storage::StorageHygieneConfig::default(),
         );
-        assert_eq!(status.wal_bytes, 128, "storage status reports WAL bytes without opening DB");
+        assert_eq!(
+            status.wal_bytes, 128,
+            "storage status reports WAL bytes without opening DB"
+        );
         assert!(
             status.wal_recovery_artifact_count >= 1,
             "storage status inventories preserved .wal.unclean.<ts> artifact (#195, #196)"
@@ -22378,8 +23959,8 @@ eurostrata\src\daemon.rs",
 
         LadybugStore::export_database_files(&db, &backup_dir)
             .expect("no-open backup succeeds on WAL-refused store (#196)");
-        let report = crate::storage::verify_snapshot(&backup_dir)
-            .expect("verify no-open backup snapshot");
+        let report =
+            crate::storage::verify_snapshot(&backup_dir).expect("verify no-open backup snapshot");
         assert!(report.valid, "no-open backup snapshot must verify cleanly");
         assert!(
             backup_dir.join("ladybug.store.wal").exists(),
@@ -22439,19 +24020,37 @@ eurostrata\src\daemon.rs",
         let funnel = lines[fn_start..fn_end].join("\n");
         // Arm 1 — enableChecksums mismatch, gated by strict WAL verification
         // when a non-empty WAL is present.
-        assert!(funnel.contains("enableChecksums"), "the enableChecksums arm is in the funnel");
+        assert!(
+            funnel.contains("enableChecksums"),
+            "the enableChecksums arm is in the funnel"
+        );
         assert!(
             funnel.contains("strict_wal_verification"),
             "the mismatch arm gates on strict WAL verification"
         );
         // Arm 2 — WAL integrity failure: unverified replay, CHECKPOINT, then
         // a verified reopen.
-        assert!(funnel.contains("unverified_config()"), "the unverified replay arm is in the funnel");
-        assert!(funnel.contains("verifying_config()"), "the funnel reopens under verifying_config()");
-        assert!(funnel.contains("CHECKPOINT;"), "the funnel checkpoints the replayed WAL");
+        assert!(
+            funnel.contains("unverified_config()"),
+            "the unverified replay arm is in the funnel"
+        );
+        assert!(
+            funnel.contains("verifying_config()"),
+            "the funnel reopens under verifying_config()"
+        );
+        assert!(
+            funnel.contains("CHECKPOINT;"),
+            "the funnel checkpoints the replayed WAL"
+        );
         // Arm 3 — unreadable WAL: renamed aside to .corrupted.<ts>.
-        assert!(funnel.contains(".corrupted."), "the unreadable-WAL rename arm is in the funnel");
-        assert!(funnel.contains("rename"), "the unreadable WAL is moved aside");
+        assert!(
+            funnel.contains(".corrupted."),
+            "the unreadable-WAL rename arm is in the funnel"
+        );
+        assert!(
+            funnel.contains("rename"),
+            "the unreadable WAL is moved aside"
+        );
         // The marginal WAL is preserved before the unverified replay.
         assert!(
             funnel.contains("preserve_unclean_wal"),
@@ -23545,13 +25144,25 @@ eurostrata\src\daemon.rs",
             PROBE_SOURCE,
             &[
                 ("src/clean.rs", "cleanfileneedle harmless"),
-                ("src/leaked.rs", "leakedsecretneedle scanner would skip this row"),
+                (
+                    "src/leaked.rs",
+                    "leakedsecretneedle scanner would skip this row",
+                ),
             ],
         )
         .await;
         // Load both caches on the generation that still carries the row.
         let warm = store
-            .search_lexical("gen", "leakedsecretneedle", 10, false, false, &[], "admin", 0)
+            .search_lexical(
+                "gen",
+                "leakedsecretneedle",
+                10,
+                false,
+                false,
+                &[],
+                "admin",
+                0,
+            )
             .await
             .unwrap()
             .results;
@@ -23573,7 +25184,16 @@ eurostrata\src\daemon.rs",
         .await;
 
         let inhouse = store
-            .search_lexical("gen", "leakedsecretneedle", 10, false, false, &[], "admin", 0)
+            .search_lexical(
+                "gen",
+                "leakedsecretneedle",
+                10,
+                false,
+                false,
+                &[],
+                "admin",
+                0,
+            )
             .await
             .unwrap()
             .results;
@@ -23650,7 +25270,16 @@ eurostrata\src\daemon.rs",
         .await;
         let active_id = crate::parser::ingest::generation_scoped_id("gen", first, "src/active.rs");
         let warm = store
-            .search_lexical("gen", "stagedstarveneedle", 1, false, false, &[], "admin", 0)
+            .search_lexical(
+                "gen",
+                "stagedstarveneedle",
+                1,
+                false,
+                false,
+                &[],
+                "admin",
+                0,
+            )
             .await
             .unwrap()
             .results;
@@ -23658,8 +25287,11 @@ eurostrata\src\daemon.rs",
 
         let second = store.begin_generation("gen", PROBE_SOURCE).await.unwrap();
         for i in 0..20 {
-            let id =
-                crate::parser::ingest::generation_scoped_id("gen", second, &format!("src/staged-{i}.rs"));
+            let id = crate::parser::ingest::generation_scoped_id(
+                "gen",
+                second,
+                &format!("src/staged-{i}.rs"),
+            );
             store
                 .upsert(
                     "gen",
@@ -23676,7 +25308,16 @@ eurostrata\src\daemon.rs",
         }
 
         let inhouse = store
-            .search_lexical("gen", "stagedstarveneedle", 1, false, false, &[], "admin", 0)
+            .search_lexical(
+                "gen",
+                "stagedstarveneedle",
+                1,
+                false,
+                false,
+                &[],
+                "admin",
+                0,
+            )
             .await
             .unwrap()
             .results;
@@ -23773,14 +25414,21 @@ eurostrata\src\daemon.rs",
         let root = tempfile::tempdir().unwrap();
         let store = LadybugStore::for_testing(root.path().join("legacy.lbug"), 4).unwrap();
         store.init("legacy").await.unwrap();
-        let generation = store.begin_generation("legacy", "worktree-x").await.unwrap();
+        let generation = store
+            .begin_generation("legacy", "worktree-x")
+            .await
+            .unwrap();
         let id = crate::parser::ingest::generation_scoped_id("legacy", generation, "src/a.rs");
         store
             .upsert(
                 "legacy",
                 &id,
                 vec![0.0; 4],
-                generation_payload("legacypointerneedle still readable", "worktree-x", json!({})),
+                generation_payload(
+                    "legacypointerneedle still readable",
+                    "worktree-x",
+                    json!({}),
+                ),
             )
             .await
             .unwrap();
@@ -23791,7 +25439,16 @@ eurostrata\src\daemon.rs",
             .unwrap();
 
         let inhouse = store
-            .search_lexical("legacy", "legacypointerneedle", 10, false, false, &[], "admin", 0)
+            .search_lexical(
+                "legacy",
+                "legacypointerneedle",
+                10,
+                false,
+                false,
+                &[],
+                "admin",
+                0,
+            )
             .await
             .unwrap()
             .results;
@@ -23801,7 +25458,15 @@ eurostrata\src\daemon.rs",
             "a legacy namespace pointer must keep its rows visible"
         );
         let tantivy = store
-            .search_tantivy_lexical("legacy", "legacypointerneedle", 10, false, false, &[], "admin")
+            .search_tantivy_lexical(
+                "legacy",
+                "legacypointerneedle",
+                10,
+                false,
+                false,
+                &[],
+                "admin",
+            )
             .await
             .unwrap()
             .results;
@@ -23829,12 +25494,29 @@ eurostrata\src\daemon.rs",
 
         for (principal, expected) in [("alice", 1), ("bob", 1), ("eve", 0)] {
             let inhouse = store
-                .search_lexical("probe", "ownerparityneedle", 10, false, false, &[], principal, 0)
+                .search_lexical(
+                    "probe",
+                    "ownerparityneedle",
+                    10,
+                    false,
+                    false,
+                    &[],
+                    principal,
+                    0,
+                )
                 .await
                 .unwrap()
                 .results;
             let tantivy = store
-                .search_tantivy_lexical("probe", "ownerparityneedle", 10, false, false, &[], principal)
+                .search_tantivy_lexical(
+                    "probe",
+                    "ownerparityneedle",
+                    10,
+                    false,
+                    false,
+                    &[],
+                    principal,
+                )
                 .await
                 .unwrap()
                 .results;
@@ -23878,8 +25560,7 @@ eurostrata\src\daemon.rs",
             .unwrap();
 
         let generation = store.begin_generation("gen", "src").await.unwrap();
-        let staged_id =
-            crate::parser::ingest::generation_scoped_id("gen", generation, "src/a.rs");
+        let staged_id = crate::parser::ingest::generation_scoped_id("gen", generation, "src/a.rs");
         store
             .upsert(
                 "gen",
@@ -23917,13 +25598,8 @@ eurostrata\src\daemon.rs",
         let mut generations = Vec::new();
         for content in ["first generation", "second generation", "third generation"] {
             generations.push(
-                publish_fixture_generation(
-                    &store,
-                    "gen",
-                    PROBE_SOURCE,
-                    &[("src/a.rs", content)],
-                )
-                .await,
+                publish_fixture_generation(&store, "gen", PROBE_SOURCE, &[("src/a.rs", content)])
+                    .await,
             );
         }
         let id = |generation: u64| {
@@ -23933,15 +25609,27 @@ eurostrata\src\daemon.rs",
         let deleted = store.prune_generations("gen", 2).await.unwrap();
         assert!(deleted > 0, "the oldest generation has rows to prune");
         assert!(
-            store.get("gen", &id(generations[0])).await.unwrap().is_none(),
+            store
+                .get("gen", &id(generations[0]))
+                .await
+                .unwrap()
+                .is_none(),
             "the superseded generation is gone"
         );
         assert!(
-            store.get("gen", &id(generations[1])).await.unwrap().is_some(),
+            store
+                .get("gen", &id(generations[1]))
+                .await
+                .unwrap()
+                .is_some(),
             "the previous generation stays as the rollback target"
         );
         assert!(
-            store.get("gen", &id(generations[2])).await.unwrap().is_some(),
+            store
+                .get("gen", &id(generations[2]))
+                .await
+                .unwrap()
+                .is_some(),
             "the active generation stays"
         );
         assert_eq!(
@@ -23986,13 +25674,14 @@ eurostrata\src\daemon.rs",
 
         let deleted = store.delete_generation("gen", first).await.unwrap();
         assert!(deleted > 0, "the superseded generation is deleted");
-        assert!(
-            store
-                .get("gen", &crate::parser::ingest::generation_scoped_id("gen", first, "src/a.rs"))
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(store
+            .get(
+                "gen",
+                &crate::parser::ingest::generation_scoped_id("gen", first, "src/a.rs")
+            )
+            .await
+            .unwrap()
+            .is_none());
         assert!(
             store.get("other", &foreign_id).await.unwrap().is_some(),
             "a foreign row with the same prefix survives"
@@ -24027,7 +25716,10 @@ eurostrata\src\daemon.rs",
             store.get("gen", &id).await.unwrap().is_some(),
             "the staged rows survive"
         );
-        store.abort_generation("gen", PROBE_SOURCE, staged).await.unwrap();
+        store
+            .abort_generation("gen", PROBE_SOURCE, staged)
+            .await
+            .unwrap();
     }
 
     /// Retention retains a staging generation even when newer generations push
@@ -24080,7 +25772,10 @@ eurostrata\src\daemon.rs",
             store.get("gen", &staged_id).await.unwrap().is_some(),
             "the staging generation is retained"
         );
-        store.abort_generation("gen", "source-a", staged).await.unwrap();
+        store
+            .abort_generation("gen", "source-a", staged)
+            .await
+            .unwrap();
     }
 
     /// Two overlapping ingests of one source each hold a staging row; pruning
@@ -24138,8 +25833,14 @@ eurostrata\src\daemon.rs",
                 "overlapping staging generation survives: {id}"
             );
         }
-        store.abort_generation("gen", "source-a", first).await.unwrap();
-        store.abort_generation("gen", "source-a", second).await.unwrap();
+        store
+            .abort_generation("gen", "source-a", first)
+            .await
+            .unwrap();
+        store
+            .abort_generation("gen", "source-a", second)
+            .await
+            .unwrap();
     }
 
     /// An in-flight ingest reads the generation that was active when it began.
@@ -24190,7 +25891,10 @@ eurostrata\src\daemon.rs",
             "the base generation survives for carry-forward"
         );
         assert!(store.get("gen", &slow_id).await.unwrap().is_some());
-        store.abort_generation("gen", "source-a", slow).await.unwrap();
+        store
+            .abort_generation("gen", "source-a", slow)
+            .await
+            .unwrap();
     }
 
     /// A marker left by a process that died between begin and publish/abort is
@@ -24198,7 +25902,8 @@ eurostrata\src\daemon.rs",
     #[tokio::test]
     async fn prune_recovers_abandoned_staging_markers() {
         let root = tempfile::tempdir().unwrap();
-        let store = LadybugStore::for_testing(root.path().join("abandoned-staging.lbug"), 4).unwrap();
+        let store =
+            LadybugStore::for_testing(root.path().join("abandoned-staging.lbug"), 4).unwrap();
         store.init("gen").await.unwrap();
         let abandoned = store.begin_generation("gen", "source-a").await.unwrap();
         let abandoned_id =
@@ -24249,8 +25954,9 @@ eurostrata\src\daemon.rs",
         assert!(store.get("gen", &abandoned_id).await.unwrap().is_none());
         let remaining = store
             .with_conn(|conn| {
-                let mut rows = conn
-                    .query("MATCH (s:StagingGeneration) WHERE s.namespace = 'gen' RETURN count(s)")?;
+                let mut rows = conn.query(
+                    "MATCH (s:StagingGeneration) WHERE s.namespace = 'gen' RETURN count(s)",
+                )?;
                 Ok(rows.next().map(|r| format!("{}", r[0])).unwrap_or_default())
             })
             .await
@@ -24316,13 +26022,15 @@ eurostrata\src\daemon.rs",
         let root = tempfile::tempdir().unwrap();
         let store = LadybugStore::for_testing(root.path().join("upgrade-prev.lbug"), 4).unwrap();
         store.init("gen").await.unwrap();
-        let a1 = publish_fixture_generation(&store, "gen", "source-a", &[("src/a.rs", "a one")]).await;
+        let a1 =
+            publish_fixture_generation(&store, "gen", "source-a", &[("src/a.rs", "a one")]).await;
         publish_fixture_generation(&store, "gen", "source-a", &[("src/a.rs", "a two")]).await;
         publish_fixture_generation(&store, "gen", "source-b", &[("src/b.rs", "b three")]).await;
         publish_fixture_generation(&store, "gen", "source-b", &[("src/b.rs", "b four")]).await;
 
         // The upgrade: the new column exists but is empty for every pointer.
-        let pointers = "MATCH (g:IngestGeneration) WHERE g.namespace = 'gen' SET g.previous_generation = 0";
+        let pointers =
+            "MATCH (g:IngestGeneration) WHERE g.namespace = 'gen' SET g.previous_generation = 0";
         store
             .with_conn(|conn| {
                 conn.query(pointers)?;
@@ -24336,16 +26044,14 @@ eurostrata\src\daemon.rs",
             deleted, 0,
             "the fallback retains source A's rollback target (generation {a1})"
         );
-        assert!(
-            store
-                .get(
-                    "gen",
-                    &crate::parser::ingest::generation_scoped_id("gen", a1, "src/a.rs")
-                )
-                .await
-                .unwrap()
-                .is_some()
-        );
+        assert!(store
+            .get(
+                "gen",
+                &crate::parser::ingest::generation_scoped_id("gen", a1, "src/a.rs")
+            )
+            .await
+            .unwrap()
+            .is_some());
     }
 
     /// Prune's delete rechecks the rollback target inside its own write turn;
@@ -24362,10 +26068,14 @@ eurostrata\src\daemon.rs",
             &[("src/a.rs", "generation one")],
         )
         .await;
-        publish_fixture_generation(&store, "gen", PROBE_SOURCE, &[("src/a.rs", "generation two")])
-            .await;
-        let previous_id =
-            crate::parser::ingest::generation_scoped_id("gen", previous, "src/a.rs");
+        publish_fixture_generation(
+            &store,
+            "gen",
+            PROBE_SOURCE,
+            &[("src/a.rs", "generation two")],
+        )
+        .await;
+        let previous_id = crate::parser::ingest::generation_scoped_id("gen", previous, "src/a.rs");
 
         let err = store
             .delete_generation_protected("gen", previous)
@@ -24410,12 +26120,189 @@ eurostrata\src\daemon.rs",
             "the refusal states why the active generation is protected: {message}"
         );
         assert_eq!(
-            store
-                .active_generation("gen", PROBE_SOURCE)
-                .await
-                .unwrap(),
+            store.active_generation("gen", PROBE_SOURCE).await.unwrap(),
             active,
             "the pointer is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn hybrid_rrf_surfaces_lexical_only_code_ast_and_respects_include_code_ast() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("hybrid-rrf.lbug"), 4).unwrap();
+        store.init("hyb").await.unwrap();
+
+        // Seed 6 vector-aligned distractor rows with no lexical overlap.
+        for i in 0..6 {
+            let mut payload = retired_test_payload("fact", "agent", json!({}));
+            payload.content = format!("unrelated vector background entry {i}");
+            store
+                .upsert(
+                    "hyb",
+                    &format!("vec-only-{i}"),
+                    vec![1.0, 0.0, 0.0, 0.0],
+                    payload,
+                )
+                .await
+                .unwrap();
+        }
+
+        // Seed a code_ast row whose vector is orthogonal to the query vector,
+        // so only Tantivy / symbol tracks match `parse_cypher_query`.
+        let mut ast_payload = retired_test_payload(
+            "code_ast",
+            "ast_ingestor",
+            json!({
+                "symbol": "crate::parser::parse_cypher_query",
+                "node_kind": "function_item"
+            }),
+        );
+        ast_payload.content = "pub fn parse_cypher_query(input: &str) -> Result<Ast>".to_string();
+        ast_payload.location = "src/parser/cypher.rs".to_string();
+        store
+            .upsert("hyb", "ast-target", vec![0.0, 1.0, 0.0, 0.0], ast_payload)
+            .await
+            .unwrap();
+
+        let hybrid_with_ast = store
+            .search_hybrid_with_domain(
+                "hyb",
+                vec![1.0, 0.0, 0.0, 0.0],
+                5,
+                false,
+                false,
+                true,
+                &[],
+                Some("parseCypherQuery"),
+                false,
+                crate::traits::SearchMode::Hybrid,
+            )
+            .await
+            .unwrap()
+            .results;
+
+        assert!(
+            hybrid_with_ast.iter().any(|r| r.id == "ast-target"),
+            "Hybrid RRF + CodeTokenizer must surface camelCase/snake_case code_ast match in top-5: {:?}",
+            result_ids(&hybrid_with_ast)
+        );
+
+        let hybrid_without_ast = store
+            .search_hybrid_with_domain(
+                "hyb",
+                vec![1.0, 0.0, 0.0, 0.0],
+                5,
+                false,
+                false,
+                false,
+                &[],
+                Some("parseCypherQuery"),
+                false,
+                crate::traits::SearchMode::Hybrid,
+            )
+            .await
+            .unwrap()
+            .results;
+
+        assert!(
+            !hybrid_without_ast.iter().any(|r| r.id == "ast-target"),
+            "include_code_ast=false must exclude code_ast rows from hybrid search"
+        );
+    }
+
+    #[tokio::test]
+    async fn hybrid_rrf_boosts_dual_track_and_reserves_governs_expansion_slot() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("hybrid-slots.lbug"), 4).unwrap();
+        store.init("hyb").await.unwrap();
+
+        // Dual-track hit: strong vector match AND lexical match.
+        let mut dual = retired_test_payload(
+            "code_ast",
+            "ast_ingestor",
+            json!({"symbol": "hybrid_rrf_ target"}),
+        );
+        dual.content = "fn hybrid_rrf_fusion_engine() {}".to_string();
+        dual.location = "src/graph_read/hybrid.rs".to_string();
+        store
+            .upsert("hyb", "dual-hit", vec![1.0, 0.0, 0.0, 0.0], dual)
+            .await
+            .unwrap();
+
+        // Single-track flood: 10 structural code_ast rows matching vector only.
+        for i in 0..10 {
+            let mut flood = retired_test_payload("code_ast", "ast_ingestor", json!({}));
+            flood.content = format!("structural helper function {i}");
+            flood.location = format!("src/flood_{i}.rs");
+            store
+                .upsert(
+                    "hyb",
+                    &format!("flood-{i}"),
+                    vec![0.99, 0.01 * (i as f32 + 1.0), 0.0, 0.0],
+                    flood,
+                )
+                .await
+                .unwrap();
+        }
+
+        // Normative rule governing `dual-hit`, orthogonal vector and no query terms,
+        // so it enters strictly via 1-hop GOVERNS graph expansion.
+        let mut gov_rule = retired_test_payload(
+            "rule",
+            "architect",
+            json!({
+                "bi_directional_anchors": {
+                    "governs": ["dual-hit"]
+                }
+            }),
+        );
+        gov_rule.content =
+            "All ranking fusion kernels must be deterministic and total-ordered.".to_string();
+        gov_rule.location = "docs/architecture.md".to_string();
+        store
+            .upsert("hyb", "governing-rule", vec![0.0, 0.0, 1.0, 0.0], gov_rule)
+            .await
+            .unwrap();
+
+        let outcome = store
+            .search_hybrid_with_domain(
+                "hyb",
+                vec![1.0, 0.0, 0.0, 0.0],
+                25,
+                false,
+                false,
+                true,
+                &[],
+                Some("hybrid_rrf_fusion_engine"),
+                false,
+                crate::traits::SearchMode::Hybrid,
+            )
+            .await
+            .unwrap();
+
+        let dual_res = outcome
+            .results
+            .iter()
+            .find(|r| r.id == "dual-hit")
+            .expect("dual-hit present");
+        let flood0_res = outcome
+            .results
+            .iter()
+            .find(|r| r.id == "flood-0")
+            .expect("flood-0 present");
+        assert!(
+            dual_res.score < flood0_res.score,
+            "dual-track hit ({}) must have strictly smaller RRF distance than single-track hit ({})",
+            dual_res.score,
+            flood0_res.score
+        );
+
+        let top10 = super::reserve_normative_and_expansion_slots(outcome.results, 10);
+        assert_eq!(top10.len(), 10);
+        assert!(
+            top10.iter().any(|r| r.id == "governing-rule"),
+            "slot reservation must preserve the 1-hop GOVERNS rule in top-10 despite 10 structural code_ast hits: {:?}",
+            result_ids(&top10)
         );
     }
 }
@@ -24477,7 +26364,9 @@ impl LadybugStore {
             })
             .await?;
 
-        Ok(crate::rdf::rows_to_quads(&rows, namespace, tier, generation, &edges))
+        Ok(crate::rdf::rows_to_quads(
+            &rows, namespace, tier, generation, &edges,
+        ))
     }
 }
 
@@ -24588,7 +26477,9 @@ impl LadybugStore {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
                 let retired = match payload.metadata.get("valid_to") {
-                    Some(v) if !v.is_null() => v.as_i64().map(|ts| ts > 0 && ts <= now_ts).unwrap_or(true),
+                    Some(v) if !v.is_null() => {
+                        v.as_i64().map(|ts| ts > 0 && ts <= now_ts).unwrap_or(true)
+                    }
                     _ => false,
                 };
                 let conflicting =
@@ -24643,7 +26534,8 @@ impl LadybugStore {
         );
         // Insert into per-namespace map (read-modify-write on ArcSwap).
         let cur = self.ontology.load();
-        let mut map: std::collections::BTreeMap<String, crate::rdf::OntologyIndex> = (**cur).clone();
+        let mut map: std::collections::BTreeMap<String, crate::rdf::OntologyIndex> =
+            (**cur).clone();
         map.insert(namespace.to_string(), idx);
         self.ontology.store(std::sync::Arc::new(map));
     }
@@ -24651,9 +26543,7 @@ impl LadybugStore {
     /// Get the cached ontology index for a namespace, building on demand (empty if missing).
     pub fn get_ontology(&self, namespace: &str) -> crate::rdf::OntologyIndex {
         let cur = self.ontology.load();
-        cur.get(namespace)
-            .cloned()
-            .unwrap_or_default()
+        cur.get(namespace).cloned().unwrap_or_default()
     }
 
     /// Check whether a directed relationship `(from)-[r:relation]->(to)` exists between two rows in `namespace`.
@@ -24729,7 +26619,9 @@ impl LadybugStore {
 
         let ns = namespace.to_string();
         if ns.trim().is_empty() {
-            return Err(ActionError::Storage("namespace must be non-empty".to_string()));
+            return Err(ActionError::Storage(
+                "namespace must be non-empty".to_string(),
+            ));
         }
         self.guard_first_write()
             .map_err(|e| ActionError::Storage(e.to_string()))?;
@@ -25086,8 +26978,7 @@ impl LadybugStore {
 }
 
 #[cfg(test)]
-fn action_batch_fail_map(
-) -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, usize>> {
+fn action_batch_fail_map() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, usize>> {
     static MAP: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, usize>>> =
         std::sync::OnceLock::new();
     MAP.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
@@ -25106,8 +26997,7 @@ fn conn_upsert_action_row(
     let safe_content = escape_ladybug_string(&payload.content);
     let safe_user_id = escape_ladybug_string(&payload.user_id);
     let safe_memory_type = escape_ladybug_string(&payload.memory_type);
-    let safe_agent_name =
-        escape_ladybug_string(payload.agent_name.as_deref().unwrap_or("unknown"));
+    let safe_agent_name = escape_ladybug_string(payload.agent_name.as_deref().unwrap_or("unknown"));
     let safe_location = escape_ladybug_string(&payload.location);
     let safe_location_lines = escape_ladybug_string(&payload.location_lines);
     let safe_metadata = escape_ladybug_string(&serde_json::to_string(&payload.metadata)?);

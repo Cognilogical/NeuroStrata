@@ -8,6 +8,7 @@ open NeuroStrata.Procedure
 open NeuroStrata.TwinCrdt
 open NeuroStrata.Retention
 open NeuroStrata.KineticAction
+open NeuroStrata.HybridSlots
 
 def boolToStr (b : Bool) : String := if b then "true" else "false"
 
@@ -99,3 +100,9 @@ def main : IO Unit := do
     for explicit in [false, true] do
       let shareable := isActionMemoryShareable kind explicit
       IO.println s!"ACTION_SHAREABLE|{kind.asStr}|{boolToStr explicit}|{boolToStr shareable}"
+  for limit in [2, 4, 5, 8] do
+    for availNorm in [0, 2, 4] do
+      for availExp in [0, 1, 3] do
+        for availOther in [0, 3] do
+          let alloc := allocateHybridSlots limit availNorm availExp availOther
+          IO.println s!"HYBRID_SLOTS|{limit}|{availNorm}|{availExp}|{availOther}|{alloc.normativeTaken}|{alloc.expansionTaken}|{alloc.remainingTaken}"

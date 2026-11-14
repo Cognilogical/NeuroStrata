@@ -21,14 +21,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use formal_kernel::{
-    action_gate_tag, action_revert_tag, action_task_effect_tag, classify_merge_decision_tag,
-    claim_decision_tag, epoch_gate_tag, evaluate_action_gate, evaluate_action_revert,
-    evaluate_action_task_effect, evaluate_claim_decision, evaluate_import_precheck,
-    evaluate_procedure_fire, evaluate_retention_gate, evaluate_seq_continuity,
-    evaluate_sovereignty_gate, import_precheck_tag, is_action_memory_shareable, join_task_status,
-    lifecycle_can_transition, procedure_fire_tag, retention_verdict_tag, seq_decision_tag,
-    sovereignty_decision_tag, task_step_tag, ActionMemoryKind, ActionReceiptState,
-    ActionTaskTargetStatus, KernelProcedureTrust,
+    action_gate_tag, action_revert_tag, action_task_effect_tag, allocate_hybrid_slots,
+    claim_decision_tag, classify_merge_decision_tag, epoch_gate_tag, evaluate_action_gate,
+    evaluate_action_revert, evaluate_action_task_effect, evaluate_claim_decision,
+    evaluate_import_precheck, evaluate_procedure_fire, evaluate_retention_gate,
+    evaluate_seq_continuity, evaluate_sovereignty_gate, import_precheck_tag,
+    is_action_memory_shareable, join_task_status, lifecycle_can_transition, procedure_fire_tag,
+    retention_verdict_tag, seq_decision_tag, sovereignty_decision_tag, task_step_tag,
+    ActionMemoryKind, ActionReceiptState, ActionTaskTargetStatus, KernelProcedureTrust,
 };
 
 /// The statuses in the exact order used by `proofs/Main.lean`.
@@ -99,13 +99,14 @@ fn generate_rust_truth_table() -> Vec<String> {
             for &same_sup in [false, true].iter() {
                 for &content_changed in [false, true].iter() {
                     for &concurrent in [false, true].iter() {
-                        let tag = classify_merge_decision_tag(formal_kernel::classify_merge_decision(
-                            local,
-                            cand,
-                            same_sup,
-                            content_changed,
-                            concurrent,
-                        ));
+                        let tag =
+                            classify_merge_decision_tag(formal_kernel::classify_merge_decision(
+                                local,
+                                cand,
+                                same_sup,
+                                content_changed,
+                                concurrent,
+                            ));
                         lines.push(format!(
                             "MESH_MERGE|{}|{}|{}|{}|{}|{}",
                             local.as_str(),
@@ -131,11 +132,17 @@ fn generate_rust_truth_table() -> Vec<String> {
     }
 
     // TASK_CLAIM: 24 rows (4 statuses × 2 same_session × 3 age cases)
-    let age_cases: [(&str, Option<i64>); 3] = [("none", None), ("live", Some(1800)), ("stale", Some(3601))];
+    let age_cases: [(&str, Option<i64>); 3] =
+        [("none", None), ("live", Some(1800)), ("stale", Some(3601))];
     for &status in TASK_STATUSES.iter() {
         for &same_session in [false, true].iter() {
             for &(age_label, age_secs) in age_cases.iter() {
-                let tag = claim_decision_tag(evaluate_claim_decision(status, same_session, age_secs, 3600));
+                let tag = claim_decision_tag(evaluate_claim_decision(
+                    status,
+                    same_session,
+                    age_secs,
+                    3600,
+                ));
                 lines.push(format!(
                     "TASK_CLAIM|{}|{}|{}|{}",
                     status.as_str(),
@@ -153,7 +160,9 @@ fn generate_rust_truth_table() -> Vec<String> {
             for &counter in [false, true].iter() {
                 for &acl_empty in [false, true].iter() {
                     for &in_acl in [false, true].iter() {
-                        let tag = sovereignty_decision_tag(evaluate_sovereignty_gate(perm, shareable, counter, acl_empty, in_acl));
+                        let tag = sovereignty_decision_tag(evaluate_sovereignty_gate(
+                            perm, shareable, counter, acl_empty, in_acl,
+                        ));
                         lines.push(format!(
                             "SOVEREIGNTY_GATE|{}|{}|{}|{}|{}|{}",
                             bool_str(perm),
@@ -173,7 +182,8 @@ fn generate_rust_truth_table() -> Vec<String> {
     for &row_exists in [false, true].iter() {
         for &has_prov in [false, true].iter() {
             for &same_upd in [false, true].iter() {
-                let tag = import_precheck_tag(evaluate_import_precheck(row_exists, has_prov, same_upd));
+                let tag =
+                    import_precheck_tag(evaluate_import_precheck(row_exists, has_prov, same_upd));
                 lines.push(format!(
                     "IMPORT_PRECHECK|{}|{}|{}|{}",
                     bool_str(row_exists),
@@ -194,18 +204,14 @@ fn generate_rust_truth_table() -> Vec<String> {
         KernelProcedureTrust::AbsentOrUnknown,
     ];
     let lapsed_cases: [(&str, Option<i64>); 2] = [("live", None), ("lapsed", Some(1000))];
-    let budget_cases: [(&str, Option<u64>); 3] = [("unbounded", None), ("zero", Some(0)), ("two", Some(2))];
+    let budget_cases: [(&str, Option<u64>); 3] =
+        [("unbounded", None), ("zero", Some(0)), ("two", Some(2))];
     for &trust in trusts.iter() {
         for &imported in [false, true].iter() {
             for &(lapsed_label, valid_to) in lapsed_cases.iter() {
                 for &(budget_label, remaining) in budget_cases.iter() {
                     let tag = procedure_fire_tag(evaluate_procedure_fire(
-                        trust,
-                        imported,
-                        valid_to,
-                        1000,
-                        remaining,
-                        0,
+                        trust, imported, valid_to, 1000, remaining, 0,
                     ));
                     lines.push(format!(
                         "PROCEDURE_FIRE|{}|{}|{}|{}|{}",
@@ -252,7 +258,9 @@ fn generate_rust_truth_table() -> Vec<String> {
             for &found in [false, true].iter() {
                 for &bound in [false, true].iter() {
                     for &matches_wt in [false, true].iter() {
-                        let tag = retention_verdict_tag(evaluate_retention_gate(budget, non_empty, found, bound, matches_wt));
+                        let tag = retention_verdict_tag(evaluate_retention_gate(
+                            budget, non_empty, found, bound, matches_wt,
+                        ));
                         lines.push(format!(
                             "RETENTION_GATE|{}|{}|{}|{}|{}|{}",
                             bool_str(budget),
@@ -360,9 +368,29 @@ fn generate_rust_truth_table() -> Vec<String> {
         }
     }
 
+    // HYBRID_SLOTS: 72 rows (4 limits × 3 avail_norm × 3 avail_exp × 2 avail_other)
+    for &limit in [2u32, 4, 5, 8].iter() {
+        for &avail_norm in [0u32, 2, 4].iter() {
+            for &avail_exp in [0u32, 1, 3].iter() {
+                for &avail_other in [0u32, 3].iter() {
+                    let alloc = allocate_hybrid_slots(limit, avail_norm, avail_exp, avail_other);
+                    lines.push(format!(
+                        "HYBRID_SLOTS|{}|{}|{}|{}|{}|{}|{}",
+                        limit,
+                        avail_norm,
+                        avail_exp,
+                        avail_other,
+                        alloc.normative_taken,
+                        alloc.expansion_taken,
+                        alloc.remaining_taken
+                    ));
+                }
+            }
+        }
+    }
+
     lines
 }
-
 
 /// Locates the `lake` binary: PATH first, then the elan default install dir.
 fn find_lake() -> Option<PathBuf> {
@@ -389,7 +417,10 @@ fn find_lake() -> Option<PathBuf> {
 #[test]
 fn formal_kernel_compiles_standalone_for_aeneas_extraction() {
     let root = repo_root();
-    let script = root.join("proofs").join("scripts").join("extract-aeneas.sh");
+    let script = root
+        .join("proofs")
+        .join("scripts")
+        .join("extract-aeneas.sh");
     assert!(
         script.is_file(),
         "missing extract script at {}",
@@ -411,21 +442,20 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
     let rust_lines = generate_rust_truth_table();
     assert_eq!(
         rust_lines.len(),
-        473,
-        "expected 473 canonical lines (64+16+128+3+24+32+8+60+16+6+32+32+32+16+4)"
+        545,
+        "expected 545 canonical lines (64+16+128+3+24+32+8+60+16+6+32+32+32+16+4+72)"
     );
 
     // Section-count verification: 64 TASK_FSM + 16 LIFECYCLE + 128 MESH_MERGE
     // + 3 EPOCH_GATE + 24 TASK_CLAIM + 32 SOVEREIGNTY_GATE + 8 IMPORT_PRECHECK
     // + 60 PROCEDURE_FIRE + 16 TWIN_CRDT_STATUS + 6 TWIN_CRDT_SEQ + 32 RETENTION_GATE
-    // + 32 ACTION_GATE + 32 ACTION_REVERT + 16 ACTION_TASK_EFFECT + 4 ACTION_SHAREABLE,
+    // + 32 ACTION_GATE + 32 ACTION_REVERT + 16 ACTION_TASK_EFFECT + 4 ACTION_SHAREABLE
+    // + 72 HYBRID_SLOTS,
     // matching the exact generation order in `proofs/Main.lean`.
-    let section_counts = rust_lines
-        .iter()
-        .fold(HashMap::new(), |mut acc, line| {
-            *acc.entry(line.split('|').next().unwrap_or("")).or_insert(0) += 1;
-            acc
-        });
+    let section_counts = rust_lines.iter().fold(HashMap::new(), |mut acc, line| {
+        *acc.entry(line.split('|').next().unwrap_or("")).or_insert(0) += 1;
+        acc
+    });
     assert_eq!(
         *section_counts.get("TASK_FSM").unwrap_or(&0),
         64,
@@ -501,8 +531,15 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
         4,
         "expected 4 ACTION_SHAREABLE rows"
     );
+    assert_eq!(
+        *section_counts.get("HYBRID_SLOTS").unwrap_or(&0),
+        72,
+        "expected 72 HYBRID_SLOTS rows"
+    );
 
-    let lake = find_lake().expect("lake not found on PATH or ~/.elan/bin/lake; install elan to run Lean parity tests");
+    let lake = find_lake().expect(
+        "lake not found on PATH or ~/.elan/bin/lake; install elan to run Lean parity tests",
+    );
     let root = repo_root();
     let build_status = Command::new(&lake)
         .arg("--dir")
@@ -511,7 +548,10 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
         .current_dir(&root)
         .status()
         .expect("failed to run lake --dir proofs build");
-    assert!(build_status.success(), "lake --dir proofs build exited non-zero");
+    assert!(
+        build_status.success(),
+        "lake --dir proofs build exited non-zero"
+    );
 
     let output = Command::new(&lake)
         .arg("--dir")
@@ -660,12 +700,20 @@ fn collect_lean_sources(dir: &Path, acc: &mut Vec<PathBuf>) {
 #[test]
 fn lean_proof_sources_contain_no_sorry_or_axiom() {
     let proofs = repo_root().join("proofs");
-    assert!(proofs.is_dir(), "missing proofs dir at {}", proofs.display());
+    assert!(
+        proofs.is_dir(),
+        "missing proofs dir at {}",
+        proofs.display()
+    );
 
     let mut sources: Vec<PathBuf> = Vec::new();
     for mandatory in ["Main.lean", "NeuroStrata.lean"] {
         let p = proofs.join(mandatory);
-        assert!(p.is_file(), "missing mandatory proof source: {}", p.display());
+        assert!(
+            p.is_file(),
+            "missing mandatory proof source: {}",
+            p.display()
+        );
         sources.push(p);
     }
     collect_lean_sources(&proofs.join("NeuroStrata"), &mut sources);

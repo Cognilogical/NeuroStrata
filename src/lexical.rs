@@ -2,21 +2,188 @@
 //! Unconditionally compiled; `tantivy = "0.27"` is present in Cargo.toml.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 use anyhow::Result;
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, ConstScoreQuery, Occur, QueryParser, RangeQuery, TermQuery};
-use tantivy::schema::{Field as TantivyField, IndexRecordOption, Schema, STORED, STRING, TEXT, FAST, INDEXED, Value as TantivyValue};
+use tantivy::schema::{
+    Field as TantivyField, IndexRecordOption, Schema, Value as TantivyValue, FAST, INDEXED, STORED,
+    STRING,
+};
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 
-use crate::traits::{MemoryPayload};
+use crate::traits::MemoryPayload;
 
-// v2 adds the `generation` field. An index written by v1 has no such field,
-// so opening it under this schema would panic on `get_field("generation")`;
-// the version file makes the upgrade clear and rebuild instead.
-pub const INDEX_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-tantivy-v2");
+// v3 switches `content`, `symbol`, and `location` to the `"code_text"` custom
+// code-aware sub-tokenizer analyzer (`neurostrata-5xjo`).
+pub const INDEX_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-tantivy-v3");
+
+/// Custom Tantivy tokenizer that splits code identifiers on path/namespace
+/// separators, snake_case underscores, camelCase/PascalCase boundaries, and
+/// digit boundaries, emitting both the lowercased sub-tokens and the full
+/// joined identifier (`neurostrata-5xjo`).
+#[derive(Clone, Default)]
+pub struct CodeTokenizer;
+
+pub struct CodeTokenStream {
+    tokens: Vec<tantivy::tokenizer::Token>,
+    index: usize,
+    token: tantivy::tokenizer::Token,
+}
+
+impl tantivy::tokenizer::TokenStream for CodeTokenStream {
+    fn advance(&mut self) -> bool {
+        if self.index < self.tokens.len() {
+            self.token = self.tokens[self.index].clone();
+            self.index += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn token(&self) -> &tantivy::tokenizer::Token {
+        &self.token
+    }
+
+    fn token_mut(&mut self) -> &mut tantivy::tokenizer::Token {
+        &mut self.token
+    }
+}
+
+fn split_identifier_subtokens(word: &str) -> Vec<String> {
+    let mut sub_tokens = Vec::new();
+    for segment in word.split('_') {
+        let segment = segment.trim_matches(|c: char| !c.is_alphanumeric());
+        if segment.is_empty() {
+            continue;
+        }
+        let chars: Vec<char> = segment.chars().collect();
+        let mut start = 0usize;
+        for i in 1..chars.len() {
+            let prev = chars[i - 1];
+            let current = chars[i];
+            let next = chars.get(i + 1).copied();
+            let boundary = (prev.is_lowercase() && current.is_uppercase())
+                || (prev.is_uppercase()
+                    && current.is_uppercase()
+                    && next.map(|c| c.is_lowercase()).unwrap_or(false))
+                || (prev.is_alphabetic() && current.is_ascii_digit())
+                || (prev.is_ascii_digit() && current.is_alphabetic());
+            if boundary {
+                let part: String = chars[start..i].iter().collect();
+                let lower = part.to_lowercase();
+                if !lower.is_empty() {
+                    sub_tokens.push(lower);
+                }
+                start = i;
+            }
+        }
+        let part: String = chars[start..].iter().collect();
+        let lower = part.to_lowercase();
+        if !lower.is_empty() {
+            sub_tokens.push(lower);
+        }
+    }
+    sub_tokens
+}
+
+impl tantivy::tokenizer::Tokenizer for CodeTokenizer {
+    type TokenStream<'a> = CodeTokenStream;
+
+    fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
+        let mut tokens = Vec::new();
+        let mut position = 0usize;
+        let mut span_start: Option<usize> = None;
+
+        for (idx, ch) in text.char_indices() {
+            if ch.is_alphanumeric() || ch == '_' {
+                if span_start.is_none() {
+                    span_start = Some(idx);
+                }
+            } else if let Some(start) = span_start.take() {
+                Self::emit_word(&text[start..idx], start, idx, &mut position, &mut tokens);
+            }
+        }
+        if let Some(start) = span_start.take() {
+            Self::emit_word(
+                &text[start..],
+                start,
+                text.len(),
+                &mut position,
+                &mut tokens,
+            );
+        }
+
+        CodeTokenStream {
+            tokens,
+            index: 0,
+            token: tantivy::tokenizer::Token::default(),
+        }
+    }
+}
+
+impl CodeTokenizer {
+    fn emit_word(
+        raw: &str,
+        offset_from: usize,
+        offset_to: usize,
+        position: &mut usize,
+        tokens: &mut Vec<tantivy::tokenizer::Token>,
+    ) {
+        let trimmed = raw.trim_matches('_');
+        if trimmed.is_empty() {
+            return;
+        }
+        let sub_tokens = split_identifier_subtokens(trimmed);
+        if sub_tokens.is_empty() {
+            return;
+        }
+        for sub in &sub_tokens {
+            tokens.push(tantivy::tokenizer::Token {
+                offset_from,
+                offset_to,
+                position: *position,
+                text: sub.clone(),
+                position_length: 1,
+            });
+            *position += 1;
+        }
+        if sub_tokens.len() > 1 {
+            let joined = sub_tokens.join("");
+            if !joined.is_empty() {
+                tokens.push(tantivy::tokenizer::Token {
+                    offset_from,
+                    offset_to,
+                    position: *position,
+                    text: joined.clone(),
+                    position_length: 1,
+                });
+                *position += 1;
+            }
+            let lower_raw = trimmed.to_lowercase();
+            if lower_raw != joined && !lower_raw.is_empty() {
+                tokens.push(tantivy::tokenizer::Token {
+                    offset_from,
+                    offset_to,
+                    position: *position,
+                    text: lower_raw,
+                    position_length: 1,
+                });
+                *position += 1;
+            }
+        }
+    }
+}
+
+pub fn code_text_analyzer() -> tantivy::tokenizer::TextAnalyzer {
+    tantivy::tokenizer::TextAnalyzer::builder(CodeTokenizer)
+        .filter(tantivy::tokenizer::RemoveLongFilter::limit(255))
+        .filter(tantivy::tokenizer::LowerCaser)
+        .build()
+}
 
 /// Code-aware pre-tokenization for Tantivy (whitespace-separated sub-tokens + full lowercased text).
 pub fn detect_task_intent(text: &str) -> Vec<crate::task::intent::TaskIntentSignal> {
@@ -67,9 +234,16 @@ pub struct TantivyHit {
 
 /// Structural types excluded from lexical indexing (per spec §4 / §5.3).
 const STRUCTURAL_MEMORY_TYPES: &[&str] = &[
-    "directory", "file", "markdown", "freshness_flag",
-    "guard_event", "community_summary", "digital_twin", "digital_twin_schema",
-    "action_type", "action_receipt",
+    "directory",
+    "file",
+    "markdown",
+    "freshness_flag",
+    "guard_event",
+    "community_summary",
+    "digital_twin",
+    "digital_twin_schema",
+    "action_type",
+    "action_receipt",
 ];
 
 pub struct TantivyLexicalIndex {
@@ -101,12 +275,19 @@ impl TantivyLexicalIndex {
     /// Build schema (spec §4).
     fn build_schema() -> Schema {
         let mut schema_builder = Schema::builder();
+        let code_text_options = tantivy::schema::TextOptions::default()
+            .set_indexing_options(
+                tantivy::schema::TextFieldIndexing::default()
+                    .set_tokenizer("code_text")
+                    .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+            )
+            .set_stored();
         schema_builder.add_text_field("id", STRING | STORED);
         schema_builder.add_text_field("memory_id", STRING | STORED);
         schema_builder.add_text_field("namespace", STRING | STORED);
-        schema_builder.add_text_field("content", TEXT | STORED);
-        schema_builder.add_text_field("symbol", TEXT | STORED);
-        schema_builder.add_text_field("location", TEXT | STORED);
+        schema_builder.add_text_field("content", code_text_options.clone());
+        schema_builder.add_text_field("symbol", code_text_options.clone());
+        schema_builder.add_text_field("location", code_text_options);
         schema_builder.add_text_field("memory_type", STRING | STORED);
         schema_builder.add_i64_field("valid_from", INDEXED | FAST | STORED);
         schema_builder.add_i64_field("valid_to", INDEXED | FAST | STORED);
@@ -129,7 +310,13 @@ impl TantivyLexicalIndex {
     pub fn open_in_ram() -> Result<Self> {
         let schema = Self::build_schema();
         let index = Index::create_in_ram(schema.clone());
-        let reader = index.reader_builder().reload_policy(ReloadPolicy::OnCommitWithDelay).try_into()?;
+        index
+            .tokenizers()
+            .register("code_text", code_text_analyzer());
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::OnCommitWithDelay)
+            .try_into()?;
         let writer = index.writer(50_000_000)?;
         let id_f = schema.get_field("id").expect("id field");
         let memory_id_f = schema.get_field("memory_id").expect("memory_id field");
@@ -140,7 +327,9 @@ impl TantivyLexicalIndex {
         let memory_type_f = schema.get_field("memory_type").expect("memory_type field");
         let valid_from_f = schema.get_field("valid_from").expect("valid_from field");
         let valid_to_f = schema.get_field("valid_to").expect("valid_to field");
-        let has_valid_to_f = schema.get_field("has_valid_to").expect("has_valid_to field");
+        let has_valid_to_f = schema
+            .get_field("has_valid_to")
+            .expect("has_valid_to field");
         let archived_f = schema.get_field("archived").expect("archived field");
         let generation_f = schema.get_field("generation").expect("generation field");
         Ok(Self {
@@ -149,8 +338,18 @@ impl TantivyLexicalIndex {
             reader,
             dirty: AtomicBool::new(false),
             index_dir: None,
-            id_f, memory_id_f, namespace_f, content_f, symbol_f, location_f,
-            memory_type_f, valid_from_f, valid_to_f, has_valid_to_f, archived_f, generation_f,
+            id_f,
+            memory_id_f,
+            namespace_f,
+            content_f,
+            symbol_f,
+            location_f,
+            memory_type_f,
+            valid_from_f,
+            valid_to_f,
+            has_valid_to_f,
+            archived_f,
+            generation_f,
         })
     }
 
@@ -161,7 +360,10 @@ impl TantivyLexicalIndex {
             match std::fs::read_to_string(&version_path) {
                 Ok(existing) => existing.trim() != INDEX_VERSION,
                 Err(e) => {
-                    tracing::warn!("failed to read lexical index version file {}: {e}", version_path.display());
+                    tracing::warn!(
+                        "failed to read lexical index version file {}: {e}",
+                        version_path.display()
+                    );
                     // Transient read error: do NOT trigger a full remove_dir_all.
                     false
                 }
@@ -172,7 +374,10 @@ impl TantivyLexicalIndex {
 
         if needs_rebuild && index_dir.exists() {
             // Warn-first / clear per spec.
-            tracing::warn!("lexical index version mismatch or missing; clearing {}", index_dir.display());
+            tracing::warn!(
+                "lexical index version mismatch or missing; clearing {}",
+                index_dir.display()
+            );
             std::fs::remove_dir_all(index_dir)?;
         }
 
@@ -184,13 +389,19 @@ impl TantivyLexicalIndex {
         let index = match dir_result {
             Ok(dir) => Index::open_or_create(dir, Self::build_schema())?,
             Err(e) => {
-                tracing::warn!("corrupt lexical index at {}; wiping and recreating: {e}", path_for_index.display());
+                tracing::warn!(
+                    "corrupt lexical index at {}; wiping and recreating: {e}",
+                    path_for_index.display()
+                );
                 std::fs::remove_dir_all(&path_for_index)?;
                 std::fs::create_dir_all(&path_for_index)?;
                 let dir = tantivy::directory::MmapDirectory::open(&path_for_index)?;
                 Index::create(dir, Self::build_schema(), tantivy::IndexSettings::default())?
             }
         };
+        index
+            .tokenizers()
+            .register("code_text", code_text_analyzer());
 
         // Writer acquisition with lock-contention fallback (§5.2).
         let writer_res = index.writer(50_000_000);
@@ -200,7 +411,9 @@ impl TantivyLexicalIndex {
                 writer_opt = Some(w);
             }
             Err(e) => {
-                tracing::warn!("lexical index writer locked by another process (read-only mode): {e}");
+                tracing::warn!(
+                    "lexical index writer locked by another process (read-only mode): {e}"
+                );
             }
         }
         // If writer acquired and version missing / rebuilt, write version.
@@ -208,7 +421,10 @@ impl TantivyLexicalIndex {
             std::fs::write(&version_path, INDEX_VERSION)?;
         }
 
-        let reader = index.reader_builder().reload_policy(ReloadPolicy::OnCommitWithDelay).try_into()?;
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::OnCommitWithDelay)
+            .try_into()?;
         let schema = Self::build_schema();
         let id_f = schema.get_field("id").expect("id");
         let memory_id_f = schema.get_field("memory_id").expect("memory_id");
@@ -229,8 +445,18 @@ impl TantivyLexicalIndex {
             reader,
             dirty: AtomicBool::new(false),
             index_dir: Some(path_for_index),
-            id_f, memory_id_f, namespace_f, content_f, symbol_f, location_f,
-            memory_type_f, valid_from_f, valid_to_f, has_valid_to_f, archived_f, generation_f,
+            id_f,
+            memory_id_f,
+            namespace_f,
+            content_f,
+            symbol_f,
+            location_f,
+            memory_type_f,
+            valid_from_f,
+            valid_to_f,
+            has_valid_to_f,
+            archived_f,
+            generation_f,
         })
     }
 
@@ -283,7 +509,12 @@ impl TantivyLexicalIndex {
     pub fn upsert_memory(&self, namespace: &str, id: &str, payload: &MemoryPayload) -> Result<()> {
         let composite = Self::composite_key(namespace, id);
         // Delete existing document by composite id.
-        if let Some(w) = self.writer.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        if let Some(w) = self
+            .writer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
             let term = Term::from_field_text(self.id_f, &composite);
             w.delete_term(term);
         } else {
@@ -292,7 +523,12 @@ impl TantivyLexicalIndex {
 
         if Self::is_excluded(payload) {
             // Excluded: delete and commit (if writer exists).
-            if let Some(w) = self.writer.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            if let Some(w) = self
+                .writer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_mut()
+            {
                 w.commit()?;
                 self.dirty.store(true, Ordering::SeqCst);
                 // Reload reader after commit.
@@ -307,15 +543,26 @@ impl TantivyLexicalIndex {
         doc.add_text(self.memory_id_f, id);
         doc.add_text(self.namespace_f, namespace);
         doc.add_text(self.content_f, &payload.content);
-        // Symbol: pre-tokenized with code-aware tokenizer (metadata["symbol"] if present).
-        let symbol_raw = payload.metadata.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
-        doc.add_text(self.symbol_f, &tokenize_code_for_tantivy(symbol_raw));
-        // Location: pre-tokenized.
-        doc.add_text(self.location_f, &tokenize_code_for_tantivy(&payload.location));
+        // Symbol and location are tokenized directly by the `"code_text"` analyzer.
+        let symbol_raw = payload
+            .metadata
+            .get("symbol")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        doc.add_text(self.symbol_f, symbol_raw);
+        doc.add_text(self.location_f, &payload.location);
         doc.add_text(self.memory_type_f, &payload.memory_type);
-        let valid_from: i64 = payload.metadata.get("valid_from").and_then(|v| v.as_i64()).unwrap_or(0);
+        let valid_from: i64 = payload
+            .metadata
+            .get("valid_from")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
         doc.add_i64(self.valid_from_f, valid_from);
-        let valid_to: i64 = payload.metadata.get("valid_to").and_then(|v| v.as_i64()).unwrap_or(0);
+        let valid_to: i64 = payload
+            .metadata
+            .get("valid_to")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
         doc.add_i64(self.valid_to_f, valid_to);
         let has_valid_to: i64 = if payload
             .metadata
@@ -328,11 +575,26 @@ impl TantivyLexicalIndex {
             0
         };
         doc.add_i64(self.has_valid_to_f, has_valid_to);
-        let archived: i64 = if payload.metadata.get("archived").and_then(|v| v.as_i64()).unwrap_or(0) != 0 { 1 } else { 0 };
+        let archived: i64 = if payload
+            .metadata
+            .get("archived")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            != 0
+        {
+            1
+        } else {
+            0
+        };
         doc.add_i64(self.archived_f, archived);
         doc.add_i64(self.generation_f, Self::generation_of_id(id));
 
-        if let Some(w) = self.writer.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        if let Some(w) = self
+            .writer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
             w.add_document(doc)?;
             w.commit()?;
             self.dirty.store(true, Ordering::SeqCst);
@@ -344,7 +606,12 @@ impl TantivyLexicalIndex {
     /// Delete by namespace + id (spec §4).
     pub fn delete_memory(&self, namespace: &str, id: &str) -> Result<()> {
         let composite = Self::composite_key(namespace, id);
-        if let Some(w) = self.writer.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        if let Some(w) = self
+            .writer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
             let term = Term::from_field_text(self.id_f, &composite);
             w.delete_term(term);
             w.commit()?;
@@ -375,7 +642,12 @@ impl TantivyLexicalIndex {
         rows: &[(String, String, MemoryPayload)],
         namespace: Option<&str>,
     ) -> Result<usize> {
-        if let Some(w) = self.writer.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        if let Some(w) = self
+            .writer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
             match namespace {
                 Some(ns) => {
                     let term = Term::from_field_text(self.namespace_f, ns);
@@ -406,13 +678,25 @@ impl TantivyLexicalIndex {
                 doc.add_text(self.memory_id_f, id);
                 doc.add_text(self.namespace_f, ns);
                 doc.add_text(self.content_f, &payload.content);
-                let symbol_raw = payload.metadata.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
-                doc.add_text(self.symbol_f, &tokenize_code_for_tantivy(symbol_raw));
-                doc.add_text(self.location_f, &tokenize_code_for_tantivy(&payload.location));
+                let symbol_raw = payload
+                    .metadata
+                    .get("symbol")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                doc.add_text(self.symbol_f, symbol_raw);
+                doc.add_text(self.location_f, &payload.location);
                 doc.add_text(self.memory_type_f, &payload.memory_type);
-                let valid_from: i64 = payload.metadata.get("valid_from").and_then(|v| v.as_i64()).unwrap_or(0);
+                let valid_from: i64 = payload
+                    .metadata
+                    .get("valid_from")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
                 doc.add_i64(self.valid_from_f, valid_from);
-                let valid_to: i64 = payload.metadata.get("valid_to").and_then(|v| v.as_i64()).unwrap_or(0);
+                let valid_to: i64 = payload
+                    .metadata
+                    .get("valid_to")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
                 doc.add_i64(self.valid_to_f, valid_to);
                 let has_valid_to: i64 = if payload
                     .metadata
@@ -425,7 +709,17 @@ impl TantivyLexicalIndex {
                     0
                 };
                 doc.add_i64(self.has_valid_to_f, has_valid_to);
-                let archived: i64 = if payload.metadata.get("archived").and_then(|v| v.as_i64()).unwrap_or(0) != 0 { 1 } else { 0 };
+                let archived: i64 = if payload
+                    .metadata
+                    .get("archived")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0)
+                    != 0
+                {
+                    1
+                } else {
+                    0
+                };
                 doc.add_i64(self.archived_f, archived);
                 doc.add_i64(self.generation_f, Self::generation_of_id(id));
                 w.add_document(doc)?;
@@ -462,11 +756,13 @@ impl TantivyLexicalIndex {
             include_archived,
             as_of,
             None,
+            true,
         )
     }
 
     /// Search, optionally restricting generation-scoped rows to the active
-    /// generations of `namespace` (`None` = no generation filter).
+    /// generations of `namespace` (`None` = no generation filter) and gating
+    /// `code_ast` / `doc_section` rows via `include_code_ast`.
     ///
     /// The filter is a zero-score `Must` clause, so a superseded or staged row
     /// cannot consume a TopDocs slot. The per-hit check stays as defense in
@@ -480,13 +776,17 @@ impl TantivyLexicalIndex {
         include_archived: bool,
         as_of: Option<i64>,
         active_generations: Option<&std::collections::HashSet<u64>>,
+        include_code_ast: bool,
     ) -> Result<Vec<TantivyHit>> {
         if self.dirty.load(Ordering::SeqCst) {
             self.reader.reload()?;
             self.dirty.store(false, Ordering::SeqCst);
         }
 
-        let mut parser = QueryParser::for_index(&self.index, vec![self.content_f, self.symbol_f, self.location_f]);
+        let mut parser = QueryParser::for_index(
+            &self.index,
+            vec![self.content_f, self.symbol_f, self.location_f],
+        );
         // Apply per-field boosts per spec (§4): content=1.0, symbol=2.0, location=1.5.
         // tantivy 0.27 exposes set_field_boost on QueryParser.
         parser.set_field_boost(self.content_f, 1.0);
@@ -508,7 +808,9 @@ impl TantivyLexicalIndex {
         let visible_at = as_of.unwrap_or(now);
         // tantivy 0.27 has no Occur::Filter; a Must clause wrapped in a
         // zero-score ConstScoreQuery filters without touching BM25 ranking.
-        fn filter(query: Box<dyn tantivy::query::Query>) -> (Occur, Box<dyn tantivy::query::Query>) {
+        fn filter(
+            query: Box<dyn tantivy::query::Query>,
+        ) -> (Occur, Box<dyn tantivy::query::Query>) {
             (Occur::Must, Box::new(ConstScoreQuery::new(query, 0.0)))
         }
         let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = vec![
@@ -532,7 +834,10 @@ impl TantivyLexicalIndex {
                 (
                     Occur::Should,
                     Box::new(RangeQuery::new(
-                        std::ops::Bound::Excluded(Term::from_field_i64(self.valid_to_f, visible_at)),
+                        std::ops::Bound::Excluded(Term::from_field_i64(
+                            self.valid_to_f,
+                            visible_at,
+                        )),
                         std::ops::Bound::Unbounded,
                     )) as Box<dyn tantivy::query::Query>,
                 ),
@@ -549,6 +854,22 @@ impl TantivyLexicalIndex {
                 Occur::MustNot,
                 Box::new(TermQuery::new(
                     Term::from_field_text(self.memory_type_f, "task"),
+                    IndexRecordOption::Basic,
+                )),
+            ));
+        }
+        if !include_code_ast {
+            clauses.push((
+                Occur::MustNot,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.memory_type_f, "code_ast"),
+                    IndexRecordOption::Basic,
+                )),
+            ));
+            clauses.push((
+                Occur::MustNot,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.memory_type_f, "doc_section"),
                     IndexRecordOption::Basic,
                 )),
             ));
@@ -594,8 +915,14 @@ impl TantivyLexicalIndex {
             let retrieved: TantivyDocument = searcher.doc(doc_address)?;
             let id_val = retrieved.get_first(self.id_f);
             let ns_val = retrieved.get_first(self.namespace_f);
-            let comp_id = id_val.as_ref().map(|v| v.as_str().unwrap_or("").to_string()).unwrap_or_default();
-            let ns = ns_val.as_ref().map(|v| v.as_str().unwrap_or("").to_string()).unwrap_or_default();
+            let comp_id = id_val
+                .as_ref()
+                .map(|v| v.as_str().unwrap_or("").to_string())
+                .unwrap_or_default();
+            let ns = ns_val
+                .as_ref()
+                .map(|v| v.as_str().unwrap_or("").to_string())
+                .unwrap_or_default();
 
             // Namespace filter
             if ns != namespace {
@@ -603,8 +930,14 @@ impl TantivyLexicalIndex {
             }
             // Memory type filter
             let mt_val = retrieved.get_first(self.memory_type_f);
-            let memory_type = mt_val.as_ref().map(|v| v.as_str().unwrap_or("").to_string()).unwrap_or_default();
+            let memory_type = mt_val
+                .as_ref()
+                .map(|v| v.as_str().unwrap_or("").to_string())
+                .unwrap_or_default();
             if memory_type == "task" && !include_tasks {
+                continue;
+            }
+            if (memory_type == "code_ast" || memory_type == "doc_section") && !include_code_ast {
                 continue;
             }
             // Archived filter
@@ -644,7 +977,11 @@ impl TantivyLexicalIndex {
 
             // Derive id (composite stripped to memory id) so the caller gets
             // the original storage id back (spec §4: `id: String`).
-            let memory_id_part = comp_id.split_once("::").map(|(_, id)| id).unwrap_or(&comp_id).to_string();
+            let memory_id_part = comp_id
+                .split_once("::")
+                .map(|(_, id)| id)
+                .unwrap_or(&comp_id)
+                .to_string();
             candidates.push(TantivyHit {
                 id: memory_id_part,
                 namespace: ns.clone(),
@@ -654,19 +991,23 @@ impl TantivyLexicalIndex {
         }
 
         // Normalize BM25 into NeuroStrata distance [0,1] (§5.4 / user spec).
-        let max_bm25 = candidates.iter().map(|h| h.raw_bm25).fold(0.0_f32, f32::max);
-        let mut hits_with_score: Vec<TantivyHit> = candidates.into_iter().map(|mut h| {
-            h.score = if max_bm25 > 0.0 {
-                (1.0 - (h.raw_bm25 / max_bm25)).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            h
-        }).collect();
+        let max_bm25 = candidates
+            .iter()
+            .map(|h| h.raw_bm25)
+            .fold(0.0_f32, f32::max);
+        let mut hits_with_score: Vec<TantivyHit> = candidates
+            .into_iter()
+            .map(|mut h| {
+                h.score = if max_bm25 > 0.0 {
+                    (1.0 - (h.raw_bm25 / max_bm25)).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                h
+            })
+            .collect();
 
-        hits_with_score.sort_by(|a, b| {
-            a.score.total_cmp(&b.score).then_with(|| a.id.cmp(&b.id))
-        });
+        hits_with_score.sort_by(|a, b| a.score.total_cmp(&b.score).then_with(|| a.id.cmp(&b.id)));
         hits_with_score.truncate(limit);
         Ok(hits_with_score)
     }
@@ -707,9 +1048,15 @@ mod tests {
         let idx = TantivyLexicalIndex::open_in_ram().unwrap();
         let p = dummy_payload("hello world lexical test", Some("MyClass.method"));
         idx.upsert_memory("ns", "m1", &p).unwrap();
-        let hits = idx.search("ns", "MyClass method", 10, true, true, None).unwrap();
+        let hits = idx
+            .search("ns", "MyClass method", 10, true, true, None)
+            .unwrap();
         assert!(!hits.is_empty());
-        assert!(hits[0].score >= 0.0 && hits[0].score <= 1.0, "distance in [0,1]: {}", hits[0].score);
+        assert!(
+            hits[0].score >= 0.0 && hits[0].score <= 1.0,
+            "distance in [0,1]: {}",
+            hits[0].score
+        );
     }
 
     #[test]
@@ -720,13 +1067,19 @@ mod tests {
         idx.upsert_memory("ns", "sym", &p_sym).unwrap();
         let p_content = dummy_payload("NeuroStrata auth module description", None);
         idx.upsert_memory("ns", "cont", &p_content).unwrap();
-        let hits = idx.search("ns", "neurostrata auth", 10, true, true, None).unwrap();
+        let hits = idx
+            .search("ns", "neurostrata auth", 10, true, true, None)
+            .unwrap();
         // The symbol hit (sym) should be first because symbol boost = 2.0 > content = 1.0.
         // We verify by checking that at least the first hit has id "sym" (memory id stripped from composite).
         assert!(!hits.is_empty());
         // Distance should remain in [0,1].
         for h in &hits {
-            assert!(h.score >= 0.0 && h.score <= 1.0, "distance out of range: {}", h.score);
+            assert!(
+                h.score >= 0.0 && h.score <= 1.0,
+                "distance out of range: {}",
+                h.score
+            );
         }
     }
 
@@ -744,8 +1097,16 @@ mod tests {
     fn test_rebuild() {
         let idx = TantivyLexicalIndex::open_in_ram().unwrap();
         let rows = vec![
-            ("ns".to_string(), "r1".to_string(), dummy_payload("rebuild a", None)),
-            ("ns".to_string(), "r2".to_string(), dummy_payload("rebuild b", Some("X.y"))),
+            (
+                "ns".to_string(),
+                "r1".to_string(),
+                dummy_payload("rebuild a", None),
+            ),
+            (
+                "ns".to_string(),
+                "r2".to_string(),
+                dummy_payload("rebuild b", Some("X.y")),
+            ),
         ];
         let count = idx.rebuild(&rows).unwrap();
         assert_eq!(count, 2);
@@ -758,7 +1119,10 @@ mod tests {
         let blocker = std::env::temp_dir().join(format!(
             "ns-lexical-blocker-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         std::fs::write(&blocker, b"not a directory").unwrap();
         let idx = TantivyLexicalIndex::open(&blocker).expect("fallback index");
@@ -774,8 +1138,11 @@ mod tests {
         // FULL memory id, not a fragment truncated at the first "::".
         let idx = TantivyLexicalIndex::open_in_ram().unwrap();
         let p = dummy_payload("zero flags architectural rule", None);
-        idx.upsert_memory("NeuroStrata", "rule::arch::zero-flags", &p).unwrap();
-        let hits = idx.search("NeuroStrata", "zero flags", 10, true, true, None).unwrap();
+        idx.upsert_memory("NeuroStrata", "rule::arch::zero-flags", &p)
+            .unwrap();
+        let hits = idx
+            .search("NeuroStrata", "zero flags", 10, true, true, None)
+            .unwrap();
         assert!(!hits.is_empty(), "expected at least one hit");
         assert!(
             hits.iter().any(|h| h.id == "rule::arch::zero-flags"),
@@ -838,13 +1205,24 @@ mod tests {
         let idx = TantivyLexicalIndex::open_in_ram().unwrap();
         let p = dummy_payload("café naïve sharedtoken", None);
         idx.upsert_memory("ns", "unicode-row", &p).unwrap();
-        for query in ["", "   ", "\"", "\\", "café::naïve", "a\nb", "term^2", "term~1"] {
+        for query in [
+            "",
+            "   ",
+            "\"",
+            "\\",
+            "café::naïve",
+            "a\nb",
+            "term^2",
+            "term~1",
+        ] {
             let hits = idx
                 .search("ns", query, 10, true, true, None)
                 .unwrap_or_else(|e| panic!("query {query:?} must not error: {e}"));
             assert!(hits.is_empty() || hits.iter().all(|h| h.namespace == "ns"));
         }
-        let zero = idx.search("ns", "sharedtoken", 0, true, true, None).unwrap();
+        let zero = idx
+            .search("ns", "sharedtoken", 0, true, true, None)
+            .unwrap();
         assert!(zero.is_empty(), "limit zero returns no rows");
     }
 
@@ -889,7 +1267,9 @@ mod tests {
         );
         idx.upsert_memory("ns", "m1", &m).unwrap();
 
-        let hits = idx.search("ns", "sharedtoken", 2, false, true, None).unwrap();
+        let hits = idx
+            .search("ns", "sharedtoken", 2, false, true, None)
+            .unwrap();
         assert!(
             hits.iter().any(|h| h.id == "m1"),
             "non-task match must be collected even when excluded tasks outscore it, got: {:?}",
@@ -904,9 +1284,13 @@ mod tests {
         p.metadata = json!({"valid_from": 0, "valid_to": 100, "archived": 0});
         idx.upsert_memory("ns", "boundary-row", &p).unwrap();
 
-        let active = idx.search("ns", "sharedtoken", 10, true, true, Some(99)).unwrap();
+        let active = idx
+            .search("ns", "sharedtoken", 10, true, true, Some(99))
+            .unwrap();
         assert!(active.iter().any(|h| h.id == "boundary-row"));
-        let retired = idx.search("ns", "sharedtoken", 10, true, true, Some(100)).unwrap();
+        let retired = idx
+            .search("ns", "sharedtoken", 10, true, true, Some(100))
+            .unwrap();
         assert!(
             !retired.iter().any(|h| h.id == "boundary-row"),
             "valid_to == as_of is retired"
@@ -917,8 +1301,16 @@ mod tests {
     fn par10_rebuild_scoped_preserves_other_namespaces() {
         let idx = TantivyLexicalIndex::open_in_ram().unwrap();
         let seed = vec![
-            ("A".to_string(), "a1".to_string(), dummy_payload("alpha oldtoken", None)),
-            ("B".to_string(), "b1".to_string(), dummy_payload("bravo uniquetoken", None)),
+            (
+                "A".to_string(),
+                "a1".to_string(),
+                dummy_payload("alpha oldtoken", None),
+            ),
+            (
+                "B".to_string(),
+                "b1".to_string(),
+                dummy_payload("bravo uniquetoken", None),
+            ),
         ];
         assert_eq!(idx.rebuild(&seed).unwrap(), 2);
 
@@ -929,30 +1321,49 @@ mod tests {
         )];
         assert_eq!(idx.rebuild_scoped(&new_a, Some("A")).unwrap(), 1);
 
-        let b_hits = idx.search("B", "uniquetoken", 10, true, true, None).unwrap();
+        let b_hits = idx
+            .search("B", "uniquetoken", 10, true, true, None)
+            .unwrap();
         assert!(
             b_hits.iter().any(|h| h.id == "b1"),
             "namespace B rows must survive a scoped rebuild of A, got: {:?}",
             b_hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
         );
         let a_old = idx.search("A", "oldtoken", 10, true, true, None).unwrap();
-        assert!(!a_old.iter().any(|h| h.id == "a1"), "scoped rebuild replaces A's old rows");
+        assert!(
+            !a_old.iter().any(|h| h.id == "a1"),
+            "scoped rebuild replaces A's old rows"
+        );
         let a_new = idx.search("A", "newtoken", 10, true, true, None).unwrap();
         assert!(a_new.iter().any(|h| h.id == "a2"));
 
-        let only_c = vec![("C".to_string(), "c1".to_string(), dummy_payload("charlie fresh token", None))];
+        let only_c = vec![(
+            "C".to_string(),
+            "c1".to_string(),
+            dummy_payload("charlie fresh token", None),
+        )];
         assert_eq!(idx.rebuild_scoped(&only_c, None).unwrap(), 1);
-        let b_hits = idx.search("B", "uniquetoken", 10, true, true, None).unwrap();
-        assert!(b_hits.is_empty(), "unscoped rebuild replaces every namespace");
-        let c_hits = idx.search("C", "charlie fresh", 10, true, true, None).unwrap();
+        let b_hits = idx
+            .search("B", "uniquetoken", 10, true, true, None)
+            .unwrap();
+        assert!(
+            b_hits.is_empty(),
+            "unscoped rebuild replaces every namespace"
+        );
+        let c_hits = idx
+            .search("C", "charlie fresh", 10, true, true, None)
+            .unwrap();
         assert!(c_hits.iter().any(|h| h.id == "c1"));
     }
 
     #[test]
     fn test_search_hits_carry_their_namespace_and_index_reports_dir() {
         let idx = TantivyLexicalIndex::open_in_ram().unwrap();
-        idx.upsert_memory("ns", "m1", &dummy_payload("namespace carry test", None)).unwrap();
-        let hits = idx.search("ns", "namespace carry", 10, true, true, None).unwrap();
+        idx.upsert_memory("ns", "m1", &dummy_payload("namespace carry test", None))
+            .unwrap();
+        let hits = idx
+            .search("ns", "namespace carry", 10, true, true, None)
+            .unwrap();
         assert!(!hits.is_empty());
         for h in &hits {
             assert_eq!(h.namespace, "ns");
@@ -974,12 +1385,8 @@ mod tests {
     }
 
     fn validity_doc(valid_to: Option<i64>) -> crate::fts::LexicalDoc {
-        let mut doc = crate::fts::LexicalDoc::new(
-            "validity",
-            "ns",
-            "memory",
-            "validityparityneedle",
-        );
+        let mut doc =
+            crate::fts::LexicalDoc::new("validity", "ns", "memory", "validityparityneedle");
         doc.user_id = "reader".to_string();
         doc.valid_to = valid_to;
         doc
@@ -1025,7 +1432,9 @@ mod tests {
             };
             idx.upsert_memory("ns", id, &payload).unwrap();
         }
-        let hits = idx.search("ns", "validityparityneedle", 10, true, true, None).unwrap();
+        let hits = idx
+            .search("ns", "validityparityneedle", 10, true, true, None)
+            .unwrap();
         let returned: std::collections::BTreeSet<String> =
             hits.iter().map(|h| h.id.clone()).collect();
         assert_eq!(
@@ -1052,7 +1461,10 @@ mod tests {
             "Tantivy as_of=now: a present 0 and the boundary row are retired"
         );
         assert!(
-            !crate::fts::doc_visible(&validity_doc(Some(now)), &visibility_options(now, Some(now))),
+            !crate::fts::doc_visible(
+                &validity_doc(Some(now)),
+                &visibility_options(now, Some(now))
+            ),
             "in-house as_of=now retires valid_to == now"
         );
     }
@@ -1064,7 +1476,8 @@ mod tests {
         let tokens = ["foo<T>", "a(b)", "x+y", "path/to/file", "C++"];
         for (i, token) in tokens.iter().enumerate() {
             let id = format!("code-{i}");
-            idx.upsert_memory("ns", &id, &dummy_payload(token, None)).unwrap();
+            idx.upsert_memory("ns", &id, &dummy_payload(token, None))
+                .unwrap();
         }
         for (i, token) in tokens.iter().enumerate() {
             let hits = idx.search("ns", token, 10, true, true, None).unwrap();
@@ -1088,7 +1501,9 @@ mod tests {
             &dummy_payload("café::naïve unicodeneedle", None),
         )
         .unwrap();
-        let hits = idx.search("ns", "café::naïve", 10, true, true, None).unwrap();
+        let hits = idx
+            .search("ns", "café::naïve", 10, true, true, None)
+            .unwrap();
         assert!(
             hits.iter().any(|h| h.id == "unicode-row"),
             "the seeded unicode row must match its own query, got {:?}",
@@ -1116,12 +1531,14 @@ mod tests {
             "archivestarve diluted by unrelated filler words that lengthen this document considerably",
             None,
         );
-        idx.upsert_memory("ns", "visible-archived", &visible).unwrap();
+        idx.upsert_memory("ns", "visible-archived", &visible)
+            .unwrap();
         let visible = dummy_payload(
             "validitystarve diluted by unrelated filler words that lengthen this document considerably",
             None,
         );
-        idx.upsert_memory("ns", "visible-validity", &visible).unwrap();
+        idx.upsert_memory("ns", "visible-validity", &visible)
+            .unwrap();
 
         // limit 5 -> fetch_window 40; 40 hidden rows would fill it without
         // query-level filtering.
@@ -1131,7 +1548,10 @@ mod tests {
         assert!(
             archived_hits.iter().any(|h| h.id == "visible-archived"),
             "a visible row must survive an archived flood, got {:?}",
-            archived_hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+            archived_hits
+                .iter()
+                .map(|h| h.id.clone())
+                .collect::<Vec<_>>()
         );
         let validity_hits = idx
             .search("ns", "validitystarve", 5, true, true, None)
@@ -1139,7 +1559,10 @@ mod tests {
         assert!(
             validity_hits.iter().any(|h| h.id == "visible-validity"),
             "a visible row must survive a retired flood, got {:?}",
-            validity_hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+            validity_hits
+                .iter()
+                .map(|h| h.id.clone())
+                .collect::<Vec<_>>()
         );
     }
 
@@ -1162,7 +1585,9 @@ mod tests {
         ];
         assert_eq!(idx.rebuild_scoped(&rows, Some("ns")).unwrap(), 1);
 
-        let inside = idx.search("ns", "scopedneedle", 10, true, true, None).unwrap();
+        let inside = idx
+            .search("ns", "scopedneedle", 10, true, true, None)
+            .unwrap();
         assert!(inside.iter().any(|h| h.id == "inside"));
         let outside = idx
             .search("other", "scopedneedle", 10, true, true, None)
@@ -1171,6 +1596,92 @@ mod tests {
             outside.is_empty(),
             "a foreign row was indexed under the scoped rebuild: {:?}",
             outside.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_code_text_analyzer_subtokenizes_content_camel_and_snake_case() {
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        let p = payload_typed(
+            "pub async fn search_tantivy_lexical(store: &LadybugStore) -> Result<()>",
+            "code_ast",
+        );
+        idx.upsert_memory("ns", "ast-1", &p).unwrap();
+
+        for query in [
+            "Ladybug",
+            "Store",
+            "LadybugStore",
+            "tantivy",
+            "search_tantivy_lexical",
+        ] {
+            let hits = idx.search("ns", query, 10, true, true, None).unwrap();
+            assert!(
+                hits.iter().any(|h| h.id == "ast-1"),
+                "query {query:?} must match code_ast content via code_text analyzer, got {:?}",
+                hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn test_include_code_ast_false_excludes_code_ast_and_doc_section_rows() {
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        idx.upsert_memory(
+            "ns",
+            "ast-row",
+            &payload_typed("hybridtokenneedle in code ast", "code_ast"),
+        )
+        .unwrap();
+        idx.upsert_memory(
+            "ns",
+            "doc-row",
+            &payload_typed("hybridtokenneedle in doc section", "doc_section"),
+        )
+        .unwrap();
+        idx.upsert_memory(
+            "ns",
+            "rule-row",
+            &payload_typed("hybridtokenneedle in normative rule", "rule"),
+        )
+        .unwrap();
+
+        let with_code = idx
+            .search_with_active_generations(
+                "ns",
+                "hybridtokenneedle",
+                10,
+                true,
+                true,
+                None,
+                None,
+                true,
+            )
+            .unwrap();
+        let with_ids: std::collections::BTreeSet<String> =
+            with_code.iter().map(|h| h.id.clone()).collect();
+        assert!(with_ids.contains("ast-row"));
+        assert!(with_ids.contains("doc-row"));
+        assert!(with_ids.contains("rule-row"));
+
+        let without_code = idx
+            .search_with_active_generations(
+                "ns",
+                "hybridtokenneedle",
+                10,
+                true,
+                true,
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        let without_ids: std::collections::BTreeSet<String> =
+            without_code.iter().map(|h| h.id.clone()).collect();
+        assert_eq!(
+            without_ids,
+            ["rule-row".to_string()].into_iter().collect(),
+            "include_code_ast=false must exclude code_ast and doc_section rows"
         );
     }
 }
