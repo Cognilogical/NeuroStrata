@@ -9649,10 +9649,12 @@ fn add_metadata_fallback_conn(
     Ok(())
 }
 
-/// Sets each hit's `linked_files`: the distinct files its `GOVERNS` and
+/// Sets each hit's `linked_files`: the distinct active files its `GOVERNS` and
 /// `RELATES_TO` edges reach (a symbol counts as its file, a linked memory as
-/// one). A directory link reaches every file under it, so it counts as ten,
-/// enough for the widest fan-out bucket. One read for all hits.
+/// one, keyed by project/source and file path so equal relative paths across
+/// namespaces do not collapse). A directory link reaches every file under it,
+/// so it counts as ten, enough for the widest fan-out bucket. Inactive or
+/// superseded targets are ignored. One read for all hits.
 fn set_linked_files(conn: &Connection, hits: &mut [MemoryHit]) -> Result<()> {
     if hits.is_empty() {
         return Ok(());
@@ -9663,28 +9665,70 @@ fn set_linked_files(conn: &Connection, hits: &mut [MemoryHit]) -> Result<()> {
         .collect::<Vec<_>>()
         .join(", ");
     let query = format!(
-        "MATCH (m:Memory)-[:GOVERNS|RELATES_TO]-(t:Memory) WHERE m.id IN [{}] RETURN DISTINCT m.id, t.id, t.location, t.memory_type",
+        "MATCH (m:Memory)-[:GOVERNS|RELATES_TO]-(t:Memory) WHERE m.id IN [{}] RETURN DISTINCT m.id, t.id, t.namespace, t.location, t.memory_type, t.metadata",
         id_list
     );
-    let mut files: std::collections::HashMap<String, std::collections::HashSet<String>> =
+    let now = chrono::Utc::now().timestamp();
+    let mut active_by_ns: std::collections::HashMap<String, ActiveGenerations> =
         std::collections::HashMap::new();
-    let mut directories: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
+    let mut files: std::collections::HashMap<
+        String,
+        std::collections::HashSet<(String, String, String)>,
+    > = std::collections::HashMap::new();
+    let mut directories: std::collections::HashMap<
+        String,
+        std::collections::HashSet<(String, String, String)>,
+    > = std::collections::HashMap::new();
     let mut rows = conn.query(&query)?;
     while let Some(row) = rows.next() {
         let id = format!("{}", row[0]);
         let target = format!("{}", row[1]);
-        let location = format!("{}", row[2]);
-        if format!("{}", row[3]) == "directory" {
-            *directories.entry(id).or_default() += 1;
+        let target_ns = format!("{}", row[2]);
+        let location = format!("{}", row[3]);
+        let target_type = format!("{}", row[4]);
+        let metadata = parse_metadata_or_warn(&format!("{}", row[5]), "metadata");
+        if is_archived(&metadata)
+            || is_retired_at(&metadata, now)
+            || is_mesh_conflicting(&metadata)
+            || is_registry_row(&metadata)
+        {
+            continue;
+        }
+        let owner_ns = split_scoped_id(&target)
+            .map(|(ns, _, _)| ns)
+            .or_else(|| {
+                target
+                    .split_once(crate::parser::ingest::NAMESPACE_SEPARATOR)
+                    .map(|(ns, _)| ns.to_string())
+            })
+            .unwrap_or_else(|| target_ns.clone());
+        let active = active_by_ns
+            .entry(owner_ns.clone())
+            .or_insert_with(|| ActiveGenerations::read(conn, &owner_ns));
+        if !active.reaches(&target, &owner_ns, &target_type, &metadata) {
+            continue;
+        }
+        let source_key = row_source_key(&metadata).unwrap_or("").to_string();
+        let raw_path = if location.is_empty() {
+            crate::parser::ingest::logical_path_of(&target)
         } else {
-            let key = if location.is_empty() { target } else { location };
+            location.as_str()
+        };
+        let file_path = raw_path
+            .split_once('#')
+            .map(|(f, _)| f)
+            .unwrap_or(raw_path)
+            .to_string();
+        let key = (owner_ns, source_key, file_path);
+        if target_type == "directory" {
+            directories.entry(id).or_default().insert(key);
+        } else {
             files.entry(id).or_default().insert(key);
         }
     }
     for hit in hits.iter_mut() {
         hit.linked_files = files.get(&hit.id).map_or(0, |s| s.len())
-            + 10 * directories.get(&hit.id).copied().unwrap_or(0);
+            + 10 * directories.get(&hit.id).map_or(0, |s| s.len());
     }
     Ok(())
 }
@@ -13187,6 +13231,176 @@ eurostrata\src\daemon.rs",
             .expect("graph read succeeds");
         let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
         assert_eq!(ids, vec!["narrow", "broad"]);
+    }
+
+    /// Superseded-generation targets left behind after re-ingestion do not
+    /// inflate a rule's `linked_files` fan-out count.
+    #[tokio::test]
+    async fn superseded_generation_targets_do_not_inflate_linked_files() {
+        let store = retired_test_store().await;
+        for path in ["src/old1.rs", "src/old2.rs"] {
+            let mut file_payload = retired_test_payload("file", "auto-ingestor", json!({}));
+            file_payload.location = path.to_string();
+            store
+                .upsert(
+                    "probe",
+                    &format!("probe::1::{path}"),
+                    vec![0.0; 4],
+                    file_payload,
+                )
+                .await
+                .unwrap();
+        }
+        store.publish_generation("probe", "source-a", 1).await.unwrap();
+
+        for path in ["src/a.rs", "src/b.rs", "src/c.rs"] {
+            let mut file_payload = retired_test_payload("file", "auto-ingestor", json!({}));
+            file_payload.location = path.to_string();
+            store
+                .upsert(
+                    "probe",
+                    &format!("probe::2::{path}"),
+                    vec![0.0; 4],
+                    file_payload,
+                )
+                .await
+                .unwrap();
+        }
+        store.publish_generation("probe", "source-a", 2).await.unwrap();
+
+        store
+            .upsert(
+                "probe",
+                "broad",
+                vec![0.0; 4],
+                retired_test_payload(
+                    "rule",
+                    "agent",
+                    json!({
+                        "governs": [
+                            "probe::2::src/a.rs",
+                            "probe::2::src/b.rs",
+                            "probe::2::src/c.rs"
+                        ],
+                        "access_count": 9,
+                        "valid_from": 1_800_000_000,
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "narrow",
+                vec![0.0; 4],
+                retired_test_payload(
+                    "rule",
+                    "agent",
+                    json!({
+                        "governs": [
+                            "probe::2::src/a.rs",
+                            "probe::1::src/old1.rs",
+                            "probe::1::src/old2.rs"
+                        ],
+                        "valid_from": 1_700_000_000,
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let hits = store
+            .memories_for_file(
+                "probe",
+                None,
+                "src/a.rs",
+                None,
+                true,
+                &["rule".to_string()],
+                &[],
+                5,
+            )
+            .await
+            .expect("graph read succeeds");
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(ids, vec!["narrow", "broad"]);
+        assert_eq!(hits[0].linked_files, 1);
+    }
+
+    /// Cross-namespace file targets sharing the same repository-relative
+    /// `location` do not collapse into a single file in `set_linked_files`.
+    #[tokio::test]
+    async fn cross_namespace_targets_with_same_relative_path_do_not_collapse() {
+        let store = retired_test_store().await;
+        for ns in ["probe", "other_a", "other_b"] {
+            let mut file_payload = retired_test_payload("file", "auto-ingestor", json!({}));
+            file_payload.location = "src/lib.rs".to_string();
+            store
+                .upsert(
+                    ns,
+                    &format!("{ns}::src/lib.rs"),
+                    vec![0.0; 4],
+                    file_payload,
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .upsert(
+                "probe",
+                "cross_project",
+                vec![0.0; 4],
+                retired_test_payload(
+                    "rule",
+                    "agent",
+                    json!({
+                        "governs": [
+                            "probe::src/lib.rs",
+                            "other_a::src/lib.rs",
+                            "other_b::src/lib.rs"
+                        ],
+                        "access_count": 9,
+                        "valid_from": 1_800_000_000,
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "single_project",
+                vec![0.0; 4],
+                retired_test_payload(
+                    "rule",
+                    "agent",
+                    json!({
+                        "governs": ["probe::src/lib.rs"],
+                        "valid_from": 1_700_000_000,
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let hits = store
+            .memories_for_file(
+                "probe",
+                None,
+                "src/lib.rs",
+                None,
+                true,
+                &["rule".to_string()],
+                &[],
+                5,
+            )
+            .await
+            .expect("graph read succeeds");
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(ids, vec!["single_project", "cross_project"]);
+        assert_eq!(hits[0].linked_files, 1);
+        assert_eq!(hits[1].linked_files, 3);
     }
 
     /// Spec §3.2: an unqualified `GOVERNS` target that resolves to `Missing`
