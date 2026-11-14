@@ -3,10 +3,11 @@ use crate::parser::schema::ParserSchema;
 use crate::traits::{Embedder, MemoryPayload, VectorStore};
 use ignore::WalkBuilder;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
+use tree_sitter::{Parser, Query, StreamingIterator};
 
 // The id/hash scheme lives in `generation.rs`, a module deliberately free of
 // `crate::` dependencies so an integration test can pin it without a library
@@ -416,6 +417,220 @@ fn read_ingest_file(path: &std::path::Path) -> anyhow::Result<Vec<u8>> {
     })
 }
 
+/// Compile every tree-sitter query a schema declares into an `Arc` cache keyed
+/// by `language:query_name`. The producer then looks patterns up per file
+/// instead of recompiling them per file; invalid patterns are skipped and
+/// logged here, so the per-file pass never sees them.
+fn compile_language_queries(schema: &ParserSchema) -> HashMap<String, std::sync::Arc<Query>> {
+    let mut compiled = HashMap::new();
+    for (lang_name, lang_schema) in &schema.languages {
+        let ts_lang = match get_language(lang_name) {
+            Some(l) => l,
+            None => continue,
+        };
+        for (query_name, query_str) in &lang_schema.queries {
+            match Query::new(&ts_lang, query_str) {
+                Ok(q) => {
+                    compiled.insert(format!("{lang_name}:{query_name}"), std::sync::Arc::new(q));
+                }
+                Err(e) => {
+                    tracing::warn!("Invalid tree-sitter query for {lang_name}: {e}");
+                }
+            }
+        }
+    }
+    compiled
+}
+
+/// Number of worker threads the parallel producer spawns for a given entry
+/// count. Bounded to the available parallelism (clamped 1..=8) and never
+/// more than there are entries to process.
+pub(crate) fn ingest_worker_count(total_entries: usize) -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 8)
+        .min(total_entries.max(1))
+}
+
+/// One entry collected during the walk, before any file I/O or parsing.
+#[derive(Clone)]
+struct WalkedEntry {
+    pub path: std::path::PathBuf,
+    pub path_str: String,
+    pub abs_path: String,
+    pub node_path: String,
+    pub node_id: String,
+    pub contained_by: Vec<String>,
+    pub is_file: bool,
+    pub mem_type: String,
+}
+
+/// The result of processing one `WalkedEntry` on a worker thread. Carries
+/// everything the producer thread needs to replay the original side effects in
+/// deterministic walk order.
+enum ProcessedEntry {
+    Directory,
+    UnchangedFile {
+        file_sha256: String,
+    },
+    SecretSkipped {
+        reason: String,
+        had_previous: bool,
+        file_sha256: String,
+    },
+    ParsedFile {
+        file_sha256: String,
+        doc_sections: Vec<DocSection>,
+        symbols: Vec<SymbolRow>,
+        imports: Vec<String>,
+        lang_name: Option<String>,
+    },
+}
+
+/// Process a single walked entry on a worker thread: read bytes, hash, secret
+/// scan, and (when applicable) parse the AST. Returns an owned `ProcessedEntry`
+/// so no tree-sitter or filesystem types cross back to the producer thread.
+fn process_walked_entry(
+    entry: &WalkedEntry,
+    ext_to_lang: &HashMap<String, String>,
+    schema: &crate::parser::schema::ParserSchema,
+    compiled_queries: &HashMap<String, std::sync::Arc<tree_sitter::Query>>,
+    prev_file_map: &HashMap<String, String>,
+    force_reparse: bool,
+    parsers_by_lang: &mut HashMap<String, Parser>,
+) -> Result<ProcessedEntry, anyhow::Error> {
+    if !entry.is_file {
+        return Ok(ProcessedEntry::Directory);
+    }
+
+    let bytes = read_ingest_file(&entry.path)?;
+    let file_sha256 = sha256_hex(&bytes);
+
+    // Incremental skip.
+    if !force_reparse {
+        if let Some(prev_hash) = prev_file_map.get(&entry.node_path) {
+            if prev_hash == &file_sha256 {
+                return Ok(ProcessedEntry::UnchangedFile { file_sha256 });
+            }
+        }
+    }
+
+    let lang_name = entry
+        .path
+        .extension()
+        .map(|ext_os| normalize_ext(&ext_os.to_string_lossy()))
+        .and_then(|ext| ext_to_lang.get(&ext).cloned())
+        .filter(|ln| get_language(ln).is_some());
+
+    let content_for_parse = if lang_name.is_some() {
+        Some(String::from_utf8_lossy(&bytes).to_string())
+    } else {
+        None
+    };
+    let scan_text = if let Some(t) = &content_for_parse {
+        Some(t.clone())
+    } else if entry.mem_type == "markdown" {
+        Some(String::from_utf8_lossy(&bytes).to_string())
+    } else {
+        None
+    };
+    if let Some(text) = &scan_text {
+        if let Some(reason) = scan_for_ingest(text) {
+            return Ok(ProcessedEntry::SecretSkipped {
+                reason,
+                had_previous: prev_file_map.contains_key(&entry.node_path),
+                file_sha256,
+            });
+        }
+    }
+
+    // ParsedFile.
+    let mut doc_sections = Vec::new();
+    if entry.mem_type == "markdown" {
+        let content = String::from_utf8_lossy(&bytes).to_string();
+        doc_sections = parse_markdown_sections(&content);
+    }
+
+    let mut symbols = Vec::new();
+    let mut imports = Vec::new();
+    let mut parsed_lang = None;
+
+    if let Some(ln) = &lang_name {
+        let content = String::from_utf8_lossy(&bytes).to_string();
+        let ts_lang = get_language(ln).expect("language present");
+        let parser = if let Some(p) = parsers_by_lang.get_mut(ln) {
+            p
+        } else {
+            let mut p = Parser::new();
+            p.set_language(&ts_lang)?;
+            parsers_by_lang.insert(ln.clone(), p);
+            parsers_by_lang.get_mut(ln).unwrap()
+        };
+
+        if let Some(tree) = parser.parse(&content, None) {
+            let lang_schema = &schema.languages[ln];
+            let mut pending: Vec<SymbolRow> = Vec::new();
+
+            for (query_name, _query_str) in &lang_schema.queries {
+                let query_key = format!("{ln}:{query_name}");
+                let query: &tree_sitter::Query = match compiled_queries.get(&query_key) {
+                    Some(q) => q.as_ref(),
+                    None => continue,
+                };
+
+                let mut cursor = tree_sitter::QueryCursor::new();
+                let mut iter = cursor.matches(query, tree.root_node(), content.as_bytes());
+
+                while let Some(m) = iter.next() {
+                    let mut name: Option<&str> = None;
+                    let mut definition: Option<tree_sitter::Node> = None;
+
+                    for capture in m.captures() {
+                        let capture_name = query.capture_names()[capture.index as usize];
+                        if capture_name == "name" {
+                            name = capture.node.utf8_text(content.as_bytes()).ok();
+                        } else if definition.map_or(true, |d: tree_sitter::Node| {
+                            capture.node.byte_range().len() > d.byte_range().len()
+                        }) {
+                            definition = Some(capture.node);
+                        }
+                    }
+
+                    let (name, definition) = match (name, definition) {
+                        (Some(n), Some(d)) => (n, d),
+                        _ => continue,
+                    };
+
+                    let full = definition.utf8_text(content.as_bytes()).unwrap_or("");
+                    pending.push(SymbolRow {
+                        name: name.to_string(),
+                        kind: query_name.clone(),
+                        start_line: definition.start_position().row + 1,
+                        end_line: definition.end_position().row + 1,
+                        body: truncate_for_embedding(full),
+                        span_sha256: sha256_hex(full.as_bytes()),
+                        calls: extract_called_identifiers(full, name),
+                    });
+                }
+            }
+
+            symbols = pending;
+        }
+
+        imports = extract_import_specifiers(ln, &content);
+        parsed_lang = Some(ln.clone());
+    }
+
+    Ok(ProcessedEntry::ParsedFile {
+        file_sha256,
+        doc_sections,
+        symbols,
+        imports,
+        lang_name: parsed_lang,
+    })
+}
+
 /// Blocking producer: walks the directory tree, reads files, parses ASTs,
 /// and streams owned results through `tx`. Runs on the blocking thread pool
 /// so filesystem I/O never stalls the async runtime.
@@ -472,6 +687,14 @@ fn run_producer(
 
     let mut unreadable = 0usize;
 
+    // One compiled tree-sitter query per schema entry per run, instead of
+    // recompiling the pattern for every file the walk reaches.
+    let compiled_queries = compile_language_queries(&schema);
+
+    // Collect walk entries in deterministic order first; processing happens
+    // in parallel below.
+    let mut entries: Vec<WalkedEntry> = Vec::new();
+
     for result in walker {
         let entry = match result {
             Ok(e) => e,
@@ -485,7 +708,7 @@ fn run_producer(
         };
 
         let path = entry.path();
-        let path_str = path.to_string_lossy();
+        let path_str = path.to_string_lossy().to_string();
 
         let mut should_skip = false;
         for skip_dir in &skipped_dirs {
@@ -519,9 +742,6 @@ fn run_producer(
         let parent_id = if path == dir_path {
             None
         } else if let Some(p) = path.parent() {
-            // Only adopt a parent that actually lives inside the ingest root;
-            // otherwise a root-level ingest leaks an absolute-path parent id
-            // (e.g. "NeuroStrata::/home/kenton/Documents") that matches no node.
             if p == dir_path || p.strip_prefix(&dir_path).is_ok() {
                 let p_str = node_id_for(&dir_path, p);
                 if p_str != "." && p_str != "" && p_str != node_path {
@@ -558,215 +778,145 @@ fn run_producer(
 
         let node_id = generation_scoped_id(&namespace, generation, &node_path);
 
-        // Every visited path is recorded so carry-forward can decide whether a
-        // previous row still belongs to the current tree.
-        current_paths.insert(node_path.clone());
-        current_kinds.insert(node_path.clone(), mem_type.to_string());
+        entries.push(WalkedEntry {
+            path: path.to_path_buf(),
+            path_str,
+            abs_path,
+            node_path,
+            node_id,
+            contained_by,
+            is_file,
+            mem_type: mem_type.to_string(),
+        });
+    }
 
-        // Every file's bytes are read once and hashed so `file_sha256` is
-        // captured on file and markdown nodes too, not only on parseable code
-        // files. The same bytes are parsed only when the extension maps to a
-        // grammar; directories carry no hash.
-        let (file_sha256, content, lang_name, raw_bytes) = if is_file {
-            // A single read per file: the bytes below are hashed, parsed (when
-            // a grammar applies) and reused for the markdown section pass.
-            // A file the walk found but we cannot read is not "unchanged" or
-            // "empty": publishing a generation without its bytes would either
-            // lose the row or carry a stale copy over it. Abort the staging
-            // generation instead; the previous one stays active.
-            let bytes = Some(read_ingest_file(path)?);
-            let hash = bytes.as_deref().map(sha256_hex);
-            let lang_name = path
-                .extension()
-                .map(|ext_os| normalize_ext(&ext_os.to_string_lossy()))
-                .and_then(|ext| ext_to_lang.get(&ext).cloned())
-                .filter(|ln| get_language(ln).is_some());
-            let content = match (&bytes, &lang_name) {
-                (Some(b), Some(_)) => Some(String::from_utf8_lossy(b).to_string()),
-                _ => None,
-            };
-            (hash, content, lang_name, bytes)
-        } else {
-            (None, None, None, None)
-        };
+    // Process entries in parallel across a bounded worker pool.
+    let worker_count = ingest_worker_count(entries.len());
+    let next_idx = AtomicUsize::new(0);
+    let results: std::sync::Mutex<Vec<(usize, Result<ProcessedEntry, anyhow::Error>)>> =
+        std::sync::Mutex::new(Vec::new());
 
-        // Incremental skip: if this file's hash matches the previous active
-        // generation, carry it forward instead of re-parsing/re-embedding.
-        if is_file {
-            if !force_reparse {
-                if let Some(prev_hash) = prev_file_map.get(&node_path) {
-                    if prev_hash == file_sha256.as_deref().unwrap_or("") {
-                        if let Some(obs) = &observer {
-                            obs.file_skipped(&path_str, "unchanged");
-                        }
-                        // Record the current hash so unchanged rows can be carried.
-                        if let Some(h) = file_sha256.as_deref() {
-                            current_hashes.insert(node_path.clone(), h.to_string());
-                        }
-                        continue;
+    std::thread::scope(|s| {
+        for _ in 0..worker_count {
+            s.spawn(|| {
+                let mut parsers_by_lang: HashMap<String, Parser> = HashMap::new();
+                loop {
+                    let idx = next_idx.fetch_add(1, Ordering::Relaxed);
+                    if idx >= entries.len() {
+                        break;
                     }
+                    let entry = &entries[idx];
+                    let res = process_walked_entry(
+                        entry,
+                        &ext_to_lang,
+                        &schema,
+                        &compiled_queries,
+                        &prev_file_map,
+                        force_reparse,
+                        &mut parsers_by_lang,
+                    );
+                    results.lock().unwrap().push((idx, res));
+                }
+            });
+        }
+    });
+
+    let mut sorted_results = results.into_inner().unwrap();
+    sorted_results.sort_by_key(|(idx, _)| *idx);
+    let processed_results: Vec<Result<ProcessedEntry, anyhow::Error>> =
+        sorted_results.into_iter().map(|(_, r)| r).collect();
+
+    // Replay side effects in deterministic walk order.
+    for (entry, result) in entries.iter().zip(processed_results.into_iter()) {
+        current_paths.insert(entry.node_path.clone());
+        current_kinds.insert(entry.node_path.clone(), entry.mem_type.clone());
+
+        let processed = result?;
+
+        match processed {
+            ProcessedEntry::Directory => {
+                if let Err(e) = tx.blocking_send(IngestItem::NodeUpsert {
+                    node_id: entry.node_id.clone(),
+                    node_path: entry.node_path.clone(),
+                    contained_by: entry.contained_by.clone(),
+                    mem_type: entry.mem_type.clone(),
+                    abs_path: entry.abs_path.clone(),
+                    file_sha256: None,
+                }) {
+                    return Err(anyhow::anyhow!("ingest consumer dropped: {}", e));
                 }
             }
-        }
-        // Record the current hash for every file the walk visits.
-        if let Some(h) = file_sha256.as_deref() {
-            current_hashes.insert(node_path.clone(), h.to_string());
-        }
-
-        // Before its node goes out, a file's text meets the secret scanner
-        // first, and a document that trips it is skipped whole — no file node,
-        // no symbols, no sections — with the skip reported through the
-        // consumer. The scan runs over the bytes already read above, so what
-        // is scanned is exactly what is parsed and stored. Markdown has no
-        // tree-sitter grammar, so its text comes from raw_bytes rather than
-        // `content`; without this arm a credential in a .md file reached the
-        // doc-section embedding path unscanned.
-        let scan_text = match (&content, &raw_bytes) {
-            (Some(text), _) => Some(text.clone()),
-            (None, Some(bytes)) if mem_type == "markdown" => {
-                Some(String::from_utf8_lossy(bytes).to_string())
+            ProcessedEntry::UnchangedFile { file_sha256 } => {
+                current_hashes.insert(entry.node_path.clone(), file_sha256);
+                if let Some(obs) = &observer {
+                    obs.file_skipped(&entry.path_str, "unchanged");
+                }
             }
-            _ => None,
-        };
-        if let Some(text) = &scan_text {
-            if let Some(reason) = scan_for_ingest(text) {
-                // A never-indexed skip is not a change: exclude it from the
-                // current walk so the unchanged fast path still applies. A
-                // path that had previous rows is a change; leave it in the
-                // sets so the generation advances and the old rows do not
-                // stay active.
-                let had_previous = prev_file_map.contains_key(&node_path);
+            ProcessedEntry::SecretSkipped {
+                reason,
+                had_previous,
+                file_sha256,
+            } => {
+                current_hashes.insert(entry.node_path.clone(), file_sha256);
                 if !had_previous {
-                    current_paths.remove(&node_path);
-                    current_kinds.remove(&node_path);
+                    current_paths.remove(&entry.node_path);
+                    current_kinds.remove(&entry.node_path);
                 }
                 if let Err(e) = tx.blocking_send(IngestItem::SkippedFile {
-                    path_display: path_str.to_string(),
+                    path_display: entry.path_str.clone(),
                     reason,
                     had_previous,
                 }) {
                     return Err(anyhow::anyhow!("ingest consumer dropped: {}", e));
                 }
-                continue;
             }
-        }
+            ProcessedEntry::ParsedFile {
+                file_sha256,
+                doc_sections,
+                symbols,
+                imports,
+                lang_name,
+            } => {
+                current_hashes.insert(entry.node_path.clone(), file_sha256.clone());
 
-        // Apply backpressure: if the channel is full, block until space is
-        // available rather than silently dropping the item. If the consumer
-        // has dropped (e.g. it errored), propagate the failure instead of
-        // reporting success over a partial ingest.
-        if let Err(e) = tx.blocking_send(IngestItem::NodeUpsert {
-            node_id,
-            node_path: node_path.clone(),
-            contained_by,
-            mem_type: mem_type.to_string(),
-            abs_path,
-            file_sha256: file_sha256.clone(),
-        }) {
-            return Err(anyhow::anyhow!("ingest consumer dropped: {}", e));
-        }
+                if let Err(e) = tx.blocking_send(IngestItem::NodeUpsert {
+                    node_id: entry.node_id.clone(),
+                    node_path: entry.node_path.clone(),
+                    contained_by: entry.contained_by.clone(),
+                    mem_type: entry.mem_type.clone(),
+                    abs_path: entry.abs_path.clone(),
+                    file_sha256: Some(file_sha256.clone()),
+                }) {
+                    return Err(anyhow::anyhow!("ingest consumer dropped: {}", e));
+                }
 
-        // For markdown files, parse into sections and stream them for embedding.
-        if is_file && path_str.ends_with(".md") {
-            if let Some(bytes) = raw_bytes.as_ref() {
-                let content = String::from_utf8_lossy(bytes).to_string();
-                let sections = parse_markdown_sections(&content);
-                if !sections.is_empty() {
-                    let file_sha = sha256_hex(bytes);
+                if !doc_sections.is_empty() {
                     if let Err(e) = tx.blocking_send(IngestItem::DocSections {
-                        node_path: node_path.clone(),
-                        sections,
-                        file_sha256: file_sha,
+                        node_path: entry.node_path.clone(),
+                        sections: doc_sections,
+                        file_sha256: file_sha256.clone(),
                     }) {
                         return Err(anyhow::anyhow!("ingest consumer dropped: {}", e));
                     }
                 }
-            }
-        }
 
-        // Parse the content already read above and stream the symbols.
-        if let (Some(content), Some(lang_name)) = (content, lang_name) {
-            let Some(ts_lang) = get_language(&lang_name) else {
-                continue;
-            };
+                if !imports.is_empty() {
+                    raw_imports.insert(entry.node_path.clone(), imports);
+                }
 
-            let mut parser = Parser::new();
-            parser.set_language(&ts_lang)?;
-
-            let tree = match parser.parse(&content, None) {
-                Some(t) => t,
-                None => continue,
-            };
-
-            let lang_schema = &schema.languages[&lang_name];
-            let mut pending: Vec<SymbolRow> = Vec::new();
-
-            for (query_name, query_str) in &lang_schema.queries {
-                let query = match Query::new(&ts_lang, query_str) {
-                    Ok(q) => q,
-                    Err(e) => {
-                        tracing::warn!("Invalid tree-sitter query for {lang_name}: {e}");
-                        continue;
-                    }
-                };
-
-                let mut cursor = QueryCursor::new();
-                let mut iter = cursor.matches(&query, tree.root_node(), content.as_bytes());
-
-                while let Some(m) = iter.next() {
-                    let mut name: Option<&str> = None;
-                    let mut definition: Option<tree_sitter::Node> = None;
-
-                    for capture in m.captures {
-                        let capture_name = query.capture_names()[capture.index as usize];
-                        if capture_name == "name" {
-                            name = capture.node.utf8_text(content.as_bytes()).ok();
-                        } else if definition.map_or(true, |d: tree_sitter::Node| {
-                            capture.node.byte_range().len() > d.byte_range().len()
+                if !symbols.is_empty() {
+                    if let Some(ln) = lang_name {
+                        let path_display = entry.path_str.clone();
+                        if let Err(e) = tx.blocking_send(IngestItem::ParsedSymbols {
+                            node_path: entry.node_path.clone(),
+                            lang_name: ln,
+                            symbols,
+                            path_display,
+                            file_sha256: file_sha256.clone(),
                         }) {
-                            definition = Some(capture.node);
+                            return Err(anyhow::anyhow!("ingest consumer dropped: {}", e));
                         }
                     }
-
-                    let (name, definition) = match (name, definition) {
-                        (Some(n), Some(d)) => (n, d),
-                        _ => continue,
-                    };
-
-                    let full = definition.utf8_text(content.as_bytes()).unwrap_or("");
-                    pending.push(SymbolRow {
-                        name: name.to_string(),
-                        kind: query_name.clone(),
-                        start_line: definition.start_position().row + 1,
-                        end_line: definition.end_position().row + 1,
-                        body: truncate_for_embedding(full),
-                        span_sha256: sha256_hex(full.as_bytes()),
-                        calls: extract_called_identifiers(full, name),
-                    });
-                }
-            }
-
-            // Extract module/import dependencies (best-effort, warn-free).
-            let imports = extract_import_specifiers(&lang_name, &content);
-            if !imports.is_empty() {
-                raw_imports.insert(node_path.clone(), imports);
-            }
-
-            if !pending.is_empty() {
-                let path_display = path.display().to_string();
-                // `file_sha256` is `Some` exactly when `content` is, so this is
-                // the hash of the bytes just parsed.
-                let file_sha = file_sha256
-                    .clone()
-                    .expect("a parseable file has a captured hash");
-                if let Err(e) = tx.blocking_send(IngestItem::ParsedSymbols {
-                    node_path,
-                    lang_name: lang_name.clone(),
-                    symbols: pending,
-                    path_display,
-                    file_sha256: file_sha,
-                }) {
-                    return Err(anyhow::anyhow!("ingest consumer dropped: {}", e));
                 }
             }
         }
@@ -896,16 +1046,37 @@ async fn run_consumer(
                         )
                     })
                     .collect();
-                for symbol in symbols {
-                    let summary = format!(
-                        "{} {} in {}\nlines {}-{}\n\n{}",
-                        symbol.kind,
-                        symbol.name,
-                        node_path,
-                        symbol.start_line,
-                        symbol.end_line,
-                        symbol.body
-                    );
+                if !symbols.is_empty() {
+                    let summaries: Vec<String> = symbols
+                        .iter()
+                        .map(|s| {
+                            format!(
+                                "{} {} in {}\nlines {}-{}\n\n{}",
+                                s.kind,
+                                s.name,
+                                node_path,
+                                s.start_line,
+                                s.end_line,
+                                s.body
+                            )
+                        })
+                        .collect();
+                    let embeddings = embedder
+                        .embed_batch(&summaries)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("failed to embed symbol batch: {}", e))?;
+                    if embeddings.len() != summaries.len() {
+                        anyhow::bail!(
+                            "embedder returned {} embeddings for {} symbols",
+                            embeddings.len(),
+                            summaries.len()
+                        );
+                    }
+                    for ((symbol, summary), embedding) in symbols
+                        .into_iter()
+                        .zip(summaries)
+                        .zip(embeddings)
+                    {
                     let id = generation_scoped_id(
                         namespace,
                         generation,
@@ -973,15 +1144,8 @@ async fn run_consumer(
                     // An embed or store failure aborts the staging generation:
                     // swallowing it here would hand back a graph whose symbols
                     // are silently missing, which is exactly the half-built
-                    // tree staged publication exists to prevent.
-                    let embedding = embedder.embed(&summary).await.map_err(|e| {
-                        anyhow::anyhow!(
-                            "failed to embed symbol {} from {}: {}",
-                            symbol.name,
-                            path_display,
-                            e
-                        )
-                    })?;
+                    // tree staged publication exists to prevent. The batch
+                    // embed above already failed the run before any row landed.
                     vector_store
                         .upsert(namespace, &id, embedding, payload)
                         .await
@@ -993,7 +1157,8 @@ async fn run_consumer(
                                 e
                             )
                         })?;
-                    symbols_stored += 1;
+                        symbols_stored += 1;
+                    }
                 }
 
                 if symbols_stored > 0 {
@@ -1021,7 +1186,27 @@ async fn run_consumer(
             sections,
             file_sha256,
         } => {
-            for section in sections {
+            if !sections.is_empty() {
+                let summaries: Vec<String> = sections
+                    .iter()
+                    .map(|section| format!("{}\n\n{}", section.heading, section.text))
+                    .collect();
+                let embeddings = embedder
+                    .embed_batch(&summaries)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("failed to embed doc section batch: {}", e))?;
+                if embeddings.len() != summaries.len() {
+                    anyhow::bail!(
+                        "embedder returned {} embeddings for {} doc sections",
+                        embeddings.len(),
+                        summaries.len()
+                    );
+                }
+                for ((section, summary), embedding) in sections
+                    .into_iter()
+                    .zip(summaries)
+                    .zip(embeddings)
+                {
                 let id = generation_scoped_id(
                     namespace,
                     generation,
@@ -1044,7 +1229,6 @@ async fn run_consumer(
                 metadata.insert("source_identity".to_string(), with_relative_path(&source_identity, &node_path));
                 metadata.insert("index_generation".to_string(), serde_json::json!(generation));
 
-                let summary = format!("{}\n\n{}", section.heading, section.text);
                 let payload = MemoryPayload {
                     content: summary.clone(),
                     location: node_path.clone(),
@@ -1055,13 +1239,11 @@ async fn run_consumer(
                     agent_name: Some("neurostrata-mcp-ingestor".to_string()),
                 };
 
-                let embedding = embedder.embed(&summary).await.map_err(|e| {
-                    anyhow::anyhow!("failed to embed doc section {}: {}", section.heading, e)
-                })?;
                 vector_store
                     .upsert(namespace, &id, embedding, payload)
                     .await
                     .map_err(|e| anyhow::anyhow!("failed to store doc section {}: {}", id, e))?;
+                }
             }
         }
     }
@@ -2694,6 +2876,14 @@ mod tests {
     }
 
     #[test]
+    fn ingest_worker_count_respects_bounds() {
+        assert_eq!(ingest_worker_count(0), 1);
+        assert!(ingest_worker_count(3) <= 3);
+        assert!(ingest_worker_count(100) <= 8);
+        assert!(ingest_worker_count(100) >= 1);
+    }
+
+    #[test]
     fn markdown_sections_extract_headings_backticks_links_and_skip_empty() {
         let md = "# Heading\n\nbody with `sym` and [link](https://example.com)\n\n## Empty\n\n   \n\n## Second\nmore";
         let secs = parse_markdown_sections(md);
@@ -3742,6 +3932,117 @@ use super::x;"#;
                 .map(|r| r.id.clone())
                 .collect::<Vec<_>>()
         );
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    /// Records every embed_batch payload so tests can observe how the
+    /// consumer batches symbol and doc-section embeddings.
+    struct BatchRecordingEmbedder {
+        batch_calls: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for BatchRecordingEmbedder {
+        async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            Ok(vec![0.0; 4])
+        }
+
+        async fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+            self.batch_calls.lock().unwrap().push(texts.to_vec());
+            Ok(texts.iter().map(|_| vec![0.0; 4]).collect())
+        }
+
+        fn dimensions(&self) -> usize {
+            4
+        }
+    }
+
+    fn batch_recording_embedder() -> (Arc<dyn Embedder>, Arc<std::sync::Mutex<Vec<Vec<String>>>>) {
+        let batch_calls = Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+        let embedder: Arc<dyn Embedder> = Arc::new(BatchRecordingEmbedder {
+            batch_calls: Arc::clone(&batch_calls),
+        });
+        (embedder, batch_calls)
+    }
+
+    /// The producer compiles one tree-sitter query per schema entry up front
+    /// instead of recompiling the pattern for every file.
+    #[test]
+    fn compile_language_queries_compiles_every_configured_query() {
+        let schema = ParserSchema::load(
+            r#"{"languages":{"rust":{"extensions":["rs"],"queries":{"functions":"(function_item name: (identifier) @name) @func"}}}}"#,
+        )
+        .expect("the fixture schema parses");
+        let compiled = compile_language_queries(&schema);
+        assert!(
+            compiled.contains_key("rust:functions"),
+            "the compiled cache is keyed by language:query, got {compiled:?}"
+        );
+    }
+
+    /// One file carrying several symbols is embedded as a single batch, not one
+    /// embed call per symbol.
+    #[tokio::test]
+    async fn ingest_batches_multi_symbol_files_into_one_embed_batch() {
+        let tmp = std::env::temp_dir().join(format!("ns-batch-symbols-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        std::fs::write(tmp.join("lib.rs"), "pub fn alpha() {}\npub fn beta() {}\n").expect("write rust file");
+        let db = std::env::temp_dir().join(format!("ns-batch-symbols-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("batch-ns").await.expect("create the schema");
+        let (embedder, batch_calls) = batch_recording_embedder();
+        let schema = ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        ingest_directory(&tmp, &schema, embedder, store.clone(), "batch-ns", None, &[])
+            .await
+            .expect("ingest batches the multi-symbol file");
+
+        let batches = batch_calls.lock().unwrap();
+        assert_eq!(batches.len(), 1, "one file with symbols is one batch: {batches:?}");
+        assert_eq!(batches[0].len(), 2, "both symbols share one batch: {batches:?}");
+        assert!(
+            batches[0][0].contains("alpha"),
+            "the batch carries the first symbol: {}",
+            batches[0][0]
+        );
+        assert!(
+            batches[0][1].contains("beta"),
+            "the batch carries the second symbol: {}",
+            batches[0][1]
+        );
+        drop(batches);
+
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    /// One markdown file carrying several sections is embedded as a single
+    /// batch.
+    #[tokio::test]
+    async fn ingest_batches_markdown_sections_into_one_embed_batch() {
+        let tmp = std::env::temp_dir().join(format!("ns-batch-md-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        std::fs::write(
+            tmp.join("guide.md"),
+            "# Guide\n\nIntro.\n\n## Setup\n\nSetup.\n\n## Usage\n\nUsage.",
+        )
+        .expect("write markdown");
+        let db = std::env::temp_dir().join(format!("ns-batch-md-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("batch-ns").await.expect("create the schema");
+        let (embedder, batch_calls) = batch_recording_embedder();
+        let schema = ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        ingest_directory(&tmp, &schema, embedder, store.clone(), "batch-ns", None, &[])
+            .await
+            .expect("ingest batches the multi-section markdown");
+
+        let batches = batch_calls.lock().unwrap();
+        assert_eq!(batches.len(), 1, "one markdown file is one batch: {batches:?}");
+        assert_eq!(batches[0].len(), 3, "all sections share one batch: {batches:?}");
+        drop(batches);
+
         std::fs::remove_dir_all(&tmp).ok();
         std::fs::remove_dir_all(&db).ok();
     }

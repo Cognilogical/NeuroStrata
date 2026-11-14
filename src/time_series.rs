@@ -9,6 +9,13 @@ pub use crate::telemetry::anomaly::MetricKind;
 
 pub type SeriesKey = (String, MetricKind, String);
 
+/// Process-wide singleton time-series store used by CLI/daemon surfaces that
+/// do not own a LadybugStore (e.g. the `bench` command's `--record-metrics`).
+pub fn global_store() -> &'static TimeSeriesStore {
+    static STORE: std::sync::OnceLock<TimeSeriesStore> = std::sync::OnceLock::new();
+    STORE.get_or_init(TimeSeriesStore::default)
+}
+
 /// Every metric kind the store tracks. A cross-stage query without an explicit
 /// `kind` sweeps all of these rather than guessing one.
 pub const ALL_METRIC_KINDS: [MetricKind; 6] = [

@@ -2,6 +2,7 @@
 #![recursion_limit = "256"]
 
 mod attempt;
+mod bench;
 mod buffer;
 mod compression;
 mod config;
@@ -170,6 +171,31 @@ enum Commands {
 
         /// The memory ID to archive
         id: String,
+    },
+
+    /// Run the longitudinal benchmark suite and emit a JSON performance receipt
+    Bench {
+        /// Benchmark suite to run
+        #[arg(long, default_value = "all")]
+        suite: crate::bench::BenchSuite,
+        /// Number of iterations per suite
+        #[arg(long, default_value_t = 5)]
+        iterations: usize,
+        /// Optional path to write the pretty JSON receipt
+        #[arg(long)]
+        output: Option<std::path::PathBuf>,
+        /// Optional path to a previous receipt for regression comparison
+        #[arg(long)]
+        baseline: Option<std::path::PathBuf>,
+        /// Maximum allowed regression percentage
+        #[arg(long, default_value_t = 20.0)]
+        max_regression_pct: f64,
+        /// Exit non-zero when regression exceeds threshold
+        #[arg(long)]
+        fail_on_regression: bool,
+        /// Optional namespace to record latency samples into TimeSeriesStore
+        #[arg(long)]
+        record_metrics: Option<String>,
     },
 
     /// Report what the thalamic bus has done since the daemon started
@@ -1641,6 +1667,24 @@ mod tests {
             parsed.is_err(),
             "a typo must never reach std::process::Command"
         );
+    }
+
+    #[test]
+    fn bench_subcommand_parses() {
+        let cli = Cli::try_parse_from([
+            "neurostrata-mcp",
+            "bench",
+            "--suite",
+            "all",
+            "--iterations",
+            "2",
+            "--max-regression-pct",
+            "10.0",
+            "--record-metrics",
+            "ns",
+        ])
+        .expect("bench parses");
+        assert!(matches!(cli.command, Some(Commands::Bench { .. })));
     }
 
     #[test]
@@ -4197,6 +4241,34 @@ async fn run() -> anyhow::Result<()> {
                 );
                 std::process::exit(1);
             }
+            Commands::Bench {
+                suite,
+                iterations,
+                output,
+                baseline,
+                max_regression_pct,
+                fail_on_regression,
+                record_metrics,
+            } => {
+                let cfg = crate::bench::BenchConfig {
+                    suite,
+                    iterations,
+                    output,
+                    baseline,
+                    max_regression_pct,
+                    fail_on_regression,
+                    record_metrics,
+                };
+                let receipt = crate::bench::run_benchmarks(&cfg).await?;
+                println!("{}", serde_json::to_string_pretty(&receipt)?);
+                if fail_on_regression {
+                    if let Some(cmp) = &receipt.comparison {
+                        if !cmp.passed {
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
             Commands::BusMetrics => {
                 // Answered from the daemon, never from a bus built here: the
                 // pulses are emitted by the daemon that owns the store, so a
@@ -5585,6 +5657,7 @@ async fn run() -> anyhow::Result<()> {
                     | Commands::BusMetrics
                     | Commands::Kge { .. }
                     | Commands::Hooks { .. }
+                    | Commands::Bench { .. }
                     // THE OUTER match already handles Learn (src/main.rs ~2822);
                     // this inner catch-all can never see it.
                     | Commands::Learn { .. } => unreachable!(),

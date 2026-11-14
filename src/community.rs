@@ -69,6 +69,18 @@ pub mod community_inner {
         Ok(CommunityResult { communities, quality })
     }
 
+    /// Async wrapper around `detect_communities_with_resolution` that offloads
+    /// CPU-bound Leiden modularity optimization onto Tokio's blocking pool so
+    /// async worker threads never stall on large graphs.
+    pub async fn detect_communities_with_resolution_async(
+        edges: Vec<(String, String, f64)>,
+        resolution: f64,
+    ) -> anyhow::Result<CommunityResult> {
+        tokio::task::spawn_blocking(move || detect_communities_with_resolution(&edges, resolution))
+            .await
+            .map_err(|e| anyhow::anyhow!("community detection task panicked: {e}"))?
+    }
+
     /// Detect communities AND return the partition quality (modularity) the
     /// Leiden run converged to (spec §5.2). `0.0` for empty input.
     /// The canonical detection entry point: the caller supplies the full node
@@ -436,5 +448,24 @@ mod tests {
         assert_eq!(out[0].member_ids, vec!["b", "a"]);
         assert_eq!(out[0].hub_id, "b", "highest access_count survivor wins");
         assert_eq!(out[0].size, 2);
+    }
+
+    #[tokio::test]
+    async fn detect_communities_with_resolution_async_matches_sync_partition() -> anyhow::Result<()> {
+        let edges = vec![
+            ("c1".to_string(), "c2".to_string(), 1.0),
+            ("c2".to_string(), "c3".to_string(), 1.0),
+            ("c1".to_string(), "c3".to_string(), 1.0),
+            ("c4".to_string(), "c5".to_string(), 1.0),
+            ("c5".to_string(), "c6".to_string(), 1.0),
+            ("c4".to_string(), "c6".to_string(), 1.0),
+            ("c3".to_string(), "c4".to_string(), 0.5),
+        ];
+        let resolution = 1.0;
+        let sync = detect_communities_with_resolution(&edges, resolution)?;
+        let async_res = detect_communities_with_resolution_async(edges.clone(), resolution).await?;
+        assert_eq!(sync.communities, async_res.communities);
+        assert_eq!(sync.quality, async_res.quality);
+        Ok(())
     }
 }

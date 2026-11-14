@@ -1047,11 +1047,17 @@ mod tests {
 
     #[test]
     fn the_guard_counts_calls_in_flight() {
-        let before = IN_FLIGHT.load(Ordering::SeqCst);
-        let g = CallGuard::begin("t", None);
-        assert_eq!(IN_FLIGHT.load(Ordering::SeqCst), before + 1);
-        drop(g);
-        assert_eq!(IN_FLIGHT.load(Ordering::SeqCst), before);
+        assert_eq!(in_flight_for_test(), 0);
+        let g1 = CallGuard::begin("t1", None);
+        assert_eq!(in_flight_for_test(), 1);
+        assert!(IN_FLIGHT.load(Ordering::SeqCst) >= 1);
+        let g2 = CallGuard::begin("t2", None);
+        assert_eq!(in_flight_for_test(), 2);
+        assert!(IN_FLIGHT.load(Ordering::SeqCst) >= 2);
+        drop(g2);
+        assert_eq!(in_flight_for_test(), 1);
+        drop(g1);
+        assert_eq!(in_flight_for_test(), 0);
     }
 
     #[test]
