@@ -380,7 +380,6 @@ impl FastEmbedder {
         // (NomicEmbedTextV15 handles 8192), and truncates silently. Anything above
         // what ingestion actually stores per symbol is wasted, so this is set to
         // match MAX_SYMBOL_CHARS in src/parser/ingest.rs -- change the two together.
-        // The CPU arena keeps the largest buffer any input ever needed.
         // Texts here are embedded one at a time at their own length, so the
         // arena ratchets up and never gives it back. This applies to every
         // local embedding (ingest, daemon queries, MCP calls), not only
