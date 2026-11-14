@@ -449,11 +449,42 @@ pub(crate) fn sample_once_with<F: FnOnce() -> Option<u64>>(
     grew
 }
 
+/// Parse the time-series sample interval. An unset value uses the default;
+/// a value that is present but not a number is reported rather than silently
+/// replaced, so an operator who mistyped the knob can see why the sampler
+/// stayed at the default.
+fn parse_sample_interval(value: Option<&str>) -> Result<u64, String> {
+    match value {
+        None => Ok(DEFAULT_SAMPLE_SECS),
+        Some(raw) => raw.trim().parse::<u64>().map_err(|e| {
+            format!(
+                "NEUROSTRATA_RSS_SAMPLE_SECS='{raw}' is not a whole number of seconds ({e}); using {DEFAULT_SAMPLE_SECS}"
+            )
+        }),
+    }
+}
+
+/// Tracks which invalid `NEUROSTRATA_RSS_SAMPLE_SECS` values have already
+/// been reported, so a mistyped knob warns once per distinct value.
+static WARNED_INVALID_INTERVAL: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+fn should_warn_invalid_interval(raw: &str) -> bool {
+    should_warn_once(&WARNED_INVALID_INTERVAL, raw)
+}
+
 fn sample_interval() -> Option<std::time::Duration> {
-    let secs = std::env::var("NEUROSTRATA_RSS_SAMPLE_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_SAMPLE_SECS);
+    let raw = std::env::var("NEUROSTRATA_RSS_SAMPLE_SECS").ok();
+    let secs = match parse_sample_interval(raw.as_deref()) {
+        Ok(value) => value,
+        Err(warning) => {
+            if should_warn_invalid_interval(raw.as_deref().unwrap_or("")) {
+                eprintln!("warning: {warning}");
+            }
+            DEFAULT_SAMPLE_SECS
+        }
+    };
     (secs > 0).then(|| std::time::Duration::from_secs(secs))
 }
 
@@ -643,6 +674,22 @@ mod tests {
         let err = parse_threshold(Some("fifty")).expect_err("not a number");
         assert!(err.contains("not a whole number"), "{err}");
         assert!(err.contains("fifty"), "the bad value is named: {err}");
+    }
+
+    /// A mistyped sample interval is reported and falls back; zero is a
+    /// valid "turn the sampler off" value.
+    #[test]
+    fn invalid_sample_interval_is_reported_not_swallowed() {
+        assert_eq!(parse_sample_interval(None).unwrap(), DEFAULT_SAMPLE_SECS);
+        assert_eq!(parse_sample_interval(Some("0")).unwrap(), 0);
+        assert_eq!(parse_sample_interval(Some(" 25 ")).unwrap(), 25);
+        let err = parse_sample_interval(Some("fifty")).expect_err("not a number");
+        assert!(err.contains("not a whole number"), "{err}");
+        assert!(err.contains("fifty"), "the bad value is named: {err}");
+        assert!(
+            err.contains("NEUROSTRATA_RSS_SAMPLE_SECS"),
+            "the knob is named: {err}"
+        );
     }
 
     #[test]
