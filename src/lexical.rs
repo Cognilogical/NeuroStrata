@@ -69,6 +69,7 @@ pub struct TantivyHit {
 const STRUCTURAL_MEMORY_TYPES: &[&str] = &[
     "directory", "file", "markdown", "freshness_flag",
     "guard_event", "community_summary", "digital_twin", "digital_twin_schema",
+    "action_type", "action_receipt",
 ];
 
 pub struct TantivyLexicalIndex {

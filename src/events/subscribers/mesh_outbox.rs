@@ -186,7 +186,9 @@ impl MeshOutbox {
         {
             return None;
         }
-        if !is_shareable_memory_type(&payload.memory_type) {
+        if payload.memory_type == "action_receipt"
+            || !is_shareable_memory_type(&payload.memory_type)
+        {
             return None;
         }
         // Derived artifacts (KGE vectors, community labels, inferred edges)

@@ -132,6 +132,19 @@ pub fn memory_to_quads(
     if let Some(source) = payload.metadata.get("source") {
         json_quad!(ns_predicate("source"), source.to_string(), ldp_json.clone());
     }
+    if payload.memory_type == "action_receipt" {
+        lit_quad!(
+            ns_predicate("eligibility"),
+            "private".to_string(),
+            xsd_string.clone()
+        );
+    } else if let Some(elig) = payload.metadata.get("eligibility").and_then(|v| v.as_str()) {
+        lit_quad!(
+            ns_predicate("eligibility"),
+            elig.to_string(),
+            xsd_string.clone()
+        );
+    }
     if let Some(topology) = payload.metadata.get("topology") {
         if let Some(obj) = topology.as_object() {
             for (k, v) in obj {
@@ -188,6 +201,127 @@ pub fn memory_to_quads(
                         v.to_string(),
                         ldp_json.clone()
                     );
+                }
+            }
+        }
+    }
+
+    // Kinetic ActionType RDF projection
+    if payload.memory_type == "action_type" {
+        quads.push(Quad {
+            subject: subject.clone(),
+            predicate: NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+            object: Term::NamedNode(NamedNode::new_unchecked(ns_predicate("ActionType"))),
+            graph_name: graph.clone(),
+        });
+        if let Some(at) = payload.metadata.get("action_type").and_then(|v| v.as_object()) {
+            if let Some(slug) = at.get("slug").and_then(|v| v.as_str()) {
+                lit_quad!(ns_predicate("actionSlug"), slug.to_string(), xsd_string.clone());
+            }
+            if let Some(title) = at.get("title").and_then(|v| v.as_str()) {
+                lit_quad!(ns_predicate("actionTitle"), title.to_string(), xsd_string.clone());
+            }
+            if let Some(desc) = at.get("description").and_then(|v| v.as_str()) {
+                lit_quad!(ns_predicate("actionDescription"), desc.to_string(), xsd_string.clone());
+            }
+            if let Some(role) = at.get("required_role").and_then(|v| v.as_str()) {
+                lit_quad!(ns_predicate("requiredRole"), role.to_string(), xsd_string.clone());
+            }
+            if let Some(params) = at.get("parameters").and_then(|v| v.as_object()) {
+                for param_name in params.keys() {
+                    lit_quad!(
+                        ns_predicate("actionParam"),
+                        param_name.clone(),
+                        xsd_string.clone()
+                    );
+                }
+            }
+        }
+    }
+
+    // Kinetic ActionReceipt RDF projection (receipt params/body values are never projected as public predicates)
+    if payload.memory_type == "action_receipt" {
+        let xsd_int = NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#integer");
+        quads.push(Quad {
+            subject: subject.clone(),
+            predicate: NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+            object: Term::NamedNode(NamedNode::new_unchecked(ns_predicate("ActionReceipt"))),
+            graph_name: graph.clone(),
+        });
+        if let Some(ar) = payload.metadata.get("action_receipt").and_then(|v| v.as_object()) {
+            if let Some(slug) = ar.get("action_slug").and_then(|v| v.as_str()) {
+                lit_quad!(ns_predicate("actionSlug"), slug.to_string(), xsd_string.clone());
+            }
+            if let Some(principal) = ar.get("principal").and_then(|v| v.as_str()) {
+                lit_quad!(ns_predicate("principal"), principal.to_string(), xsd_string.clone());
+            }
+            if let Some(exec_at) = ar.get("executed_at").and_then(|v| v.as_i64()) {
+                lit_quad!(ns_predicate("executedAt"), exec_at.to_string(), xsd_int.clone());
+            }
+            if let Some(rev_at) = ar.get("reverted_at").and_then(|v| v.as_i64()) {
+                lit_quad!(ns_predicate("revertedAt"), rev_at.to_string(), xsd_int.clone());
+            }
+            if let Some(rev_by) = ar.get("reverted_by_receipt_id").and_then(|v| v.as_str()) {
+                if !rev_by.trim().is_empty() {
+                    iri_quad!(
+                        ns_predicate("revertedByReceipt"),
+                        super::namespace::memory_iri(rev_by, None)
+                    );
+                }
+            }
+            if let Some(reverts) = ar.get("reverts_receipt_id").and_then(|v| v.as_str()) {
+                if !reverts.trim().is_empty() {
+                    iri_quad!(
+                        ns_predicate("revertsReceipt"),
+                        super::namespace::memory_iri(reverts, None)
+                    );
+                }
+            }
+            if let Some(forced_by) = ar.get("forced_by").and_then(|v| v.as_str()) {
+                if !forced_by.trim().is_empty() {
+                    lit_quad!(ns_predicate("forcedBy"), forced_by.to_string(), xsd_string.clone());
+                }
+            }
+            if let Some(forced_at) = ar.get("forced_at").and_then(|v| v.as_i64()) {
+                lit_quad!(ns_predicate("forcedAt"), forced_at.to_string(), xsd_int.clone());
+            }
+            if let Some(pairs) = ar.get("superseded_pairs").and_then(|v| v.as_array()) {
+                for pair in pairs {
+                    if let Some(before_id) = pair.get("before_id").and_then(|v| v.as_str()) {
+                        if !before_id.trim().is_empty() {
+                            iri_quad!(
+                                ns_predicate("supersededMemory"),
+                                super::namespace::memory_iri(before_id, None)
+                            );
+                        }
+                    }
+                    if let Some(after_id) = pair.get("after_id").and_then(|v| v.as_str()) {
+                        if !after_id.trim().is_empty() {
+                            iri_quad!(
+                                ns_predicate("replacementMemory"),
+                                super::namespace::memory_iri(after_id, None)
+                            );
+                        }
+                    }
+                }
+            }
+            if let Some(created) = ar.get("created_ids").and_then(|v| v.as_array()) {
+                for cid in created.iter().filter_map(|v| v.as_str()) {
+                    if !cid.trim().is_empty() {
+                        iri_quad!(
+                            ns_predicate("createdMemory"),
+                            super::namespace::memory_iri(cid, None)
+                        );
+                    }
+                }
+            }
+            if let Some(twins) = ar.get("twin_deltas").and_then(|v| v.as_array()) {
+                for td in twins {
+                    if let Some(tid) = td.get("twin_id").and_then(|v| v.as_str()) {
+                        if !tid.trim().is_empty() {
+                            lit_quad!(ns_predicate("mutatedTwin"), tid.to_string(), xsd_string.clone());
+                        }
+                    }
                 }
             }
         }
@@ -630,6 +764,502 @@ mod tests {
         for (orig, conv) in qs.iter().zip(legacy.iter()) {
             let back = super::super::types_oxrdf::OxRdfBridge::neurostrata_quad_to_oxrdf(conv).unwrap();
             assert_eq!(orig, &back.inner);
+        }
+    }
+
+    #[test]
+    fn action_types_and_receipts_project_expected_rdf_classes_and_revert_links() {
+        let action_def_payload = MemoryPayload {
+            content: "Action: recalibrate-cooling-loop".to_string(),
+            user_id: "alice".to_string(),
+            memory_type: "action_type".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: json!({
+                "eligibility": "shareable",
+                "action_type": {
+                    "slug": "recalibrate-cooling-loop",
+                    "title": "Recalibrate Cooling Loop",
+                    "description": "Adjusts cooling loop target temperature",
+                    "required_role": "editor",
+                    "parameters": {
+                        "twin_id": { "param_type": "twin_id", "required": true },
+                        "target_temp": { "param_type": "f64", "required": true }
+                    },
+                    "submission_criteria": [],
+                    "effects": []
+                }
+            }),
+        };
+        let def_quads = memory_to_quads("act-def-1", &action_def_payload, "ns", Tier::Domain, 0);
+        assert!(
+            def_quads.iter().any(|q| {
+                q.predicate.as_str() == "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+                    && matches!(&q.object, Term::NamedNode(nn) if nn.as_str() == "urn:neurostrata:ns#ActionType")
+            }),
+            "action_type must project rdf:type ns:ActionType"
+        );
+        assert!(def_quads.iter().any(|q| {
+            q.predicate.as_str() == "urn:neurostrata:ns#actionSlug"
+                && matches!(&q.object, Term::Literal(l) if l.value() == "recalibrate-cooling-loop")
+        }));
+        assert!(def_quads.iter().any(|q| {
+            q.predicate.as_str() == "urn:neurostrata:ns#requiredRole"
+                && matches!(&q.object, Term::Literal(l) if l.value() == "editor")
+        }));
+        assert!(def_quads.iter().any(|q| {
+            q.predicate.as_str() == "urn:neurostrata:ns#actionParam"
+                && matches!(&q.object, Term::Literal(l) if l.value() == "twin_id")
+        }));
+
+        let receipt_payload = MemoryPayload {
+            content: "Action receipt r1".to_string(),
+            user_id: "alice".to_string(),
+            memory_type: "action_receipt".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: json!({
+                "eligibility": "private",
+                "action_receipt": {
+                    "receipt_id": "act-receipt-1",
+                    "action_slug": "recalibrate-cooling-loop",
+                    "principal": "alice",
+                    "executed_at": 1794675600,
+                    "params": { "twin_id": "loop-a", "target_temp": 42.5 },
+                    "superseded_pairs": [{ "before_id": "mem-old", "after_id": "mem-new" }],
+                    "created_ids": ["mem-created-1"],
+                    "twin_deltas": [{
+                        "twin_id": "loop-a",
+                        "before_row_id": "twin-v1",
+                        "after_row_id": "twin-v2",
+                        "before_version": 1,
+                        "after_version": 2,
+                        "name": "temperature",
+                        "old": 65.0,
+                        "new": 42.5
+                    }],
+                    "edge_deltas": [],
+                    "row_deltas": [],
+                    "task_deltas": [],
+                    "reverted_at": 1794675700,
+                    "reverted_by_receipt_id": "act-revert-99",
+                    "reverts_receipt_id": "act-receipt-0",
+                    "forced_by": "admin",
+                    "forced_at": 1794675700
+                }
+            }),
+        };
+        let rec_quads = memory_to_quads("act-receipt-1", &receipt_payload, "ns", Tier::Domain, 0);
+        assert!(
+            rec_quads.iter().any(|q| {
+                q.predicate.as_str() == "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+                    && matches!(&q.object, Term::NamedNode(nn) if nn.as_str() == "urn:neurostrata:ns#ActionReceipt")
+            }),
+            "action_receipt must project rdf:type ns:ActionReceipt"
+        );
+        assert!(rec_quads.iter().any(|q| {
+            q.predicate.as_str() == "urn:neurostrata:ns#revertedByReceipt"
+                && matches!(&q.object, Term::NamedNode(nn) if nn.as_str() == "urn:neurostrata:memory:act-revert-99")
+        }));
+        assert!(rec_quads.iter().any(|q| {
+            q.predicate.as_str() == "urn:neurostrata:ns#revertsReceipt"
+                && matches!(&q.object, Term::NamedNode(nn) if nn.as_str() == "urn:neurostrata:memory:act-receipt-0")
+        }));
+        assert!(rec_quads.iter().any(|q| {
+            q.predicate.as_str() == "urn:neurostrata:ns#supersededMemory"
+                && matches!(&q.object, Term::NamedNode(nn) if nn.as_str() == "urn:neurostrata:memory:mem-old")
+        }));
+        assert!(rec_quads.iter().any(|q| {
+            q.predicate.as_str() == "urn:neurostrata:ns#replacementMemory"
+                && matches!(&q.object, Term::NamedNode(nn) if nn.as_str() == "urn:neurostrata:memory:mem-new")
+        }));
+        assert!(rec_quads.iter().any(|q| {
+            q.predicate.as_str() == "urn:neurostrata:ns#createdMemory"
+                && matches!(&q.object, Term::NamedNode(nn) if nn.as_str() == "urn:neurostrata:memory:mem-created-1")
+        }));
+        assert!(rec_quads.iter().any(|q| {
+            q.predicate.as_str() == "urn:neurostrata:ns#mutatedTwin"
+                && matches!(&q.object, Term::Literal(l) if l.value() == "loop-a")
+        }));
+    }
+
+    #[tokio::test]
+    async fn structural_actions_stay_out_of_default_vector_and_lexical_recall() {
+        use crate::traits::VectorStore;
+
+        let tmp = std::env::temp_dir().join(format!("ns-struct-action-recall-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = crate::store::ladybug::LadybugStore::for_testing(&tmp, 4).expect("store");
+        store.init("ns-recall").await.unwrap();
+
+        let shared_vec = vec![0.9, 0.1, 0.0, 0.0];
+        store
+            .upsert(
+                "ns-recall",
+                "normative-fact-1",
+                shared_vec.clone(),
+                MemoryPayload {
+                    content: "cryogenicmanifold77 normative cooling rule".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({ "domain": "ops" }),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "ns-recall",
+                "struct-action-type-1",
+                shared_vec.clone(),
+                MemoryPayload {
+                    content: "cryogenicmanifold77 action definition".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "action_type".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({
+                        "action_type": {
+                            "slug": "cryo-op",
+                            "title": "Cryo Op",
+                            "description": "cryogenicmanifold77",
+                            "required_role": "editor",
+                            "parameters": {},
+                            "submission_criteria": [],
+                            "effects": [
+                                {
+                                    "op": "upsert_memory",
+                                    "memory_type": "fact",
+                                    "content_template": "noop",
+                                    "metadata_template": {}
+                                }
+                            ]
+                        }
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "ns-recall",
+                "struct-action-receipt-1",
+                shared_vec.clone(),
+                MemoryPayload {
+                    content: "cryogenicmanifold77 action receipt".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "action_receipt".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({
+                        "eligibility": "private",
+                        "action_receipt": {
+                            "receipt_id": "struct-action-receipt-1",
+                            "action_slug": "cryo-op",
+                            "principal": "alice",
+                            "executed_at": 1794675600,
+                            "params": {},
+                            "superseded_pairs": [],
+                            "created_ids": [],
+                            "twin_deltas": [],
+                            "edge_deltas": [],
+                            "row_deltas": [],
+                            "task_deltas": [],
+                            "reverted_at": null,
+                            "reverted_by_receipt_id": null
+                        }
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+
+        // 1. Default vector recall excludes action_type and action_receipt
+        let vec_hits = store
+            .search(
+                "ns-recall",
+                shared_vec,
+                10,
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        let vec_ids: Vec<&str> = vec_hits.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(vec_ids, vec!["normative-fact-1"]);
+
+        // 2. Default lexical recall excludes action_type and action_receipt
+        let lex_hits = store
+            .search_lexical(
+                "ns-recall",
+                "cryogenicmanifold77",
+                10,
+                false,
+                false,
+                &[],
+                "alice",
+                0,
+            )
+            .await
+            .unwrap();
+        let lex_ids: Vec<&str> = lex_hits.results.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(lex_ids, vec!["normative-fact-1"]);
+
+        // 3. Direct SPARQL over the projected dataset still finds both ActionType and ActionReceipt
+        let (ask_type_str, _, _, _) = crate::rdf::sparql::execute_sparql_query(
+            "ASK { <urn:neurostrata:memory:struct-action-type-1> a <urn:neurostrata:ns#ActionType> }",
+            "ns-recall",
+            sparesults::QueryResultsFormat::Json,
+            true,
+            false,
+            &store,
+        )
+        .await
+        .unwrap();
+        let ask_type: serde_json::Value = serde_json::from_str(&ask_type_str).unwrap();
+        assert_eq!(ask_type["boolean"], json!(true));
+        let (ask_rec_str, _, _, _) = crate::rdf::sparql::execute_sparql_query(
+            "ASK { <urn:neurostrata:memory:struct-action-receipt-1> a <urn:neurostrata:ns#ActionReceipt> }",
+            "ns-recall",
+            sparesults::QueryResultsFormat::Json,
+            true,
+            false,
+            &store,
+        )
+        .await
+        .unwrap();
+        let ask_rec: serde_json::Value = serde_json::from_str(&ask_rec_str).unwrap();
+        assert_eq!(ask_rec["boolean"], json!(true));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn shareable_action_type_round_trips_but_receipt_is_rejected_everywhere() {
+        use crate::synaptic_mesh::import::{ validate_record, Candidate };
+        use crate::synaptic_mesh::outbox::{
+            is_shareable_memory_type, outbox_dir_for, Outbox, OutboxEntry, OP_CREATED,
+        };
+        use crate::synaptic_mesh::storage::MeshStorage;
+        use crate::synaptic_mesh::worker::drain_once;
+        use uuid::Uuid;
+
+        assert!(
+            is_shareable_memory_type("action_type"),
+            "action_type must be in SHAREABLE_MEMORY_TYPES when opted into eligibility: shareable"
+        );
+        assert!(
+            !is_shareable_memory_type("action_receipt"),
+            "action_receipt must never be shareable"
+        );
+
+        let base = std::env::temp_dir().join(format!(
+            "ns-mesh-action-share-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let mesh =
+            MeshStorage::init(&base, "node-a", "team", &["ns".to_string()], None).unwrap();
+        let outbox = Outbox::open(&outbox_dir_for(mesh.root())).unwrap();
+
+        let action_id = Uuid::now_v7();
+        let receipt_id = Uuid::now_v7();
+
+        outbox
+            .append(&OutboxEntry {
+                stable_op_id: Uuid::now_v7(),
+                op: OP_CREATED.to_string(),
+                id: action_id.to_string(),
+                namespace: "ns".to_string(),
+                memory_type: "action_type".to_string(),
+                content: "Action: shared-op".to_string(),
+                metadata: json!({
+                    "eligibility": "shareable",
+                    "action_type": {
+                        "slug": "shared-op",
+                        "title": "Shared Op",
+                        "description": "Shareable action definition",
+                        "required_role": "editor",
+                        "parameters": {},
+                        "submission_criteria": [],
+                        "effects": []
+                    }
+                }),
+                superseded_by: None,
+                ts: 1794675600,
+                epoch: 1,
+            })
+            .unwrap();
+
+        // Even if an action_receipt were somehow appended to outbox with forged eligibility: shareable,
+        // worker::drain_once must skip it and never write a mesh file.
+        outbox
+            .append(&OutboxEntry {
+                stable_op_id: Uuid::now_v7(),
+                op: OP_CREATED.to_string(),
+                id: receipt_id.to_string(),
+                namespace: "ns".to_string(),
+                memory_type: "action_receipt".to_string(),
+                content: "Receipt: secret".to_string(),
+                metadata: json!({
+                    "eligibility": "shareable",
+                    "action_receipt": {
+                        "receipt_id": receipt_id.to_string(),
+                        "action_slug": "shared-op",
+                        "principal": "alice",
+                        "executed_at": 1794675600
+                    }
+                }),
+                superseded_by: None,
+                ts: 1794675600,
+                epoch: 1,
+            })
+            .unwrap();
+
+        let report = drain_once(&outbox, &mesh, "node-a").unwrap();
+        assert_eq!(report.applied, 1, "only action_type may be drained");
+        assert_eq!(report.skipped, 1, "action_receipt must be skipped");
+
+        let action_path = mesh
+            .root()
+            .join("ns")
+            .join("memories")
+            .join(format!("{action_id}.json"));
+        let receipt_path = mesh
+            .root()
+            .join("ns")
+            .join("memories")
+            .join(format!("{receipt_id}.json"));
+        assert!(action_path.exists(), "shareable action_type record written");
+        assert!(!receipt_path.exists(), "action_receipt must never be written");
+
+        // Validate import accepts action_type and preserves metadata.action_type
+        let raw_action = std::fs::read_to_string(&action_path).unwrap();
+        let (parsed_action, _) = validate_record(
+            &Candidate {
+                namespace: "ns".to_string(),
+                file_stem: action_id.to_string(),
+            },
+            &["ns".to_string()],
+            &raw_action,
+        )
+        .expect("import must accept shareable action_type");
+        assert_eq!(parsed_action.memory_type, "action_type");
+        assert_eq!(
+            parsed_action.metadata["action_type"]["slug"],
+            json!("shared-op")
+        );
+
+        // Validate import rejects a forged action_receipt JSON record
+        let forged_receipt_json = raw_action.replace(
+            "\"memory_type\": \"action_type\"",
+            "\"memory_type\": \"action_receipt\"",
+        );
+        let forged_res = validate_record(
+            &Candidate {
+                namespace: "ns".to_string(),
+                file_stem: action_id.to_string(),
+            },
+            &["ns".to_string()],
+            &forged_receipt_json,
+        );
+        assert!(
+            forged_res.is_err(),
+            "mesh import must reject action_receipt memory_type"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn forged_receipt_eligibility_is_private_and_log_fields_are_not_projected_publicly() {
+        let forged_receipt = MemoryPayload {
+            content: "Forged receipt".to_string(),
+            user_id: "alice".to_string(),
+            memory_type: "action_receipt".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: json!({
+                "eligibility": "shareable",
+                "action_receipt": {
+                    "receipt_id": "rec-forged-1",
+                    "action_slug": "secret-op",
+                    "principal": "alice",
+                    "executed_at": 1794675600,
+                    "params": {
+                        "api_secret": "ULTRA_SENSITIVE_PARAM_999"
+                    },
+                    "superseded_pairs": [],
+                    "created_ids": [],
+                    "twin_deltas": [],
+                    "edge_deltas": [],
+                    "row_deltas": [
+                        {
+                            "kind": "upsert_memory",
+                            "before_id": null,
+                            "before_payload": null,
+                            "after_id": "m-secret",
+                            "after_payload": {
+                                "content": "ULTRA_SENSITIVE_BODY_888",
+                                "user_id": "alice",
+                                "memory_type": "fact",
+                                "agent_name": null,
+                                "location": "",
+                                "location_lines": "",
+                                "metadata": {}
+                            },
+                            "created": true
+                        }
+                    ],
+                    "task_deltas": [],
+                    "reverted_at": null,
+                    "reverted_by_receipt_id": null
+                }
+            }),
+        };
+
+        // 1. SHACL validation rejects forged eligibility != "private"
+        let violations = crate::rdf::shacl::validate_memory(&forged_receipt);
+        assert!(
+            violations.iter().any(|v| v.field == "metadata.eligibility"),
+            "SHACL must reject forged eligibility on action_receipt: {violations:?}"
+        );
+
+        // 2. RDF projection forces ns:eligibility to "private" and never projects secret param/body values as public ns:* predicates
+        let quads = memory_to_quads("rec-forged-1", &forged_receipt, "ns", Tier::Domain, 0);
+        assert!(
+            quads.iter().any(|q| {
+                q.predicate.as_str() == "urn:neurostrata:ns#eligibility"
+                    && matches!(&q.object, Term::Literal(l) if l.value() == "private")
+            }),
+            "projected ns:eligibility on action_receipt must be forced to 'private'"
+        );
+        assert!(
+            !quads.iter().any(|q| {
+                q.predicate.as_str() == "urn:neurostrata:ns#eligibility"
+                    && matches!(&q.object, Term::Literal(l) if l.value() == "shareable")
+            }),
+            "forged shareable eligibility must never be projected"
+        );
+        for q in &quads {
+            if q.predicate.as_str() != "urn:neurostrata:ns#metadata" {
+                let obj_str = q.object.to_string();
+                assert!(
+                    !obj_str.contains("ULTRA_SENSITIVE_PARAM_999")
+                        && !obj_str.contains("ULTRA_SENSITIVE_BODY_888"),
+                    "public RDF predicates must not project raw param or delta body values: {q}"
+                );
+            }
         }
     }
 }

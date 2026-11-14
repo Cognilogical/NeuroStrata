@@ -111,10 +111,11 @@ pub const OP_SUPERSEDED: &str = "superseded";
 pub const OP_ARCHIVED: &str = "archived";
 
 /// The memory types that may be shared over the mesh (spec §"Sharing
-/// boundary": `rule`, `fact`, `procedure` definitions). Everything else —
-/// tasks, structural/source-ingestion rows, embeddings, the bus's own
+/// boundary": `rule`, `fact`, `procedure`, and opt-in `action_type`
+/// definitions). Everything else — `action_receipt`, tasks,
+/// structural/source-ingestion rows, embeddings, the bus's own
 /// sentinel/audit rows — is strictly local.
-const SHAREABLE_MEMORY_TYPES: &[&str] = &["rule", "fact", "procedure"];
+const SHAREABLE_MEMORY_TYPES: &[&str] = &["rule", "fact", "procedure", "action_type"];
 
 /// Whether `memory_type` is a type the mesh may carry. Used by both the
 /// subscriber (to decide what to capture) and the worker (to decide what to
@@ -560,7 +561,7 @@ mod tests {
 
     #[test]
     fn shareable_types_are_only_rule_fact_procedure() {
-        for t in ["rule", "fact", "procedure"] {
+        for t in ["rule", "fact", "procedure", "action_type"] {
             assert!(is_shareable_memory_type(t), "{t} is shareable");
         }
         for t in [
@@ -572,6 +573,7 @@ mod tests {
             "guard_event",
             "freshness_flag",
             "context",
+            "action_receipt",
         ] {
             assert!(!is_shareable_memory_type(t), "{t} is NOT shareable");
         }

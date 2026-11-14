@@ -4923,7 +4923,7 @@ pub fn edge_specs(metadata: &serde_json::Value) -> Vec<EdgeSpec> {
 /// lives, or record that a machine operation happened, not what it says, so
 /// they carry no meaning for a similarity search: directory ingestion's nodes,
 /// and the thalamic bus's sentinel and audit rows.
-const STRUCTURAL_MEMORY_TYPES: [&str; 8] = [
+const STRUCTURAL_MEMORY_TYPES: [&str; 10] = [
     "directory",
     "file",
     "markdown",
@@ -4932,6 +4932,8 @@ const STRUCTURAL_MEMORY_TYPES: [&str; 8] = [
     "community_summary",
     "digital_twin",
     "digital_twin_schema",
+    "action_type",
+    "action_receipt",
 ];
 
 /// Row-class predicates for filtering at the store seam.

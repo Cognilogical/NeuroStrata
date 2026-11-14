@@ -705,6 +705,11 @@ fn projected_metadata(metadata: &Value) -> Value {
     if let Some(concept_iri) = metadata.get("concept_iri") {
         out.insert("concept_iri".to_string(), concept_iri.clone());
     }
+    // Shareable kinetic action_type definitions carry their declarative schema;
+    // action_receipt is strictly private and never projected onto mesh records.
+    if let Some(action_type) = metadata.get("action_type") {
+        out.insert("action_type".to_string(), action_type.clone());
+    }
     Value::Object(out)
 }
 
