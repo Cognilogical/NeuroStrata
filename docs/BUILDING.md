@@ -314,5 +314,5 @@ problem. Ninja resumes on a re-run.
 ## Runtime memory knobs
 
 - `NEUROSTRATA_EMBED_ARENA`: ONNX Runtime's CPU memory arena is disabled by default (`0` / unset) so transient embedding bursts release memory back to the OS instead of ratcheting up the resident set; set `NEUROSTRATA_EMBED_ARENA=1` (or `true`/`yes`/`on`) to opt back into the arena allocator (`neurostrata-igg4`).
-- `NEUROSTRATA_BUFFER_POOL_MB`: Caps the LadybugDB buffer pool in MiB (default `384`); set a positive integer to size the pool explicitly or `0` to use the engine's uncapped default (`neurostrata-igg4`).
+- `NEUROSTRATA_BUFFER_POOL_MB`: Caps the LadybugDB buffer pool in MiB (default `384`); set a positive integer to size the pool explicitly or `0` to use the engine's uncapped default. Any other value below the 128 MiB floor is raised to that floor, and an unparseable value is ignored in favour of the configured `storage_hygiene.buffer_pool_mb` value (`384` by default), which is then treated exactly like a directly set value (`0` stays uncapped, a value below the floor is raised to it) (`neurostrata-igg4`).
 - `NEUROSTRATA_PROFILE`, `NEUROSTRATA_RSS_LOG_MB` (default `50`, `0` disables per-call rows), and `NEUROSTRATA_RSS_SAMPLE_SECS` (default `600`, `0` disables periodic sampling) for opt-in `memory-growth.log` profiling (`neurostrata-igg4`).
