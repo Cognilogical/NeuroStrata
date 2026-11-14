@@ -12,12 +12,42 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
-/// The daemon's token directory: `~/.config/neurostrata`, the directory
-/// that also holds `embedders.json`.
+/// The daemon's token directory. `NEUROSTRATA_TOKEN_DIR` overrides it for
+/// operators and tests alike; under `cargo test` an unset variable yields a
+/// process-scoped temp directory, so a test binary never reads, creates, or
+/// deletes the operator's real `~/.config/neurostrata/daemon.token`.
 fn token_config_dir() -> PathBuf {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-    home.join(".config").join("neurostrata")
+    if let Ok(val) = std::env::var("NEUROSTRATA_TOKEN_DIR") {
+        if !val.trim().is_empty() {
+            return PathBuf::from(val);
+        }
+    }
+    #[cfg(test)]
+    {
+        TEST_TOKEN_DIR
+            .get_or_init(|| {
+                std::env::temp_dir().join(format!(
+                    "neurostrata-test-token-{}",
+                    std::process::id()
+                ))
+            })
+            .clone()
+    }
+    #[cfg(not(test))]
+    {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+        home.join(".config").join("neurostrata")
+    }
 }
+
+/// The daemon token file's full path. One source of truth for the daemon and
+/// for the server proxy tests, so an isolated token dir is honored by both.
+pub(crate) fn token_path() -> PathBuf {
+    token_config_dir().join("daemon.token")
+}
+
+#[cfg(test)]
+static TEST_TOKEN_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// A fresh token: two v4 UUIDs' raw bytes, hex-encoded (64 chars) --
 /// ~244 bits of CSPRNG entropy (122 per UUID after the version and
@@ -101,7 +131,7 @@ fn load_or_create_token_file(path: &Path) -> String {
 /// Load or create the per-user daemon bearer <redacted> Stored at
 /// `~/.config/neurostrata/daemon.token` with mode 0600.
 pub(crate) fn load_or_create_daemon_token() -> String {
-    load_or_create_token_file(&token_config_dir().join("daemon.token"))
+    load_or_create_token_file(&token_path())
 }
 
 /// Load or create the daemon's operator token (DR-5): the second token
@@ -118,7 +148,6 @@ pub(crate) fn load_or_create_daemon_token() -> String {
 pub(crate) fn load_or_create_operator_token() -> String {
     load_or_create_token_file(&token_config_dir().join("operator.token"))
 }
-
 /// Read a token file's contents for a client: the trimmed value, or None
 /// when no usable token is there. Creation is the daemon's job; clients
 /// only read.
@@ -442,6 +471,20 @@ pub async fn start_daemon(
     vector_store: Arc<dyn VectorStore>,
     deduplication_config: Option<DeduplicationConfig>,
 ) -> anyhow::Result<()> {
+    // Auto-install detected CLI/terminal harness plugins fail-soft at startup
+    // over the startup root and every configured project context directory, so
+    // existing workspaces are upgraded immediately on daemon boot. This runs
+    // here and not in `start_daemon_on` because the in-process test daemons
+    // start there: they would write `.claude/` and `.NeuroStrata/plugins/`
+    // into the directory `cargo test` runs in and into every configured
+    // project.
+    let startup_root = resolve_project_root();
+    let _ = crate::task::harness_plugins::auto_install_detected_plugins(&startup_root, "", None);
+    if let Ok(cfg) = crate::config::Config::load() {
+        for dir in cfg.project_contexts.values() {
+            let _ = crate::task::harness_plugins::auto_install_detected_plugins(dir, "", None);
+        }
+    }
     // The port the MCP proxy and CLI hardcode; changing it changes the wire
     // contract, so production never does. Tests pass an ephemeral address to
     // `start_daemon_on` directly.
@@ -992,16 +1035,7 @@ pub(crate) async fn start_daemon_on(
     // pull triggers (spec §Triggers): fail-soft, timeout-capped spawns.
     wire_mesh_publish(&bus, vector_store.clone(), embedder.clone());
 
-    // Auto-install detected CLI/terminal harness plugins fail-soft at startup
-    // over the startup root and every configured project context directory, so
-    // existing workspaces are upgraded immediately on daemon boot.
     let startup_root = resolve_project_root();
-    let _ = crate::task::harness_plugins::auto_install_detected_plugins(&startup_root, "", None);
-    if let Ok(cfg) = crate::config::Config::load() {
-        for dir in cfg.project_contexts.values() {
-            let _ = crate::task::harness_plugins::auto_install_detected_plugins(dir, "", None);
-        }
-    }
 
     // Kept here as well as in the state, because stopping has to wait for it.
     let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
@@ -2061,6 +2095,42 @@ mod tests {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
+    fn daemon_token_tests_never_touch_real_home_config() {
+        let path = token_path();
+        if let Ok(dir) = std::env::var("NEUROSTRATA_TOKEN_DIR") {
+            assert!(
+                path.starts_with(dir),
+                "the token path must honor NEUROSTRATA_TOKEN_DIR, got {}",
+                path.display()
+            );
+        } else {
+            let temp = std::env::temp_dir();
+            assert!(
+                path.starts_with(&temp),
+                "under test the token path must live in a process-isolated temp dir, got {}",
+                path.display()
+            );
+            assert!(
+                path.to_string_lossy().contains(&format!(
+                    "neurostrata-test-token-{}",
+                    std::process::id()
+                )),
+                "the temp dir is scoped to this process: {}",
+                path.display()
+            );
+        }
+        let real = dirs::home_dir()
+            .unwrap_or_default()
+            .join(".config")
+            .join("neurostrata")
+            .join("daemon.token");
+        assert_ne!(
+            path, real,
+            "token tests must never resolve to the operator's real daemon.token"
+        );
+    }
+
+    #[test]
     fn the_first_retry_comes_quickly() {
         // The quiet moment a checkpoint needs can open as soon as one query
         // finishes, so the first wait is seconds, not the full interval.
@@ -2551,9 +2621,9 @@ impl crate::traits::AsAny for RecordingStore {
         // does not exist yet, the client goes out tokenless, and every
         // authenticated route answers 401.
         let mut headers = reqwest::header::HeaderMap::new();
-        let home = dirs::home_dir().unwrap_or_default();
-        let token_path = home.join(".config").join("neurostrata").join("daemon.token");
-        if let Ok(token) = std::fs::read_to_string(&token_path) {
+        let token_dir = token_config_dir();
+        let daemon_path = token_dir.join("daemon.token");
+        if let Ok(token) = std::fs::read_to_string(&daemon_path) {
             let trimmed = token.trim();
             if !trimmed.is_empty() {
                 if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", trimmed)) {
@@ -2564,7 +2634,7 @@ impl crate::traits::AsAny for RecordingStore {
         // The helper client is the operator's own client: it also carries
         // the operator token, so the destructive routes (its /shutdown
         // cleanup above all) keep working under the operator tier.
-        let operator_path = home.join(".config").join("neurostrata").join("operator.token");
+        let operator_path = token_dir.join("operator.token");
         if let Ok(operator) = std::fs::read_to_string(&operator_path) {
             let trimmed = operator.trim();
             if !trimmed.is_empty() {
@@ -2666,9 +2736,9 @@ impl crate::traits::AsAny for RecordingStore {
         // folded into Task 1: the archive-route test failed 401-for-404 in
         // CI while passing wherever a token file already existed.
         let mut headers = reqwest::header::HeaderMap::new();
-        let home = dirs::home_dir().unwrap_or_default();
-        let token_path = home.join(".config").join("neurostrata").join("daemon.token");
-        if let Ok(token) = std::fs::read_to_string(&token_path) {
+        let token_dir = token_config_dir();
+        let daemon_path = token_dir.join("daemon.token");
+        if let Ok(token) = std::fs::read_to_string(&daemon_path) {
             let trimmed = token.trim();
             if !trimmed.is_empty() {
                 if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", trimmed)) {
@@ -2679,7 +2749,7 @@ impl crate::traits::AsAny for RecordingStore {
         // The helper client is the operator's own client: it also carries
         // the operator token, so the destructive routes (its /shutdown
         // cleanup above all) keep working under the operator tier.
-        let operator_path = home.join(".config").join("neurostrata").join("operator.token");
+        let operator_path = token_dir.join("operator.token");
         if let Ok(operator) = std::fs::read_to_string(&operator_path) {
             let trimmed = operator.trim();
             if !trimmed.is_empty() {
@@ -2711,8 +2781,7 @@ impl crate::traits::AsAny for RecordingStore {
     /// The contents of one of the daemon's token files, or "" if it cannot
     /// be read -- the same read every first-party client performs.
     fn token_file(name: &str) -> String {
-        let home = dirs::home_dir().unwrap_or_default();
-        std::fs::read_to_string(home.join(".config").join("neurostrata").join(name))
+        std::fs::read_to_string(token_config_dir().join(name))
             .map(|s| s.trim().to_string())
             .unwrap_or_default()
     }
@@ -2923,9 +2992,9 @@ impl crate::traits::AsAny for RecordingStore {
     async fn token_files_have_owner_only_permissions() {
         use std::os::unix::fs::PermissionsExt;
         let (base, _authed, daemon, _credential_guard) = spawn_test_daemon().await;
-        let home = dirs::home_dir().unwrap_or_default();
+        let token_dir = token_config_dir();
         for name in ["daemon.token", "operator.token"] {
-            let path = home.join(".config").join("neurostrata").join(name);
+            let path = token_dir.join(name);
             let metadata = std::fs::metadata(&path)
                 .unwrap_or_else(|e| panic!("{name} must exist once the daemon runs: {e}"));
             assert_eq!(
@@ -3173,8 +3242,7 @@ impl crate::traits::AsAny for RecordingStore {
         let bare = reqwest::Client::new();
         wait_for_serving(&bare, &addr).await;
         std::env::remove_var(PROJECT_ROOT_ENV);
-        let home = dirs::home_dir().unwrap_or_default();
-        let token_dir = home.join(".config").join("neurostrata");
+        let token_dir = token_config_dir();
         let token = std::fs::read_to_string(token_dir.join("daemon.token"))
             .expect("the daemon created its token file before serving");
         let operator = std::fs::read_to_string(token_dir.join("operator.token"))
@@ -3215,6 +3283,31 @@ impl crate::traits::AsAny for RecordingStore {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("lib.rs"), "pub fn t2r_marker() {}\n").unwrap();
         dir
+    }
+
+    /// The in-process test daemon must not install harness plugins into the
+    /// root it serves. That root is the directory `cargo test` runs in unless
+    /// a test names another, so an install here leaves `.claude/` and
+    /// `.NeuroStrata/plugins/` in the developer's checkout. A `.claude/`
+    /// directory in the scratch root makes the Claude harness count as
+    /// detected without any environment variable.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_daemon_does_not_install_plugins_into_its_root() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = scratch_root("no-plugin-install");
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        let (base, client, daemon, _credential_guard) = spawn_daemon_serving(&root).await;
+        stop_daemon(&client, &base, daemon).await;
+        assert!(
+            !root.join(".NeuroStrata").exists(),
+            "the test daemon wrote .NeuroStrata/ into {}",
+            root.display()
+        );
+        assert!(
+            !root.join(".claude").join("settings.local.json").exists(),
+            "the test daemon wrote .claude/settings.local.json into {}",
+            root.display()
+        );
     }
 
     /// Task 2 re-file (J6): a caller-named backup destination outside the

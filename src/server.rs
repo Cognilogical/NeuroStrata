@@ -50,6 +50,25 @@ const PARSE_ERROR: i64 = -32700;
 /// far end.
 const INTERNAL_ERROR: i64 = -32603;
 
+/// Appends a daemon-memory advisory to tool-call error text when it matches
+/// known buffer-pool / OOM diagnostics, case-insensitively. Idempotent if the
+/// advice marker is already present.
+pub(crate) fn annotate_daemon_memory_error(msg: &str) -> String {
+    let lower = msg.to_lowercase();
+    if lower.contains("buffer pool")
+        || lower.contains("buffer manager")
+        || lower.contains("out of memory")
+        || lower.contains("cannot allocate memory")
+    {
+        let advice =
+            " [NEUROSTRATA_ADVICE[daemon_memory]: raise NEUROSTRATA_BUFFER_POOL_MB or storage_hygiene.buffer_pool_mb and restart the daemon]";
+        if !msg.contains("NEUROSTRATA_ADVICE[daemon_memory]") {
+            return format!("{msg}{advice}");
+        }
+    }
+    msg.to_string()
+}
+
 impl JsonRpcResponse<Value> {
     pub fn failure(id: Option<Value>, code: i64, message: String) -> Self {
         Self::error(id, serde_json::json!({ "code": code, "message": message }))
@@ -1080,12 +1099,13 @@ pub async fn process_mcp_request(
                                     // Encoding failures must be JSON-RPC errors with
                                     // the original id — never a successful result
                                     // containing an error string.
+                                    let annotated = crate::server::annotate_daemon_memory_error(&msg);
                                     error_response = Some(serde_json::json!({
                                         "jsonrpc": "2.0",
                                         "id": id,
                                         "error": {
                                             "code": INTERNAL_ERROR,
-                                            "message": msg
+                                            "message": annotated
                                         }
                                     }));
                                 }
@@ -1177,12 +1197,13 @@ pub async fn process_mcp_request(
                                     // A refused completion (Lock 2) is a JSON-RPC
                                     // error, never a success payload carrying an
                                     // error string.
+                                    let annotated = crate::server::annotate_daemon_memory_error(&msg);
                                     error_response = Some(serde_json::json!({
                                         "jsonrpc": "2.0",
                                         "id": id,
                                         "error": {
                                             "code": INTERNAL_ERROR,
-                                            "message": msg
+                                            "message": annotated
                                         }
                                     }));
                                 }
@@ -1329,7 +1350,7 @@ pub async fn process_mcp_request(
                                     }).to_string();
                                 }
                                 Err(e) => {
-                                    result_text = serde_json::json!({"ok": false, "error": format!("{}", e)}).to_string();
+                                    result_text = serde_json::json!({"ok": false, "error": crate::server::annotate_daemon_memory_error(&format!("{}", e))}).to_string();
                                 }
                             }
                         }
@@ -8776,12 +8797,11 @@ mod tests {
         crate::daemon::credential_file_test_lock()
     }
 
-    /// The real daemon token path. `crate::daemon::token_config_dir` is
-    /// private, so this mirrors its construction -- the same way
-    /// daemon.rs's own tests locate the file.
+    /// The real daemon token path. Delegates to the daemon module's single
+    /// source of truth: `NEUROSTRATA_TOKEN_DIR` and, under `cargo test`, a
+    /// process-scoped temp directory, instead of the operator's home config.
     fn daemon_token_path() -> std::path::PathBuf {
-        let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
-        home.join(".config").join("neurostrata").join("daemon.token")
+        crate::daemon::token_path()
     }
 
     /// Writes a token file atomically at 0600 on Unix: the bytes go to

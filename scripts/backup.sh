@@ -48,20 +48,19 @@
 # Backup-set unit invariant: a backup is a unit — the db file plus
 # the companions (sidecar, WAL) this run produces under one timestamp
 # name. The timestamp has second resolution, so two runs in the same
-# second into the same directory reuse one destination name and the
-# step-4 cp overwrites the db in place. A reused destination must
-# never mix the current run's db with a previous run's companions:
-# steps 4b/4c therefore remove the destination sidecar / WAL companion
-# whenever the current run does not produce one, so the surviving set
-# is exactly the set the current run captured.
+# second into the same directory reuse one destination name. The whole
+# set is staged under temporary `<name>.tmp-$$` files and md5-verified
+# there; only once every copy and checksum passes does the set get
+# committed by `mv` (steps 4d). A run that fails before the commit
+# removes its staged files and exits non-zero, leaving any prior
+# same-second backup set completely untouched. Companions the commit
+# point does not carry are removed there — and only there — so the
+# surviving set is exactly the set the current run captured.
 #
-# Scope of that invariant: it is enforced by the steps 4b/4c cleanup
-# on runs that complete steps 4–4c successfully. It is not a
-# construction guarantee — a run that fails or is interrupted
-# mid-copy can leave a mixed set (and the in-place step-4 cp can
-# already have overwritten a prior good backup), and orphaned
-# companions are never pruned. Building the set under temp names
-# and renaming it into place is tracked in #93.
+# Pruning (step 5) selects backups by filename timestamp
+# (db-YYYYMMDD-HHMMSS sorts exactly by name), not by mtime, and
+# removes orphaned `.tmp-*` staged files and orphaned
+# `.store-state.json` / `.wal` companions whose base backup is gone.
 #
 # Assumes the daemon is managed by systemd (neurostrata-mcp setup installs
 # the service). If you ran `neurostrata-mcp daemon &` ad-hoc, the stop/start
@@ -147,17 +146,28 @@ if command -v lsof >/dev/null; then
     log "lsof: no holders"
 fi
 
-# 4. Create backup dir, cp, md5-verify
+# 4. Create backup dir, stage the copies as .tmp-$$ files, verify MD5s;
+#    only step 4d below commits the verified set into place.
 mkdir -p "$BACKUP_DIR"
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 BACKUP_FILE="$BACKUP_DIR/db-$TIMESTAMP"
+STAGED_BACKUP="$BACKUP_FILE.tmp-$$"
+STAGED_COMPANION="$BACKUP_FILE.store-state.json.tmp-$$"
+STAGED_WAL="$BACKUP_FILE.wal.tmp-$$"
 
-cp -p "$DB_PATH" "$BACKUP_FILE" || die "cp failed" 7
+# cleanup_staged removes whatever of the staged set exists, so a failed
+# run never leaves .tmp-$$ litter behind and never touches a prior
+# same-second backup (those live at the un-staged names).
+cleanup_staged() {
+    rm -f "$STAGED_BACKUP" "$STAGED_COMPANION" "$STAGED_WAL"
+}
+
+cp -p "$DB_PATH" "$STAGED_BACKUP" || { cleanup_staged; die "cp failed" 7; }
 SRC_MD5=$(md5sum "$DB_PATH" | awk '{print $1}')
-DST_MD5=$(md5sum "$BACKUP_FILE" | awk '{print $1}')
+DST_MD5=$(md5sum "$STAGED_BACKUP" | awk '{print $1}')
 
 if [ "$SRC_MD5" != "$DST_MD5" ]; then
-    rm -f "$BACKUP_FILE"
+    cleanup_staged
     die "md5 mismatch: src=$SRC_MD5 dst=$DST_MD5 — bad backup deleted, source untouched" 8
 fi
 
@@ -171,28 +181,20 @@ SIDECAR_PATH="$DB_PATH.store-state.json"
 COMPANION_FILE="$BACKUP_FILE.store-state.json"
 
 if [ -f "$SIDECAR_PATH" ]; then
-    if ! cp -p "$SIDECAR_PATH" "$COMPANION_FILE"; then
-        rm -f "$BACKUP_FILE" "$COMPANION_FILE"
+    if ! cp -p "$SIDECAR_PATH" "$STAGED_COMPANION"; then
+        cleanup_staged
         die "sidecar cp failed — bad backup deleted, source untouched" 7
     fi
     SRC_SIDECAR_MD5=$(md5sum "$SIDECAR_PATH" | awk '{print $1}')
-    DST_SIDECAR_MD5=$(md5sum "$COMPANION_FILE" | awk '{print $1}')
+    DST_SIDECAR_MD5=$(md5sum "$STAGED_COMPANION" | awk '{print $1}')
 
     if [ "$SRC_SIDECAR_MD5" != "$DST_SIDECAR_MD5" ]; then
-        rm -f "$BACKUP_FILE" "$COMPANION_FILE"
+        cleanup_staged
         die "sidecar md5 mismatch: src=$SRC_SIDECAR_MD5 dst=$DST_SIDECAR_MD5 — bad backup deleted, source untouched" 8
     fi
 
     log "sidecar OK: $COMPANION_FILE (md5=$SRC_SIDECAR_MD5)"
 else
-    # Unit invariant (see header): on a reused destination name, a
-    # companion left by an earlier run must not survive into a backup
-    # whose source has no sidecar — it would lend this db a recorded
-    # identity it did not have at backup time.
-    if [ -f "$COMPANION_FILE" ]; then
-        rm -f "$COMPANION_FILE"
-        log "removed stale sidecar companion $COMPANION_FILE — destination reused, current backup carries no recorded identity"
-    fi
     log "no store-state sidecar at $SIDECAR_PATH — backup carries no recorded identity"
 fi
 
@@ -207,52 +209,139 @@ WAL_PATH="$DB_PATH.wal"
 WAL_COMPANION_FILE="$BACKUP_FILE.wal"
 
 if ! $DAEMON_WAS_RUNNING && [ -f "$WAL_PATH" ]; then
-    if ! cp -p "$WAL_PATH" "$WAL_COMPANION_FILE"; then
-        rm -f "$BACKUP_FILE" "$COMPANION_FILE" "$WAL_COMPANION_FILE"
+    if ! cp -p "$WAL_PATH" "$STAGED_WAL"; then
+        cleanup_staged
         die "wal cp failed — bad backup deleted, source untouched" 7
     fi
     SRC_WAL_MD5=$(md5sum "$WAL_PATH" | awk '{print $1}')
-    DST_WAL_MD5=$(md5sum "$WAL_COMPANION_FILE" | awk '{print $1}')
+    DST_WAL_MD5=$(md5sum "$STAGED_WAL" | awk '{print $1}')
 
     if [ "$SRC_WAL_MD5" != "$DST_WAL_MD5" ]; then
-        rm -f "$BACKUP_FILE" "$COMPANION_FILE" "$WAL_COMPANION_FILE"
+        cleanup_staged
         die "wal md5 mismatch: src=$SRC_WAL_MD5 dst=$DST_WAL_MD5 — bad backup deleted, source untouched" 8
     fi
 
     log "wal OK: $WAL_COMPANION_FILE (md5=$SRC_WAL_MD5)"
-elif ! $DAEMON_WAS_RUNNING; then
-    # Unit invariant (see header): on a reused destination name, a WAL
-    # companion left by an earlier run must not survive into a backup
-    # whose source has no WAL — restoring it would replay unrelated
-    # writes against this run's db.
-    if [ -f "$WAL_COMPANION_FILE" ]; then
-        rm -f "$WAL_COMPANION_FILE"
-        log "removed stale WAL companion $WAL_COMPANION_FILE — destination reused, current backup carries no uncheckpointed writes"
-    fi
-    log "no WAL at $WAL_PATH — backup carries no uncheckpointed writes"
 else
-    # Daemon was running: its checkpoint means this run carries no WAL
-    # companion, so the same unit invariant applies — a WAL companion
-    # left at a reused destination by an earlier daemon-inactive run
-    # must not survive into this backup.
-    if [ -f "$WAL_COMPANION_FILE" ]; then
-        rm -f "$WAL_COMPANION_FILE"
-        log "removed stale WAL companion $WAL_COMPANION_FILE — destination reused, daemon-running backup carries no WAL companion"
+    if $DAEMON_WAS_RUNNING; then
+        log "daemon was running: its stop checkpointed the WAL into the db — backup carries no WAL companion"
+    else
+        log "no WAL at $WAL_PATH — backup carries no uncheckpointed writes"
     fi
 fi
 
+# 4d. Commit: the staged set is verified, so move it into place as a
+# unit. mv within one filesystem is atomic, so a reader of the backup
+# directory never sees a db split from its companions. The commit is
+# rollback-safe (issue #93): any existing regular-file destinations are
+# stashed to .prev-$$ first, and a directory at any destination path (or
+# any mv failure) rolls back — removing partially moved destination files
+# and restoring the stashed .prev-$$ companions — before dying. A failed
+# commit therefore leaves any prior same-second backup set untouched.
+rollback_commit() {
+    # Remove any destination files this run moved into place (a partial
+    # commit must leave none behind).
+    rm -f "$BACKUP_FILE" "$COMPANION_FILE" "$WAL_COMPANION_FILE" 2>/dev/null || true
+    # Restore stashed previous companions, if any were stashed.
+    if [ -f "$BACKUP_FILE.prev-$$" ]; then
+        mv -f "$BACKUP_FILE.prev-$$" "$BACKUP_FILE" 2>/dev/null || true
+    fi
+    if [ -f "$COMPANION_FILE.prev-$$" ]; then
+        mv -f "$COMPANION_FILE.prev-$$" "$COMPANION_FILE" 2>/dev/null || true
+    fi
+    if [ -f "$WAL_COMPANION_FILE.prev-$$" ]; then
+        mv -f "$WAL_COMPANION_FILE.prev-$$" "$WAL_COMPANION_FILE" 2>/dev/null || true
+    fi
+    cleanup_staged
+}
+
+# Fail fast if any destination path is a directory: remove_file/mv cannot
+# replace it, so a commit would fail partway and leave the set half-committed.
+if [ -d "$BACKUP_FILE" ] || [ -d "$COMPANION_FILE" ] || [ -d "$WAL_COMPANION_FILE" ]; then
+    rollback_commit
+    die "refusing to commit over a directory at $BACKUP_FILE / $COMPANION_FILE / $WAL_COMPANION_FILE" 7
+fi
+
+# Stash any existing regular-file destinations aside so a partial commit
+# can restore them on failure (same-second destination reuse).
+if [ -f "$BACKUP_FILE" ]; then
+    mv -f "$BACKUP_FILE" "$BACKUP_FILE.prev-$$" \
+        || { rollback_commit; die "could not stash existing backup destination $BACKUP_FILE" 7; }
+fi
+if [ -f "$COMPANION_FILE" ]; then
+    mv -f "$COMPANION_FILE" "$COMPANION_FILE.prev-$$" \
+        || { rollback_commit; die "could not stash existing sidecar destination $COMPANION_FILE" 7; }
+fi
+if [ -f "$WAL_COMPANION_FILE" ]; then
+    mv -f "$WAL_COMPANION_FILE" "$WAL_COMPANION_FILE.prev-$$" \
+        || { rollback_commit; die "could not stash existing wal destination $WAL_COMPANION_FILE" 7; }
+fi
+
+mv -f "$STAGED_BACKUP" "$BACKUP_FILE" \
+    || { rollback_commit; die "could not move the staged backup into place" 7; }
+if [ -f "$SIDECAR_PATH" ]; then
+    mv -f "$STAGED_COMPANION" "$COMPANION_FILE" \
+        || { rollback_commit; die "could not move the staged sidecar companion into place" 7; }
+else
+    # Unit invariant (see header): a companion left at a reused
+    # destination by an earlier run must not survive into a backup
+    # whose source has no sidecar — it would lend this db a recorded
+    # identity it did not have at backup time.
+    if [ -f "$COMPANION_FILE" ]; then
+        rm -f "$COMPANION_FILE"
+        log "removed stale sidecar companion $COMPANION_FILE — destination reused, current backup carries no recorded identity"
+    fi
+fi
+if ! $DAEMON_WAS_RUNNING && [ -f "$WAL_PATH" ]; then
+    mv -f "$STAGED_WAL" "$WAL_COMPANION_FILE" \
+        || { rollback_commit; die "could not move the staged WAL companion into place" 7; }
+elif [ -f "$WAL_COMPANION_FILE" ]; then
+    # Unit invariant (see header): a WAL companion left at a reused
+    # destination must not survive into a backup whose source had no
+    # WAL (daemon-inactive path) or whose daemon stop checkpointed it
+    # (daemon-running path) — restoring it would replay unrelated
+    # writes against this run's db.
+    rm -f "$WAL_COMPANION_FILE"
+    log "removed stale WAL companion $WAL_COMPANION_FILE — destination reused, current backup carries no uncheckpointed writes"
+fi
+
+# Commit succeeded: discard the stashed previous companions.
+rm -f "$BACKUP_FILE.prev-$$" "$COMPANION_FILE.prev-$$" "$WAL_COMPANION_FILE.prev-$$"
+
 # 5. Prune old backups (pair-aware: companions are not backups in their
 # own right — count/select only db-* files without the sidecar or WAL
-# suffix, and delete a pruned backup's companions with it)
+# suffix, and delete a pruned backup's companions with it). Selection
+# is by filename timestamp (db-YYYYMMDD-HHMMSS sorts exactly by name),
+# not by mtime: an operator touching or restoring an older backup must
+# not make it look newest and escape pruning.
 if [ "$MAX_BACKUPS" -gt 0 ]; then
-    PRUNE_COUNT=$(ls -1t "$BACKUP_DIR"/db-* 2>/dev/null | grep -v -e '\.store-state\.json$' -e '\.wal$' | wc -l)
+    PRUNE_COUNT=$(ls -1d "$BACKUP_DIR"/db-* 2>/dev/null | grep -v -e '\.store-state\.json$' -e '\.wal$' -e '\.tmp-' -e '\.prev-' | sort -r | wc -l)
     if [ "$PRUNE_COUNT" -gt "$MAX_BACKUPS" ]; then
-        ls -1t "$BACKUP_DIR"/db-* 2>/dev/null | grep -v -e '\.store-state\.json$' -e '\.wal$' | tail -n +$((MAX_BACKUPS + 1)) | while IFS= read -r OLD_BACKUP; do
+        ls -1d "$BACKUP_DIR"/db-* 2>/dev/null | grep -v -e '\.store-state\.json$' -e '\.wal$' -e '\.tmp-' -e '\.prev-' | sort -r | tail -n +$((MAX_BACKUPS + 1)) | while IFS= read -r OLD_BACKUP; do
             rm -f "$OLD_BACKUP" "$OLD_BACKUP.store-state.json" "$OLD_BACKUP.wal"
         done
         log "pruned $((PRUNE_COUNT - MAX_BACKUPS)) old backup(s), keeping $MAX_BACKUPS"
     fi
 fi
+
+# 5b. Orphan cleanup: staged `.tmp-*` leftovers from an interrupted or
+# crashed run are litter (the current run's staged files were moved away
+# in step 4d); companions whose base db-* backup no longer exists would
+# otherwise restore the wrong identity / writes onto nothing.
+for ORPHAN in "$BACKUP_DIR"/db-*.tmp-*; do
+    [ -e "$ORPHAN" ] || continue
+    rm -f "$ORPHAN"
+    log "removed staged leftover $ORPHAN"
+done
+for ORPHAN in "$BACKUP_DIR"/db-*.store-state.json "$BACKUP_DIR"/db-*.wal; do
+    [ -e "$ORPHAN" ] || continue
+    base="$ORPHAN"
+    case "$base" in
+        *.store-state.json) base="${base%.store-state.json}" ;;
+        *.wal) base="${base%.wal}" ;;
+    esac
+    [ -f "$base" ] || { rm -f "$ORPHAN"; log "removed orphan companion $ORPHAN — its base backup is gone"; }
+done
 
 # 6. Restart daemon if it was running
 if $DAEMON_WAS_RUNNING; then

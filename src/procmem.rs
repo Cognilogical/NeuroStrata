@@ -25,6 +25,9 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+#[cfg(not(test))]
+use std::sync::OnceLock;
+
 const MB: u64 = 1024 * 1024;
 const DEFAULT_THRESHOLD_MB: u64 = 50;
 /// The log is rewritten from empty once it passes this size, keeping the
@@ -171,7 +174,7 @@ pub fn status_json() -> serde_json::Value {
         "rss_mb": mb(s.rss_bytes),
         "peak_rss_mb": mb(s.peak_bytes),
         "rss_available": s.rss_bytes.is_some(),
-        "growth_log": log_path().to_string_lossy(),
+        "growth_log": growth_log_file_name(),
         "growth_log_threshold_mb": threshold_mb(),
     })
 }
@@ -203,11 +206,35 @@ pub fn enable_profile() {
 /// syscall and has nothing to switch.
 fn profile_enabled() -> bool {
     PROFILE.load(Ordering::Relaxed)
-        || matches!(
-            std::env::var("NEUROSTRATA_PROFILE").ok().as_deref().map(str::trim),
-            Some("1") | Some("true") | Some("on")
-        )
+        || {
+            #[cfg(not(test))]
+            {
+                // `CallGuard::enter` runs on every tool call; a disabled
+                // profile must cost one relaxed load, not an `env::var`
+                // syscall. The value cannot change mid-process in a way that
+                // matters: `--profile` sets `PROFILE` above, and an operator
+                // flipping the variable after start has no contract to honor.
+                *PROFILE_ENV.get_or_init(env_says_profile)
+            }
+            #[cfg(test)]
+            {
+                // Tests toggle the variable at runtime, so they keep the
+                // uncached read.
+                env_says_profile()
+            }
+        }
 }
+
+/// The `NEUROSTRATA_PROFILE` lookup the release build caches once.
+fn env_says_profile() -> bool {
+    matches!(
+        std::env::var("NEUROSTRATA_PROFILE").ok().as_deref().map(str::trim),
+        Some("1") | Some("true") | Some("on")
+    )
+}
+
+#[cfg(not(test))]
+static PROFILE_ENV: OnceLock<bool> = OnceLock::new();
 
 /// Parse the per-call growth threshold. An unset value uses the default; a
 /// value that is present but not a number is reported rather than silently
@@ -239,6 +266,16 @@ fn threshold_mb() -> u64 {
 fn log_path() -> PathBuf {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     home.join(".config").join("neurostrata").join("memory-growth.log")
+}
+
+/// The growth log's file name, never its path: `/status` is operator-facing
+/// and the home directory's layout is not the daemon's business to publish.
+fn growth_log_file_name() -> String {
+    log_path()
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("memory-growth.log")
+        .to_string()
 }
 
 /// True when `after` is at least `threshold_mb` above `before`. Unknown
@@ -310,6 +347,46 @@ fn sample_line(s: Sample, calls_since_last: u64, in_flight: usize) -> String {
     .to_string()
 }
 
+/// One deterministic sampler tick for the growth seam. Reads RSS through
+/// `read_rss`, and when it has grown `threshold_bytes` past `*prev_rss`
+/// appends a `"kind": "sampler"` row to `log_path` -- the slow growth no
+/// single call accounts for, visible without waiting for a real process to
+/// balloon. Returns whether a row was written. `read_rss` is injectable so
+/// tests can drive growth with synthetic figures.
+pub(crate) fn sample_once_with<F: FnOnce() -> Option<u64>>(
+    read_rss: F,
+    prev_rss: &mut Option<u64>,
+    threshold_bytes: u64,
+    log_path: &std::path::Path,
+) -> bool {
+    let now = read_rss();
+    let previous = *prev_rss;
+    let grew = match (previous, now) {
+        (Some(prev), Some(cur)) if threshold_bytes > 0 => {
+            cur.saturating_sub(prev) >= threshold_bytes
+        }
+        _ => false,
+    };
+    *prev_rss = now;
+    if grew {
+        let prev = previous.expect("grew implies a previous figure");
+        let cur = now.expect("grew implies a current figure");
+        let row = serde_json::json!({
+            "kind": "sampler",
+            "ts": now_secs(),
+            "prev_rss_mb": mb(Some(prev)),
+            "rss_mb": mb(Some(cur)),
+            "delta_mb": (cur as i64 - prev as i64) / MB as i64,
+            "in_flight": IN_FLIGHT.load(Ordering::SeqCst),
+        })
+        .to_string();
+        if let Err(e) = append(log_path, &row) {
+            eprintln!("warning: memory growth log write failed for {}: {e}", log_path.display());
+        }
+    }
+    grew
+}
+
 fn sample_interval() -> Option<std::time::Duration> {
     let secs = std::env::var("NEUROSTRATA_RSS_SAMPLE_SECS")
         .ok()
@@ -333,11 +410,15 @@ async fn run_sampler(
     every: std::time::Duration,
     mut stop: tokio::sync::watch::Receiver<bool>,
 ) {
+    let threshold_bytes = threshold_mb().saturating_mul(MB);
+    let mut prev_rss: Option<u64> = None;
     loop {
         let calls = CALLS.swap(0, Ordering::Relaxed);
-        if let Err(e) = append(&path, &sample_line(sample(), calls, IN_FLIGHT.load(Ordering::SeqCst))) {
+        let s = sample();
+        if let Err(e) = append(&path, &sample_line(s, calls, IN_FLIGHT.load(Ordering::SeqCst))) {
             eprintln!("warning: memory growth log write failed for {}: {e}", path.display());
         }
+        sample_once_with(|| s.rss_bytes, &mut prev_rss, threshold_bytes, &path);
         tokio::select! {
             _ = tokio::time::sleep(every) => {}
             _ = stop.changed() => break,
@@ -594,8 +675,47 @@ mod tests {
         let p = &v["process"];
         assert!(p.get("rss_mb").is_some() && p.get("peak_rss_mb").is_some());
         assert!(p.get("rss_available").is_some(), "callers can tell whether rss is live");
-        assert!(p["growth_log"].as_str().unwrap().ends_with("memory-growth.log"));
+        assert_eq!(p["growth_log"].as_str().unwrap(), "memory-growth.log");
         assert!(p["growth_log_threshold_mb"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn the_sampler_seam_emits_a_row_on_synthetic_growth() {
+        let dir = std::env::temp_dir().join(format!(
+            "procmem-sample-once-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("memory-growth.log");
+        let mut prev: Option<u64> = None;
+        assert!(
+            !sample_once_with(|| Some(100 * MB), &mut prev, 50 * MB, &path),
+            "the first tick establishes the baseline; it is not growth"
+        );
+        assert_eq!(prev, Some(100 * MB));
+        assert!(
+            sample_once_with(|| Some(180 * MB), &mut prev, 50 * MB, &path),
+            "80 MiB of growth clears the 50 MiB threshold"
+        );
+        assert_eq!(prev, Some(180 * MB));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let rows: Vec<serde_json::Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("strict JSON"))
+            .collect();
+        assert_eq!(rows.len(), 1, "one growth row: {text}");
+        assert_eq!(rows[0]["kind"], "sampler");
+        assert_eq!(rows[0]["prev_rss_mb"], 100);
+        assert_eq!(rows[0]["rss_mb"], 180);
+        assert_eq!(rows[0]["delta_mb"], 80);
+        // No second row when the process does not grow again.
+        assert!(!sample_once_with(|| Some(190 * MB), &mut prev, 50 * MB, &path));
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

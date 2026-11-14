@@ -258,7 +258,13 @@ function pathRelativeToProjectRoot(filePath: string, config: ResolvedConfig): st
 // ──────────────────────────────────────────────────────────────────────
 
 export function daemonTokenPath(tokenFile?: string | null): string {
-  if (tokenFile && tokenFile.trim() !== "") return tokenFile.trim();
+  if (tokenFile && tokenFile.trim() !== "") {
+    return tokenFile.trim();
+  }
+  const envTokenDir = (typeof process !== "undefined" && process.env?.NEUROSTRATA_TOKEN_DIR?.trim()) ?? "";
+  if (envTokenDir) {
+    return envTokenDir;
+  }
   return join(homedir(), ".config", "neurostrata", DEFAULT_TOKEN_FILE);
 }
 
@@ -336,6 +342,10 @@ export class NeuroStrataMCPClient {
   private readonly token: string | null;
   private readonly timeoutMs: number;
   private requestId = 0;
+  /** Daemon memory advisory captured on the last errored tool call, drained by
+   *  the plugin's execute.after handler so the agent sees it as a suffix line
+   *  rather than an opaque throw. Cleared on every callTool. */
+  private pendingDaemonAdvisory: string | null = null;
 
   constructor(options: { endpoint: string; token: string | null; timeoutMs: number }) {
     this.endpoint = options.endpoint;
@@ -343,13 +353,44 @@ export class NeuroStrataMCPClient {
     this.timeoutMs = options.timeoutMs;
   }
 
+  /** Drain the advisory captured by the last errored callTool, if any. */
+  flushPendingAdvisory(): string | null {
+    const advisory = this.pendingDaemonAdvisory;
+    this.pendingDaemonAdvisory = null;
+    return advisory;
+  }
+
   async callTool(name: string, args: unknown): Promise<string> {
     const id = ++this.requestId;
     const response = await this.post(buildToolCallRequest(id, name, args));
-    if (response.error) throw new Error(`[${response.error.code ?? "?"}] ${response.error.message ?? "tool call failed"}`);
-    if (response.result === undefined || response.result === null) throw new Error(`${name} returned no result`);
-    const text = extractToolText(response.result);
-    if ((response.result as McpToolResult).isError) throw new Error(`${name} failed: ${text}`);
+    // Compute the tool text once: it is the same payload the error path
+    // throws on, and the daemon's advisory marker lives on the error
+    // channel, so only that channel is scanned (never normal tool output).
+    const text =
+      response.result === undefined || response.result === null
+        ? ""
+        : (() => {
+            try {
+              return extractToolText(response.result);
+            } catch {
+              return "";
+            }
+          })();
+    if (response.error) {
+      this.pendingDaemonAdvisory = extractDaemonMemoryAdvisory(
+        typeof response.error.message === "string" ? response.error.message : "",
+      );
+      throw new Error(`[${response.error.code ?? "?"}] ${response.error.message ?? "tool call failed"}`);
+    }
+    if (response.result === undefined || response.result === null) {
+      this.pendingDaemonAdvisory = null;
+      throw new Error(`${name} returned no result`);
+    }
+    if ((response.result as McpToolResult).isError) {
+      this.pendingDaemonAdvisory = extractDaemonMemoryAdvisory(text);
+      throw new Error(`${name} failed: ${text}`);
+    }
+    this.pendingDaemonAdvisory = null;
     return text;
   }
 
@@ -1502,6 +1543,54 @@ export function resetClientForTesting(): void {
 
 export function getTrackingState() {
   return { activeTaskId, activeSessionId, mutationsSinceNote };
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Daemon memory advisory (#140)
+// ──────────────────────────────────────────────────────────────────────
+
+/** Structured marker the daemon writes on its error/diagnostic channel when
+ *  it reports buffer-pool / RSS pressure. Memory payloads and tool-result
+ *  rows never carry it, so matching it can never misfire on user content. */
+export const DAEMON_MEMORY_ADVICE_MARKER = "NEUROSTRATA_ADVICE[daemon_memory]";
+
+/** One advisory per session per window: repeated pressure is one message,
+ *  not one per errored request. */
+const ADVISORY_THROTTLE_MS = 10 * 60 * 1000;
+
+let advisoryLastShown = 0;
+
+export function resetAdvisoryStateForTesting(): void {
+  advisoryLastShown = 0;
+}
+
+/** Drain the live client's pending advisory (if any). Returns-and-clears. */
+export function flushPendingDaemonAdvisory(): string | null {
+  return mcpClient?.flushPendingAdvisory() ?? null;
+}
+
+/** Pull the daemon memory advisory out of the error/diagnostic channel.
+ * Only text carrying the marker is inspected — memory payloads and result
+ * rows are never matched, so a memory that merely discusses
+ * `NEUROSTRATA_BUFFER_POOL_MB` cannot synthesize an advisory. Returns the
+ * guidance string once per 10-minute window, or `null` when already shown
+ * or absent. */
+export function extractDaemonMemoryAdvisory(
+  errorChannelText: string | null | undefined,
+  nowMs: number = Date.now(),
+): string | null {
+  if (!errorChannelText || !errorChannelText.includes(DAEMON_MEMORY_ADVICE_MARKER)) {
+    return null;
+  }
+  if (advisoryLastShown > 0 && nowMs - advisoryLastShown < ADVISORY_THROTTLE_MS) {
+    return null;
+  }
+  advisoryLastShown = nowMs;
+  return [
+    "[NeuroStrata — DAEMON MEMORY ADVISORY]",
+    "The daemon reports buffer-pool or RSS pressure.",
+    "Raise NEUROSTRATA_BUFFER_POOL_MB (or the daemon's configured buffer pool) and restart the daemon; repeated advisories are suppressed for 10 minutes.",
+  ].join(" ");
 }
 
 // ──────────────────────────────────────────────────────────────────────
