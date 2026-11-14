@@ -1296,6 +1296,7 @@ pub struct LadybugStore {
     /// evidence the store is pristine, and `init` must not run the
     /// LockedUnknown provenance upgrade from it.
     open_provenance: OpenProvenance,
+    opened_via_recovery: bool,
     /// This process's view of the store-state sidecar, loaded on first
     /// use. The sidecar is the setup-time model choice's lock record:
     /// see `crate::model_choice::store_has_data`.
@@ -2185,6 +2186,7 @@ impl LadybugStore {
         // Open with verification first. Only if the WAL fails to authenticate do we
         // consider replaying it unverified, and never quietly.
         let mut open_provenance = OpenProvenance::Verified;
+        let mut opened_via_recovery = false;
         let db = match Database::new(&local_path, initial_config) {
             Ok(db) => db,
             Err(e) => {
@@ -2219,7 +2221,7 @@ impl LadybugStore {
                             // live session runs under verifying_config(). A store
                             // whose main DB was created without checksums keeps
                             // the unverified configuration.
-                            if !wal_nonempty {
+                            if wal_nonempty {
                                 unverified_db
                             } else {
                                 let has_memory_table = match Connection::new(&unverified_db) {
@@ -2257,58 +2259,8 @@ impl LadybugStore {
                         }
                         Err(e2) => return Err(e2.into()),
                     }
-                    eprintln!("WARN: DB checksum config mismatch; reopening with checksums disabled.");
-                    match Database::new(&local_path, unverified_config()) {
-                        Ok(unverified_db) => {
-                            // #90: the checksum mismatch may have come from the
-                            // WAL, not the main DB. If a live WAL exists, drain
-                            // it via CHECKPOINT and then reopen verified, so the
-                            // live session runs under verifying_config(). A store
-                            // whose main DB was created without checksums keeps
-                            // the unverified configuration.
-                            if !wal_nonempty {
-                                unverified_db
-                            } else {
-                                let has_memory_table = match Connection::new(&unverified_db) {
-                                    Ok(conn) => conn
-                                        .query("MATCH (m:Memory) RETURN count(m);")
-                                        .is_ok(),
-                                    Err(_) => false,
-                                };
-                                if has_memory_table {
-                                    if let Ok(conn) = Connection::new(&unverified_db) {
-                                        let _ = conn.query("CHECKPOINT;");
-                                        drop(conn);
-                                    }
-                                }
-                                drop(unverified_db);
-                                match Database::new(&local_path, verifying_config()) {
-                                    Ok(db) => db,
-                                    Err(e) if e.to_string().contains("enableChecksums") => {
-                                        eprintln!(
-                                            "WARN: the database was created without checksums; \
-                                             the recovery session stays on the unverified configuration."
-                                        );
-                                        Database::new(&local_path, unverified_config())
-                                            .map_err(|retry_e| {
-                                                anyhow::anyhow!("Recovery reopen failed: {retry_e}")
-                                            })?
-                                    }
-                                    Err(e) => {
-                                        return Err(anyhow::anyhow!(
-                                            "Recovery reopen with verification failed: {e}"
-                                        ))
-                                    }
-                                }
-                            }
-                        }
-                        Err(e2) => return Err(e2.into()),
-                    }
-                } else if !is_wal_integrity_failure(&err_msg) {
-                    return Err(e.into());
                 } else {
-
-                eprintln!(
+                    eprintln!(
                     "ERROR: the write-ahead log failed verification: {}",
                     err_msg
                 );
@@ -2529,6 +2481,7 @@ impl LadybugStore {
             serving_descriptor: std::sync::Mutex::new(None),
             db_preexisting,
             open_provenance,
+            opened_via_recovery,
             store_state: Arc::new(std::sync::Mutex::new(None)),
         })
     }
@@ -20910,7 +20863,7 @@ eurostrata\src\daemon.rs",
     /// strict verification is opted out of.
     #[tokio::test]
     async fn enable_checksums_mismatch_with_wal_refuses_under_strict_wal() {
-        let _env_guard = WAL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env_guard = WAL_ENV_LOCK.lock().await;
         let root = std::env::temp_dir().join(format!(
             "lbug-wal-mismatch-{}-{}",
             std::process::id(),
