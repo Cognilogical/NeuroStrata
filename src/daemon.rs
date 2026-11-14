@@ -334,10 +334,13 @@ async fn auth_middleware(
         }
     }
 
-    let route_label = (req.uri().path() != "/mcp").then(|| format!("http:{}", req.uri().path()));
-    let _memory_guard = route_label
-        .as_deref()
-        .map(|label| crate::procmem::CallGuard::begin(label, None));
+    // The label is built lazily: `begin_lazy` invokes the closure only
+    // when profiling is enabled, so the disabled fast path allocates
+    // nothing here. The guard is still created for every authenticated
+    // non-/mcp request, exactly as before.
+    let _memory_guard = (req.uri().path() != "/mcp").then(|| {
+        crate::procmem::CallGuard::begin_lazy(|| format!("http:{}", req.uri().path()), None)
+    });
     next.run(req).await
 }
 
@@ -3720,6 +3723,84 @@ impl crate::traits::AsAny for RecordingStore {
             daemon_token: "test-daemon-token".to_string(),
             operator_token: "test-operator-token".to_string(),
         }
+    }
+
+    /// F-10 wiring pin: `auth_middleware` creates the memory guard for
+    /// an authenticated non-/mcp route (a guard is in flight inside the
+    /// handler), and for nothing else at this layer — /health returns
+    /// before the guard site and /mcp is excluded from it. The handlers
+    /// record procmem's in-flight count; assertions are relative to the
+    /// count immediately before each request, the same baseline shape
+    /// as procmem's own in-flight counting test.
+    #[tokio::test]
+    async fn auth_middleware_guards_only_authenticated_non_mcp_routes() {
+        use tower::ServiceExt;
+
+        let root = scratch_root("f10-middleware-wiring");
+        std::fs::create_dir_all(&root).unwrap();
+        let state = caller_path_state(&root, vec![]).await;
+        let seen: Arc<Mutex<Vec<(&'static str, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+        let record = |name: &'static str, seen: Arc<Mutex<Vec<(&'static str, usize)>>>| {
+            move || {
+                let seen = seen.clone();
+                async move {
+                    seen.lock()
+                        .unwrap()
+                        .push((name, crate::procmem::in_flight_for_test()));
+                    "ok"
+                }
+            }
+        };
+        let app = Router::new()
+            .route("/health", get(record("health", seen.clone())))
+            .route("/dummy", get(record("dummy", seen.clone())))
+            .route("/mcp", post(record("mcp", seen.clone())))
+            .with_state(state.clone())
+            .layer(axum::middleware::from_fn_with_state(state, auth_middleware));
+
+        let drive = |app: Router,
+                     uri: &'static str,
+                     method: axum::http::Method,
+                     auth: bool| async move {
+            let mut builder = axum::http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(axum::http::header::HOST, "127.0.0.1");
+            if auth {
+                builder = builder.header(axum::http::header::AUTHORIZATION, "Bearer test-daemon-token");
+            }
+            let before = crate::procmem::in_flight_for_test();
+            let response = app
+                .oneshot(builder.body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap();
+            (response.status(), before)
+        };
+
+        let (status, before) =
+            drive(app.clone(), "/health", axum::http::Method::GET, false).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            seen.lock().unwrap().last().copied(),
+            Some(("health", before)),
+            "/health runs with no guard active"
+        );
+
+        let (status, before) = drive(app.clone(), "/dummy", axum::http::Method::GET, true).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            seen.lock().unwrap().last().copied(),
+            Some(("dummy", before + 1)),
+            "an authenticated route runs with the guard in flight"
+        );
+
+        let (status, before) = drive(app, "/mcp", axum::http::Method::POST, true).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            seen.lock().unwrap().last().copied(),
+            Some(("mcp", before)),
+            "/mcp runs with no guard at the middleware layer"
+        );
     }
 
     /// Task 2 re-file (J6): an export target under an

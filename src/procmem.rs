@@ -609,19 +609,59 @@ impl CallGuard {
         namespace: Option<&str>,
         sampler: fn() -> Sample,
     ) -> Self {
+        let enabled = profile_enabled();
+        Self::begin_impl(
+            enabled,
+            enabled.then(|| tool.to_string()),
+            if enabled { namespace.map(str::to_string) } else { None },
+            sampler,
+        )
+    }
+
+    /// `begin` with the label built lazily: `label` runs only when
+    /// profiling is enabled, so a call site that formats its label (the
+    /// daemon's `http:<path>`) pays no allocation on the disabled fast
+    /// path. Counting, epoch, sampling, and drop behaviour are identical
+    /// to `begin` — the guard is still created either way.
+    pub fn begin_lazy(label: impl FnOnce() -> String, namespace: Option<&str>) -> Self {
+        let enabled = profile_enabled();
+        Self::begin_impl(
+            enabled,
+            enabled.then(label),
+            if enabled { namespace.map(str::to_string) } else { None },
+            sample,
+        )
+    }
+
+    /// Shared constructor behind `begin_with`/`begin_lazy`. The caller
+    /// resolves `enabled` first and gates the label/namespace strings on
+    /// it, so this only ever stores strings profiling will actually use.
+    fn begin_impl(
+        enabled: bool,
+        tool: Option<String>,
+        namespace: Option<String>,
+        sampler: fn() -> Sample,
+    ) -> Self {
         IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
         CALLS.fetch_add(1, Ordering::Relaxed);
         let epoch_at_begin = CALL_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
-        let enabled = profile_enabled();
         Self {
-            tool: enabled.then(|| tool.to_string()),
-            namespace: if enabled { namespace.map(str::to_string) } else { None },
+            tool,
+            namespace,
             // Disabled profiling must not pay for a syscall or heap allocation per call.
             before: if enabled { sampler() } else { Sample::default() },
             epoch_at_begin,
             sampler,
         }
     }
+}
+
+/// The number of guards currently in flight, exposed so the daemon's
+/// middleware wiring test can observe whether a guard is active inside
+/// a handler without reaching into this module's statics.
+#[cfg(test)]
+pub(crate) fn in_flight_for_test() -> usize {
+    IN_FLIGHT.load(Ordering::SeqCst)
 }
 
 impl Drop for CallGuard {
@@ -1134,6 +1174,38 @@ mod tests {
             2,
             "one sample at begin, one at drop"
         );
+        std::env::remove_var("NEUROSTRATA_PROFILE");
+    }
+
+    /// The F-10 lazy-label contract: the label closure runs only when
+    /// profiling is enabled, so the daemon's per-request `format!`
+    /// costs nothing on the disabled fast path. The guard itself is
+    /// created either way (counting is unchanged).
+    #[test]
+    fn begin_lazy_builds_its_label_only_when_profiling_is_enabled() {
+        let _env = PROFILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("NEUROSTRATA_PROFILE");
+        let built = std::cell::Cell::new(false);
+        let g = CallGuard::begin_lazy(
+            || {
+                built.set(true);
+                "lazy".to_string()
+            },
+            None,
+        );
+        assert!(!built.get(), "disabled profiling never builds the label");
+        drop(g);
+        assert!(!built.get(), "dropping a disabled guard builds nothing either");
+        std::env::set_var("NEUROSTRATA_PROFILE", "1");
+        let g = CallGuard::begin_lazy(
+            || {
+                built.set(true);
+                "lazy".to_string()
+            },
+            None,
+        );
+        assert!(built.get(), "enabled profiling builds the label at begin");
+        drop(g);
         std::env::remove_var("NEUROSTRATA_PROFILE");
     }
 }
