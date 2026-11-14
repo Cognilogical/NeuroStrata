@@ -54,6 +54,7 @@ struct PendingShapeProp {
 pub struct OntologyIndex {
     pub domains: Vec<DomainEntry>,
     pub shacl_shapes: Vec<ShaclShapeDef>,
+    pub action_types: BTreeMap<String, crate::rdf::action::ActionTypeDefinition>,
     children: BTreeMap<String, Vec<String>>,
     alias_map: BTreeMap<String, String>,
     sub_properties: BTreeMap<String, Vec<String>>,
@@ -165,6 +166,7 @@ impl OntologyIndex {
                 broader: BTreeMap::new(),
                 narrower: BTreeMap::new(),
                 shacl_shapes: Vec::new(),
+                action_types: BTreeMap::new(),
             }
         };
 

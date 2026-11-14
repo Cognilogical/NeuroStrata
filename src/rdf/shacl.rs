@@ -354,6 +354,13 @@ pub fn validate_memory(payload: &MemoryPayload) -> Vec<ShaclViolation> {
                 });
             }
         }
+        "action_type" => match crate::rdf::action::ActionTypeDefinition::from_payload(payload) {
+            Ok(def) => out.extend(def.validate_definition()),
+            Err(why) => out.push(ShaclViolation {
+                field: "metadata.action_type".to_string(),
+                why,
+            }),
+        },
         _ => {}
     }
 
@@ -392,6 +399,8 @@ fn is_structural(t: &str) -> bool {
         || t == "community_summary"
         || t == "digital_twin"
         || t == "digital_twin_schema"
+        || t == "action_type"
+        || t == "action_receipt"
 }
 
 pub fn endpoint_role_allowed(rel_type: &str, source_type: &str, target_type: &str) -> bool {

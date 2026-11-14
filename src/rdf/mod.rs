@@ -1,3 +1,4 @@
+pub mod action;
 pub mod canonical;
 pub mod dataset_canonical;
 pub mod federation;
@@ -11,6 +12,8 @@ pub mod sparql;
 pub mod types_oxrdf;
 pub mod types;
 
+#[allow(unused_imports)]
+pub use action::*;
 pub use canonical::*;
 pub use dataset_canonical::*;
 pub use ontology::*;

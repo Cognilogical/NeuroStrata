@@ -7703,6 +7703,9 @@ impl VectorStore for LadybugStore {
         let dimensions = self.dimensions;
         let zero_vec = zero_vector_str(dimensions);
         let lexical_doc = Self::lexical_doc(&namespace, &id, &payload);
+        let refresh_ont_after_upsert = payload.memory_type == "action_type"
+            || id == crate::registry::registry_row_id(&namespace);
+        let ns_for_post_refresh = namespace.clone();
         // Composite Rec #14: memory ids are globally unique (PRIMARY KEY), so an
         // upsert of an existing id into a DIFFERENT namespace would silently
         // relocate the row. Read which namespace owns the id first and fail
@@ -8118,6 +8121,9 @@ impl VectorStore for LadybugStore {
         .await;
         if outcome.is_ok() {
             self.lexical_apply_doc(lexical_doc);
+            if refresh_ont_after_upsert {
+                self.refresh_ontology(&ns_for_post_refresh).await;
+            }
             // No caller-side first-data flip: the committing task
             // already recorded the transition inside the write closure
             // (see above), so it is recorded even when this caller was
@@ -8668,6 +8674,7 @@ impl VectorStore for LadybugStore {
         .await;
         if outcome.is_ok() {
             self.lexical_remove_doc(&index_namespace, &index_id);
+            self.refresh_ontology(&index_namespace).await;
         }
         outcome
     }
@@ -24475,28 +24482,72 @@ impl LadybugStore {
 impl LadybugStore {
     pub async fn refresh_ontology(&self, namespace: &str) {
         let namespace_owned = namespace.to_string();
-        let metadata = self
-            .with_conn(move |conn: &Connection| -> Result<Option<serde_json::Value>> {
-                let safe_ns = escape_ladybug_string(&namespace_owned);
-                let rid = crate::registry::registry_row_id(&namespace_owned);
-                let safe_id = escape_ladybug_string(&rid);
-                let query = format!(
-                    "MATCH (m:Memory) WHERE m.id = '{}' AND m.namespace = '{}' RETURN m.metadata",
-                    safe_id, safe_ns
-                );
-                if let Ok(mut rows) = conn.query(&query) {
-                    if let Some(row) = rows.next() {
-                        let meta_str = format!("{}", row[0]);
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&meta_str) {
-                            return Ok(Some(v));
+        let (metadata, action_rows) = self
+            .with_conn(
+                move |conn: &Connection| -> Result<(
+                    Option<serde_json::Value>,
+                    Vec<(String, MemoryPayload)>,
+                )> {
+                    let safe_ns = escape_ladybug_string(&namespace_owned);
+                    let rid = crate::registry::registry_row_id(&namespace_owned);
+                    let safe_id = escape_ladybug_string(&rid);
+                    let query = format!(
+                        "MATCH (m:Memory) WHERE m.id = '{}' AND m.namespace = '{}' RETURN m.metadata",
+                        safe_id, safe_ns
+                    );
+                    let mut reg_meta = None;
+                    if let Ok(mut rows) = conn.query(&query) {
+                        if let Some(row) = rows.next() {
+                            let meta_str = format!("{}", row[0]);
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&meta_str) {
+                                reg_meta = Some(v);
+                            }
                         }
                     }
-                }
-                Ok(None)
-            })
+
+                    let mut actions = Vec::new();
+                    let action_query = format!(
+                        "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.memory_type = 'action_type' RETURN m.id, m.content, m.user_id, m.agent_name, m.location, m.location_lines, m.metadata",
+                        safe_ns
+                    );
+                    if let Ok(rows) = conn.query(&action_query) {
+                        for row in rows {
+                            let id = format!("{}", row[0]);
+                            let content = format!("{}", row[1]);
+                            let user_id = format!("{}", row[2]);
+                            let agent_name_str = format!("{}", row[3]);
+                            let location = format!("{}", row[4]);
+                            let location_lines = format!("{}", row[5]);
+                            let meta_str = format!("{}", row[6]);
+                            let metadata = serde_json::from_str::<serde_json::Value>(&meta_str)
+                                .unwrap_or_else(|_| serde_json::json!({}));
+                            actions.push((
+                                id,
+                                MemoryPayload {
+                                    content,
+                                    user_id,
+                                    memory_type: "action_type".to_string(),
+                                    agent_name: if agent_name_str.is_empty()
+                                        || agent_name_str == "unknown"
+                                    {
+                                        None
+                                    } else {
+                                        Some(agent_name_str)
+                                    },
+                                    location,
+                                    location_lines,
+                                    metadata,
+                                },
+                            ));
+                        }
+                    }
+
+                    Ok((reg_meta, actions))
+                },
+            )
             .await
             .ok()
-            .flatten();
+            .unwrap_or((None, Vec::new()));
         let mut idx = metadata
             .as_ref()
             .map(|m| crate::rdf::OntologyIndex::from_registry_metadata(m))
@@ -24521,6 +24572,60 @@ impl LadybugStore {
                     aliases: Vec::new(),
                     concept_iri: None,
                 });
+            }
+        }
+
+        // Compile active action_type rows in deterministic (valid_from, id) order.
+        let now_ts = chrono::Utc::now().timestamp();
+        let mut active_actions: Vec<(i64, String, MemoryPayload)> = action_rows
+            .into_iter()
+            .filter_map(|(id, payload)| {
+                let archived = payload
+                    .metadata
+                    .get("archived")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let retired = match payload.metadata.get("valid_to") {
+                    Some(v) if !v.is_null() => v.as_i64().map(|ts| ts > 0 && ts <= now_ts).unwrap_or(true),
+                    _ => false,
+                };
+                let conflicting =
+                    crate::synaptic_mesh::conflict::is_conflicting_metadata(&payload.metadata);
+                if archived || retired || conflicting {
+                    return None;
+                }
+                let vf = payload
+                    .metadata
+                    .get("valid_from")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                Some((vf, id, payload))
+            })
+            .collect();
+        active_actions.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        for (_vf, row_id, payload) in active_actions {
+            match crate::rdf::action::ActionTypeDefinition::from_payload(&payload) {
+                Ok(def) => {
+                    let violations = def.validate_definition();
+                    if violations.is_empty() {
+                        idx.action_types.insert(def.slug.clone(), def);
+                    } else {
+                        tracing::warn!(
+                            "skipping invalid action_type '{}' in namespace '{}': {:?}",
+                            row_id,
+                            namespace,
+                            violations
+                        );
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "skipping malformed action_type '{}' in namespace '{}': {}",
+                        row_id,
+                        namespace,
+                        err
+                    );
+                }
             }
         }
         // Keep the read-side accessors honest for every registry shape: an
