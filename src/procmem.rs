@@ -548,17 +548,11 @@ fn append(path: &std::path::Path, line: &str) -> std::io::Result<()> {
     let mut rolled = path.as_os_str().to_owned();
     rolled.push(".1");
     let rolled = PathBuf::from(rolled);
-    let rotation_succeeded = if std::fs::metadata(path).map(|m| m.len() > MAX_LOG_BYTES).unwrap_or(false) {
-        match std::fs::rename(path, &rolled) {
-            Ok(()) => true,
-            Err(e) => {
-                eprintln!("warning: could not rotate {}: {e}", path.display());
-                false
-            }
+    if std::fs::metadata(path).map(|m| m.len() > MAX_LOG_BYTES).unwrap_or(false) {
+        if let Err(e) = std::fs::rename(path, &rolled) {
+            eprintln!("warning: could not rotate {}: {e}", path.display());
         }
-    } else {
-        false
-    };
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -567,9 +561,19 @@ fn append(path: &std::path::Path, line: &str) -> std::io::Result<()> {
             .append(true)
             .mode(0o600)
             .open(path)?;
-        std::fs::set_permissions(path, PermissionsExt::from_mode(0o600))?;
-        if rotation_succeeded {
-            std::fs::set_permissions(&rolled, PermissionsExt::from_mode(0o600))?;
+        if let Err(e) = f.set_permissions(PermissionsExt::from_mode(0o600)) {
+            eprintln!("warning: could not tighten permissions on {}: {e}", path.display());
+        }
+        match std::fs::symlink_metadata(&rolled) {
+            Ok(md) if !md.file_type().is_symlink() => {
+                if let Err(e) = std::fs::set_permissions(&rolled, PermissionsExt::from_mode(0o600)) {
+                    eprintln!(
+                        "warning: could not tighten permissions on {}: {e}",
+                        rolled.display()
+                    );
+                }
+            }
+            _ => {}
         }
         writeln!(f, "{line}")
     }
@@ -1015,6 +1019,55 @@ mod tests {
         let rolled = dir.join("memory-growth.log.1");
         let rolled_mode = std::fs::metadata(&rolled).unwrap().permissions().mode() & 0o777;
         assert_eq!(rolled_mode, 0o600, "rotated log mode must be 0600, got {rolled_mode:o}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_tightens_a_pre_existing_log_without_rotating() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "procmem-perms-existing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("memory-growth.log");
+        std::fs::write(&path, "{\"old\":true}\n").unwrap();
+        std::fs::set_permissions(&path, PermissionsExt::from_mode(0o644)).unwrap();
+        append(&path, "{\"fresh\":true}").expect("append");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "active log mode must be 0600, got {mode:o}");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("{\"fresh\":true}"), "the appended line is present: {text}");
+        assert!(!dir.join("memory-growth.log.1").exists(), "no rotation for a small log");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_tightens_a_pre_existing_rolled_log_without_rotating() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "procmem-perms-rolled-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("memory-growth.log");
+        std::fs::write(&path, "{\"old\":true}\n").unwrap();
+        let rolled = dir.join("memory-growth.log.1");
+        std::fs::write(&rolled, "{\"rolled\":true}\n").unwrap();
+        std::fs::set_permissions(&rolled, PermissionsExt::from_mode(0o644)).unwrap();
+        append(&path, "{\"fresh\":true}").expect("append");
+        let rolled_mode = std::fs::metadata(&rolled).unwrap().permissions().mode() & 0o777;
+        assert_eq!(rolled_mode, 0o600, "rolled log mode must be 0600, got {rolled_mode:o}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
