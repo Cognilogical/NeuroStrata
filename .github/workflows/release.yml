@@ -33,7 +33,7 @@ jobs:
       LBUG_VERSION: "0.22.3"
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
         with:
           ref: ${{ inputs.tag || github.ref_name }}
 
@@ -139,7 +139,7 @@ jobs:
       # workflow_dispatch run builds whatever branch it was launched from and
       # then attaches those binaries to the requested tag.
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
         with:
           ref: ${{ inputs.tag || github.ref_name }}
 
