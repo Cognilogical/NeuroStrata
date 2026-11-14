@@ -510,7 +510,7 @@ async fn run_sampler(
         let in_flight = IN_FLIGHT.load(Ordering::SeqCst);
         let path_for_tick = path.clone();
         let prev_before = prev_rss;
-        if let Ok(next_prev) = tokio::task::spawn_blocking(move || {
+        match tokio::task::spawn_blocking(move || {
             let mut prev = prev_before;
             let s = sample();
             if let Err(e) = append(&path_for_tick, &sample_line(s, calls, in_flight)) {
@@ -524,7 +524,8 @@ async fn run_sampler(
         })
         .await
         {
-            prev_rss = next_prev;
+            Ok(next_prev) => prev_rss = next_prev,
+            Err(e) => eprintln!("warning: memory sampler tick failed: {e}"),
         }
         tokio::select! {
             _ = tokio::time::sleep(every) => {}

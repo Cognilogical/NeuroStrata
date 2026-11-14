@@ -34,10 +34,14 @@ process delta, but the attribution to that call is not exact.
   or allocator page retention — is captured by `"kind": "sample"` and
   `"kind": "sampler"` time-series rows rather than a single `"kind": "call"`
   row.
-- **P3-7 / X6b — `Drop` synchronous I/O waiver (`neurostrata-igg4`):** The
-  sampler offloads periodic log writes to `tokio::task::spawn_blocking`, while
-  `CallGuard::drop` performs its single-line append synchronously — but only on
-  calls that crossed `NEUROSTRATA_RSS_LOG_MB` when profiling is enabled.
+- **P3-7 / X6b — `Drop` synchronous I/O waiver (`neurostrata-igg4`):**
+  Accepted as a deliberate waiver. The sampler offloads periodic log writes
+  to `tokio::task::spawn_blocking`, while `CallGuard::drop` performs its
+  single-line append synchronously. This is accepted because `Drop` cannot
+  await: the append is a single line under `LOG_LOCK` and happens only for
+  calls that crossed `NEUROSTRATA_RSS_LOG_MB` with profiling enabled, and
+  moving it off `Drop` would lose the crossing call's row when the process
+  exits.
 - **P3-11 / N1 — `calls_since_last` & direct HTTP surface (`neurostrata-igg4`):**
   `CallGuard` wraps both MCP `tools/call` invocations and authenticated direct
   HTTP routes (`http:<path>`, excluding `/health` and `/mcp`, which guards at
