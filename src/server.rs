@@ -5696,6 +5696,10 @@ pub(crate) async fn handle_storage_status(store: Arc<dyn VectorStore>) -> String
         .unwrap_or_default();
     if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::LadybugStore>() {
         let status = crate::storage::compute_storage_status(ls.local_path(), &hygiene_cfg);
+        let status = crate::storage::snapshot::StorageStatus {
+            opened_via_recovery: ls.opened_via_recovery(),
+            ..status
+        };
         return crate::procmem::status_with_process_memory(&status);
     }
     let db_path = cfg

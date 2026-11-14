@@ -2113,7 +2113,49 @@ impl LadybugStore {
                     opened_via_recovery = true;
                     eprintln!("WARN: DB checksum config mismatch; reopening with checksums disabled.");
                     match Database::new(&local_path, unverified_config()) {
-                        Ok(db) => db,
+                        Ok(unverified_db) => {
+                            // #90: the checksum mismatch may have come from the
+                            // WAL, not the main DB. If a live WAL exists, drain
+                            // it via CHECKPOINT and then reopen verified, so the
+                            // live session runs under verifying_config(). A store
+                            // whose main DB was created without checksums keeps
+                            // the unverified configuration.
+                            if !wal_nonempty {
+                                unverified_db
+                            } else {
+                                let has_memory_table = match Connection::new(&unverified_db) {
+                                    Ok(conn) => conn
+                                        .query("MATCH (m:Memory) RETURN count(m);")
+                                        .is_ok(),
+                                    Err(_) => false,
+                                };
+                                if has_memory_table {
+                                    if let Ok(conn) = Connection::new(&unverified_db) {
+                                        let _ = conn.query("CHECKPOINT;");
+                                        drop(conn);
+                                    }
+                                }
+                                drop(unverified_db);
+                                match Database::new(&local_path, verifying_config()) {
+                                    Ok(db) => db,
+                                    Err(e) if e.to_string().contains("enableChecksums") => {
+                                        eprintln!(
+                                            "WARN: the database was created without checksums; \
+                                             the recovery session stays on the unverified configuration."
+                                        );
+                                        Database::new(&local_path, unverified_config())
+                                            .map_err(|retry_e| {
+                                                anyhow::anyhow!("Recovery reopen failed: {retry_e}")
+                                            })?
+                                    }
+                                    Err(e) => {
+                                        return Err(anyhow::anyhow!(
+                                            "Recovery reopen with verification failed: {e}"
+                                        ))
+                                    }
+                                }
+                            }
+                        }
                         Err(e2) => return Err(e2.into()),
                     }
                 } else if !is_wal_integrity_failure(&err_msg) {
@@ -2150,6 +2192,73 @@ impl LadybugStore {
                         // Checkpoint them into the main DB files right away, so
                         // a later crash does not put the same marginal WAL back
                         // in front of the strict verifier.
+                        // #69: guard the checkpoint against zero-record WAL
+                        // replay. When throw_on_wal_replay_failure(false)
+                        // stops at the first bad record on a non-empty WAL,
+                        // running CHECKPOINT would truncate the live .wal
+                        // while committing an empty state. Verify that the
+                        // Memory table actually exists after replay before
+                        // checkpointing.
+                        let has_memory_table = match Connection::new(&unverified_db) {
+                            Ok(conn) => conn
+                                .query("MATCH (m:Memory) RETURN count(m);")
+                                .is_ok(),
+                            Err(_) => false,
+                        };
+
+                        if pre_replay_wal_bytes > 0 && !has_memory_table {
+                            // Zero-record replay from a non-empty WAL: the
+                            // schema never made it through. Truncating the
+                            // live .wal would lose data that never reached
+                            // the main DB. Restore the preserved copy and
+                            // refuse to checkpoint an empty store over the
+                            // WAL, pointing the operator to the backup.
+                            let mut wal_path = local_path.clone().into_os_string();
+                            wal_path.push(".wal");
+                            let wal_file = std::path::PathBuf::from(wal_path);
+
+                            // Restore the preserved .wal.unclean.<ts> copy if
+                            // one exists, so the operator can inspect it.
+                            if let Some(parent) = local_path.parent() {
+                                let file_name = local_path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_default();
+                                let unclean_prefix = format!("{}.wal.unclean.", file_name);
+                                if let Ok(entries) = std::fs::read_dir(parent) {
+                                    for entry in entries.flatten() {
+                                        let name = entry
+                                            .file_name()
+                                            .to_string_lossy()
+                                            .to_string();
+                                        if name.starts_with(&unclean_prefix) {
+                                            let _ =
+                                                std::fs::rename(entry.path(), &wal_file);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+
+                            eprintln!(
+                                "ERROR: DATA LOSS. {} bytes of unverified WAL \
+                                 replay produced zero schema records from a \
+                                 non-empty WAL ({pre_replay_wal_bytes} bytes). \
+                                 Refusing to checkpoint an empty store over the \
+                                 WAL. The preserved copy at \
+                                 <local_path>.wal.unclean.<ts> is available for \
+                                 manual recovery.",
+                                pre_replay_wal_bytes
+                            );
+                            return Err(anyhow::anyhow!(
+                                "Unverified WAL replay recovered zero schema \
+                                 records from a non-empty WAL ({pre_replay_wal_bytes} \
+                                 bytes). Refusing to checkpoint an empty store \
+                                 over the WAL. See the error log above for \
+                                 recovery options."
+                            ));
+                        }
+
                         match Connection::new(&unverified_db) {
                             Ok(conn) => {
                                 if let Err(e) = conn.query("CHECKPOINT;") {
@@ -2160,7 +2269,9 @@ impl LadybugStore {
                                 drop(conn);
                             }
                             Err(e) => {
-                                tracing::warn!("failed to open connection for post-recovery CHECKPOINT: {e}");
+                                tracing::warn!(
+                                    "failed to open connection for post-recovery CHECKPOINT: {e}"
+                                );
                             }
                         }
                         if pre_replay_wal_bytes > 0 {
@@ -6596,6 +6707,10 @@ impl VectorStore for LadybugStore {
 
     fn as_intake_store(&self) -> Option<&dyn crate::traits::IntakeStore> {
         Some(self)
+    }
+
+    fn opened_via_recovery(&self) -> bool {
+        self.opened_via_recovery()
     }
 
     async fn upsert(
@@ -19851,17 +19966,24 @@ eurostrata\src\daemon.rs",
     /// Opt this process into the unverified-WAL recovery fallback
     /// (the operator opt-in the WAL-discard/unverified arms require),
     /// returning the previous values for restoration.
+    static WAL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::<()>::new(());
+
+    /// Opt this process into the unverified-WAL recovery fallback
+    /// (the operator opt-in the WAL-discard/unverified arms require),
+    /// returning the previous values for restoration.
     fn allow_unverified_wal_recovery() -> (Option<String>, Option<String>) {
         let previous = (
             std::env::var("NEUROSTRATA_STRICT_WAL").ok(),
             std::env::var("NEUROSTRATA_ALLOW_UNVERIFIED_WAL").ok(),
         );
+        let _guard = WAL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("NEUROSTRATA_ALLOW_UNVERIFIED_WAL");
         std::env::set_var("NEUROSTRATA_STRICT_WAL", "0");
         previous
     }
 
     fn restore_wal_env(previous: (Option<String>, Option<String>)) {
+        let _guard = WAL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         match previous.0 {
             Some(value) => std::env::set_var("NEUROSTRATA_STRICT_WAL", value),
             None => std::env::remove_var("NEUROSTRATA_STRICT_WAL"),
@@ -20030,6 +20152,7 @@ eurostrata\src\daemon.rs",
     /// strict verification is opted out of.
     #[tokio::test]
     async fn enable_checksums_mismatch_with_wal_refuses_under_strict_wal() {
+        let _env_guard = WAL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let root = std::env::temp_dir().join(format!(
             "lbug-wal-mismatch-{}-{}",
             std::process::id(),
