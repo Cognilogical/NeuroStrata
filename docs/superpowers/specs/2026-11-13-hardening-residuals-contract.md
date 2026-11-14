@@ -1,8 +1,8 @@
 # Residual hardening — contract (WP3.2 & #183)
 
 Status: Phase 3 / WP3.2 & `#183` (`neurostrata-igg4`). Covers the `#164` P2
-arena guard restoration, the sampler seam (`#181`), and the 12 P3 residue items
-from `#183`.
+arena guard restoration, this branch's counting-sampler seam (`CallGuard::begin_with`),
+and the 12 P3 residue items from `#183`.
 
 ## Landed
 
@@ -10,7 +10,7 @@ from `#183`.
 
 `procmem::parse_threshold` returns a typed error for a present-but-invalid
 `NEUROSTRATA_RSS_LOG_MB`, naming the value; `threshold_mb` warns once per
-invalid value to stderr and uses the default (`50`). In release builds,
+invalid value to stderr and uses the default (`50`). In non-test builds (`#[cfg(not(test))]`),
 `threshold_mb` caches the parsed threshold in a `OnceLock<u64>` so per-call
 guards do not re-read or re-parse `NEUROSTRATA_RSS_LOG_MB` on every call
 (`P3-8 / X6c`, `neurostrata-igg4`). Unset uses the default; `0` remains the
@@ -26,6 +26,8 @@ with the arena allocator off, or `None` for fastembed's default. Both
 `init.with_execution_providers(providers)` in `FastEmbedder::new`) verify that
 neither flipping the boolean nor dropping the constructor wiring can silently
 re-enable the ONNX CPU arena (`#164`, `neurostrata-igg4`).
+
+Supersession note: the flip- and delete-sensitivity claims above hold as a result of the remediation commits on this branch, which bounded the constructor slice at `TextEmbedding::try_new(init.with_show_download_progress(true))` and constructed both needles dynamically with `format!`.
 
 ### C3 — `procmem` growth log security, status telemetry, and arithmetic (`#183`)
 

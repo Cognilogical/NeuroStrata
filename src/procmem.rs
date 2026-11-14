@@ -603,6 +603,8 @@ pub struct CallGuard {
     before: Sample,
     epoch_at_begin: u64,
     sampler: fn() -> Sample,
+    #[cfg(test)]
+    origin_thread: std::thread::ThreadId,
 }
 
 impl CallGuard {
@@ -659,6 +661,15 @@ impl CallGuard {
         IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
         CALLS.fetch_add(1, Ordering::Relaxed);
         let epoch_at_begin = CALL_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+        #[cfg(test)]
+        let origin_thread = {
+            let tid = std::thread::current().id();
+            let mut map = IN_FLIGHT_BY_THREAD
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *map.entry(tid).or_insert(0) += 1;
+            tid
+        };
         Self {
             tool,
             namespace,
@@ -670,21 +681,49 @@ impl CallGuard {
             },
             epoch_at_begin,
             sampler,
+            #[cfg(test)]
+            origin_thread,
         }
     }
 }
 
-/// The number of guards currently in flight, exposed so the daemon's
-/// middleware wiring test can observe whether a guard is active inside
-/// a handler without reaching into this module's statics.
+/// A per-thread counter for CallGuard guards currently in flight, exposed so
+/// the daemon's middleware wiring test can observe whether a guard is active
+/// inside a handler without interference from parallel tests on other threads.
+#[cfg(test)]
+static IN_FLIGHT_BY_THREAD: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<std::thread::ThreadId, usize>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// The number of guards currently in flight on the calling thread, exposed so
+/// the daemon's middleware wiring test can observe whether a guard is active
+/// inside a handler without interference from parallel tests on other threads.
 #[cfg(test)]
 pub(crate) fn in_flight_for_test() -> usize {
-    IN_FLIGHT.load(Ordering::SeqCst)
+    let tid = std::thread::current().id();
+    IN_FLIGHT_BY_THREAD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&tid)
+        .copied()
+        .unwrap_or(0)
 }
 
 impl Drop for CallGuard {
     fn drop(&mut self) {
         let in_flight = IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+        #[cfg(test)]
+        {
+            let mut map = IN_FLIGHT_BY_THREAD
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(count) = map.get_mut(&self.origin_thread) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    map.remove(&self.origin_thread);
+                }
+            }
+        }
         if !profile_enabled() {
             return;
         }
