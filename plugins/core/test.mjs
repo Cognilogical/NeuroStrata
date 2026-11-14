@@ -636,6 +636,41 @@ describe("extractRepoFilePaths", () => {
     const dups = extractRepoFilePaths("a/b.ts a/b.ts c/d.ts");
     assert.deepEqual(dups, ["a/b.ts", "c/d.ts"]);
   });
+
+  it("extracts paths from a sentence, normalizing ./ prefixes, ignoring URLs", () => {
+    const out = extractRepoFilePaths(
+      "Edited src/store/ladybug.rs, ./plugins/core/index.ts, and .github/workflows/ci.yml. Ignore https://example.com/foo/bar.ts",
+    );
+    assert.deepEqual(out, ["src/store/ladybug.rs", "plugins/core/index.ts", ".github/workflows/ci.yml"]);
+  });
+
+  it("adversarial ReDoS input completes in < 50 ms and returns []", () => {
+    const start = performance.now();
+    const out = extractRepoFilePaths("a/".repeat(25000) + "!");
+    const elapsed = performance.now() - start;
+    assert.deepEqual(out, []);
+    assert.ok(elapsed < 50, `extractRepoFilePaths took ${elapsed}ms on adversarial input, expected < 50ms`);
+  });
+
+  it("extracts generic file extensions (.ttl, .lean, .jsonl, .cmake)", () => {
+    const out = extractRepoFilePaths(
+      "update schemas/neurostrata-ontology.ttl, proofs/NeuroStrata/Safeguards.lean, .NeuroStrata/tasks.jsonl, cmake/FindFoo.cmake",
+    );
+    assert.ok(out.includes("schemas/neurostrata-ontology.ttl"));
+    assert.ok(out.includes("proofs/NeuroStrata/Safeguards.lean"));
+    assert.ok(out.includes(".NeuroStrata/tasks.jsonl"));
+    assert.ok(out.includes("cmake/FindFoo.cmake"));
+  });
+
+  it("ignores numeric-only version suffixes and URL bodies", () => {
+    assert.deepEqual(extractRepoFilePaths("release/v1.2 and https://example.com/a/b.ts"), []);
+    assert.deepEqual(extractRepoFilePaths("pkg/1.2.3"), []);
+  });
+
+  it("ignores empty, '.' and '..' segments", () => {
+    assert.deepEqual(extractRepoFilePaths("src/./foo.ts and a//b.ts"), []);
+    assert.deepEqual(extractRepoFilePaths("a/../b.ts"), []);
+  });
 });
 
 describe("enrichAndInjectSubagentPrompt", () => {
