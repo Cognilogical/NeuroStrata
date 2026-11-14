@@ -1,0 +1,173 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 640" width="100%" height="100%">
+  <defs>
+    <linearGradient id="bg5" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#090d16"/>
+      <stop offset="50%" stop-color="#111827"/>
+      <stop offset="100%" stop-color="#090d16"/>
+    </linearGradient>
+    <marker id="arrowPink" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1 L 9 5 L 0 9 z" fill="#f472b6"/>
+    </marker>
+    <marker id="arrowGreen" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1 L 9 5 L 0 9 z" fill="#34d399"/>
+    </marker>
+  </defs>
+
+  <rect width="1200" height="640" rx="18" fill="url(#bg5)"/>
+
+  <!-- Header -->
+  <text x="600" y="46" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="27" font-weight="800" fill="#f8fafc" letter-spacing="0.5">
+    ZERO-TOUCH SETUP, SUBAGENT INJECTION &amp; SYNAPTIC MESH
+  </text>
+  <text x="600" y="74" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="15" fill="#94a3b8">
+    Say one sentence to initialize; every CLI harness, subagent spawn, and team git sync is wired automatically
+  </text>
+
+  <!-- TOP BAR: 1-SENTENCE ONBOARDING -->
+  <g transform="translate(40, 100)">
+    <rect width="1120" height="86" rx="14" fill="#131c31" stroke="#38bdf8" stroke-width="2"/>
+    <rect x="22" y="18" width="330" height="50" rx="10" fill="#083344" stroke="#22d3ee" stroke-width="1.5"/>
+    <text x="187" y="38" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" font-weight="700" fill="#67e8f9" letter-spacing="0.6">
+      USER SAYS ONE SENTENCE:
+    </text>
+    <text x="187" y="57" text-anchor="middle" font-family="system-ui, sans-serif" font-size="14" font-weight="800" fill="#f8fafc">
+      "Initialize NeuroStrata for this project."
+    </text>
+
+    <text x="385" y="36" font-family="system-ui, sans-serif" font-size="13" font-weight="700" fill="#e2e8f0">
+      100% Automated Zero-Touch Wiring:
+    </text>
+    <text x="385" y="58" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
+      ✓ Detects CLI harness &amp; installs embedded plugin  ·  ✓ Installs <tspan font-family="monospace" fill="#67e8f9">pre-commit</tspan> &amp; <tspan font-family="monospace" fill="#67e8f9">pre-push</tspan> hooks  ·  ✓ Ingests 6-lang AST  ·  ✓ Self-upgrades on snapshot
+    </text>
+  </g>
+
+  <!-- LEFT COLUMN: 6 AUTO-DETECTED CLI HARNESSES -->
+  <g transform="translate(40, 212)">
+    <rect width="320" height="388" rx="14" fill="#111827" stroke="#6366f1" stroke-width="2"/>
+    <rect width="320" height="40" rx="14" fill="#1e1b4b"/>
+    <text x="160" y="25" text-anchor="middle" font-family="system-ui, sans-serif" font-size="13.5" font-weight="800" fill="#a5b4fc">
+      6 AUTO-WIRED AGENT HARNESSES
+    </text>
+
+    <!-- 6 Harness Pills -->
+    <g transform="translate(22, 56)">
+      <rect width="276" height="44" rx="8" fill="#172036" stroke="#818cf8" stroke-width="1.2"/>
+      <text x="16" y="27" font-family="system-ui, sans-serif" font-size="13" font-weight="700" fill="#e0e7ff">1. OpenCode</text>
+      <text x="260" y="27" text-anchor="end" font-family="monospace" font-size="11" fill="#818cf8">opencode.json</text>
+    </g>
+    <g transform="translate(22, 110)">
+      <rect width="276" height="44" rx="8" fill="#172036" stroke="#818cf8" stroke-width="1.2"/>
+      <text x="16" y="27" font-family="system-ui, sans-serif" font-size="13" font-weight="700" fill="#e0e7ff">2. Claude Code</text>
+      <text x="260" y="27" text-anchor="end" font-family="monospace" font-size="11" fill="#818cf8">.claude/settings</text>
+    </g>
+    <g transform="translate(22, 164)">
+      <rect width="276" height="44" rx="8" fill="#172036" stroke="#818cf8" stroke-width="1.2"/>
+      <text x="16" y="27" font-family="system-ui, sans-serif" font-size="13" font-weight="700" fill="#e0e7ff">3. Hermes Agent</text>
+      <text x="260" y="27" text-anchor="end" font-family="monospace" font-size="11" fill="#818cf8">.hermes/plugins</text>
+    </g>
+    <g transform="translate(22, 218)">
+      <rect width="276" height="44" rx="8" fill="#172036" stroke="#818cf8" stroke-width="1.2"/>
+      <text x="16" y="27" font-family="system-ui, sans-serif" font-size="13" font-weight="700" fill="#e0e7ff">4. OpenAI Codex CLI</text>
+      <text x="260" y="27" text-anchor="end" font-family="monospace" font-size="11" fill="#818cf8">.codex/config</text>
+    </g>
+    <g transform="translate(22, 272)">
+      <rect width="276" height="44" rx="8" fill="#172036" stroke="#818cf8" stroke-width="1.2"/>
+      <text x="16" y="27" font-family="system-ui, sans-serif" font-size="13" font-weight="700" fill="#e0e7ff">5. GitHub Copilot CLI</text>
+      <text x="260" y="27" text-anchor="end" font-family="monospace" font-size="11" fill="#818cf8">.github/copilot</text>
+    </g>
+    <g transform="translate(22, 326)">
+      <rect width="276" height="44" rx="8" fill="#172036" stroke="#818cf8" stroke-width="1.2"/>
+      <text x="16" y="27" font-family="system-ui, sans-serif" font-size="13" font-weight="700" fill="#e0e7ff">6. OpenClaw Gateway</text>
+      <text x="260" y="27" text-anchor="end" font-family="monospace" font-size="11" fill="#818cf8">.openclaw/ws</text>
+    </g>
+  </g>
+
+  <!-- MIDDLE COLUMN: SUBAGENT CONTEXT PROPAGATION -->
+  <g transform="translate(395, 212)">
+    <rect width="410" height="388" rx="14" fill="#231124" stroke="#ec4899" stroke-width="2"/>
+    <rect width="410" height="40" rx="14" fill="#500724"/>
+    <text x="205" y="25" text-anchor="middle" font-family="system-ui, sans-serif" font-size="13.5" font-weight="800" fill="#f9a8d4">
+      SUBAGENTS NEVER SPAWN WITH A BLANK BRAIN
+    </text>
+
+    <!-- Parent Orchestrator Box -->
+    <rect x="28" y="56" width="354" height="66" rx="10" fill="#381236" stroke="#f472b6" stroke-width="1.5"/>
+    <text x="205" y="80" text-anchor="middle" font-family="system-ui, sans-serif" font-size="13.5" font-weight="800" fill="#fce7f3">
+      Parent Orchestrator Claims Task
+    </text>
+    <text x="205" y="102" text-anchor="middle" font-family="monospace" font-size="11.5" fill="#f9a8d4">
+      neurostrata_task_claim("neurostrata-wkpo")
+    </text>
+
+    <line x1="205" y1="122" x2="205" y2="148" stroke="#f472b6" stroke-width="2.5" marker-end="url(#arrowPink)"/>
+
+    <!-- Injection Block -->
+    <rect x="28" y="154" width="354" height="106" rx="10" fill="#170d1c" stroke="#ec4899" stroke-width="1.5" stroke-dasharray="5,3"/>
+    <text x="205" y="177" text-anchor="middle" font-family="monospace" font-size="12" font-weight="700" fill="#f472b6">
+      subagent_prompt_injection (Auto-Prepended)
+    </text>
+    <text x="44" y="199" font-family="monospace" font-size="11" fill="#fbcfe8">• Active Task Goal &amp; Namespace</text>
+    <text x="44" y="217" font-family="monospace" font-size="11" fill="#fbcfe8">• Pinned Golden Rules (Global + Project)</text>
+    <text x="44" y="235" font-family="monospace" font-size="11" fill="#fbcfe8">• 1-Hop AST Neighbors &amp; Conceptual Bridges</text>
+    <text x="44" y="251" font-family="monospace" font-size="11" fill="#fbcfe8">• Mandatory Graph-First Lookup Predicate</text>
+
+    <!-- Arrows to 3 Subagents -->
+    <line x1="110" y1="260" x2="80" y2="292" stroke="#f472b6" stroke-width="2" marker-end="url(#arrowPink)"/>
+    <line x1="205" y1="260" x2="205" y2="292" stroke="#f472b6" stroke-width="2" marker-end="url(#arrowPink)"/>
+    <line x1="300" y1="260" x2="330" y2="292" stroke="#f472b6" stroke-width="2" marker-end="url(#arrowPink)"/>
+
+    <!-- 3 Subagents -->
+    <g transform="translate(22, 298)">
+      <rect width="112" height="70" rx="8" fill="#381236" stroke="#f472b6" stroke-width="1.2"/>
+      <text x="56" y="28" text-anchor="middle" font-family="system-ui, sans-serif" font-size="12.5" font-weight="800" fill="#fce7f3">Worker</text>
+      <text x="56" y="46" text-anchor="middle" font-family="system-ui, sans-serif" font-size="10.5" fill="#f9a8d4">Knows all rules</text>
+      <text x="56" y="60" text-anchor="middle" font-family="system-ui, sans-serif" font-size="10.5" fill="#6ee7b7">✓ Zero amnesia</text>
+    </g>
+    <g transform="translate(149, 298)">
+      <rect width="112" height="70" rx="8" fill="#381236" stroke="#f472b6" stroke-width="1.2"/>
+      <text x="56" y="28" text-anchor="middle" font-family="system-ui, sans-serif" font-size="12.5" font-weight="800" fill="#fce7f3">Craftsman</text>
+      <text x="56" y="46" text-anchor="middle" font-family="system-ui, sans-serif" font-size="10.5" fill="#f9a8d4">Sees AST edges</text>
+      <text x="56" y="60" text-anchor="middle" font-family="system-ui, sans-serif" font-size="10.5" fill="#6ee7b7">✓ Safe refactors</text>
+    </g>
+    <g transform="translate(276, 298)">
+      <rect width="112" height="70" rx="8" fill="#381236" stroke="#f472b6" stroke-width="1.2"/>
+      <text x="56" y="28" text-anchor="middle" font-family="system-ui, sans-serif" font-size="12.5" font-weight="800" fill="#fce7f3">Checker</text>
+      <text x="56" y="46" text-anchor="middle" font-family="system-ui, sans-serif" font-size="10.5" fill="#f9a8d4">Verifies invariants</text>
+      <text x="56" y="60" text-anchor="middle" font-family="system-ui, sans-serif" font-size="10.5" fill="#6ee7b7">✓ Runs gates</text>
+    </g>
+  </g>
+
+  <!-- RIGHT COLUMN: SYNAPTIC MESH TEAM SYNC -->
+  <g transform="translate(840, 212)">
+    <rect width="320" height="388" rx="14" fill="#0b2620" stroke="#10b981" stroke-width="2"/>
+    <rect width="320" height="40" rx="14" fill="#064e3b"/>
+    <text x="160" y="25" text-anchor="middle" font-family="system-ui, sans-serif" font-size="13.5" font-weight="800" fill="#6ee7b7">
+      SYNAPTIC MESH (GIT TEAM SYNC)
+    </text>
+
+    <g transform="translate(22, 58)">
+      <rect width="276" height="88" rx="10" fill="#0f352c" stroke="#34d399" stroke-width="1.2"/>
+      <text x="16" y="26" font-family="system-ui, sans-serif" font-size="13" font-weight="800" fill="#a7f3d0">✓ What Crosses the Mesh</text>
+      <text x="16" y="46" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">• <tspan font-family="monospace" fill="#6ee7b7">eligibility: "shareable"</tspan> rules &amp; facts</text>
+      <text x="16" y="64" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">• Procedure definitions (stripped of</text>
+      <text x="16" y="79" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">  local runtime rehearsal counters)</text>
+    </g>
+
+    <g transform="translate(22, 162)">
+      <rect width="276" height="88" rx="10" fill="#17242a" stroke="#38bdf8" stroke-width="1.2"/>
+      <text x="16" y="26" font-family="system-ui, sans-serif" font-size="13" font-weight="800" fill="#7dd3fc">🔒 What Stays Strictly Local</text>
+      <text x="16" y="46" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">• Private memories &amp; sovereign IDs</text>
+      <text x="16" y="64" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">• Tasks, embeddings &amp; AST rows</text>
+      <text x="16" y="79" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">• Runtime counters (<tspan font-family="monospace" fill="#7dd3fc">remaining_fires</tspan>)</text>
+    </g>
+
+    <g transform="translate(22, 266)">
+      <rect width="276" height="102" rx="10" fill="#0f352c" stroke="#34d399" stroke-width="1.2"/>
+      <text x="16" y="26" font-family="system-ui, sans-serif" font-size="13" font-weight="800" fill="#a7f3d0">🛡️ Honesty &amp; Safety Discipline</text>
+      <text x="16" y="46" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">• Standard <tspan font-family="monospace" fill="#6ee7b7">git pull --ff-only</tspan> &amp; push</text>
+      <text x="16" y="64" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">• Never force-pushes or overwrites</text>
+      <text x="16" y="81" font-family="system-ui, sans-serif" font-size="11.5" fill="#cbd5e1">• Fail-soft queuing when offline</text>
+    </g>
+  </g>
+</svg>

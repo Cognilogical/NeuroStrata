@@ -16,6 +16,19 @@ And here is the best part: **100% of it is automated.** Your agent installs the 
 
 👉 **[Explore the Complete Feature & Benefit Catalog (`docs/FEATURES.md`)](docs/FEATURES.md)**
 
+---
+
+## Visual Overview: NeuroStrata at a Glance
+
+<p align="center">
+  <img src="docs/assets/infographics/hero-six-cognitive-strata.png" alt="NeuroStrata: One MCP Interface, Six Ways to Think" width="49%" />
+  <img src="docs/assets/infographics/hero-before-after-agent.png" alt="Ordinary AI Agent vs. NeuroStrata Agent" width="49%" />
+</p>
+
+![Why NeuroStrata — 5-Second Comparison](docs/assets/infographics/01-before-vs-after.svg)
+
+![One MCP Interface, Six Ways to Think](docs/assets/infographics/02-six-cognitive-organs.svg)
+
 
 
 ## How NeuroStrata Helps Your Agents Think (In Every Dimension)
@@ -31,6 +44,8 @@ Instead of burning tokens on blind `grep` loops and breaking callers three files
 - **Unified Six-Language AST + Rule Graph:** Incremental **Tree-sitter** parsing (Rust, TypeScript, TSX, Python, Go, Java) links functions, structs, classes, and imports directly to the architectural `[rule]` memories that govern them (`GOVERNS`, `DEPENDS_ON`, `calls`, `imports`).
 - **Automatic Graph-First Reflex:** Before editing a file, one deterministic lookup (`neurostrata_memories_for_file`, with `include_ast_edges` for the call-graph and blast radius) reveals every governing constraint and the transitive upstream/downstream impact.
 
+![Graph-First Blast Radius vs. Blind Grep](docs/assets/infographics/04-graph-first-blast-radius.svg)
+
 ### 3. Deductive & Semantic Thinking — *Exact W3C Logic When Fuzzy Search Isn't Enough*
 Vector similarity is great for concepts, but terrible for strict invariants. NeuroStrata embeds a native **W3C Semantic Web engine** (`oxrdf` / `oxttl` for the quads, `spargebra` for SPARQL 1.1, `shacl` for shapes) alongside its property graph:
 - **SPARQL 1.1 Queries (`SELECT` / `ASK` / `CONSTRUCT`):** Agents run exact multi-hop logical queries across code symbols, tasks, and domain rules (`neurostrata_sparql_query`).
@@ -43,11 +58,19 @@ Prompts get rationalized away; binary locks do not. NeuroStrata's **Central Exec
 - **Lock 2 — Done-Funnel Mandatory Extraction:** A task **cannot** transition to `done` (`neurostrata_task_complete`) unless the agent extracts at least one architectural rule or lesson into permanent memory. Every finished task makes the system smarter.
 - **Lock 1 — Pre-Push Git Gate:** `git push` runs `neurostrata-mcp task gate <namespace> --strict`. Any `in_progress` task, any `done` task without an extracted memory, or any P0 task open for more than 24 hours blocks the push automatically. Deferral wording is caught separately by the lexical task-intent detector, which nudges the agent to file a tracked task instead of letting it evaporate; the vocabulary it detects is listed in the [feature catalog](docs/FEATURES.md).
 
+<p align="center">
+  <img src="docs/assets/infographics/hero-three-soft-locks.png" alt="The Central Executive & 3 Resilient Soft Locks" width="85%" />
+</p>
+
+![The Central Executive & 3 Resilient Soft Locks](docs/assets/infographics/03-central-executive-locks.svg)
+
 ### 5. Collective & Subagent Thinking — *Subagents Never Spawn With a Blank Brain*
 When an orchestrator delegates to a subagent (`worker`, `checker`, `craftsman`, `Task`), context normally evaporates. NeuroStrata makes context propagation automatic:
 - **Auto-Retrieved Subagent Injection (`subagent_prompt_injection`):** Creating or claiming a task automatically runs a hybrid vector + 1-hop graph search and returns a ready-to-paste `subagent_prompt_injection` block containing the active Goal, governing `[rule]` constraints, and AST neighbors.
 - **Zero-Dependency Harness Interception:** Embedded plugins for **OpenCode**, **Claude Code**, **Hermes Agent**, **OpenAI Codex CLI**, **GitHub Copilot CLI**, and **OpenClaw** automatically prepend that context block into every spawned subagent call.
 - **Brokerless Team Sync (`SynapticMesh`):** Share approved rules and procedures across machines and teammates over standard `git push` and `git pull --ff-only` while keeping private memories sovereign on your disk.
+
+![Zero-Touch Setup, Subagent Injection & SynapticMesh](docs/assets/infographics/05-zero-touch-subagent-mesh.svg)
 
 ### 6. Predictive & Conscience Thinking — *Simulate State & Sandbox Risky Commands First*
 - **Digital Twins & Neuroplasticity Telemetry:** Agents model complex system state with versioned **Digital Twins** (`neurostrata_twin_set`, `neurostrata_twin_get`, `neurostrata_twin_list`, `neurostrata_twin_diff`) and read rolling time-series performance summaries (`neurostrata_metrics_query`, `neurostrata_metrics_list`).

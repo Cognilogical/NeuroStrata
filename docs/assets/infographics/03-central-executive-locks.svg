@@ -1,0 +1,224 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 620" width="100%" height="100%">
+  <defs>
+    <linearGradient id="bg3" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#090d16"/>
+      <stop offset="100%" stop-color="#111827"/>
+    </linearGradient>
+    <linearGradient id="feedbackGrad" x1="100%" y1="0%" x2="0%" y2="0%">
+      <stop offset="0%" stop-color="#10b981"/>
+      <stop offset="50%" stop-color="#8b5cf6"/>
+      <stop offset="100%" stop-color="#06b6d4"/>
+    </linearGradient>
+    <marker id="arrowCyan" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 9 5 L 0 9 z" fill="#38bdf8"/>
+    </marker>
+    <marker id="arrowAmber" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 9 5 L 0 9 z" fill="#fbbf24"/>
+    </marker>
+    <marker id="arrowViolet" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 9 5 L 0 9 z" fill="#a78bfa"/>
+    </marker>
+    <marker id="arrowEmerald" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 9 5 L 0 9 z" fill="#34d399"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1200" height="620" rx="18" fill="url(#bg3)"/>
+
+  <!-- Header -->
+  <text x="600" y="46" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="27" font-weight="800" fill="#f8fafc" letter-spacing="0.5">
+    THE CENTRAL EXECUTIVE &amp; 3 RESILIENT SOFT LOCKS
+  </text>
+  <text x="600" y="74" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="15" fill="#94a3b8">
+    Prompts get rationalized away; binary locks do not. Every completed task feeds a new lesson back into memory.
+  </text>
+
+  <!-- STAGE 1: ZERO-ACTION START (CYAN) -->
+  <g transform="translate(35, 110)">
+    <rect width="255" height="330" rx="14" fill="#0b2230" stroke="#06b6d4" stroke-width="2"/>
+    <rect width="255" height="42" rx="14" fill="#083344"/>
+    <text x="127" y="27" text-anchor="middle" font-family="system-ui, sans-serif" font-size="14" font-weight="800" fill="#67e8f9">
+      STAGE 1: ZERO-ACTION START
+    </text>
+
+    <circle cx="127" cy="88" r="28" fill="#0e4157" stroke="#22d3ee" stroke-width="2"/>
+    <text x="127" y="95" text-anchor="middle" font-family="system-ui, sans-serif" font-size="22" font-weight="800" fill="#a5f3fc">⚡</text>
+
+    <text x="127" y="138" text-anchor="middle" font-family="system-ui, sans-serif" font-size="14" font-weight="700" fill="#ecfeff">
+      Snapshot + Exclusive Claim
+    </text>
+
+    <text x="20" y="168" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
+      1. Agent calls <tspan font-family="monospace" fill="#67e8f9">get_snapshot</tspan> to load
+    </text>
+    <text x="20" y="185" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
+      Golden Rules &amp; project constraints.
+    </text>
+
+    <text x="20" y="213" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
+      2. Claims task via <tspan font-family="monospace" fill="#67e8f9">task_claim</tspan>
+    </text>
+    <text x="20" y="230" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
+      (60-min lease prevents collisions).
+    </text>
+
+    <text x="20" y="258" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
+      3. Auto-retrieves vector + 1-hop AST
+    </text>
+    <text x="20" y="275" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
+      context &amp; <tspan font-family="monospace" fill="#67e8f9">subagent_prompt_injection</tspan>.
+    </text>
+
+    <rect x="18" y="294" width="219" height="24" rx="6" fill="#164e63"/>
+    <text x="127" y="310" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" font-weight="700" fill="#67e8f9">
+      🚫 Edits Blocked Until Claimed
+    </text>
+  </g>
+
+  <!-- Arrow 1 -> 2 -->
+  <line x1="292" y1="275" x2="322" y2="275" stroke="#38bdf8" stroke-width="3" marker-end="url(#arrowCyan)"/>
+
+  <!-- STAGE 2: LOCK 3 — THE BREATH (AMBER) -->
+  <g transform="translate(327, 110)">
+    <rect width="255" height="330" rx="14" fill="#271c0c" stroke="#f59e0b" stroke-width="2"/>
+    <rect width="255" height="42" rx="14" fill="#451a03"/>
+    <text x="127" y="27" text-anchor="middle" font-family="system-ui, sans-serif" font-size="14" font-weight="800" fill="#fcd34d">
+      LOCK 3: THE BREATH PROMPT
+    </text>
+
+    <circle cx="127" cy="88" r="28" fill="#5c2804" stroke="#fbbf24" stroke-width="2"/>
+    <text x="127" y="95" text-anchor="middle" font-family="system-ui, sans-serif" font-size="22" font-weight="800" fill="#fef08a">🔒</text>
+
+    <text x="127" y="138" text-anchor="middle" font-family="system-ui, sans-serif" font-size="14" font-weight="700" fill="#fef3c7">
+      Working-Memory Checkpoints
+    </text>
+
+    <text x="20" y="168" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
+      1. Before touching any file, calls
+    </text>
+    <text x="20" y="185" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
+      <tspan font-family="monospace" fill="#fcd34d">memories_for_file</tspan> (blast radius).
+    </text>
+
+    <text x="20" y="213" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
+      2. Every 3–5 mutation steps, pauses
+    </text>
+    <text x="20" y="230" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
+      to append state via <tspan font-family="monospace" fill="#fcd34d">task_update</tspan>.
+    </text>
+
+    <text x="20" y="258" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
+      3. Lexical detector catches <tspan font-family="monospace" fill="#fcd34d">TODO:</tspan> or
+    </text>
+    <text x="20" y="275" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
+      deferral phrasing &amp; nudges task filing.
+    </text>
+
+    <rect x="18" y="294" width="219" height="24" rx="6" fill="#78350f"/>
+    <text x="127" y="310" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" font-weight="700" fill="#fde68a">
+      🚫 task_update Refuses status:"done"
+    </text>
+  </g>
+
+  <!-- Arrow 2 -> 3 -->
+  <line x1="584" y1="275" x2="614" y2="275" stroke="#fbbf24" stroke-width="3" marker-end="url(#arrowAmber)"/>
+
+  <!-- STAGE 3: LOCK 2 — DONE-FUNNEL (VIOLET) -->
+  <g transform="translate(619, 110)">
+    <rect width="255" height="330" rx="14" fill="#191438" stroke="#8b5cf6" stroke-width="2"/>
+    <rect width="255" height="42" rx="14" fill="#2e1065"/>
+    <text x="127" y="27" text-anchor="middle" font-family="system-ui, sans-serif" font-size="14" font-weight="800" fill="#c4b5fd">
+      LOCK 2: DONE-FUNNEL GATE
+    </text>
+
+    <circle cx="127" cy="88" r="28" fill="#3b0764" stroke="#a78bfa" stroke-width="2"/>
+    <text x="127" y="95" text-anchor="middle" font-family="system-ui, sans-serif" font-size="22" font-weight="800" fill="#ddd6fe">🧠</text>
+
+    <text x="127" y="138" text-anchor="middle" font-family="system-ui, sans-serif" font-size="14" font-weight="700" fill="#ede9fe">
+      Mandatory Memory Extraction
+    </text>
+
+    <text x="20" y="168" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
+      1. Only <tspan font-family="monospace" fill="#c4b5fd">task_complete</tspan> can transition
+    </text>
+    <text x="20" y="185" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
+      a task to <tspan font-family="monospace" fill="#c4b5fd">done</tspan>.
+    </text>
+
+    <text x="20" y="213" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
+      2. Requires an extracted <tspan font-family="monospace" fill="#c4b5fd">[rule]</tspan> or
+    </text>
+    <text x="20" y="230" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
+      <tspan font-family="monospace" fill="#c4b5fd">[fact]</tspan> linked via <tspan font-family="monospace" fill="#c4b5fd">EXTRACTED_FROM</tspan>.
+    </text>
+
+    <text x="20" y="258" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
+      3. Anchors the new rule to governed
+    </text>
+    <text x="20" y="275" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
+      files (<tspan font-family="monospace" fill="#c4b5fd">GOVERNS</tspan>) for future sessions.
+    </text>
+
+    <rect x="18" y="294" width="219" height="24" rx="6" fill="#4c1d95"/>
+    <text x="127" y="310" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" font-weight="700" fill="#ddd6fe">
+      🚫 0 Memories = BLOCKED (Lock 2)
+    </text>
+  </g>
+
+  <!-- Arrow 3 -> 4 -->
+  <line x1="876" y1="275" x2="906" y2="275" stroke="#a78bfa" stroke-width="3" marker-end="url(#arrowViolet)"/>
+
+  <!-- STAGE 4: LOCK 1 — PRE-PUSH GIT GATE (EMERALD) -->
+  <g transform="translate(911, 110)">
+    <rect width="255" height="330" rx="14" fill="#0b2620" stroke="#10b981" stroke-width="2"/>
+    <rect width="255" height="42" rx="14" fill="#064e3b"/>
+    <text x="127" y="27" text-anchor="middle" font-family="system-ui, sans-serif" font-size="14" font-weight="800" fill="#6ee7b7">
+      LOCK 1: PRE-PUSH GIT GATE
+    </text>
+
+    <circle cx="127" cy="88" r="28" fill="#065f46" stroke="#34d399" stroke-width="2"/>
+    <text x="127" y="95" text-anchor="middle" font-family="system-ui, sans-serif" font-size="22" font-weight="800" fill="#a7f3d0">🛡️</text>
+
+    <text x="127" y="138" text-anchor="middle" font-family="system-ui, sans-serif" font-size="14" font-weight="700" fill="#d1fae5">
+      Strict Repository Verification
+    </text>
+
+    <text x="20" y="168" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
+      1. <tspan font-family="monospace" fill="#6ee7b7">.git/hooks/pre-push</tspan> runs
+    </text>
+    <text x="20" y="185" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
+      <tspan font-family="monospace" fill="#6ee7b7">neurostrata-mcp task gate --strict</tspan>.
+    </text>
+
+    <text x="20" y="213" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
+      2. Verifies 0 active <tspan font-family="monospace" fill="#6ee7b7">in_progress</tspan> tasks,
+    </text>
+    <text x="20" y="230" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
+      all <tspan font-family="monospace" fill="#6ee7b7">done</tspan> tasks have memories, 0 stale P0s.
+    </text>
+
+    <text x="20" y="258" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
+      3. Mirrors shareable rules to team
+    </text>
+    <text x="20" y="275" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">
+      via <tspan font-family="monospace" fill="#6ee7b7">SynapticMesh</tspan> automatically.
+    </text>
+
+    <rect x="18" y="294" width="219" height="24" rx="6" fill="#065f46"/>
+    <text x="127" y="310" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" font-weight="700" fill="#a7f3d0">
+      ✓ Verified git push Succeeds
+    </text>
+  </g>
+
+  <!-- SELF-IMPROVING FLYWHEEL LOOP AT BOTTOM -->
+  <path d="M 746 442 L 746 535 Q 746 555 726 555 L 182 555 Q 162 555 162 535 L 162 450" fill="none" stroke="url(#feedbackGrad)" stroke-width="3.5" marker-end="url(#arrowCyan)"/>
+
+  <rect x="290" y="528" width="520" height="52" rx="26" fill="#1e1b4b" stroke="#818cf8" stroke-width="2"/>
+  <text x="550" y="550" text-anchor="middle" font-family="system-ui, sans-serif" font-size="13.5" font-weight="800" fill="#e0e7ff">
+    ♻️ THE COMPOUNDING COGNITIVE FLYWHEEL
+  </text>
+  <text x="550" y="569" text-anchor="middle" font-family="system-ui, sans-serif" font-size="12" fill="#a5b4fc">
+    Extracted rules from Lock 2 immediately surface in Stage 1 (<tspan font-family="monospace">get_snapshot</tspan>) on the next task!
+  </text>
+</svg>
