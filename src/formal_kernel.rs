@@ -639,3 +639,57 @@ pub const fn retention_verdict_tag(v: KernelRetentionVerdict) -> &'static str {
         KernelRetentionVerdict::FailedWorktreeMoved => "failed_worktree_moved",
     }
 }
+
+/// Claim scope gate verdict for strict pre-push evaluation of an `in_progress` task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelClaimScopeVerdict {
+    BlockUnscoped,
+    BlockUncapturableScope,
+    BlockLegacyUnattributed,
+    BlockBranchMatch,
+    BlockWorktreeMatch,
+    AllowIsolatedScope,
+}
+
+impl KernelClaimScopeVerdict {
+    pub const fn blocks(self) -> bool {
+        !matches!(self, KernelClaimScopeVerdict::AllowIsolatedScope)
+    }
+}
+
+/// Evaluates whether a live `in_progress` task claim blocks the caller's push scope.
+pub const fn evaluate_claim_scope_gate(
+    scoped: bool,
+    caller_identifiable: bool,
+    claim_attributed: bool,
+    branch_matches: bool,
+    worktree_matches: bool,
+) -> KernelClaimScopeVerdict {
+    if !scoped {
+        KernelClaimScopeVerdict::BlockUnscoped
+    } else if !caller_identifiable {
+        KernelClaimScopeVerdict::BlockUncapturableScope
+    } else if !claim_attributed {
+        KernelClaimScopeVerdict::BlockLegacyUnattributed
+    } else if branch_matches {
+        KernelClaimScopeVerdict::BlockBranchMatch
+    } else if worktree_matches {
+        KernelClaimScopeVerdict::BlockWorktreeMatch
+    } else {
+        KernelClaimScopeVerdict::AllowIsolatedScope
+    }
+}
+
+/// Tag string for a claim scope gate verdict: "block_unscoped",
+/// "block_uncapturable_scope", "block_legacy_unattributed",
+/// "block_branch_match", "block_worktree_match", "allow_isolated_scope".
+pub const fn claim_scope_verdict_tag(v: KernelClaimScopeVerdict) -> &'static str {
+    match v {
+        KernelClaimScopeVerdict::BlockUnscoped => "block_unscoped",
+        KernelClaimScopeVerdict::BlockUncapturableScope => "block_uncapturable_scope",
+        KernelClaimScopeVerdict::BlockLegacyUnattributed => "block_legacy_unattributed",
+        KernelClaimScopeVerdict::BlockBranchMatch => "block_branch_match",
+        KernelClaimScopeVerdict::BlockWorktreeMatch => "block_worktree_match",
+        KernelClaimScopeVerdict::AllowIsolatedScope => "allow_isolated_scope",
+    }
+}

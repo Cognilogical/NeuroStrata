@@ -7,6 +7,7 @@ open NeuroStrata.Sovereignty
 open NeuroStrata.Procedure
 open NeuroStrata.TwinCrdt
 open NeuroStrata.Retention
+open NeuroStrata.TaskGate
 
 def boolToStr (b : Bool) : String := if b then "true" else "false"
 
@@ -73,3 +74,10 @@ def main : IO Unit := do
           for matchesWt in [false, true] do
             let tag := evaluateRetentionGate budget nonEmpty found bound matchesWt |>.asTag
             IO.println s!"RETENTION_GATE|{boolToStr budget}|{boolToStr nonEmpty}|{boolToStr found}|{boolToStr bound}|{boolToStr matchesWt}|{tag}"
+  for isScoped in [false, true] do
+    for callerId in [false, true] do
+      for claimAttr in [false, true] do
+        for branchMatch in [false, true] do
+          for wtMatch in [false, true] do
+            let tag := evaluateClaimScopeGate isScoped callerId claimAttr branchMatch wtMatch |>.asTag
+            IO.println s!"CLAIM_SCOPE_GATE|{boolToStr isScoped}|{boolToStr callerId}|{boolToStr claimAttr}|{boolToStr branchMatch}|{boolToStr wtMatch}|{tag}"

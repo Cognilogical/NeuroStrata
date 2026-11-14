@@ -7,7 +7,7 @@
 //! Three contracts:
 //! 1. the kernel compiles standalone with zero `--extern` flags (Aeneas/Charon
 //!    extractability precondition);
-//! 2. the exhaustive 389-row truth table produced by the Rust kernel equals the
+//! 2. the exhaustive 421-row truth table produced by the Rust kernel equals the
 //!    one emitted by `lake --dir proofs exe neurostrata-proofs`;
 //! 3. no Lean proof source carries a `sorry` placeholder or an `axiom`.
 
@@ -21,12 +21,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use formal_kernel::{
-    classify_merge_decision_tag, claim_decision_tag, evaluate_claim_decision,
-    evaluate_import_precheck, evaluate_procedure_fire, evaluate_retention_gate,
-    evaluate_seq_continuity, evaluate_sovereignty_gate, epoch_gate_tag,
-    import_precheck_tag, join_task_status, lifecycle_can_transition, procedure_fire_tag,
-    retention_verdict_tag, seq_decision_tag, sovereignty_decision_tag, task_step_tag,
-    KernelProcedureTrust,
+    classify_merge_decision_tag, claim_decision_tag, claim_scope_verdict_tag,
+    evaluate_claim_decision, evaluate_claim_scope_gate, evaluate_import_precheck,
+    evaluate_procedure_fire, evaluate_retention_gate, evaluate_seq_continuity,
+    evaluate_sovereignty_gate, epoch_gate_tag, import_precheck_tag, join_task_status,
+    lifecycle_can_transition, procedure_fire_tag, retention_verdict_tag, seq_decision_tag,
+    sovereignty_decision_tag, task_step_tag, KernelProcedureTrust,
 };
 
 /// The statuses in the exact order used by `proofs/Main.lean`.
@@ -58,10 +58,10 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// Generates the canonical 389-line truth table in `proofs/Main.lean` order:
-/// 64 `TASK_FSM` + 16 `LIFECYCLE` + 128 `MESH_MERGE` + 3 `EPOCH_GATE` + 24 `TASK_CLAIM` + 32 `SOVEREIGNTY_GATE` + 8 `IMPORT_PRECHECK` + 60 `PROCEDURE_FIRE` + 16 `TWIN_CRDT_STATUS` + 6 `TWIN_CRDT_SEQ` + 32 `RETENTION_GATE`.
+/// Generates the canonical 421-line truth table in `proofs/Main.lean` order:
+/// 64 `TASK_FSM` + 16 `LIFECYCLE` + 128 `MESH_MERGE` + 3 `EPOCH_GATE` + 24 `TASK_CLAIM` + 32 `SOVEREIGNTY_GATE` + 8 `IMPORT_PRECHECK` + 60 `PROCEDURE_FIRE` + 16 `TWIN_CRDT_STATUS` + 6 `TWIN_CRDT_SEQ` + 32 `RETENTION_GATE` + 32 `CLAIM_SCOPE_GATE`.
 fn generate_rust_truth_table() -> Vec<String> {
-    let mut lines: Vec<String> = Vec::with_capacity(389);
+    let mut lines: Vec<String> = Vec::with_capacity(421);
 
     for &from in TASK_STATUSES.iter() {
         for &to in TASK_STATUSES.iter() {
@@ -266,6 +266,34 @@ fn generate_rust_truth_table() -> Vec<String> {
         }
     }
 
+    // CLAIM_SCOPE_GATE: 32 rows (5 booleans)
+    for &is_scoped in [false, true].iter() {
+        for &caller_id in [false, true].iter() {
+            for &claim_attr in [false, true].iter() {
+                for &branch_match in [false, true].iter() {
+                    for &wt_match in [false, true].iter() {
+                        let tag = claim_scope_verdict_tag(evaluate_claim_scope_gate(
+                            is_scoped,
+                            caller_id,
+                            claim_attr,
+                            branch_match,
+                            wt_match,
+                        ));
+                        lines.push(format!(
+                            "CLAIM_SCOPE_GATE|{}|{}|{}|{}|{}|{}",
+                            bool_str(is_scoped),
+                            bool_str(caller_id),
+                            bool_str(claim_attr),
+                            bool_str(branch_match),
+                            bool_str(wt_match),
+                            tag
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     lines
 }
 
@@ -317,14 +345,14 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
     let rust_lines = generate_rust_truth_table();
     assert_eq!(
         rust_lines.len(),
-        389,
-        "expected 389 canonical lines (64+16+128+3+24+32+8+60+16+6+32)"
+        421,
+        "expected 421 canonical lines (64+16+128+3+24+32+8+60+16+6+32+32)"
     );
 
     // Section-count verification: 64 TASK_FSM + 16 LIFECYCLE + 128 MESH_MERGE
     // + 3 EPOCH_GATE + 24 TASK_CLAIM + 32 SOVEREIGNTY_GATE + 8 IMPORT_PRECHECK
-    // + 60 PROCEDURE_FIRE + 16 TWIN_CRDT_STATUS + 6 TWIN_CRDT_SEQ + 32 RETENTION_GATE,
-    // matching the exact generation order in `proofs/Main.lean`.
+    // + 60 PROCEDURE_FIRE + 16 TWIN_CRDT_STATUS + 6 TWIN_CRDT_SEQ + 32 RETENTION_GATE
+    // + 32 CLAIM_SCOPE_GATE, matching the exact generation order in `proofs/Main.lean`.
     let section_counts = rust_lines
         .iter()
         .fold(HashMap::new(), |mut acc, line| {
@@ -385,6 +413,11 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
         *section_counts.get("RETENTION_GATE").unwrap_or(&0),
         32,
         "expected 32 RETENTION_GATE rows"
+    );
+    assert_eq!(
+        *section_counts.get("CLAIM_SCOPE_GATE").unwrap_or(&0),
+        32,
+        "expected 32 CLAIM_SCOPE_GATE rows"
     );
 
     let lake = find_lake().expect("lake not found on PATH or ~/.elan/bin/lake; install elan to run Lean parity tests");
@@ -454,6 +487,12 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
         "TWIN_CRDT_SEQ|false|3|buffer_out_of_order",
         "RETENTION_GATE|true|true|true|true|false|failed_worktree_moved",
         "RETENTION_GATE|true|true|true|true|true|retained",
+        "CLAIM_SCOPE_GATE|false|true|true|true|true|block_unscoped",
+        "CLAIM_SCOPE_GATE|true|false|true|false|false|block_uncapturable_scope",
+        "CLAIM_SCOPE_GATE|true|true|false|false|false|block_legacy_unattributed",
+        "CLAIM_SCOPE_GATE|true|true|true|true|false|block_branch_match",
+        "CLAIM_SCOPE_GATE|true|true|true|false|true|block_worktree_match",
+        "CLAIM_SCOPE_GATE|true|true|true|false|false|allow_isolated_scope",
     ] {
         assert!(
             rust_lines.iter().any(|l| l == expected),

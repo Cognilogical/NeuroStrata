@@ -1029,9 +1029,22 @@ fn git_toplevel() -> Option<std::path::PathBuf> {
 /// Section 5.1, path 2: no daemon to ask, so open the database for the
 /// metadata-only read. Dimensions come from config -- loading the embedding
 /// model would turn a `git push` into a model download.
+fn task_gate_request(
+    namespace: &str,
+    strict: bool,
+    scope: &crate::task::gate::GateScope,
+) -> serde_json::Value {
+    serde_json::json!({
+        "namespace": namespace,
+        "strict": strict,
+        "scope": scope,
+    })
+}
+
 async fn direct_report(
     config: &Config,
     namespace: &str,
+    scope: Option<&crate::task::gate::GateScope>,
 ) -> Result<crate::task::gate::GateReport, String> {
     let dimensions = embed::configured_dimensions().map_err(|e| {
         format!(
@@ -1048,7 +1061,7 @@ async fn direct_report(
         .await
         .map_err(|e| format!("the schema could not be opened: {}", e))?;
     let namespace = crate::server::resolve_namespace(&store, namespace).await;
-    crate::task::gate::run(&store, &namespace)
+    crate::task::gate::run_scoped(&store, &namespace, scope)
         .await
         .map_err(|e| format!("the gate could not list the tasks: {}", e))
 }
@@ -2860,6 +2873,26 @@ mod tests {
         assert!(gate_verify_daemon(None, own).is_err());
     }
 
+    #[test]
+    fn strict_gate_request_carries_the_callers_git_scope() {
+        let scope = crate::task::gate::GateScope {
+            branch: Some("release/v1.17.3".to_string()),
+            worktree: Some("/repo/release".to_string()),
+        };
+        let body = task_gate_request("NeuroStrata", true, &scope);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "namespace": "NeuroStrata",
+                "strict": true,
+                "scope": {
+                    "branch": "release/v1.17.3",
+                    "worktree": "/repo/release",
+                },
+            })
+        );
+    }
+
     /// An embedder serving ModelB at the fixture width: its descriptor
     /// is the shape `FastEmbedder::embedding_descriptor` produces for
     /// the ModelB entry, matching the descriptor the store synthesizes
@@ -4542,6 +4575,8 @@ async fn run() -> anyhow::Result<()> {
                         return Ok(());
                     }
 
+                    let cwd = std::env::current_dir().unwrap_or_default();
+                    let scope = crate::task::gate::GateScope::capture(&cwd);
                     let outcome: Result<serde_json::Value, String> = if probe
                         == DaemonProbe::Responsive
                     {
@@ -4558,10 +4593,7 @@ async fn run() -> anyhow::Result<()> {
                             Err(e) => Err(e),
                             Ok(()) => match daemon_http_client()
                                 .post("http://127.0.0.1:34343/tasks/gate")
-                                .json(&serde_json::json!({
-                                    "namespace": namespace,
-                                    "strict": strict,
-                                }))
+                                .json(&task_gate_request(&namespace, strict, &scope))
                                 .timeout(std::time::Duration::from_secs(10))
                                 .send()
                                 .await
@@ -4601,12 +4633,11 @@ async fn run() -> anyhow::Result<()> {
                                 } else if probe == DaemonProbe::Silent {
                                     Err("nothing answered on 127.0.0.1:34343 within 500ms, so a daemon may be busy in the database; not opening it".to_string())
                                 } else {
-                                    let cwd = std::env::current_dir().unwrap_or_default();
                                     let line = crate::task::hook_hygiene(&cwd);
                                     if !line.is_empty() {
                                         println!("{}", line);
                                     }
-                                    direct_report(&config, &namespace)
+                                    direct_report(&config, &namespace, Some(&scope))
                                         .await
                                         .map(|report| report.gate_json())
                                 }
@@ -4742,7 +4773,7 @@ async fn run() -> anyhow::Result<()> {
                                     namespace, DAEMON_BUSY_MESSAGE
                                 );
                             }
-                            Ok(config) => match direct_report(&config, &namespace).await {
+                            Ok(config) => match direct_report(&config, &namespace, None).await {
                                 Ok(report) => {
                                     println!(
                                         "{}",
