@@ -542,11 +542,17 @@ impl MeshReactor {
         frame: &MeshFrame,
         key: (String, u64),
     ) -> Result<(), ReactorApplyError> {
-        let _ = self
-            .lamport_clock
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |curr| {
-                Some(curr.max(frame.lamport_ts) + 1)
-            });
+        loop {
+            let curr = self.lamport_clock.load(Ordering::SeqCst);
+            let next = curr.max(frame.lamport_ts) + 1;
+            if self
+                .lamport_clock
+                .compare_exchange_weak(curr, next, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                break;
+            }
+        }
         self.seen_frames
             .lock()
             .map_err(|_| ReactorApplyError::Storage("seen_frames lock poisoned".into()))?

@@ -85,12 +85,12 @@ tracing = "0.1"
 
 futures = "0.3.34"
 dirs = "7.0.0"
-toml = "1.1.6"
+toml = "1.2.1"
 dunce = "1"
-uuid = { version = "1.26", features = ["v4", "v5", "v7", "serde"] }
+uuid = { version = "1.29", features = ["v4", "v5", "v7", "serde"] }
 chrono = { version = "0.4.45", features = ["serde"] }
 tree-sitter = "0.27.1"
-ignore = "0.4.33"
+ignore = "0.4.34"
 tree-sitter-rust = "0.24.2"
 tree-sitter-typescript = "0.23.2"
 tree-sitter-python = "0.25.0"
@@ -98,7 +98,7 @@ tree-sitter-go = "0.25.0"
 tree-sitter-java = "0.23.5"
 regex = "1.13"
 tempfile = "3.14"
-cxx = "=1.0.138"
+cxx = "1.0.197"
 lbug = "0.22.3"
 arc-swap = "1"
 axum = "0.8"
@@ -131,14 +131,14 @@ shacl = "0.3"
 # libssl/libcrypto on every target (its C++ core hard-requires OpenSSL), so
 # Windows now needs a vendored build to satisfy the linker. Apple targets keep
 # the system-path resolution that already works.
-ort = { version = "2.0.0-rc.13" }
+ort = { version = "2.0.0-rc.15" }
 tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }
 ndarray = { version = "0.17.2" }
 petgraph = { version = "0.8" }
 leiden-rs = { version = "0.8", default-features = false, features = ["petgraph"] }
 rand = { version = "0.10" }
 tantivy = { version = "0.27" }
-openssl = { version = "0.10.81", features = ["vendored"] }
+openssl = { version = "0.10.82", features = ["vendored"] }
 
 [dev-dependencies]
 # Already in the tree as axum's transitive dependency (same version in
@@ -147,7 +147,7 @@ openssl = { version = "0.10.81", features = ["vendored"] }
 tower = { version = "0.5", features = ["util"] }
 
 [build-dependencies]
-cxx-build = "=1.0.138"
+cxx-build = "1.0.197"
 
 [features]
 default = []

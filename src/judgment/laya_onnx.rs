@@ -98,7 +98,8 @@ impl LayaOnnxProvider {
 
         // Build session directly from file (local-first; graceful on bad model).
         let inference_session = {
-            let builder = Session::builder();
+            let builder = crate::embed::shared_ort_environment()
+                .and_then(|env| Session::builder(env).map_err(|e| anyhow!("{e}")));
             match builder {
                 Err(e) => {
                     tracing::warn!("LayaOnnx failed to build ORT session: {e}");

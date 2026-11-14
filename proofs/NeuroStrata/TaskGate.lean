@@ -74,7 +74,7 @@ def hasDoneWithoutExtractionViolation (r : Row) (rows : List Row) (now : Int) : 
 theorem isRetired_boundary_inclusive : ∀ (r : Row) (now : Int),
     r.validTo = some now → isRetired r now = true := by
   intro r now hvt
-  simp [isRetired, hvt, Int.le_refl]
+  simp [isRetired, hvt]
 
 theorem isRetired_none_stays_live : ∀ (r : Row) (now : Int),
     r.validTo = none → isRetired r now = false := by
@@ -150,9 +150,7 @@ theorem liveSuccessor_two_node_cycle_returns_none (now : Int) :
     let rB : Row := ⟨1, true, .done, some now, some 0, [0], [], false⟩
     liveSuccessor 32 [] (some 0) [rA, rB] now = none := by
   intro rA rB
-  have hretA : isRetired rA now = true := isRetired_boundary_inclusive rA now rfl
-  have hretB : isRetired rB now = true := isRetired_boundary_inclusive rB now rfl
-  simp [liveSuccessor, findRow, hretA, hretB]
+  simp [liveSuccessor, findRow, isRetired, rA, rB]
 
 inductive ClaimScopeVerdict where
   | blockUnscoped
