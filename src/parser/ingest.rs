@@ -717,7 +717,7 @@ fn run_producer(
                     let mut name: Option<&str> = None;
                     let mut definition: Option<tree_sitter::Node> = None;
 
-                    for capture in m.captures {
+                    for capture in m.captures() {
                         let capture_name = query.capture_names()[capture.index as usize];
                         if capture_name == "name" {
                             name = capture.node.utf8_text(content.as_bytes()).ok();
