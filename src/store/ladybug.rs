@@ -1210,6 +1210,8 @@ pub struct LadybugStore {
     dimensions: usize,
     db: Arc<Database>,
     dirty: Dirty,
+    /// Set by `stop_checkpoints_after_pool_failure`; no checkpoint runs after.
+    checkpoints_stopped: Arc<std::sync::atomic::AtomicBool>,
     /// LadybugDB allows exactly one write transaction and REFUSES a second
     /// rather than queueing it, so two writers that overlap produce "Cannot
     /// start a new write transaction in the system" for whichever arrives
@@ -1558,6 +1560,58 @@ fn explain_engine_error(e: anyhow::Error) -> anyhow::Error {
     )
 }
 
+/// After a checkpoint runs out of buffer pool, stop checkpointing for the rest
+/// of this process. Such a checkpoint fails part way, keeps the pages it had
+/// already added to ladybug.db, and leaves the WAL as it was, so every retry
+/// fails the same way and grows the file again. The engine retries after each
+/// write commit once the WAL is past its auto-checkpoint threshold (16 MB), and
+/// the daemon every 30 s, so the file keeps growing for as long as writes come in.
+/// The writes stay in the WAL, and a restart with a bigger pool checkpoints them.
+///
+/// `explicit` is our own CHECKPOINT; otherwise only the engine's post-commit
+/// checkpoint counts, not an ordinary query that ran out of pool.
+fn stop_checkpoints_after_pool_failure(
+    conn: &Connection,
+    stopped: &std::sync::atomic::AtomicBool,
+    err: &anyhow::Error,
+    explicit: bool,
+) {
+    let text = err.to_string();
+    if !text.contains("buffer pool is full")
+        || !(explicit || text.contains("post-commit checkpoint failed"))
+        || stopped.swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        return;
+    }
+    if let Err(e) = conn.query("CALL auto_checkpoint=false") {
+        tracing::warn!("could not turn off the engine's auto-checkpoint: {e}");
+    }
+    // The engine also checkpoints when the database closes.
+    if let Err(e) = conn.query("CALL force_checkpoint_on_close=false") {
+        tracing::warn!("could not turn off the engine's checkpoint on close: {e}");
+    }
+    eprintln!(
+        "WARNING: a checkpoint ran out of buffer pool. Each failed attempt leaves pages behind in \
+         ladybug.db, so checkpoints are off until restart; writes still reach the write-ahead log. \
+         Raise NEUROSTRATA_BUFFER_POOL_MB (or storage_hygiene.buffer_pool_mb; 0 lets the engine \
+         size it) and restart to checkpoint them."
+    );
+}
+
+/// Our CHECKPOINT, skipped once checkpoints are stopped and stopping them on
+/// a buffer-pool failure. Runs under the connection lock, so a write that
+/// stopped them while this waited is seen.
+fn guarded_checkpoint(conn: &Connection, stopped: &std::sync::atomic::AtomicBool) -> Result<()> {
+    if stopped.load(std::sync::atomic::Ordering::Acquire) {
+        anyhow::bail!("checkpoint skipped: an earlier one ran out of buffer pool");
+    }
+    let result = conn.query("CHECKPOINT").map(|_| ()).map_err(anyhow::Error::from);
+    if let Err(e) = &result {
+        stop_checkpoints_after_pool_failure(conn, stopped, e, true);
+    }
+    result
+}
+
 #[cfg(test)]
 mod buffer_pool_tests {
     use super::*;
@@ -1660,6 +1714,94 @@ mod buffer_pool_tests {
         }
         assert!(advised > 0, "no search failed with the advice; the pool may be big enough here");
     }
+
+    /// A WAL too large for the pool to checkpoint, as one big relink leaves it:
+    /// without the stop, each write's post-commit checkpoint and each periodic
+    /// checkpoint failed again and grew the file each time.
+    #[tokio::test]
+    async fn a_checkpoint_out_of_pool_is_not_retried() {
+        use crate::traits::VectorStore;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("ladybug.db");
+        let pool = |mb: u64| {
+            SystemConfig::default()
+                .max_db_size(512 * 1024 * 1024)
+                .buffer_pool_size(mb * 1024 * 1024)
+        };
+        {
+            let store = LadybugStore::with_system_config(&path, 4, pool(256)).unwrap();
+            store
+                .with_conn(|c| {
+                    c.query(
+                        "CREATE NODE TABLE M (id STRING, content STRING, meta STRING, emb FLOAT[256], PRIMARY KEY (id))",
+                    )?;
+                    for start in (0..8000).step_by(2000) {
+                        c.query(&format!(
+                            "UNWIND range({start}, {}) AS k CREATE (:M {{id: 'id' + string(k), \
+                             content: 'content number ' + string(k) + ' lorem ipsum dolor sit amet', \
+                             meta: '{{\"k\":' + string(k) + '}}', \
+                             emb: cast(list_transform(range(1, 256), x -> to_double(x + k) / 1000.0), 'FLOAT[256]')}})",
+                            start + 1999
+                        ))?;
+                    }
+                    c.query("CHECKPOINT")?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+        let store = LadybugStore::with_system_config(&path, 4, pool(32)).unwrap();
+        store
+            .with_conn(|c| {
+                // Many small transactions with no checkpoint between them.
+                c.query("CALL auto_checkpoint=false")?;
+                for a in 1..=9 {
+                    for b in 0..=9 {
+                        c.query(&format!(
+                            "MATCH (m:M) WHERE m.id STARTS WITH 'id{a}{b}' SET m.meta = m.meta + 'x', m.content = m.content + 'y', m.emb = m.emb"
+                        ))?;
+                    }
+                }
+                c.query("CALL auto_checkpoint=true")?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let size = || std::fs::metadata(&path).unwrap().len();
+        let before = size();
+        let mut failed_writes = 0;
+        for i in 0..8 {
+            let q = format!("MATCH (m:M {{id: 'id{i}'}}) SET m.meta = 'small'");
+            if store.with_conn(move |c| c.query(&q).map(|_| ()).map_err(Into::into)).await.is_err() {
+                failed_writes += 1;
+            }
+        }
+        let mut failed_checkpoints = 0;
+        for _ in 0..4 {
+            if store.checkpoint().await.is_err() {
+                failed_checkpoints += 1;
+            }
+            // A backup checkpoints first; it must not retry either.
+            let export = root.path().join("export");
+            if store.export_database(export.to_str().unwrap()).await.is_err() {
+                failed_checkpoints += 1;
+            }
+        }
+        let grown = size() - before;
+        eprintln!("grew {grown} bytes; {failed_writes} writes and {failed_checkpoints} checkpoints failed");
+        assert_eq!(failed_checkpoints, 8, "the WAL fit the pool; nothing was tested");
+        assert!(failed_writes <= 1, "{failed_writes} writes hit a failing post-commit checkpoint");
+        assert!(grown < 1024 * 1024, "ladybug.db grew {grown} bytes over failed checkpoints");
+
+        // Closing must not retry it either: the engine checkpoints on close
+        // unless told not to.
+        let at_stop = size();
+        drop(store);
+        let on_close = size() as i64 - at_stop as i64;
+        eprintln!("close changed ladybug.db by {on_close} bytes");
+        assert_eq!(on_close, 0, "closing the store retried the checkpoint");
+    }
 }
 
 /// Recovery open, used only after verification has already failed. The engine
@@ -1755,7 +1897,8 @@ fn preserve_unclean_wal(local_path: &std::path::Path) {
 
 impl Drop for LadybugStore {
     fn drop(&mut self) {
-        if self.dirty.take() {
+        let stopped = self.checkpoints_stopped.load(std::sync::atomic::Ordering::Acquire);
+        if self.dirty.take() && !stopped {
             if let Ok(conn) = Connection::new(&self.db) {
                 if let Err(e) = conn.query("CHECKPOINT;") {
                     tracing::warn!("LadybugStore drop CHECKPOINT failed: {e}");
@@ -2457,6 +2600,7 @@ impl LadybugStore {
             dimensions,
             db: Arc::new(db),
             dirty: Dirty::default(),
+            checkpoints_stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             schema_ready: std::sync::atomic::AtomicBool::new(false),
             ontology: Arc::new(arc_swap::ArcSwap::from_pointee(
@@ -3071,6 +3215,7 @@ impl LadybugStore {
     {
         let write_lock = Arc::clone(&self.write_lock);
         let db = self.db.clone();
+        let stopped = Arc::clone(&self.checkpoints_stopped);
 
         let outcome = bounded(what, write_timeout(), async move {
             // One writer at a time, because the engine refuses the second
@@ -3088,7 +3233,7 @@ impl LadybugStore {
             let mut attempt = 0;
             loop {
                 let (returned, result) =
-                    Self::write_owning_turn(db.clone(), turn, f.clone()).await?;
+                    Self::write_owning_turn(db.clone(), stopped.clone(), turn, f.clone()).await?;
                 turn = returned;
 
                 match result {
@@ -3132,6 +3277,7 @@ impl LadybugStore {
     /// should be allowed to start.
     async fn write_owning_turn<T, F>(
         db: Arc<Database>,
+        stopped: Arc<std::sync::atomic::AtomicBool>,
         turn: tokio::sync::OwnedMutexGuard<()>,
         f: F,
     ) -> Result<(tokio::sync::OwnedMutexGuard<()>, Result<T>)>
@@ -3152,7 +3298,11 @@ impl LadybugStore {
             }
             let outcome = (|| -> Result<T> {
                 let conn = Connection::new(&db)?;
-                f(&conn)
+                let result = f(&conn);
+                if let Err(e) = &result {
+                    stop_checkpoints_after_pool_failure(&conn, &stopped, e, false);
+                }
+                result
             })()
             .map_err(explain_engine_error);
             ENGINE_CALLS_FINISHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3180,6 +3330,7 @@ impl LadybugStore {
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,
     {
         let db = self.db.clone();
+        let stopped = Arc::clone(&self.checkpoints_stopped);
         // Held across the engine call on purpose: lbug's C++
         // DictionaryColumn::scan / BufferManager::optimisticRead segfaults
         // when a read Connection races a concurrent write Connection on the
@@ -3198,7 +3349,11 @@ impl LadybugStore {
             }
             let outcome = (|| -> Result<T> {
                 let conn = Connection::new(&db)?;
-                f(&conn)
+                let result = f(&conn);
+                if let Err(e) = &result {
+                    stop_checkpoints_after_pool_failure(&conn, &stopped, e, false);
+                }
+                result
             })()
             .map_err(explain_engine_error);
             // Counted here rather than after the await: the await is what a
@@ -8270,14 +8425,13 @@ impl VectorStore for LadybugStore {
         // mid-copy; the metadata bracket on the copy catches that.
         let mut turn = Arc::clone(&self.write_lock).lock_owned().await;
         let started = std::time::Instant::now();
+        let stopped = Arc::clone(&self.checkpoints_stopped);
         let checkpoint_result: Result<()> = {
             let (returned, outcome) = Self::write_owning_turn(
                 self.db.clone(),
+                Arc::clone(&stopped),
                 turn,
-                |conn| {
-                    conn.query("CHECKPOINT")?;
-                    Ok(())
-                },
+                move |conn| guarded_checkpoint(conn, &stopped),
             )
             .await?;
             turn = returned;
@@ -8417,6 +8571,12 @@ impl VectorStore for LadybugStore {
     }
 
     async fn checkpoint(&self) -> Result<()> {
+        if self.checkpoints_stopped.load(std::sync::atomic::Ordering::Acquire) {
+            anyhow::bail!(
+                "checkpoint skipped: an earlier one ran out of buffer pool and a retry would grow \
+                 ladybug.db; raise NEUROSTRATA_BUFFER_POOL_MB and restart"
+            );
+        }
         // Cleared first: a write that lands while the engine is flushing must
         // survive, and clearing afterwards would drop its mark.
         let had_writes = self.dirty.take();
@@ -8424,11 +8584,9 @@ impl VectorStore for LadybugStore {
         // The duration and success of every real checkpoint is recorded so
         // `compute_storage_status` reports actual hygiene, not constants.
         let started = std::time::Instant::now();
+        let stopped = Arc::clone(&self.checkpoints_stopped);
         let outcome = self
-            .with_conn(move |conn| {
-                conn.query("CHECKPOINT")?;
-                Ok(())
-            })
+            .with_conn(move |conn| guarded_checkpoint(conn, &stopped))
             .await;
         crate::storage::snapshot::record_checkpoint_outcome(
             started.elapsed().as_millis() as u64,
