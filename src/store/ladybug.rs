@@ -24653,4 +24653,35 @@ impl LadybugStore {
             .cloned()
             .unwrap_or_default()
     }
+
+    /// Check whether a directed relationship `(from)-[r:relation]->(to)` exists between two rows in `namespace`.
+    pub async fn has_edge(
+        &self,
+        namespace: &str,
+        from: &str,
+        relation: &str,
+        to: &str,
+    ) -> Result<bool> {
+        let rel = match relation {
+            "GOVERNS" | "DEPENDS_ON" | "RELATES_TO" | "CONTAINS" | "EXTRACTED_FROM" => {
+                relation.to_string()
+            }
+            _ => anyhow::bail!("unsupported relation '{relation}'"),
+        };
+        let ns = namespace.to_string();
+        let src = from.to_string();
+        let dst = to.to_string();
+        self.with_conn(move |conn| {
+            let q = format!(
+                "MATCH (a:Memory {{id: '{}', namespace: '{}'}})-[r:{rel}]->(b:Memory {{id: '{}', namespace: '{}'}}) RETURN a.id LIMIT 1",
+                escape_ladybug_string(&src),
+                escape_ladybug_string(&ns),
+                escape_ladybug_string(&dst),
+                escape_ladybug_string(&ns)
+            );
+            let mut res = conn.query(&q)?;
+            Ok(res.next().is_some())
+        })
+        .await
+    }
 }

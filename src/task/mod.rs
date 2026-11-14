@@ -307,6 +307,66 @@ async fn save_task(
         .map_err(|e| format!("Failed to store task '{}': {}", id, e))
 }
 
+/// Pure staging helper for kinetic `TransitionTask` effects.
+/// Never writes to storage and unconditionally forbids transitioning to `done` (Lock 2).
+pub fn stage_task_transition_at(
+    id: &str,
+    payload: &MemoryPayload,
+    new_status: &str,
+    note: &str,
+    actor: &str,
+    session: &str,
+    now_ts: i64,
+) -> Result<(String, String, MemoryPayload), String> {
+    let target_status = machine::Status::parse(new_status)
+        .ok_or_else(|| format!("invalid task status '{new_status}'"))?;
+    if target_status == machine::Status::Done {
+        return Err(
+            "TransitionTask cannot transition to 'done' (Lock 2 requires neurostrata_task_complete)"
+                .to_string(),
+        );
+    }
+    let task = machine::Task {
+        id: id.to_string(),
+        payload: payload.clone(),
+    };
+    let from_status = task.status();
+    let ctx = machine::Ctx {
+        reason: note.to_string(),
+        extraction_edge_exists: false,
+        actor: actor.to_string(),
+        session: session.to_string(),
+    };
+    let mut next_task = if from_status == target_status {
+        if note.trim().is_empty() {
+            return Err("same-status task transition requires a non-empty note".to_string());
+        }
+        machine::annotate(&task, &ctx)
+    } else {
+        machine::apply(&task, target_status, &ctx).map_err(|e| e.to_string())?
+    };
+
+    if let Some(task_obj) = next_task
+        .payload
+        .metadata
+        .get_mut("task")
+        .and_then(|t| t.as_object_mut())
+    {
+        task_obj.insert("updated_at".to_string(), serde_json::json!(now_ts));
+        if let Some(history) = task_obj.get_mut("history").and_then(|h| h.as_array_mut()) {
+            if let Some(last) = history.last_mut().and_then(|e| e.as_object_mut()) {
+                last.insert("at".to_string(), serde_json::json!(now_ts));
+            }
+        }
+    }
+
+    Ok((
+        from_status.as_str().to_string(),
+        target_status.as_str().to_string(),
+        next_task.payload,
+    ))
+}
+
 /// Writes a task row under an already-allocated id. Every creation path ends
 /// here so ids, timestamps, and shape look the same however a task was born.
 #[allow(clippy::too_many_arguments)]

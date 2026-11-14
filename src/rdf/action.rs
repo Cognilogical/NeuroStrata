@@ -1,7 +1,7 @@
 use crate::rdf::shacl::ShaclViolation;
 use crate::traits::MemoryPayload;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ActionTypeDefinition {
@@ -527,6 +527,7 @@ pub enum ActionError {
         slug: String,
     },
     InvalidDefinition(Vec<ShaclViolation>),
+    SubmissionRejected(Vec<ActionSubmissionFailure>),
     ReceiptNotFound {
         namespace: String,
         receipt_id: String,
@@ -558,6 +559,9 @@ impl std::fmt::Display for ActionError {
             ActionError::InvalidDefinition(v) => {
                 write!(f, "invalid action_type definition ({} violations)", v.len())
             }
+            ActionError::SubmissionRejected(v) => {
+                write!(f, "action submission rejected ({} failures)", v.len())
+            }
             ActionError::ReceiptNotFound {
                 namespace,
                 receipt_id,
@@ -586,6 +590,182 @@ impl std::fmt::Display for ActionError {
 }
 
 impl std::error::Error for ActionError {}
+
+pub const MAX_TEMPLATE_RENDER_BYTES: usize = 1_048_576;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StagedMemoryWrite {
+    pub id: String,
+    pub vector: Vec<f32>,
+    pub payload: MemoryPayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExpectedHead {
+    ActiveRow {
+        row_id: String,
+        twin_id: Option<String>,
+        expected_twin_version: Option<u64>,
+        expected_task_status: Option<String>,
+        expected_updated_at: Option<i64>,
+    },
+    AbsentOrInactive {
+        row_id: String,
+    },
+    EdgeState {
+        source: String,
+        relation: String,
+        target: String,
+        expected_exists: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeMutationOp {
+    EnsurePresent,
+    Remove,
+}
+
+fn default_edge_mutation_op() -> EdgeMutationOp {
+    EdgeMutationOp::EnsurePresent
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeDelta {
+    pub source: String,
+    pub relation: String,
+    pub target: String,
+    #[serde(default)]
+    pub existed_before: bool,
+    #[serde(default = "default_edge_mutation_op")]
+    pub op: EdgeMutationOp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SupersededPair {
+    pub before_id: String,
+    pub after_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ActionTwinDelta {
+    pub twin_id: String,
+    pub before_row_id: String,
+    pub after_row_id: String,
+    pub before_version: u64,
+    pub after_version: u64,
+    pub name: String,
+    pub old: Option<f64>,
+    pub new: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RowDelta {
+    pub kind: String,
+    pub before_id: Option<String>,
+    pub before_payload: Option<MemoryPayload>,
+    pub after_id: String,
+    pub after_payload: MemoryPayload,
+    pub created: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskDelta {
+    pub task_id: String,
+    pub before_status: String,
+    pub after_status: String,
+    pub before_payload: MemoryPayload,
+    pub after_payload: MemoryPayload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionReceiptPayload {
+    pub receipt_id: String,
+    pub action_slug: String,
+    pub principal: String,
+    pub executed_at: i64,
+    #[serde(default)]
+    pub params: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub superseded_pairs: Vec<SupersededPair>,
+    #[serde(default)]
+    pub created_ids: Vec<String>,
+    #[serde(default)]
+    pub twin_deltas: Vec<ActionTwinDelta>,
+    #[serde(default)]
+    pub edge_deltas: Vec<EdgeDelta>,
+    #[serde(default)]
+    pub row_deltas: Vec<RowDelta>,
+    #[serde(default)]
+    pub task_deltas: Vec<TaskDelta>,
+    pub reverted_at: Option<i64>,
+    pub reverted_by_receipt_id: Option<String>,
+    #[serde(default)]
+    pub reverts_receipt_id: Option<String>,
+    #[serde(default)]
+    pub forced_by: Option<String>,
+    #[serde(default)]
+    pub forced_at: Option<i64>,
+}
+
+impl ActionReceiptPayload {
+    pub fn from_payload(payload: &MemoryPayload) -> Result<Self, String> {
+        let raw = payload
+            .metadata
+            .get("action_receipt")
+            .ok_or_else(|| "action_receipt object is required for an action_receipt memory".to_string())?;
+        if !raw.is_object() {
+            return Err("action_receipt must be a JSON object".to_string());
+        }
+        serde_json::from_value(raw.clone())
+            .map_err(|e| format!("invalid action_receipt schema: {e}"))
+    }
+
+    pub fn validate_receipt(&self, payload: &MemoryPayload) -> Vec<ShaclViolation> {
+        let mut out = Vec::new();
+        if !is_canonical_kebab_slug(&self.action_slug) {
+            out.push(ShaclViolation {
+                field: "metadata.action_receipt.action_slug".to_string(),
+                why: "action_slug must be a non-empty canonical kebab-case slug".to_string(),
+            });
+        }
+        if self.principal.trim().is_empty() {
+            out.push(ShaclViolation {
+                field: "metadata.action_receipt.principal".to_string(),
+                why: "principal must be non-empty".to_string(),
+            });
+        }
+        let eligibility = payload
+            .metadata
+            .get("eligibility")
+            .and_then(|v| v.as_str());
+        if eligibility != Some("private") {
+            out.push(ShaclViolation {
+                field: "metadata.eligibility".to_string(),
+                why: "action_receipt eligibility must be 'private'".to_string(),
+            });
+        }
+        out
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ActionWriteSet {
+    pub expected_heads: Vec<ExpectedHead>,
+    pub writes: Vec<StagedMemoryWrite>,
+    pub edge_deltas: Vec<EdgeDelta>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActionStage {
+    pub namespace: String,
+    pub receipt_id: String,
+    pub receipt: ActionReceiptPayload,
+    pub write_set: ActionWriteSet,
+    pub submission_failures: Vec<ActionSubmissionFailure>,
+}
 
 pub(crate) fn is_active_payload(payload: &MemoryPayload, now_ts: i64) -> bool {
     let archived = payload
@@ -626,7 +806,7 @@ async fn resolve_namespace_target_row(
 
     if is_twin_lookup {
         let rows = store
-            .list(namespace, Some("digital_twin"), None)
+            .list(namespace, None, Some("digital_twin"))
             .await
             .map_err(|e| ActionError::Storage(e.to_string()))?;
         let mut best: Option<(u64, String, MemoryPayload)> = None;
@@ -1088,7 +1268,7 @@ pub async fn evaluate_action(
     // verify the caller satisfies required_role on the action_type definition row itself.
     let now_ts = chrono::Utc::now().timestamp();
     if let Ok(action_rows) = store
-        .list(&invocation.namespace, Some("action_type"), None)
+        .list(&invocation.namespace, None, Some("action_type"))
         .await
     {
         if let Some(def_row) = action_rows.into_iter().rev().find(|r| {
@@ -1226,6 +1406,960 @@ pub async fn evaluate_action(
         rdf_bindings,
         targets,
         submission_failures,
+    })
+}
+
+fn is_valid_placeholder_ident(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn scalar_value_to_string(
+    param_name: &str,
+    val: &serde_json::Value,
+) -> Result<String, ActionSubmissionFailure> {
+    match val {
+        serde_json::Value::String(s) => Ok(s.clone()),
+        serde_json::Value::Bool(b) => Ok(b.to_string()),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Ok(i.to_string())
+            } else if let Some(u) = n.as_u64() {
+                Ok(u.to_string())
+            } else if let Some(f) = n.as_f64().filter(|v| v.is_finite()) {
+                Ok(f.to_string())
+            } else {
+                Err(ActionSubmissionFailure {
+                    code: "non_finite_number".to_string(),
+                    target: param_name.to_string(),
+                    message: format!("template parameter '{param_name}' is non-finite"),
+                })
+            }
+        }
+        _ => Err(ActionSubmissionFailure {
+            code: "non_scalar_template_parameter".to_string(),
+            target: param_name.to_string(),
+            message: format!("template parameter '{param_name}' must be a scalar value"),
+        }),
+    }
+}
+
+pub fn render_template_string(
+    template: &str,
+    params: &BTreeMap<String, serde_json::Value>,
+) -> Result<String, ActionSubmissionFailure> {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while !rest.is_empty() {
+        if let Some(open_idx) = rest.find("{{") {
+            let prefix = &rest[..open_idx];
+            if prefix.contains("}}") {
+                return Err(ActionSubmissionFailure {
+                    code: "invalid_template_placeholder".to_string(),
+                    target: "template".to_string(),
+                    message: "unmatched closing '}}' in template".to_string(),
+                });
+            }
+            out.push_str(prefix);
+            let after_open = &rest[open_idx + 2..];
+            let Some(close_idx) = after_open.find("}}") else {
+                return Err(ActionSubmissionFailure {
+                    code: "invalid_template_placeholder".to_string(),
+                    target: "template".to_string(),
+                    message: "unclosed '{{' placeholder in template".to_string(),
+                });
+            };
+            let raw_name = &after_open[..close_idx];
+            if !is_valid_placeholder_ident(raw_name) {
+                return Err(ActionSubmissionFailure {
+                    code: "invalid_template_placeholder".to_string(),
+                    target: "template".to_string(),
+                    message: "template placeholder must be a bare parameter identifier".to_string(),
+                });
+            }
+            let Some(bound) = params.get(raw_name) else {
+                return Err(ActionSubmissionFailure {
+                    code: "unbound_template_parameter".to_string(),
+                    target: raw_name.to_string(),
+                    message: format!("unbound template parameter '{raw_name}'"),
+                });
+            };
+            let rendered = scalar_value_to_string(raw_name, bound)?;
+            if out.len().saturating_add(rendered.len()) > MAX_TEMPLATE_RENDER_BYTES {
+                return Err(ActionSubmissionFailure {
+                    code: "template_output_too_large".to_string(),
+                    target: "template".to_string(),
+                    message: "rendered template exceeds 1 MiB limit".to_string(),
+                });
+            }
+            out.push_str(&rendered);
+            rest = &after_open[close_idx + 2..];
+        } else {
+            if rest.contains("}}") {
+                return Err(ActionSubmissionFailure {
+                    code: "invalid_template_placeholder".to_string(),
+                    target: "template".to_string(),
+                    message: "unmatched closing '}}' in template".to_string(),
+                });
+            }
+            if out.len().saturating_add(rest.len()) > MAX_TEMPLATE_RENDER_BYTES {
+                return Err(ActionSubmissionFailure {
+                    code: "template_output_too_large".to_string(),
+                    target: "template".to_string(),
+                    message: "rendered template exceeds 1 MiB limit".to_string(),
+                });
+            }
+            out.push_str(rest);
+            break;
+        }
+    }
+    Ok(out)
+}
+
+pub fn render_template_value(
+    template: &serde_json::Value,
+    params: &BTreeMap<String, serde_json::Value>,
+) -> Result<serde_json::Value, ActionSubmissionFailure> {
+    let val = render_template_value_inner(template, params)?;
+    let encoded_len = serde_json::to_vec(&val)
+        .map(|b| b.len())
+        .unwrap_or(usize::MAX);
+    if encoded_len > MAX_TEMPLATE_RENDER_BYTES {
+        return Err(ActionSubmissionFailure {
+            code: "template_output_too_large".to_string(),
+            target: "metadata".to_string(),
+            message: "rendered metadata exceeds 1 MiB limit".to_string(),
+        });
+    }
+    Ok(val)
+}
+
+fn render_template_value_inner(
+    template: &serde_json::Value,
+    params: &BTreeMap<String, serde_json::Value>,
+) -> Result<serde_json::Value, ActionSubmissionFailure> {
+    match template {
+        serde_json::Value::String(s) => {
+            if let Some(inner) = s.strip_prefix("{{").and_then(|r| r.strip_suffix("}}")) {
+                if !inner.contains("{{") && !inner.contains("}}") {
+                    if !is_valid_placeholder_ident(inner) {
+                        return Err(ActionSubmissionFailure {
+                            code: "invalid_template_placeholder".to_string(),
+                            target: "template".to_string(),
+                            message: "template placeholder must be a bare parameter identifier"
+                                .to_string(),
+                        });
+                    }
+                    let Some(bound) = params.get(inner) else {
+                        return Err(ActionSubmissionFailure {
+                            code: "unbound_template_parameter".to_string(),
+                            target: inner.to_string(),
+                            message: format!("unbound template parameter '{inner}'"),
+                        });
+                    };
+                    // Validate scalar & finite before returning exact JSON type
+                    let _ = scalar_value_to_string(inner, bound)?;
+                    return Ok(bound.clone());
+                }
+            }
+            Ok(serde_json::Value::String(render_template_string(s, params)?))
+        }
+        serde_json::Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(render_template_value_inner(item, params)?);
+            }
+            Ok(serde_json::Value::Array(out))
+        }
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (k, v) in map {
+                if k.contains("{{") || k.contains("}}") {
+                    return Err(ActionSubmissionFailure {
+                        code: "template_key_not_allowed".to_string(),
+                        target: "metadata".to_string(),
+                        message: "template placeholders are not allowed in JSON object keys"
+                            .to_string(),
+                    });
+                }
+                out.insert(k.clone(), render_template_value_inner(v, params)?);
+            }
+            Ok(serde_json::Value::Object(out))
+        }
+        other => Ok(other.clone()),
+    }
+}
+
+pub fn deterministic_upsert_id(
+    namespace: &str,
+    action_slug: &str,
+    params: &BTreeMap<String, serde_json::Value>,
+    effect_index: usize,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(namespace.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(action_slug.as_bytes());
+    hasher.update(b"\0");
+    let canonical_params = serde_json::to_string(params).unwrap_or_default();
+    hasher.update(canonical_params.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(effect_index.to_string().as_bytes());
+    let digest: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("act-upsert-{}", &digest[..24])
+}
+
+fn deterministic_effect_hash(
+    namespace: &str,
+    action_slug: &str,
+    params: &BTreeMap<String, serde_json::Value>,
+    effect_index: usize,
+    now_ts: i64,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(namespace.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(action_slug.as_bytes());
+    hasher.update(b"\0");
+    let canonical_params = serde_json::to_string(params).unwrap_or_default();
+    hasher.update(canonical_params.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(effect_index.to_string().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(now_ts.to_string().as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn record_expected_active_row(
+    expected_heads: &mut Vec<ExpectedHead>,
+    seen_row_ids: &mut BTreeSet<String>,
+    row_id: &str,
+    payload: &MemoryPayload,
+) {
+    if !seen_row_ids.insert(row_id.to_string()) {
+        return;
+    }
+    let twin_id = payload
+        .metadata
+        .get("twin")
+        .and_then(|t| t.get("id"))
+        .or_else(|| {
+            payload
+                .metadata
+                .get("digital_twin")
+                .and_then(|t| t.get("twin_id").or_else(|| t.get("id")))
+        })
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let expected_twin_version = payload
+        .metadata
+        .get("twin")
+        .and_then(|t| t.get("version"))
+        .or_else(|| {
+            payload
+                .metadata
+                .get("digital_twin")
+                .and_then(|t| t.get("version"))
+        })
+        .and_then(|v| v.as_u64());
+    let expected_task_status = payload
+        .metadata
+        .get("task")
+        .and_then(|t| t.get("status"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let expected_updated_at = payload
+        .metadata
+        .get("task")
+        .and_then(|t| t.get("updated_at"))
+        .and_then(|v| v.as_i64());
+
+    expected_heads.push(ExpectedHead::ActiveRow {
+        row_id: row_id.to_string(),
+        twin_id,
+        expected_twin_version,
+        expected_task_status,
+        expected_updated_at,
+    });
+}
+
+fn stage_payload(
+    staged_rows: &mut BTreeMap<String, MemoryPayload>,
+    staged_order: &mut Vec<String>,
+    row_id: String,
+    payload: MemoryPayload,
+) {
+    if !staged_rows.contains_key(&row_id) {
+        staged_order.push(row_id.clone());
+    }
+    staged_rows.insert(row_id, payload);
+}
+
+pub async fn stage_action(
+    store: &crate::store::ladybug::LadybugStore,
+    eval: ActionEvaluation,
+    embedder: &dyn crate::traits::Embedder,
+    now_ts: i64,
+) -> Result<ActionStage, ActionError> {
+    use crate::traits::VectorStore;
+
+    if !eval.submission_failures.is_empty() {
+        return Err(ActionError::SubmissionRejected(eval.submission_failures));
+    }
+
+    let mut submission_failures: Vec<ActionSubmissionFailure> = Vec::new();
+    let mut current_targets = eval.targets.clone();
+    let mut expected_heads: Vec<ExpectedHead> = Vec::new();
+    let mut seen_expected_rows: BTreeSet<String> = BTreeSet::new();
+    let mut staged_rows: BTreeMap<String, MemoryPayload> = BTreeMap::new();
+    let mut staged_order: Vec<String> = Vec::new();
+
+    let mut superseded_pairs: Vec<SupersededPair> = Vec::new();
+    let mut created_ids: Vec<String> = Vec::new();
+    let mut twin_deltas: Vec<ActionTwinDelta> = Vec::new();
+    let mut edge_deltas: Vec<EdgeDelta> = Vec::new();
+    let mut row_deltas: Vec<RowDelta> = Vec::new();
+    let mut task_deltas: Vec<TaskDelta> = Vec::new();
+
+    for (effect_idx, effect) in eval.definition.effects.iter().enumerate() {
+        let effect_target = format!("effects[{effect_idx}]");
+        match effect {
+            ActionEffectTemplate::SetTwinState {
+                twin_param,
+                merge,
+                variables_from_params,
+            } => {
+                let Some(target_rec) = current_targets.get(twin_param).cloned() else {
+                    submission_failures.push(ActionSubmissionFailure {
+                        code: "target_not_found".to_string(),
+                        target: effect_target,
+                        message: format!("unresolved twin parameter '{twin_param}'"),
+                    });
+                    continue;
+                };
+                record_expected_active_row(
+                    &mut expected_heads,
+                    &mut seen_expected_rows,
+                    &target_rec.row_id,
+                    &target_rec.payload,
+                );
+
+                let mut new_vars = BTreeMap::new();
+                for (var_name, param_name) in variables_from_params {
+                    let Some(val) = eval.bound_params.get(param_name) else {
+                        submission_failures.push(ActionSubmissionFailure {
+                            code: "unbound_template_parameter".to_string(),
+                            target: effect_target.clone(),
+                            message: format!(
+                                "unbound parameter '{param_name}' for twin variable '{var_name}'"
+                            ),
+                        });
+                        continue;
+                    };
+                    let Some(f) = val.as_f64().filter(|v| v.is_finite()) else {
+                        submission_failures.push(ActionSubmissionFailure {
+                            code: "non_finite_number".to_string(),
+                            target: effect_target.clone(),
+                            message: format!(
+                                "parameter '{param_name}' for twin variable '{var_name}' must be finite"
+                            ),
+                        });
+                        continue;
+                    };
+                    new_vars.insert(var_name.clone(), f);
+                }
+                if !submission_failures.is_empty() {
+                    continue;
+                }
+
+                let before_row_id = target_rec.row_id.clone();
+                let before_payload = target_rec.payload.clone();
+                let source_tag = format!("action:{}", eval.definition.slug);
+                let (twin_id, before_version, after_version, next_payload, deltas) =
+                    crate::digital_twin::stage_twin_mutation(
+                        &before_row_id,
+                        &before_payload,
+                        &new_vars,
+                        *merge,
+                        Some(&source_tag),
+                        now_ts,
+                    );
+
+                let hash_suffix = &deterministic_effect_hash(
+                    &eval.namespace,
+                    &eval.definition.slug,
+                    &eval.bound_params,
+                    effect_idx,
+                    now_ts,
+                )[..12];
+                let after_row_id = format!("twin-{twin_id}-v{after_version}-{hash_suffix}");
+                seen_expected_rows.insert(after_row_id.clone());
+                expected_heads.push(ExpectedHead::AbsentOrInactive {
+                    row_id: after_row_id.clone(),
+                });
+
+                let mut retired_before = before_payload.clone();
+                if !retired_before.metadata.is_object() {
+                    retired_before.metadata = serde_json::json!({});
+                }
+                if let Some(meta) = retired_before.metadata.as_object_mut() {
+                    meta.insert("valid_to".to_string(), serde_json::json!(now_ts));
+                    meta.insert(
+                        "superseded_by".to_string(),
+                        serde_json::json!(after_row_id),
+                    );
+                }
+
+                stage_payload(
+                    &mut staged_rows,
+                    &mut staged_order,
+                    before_row_id.clone(),
+                    retired_before,
+                );
+                stage_payload(
+                    &mut staged_rows,
+                    &mut staged_order,
+                    after_row_id.clone(),
+                    next_payload.clone(),
+                );
+
+                superseded_pairs.push(SupersededPair {
+                    before_id: before_row_id.clone(),
+                    after_id: after_row_id.clone(),
+                });
+                if !created_ids.contains(&after_row_id) {
+                    created_ids.push(after_row_id.clone());
+                }
+                for d in deltas {
+                    twin_deltas.push(ActionTwinDelta {
+                        twin_id: twin_id.clone(),
+                        before_row_id: before_row_id.clone(),
+                        after_row_id: after_row_id.clone(),
+                        before_version,
+                        after_version,
+                        name: d.name,
+                        old: d.old,
+                        new: d.new,
+                    });
+                }
+                row_deltas.push(RowDelta {
+                    kind: "set_twin_state".to_string(),
+                    before_id: Some(before_row_id),
+                    before_payload: Some(before_payload),
+                    after_id: after_row_id.clone(),
+                    after_payload: next_payload.clone(),
+                    created: true,
+                });
+                current_targets.insert(
+                    twin_param.clone(),
+                    ActionTargetRecord {
+                        param_name: twin_param.clone(),
+                        row_id: after_row_id,
+                        payload: next_payload,
+                    },
+                );
+            }
+            ActionEffectTemplate::SupersedeMemory {
+                target_param,
+                new_content_template,
+                metadata_patch,
+            } => {
+                let Some(target_rec) = current_targets.get(target_param).cloned() else {
+                    submission_failures.push(ActionSubmissionFailure {
+                        code: "target_not_found".to_string(),
+                        target: effect_target,
+                        message: format!("unresolved target parameter '{target_param}'"),
+                    });
+                    continue;
+                };
+                record_expected_active_row(
+                    &mut expected_heads,
+                    &mut seen_expected_rows,
+                    &target_rec.row_id,
+                    &target_rec.payload,
+                );
+
+                let new_content = match render_template_string(
+                    new_content_template,
+                    &eval.bound_params,
+                ) {
+                    Ok(c) => c,
+                    Err(mut f) => {
+                        f.target = effect_target;
+                        submission_failures.push(f);
+                        continue;
+                    }
+                };
+                let patch_val = match render_template_value(metadata_patch, &eval.bound_params) {
+                    Ok(v) => v,
+                    Err(mut f) => {
+                        f.target = effect_target;
+                        submission_failures.push(f);
+                        continue;
+                    }
+                };
+
+                let before_id = target_rec.row_id.clone();
+                let before_payload = target_rec.payload.clone();
+                let hash_suffix = &deterministic_effect_hash(
+                    &eval.namespace,
+                    &eval.definition.slug,
+                    &eval.bound_params,
+                    effect_idx,
+                    now_ts,
+                )[..16];
+                let after_id = format!("act-sup-{hash_suffix}");
+                seen_expected_rows.insert(after_id.clone());
+                expected_heads.push(ExpectedHead::AbsentOrInactive {
+                    row_id: after_id.clone(),
+                });
+
+                let mut retired_before = before_payload.clone();
+                if !retired_before.metadata.is_object() {
+                    retired_before.metadata = serde_json::json!({});
+                }
+                if let Some(meta) = retired_before.metadata.as_object_mut() {
+                    meta.insert("valid_to".to_string(), serde_json::json!(now_ts));
+                    meta.insert("superseded_by".to_string(), serde_json::json!(after_id));
+                }
+
+                let mut after_payload = before_payload.clone();
+                after_payload.content = new_content;
+                if !after_payload.metadata.is_object() {
+                    after_payload.metadata = serde_json::json!({});
+                }
+                if let Some(meta) = after_payload.metadata.as_object_mut() {
+                    if let Some(patch_obj) = patch_val.as_object() {
+                        for (k, v) in patch_obj {
+                            meta.insert(k.clone(), v.clone());
+                        }
+                    }
+                    meta.remove("valid_to");
+                    meta.remove("superseded_by");
+                    meta.insert("valid_from".to_string(), serde_json::json!(now_ts));
+                    meta.insert("supersedes".to_string(), serde_json::json!(before_id));
+                }
+
+                stage_payload(
+                    &mut staged_rows,
+                    &mut staged_order,
+                    before_id.clone(),
+                    retired_before,
+                );
+                stage_payload(
+                    &mut staged_rows,
+                    &mut staged_order,
+                    after_id.clone(),
+                    after_payload.clone(),
+                );
+
+                superseded_pairs.push(SupersededPair {
+                    before_id: before_id.clone(),
+                    after_id: after_id.clone(),
+                });
+                if !created_ids.contains(&after_id) {
+                    created_ids.push(after_id.clone());
+                }
+                row_deltas.push(RowDelta {
+                    kind: "supersede_memory".to_string(),
+                    before_id: Some(before_id),
+                    before_payload: Some(before_payload),
+                    after_id: after_id.clone(),
+                    after_payload: after_payload.clone(),
+                    created: true,
+                });
+                current_targets.insert(
+                    target_param.clone(),
+                    ActionTargetRecord {
+                        param_name: target_param.clone(),
+                        row_id: after_id,
+                        payload: after_payload,
+                    },
+                );
+            }
+            ActionEffectTemplate::UpsertMemory {
+                memory_type,
+                content_template,
+                metadata_template,
+            } => {
+                let content = match render_template_string(content_template, &eval.bound_params) {
+                    Ok(c) => c,
+                    Err(mut f) => {
+                        f.target = effect_target;
+                        submission_failures.push(f);
+                        continue;
+                    }
+                };
+                let mut metadata =
+                    match render_template_value(metadata_template, &eval.bound_params) {
+                        Ok(v) => v,
+                        Err(mut f) => {
+                            f.target = effect_target;
+                            submission_failures.push(f);
+                            continue;
+                        }
+                    };
+                if !metadata.is_object() {
+                    metadata = serde_json::json!({});
+                }
+                if let Some(meta_obj) = metadata.as_object_mut() {
+                    meta_obj
+                        .entry("valid_from")
+                        .or_insert_with(|| serde_json::json!(now_ts));
+                }
+
+                let upsert_id = deterministic_upsert_id(
+                    &eval.namespace,
+                    &eval.definition.slug,
+                    &eval.bound_params,
+                    effect_idx,
+                );
+                let existing_active = if let Some(staged_prev) = staged_rows.get(&upsert_id) {
+                    if is_active_payload(staged_prev, now_ts) {
+                        Some(staged_prev.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    store
+                        .get(&eval.namespace, &upsert_id)
+                        .await
+                        .map_err(|e| ActionError::Storage(e.to_string()))?
+                        .and_then(|(_vec, p)| {
+                            if is_active_payload(&p, now_ts) {
+                                Some(p)
+                            } else {
+                                None
+                            }
+                        })
+                };
+
+                let created = existing_active.is_none();
+                if let Some(ref prev_payload) = existing_active {
+                    record_expected_active_row(
+                        &mut expected_heads,
+                        &mut seen_expected_rows,
+                        &upsert_id,
+                        prev_payload,
+                    );
+                } else if seen_expected_rows.insert(upsert_id.clone()) {
+                    expected_heads.push(ExpectedHead::AbsentOrInactive {
+                        row_id: upsert_id.clone(),
+                    });
+                }
+
+                if created && !created_ids.contains(&upsert_id) {
+                    created_ids.push(upsert_id.clone());
+                }
+
+                let after_payload = MemoryPayload {
+                    content,
+                    user_id: eval.effective_principal.clone(),
+                    memory_type: memory_type.clone(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata,
+                };
+                stage_payload(
+                    &mut staged_rows,
+                    &mut staged_order,
+                    upsert_id.clone(),
+                    after_payload.clone(),
+                );
+                row_deltas.push(RowDelta {
+                    kind: "upsert_memory".to_string(),
+                    before_id: existing_active.as_ref().map(|_| upsert_id.clone()),
+                    before_payload: existing_active,
+                    after_id: upsert_id,
+                    after_payload,
+                    created,
+                });
+            }
+            ActionEffectTemplate::LinkEdge {
+                source_param,
+                relation,
+                target_param,
+            } => {
+                let Some(src_rec) = current_targets.get(source_param).cloned() else {
+                    submission_failures.push(ActionSubmissionFailure {
+                        code: "target_not_found".to_string(),
+                        target: effect_target,
+                        message: format!("unresolved source parameter '{source_param}'"),
+                    });
+                    continue;
+                };
+                let Some(dst_rec) = current_targets.get(target_param).cloned() else {
+                    submission_failures.push(ActionSubmissionFailure {
+                        code: "target_not_found".to_string(),
+                        target: effect_target,
+                        message: format!("unresolved target parameter '{target_param}'"),
+                    });
+                    continue;
+                };
+                record_expected_active_row(
+                    &mut expected_heads,
+                    &mut seen_expected_rows,
+                    &src_rec.row_id,
+                    &src_rec.payload,
+                );
+                record_expected_active_row(
+                    &mut expected_heads,
+                    &mut seen_expected_rows,
+                    &dst_rec.row_id,
+                    &dst_rec.payload,
+                );
+
+                if !crate::rdf::shacl::endpoint_role_allowed(
+                    relation,
+                    &src_rec.payload.memory_type,
+                    &dst_rec.payload.memory_type,
+                ) {
+                    submission_failures.push(ActionSubmissionFailure {
+                        code: "shacl_violation".to_string(),
+                        target: effect_target,
+                        message: format!(
+                            "edge relation '{}' is not allowed from '{}' to '{}'",
+                            relation, src_rec.payload.memory_type, dst_rec.payload.memory_type
+                        ),
+                    });
+                    continue;
+                }
+
+                let existed_before = store
+                    .has_edge(&eval.namespace, &src_rec.row_id, relation, &dst_rec.row_id)
+                    .await
+                    .map_err(|e| ActionError::Storage(e.to_string()))?;
+
+                expected_heads.push(ExpectedHead::EdgeState {
+                    source: src_rec.row_id.clone(),
+                    relation: relation.clone(),
+                    target: dst_rec.row_id.clone(),
+                    expected_exists: existed_before,
+                });
+                edge_deltas.push(EdgeDelta {
+                    source: src_rec.row_id,
+                    relation: relation.clone(),
+                    target: dst_rec.row_id,
+                    existed_before,
+                    op: EdgeMutationOp::EnsurePresent,
+                });
+            }
+            ActionEffectTemplate::TransitionTask {
+                target_param,
+                new_status,
+                note_template,
+            } => {
+                let Some(target_rec) = current_targets.get(target_param).cloned() else {
+                    submission_failures.push(ActionSubmissionFailure {
+                        code: "target_not_found".to_string(),
+                        target: effect_target,
+                        message: format!("unresolved task parameter '{target_param}'"),
+                    });
+                    continue;
+                };
+                record_expected_active_row(
+                    &mut expected_heads,
+                    &mut seen_expected_rows,
+                    &target_rec.row_id,
+                    &target_rec.payload,
+                );
+
+                let note = match render_template_string(note_template, &eval.bound_params) {
+                    Ok(n) => n,
+                    Err(mut f) => {
+                        f.target = effect_target;
+                        submission_failures.push(f);
+                        continue;
+                    }
+                };
+
+                let session_tag = format!("action:{}", eval.definition.slug);
+                let (before_status, after_status, after_payload) =
+                    match crate::task::stage_task_transition_at(
+                        &target_rec.row_id,
+                        &target_rec.payload,
+                        new_status,
+                        &note,
+                        &eval.effective_principal,
+                        &session_tag,
+                        now_ts,
+                    ) {
+                        Ok(res) => res,
+                        Err(err) => {
+                            submission_failures.push(ActionSubmissionFailure {
+                                code: "task_transition_failed".to_string(),
+                                target: effect_target,
+                                message: err,
+                            });
+                            continue;
+                        }
+                    };
+
+                let task_id = target_rec.row_id.clone();
+                let before_payload = target_rec.payload.clone();
+                stage_payload(
+                    &mut staged_rows,
+                    &mut staged_order,
+                    task_id.clone(),
+                    after_payload.clone(),
+                );
+                task_deltas.push(TaskDelta {
+                    task_id: task_id.clone(),
+                    before_status,
+                    after_status,
+                    before_payload: before_payload.clone(),
+                    after_payload: after_payload.clone(),
+                });
+                row_deltas.push(RowDelta {
+                    kind: "transition_task".to_string(),
+                    before_id: Some(task_id.clone()),
+                    before_payload: Some(before_payload),
+                    after_id: task_id.clone(),
+                    after_payload: after_payload.clone(),
+                    created: false,
+                });
+                current_targets.insert(
+                    target_param.clone(),
+                    ActionTargetRecord {
+                        param_name: target_param.clone(),
+                        row_id: task_id,
+                        payload: after_payload,
+                    },
+                );
+            }
+        }
+    }
+
+    if !submission_failures.is_empty() {
+        return Err(ActionError::SubmissionRejected(submission_failures));
+    }
+
+    let receipt_hash = &deterministic_effect_hash(
+        &eval.namespace,
+        &eval.definition.slug,
+        &eval.bound_params,
+        usize::MAX,
+        now_ts,
+    )[..20];
+    let receipt_id = format!("act-receipt-{receipt_hash}");
+    if seen_expected_rows.insert(receipt_id.clone()) {
+        expected_heads.push(ExpectedHead::AbsentOrInactive {
+            row_id: receipt_id.clone(),
+        });
+    }
+
+    let receipt = ActionReceiptPayload {
+        receipt_id: receipt_id.clone(),
+        action_slug: eval.definition.slug.clone(),
+        principal: eval.effective_principal.clone(),
+        executed_at: now_ts,
+        params: eval.bound_params.clone(),
+        superseded_pairs,
+        created_ids,
+        twin_deltas,
+        edge_deltas: edge_deltas.clone(),
+        row_deltas,
+        task_deltas,
+        reverted_at: None,
+        reverted_by_receipt_id: None,
+        reverts_receipt_id: None,
+        forced_by: None,
+        forced_at: None,
+    };
+
+    let receipt_payload = MemoryPayload {
+        content: format!(
+            "Action receipt '{}' for '{}' by '{}' at {}",
+            receipt_id, eval.definition.slug, eval.effective_principal, now_ts
+        ),
+        user_id: eval.effective_principal.clone(),
+        memory_type: "action_receipt".to_string(),
+        agent_name: None,
+        location: String::new(),
+        location_lines: String::new(),
+        metadata: serde_json::json!({
+            "eligibility": "private",
+            "valid_from": now_ts,
+            "action_receipt": receipt
+        }),
+    };
+    stage_payload(
+        &mut staged_rows,
+        &mut staged_order,
+        receipt_id.clone(),
+        receipt_payload,
+    );
+
+    // Run strict SHACL + custom shapes + reasoning validation on every staged active post-image and receipt.
+    let ont = store.get_ontology(&eval.namespace);
+    for row_id in &staged_order {
+        let Some(payload) = staged_rows.get(row_id) else {
+            continue;
+        };
+        if !is_active_payload(payload, now_ts) {
+            continue;
+        }
+        for v in ont.validate_strict_post_image(payload) {
+            submission_failures.push(ActionSubmissionFailure {
+                code: "shacl_violation".to_string(),
+                target: format!("{row_id}:{}", v.field),
+                message: v.why,
+            });
+        }
+    }
+
+    if !submission_failures.is_empty() {
+        return Err(ActionError::SubmissionRejected(submission_failures));
+    }
+
+    // Compute embeddings for all staged rows before any write turn.
+    let texts: Vec<String> = staged_order
+        .iter()
+        .filter_map(|id| staged_rows.get(id).map(|p| p.content.clone()))
+        .collect();
+    let vectors = embedder
+        .embed_batch(&texts)
+        .await
+        .map_err(|e| ActionError::Storage(format!("embedding failed: {e}")))?;
+
+    let mut writes = Vec::with_capacity(staged_order.len());
+    for (row_id, vector) in staged_order.into_iter().zip(vectors.into_iter()) {
+        if let Some(payload) = staged_rows.remove(&row_id) {
+            writes.push(StagedMemoryWrite {
+                id: row_id,
+                vector,
+                payload,
+            });
+        }
+    }
+
+    Ok(ActionStage {
+        namespace: eval.namespace,
+        receipt_id,
+        receipt,
+        write_set: ActionWriteSet {
+            expected_heads,
+            writes,
+            edge_deltas,
+        },
+        submission_failures: Vec::new(),
     })
 }
 
@@ -2143,6 +3277,694 @@ mod tests {
                 eval.submission_failures
             );
         }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    struct DummyActionEmbedder;
+
+    #[async_trait::async_trait]
+    impl crate::traits::Embedder for DummyActionEmbedder {
+        async fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+            let n = (text.len() % 17) as f32 / 17.0;
+            Ok(vec![n, 0.25, 0.5, 0.75])
+        }
+
+        fn dimensions(&self) -> usize {
+            4
+        }
+    }
+
+    #[tokio::test]
+    async fn set_twin_state_stages_version_and_complete_delta() {
+        let tmp = std::env::temp_dir().join(format!("ns-action-stage-twin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = crate::store::ladybug::LadybugStore::for_testing(&tmp, 4).expect("store");
+        store.init("ns-stage-twin").await.unwrap();
+
+        store
+            .upsert(
+                "ns-stage-twin",
+                "twin-row-1",
+                vec![0.1; 4],
+                MemoryPayload {
+                    content: "Digital twin 'loop-a' v1".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "digital_twin".to_string(),
+                    agent_name: None,
+                    location: "".to_string(),
+                    location_lines: "".to_string(),
+                    metadata: json!({
+                        "twin": {
+                            "id": "loop-a",
+                            "version": 1,
+                            "schema_id": "cooling-loop",
+                            "variables": {
+                                "temperature": 65.0,
+                                "flow_rate": 12.0
+                            }
+                        }
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+
+        store
+            .upsert(
+                "ns-stage-twin",
+                "act-recal",
+                vec![0.1; 4],
+                MemoryPayload {
+                    content: "Action: recalibrate-cooling-loop".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "action_type".to_string(),
+                    agent_name: None,
+                    location: "".to_string(),
+                    location_lines: "".to_string(),
+                    metadata: json!({
+                        "action_type": {
+                            "slug": "recalibrate-cooling-loop",
+                            "title": "Recalibrate Cooling Loop",
+                            "description": "Set target temperature",
+                            "required_role": "editor",
+                            "parameters": {
+                                "twin_id": {
+                                    "param_type": "twin_id",
+                                    "required": true,
+                                    "target_memory_type": "digital_twin",
+                                    "target_schema_id": "cooling-loop"
+                                },
+                                "target_temp": {
+                                    "param_type": "f64",
+                                    "required": true,
+                                    "min": 10.0,
+                                    "max": 90.0
+                                }
+                            },
+                            "submission_criteria": [],
+                            "effects": [
+                                {
+                                    "op": "set_twin_state",
+                                    "twin_param": "twin_id",
+                                    "merge": true,
+                                    "variables_from_params": {
+                                        "temperature": "target_temp"
+                                    }
+                                }
+                            ]
+                        }
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut params = BTreeMap::new();
+        params.insert("twin_id".to_string(), json!("loop-a"));
+        params.insert("target_temp".to_string(), json!(42.5));
+
+        let eval = evaluate_action(
+            &store,
+            &ActionInvocation {
+                namespace: "ns-stage-twin".to_string(),
+                slug: "recalibrate-cooling-loop".to_string(),
+                security: ActionSecurityContext {
+                    authenticated_principal: "alice".to_string(),
+                    requested_principal: None,
+                },
+                params,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(eval.submission_failures.is_empty());
+
+        let before_rows = store.list("ns-stage-twin", None, None).await.unwrap();
+        let stage = stage_action(&store, eval, &DummyActionEmbedder, 1794675600)
+            .await
+            .expect("stage_action");
+        let after_rows = store.list("ns-stage-twin", None, None).await.unwrap();
+        assert_eq!(before_rows.len(), after_rows.len(), "stage_action must not write to store");
+
+        assert_eq!(stage.receipt.twin_deltas.len(), 1);
+        let td = &stage.receipt.twin_deltas[0];
+        assert_eq!(td.twin_id, "loop-a");
+        assert_eq!(td.name, "temperature");
+        assert_eq!(td.old, Some(65.0));
+        assert_eq!(td.new, Some(42.5));
+        assert_eq!(td.before_version, 1);
+        assert_eq!(td.after_version, 2);
+
+        // Staged writes include retired old twin row, new v2 twin row, and private receipt row
+        assert_eq!(stage.write_set.writes.len(), 3);
+        let new_twin_write = stage
+            .write_set
+            .writes
+            .iter()
+            .find(|w| w.id == td.after_row_id)
+            .expect("new twin row staged");
+        assert_eq!(
+            new_twin_write.payload.metadata["twin"]["version"],
+            json!(2)
+        );
+        assert_eq!(
+            new_twin_write.payload.metadata["twin"]["variables"]["temperature"],
+            json!(42.5)
+        );
+        assert_eq!(
+            new_twin_write.payload.metadata["twin"]["variables"]["flow_rate"],
+            json!(12.0)
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn supersede_and_upsert_capture_full_before_images_and_created_ids() {
+        let tmp = std::env::temp_dir().join(format!("ns-action-stage-sup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = crate::store::ladybug::LadybugStore::for_testing(&tmp, 4).expect("store");
+        store.init("ns-stage-sup").await.unwrap();
+
+        let orig_rule = MemoryPayload {
+            content: "Old cooling rule".to_string(),
+            user_id: "alice".to_string(),
+            memory_type: "rule".to_string(),
+            agent_name: None,
+            location: "src/cooling.rs".to_string(),
+            location_lines: "10-20".to_string(),
+            metadata: json!({
+                "domain": "ops",
+                "source": "owner 2026-10-01"
+            }),
+        };
+        store
+            .upsert("ns-stage-sup", "rule-old", vec![0.1; 4], orig_rule.clone())
+            .await
+            .unwrap();
+
+        store
+            .upsert(
+                "ns-stage-sup",
+                "act-sup-up",
+                vec![0.1; 4],
+                MemoryPayload {
+                    content: "Action: supersede-and-log".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "action_type".to_string(),
+                    agent_name: None,
+                    location: "".to_string(),
+                    location_lines: "".to_string(),
+                    metadata: json!({
+                        "action_type": {
+                            "slug": "supersede-and-log",
+                            "title": "Supersede and Upsert",
+                            "description": "Supersedes rule and upserts deterministic fact",
+                            "required_role": "editor",
+                            "parameters": {
+                                "rule_id": {
+                                    "param_type": "memory_id",
+                                    "required": true,
+                                    "target_memory_type": "rule"
+                                },
+                                "summary": {
+                                    "param_type": "string",
+                                    "required": true
+                                }
+                            },
+                            "submission_criteria": [],
+                            "effects": [
+                                {
+                                    "op": "supersede_memory",
+                                    "target_param": "rule_id",
+                                    "new_content_template": "Updated rule: {{summary}}",
+                                    "metadata_patch": { "source": "action supersede-and-log" }
+                                },
+                                {
+                                    "op": "upsert_memory",
+                                    "memory_type": "fact",
+                                    "content_template": "Audit note: {{summary}}",
+                                    "metadata_template": { "domain": "ops" }
+                                }
+                            ]
+                        }
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut params = BTreeMap::new();
+        params.insert("rule_id".to_string(), json!("rule-old"));
+        params.insert("summary".to_string(), json!("tightened threshold"));
+
+        let eval1 = evaluate_action(
+            &store,
+            &ActionInvocation {
+                namespace: "ns-stage-sup".to_string(),
+                slug: "supersede-and-log".to_string(),
+                security: ActionSecurityContext {
+                    authenticated_principal: "alice".to_string(),
+                    requested_principal: None,
+                },
+                params: params.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let stage1 = stage_action(&store, eval1, &DummyActionEmbedder, 1794675600)
+            .await
+            .expect("stage1");
+
+        assert_eq!(stage1.receipt.superseded_pairs.len(), 1);
+        assert_eq!(stage1.receipt.superseded_pairs[0].before_id, "rule-old");
+        let new_rule_id = &stage1.receipt.superseded_pairs[0].after_id;
+        assert!(stage1.receipt.created_ids.contains(new_rule_id));
+
+        let upsert_delta = stage1
+            .receipt
+            .row_deltas
+            .iter()
+            .find(|d| d.kind == "upsert_memory")
+            .expect("upsert delta");
+        assert!(upsert_delta.created);
+        assert!(upsert_delta.before_payload.is_none());
+        assert!(stage1.receipt.created_ids.contains(&upsert_delta.after_id));
+
+        let sup_delta = stage1
+            .receipt
+            .row_deltas
+            .iter()
+            .find(|d| d.kind == "supersede_memory")
+            .expect("supersede delta");
+        let stored_orig_rule = store
+            .get("ns-stage-sup", "rule-old")
+            .await
+            .unwrap()
+            .unwrap()
+            .1;
+        assert_eq!(
+            serde_json::to_value(sup_delta.before_payload.as_ref().unwrap()).unwrap(),
+            serde_json::to_value(&stored_orig_rule).unwrap()
+        );
+
+        // Now pre-populate the deterministic upsert ID to verify same-ID replace captures before_payload and created=false
+        let existing_upsert_payload = MemoryPayload {
+            content: "Pre-existing deterministic fact".to_string(),
+            user_id: "alice".to_string(),
+            memory_type: "fact".to_string(),
+            agent_name: None,
+            location: "".to_string(),
+            location_lines: "".to_string(),
+            metadata: json!({"domain": "ops"}),
+        };
+        store
+            .upsert(
+                "ns-stage-sup",
+                &upsert_delta.after_id,
+                vec![0.2; 4],
+                existing_upsert_payload.clone(),
+            )
+            .await
+            .unwrap();
+        let stored_existing_upsert = store
+            .get("ns-stage-sup", &upsert_delta.after_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .1;
+
+        let eval2 = evaluate_action(
+            &store,
+            &ActionInvocation {
+                namespace: "ns-stage-sup".to_string(),
+                slug: "supersede-and-log".to_string(),
+                security: ActionSecurityContext {
+                    authenticated_principal: "alice".to_string(),
+                    requested_principal: None,
+                },
+                params,
+            },
+        )
+        .await
+        .unwrap();
+        let stage2 = stage_action(&store, eval2, &DummyActionEmbedder, 1794675610)
+            .await
+            .expect("stage2");
+        let upsert_delta2 = stage2
+            .receipt
+            .row_deltas
+            .iter()
+            .find(|d| d.kind == "upsert_memory")
+            .expect("upsert delta 2");
+        assert!(!upsert_delta2.created, "same-ID replace must set created=false");
+        assert_eq!(
+            serde_json::to_value(upsert_delta2.before_payload.as_ref().unwrap()).unwrap(),
+            serde_json::to_value(&stored_existing_upsert).unwrap()
+        );
+        assert!(!stage2.receipt.created_ids.contains(&upsert_delta2.after_id));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn link_edge_records_existed_before_and_task_transition_captures_history() {
+        let tmp = std::env::temp_dir().join(format!("ns-action-stage-edge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = crate::store::ladybug::LadybugStore::for_testing(&tmp, 4).expect("store");
+        store.init("ns-stage-edge").await.unwrap();
+
+        store
+            .upsert(
+                "ns-stage-edge",
+                "rule-1",
+                vec![0.1; 4],
+                MemoryPayload {
+                    content: "Rule 1".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "rule".to_string(),
+                    agent_name: None,
+                    location: "".to_string(),
+                    location_lines: "".to_string(),
+                    metadata: json!({
+                        "domain": "ops",
+                        "source": "owner 2026-10-01",
+                        "governs": ["fact-existing"]
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "ns-stage-edge",
+                "fact-existing",
+                vec![0.1; 4],
+                MemoryPayload {
+                    content: "Fact existing".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: "".to_string(),
+                    location_lines: "".to_string(),
+                    metadata: json!({"domain": "ops"}),
+                },
+            )
+            .await
+            .unwrap();
+        // Re-upsert rule-1 so GOVERNS edge to fact-existing materializes
+        store
+            .upsert(
+                "ns-stage-edge",
+                "rule-1",
+                vec![0.1; 4],
+                MemoryPayload {
+                    content: "Rule 1".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "rule".to_string(),
+                    agent_name: None,
+                    location: "".to_string(),
+                    location_lines: "".to_string(),
+                    metadata: json!({
+                        "domain": "ops",
+                        "source": "owner 2026-10-01",
+                        "governs": ["fact-existing"]
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "ns-stage-edge",
+                "fact-new-edge",
+                vec![0.1; 4],
+                MemoryPayload {
+                    content: "Fact without edge".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: "".to_string(),
+                    location_lines: "".to_string(),
+                    metadata: json!({"domain": "ops"}),
+                },
+            )
+            .await
+            .unwrap();
+        let orig_task_payload = MemoryPayload {
+            content: "Task 1".to_string(),
+            user_id: "alice".to_string(),
+            memory_type: "task".to_string(),
+            agent_name: None,
+            location: "".to_string(),
+            location_lines: "".to_string(),
+            metadata: json!({
+                "task": {
+                    "title": "Task 1",
+                    "status": "open",
+                    "priority": 1,
+                    "created_at": 1700000000,
+                    "updated_at": 1700000000,
+                    "history": []
+                }
+            }),
+        };
+        store
+            .upsert("ns-stage-edge", "task-1", vec![0.1; 4], orig_task_payload.clone())
+            .await
+            .unwrap();
+
+        store
+            .upsert(
+                "ns-stage-edge",
+                "act-edge-task",
+                vec![0.1; 4],
+                MemoryPayload {
+                    content: "Action: link-and-transition".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "action_type".to_string(),
+                    agent_name: None,
+                    location: "".to_string(),
+                    location_lines: "".to_string(),
+                    metadata: json!({
+                        "action_type": {
+                            "slug": "link-and-transition",
+                            "title": "Link and Transition",
+                            "description": "Links edges and transitions task",
+                            "required_role": "editor",
+                            "parameters": {
+                                "rule_id": { "param_type": "memory_id", "required": true, "target_memory_type": "rule" },
+                                "existing_target": { "param_type": "memory_id", "required": true, "target_memory_type": "fact" },
+                                "fresh_target": { "param_type": "memory_id", "required": true, "target_memory_type": "fact" },
+                                "task_id": { "param_type": "memory_id", "required": true, "target_memory_type": "task" },
+                                "reason": { "param_type": "string", "required": true }
+                            },
+                            "submission_criteria": [],
+                            "effects": [
+                                {
+                                    "op": "link_edge",
+                                    "source_param": "rule_id",
+                                    "relation": "GOVERNS",
+                                    "target_param": "existing_target"
+                                },
+                                {
+                                    "op": "link_edge",
+                                    "source_param": "rule_id",
+                                    "relation": "GOVERNS",
+                                    "target_param": "fresh_target"
+                                },
+                                {
+                                    "op": "transition_task",
+                                    "target_param": "task_id",
+                                    "new_status": "blocked",
+                                    "note_template": "Blocked on {{reason}}"
+                                }
+                            ]
+                        }
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut params = BTreeMap::new();
+        params.insert("rule_id".to_string(), json!("rule-1"));
+        params.insert("existing_target".to_string(), json!("fact-existing"));
+        params.insert("fresh_target".to_string(), json!("fact-new-edge"));
+        params.insert("task_id".to_string(), json!("task-1"));
+        params.insert("reason".to_string(), json!("upstream valve maintenance"));
+
+        let eval = evaluate_action(
+            &store,
+            &ActionInvocation {
+                namespace: "ns-stage-edge".to_string(),
+                slug: "link-and-transition".to_string(),
+                security: ActionSecurityContext {
+                    authenticated_principal: "alice".to_string(),
+                    requested_principal: None,
+                },
+                params,
+            },
+        )
+        .await
+        .unwrap();
+        let stage = stage_action(&store, eval, &DummyActionEmbedder, 1794675600)
+            .await
+            .expect("stage");
+
+        assert_eq!(stage.receipt.edge_deltas.len(), 2);
+        let existing_ed = stage
+            .receipt
+            .edge_deltas
+            .iter()
+            .find(|e| e.target == "fact-existing")
+            .unwrap();
+        assert!(existing_ed.existed_before);
+        let fresh_ed = stage
+            .receipt
+            .edge_deltas
+            .iter()
+            .find(|e| e.target == "fact-new-edge")
+            .unwrap();
+        assert!(!fresh_ed.existed_before);
+
+        let stored_orig_task = store
+            .get("ns-stage-edge", "task-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .1;
+        assert_eq!(stage.receipt.task_deltas.len(), 1);
+        let td = &stage.receipt.task_deltas[0];
+        assert_eq!(td.task_id, "task-1");
+        assert_eq!(td.before_status, "open");
+        assert_eq!(td.after_status, "blocked");
+        assert_eq!(
+            serde_json::to_value(&td.before_payload).unwrap(),
+            serde_json::to_value(&stored_orig_task).unwrap()
+        );
+        let history = td.after_payload.metadata["task"]["history"]
+            .as_array()
+            .expect("history array");
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history[0]["note"],
+            json!("Blocked on upstream valve maintenance")
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn templates_preserve_whole_json_types_and_reject_bad_or_oversized_placeholders() {
+        let mut params = BTreeMap::new();
+        params.insert("count".to_string(), json!(42));
+        params.insert("temp".to_string(), json!(36.5));
+        params.insert("flag".to_string(), json!(true));
+        params.insert("name".to_string(), json!("cooling-loop"));
+
+        let val = render_template_value(
+            &json!({
+                "whole_int": "{{count}}",
+                "whole_float": "{{temp}}",
+                "whole_bool": "{{flag}}",
+                "embedded": "Loop {{name}} has count={{count}} and flag={{flag}}"
+            }),
+            &params,
+        )
+        .expect("render valid template");
+
+        assert_eq!(val["whole_int"], json!(42));
+        assert_eq!(val["whole_float"], json!(36.5));
+        assert_eq!(val["whole_bool"], json!(true));
+        assert_eq!(
+            val["embedded"],
+            json!("Loop cooling-loop has count=42 and flag=true")
+        );
+
+        // Reject unbound parameter
+        assert!(render_template_string("Hello {{unknown}}", &params).is_err());
+        // Reject expression / bad placeholder syntax
+        assert!(render_template_string("Hello {{count + 1}}", &params).is_err());
+        // Reject unbalanced braces
+        assert!(render_template_string("Hello {{count", &params).is_err());
+        // Reject template in JSON object key
+        assert!(render_template_value(&json!({"{{name}}": "value"}), &params).is_err());
+        // Reject oversized output (> 1 MiB)
+        let mut big_params = BTreeMap::new();
+        big_params.insert("blob".to_string(), json!("x".repeat(600_000)));
+        assert!(render_template_string("{{blob}}{{blob}}", &big_params).is_err());
+    }
+
+    #[tokio::test]
+    async fn any_staged_shacl_violation_rejects_all_rows_and_receipt_before_write() {
+        let tmp = std::env::temp_dir().join(format!("ns-action-stage-shacl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = crate::store::ladybug::LadybugStore::for_testing(&tmp, 4).expect("store");
+        store.init("ns-stage-shacl").await.unwrap();
+
+        // Action upserts a 'rule' memory without required 'metadata.source', which violates SHACL!
+        store
+            .upsert(
+                "ns-stage-shacl",
+                "act-bad-shacl",
+                vec![0.1; 4],
+                MemoryPayload {
+                    content: "Action: upsert-sourceless-rule".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "action_type".to_string(),
+                    agent_name: None,
+                    location: "".to_string(),
+                    location_lines: "".to_string(),
+                    metadata: json!({
+                        "action_type": {
+                            "slug": "upsert-sourceless-rule",
+                            "title": "Upsert Sourceless Rule",
+                            "description": "Stages a rule missing source",
+                            "required_role": "editor",
+                            "parameters": {
+                                "text": { "param_type": "string", "required": true }
+                            },
+                            "submission_criteria": [],
+                            "effects": [
+                                {
+                                    "op": "upsert_memory",
+                                    "memory_type": "rule",
+                                    "content_template": "Rule: {{text}}",
+                                    "metadata_template": { "domain": "ops" }
+                                }
+                            ]
+                        }
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+
+        let before_count = store.list("ns-stage-shacl", None, None).await.unwrap().len();
+        let mut params = BTreeMap::new();
+        params.insert("text".to_string(), json!("must have source"));
+
+        let eval = evaluate_action(
+            &store,
+            &ActionInvocation {
+                namespace: "ns-stage-shacl".to_string(),
+                slug: "upsert-sourceless-rule".to_string(),
+                security: ActionSecurityContext {
+                    authenticated_principal: "alice".to_string(),
+                    requested_principal: None,
+                },
+                params,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(eval.submission_failures.is_empty());
+
+        let stage_res = stage_action(&store, eval, &DummyActionEmbedder, 1794675600).await;
+        assert!(
+            stage_res.is_err(),
+            "post-image SHACL violation must reject staging"
+        );
+        let after_count = store.list("ns-stage-shacl", None, None).await.unwrap().len();
+        assert_eq!(before_count, after_count, "zero rows written on SHACL rejection");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

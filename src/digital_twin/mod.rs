@@ -463,6 +463,76 @@ pub fn twin_diff_from_rows(
     Ok(diff(from_payload.unwrap(), to_payload.unwrap()))
 }
 
+pub fn stage_twin_mutation(
+    prev_row_id: &str,
+    prev_payload: &crate::traits::MemoryPayload,
+    new_vars: &BTreeMap<String, f64>,
+    merge: bool,
+    source: Option<&str>,
+    now_ts: i64,
+) -> (
+    String,
+    u64,
+    u64,
+    crate::traits::MemoryPayload,
+    Vec<TwinDelta>,
+) {
+    let twin_id = prev_payload
+        .metadata
+        .get("twin")
+        .and_then(|t| t.get("id"))
+        .or_else(|| {
+            prev_payload
+                .metadata
+                .get("digital_twin")
+                .and_then(|t| t.get("twin_id").or_else(|| t.get("id")))
+        })
+        .and_then(|v| v.as_str())
+        .unwrap_or(prev_row_id)
+        .to_string();
+    let prev_version = prev_payload
+        .metadata
+        .get("twin")
+        .and_then(|t| t.get("version"))
+        .or_else(|| {
+            prev_payload
+                .metadata
+                .get("digital_twin")
+                .and_then(|t| t.get("version"))
+        })
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1);
+    let next_version = prev_version + 1;
+
+    let mut next_payload = prev_payload.clone();
+    next_payload.memory_type = "digital_twin".to_string();
+    let _ = set_state(&mut next_payload, new_vars, merge);
+    let state_after = get_state(&next_payload);
+
+    if !next_payload.metadata.is_object() {
+        next_payload.metadata = serde_json::json!({});
+    }
+    if let Some(meta) = next_payload.metadata.as_object_mut() {
+        meta.remove("valid_to");
+        meta.remove("superseded_by");
+        meta.insert("valid_from".to_string(), serde_json::json!(now_ts));
+        meta.insert("supersedes".to_string(), serde_json::json!(prev_row_id));
+        if let Some(twin_obj) = meta.get_mut("twin").and_then(|t| t.as_object_mut()) {
+            twin_obj.insert("id".to_string(), serde_json::json!(twin_id));
+            twin_obj.insert("version".to_string(), serde_json::json!(next_version));
+            if let Some(src) = source {
+                twin_obj.insert("source".to_string(), serde_json::json!(src));
+            }
+        }
+    }
+    next_payload.content = format!(
+        "Digital twin '{}' v{}: {:?}",
+        twin_id, next_version, state_after
+    );
+    let deltas = diff(prev_payload, &next_payload);
+    (twin_id, prev_version, next_version, next_payload, deltas)
+}
+
 pub async fn list_twins(
     store: &dyn crate::traits::VectorStore,
     namespace: &str,

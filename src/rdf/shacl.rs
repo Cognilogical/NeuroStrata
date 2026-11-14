@@ -361,6 +361,15 @@ pub fn validate_memory(payload: &MemoryPayload) -> Vec<ShaclViolation> {
                 why,
             }),
         },
+        "action_receipt" => {
+            match crate::rdf::action::ActionReceiptPayload::from_payload(payload) {
+                Ok(receipt) => out.extend(receipt.validate_receipt(payload)),
+                Err(why) => out.push(ShaclViolation {
+                    field: "metadata.action_receipt".to_string(),
+                    why,
+                }),
+            }
+        }
         _ => {}
     }
 

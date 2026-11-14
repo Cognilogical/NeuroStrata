@@ -1060,8 +1060,8 @@ pub fn clear_shacl_shapes(&mut self) {
         for shape in &self.shacl_shapes {
             // Match shape to memory_type via targetClass (ns:Rule, ns:Procedure, ns:Task, etc.)
             let shape_match = shape.target_class.as_deref().map_or(false, |tc| {
-                memory_type == tc.split('/').last().unwrap_or(&tc)
-                    || memory_type.to_lowercase() == tc.split('/').last().unwrap_or(&tc).to_lowercase()
+                let tail = tc.rsplit(|c| c == '/' || c == '#' || c == ':').next().unwrap_or(tc);
+                memory_type == tail || memory_type.eq_ignore_ascii_case(tail)
             });
 
             if !shape_match && shape.target_class.is_some() {
@@ -1080,9 +1080,32 @@ pub fn clear_shacl_shapes(&mut self) {
         violations
     }
 
+    /// Strict post-image validation combining hardcoded SHACL, custom loaded SHACL shapes,
+    /// and ontology domain/reasoning constraints (`ReasoningAdapter::validate_payload`).
+    pub fn validate_strict_post_image(&self, payload: &MemoryPayload) -> Vec<ShaclViolation> {
+        let mut violations = crate::rdf::shacl::validate_memory(payload);
+        for v in self.shacl_validate(payload) {
+            if !violations.contains(&v) {
+                violations.push(v);
+            }
+        }
+        let adapter = crate::rdf::reasoning::ReasoningAdapter::new();
+        for v in adapter.validate_payload(self, payload) {
+            if !violations.contains(&v) {
+                violations.push(v);
+            }
+        }
+        violations
+    }
+
     fn validate_path(&self, payload: &MemoryPayload, path: &str, shape: &ShaclShapeDef) -> Vec<ShaclViolation> {
         let mut out = Vec::new();
-        let value = match payload.metadata.get(path.trim_start_matches("ns:")) {
+        let meta_key = path
+            .trim_start_matches("urn:neurostrata:ns#")
+            .trim_start_matches("http://neurostrata.io/ns#")
+            .trim_start_matches("https://neurostrata.io/ns#")
+            .trim_start_matches("ns:");
+        let value = match payload.metadata.get(meta_key).or_else(|| payload.metadata.get(path)) {
             Some(v) => v.clone(),
             None => {
                 // Check min_count
