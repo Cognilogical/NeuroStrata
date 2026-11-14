@@ -19985,11 +19985,11 @@ eurostrata\src\daemon.rs",
         // A checksum-config mismatch reopen: the database written
         // without checksums, left with a WAL behind by an unclean
         // shutdown (clean closes checkpoint and remove the WAL, so
-        // the fixture simulates the crash with a leak), fails the
+        // the fixture closes without the checkpoint), fails the
         // verifying open at the WAL header check, and the engine
         // falls back to unverified_config() — provenance is
         // unverified and nothing may reconcile or migrate from
-        // this open. The leaked handle left a non-empty WAL in
+        // this open. That close left a non-empty WAL in
         // place (#94), so the reopen exercises the
         // NEUROSTRATA_STRICT_WAL=0 opt-in under WAL_ENV_LOCK.
         let fx = store_state_fixture("open-provenance-mismatch", "ModelA");
@@ -20002,7 +20002,19 @@ eurostrata\src\daemon.rs",
             let creator = LadybugStore::with_system_config(&fx.db, 4, no_checksums)
                 .expect("open temp database without checksums");
             creator.init("probe").await.expect("init");
-            std::mem::forget(creator);
+            // Close without the checkpoint a clean close would run, so
+            // the WAL stays behind and the engine's file lock is
+            // released (a leaked handle keeps it on Windows, and the
+            // reopen below fails with OS error 33).
+            creator
+                .with_conn(|conn| {
+                    conn.query("CALL force_checkpoint_on_close=false")?;
+                    Ok(())
+                })
+                .await
+                .expect("turn off the checkpoint on close");
+            creator.dirty.take();
+            drop(creator);
         }
         let _wal_env_serial = WAL_ENV_LOCK.lock().await;
         let previous_wal = allow_unverified_wal_recovery();
