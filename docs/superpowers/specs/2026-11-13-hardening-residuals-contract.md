@@ -43,10 +43,12 @@ re-enable the ONNX CPU arena (`#164`, `neurostrata-igg4`).
 - **P3-11 / N1 (direct HTTP surface):** The daemon's stateful direct HTTP routes
   wrap execution in `CallGuard::begin("http:<route>", ...)`, and
   `docs/limitations.md` documents what `calls_since_last` counts (`neurostrata-igg4`).
-- **P3-12 / N2 (process role attribution):** `status_json()` reports
-  `"role": process_role()` (`"daemon"` when `mark_daemon_process()` has been
-  called by the daemon, or `"cli"` on the CLI daemon-down fallback path) so
-  callers can distinguish the transient CLI process from a live daemon (`neurostrata-igg4`).
+- **P3-12 / N2 (process role attribution):** `status_json()` delegates to a
+  pure `status_json_for(sample, is_daemon)` / `role_for(is_daemon)` seam and
+  reports `"role"` (`"daemon"` when `mark_daemon_process()` has been called by
+  the daemon, or `"cli"` on the CLI daemon-down fallback path) so callers can
+  distinguish the transient CLI process from a live daemon without unit tests
+  mutating process-global `IS_DAEMON` (`neurostrata-igg4`, `neurostrata-flgp`).
 - **P3-7 / X6b (async sampler & `Drop` I/O):** `run_sampler` runs its file
   append and `sample_once_with` tick inside `tokio::task::spawn_blocking`, and
   `docs/limitations.md` records the explicit waiver for `CallGuard::drop`

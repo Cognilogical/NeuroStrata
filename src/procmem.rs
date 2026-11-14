@@ -169,14 +169,17 @@ fn mb(bytes: Option<u64>) -> serde_json::Value {
 /// The figures `neurostrata_storage_status` reports. Null where the platform
 /// has none, never a made-up zero.
 pub fn status_json() -> serde_json::Value {
-    let s = sample();
+    status_json_for(sample(), IS_DAEMON.load(Ordering::Relaxed))
+}
+
+fn status_json_for(s: Sample, is_daemon: bool) -> serde_json::Value {
     serde_json::json!({
         "rss_mb": mb(s.rss_bytes),
         "peak_rss_mb": mb(s.peak_bytes),
         "rss_available": s.rss_bytes.is_some(),
         "profile_enabled": profile_enabled(),
         "growth_supported": s.rss_bytes.is_some(),
-        "role": process_role(),
+        "role": role_for(is_daemon),
         "growth_log": growth_log_file_name(),
         "growth_log_threshold_mb": threshold_mb(),
     })
@@ -209,8 +212,8 @@ pub fn mark_daemon_process() {
 
 /// Returns the process role: "daemon" when served by the running daemon, "cli"
 /// when the CLI computes status in-process because the daemon is down.
-pub fn process_role() -> &'static str {
-    if IS_DAEMON.load(Ordering::Relaxed) {
+fn role_for(is_daemon: bool) -> &'static str {
+    if is_daemon {
         "daemon"
     } else {
         "cli"
@@ -915,14 +918,13 @@ mod tests {
 
     #[test]
     fn status_json_exposes_profile_enabled_growth_supported_and_role() {
-        IS_DAEMON.store(false, Ordering::Relaxed);
-        let s = status_json();
+        let s = status_json_for(sample(), false);
         assert!(s["profile_enabled"].is_boolean());
         assert_eq!(s["growth_supported"], s["rss_available"]);
         assert_eq!(s["role"], "cli");
-        mark_daemon_process();
-        assert_eq!(status_json()["role"], "daemon");
-        IS_DAEMON.store(false, Ordering::Relaxed);
+        assert_eq!(status_json_for(sample(), true)["role"], "daemon");
+        let live = status_json();
+        assert!(matches!(live["role"].as_str(), Some("cli" | "daemon")));
     }
 
     #[cfg(unix)]
