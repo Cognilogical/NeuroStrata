@@ -1590,6 +1590,51 @@ mod tests {
     }
 
     #[test]
+    fn copy_snapshot_into_place_refuses_sidecar_directory_and_preserves_target_wal() {
+        // Issue #95: a pre-existing target_wal file and a target_sidecar
+        // directory must not leave a half-committed target. The sidecar
+        // directory blocks the commit, so the call fails before target is
+        // touched, the pre-existing WAL is preserved intact, and the target
+        // file is absent.
+        let root = std::env::temp_dir().join(format!(
+            "mcp-restore-sidecar-dir-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let snapshot = root.join("snapshot");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join("ladybug.store"), b"store-bytes").unwrap();
+
+        let target = root.join("restored");
+        let target_wal = root.join("restored.wal");
+        std::fs::write(&target_wal, b"preexisting-wal").unwrap();
+        let target_sidecar = crate::model_choice::store_state_path(&target);
+        std::fs::create_dir_all(&target_sidecar).unwrap();
+
+        let err = copy_snapshot_into_place(&snapshot, &target)
+            .expect_err("a directory at the sidecar path blocks the commit");
+        assert!(
+            !target.exists(),
+            "the target store file must be absent when the sidecar path is a directory: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&target_wal).unwrap(),
+            b"preexisting-wal",
+            "the pre-existing target WAL must survive the refusal intact"
+        );
+        assert!(
+            !root.join(format!(
+                "restored.restore-tmp-{}",
+                std::process::id()
+            ))
+            .exists(),
+            "the staged store copy is removed on refusal"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn a_mistyped_subcommand_is_an_error_not_an_execution() {
         let parsed = Cli::try_parse_from(["neurostrata-mcp", "lsit"]);
         assert!(
@@ -3504,61 +3549,115 @@ fn copy_snapshot_into_place(
         produced_sidecar = true;
     }
 
-    // Every staged copy succeeded: the set commits now. Stale companions
-    // the snapshot does not carry are removed — not before, so a failed
-    // restore keeps whatever happened to sit at the companion paths.
-    let mut target_wal = target.as_os_str().to_os_string();
-    target_wal.push(".wal");
-    let target_wal = std::path::PathBuf::from(target_wal);
-    if !produced_wal && target_wal.exists() {
-        // The target DB file was absent (the Restore arm refuses an
-        // existing one), but an old store's WAL can be left behind at
-        // the target path as an orphan. It must not survive into the
-        // restored store, or the engine would replay it against a
-        // store it never belonged to (the issue-#76 hazard class,
-        // fixed for export but not restore). Removal is loud: a
-        // directory at the WAL path is an error, not a silent pass.
-        if let Err(e) = std::fs::remove_file(&target_wal) {
-            cleanup_staged(produced_wal, produced_sidecar);
-            return Err(anyhow::anyhow!(
-                "could not remove the stale write-ahead log at the restore target: {}",
-                e
-            ));
-        }
-    }
+    // Every staged copy succeeded: the set commits now. The commit is
+    // rollback-safe (issue #95): if a rename fails after an earlier one
+    // succeeded, the partially moved target files are removed and any
+    // pre-existing companions stashed in Step A are restored, so the
+    // target is left exactly as it was before this call. Stale
+    // companions the snapshot does not carry are removed by moving them
+    // aside in Step A and discarding them in Step C — not before, so a
+    // failed restore keeps whatever happened to sit at the companion
+    // paths.
+    let target_wal = {
+        let mut path = target.as_os_str().to_os_string();
+        path.push(".wal");
+        std::path::PathBuf::from(path)
+    };
     let target_sidecar = crate::model_choice::store_state_path(target);
-    if !produced_sidecar && target_sidecar.exists() {
-        // An orphan sidecar left at the target path must not survive
-        // into the restored store, for the same reason as the WAL
-        // above: the restored store must not inherit the old store's
-        // recorded identity.
-        if let Err(e) = std::fs::remove_file(&target_sidecar) {
+
+    // Step A: stash any pre-existing orphan companions aside, and refuse
+    // a directory at either path BEFORE touching target. A directory at
+    // the WAL or sidecar path means remove_file/rename cannot succeed, so
+    // the commit would fail partway and leave target half-committed.
+    let prev_wal = target.with_extension(format!("wal.prev-tmp-{pid}"));
+    if target_wal.exists() {
+        if target_wal.is_dir() {
             cleanup_staged(produced_wal, produced_sidecar);
             return Err(anyhow::anyhow!(
-                "could not remove the stale store-state sidecar at the restore target: {}",
+                "the restore target's write-ahead log path is a directory: {}",
+                target_wal.display()
+            ));
+        }
+        if let Err(e) = std::fs::rename(&target_wal, &prev_wal) {
+            cleanup_staged(produced_wal, produced_sidecar);
+            return Err(anyhow::anyhow!(
+                "could not move the existing write-ahead log out of the way: {}",
                 e
             ));
         }
     }
-    std::fs::rename(&staged_store, target).map_err(|e| {
+    let prev_sidecar =
+        target.with_extension(format!("store-state.json.prev-tmp-{pid}"));
+    if target_sidecar.exists() {
+        if target_sidecar.is_dir() {
+            // Restore the stashed WAL (if any) before bailing: the
+            // pre-existing target_wal must survive a sidecar-directory
+            // refusal untouched.
+            if prev_wal.exists() {
+                let _ = std::fs::rename(&prev_wal, &target_wal);
+            }
+            cleanup_staged(produced_wal, produced_sidecar);
+            return Err(anyhow::anyhow!(
+                "the restore target's store-state sidecar path is a directory: {}",
+                target_sidecar.display()
+            ));
+        }
+        if let Err(e) = std::fs::rename(&target_sidecar, &prev_sidecar) {
+            if prev_wal.exists() {
+                let _ = std::fs::rename(&prev_wal, &target_wal);
+            }
+            cleanup_staged(produced_wal, produced_sidecar);
+            return Err(anyhow::anyhow!(
+                "could not move the existing store-state sidecar out of the way: {}",
+                e
+            ));
+        }
+    }
+
+    // Step B: commit the staged set with full rollback on error.
+    let rollback_commit = || {
+        // Remove any target files created by a partial commit.
+        let _ = std::fs::remove_file(target);
+        if produced_wal {
+            let _ = std::fs::remove_file(&target_wal);
+        }
+        if produced_sidecar {
+            let _ = std::fs::remove_file(&target_sidecar);
+        }
+        // Restore stashed companions, if any.
+        if prev_wal.exists() {
+            let _ = std::fs::rename(&prev_wal, &target_wal);
+        }
+        if prev_sidecar.exists() {
+            let _ = std::fs::rename(&prev_sidecar, &target_sidecar);
+        }
         cleanup_staged(produced_wal, produced_sidecar);
+    };
+
+    std::fs::rename(&staged_store, target).map_err(|e| {
+        rollback_commit();
         anyhow::anyhow!("could not move the staged store into place: {}", e)
     })?;
     if produced_wal {
         std::fs::rename(&staged_wal, &target_wal).map_err(|e| {
-            cleanup_staged(produced_wal, produced_sidecar);
+            rollback_commit();
             anyhow::anyhow!("could not move the staged write-ahead log into place: {}", e)
         })?;
     }
     if produced_sidecar {
         std::fs::rename(&staged_sidecar, &target_sidecar).map_err(|e| {
-            cleanup_staged(produced_wal, produced_sidecar);
+            rollback_commit();
             anyhow::anyhow!(
                 "could not move the staged store-state sidecar into place: {}",
                 e
             )
         })?;
     }
+
+    // Step C: the commit succeeded; the stashed companions are now
+    // superseded by the new set, so discard them.
+    let _ = std::fs::remove_file(&prev_wal);
+    let _ = std::fs::remove_file(&prev_sidecar);
     Ok(())
 }
 

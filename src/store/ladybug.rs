@@ -6206,13 +6206,21 @@ impl LadybugStore {
     /// operator override `NEUROSTRATA_SNAPSHOT_RETENTION_COUNT` wins over
     /// the hygiene config, floored at one snapshot: a configured count below
     /// the config's five must be honoured, not raised to it (issue #89).
+    /// An unset or unparseable override falls through to the hygiene
+    /// config loaded from the default `config.json` path, so the persisted
+    /// `storage_hygiene.snapshot_retention_count` is honoured.
     pub(crate) fn configured_snapshot_retention_count() -> usize {
         std::env::var("NEUROSTRATA_SNAPSHOT_RETENTION_COUNT")
             .ok()
             .and_then(|raw| raw.parse::<usize>().ok())
             .unwrap_or_else(|| {
-                crate::storage::snapshot::StorageHygieneConfig::default()
-                    .snapshot_retention_count
+                crate::config::Config::from_default_path()
+                    .ok()
+                    .map(|c| c.storage_hygiene.snapshot_retention_count)
+                    .unwrap_or_else(|| {
+                        crate::storage::snapshot::StorageHygieneConfig::default()
+                            .snapshot_retention_count
+                    })
             })
             .max(1)
     }
@@ -11262,11 +11270,20 @@ mod tests {
         );
     }
 
+    static RETENTION_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn configured_snapshot_retention_count_honors_small_and_zero_values() {
+        let _env_guard = RETENTION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let previous = std::env::var("NEUROSTRATA_SNAPSHOT_RETENTION_COUNT").ok();
-        let default_keep = crate::storage::snapshot::StorageHygieneConfig::default()
-            .snapshot_retention_count;
+        let default_keep = crate::config::Config::from_default_path()
+            .ok()
+            .map(|c| c.storage_hygiene.snapshot_retention_count)
+            .unwrap_or_else(|| {
+                crate::storage::snapshot::StorageHygieneConfig::default()
+                    .snapshot_retention_count
+            })
+            .max(1);
 
         std::env::set_var("NEUROSTRATA_SNAPSHOT_RETENTION_COUNT", "2");
         assert_eq!(
@@ -11303,6 +11320,7 @@ mod tests {
         // Issue #89: the operator-configured retention must reach the
         // prune step even when it is below the five the old code clamped
         // to, so the oldest snapshots expire at the configured count.
+        let _env_guard = RETENTION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let previous_retention = std::env::var("NEUROSTRATA_SNAPSHOT_RETENTION_COUNT").ok();
         let previous_prune = std::env::var("NEUROSTRATA_PRUNE_SNAPSHOTS").ok();
         std::env::set_var("NEUROSTRATA_SNAPSHOT_RETENTION_COUNT", "2");

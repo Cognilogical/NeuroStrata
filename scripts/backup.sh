@@ -230,17 +230,58 @@ else
     fi
 fi
 
-# 4d. Commit: the staged set is verified, so rename it into place as a
+# 4d. Commit: the staged set is verified, so move it into place as a
 # unit. mv within one filesystem is atomic, so a reader of the backup
-# directory never sees a db split from its companions. Companions the
-# current run does not carry are removed here — and only here — so a
-# reused destination never mixes this run's db with a previous run's
-# companions, and a failed run never touched them at all.
+# directory never sees a db split from its companions. The commit is
+# rollback-safe (issue #93): any existing regular-file destinations are
+# stashed to .prev-$$ first, and a directory at any destination path (or
+# any mv failure) rolls back — removing partially moved destination files
+# and restoring the stashed .prev-$$ companions — before dying. A failed
+# commit therefore leaves any prior same-second backup set untouched.
+rollback_commit() {
+    # Remove any destination files this run moved into place (a partial
+    # commit must leave none behind).
+    rm -f "$BACKUP_FILE" "$COMPANION_FILE" "$WAL_COMPANION_FILE" 2>/dev/null || true
+    # Restore stashed previous companions, if any were stashed.
+    if [ -f "$BACKUP_FILE.prev-$$" ]; then
+        mv -f "$BACKUP_FILE.prev-$$" "$BACKUP_FILE" 2>/dev/null || true
+    fi
+    if [ -f "$COMPANION_FILE.prev-$$" ]; then
+        mv -f "$COMPANION_FILE.prev-$$" "$COMPANION_FILE" 2>/dev/null || true
+    fi
+    if [ -f "$WAL_COMPANION_FILE.prev-$$" ]; then
+        mv -f "$WAL_COMPANION_FILE.prev-$$" "$WAL_COMPANION_FILE" 2>/dev/null || true
+    fi
+    cleanup_staged
+}
+
+# Fail fast if any destination path is a directory: remove_file/mv cannot
+# replace it, so a commit would fail partway and leave the set half-committed.
+if [ -d "$BACKUP_FILE" ] || [ -d "$COMPANION_FILE" ] || [ -d "$WAL_COMPANION_FILE" ]; then
+    rollback_commit
+    die "refusing to commit over a directory at $BACKUP_FILE / $COMPANION_FILE / $WAL_COMPANION_FILE" 7
+fi
+
+# Stash any existing regular-file destinations aside so a partial commit
+# can restore them on failure (same-second destination reuse).
+if [ -f "$BACKUP_FILE" ]; then
+    mv -f "$BACKUP_FILE" "$BACKUP_FILE.prev-$$" \
+        || { rollback_commit; die "could not stash existing backup destination $BACKUP_FILE" 7; }
+fi
+if [ -f "$COMPANION_FILE" ]; then
+    mv -f "$COMPANION_FILE" "$COMPANION_FILE.prev-$$" \
+        || { rollback_commit; die "could not stash existing sidecar destination $COMPANION_FILE" 7; }
+fi
+if [ -f "$WAL_COMPANION_FILE" ]; then
+    mv -f "$WAL_COMPANION_FILE" "$WAL_COMPANION_FILE.prev-$$" \
+        || { rollback_commit; die "could not stash existing wal destination $WAL_COMPANION_FILE" 7; }
+fi
+
 mv -f "$STAGED_BACKUP" "$BACKUP_FILE" \
-    || { cleanup_staged; die "could not move the staged backup into place" 7; }
+    || { rollback_commit; die "could not move the staged backup into place" 7; }
 if [ -f "$SIDECAR_PATH" ]; then
     mv -f "$STAGED_COMPANION" "$COMPANION_FILE" \
-        || { cleanup_staged; die "could not move the staged sidecar companion into place" 7; }
+        || { rollback_commit; die "could not move the staged sidecar companion into place" 7; }
 else
     # Unit invariant (see header): a companion left at a reused
     # destination by an earlier run must not survive into a backup
@@ -253,7 +294,7 @@ else
 fi
 if ! $DAEMON_WAS_RUNNING && [ -f "$WAL_PATH" ]; then
     mv -f "$STAGED_WAL" "$WAL_COMPANION_FILE" \
-        || { cleanup_staged; die "could not move the staged WAL companion into place" 7; }
+        || { rollback_commit; die "could not move the staged WAL companion into place" 7; }
 elif [ -f "$WAL_COMPANION_FILE" ]; then
     # Unit invariant (see header): a WAL companion left at a reused
     # destination must not survive into a backup whose source had no
@@ -264,6 +305,9 @@ elif [ -f "$WAL_COMPANION_FILE" ]; then
     log "removed stale WAL companion $WAL_COMPANION_FILE — destination reused, current backup carries no uncheckpointed writes"
 fi
 
+# Commit succeeded: discard the stashed previous companions.
+rm -f "$BACKUP_FILE.prev-$$" "$COMPANION_FILE.prev-$$" "$WAL_COMPANION_FILE.prev-$$"
+
 # 5. Prune old backups (pair-aware: companions are not backups in their
 # own right — count/select only db-* files without the sidecar or WAL
 # suffix, and delete a pruned backup's companions with it). Selection
@@ -271,9 +315,9 @@ fi
 # not by mtime: an operator touching or restoring an older backup must
 # not make it look newest and escape pruning.
 if [ "$MAX_BACKUPS" -gt 0 ]; then
-    PRUNE_COUNT=$(ls -1d "$BACKUP_DIR"/db-* 2>/dev/null | grep -v -e '\.store-state\.json$' -e '\.wal$' -e '\.tmp-' | sort -r | wc -l)
+    PRUNE_COUNT=$(ls -1d "$BACKUP_DIR"/db-* 2>/dev/null | grep -v -e '\.store-state\.json$' -e '\.wal$' -e '\.tmp-' -e '\.prev-' | sort -r | wc -l)
     if [ "$PRUNE_COUNT" -gt "$MAX_BACKUPS" ]; then
-        ls -1d "$BACKUP_DIR"/db-* 2>/dev/null | grep -v -e '\.store-state\.json$' -e '\.wal$' -e '\.tmp-' | sort -r | tail -n +$((MAX_BACKUPS + 1)) | while IFS= read -r OLD_BACKUP; do
+        ls -1d "$BACKUP_DIR"/db-* 2>/dev/null | grep -v -e '\.store-state\.json$' -e '\.wal$' -e '\.tmp-' -e '\.prev-' | sort -r | tail -n +$((MAX_BACKUPS + 1)) | while IFS= read -r OLD_BACKUP; do
             rm -f "$OLD_BACKUP" "$OLD_BACKUP.store-state.json" "$OLD_BACKUP.wal"
         done
         log "pruned $((PRUNE_COUNT - MAX_BACKUPS)) old backup(s), keeping $MAX_BACKUPS"
