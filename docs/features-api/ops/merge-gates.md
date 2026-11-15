@@ -38,6 +38,14 @@ Inline findings are counted from unresolved review threads when the GraphQL
 unavailable, every inline finding counts (over-gating) and the script says so on
 stderr; it never treats an unresolved thread as clearance.
 
+GitHub Actions has no thread-resolution trigger: `pull_request_review_thread`
+is a webhook event only, and listing it in `on:` makes the workflow invalid. A
+bare resolve/unresolve therefore does not re-run the check; it re-evaluates on
+the next review, inline comment, PR edit, issue comment, or a manual
+`workflow_dispatch` of `gate-receipt.yml` with the PR number. A `fixed@` or
+`filed` reply is an inline comment, so the normal receipt path re-runs the check
+without an unrelated push.
+
 For offline checks, `--reviews-file <path>` takes a legacy body fixture and
 `--fixtures-dir <dir>` takes `reviews.json`, `issue-comments.json`, and either
 `threads.json` or `pull-comments.json` with the same payload shapes as the API.

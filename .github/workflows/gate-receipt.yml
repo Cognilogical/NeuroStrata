@@ -1,12 +1,26 @@
 name: gate-receipt
 
+# GitHub Actions has no review-thread-resolution trigger:
+# `pull_request_review_thread` is a webhook event only, and listing it under
+# `on:` makes the workflow invalid. A bare resolve/unresolve therefore
+# re-evaluates on the next review, inline comment, PR edit, issue comment, or
+# a manual workflow_dispatch. A `fixed@`/`filed`/`ruled:` reply is an inline
+# comment, so the receipt path re-runs the check without an unrelated push.
 on:
   pull_request_review:
     types: [submitted, edited, dismissed]
+  pull_request_review_comment:
+    types: [created, edited, deleted]
   pull_request:
     types: [opened, synchronize, reopened, edited]
   issue_comment:
     types: [created, edited, deleted]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Pull request number to re-evaluate
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -21,13 +35,20 @@ jobs:
       # Bootstrap: this workflow lands in the PR that adds the script, so the
       # first run must use the head. After this lands, pin to base.ref so a PR
       # cannot edit the gate that checks it.
-      - name: Resolve the PR head for comment events
+      - name: Resolve the PR head for comment and dispatch events
         id: resolve
-        if: github.event_name == 'issue_comment'
+        if: github.event_name == 'issue_comment' || github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number || inputs.pr }}
         run: |
-          sha=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.issue.number }}" --jq .head.sha)
+          case "$PR_NUMBER" in
+            ''|*[!0-9]*)
+              echo "::error::PR number is missing or not numeric: '$PR_NUMBER'"
+              exit 2
+              ;;
+          esac
+          sha=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER" --jq .head.sha)
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
       - name: Checkout PR head (bootstrap; pin to base after merge)
@@ -38,4 +59,4 @@ jobs:
       - name: Require a receipt for every gating marker
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash scripts/gate-receipt.sh --pr "${{ github.event.pull_request.number || github.event.issue.number }}"
+        run: bash scripts/gate-receipt.sh --pr "${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}"
