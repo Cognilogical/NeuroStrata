@@ -192,6 +192,17 @@
       "thresholds": {
         "ignored": 0
       }
+    },
+    "recall-census-boundary": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp linked_files_census_stays_exact_across_the_id_batch_boundary -- --test-threads=1"
+      ],
+      "tests": [
+        "store::ladybug::tests::linked_files_census_stays_exact_across_the_id_batch_boundary"
+      ],
+      "thresholds": {
+        "ignored": 0
+      }
     }
   }
 }
