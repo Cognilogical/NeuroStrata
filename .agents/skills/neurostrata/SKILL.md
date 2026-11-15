@@ -2,7 +2,7 @@
 name: neurostrata
 description: "Manage the 3-Tier Memory Architecture (Global, Domain, Task), Central Executive Task Machine, Automatic Graph-First Exploration, and Subagent Context Propagation. Replaces legacy MEMORY.md and bd remember."
 ---
-# NeuroStrata (v1.17.0 — Tri-Strata Memory, Central Executive & Graph-First Architecture)
+# NeuroStrata (v1.18.0 — Tri-Strata Memory, Central Executive, Enterprise Ontology & Subject-Matter Domain Expertise)
 
 ## Overview
 NeuroStrata (`neurostrata-mcp`, `neurostrata-lf3p`) is a single compiled Rust binary housing an embedded vector, property graph, full-text, and W3C RDF/SPARQL 1.1/SHACL engine (LadybugDB + Tantivy + `oxrdf`/`oxttl` + `spargebra`/`spareval` + `shacl` + Laya). It completely replaces `MEMORY.md`, local markdown TODO lists, `TodoWrite`, and deprecated `bd` commands with binary-enforced task and memory gates.
@@ -70,3 +70,12 @@ NeuroStrata (`neurostrata-mcp`, `neurostrata-lf3p`) is a single compiled Rust bi
 - **Digital Twins & Telemetry:** Model state with `neurostrata_twin_set`, `neurostrata_twin_get`, `neurostrata_twin_list` and `neurostrata_twin_diff`, and read rolling time-series summaries with `neurostrata_metrics_query` and `neurostrata_metrics_list`.
 - **SynapticMesh (`neurostrata_synaptic_mesh_*`):** Shares `eligibility: "shareable"` rules, facts, and procedure definitions (stripped of local runtime counters) over plain `git`. Private rows are sovereign; conflicts are preserved visibly (`neurostrata_synaptic_mesh_status`) and never force-pushed. The CLI surface is `neurostrata-mcp synaptic-mesh` (alias `mesh`) with `init`, `join`, `leave`, `pull`, `push` and `status`.
 - **Daemon Caller-Path Authority (`J6`):** Every caller-supplied filesystem path on `/ingest`, `/backup`, `/export-graph`, and `/tasks/import` is canonicalized via `check_caller_path` and must reside inside `startup_root` or `allowed_external_dirs` in `~/.config/neurostrata/config.json`.
+
+---
+
+## 6. Subject-Matter Domain Expertise, SKOS Concept Taxonomy & SME Frontier Advisor (`neurostrata_taxonomy`)
+- **Operations (`set_thesis`, `upsert_concept`, `tree`, `briefing`, `compare`, `gaps`, `advise`):**
+  - `set_thesis`: Defines or atomically supersedes the singleton Project Thesis (`primary_domain`, `mission`, `direction`, `core_pillars`, `adjacent_domains`, `evaluation_axes`, `non_goals`, `open_questions`).
+  - `upsert_concept`: Defines or atomically supersedes a canonical SKOS concept (`slug`, `pref_label`, `definition`, `domain`, `aliases`, `broader`, `related_concepts`, `contrasts_with`, `tradeoffs`, `references`, license-verified `comparable_implementations`, `realization_status`, `current_limitations`, `frontier_opportunities`, `implemented_interfaces`, `linked_action_types`, `evaluation_scores`, `evidence_refs`), enforcing DAG cycle-freedom and transitive W3C SKOS S27 disjointness.
+  - `tree` / `briefing` / `compare` / `gaps`: Principal-filtered SKOS hierarchy, Forward-Expand / Backward-Prune multi-hop subject-matter briefings, multi-perspective comparative matrices, and epistemic coverage (`0..10000` bps) + ontology anti-pattern lints (`OrphanConcept`, `OverloadedUmbrella`, `UnanchoredPillar`, `SymmetricConflict`).
+  - `advise` (Expert-to-Expert Advisory Protocol): Ranks SME improvement opportunities by `compute_frontier_leverage_bps`, joining external research/comparables (`references`, `comparable_implementations`, `frontier_opportunities`, `current_limitations`) with canonical project entities (`implemented_interfaces`, `linked_action_types`, governing rules/facts, files/symbols, open tasks). When asked strategic or domain-improvement questions (e.g., *"What are the top 5 ways we could improve this project?"*), run `neurostrata_taxonomy(operation: "advise", top_k: 5)`, execute any `public_safe` external research agenda queries (`websearch`, `context7`), persist newly discovered literature/comparables via `upsert_concept`, and ground recommendations in canonical project entities and domain literature.
