@@ -198,3 +198,16 @@ path = "tests/search/upgraded_search_test.rs"
 [[test]]
 name = "validator_test"
 path = "tests/guard/validator_test.rs"
+
+# Prevent 20+ GB target/ directories across worktrees: strip DWARF debug info
+# from third-party C++/Rust dependencies (lbug, ort, tantivy, shacl, openssl)
+# and retain line-tables-only for workspace backtraces.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
