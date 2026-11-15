@@ -6,7 +6,7 @@
 
 ## 1. Problem
 
-In Palantir Foundry, **Object Views** serve as the canonical 360° operational hub for any entity in the Ontology: in a single view, an operator or AI agent sees the object's core properties, implemented interfaces, derived reducer metrics, 1-hop linked objects grouped by link type, bound time-series telemetry, bitemporal edit/action history, governance status, and the exact list of **legal `Action Types`** that can currently be executed on that object.
+In an enterprise ontology, **Object Views** serve as the canonical 360° operational hub for any entity in the Ontology: in a single view, an operator or AI agent sees the object's core properties, implemented interfaces, derived reducer metrics, 1-hop linked objects grouped by link type, bound time-series telemetry, bitemporal edit/action history, governance status, and the exact list of **legal `Action Types`** that can currently be executed on that object.
 
 In NeuroStrata today, assembling this 360° view for a `digital_twin`, `code_ast` symbol, `file`, `task`, or normative `rule`/`fact` requires chaining 5–7 separate MCP calls:
 1. `get_by_id` / `neurostrata_search_memory` (core row payload & metadata).

@@ -6,9 +6,9 @@
 
 ## 1. Problem
 
-Sourcegraph's **Guided Diff Tour** demonstrated that reviewing multi-file diffs in alphabetical file order forces humans and code-review agents (`reviewer`, `checker-free`) to jump back and forth between callers, types, and tests.
+Reviewing multi-file diffs in alphabetical file order forces humans and code-review agents (`reviewer`, `checker-free`) to jump back and forth between callers, types, and tests.
 
-NeuroStrata has a unique advantage over Sourcegraph for diff review: in addition to an AST call/import graph (`DEPENDS_ON`), NeuroStrata holds normative **`GOVERNS` rules**, **SHACL constraints**, and **failed `attempt` memories**. However, NeuroStrata currently has no tool that maps a changeset/diff onto the knowledge graph to:
+NeuroStrata has a unique advantage for topological diff review: in addition to an AST call/import graph (`DEPENDS_ON`), NeuroStrata holds normative **`GOVERNS` rules**, **SHACL constraints**, and **failed `attempt` memories**. However, NeuroStrata currently has no tool that maps a changeset/diff onto the knowledge graph to:
 1. Order changed hunks topologically (definitions/schemas before core logic before callers before tests).
 2. Identify **un-edited callers in the blast radius** whose callee signatures or behavior changed.
 3. Surface every active `GOVERNS` rule and historical failed `attempt` that applies to the modified line ranges.

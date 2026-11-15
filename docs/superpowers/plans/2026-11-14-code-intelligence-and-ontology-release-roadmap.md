@@ -1,19 +1,19 @@
-# Sourcegraph Code Intelligence & Palantir Ontology Release Master Plan (`v1.18.0` on `feat/kinetic-actions`)
+# Code Intelligence & Enterprise Ontology Release Master Plan (`v1.18.0` on `feat/kinetic-actions`)
 
 **Date:** 2026-11-14
 **Target Release:** `v1.18.0` (dedicated feature release following `v1.17.3` on `main`)
 **Integration Branch:** `feat/kinetic-actions`
 **Umbrella Epics:**
-- `neurostrata-mtqx` — *Epic: Sourcegraph-Inspired Code Intelligence & Retrieval Upgrades* (5 features)
-- `neurostrata-1mus` — *Epic: Palantir Ontology Kinetic, Dynamic & Semantic Upgrades* (4 features)
+- `neurostrata-mtqx` — *Epic: Code Intelligence & Retrieval Upgrades* (5 features)
+- `neurostrata-1mus` — *Epic: Enterprise Ontology Kinetic, Dynamic & Semantic Upgrades* (4 features)
 
 ---
 
 ## 1. Release Scope & 100% Feature Inventory
 
-This release bundles **all 9 capabilities** identified from the Sourcegraph Code Intelligence audit (`neurostrata-mtqx`) and the Palantir Foundry Ontology audit (`neurostrata-1mus`) into a single cohesive release (`v1.18.0`). All specs, plans, Lean 4 formal-verification contracts, and implementation commits are isolated on `feat/kinetic-actions` so `v1.17.3` ships cleanly from `main` first.
+This release bundles **all 9 capabilities** from the Code Intelligence architecture track (`neurostrata-mtqx`) and the Enterprise Ontology architecture track (`neurostrata-1mus`) into a single cohesive release (`v1.18.0`). All specs, plans, Lean 4 formal-verification contracts, and implementation commits are isolated on `feat/kinetic-actions` so `v1.17.3` ships cleanly from `main` first.
 
-### Part A — Sourcegraph-Inspired Code Intelligence Suite (Epic `neurostrata-mtqx`)
+### Part A — Code Intelligence Suite (Epic `neurostrata-mtqx`)
 
 | # | Task ID | Feature | Design Spec | Primary Code Surfaces | MCP / CLI / HTTP Surface |
 |---|---------|---------|-------------|----------------------|--------------------------|
@@ -23,7 +23,7 @@ This release bundles **all 9 capabilities** identified from the Sourcegraph Code
 | S4 | `neurostrata-737r` (blocked by `rbde`) | `neurostrata_diff_tour` — Guided Diff Tour with 4-Stop AST Topological Ordering, Unchanged-Caller Blast Radius & `GOVERNS` Audit | `docs/superpowers/specs/2026-11-14-guided-diff-tour-design.md` | `src/graph_read/diff_tour.rs`, `src/server.rs`, `src/daemon.rs`, `src/main.rs`, `src/formal_kernel.rs` | `neurostrata_diff_tour`, `POST /diff-tour`, `neurostrata-mcp diff-tour` |
 | S5 | `neurostrata-kx2n` | `neurostrata_insights` — Longitudinal Architectural & Governance Code Insights over the Bitemporal Graph & `TimeSeriesStore` | `docs/superpowers/specs/2026-11-14-architectural-code-insights-design.md` | `src/telemetry/insights.rs`, `src/telemetry/anomaly.rs`, `src/time_series.rs`, `src/registry.rs`, `src/server.rs`, `src/main.rs` | `neurostrata_insights`, `POST /insights`, `neurostrata-mcp insights` |
 
-### Part B — Palantir Foundry Ontology Suite (Epic `neurostrata-1mus`)
+### Part B — Enterprise Ontology Suite (Epic `neurostrata-1mus`)
 
 | # | Task ID | Feature | Design Spec | Implementation Plan | Primary Code Surfaces | MCP / CLI / HTTP Surface |
 |---|---------|---------|-------------|---------------------|----------------------|--------------------------|

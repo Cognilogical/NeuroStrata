@@ -94,6 +94,7 @@ When this project is joined to a SynapticMesh (`neurostrata-mcp synaptic-mesh st
 
 ## 8. Core Engineering Mandates
 - **Conventions:** Rigorously adhere to existing project conventions (formatting, naming, frameworks).
+- **Competitor Naming Prohibition (`9e64a5a8-aba4-4034-abfe-8b478bd9950e`):** NEVER name NeuroStrata files, features, plans, specs, tasks, symbols, or documentation after competitor companies, products, or projects. When adopting or adapting capabilities from external product comparisons, always use NeuroStrata-native domain terminology and never include competitor brand or product names in the repository.
 - **Libraries/Frameworks:** NEVER assume a library is available. Verify in configuration files first.
 - **Comments:** Add comments sparingly, focusing on *why* rather than *what*. Never talk to the user through code comments.
 - **Paths:** Always use absolute paths when using file system tools.

@@ -6,9 +6,9 @@
 
 ## 1. Problem
 
-Sourcegraph's **Code Insights** turns code queries into longitudinal time-series charts tracking API migrations, deprecations, and vulnerability burn-down across time.
+Longitudinal **Code Insights** turn code and governance queries into time-series charts tracking API migrations, deprecations, and vulnerability burn-down across time.
 
-NeuroStrata already possesses two foundational building blocks that Sourcegraph lacks:
+NeuroStrata already possesses two foundational building blocks that standalone code-search engines lack:
 1. **Bitemporal Knowledge Graph (`valid_from`, `valid_to`, `IngestGeneration`):** Normative memories (`rule`, `fact`, `procedure`, `task`) carry epoch validity windows, and Oxigraph SPARQL (`src/rdf/`) supports `ns:validAt(?mem, ?ts)` and `ns:isRetired(?mem)`.
 2. **Embedded Time-Series Store (`src/time_series.rs` + `MemoryMetric` node table in `src/store/ladybug.rs:5755`):** `TimeSeriesStore` already supports `SeriesKey`, `Sample`, `RollingAgg` EWMA summaries, anomaly detection (`recent_anomalies`), and persistent flushing to `MemoryMetric`.
 

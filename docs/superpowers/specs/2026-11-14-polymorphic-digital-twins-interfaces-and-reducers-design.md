@@ -6,17 +6,17 @@
 
 ## 1. Problem
 
-A direct comparison between Palantir Foundry's **Semantic Layer (Object Types, Interfaces, Link Types, Derived Property Reducers)** and NeuroStrata's Digital Twin module (`src/digital_twin/mod.rs`, `docs/superpowers/specs/2026-10-28-digital-twin-design.md`) reveals four expressive limitations in our current implementation:
+An architecture review of **Semantic Layer ontologies (Object Types, Interfaces, Link Types, Derived Property Reducers)** and NeuroStrata's Digital Twin module (`src/digital_twin/mod.rs`, `docs/superpowers/specs/2026-10-28-digital-twin-design.md`) reveals four expressive limitations in our current implementation:
 
 1. **No Polymorphic Interfaces (`src/digital_twin/mod.rs:73-97`):**
    - In `src/digital_twin/mod.rs:73`, `TwinSchema` is strictly a flat `BTreeMap<String, TwinVarBounds>` bound to a single `schema_id`.
-   - Palantir's **Interfaces** allow heterogeneous object types (e.g., `CoolingPump`, `BackupGenerator`, `ChillerUnit`) to implement shared interfaces (e.g., `ThermalAsset`, `MaintainableEquipment`) that enforce required shared properties/variables and allow polymorphic queries (`SELECT ?asset WHERE { ?asset a ns:Interface_ThermalAsset }`) and polymorphic `Action Types`.
+   - **Ontology Interfaces** allow heterogeneous object types (e.g., `CoolingPump`, `BackupGenerator`, `ChillerUnit`) to implement shared interfaces (e.g., `ThermalAsset`, `MaintainableEquipment`) that enforce required shared properties/variables and allow polymorphic queries (`SELECT ?asset WHERE { ?asset a ns:Interface_ThermalAsset }`) and polymorphic `Action Types`.
 2. **Numeric-Only `f64` State (`src/digital_twin/mod.rs:105-119`):**
    - `get_state` and `set_state` only accept `BTreeMap<String, f64>`. Real-world operational twins also carry discrete typed **attributes** (`status: "online" | "degraded" | "offline"`, `firmware_version: "v2.4.1"`, `failover_enabled: true`).
 3. **No Typed Link Constraints Between Twins, Rules & Code (`src/digital_twin/mod.rs:121+`):**
    - Twin schemas cannot declare cardinality-constrained link types (e.g., a `CoolingLoop` twin must link via `CONTAINS` to `1..=8` `CoolingPump` twins and be governed via `GOVERNS` by $\ge 1$ safety `rule`).
 4. **No Declarative Property Reducers (Derived Roll-Up Properties):**
-   - In Palantir's Ontology, a parent object type can declare a **Property Reducer** (e.g., `total_power_kw = sum(CONTAINS -> ChildAsset.power_kw)`, `max_child_temp = max(CONTAINS -> ThermalAsset.temperature)`). In NeuroStrata today, twin variables are strictly static stored `f64` numbers with no roll-up reducer evaluation.
+   - In an enterprise ontology, a parent object type can declare a **Property Reducer** (e.g., `total_power_kw = sum(CONTAINS -> ChildAsset.power_kw)`, `max_child_temp = max(CONTAINS -> ThermalAsset.temperature)`). In NeuroStrata today, twin variables are strictly static stored `f64` numbers with no roll-up reducer evaluation.
 
 ## 2. Goals
 

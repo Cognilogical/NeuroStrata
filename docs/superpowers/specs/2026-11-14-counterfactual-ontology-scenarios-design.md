@@ -6,7 +6,7 @@
 
 ## 1. Problem
 
-Palantir Foundry's **Dynamic Layer (`Ontology Scenarios`)** allows operators and AI agents to fork a temporary, isolated **"what-if" overlay** on top of the live Ontology, apply one or more hypothetical `Actions` or `Digital Twin` state changes, run queries/models/validations against the simulated state without mutating the live database, compare multiple scenarios side-by-side, and either **Merge (Commit)** the winning scenario or discard it.
+An enterprise ontology's **Dynamic Layer (`Ontology Scenarios`)** allows operators and AI agents to fork a temporary, isolated **"what-if" overlay** on top of the live Ontology, apply one or more hypothetical `Actions` or `Digital Twin` state changes, run queries/models/validations against the simulated state without mutating the live database, compare multiple scenarios side-by-side, and either **Merge (Commit)** the winning scenario or discard it.
 
 In NeuroStrata today:
 - Every mutation (`neurostrata_add_memory`, `neurostrata_supersede_memory`, `neurostrata_twin_set_state`) mutates the live LadybugDB store immediately and triggers live event bus / SynapticMesh subscribers.

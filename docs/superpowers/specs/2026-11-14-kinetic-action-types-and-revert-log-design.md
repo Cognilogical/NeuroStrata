@@ -6,7 +6,7 @@
 
 ## 1. Problem
 
-Palantir Foundry's **Kinetic Layer** (`Action Types`) separates *raw storage CRUD* from *governed domain mutations*. In Palantir's Ontology, operators and AI agents do not arbitrarily mutate individual database fields; they invoke typed **`Action Types`** that bundle:
+An enterprise ontology's **Kinetic Layer** (`Action Types`) separates *raw storage CRUD* from *governed domain mutations*. Rather than arbitrarily mutating individual database fields, operators and AI agents invoke typed **`Action Types`** that bundle:
 1. Typed input parameters with constraint validation.
 2. Role-based authorization (`ReBAC`) and cross-object **submission criteria** (pre-conditions that must hold across the graph before the action is permitted).
 3. Multi-object atomic mutations (updating object properties, digital twin variables, and graph links together).

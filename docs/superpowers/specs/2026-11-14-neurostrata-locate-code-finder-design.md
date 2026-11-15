@@ -2,11 +2,11 @@
 
 **Date:** 2026-11-14
 > Status: DRAFT — tracked under Epic `neurostrata-mtqx`, Feature Task `neurostrata-r3as` (Spec Task `neurostrata-sttv`).
-**Approach:** Compound In-Daemon Graph + Hybrid RRF Locator inspired by Sourcegraph's `Code Finder` MCP subagent, returning ranked `file:line_range` spans hydrated with AST call-graph summary, active `GOVERNS` rules, and negative `attempt` hazards in a single MCP round-trip.
+**Approach:** Compound In-Daemon Graph + Hybrid RRF Locator (`Code Finder`), returning ranked `file:line_range` spans hydrated with AST call-graph summary, active `GOVERNS` rules, and negative `attempt` hazards in a single MCP round-trip.
 
 ## 1. Problem
 
-Sourcegraph's 2026 MCP benchmarks showed that a dedicated single-call locator (`code_finder`) is **$2.19\times$ faster** and uses a fraction of the host context window compared to an agent manually chaining `search` $\rightarrow$ `read_file` $\rightarrow$ `find_references`.
+MCP retrieval benchmarks show that a dedicated single-call locator (`code_finder`) is **$2.19\times$ faster** and uses a fraction of the host context window compared to an agent manually chaining `search` $\rightarrow$ `read_file` $\rightarrow$ `find_references`.
 
 In NeuroStrata today, an agent obeying the Graph-First Lookup Reflex (`AGENTS.md` §3d) must execute 3–6 sequential MCP tool calls to orient on a task:
 1. `neurostrata_search_memory({ query, include_code_ast: true })` to find candidate rules and AST symbols.

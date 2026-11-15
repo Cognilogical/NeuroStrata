@@ -6,7 +6,7 @@
 
 ## 1. Problem
 
-A source audit against Sourcegraph's retrieval stack (`zoekt` + hybrid ranking) identified three concrete retrieval gaps in NeuroStrata's current search pipeline:
+An architecture audit of NeuroStrata's code retrieval stack (`zoekt`-style trigram/lexical indexing + hybrid ranking) identified three concrete retrieval gaps in our current search pipeline:
 
 1. **`SearchMode::Hybrid` is single-retriever re-scoring, not multi-retriever fusion (`src/store/ladybug.rs:1057-1138`, `src/graph_read/hybrid.rs:47-64`):**
    - `SearchMode::Hybrid` currently runs only on the candidate pool already returned by the HNSW vector scan and its Cypher expansion (`src/store/ladybug.rs:48-1056`). It never queries `tantivy_lexical` (`src/lexical.rs`) or the in-house `fts::LexicalIndex` (`src/fts.rs`).

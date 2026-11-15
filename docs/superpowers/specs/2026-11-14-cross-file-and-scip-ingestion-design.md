@@ -6,7 +6,7 @@
 
 ## 1. Problem
 
-NeuroStrata's AST call graph (`DEPENDS_ON` edges on `code_ast` rows) currently has a structural blind spot compared to Sourcegraph's SCIP code intelligence:
+NeuroStrata's AST call graph (`DEPENDS_ON` edges on `code_ast` rows) currently has a structural blind spot compared to compiler-grade SCIP code intelligence:
 
 1. **Same-File-Only Call Resolution (`src/parser/ingest.rs:881-961`, `1285`, `1476-1501`):**
    - Inside `run_consumer` (`src/parser/ingest.rs:881-961`), `file_symbol_ids` (`HashMap<String, String>`) is constructed *per file* as `WorkItem::ParsedSymbols` arrives and dropped at the end of that file's loop iteration.
@@ -27,7 +27,7 @@ NeuroStrata's AST call graph (`DEPENDS_ON` edges on `code_ast` rows) currently h
 
 3. **No Compiler-Grade Index Ingestion (SCIP):**
    - Tree-sitter alone cannot resolve overloaded methods, generic trait dispatch (`VectorStore::search` -> `LadybugStore::search`), or type-inferred method receivers (`store.search(...)`).
-   - Sourcegraph's open **SCIP** format (`index.scip` emitted by `rust-analyzer scip .`, `scip-typescript`, `scip-python`, `scip-go`, `scip-java`) solves this deterministically using compiler typecheckers.
+   - The open **SCIP** format (`index.scip` emitted by `rust-analyzer scip .`, `scip-typescript`, `scip-python`, `scip-go`, `scip-java`) solves this deterministically using compiler typecheckers.
 
 ## 2. Goals
 
@@ -80,7 +80,7 @@ NeuroStrata's AST call graph (`DEPENDS_ON` edges on `code_ast` rows) currently h
 ### 4.2 Tier 2: SCIP Protobuf Reader in `src/parser/scip.rs`
 
 1. **Library Reuse & Dependency Selection (Rule `227984e4-780c-4fe4-a44c-286d7d14eabf`):**
-   - Add the official Sourcegraph `scip` crate (`Apache-2.0`) and/or `prost = "0.13"` (`Apache-2.0`) to `Cargo.toml` to decode `scip.proto` messages (`Index`, `Metadata`, `Document`, `SymbolInformation`, `Relationship`, `Occurrence`) and parse SCIP symbol monikers directly rather than writing a bespoke protobuf wire decoder.
+   - Add the official `scip` crate (`Apache-2.0`) and/or `prost = "0.13"` (`Apache-2.0`) to `Cargo.toml` to decode `scip.proto` messages (`Index`, `Metadata`, `Document`, `SymbolInformation`, `Relationship`, `Occurrence`) and parse SCIP symbol monikers directly rather than writing a bespoke protobuf wire decoder.
 2. **SCIP Moniker to NeuroStrata Node Mapping:**
    - For each `Document` (`relative_path`, `occurrences`, `symbols`):
      - Reject paths escaping `project_root` (`..`, absolute paths, or symlinks).
