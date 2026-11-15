@@ -927,3 +927,149 @@ pub const fn allocate_hybrid_slots(
         remaining_taken: rem_taken,
     }
 }
+
+/// Error from intersecting an interface's variable bounds with a child twin schema's bounds (`neurostrata-brs1`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TwinBoundError {
+    InvertedInterfaceBounds,
+    InvertedTwinBounds,
+    DisjointBounds,
+}
+
+/// Intersects an interface bound `[iface_min, iface_max]` with a child schema bound `[twin_min, twin_max]`,
+/// enforcing covariant bound tightening (`eff_min >= iface_min && eff_max <= iface_max`).
+pub const fn intersect_var_bounds(
+    iface_min: i64,
+    iface_max: i64,
+    twin_min: i64,
+    twin_max: i64,
+) -> Result<(i64, i64), TwinBoundError> {
+    if iface_min > iface_max {
+        return Err(TwinBoundError::InvertedInterfaceBounds);
+    }
+    if twin_min > twin_max {
+        return Err(TwinBoundError::InvertedTwinBounds);
+    }
+    let eff_min = if iface_min >= twin_min {
+        iface_min
+    } else {
+        twin_min
+    };
+    let eff_max = if iface_max <= twin_max {
+        iface_max
+    } else {
+        twin_max
+    };
+    if eff_min > eff_max {
+        Err(TwinBoundError::DisjointBounds)
+    } else {
+        Ok((eff_min, eff_max))
+    }
+}
+
+/// Deterministic link-reducer operator kind (`neurostrata-brs1`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReducerOpKind {
+    Count,
+    Sum,
+    Min,
+    Max,
+    Avg,
+    AllInBounds,
+    AnyOutOfBounds,
+}
+
+impl ReducerOpKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ReducerOpKind::Count => "count",
+            ReducerOpKind::Sum => "sum",
+            ReducerOpKind::Min => "min",
+            ReducerOpKind::Max => "max",
+            ReducerOpKind::Avg => "avg",
+            ReducerOpKind::AllInBounds => "all_in_bounds",
+            ReducerOpKind::AnyOutOfBounds => "any_out_of_bounds",
+        }
+    }
+}
+
+/// Total outcome of evaluating a declarative link reducer over 1-hop twin neighbors (`neurostrata-brs1`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReducerEvalOutcome {
+    pub numeric_val: i64,
+    pub bool_val: bool,
+    pub is_defined: bool,
+}
+
+/// Total, division-by-zero-free link reducer evaluation kernel (`neurostrata-brs1`).
+pub const fn evaluate_reducer_total(
+    op: ReducerOpKind,
+    count: u32,
+    sum_val: i64,
+    min_val: i64,
+    max_val: i64,
+    any_out_of_bounds: bool,
+) -> ReducerEvalOutcome {
+    if count == 0 {
+        match op {
+            ReducerOpKind::Count | ReducerOpKind::Sum | ReducerOpKind::Avg => ReducerEvalOutcome {
+                numeric_val: 0,
+                bool_val: false,
+                is_defined: true,
+            },
+            ReducerOpKind::Min | ReducerOpKind::Max => ReducerEvalOutcome {
+                numeric_val: 0,
+                bool_val: false,
+                is_defined: false,
+            },
+            ReducerOpKind::AllInBounds => ReducerEvalOutcome {
+                numeric_val: 1,
+                bool_val: true,
+                is_defined: true,
+            },
+            ReducerOpKind::AnyOutOfBounds => ReducerEvalOutcome {
+                numeric_val: 0,
+                bool_val: false,
+                is_defined: true,
+            },
+        }
+    } else {
+        match op {
+            ReducerOpKind::Count => ReducerEvalOutcome {
+                numeric_val: count as i64,
+                bool_val: true,
+                is_defined: true,
+            },
+            ReducerOpKind::Sum => ReducerEvalOutcome {
+                numeric_val: sum_val,
+                bool_val: true,
+                is_defined: true,
+            },
+            ReducerOpKind::Min => ReducerEvalOutcome {
+                numeric_val: min_val,
+                bool_val: true,
+                is_defined: true,
+            },
+            ReducerOpKind::Max => ReducerEvalOutcome {
+                numeric_val: max_val,
+                bool_val: true,
+                is_defined: true,
+            },
+            ReducerOpKind::Avg => ReducerEvalOutcome {
+                numeric_val: sum_val / (count as i64),
+                bool_val: true,
+                is_defined: true,
+            },
+            ReducerOpKind::AllInBounds => ReducerEvalOutcome {
+                numeric_val: if !any_out_of_bounds { 1 } else { 0 },
+                bool_val: !any_out_of_bounds,
+                is_defined: true,
+            },
+            ReducerOpKind::AnyOutOfBounds => ReducerEvalOutcome {
+                numeric_val: if any_out_of_bounds { 1 } else { 0 },
+                bool_val: any_out_of_bounds,
+                is_defined: true,
+            },
+        }
+    }
+}

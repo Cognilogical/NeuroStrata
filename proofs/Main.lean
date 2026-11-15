@@ -9,6 +9,7 @@ open NeuroStrata.TwinCrdt
 open NeuroStrata.Retention
 open NeuroStrata.KineticAction
 open NeuroStrata.HybridSlots
+open NeuroStrata.TwinInterface
 
 def boolToStr (b : Bool) : String := if b then "true" else "false"
 
@@ -106,3 +107,15 @@ def main : IO Unit := do
         for availOther in [0, 3] do
           let alloc := allocateHybridSlots limit availNorm availExp availOther
           IO.println s!"HYBRID_SLOTS|{limit}|{availNorm}|{availExp}|{availOther}|{alloc.normativeTaken}|{alloc.expansionTaken}|{alloc.remainingTaken}"
+  let boundCases : List (Int × Int × Int × Int) :=
+    [(10, 0, 0, 100), (0, 100, 20, 10), (0, 10, 20, 30), (-50, 200, 0, 120), (0, 100, -10, 80)]
+  for (imin, imax, tmin, tmax) in boundCases do
+    let tag := formatBoundsOutcome (intersectVarBounds imin imax tmin tmax)
+    IO.println s!"TWIN_BOUNDS|{imin}|{imax}|{tmin}|{tmax}|{tag}"
+  let reducerOps : List ReducerOpKind := [.count, .sum, .min, .max, .avg, .allInBounds, .anyOutOfBounds]
+  let reducerInputs : List (String × Nat × Int × Int × Int × Bool) :=
+    [("empty", 0, 0, 0, 0, false), ("populated_ok", 3, 45, 10, 20, false), ("populated_oob", 3, 45, 10, 20, true)]
+  for op in reducerOps do
+    for (label, cnt, sumV, minV, maxV, oob) in reducerInputs do
+      let out := evaluateReducerTotal op cnt sumV minV maxV oob
+      IO.println s!"TWIN_REDUCER|{op.asStr}|{label}|{out.numericVal}|{boolToStr out.boolVal}|{boolToStr out.isDefined}"

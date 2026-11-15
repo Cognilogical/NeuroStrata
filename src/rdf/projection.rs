@@ -1,12 +1,12 @@
 //! RDF projection: MemoryPayload → RDF quads (oxrdf-backed).
-//! 
+//!
 //! Phase 2 migration: uses oxrdf::Quad and oxrdf::Term instead of hand-written
 //! Quad/QuadObject. The OxRdfBridge provides conversion to/from legacy types.
 
-use crate::traits::MemoryPayload;
 use super::namespace::{field_predicate, ns_predicate, relation_predicate};
 use super::types::{EdgeProvenance, Tier};
-use oxrdf::{NamedNode, NamedOrBlankNode, Term, Literal, GraphName, Quad};
+use crate::traits::MemoryPayload;
+use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
 use std::collections::BTreeMap;
 
 /// XSD string datatype IRI
@@ -18,7 +18,13 @@ const LDP_JSON: &str = "https://www.w3.org/ns/ldp#JSON";
 /// `NamedNode::new_unchecked` can never panic on spaces or `<`/`>`.
 fn sanitize_iri_suffix(k: &str) -> String {
     k.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -31,12 +37,17 @@ pub fn memory_to_quads(
     tier: Tier,
     generation: u64,
 ) -> Vec<Quad> {
-    let subject = NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(format!("urn:neurostrata:memory:{}", id)));
-    let graph_iri = format!("urn:neurostrata:graph:{}:{}:gen:{}",
-        namespace, tier.as_str(), generation);
-    let graph = GraphName::NamedNode(
-        NamedNode::new_unchecked(graph_iri.clone())
+    let subject = NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(format!(
+        "urn:neurostrata:memory:{}",
+        id
+    )));
+    let graph_iri = format!(
+        "urn:neurostrata:graph:{}:{}:gen:{}",
+        namespace,
+        tier.as_str(),
+        generation
     );
+    let graph = GraphName::NamedNode(NamedNode::new_unchecked(graph_iri.clone()));
 
     let xsd_string = NamedNode::new_unchecked(XSD_STRING.to_string());
     let ldp_json = NamedNode::new_unchecked(LDP_JSON.to_string());
@@ -79,19 +90,47 @@ pub fn memory_to_quads(
     }
 
     // Core fields.
-    lit_quad!(field_predicate("content"), payload.content.clone(), xsd_string.clone());
-    lit_quad!(field_predicate("user_id"), payload.user_id.clone(), xsd_string.clone());
-    lit_quad!(field_predicate("memory_type"), payload.memory_type.clone(), xsd_string.clone());
+    lit_quad!(
+        field_predicate("content"),
+        payload.content.clone(),
+        xsd_string.clone()
+    );
+    lit_quad!(
+        field_predicate("user_id"),
+        payload.user_id.clone(),
+        xsd_string.clone()
+    );
+    lit_quad!(
+        field_predicate("memory_type"),
+        payload.memory_type.clone(),
+        xsd_string.clone()
+    );
 
     if let Some(agent) = &payload.agent_name {
-        lit_quad!(field_predicate("agent_name"), agent.clone(), xsd_string.clone());
+        lit_quad!(
+            field_predicate("agent_name"),
+            agent.clone(),
+            xsd_string.clone()
+        );
     }
 
-    lit_quad!(field_predicate("location"), payload.location.clone(), xsd_string.clone());
-    lit_quad!(field_predicate("location_lines"), payload.location_lines.clone(), xsd_string.clone());
+    lit_quad!(
+        field_predicate("location"),
+        payload.location.clone(),
+        xsd_string.clone()
+    );
+    lit_quad!(
+        field_predicate("location_lines"),
+        payload.location_lines.clone(),
+        xsd_string.clone()
+    );
 
     // Metadata as a JSON literal (lossless round-trip).
-    json_quad!(field_predicate("metadata"), payload.metadata.to_string(), ldp_json.clone());
+    json_quad!(
+        field_predicate("metadata"),
+        payload.metadata.to_string(),
+        ldp_json.clone()
+    );
 
     // Selected metadata sub-fields as first-class predicates.
     if let Some(domain) = payload.metadata.get("domain") {
@@ -114,11 +153,16 @@ pub fn memory_to_quads(
     if let Some(concept) = payload.metadata.get("concept_iri") {
         let iris: Vec<String> = match concept {
             serde_json::Value::String(s) => vec![s.clone()],
-            serde_json::Value::Array(arr) => arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect(),
+            serde_json::Value::Array(arr) => arr
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect(),
             _ => vec![],
         };
         for iri in iris {
-            if iri.trim().is_empty() { continue; }
+            if iri.trim().is_empty() {
+                continue;
+            }
             iri_quad!(ns_predicate("conceptIri"), iri);
         }
     }
@@ -148,13 +192,21 @@ pub fn memory_to_quads(
     if let Some(topology) = payload.metadata.get("topology") {
         if let Some(obj) = topology.as_object() {
             for (k, v) in obj {
-                json_quad!(ns_predicate(&format!("topology_{}", sanitize_iri_suffix(k))), v.to_string(), ldp_json.clone());
+                json_quad!(
+                    ns_predicate(&format!("topology_{}", sanitize_iri_suffix(k))),
+                    v.to_string(),
+                    ldp_json.clone()
+                );
             }
         }
     }
 
     // ReBAC visible_to projection: `<mem_iri> ns:visibleTo "<principal>:<role>"`
-    if let Some(vt) = payload.metadata.get("visible_to").and_then(|v| v.as_array()) {
+    if let Some(vt) = payload
+        .metadata
+        .get("visible_to")
+        .and_then(|v| v.as_array())
+    {
         for entry in vt {
             if let (Some(p), Some(r)) = (
                 entry.get("principal").and_then(|v| v.as_str()),
@@ -169,6 +221,43 @@ pub fn memory_to_quads(
         }
     }
 
+    // Digital twin schema RDF projection (interfaces -> owl:Class + rdfs:subClassOf)
+    if payload.memory_type == "digital_twin_schema" || payload.metadata.get("twin_schema").is_some()
+    {
+        if let Some(schema) = crate::digital_twin::TwinSchema::from_metadata(&payload.metadata) {
+            if schema.kind == "interface" {
+                let slug = schema
+                    .interface_slug
+                    .or(schema.schema_id)
+                    .unwrap_or_else(|| id.to_string());
+                let iface_iri = format!("urn:neurostrata:interface:{}", sanitize_iri_suffix(&slug));
+                let iface_subj = NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(iface_iri));
+                quads.push(Quad {
+                    subject: iface_subj.clone(),
+                    predicate: NamedNode::new_unchecked(
+                        "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                    ),
+                    object: Term::NamedNode(NamedNode::new_unchecked(
+                        "http://www.w3.org/2002/07/owl#Class",
+                    )),
+                    graph_name: graph.clone(),
+                });
+                for parent in &schema.implements_interfaces {
+                    let parent_iri =
+                        format!("urn:neurostrata:interface:{}", sanitize_iri_suffix(parent));
+                    quads.push(Quad {
+                        subject: iface_subj.clone(),
+                        predicate: NamedNode::new_unchecked(
+                            "http://www.w3.org/2000/01/rdf-schema#subClassOf",
+                        ),
+                        object: Term::NamedNode(NamedNode::new_unchecked(parent_iri)),
+                        graph_name: graph.clone(),
+                    });
+                }
+            }
+        }
+    }
+
     // Digital twin RDF projection
     if payload.memory_type == "digital_twin" {
         if let Some(dt) = payload
@@ -178,14 +267,25 @@ pub fn memory_to_quads(
             .and_then(|v| v.as_object())
         {
             let xsd_int = NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#integer");
+            let xsd_bool = NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#boolean");
             quads.push(Quad {
                 subject: subject.clone(),
-                predicate: NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+                predicate: NamedNode::new_unchecked(
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                ),
                 object: Term::NamedNode(NamedNode::new_unchecked(ns_predicate("TwinState"))),
                 graph_name: graph.clone(),
             });
-            if let Some(twin_id) = dt.get("twin_id").or_else(|| dt.get("id")).and_then(|v| v.as_str()) {
-                lit_quad!(ns_predicate("twinId"), twin_id.to_string(), xsd_string.clone());
+            if let Some(twin_id) = dt
+                .get("twin_id")
+                .or_else(|| dt.get("id"))
+                .and_then(|v| v.as_str())
+            {
+                lit_quad!(
+                    ns_predicate("twinId"),
+                    twin_id.to_string(),
+                    xsd_string.clone()
+                );
             }
             if let Some(obs) = dt
                 .get("observed_at")
@@ -194,13 +294,52 @@ pub fn memory_to_quads(
             {
                 lit_quad!(ns_predicate("observedAt"), obs.to_string(), xsd_int.clone());
             }
-            if let Some(props) = dt.get("properties").or_else(|| dt.get("variables")).and_then(|v| v.as_object()) {
+            if let Some(props) = dt
+                .get("properties")
+                .or_else(|| dt.get("variables"))
+                .and_then(|v| v.as_object())
+            {
                 for (k, v) in props {
                     json_quad!(
                         ns_predicate(&format!("twinProp_{}", sanitize_iri_suffix(k))),
                         v.to_string(),
                         ldp_json.clone()
                     );
+                }
+            }
+            if let Some(attrs) = dt.get("attributes").and_then(|v| v.as_object()) {
+                for (k, v) in attrs {
+                    let pred = ns_predicate(&format!("twinAttr_{}", sanitize_iri_suffix(k)));
+                    if let Some(b) = v.as_bool() {
+                        lit_quad!(pred, b.to_string(), xsd_bool.clone());
+                    } else if let Some(i) = v.as_i64() {
+                        lit_quad!(pred, i.to_string(), xsd_int.clone());
+                    } else if let Some(s) = v.as_str() {
+                        lit_quad!(pred, s.to_string(), xsd_string.clone());
+                    }
+                }
+            }
+            if let Some(derived) = dt.get("derived_variables").and_then(|v| v.as_object()) {
+                for (k, v) in derived {
+                    json_quad!(
+                        ns_predicate(&format!("twinDerived_{}", sanitize_iri_suffix(k))),
+                        v.to_string(),
+                        ldp_json.clone()
+                    );
+                }
+            }
+            if let Some(ifaces) = dt.get("implements_interfaces").and_then(|v| v.as_array()) {
+                for iface in ifaces.iter().filter_map(|v| v.as_str()) {
+                    let iface_iri =
+                        format!("urn:neurostrata:interface:{}", sanitize_iri_suffix(iface));
+                    quads.push(Quad {
+                        subject: subject.clone(),
+                        predicate: NamedNode::new_unchecked(
+                            "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                        ),
+                        object: Term::NamedNode(NamedNode::new_unchecked(iface_iri)),
+                        graph_name: graph.clone(),
+                    });
                 }
             }
         }
@@ -214,18 +353,38 @@ pub fn memory_to_quads(
             object: Term::NamedNode(NamedNode::new_unchecked(ns_predicate("ActionType"))),
             graph_name: graph.clone(),
         });
-        if let Some(at) = payload.metadata.get("action_type").and_then(|v| v.as_object()) {
+        if let Some(at) = payload
+            .metadata
+            .get("action_type")
+            .and_then(|v| v.as_object())
+        {
             if let Some(slug) = at.get("slug").and_then(|v| v.as_str()) {
-                lit_quad!(ns_predicate("actionSlug"), slug.to_string(), xsd_string.clone());
+                lit_quad!(
+                    ns_predicate("actionSlug"),
+                    slug.to_string(),
+                    xsd_string.clone()
+                );
             }
             if let Some(title) = at.get("title").and_then(|v| v.as_str()) {
-                lit_quad!(ns_predicate("actionTitle"), title.to_string(), xsd_string.clone());
+                lit_quad!(
+                    ns_predicate("actionTitle"),
+                    title.to_string(),
+                    xsd_string.clone()
+                );
             }
             if let Some(desc) = at.get("description").and_then(|v| v.as_str()) {
-                lit_quad!(ns_predicate("actionDescription"), desc.to_string(), xsd_string.clone());
+                lit_quad!(
+                    ns_predicate("actionDescription"),
+                    desc.to_string(),
+                    xsd_string.clone()
+                );
             }
             if let Some(role) = at.get("required_role").and_then(|v| v.as_str()) {
-                lit_quad!(ns_predicate("requiredRole"), role.to_string(), xsd_string.clone());
+                lit_quad!(
+                    ns_predicate("requiredRole"),
+                    role.to_string(),
+                    xsd_string.clone()
+                );
             }
             if let Some(params) = at.get("parameters").and_then(|v| v.as_object()) {
                 for param_name in params.keys() {
@@ -248,18 +407,38 @@ pub fn memory_to_quads(
             object: Term::NamedNode(NamedNode::new_unchecked(ns_predicate("ActionReceipt"))),
             graph_name: graph.clone(),
         });
-        if let Some(ar) = payload.metadata.get("action_receipt").and_then(|v| v.as_object()) {
+        if let Some(ar) = payload
+            .metadata
+            .get("action_receipt")
+            .and_then(|v| v.as_object())
+        {
             if let Some(slug) = ar.get("action_slug").and_then(|v| v.as_str()) {
-                lit_quad!(ns_predicate("actionSlug"), slug.to_string(), xsd_string.clone());
+                lit_quad!(
+                    ns_predicate("actionSlug"),
+                    slug.to_string(),
+                    xsd_string.clone()
+                );
             }
             if let Some(principal) = ar.get("principal").and_then(|v| v.as_str()) {
-                lit_quad!(ns_predicate("principal"), principal.to_string(), xsd_string.clone());
+                lit_quad!(
+                    ns_predicate("principal"),
+                    principal.to_string(),
+                    xsd_string.clone()
+                );
             }
             if let Some(exec_at) = ar.get("executed_at").and_then(|v| v.as_i64()) {
-                lit_quad!(ns_predicate("executedAt"), exec_at.to_string(), xsd_int.clone());
+                lit_quad!(
+                    ns_predicate("executedAt"),
+                    exec_at.to_string(),
+                    xsd_int.clone()
+                );
             }
             if let Some(rev_at) = ar.get("reverted_at").and_then(|v| v.as_i64()) {
-                lit_quad!(ns_predicate("revertedAt"), rev_at.to_string(), xsd_int.clone());
+                lit_quad!(
+                    ns_predicate("revertedAt"),
+                    rev_at.to_string(),
+                    xsd_int.clone()
+                );
             }
             if let Some(rev_by) = ar.get("reverted_by_receipt_id").and_then(|v| v.as_str()) {
                 if !rev_by.trim().is_empty() {
@@ -279,11 +458,19 @@ pub fn memory_to_quads(
             }
             if let Some(forced_by) = ar.get("forced_by").and_then(|v| v.as_str()) {
                 if !forced_by.trim().is_empty() {
-                    lit_quad!(ns_predicate("forcedBy"), forced_by.to_string(), xsd_string.clone());
+                    lit_quad!(
+                        ns_predicate("forcedBy"),
+                        forced_by.to_string(),
+                        xsd_string.clone()
+                    );
                 }
             }
             if let Some(forced_at) = ar.get("forced_at").and_then(|v| v.as_i64()) {
-                lit_quad!(ns_predicate("forcedAt"), forced_at.to_string(), xsd_int.clone());
+                lit_quad!(
+                    ns_predicate("forcedAt"),
+                    forced_at.to_string(),
+                    xsd_int.clone()
+                );
             }
             if let Some(pairs) = ar.get("superseded_pairs").and_then(|v| v.as_array()) {
                 for pair in pairs {
@@ -319,7 +506,11 @@ pub fn memory_to_quads(
                 for td in twins {
                     if let Some(tid) = td.get("twin_id").and_then(|v| v.as_str()) {
                         if !tid.trim().is_empty() {
-                            lit_quad!(ns_predicate("mutatedTwin"), tid.to_string(), xsd_string.clone());
+                            lit_quad!(
+                                ns_predicate("mutatedTwin"),
+                                tid.to_string(),
+                                xsd_string.clone()
+                            );
                         }
                     }
                 }
@@ -328,17 +519,24 @@ pub fn memory_to_quads(
     }
 
     // Multimodal attachment RDF projection
-    if let Some(atts) = payload.metadata.get("attachments").and_then(|v| v.as_array()) {
+    if let Some(atts) = payload
+        .metadata
+        .get("attachments")
+        .and_then(|v| v.as_array())
+    {
         let xsd_int = NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#integer");
         for (idx, att) in atts.iter().enumerate() {
             let Some(obj) = att.as_object() else { continue };
-            let raw_id = obj
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let raw_id = obj.get("id").and_then(|v| v.as_str()).unwrap_or("");
             let sanitized_id: String = raw_id
                 .chars()
-                .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '_' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
                 .collect();
             let bnode_id = if sanitized_id.is_empty() {
                 format!("att_{}_{}", id.replace('-', "_"), idx)
@@ -355,7 +553,9 @@ pub fn memory_to_quads(
             });
             quads.push(Quad {
                 subject: bnode_subj.clone(),
-                predicate: NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+                predicate: NamedNode::new_unchecked(
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                ),
                 object: Term::NamedNode(NamedNode::new_unchecked(ns_predicate("Attachment"))),
                 graph_name: graph.clone(),
             });
@@ -363,7 +563,10 @@ pub fn memory_to_quads(
                 quads.push(Quad {
                     subject: bnode_subj.clone(),
                     predicate: NamedNode::new_unchecked(ns_predicate("attachmentId")),
-                    object: Term::Literal(Literal::new_typed_literal(raw_id.to_string(), xsd_string.clone())),
+                    object: Term::Literal(Literal::new_typed_literal(
+                        raw_id.to_string(),
+                        xsd_string.clone(),
+                    )),
                     graph_name: graph.clone(),
                 });
             }
@@ -371,7 +574,10 @@ pub fn memory_to_quads(
                 quads.push(Quad {
                     subject: bnode_subj.clone(),
                     predicate: NamedNode::new_unchecked(ns_predicate("attachmentMime")),
-                    object: Term::Literal(Literal::new_typed_literal(mime.to_string(), xsd_string.clone())),
+                    object: Term::Literal(Literal::new_typed_literal(
+                        mime.to_string(),
+                        xsd_string.clone(),
+                    )),
                     graph_name: graph.clone(),
                 });
             }
@@ -379,7 +585,10 @@ pub fn memory_to_quads(
                 quads.push(Quad {
                     subject: bnode_subj.clone(),
                     predicate: NamedNode::new_unchecked(ns_predicate("attachmentSizeBytes")),
-                    object: Term::Literal(Literal::new_typed_literal(sz.to_string(), xsd_int.clone())),
+                    object: Term::Literal(Literal::new_typed_literal(
+                        sz.to_string(),
+                        xsd_int.clone(),
+                    )),
                     graph_name: graph.clone(),
                 });
             }
@@ -387,7 +596,10 @@ pub fn memory_to_quads(
                 quads.push(Quad {
                     subject: bnode_subj.clone(),
                     predicate: NamedNode::new_unchecked(ns_predicate("attachmentDigest")),
-                    object: Term::Literal(Literal::new_typed_literal(dig.to_string(), xsd_string.clone())),
+                    object: Term::Literal(Literal::new_typed_literal(
+                        dig.to_string(),
+                        xsd_string.clone(),
+                    )),
                     graph_name: graph.clone(),
                 });
             }
@@ -395,7 +607,10 @@ pub fn memory_to_quads(
                 quads.push(Quad {
                     subject: bnode_subj.clone(),
                     predicate: NamedNode::new_unchecked(ns_predicate("attachmentUri")),
-                    object: Term::Literal(Literal::new_typed_literal(uri.to_string(), xsd_string.clone())),
+                    object: Term::Literal(Literal::new_typed_literal(
+                        uri.to_string(),
+                        xsd_string.clone(),
+                    )),
                     graph_name: graph.clone(),
                 });
             }
@@ -403,7 +618,10 @@ pub fn memory_to_quads(
                 quads.push(Quad {
                     subject: bnode_subj.clone(),
                     predicate: NamedNode::new_unchecked(ns_predicate("attachmentWidth")),
-                    object: Term::Literal(Literal::new_typed_literal(w.to_string(), xsd_int.clone())),
+                    object: Term::Literal(Literal::new_typed_literal(
+                        w.to_string(),
+                        xsd_int.clone(),
+                    )),
                     graph_name: graph.clone(),
                 });
             }
@@ -411,7 +629,10 @@ pub fn memory_to_quads(
                 quads.push(Quad {
                     subject: bnode_subj.clone(),
                     predicate: NamedNode::new_unchecked(ns_predicate("attachmentHeight")),
-                    object: Term::Literal(Literal::new_typed_literal(h.to_string(), xsd_int.clone())),
+                    object: Term::Literal(Literal::new_typed_literal(
+                        h.to_string(),
+                        xsd_int.clone(),
+                    )),
                     graph_name: graph.clone(),
                 });
             }
@@ -419,7 +640,10 @@ pub fn memory_to_quads(
                 quads.push(Quad {
                     subject: bnode_subj.clone(),
                     predicate: NamedNode::new_unchecked(ns_predicate("attachmentAltText")),
-                    object: Term::Literal(Literal::new_typed_literal(alt.to_string(), xsd_string.clone())),
+                    object: Term::Literal(Literal::new_typed_literal(
+                        alt.to_string(),
+                        xsd_string.clone(),
+                    )),
                     graph_name: graph.clone(),
                 });
             }
@@ -448,8 +672,14 @@ pub fn edge_to_quad(
     _provenance: Option<EdgeProvenance>,
     graph: Option<GraphName>,
 ) -> Quad {
-    let subject = NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(format!("urn:neurostrata:memory:{}", from)));
-    let object = Term::NamedNode(NamedNode::new_unchecked(format!("urn:neurostrata:memory:{}", to)));
+    let subject = NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(format!(
+        "urn:neurostrata:memory:{}",
+        from
+    )));
+    let object = Term::NamedNode(NamedNode::new_unchecked(format!(
+        "urn:neurostrata:memory:{}",
+        to
+    )));
     let graph = graph.unwrap_or(GraphName::DefaultGraph);
 
     Quad {
@@ -472,10 +702,14 @@ pub fn edge_to_quads(
 ) -> Vec<Quad> {
     let mut quads = vec![edge_to_quad(from, rel_type, to, None, graph.clone())];
     if let Some(prov) = provenance {
-        let subject = NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(format!("urn:neurostrata:memory:{}", from)));
+        let subject = NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(format!(
+            "urn:neurostrata:memory:{}",
+            from
+        )));
         let graph = graph.unwrap_or(GraphName::DefaultGraph);
         let xsd_string = NamedNode::new_unchecked(XSD_STRING.to_string());
-        let xsd_integer = NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#integer".to_string());
+        let xsd_integer =
+            NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#integer".to_string());
         let mut provenance_quals: Vec<(&'static str, Term)> = Vec::new();
         if let Some(src) = prov.source {
             provenance_quals.push((
@@ -486,19 +720,28 @@ pub fn edge_to_quads(
         if let Some(vf) = prov.valid_from {
             provenance_quals.push((
                 "provenanceValidFrom",
-                Term::Literal(Literal::new_typed_literal(vf.to_string(), xsd_integer.clone())),
+                Term::Literal(Literal::new_typed_literal(
+                    vf.to_string(),
+                    xsd_integer.clone(),
+                )),
             ));
         }
         if let Some(vt) = prov.valid_to {
             provenance_quals.push((
                 "provenanceValidTo",
-                Term::Literal(Literal::new_typed_literal(vt.to_string(), xsd_integer.clone())),
+                Term::Literal(Literal::new_typed_literal(
+                    vt.to_string(),
+                    xsd_integer.clone(),
+                )),
             ));
         }
         if let Some(gen) = prov.generation {
             provenance_quals.push((
                 "provenanceGeneration",
-                Term::Literal(Literal::new_typed_literal(gen.to_string(), xsd_integer.clone())),
+                Term::Literal(Literal::new_typed_literal(
+                    gen.to_string(),
+                    xsd_integer.clone(),
+                )),
             ));
         }
         if let Some(ex) = prov.extractor {
@@ -519,6 +762,86 @@ pub fn edge_to_quads(
     quads
 }
 
+/// Emit schema-resolved `rdf:type urn:neurostrata:interface:<slug>` and
+/// `ns:twinDerived_<name>` quads for a `digital_twin` row given the namespace's
+/// active schema map, rows, and edges.
+pub fn twin_schema_and_reducer_quads_for_row(
+    id: &str,
+    payload: &MemoryPayload,
+    namespace: &str,
+    tier: Tier,
+    generation: u64,
+    schemas: &BTreeMap<String, crate::digital_twin::TwinSchema>,
+    rows: &[(String, MemoryPayload)],
+    edges: &[(String, String, String, Option<EdgeProvenance>)],
+) -> Vec<Quad> {
+    let mut quads = Vec::new();
+    if payload.memory_type != "digital_twin" {
+        return quads;
+    }
+    let Some(dt) = payload
+        .metadata
+        .get("digital_twin")
+        .or_else(|| payload.metadata.get("twin"))
+        .and_then(|v| v.as_object())
+    else {
+        return quads;
+    };
+    let Some(schema_id) = dt.get("schema_id").and_then(|v| v.as_str()) else {
+        return quads;
+    };
+    let Some(raw_schema) = schemas.get(schema_id) else {
+        return quads;
+    };
+    let eff = crate::digital_twin::resolve_effective_twin_schema(raw_schema, schemas);
+    let subject = NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(format!(
+        "urn:neurostrata:memory:{}",
+        id
+    )));
+    let graph_iri = format!(
+        "urn:neurostrata:graph:{}:{}:gen:{}",
+        namespace,
+        tier.as_str(),
+        generation
+    );
+    let graph = GraphName::NamedNode(NamedNode::new_unchecked(graph_iri));
+    let ldp_json = NamedNode::new_unchecked(LDP_JSON.to_string());
+
+    for iface in &eff.resolved_interfaces {
+        let iface_iri = format!("urn:neurostrata:interface:{}", sanitize_iri_suffix(iface));
+        quads.push(Quad {
+            subject: subject.clone(),
+            predicate: NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+            object: Term::NamedNode(NamedNode::new_unchecked(iface_iri)),
+            graph_name: graph.clone(),
+        });
+    }
+
+    if !eff.reducers.is_empty() {
+        let twin_id = dt
+            .get("id")
+            .or_else(|| dt.get("twin_id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(id);
+        let derived = crate::digital_twin::compute_twin_reducers(
+            id, twin_id, payload, &eff, rows, edges, schemas, None,
+        );
+        for (k, v) in derived {
+            quads.push(Quad {
+                subject: subject.clone(),
+                predicate: NamedNode::new_unchecked(ns_predicate(&format!(
+                    "twinDerived_{}",
+                    sanitize_iri_suffix(&k)
+                ))),
+                object: Term::Literal(Literal::new_typed_literal(v.to_string(), ldp_json.clone())),
+                graph_name: graph.clone(),
+            });
+        }
+    }
+
+    quads
+}
+
 /// Combine node + edge quads for a namespace snapshot.
 /// Returns legacy `crate::rdf::types::Quad` for backward compatibility with LadybugStore API.
 pub fn rows_to_quads(
@@ -529,15 +852,27 @@ pub fn rows_to_quads(
     edges: &[(String, String, String, Option<EdgeProvenance>)],
 ) -> Vec<super::types::Quad> {
     let mut out = Vec::new();
+    let schemas = crate::digital_twin::collect_twin_schemas_from_rows(rows);
     for (id, payload) in rows {
-        let qs = memory_to_quads(id, payload, namespace, tier, generation);
+        let mut qs = memory_to_quads(id, payload, namespace, tier, generation);
+        if !schemas.is_empty() && payload.memory_type == "digital_twin" {
+            let extra = twin_schema_and_reducer_quads_for_row(
+                id, payload, namespace, tier, generation, &schemas, rows, edges,
+            );
+            for eq in extra {
+                if !qs.contains(&eq) {
+                    qs.push(eq);
+                }
+            }
+        }
         out.extend(quads_to_legacy(&qs));
     }
     let graph = super::types_oxrdf::OxRdfBridge::tier_to_graph_name(&tier, namespace, generation);
     let graph = Some(graph);
-    let ox_quads: Vec<Quad> = edges.iter().flat_map(|(from, rel, to, prov)| {
-        edge_to_quads(from, rel, to, prov.clone(), graph.clone())
-    }).collect();
+    let ox_quads: Vec<Quad> = edges
+        .iter()
+        .flat_map(|(from, rel, to, prov)| edge_to_quads(from, rel, to, prov.clone(), graph.clone()))
+        .collect();
     out.extend(quads_to_legacy(&ox_quads));
     out
 }
@@ -637,8 +972,8 @@ pub fn quads_to_legacy(quads: &[Quad]) -> Vec<super::types::Quad> {
 mod tests {
     use super::*;
     use crate::traits::MemoryPayload;
-    use serde_json::json;
     use oxrdf::Dataset;
+    use serde_json::json;
 
     fn payload() -> MemoryPayload {
         MemoryPayload {
@@ -655,9 +990,12 @@ mod tests {
     #[test]
     fn memory_to_oxrdf_quads_core_fields() {
         let qs = memory_to_quads("m1", &payload(), "ns", Tier::Domain, 0);
-        
+
         // Check that we got valid oxrdf quads
-        let preds: Vec<String> = qs.iter().map(|q| q.predicate.as_str().to_string()).collect();
+        let preds: Vec<String> = qs
+            .iter()
+            .map(|q| q.predicate.as_str().to_string())
+            .collect();
         assert!(preds.contains(&"urn:neurostrata:ns#content".to_string()));
         assert!(preds.contains(&"urn:neurostrata:ns#memory_type".to_string()));
         assert!(preds.contains(&"urn:neurostrata:ns#domain".to_string()));
@@ -683,7 +1021,7 @@ mod tests {
         let mut p = payload();
         p.metadata = json!({"concept_iri": "urn:example:foo"});
         let qs = memory_to_quads("m1", &p, "ns", Tier::Domain, 0);
-        
+
         // All subjects should be the memory subject
         let subj = format!("urn:neurostrata:memory:m1");
         assert!(qs.iter().all(|q| {
@@ -692,18 +1030,20 @@ mod tests {
                 _ => false,
             }
         }));
-        
+
         // Should have conceptIri as predicate with IRI object
         assert!(qs.iter().any(|q| {
-            q.predicate.as_str() == "urn:neurostrata:ns#conceptIri" &&
-            matches!(&q.object, Term::NamedNode(nn) if nn.as_str() == "urn:example:foo")
+            q.predicate.as_str() == "urn:neurostrata:ns#conceptIri"
+                && matches!(&q.object, Term::NamedNode(nn) if nn.as_str() == "urn:example:foo")
         }));
-        
+
         // Two memories sharing one concept keep distinct subjects.
         let qs2 = memory_to_quads("m2", &p, "ns", Tier::Domain, 0);
         assert!(qs2.iter().all(|q| {
             match &q.subject {
-                NamedOrBlankNode::NamedNode(nn) => nn.as_str() == format!("urn:neurostrata:memory:m2"),
+                NamedOrBlankNode::NamedNode(nn) => {
+                    nn.as_str() == format!("urn:neurostrata:memory:m2")
+                }
                 _ => false,
             }
         }));
@@ -712,8 +1052,13 @@ mod tests {
     #[test]
     fn edge_projects_relation() {
         let q = edge_to_quad("a", "GOVERNS", "b", None, Some(GraphName::DefaultGraph));
-        assert_eq!(q.predicate, NamedNode::new_unchecked("urn:neurostrata:ns#governs"));
-        assert!(matches!(&q.object, Term::NamedNode(nn) if nn.as_str() == "urn:neurostrata:memory:b"));
+        assert_eq!(
+            q.predicate,
+            NamedNode::new_unchecked("urn:neurostrata:ns#governs")
+        );
+        assert!(
+            matches!(&q.object, Term::NamedNode(nn) if nn.as_str() == "urn:neurostrata:memory:b")
+        );
     }
 
     #[test]
@@ -728,7 +1073,13 @@ mod tests {
         let none = edge_to_quads("a", "GOVERNS", "b", None, Some(GraphName::DefaultGraph));
         assert_eq!(none.len(), 1, "no provenance -> only the relation quad");
 
-        let qs = edge_to_quads("a", "GOVERNS", "b", Some(prov), Some(GraphName::DefaultGraph));
+        let qs = edge_to_quads(
+            "a",
+            "GOVERNS",
+            "b",
+            Some(prov),
+            Some(GraphName::DefaultGraph),
+        );
         let preds: Vec<&str> = qs
             .iter()
             .skip(1)
@@ -743,26 +1094,36 @@ mod tests {
                 "provenanceExtractor"
             ]
         );
-        assert!(qs.iter().any(|q| q.predicate.as_str().ends_with("#provenanceSource")
-            && matches!(&q.object, Term::Literal(l) if l.value() == "owner")));
+        assert!(qs
+            .iter()
+            .any(|q| q.predicate.as_str().ends_with("#provenanceSource")
+                && matches!(&q.object, Term::Literal(l) if l.value() == "owner")));
     }
 
     #[test]
     fn rows_to_oxrdf_quads_combines() {
         let rows = vec![("m1".to_string(), payload())];
-        let edges = vec![("m1".to_string(), "GOVERNS".to_string(), "m2".to_string(), None)];
+        let edges = vec![(
+            "m1".to_string(),
+            "GOVERNS".to_string(),
+            "m2".to_string(),
+            None,
+        )];
         let qs = rows_to_quads(&rows, "ns", Tier::Domain, 0, &edges);
-        assert!(qs.iter().any(|q| q.predicate.as_str().ends_with("#governs")));
+        assert!(qs
+            .iter()
+            .any(|q| q.predicate.as_str().ends_with("#governs")));
     }
 
     #[test]
     fn oxrdf_to_legacy_round_trip() {
         let qs = memory_to_quads("m1", &payload(), "ns", Tier::Domain, 0);
         let legacy = quads_to_legacy(&qs);
-        
+
         assert_eq!(legacy.len(), qs.len());
         for (orig, conv) in qs.iter().zip(legacy.iter()) {
-            let back = super::super::types_oxrdf::OxRdfBridge::neurostrata_quad_to_oxrdf(conv).unwrap();
+            let back =
+                super::super::types_oxrdf::OxRdfBridge::neurostrata_quad_to_oxrdf(conv).unwrap();
             assert_eq!(orig, &back.inner);
         }
     }
@@ -889,7 +1250,8 @@ mod tests {
     async fn structural_actions_stay_out_of_default_vector_and_lexical_recall() {
         use crate::traits::VectorStore;
 
-        let tmp = std::env::temp_dir().join(format!("ns-struct-action-recall-{}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("ns-struct-action-recall-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let store = crate::store::ladybug::LadybugStore::for_testing(&tmp, 4).expect("store");
         store.init("ns-recall").await.unwrap();
@@ -983,13 +1345,7 @@ mod tests {
 
         // 1. Default vector recall excludes action_type and action_receipt
         let vec_hits = store
-            .search(
-                "ns-recall",
-                shared_vec,
-                10,
-                false,
-                false,
-            )
+            .search("ns-recall", shared_vec, 10, false, false)
             .await
             .unwrap();
         let vec_ids: Vec<&str> = vec_hits.iter().map(|r| r.id.as_str()).collect();
@@ -1043,7 +1399,7 @@ mod tests {
 
     #[test]
     fn shareable_action_type_round_trips_but_receipt_is_rejected_everywhere() {
-        use crate::synaptic_mesh::import::{ validate_record, Candidate };
+        use crate::synaptic_mesh::import::{validate_record, Candidate};
         use crate::synaptic_mesh::outbox::{
             is_shareable_memory_type, outbox_dir_for, Outbox, OutboxEntry, OP_CREATED,
         };
@@ -1067,8 +1423,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
-        let mesh =
-            MeshStorage::init(&base, "node-a", "team", &["ns".to_string()], None).unwrap();
+        let mesh = MeshStorage::init(&base, "node-a", "team", &["ns".to_string()], None).unwrap();
         let outbox = Outbox::open(&outbox_dir_for(mesh.root())).unwrap();
 
         let action_id = Uuid::now_v7();
@@ -1140,7 +1495,10 @@ mod tests {
             .join("memories")
             .join(format!("{receipt_id}.json"));
         assert!(action_path.exists(), "shareable action_type record written");
-        assert!(!receipt_path.exists(), "action_receipt must never be written");
+        assert!(
+            !receipt_path.exists(),
+            "action_receipt must never be written"
+        );
 
         // Validate import accepts action_type and preserves metadata.action_type
         let raw_action = std::fs::read_to_string(&action_path).unwrap();

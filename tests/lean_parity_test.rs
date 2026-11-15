@@ -24,11 +24,12 @@ use formal_kernel::{
     action_gate_tag, action_revert_tag, action_task_effect_tag, allocate_hybrid_slots,
     claim_decision_tag, classify_merge_decision_tag, epoch_gate_tag, evaluate_action_gate,
     evaluate_action_revert, evaluate_action_task_effect, evaluate_claim_decision,
-    evaluate_import_precheck, evaluate_procedure_fire, evaluate_retention_gate,
-    evaluate_seq_continuity, evaluate_sovereignty_gate, import_precheck_tag,
-    is_action_memory_shareable, join_task_status, lifecycle_can_transition, procedure_fire_tag,
-    retention_verdict_tag, seq_decision_tag, sovereignty_decision_tag, task_step_tag,
-    ActionMemoryKind, ActionReceiptState, ActionTaskTargetStatus, KernelProcedureTrust,
+    evaluate_import_precheck, evaluate_procedure_fire, evaluate_reducer_total,
+    evaluate_retention_gate, evaluate_seq_continuity, evaluate_sovereignty_gate,
+    import_precheck_tag, intersect_var_bounds, is_action_memory_shareable, join_task_status,
+    lifecycle_can_transition, procedure_fire_tag, retention_verdict_tag, seq_decision_tag,
+    sovereignty_decision_tag, task_step_tag, ActionMemoryKind, ActionReceiptState,
+    ActionTaskTargetStatus, KernelProcedureTrust, ReducerOpKind, TwinBoundError,
 };
 
 /// The statuses in the exact order used by `proofs/Main.lean`.
@@ -389,6 +390,56 @@ fn generate_rust_truth_table() -> Vec<String> {
         }
     }
 
+    // TWIN_BOUNDS: 5 rows
+    let bound_cases: [(i64, i64, i64, i64); 5] = [
+        (10, 0, 0, 100),
+        (0, 100, 20, 10),
+        (0, 10, 20, 30),
+        (-50, 200, 0, 120),
+        (0, 100, -10, 80),
+    ];
+    for &(imin, imax, tmin, tmax) in bound_cases.iter() {
+        let tag = match intersect_var_bounds(imin, imax, tmin, tmax) {
+            Err(TwinBoundError::InvertedInterfaceBounds) => "err_inverted_iface".to_string(),
+            Err(TwinBoundError::InvertedTwinBounds) => "err_inverted_twin".to_string(),
+            Err(TwinBoundError::DisjointBounds) => "err_disjoint".to_string(),
+            Ok((emin, emax)) => format!("ok_{}_{}", emin, emax),
+        };
+        lines.push(format!(
+            "TWIN_BOUNDS|{}|{}|{}|{}|{}",
+            imin, imax, tmin, tmax, tag
+        ));
+    }
+
+    // TWIN_REDUCER: 21 rows (7 ops × 3 inputs)
+    let reducer_ops = [
+        ReducerOpKind::Count,
+        ReducerOpKind::Sum,
+        ReducerOpKind::Min,
+        ReducerOpKind::Max,
+        ReducerOpKind::Avg,
+        ReducerOpKind::AllInBounds,
+        ReducerOpKind::AnyOutOfBounds,
+    ];
+    let reducer_inputs = [
+        ("empty", 0u32, 0i64, 0i64, 0i64, false),
+        ("populated_ok", 3, 45, 10, 20, false),
+        ("populated_oob", 3, 45, 10, 20, true),
+    ];
+    for &op in reducer_ops.iter() {
+        for &(label, cnt, sum_v, min_v, max_v, oob) in reducer_inputs.iter() {
+            let out = evaluate_reducer_total(op, cnt, sum_v, min_v, max_v, oob);
+            lines.push(format!(
+                "TWIN_REDUCER|{}|{}|{}|{}|{}",
+                op.as_str(),
+                label,
+                out.numeric_val,
+                bool_str(out.bool_val),
+                bool_str(out.is_defined)
+            ));
+        }
+    }
+
     lines
 }
 
@@ -442,8 +493,8 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
     let rust_lines = generate_rust_truth_table();
     assert_eq!(
         rust_lines.len(),
-        545,
-        "expected 545 canonical lines (64+16+128+3+24+32+8+60+16+6+32+32+32+16+4+72)"
+        571,
+        "expected 571 canonical lines (64+16+128+3+24+32+8+60+16+6+32+32+32+16+4+72+5+21)"
     );
 
     // Section-count verification: 64 TASK_FSM + 16 LIFECYCLE + 128 MESH_MERGE
@@ -535,6 +586,16 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
         *section_counts.get("HYBRID_SLOTS").unwrap_or(&0),
         72,
         "expected 72 HYBRID_SLOTS rows"
+    );
+    assert_eq!(
+        *section_counts.get("TWIN_BOUNDS").unwrap_or(&0),
+        5,
+        "expected 5 TWIN_BOUNDS rows"
+    );
+    assert_eq!(
+        *section_counts.get("TWIN_REDUCER").unwrap_or(&0),
+        21,
+        "expected 21 TWIN_REDUCER rows"
     );
 
     let lake = find_lake().expect(

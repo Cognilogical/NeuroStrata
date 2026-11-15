@@ -443,6 +443,14 @@ pub trait VectorStore: Send + Sync + AsAny {
     /// until something replays them (bead neurostrata-sij).
     async fn relink_edges(&self, namespace: &str, source_key: &str) -> Result<usize>;
 
+    /// List all graph edges `(from_id, relation, to_id, provenance)` in `namespace`.
+    async fn list_edges(
+        &self,
+        _namespace: &str,
+    ) -> Result<Vec<(String, String, String, Option<crate::rdf::EdgeProvenance>)>> {
+        Ok(Vec::new())
+    }
+
     /// Begin a staged ingestion: allocate a fresh generation for this namespace
     /// and source and return it. Nodes written against it are invisible to edge
     /// resolution until `publish_generation` flips the active pointer onto it.

@@ -1,17 +1,19 @@
-use uuid::Uuid;
-use crate::synaptic_mesh::record::{Lifecycle, LifecycleState, MESH_RECORD_SCHEMA_VERSION, RdfBlock};
+use crate::synaptic_mesh::record::{
+    Lifecycle, LifecycleState, RdfBlock, MESH_RECORD_SCHEMA_VERSION,
+};
 use crate::traits::{Embedder, GraphRead, MemoryPayload, SearchResult, VectorStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{self, json, Value};
-use std::sync::Arc;
 use std::cmp::Ordering;
+use std::sync::Arc;
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use uuid::Uuid;
 
 use crate::events::{RecursionToken, ThalamicBus, ThalamicPulse};
 use crate::guard::{BehavioralRule, GuardValidator, ValidateResponse};
 use crate::task::intake::{
-    CreateReceiptRequest, Disposition, ListCandidatesRequest, ProvenanceSpan, ResolveCandidateRequest,
-    ReviewState, SourceKind, undisposed_high_confidence_obligations,
+    undisposed_high_confidence_obligations, CreateReceiptRequest, Disposition,
+    ListCandidatesRequest, ProvenanceSpan, ResolveCandidateRequest, ReviewState, SourceKind,
 };
 
 #[derive(Deserialize)]
@@ -1096,7 +1098,9 @@ pub async fn process_mcp_request(
 
                     match name {
                         "neurostrata_list_namespaces" => {
-                            result_text = crate::handlers::memory::handle_list_namespaces(store.clone()).await;
+                            result_text =
+                                crate::handlers::memory::handle_list_namespaces(store.clone())
+                                    .await;
                         }
                         "neurostrata_add_memory" => {
                             result_text = handle_add_memory(
@@ -1118,7 +1122,8 @@ pub async fn process_mcp_request(
                                     // Encoding failures must be JSON-RPC errors with
                                     // the original id — never a successful result
                                     // containing an error string.
-                                    let annotated = crate::server::annotate_daemon_memory_error(&msg);
+                                    let annotated =
+                                        crate::server::annotate_daemon_memory_error(&msg);
                                     error_response = Some(serde_json::json!({
                                         "jsonrpc": "2.0",
                                         "id": id,
@@ -1145,7 +1150,8 @@ pub async fn process_mcp_request(
                                 handle_search_memory(arguments, emb.clone(), store.clone()).await;
                         }
                         "neurostrata_rebuild_lexical_index" => {
-                            result_text = handle_rebuild_lexical_index(arguments, store.clone()).await;
+                            result_text =
+                                handle_rebuild_lexical_index(arguments, store.clone()).await;
                         }
                         "neurostrata_rebuild_communities" => {
                             result_text =
@@ -1153,7 +1159,8 @@ pub async fn process_mcp_request(
                                     .await;
                         }
                         "neurostrata_find_duplicate_candidates" => {
-                            result_text = handle_find_duplicate_candidates(arguments, store.clone()).await;
+                            result_text =
+                                handle_find_duplicate_candidates(arguments, store.clone()).await;
                         }
                         "neurostrata_memories_for_file" => {
                             result_text = handle_memories_for_file(arguments, store.clone()).await;
@@ -1216,7 +1223,8 @@ pub async fn process_mcp_request(
                                     // A refused completion (Lock 2) is a JSON-RPC
                                     // error, never a success payload carrying an
                                     // error string.
-                                    let annotated = crate::server::annotate_daemon_memory_error(&msg);
+                                    let annotated =
+                                        crate::server::annotate_daemon_memory_error(&msg);
                                     error_response = Some(serde_json::json!({
                                         "jsonrpc": "2.0",
                                         "id": id,
@@ -1233,21 +1241,17 @@ pub async fn process_mcp_request(
                                 crate::task::handle_task_validate(arguments, store.clone()).await;
                         }
                         "neurostrata_domain_registry" => {
-                            result_text = handle_domain_registry(arguments, emb.clone(), store.clone()).await;
+                            result_text =
+                                handle_domain_registry(arguments, emb.clone(), store.clone()).await;
                         }
                         "neurostrata_task_intake" => {
-                            result_text = crate::task::intake::handle_intake(
-                                arguments,
-                                store.clone(),
-                            )
-                            .await;
+                            result_text =
+                                crate::task::intake::handle_intake(arguments, store.clone()).await;
                         }
                         "neurostrata_task_intake_list" => {
-                            result_text = crate::task::intake::handle_intake_list(
-                                arguments,
-                                store.clone(),
-                            )
-                            .await;
+                            result_text =
+                                crate::task::intake::handle_intake_list(arguments, store.clone())
+                                    .await;
                         }
                         "neurostrata_task_intake_resolve" => {
                             result_text = crate::task::intake::handle_intake_resolve(
@@ -1281,7 +1285,12 @@ pub async fn process_mcp_request(
                             .await;
                         }
                         "neurostrata_append_log" => {
-                            result_text = crate::buffer::handle_append_log(arguments, emb.clone(), store.clone()).await;
+                            result_text = crate::buffer::handle_append_log(
+                                arguments,
+                                emb.clone(),
+                                store.clone(),
+                            )
+                            .await;
                         }
                         "neurostrata_guard_validate" => {
                             result_text = handle_guard_validate(
@@ -1319,10 +1328,12 @@ pub async fn process_mcp_request(
                             result_text = handle_validate_shapes(arguments, store.clone()).await;
                         }
                         "neurostrata_export_canonical_rdf" => {
-                            result_text = handle_export_canonical_rdf(&arguments, store.clone()).await;
+                            result_text =
+                                handle_export_canonical_rdf(&arguments, store.clone()).await;
                         }
                         "neurostrata_validate_canonical_rdf" => {
-                            result_text = handle_validate_canonical_rdf(&arguments, store.clone()).await;
+                            result_text =
+                                handle_validate_canonical_rdf(&arguments, store.clone()).await;
                         }
                         "neurostrata_sparql_query" => {
                             result_text = handle_sparql_query(&arguments, store.clone()).await;
@@ -1331,7 +1342,8 @@ pub async fn process_mcp_request(
                             result_text = handle_twin_get(&arguments, store.clone()).await;
                         }
                         "neurostrata_twin_set" => {
-                            result_text = handle_twin_set(&arguments, emb.clone(), store.clone()).await;
+                            result_text =
+                                handle_twin_set(&arguments, emb.clone(), store.clone()).await;
                         }
                         "neurostrata_twin_diff" => {
                             result_text = handle_twin_diff(&arguments, store.clone()).await;
@@ -1352,14 +1364,35 @@ pub async fn process_mcp_request(
                             result_text = handle_graphql_query(&arguments, store.clone()).await;
                         }
                         "neurostrata_kge_train" => {
-                            let namespace = arguments.get("namespace").and_then(|v| v.as_str()).map(String::from);
-                            let all = arguments.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
-                            let epochs = arguments.get("epochs").and_then(|v| v.as_u64()).map(|v| v as u32);
-                            let dim = arguments.get("dim").and_then(|v| v.as_u64()).map(|v| v as u32);
-                            let kge_weight = arguments.get("kge_weight").and_then(|v| v.as_f64()).map(|v| v as f32);
+                            let namespace = arguments
+                                .get("namespace")
+                                .and_then(|v| v.as_str())
+                                .map(String::from);
+                            let all = arguments
+                                .get("all")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            let epochs = arguments
+                                .get("epochs")
+                                .and_then(|v| v.as_u64())
+                                .map(|v| v as u32);
+                            let dim = arguments
+                                .get("dim")
+                                .and_then(|v| v.as_u64())
+                                .map(|v| v as u32);
+                            let kge_weight = arguments
+                                .get("kge_weight")
+                                .and_then(|v| v.as_f64())
+                                .map(|v| v as f32);
                             let train_ns = namespace.clone();
                             let train_res = tokio::task::spawn_blocking(move || {
-                                crate::kge::cli_train(train_ns.as_deref(), all, epochs, dim, kge_weight)
+                                crate::kge::cli_train(
+                                    train_ns.as_deref(),
+                                    all,
+                                    epochs,
+                                    dim,
+                                    kge_weight,
+                                )
                             })
                             .await
                             .map_err(|e| anyhow::anyhow!("kge train task panicked: {e}"))
@@ -1373,7 +1406,8 @@ pub async fn process_mcp_request(
                                         "epochs": epochs.unwrap_or(10),
                                         "dim": dim.unwrap_or(64),
                                         "kge_weight": kge_weight.unwrap_or(1.0),
-                                    }).to_string();
+                                    })
+                                    .to_string();
                                 }
                                 Err(e) => {
                                     result_text = serde_json::json!({"ok": false, "error": crate::server::annotate_daemon_memory_error(&format!("{}", e))}).to_string();
@@ -1387,16 +1421,20 @@ pub async fn process_mcp_request(
                             result_text = handle_metrics_list(&arguments, store.clone()).await;
                         }
                         "neurostrata_chat_ask" => {
-                            result_text = handle_chat_ask(&arguments, emb.clone(), store.clone()).await;
+                            result_text =
+                                handle_chat_ask(&arguments, emb.clone(), store.clone()).await;
                         }
                         "neurostrata_export_wasm_snapshot" => {
-                            result_text = handle_export_wasm_snapshot(&arguments, store.clone()).await;
+                            result_text =
+                                handle_export_wasm_snapshot(&arguments, store.clone()).await;
                         }
                         "neurostrata_context_plan" => {
-                            result_text = handle_context_plan(&arguments, emb.clone(), store.clone()).await;
+                            result_text =
+                                handle_context_plan(&arguments, emb.clone(), store.clone()).await;
                         }
                         "neurostrata_action" => {
-                            result_text = handle_action(&arguments, emb.clone(), store.clone()).await;
+                            result_text =
+                                handle_action(&arguments, emb.clone(), store.clone()).await;
                         }
                         // SynapticMesh: the handler is a pure string-in/
                         // string-out dispatch (filesystem + git only; no
@@ -1424,7 +1462,7 @@ pub async fn process_mcp_request(
                             result_text = format!("Unknown tool: {}", name);
                         }
                     }
-                    
+
                     if matches!(
                         name,
                         "neurostrata_search_memory"
@@ -1512,10 +1550,18 @@ async fn handle_context_plan(
     embedder: Arc<dyn Embedder>,
     store: Arc<dyn VectorStore>,
 ) -> String {
-    use crate::context::{ContextService, ContextItem, Budget, render_plan_text, CONTEXT_PLAN_SCHEMA_VERSION};
     use crate::context::model::{ContextRequest, EgressPolicy};
-    let namespace = arguments.get("namespace").and_then(|v| v.as_str()).unwrap_or("global");
-    let query = arguments.get("query").and_then(|v| v.as_str()).unwrap_or("");
+    use crate::context::{
+        render_plan_text, Budget, ContextItem, ContextService, CONTEXT_PLAN_SCHEMA_VERSION,
+    };
+    let namespace = arguments
+        .get("namespace")
+        .and_then(|v| v.as_str())
+        .unwrap_or("global");
+    let query = arguments
+        .get("query")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let file_path = arguments.get("file_path").and_then(|v| v.as_str());
     let requested_files: Vec<String> = {
         let mut v: Vec<String> = Vec::new();
@@ -1535,9 +1581,18 @@ async fn handle_context_plan(
         }
         v
     };
-    let max_items = arguments.get("max_items").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
-    let max_bytes = arguments.get("max_bytes").and_then(|v| v.as_u64()).map(|b| b as usize);
-    let format = arguments.get("format").and_then(|v| v.as_str()).unwrap_or("json");
+    let max_items = arguments
+        .get("max_items")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(10) as usize;
+    let max_bytes = arguments
+        .get("max_bytes")
+        .and_then(|v| v.as_u64())
+        .map(|b| b as usize);
+    let format = arguments
+        .get("format")
+        .and_then(|v| v.as_str())
+        .unwrap_or("json");
 
     // Cross-scope authorization before any backend call: a caller may not even
     // probe another namespace's memories through the plan unless authorized.
@@ -1562,7 +1617,10 @@ async fn handle_context_plan(
             vec![0.0f32; embedder.dimensions()]
         }
     };
-    let results = match store.search(effective_ns, vector, max_items.max(1), false, false).await {
+    let results = match store
+        .search(effective_ns, vector, max_items.max(1), false, false)
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             had_backend_error = true;
@@ -1575,7 +1633,9 @@ async fn handle_context_plan(
         .get("exclude_stale")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let project_root = crate::daemon::resolve_project_root().to_string_lossy().to_string();
+    let project_root = crate::daemon::resolve_project_root()
+        .to_string_lossy()
+        .to_string();
     for res in results {
         let metadata = &res.payload.metadata;
         let sha = |key: &str| metadata.get(key).and_then(|v| v.as_str()).map(String::from);
@@ -1610,7 +1670,10 @@ async fn handle_context_plan(
                     // A governed file that can no longer be read is honestly
                     // reported as un-hashed (missing), not as unchanged.
                     Err(e) => {
-                        tracing::debug!("hash_governed_file failed to read {}: {e}", resolved.display());
+                        tracing::debug!(
+                            "hash_governed_file failed to read {}: {e}",
+                            resolved.display()
+                        );
                         None
                     }
                 }
@@ -1619,24 +1682,29 @@ async fn handle_context_plan(
             // state and currency stays as-is.
             _ => stored_file_sha256.clone(),
         };
-        let freshness = crate::context::freshness::compute_freshness(&crate::context::freshness::FreshnessInputs {
-            stored_file_sha256: stored_file_sha256.clone(),
-            current_file_sha256,
-            stored_span_sha256: sha("span_sha256"),
-            current_span_sha256: metadata.get("span_sha256").and_then(|v| v.as_str()).map(String::from),
-            verification_status: metadata
-                .get("verification")
-                .and_then(|v| v.get("status"))
-                .and_then(|v| v.as_str())
-                .map(String::from),
-            index_coverage: Some(crate::context::model::Coverage::Complete),
-            decision_status: metadata
-                .get("decision")
-                .and_then(|v| v.get("status"))
-                .and_then(|v| v.as_str())
-                .map(String::from),
-            has_governed_path: !res.payload.location.is_empty(),
-        });
+        let freshness = crate::context::freshness::compute_freshness(
+            &crate::context::freshness::FreshnessInputs {
+                stored_file_sha256: stored_file_sha256.clone(),
+                current_file_sha256,
+                stored_span_sha256: sha("span_sha256"),
+                current_span_sha256: metadata
+                    .get("span_sha256")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                verification_status: metadata
+                    .get("verification")
+                    .and_then(|v| v.get("status"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                index_coverage: Some(crate::context::model::Coverage::Complete),
+                decision_status: metadata
+                    .get("decision")
+                    .and_then(|v| v.get("status"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                has_governed_path: !res.payload.location.is_empty(),
+            },
+        );
         if exclude_stale && crate::context::freshness::is_stale(&freshness) {
             continue;
         }
@@ -1708,7 +1776,9 @@ async fn handle_context_plan(
             });
         }
     }
-    let token_budget = max_bytes.map(|b| (b / 4).max(64)).unwrap_or_else(|| max_items.saturating_mul(256).max(1024));
+    let token_budget = max_bytes
+        .map(|b| (b / 4).max(64))
+        .unwrap_or_else(|| max_items.saturating_mul(256).max(1024));
     let turn_used = arguments
         .get("turn_tokens_used")
         // The schema historically advertised `turn_used`/`session_used`; both
@@ -2080,7 +2150,9 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
     // Direct invocations of handle_memories_for_file also record the
     // touched file path in `.NeuroStrata/session_queries.json` and bump
     // `graph_queries_count` on the active in_progress task.
-    let _ = crate::task::record_graph_query(&store, &namespace, "neurostrata_memories_for_file", path).await;
+    let _ =
+        crate::task::record_graph_query(&store, &namespace, "neurostrata_memories_for_file", path)
+            .await;
 
     let symbol = arguments.get("symbol").and_then(|s| s.as_str());
     let include_ancestors = arguments
@@ -2232,8 +2304,7 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
     let max_hops = arguments
         .get("max_hops")
         .and_then(|v| v.as_u64())
-        .unwrap_or(crate::graph_read::related::DEFAULT_MAX_HOPS as u64)
-        as usize;
+        .unwrap_or(crate::graph_read::related::DEFAULT_MAX_HOPS as u64) as usize;
     let memory_types: Vec<String> = match arguments.get("memory_types") {
         Some(Value::Array(arr)) => arr
             .iter()
@@ -2244,8 +2315,7 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
     let limit = arguments
         .get("limit")
         .and_then(|v| v.as_u64())
-        .unwrap_or(crate::graph_read::related::DEFAULT_LIMIT as u64)
-        as usize;
+        .unwrap_or(crate::graph_read::related::DEFAULT_LIMIT as u64) as usize;
     let cursor: Option<crate::graph_read::related::Cursor> = arguments
         .get("cursor")
         .filter(|c| !c.is_null())
@@ -2347,7 +2417,9 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
                         .map(|path| path.iter().all(active))
                         .unwrap_or(true)
                 });
-                result.evidence.retain(|evidence| evidence.path.iter().all(active));
+                result
+                    .evidence
+                    .retain(|evidence| evidence.path.iter().all(active));
                 result.edges.retain(active);
                 result.total = result.nodes.len();
             }
@@ -2420,8 +2492,7 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
                 if cross_namespace.allow_cross_namespace {
                     obj.insert(
                         "cross_namespace".to_string(),
-                        serde_json::to_value(&cross_namespace)
-                            .unwrap_or(serde_json::Value::Null),
+                        serde_json::to_value(&cross_namespace).unwrap_or(serde_json::Value::Null),
                     );
                 }
                 if include_propagated {
@@ -2429,9 +2500,7 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
                         .nodes
                         .iter()
                         .filter_map(|node| {
-                            node.domain
-                                .clone()
-                                .map(|domain| (node.id.clone(), domain))
+                            node.domain.clone().map(|domain| (node.id.clone(), domain))
                         })
                         .collect();
                     let edges: Vec<crate::graph_read::related::EdgeSpec> = result
@@ -2455,7 +2524,11 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
                         serde_json::to_value(tags).unwrap_or(serde_json::Value::Null),
                     );
                 }
-                if arguments.get("closure_governs").and_then(|v| v.as_bool()).unwrap_or(false) {
+                if arguments
+                    .get("closure_governs")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
                     let edges: Vec<crate::graph_read::related::EdgeSpec> = result
                         .edges
                         .iter()
@@ -2647,10 +2720,7 @@ fn payload_fallback_hash(
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::default();
     hasher.update(payload.content.as_bytes());
-    crate::learning::observation::PayloadHash(format!(
-        "sha256:{}",
-        hex::encode(hasher.finalize())
-    ))
+    crate::learning::observation::PayloadHash(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
 
 /// The write half of add_memory: init, embed, dedup check, upsert.
@@ -2752,30 +2822,30 @@ pub(crate) async fn embed_dedup_and_upsert(
                         // merge extracted_from ids, reuse its vector, no twin row.
                         match store.get(namespace, &ec.id).await {
                             Ok(Some((existing_vec, mut existing_payload))) => {
-                            let meta = existing_payload.metadata.as_object_mut();
-                            if let Some(m) = meta {
-                                let arr = m
-                                    .entry("extracted_from".to_string())
-                                    .or_insert_with(|| serde_json::json!([]));
-                                if let Some(a) = arr.as_array_mut() {
-                                    for tid in &incoming_ids {
-                                        if !a.iter().any(|x| x.as_str() == Some(tid)) {
-                                            a.push(serde_json::json!(tid));
+                                let meta = existing_payload.metadata.as_object_mut();
+                                if let Some(m) = meta {
+                                    let arr = m
+                                        .entry("extracted_from".to_string())
+                                        .or_insert_with(|| serde_json::json!([]));
+                                    if let Some(a) = arr.as_array_mut() {
+                                        for tid in &incoming_ids {
+                                            if !a.iter().any(|x| x.as_str() == Some(tid)) {
+                                                a.push(serde_json::json!(tid));
+                                            }
                                         }
                                     }
                                 }
+                                // Also carry other metadata? Keep existing; idempotent.
+                                if let Err(e) = store
+                                    .upsert(namespace, &ec.id, existing_vec, existing_payload)
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        "dedup idempotent upsert failed for '{namespace}:{}': {e}",
+                                        ec.id
+                                    );
+                                }
                             }
-                            // Also carry other metadata? Keep existing; idempotent.
-                            if let Err(e) = store
-                                .upsert(namespace, &ec.id, existing_vec, existing_payload)
-                                .await
-                            {
-                                tracing::warn!(
-                                    "dedup idempotent upsert failed for '{namespace}:{}': {e}",
-                                    ec.id
-                                );
-                            }
-                        }
                             Err(e) => {
                                 tracing::warn!(
                                     "failed to fetch existing candidate {} for extracted_from merge: {e}",
@@ -2917,12 +2987,8 @@ pub(crate) async fn embed_dedup_and_upsert(
                             payload_hash,
                             source: crate::learning::observation::CandidateSource::RawDistance,
                             raw_distance: Some(c.raw_distance),
-                            provider_confidence: provider_predictions
-                                .get(c.id.as_str())
-                                .copied(),
-                            shadow_prediction: shadow_predictions
-                                .get(c.id.as_str())
-                                .copied(),
+                            provider_confidence: provider_predictions.get(c.id.as_str()).copied(),
+                            shadow_prediction: shadow_predictions.get(c.id.as_str()).copied(),
                         });
                     }
                 }
@@ -2931,7 +2997,10 @@ pub(crate) async fn embed_dedup_and_upsert(
     }
 
     // Write unless blocked.
-    if matches!(decision, DedupDecision::BlockedExact | DedupDecision::BlockedModel) {
+    if matches!(
+        decision,
+        DedupDecision::BlockedExact | DedupDecision::BlockedModel
+    ) {
         return Ok(MemoryWriteReport {
             upsert: None,
             decision,
@@ -2976,15 +3045,17 @@ pub(crate) async fn embed_dedup_and_upsert(
                             tracing::trace!(bytes = cached_len, "blob stored");
                         }
                         None => {
-                            tracing::warn!("learning blob store missed hash '{}' on read-back", hash.0);
+                            tracing::warn!(
+                                "learning blob store missed hash '{}' on read-back",
+                                hash.0
+                            );
                         }
                     };
                     if let Err(e) = recorder.record_blob_hash(&hash, payload).await {
                         tracing::warn!("learning record_blob_hash failed: {e}");
                     }
                 }
-                let last_shadow_verdict =
-                    dedup.and_then(|d| d.last_shadow_verdict());
+                let last_shadow_verdict = dedup.and_then(|d| d.last_shadow_verdict());
                 let input_payload_hash = blob_store.put(payload).unwrap_or_else(|_| {
                     use sha2::{Digest, Sha256};
                     let mut hasher = Sha256::default();
@@ -3014,9 +3085,7 @@ pub(crate) async fn embed_dedup_and_upsert(
                     selected_provider,
                     policy_version: "baseline".to_string(),
                     model_version: None,
-                    shadow_provider: last_shadow_verdict
-                        .as_ref()
-                        .map(|(name, _)| name.clone()),
+                    shadow_provider: last_shadow_verdict.as_ref().map(|(name, _)| name.clone()),
                     shadow_model_version: None,
                     decision,
                 };
@@ -3207,7 +3276,9 @@ async fn handle_add_memory(
         .get("multimodal_strict")
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
-        && multimodal_warnings.iter().any(|w| w.is_strict_failure(false))
+        && multimodal_warnings
+            .iter()
+            .any(|w| w.is_strict_failure(false))
     {
         return format!(
             "ERROR [MULTIMODAL]: strict attachment validation failed: {}",
@@ -3237,20 +3308,26 @@ async fn handle_add_memory(
     // caller omitted source (or left it blank), backfill from the location
     // argument when it is usable, otherwise fall back to "agent".
     if memory_type == "rule" {
-        if metadata.as_object().map_or(true, |o| match o.get("source") {
-            None => true,
-            Some(Value::String(s)) => s.trim().is_empty(),
-            Some(_) => false,
-        }) {
+        if metadata
+            .as_object()
+            .map_or(true, |o| match o.get("source") {
+                None => true,
+                Some(Value::String(s)) => s.trim().is_empty(),
+                Some(_) => false,
+            })
+        {
             let resolved_source = if !location.is_empty() && location != "N/A" {
                 Some(location.clone())
             } else {
                 None
             };
             if let Some(o) = metadata.as_object_mut() {
-                o.insert("source".to_string(), serde_json::Value::String(
-                    resolved_source.unwrap_or_else(|| "agent".to_string()),
-                ));
+                o.insert(
+                    "source".to_string(),
+                    serde_json::Value::String(
+                        resolved_source.unwrap_or_else(|| "agent".to_string()),
+                    ),
+                );
             }
         }
     }
@@ -3272,24 +3349,26 @@ async fn handle_add_memory(
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| std::path::PathBuf::from("artifacts/gliner-bundle"));
         let verified = match std::env::var("NEUROSTRATA_GLINER_SHA256") {
-            Ok(expected_sha) => match crate::gliner::verify_bundle_sha256(&bundle_dir, &expected_sha) {
-                Ok(true) => true,
-                Ok(false) => {
-                    tracing::warn!(
-                        bundle_dir = %bundle_dir.display(),
-                        "GLiNER bundle fails its provisioned SHA-256; skipping load"
-                    );
-                    false
+            Ok(expected_sha) => {
+                match crate::gliner::verify_bundle_sha256(&bundle_dir, &expected_sha) {
+                    Ok(true) => true,
+                    Ok(false) => {
+                        tracing::warn!(
+                            bundle_dir = %bundle_dir.display(),
+                            "GLiNER bundle fails its provisioned SHA-256; skipping load"
+                        );
+                        false
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            bundle_dir = %bundle_dir.display(),
+                            "GLiNER bundle SHA-256 verification failed; skipping load"
+                        );
+                        false
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        bundle_dir = %bundle_dir.display(),
-                        "GLiNER bundle SHA-256 verification failed; skipping load"
-                    );
-                    false
-                }
-            },
+            }
             // No expected hash provisioned: nothing to verify against.
             Err(_) => true,
         };
@@ -3328,8 +3407,7 @@ async fn handle_add_memory(
         let mut registry_cache: Option<Vec<String>> = None;
         let mut check_warning: Option<String> = None;
         if let Some(raw) = &raw_domain {
-            match crate::registry::check_domain(&store, namespace, raw, register_domain).await
-            {
+            match crate::registry::check_domain(&store, namespace, raw, register_domain).await {
                 Ok(check) => {
                     registry_cache = check.cache;
                     check_warning = check.warning;
@@ -3348,12 +3426,19 @@ async fn handle_add_memory(
             metadata,
         };
 
-        if arguments.get("shacl_enforce").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if arguments
+            .get("shacl_enforce")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
             if let Err(violations) = crate::rdf::shacl::enforce(&payload) {
                 return format!("ERROR [SHACL]: {:?}", violations);
             }
         }
-        let include_rdf_projection = arguments.get("include_rdf_projection").and_then(|v| v.as_bool()).unwrap_or(false);
+        let include_rdf_projection = arguments
+            .get("include_rdf_projection")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         // Projection over "pending" is wrong: the digest must be computed from
         // the id the row actually persists under, which embed_dedup_and_upsert
         // only knows after the call. Clone now, project in the Ok arm.
@@ -3388,8 +3473,14 @@ async fn handle_add_memory(
                             // back to the payload as prepared, still under the
                             // real id.
                             _ => Some((
-                                crate::rdf::canonical::dual_write(&u.id, payload_for_projection.as_ref().unwrap()).1,
-                                crate::rdf::shacl::infer_shape(payload_for_projection.as_ref().unwrap()),
+                                crate::rdf::canonical::dual_write(
+                                    &u.id,
+                                    payload_for_projection.as_ref().unwrap(),
+                                )
+                                .1,
+                                crate::rdf::shacl::infer_shape(
+                                    payload_for_projection.as_ref().unwrap(),
+                                ),
                             )),
                         },
                         // Nothing fresh was upserted (dedup reuse) — a digest
@@ -3462,7 +3553,11 @@ async fn handle_add_memory(
                 }
                 // TASK NUDGE: advisory when a non-task/procedure memory's content
                 if let Some((rdf_digest, shape_fields)) = rdf_projection_info {
-                    msg.push_str(&format!("\nRDF Digest: {}\nInferred Shape Fields: {}", rdf_digest, shape_fields.join(", ")));
+                    msg.push_str(&format!(
+                        "\nRDF Digest: {}\nInferred Shape Fields: {}",
+                        rdf_digest,
+                        shape_fields.join(", ")
+                    ));
                 }
                 // TASK NUDGE: advisory when a non-task/procedure memory's content
                 // carries task-shaped markers.
@@ -3554,7 +3649,9 @@ pub async fn handle_task_candidates(
         Some("record") => "record",
         Some("resolve") => "resolve",
         Some("dismiss") => "dismiss",
-        Some(a) => return format!("ERROR: unknown action '{a}' (expected record|list|resolve|dismiss)."),
+        Some(a) => {
+            return format!("ERROR: unknown action '{a}' (expected record|list|resolve|dismiss).")
+        }
     };
 
     let intake_store = store.as_intake_store();
@@ -3565,8 +3662,14 @@ pub async fn handle_task_candidates(
 
     match action {
         "list" => {
-            let limit = args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
-            let offset = args.get("offset").and_then(|v| v.as_u64()).map(|v| v as usize);
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
+            let offset = args
+                .get("offset")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
             let review_state = match args.get("review_state").and_then(|v| v.as_str()) {
                 Some(s) if !s.is_empty() => match s {
                     "pending" => Some(ReviewState::Pending),
@@ -3608,7 +3711,8 @@ pub async fn handle_task_candidates(
                         "limit": response.limit,
                         "candidates": response.items,
                     });
-                    serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("ERROR: {}", e))
+                    serde_json::to_string_pretty(&result)
+                        .unwrap_or_else(|e| format!("ERROR: {}", e))
                 }
                 Err(e) => {
                     if e.starts_with("ERROR:") {
@@ -3625,7 +3729,10 @@ pub async fn handle_task_candidates(
                 .and_then(|v| v.as_str())
                 .unwrap_or("task_obligation")
                 .to_string();
-            let category = args.get("category").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let category = args
+                .get("category")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             let top_confidence = args.get("confidence").and_then(|v| v.as_f64());
             let provenance = args
                 .get("provenance")
@@ -3641,23 +3748,39 @@ pub async fn handle_task_candidates(
             // take the max so the strongest signal wins; a candidate recorded
             // with only provenance.confidence still persists with confidence
             // >= 0.85 and is visible to the Lock 2 obligation gate.
-            let confidence = [top_confidence, provenance_confidence, source_span_confidence]
-                .into_iter()
-                .flatten()
-                .reduce(f64::max);
-            let title = args.get("title").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let confidence = [
+                top_confidence,
+                provenance_confidence,
+                source_span_confidence,
+            ]
+            .into_iter()
+            .flatten()
+            .reduce(f64::max);
+            let title = args
+                .get("title")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             let description = args
                 .get("description")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            let task_id = args.get("task_id").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let auto_commit = args.get("auto_commit").and_then(|v| v.as_bool()).unwrap_or(false);
+            let task_id = args
+                .get("task_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let auto_commit = args
+                .get("auto_commit")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let provenance = args
                 .get("provenance")
                 .cloned()
                 .and_then(|v| serde_json::from_value::<ProvenanceSpan>(v).ok());
 
-            let text = title.clone().or_else(|| description.clone()).unwrap_or_default();
+            let text = title
+                .clone()
+                .or_else(|| description.clone())
+                .unwrap_or_default();
             if text.is_empty() {
                 return "ERROR: 'title' or 'description' is required for record.".to_string();
             }
@@ -3735,14 +3858,8 @@ pub async fn handle_task_candidates(
                                 location_lines: String::new(),
                                 metadata: meta,
                             };
-                            match embed_dedup_and_upsert(
-                                &store,
-                                &emb,
-                                &namespace,
-                                &payload,
-                                None,
-                            )
-                            .await
+                            match embed_dedup_and_upsert(&store, &emb, &namespace, &payload, None)
+                                .await
                             {
                                 Ok(_) => {
                                     let resolve_req = ResolveCandidateRequest {
@@ -3786,7 +3903,8 @@ pub async fn handle_task_candidates(
                         "auto_commit": auto_commit,
                         "auto_committed": auto_committed,
                     });
-                    serde_json::to_string_pretty(&response).unwrap_or_else(|e| format!("ERROR: {}", e))
+                    serde_json::to_string_pretty(&response)
+                        .unwrap_or_else(|e| format!("ERROR: {}", e))
                 }
                 Err(e) => {
                     if e.starts_with("ERROR:") {
@@ -3816,11 +3934,17 @@ pub async fn handle_task_candidates(
                     }
                 }
             };
-            let task_id = args.get("task_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let task_id = args
+                .get("task_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             if (disposition == Disposition::Created || disposition == Disposition::Linked)
                 && task_id.is_none()
             {
-                return format!("ERROR: 'task_id' is required when disposition is '{}'.", disposition);
+                return format!(
+                    "ERROR: 'task_id' is required when disposition is '{}'.",
+                    disposition
+                );
             }
             let cas_version = match args.get("cas_version").and_then(|v| v.as_u64()) {
                 Some(v) => v,
@@ -3842,7 +3966,8 @@ pub async fn handle_task_candidates(
                         "task_created": result.task_created,
                         "task_id": result.task_id,
                     });
-                    serde_json::to_string_pretty(&response).unwrap_or_else(|e| format!("ERROR: {}", e))
+                    serde_json::to_string_pretty(&response)
+                        .unwrap_or_else(|e| format!("ERROR: {}", e))
                 }
                 Err(e) => {
                     if e.starts_with("ERROR:") {
@@ -3937,7 +4062,12 @@ async fn handle_get_snapshot(
         all_memories
             .iter()
             .filter(|m| m.payload.memory_type == "directory")
-            .filter_map(|m| m.payload.metadata.get("absolute_path").and_then(|v| v.as_str()))
+            .filter_map(|m| {
+                m.payload
+                    .metadata
+                    .get("absolute_path")
+                    .and_then(|v| v.as_str())
+            })
             .filter(|p| std::path::Path::new(p).join(".git").exists())
             .min_by_key(|p| p.len())
             .map(|s| s.to_string())
@@ -3983,10 +4113,21 @@ async fn handle_get_snapshot(
     // Computed off the pre-truncation list too: a procedure is worth surfacing
     // whether or not it made the top-5 by access count, and a procedure nobody
     // has ever performed has the lowest access count of all.
-    let snap_query = arguments.get("query").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let snap_task_id = arguments.get("task_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let snap_query = arguments
+        .get("query")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let snap_task_id = arguments
+        .get("task_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let procedures = if snap_query.is_some() || snap_task_id.is_some() {
-        crate::tools::procedure::procedures_due_strap_filtered(&all_memories, now, snap_query.as_deref(), snap_task_id.as_deref())
+        crate::tools::procedure::procedures_due_strap_filtered(
+            &all_memories,
+            now,
+            snap_query.as_deref(),
+            snap_task_id.as_deref(),
+        )
     } else {
         crate::tools::procedure::procedures_due_strap(&all_memories, now)
     };
@@ -4034,8 +4175,14 @@ async fn handle_get_snapshot(
             if disputed.contains(&r.id) {
                 if let Some(obj) = r.payload.metadata.as_object_mut() {
                     obj.insert("disputed".to_string(), serde_json::json!(true));
-                    let mut dw = obj.get("disputed_with").and_then(|v|v.as_array()).cloned().unwrap_or_default();
-                    if !dw.iter().any(|x| x.as_str()==Some(id.as_str())) { dw.push(serde_json::json!(id)); }
+                    let mut dw = obj
+                        .get("disputed_with")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    if !dw.iter().any(|x| x.as_str() == Some(id.as_str())) {
+                        dw.push(serde_json::json!(id));
+                    }
                     obj.insert("disputed_with".to_string(), serde_json::Value::Array(dw));
                 }
             }
@@ -4074,7 +4221,9 @@ async fn handle_get_snapshot(
     let (mode, requested_slugs) = match domain_arg {
         None => ("recent_domain", Vec::new()),
         Some(Value::String(s)) => {
-            let slugs = crate::domain::normalize_domain_slug(s).into_iter().collect();
+            let slugs = crate::domain::normalize_domain_slug(s)
+                .into_iter()
+                .collect();
             ("explicit", slugs)
         }
         Some(Value::Array(arr)) => {
@@ -4095,7 +4244,13 @@ async fn handle_get_snapshot(
         .filter(|r| {
             !matches!(
                 r.payload.memory_type.as_str(),
-                "directory" | "file" | "markdown" | "freshness_flag" | "guard_event" | "task" | "procedure"
+                "directory"
+                    | "file"
+                    | "markdown"
+                    | "freshness_flag"
+                    | "guard_event"
+                    | "task"
+                    | "procedure"
             )
         })
         .filter(|r| !crate::domain::domain_keys(&r.payload.metadata).is_empty())
@@ -4145,7 +4300,10 @@ async fn handle_get_snapshot(
         if selected.len() >= 3 {
             break;
         }
-        let slug = crate::domain::domain_keys(&r.payload.metadata).into_iter().next().unwrap_or_default();
+        let slug = crate::domain::domain_keys(&r.payload.metadata)
+            .into_iter()
+            .next()
+            .unwrap_or_default();
         if mode == "recent_domain" {
             let count = selected_domains.iter().filter(|d| *d == &slug).count();
             if count >= 2 {
@@ -4159,7 +4317,10 @@ async fn handle_get_snapshot(
     let strap_entries: Vec<Value> = selected
         .iter()
         .map(|r| {
-            let slug = crate::domain::domain_keys(&r.payload.metadata).into_iter().next().unwrap_or_default();
+            let slug = crate::domain::domain_keys(&r.payload.metadata)
+                .into_iter()
+                .next()
+                .unwrap_or_default();
             let prefix = if crate::attempt::is_failed_attempt(&r.payload.metadata) {
                 crate::attempt::FAILED_ATTEMPT_PREFIX
             } else {
@@ -4260,7 +4421,8 @@ async fn handle_get_snapshot(
     let mut doctor_report: Option<String> = None;
     let mut hygiene_ok = true;
     if trigger {
-        let known = crate::store::ladybug::KnownIds::new(all_memories.iter().map(|m| m.id.as_str()));
+        let known =
+            crate::store::ladybug::KnownIds::new(all_memories.iter().map(|m| m.id.as_str()));
         let mut unqualified_ingested = 0usize;
         let mut resolvable = 0usize;
         let mut missing = 0usize;
@@ -4336,10 +4498,7 @@ async fn handle_get_snapshot(
             None => Vec::new(),
         };
         if !ontology_warnings.is_empty() {
-            findings.push(format!(
-                "  ontology warnings: {}",
-                ontology_warnings.len()
-            ));
+            findings.push(format!("  ontology warnings: {}", ontology_warnings.len()));
         }
         // Enrichment state (F12/F14/F24): warn-first.
         let rid = crate::registry::registry_row_id(namespace);
@@ -4353,16 +4512,26 @@ async fn handle_get_snapshot(
         let configured_wires: Vec<String> = doctor_state
             .get("configured_wires")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
             .unwrap_or_default();
         let configured_fires_on: Vec<String> = doctor_state
             .get("configured_fires_on")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
             .unwrap_or_default();
         if !configured_wires.is_empty() || !last_run_version.is_empty() {
-            let (new_auto, new_rem, new_fires) =
-                crate::task::wiring::compute_lifecycle_delta(&configured_wires, &configured_fires_on);
+            let (new_auto, new_rem, new_fires) = crate::task::wiring::compute_lifecycle_delta(
+                &configured_wires,
+                &configured_fires_on,
+            );
             if !new_auto.is_empty() || !new_rem.is_empty() || !new_fires.is_empty() {
                 let auto_ids: Vec<&str> = new_auto.iter().map(|w| w.id).collect();
                 let rem_ids: Vec<&str> = new_rem.iter().map(|r| r.id).collect();
@@ -4409,14 +4578,19 @@ async fn handle_get_snapshot(
         apply_doctor_version(&mut doctor_state, current_version, hygiene_ok);
         doctor_state["last_run_ts"] = serde_json::json!(now_ts);
         doctor_state["configured_wires"] = serde_json::json!(crate::task::wiring::known_wire_ids());
-        doctor_state["configured_fires_on"] = serde_json::json!(crate::task::wiring::VALID_FIRES_ON);
+        doctor_state["configured_fires_on"] =
+            serde_json::json!(crate::task::wiring::VALID_FIRES_ON);
     }
     if let (Some(vec), Some(mut payload)) = (reg_vec_opt, reg_payload_opt) {
         if let Some(obj) = payload.metadata.as_object_mut() {
             obj.insert("doctor_state".to_string(), doctor_state);
         }
         if let Err(e) = store.upsert(namespace, &rid, vec, payload).await {
-            tracing::warn!("failed to persist doctor_state into {}::{}: {e}", namespace, rid);
+            tracing::warn!(
+                "failed to persist doctor_state into {}::{}: {e}",
+                namespace,
+                rid
+            );
         }
     }
 
@@ -4445,21 +4619,46 @@ async fn handle_get_snapshot(
         String::new()
     } else {
         // Build type map for domain/hub lookups from already-fetched list.
-        let mut type_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        let mut access_map: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        let mut type_map: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let mut access_map: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
         for r in &communities_rows {
             let meta = &r.payload.metadata;
             type_map.insert(r.id.clone(), r.payload.memory_type.clone());
-            let cnt = meta.get("access_count").and_then(|v| v.as_i64()).unwrap_or(0);
+            let cnt = meta
+                .get("access_count")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
             access_map.insert(r.id.clone(), cnt);
         }
         // Sort communities by size DESC (spec §5.6: size DESC, community_id ASC for snapshot top-10).
         let mut sorted: Vec<&crate::traits::SearchResult> = communities_rows.iter().collect();
         sorted.sort_by(|a, b| {
-            let size_a = a.payload.metadata.get("member_count").and_then(|v| v.as_u64()).unwrap_or(0);
-            let size_b = b.payload.metadata.get("member_count").and_then(|v| v.as_u64()).unwrap_or(0);
-            let id_a = a.payload.metadata.get("community_id").and_then(|v| v.as_u64()).unwrap_or(0);
-            let id_b = b.payload.metadata.get("community_id").and_then(|v| v.as_u64()).unwrap_or(0);
+            let size_a = a
+                .payload
+                .metadata
+                .get("member_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let size_b = b
+                .payload
+                .metadata
+                .get("member_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let id_a = a
+                .payload
+                .metadata
+                .get("community_id")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let id_b = b
+                .payload
+                .metadata
+                .get("community_id")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
             size_b.cmp(&size_a).then_with(|| id_a.cmp(&id_b))
         });
         let top10: Vec<&crate::traits::SearchResult> = sorted.into_iter().take(10).collect();
@@ -4470,12 +4669,23 @@ async fn handle_get_snapshot(
         section.push_str("):");
         for r in &top10 {
             let meta = &r.payload.metadata;
-            let community_id = meta.get("community_id").and_then(|v| v.as_u64()).unwrap_or(0);
-            let size = meta.get("member_count").and_then(|v| v.as_u64()).unwrap_or(0);
+            let community_id = meta
+                .get("community_id")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let size = meta
+                .get("member_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
             let hub_id = meta.get("hub_id").and_then(|v| v.as_str()).unwrap_or("");
             // Domains of members: use member list metadata, find top domain(s)
-            let members = meta.get("members").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-            let mut domains: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            let members = meta
+                .get("members")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let mut domains: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
             for m in &members {
                 if let Some(mid) = m.as_str() {
                     // Search all_memories (untruncated, pre-truncate list would have included community summaries but they're removed now)
@@ -4491,7 +4701,12 @@ async fn handle_get_snapshot(
             }
             let mut domain_vec: Vec<(String, usize)> = domains.into_iter().collect();
             domain_vec.sort_by(|a, b| b.1.cmp(&a.1));
-            let mut top_domains: String = domain_vec.iter().take(3).map(|(d, c)| format!("{}x{}", d, c)).collect::<Vec<_>>().join(", ");
+            let mut top_domains: String = domain_vec
+                .iter()
+                .take(3)
+                .map(|(d, c)| format!("{}x{}", d, c))
+                .collect::<Vec<_>>()
+                .join(", ");
             if top_domains.is_empty() {
                 domain_vec.clear();
                 // fallback: find hub's domain
@@ -4503,7 +4718,11 @@ async fn handle_get_snapshot(
                     }
                 }
             }
-            let hubs = if hub_id.is_empty() { String::from("none") } else { hub_id.to_string() };
+            let hubs = if hub_id.is_empty() {
+                String::from("none")
+            } else {
+                hub_id.to_string()
+            };
             section.push_str(&format!(
                 "\n- [{community_id}] ({size} memories, domains: {top_domains}) — hubs: {hubs}"
             ));
@@ -4592,8 +4811,15 @@ async fn handle_ingest_directory(
     let namespace = resolve_namespace(&store, namespace).await;
     let namespace = namespace.as_str();
 
-    let dry_run = arguments.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
-    let dry_run_mode = arguments.get("dry_run_mode").and_then(|v| v.as_str()).unwrap_or("estimate").to_string();
+    let dry_run = arguments
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let dry_run_mode = arguments
+        .get("dry_run_mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("estimate")
+        .to_string();
 
     let schema_str = include_str!("schema.json");
     let schema = match crate::parser::schema::ParserSchema::load(schema_str) {
@@ -4603,9 +4829,18 @@ async fn handle_ingest_directory(
 
     if dry_run {
         if !matches!(dry_run_mode.as_str(), "estimate" | "presort") {
-            return format!("ERROR: Invalid dry_run_mode '{}' (expected 'estimate' or 'presort').", dry_run_mode);
+            return format!(
+                "ERROR: Invalid dry_run_mode '{}' (expected 'estimate' or 'presort').",
+                dry_run_mode
+            );
         }
-        match crate::parser::ingest::dry_run_directory(std::path::Path::new(dir_path), &schema, &dry_run_mode).await {
+        match crate::parser::ingest::dry_run_directory(
+            std::path::Path::new(dir_path),
+            &schema,
+            &dry_run_mode,
+        )
+        .await
+        {
             Ok(report) => return report,
             Err(e) => return format!("Dry-run failed: {}", e),
         }
@@ -4615,16 +4850,19 @@ async fn handle_ingest_directory(
     // times out and disconnects no longer leaves the graph half-built (bead
     // neurostrata-7ej). Ingestion upserts thousands of rows, and checkpointing
     // each one would dominate the run, so that happens once at the end.
-    match ingests.run(namespace, dir_path, schema, emb.clone(), store.clone()).await {
+    match ingests
+        .run(namespace, dir_path, schema, emb.clone(), store.clone())
+        .await
+    {
         Ok(progress) => {
             // AC4: normalize resolvable declared targets so every ingest run
             // leaves the namespace edge-canonical, not just bus subscribers.
             // A normalization failure is logged, never silently swallowed.
-            if let Err(e) = crate::events::subscribers::post_ingest_normalize::normalize_namespace_targets(
-                &*store,
-                namespace,
-            )
-            .await
+            if let Err(e) =
+                crate::events::subscribers::post_ingest_normalize::normalize_namespace_targets(
+                    &*store, namespace,
+                )
+                .await
             {
                 tracing::warn!("post-ingest normalize failed: {e}");
             }
@@ -4691,13 +4929,21 @@ async fn handle_feedback_memory(arguments: Value, store: Arc<dyn VectorStore>) -
                 payload.metadata = serde_json::json!({});
             }
             let new_count = if let Some(obj) = payload.metadata.as_object_mut() {
-                let prev = obj.get("feedback_count").and_then(|v| v.as_i64()).unwrap_or(0);
+                let prev = obj
+                    .get("feedback_count")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
                 let count = prev.saturating_add(1);
                 obj.insert("feedback_score".to_string(), serde_json::json!(rating));
                 obj.insert("feedback_count".to_string(), serde_json::json!(count));
-                obj.insert("feedback_updated_at".to_string(), serde_json::json!(chrono::Utc::now().to_rfc3339()));
+                obj.insert(
+                    "feedback_updated_at".to_string(),
+                    serde_json::json!(chrono::Utc::now().to_rfc3339()),
+                );
                 count
-            } else { 0 };
+            } else {
+                0
+            };
             match store.upsert(namespace, &id, vec, payload).await {
                 Ok(_) => serde_json::json!({"ok":true,"id":id,"namespace":namespace,"feedback_score":rating,"feedback_count":new_count}).to_string(),
                 Err(e) => serde_json::json!({"ok":false,"error":e.to_string()}).to_string(),
@@ -4721,14 +4967,16 @@ async fn handle_validate_shapes(arguments: Value, store: Arc<dyn VectorStore>) -
     match store.get(&namespace, &id).await {
         Ok(Some((_vec, payload))) => {
             let violations = crate::rdf::shacl::validate_memory(&payload);
-            let v: Vec<serde_json::Value> = violations.iter().map(|x| serde_json::json!({"field":x.field,"why":x.why})).collect();
+            let v: Vec<serde_json::Value> = violations
+                .iter()
+                .map(|x| serde_json::json!({"field":x.field,"why":x.why}))
+                .collect();
             serde_json::json!({"ok":true,"id":id,"namespace":namespace,"violations":v,"count":v.len()}).to_string()
         }
         Ok(None) => serde_json::json!({"ok":false,"error":"memory not found"}).to_string(),
         Err(e) => serde_json::json!({"ok":false,"error":e.to_string()}).to_string(),
     }
 }
-
 
 async fn handle_export_canonical_rdf(arguments: &Value, store: Arc<dyn VectorStore>) -> String {
     use crate::rdf::dataset_canonical::build_mesh_canonical_nquads;
@@ -4739,25 +4987,37 @@ async fn handle_export_canonical_rdf(arguments: &Value, store: Arc<dyn VectorSto
             if arguments.get("memory_id").is_some() {
                 return serde_json::json!({"ok":false,"error":"namespace required when memory_id given"}).to_string();
             }
-            return serde_json::json!({"ok":false,"error":"namespace or memory_id required"}).to_string();
+            return serde_json::json!({"ok":false,"error":"namespace or memory_id required"})
+                .to_string();
         }
     };
     let namespace = resolve_namespace(&store, &namespace).await;
     let namespace_str = namespace.as_str();
-    let profile = arguments.get("profile").and_then(|v| v.as_str()).unwrap_or("mesh");
+    let profile = arguments
+        .get("profile")
+        .and_then(|v| v.as_str())
+        .unwrap_or("mesh");
     // Validate up-front: a namespace-wide export must fail fast with a single
     // ok:false error instead of burning a per-memory project for every row
     // before the unsupported profile is discovered at render time.
     if profile != "mesh" && profile != "local" {
-        return serde_json::json!({"ok":false,"error":format!("unsupported profile: {profile}")}).to_string();
+        return serde_json::json!({"ok":false,"error":format!("unsupported profile: {profile}")})
+            .to_string();
     }
-    let format = arguments.get("format").and_then(|v| v.as_str()).unwrap_or("n-quads");
+    let format = arguments
+        .get("format")
+        .and_then(|v| v.as_str())
+        .unwrap_or("n-quads");
     // N-Quads is the canonical serialization (spec §5.2d); TriG is a lossless
     // re-grouping of the same canonical quads into named graphs.
     if format != "n-quads" && format != "trig" {
-        return serde_json::json!({"ok":false,"error":format!("unsupported format: {format}")}).to_string();
+        return serde_json::json!({"ok":false,"error":format!("unsupported format: {format}")})
+            .to_string();
     }
-    let memory_id_opt: Option<String> = arguments.get("memory_id").and_then(|v| v.as_str()).map(String::from);
+    let memory_id_opt: Option<String> = arguments
+        .get("memory_id")
+        .and_then(|v| v.as_str())
+        .map(String::from);
 
     // Canonical export targets: an explicit memory_id exports exactly that
     // memory; a namespace without memory_id exports every memory in the
@@ -4765,7 +5025,10 @@ async fn handle_export_canonical_rdf(arguments: &Value, store: Arc<dyn VectorSto
     let id_targets: Vec<String> = match &memory_id_opt {
         Some(id) => vec![match Uuid::parse_str(id) {
             Ok(u) => u.to_string(),
-            Err(e) => return serde_json::json!({"ok":false,"error":format!("invalid memory_id: {e}")}).to_string(),
+            Err(e) => {
+                return serde_json::json!({"ok":false,"error":format!("invalid memory_id: {e}")})
+                    .to_string()
+            }
         }],
         None => match store.list(namespace_str, None, None).await {
             Ok(rows) => rows.into_iter().map(|r| r.id).collect(),
@@ -4776,114 +5039,164 @@ async fn handle_export_canonical_rdf(arguments: &Value, store: Arc<dyn VectorSto
     let mut exports: Vec<serde_json::Value> = Vec::new();
     let mut export_errors: Vec<serde_json::Value> = Vec::new();
     for id_str in &id_targets {
-    match store.get(namespace_str, id_str).await {
-        Ok(Some((_, payload))) => {
-            let meta = payload.metadata.as_object().cloned().unwrap_or_default();
-            let memory_type = payload.memory_type.as_str();
-            let lifecycle_state = meta.get("lifecycle_state").and_then(|v| v.as_str()).unwrap_or("active");
-            // created_at is required for deterministic canonical RDF (fail closed).
-            let created_at = match meta.get("created_at").and_then(|v| v.as_str()) {
-                Some(t) => t.to_string(),
-                None => {
-                    export_errors.push(serde_json::json!({
-                        "memory_id": id_str,
-                        "error": "created_at missing from memory metadata"
-                    }));
-                    continue;
-                }
-            };
-            let created_by = &payload.user_id;
-            let superseded_by = meta.get("superseded_by").and_then(|v| v.as_str());
-            let archived_at = meta.get("archived_at").and_then(|v| v.as_i64()).map(|t| {
-                chrono::DateTime::from_timestamp(t, 0).map(|d| d.to_rfc3339())
-            }).flatten();
-            let tombstoned_at = meta.get("tombstoned_at").and_then(|v| v.as_str());
-            let content_str = payload.content.clone();
-            let eligibility = meta.get("eligibility").and_then(|v| v.as_str());
-            let source = meta.get("source").and_then(|v| v.as_str());
-            let tags: Vec<String> = meta.get("tags").and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                .unwrap_or_default();
-            let concept_iri = meta.get("concept_iri").and_then(|v| v.as_str());
-            let mut rels: Vec<(String, String)> = Vec::new();
-            if let Some(sb) = meta.get("supersedes").and_then(|v| v.as_str()) { rels.push(("supersedes".to_string(), sb.to_string())); }
-            if let Some(refs) = meta.get("references").and_then(|v| v.as_array()) {
-                for r in refs { if let Some(s) = r.as_str() { rels.push(("references".to_string(), s.to_string())); } }
-            }
-            let update_id = meta.get("update_id").and_then(|v| v.as_str()).unwrap_or(&id_str).to_string();
-            let origin_mesh_epoch = meta.get("origin_mesh_epoch").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-            let trust = meta.get("trust").and_then(|v| v.as_str()).unwrap_or("untrusted");
-
-            let proc_meta = meta.get("procedure_definition").and_then(|v| v.as_object()).cloned().unwrap_or_default();
-            let trigger = proc_meta.get("trigger").and_then(|v| v.as_str());
-            let initial_fires = proc_meta.get("remaining_fires_initial").and_then(|v| v.as_i64());
-            let valid_to = proc_meta.get("valid_to").and_then(|v| v.as_str());
-            let rehearsal_script = proc_meta.get("rehearsal_script").and_then(|v| v.as_str());
-
-            let (nquads_text, digest_str) = build_mesh_canonical_nquads(
-                id_str, namespace_str, memory_type, lifecycle_state,
-                &created_at, created_by,
-                superseded_by,
-                archived_at.as_deref(),
-                tombstoned_at,
-                &content_str, eligibility, source, &tags, concept_iri,
-                &rels, &update_id, origin_mesh_epoch, trust,
-                trigger, initial_fires, valid_to, rehearsal_script,
-            );
-            // Honor profile parameter: mesh = canonical N-Quads wire format; local = full MemoryPayload JSON.
-            let result_obj: serde_json::Value = match profile {
-                "mesh" => {
-                    let mut obj = serde_json::json!({
-                        "ok":true,
-                        "namespace":namespace_str,
-                        "memory_id":id_str,
-                        "format":format,
-                        "canonical_hash":digest_str,
-                        "quads":nquads_text,
-                    });
-                    if format == "trig" {
-                        // Group the canonical quads into named-graph TriG
-                        // blocks; every quad already carries its own graph
-                        // term, but a triple would fall back to the
-                        // namespace-scoped graph label.
-                        let fallback = format!("urn:neurostrata:graph:{namespace_str}");
-                        obj["trig"] = serde_json::Value::String(nquads_to_trig(&nquads_text, &fallback));
+        match store.get(namespace_str, id_str).await {
+            Ok(Some((_, payload))) => {
+                let meta = payload.metadata.as_object().cloned().unwrap_or_default();
+                let memory_type = payload.memory_type.as_str();
+                let lifecycle_state = meta
+                    .get("lifecycle_state")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("active");
+                // created_at is required for deterministic canonical RDF (fail closed).
+                let created_at = match meta.get("created_at").and_then(|v| v.as_str()) {
+                    Some(t) => t.to_string(),
+                    None => {
+                        export_errors.push(serde_json::json!({
+                            "memory_id": id_str,
+                            "error": "created_at missing from memory metadata"
+                        }));
+                        continue;
                     }
-                    obj
-                }
-                "local" => {
-                    // Honor `format == "trig"` here too: the mesh profile
-                    // regroups its canonical quads into TriG, so the local
-                    // profile re-renders the payload the same way instead of
-                    // silently ignoring the requested format.
-                    let rendered: serde_json::Value = if format == "trig" {
-                        let fallback = format!("urn:neurostrata:graph:{namespace_str}");
-                        serde_json::Value::String(nquads_to_trig(&nquads_text, &fallback))
-                    } else {
-                        serde_json::to_value(&payload).unwrap_or_default()
-                    };
-                    serde_json::json!({
-                        "ok":true,
-                        "namespace":namespace_str,
-                        "memory_id":id_str,
-                        "payload":rendered,
-                        "format":format,
-                        "canonical_hash":digest_str,
+                };
+                let created_by = &payload.user_id;
+                let superseded_by = meta.get("superseded_by").and_then(|v| v.as_str());
+                let archived_at = meta
+                    .get("archived_at")
+                    .and_then(|v| v.as_i64())
+                    .map(|t| chrono::DateTime::from_timestamp(t, 0).map(|d| d.to_rfc3339()))
+                    .flatten();
+                let tombstoned_at = meta.get("tombstoned_at").and_then(|v| v.as_str());
+                let content_str = payload.content.clone();
+                let eligibility = meta.get("eligibility").and_then(|v| v.as_str());
+                let source = meta.get("source").and_then(|v| v.as_str());
+                let tags: Vec<String> = meta
+                    .get("tags")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
                     })
+                    .unwrap_or_default();
+                let concept_iri = meta.get("concept_iri").and_then(|v| v.as_str());
+                let mut rels: Vec<(String, String)> = Vec::new();
+                if let Some(sb) = meta.get("supersedes").and_then(|v| v.as_str()) {
+                    rels.push(("supersedes".to_string(), sb.to_string()));
                 }
-                other => serde_json::json!({"ok":false,"error":format!("unsupported profile: {other}")}),
-            };
-            exports.push(result_obj);
+                if let Some(refs) = meta.get("references").and_then(|v| v.as_array()) {
+                    for r in refs {
+                        if let Some(s) = r.as_str() {
+                            rels.push(("references".to_string(), s.to_string()));
+                        }
+                    }
+                }
+                let update_id = meta
+                    .get("update_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&id_str)
+                    .to_string();
+                let origin_mesh_epoch = meta
+                    .get("origin_mesh_epoch")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32;
+                let trust = meta
+                    .get("trust")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("untrusted");
+
+                let proc_meta = meta
+                    .get("procedure_definition")
+                    .and_then(|v| v.as_object())
+                    .cloned()
+                    .unwrap_or_default();
+                let trigger = proc_meta.get("trigger").and_then(|v| v.as_str());
+                let initial_fires = proc_meta
+                    .get("remaining_fires_initial")
+                    .and_then(|v| v.as_i64());
+                let valid_to = proc_meta.get("valid_to").and_then(|v| v.as_str());
+                let rehearsal_script = proc_meta.get("rehearsal_script").and_then(|v| v.as_str());
+
+                let (nquads_text, digest_str) = build_mesh_canonical_nquads(
+                    id_str,
+                    namespace_str,
+                    memory_type,
+                    lifecycle_state,
+                    &created_at,
+                    created_by,
+                    superseded_by,
+                    archived_at.as_deref(),
+                    tombstoned_at,
+                    &content_str,
+                    eligibility,
+                    source,
+                    &tags,
+                    concept_iri,
+                    &rels,
+                    &update_id,
+                    origin_mesh_epoch,
+                    trust,
+                    trigger,
+                    initial_fires,
+                    valid_to,
+                    rehearsal_script,
+                );
+                // Honor profile parameter: mesh = canonical N-Quads wire format; local = full MemoryPayload JSON.
+                let result_obj: serde_json::Value = match profile {
+                    "mesh" => {
+                        let mut obj = serde_json::json!({
+                            "ok":true,
+                            "namespace":namespace_str,
+                            "memory_id":id_str,
+                            "format":format,
+                            "canonical_hash":digest_str,
+                            "quads":nquads_text,
+                        });
+                        if format == "trig" {
+                            // Group the canonical quads into named-graph TriG
+                            // blocks; every quad already carries its own graph
+                            // term, but a triple would fall back to the
+                            // namespace-scoped graph label.
+                            let fallback = format!("urn:neurostrata:graph:{namespace_str}");
+                            obj["trig"] =
+                                serde_json::Value::String(nquads_to_trig(&nquads_text, &fallback));
+                        }
+                        obj
+                    }
+                    "local" => {
+                        // Honor `format == "trig"` here too: the mesh profile
+                        // regroups its canonical quads into TriG, so the local
+                        // profile re-renders the payload the same way instead of
+                        // silently ignoring the requested format.
+                        let rendered: serde_json::Value = if format == "trig" {
+                            let fallback = format!("urn:neurostrata:graph:{namespace_str}");
+                            serde_json::Value::String(nquads_to_trig(&nquads_text, &fallback))
+                        } else {
+                            serde_json::to_value(&payload).unwrap_or_default()
+                        };
+                        serde_json::json!({
+                            "ok":true,
+                            "namespace":namespace_str,
+                            "memory_id":id_str,
+                            "payload":rendered,
+                            "format":format,
+                            "canonical_hash":digest_str,
+                        })
+                    }
+                    other => {
+                        serde_json::json!({"ok":false,"error":format!("unsupported profile: {other}")})
+                    }
+                };
+                exports.push(result_obj);
+            }
+            Ok(None) => export_errors.push(serde_json::json!({
+                "memory_id": id_str,
+                "error": "memory not found"
+            })),
+            Err(e) => export_errors.push(serde_json::json!({
+                "memory_id": id_str,
+                "error": e.to_string()
+            })),
         }
-        Ok(None) => export_errors.push(serde_json::json!({
-            "memory_id": id_str,
-            "error": "memory not found"
-        })),
-        Err(e) => export_errors.push(serde_json::json!({
-            "memory_id": id_str,
-            "error": e.to_string()
-        })),
-    }
     }
 
     // Single-memory export keeps the exact original response shape.
@@ -5001,15 +5314,21 @@ fn split_nquad_terms(line: &str) -> Vec<&str> {
 async fn handle_validate_canonical_rdf(arguments: &Value, store: Arc<dyn VectorStore>) -> String {
     use crate::rdf::dataset_canonical::{build_mesh_canonical_nquads, validate_canonical_rdf};
     use crate::synaptic_mesh::manifest::Trust;
-use crate::synaptic_mesh::record::{MeshRecord, Relationship};
+    use crate::synaptic_mesh::record::{MeshRecord, Relationship};
 
     let namespace = match arguments.get("namespace").and_then(|v| v.as_str()) {
         Some(n) => n.to_string(),
-        None => return serde_json::json!({"ok":false,"valid":false,"violations":["namespace missing"]}).to_string(),
+        None => {
+            return serde_json::json!({"ok":false,"valid":false,"violations":["namespace missing"]})
+                .to_string()
+        }
     };
     let memory_id = match arguments.get("memory_id").and_then(|v| v.as_str()) {
         Some(i) => i.to_string(),
-        None => return serde_json::json!({"ok":false,"valid":false,"violations":["memory_id missing"]}).to_string(),
+        None => {
+            return serde_json::json!({"ok":false,"valid":false,"violations":["memory_id missing"]})
+                .to_string()
+        }
     };
 
     let id = match Uuid::parse_str(&memory_id) {
@@ -5024,20 +5343,24 @@ use crate::synaptic_mesh::record::{MeshRecord, Relationship};
         Ok(Some((_, payload))) => {
             let meta = payload.metadata.as_object().cloned().unwrap_or_default();
             let memory_type = payload.memory_type.as_str();
-            let lifecycle_state = meta.get("lifecycle_state").and_then(|v| v.as_str()).unwrap_or("active");
+            let lifecycle_state = meta
+                .get("lifecycle_state")
+                .and_then(|v| v.as_str())
+                .unwrap_or("active");
             // Fail closed: an unparseable lifecycle_state is a finding, not a
             // silent coercion to Active.
-            let lifecycle_state_enum: LifecycleState = match lifecycle_state.parse::<LifecycleState>() {
-                Ok(s) => s,
-                Err(_) => {
-                    return serde_json::json!({
-                        "ok":false,
-                        "valid":false,
-                        "violations":[format!("invalid lifecycle_state: {lifecycle_state}")]
-                    })
-                    .to_string()
-                }
-            };
+            let lifecycle_state_enum: LifecycleState =
+                match lifecycle_state.parse::<LifecycleState>() {
+                    Ok(s) => s,
+                    Err(_) => {
+                        return serde_json::json!({
+                            "ok":false,
+                            "valid":false,
+                            "violations":[format!("invalid lifecycle_state: {lifecycle_state}")]
+                        })
+                        .to_string()
+                    }
+                };
             // created_at is required for deterministic canonical RDF (fail closed).
             let created_at = match meta.get("created_at").and_then(|v| v.as_str()) {
                 Some(t) => t.to_string(),
@@ -5058,26 +5381,49 @@ use crate::synaptic_mesh::record::{MeshRecord, Relationship};
             };
             let created_by = &payload.user_id;
             let superseded_by = meta.get("superseded_by").and_then(|v| v.as_str());
-            let archived_at = meta.get("archived_at").and_then(|v| v.as_i64()).map(|t| {
-                chrono::DateTime::from_timestamp(t, 0).map(|d| d.to_rfc3339())
-            }).flatten();
+            let archived_at = meta
+                .get("archived_at")
+                .and_then(|v| v.as_i64())
+                .map(|t| chrono::DateTime::from_timestamp(t, 0).map(|d| d.to_rfc3339()))
+                .flatten();
             let tombstoned_at = meta.get("tombstoned_at").and_then(|v| v.as_str());
             let content_str = payload.content.clone();
             let eligibility = meta.get("eligibility").and_then(|v| v.as_str());
             let source = meta.get("source").and_then(|v| v.as_str());
-            let tags: Vec<String> = meta.get("tags").and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            let tags: Vec<String> = meta
+                .get("tags")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
             let concept_iri = meta.get("concept_iri").and_then(|v| v.as_str());
             let mut rels: Vec<(String, String)> = Vec::new();
-            if let Some(sb) = meta.get("supersedes").and_then(|v| v.as_str()) { rels.push(("supersedes".to_string(), sb.to_string())); }
-            if let Some(refs) = meta.get("references").and_then(|v| v.as_array()) {
-                for r in refs { if let Some(s) = r.as_str() { rels.push(("references".to_string(), s.to_string())); } }
+            if let Some(sb) = meta.get("supersedes").and_then(|v| v.as_str()) {
+                rels.push(("supersedes".to_string(), sb.to_string()));
             }
-            let update_id_raw = meta.get("update_id").and_then(|v| v.as_str()).unwrap_or(&id_str);
+            if let Some(refs) = meta.get("references").and_then(|v| v.as_array()) {
+                for r in refs {
+                    if let Some(s) = r.as_str() {
+                        rels.push(("references".to_string(), s.to_string()));
+                    }
+                }
+            }
+            let update_id_raw = meta
+                .get("update_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&id_str);
             let update_id = Uuid::parse_str(update_id_raw).unwrap_or(id).to_string();
-            let origin_mesh_epoch = meta.get("origin_mesh_epoch").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-            let trust = meta.get("trust").and_then(|v| v.as_str()).unwrap_or("untrusted");
+            let origin_mesh_epoch = meta
+                .get("origin_mesh_epoch")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+            let trust = meta
+                .get("trust")
+                .and_then(|v| v.as_str())
+                .unwrap_or("untrusted");
 
             // Convert trust string to Trust enum
             let trust_enum = match trust {
@@ -5090,31 +5436,68 @@ use crate::synaptic_mesh::record::{MeshRecord, Relationship};
             let mut rels_converted: Vec<Relationship> = Vec::new();
             for (kind, target) in &rels {
                 if let Ok(target_uuid) = Uuid::parse_str(target) {
-                    let kind_str = if kind == "supersedes" { "supersedes" } else if kind == "references" { "references" } else { "references" };
-                    rels_converted.push(Relationship { kind: kind_str.to_string(), target: target_uuid });
+                    let kind_str = if kind == "supersedes" {
+                        "supersedes"
+                    } else if kind == "references" {
+                        "references"
+                    } else {
+                        "references"
+                    };
+                    rels_converted.push(Relationship {
+                        kind: kind_str.to_string(),
+                        target: target_uuid,
+                    });
                 }
             }
 
-            let proc_meta = meta.get("procedure_definition").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+            let proc_meta = meta
+                .get("procedure_definition")
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default();
             let trigger = proc_meta.get("trigger").and_then(|v| v.as_str());
-            let initial_fires = proc_meta.get("remaining_fires_initial").and_then(|v| v.as_i64());
+            let initial_fires = proc_meta
+                .get("remaining_fires_initial")
+                .and_then(|v| v.as_i64());
             let valid_to = proc_meta.get("valid_to").and_then(|v| v.as_str());
             let rehearsal_script = proc_meta.get("rehearsal_script").and_then(|v| v.as_str());
 
             let (nquads_text, digest_str) = build_mesh_canonical_nquads(
-                &id_str, namespace, memory_type, lifecycle_state,
-                &created_at, created_by,
+                &id_str,
+                namespace,
+                memory_type,
+                lifecycle_state,
+                &created_at,
+                created_by,
                 superseded_by,
                 archived_at.as_deref(),
                 tombstoned_at,
-                &content_str, eligibility, source, &tags, concept_iri,
-                &rels, &update_id, origin_mesh_epoch, trust,
-                trigger, initial_fires, valid_to, rehearsal_script,
+                &content_str,
+                eligibility,
+                source,
+                &tags,
+                concept_iri,
+                &rels,
+                &update_id,
+                origin_mesh_epoch,
+                trust,
+                trigger,
+                initial_fires,
+                valid_to,
+                rehearsal_script,
             );
             let created_by_str = payload.user_id.clone();
             let superseded_uuid = superseded_by.and_then(|s| Uuid::parse_str(s).ok());
-            let archived_dt = archived_at.as_ref().and_then(|t_str| chrono::DateTime::parse_from_rfc3339(t_str).ok().map(|dt| dt.with_timezone(&chrono::Utc)));
-            let tombstoned_dt = tombstoned_at.and_then(|t_str| chrono::DateTime::parse_from_rfc3339(t_str).ok().map(|dt| dt.with_timezone(&chrono::Utc)));
+            let archived_dt = archived_at.as_ref().and_then(|t_str| {
+                chrono::DateTime::parse_from_rfc3339(t_str)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+            });
+            let tombstoned_dt = tombstoned_at.and_then(|t_str| {
+                chrono::DateTime::parse_from_rfc3339(t_str)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+            });
             let lifecycle = Lifecycle {
                 state: lifecycle_state_enum,
                 created_at: created_dt,
@@ -5131,7 +5514,12 @@ use crate::synaptic_mesh::record::{MeshRecord, Relationship};
                 lifecycle,
                 content: serde_json::json!(content_str),
                 metadata: Value::Object(meta),
-                rdf: Some(RdfBlock { schema: "neurostrata-rdf-record/v1".to_string(), format: "n-quads".to_string(), canonical_hash: digest_str.clone(), quads: nquads_text.clone() }),
+                rdf: Some(RdfBlock {
+                    schema: "neurostrata-rdf-record/v1".to_string(),
+                    format: "n-quads".to_string(),
+                    canonical_hash: digest_str.clone(),
+                    quads: nquads_text.clone(),
+                }),
                 relationships: rels_converted,
                 update_id: Uuid::parse_str(&update_id).unwrap_or(id),
                 origin_mesh_epoch,
@@ -5141,24 +5529,33 @@ use crate::synaptic_mesh::record::{MeshRecord, Relationship};
                 signature: None,
                 patch: None,
             };
-            let rdf_block = RdfBlock { schema: "neurostrata-rdf-record/v1".to_string(), format: "n-quads".to_string(), canonical_hash: digest_str, quads: nquads_text };
+            let rdf_block = RdfBlock {
+                schema: "neurostrata-rdf-record/v1".to_string(),
+                format: "n-quads".to_string(),
+                canonical_hash: digest_str,
+                quads: nquads_text,
+            };
             match validate_canonical_rdf(&record, &rdf_block) {
                 Ok(()) => serde_json::json!({"ok":true,"valid":true,"namespace":namespace,"memory_id":memory_id,"violations":[]}).to_string(),
                 Err(violations) => serde_json::json!({"ok":true,"valid":false,"namespace":namespace,"memory_id":memory_id,"violations":violations}).to_string(),
             }
         }
-        Ok(None) => serde_json::json!({"ok":false,"valid":false,"violations":["memory not found"]}).to_string(),
-        Err(e) => serde_json::json!({"ok":false,"valid":false,"violations":[e.to_string()]}).to_string(),
+        Ok(None) => serde_json::json!({"ok":false,"valid":false,"violations":["memory not found"]})
+            .to_string(),
+        Err(e) => {
+            serde_json::json!({"ok":false,"valid":false,"violations":[e.to_string()]}).to_string()
+        }
     }
 }
 
 pub(crate) async fn handle_sparql_query(arguments: &Value, store: Arc<dyn VectorStore>) -> String {
     use crate::rdf::sparql::execute_sparql_query_with_config;
 
-
     let query = match arguments.get("query").and_then(|v| v.as_str()) {
         Some(q) => q.to_string(),
-        None => return serde_json::json!({"ok":false,"error":"query parameter required"}).to_string(),
+        None => {
+            return serde_json::json!({"ok":false,"error":"query parameter required"}).to_string()
+        }
     };
 
     let format = match arguments.get("format").and_then(|v| v.as_str()) {
@@ -5174,8 +5571,14 @@ pub(crate) async fn handle_sparql_query(arguments: &Value, store: Arc<dyn Vector
         _ => resolve_namespace(&store, "NeuroStrata").await,
     };
 
-    let include_retired = arguments.get("include_retired").and_then(|v| v.as_bool()).unwrap_or(false);
-    let include_archived = arguments.get("include_archived").and_then(|v| v.as_bool()).unwrap_or(false);
+    let include_retired = arguments
+        .get("include_retired")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let include_archived = arguments
+        .get("include_archived")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     // AS-A6: apply caller-provided budget overrides directly on top of the
     // env-resolved config and pass it explicitly to the executor — no env
@@ -5195,21 +5598,31 @@ pub(crate) async fn handle_sparql_query(arguments: &Value, store: Arc<dyn Vector
     }
 
     // Downcast to LadybugStore for SPARQL projection
-    let ladybug_store = match crate::traits::VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::ladybug::LadybugStore>() {
+    let ladybug_store = match crate::traits::VectorStore::as_any(store.as_ref())
+        .downcast_ref::<crate::store::ladybug::LadybugStore>()
+    {
         Some(ls) => ls,
         None => {
-            return serde_json::json!({"ok":false,"error":"SPARQL requires LadybugStore backend"}).to_string();
+            return serde_json::json!({"ok":false,"error":"SPARQL requires LadybugStore backend"})
+                .to_string();
         }
     };
 
-    let federated = arguments.get("federated").and_then(|v| v.as_bool()).unwrap_or(false);
+    let federated = arguments
+        .get("federated")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     if federated {
         let served_env = std::env::var("NEUROSTRATA_SPARQL_SERVED_NAMESPACES").unwrap_or_default();
         let served_namespaces = if served_env.trim().is_empty() {
             vec![namespace.clone()]
         } else {
-            served_env.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<Vec<String>>()
+            served_env
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<String>>()
         };
         let fed_cfg = crate::rdf::federation::FederationConfig {
             served_namespaces,
@@ -5219,7 +5632,16 @@ pub(crate) async fn handle_sparql_query(arguments: &Value, store: Arc<dyn Vector
             max_solutions: cfg.max_solutions,
             max_dataset_quads: cfg.max_dataset_quads,
         };
-        match crate::rdf::federation::handle_remote_sparql_request(&query, &namespace, None, None, &fed_cfg, ladybug_store).await {
+        match crate::rdf::federation::handle_remote_sparql_request(
+            &query,
+            &namespace,
+            None,
+            None,
+            &fed_cfg,
+            ladybug_store,
+        )
+        .await
+        {
             Ok(report) => {
                 let response = serde_json::json!({
                     "ok": true,
@@ -5230,7 +5652,9 @@ pub(crate) async fn handle_sparql_query(arguments: &Value, store: Arc<dyn Vector
                     "timed_out": report.timed_out,
                     "warnings": report.warnings,
                 });
-                return serde_json::to_string(&response).unwrap_or_else(|_| serde_json::json!({"ok":false,"error":"serialization"}).to_string());
+                return serde_json::to_string(&response).unwrap_or_else(|_| {
+                    serde_json::json!({"ok":false,"error":"serialization"}).to_string()
+                });
             }
             Err(e) => {
                 return serde_json::json!({"ok":false,"error":format!("{}",e)}).to_string();
@@ -5238,7 +5662,16 @@ pub(crate) async fn handle_sparql_query(arguments: &Value, store: Arc<dyn Vector
         }
     }
 
-    let execution = execute_sparql_query_with_config(ladybug_store, &namespace, &query, format, include_retired, include_archived, cfg).await;
+    let execution = execute_sparql_query_with_config(
+        ladybug_store,
+        &namespace,
+        &query,
+        format,
+        include_retired,
+        include_archived,
+        cfg,
+    )
+    .await;
     match execution {
         Ok((results, solution_count, truncated, timed_out)) => {
             let query_form = if query.trim().to_uppercase().starts_with("ASK") {
@@ -5270,12 +5703,11 @@ pub(crate) async fn handle_sparql_query(arguments: &Value, store: Arc<dyn Vector
             }
 
             serde_json::to_string(&response).unwrap_or_else(|e| {
-                serde_json::json!({"ok":false,"error":format!("serialization error: {}", e)}).to_string()
+                serde_json::json!({"ok":false,"error":format!("serialization error: {}", e)})
+                    .to_string()
             })
         }
-        Err(e) => {
-            serde_json::json!({"ok":false,"error":e}).to_string()
-        }
+        Err(e) => serde_json::json!({"ok":false,"error":e}).to_string(),
     }
 }
 
@@ -5291,16 +5723,15 @@ pub(crate) async fn handle_twin_get(arguments: &Value, store: Arc<dyn VectorStor
     if let Some(v) = req_version {
         // Async history channel first; the rows fallback keeps a namespace
         // whose typed listing misses the twin from silently reporting absence.
-        let mut hist = crate::digital_twin::twin_history(store.as_ref(), &namespace, twin_id, 0).await;
+        let mut hist =
+            crate::digital_twin::twin_history(store.as_ref(), &namespace, twin_id, 0).await;
         if hist.is_empty() {
             let rows_raw = match store.list(&namespace, None, None).await {
                 Ok(r) => r,
                 Err(e) => return serde_json::json!({"ok":false,"error":e.to_string()}).to_string(),
             };
-            let rows: Vec<(String, crate::traits::MemoryPayload)> = rows_raw
-                .into_iter()
-                .map(|r| (r.id, r.payload))
-                .collect();
+            let rows: Vec<(String, crate::traits::MemoryPayload)> =
+                rows_raw.into_iter().map(|r| (r.id, r.payload)).collect();
             hist = crate::digital_twin::twin_history_from_rows(&rows, twin_id, 0);
         }
         if let Some((ver, ts, state)) = hist.into_iter().find(|(ver, _, _)| *ver == v) {
@@ -5320,8 +5751,10 @@ pub(crate) async fn handle_twin_get(arguments: &Value, store: Arc<dyn VectorStor
         })
         .to_string();
     }
-    match crate::digital_twin::get_twin_state(store.as_ref(), &namespace, twin_id).await {
-        Some(state) => {
+    match crate::digital_twin::get_twin_state_with_reducers(store.as_ref(), &namespace, twin_id)
+        .await
+    {
+        Some(full_state) => {
             let summaries = crate::digital_twin::list_twins(store.as_ref(), &namespace).await;
             let latest_version = summaries
                 .into_iter()
@@ -5333,7 +5766,10 @@ pub(crate) async fn handle_twin_get(arguments: &Value, store: Arc<dyn VectorStor
                 "namespace": namespace,
                 "twin_id": twin_id,
                 "version": latest_version,
-                "variables": state,
+                "variables": full_state.variables,
+                "derived_variables": full_state.derived_variables,
+                "attributes": full_state.attributes,
+                "implements_interfaces": full_state.implements_interfaces,
             })
             .to_string()
         }
@@ -5345,10 +5781,8 @@ pub(crate) async fn handle_twin_get(arguments: &Value, store: Arc<dyn VectorStor
                 Ok(r) => r,
                 Err(e) => return serde_json::json!({"ok":false,"error":e.to_string()}).to_string(),
             };
-            let rows: Vec<(String, crate::traits::MemoryPayload)> = rows_raw
-                .into_iter()
-                .map(|r| (r.id, r.payload))
-                .collect();
+            let rows: Vec<(String, crate::traits::MemoryPayload)> =
+                rows_raw.into_iter().map(|r| (r.id, r.payload)).collect();
             match crate::digital_twin::require_twin_state_from_rows(&rows, twin_id) {
                 Ok(state) => {
                     let summaries = crate::digital_twin::list_twins_from_rows(&rows);
@@ -5357,12 +5791,20 @@ pub(crate) async fn handle_twin_get(arguments: &Value, store: Arc<dyn VectorStor
                         .find(|s| s.twin_id == twin_id)
                         .map(|s| s.twin_version)
                         .unwrap_or(1);
+                    let edges = store.list_edges(&namespace).await.unwrap_or_default();
+                    let full = crate::digital_twin::get_twin_state_with_reducers_from_rows(
+                        &rows, &edges, twin_id,
+                    )
+                    .unwrap_or_default();
                     serde_json::json!({
                         "ok": true,
                         "namespace": namespace,
                         "twin_id": twin_id,
                         "version": latest_version,
                         "variables": state,
+                        "derived_variables": full.derived_variables,
+                        "attributes": full.attributes,
+                        "implements_interfaces": full.implements_interfaces,
                     })
                     .to_string()
                 }
@@ -5417,10 +5859,8 @@ pub(crate) async fn handle_twin_set(
         Ok(r) => r,
         Err(e) => return serde_json::json!({"ok": false, "error": format!("Failed to list namespace '{}': {}", namespace, e)}).to_string(),
     };
-    let rows: Vec<(String, crate::traits::MemoryPayload)> = rows_raw
-        .into_iter()
-        .map(|r| (r.id, r.payload))
-        .collect();
+    let rows: Vec<(String, crate::traits::MemoryPayload)> =
+        rows_raw.into_iter().map(|r| (r.id, r.payload)).collect();
     let summaries = crate::digital_twin::list_twins_from_rows(&rows);
     let prev = summaries.into_iter().find(|s| s.twin_id == twin_id);
     let next_version = prev.as_ref().map(|s| s.twin_version + 1).unwrap_or(1);
@@ -5465,34 +5905,83 @@ pub(crate) async fn handle_twin_set(
     if let Err(e) = crate::digital_twin::set_state(&mut base_payload, &vars, merge) {
         return serde_json::json!({"ok":false,"error":e.to_string()}).to_string();
     }
+    if let Some(attrs_val) = arguments.get("attributes") {
+        let attrs: std::collections::BTreeMap<String, crate::digital_twin::TwinAttrValue> =
+            match serde_json::from_value(attrs_val.clone()) {
+                Ok(a) => a,
+                Err(e) => {
+                    return serde_json::json!({
+                        "ok": false,
+                        "error": format!("invalid attributes object: {}", e)
+                    })
+                    .to_string()
+                }
+            };
+        if let Err(e) = crate::digital_twin::set_attributes(&mut base_payload, &attrs, merge) {
+            return serde_json::json!({"ok":false,"error":e.to_string()}).to_string();
+        }
+    }
     let state_after = crate::digital_twin::get_state(&base_payload);
+    let attrs_after = crate::digital_twin::get_attributes(&base_payload);
 
     // ReBAC write gate: a caller that names a principal must actually be
     // permitted to write memory of the target row's ownership/visibility.
     if let Some(req_principal) = arguments.get("principal").and_then(|v| v.as_str()) {
         let resolved = crate::rebac::resolve_principal(req_principal, Some(req_principal));
-        if !crate::rebac::can_write_memory(&resolved, &base_payload.user_id, &base_payload.metadata) {
-            return serde_json::json!({"ok":false,"error":"access denied by ReBAC policy"}).to_string();
+        if !crate::rebac::can_write_memory(&resolved, &base_payload.user_id, &base_payload.metadata)
+        {
+            return serde_json::json!({"ok":false,"error":"access denied by ReBAC policy"})
+                .to_string();
         }
     }
 
-    let eff_schema_id = schema_id.or_else(|| prev.and_then(|p| p.schema_id));
+    let eff_schema_id = schema_id.or_else(|| prev.as_ref().and_then(|p| p.schema_id.clone()));
     let mut violations = Vec::new();
+    let mut resolved_interfaces: Vec<String> = Vec::new();
+    let schemas_map = crate::digital_twin::collect_twin_schemas_from_rows(&rows);
     if let Some(ref sid) = eff_schema_id {
-        match store.get(&namespace, sid).await {
-            Ok(Some((_, schema_payload))) => {
-                let schema = crate::digital_twin::TwinSchema::from_metadata(&schema_payload.metadata);
-                violations = crate::digital_twin::validate_state(&state_after, schema.as_ref());
+        let base_schema = if let Some(s) = schemas_map.get(sid).cloned() {
+            Some(s)
+        } else {
+            match store.get(&namespace, sid).await {
+                Ok(Some((_, schema_payload))) => {
+                    crate::digital_twin::TwinSchema::from_metadata(&schema_payload.metadata)
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        "twin schema {sid} not found in namespace {namespace}; state validated without a schema"
+                    );
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "twin schema {sid} read failed in namespace {namespace}: {e}; state validated without a schema"
+                    );
+                    None
+                }
             }
-            Ok(None) => {
-                tracing::warn!(
-                    "twin schema {sid} not found in namespace {namespace}; state validated without a schema"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "twin schema {sid} read failed in namespace {namespace}: {e}; state validated without a schema"
-                );
+        };
+        if let Some(raw_schema) = base_schema {
+            let eff_schema =
+                crate::digital_twin::resolve_effective_twin_schema(&raw_schema, &schemas_map);
+            resolved_interfaces = eff_schema.resolved_interfaces.clone();
+            violations = crate::digital_twin::validate_state(&state_after, Some(&eff_schema));
+            violations.extend(crate::digital_twin::validate_attributes(
+                &attrs_after,
+                Some(&eff_schema),
+            ));
+            if !eff_schema.link_constraints.is_empty() {
+                let edges = store.list_edges(&namespace).await.unwrap_or_default();
+                let prev_row_id = prev.as_ref().map(|p| p.id.as_str()).unwrap_or(twin_id);
+                violations.extend(crate::digital_twin::validate_link_constraints(
+                    prev_row_id,
+                    twin_id,
+                    &base_payload,
+                    &eff_schema,
+                    &rows,
+                    &edges,
+                    &schemas_map,
+                ));
             }
         }
     }
@@ -5506,6 +5995,12 @@ pub(crate) async fn handle_twin_set(
             if let Some(ref s) = eff_schema_id {
                 twin_obj.insert("schema_id".to_string(), serde_json::json!(s));
             }
+            if !resolved_interfaces.is_empty() {
+                twin_obj.insert(
+                    "implements_interfaces".to_string(),
+                    serde_json::json!(resolved_interfaces),
+                );
+            }
             if let Some(ref src) = source {
                 twin_obj.insert("source".to_string(), serde_json::json!(src));
             }
@@ -5517,13 +6012,12 @@ pub(crate) async fn handle_twin_set(
     );
 
     let id = uuid::Uuid::new_v4().to_string();
-    let vec = emb
-        .embed(&base_payload.content)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!("handle_twin_set embed failed for '{namespace}:{twin_id}', using fallback vector: {e}");
-            vec![0.0; emb.dimensions()]
-        });
+    let vec = emb.embed(&base_payload.content).await.unwrap_or_else(|e| {
+        tracing::warn!(
+            "handle_twin_set embed failed for '{namespace}:{twin_id}', using fallback vector: {e}"
+        );
+        vec![0.0; emb.dimensions()]
+    });
     if let Err(e) = store.upsert(&namespace, &id, vec, base_payload).await {
         return serde_json::json!({"ok":false,"error":e.to_string()}).to_string();
     }
@@ -5554,7 +6048,15 @@ pub(crate) async fn handle_twin_diff(arguments: &Value, store: Arc<dyn VectorSto
         return serde_json::json!({"ok":false,"error":"to_version required"}).to_string();
     };
     let namespace = resolve_namespace(&store, ns_raw).await;
-    match crate::digital_twin::twin_diff(store.as_ref(), &namespace, twin_id, from_version, to_version).await {
+    match crate::digital_twin::twin_diff(
+        store.as_ref(),
+        &namespace,
+        twin_id,
+        from_version,
+        to_version,
+    )
+    .await
+    {
         Ok(deltas) => serde_json::json!({
             "ok": true,
             "namespace": namespace,
@@ -5582,7 +6084,10 @@ pub(crate) async fn handle_twin_list(arguments: &Value, store: Arc<dyn VectorSto
     .to_string()
 }
 
-pub(crate) async fn handle_export_rdf_star(arguments: &Value, store: Arc<dyn VectorStore>) -> String {
+pub(crate) async fn handle_export_rdf_star(
+    arguments: &Value,
+    store: Arc<dyn VectorStore>,
+) -> String {
     let Some(ns_raw) = arguments.get("namespace").and_then(|v| v.as_str()) else {
         return serde_json::json!({"ok":false,"error":"namespace required"}).to_string();
     };
@@ -5633,17 +6138,21 @@ pub(crate) async fn handle_export_rdf_star(arguments: &Value, store: Arc<dyn Vec
     // Legacy-graph projection: the rows and edges also get the
     // graph IRI treatment so both shapes of the RDF surface are
     // produced on every export call.
-    let row_pairs: Vec<(String, crate::traits::MemoryPayload)> =
-        rows_raw
-            .iter()
-            .filter(|r| memory_id_filter.is_none() || memory_id_filter == Some(r.id.as_str()))
-            .map(|r| (r.id.clone(), r.payload.clone()))
-            .collect();
+    let row_pairs: Vec<(String, crate::traits::MemoryPayload)> = rows_raw
+        .iter()
+        .filter(|r| memory_id_filter.is_none() || memory_id_filter == Some(r.id.as_str()))
+        .map(|r| (r.id.clone(), r.payload.clone()))
+        .collect();
     let graph_name = oxrdf::GraphName::NamedNode(oxrdf::NamedNode::new_unchecked(format!(
         "urn:neurostrata:graph:{}:{}:gen:{}",
         namespace, "domain", 0
     )));
-    let mut edge_tuples: Vec<(String, String, String, Option<crate::rdf::types::EdgeProvenance>)> = Vec::new();
+    let mut edge_tuples: Vec<(
+        String,
+        String,
+        String,
+        Option<crate::rdf::types::EdgeProvenance>,
+    )> = Vec::new();
     let mut edge_ox_quads: Vec<oxrdf::Quad> = Vec::new();
     for r in &row_pairs {
         let prov = crate::rdf::types::EdgeProvenance {
@@ -5664,20 +6173,42 @@ pub(crate) async fn handle_export_rdf_star(arguments: &Value, store: Arc<dyn Vec
                 Some(prov.clone()),
                 Some(graph_name.clone()),
             ));
-            edge_tuples.push((r.0.clone(), edge.rel_type.to_string(), edge.target_id.clone(), Some(prov.clone())));
+            edge_tuples.push((
+                r.0.clone(),
+                edge.rel_type.to_string(),
+                edge.target_id.clone(),
+                Some(prov.clone()),
+            ));
         }
     }
-    let mut legacy_quads = crate::rdf::projection::project_rows_legacy(&row_pairs, &edge_tuples, &namespace, crate::rdf::types::Tier::Domain, 0);
+    let mut legacy_quads = crate::rdf::projection::project_rows_legacy(
+        &row_pairs,
+        &edge_tuples,
+        &namespace,
+        crate::rdf::types::Tier::Domain,
+        0,
+    );
     legacy_quads.extend(crate::rdf::projection::quads_to_legacy(&edge_ox_quads));
-    if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::LadybugStore>() {
-        match ls.project_namespace_rdf(&namespace, crate::rdf::types::Tier::Domain, 0).await {
+    if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref())
+        .downcast_ref::<crate::store::LadybugStore>()
+    {
+        match ls
+            .project_namespace_rdf(&namespace, crate::rdf::types::Tier::Domain, 0)
+            .await
+        {
             Ok(ox_quads) => legacy_quads = ox_quads,
             Err(e) => tracing::warn!("project_namespace_rdf failed for '{namespace}': {e}"),
         }
     }
     let projected_quad_count = legacy_quads
         .iter()
-        .filter(|q| matches!(q.object, crate::rdf::types::QuadObject::Iri(_) | crate::rdf::types::QuadObject::Literal { .. }))
+        .filter(|q| {
+            matches!(
+                q.object,
+                crate::rdf::types::QuadObject::Iri(_)
+                    | crate::rdf::types::QuadObject::Literal { .. }
+            )
+        })
         .count();
     let flatten = format == "n-triples-star" || format == "turtle-star";
     match crate::rdf::provenance::serialize_rdf_star(&all_quads, format, flatten) {
@@ -5694,7 +6225,10 @@ pub(crate) async fn handle_export_rdf_star(arguments: &Value, store: Arc<dyn Vec
     }
 }
 
-pub(crate) async fn handle_provenance_for(arguments: &Value, store: Arc<dyn VectorStore>) -> String {
+pub(crate) async fn handle_provenance_for(
+    arguments: &Value,
+    store: Arc<dyn VectorStore>,
+) -> String {
     let Some(ns_raw) = arguments.get("namespace").and_then(|v| v.as_str()) else {
         return serde_json::json!({"ok":false,"error":"namespace required"}).to_string();
     };
@@ -5709,11 +6243,7 @@ pub(crate) async fn handle_provenance_for(arguments: &Value, store: Arc<dyn Vect
             let edges = crate::store::ladybug::edge_specs(&payload.metadata);
             let edge_count = edges.len();
             let assertion_iri = crate::rdf::provenance::memory_assertion_iri(
-                &namespace,
-                memory_id,
-                "content",
-                0,
-                1,
+                &namespace, memory_id, "content", 0, 1,
             );
             serde_json::json!({
                 "ok": true,
@@ -5763,7 +6293,9 @@ pub(crate) async fn handle_storage_status(store: Arc<dyn VectorStore>) -> String
         .map(|c| c.storage_hygiene.clone())
         .unwrap_or_default();
     let opened_via_recovery = store.opened_via_recovery();
-    if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::LadybugStore>() {
+    if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref())
+        .downcast_ref::<crate::store::LadybugStore>()
+    {
         let status = crate::storage::compute_storage_status(ls.local_path(), &hygiene_cfg);
         let status = crate::storage::snapshot::StorageStatus {
             opened_via_recovery,
@@ -5790,10 +6322,14 @@ pub(crate) async fn handle_storage_status(store: Arc<dyn VectorStore>) -> String
 
 pub(crate) async fn handle_graphql_query(arguments: &Value, store: Arc<dyn VectorStore>) -> String {
     let Some(query) = arguments.get("query").and_then(|v| v.as_str()) else {
-        return serde_json::json!({"data":null,"errors":[{"message":"query required"}]}).to_string();
+        return serde_json::json!({"data":null,"errors":[{"message":"query required"}]})
+            .to_string();
     };
     let variables = arguments.get("variables");
-    let principal = crate::rebac::resolve_principal("admin", arguments.get("principal").and_then(|v| v.as_str()));
+    let principal = crate::rebac::resolve_principal(
+        "admin",
+        arguments.get("principal").and_then(|v| v.as_str()),
+    );
     let ns_raw = arguments
         .get("namespace")
         .and_then(|v| v.as_str())
@@ -5806,7 +6342,9 @@ pub(crate) async fn handle_graphql_query(arguments: &Value, store: Arc<dyn Vecto
     let namespace = resolve_namespace(&store, ns_raw).await;
     // Introspection/SDL queries run on the sync executor; data queries ride the
     // async executor so both GraphQL entry points stay exercised in production.
-    if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::LadybugStore>() {
+    if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref())
+        .downcast_ref::<crate::store::LadybugStore>()
+    {
         let resp = if query.contains("__schema") || query.contains("_sdl") {
             crate::graphql::execute(ls, &namespace, &principal, query, variables)
         } else {
@@ -5829,7 +6367,13 @@ pub(crate) async fn handle_graphql_query(arguments: &Value, store: Arc<dyn Vecto
         let specs = crate::store::ladybug::edge_specs(&r.payload.metadata);
         let mapped: Vec<(String, String, Option<String>)> = specs
             .into_iter()
-            .map(|e| (e.target_id, e.rel_type.to_string(), Some("metadata".to_string())))
+            .map(|e| {
+                (
+                    e.target_id,
+                    e.rel_type.to_string(),
+                    Some("metadata".to_string()),
+                )
+            })
             .collect();
         if !mapped.is_empty() {
             edges_by_source.insert(r.id.clone(), mapped);
@@ -5878,8 +6422,8 @@ pub(crate) async fn handle_action_with_auth(
         return serde_json::json!({"ok": false, "error": "action required"}).to_string();
     };
     let namespace = resolve_namespace(&store, ns_raw).await;
-    let Some(lb_store) =
-        crate::traits::VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::ladybug::LadybugStore>()
+    let Some(lb_store) = crate::traits::VectorStore::as_any(store.as_ref())
+        .downcast_ref::<crate::store::ladybug::LadybugStore>()
     else {
         return serde_json::json!({"ok": false, "error": "kinetic actions require LadybugStore backend"}).to_string();
     };
@@ -5888,10 +6432,8 @@ pub(crate) async fn handle_action_with_auth(
         .get("principal")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let resolved_principal = crate::rebac::resolve_principal(
-        authenticated_principal,
-        requested_principal.as_deref(),
-    );
+    let resolved_principal =
+        crate::rebac::resolve_principal(authenticated_principal, requested_principal.as_deref());
     let security = crate::rdf::action::ActionSecurityContext {
         authenticated_principal: authenticated_principal.to_string(),
         requested_principal: Some(resolved_principal),
@@ -6192,7 +6734,9 @@ pub(crate) async fn handle_metrics_query(arguments: &Value, store: Arc<dyn Vecto
             .aggregate(&(namespace.to_string(), kind, name.to_string()));
         (sample_set, agg)
     }
-    if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::LadybugStore>() {
+    if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref())
+        .downcast_ref::<crate::store::LadybugStore>()
+    {
         let (kind_label, name_label, sample_sets, agg_opts, report): (
             String,
             String,
@@ -6210,8 +6754,21 @@ pub(crate) async fn handle_metrics_query(arguments: &Value, store: Arc<dyn Vecto
                     .iter()
                     .map(|s| (s.id.clone(), s.clone()))
                     .collect();
-                let report = ls.metrics().query_metrics(&namespace, *kind, Some(name), since_ts, until_ts, &db_pairs);
-                (kind.as_str().to_string(), name.clone(), vec![sample_set], vec![agg], Some(report))
+                let report = ls.metrics().query_metrics(
+                    &namespace,
+                    *kind,
+                    Some(name),
+                    since_ts,
+                    until_ts,
+                    &db_pairs,
+                );
+                (
+                    kind.as_str().to_string(),
+                    name.clone(),
+                    vec![sample_set],
+                    vec![agg],
+                    Some(report),
+                )
             }
             Target::AllStagesOfKind(kind) => {
                 // Every live stage of this kind in the namespace (persisted
@@ -6227,11 +6784,18 @@ pub(crate) async fn handle_metrics_query(arguments: &Value, store: Arc<dyn Vecto
                 let mut agg_opts = Vec::new();
                 for stage in stages {
                     let (sample_set, agg) =
-                        query_series(ls, &namespace, *kind, &stage, since_ts, until_ts, limit).await;
+                        query_series(ls, &namespace, *kind, &stage, since_ts, until_ts, limit)
+                            .await;
                     sample_sets.push(sample_set);
                     agg_opts.push(agg);
                 }
-                (kind.as_str().to_string(), kind.as_str().to_string(), sample_sets, agg_opts, None)
+                (
+                    kind.as_str().to_string(),
+                    kind.as_str().to_string(),
+                    sample_sets,
+                    agg_opts,
+                    None,
+                )
             }
             Target::AllKindsOfName(name) => {
                 let mut sample_sets = Vec::new();
@@ -6311,7 +6875,9 @@ pub(crate) async fn handle_metrics_list(arguments: &Value, store: Arc<dyn Vector
         .and_then(|v| v.as_str())
         .unwrap_or("NeuroStrata");
     let namespace = resolve_namespace(&store, ns_raw).await;
-    if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::LadybugStore>() {
+    if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref())
+        .downcast_ref::<crate::store::LadybugStore>()
+    {
         let keys = ls.metrics().list_keys(&namespace);
         let series: Vec<Value> = keys
             .into_iter()
@@ -6370,27 +6936,26 @@ pub(crate) async fn handle_chat_ask(
         .unwrap_or(&cfg.default_principal);
     let namespace = resolve_namespace(&store, ns_raw).await;
 
-    let provider: Arc<dyn crate::rag_chat::LlmProvider> =
-        if cfg.provider == "openai" || cfg.provider == "openai-compatible" {
-            if let Some(ref url) = cfg.base_url {
-                match crate::rag_chat::OpenAiCompatibleProvider::new(
-                    url,
-                    cfg.api_key_env.as_deref(),
-                    &cfg.model,
-                    std::time::Duration::from_secs(cfg.timeout_secs.max(1)),
-                    cfg.allow_remote_base_url,
-                ) {
-                    Ok(p) => Arc::new(p),
-                    Err(e) => {
-                        return serde_json::json!({"ok":false,"error":e.to_string()}).to_string()
-                    }
-                }
-            } else {
-                Arc::new(crate::rag_chat::OfflineProvider)
+    let provider: Arc<dyn crate::rag_chat::LlmProvider> = if cfg.provider == "openai"
+        || cfg.provider == "openai-compatible"
+    {
+        if let Some(ref url) = cfg.base_url {
+            match crate::rag_chat::OpenAiCompatibleProvider::new(
+                url,
+                cfg.api_key_env.as_deref(),
+                &cfg.model,
+                std::time::Duration::from_secs(cfg.timeout_secs.max(1)),
+                cfg.allow_remote_base_url,
+            ) {
+                Ok(p) => Arc::new(p),
+                Err(e) => return serde_json::json!({"ok":false,"error":e.to_string()}).to_string(),
             }
         } else {
             Arc::new(crate::rag_chat::OfflineProvider)
-        };
+        }
+    } else {
+        Arc::new(crate::rag_chat::OfflineProvider)
+    };
 
     match crate::rag_chat::ask(
         store,
@@ -6426,7 +6991,9 @@ pub(crate) async fn handle_export_wasm_snapshot(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let namespace = resolve_namespace(&store, ns_raw).await;
-    if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::LadybugStore>() {
+    if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref())
+        .downcast_ref::<crate::store::LadybugStore>()
+    {
         match ls.export_wasm_snapshot(&namespace, include_retired).await {
             Ok((docs, edges)) => {
                 return serde_json::json!({
@@ -6453,17 +7020,27 @@ pub(crate) async fn handle_export_wasm_snapshot(
     .to_string()
 }
 
-async fn handle_domain_registry(arguments: Value, emb: Arc<dyn crate::traits::Embedder>, store: Arc<dyn VectorStore>) -> String {
+async fn handle_domain_registry(
+    arguments: Value,
+    emb: Arc<dyn crate::traits::Embedder>,
+    store: Arc<dyn VectorStore>,
+) -> String {
     let namespace = match arguments.get("namespace").and_then(|v| v.as_str()) {
         Some(n) => n.to_string(),
         None => return serde_json::json!({"ok":false,"error":{"code":"INVALID_SLUG","message":"namespace missing"}}).to_string(),
     };
     let namespace = resolve_namespace(&store, &namespace).await;
     let namespace = namespace.as_str();
-    let action = arguments.get("action").and_then(|v| v.as_str()).unwrap_or("list");
+    let action = arguments
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("list");
 
     let read_registry = || async {
-        match store.get(namespace, &crate::registry::registry_row_id(namespace)).await {
+        match store
+            .get(namespace, &crate::registry::registry_row_id(namespace))
+            .await
+        {
             Ok(Some((_, payload))) => payload.metadata.clone(),
             Ok(None) => serde_json::json!({}),
             Err(e) => {
@@ -7087,10 +7664,7 @@ async fn handle_supersede_memory(
     report
 }
 
-async fn handle_rebuild_lexical_index(
-    arguments: Value,
-    store: Arc<dyn VectorStore>,
-) -> String {
+async fn handle_rebuild_lexical_index(arguments: Value, store: Arc<dyn VectorStore>) -> String {
     let engine = arguments
         .get("engine")
         .and_then(|v| v.as_str())
@@ -7100,7 +7674,9 @@ async fn handle_rebuild_lexical_index(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
     if engine == "tantivy" {
-        if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::LadybugStore>() {
+        if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref())
+            .downcast_ref::<crate::store::LadybugStore>()
+        {
             return match ls.rebuild_tantivy_lexical(namespace.as_deref()).await {
                 Ok((documents, version)) => format!(
                     "Rebuilt the Tantivy lexical index ({}): {} document(s) indexed{}.",
@@ -7149,8 +7725,8 @@ async fn handle_rebuild_communities(
     store: Arc<dyn VectorStore>,
 ) -> String {
     use crate::community::{
-        detect_communities_with_resolution_async,
-        filter_structural_with_access_counts, COMMUNITY_STRUCTURAL_TYPES,
+        detect_communities_with_resolution_async, filter_structural_with_access_counts,
+        COMMUNITY_STRUCTURAL_TYPES,
     };
     use crate::store::ladybug::edge_specs;
 
@@ -7188,8 +7764,10 @@ async fn handle_rebuild_communities(
 
     // Filter eligible nodes (spec §5.2): active-generation, not retired, not archived, not mesh-conflicting, not registry.
     let mut node_ids: Vec<String> = Vec::new();
-    let mut node_type_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut access_counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut node_type_map: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut access_counts: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
     let mut edges: Vec<(String, String, f64)> = Vec::new();
 
     for r in &all_memories {
@@ -7223,7 +7801,10 @@ async fn handle_rebuild_communities(
         node_type_map.insert(r.id.clone(), r.payload.memory_type.clone());
         access_counts.insert(
             r.id.clone(),
-            metadata.get("access_count").and_then(|v| v.as_u64()).unwrap_or(0),
+            metadata
+                .get("access_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
         );
 
         // Extract edges (spec §5.2: typed relations GOVERNS/CONTAINS/RELATES_TO/DEPENDS_ON/EXTRACTED_FROM)
@@ -7241,7 +7822,8 @@ async fn handle_rebuild_communities(
             "unassigned_nodes": 0,
             "modularity": 0.0,
             "communities": []
-        }).to_string();
+        })
+        .to_string();
     }
 
     // Run community detection (deterministic Leiden), with the quality value
@@ -7321,7 +7903,11 @@ async fn handle_rebuild_communities(
             .filter_map(|id| all_memories.iter().find(|r| &r.id == id))
             .map(|r| {
                 let line = r.payload.content.lines().next().unwrap_or("").trim();
-                if line.len() > 80 { format!("{}...", &line[..77]) } else { line.to_string() }
+                if line.len() > 80 {
+                    format!("{}...", &line[..77])
+                } else {
+                    line.to_string()
+                }
             })
             .collect();
         let content = content_lines.join("; ");
@@ -7353,7 +7939,10 @@ async fn handle_rebuild_communities(
         let zero_vec = vec![0.0f32; vec_dim];
 
         // Upsert the community summary
-        if let Err(e) = store.upsert(namespace, &summary_id, zero_vec, payload).await {
+        if let Err(e) = store
+            .upsert(namespace, &summary_id, zero_vec, payload)
+            .await
+        {
             return format!("Failed to upsert community summary {}: {e}", summary_id);
         }
 
@@ -7368,9 +7957,14 @@ async fn handle_rebuild_communities(
     let unassigned_nodes = node_ids.len().saturating_sub(nodes_assigned);
 
     // Also rebuild the on-disk Tantivy BM25 lexical index for the namespace.
-    if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::LadybugStore>() {
+    if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref())
+        .downcast_ref::<crate::store::LadybugStore>()
+    {
         if let Err(e) = ls.rebuild_tantivy_lexical(Some(namespace)).await {
-            tracing::warn!("failed to rebuild Tantivy lexical index for {}: {e}", namespace);
+            tracing::warn!(
+                "failed to rebuild Tantivy lexical index for {}: {e}",
+                namespace
+            );
         }
     }
 
@@ -7382,7 +7976,8 @@ async fn handle_rebuild_communities(
         "unassigned_nodes": unassigned_nodes,
         "modularity": modularity,
         "communities": community_results
-    }).to_string()
+    })
+    .to_string()
 }
 
 async fn handle_find_duplicate_candidates(arguments: Value, store: Arc<dyn VectorStore>) -> String {
@@ -7394,12 +7989,14 @@ async fn handle_find_duplicate_candidates(arguments: Value, store: Arc<dyn Vecto
     let namespace = resolve_namespace(&store, namespace).await;
     let namespace = namespace.as_str();
 
-    let threshold = arguments.get("threshold")
+    let threshold = arguments
+        .get("threshold")
         .and_then(|v| v.as_f64())
         .unwrap_or(0.85)
         .clamp(0.0, 1.0);
 
-    let limit = arguments.get("limit")
+    let limit = arguments
+        .get("limit")
         .and_then(|v| v.as_i64())
         .unwrap_or(20)
         .clamp(1, 100) as usize;
@@ -7442,9 +8039,13 @@ async fn handle_find_duplicate_candidates(arguments: Value, store: Arc<dyn Vecto
     }
 
     // Group memories by memory_type so we only compare pairs of the same type
-    let mut by_type: std::collections::HashMap<String, Vec<&SearchResult>> = std::collections::HashMap::new();
+    let mut by_type: std::collections::HashMap<String, Vec<&SearchResult>> =
+        std::collections::HashMap::new();
     for sr in &non_structural_memories {
-        by_type.entry(sr.payload.memory_type.clone()).or_default().push(sr);
+        by_type
+            .entry(sr.payload.memory_type.clone())
+            .or_default()
+            .push(sr);
     }
 
     let mut candidates: Vec<serde_json::Value> = Vec::new();
@@ -7460,11 +8061,13 @@ async fn handle_find_duplicate_candidates(arguments: Value, store: Arc<dyn Vecto
                 if a.id >= b.id {
                     continue;
                 }
-                let sim = compute_token_jaccard(&a.payload.content, &b.payload.content).clamp(0.0, 1.0);
+                let sim =
+                    compute_token_jaccard(&a.payload.content, &b.payload.content).clamp(0.0, 1.0);
                 if let Some(ref model) = kge_model {
                     let raw_struct_dist = model.structural_distance(&a.id, &b.id);
                     let norm_struct_dist = model.normalized_structural_distance(&a.id, &b.id);
-                    let rel_dist = model.relation_distance(&a.id, crate::kge::EdgeType::RelatesTo, &b.id);
+                    let rel_dist =
+                        model.relation_distance(&a.id, crate::kge::EdgeType::RelatesTo, &b.id);
                     let combined_score = model.duplicate_score(sim, &a.id, &b.id) as f64;
                     if (f64::from(sim)).max(combined_score) >= threshold {
                         candidates.push(serde_json::json!({
@@ -7480,20 +8083,20 @@ async fn handle_find_duplicate_candidates(arguments: Value, store: Arc<dyn Vecto
                         }));
                     }
                 } else {
-                // Without KGE, use pure text similarity directly: halving it
-                // would cap the score at 0.5 and make thresholds >= 0.5
-                // unreachable.
-                let combined_score = sim;
-                if combined_score >= threshold as f32 {
-                    candidates.push(serde_json::json!({
-                        "memory_a": a.id,
-                        "memory_b": b.id,
-                        "text_similarity": sim,
-                        "structural_distance": 1.0,
-                        "combined_score": combined_score,
-                        "review_only": true
-                    }));
-                }
+                    // Without KGE, use pure text similarity directly: halving it
+                    // would cap the score at 0.5 and make thresholds >= 0.5
+                    // unreachable.
+                    let combined_score = sim;
+                    if combined_score >= threshold as f32 {
+                        candidates.push(serde_json::json!({
+                            "memory_a": a.id,
+                            "memory_b": b.id,
+                            "text_similarity": sim,
+                            "structural_distance": 1.0,
+                            "combined_score": combined_score,
+                            "review_only": true
+                        }));
+                    }
                 }
             }
         }
@@ -7502,9 +8105,20 @@ async fn handle_find_duplicate_candidates(arguments: Value, store: Arc<dyn Vecto
     candidates.sort_by(|x, y| {
         let sx = x["combined_score"].as_f64().unwrap_or(0.0);
         let sy = y["combined_score"].as_f64().unwrap_or(0.0);
-        sy.partial_cmp(&sx).unwrap_or(Ordering::Equal)
-            .then(x["memory_a"].as_str().unwrap_or("").cmp(y["memory_a"].as_str().unwrap_or("")))
-            .then(x["memory_b"].as_str().unwrap_or("").cmp(y["memory_b"].as_str().unwrap_or("")))
+        sy.partial_cmp(&sx)
+            .unwrap_or(Ordering::Equal)
+            .then(
+                x["memory_a"]
+                    .as_str()
+                    .unwrap_or("")
+                    .cmp(y["memory_a"].as_str().unwrap_or("")),
+            )
+            .then(
+                x["memory_b"]
+                    .as_str()
+                    .unwrap_or("")
+                    .cmp(y["memory_b"].as_str().unwrap_or("")),
+            )
     });
     let candidates = &candidates[..candidates.len().min(limit)];
 
@@ -7532,9 +8146,7 @@ fn token_set_tokens(content: &str) -> std::collections::HashSet<String> {
     content
         .to_lowercase()
         .split_whitespace()
-        .filter(|token| {
-            token.chars().all(|c| c.is_alphanumeric()) && token.len() >= 2
-        })
+        .filter(|token| token.chars().all(|c| c.is_alphanumeric()) && token.len() >= 2)
         .map(|token| token.to_string())
         .collect()
 }
@@ -7601,22 +8213,44 @@ async fn handle_search_memory(
     let facets_filter: Vec<String> = arguments
         .get("facets")
         .map(|v| {
-            if let Some(s) = v.as_str() { vec![s.to_string()] }
-            else if let Some(arr) = v.as_array() { arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect() }
-            else { vec![] }
+            if let Some(s) = v.as_str() {
+                vec![s.to_string()]
+            } else if let Some(arr) = v.as_array() {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect()
+            } else {
+                vec![]
+            }
         })
         .unwrap_or_default();
     let node_sets_filter: Vec<String> = arguments
         .get("node_sets")
         .map(|v| {
-            if let Some(s) = v.as_str() { vec![s.to_string()] }
-            else if let Some(arr) = v.as_array() { arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect() }
-            else { vec![] }
+            if let Some(s) = v.as_str() {
+                vec![s.to_string()]
+            } else if let Some(arr) = v.as_array() {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect()
+            } else {
+                vec![]
+            }
         })
         .unwrap_or_default();
-    let node_set_mode = arguments.get("node_set_mode").and_then(|v| v.as_str()).unwrap_or("any").to_string();
-    let domain_expansion = arguments.get("domain_expansion").and_then(|v| v.as_bool()).unwrap_or(true);
-    let include_references = arguments.get("include_references").and_then(|v| v.as_bool()).unwrap_or(false);
+    let node_set_mode = arguments
+        .get("node_set_mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("any")
+        .to_string();
+    let domain_expansion = arguments
+        .get("domain_expansion")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let include_references = arguments
+        .get("include_references")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     // Upgraded SearchFilters (src/search.rs). Optional: defaults preserve
     // existing search behavior (include_code_ast defaults to true so searches
@@ -7625,12 +8259,28 @@ async fn handle_search_memory(
         memory_types: arguments
             .get("memory_types")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
             .unwrap_or_default(),
-        fact_shape: arguments.get("fact_shape").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        path_prefix: arguments.get("path_prefix").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        exclude_stale: arguments.get("exclude_stale").and_then(|v| v.as_bool()).unwrap_or(false),
-        include_code_ast: arguments.get("include_code_ast").and_then(|v| v.as_bool()).unwrap_or(true),
+        fact_shape: arguments
+            .get("fact_shape")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        path_prefix: arguments
+            .get("path_prefix")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        exclude_stale: arguments
+            .get("exclude_stale")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        include_code_ast: arguments
+            .get("include_code_ast")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true),
     };
     let has_upgraded_filters = !search_filters.memory_types.is_empty()
         || search_filters.fact_shape.is_some()
@@ -7674,7 +8324,9 @@ async fn handle_search_memory(
 
     if search_mode == "lexical" || search_mode == "lexical-inhouse" {
         let outcome_res = if search_mode == "lexical" {
-            if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::LadybugStore>() {
+            if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref())
+                .downcast_ref::<crate::store::LadybugStore>()
+            {
                 ls.search_tantivy_lexical_with_options(
                     namespace,
                     &query,
@@ -7755,11 +8407,21 @@ async fn handle_search_memory(
             });
         }
         if has_upgraded_filters {
-            results.retain(|r| crate::search::passes_filters(&r.payload.memory_type, &r.payload.metadata, &r.payload.location, &search_filters));
+            results.retain(|r| {
+                crate::search::passes_filters(
+                    &r.payload.memory_type,
+                    &r.payload.metadata,
+                    &r.payload.location,
+                    &search_filters,
+                )
+            });
         }
         if let Some(q_ts) = crate::graph_read::temporal::extract_query_timestamp(&query) {
             for r in &mut results {
-                let boost = crate::graph_read::temporal::temporal_proximity_boost(q_ts, &r.payload.metadata);
+                let boost = crate::graph_read::temporal::temporal_proximity_boost(
+                    q_ts,
+                    &r.payload.metadata,
+                );
                 if boost > 0.0 {
                     r.score = (r.score - boost).max(0.0);
                 }
@@ -7848,8 +8510,8 @@ async fn handle_search_memory(
     let is_ladybug_store = crate::traits::VectorStore::as_any(store.as_ref())
         .downcast_ref::<crate::store::LadybugStore>()
         .is_some();
-    let outcome_res = if let Some(ls) =
-        crate::traits::VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::LadybugStore>()
+    let outcome_res = if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref())
+        .downcast_ref::<crate::store::LadybugStore>()
     {
         let store_mode = if search_mode == "hybrid" {
             crate::traits::SearchMode::Hybrid
@@ -7883,229 +8545,266 @@ async fn handle_search_memory(
             )
             .await
     };
-    if let Ok(outcome) = outcome_res
+    if let Ok(outcome) = outcome_res {
+        let mode = outcome.mode;
+        let mut results = outcome.results;
+        if !domain_expansion && !slugs.is_empty() && mode == crate::traits::DomainMatchMode::Domain
+        {
+            let unexpanded: std::collections::HashSet<String> = if let Some(ls) =
+                crate::traits::VectorStore::as_any(store.as_ref())
+                    .downcast_ref::<crate::store::LadybugStore>()
             {
-                let mode = outcome.mode;
-                let mut results = outcome.results;
-                if !domain_expansion && !slugs.is_empty() && mode == crate::traits::DomainMatchMode::Domain {
-                    let unexpanded: std::collections::HashSet<String> = if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::LadybugStore>() {
-                        let ont = ls.get_ontology(namespace);
-                        slugs.iter().map(|s| ont.canonical_slug(s).unwrap_or_else(|| s.clone())).collect()
-                    } else {
-                        slugs.iter().cloned().collect()
-                    };
-                    results.retain(|r| {
-                        let row_keys = crate::domain::domain_keys(&r.payload.metadata);
-                        row_keys.iter().any(|k| unexpanded.contains(k))
-                    });
+                let ont = ls.get_ontology(namespace);
+                slugs
+                    .iter()
+                    .map(|s| ont.canonical_slug(s).unwrap_or_else(|| s.clone()))
+                    .collect()
+            } else {
+                slugs.iter().cloned().collect()
+            };
+            results.retain(|r| {
+                let row_keys = crate::domain::domain_keys(&r.payload.metadata);
+                row_keys.iter().any(|k| unexpanded.contains(k))
+            });
+        }
+        if !facets_filter.is_empty() {
+            results.retain(|r| {
+                let facets =
+                    crate::domain::compute_facets(&r.payload.memory_type, &r.payload.metadata);
+                facets_filter.iter().all(|f| facets.contains(f))
+            });
+        }
+        if !node_sets_filter.is_empty() {
+            results.retain(|r| {
+                let sets: Vec<String> = r
+                    .payload
+                    .metadata
+                    .get("node_set")
+                    .map(|v| {
+                        if let Some(s) = v.as_str() {
+                            vec![s.to_string()]
+                        } else if let Some(arr) = v.as_array() {
+                            arr.iter()
+                                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                .collect()
+                        } else {
+                            vec![]
+                        }
+                    })
+                    .unwrap_or_default();
+                if node_set_mode == "all" {
+                    node_sets_filter.iter().all(|f| sets.contains(f))
+                } else {
+                    node_sets_filter.iter().any(|f| sets.contains(f))
                 }
-                if !facets_filter.is_empty() {
-                    results.retain(|r| {
-                        let facets = crate::domain::compute_facets(&r.payload.memory_type, &r.payload.metadata);
-                        facets_filter.iter().all(|f| facets.contains(f))
-                    });
+            });
+        }
+        if has_upgraded_filters {
+            results.retain(|r| {
+                crate::search::passes_filters(
+                    &r.payload.memory_type,
+                    &r.payload.metadata,
+                    &r.payload.location,
+                    &search_filters,
+                )
+            });
+        }
+        // In-house lexical blend: merge the lexical candidate set into the vector
+        // result set and re-score with the documented single rule. Vector-only rows
+        // substitute worst-case lexical distance 1.0; lexical-only rows
+        // substitute worst-case vector distance 1.0.
+        // In 'hybrid' mode on LadybugStore, search_hybrid_with_domain already fused
+        // HNSW + Tantivy + symbol + graph expansion via RRF.
+        if search_mode == "vector" || !is_ladybug_store {
+            let lexical_outcome = store
+                .search_lexical(
+                    namespace,
+                    &query,
+                    FETCH_LIMIT,
+                    include_tasks,
+                    include_archived,
+                    &slugs,
+                    principal,
+                    fuzzy_max_distance,
+                )
+                .await;
+            if let Err(e) = &lexical_outcome {
+                tracing::warn!("search_lexical blend failed for '{namespace}': {e}");
+            }
+            if let Ok(lexical_outcome) = lexical_outcome {
+                let lexical_by_id: std::collections::HashMap<String, f32> = lexical_outcome
+                    .results
+                    .iter()
+                    .map(|r| (r.id.clone(), r.score))
+                    .collect();
+                let vector_ids: std::collections::HashSet<String> =
+                    results.iter().map(|r| r.id.clone()).collect();
+                for res in &mut results {
+                    let lexical_distance = lexical_by_id.get(&res.id).copied().unwrap_or(1.0);
+                    res.score = 0.7 * res.score + 0.3 * lexical_distance;
                 }
-                if !node_sets_filter.is_empty() {
-                    results.retain(|r| {
-                        let sets: Vec<String> = r.payload.metadata.get("node_set")
+                for lex in lexical_outcome.results {
+                    if vector_ids.contains(&lex.id) {
+                        continue;
+                    }
+                    // Apply the same facet/node-set filters as the
+                    // vector candidates so the merged set stays consistent.
+                    if !facets_filter.is_empty() {
+                        let facets = crate::domain::compute_facets(
+                            &lex.payload.memory_type,
+                            &lex.payload.metadata,
+                        );
+                        if !facets_filter.iter().all(|f| facets.contains(f)) {
+                            continue;
+                        }
+                    }
+                    if !node_sets_filter.is_empty() {
+                        let sets: Vec<String> = lex
+                            .payload
+                            .metadata
+                            .get("node_set")
                             .map(|v| {
-                                if let Some(s) = v.as_str() { vec![s.to_string()] }
-                                else if let Some(arr) = v.as_array() { arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect() }
-                                else { vec![] }
+                                if let Some(s) = v.as_str() {
+                                    vec![s.to_string()]
+                                } else if let Some(arr) = v.as_array() {
+                                    arr.iter()
+                                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                        .collect()
+                                } else {
+                                    vec![]
+                                }
                             })
                             .unwrap_or_default();
-                        if node_set_mode == "all" {
+                        let keep = if node_set_mode == "all" {
                             node_sets_filter.iter().all(|f| sets.contains(f))
                         } else {
                             node_sets_filter.iter().any(|f| sets.contains(f))
+                        };
+                        if !keep {
+                            continue;
+                        }
+                    }
+                    if has_upgraded_filters
+                        && !crate::search::passes_filters(
+                            &lex.payload.memory_type,
+                            &lex.payload.metadata,
+                            &lex.payload.location,
+                            &search_filters,
+                        )
+                    {
+                        continue;
+                    }
+                    let blended = 0.7 + 0.3 * lex.score;
+                    let mut lex = lex;
+                    lex.score = blended;
+                    if lex.evidence.as_ref().map_or(true, |e| e.is_empty()) {
+                        lex.evidence = Some(vec![crate::traits::SearchEvidence {
+                            kind: crate::traits::EvidenceKind::DirectMatch,
+                            path: Vec::new(),
+                            explanation: "This memory matched the lexical query.".to_string(),
+                            derivation: vec!["lexical-inhouse".to_string()],
+                        }]);
+                    }
+                    results.push(lex);
+                }
+                results.sort_by(|a, b| a.score.total_cmp(&b.score).then_with(|| a.id.cmp(&b.id)));
+            }
+        }
+        if let Some(q_ts) = crate::graph_read::temporal::extract_query_timestamp(&query) {
+            for r in &mut results {
+                let boost = crate::graph_read::temporal::temporal_proximity_boost(
+                    q_ts,
+                    &r.payload.metadata,
+                );
+                if boost > 0.0 {
+                    r.score = (r.score - boost).max(0.0);
+                }
+            }
+            results.sort_by(|a, b| a.score.total_cmp(&b.score).then_with(|| a.id.cmp(&b.id)));
+        }
+        // Pre-limit contract: filtering happened against the wider FETCH_LIMIT
+        // candidate set above; truncate to the default page size now.
+        if search_mode == "hybrid" && is_ladybug_store {
+            results = crate::store::reserve_normative_and_expansion_slots(results, DEFAULT_LIMIT);
+        } else {
+            results.truncate(DEFAULT_LIMIT);
+        }
+        if domain_requested {
+            let single_domain =
+                crate::registry::registry_domain_count(&store, namespace).await <= 1;
+            crate::recall_metrics::record_domain_query(
+                mode == crate::traits::DomainMatchMode::Domain,
+                mode == crate::traits::DomainMatchMode::Vector,
+                single_domain,
+            );
+        }
+        if results.is_empty() {
+            "No relevant memories found.".to_string()
+        } else {
+            // Increment access_count ONLY for direct hits (EvidenceKind::DirectMatch)
+            for res in &results {
+                if crate::traits::is_direct_match(&res.evidence) {
+                    let store_clone = store.clone();
+                    let ns_clone = namespace.to_string();
+                    let id_clone = res.id.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = store_clone
+                            .increment_access_count(&ns_clone, &id_clone)
+                            .await
+                        {
+                            tracing::debug!(
+                                "increment_access_count failed for '{ns_clone}:{id_clone}': {e}"
+                            );
                         }
                     });
                 }
-                if has_upgraded_filters {
-                    results.retain(|r| crate::search::passes_filters(&r.payload.memory_type, &r.payload.metadata, &r.payload.location, &search_filters));
-                }
-                // In-house lexical blend: merge the lexical candidate set into the vector
-                // result set and re-score with the documented single rule. Vector-only rows
-                // substitute worst-case lexical distance 1.0; lexical-only rows
-                // substitute worst-case vector distance 1.0.
-                // In 'hybrid' mode on LadybugStore, search_hybrid_with_domain already fused
-                // HNSW + Tantivy + symbol + graph expansion via RRF.
-                if search_mode == "vector" || !is_ladybug_store {
-                let lexical_outcome = store
-                    .search_lexical(
-                        namespace,
-                        &query,
-                        FETCH_LIMIT,
-                        include_tasks,
-                        include_archived,
-                        &slugs,
-                        principal,
-                        fuzzy_max_distance,
-                    )
-                    .await;
-                if let Err(e) = &lexical_outcome {
-                    tracing::warn!("search_lexical blend failed for '{namespace}': {e}");
-                }
-                if let Ok(lexical_outcome) = lexical_outcome {
-                    let lexical_by_id: std::collections::HashMap<String, f32> =
-                        lexical_outcome.results.iter().map(|r| (r.id.clone(), r.score)).collect();
-                    let vector_ids: std::collections::HashSet<String> =
-                        results.iter().map(|r| r.id.clone()).collect();
-                    for res in &mut results {
-                        let lexical_distance = lexical_by_id.get(&res.id).copied().unwrap_or(1.0);
-                        res.score = 0.7 * res.score + 0.3 * lexical_distance;
-                    }
-                    for lex in lexical_outcome.results {
-                        if vector_ids.contains(&lex.id) {
-                            continue;
-                        }
-                        // Apply the same facet/node-set filters as the
-                        // vector candidates so the merged set stays consistent.
-                        if !facets_filter.is_empty() {
-                            let facets =
-                                crate::domain::compute_facets(&lex.payload.memory_type, &lex.payload.metadata);
-                            if !facets_filter.iter().all(|f| facets.contains(f)) {
-                                continue;
-                            }
-                        }
-                        if !node_sets_filter.is_empty() {
-                            let sets: Vec<String> = lex
-                                .payload
-                                .metadata
-                                .get("node_set")
-                                .map(|v| {
-                                    if let Some(s) = v.as_str() {
-                                        vec![s.to_string()]
-                                    } else if let Some(arr) = v.as_array() {
-                                        arr.iter()
-                                            .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                                            .collect()
-                                    } else {
-                                        vec![]
-                                    }
-                                })
-                                .unwrap_or_default();
-                            let keep = if node_set_mode == "all" {
-                                node_sets_filter.iter().all(|f| sets.contains(f))
-                            } else {
-                                node_sets_filter.iter().any(|f| sets.contains(f))
-                            };
-                            if !keep {
-                                continue;
-                            }
-                        }
-                        if has_upgraded_filters && !crate::search::passes_filters(&lex.payload.memory_type, &lex.payload.metadata, &lex.payload.location, &search_filters) {
-                            continue;
-                        }
-                        let blended = 0.7 + 0.3 * lex.score;
-                        let mut lex = lex;
-                        lex.score = blended;
-                        if lex.evidence.as_ref().map_or(true, |e| e.is_empty()) {
-                            lex.evidence = Some(vec![crate::traits::SearchEvidence {
-                                kind: crate::traits::EvidenceKind::DirectMatch,
-                                path: Vec::new(),
-                                explanation: "This memory matched the lexical query.".to_string(),
-                                derivation: vec!["lexical-inhouse".to_string()],
-                            }]);
-                        }
-                        results.push(lex);
-                    }
-                    results.sort_by(|a, b| {
-                        a.score
-                            .total_cmp(&b.score)
-                            .then_with(|| a.id.cmp(&b.id))
-                    });
-                }
-                }
-                if let Some(q_ts) = crate::graph_read::temporal::extract_query_timestamp(&query) {
-                    for r in &mut results {
-                        let boost = crate::graph_read::temporal::temporal_proximity_boost(q_ts, &r.payload.metadata);
-                        if boost > 0.0 {
-                            r.score = (r.score - boost).max(0.0);
-                        }
-                    }
-                    results.sort_by(|a, b| a.score.total_cmp(&b.score).then_with(|| a.id.cmp(&b.id)));
-                }
-                // Pre-limit contract: filtering happened against the wider FETCH_LIMIT
-                // candidate set above; truncate to the default page size now.
-                if search_mode == "hybrid" && is_ladybug_store {
-                    results = crate::store::reserve_normative_and_expansion_slots(
-                        results,
-                        DEFAULT_LIMIT,
-                    );
-                } else {
-                    results.truncate(DEFAULT_LIMIT);
-                }
-                if domain_requested {
-                    let single_domain =
-                        crate::registry::registry_domain_count(&store, namespace).await <= 1;
-                    crate::recall_metrics::record_domain_query(
-                        mode == crate::traits::DomainMatchMode::Domain,
-                        mode == crate::traits::DomainMatchMode::Vector,
-                        single_domain,
-                    );
-                }
-                if results.is_empty() {
-                    "No relevant memories found.".to_string()
-                } else {
-                    // Increment access_count ONLY for direct hits (EvidenceKind::DirectMatch)
-                    for res in &results {
-                        if crate::traits::is_direct_match(&res.evidence) {
-                            let store_clone = store.clone();
-                            let ns_clone = namespace.to_string();
-                            let id_clone = res.id.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = store_clone
-                                    .increment_access_count(&ns_clone, &id_clone)
-                                    .await
-                                {
-                                    tracing::debug!(
-                                        "increment_access_count failed for '{ns_clone}:{id_clone}': {e}"
-                                    );
-                                }
-                            });
-                        }
-                    }
+            }
 
-                    // F10: surface conflict candidates in recall as a warning badge.
-                    let conflicts = crate::domain::detect_conflicts(&results);
-                    let mut report = render_search_results(&results);
-                    if include_references {
-                        let refs: Vec<serde_json::Value> = results
-                            .iter()
-                            .filter_map(|r| {
-                                r.payload
-                                    .metadata
-                                    .get("edge_sources")
-                                    .and_then(|v| v.as_array())
-                                    .filter(|a| !a.is_empty())
-                                    .map(|a| serde_json::json!({"id": r.id, "edge_sources": a}))
-                            })
-                            .collect();
-                        if !refs.is_empty() {
-                            report.push_str(&format!(
-                                "\n\nedge_references: {}",
-                                serde_json::to_string(&refs).unwrap_or_default()
-                            ));
-                        }
-                    }
-                    if !conflicts.is_empty() {
-                        let arr: Vec<serde_json::Value> = conflicts.iter().map(|(id, dw)| serde_json::json!({"id": id, "disputed_with": dw})).collect();
-                        report.push_str(&format!("\n\nconflict_candidates: {}", serde_json::to_string(&arr).unwrap_or_default()));
-                    }
-                    if !domain_requested {
-                        report
-                    } else {
-                        // A filter that was skipped is a substitution the caller
-                        // has to be told about: a wrong domain must never blind
-                        // the search, and a silent fallback would misreport what
-                        // was searched. The store's mode alone cannot tell the
-                        // two kinds of skip apart -- an empty key set was never
-                        // compared with anything -- so the survivors decide.
-                        let mode_line = if slugs.is_empty() {
-                            "domain filter: skipped — the domain did not normalize; the results are unfiltered (vector)"
-                        } else {
-                            match mode {
+            // F10: surface conflict candidates in recall as a warning badge.
+            let conflicts = crate::domain::detect_conflicts(&results);
+            let mut report = render_search_results(&results);
+            if include_references {
+                let refs: Vec<serde_json::Value> = results
+                    .iter()
+                    .filter_map(|r| {
+                        r.payload
+                            .metadata
+                            .get("edge_sources")
+                            .and_then(|v| v.as_array())
+                            .filter(|a| !a.is_empty())
+                            .map(|a| serde_json::json!({"id": r.id, "edge_sources": a}))
+                    })
+                    .collect();
+                if !refs.is_empty() {
+                    report.push_str(&format!(
+                        "\n\nedge_references: {}",
+                        serde_json::to_string(&refs).unwrap_or_default()
+                    ));
+                }
+            }
+            if !conflicts.is_empty() {
+                let arr: Vec<serde_json::Value> = conflicts
+                    .iter()
+                    .map(|(id, dw)| serde_json::json!({"id": id, "disputed_with": dw}))
+                    .collect();
+                report.push_str(&format!(
+                    "\n\nconflict_candidates: {}",
+                    serde_json::to_string(&arr).unwrap_or_default()
+                ));
+            }
+            if !domain_requested {
+                report
+            } else {
+                // A filter that was skipped is a substitution the caller
+                // has to be told about: a wrong domain must never blind
+                // the search, and a silent fallback would misreport what
+                // was searched. The store's mode alone cannot tell the
+                // two kinds of skip apart -- an empty key set was never
+                // compared with anything -- so the survivors decide.
+                let mode_line = if slugs.is_empty() {
+                    "domain filter: skipped — the domain did not normalize; the results are unfiltered (vector)"
+                } else {
+                    match mode {
                                 crate::traits::DomainMatchMode::Domain => {
                                     "domain filter: applied (domain)"
                                 }
@@ -8113,13 +8812,13 @@ async fn handle_search_memory(
                                     "domain filter: skipped — no row matched the domain; the results are unfiltered (vector)"
                                 }
                             }
-                        };
-                        format!("{}\n\n{}", mode_line, report)
-                    }
-                }
-            } else {
-                "Failed to search database.".to_string()
+                };
+                format!("{}\n\n{}", mode_line, report)
             }
+        }
+    } else {
+        "Failed to search database.".to_string()
+    }
 }
 
 /// Resolves a namespace against the ones that already exist, ignoring case.
@@ -8366,9 +9065,18 @@ pub(crate) fn format_memory(id: &str, payload: &MemoryPayload) -> String {
     let mut out = format!("--- Memory ID: {} ---\nType: {}", id, payload.memory_type);
     if crate::attempt::is_failed_attempt(&payload.metadata) {
         let attempt = payload.metadata.get("attempt").unwrap();
-        let context = attempt.get("context").and_then(|v| v.as_str()).unwrap_or("");
-        let approach = attempt.get("approach").and_then(|v| v.as_str()).unwrap_or("");
-        let failure_mode = attempt.get("failure_mode").and_then(|v| v.as_str()).unwrap_or("");
+        let context = attempt
+            .get("context")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let approach = attempt
+            .get("approach")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let failure_mode = attempt
+            .get("failure_mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         out.push_str(&format!(
             "\nAttempt [FAILED in {}]: tried '{}' -> failed with '{}' (single episode, not a global rule)",
             context, approach, failure_mode
@@ -8495,12 +9203,10 @@ fn render_evidence_suffix(result: &SearchResult, remaining_bytes: usize) -> Opti
                 let second = &ev.path[1];
                 // The intermediate is the node the two edges share: the endpoint
                 // of the first edge that is also an endpoint of the second.
-                let intermediate = if first.source == second.source
-                    || first.source == second.target
+                let intermediate = if first.source == second.source || first.source == second.target
                 {
                     first.source.as_str()
-                } else if first.target == second.source || first.target == second.target
-                {
+                } else if first.target == second.source || first.target == second.target {
                     first.target.as_str()
                 } else {
                     continue;
@@ -8564,19 +9270,25 @@ fn render_path(ev: &crate::traits::SearchEvidence, orig: &str) -> String {
         if !forward && edge.target != current {
             continue;
         }
-        let next = if forward { edge.target.as_str() } else { edge.source.as_str() };
+        let next = if forward {
+            edge.target.as_str()
+        } else {
+            edge.source.as_str()
+        };
         // The vocabulary declares the direction: an undirected relation has no
         // arrow, so the connector marks it instead.
-        let connector =
-            if crate::traits::memory_vocabulary()["relations"][edge.relation.as_str()]["direction"] == "undirected" {
-                format!(" --{}-- ", edge.relation)
-            } else if forward {
-                // Forward: source -> target
-                format!(" -{}- ", edge.relation)
-            } else {
-                // Reverse: target <- source
-                format!(" <-{}- ", edge.relation)
-            };
+        let connector = if crate::traits::memory_vocabulary()["relations"][edge.relation.as_str()]
+            ["direction"]
+            == "undirected"
+        {
+            format!(" --{}-- ", edge.relation)
+        } else if forward {
+            // Forward: source -> target
+            format!(" -{}- ", edge.relation)
+        } else {
+            // Reverse: target <- source
+            format!(" <-{}- ", edge.relation)
+        };
         parts.push(format!("\"{}\"{}\"{}\"", current, connector, next));
         current = next;
     }
@@ -8657,8 +9369,17 @@ async fn handle_guard_validate(
     // actions and namespaces with no task rows at all are exempt.
     let mutating = !matches!(
         action_type.to_lowercase().as_str(),
-        "read" | "read_file" | "get" | "list" | "search" | "query" | "view" | "cat" | "inspect"
-            | "grep" | "glob"
+        "read"
+            | "read_file"
+            | "get"
+            | "list"
+            | "search"
+            | "query"
+            | "view"
+            | "cat"
+            | "inspect"
+            | "grep"
+            | "glob"
     );
     if mutating {
         // Determine whether this namespace is task-enabled. Only task rows
@@ -8694,110 +9415,114 @@ async fn handle_guard_validate(
             }
         };
         let has_any_task = memories.iter().any(|m| crate::task::gate::is_task(m));
-            if has_any_task {
-                let has_in_progress = memories
-                    .iter()
-                    .any(|m| crate::task::gate::is_task(m) && crate::task::gate::task_status(m) == crate::task::machine::Status::InProgress);
-                if !has_in_progress {
-                    let trace_id = format!(
-                        "guard-validate-{}-{}",
-                        std::process::id(),
-                        chrono::Utc::now().timestamp_millis()
-                    );
-                    let body = serde_json::json!({
-                        "trace_id": trace_id,
-                        "verdict": {
-                            "bucket": "DeterministicReject",
-                            "reasons": ["Zero-Action Start: no claimed (in_progress) task in this namespace. Claim or create a task before editing."],
-                            "constraints": []
-                        },
-                        "rule_ids_triggered": []
-                    });
-                    return format!(
-                        "namespace: {}\ntrace_id: {}\n{}",
-                        namespace,
-                        trace_id,
-                        serde_json::to_string_pretty(&body).unwrap_or_default()
-                    );
-                }
-                // AC2: a claimed task exists, so the mutating action must pass
-                // the session/worktree preflight before rule validation runs.
-                // Caller-named active task wins when it is InProgress; else any
-                // InProgress row in the namespace.
-                // Resolve the active InProgress task: caller-named active_task_id
-                // wins when it is an InProgress row; else any InProgress row.
-                let active_task_row: Option<&SearchResult> = arguments
-                    .get("active_task_id")
-                    .and_then(|v| v.as_str())
-                    .and_then(|tid| {
-                        memories.iter().find(|m| {
-                            m.id == tid
-                                && crate::task::gate::is_task(m)
-                                && crate::task::gate::task_status(m)
-                                    == crate::task::machine::Status::InProgress
-                        })
-                    })
-                    .or_else(|| {
-                        memories.iter().find(|m| {
-                            crate::task::gate::is_task(m)
-                                && crate::task::gate::task_status(m)
-                                    == crate::task::machine::Status::InProgress
-                        })
-                    });
-                let active_task_id = active_task_row.map(|m| m.id.as_str());
-                let session_id = arguments
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                // Enhancement 1: a stateless caller (cli-hook.mjs) may send an empty
-                // or "unknown" session_id with active_task_id: null. Fall back to the
-                // session recorded on the active InProgress task so Zero-Action Start
-                // preflight passes when an InProgress task exists in the namespace.
-                let effective_session_id: String = if session_id.is_empty() || session_id == "unknown" {
-                    active_task_row
-                        .and_then(|m| m.payload.metadata.get("task"))
-                        .and_then(|t| t.get("session_id"))
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.trim().is_empty())
-                        .map(String::from)
-                        .unwrap_or_default()
-                } else {
-                    session_id.to_string()
-                };
-                let (allowed, transition) = validator.guard_validate_with_mutations(
-                    &effective_session_id,
-                    active_task_id,
-                    cwd,
-                    action_type,
-                    mutating,
-                    arguments.get("mutations_since_note").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+        if has_any_task {
+            let has_in_progress = memories.iter().any(|m| {
+                crate::task::gate::is_task(m)
+                    && crate::task::gate::task_status(m) == crate::task::machine::Status::InProgress
+            });
+            if !has_in_progress {
+                let trace_id = format!(
+                    "guard-validate-{}-{}",
+                    std::process::id(),
+                    chrono::Utc::now().timestamp_millis()
                 );
-                if !allowed {
-                    let reason = transition.unwrap_or_else(|| {
-                        "Unpreflighted: AC2 preflight rejected this mutating action.".to_string()
-                    });
-                    let trace_id = format!(
-                        "guard-validate-{}-{}",
-                        std::process::id(),
-                        chrono::Utc::now().timestamp_millis()
-                    );
-                    let body = serde_json::json!({
-                        "trace_id": trace_id,
-                        "verdict": {
-                            "bucket": "DeterministicReject",
-                            "reasons": [reason],
-                            "constraints": []
-                        },
-                        "rule_ids_triggered": []
-                    });
-                    return format!(
-                        "namespace: {}\ntrace_id: {}\n{}",
-                        namespace,
-                        trace_id,
-                        serde_json::to_string_pretty(&body).unwrap_or_default()
-                    );
-                }
+                let body = serde_json::json!({
+                    "trace_id": trace_id,
+                    "verdict": {
+                        "bucket": "DeterministicReject",
+                        "reasons": ["Zero-Action Start: no claimed (in_progress) task in this namespace. Claim or create a task before editing."],
+                        "constraints": []
+                    },
+                    "rule_ids_triggered": []
+                });
+                return format!(
+                    "namespace: {}\ntrace_id: {}\n{}",
+                    namespace,
+                    trace_id,
+                    serde_json::to_string_pretty(&body).unwrap_or_default()
+                );
             }
+            // AC2: a claimed task exists, so the mutating action must pass
+            // the session/worktree preflight before rule validation runs.
+            // Caller-named active task wins when it is InProgress; else any
+            // InProgress row in the namespace.
+            // Resolve the active InProgress task: caller-named active_task_id
+            // wins when it is an InProgress row; else any InProgress row.
+            let active_task_row: Option<&SearchResult> = arguments
+                .get("active_task_id")
+                .and_then(|v| v.as_str())
+                .and_then(|tid| {
+                    memories.iter().find(|m| {
+                        m.id == tid
+                            && crate::task::gate::is_task(m)
+                            && crate::task::gate::task_status(m)
+                                == crate::task::machine::Status::InProgress
+                    })
+                })
+                .or_else(|| {
+                    memories.iter().find(|m| {
+                        crate::task::gate::is_task(m)
+                            && crate::task::gate::task_status(m)
+                                == crate::task::machine::Status::InProgress
+                    })
+                });
+            let active_task_id = active_task_row.map(|m| m.id.as_str());
+            let session_id = arguments
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            // Enhancement 1: a stateless caller (cli-hook.mjs) may send an empty
+            // or "unknown" session_id with active_task_id: null. Fall back to the
+            // session recorded on the active InProgress task so Zero-Action Start
+            // preflight passes when an InProgress task exists in the namespace.
+            let effective_session_id: String = if session_id.is_empty() || session_id == "unknown" {
+                active_task_row
+                    .and_then(|m| m.payload.metadata.get("task"))
+                    .and_then(|t| t.get("session_id"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .map(String::from)
+                    .unwrap_or_default()
+            } else {
+                session_id.to_string()
+            };
+            let (allowed, transition) = validator.guard_validate_with_mutations(
+                &effective_session_id,
+                active_task_id,
+                cwd,
+                action_type,
+                mutating,
+                arguments
+                    .get("mutations_since_note")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize,
+            );
+            if !allowed {
+                let reason = transition.unwrap_or_else(|| {
+                    "Unpreflighted: AC2 preflight rejected this mutating action.".to_string()
+                });
+                let trace_id = format!(
+                    "guard-validate-{}-{}",
+                    std::process::id(),
+                    chrono::Utc::now().timestamp_millis()
+                );
+                let body = serde_json::json!({
+                    "trace_id": trace_id,
+                    "verdict": {
+                        "bucket": "DeterministicReject",
+                        "reasons": [reason],
+                        "constraints": []
+                    },
+                    "rule_ids_triggered": []
+                });
+                return format!(
+                    "namespace: {}\ntrace_id: {}\n{}",
+                    namespace,
+                    trace_id,
+                    serde_json::to_string_pretty(&body).unwrap_or_default()
+                );
+            }
+        }
     }
 
     let trace_id = format!(
@@ -9087,11 +9812,7 @@ mod tests {
         assert!(!hygiene_allows_version_advance(&err));
 
         let mut state = serde_json::json!({"last_run_version": "1.0.0"});
-        apply_doctor_version(
-            &mut state,
-            "1.1.0",
-            hygiene_allows_version_advance(&err),
-        );
+        apply_doctor_version(&mut state, "1.1.0", hygiene_allows_version_advance(&err));
         assert_eq!(
             state["last_run_version"],
             serde_json::json!("1.0.0"),
@@ -9154,10 +9875,7 @@ mod tests {
     /// looser permissions -- a plain create under the usual umask 022
     /// would leave the daemon credential 0644, readable by other users.
     /// On non-Unix a plain write is used.
-    fn write_token_file_atomically(
-        path: &std::path::Path,
-        contents: &str,
-    ) -> std::io::Result<()> {
+    fn write_token_file_atomically(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -9735,21 +10453,17 @@ mod tests {
                 laya_bundle_path: "artifacts/laya-bundle".to_string(),
             };
             let _ = &mut cfg;
-            let checker = Arc::new(crate::judgment::DeduplicationChecker::new_with_provider(cfg, provider));
+            let checker = Arc::new(crate::judgment::DeduplicationChecker::new_with_provider(
+                cfg, provider,
+            ));
 
             let incoming = payload("same subject");
             let mut incoming = incoming;
             incoming.memory_type = "fact".to_string();
             // no attempt
 
-            let res = embed_dedup_and_upsert(
-                &store,
-                &emb,
-                "probe",
-                &incoming,
-                Some(&checker),
-            )
-            .await;
+            let res =
+                embed_dedup_and_upsert(&store, &emb, "probe", &incoming, Some(&checker)).await;
             assert!(res.is_ok(), "write should succeed: {:?}", res);
             assert_eq!(
                 *calls.lock().unwrap(),
@@ -9792,7 +10506,9 @@ mod tests {
                 laya_bundle_path: "artifacts/laya-bundle".to_string(),
                 cb_backoff_max_seconds: 60,
             };
-            let checker = Arc::new(crate::judgment::DeduplicationChecker::new_with_provider(cfg, provider));
+            let checker = Arc::new(crate::judgment::DeduplicationChecker::new_with_provider(
+                cfg, provider,
+            ));
 
             let mut incoming = payload("same subject");
             incoming.memory_type = "fact".to_string();
@@ -9805,14 +10521,8 @@ mod tests {
                 }
             });
 
-            let res = embed_dedup_and_upsert(
-                &store,
-                &emb,
-                "probe",
-                &incoming,
-                Some(&checker),
-            )
-            .await;
+            let res =
+                embed_dedup_and_upsert(&store, &emb, "probe", &incoming, Some(&checker)).await;
             assert!(res.is_ok(), "write should succeed: {:?}", res);
             assert_eq!(
                 *calls.lock().unwrap(),
@@ -9862,7 +10572,9 @@ mod tests {
                 cb_backoff_initial_seconds: 1,
                 cb_backoff_max_seconds: 60,
             };
-            let checker = Arc::new(crate::judgment::DeduplicationChecker::new_with_provider(cfg, provider));
+            let checker = Arc::new(crate::judgment::DeduplicationChecker::new_with_provider(
+                cfg, provider,
+            ));
 
             let mut incoming = payload("same subject");
             incoming.memory_type = "fact".to_string();
@@ -9875,21 +10587,19 @@ mod tests {
                 }
             });
 
-            let res = embed_dedup_and_upsert(
-                &store,
-                &emb,
-                "probe",
-                &incoming,
-                Some(&checker),
-            )
-            .await;
+            let res =
+                embed_dedup_and_upsert(&store, &emb, "probe", &incoming, Some(&checker)).await;
             assert!(res.is_ok(), "write should succeed: {:?}", res);
             assert_eq!(
                 *calls.lock().unwrap(),
                 1,
                 "provider must be called for same-attempt candidates"
             );
-            assert_eq!(*last.lock().unwrap(), 1, "the candidate must be handed over");
+            assert_eq!(
+                *last.lock().unwrap(),
+                1,
+                "the candidate must be handed over"
+            );
         }
     }
 
@@ -10305,7 +11015,7 @@ mod tests {
     /// back and the merged aggregate carries a mean.
     #[tokio::test]
     async fn metrics_query_by_stage_name_only_sweeps_all_kinds() {
-        use crate::time_series::{ALL_METRIC_KINDS, MetricKind};
+        use crate::time_series::{MetricKind, ALL_METRIC_KINDS};
         let dir = std::env::temp_dir().join(format!(
             "ns-metrics-sweep-{}-{}",
             std::process::id(),
@@ -10395,7 +11105,10 @@ mod tests {
         )
         .await;
         assert!(text.contains(&id), "the lexical hit is rendered: {text}");
-        assert!(text.contains("lexical-inhouse"), "the derivation is visible: {text}");
+        assert!(
+            text.contains("lexical-inhouse"),
+            "the derivation is visible: {text}"
+        );
     }
 
     /// A store holding two rules in two different domains, so a domain filter
@@ -10735,8 +11448,13 @@ mod tests {
         let parsed: Value = serde_json::from_str(&text).expect("valid JSON");
         assert_eq!(parsed["unsupported"], serde_json::json!(false));
         assert!(parsed.get("memories").is_some(), "memories present: {text}");
-        assert!(parsed.get("related_memories").is_some(), "related_memories present: {text}");
-        let ast = parsed.get("ast_summary").expect("ast_summary present: {text}");
+        assert!(
+            parsed.get("related_memories").is_some(),
+            "related_memories present: {text}"
+        );
+        let ast = parsed
+            .get("ast_summary")
+            .expect("ast_summary present: {text}");
         assert!(ast.get("symbols").is_some());
         assert!(ast.get("blast_radius_count").is_some());
         assert_eq!(
@@ -10752,7 +11470,10 @@ mod tests {
         });
         let text = handle_memories_for_file(defaulted, store.clone()).await;
         let parsed: Value = serde_json::from_str(&text).expect("valid JSON");
-        assert!(parsed.get("related_memories").is_some(), "default true: {text}");
+        assert!(
+            parsed.get("related_memories").is_some(),
+            "default true: {text}"
+        );
         assert!(parsed.get("ast_summary").is_some(), "default true: {text}");
 
         // `include_ast_edges: false` omits them.
@@ -10763,8 +11484,14 @@ mod tests {
         });
         let text = handle_memories_for_file(without, store).await;
         let parsed: Value = serde_json::from_str(&text).expect("valid JSON");
-        assert!(parsed.get("related_memories").is_none(), "related_memories omitted: {text}");
-        assert!(parsed.get("ast_summary").is_none(), "ast_summary omitted: {text}");
+        assert!(
+            parsed.get("related_memories").is_none(),
+            "related_memories omitted: {text}"
+        );
+        assert!(
+            parsed.get("ast_summary").is_none(),
+            "ast_summary omitted: {text}"
+        );
     }
 
     #[tokio::test]
@@ -11199,7 +11926,10 @@ mod tests {
             .into_iter()
             .find(|r| r.payload.content == "LadybugDB and FastEmbedder run locally")
             .expect("the memory is stored");
-        let cands = stored.payload.metadata.get("gliner_candidates")
+        let cands = stored
+            .payload
+            .metadata
+            .get("gliner_candidates")
             .and_then(|v| v.as_array())
             .expect("gliner_candidates array");
         assert!(!cands.is_empty(), "candidates should be non-empty");
@@ -11253,7 +11983,11 @@ mod tests {
             quiet_bus(),
         )
         .await;
-        assert!(reply_strict.contains("ERROR [MULTIMODAL]:"), "{}", reply_strict);
+        assert!(
+            reply_strict.contains("ERROR [MULTIMODAL]:"),
+            "{}",
+            reply_strict
+        );
     }
 
     #[tokio::test]
@@ -11292,7 +12026,11 @@ mod tests {
         )
         .await;
         assert!(projected.contains("RDF Digest:"), "{}", projected);
-        assert!(projected.contains("Inferred Shape Fields:"), "{}", projected);
+        assert!(
+            projected.contains("Inferred Shape Fields:"),
+            "{}",
+            projected
+        );
 
         // The digest must be computed from the REAL persisted id, not the
         // "pending" placeholder: pull the memory id out of the reply, find the
@@ -11303,10 +12041,7 @@ mod tests {
             .find(|l| l.starts_with("Memory ID: "))
             .map(|l| l["Memory ID: ".len()..].trim().to_string())
             .expect("reply must carry the persisted memory id");
-        let memories = store
-            .list("probe", None, None)
-            .await
-            .expect("probe rows");
+        let memories = store.list("probe", None, None).await.expect("probe rows");
         let row = memories
             .iter()
             .find(|m| m.id == bare_id || m.id.ends_with(&bare_id))
@@ -11669,7 +12404,11 @@ mod tests {
             .await
             .expect("list")
             .into_iter()
-            .find(|r| r.payload.content.starts_with("a rule written under a domain"))
+            .find(|r| {
+                r.payload
+                    .content
+                    .starts_with("a rule written under a domain")
+            })
             .expect("the memory is stored");
         assert_eq!(stored.payload.metadata["domain"], serde_json::json!("!!!"));
         assert_eq!(
@@ -12393,7 +13132,10 @@ mod tests {
         let refused = err.to_string();
         assert!(refused.contains("ERROR [SECURITY]"), "got {}", refused);
         assert!(refused.contains("github_pat"), "got {}", refused);
-        assert!(!refused.contains(&secret), "the refusal must not echo the secret");
+        assert!(
+            !refused.contains(&secret),
+            "the refusal must not echo the secret"
+        );
 
         let (_, payload) = store.get("probe", &id).await.unwrap().unwrap();
         assert_eq!(
@@ -12403,10 +13145,7 @@ mod tests {
     }
 
     /// A row owned by `owner`, with `metadata` already in place.
-    async fn store_with_owned_row(
-        owner: &str,
-        metadata: Value,
-    ) -> (Arc<dyn VectorStore>, String) {
+    async fn store_with_owned_row(owner: &str, metadata: Value) -> (Arc<dyn VectorStore>, String) {
         let dir = std::env::temp_dir().join(format!("ns-metadata-acl-{}", uuid::Uuid::new_v4()));
         let store: Arc<dyn VectorStore> = Arc::new(
             crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database"),
@@ -12417,7 +13156,15 @@ mod tests {
         p.user_id = owner.to_string();
         p.metadata = metadata;
         store
-            .upsert("probe", &id, StubEmbedder.embed("metadata authorization probe").await.unwrap(), p)
+            .upsert(
+                "probe",
+                &id,
+                StubEmbedder
+                    .embed("metadata authorization probe")
+                    .await
+                    .unwrap(),
+                p,
+            )
             .await
             .expect("seed the owned row");
         (store, id)
@@ -12427,7 +13174,8 @@ mod tests {
     #[tokio::test]
     async fn set_metadata_denies_a_viewer() {
         let acl = serde_json::json!([{"principal": "bob", "role": "viewer"}]);
-        let (store, id) = store_with_owned_row("alice", serde_json::json!({ "visible_to": acl })).await;
+        let (store, id) =
+            store_with_owned_row("alice", serde_json::json!({ "visible_to": acl })).await;
         let err = set_metadata(
             &*store,
             "probe",
@@ -12475,7 +13223,10 @@ mod tests {
         )
         .await
         .expect_err("only the owner or an admin may change visibility");
-        assert!(err.to_string().contains("only the owner or an admin"), "{err}");
+        assert!(
+            err.to_string().contains("only the owner or an admin"),
+            "{err}"
+        );
     }
 
     /// An ACL editor cannot promote a principal's role: the principals are
@@ -12506,7 +13257,10 @@ mod tests {
         )
         .await
         .expect_err("a role promotion needs the owner or an admin");
-        assert!(err.to_string().contains("only the owner or an admin"), "{err}");
+        assert!(
+            err.to_string().contains("only the owner or an admin"),
+            "{err}"
+        );
     }
 
     /// The owner may hand the row to someone else.
@@ -12933,8 +13687,8 @@ mod tests {
                 "neurostrata_sparql_query",
                 "neurostrata_task_intake",
                 "neurostrata_task_intake_list",
-            "neurostrata_task_intake_resolve",
-            "neurostrata_task_candidates",
+                "neurostrata_task_intake_resolve",
+                "neurostrata_task_candidates",
                 "neurostrata_twin_get",
                 "neurostrata_twin_set",
                 "neurostrata_twin_diff",
@@ -13329,10 +14083,7 @@ mod tests {
             bus.clone(),
         )
         .await;
-        assert!(
-            reply.starts_with("Successfully added memory"),
-            "{reply}"
-        );
+        assert!(reply.starts_with("Successfully added memory"), "{reply}");
 
         let rows = store.list("probe", None, None).await.expect("list");
         let proc_row = rows
@@ -13346,8 +14097,7 @@ mod tests {
             proc_row.payload.metadata
         );
 
-        let root =
-            std::env::temp_dir().join(format!("ns-task3-local-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("ns-task3-local-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).expect("scratch root");
         let outcome_text = crate::tools::procedure::handle_procedure_perform(
             serde_json::json!({
@@ -13377,10 +14127,7 @@ mod tests {
             bus,
         )
         .await;
-        assert!(
-            reply.starts_with("Successfully added memory"),
-            "{reply}"
-        );
+        assert!(reply.starts_with("Successfully added memory"), "{reply}");
         let rows = store.list("probe", None, None).await.expect("list");
         let rule_row = rows
             .iter()
@@ -13997,7 +14744,10 @@ mod tests {
     async fn the_snapshot_body_holds_no_registry_row() {
         let (store, _live_id) = store_with_one_rule("probe").await;
         let registry_id = crate::registry::registry_row_id("probe");
-        let vector = StubEmbedder.embed("Domain registry for probe").await.unwrap();
+        let vector = StubEmbedder
+            .embed("Domain registry for probe")
+            .await
+            .unwrap();
         let mut p = payload("Domain registry for probe");
         p.memory_type = "fact".to_string();
         p.metadata = crate::registry::registry_metadata(&["auth".to_string()]);
@@ -14006,12 +14756,9 @@ mod tests {
             .await
             .expect("seed the registry row");
 
-        let text = handle_get_snapshot(
-            serde_json::json!({ "namespace": "probe" }),
-            store,
-        )
-        .await
-        .expect("snapshot");
+        let text = handle_get_snapshot(serde_json::json!({ "namespace": "probe" }), store)
+            .await
+            .expect("snapshot");
         assert!(
             !text.contains(&registry_id),
             "the registry row is absent from the snapshot body: {text}"
@@ -14020,10 +14767,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_fact_written_with_a_free_text_domain_is_recalled_by_its_slug_tag() {
-        let dir = std::env::temp_dir().join(format!(
-            "ns-recall-real-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir = std::env::temp_dir().join(format!("ns-recall-real-{}", uuid::Uuid::new_v4()));
         // Create the parent directory for both the store and buffer
         std::fs::create_dir_all(&dir).expect("create parent dir");
         // Use a subdirectory path for the LadybugStore database (not created yet)
@@ -14048,7 +14792,11 @@ mod tests {
             quiet_bus(),
         )
         .await;
-        assert!(add_result.starts_with("Successfully added memory"), "add failed: {}", add_result);
+        assert!(
+            add_result.starts_with("Successfully added memory"),
+            "add failed: {}",
+            add_result
+        );
         // Extract the fact ID from the response
         let fact_id = add_result
             .lines()
@@ -14086,15 +14834,32 @@ mod tests {
         .await;
 
         let parsed: serde_json::Value = serde_json::from_str(&recall_result).unwrap();
-        assert!(parsed.get("appended").and_then(|v| v.as_bool()).unwrap_or(false), "appended was false or missing: {}", recall_result);
-        let recalled = parsed.get("recalled").expect("recalled field must be present");
+        assert!(
+            parsed
+                .get("appended")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            "appended was false or missing: {}",
+            recall_result
+        );
+        let recalled = parsed
+            .get("recalled")
+            .expect("recalled field must be present");
         let recalled_arr = recalled.as_array().unwrap();
-        assert_eq!(recalled_arr.len(), 1, "exactly one fact recalled: {}", recall_result);
+        assert_eq!(
+            recalled_arr.len(),
+            1,
+            "exactly one fact recalled: {}",
+            recall_result
+        );
         assert_eq!(
             recalled_arr[0].get("id").and_then(|v| v.as_str()),
             Some(fact_id.as_str())
         );
-        assert_eq!(parsed.get("recalled_from").and_then(|v| v.as_str()), Some("domain"));
+        assert_eq!(
+            parsed.get("recalled_from").and_then(|v| v.as_str()),
+            Some("domain")
+        );
 
         // Read access_count AFTER recall (must be present and unchanged)
         let after = store
@@ -14110,7 +14875,10 @@ mod tests {
             .as_u64()
             .expect("access_count must be a number");
         assert_eq!(access_after, 0, "access_count must still be 0 after recall");
-        assert_eq!(access_after, access_before, "access_count must not change during recall");
+        assert_eq!(
+            access_after, access_before,
+            "access_count must not change during recall"
+        );
     }
 
     /// The neurostrata_append_log tool's inputSchema must carry the optional
@@ -14126,15 +14894,8 @@ mod tests {
             params: Some(serde_json::json!({})),
         };
         let (bus, _seen) = recording_bus();
-        let response = process_mcp_request(
-            request,
-            Arc::new(StubEmbedder),
-            store,
-            ingests,
-            None,
-            bus,
-        )
-        .await;
+        let response =
+            process_mcp_request(request, Arc::new(StubEmbedder), store, ingests, None, bus).await;
         let tools = response["result"]["tools"]
             .as_array()
             .expect("tools/list returns an array");
@@ -14145,12 +14906,20 @@ mod tests {
         let props = append_log["inputSchema"]["properties"]
             .as_object()
             .expect("inputSchema.properties must be an object");
-        assert!(props.contains_key("namespace"), "namespace property missing: {:?}", props);
+        assert!(
+            props.contains_key("namespace"),
+            "namespace property missing: {:?}",
+            props
+        );
         let required = append_log["inputSchema"]["required"]
             .as_array()
             .expect("required must be an array");
         let required_names: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
-        assert!(!required_names.contains(&"namespace"), "namespace must not be in required: {:?}", required_names);
+        assert!(
+            !required_names.contains(&"namespace"),
+            "namespace must not be in required: {:?}",
+            required_names
+        );
     }
 
     /// End-to-end MCP path: tools/call → dispatch → handler → JSON with recalled.
@@ -14210,16 +14979,33 @@ mod tests {
             .expect("content[0].text must be a string");
         // Branch-tolerant: buffer may be disabled by machine config
         if text.contains("Episodic Buffer disabled") {
-            assert!(!text.contains("\"appended\":true"), "disabled response must not claim success: {}", text);
+            assert!(
+                !text.contains("\"appended\":true"),
+                "disabled response must not claim success: {}",
+                text
+            );
         } else {
-            let parsed: serde_json::Value = serde_json::from_str(text)
-                .expect("handler returns JSON");
-            assert!(parsed.get("appended").and_then(|v| v.as_bool()).unwrap_or(false));
-            assert!(parsed.get("recalled").is_some(), "recalled must be present: {}", text);
+            let parsed: serde_json::Value =
+                serde_json::from_str(text).expect("handler returns JSON");
+            assert!(parsed
+                .get("appended")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false));
+            assert!(
+                parsed.get("recalled").is_some(),
+                "recalled must be present: {}",
+                text
+            );
             let recalled = parsed.get("recalled").unwrap().as_array().unwrap();
             assert_eq!(recalled.len(), 1);
-            assert_eq!(recalled[0].get("id").and_then(|v| v.as_str()), Some(fact_id));
-            assert_eq!(parsed.get("recalled_from").and_then(|v| v.as_str()), Some("domain"));
+            assert_eq!(
+                recalled[0].get("id").and_then(|v| v.as_str()),
+                Some(fact_id)
+            );
+            assert_eq!(
+                parsed.get("recalled_from").and_then(|v| v.as_str()),
+                Some("domain")
+            );
         }
     }
 
@@ -14229,10 +15015,9 @@ mod tests {
     /// (src/server.rs:2468) -- so this pins an outgoing GOVERNS edge's text.
     #[tokio::test]
     async fn an_outgoing_directed_edge_is_printed_from_the_primary() {
-        let dir =
-            std::env::temp_dir().join(format!("ns-outgoing-render-{}", uuid::Uuid::new_v4()));
-        let store = crate::store::ladybug::LadybugStore::for_testing(&dir, 4)
-            .expect("open temp database");
+        let dir = std::env::temp_dir().join(format!("ns-outgoing-render-{}", uuid::Uuid::new_v4()));
+        let store =
+            crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database");
         store.init("probe").await.expect("create the schema");
 
         // The target first: an edge target must exist before the row that
@@ -14298,10 +15083,9 @@ mod tests {
     /// intermediate, to the neighbour that governs the intermediate.
     #[tokio::test]
     async fn a_two_hop_path_is_printed_from_the_primary_to_the_neighbour() {
-        let dir =
-            std::env::temp_dir().join(format!("ns-two-hop-render-{}", uuid::Uuid::new_v4()));
-        let store = crate::store::ladybug::LadybugStore::for_testing(&dir, 4)
-            .expect("open temp database");
+        let dir = std::env::temp_dir().join(format!("ns-two-hop-render-{}", uuid::Uuid::new_v4()));
+        let store =
+            crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database");
         store.init("probe").await.expect("create the schema");
 
         // The intermediate: an edge target must exist before the row that
@@ -14388,8 +15172,8 @@ mod tests {
     async fn an_undirected_relation_is_printed_once_with_an_undirected_connector() {
         let dir =
             std::env::temp_dir().join(format!("ns-undirected-render-{}", uuid::Uuid::new_v4()));
-        let store = crate::store::ladybug::LadybugStore::for_testing(&dir, 4)
-            .expect("open temp database");
+        let store =
+            crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database");
         store.init("probe").await.expect("create the schema");
 
         // The neighbour: an edge target must exist before the row that
@@ -14441,8 +15225,7 @@ mod tests {
             .find(|l| l.contains("Path [one_hop]:"))
             .expect("the neighbour must carry the one-hop path");
         assert_eq!(
-            line,
-            "Path [one_hop]: \"probe::primary\" --RELATES_TO-- \"probe::neighbour\"",
+            line, "Path [one_hop]: \"probe::primary\" --RELATES_TO-- \"probe::neighbour\"",
             "an undirected relation is printed once, with an undirected connector"
         );
     }
@@ -14488,8 +15271,8 @@ mod tests {
     async fn a_two_hop_path_with_a_directed_first_hop_shows_its_orientation() {
         let dir =
             std::env::temp_dir().join(format!("ns-two-hop-directed-{}", uuid::Uuid::new_v4()));
-        let store = crate::store::ladybug::LadybugStore::for_testing(&dir, 4)
-            .expect("open temp database");
+        let store =
+            crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database");
         store.init("probe").await.expect("create the schema");
 
         // The intermediate: the target of both GOVERNS edges.
@@ -14562,7 +15345,6 @@ mod tests {
             line,
             "Path [governs_2hop]: \"probe::primary\" -GOVERNS- \"probe::mid\" \
              \"probe::mid\" <-GOVERNS- \"probe::ruler\"",
-
             "a directed first hop must show the graph's direction"
         );
     }
@@ -14612,7 +15394,10 @@ mod tests {
         )
         .await
         .expect("snapshot");
-        assert!(text2.contains(&low_id), "strap holds the low fact (explicit): {text2}");
+        assert!(
+            text2.contains(&low_id),
+            "strap holds the low fact (explicit): {text2}"
+        );
     }
 
     #[tokio::test]
@@ -14622,7 +15407,11 @@ mod tests {
         // Five high-access rows, one of them domain-tagged.
         let domain_high_id = "high-domain".to_string();
         for i in 0..5 {
-            let id = if i == 0 { domain_high_id.clone() } else { format!("high-{}", i) };
+            let id = if i == 0 {
+                domain_high_id.clone()
+            } else {
+                format!("high-{}", i)
+            };
             let mut p = payload(&format!("high access rule {}", i));
             if i == 0 {
                 p.metadata = serde_json::json!({ "domain": "auth", "access_count": 10 });
@@ -14772,7 +15561,10 @@ mod tests {
     async fn the_snapshot_names_the_registered_domains() {
         let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
         let registry_id = crate::registry::registry_row_id("probe");
-        let vector = StubEmbedder.embed("Domain registry for probe").await.unwrap();
+        let vector = StubEmbedder
+            .embed("Domain registry for probe")
+            .await
+            .unwrap();
         let mut p = payload("Domain registry for probe");
         p.memory_type = "fact".to_string();
         p.metadata = crate::registry::registry_metadata(&[
@@ -14846,10 +15638,12 @@ mod tests {
         let before_total = crate::recall_metrics::domain_filter_snapshot()["domain_queries_total"]
             .as_u64()
             .unwrap();
-        let before_bypass = crate::recall_metrics::domain_filter_snapshot()["single_domain_bypasses"]
+        let before_bypass = crate::recall_metrics::domain_filter_snapshot()
+            ["single_domain_bypasses"]
             .as_u64()
             .unwrap();
-        let before_narrowed = crate::recall_metrics::domain_filter_snapshot()["domain_narrowed_hits"]
+        let before_narrowed = crate::recall_metrics::domain_filter_snapshot()
+            ["domain_narrowed_hits"]
             .as_u64()
             .unwrap();
 
@@ -14863,10 +15657,12 @@ mod tests {
         let after_total = crate::recall_metrics::domain_filter_snapshot()["domain_queries_total"]
             .as_u64()
             .unwrap();
-        let after_bypass = crate::recall_metrics::domain_filter_snapshot()["single_domain_bypasses"]
+        let after_bypass = crate::recall_metrics::domain_filter_snapshot()
+            ["single_domain_bypasses"]
             .as_u64()
             .unwrap();
-        let after_narrowed = crate::recall_metrics::domain_filter_snapshot()["domain_narrowed_hits"]
+        let after_narrowed = crate::recall_metrics::domain_filter_snapshot()
+            ["domain_narrowed_hits"]
             .as_u64()
             .unwrap();
         assert_eq!(after_total, before_total + 1);
@@ -14910,24 +15706,41 @@ mod tests {
         let mut reg_p = payload("Domain registry for probe-f9");
         reg_p.memory_type = "fact".to_string();
         reg_p.metadata = crate::registry::registry_metadata_v2(&entries);
-        store.upsert("probe-f9", &reg_id, vec.clone(), reg_p).await.unwrap();
+        store
+            .upsert("probe-f9", &reg_id, vec.clone(), reg_p)
+            .await
+            .unwrap();
 
         let mut p1 = payload("Parent auth rule");
-        p1.metadata = serde_json::json!({"domain": ["auth", "security"], "node_set": ["core", "edge"]});
-        store.upsert("probe-f9", "m-parent", vec.clone(), p1).await.unwrap();
+        p1.metadata =
+            serde_json::json!({"domain": ["auth", "security"], "node_set": ["core", "edge"]});
+        store
+            .upsert("probe-f9", "m-parent", vec.clone(), p1)
+            .await
+            .unwrap();
 
         let mut p2 = payload("Child tls rule");
         p2.metadata = serde_json::json!({"domain": "tls", "node_set": ["edge"]});
-        store.upsert("probe-f9", "m-child", vec.clone(), p2).await.unwrap();
+        store
+            .upsert("probe-f9", "m-child", vec.clone(), p2)
+            .await
+            .unwrap();
 
         // Default domain_expansion: true includes child domain "tls" when querying "auth"
         let expanded_res = handle_search_memory(
             serde_json::json!({"namespace": "probe-f9", "query": "auth rule", "domain": "auth"}),
             emb.clone(),
             store.clone(),
-        ).await;
-        assert!(expanded_res.contains("m-parent"), "expanded should contain parent: {expanded_res}");
-        assert!(expanded_res.contains("m-child"), "expanded should contain child: {expanded_res}");
+        )
+        .await;
+        assert!(
+            expanded_res.contains("m-parent"),
+            "expanded should contain parent: {expanded_res}"
+        );
+        assert!(
+            expanded_res.contains("m-child"),
+            "expanded should contain child: {expanded_res}"
+        );
 
         // domain_expansion: false excludes child domain "tls" when querying "auth"
         let unexpanded_res = handle_search_memory(
@@ -14935,8 +15748,14 @@ mod tests {
             emb.clone(),
             store.clone(),
         ).await;
-        assert!(unexpanded_res.contains("m-parent"), "unexpanded should contain parent: {unexpanded_res}");
-        assert!(!unexpanded_res.contains("m-child"), "unexpanded must exclude child: {unexpanded_res}");
+        assert!(
+            unexpanded_res.contains("m-parent"),
+            "unexpanded should contain parent: {unexpanded_res}"
+        );
+        assert!(
+            !unexpanded_res.contains("m-child"),
+            "unexpanded must exclude child: {unexpanded_res}"
+        );
 
         // node_set_mode: "all" with ["core", "edge"] keeps only m-parent
         let ns_all_res = handle_search_memory(
@@ -14967,16 +15786,30 @@ mod tests {
         let dry = handle_distill(
             serde_json::json!({"namespace": "probe-f22", "session_dir": rel_sess, "dry_run": true}),
             store.clone(),
-        ).await;
-        assert!(dry.contains("[rule_candidate] We must always validate SHACL shapes before export."), "dry={dry}");
-        assert!(dry.contains("[todo:] TODO: wire extra telemetry metric"), "dry={dry}");
-        assert_eq!(dry.matches("[rule_candidate]").count(), 1, "duplicate line must be deduped: {dry}");
+        )
+        .await;
+        assert!(
+            dry.contains("[rule_candidate] We must always validate SHACL shapes before export."),
+            "dry={dry}"
+        );
+        assert!(
+            dry.contains("[todo:] TODO: wire extra telemetry metric"),
+            "dry={dry}"
+        );
+        assert_eq!(
+            dry.matches("[rule_candidate]").count(),
+            1,
+            "duplicate line must be deduped: {dry}"
+        );
 
         let live = handle_distill(
             serde_json::json!({"namespace": "probe-f22", "session_dir": rel_sess, "dry_run": false}),
             store,
         ).await;
-        assert!(live.contains("Proposed candidates (review-only): 2 created."), "live={live}");
+        assert!(
+            live.contains("Proposed candidates (review-only): 2 created."),
+            "live={live}"
+        );
         let _ = std::fs::remove_dir_all(&sess_path);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -14990,713 +15823,777 @@ mod tests {
         let vec = vec![1.0, 0.0, 0.0, 0.0];
 
         let p1 = payload("First candidate memory");
-        store.upsert("probe-f23", "cand-low", vec.clone(), p1).await.unwrap();
+        store
+            .upsert("probe-f23", "cand-low", vec.clone(), p1)
+            .await
+            .unwrap();
         let p2 = payload("Second candidate memory");
-        store.upsert("probe-f23", "cand-high", vec.clone(), p2).await.unwrap();
+        store
+            .upsert("probe-f23", "cand-high", vec.clone(), p2)
+            .await
+            .unwrap();
 
         // Out-of-range rating rejected without mutating
         let bad = handle_feedback_memory(
             serde_json::json!({"namespace": "probe-f23", "id": "cand-high", "rating": 2.5}),
             store.clone(),
-        ).await;
-        assert!(bad.contains("ERROR: rating must be in [-1, 1]."), "bad={bad}");
+        )
+        .await;
+        assert!(
+            bad.contains("ERROR: rating must be in [-1, 1]."),
+            "bad={bad}"
+        );
 
         // Valid positive feedback on cand-high and negative on cand-low
         let ok_high = handle_feedback_memory(
             serde_json::json!({"namespace": "probe-f23", "id": "cand-high", "rating": 1.0}),
             store.clone(),
-        ).await;
-        assert!(ok_high.contains("\"ok\":true") && ok_high.contains("\"feedback_score\":1.0"), "ok_high={ok_high}");
+        )
+        .await;
+        assert!(
+            ok_high.contains("\"ok\":true") && ok_high.contains("\"feedback_score\":1.0"),
+            "ok_high={ok_high}"
+        );
         let ok_low = handle_feedback_memory(
             serde_json::json!({"namespace": "probe-f23", "id": "cand-low", "rating": -1.0}),
             store.clone(),
-        ).await;
-        assert!(ok_low.contains("\"ok\":true") && ok_low.contains("\"feedback_score\":-1.0"), "ok_low={ok_low}");
+        )
+        .await;
+        assert!(
+            ok_low.contains("\"ok\":true") && ok_low.contains("\"feedback_score\":-1.0"),
+            "ok_low={ok_low}"
+        );
 
         // Verify ranking: cand-high must rank ahead of cand-low (lower distance score)
-        let results = store.search("probe-f23", vec, 5, false, false).await.unwrap();
-        let pos_high = results.iter().position(|r| r.id == "cand-high").expect("cand-high present");
-        let pos_low = results.iter().position(|r| r.id == "cand-low").expect("cand-low present");
-        assert!(pos_high < pos_low, "positive feedback memory must rank above negative feedback memory");
+        let results = store
+            .search("probe-f23", vec, 5, false, false)
+            .await
+            .unwrap();
+        let pos_high = results
+            .iter()
+            .position(|r| r.id == "cand-high")
+            .expect("cand-high present");
+        let pos_low = results
+            .iter()
+            .position(|r| r.id == "cand-low")
+            .expect("cand-low present");
+        assert!(
+            pos_high < pos_low,
+            "positive feedback memory must rank above negative feedback memory"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn test_handle_search_memory_applies_search_filters() {
+        let dir = std::env::temp_dir().join(format!("ns-sf-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn crate::traits::VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&dir, 4).expect("open temp database"));
+        store.init("probe").await.expect("init namespace");
 
-#[tokio::test]
-async fn test_handle_search_memory_applies_search_filters() {
-    let dir = std::env::temp_dir().join(format!("ns-sf-{}", uuid::Uuid::new_v4()));
-    let store: Arc<dyn crate::traits::VectorStore> = Arc::new(
-        crate::store::LadybugStore::for_testing(&dir, 4).expect("open temp database"),
-    );
-    store.init("probe").await.expect("init namespace");
+        let id_rule = uuid::Uuid::new_v4().to_string();
+        let mut p_rule = payload("always use podman");
+        p_rule.location = "src/a.rs".to_string();
+        p_rule.memory_type = "rule".to_string();
+        store
+            .upsert(
+                "probe",
+                &id_rule,
+                StubEmbedder.embed("always use podman").await.unwrap(),
+                p_rule,
+            )
+            .await
+            .expect("seed rule");
 
-    let id_rule = uuid::Uuid::new_v4().to_string();
-    let mut p_rule = payload("always use podman");
-    p_rule.location = "src/a.rs".to_string();
-    p_rule.memory_type = "rule".to_string();
-    store
-        .upsert("probe", &id_rule, StubEmbedder.embed("always use podman").await.unwrap(), p_rule)
-        .await
-        .expect("seed rule");
+        let id_fact = uuid::Uuid::new_v4().to_string();
+        let mut p_fact = payload("podman database access");
+        p_fact.location = "src/b.rs".to_string();
+        p_fact.memory_type = "fact".to_string();
+        p_fact.metadata =
+            serde_json::json!({"source_currency":"changed","verification":{"status":"unverified"}});
+        store
+            .upsert(
+                "probe",
+                &id_fact,
+                StubEmbedder.embed("podman database access").await.unwrap(),
+                p_fact,
+            )
+            .await
+            .expect("seed fact");
 
-    let id_fact = uuid::Uuid::new_v4().to_string();
-    let mut p_fact = payload("podman database access");
-    p_fact.location = "src/b.rs".to_string();
-    p_fact.memory_type = "fact".to_string();
-    p_fact.metadata = serde_json::json!({"source_currency":"changed","verification":{"status":"unverified"}});
-    store
-        .upsert("probe", &id_fact, StubEmbedder.embed("podman database access").await.unwrap(), p_fact)
-        .await
-        .expect("seed fact");
+        let id_code = uuid::Uuid::new_v4().to_string();
+        let mut p_code = payload("podman code ast");
+        p_code.location = "src/c.rs".to_string();
+        p_code.memory_type = "code_ast".to_string();
+        store
+            .upsert(
+                "probe",
+                &id_code,
+                StubEmbedder.embed("podman code ast").await.unwrap(),
+                p_code,
+            )
+            .await
+            .expect("seed code_ast");
 
-    let id_code = uuid::Uuid::new_v4().to_string();
-    let mut p_code = payload("podman code ast");
-    p_code.location = "src/c.rs".to_string();
-    p_code.memory_type = "code_ast".to_string();
-    store
-        .upsert("probe", &id_code, StubEmbedder.embed("podman code ast").await.unwrap(), p_code)
-        .await
-        .expect("seed code_ast");
-
-    // memory_types filter
-    let text = handle_search_memory(
+        // memory_types filter
+        let text = handle_search_memory(
         serde_json::json!({"namespace":"probe","query":"podman","memory_types":["rule"],"mode":"lexical-inhouse"}),
         Arc::new(StubEmbedder),
         store.clone(),
     )
     .await;
-    assert!(text.contains(&id_rule), "rule should survive memory_types filter: {text}");
-    assert!(!text.contains(&id_fact), "fact should be filtered out: {text}");
-    assert!(!text.contains(&id_code), "code_ast should be filtered out: {text}");
+        assert!(
+            text.contains(&id_rule),
+            "rule should survive memory_types filter: {text}"
+        );
+        assert!(
+            !text.contains(&id_fact),
+            "fact should be filtered out: {text}"
+        );
+        assert!(
+            !text.contains(&id_code),
+            "code_ast should be filtered out: {text}"
+        );
 
-    // path_prefix filter
-    let text = handle_search_memory(
+        // path_prefix filter
+        let text = handle_search_memory(
         serde_json::json!({"namespace":"probe","query":"podman","path_prefix":"src/b.rs","mode":"lexical-inhouse"}),
         Arc::new(StubEmbedder),
         store.clone(),
     )
     .await;
-    assert!(text.contains(&id_fact), "fact should survive path_prefix filter: {text}");
-    assert!(!text.contains(&id_rule), "rule should be filtered out by path_prefix: {text}");
+        assert!(
+            text.contains(&id_fact),
+            "fact should survive path_prefix filter: {text}"
+        );
+        assert!(
+            !text.contains(&id_rule),
+            "rule should be filtered out by path_prefix: {text}"
+        );
 
-    // exclude_stale filter
-    let text = handle_search_memory(
+        // exclude_stale filter
+        let text = handle_search_memory(
         serde_json::json!({"namespace":"probe","query":"podman","exclude_stale":true,"mode":"lexical-inhouse"}),
         Arc::new(StubEmbedder),
         store.clone(),
     )
     .await;
-    assert!(!text.contains(&id_fact), "stale fact should be excluded: {text}");
+        assert!(
+            !text.contains(&id_fact),
+            "stale fact should be excluded: {text}"
+        );
 
-    let _ = std::fs::remove_dir_all(&dir);
-}
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
-#[tokio::test]
-async fn process_mcp_request_injects_and_drains_neuromesh_delta_notices() {
-    let ns = format!("ns-neuromesh-mcp-{}", uuid::Uuid::new_v4());
-    let (store, _) = store_with_one_rule(&ns).await;
-    let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
-    let (bus, _) = recording_bus();
+    #[tokio::test]
+    async fn process_mcp_request_injects_and_drains_neuromesh_delta_notices() {
+        let ns = format!("ns-neuromesh-mcp-{}", uuid::Uuid::new_v4());
+        let (store, _) = store_with_one_rule(&ns).await;
+        let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+        let (bus, _) = recording_bus();
 
-    // 1. First MCP tool call touches `src/synaptic_mesh/reactor.rs` in namespace `ns`.
-    let req1 = JsonRpcRequest {
-        jsonrpc: "2.0".to_string(),
-        id: Some(serde_json::json!(101)),
-        method: "tools/call".to_string(),
-        params: Some(serde_json::json!({
-            "name": "neurostrata_memories_for_file",
-            "arguments": {
-                "namespace": ns,
-                "file_path": "src/synaptic_mesh/reactor.rs"
-            }
-        })),
-    };
-    let _ = process_mcp_request(
-        req1,
-        Arc::new(StubEmbedder),
-        store.clone(),
-        ingests.clone(),
-        None,
-        bus.clone(),
-    )
-    .await;
-
-    // 2. Peer frame arrives touching `task-mesh-1` after session also claims `task-mesh-1`,
-    //    or touching `src/synaptic_mesh/reactor.rs` via a twin/task in `ns`.
-    crate::synaptic_mesh::attention::global_attention_filter().record_mcp_tool_call(
-        "neurostrata_task_claim",
-        &serde_json::json!({
-            "namespace": ns,
-            "id": "task-mesh-1",
-            "session_id": "ses-mcp-e2e"
-        }),
-    );
-    let inbound = crate::synaptic_mesh::frame::MeshFrame {
-        mesh_id: "m-e2e".into(),
-        epoch: 1,
-        origin_node_id: "did:key:z6MkpPeerNode9999".into(),
-        seq: 1,
-        lamport_ts: 777,
-        timestamp_ms: 1000,
-        namespace: ns.clone(),
-        visible_to: vec![],
-        kind: crate::synaptic_mesh::frame::MeshPayloadKind::TaskLeaseDelta {
-            lease: crate::synaptic_mesh::frame::TaskLease {
-                task_id: "task-mesh-1".into(),
-                holder_node_id: "did:key:z6MkpPeerNode9999".into(),
-                session_id: "peer-ses".into(),
-                lamport_ts: 777,
-                ttl_ms: 60_000,
-                expires_at_ms: 99_999,
-            },
-        },
-        signature: "sig".into(),
-    };
-    let hits = crate::synaptic_mesh::attention::global_attention_filter()
-        .evaluate_inbound_frame(&inbound);
-    assert_eq!(hits.len(), 1);
-
-    // 3. Next MCP tool call in `ns` receives the `[NeuroMesh Δ ...]` interrupt at the end of its text.
-    let req2 = JsonRpcRequest {
-        jsonrpc: "2.0".to_string(),
-        id: Some(serde_json::json!(102)),
-        method: "tools/call".to_string(),
-        params: Some(serde_json::json!({
-            "name": "neurostrata_search_memory",
-            "arguments": {
-                "namespace": ns,
-                "query": "rule"
-            }
-        })),
-    };
-    let resp2 = process_mcp_request(
-        req2,
-        Arc::new(StubEmbedder),
-        store.clone(),
-        ingests.clone(),
-        None,
-        bus.clone(),
-    )
-    .await;
-    let text2 = resp2["result"]["content"][0]["text"]
-        .as_str()
-        .expect("text response");
-    assert!(
-        text2.contains("[NeuroMesh Δ peer=") && text2.contains("lamport=777]") && text2.contains("task-mesh-1"),
-        "expected [NeuroMesh Δ] notice in MCP response, got: {text2}"
-    );
-
-    // 4. Subsequent MCP tool call has drained the notice and does not repeat it.
-    let req3 = JsonRpcRequest {
-        jsonrpc: "2.0".to_string(),
-        id: Some(serde_json::json!(103)),
-        method: "tools/call".to_string(),
-        params: Some(serde_json::json!({
-            "name": "neurostrata_search_memory",
-            "arguments": {
-                "namespace": ns,
-                "query": "rule"
-            }
-        })),
-    };
-    let resp3 = process_mcp_request(
-        req3,
-        Arc::new(StubEmbedder),
-        store,
-        ingests,
-        None,
-        bus,
-    )
-    .await;
-    let text3 = resp3["result"]["content"][0]["text"]
-        .as_str()
-        .expect("text response");
-    assert!(
-        !text3.contains("[NeuroMesh Δ"),
-        "drained notice must not repeat on subsequent call: {text3}"
-    );
-}
-
-#[tokio::test]
-async fn tool_list_and_mcp_dispatch_expose_all_five_action_operations() {
-    let ns = format!("ns-mcp-act-{}", uuid::Uuid::new_v4());
-    let (store, _) = store_with_one_rule(&ns).await;
-    let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
-    let (bus, _) = recording_bus();
-
-    // 1. tools/list exposes neurostrata_action with all 5 action enum values
-    let list_req = JsonRpcRequest {
-        jsonrpc: "2.0".to_string(),
-        id: Some(serde_json::json!(1)),
-        method: "tools/list".to_string(),
-        params: Some(serde_json::json!({})),
-    };
-    let list_resp = process_mcp_request(
-        list_req,
-        Arc::new(StubEmbedder),
-        store.clone(),
-        ingests.clone(),
-        None,
-        bus.clone(),
-    )
-    .await;
-    let tools = list_resp["result"]["tools"].as_array().expect("tools array");
-    let action_tool = tools
-        .iter()
-        .find(|t| t["name"] == "neurostrata_action")
-        .expect("neurostrata_action must be in tools/list");
-    let enum_vals = action_tool["inputSchema"]["properties"]["action"]["enum"]
-        .as_array()
-        .expect("action enum");
-    assert_eq!(
-        enum_vals,
-        &vec![
-            serde_json::json!("define"),
-            serde_json::json!("validate"),
-            serde_json::json!("apply"),
-            serde_json::json!("revert"),
-            serde_json::json!("log"),
-        ]
-    );
-
-    // Seed a digital twin target for the action
-    store
-        .upsert(
-            &ns,
-            "twin-loop-a",
-            vec![0.1, 0.2, 0.3, 0.4],
-            MemoryPayload {
-                content: "Digital twin loop-a v1".to_string(),
-                user_id: "alice".to_string(),
-                memory_type: "digital_twin".to_string(),
-                agent_name: None,
-                location: String::new(),
-                location_lines: String::new(),
-                metadata: serde_json::json!({
-                    "valid_from": 1700000000,
-                    "twin": {
-                        "id": "loop-a",
-                        "version": 1,
-                        "schema_id": "cooling-loop",
-                        "variables": { "temperature": 65.0 }
-                    }
-                }),
-            },
+        // 1. First MCP tool call touches `src/synaptic_mesh/reactor.rs` in namespace `ns`.
+        let req1 = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(101)),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "name": "neurostrata_memories_for_file",
+                "arguments": {
+                    "namespace": ns,
+                    "file_path": "src/synaptic_mesh/reactor.rs"
+                }
+            })),
+        };
+        let _ = process_mcp_request(
+            req1,
+            Arc::new(StubEmbedder),
+            store.clone(),
+            ingests.clone(),
+            None,
+            bus.clone(),
         )
-        .await
-        .unwrap();
+        .await;
 
-    // 2. Dispatch "define"
-    let def_req = JsonRpcRequest {
-        jsonrpc: "2.0".to_string(),
-        id: Some(serde_json::json!(2)),
-        method: "tools/call".to_string(),
-        params: Some(serde_json::json!({
-            "name": "neurostrata_action",
-            "arguments": {
+        // 2. Peer frame arrives touching `task-mesh-1` after session also claims `task-mesh-1`,
+        //    or touching `src/synaptic_mesh/reactor.rs` via a twin/task in `ns`.
+        crate::synaptic_mesh::attention::global_attention_filter().record_mcp_tool_call(
+            "neurostrata_task_claim",
+            &serde_json::json!({
+                "namespace": ns,
+                "id": "task-mesh-1",
+                "session_id": "ses-mcp-e2e"
+            }),
+        );
+        let inbound = crate::synaptic_mesh::frame::MeshFrame {
+            mesh_id: "m-e2e".into(),
+            epoch: 1,
+            origin_node_id: "did:key:z6MkpPeerNode9999".into(),
+            seq: 1,
+            lamport_ts: 777,
+            timestamp_ms: 1000,
+            namespace: ns.clone(),
+            visible_to: vec![],
+            kind: crate::synaptic_mesh::frame::MeshPayloadKind::TaskLeaseDelta {
+                lease: crate::synaptic_mesh::frame::TaskLease {
+                    task_id: "task-mesh-1".into(),
+                    holder_node_id: "did:key:z6MkpPeerNode9999".into(),
+                    session_id: "peer-ses".into(),
+                    lamport_ts: 777,
+                    ttl_ms: 60_000,
+                    expires_at_ms: 99_999,
+                },
+            },
+            signature: "sig".into(),
+        };
+        let hits = crate::synaptic_mesh::attention::global_attention_filter()
+            .evaluate_inbound_frame(&inbound);
+        assert_eq!(hits.len(), 1);
+
+        // 3. Next MCP tool call in `ns` receives the `[NeuroMesh Δ ...]` interrupt at the end of its text.
+        let req2 = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(102)),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "name": "neurostrata_search_memory",
+                "arguments": {
+                    "namespace": ns,
+                    "query": "rule"
+                }
+            })),
+        };
+        let resp2 = process_mcp_request(
+            req2,
+            Arc::new(StubEmbedder),
+            store.clone(),
+            ingests.clone(),
+            None,
+            bus.clone(),
+        )
+        .await;
+        let text2 = resp2["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text response");
+        assert!(
+            text2.contains("[NeuroMesh Δ peer=")
+                && text2.contains("lamport=777]")
+                && text2.contains("task-mesh-1"),
+            "expected [NeuroMesh Δ] notice in MCP response, got: {text2}"
+        );
+
+        // 4. Subsequent MCP tool call has drained the notice and does not repeat it.
+        let req3 = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(103)),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "name": "neurostrata_search_memory",
+                "arguments": {
+                    "namespace": ns,
+                    "query": "rule"
+                }
+            })),
+        };
+        let resp3 =
+            process_mcp_request(req3, Arc::new(StubEmbedder), store, ingests, None, bus).await;
+        let text3 = resp3["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text response");
+        assert!(
+            !text3.contains("[NeuroMesh Δ"),
+            "drained notice must not repeat on subsequent call: {text3}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_list_and_mcp_dispatch_expose_all_five_action_operations() {
+        let ns = format!("ns-mcp-act-{}", uuid::Uuid::new_v4());
+        let (store, _) = store_with_one_rule(&ns).await;
+        let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+        let (bus, _) = recording_bus();
+
+        // 1. tools/list exposes neurostrata_action with all 5 action enum values
+        let list_req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: "tools/list".to_string(),
+            params: Some(serde_json::json!({})),
+        };
+        let list_resp = process_mcp_request(
+            list_req,
+            Arc::new(StubEmbedder),
+            store.clone(),
+            ingests.clone(),
+            None,
+            bus.clone(),
+        )
+        .await;
+        let tools = list_resp["result"]["tools"]
+            .as_array()
+            .expect("tools array");
+        let action_tool = tools
+            .iter()
+            .find(|t| t["name"] == "neurostrata_action")
+            .expect("neurostrata_action must be in tools/list");
+        let enum_vals = action_tool["inputSchema"]["properties"]["action"]["enum"]
+            .as_array()
+            .expect("action enum");
+        assert_eq!(
+            enum_vals,
+            &vec![
+                serde_json::json!("define"),
+                serde_json::json!("validate"),
+                serde_json::json!("apply"),
+                serde_json::json!("revert"),
+                serde_json::json!("log"),
+            ]
+        );
+
+        // Seed a digital twin target for the action
+        store
+            .upsert(
+                &ns,
+                "twin-loop-a",
+                vec![0.1, 0.2, 0.3, 0.4],
+                MemoryPayload {
+                    content: "Digital twin loop-a v1".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "digital_twin".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({
+                        "valid_from": 1700000000,
+                        "twin": {
+                            "id": "loop-a",
+                            "version": 1,
+                            "schema_id": "cooling-loop",
+                            "variables": { "temperature": 65.0 }
+                        }
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+
+        // 2. Dispatch "define"
+        let def_req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(2)),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "name": "neurostrata_action",
+                "arguments": {
+                    "namespace": ns,
+                    "action": "define",
+                    "definition": {
+                        "slug": "recalibrate-cooling-loop",
+                        "title": "Recalibrate Cooling Loop",
+                        "description": "Adjust loop temperature",
+                        "required_role": "editor",
+                        "parameters": {
+                            "twin_id": { "param_type": "twin_id", "required": true },
+                            "target_temp": { "param_type": "f64", "required": true, "min": 10.0, "max": 90.0 }
+                        },
+                        "submission_criteria": [
+                            {
+                                "kind": "twin_var_precondition",
+                                "twin_param": "twin_id",
+                                "variable": "temperature",
+                                "min": 0.0,
+                                "max": 100.0
+                            }
+                        ],
+                        "effects": [
+                            {
+                                "op": "set_twin_state",
+                                "twin_param": "twin_id",
+                                "merge": true,
+                                "variables_from_params": { "temperature": "target_temp" }
+                            }
+                        ]
+                    }
+                }
+            })),
+        };
+        let def_resp = process_mcp_request(
+            def_req,
+            Arc::new(StubEmbedder),
+            store.clone(),
+            ingests.clone(),
+            None,
+            bus.clone(),
+        )
+        .await;
+        let def_json: Value =
+            serde_json::from_str(def_resp["result"]["content"][0]["text"].as_str().unwrap())
+                .expect("define returns JSON");
+        assert_eq!(
+            def_json["ok"],
+            serde_json::json!(true),
+            "define failed: {def_json}"
+        );
+        assert_eq!(
+            def_json["defined"]["slug"],
+            serde_json::json!("recalibrate-cooling-loop")
+        );
+
+        // 3. Dispatch "validate"
+        let val_req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(3)),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "name": "neurostrata_action",
+                "arguments": {
+                    "namespace": ns,
+                    "action": "validate",
+                    "slug": "recalibrate-cooling-loop",
+                    "params": { "twin_id": "loop-a", "target_temp": 42.5 }
+                }
+            })),
+        };
+        let val_resp = process_mcp_request(
+            val_req,
+            Arc::new(StubEmbedder),
+            store.clone(),
+            ingests.clone(),
+            None,
+            bus.clone(),
+        )
+        .await;
+        let val_json: Value =
+            serde_json::from_str(val_resp["result"]["content"][0]["text"].as_str().unwrap())
+                .expect("validate returns JSON");
+        assert_eq!(val_json["ok"], serde_json::json!(true));
+        assert_eq!(val_json["valid"], serde_json::json!(true));
+
+        // 4. Dispatch "apply"
+        let apply_req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(4)),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "name": "neurostrata_action",
+                "arguments": {
+                    "namespace": ns,
+                    "action": "apply",
+                    "slug": "recalibrate-cooling-loop",
+                    "params": { "twin_id": "loop-a", "target_temp": 42.5 }
+                }
+            })),
+        };
+        let apply_resp = process_mcp_request(
+            apply_req,
+            Arc::new(StubEmbedder),
+            store.clone(),
+            ingests.clone(),
+            None,
+            bus.clone(),
+        )
+        .await;
+        let apply_json: Value =
+            serde_json::from_str(apply_resp["result"]["content"][0]["text"].as_str().unwrap())
+                .expect("apply returns JSON");
+        assert_eq!(
+            apply_json["ok"],
+            serde_json::json!(true),
+            "apply failed: {apply_json}"
+        );
+        let receipt_id = apply_json["applied"]["receipt_id"]
+            .as_str()
+            .expect("receipt_id")
+            .to_string();
+
+        // 5. Dispatch "revert"
+        let rev_req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(5)),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "name": "neurostrata_action",
+                "arguments": {
+                    "namespace": ns,
+                    "action": "revert",
+                    "receipt_id": receipt_id
+                }
+            })),
+        };
+        let rev_resp = process_mcp_request(
+            rev_req,
+            Arc::new(StubEmbedder),
+            store.clone(),
+            ingests.clone(),
+            None,
+            bus.clone(),
+        )
+        .await;
+        let rev_json: Value =
+            serde_json::from_str(rev_resp["result"]["content"][0]["text"].as_str().unwrap())
+                .expect("revert returns JSON");
+        assert_eq!(
+            rev_json["ok"],
+            serde_json::json!(true),
+            "revert failed: {rev_json}"
+        );
+
+        // 6. Dispatch "log"
+        let log_req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(6)),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "name": "neurostrata_action",
+                "arguments": {
+                    "namespace": ns,
+                    "action": "log",
+                    "limit": 10
+                }
+            })),
+        };
+        let log_resp =
+            process_mcp_request(log_req, Arc::new(StubEmbedder), store, ingests, None, bus).await;
+        let log_json: Value =
+            serde_json::from_str(log_resp["result"]["content"][0]["text"].as_str().unwrap())
+                .expect("log returns JSON");
+        assert_eq!(log_json["ok"], serde_json::json!(true));
+        assert_eq!(log_json["entries"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn define_is_strict_about_schema_and_duplicate_active_slug() {
+        let ns = format!("ns-def-strict-{}", uuid::Uuid::new_v4());
+        let (store, _) = store_with_one_rule(&ns).await;
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+
+        let count_before = store.list(&ns, None, None).await.unwrap().len();
+
+        // 1. Malformed definition (invalid role + empty effects) is strictly rejected with zero writes
+        let bad_out = handle_action(
+            &serde_json::json!({
                 "namespace": ns,
                 "action": "define",
                 "definition": {
-                    "slug": "recalibrate-cooling-loop",
-                    "title": "Recalibrate Cooling Loop",
-                    "description": "Adjust loop temperature",
+                    "slug": "Invalid_Slug",
+                    "title": "Bad",
+                    "description": "Bad",
+                    "required_role": "superadmin",
+                    "parameters": {},
+                    "submission_criteria": [],
+                    "effects": []
+                }
+            }),
+            emb.clone(),
+            store.clone(),
+        )
+        .await;
+        let bad_json: Value = serde_json::from_str(&bad_out).unwrap();
+        assert_eq!(bad_json["ok"], serde_json::json!(false));
+        assert_eq!(
+            store.list(&ns, None, None).await.unwrap().len(),
+            count_before,
+            "malformed define must not write any row"
+        );
+
+        // 2. Valid definition succeeds and compiles into OntologyIndex
+        let valid_def = serde_json::json!({
+            "slug": "strict-create-note",
+            "title": "Strict Create Note",
+            "description": "Creates a fact note",
+            "required_role": "editor",
+            "parameters": {
+                "msg": { "param_type": "string", "required": true }
+            },
+            "submission_criteria": [],
+            "effects": [
+                {
+                    "op": "upsert_memory",
+                    "memory_type": "fact",
+                    "content_template": "Note: {{msg}}",
+                    "metadata_template": {}
+                }
+            ]
+        });
+        let ok_out = handle_action(
+            &serde_json::json!({
+                "namespace": ns,
+                "action": "define",
+                "definition": valid_def.clone()
+            }),
+            emb.clone(),
+            store.clone(),
+        )
+        .await;
+        let ok_json: Value = serde_json::from_str(&ok_out).unwrap();
+        assert_eq!(
+            ok_json["ok"],
+            serde_json::json!(true),
+            "valid define failed: {ok_json}"
+        );
+
+        // 3. Duplicate active slug is rejected without writing a second row
+        let count_after_first = store.list(&ns, None, None).await.unwrap().len();
+        let dup_out = handle_action(
+            &serde_json::json!({
+                "namespace": ns,
+                "action": "define",
+                "definition": valid_def
+            }),
+            emb,
+            store.clone(),
+        )
+        .await;
+        let dup_json: Value = serde_json::from_str(&dup_out).unwrap();
+        assert_eq!(dup_json["ok"], serde_json::json!(false));
+        assert!(
+            dup_json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("strict-create-note"),
+            "duplicate slug error must name the slug: {dup_json}"
+        );
+        assert_eq!(
+            store.list(&ns, None, None).await.unwrap().len(),
+            count_after_first,
+            "duplicate active slug define must not write any row"
+        );
+    }
+
+    #[tokio::test]
+    async fn surface_resolves_principal_before_service_and_never_echoes_secret_params() {
+        let ns = format!("ns-surf-sec-{}", uuid::Uuid::new_v4());
+        let (store, _) = store_with_one_rule(&ns).await;
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+
+        // Seed a digital twin where bob is only a viewer and alice is owner
+        store
+            .upsert(
+                &ns,
+                "twin-sec-1",
+                vec![0.1, 0.2, 0.3, 0.4],
+                MemoryPayload {
+                    content: "Digital twin sec-loop v1".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "digital_twin".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({
+                        "valid_from": 1700000000,
+                        "visible_to": [{ "principal": "bob", "role": "viewer" }],
+                        "twin": {
+                            "id": "sec-loop",
+                            "version": 1,
+                            "schema_id": "cooling-loop",
+                            "variables": { "temperature": 65.0 }
+                        }
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Define an action with a secret parameter and a float parameter with bounds
+        let _ = handle_action(
+            &serde_json::json!({
+                "namespace": ns,
+                "action": "define",
+                "definition": {
+                    "slug": "secret-twin-tune",
+                    "title": "Secret Twin Tune",
+                    "description": "Tune twin with secret token",
                     "required_role": "editor",
                     "parameters": {
                         "twin_id": { "param_type": "twin_id", "required": true },
-                        "target_temp": { "param_type": "f64", "required": true, "min": 10.0, "max": 90.0 }
+                        "api_secret": { "param_type": "string", "required": true },
+                        "temp": { "param_type": "f64", "required": true, "min": 20.0, "max": 80.0 }
                     },
-                    "submission_criteria": [
-                        {
-                            "kind": "twin_var_precondition",
-                            "twin_param": "twin_id",
-                            "variable": "temperature",
-                            "min": 0.0,
-                            "max": 100.0
-                        }
-                    ],
+                    "submission_criteria": [],
                     "effects": [
                         {
                             "op": "set_twin_state",
                             "twin_param": "twin_id",
                             "merge": true,
-                            "variables_from_params": { "temperature": "target_temp" }
+                            "variables_from_params": { "temperature": "temp" }
                         }
                     ]
                 }
-            }
-        })),
-    };
-    let def_resp = process_mcp_request(
-        def_req,
-        Arc::new(StubEmbedder),
-        store.clone(),
-        ingests.clone(),
-        None,
-        bus.clone(),
-    )
-    .await;
-    let def_json: Value = serde_json::from_str(
-        def_resp["result"]["content"][0]["text"].as_str().unwrap(),
-    )
-    .expect("define returns JSON");
-    assert_eq!(def_json["ok"], serde_json::json!(true), "define failed: {def_json}");
-    assert_eq!(def_json["defined"]["slug"], serde_json::json!("recalibrate-cooling-loop"));
+            }),
+            emb.clone(),
+            store.clone(),
+        )
+        .await;
 
-    // 3. Dispatch "validate"
-    let val_req = JsonRpcRequest {
-        jsonrpc: "2.0".to_string(),
-        id: Some(serde_json::json!(3)),
-        method: "tools/call".to_string(),
-        params: Some(serde_json::json!({
-            "name": "neurostrata_action",
-            "arguments": {
-                "namespace": ns,
-                "action": "validate",
-                "slug": "recalibrate-cooling-loop",
-                "params": { "twin_id": "loop-a", "target_temp": 42.5 }
-            }
-        })),
-    };
-    let val_resp = process_mcp_request(
-        val_req,
-        Arc::new(StubEmbedder),
-        store.clone(),
-        ingests.clone(),
-        None,
-        bus.clone(),
-    )
-    .await;
-    let val_json: Value = serde_json::from_str(
-        val_resp["result"]["content"][0]["text"].as_str().unwrap(),
-    )
-    .expect("validate returns JSON");
-    assert_eq!(val_json["ok"], serde_json::json!(true));
-    assert_eq!(val_json["valid"], serde_json::json!(true));
+        let secret_val = "sk-topsecretvalue99999";
 
-    // 4. Dispatch "apply"
-    let apply_req = JsonRpcRequest {
-        jsonrpc: "2.0".to_string(),
-        id: Some(serde_json::json!(4)),
-        method: "tools/call".to_string(),
-        params: Some(serde_json::json!({
-            "name": "neurostrata_action",
-            "arguments": {
+        // 1. Non-admin authenticated caller ("bob") attempting to impersonate "admin" is resolved to "bob" and denied
+        let escalation_out = handle_action_with_auth(
+            &serde_json::json!({
                 "namespace": ns,
                 "action": "apply",
-                "slug": "recalibrate-cooling-loop",
-                "params": { "twin_id": "loop-a", "target_temp": 42.5 }
-            }
-        })),
-    };
-    let apply_resp = process_mcp_request(
-        apply_req,
-        Arc::new(StubEmbedder),
-        store.clone(),
-        ingests.clone(),
-        None,
-        bus.clone(),
-    )
-    .await;
-    let apply_json: Value = serde_json::from_str(
-        apply_resp["result"]["content"][0]["text"].as_str().unwrap(),
-    )
-    .expect("apply returns JSON");
-    assert_eq!(apply_json["ok"], serde_json::json!(true), "apply failed: {apply_json}");
-    let receipt_id = apply_json["applied"]["receipt_id"]
-        .as_str()
-        .expect("receipt_id")
-        .to_string();
+                "slug": "secret-twin-tune",
+                "principal": "admin",
+                "params": {
+                    "twin_id": "sec-loop",
+                    "api_secret": secret_val,
+                    "temp": 45.0
+                }
+            }),
+            "bob",
+            emb.clone(),
+            store.clone(),
+        )
+        .await;
+        assert!(
+            !escalation_out.contains(secret_val),
+            "rejected apply must never echo secret param value: {escalation_out}"
+        );
+        let escalation_json: Value = serde_json::from_str(&escalation_out).unwrap();
+        assert_eq!(escalation_json["ok"], serde_json::json!(false));
+        assert_eq!(
+            escalation_json["submission_failures"][0]["code"],
+            serde_json::json!("rebac_denied")
+        );
 
-    // 5. Dispatch "revert"
-    let rev_req = JsonRpcRequest {
-        jsonrpc: "2.0".to_string(),
-        id: Some(serde_json::json!(5)),
-        method: "tools/call".to_string(),
-        params: Some(serde_json::json!({
-            "name": "neurostrata_action",
-            "arguments": {
+        // 2. Authorized apply succeeds, and subsequent log output redacts params and never echoes secret_val
+        let apply_out = handle_action_with_auth(
+            &serde_json::json!({
                 "namespace": ns,
-                "action": "revert",
-                "receipt_id": receipt_id
-            }
-        })),
-    };
-    let rev_resp = process_mcp_request(
-        rev_req,
-        Arc::new(StubEmbedder),
-        store.clone(),
-        ingests.clone(),
-        None,
-        bus.clone(),
-    )
-    .await;
-    let rev_json: Value = serde_json::from_str(
-        rev_resp["result"]["content"][0]["text"].as_str().unwrap(),
-    )
-    .expect("revert returns JSON");
-    assert_eq!(rev_json["ok"], serde_json::json!(true), "revert failed: {rev_json}");
+                "action": "apply",
+                "slug": "secret-twin-tune",
+                "params": {
+                    "twin_id": "sec-loop",
+                    "api_secret": secret_val,
+                    "temp": 45.0
+                }
+            }),
+            "alice",
+            emb.clone(),
+            store.clone(),
+        )
+        .await;
+        let apply_json: Value = serde_json::from_str(&apply_out).unwrap();
+        assert_eq!(apply_json["ok"], serde_json::json!(true));
 
-    // 6. Dispatch "log"
-    let log_req = JsonRpcRequest {
-        jsonrpc: "2.0".to_string(),
-        id: Some(serde_json::json!(6)),
-        method: "tools/call".to_string(),
-        params: Some(serde_json::json!({
-            "name": "neurostrata_action",
-            "arguments": {
+        let log_out = handle_action_with_auth(
+            &serde_json::json!({
                 "namespace": ns,
                 "action": "log",
-                "limit": 10
-            }
-        })),
-    };
-    let log_resp = process_mcp_request(
-        log_req,
-        Arc::new(StubEmbedder),
-        store,
-        ingests,
-        None,
-        bus,
-    )
-    .await;
-    let log_json: Value = serde_json::from_str(
-        log_resp["result"]["content"][0]["text"].as_str().unwrap(),
-    )
-    .expect("log returns JSON");
-    assert_eq!(log_json["ok"], serde_json::json!(true));
-    assert_eq!(log_json["entries"].as_array().unwrap().len(), 2);
-}
-
-#[tokio::test]
-async fn define_is_strict_about_schema_and_duplicate_active_slug() {
-    let ns = format!("ns-def-strict-{}", uuid::Uuid::new_v4());
-    let (store, _) = store_with_one_rule(&ns).await;
-    let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
-
-    let count_before = store.list(&ns, None, None).await.unwrap().len();
-
-    // 1. Malformed definition (invalid role + empty effects) is strictly rejected with zero writes
-    let bad_out = handle_action(
-        &serde_json::json!({
-            "namespace": ns,
-            "action": "define",
-            "definition": {
-                "slug": "Invalid_Slug",
-                "title": "Bad",
-                "description": "Bad",
-                "required_role": "superadmin",
-                "parameters": {},
-                "submission_criteria": [],
-                "effects": []
-            }
-        }),
-        emb.clone(),
-        store.clone(),
-    )
-    .await;
-    let bad_json: Value = serde_json::from_str(&bad_out).unwrap();
-    assert_eq!(bad_json["ok"], serde_json::json!(false));
-    assert_eq!(
-        store.list(&ns, None, None).await.unwrap().len(),
-        count_before,
-        "malformed define must not write any row"
-    );
-
-    // 2. Valid definition succeeds and compiles into OntologyIndex
-    let valid_def = serde_json::json!({
-        "slug": "strict-create-note",
-        "title": "Strict Create Note",
-        "description": "Creates a fact note",
-        "required_role": "editor",
-        "parameters": {
-            "msg": { "param_type": "string", "required": true }
-        },
-        "submission_criteria": [],
-        "effects": [
-            {
-                "op": "upsert_memory",
-                "memory_type": "fact",
-                "content_template": "Note: {{msg}}",
-                "metadata_template": {}
-            }
-        ]
-    });
-    let ok_out = handle_action(
-        &serde_json::json!({
-            "namespace": ns,
-            "action": "define",
-            "definition": valid_def.clone()
-        }),
-        emb.clone(),
-        store.clone(),
-    )
-    .await;
-    let ok_json: Value = serde_json::from_str(&ok_out).unwrap();
-    assert_eq!(ok_json["ok"], serde_json::json!(true), "valid define failed: {ok_json}");
-
-    // 3. Duplicate active slug is rejected without writing a second row
-    let count_after_first = store.list(&ns, None, None).await.unwrap().len();
-    let dup_out = handle_action(
-        &serde_json::json!({
-            "namespace": ns,
-            "action": "define",
-            "definition": valid_def
-        }),
-        emb,
-        store.clone(),
-    )
-    .await;
-    let dup_json: Value = serde_json::from_str(&dup_out).unwrap();
-    assert_eq!(dup_json["ok"], serde_json::json!(false));
-    assert!(
-        dup_json["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("strict-create-note"),
-        "duplicate slug error must name the slug: {dup_json}"
-    );
-    assert_eq!(
-        store.list(&ns, None, None).await.unwrap().len(),
-        count_after_first,
-        "duplicate active slug define must not write any row"
-    );
-}
-
-#[tokio::test]
-async fn surface_resolves_principal_before_service_and_never_echoes_secret_params() {
-    let ns = format!("ns-surf-sec-{}", uuid::Uuid::new_v4());
-    let (store, _) = store_with_one_rule(&ns).await;
-    let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
-
-    // Seed a digital twin where bob is only a viewer and alice is owner
-    store
-        .upsert(
-            &ns,
-            "twin-sec-1",
-            vec![0.1, 0.2, 0.3, 0.4],
-            MemoryPayload {
-                content: "Digital twin sec-loop v1".to_string(),
-                user_id: "alice".to_string(),
-                memory_type: "digital_twin".to_string(),
-                agent_name: None,
-                location: String::new(),
-                location_lines: String::new(),
-                metadata: serde_json::json!({
-                    "valid_from": 1700000000,
-                    "visible_to": [{ "principal": "bob", "role": "viewer" }],
-                    "twin": {
-                        "id": "sec-loop",
-                        "version": 1,
-                        "schema_id": "cooling-loop",
-                        "variables": { "temperature": 65.0 }
-                    }
-                }),
-            },
+                "limit": 5
+            }),
+            "alice",
+            emb,
+            store,
         )
-        .await
-        .unwrap();
-
-    // Define an action with a secret parameter and a float parameter with bounds
-    let _ = handle_action(
-        &serde_json::json!({
-            "namespace": ns,
-            "action": "define",
-            "definition": {
-                "slug": "secret-twin-tune",
-                "title": "Secret Twin Tune",
-                "description": "Tune twin with secret token",
-                "required_role": "editor",
-                "parameters": {
-                    "twin_id": { "param_type": "twin_id", "required": true },
-                    "api_secret": { "param_type": "string", "required": true },
-                    "temp": { "param_type": "f64", "required": true, "min": 20.0, "max": 80.0 }
-                },
-                "submission_criteria": [],
-                "effects": [
-                    {
-                        "op": "set_twin_state",
-                        "twin_param": "twin_id",
-                        "merge": true,
-                        "variables_from_params": { "temperature": "temp" }
-                    }
-                ]
-            }
-        }),
-        emb.clone(),
-        store.clone(),
-    )
-    .await;
-
-    let secret_val = "sk-topsecretvalue99999";
-
-    // 1. Non-admin authenticated caller ("bob") attempting to impersonate "admin" is resolved to "bob" and denied
-    let escalation_out = handle_action_with_auth(
-        &serde_json::json!({
-            "namespace": ns,
-            "action": "apply",
-            "slug": "secret-twin-tune",
-            "principal": "admin",
-            "params": {
-                "twin_id": "sec-loop",
-                "api_secret": secret_val,
-                "temp": 45.0
-            }
-        }),
-        "bob",
-        emb.clone(),
-        store.clone(),
-    )
-    .await;
-    assert!(
-        !escalation_out.contains(secret_val),
-        "rejected apply must never echo secret param value: {escalation_out}"
-    );
-    let escalation_json: Value = serde_json::from_str(&escalation_out).unwrap();
-    assert_eq!(escalation_json["ok"], serde_json::json!(false));
-    assert_eq!(
-        escalation_json["submission_failures"][0]["code"],
-        serde_json::json!("rebac_denied")
-    );
-
-    // 2. Authorized apply succeeds, and subsequent log output redacts params and never echoes secret_val
-    let apply_out = handle_action_with_auth(
-        &serde_json::json!({
-            "namespace": ns,
-            "action": "apply",
-            "slug": "secret-twin-tune",
-            "params": {
-                "twin_id": "sec-loop",
-                "api_secret": secret_val,
-                "temp": 45.0
-            }
-        }),
-        "alice",
-        emb.clone(),
-        store.clone(),
-    )
-    .await;
-    let apply_json: Value = serde_json::from_str(&apply_out).unwrap();
-    assert_eq!(apply_json["ok"], serde_json::json!(true));
-
-    let log_out = handle_action_with_auth(
-        &serde_json::json!({
-            "namespace": ns,
-            "action": "log",
-            "limit": 5
-        }),
-        "alice",
-        emb,
-        store,
-    )
-    .await;
-    assert!(
-        !log_out.contains(secret_val),
-        "action log must never echo secret parameter values: {log_out}"
-    );
+        .await;
+        assert!(
+            !log_out.contains(secret_val),
+            "action log must never echo secret parameter values: {log_out}"
+        );
+    }
 }
-
-}
-
 
 async fn handle_distill(arguments: Value, store: Arc<dyn VectorStore>) -> String {
     // Parse namespace.
@@ -15725,16 +16622,23 @@ async fn handle_distill(arguments: Value, store: Arc<dyn VectorStore>) -> String
     } else {
         project_root.join(&session_dir)
     };
-    let canon_root = project_root.canonicalize().unwrap_or_else(|_| project_root.clone());
+    let canon_root = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.clone());
     let canon_resolved = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
     if !canon_resolved.starts_with(&canon_root) {
         return "ERROR: session_dir must be within the project root.".to_string();
     }
 
-    let dry_run = arguments.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+    let dry_run = arguments
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     // Downcast to IntakeStore backend.
-    let intake_store = match crate::traits::VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::ladybug::LadybugStore>() {
+    let intake_store = match crate::traits::VectorStore::as_any(store.as_ref())
+        .downcast_ref::<crate::store::ladybug::LadybugStore>()
+    {
         Some(s) => s,
         None => return "ERROR: Distill requires LadybugStore backend.".to_string(),
     };
@@ -15793,7 +16697,11 @@ async fn handle_distill(arguments: Value, store: Arc<dyn VectorStore>) -> String
                 if marker == "task" {
                     format!("[task] {}", trimmed.chars().take(120).collect::<String>())
                 } else {
-                    format!("[{}] {}", marker, trimmed.chars().take(120).collect::<String>())
+                    format!(
+                        "[{}] {}",
+                        marker,
+                        trimmed.chars().take(120).collect::<String>()
+                    )
                 }
             } else if lower.contains("prefer")
                 || lower.contains("preference")
@@ -15814,7 +16722,12 @@ async fn handle_distill(arguments: Value, store: Arc<dyn VectorStore>) -> String
             if !seen.insert(dedup_key) {
                 continue;
             }
-            proposed.push((title, trimmed.to_string(), file.display().to_string(), line_no + 1));
+            proposed.push((
+                title,
+                trimmed.to_string(),
+                file.display().to_string(),
+                line_no + 1,
+            ));
         }
     }
 
@@ -15824,15 +16737,23 @@ async fn handle_distill(arguments: Value, store: Arc<dyn VectorStore>) -> String
 
     // Dry run: report only.
     if dry_run {
-        let lines: Vec<String> = proposed.iter().map(|(t, _, _, _)| format!("- {}", t)).collect();
-        return format!("Proposed candidates (dry-run, review-only):
-{}", lines.join("
-"));
+        let lines: Vec<String> = proposed
+            .iter()
+            .map(|(t, _, _, _)| format!("- {}", t))
+            .collect();
+        return format!(
+            "Proposed candidates (dry-run, review-only):
+{}",
+            lines.join(
+                "
+"
+            )
+        );
     }
 
     // Route through IntakeStore (review-only; never auto-create Memory/Task).
-    use crate::traits::IntakeStore;
     use crate::task::intake::{CreateReceiptRequest, SourceKind};
+    use crate::traits::IntakeStore;
     let source_revision = format!("distill:{}", session_dir);
     let mut created = 0usize;
     let mut candidate_ids: Vec<String> = Vec::new();
@@ -15842,7 +16763,11 @@ async fn handle_distill(arguments: Value, store: Arc<dyn VectorStore>) -> String
         let mut hasher = Sha256::new();
         hasher.update(digest_input.as_bytes());
         let source_digest = hex::encode(hasher.finalize());
-        let ck = if title.to_lowercase().contains("rule") { "rule" } else { "task" };
+        let ck = if title.to_lowercase().contains("rule") {
+            "rule"
+        } else {
+            "task"
+        };
         let request = CreateReceiptRequest {
             namespace: namespace.clone(),
             source_kind: SourceKind::Conversation,
@@ -15873,13 +16798,13 @@ async fn handle_distill(arguments: Value, store: Arc<dyn VectorStore>) -> String
         }
     }
 
-    let mut out = format!(
-        "Proposed candidates (review-only): {} created.\n",
-        created
-    );
+    let mut out = format!("Proposed candidates (review-only): {} created.\n", created);
     for id in candidate_ids {
-        out.push_str(&format!("- {}
-", id));
+        out.push_str(&format!(
+            "- {}
+",
+            id
+        ));
     }
     out
 }
@@ -15893,37 +16818,48 @@ mod context_plan_tests {
     impl crate::traits::Embedder for LocalStubEmbedder {
         async fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
             let mut v = vec![0.0f32; 4];
-            for (i, b) in text.bytes().enumerate() { v[i % 4] += b as f32; }
-            for (i, x) in v.iter_mut().enumerate() { *x += (i as f32 + 1.0) * 0.001; }
+            for (i, b) in text.bytes().enumerate() {
+                v[i % 4] += b as f32;
+            }
+            for (i, x) in v.iter_mut().enumerate() {
+                *x += (i as f32 + 1.0) * 0.001;
+            }
             Ok(v)
         }
-        fn dimensions(&self) -> usize { 4 }
+        fn dimensions(&self) -> usize {
+            4
+        }
     }
 
     #[tokio::test]
     async fn test_handle_context_plan_returns_budgeted_plan() {
         use crate::context::model::{ContextPlan, Degradation, CONTEXT_PLAN_SCHEMA_VERSION};
-        let args_json = serde_json::json!({"namespace":"test","max_items":2,"format":"json","query":"test"});
+        let args_json =
+            serde_json::json!({"namespace":"test","max_items":2,"format":"json","query":"test"});
         let embedder = Arc::new(LocalStubEmbedder);
-        let store: Arc<dyn crate::traits::VectorStore> = Arc::new(crate::store::LadybugStore::for_testing(&std::env::temp_dir().join("plan-test"), 4).expect("open"));
+        let store: Arc<dyn crate::traits::VectorStore> = Arc::new(
+            crate::store::LadybugStore::for_testing(&std::env::temp_dir().join("plan-test"), 4)
+                .expect("open"),
+        );
         store.init("test").await.unwrap();
         let seed = vec![0.1f32; 4];
-        store.upsert(
-            "test",
-            "plan-seed",
-            seed,
-            crate::traits::MemoryPayload {
-                content: "SHACL validation".to_string(),
-                user_id: "test".to_string(),
-                memory_type: "fact".to_string(),
-                agent_name: None,
-                location: String::new(),
-                location_lines: String::new(),
-                metadata: serde_json::json!({}),
-            },
-        )
-        .await
-        .expect("insert seed");
+        store
+            .upsert(
+                "test",
+                "plan-seed",
+                seed,
+                crate::traits::MemoryPayload {
+                    content: "SHACL validation".to_string(),
+                    user_id: "test".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("insert seed");
         let result_json = handle_context_plan(&args_json, embedder.clone(), store.clone()).await;
         let plan: ContextPlan = serde_json::from_str(&result_json).expect("json parses");
         assert_eq!(plan.schema_version, CONTEXT_PLAN_SCHEMA_VERSION);
@@ -15942,8 +16878,11 @@ mod context_plan_tests {
         use crate::traits::MemoryPayload;
         let embedder = Arc::new(LocalStubEmbedder);
         let store: Arc<dyn crate::traits::VectorStore> = Arc::new(
-            crate::store::LadybugStore::for_testing(&std::env::temp_dir().join("plan-alias-test"), 4)
-                .expect("open"),
+            crate::store::LadybugStore::for_testing(
+                &std::env::temp_dir().join("plan-alias-test"),
+                4,
+            )
+            .expect("open"),
         );
         store.init("test").await.unwrap();
         let seed = vec![0.1f32; 4];
@@ -15968,7 +16907,11 @@ mod context_plan_tests {
             let val: serde_json::Value = serde_json::from_str(&result).expect("json parses");
             val["items"]
                 .as_array()
-                .map(|a| a.iter().map(|i| i["id"].as_str().unwrap_or_default().to_string()).collect())
+                .map(|a| {
+                    a.iter()
+                        .map(|i| i["id"].as_str().unwrap_or_default().to_string())
+                        .collect()
+                })
                 .expect("items array")
         };
         // Legacy key names from the original schema.
@@ -15986,8 +16929,14 @@ mod context_plan_tests {
         )
         .await;
         // With prior usage beyond every ceiling, no item can be delivered.
-        assert!(parse_items(legacy).is_empty(), "turn_used/session_used must consume prior budget");
-        assert!(parse_items(token_keys).is_empty(), "turn_tokens_used/session_tokens_used must consume prior budget");
+        assert!(
+            parse_items(legacy).is_empty(),
+            "turn_used/session_used must consume prior budget"
+        );
+        assert!(
+            parse_items(token_keys).is_empty(),
+            "turn_tokens_used/session_tokens_used must consume prior budget"
+        );
         // Without prior usage the seeded item is delivered.
         let none = handle_context_plan(
             &serde_json::json!({"namespace":"test","query":"alias seed memory"}),
@@ -16002,7 +16951,8 @@ mod context_plan_tests {
     }
 
     #[tokio::test]
-    async fn snapshot_surfaces_global_and_pinned_golden_rules_above_top5_and_persists_active_session() {
+    async fn snapshot_surfaces_global_and_pinned_golden_rules_above_top5_and_persists_active_session(
+    ) {
         use crate::traits::MemoryPayload;
         let tmp_dir = std::env::temp_dir().join(format!("ns-golden-snap-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
@@ -16019,7 +16969,8 @@ mod context_plan_tests {
                 "bf710e0e-a4b5-41cc-a8d7-e25fb14b12f8",
                 vec![0.1f32; 4],
                 MemoryPayload {
-                    content: "RULE: The user has a strong preference AGAINST using Python.".to_string(),
+                    content: "RULE: The user has a strong preference AGAINST using Python."
+                        .to_string(),
                     user_id: "kenton".to_string(),
                     memory_type: "fact".to_string(),
                     agent_name: None,
@@ -16117,4 +17068,3 @@ mod context_plan_tests {
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }
-

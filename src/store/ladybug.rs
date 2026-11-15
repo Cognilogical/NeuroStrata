@@ -9562,6 +9562,13 @@ impl VectorStore for LadybugStore {
         self.dirty.is_set()
     }
 
+    async fn list_edges(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<(String, String, String, Option<crate::rdf::EdgeProvenance>)>> {
+        LadybugStore::list_edges(self, namespace).await
+    }
+
     async fn relink_edges(&self, namespace: &str, source_key: &str) -> Result<usize> {
         // Declarations live in each memory's metadata, which survives ingestion;
         // only the edges themselves are lost with the nodes. Replaying them is
@@ -26308,6 +26315,56 @@ eurostrata\src\daemon.rs",
 }
 
 impl LadybugStore {
+    pub async fn list_edges(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<(String, String, String, Option<crate::rdf::EdgeProvenance>)>> {
+        let namespace_owned = namespace.to_string();
+        self.with_conn(move |conn: &Connection| -> Result<Vec<(String, String, String, Option<crate::rdf::EdgeProvenance>)>> {
+            let safe_ns = escape_ladybug_string(&namespace_owned);
+            let mut out: Vec<(String, String, String, Option<crate::rdf::EdgeProvenance>)> =
+                Vec::new();
+            let tables = ["RELATES_TO", "CONTAINS", "GOVERNS", "EXTRACTED_FROM", "DEPENDS_ON"];
+            for table in tables {
+                let query = format!(
+                    "MATCH (a:Memory)-[r:{}]->(b:Memory) WHERE a.namespace = '{}' AND b.namespace = '{}' RETURN a.id, b.id, r.source, r.valid_from, r.valid_to, r.generation, r.extractor",
+                    table, safe_ns, safe_ns
+                );
+                if let Ok(mut rows) = conn.query(&query) {
+                    while let Some(row) = rows.next() {
+                        let from = format!("{}", row[0]);
+                        let to = format!("{}", row[1]);
+                        let source = match format!("{}", row[2]).as_str() {
+                            "" | "null" => None,
+                            s => Some(s.to_string()),
+                        };
+                        let valid_from = format!("{}", row[3]).parse::<i64>().ok();
+                        let valid_to = format!("{}", row[4]).parse::<i64>().ok();
+                        let gen = format!("{}", row[5]).parse::<i64>().ok();
+                        let extractor = match format!("{}", row[6]).as_str() {
+                            "" | "null" => None,
+                            s => Some(s.to_string()),
+                        };
+                        out.push((
+                            from,
+                            table.to_string(),
+                            to,
+                            Some(crate::rdf::EdgeProvenance {
+                                source,
+                                valid_from,
+                                valid_to,
+                                generation: gen,
+                                extractor,
+                            }),
+                        ));
+                    }
+                }
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     pub async fn project_namespace_rdf(
         &self,
         namespace: &str,
@@ -26317,52 +26374,7 @@ impl LadybugStore {
         let memories = crate::traits::VectorStore::list(self, namespace, None, None).await?;
         let rows: Vec<(String, crate::traits::MemoryPayload)> =
             memories.into_iter().map(|m| (m.id, m.payload)).collect();
-
-        let namespace_owned = namespace.to_string();
-        let edges: Vec<(String, String, String, Option<crate::rdf::EdgeProvenance>)> =
-            self.with_conn(move |conn: &Connection| -> Result<Vec<(String, String, String, Option<crate::rdf::EdgeProvenance>)>> {
-                let safe_ns = escape_ladybug_string(&namespace_owned);
-                let mut out: Vec<(String, String, String, Option<crate::rdf::EdgeProvenance>)> =
-                    Vec::new();
-                let tables = ["RELATES_TO", "CONTAINS", "GOVERNS", "EXTRACTED_FROM", "DEPENDS_ON"];
-                for table in tables {
-                    let query = format!(
-                        "MATCH (a:Memory)-[r:{}]->(b:Memory) WHERE a.namespace = '{}' AND b.namespace = '{}' RETURN a.id, b.id, r.source, r.valid_from, r.valid_to, r.generation, r.extractor",
-                        table, safe_ns, safe_ns
-                    );
-                    if let Ok(mut rows) = conn.query(&query) {
-                        while let Some(row) = rows.next() {
-                            let from = format!("{}", row[0]);
-                            let to = format!("{}", row[1]);
-                            let source = match format!("{}", row[2]).as_str() {
-                                "" | "null" => None,
-                                s => Some(s.to_string()),
-                            };
-                            let valid_from = format!("{}", row[3]).parse::<i64>().ok();
-                            let valid_to = format!("{}", row[4]).parse::<i64>().ok();
-                            let gen = format!("{}", row[5]).parse::<i64>().ok();
-                            let extractor = match format!("{}", row[6]).as_str() {
-                                "" | "null" => None,
-                                s => Some(s.to_string()),
-                            };
-                            out.push((
-                                from,
-                                table.to_string(),
-                                to,
-                                Some(crate::rdf::EdgeProvenance {
-                                    source,
-                                    valid_from,
-                                    valid_to,
-                                    generation: gen,
-                                    extractor,
-                                }),
-                            ));
-                        }
-                    }
-                }
-                Ok(out)
-            })
-            .await?;
+        let edges = self.list_edges(namespace).await?;
 
         Ok(crate::rdf::rows_to_quads(
             &rows, namespace, tier, generation, &edges,

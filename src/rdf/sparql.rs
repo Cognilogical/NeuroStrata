@@ -9,13 +9,13 @@
 //! See docs/superpowers/specs/2026-10-27-sparql-query-engine-design.md for detailed spec.
 
 use oxrdf::{Dataset, Variable};
-use spargebra::SparqlParser;
-use spareval::QueryEvaluator;
 use sparesults::{QueryResultsFormat, QueryResultsSerializer};
+use spareval::QueryEvaluator;
+use spargebra::SparqlParser;
 
-use std::collections::{HashMap, HashSet};
 use crate::parser::ingest::split_scoped_id;
 use crate::store::ladybug::active_generations_by_source_of;
+use std::collections::{HashMap, HashSet};
 
 /// Configuration for SPARQL query execution.
 #[derive(Debug, Clone)]
@@ -48,19 +48,32 @@ fn escape_ladybug_string(s: &str) -> String {
 /// Create a SparqlParser with all 9 pre-registered prefixes from spec §6.
 pub fn parser_with_prefixes() -> SparqlParser {
     SparqlParser::new()
-        .with_prefix("ns", "urn:neurostrata:ns#").unwrap()
-        .with_prefix("mem", "urn:neurostrata:memory:").unwrap()
-        .with_prefix("class", "urn:neurostrata:class:").unwrap()
-        .with_prefix("dom", "urn:neurostrata:domain:").unwrap()
-        .with_prefix("rdf", "http://www.w3.org/1999/02/22-rdf-syntax-ns#").unwrap()
-        .with_prefix("rdfs", "http://www.w3.org/2000/01/rdf-schema#").unwrap()
-        .with_prefix("owl", "http://www.w3.org/2002/07/owl#").unwrap()
-        .with_prefix("skos", "http://www.w3.org/2004/02/skos/core#").unwrap()
-        .with_prefix("xsd", "http://www.w3.org/2001/XMLSchema#").unwrap()
+        .with_prefix("ns", "urn:neurostrata:ns#")
+        .unwrap()
+        .with_prefix("mem", "urn:neurostrata:memory:")
+        .unwrap()
+        .with_prefix("class", "urn:neurostrata:class:")
+        .unwrap()
+        .with_prefix("dom", "urn:neurostrata:domain:")
+        .unwrap()
+        .with_prefix("rdf", "http://www.w3.org/1999/02/22-rdf-syntax-ns#")
+        .unwrap()
+        .with_prefix("rdfs", "http://www.w3.org/2000/01/rdf-schema#")
+        .unwrap()
+        .with_prefix("owl", "http://www.w3.org/2002/07/owl#")
+        .unwrap()
+        .with_prefix("skos", "http://www.w3.org/2004/02/skos/core#")
+        .unwrap()
+        .with_prefix("xsd", "http://www.w3.org/2001/XMLSchema#")
+        .unwrap()
 }
 
 fn is_archived(metadata: &serde_json::Value) -> bool {
-    metadata.get("archived").and_then(|v| v.as_bool()).unwrap_or(false)}
+    metadata
+        .get("archived")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
 
 fn is_mesh_conflicting(metadata: &serde_json::Value) -> bool {
     crate::synaptic_mesh::conflict::is_conflicting_metadata(metadata)
@@ -78,10 +91,22 @@ pub fn compute_memory_salience(metadata: &serde_json::Value, now: i64) -> f64 {
     if is_archived(metadata) || is_retired_at(metadata, now) || is_mesh_conflicting(metadata) {
         return 0.0;
     }
-    let access_count = metadata.get("access_count").and_then(|v| v.as_u64()).unwrap_or(0) as f64;
+    let access_count = metadata
+        .get("access_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as f64;
     let access_term = (1.0 + access_count).ln() * 0.1;
-    let feedback = metadata.get("feedback_score").and_then(|v| v.as_f64()).unwrap_or(0.0).clamp(-1.0, 1.0) * 0.05;
-    let neural_gain = metadata.get("neural_gain").and_then(|v| v.as_f64()).unwrap_or(1.0).clamp(0.0, 10.0);
+    let feedback = metadata
+        .get("feedback_score")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0)
+        .clamp(-1.0, 1.0)
+        * 0.05;
+    let neural_gain = metadata
+        .get("neural_gain")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1.0)
+        .clamp(0.0, 10.0);
     ((1.0 + access_term + feedback) * neural_gain).max(0.0)
 }
 
@@ -91,7 +116,13 @@ pub async fn project_sparql_dataset_with_meta_async(
     include_retired: bool,
     include_archived: bool,
     store: &crate::store::ladybug::LadybugStore,
-) -> Result<(Dataset, std::collections::HashMap<String, serde_json::Value>), String> {
+) -> Result<
+    (
+        Dataset,
+        std::collections::HashMap<String, serde_json::Value>,
+    ),
+    String,
+> {
     let mut dataset = Dataset::new();
     let mut meta_map = std::collections::HashMap::new();
 
@@ -100,9 +131,7 @@ pub async fn project_sparql_dataset_with_meta_async(
     // `with_conn` requires a 'static closure, so the namespace is copied in.
     let ns_owned = namespace.to_string();
     let (by_source, active_set, _max_code_gen) = store
-        .with_conn(move |conn| {
-            Ok(active_generations_by_source_of(conn, &ns_owned))
-        })
+        .with_conn(move |conn| Ok(active_generations_by_source_of(conn, &ns_owned)))
         .await
         .unwrap_or_else(|_err| {
             tracing::warn!("active_generations_by_source_of query failed for '{namespace}'");
@@ -130,11 +159,12 @@ pub async fn project_sparql_dataset_with_meta_async(
             &by_source,
             &active_set,
             _max_code_gen,
-        ).is_some()
-        && (include_retired || !is_retired_at(&m.payload.metadata, now))
-        && (include_archived || !is_archived(&m.payload.metadata))
-        && !is_mesh_conflicting(&m.payload.metadata)
-        && !crate::registry::is_registry_row(&m.payload.metadata)
+        )
+        .is_some()
+            && (include_retired || !is_retired_at(&m.payload.metadata, now))
+            && (include_archived || !is_archived(&m.payload.metadata))
+            && !is_mesh_conflicting(&m.payload.metadata)
+            && !crate::registry::is_registry_row(&m.payload.metadata)
     };
 
     // Best active generation per bare_id among passing rows (dedup key: keep
@@ -156,12 +186,66 @@ pub async fn project_sparql_dataset_with_meta_async(
         }
     }
 
+    // Best active version per twin_id among passing digital_twin rows when
+    // retired versions are excluded, so SPARQL queries over active twins only
+    // match the latest version per twin_id.
+    let mut best_twin_row_by_twin_id: HashMap<String, (u64, String)> = HashMap::new();
+    if !include_retired {
+        for m in &memories {
+            if !passes(m) || m.payload.memory_type != "digital_twin" {
+                continue;
+            }
+            if let Some(dt) = m
+                .payload
+                .metadata
+                .get("digital_twin")
+                .or_else(|| m.payload.metadata.get("twin"))
+                .and_then(|v| v.as_object())
+            {
+                if let Some(tid) = dt
+                    .get("id")
+                    .or_else(|| dt.get("twin_id"))
+                    .and_then(|v| v.as_str())
+                {
+                    let ver = dt.get("version").and_then(|v| v.as_u64()).unwrap_or(1);
+                    let entry = best_twin_row_by_twin_id
+                        .entry(tid.to_string())
+                        .or_insert_with(|| (ver, m.id.clone()));
+                    if ver >= entry.0 {
+                        *entry = (ver, m.id.clone());
+                    }
+                }
+            }
+        }
+    }
+
     // Keep each passing row that is either unscoped or the highest-generation
-    // version of its bare_id. Input order is preserved.
+    // version of its bare_id (and latest twin version when !include_retired).
     let mut kept_memories: Vec<&crate::traits::SearchResult> = Vec::new();
     for m in &memories {
         if !passes(m) {
             continue;
+        }
+        if !include_retired && m.payload.memory_type == "digital_twin" {
+            if let Some(dt) = m
+                .payload
+                .metadata
+                .get("digital_twin")
+                .or_else(|| m.payload.metadata.get("twin"))
+                .and_then(|v| v.as_object())
+            {
+                if let Some(tid) = dt
+                    .get("id")
+                    .or_else(|| dt.get("twin_id"))
+                    .and_then(|v| v.as_str())
+                {
+                    if let Some((_, best_id)) = best_twin_row_by_twin_id.get(tid) {
+                        if best_id != &m.id {
+                            continue;
+                        }
+                    }
+                }
+            }
         }
         match split_scoped_id(&m.id) {
             Some((_, gen, bare)) => {
@@ -173,18 +257,49 @@ pub async fn project_sparql_dataset_with_meta_async(
         }
     }
 
+    let kept_rows: Vec<(String, crate::traits::MemoryPayload)> = kept_memories
+        .iter()
+        .map(|m| (m.id.clone(), m.payload.clone()))
+        .collect();
+    let twin_schemas = crate::digital_twin::collect_twin_schemas_from_rows(&kept_rows);
+    let edges = if !twin_schemas.is_empty() {
+        store.list_edges(namespace).await.unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
     for m in kept_memories {
         let payload = m.payload.clone();
-        meta_map.insert(format!("urn:neurostrata:memory:{}", m.id), m.payload.metadata.clone());
+        meta_map.insert(
+            format!("urn:neurostrata:memory:{}", m.id),
+            m.payload.metadata.clone(),
+        );
         meta_map.insert(m.id.clone(), m.payload.metadata.clone());
 
-        let qs = crate::rdf::projection::memory_to_quads(
+        let mut qs = crate::rdf::projection::memory_to_quads(
             &m.id,
             &payload,
             namespace,
             crate::rdf::types::Tier::Domain,
             0,
         );
+        if !twin_schemas.is_empty() && payload.memory_type == "digital_twin" {
+            let extra = crate::rdf::projection::twin_schema_and_reducer_quads_for_row(
+                &m.id,
+                &payload,
+                namespace,
+                crate::rdf::types::Tier::Domain,
+                0,
+                &twin_schemas,
+                &kept_rows,
+                &edges,
+            );
+            for eq in extra {
+                if !qs.contains(&eq) {
+                    qs.push(eq);
+                }
+            }
+        }
         for q in qs {
             dataset.insert(&q);
             // Default-graph union semantics are handled by
@@ -224,65 +339,61 @@ fn custom_functions_on(
     meta_map: std::sync::Arc<std::collections::HashMap<String, serde_json::Value>>,
     now: i64,
 ) -> QueryEvaluator {
-    use oxrdf::{NamedNode, Term, Literal};
-    base
-        .with_custom_function(
-            NamedNode::new("urn:neurostrata:ns#salience").unwrap(),
-            {
-                let meta_map = meta_map.clone();
-                move |args: &[Term]| -> Option<Term> {
-                    let key = args.first()?;
-                    let key_str = match key {
-                        Term::NamedNode(n) => n.as_str().to_string(),
-                        Term::Literal(l) => l.value().to_string(),
-                        _ => return Some(Literal::from(0.0f64).into()),
-                    };
-                    let score = meta_map.get(&key_str).map(|m| compute_memory_salience(m, now)).unwrap_or(0.0);
-                    Some(Literal::from(score).into())
-                }
-            },
-        )
-        .with_custom_function(
-            NamedNode::new("urn:neurostrata:ns#validAt").unwrap(),
-            {
-                let meta_map = meta_map.clone();
-                move |args: &[Term]| -> Option<Term> {
-                    let mem_term = args.get(0)?;
-                    let ts_term = args.get(1)?;
-                    let key_str = match mem_term {
-                        Term::NamedNode(n) => n.as_str().to_string(),
-                        Term::Literal(l) => l.value().to_string(),
-                        _ => return Some(Literal::from(false).into()),
-                    };
-                    let ts: i64 = match ts_term {
-                        Term::Literal(l) => l.value().parse::<i64>().ok()?,
-                        _ => return Some(Literal::from(false).into()),
-                    };
-                    let meta = meta_map.get(&key_str)?;
-                    let valid_from = meta.get("valid_from").and_then(|v| v.as_i64()).unwrap_or(0);
-                    let valid_to = meta.get("valid_to").and_then(|v| v.as_i64()).filter(|v| *v != 0);
-                    let is_valid = valid_from <= ts && (valid_to.is_none() || ts < valid_to.unwrap());
-                    Some(Literal::from(is_valid).into())
-                }
-            },
-        )
-        .with_custom_function(
-            NamedNode::new("urn:neurostrata:ns#isRetired").unwrap(),
-            {
-                let meta_map = meta_map.clone();
-                move |args: &[Term]| -> Option<Term> {
-                    let mem_term = args.first()?;
-                    let key_str = match mem_term {
-                        Term::NamedNode(n) => n.as_str().to_string(),
-                        Term::Literal(l) => l.value().to_string(),
-                        _ => return Some(Literal::from(false).into()),
-                    };
-                    let meta = meta_map.get(&key_str)?;
-                    let retired = is_retired_at(meta, now);
-                    Some(Literal::from(retired).into())
-                }
-            },
-        )
+    use oxrdf::{Literal, NamedNode, Term};
+    base.with_custom_function(NamedNode::new("urn:neurostrata:ns#salience").unwrap(), {
+        let meta_map = meta_map.clone();
+        move |args: &[Term]| -> Option<Term> {
+            let key = args.first()?;
+            let key_str = match key {
+                Term::NamedNode(n) => n.as_str().to_string(),
+                Term::Literal(l) => l.value().to_string(),
+                _ => return Some(Literal::from(0.0f64).into()),
+            };
+            let score = meta_map
+                .get(&key_str)
+                .map(|m| compute_memory_salience(m, now))
+                .unwrap_or(0.0);
+            Some(Literal::from(score).into())
+        }
+    })
+    .with_custom_function(NamedNode::new("urn:neurostrata:ns#validAt").unwrap(), {
+        let meta_map = meta_map.clone();
+        move |args: &[Term]| -> Option<Term> {
+            let mem_term = args.get(0)?;
+            let ts_term = args.get(1)?;
+            let key_str = match mem_term {
+                Term::NamedNode(n) => n.as_str().to_string(),
+                Term::Literal(l) => l.value().to_string(),
+                _ => return Some(Literal::from(false).into()),
+            };
+            let ts: i64 = match ts_term {
+                Term::Literal(l) => l.value().parse::<i64>().ok()?,
+                _ => return Some(Literal::from(false).into()),
+            };
+            let meta = meta_map.get(&key_str)?;
+            let valid_from = meta.get("valid_from").and_then(|v| v.as_i64()).unwrap_or(0);
+            let valid_to = meta
+                .get("valid_to")
+                .and_then(|v| v.as_i64())
+                .filter(|v| *v != 0);
+            let is_valid = valid_from <= ts && (valid_to.is_none() || ts < valid_to.unwrap());
+            Some(Literal::from(is_valid).into())
+        }
+    })
+    .with_custom_function(NamedNode::new("urn:neurostrata:ns#isRetired").unwrap(), {
+        let meta_map = meta_map.clone();
+        move |args: &[Term]| -> Option<Term> {
+            let mem_term = args.first()?;
+            let key_str = match mem_term {
+                Term::NamedNode(n) => n.as_str().to_string(),
+                Term::Literal(l) => l.value().to_string(),
+                _ => return Some(Literal::from(false).into()),
+            };
+            let meta = meta_map.get(&key_str)?;
+            let retired = is_retired_at(meta, now);
+            Some(Literal::from(retired).into())
+        }
+    })
 }
 
 /// The algebra tree of a parsed query (SELECT/ASK/CONSTRUCT/DESCRIBE share the
@@ -301,18 +412,10 @@ pub(crate) fn sparql_pattern(query: &spargebra::Query) -> &spargebra::algebra::G
 pub(crate) fn count_algebra_nodes(pattern: &spargebra::algebra::GraphPattern) -> usize {
     use spargebra::algebra::GraphPattern as GP;
     1 + match pattern {
-        GP::Join { left, right } => {
-            count_algebra_nodes(left) + count_algebra_nodes(right)
-        }
-        GP::Union { left, right } => {
-            count_algebra_nodes(left) + count_algebra_nodes(right)
-        }
-        GP::Minus { left, right } => {
-            count_algebra_nodes(left) + count_algebra_nodes(right)
-        }
-        GP::LeftJoin { left, right, .. } => {
-            count_algebra_nodes(left) + count_algebra_nodes(right)
-        }
+        GP::Join { left, right } => count_algebra_nodes(left) + count_algebra_nodes(right),
+        GP::Union { left, right } => count_algebra_nodes(left) + count_algebra_nodes(right),
+        GP::Minus { left, right } => count_algebra_nodes(left) + count_algebra_nodes(right),
+        GP::LeftJoin { left, right, .. } => count_algebra_nodes(left) + count_algebra_nodes(right),
         GP::Filter { inner, .. } => count_algebra_nodes(inner),
         GP::Graph { inner, .. } => count_algebra_nodes(inner),
         GP::Extend { inner, .. } => count_algebra_nodes(inner),
@@ -421,116 +524,120 @@ pub async fn execute_sparql_query_with_config(
 
     let cancel_token_for_blocking = cancel_token.clone();
     let timed_out_flag_for_blocking = timed_out_flag.clone();
-    let eval_join = tokio::task::spawn_blocking(move || -> Result<(String, usize, bool, bool), String> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        let evaluator = if !service_endpoints.is_empty() {
-            let handler = crate::rdf::federation::HttpServiceHandler {
-                config: crate::rdf::federation::FederationConfig {
-                    timeout_ms: config.timeout_ms,
-                    max_solutions: config.max_solutions,
-                    max_dataset_quads: config.max_dataset_quads,
-                    ..Default::default()
-                },
+    let eval_join =
+        tokio::task::spawn_blocking(move || -> Result<(String, usize, bool, bool), String> {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            let evaluator = if !service_endpoints.is_empty() {
+                let handler = crate::rdf::federation::HttpServiceHandler {
+                    config: crate::rdf::federation::FederationConfig {
+                        timeout_ms: config.timeout_ms,
+                        max_solutions: config.max_solutions,
+                        max_dataset_quads: config.max_dataset_quads,
+                        ..Default::default()
+                    },
+                };
+                evaluator_with_custom_functions_and_service(meta_arc.clone(), now, handler)
+            } else {
+                evaluator_with_custom_functions(meta_arc, now)
             };
-            evaluator_with_custom_functions_and_service(meta_arc.clone(), now, handler)
-        } else {
-            evaluator_with_custom_functions(meta_arc, now)
-        };
-        let evaluator = evaluator.with_cancellation_token(cancel_token_for_blocking);
+            let evaluator = evaluator.with_cancellation_token(cancel_token_for_blocking);
 
-        // Default-graph union semantics: a query over the default graph sees every
-        // projected quad regardless of which named graph it lives in. Quads are
-        // inserted once (in their named graph) by project_sparql_dataset_with_meta_async,
-        // and the union handles the default graph — no double insert.
-        let mut prepared = evaluator.prepare(&query);
-        prepared.dataset_mut().set_default_graph_as_union();
-        let results = match prepared.execute(&dataset) {
-            Ok(r) => r,
-            Err(e) => {
-                return Err(format!("SPARQL evaluation error: {}", e));
-            }
-        };
+            // Default-graph union semantics: a query over the default graph sees every
+            // projected quad regardless of which named graph it lives in. Quads are
+            // inserted once (in their named graph) by project_sparql_dataset_with_meta_async,
+            // and the union handles the default graph — no double insert.
+            let mut prepared = evaluator.prepare(&query);
+            prepared.dataset_mut().set_default_graph_as_union();
+            let results = match prepared.execute(&dataset) {
+                Ok(r) => r,
+                Err(e) => {
+                    return Err(format!("SPARQL evaluation error: {}", e));
+                }
+            };
 
-        // Serialize results
-        let mut output = Vec::new();
-        let serializer = QueryResultsSerializer::from_format(format);
+            // Serialize results
+            let mut output = Vec::new();
+            let serializer = QueryResultsSerializer::from_format(format);
 
-        // Extract variables before take() (wrapper loses variables())
-        let results_vars: Vec<Variable> = match &results {
-            spareval::QueryResults::Solutions(sol_iter) => sol_iter.variables().to_vec(),
-            _ => Vec::new(),
-        };
+            // Extract variables before take() (wrapper loses variables())
+            let results_vars: Vec<Variable> = match &results {
+                spareval::QueryResults::Solutions(sol_iter) => sol_iter.variables().to_vec(),
+                _ => Vec::new(),
+            };
 
-        let mut solution_count: usize = 0;
-        let mut timed_out = false;
-        let mut truncated = false;
+            let mut solution_count: usize = 0;
+            let mut timed_out = false;
+            let mut truncated = false;
 
-        match results {
-            spareval::QueryResults::Boolean(b) => {
-                serializer
-                    .serialize_boolean_to_writer(&mut output, b)
-                    .map_err(|e| format!("serialize boolean: {}", e))?;
-            }
-            spareval::QueryResults::Solutions(solutions) => {
-                // Take one extra solution to detect truncation: a query returning
-                // exactly `max_solutions` rows must not be reported as truncated.
-                let mut collected: Vec<_> = Vec::new();
-                for item in solutions.take(config.max_solutions + 1) {
-                    match item {
-                        Ok(sol) => collected.push(sol),
-                        Err(e) => {
-                            if timed_out_flag_for_blocking.load(std::sync::atomic::Ordering::SeqCst) {
-                                // Cancellation consumed the timeout budget mid-iteration.
-                                timed_out = true;
-                                break;
+            match results {
+                spareval::QueryResults::Boolean(b) => {
+                    serializer
+                        .serialize_boolean_to_writer(&mut output, b)
+                        .map_err(|e| format!("serialize boolean: {}", e))?;
+                }
+                spareval::QueryResults::Solutions(solutions) => {
+                    // Take one extra solution to detect truncation: a query returning
+                    // exactly `max_solutions` rows must not be reported as truncated.
+                    let mut collected: Vec<_> = Vec::new();
+                    for item in solutions.take(config.max_solutions + 1) {
+                        match item {
+                            Ok(sol) => collected.push(sol),
+                            Err(e) => {
+                                if timed_out_flag_for_blocking
+                                    .load(std::sync::atomic::Ordering::SeqCst)
+                                {
+                                    // Cancellation consumed the timeout budget mid-iteration.
+                                    timed_out = true;
+                                    break;
+                                }
+                                return Err(format!("evaluation error: {}", e));
                             }
-                            return Err(format!("evaluation error: {}", e));
                         }
                     }
-                }
 
-                truncated = collected.len() > config.max_solutions;
-                if truncated {
-                    collected.truncate(config.max_solutions);
-                }
+                    truncated = collected.len() > config.max_solutions;
+                    if truncated {
+                        collected.truncate(config.max_solutions);
+                    }
 
-                let mut serializer_solutions =
-                    serializer
+                    let mut serializer_solutions = serializer
                         .serialize_solutions_to_writer(&mut output, results_vars)
                         .map_err(|e| format!("serialize solutions start: {}", e))?;
-                for sol in &collected {
-                    serializer_solutions
-                        .serialize(sol)
-                        .map_err(|e| format!("serialize solution: {}", e))?;
-                }
-                solution_count = collected.len();
-                serializer_solutions.finish()
-                    .map_err(|e| format!("serialize finish: {}", e))?;
-            }
-            spareval::QueryResults::Graph(triples) => {
-                // CONSTRUCT/DESCRIBE: serialize triples as N-Triples.
-                for triple in triples {
-                    if timed_out_flag_for_blocking.load(std::sync::atomic::Ordering::SeqCst) {
-                        timed_out = true;
-                        break;
+                    for sol in &collected {
+                        serializer_solutions
+                            .serialize(sol)
+                            .map_err(|e| format!("serialize solution: {}", e))?;
                     }
-                    let t = triple.map_err(|e| format!("graph evaluation error: {}", e))?;
-                    output.extend_from_slice(format!("{} .\n", t).as_bytes());
-                    solution_count += 1;
+                    solution_count = collected.len();
+                    serializer_solutions
+                        .finish()
+                        .map_err(|e| format!("serialize finish: {}", e))?;
+                }
+                spareval::QueryResults::Graph(triples) => {
+                    // CONSTRUCT/DESCRIBE: serialize triples as N-Triples.
+                    for triple in triples {
+                        if timed_out_flag_for_blocking.load(std::sync::atomic::Ordering::SeqCst) {
+                            timed_out = true;
+                            break;
+                        }
+                        let t = triple.map_err(|e| format!("graph evaluation error: {}", e))?;
+                        output.extend_from_slice(format!("{} .\n", t).as_bytes());
+                        solution_count += 1;
+                    }
                 }
             }
-        }
 
-        let results_string = String::from_utf8(output)
-            .map_err(|e| format!("UTF-8 error: {}", e))?;
-        let timed_out = timed_out || timed_out_flag_for_blocking.load(std::sync::atomic::Ordering::SeqCst);
+            let results_string =
+                String::from_utf8(output).map_err(|e| format!("UTF-8 error: {}", e))?;
+            let timed_out =
+                timed_out || timed_out_flag_for_blocking.load(std::sync::atomic::Ordering::SeqCst);
 
-        Ok((results_string, solution_count, truncated, timed_out))
-    })
-    .await;
+            Ok((results_string, solution_count, truncated, timed_out))
+        })
+        .await;
 
     // Evaluation finished: stop the timer so a completed query neither leaks
     // the sleep task nor races with the timed-out flag afterwards.
@@ -752,7 +859,10 @@ mod tests {
         )
         .await
         .expect("sparql query succeeds");
-        assert!(count > 0, "expected projected triples in default union graph");
+        assert!(
+            count > 0,
+            "expected projected triples in default union graph"
+        );
         assert!(!truncated);
         assert!(!timed_out);
         assert!(serialized.contains("urn:neurostrata:memory:mem-1"));
@@ -761,37 +871,53 @@ mod tests {
 
     #[test]
     fn test_preregistered_prefixes_parse() {
-        let q = parser_with_prefixes().parse_query("SELECT ?s WHERE { ?s a class:Fact ; ns:domain dom:auth }");
-        assert!(q.is_ok(), "pre-registered prefixes should parse without explicit PREFIX");
+        let q = parser_with_prefixes()
+            .parse_query("SELECT ?s WHERE { ?s a class:Fact ; ns:domain dom:auth }");
+        assert!(
+            q.is_ok(),
+            "pre-registered prefixes should parse without explicit PREFIX"
+        );
     }
 
     #[test]
     fn test_custom_functions_salience_valid_at_is_retired() {
-        use std::collections::HashMap;
         use oxrdf::Dataset;
-        
-        
+        use std::collections::HashMap;
 
         let mut meta_map = HashMap::new();
-        meta_map.insert("urn:neurostrata:memory:m1".into(), serde_json::json!({
-            "access_count": 10,
-            "feedback_score": 0.8,
-            "neural_gain": 1.5,
-            "valid_from": 100
-        }));
-        meta_map.insert("m1".into(), meta_map.get("urn:neurostrata:memory:m1").unwrap().clone());
+        meta_map.insert(
+            "urn:neurostrata:memory:m1".into(),
+            serde_json::json!({
+                "access_count": 10,
+                "feedback_score": 0.8,
+                "neural_gain": 1.5,
+                "valid_from": 100
+            }),
+        );
+        meta_map.insert(
+            "m1".into(),
+            meta_map.get("urn:neurostrata:memory:m1").unwrap().clone(),
+        );
 
-        meta_map.insert("urn:neurostrata:memory:m2".into(), serde_json::json!({
-            "valid_to": 500
-        }));
-        meta_map.insert("m2".into(), meta_map.get("urn:neurostrata:memory:m2").unwrap().clone());
+        meta_map.insert(
+            "urn:neurostrata:memory:m2".into(),
+            serde_json::json!({
+                "valid_to": 500
+            }),
+        );
+        meta_map.insert(
+            "m2".into(),
+            meta_map.get("urn:neurostrata:memory:m2").unwrap().clone(),
+        );
 
         let meta_arc = std::sync::Arc::new(meta_map);
         let now = 600i64; // past m2's valid_to 500 so it is retired
         let evaluator = evaluator_with_custom_functions(meta_arc, now);
 
         let query_str = "SELECT (ns:salience(<urn:neurostrata:memory:m1>) AS ?s1) (ns:salience(<urn:neurostrata:memory:m2>) AS ?s2) (ns:validAt(<urn:neurostrata:memory:m1>, 200) AS ?v1) (ns:isRetired(<urn:neurostrata:memory:m2>) AS ?r2) WHERE {}";
-        let query = parser_with_prefixes().parse_query(query_str).expect("parse");
+        let query = parser_with_prefixes()
+            .parse_query(query_str)
+            .expect("parse");
         let dataset = Dataset::new();
         let prepared = evaluator.prepare(&query);
         let results = prepared.execute(&dataset).expect("execute");
@@ -808,7 +934,11 @@ mod tests {
                 oxrdf::Term::Literal(l) => l.value().parse::<f64>().unwrap(),
                 _ => 0.0,
             };
-            assert!(s1_val > 1.0, "salience of active memory should be > 1.0 (got {})", s1_val);
+            assert!(
+                s1_val > 1.0,
+                "salience of active memory should be > 1.0 (got {})",
+                s1_val
+            );
 
             // Assert s2 == 0.0
             let s2_val = match s2 {
@@ -829,7 +959,10 @@ mod tests {
                 oxrdf::Term::Literal(l) => l.value().to_string(),
                 _ => "false".into(),
             };
-            assert_eq!(r2_str, "true", "isRetired for m2 at now=600 should be true (valid_to 500 <= 600)");
+            assert_eq!(
+                r2_str, "true",
+                "isRetired for m2 at now=600 should be true (valid_to 500 <= 600)"
+            );
         } else {
             panic!("expected solutions");
         }
@@ -856,22 +989,34 @@ mod tests {
         };
 
         // Generation 1 for source-a: superseded by generation 2.
-        assert_eq!(store.begin_generation("probe", "source-a").await.unwrap(), 1);
+        assert_eq!(
+            store.begin_generation("probe", "source-a").await.unwrap(),
+            1
+        );
         let gen1_id = crate::parser::ingest::generation_scoped_id("probe", 1, "src/a.rs");
         store
             .upsert("probe", &gen1_id, zero.clone(), scoped("code_ast"))
             .await
             .unwrap();
-        store.publish_generation("probe", "source-a", 1).await.unwrap();
+        store
+            .publish_generation("probe", "source-a", 1)
+            .await
+            .unwrap();
 
         // Generation 2 for source-a: same bare_id, now active.
-        assert_eq!(store.begin_generation("probe", "source-a").await.unwrap(), 2);
+        assert_eq!(
+            store.begin_generation("probe", "source-a").await.unwrap(),
+            2
+        );
         let gen2_id = crate::parser::ingest::generation_scoped_id("probe", 2, "src/a.rs");
         store
             .upsert("probe", &gen2_id, zero.clone(), scoped("code_ast"))
             .await
             .unwrap();
-        store.publish_generation("probe", "source-a", 2).await.unwrap();
+        store
+            .publish_generation("probe", "source-a", 2)
+            .await
+            .unwrap();
 
         // Unscoped normative row: reachable regardless of generations.
         store
@@ -892,11 +1037,10 @@ mod tests {
             .await
             .unwrap();
 
-        let (dataset, _meta_map) = project_sparql_dataset_with_meta_async(
-            "probe", false, false, &store,
-        )
-        .await
-        .expect("projection succeeds");
+        let (dataset, _meta_map) =
+            project_sparql_dataset_with_meta_async("probe", false, false, &store)
+                .await
+                .expect("projection succeeds");
 
         let mut gen1_quads = 0usize;
         let mut gen2_quads = 0usize;
@@ -923,14 +1067,20 @@ mod tests {
         }
 
         // Superseded generation is filtered out; active generation projects.
-        assert_eq!(gen1_quads, 0, "superseded generation {gen1_id} must not project");
+        assert_eq!(
+            gen1_quads, 0,
+            "superseded generation {gen1_id} must not project"
+        );
         assert!(gen2_quads > 0, "active generation {gen2_id} must project");
         assert!(rule_quads > 0, "unscoped normative rule must project");
 
         // Dedup by bare_id: exactly one generation of src/a.rs is present.
         // No double insert: nothing lands in the default graph (union applied
         // at query time) and each memory projects its quads exactly once.
-        assert_eq!(default_graph_quads, 0, "no quad inserted into the default graph");
+        assert_eq!(
+            default_graph_quads, 0,
+            "no quad inserted into the default graph"
+        );
         assert_eq!(
             dataset.len(),
             gen2_quads + rule_quads,
@@ -955,7 +1105,12 @@ mod tests {
             metadata: serde_json::json!({"domain": "retrieval"}),
         };
         store
-            .upsert("test-sparql-cfg", "mem-1", vec![0.1, 0.2, 0.3, 0.4], payload)
+            .upsert(
+                "test-sparql-cfg",
+                "mem-1",
+                vec![0.1, 0.2, 0.3, 0.4],
+                payload,
+            )
             .await
             .unwrap();
 
@@ -975,6 +1130,151 @@ mod tests {
         assert!(!truncated);
         assert!(!timed_out);
         assert!(serialized.contains("urn:neurostrata:memory:mem-1"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_sparql_polymorphic_interface_and_derived_reducer_projection() {
+        use crate::traits::{MemoryPayload, VectorStore};
+        let tmp = std::env::temp_dir().join(format!("ns-sparql-twin-iface-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = crate::store::ladybug::LadybugStore::for_testing(&tmp, 4).expect("store");
+        store.init("twin-iface").await.unwrap();
+        let zero = vec![0.0f32; 4];
+
+        let mk_row = |mtype: &str, meta: serde_json::Value| MemoryPayload {
+            content: "twin test".to_string(),
+            user_id: "u1".to_string(),
+            memory_type: mtype.to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: meta,
+        };
+
+        // Interface schema: thermal-asset
+        store
+            .upsert(
+                "twin-iface",
+                "iface-thermal",
+                zero.clone(),
+                mk_row(
+                    "digital_twin_schema",
+                    serde_json::json!({
+                        "twin_schema": {
+                            "kind": "interface",
+                            "interface_slug": "thermal-asset",
+                            "variables": {
+                                "temperature": { "min": -50.0, "max": 200.0, "unit": "C" }
+                            }
+                        }
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+
+        // Object schema: cooling-pump implements thermal-asset
+        store
+            .upsert(
+                "twin-iface",
+                "schema-pump",
+                zero.clone(),
+                mk_row(
+                    "digital_twin_schema",
+                    serde_json::json!({
+                        "twin_schema": {
+                            "kind": "object_schema",
+                            "schema_id": "cooling-pump",
+                            "implements_interfaces": ["thermal-asset"],
+                            "variables": {
+                                "power_kw": { "min": 0.0, "max": 500.0, "unit": "kW" }
+                            }
+                        }
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+
+        // Object schema: chiller-unit implements thermal-asset
+        store
+            .upsert(
+                "twin-iface",
+                "schema-chiller",
+                zero.clone(),
+                mk_row(
+                    "digital_twin_schema",
+                    serde_json::json!({
+                        "twin_schema": {
+                            "kind": "object_schema",
+                            "schema_id": "chiller-unit",
+                            "implements_interfaces": ["thermal-asset"],
+                            "variables": {}
+                        }
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+
+        // Active twins: pump-1 and chiller-1
+        store
+            .upsert(
+                "twin-iface",
+                "twin-pump-1",
+                zero.clone(),
+                mk_row(
+                    "digital_twin",
+                    serde_json::json!({
+                        "twin": {
+                            "id": "pump-1",
+                            "version": 1,
+                            "schema_id": "cooling-pump",
+                            "variables": { "temperature": 42.0, "power_kw": 10.0 }
+                        }
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "twin-iface",
+                "twin-chiller-1",
+                zero.clone(),
+                mk_row(
+                    "digital_twin",
+                    serde_json::json!({
+                        "twin": {
+                            "id": "chiller-1",
+                            "version": 1,
+                            "schema_id": "chiller-unit",
+                            "variables": { "temperature": 8.0 }
+                        }
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let (serialized, count, _, _) = execute_sparql_query(
+            "SELECT ?twin WHERE { ?twin a <urn:neurostrata:interface:thermal-asset> }",
+            "twin-iface",
+            QueryResultsFormat::Json,
+            false,
+            false,
+            &store,
+        )
+        .await
+        .expect("polymorphic interface sparql succeeds");
+
+        assert_eq!(
+            count, 2,
+            "both cooling-pump and chiller-unit must match thermal-asset: {serialized}"
+        );
+        assert!(serialized.contains("urn:neurostrata:memory:twin-pump-1"));
+        assert!(serialized.contains("urn:neurostrata:memory:twin-chiller-1"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

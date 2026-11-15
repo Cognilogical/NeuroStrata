@@ -9,3 +9,4 @@ import NeuroStrata.TwinCrdt
 import NeuroStrata.Retention
 import NeuroStrata.KineticAction
 import NeuroStrata.HybridSlots
+import NeuroStrata.TwinInterface
