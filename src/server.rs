@@ -1712,10 +1712,11 @@ pub async fn process_mcp_request(
                             result_text = handle_insights(&arguments, store.clone()).await;
                         }
                         "neurostrata_taxonomy" => {
-                            result_text = crate::handlers::taxonomy::handle_taxonomy(
+                            result_text = crate::handlers::taxonomy::handle_taxonomy_with_bus(
                                 &arguments,
                                 emb.clone(),
                                 store.clone(),
+                                Some(bus.clone()),
                             )
                             .await;
                         }

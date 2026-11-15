@@ -38,6 +38,8 @@ pub const PERMITTED_MESH_MEMORY_TYPES: &[&str] = &[
     "digital_twin",
     "digital_twin_schema",
     "action_type",
+    "thesis",
+    "concept",
 ];
 
 /// Signed capability token (`nsmesh1<base58btc(json)>`) used for zero-config peer join.

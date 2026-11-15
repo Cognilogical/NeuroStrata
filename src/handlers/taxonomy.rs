@@ -1,6 +1,7 @@
 //! Shared request handler for `neurostrata_taxonomy` (MCP), `POST /taxonomy` (Daemon),
 //! and `neurostrata-mcp taxonomy` (CLI).
 
+use crate::events::{RecursionToken, ThalamicBus, ThalamicPulse};
 use crate::rdf::action::ActionSecurityContext;
 use crate::rdf::taxonomy::{execute_taxonomy, TaxonomyRequest};
 use crate::store::ladybug::LadybugStore;
@@ -14,7 +15,17 @@ pub async fn handle_taxonomy(
     emb: Arc<dyn Embedder>,
     store: Arc<dyn VectorStore>,
 ) -> String {
-    handle_taxonomy_with_auth(arguments, "admin", emb, store).await
+    handle_taxonomy_with_auth_and_bus(arguments, "admin", emb, store, None).await
+}
+
+/// Dispatch a `neurostrata_taxonomy` request with default `"admin"` principal and optional `ThalamicBus`.
+pub async fn handle_taxonomy_with_bus(
+    arguments: &Value,
+    emb: Arc<dyn Embedder>,
+    store: Arc<dyn VectorStore>,
+    bus: Option<Arc<ThalamicBus>>,
+) -> String {
+    handle_taxonomy_with_auth_and_bus(arguments, "admin", emb, store, bus).await
 }
 
 /// Dispatch a `neurostrata_taxonomy` request with an explicit authenticated principal.
@@ -23,6 +34,17 @@ pub async fn handle_taxonomy_with_auth(
     authenticated_principal: &str,
     emb: Arc<dyn Embedder>,
     store: Arc<dyn VectorStore>,
+) -> String {
+    handle_taxonomy_with_auth_and_bus(arguments, authenticated_principal, emb, store, None).await
+}
+
+/// Dispatch a `neurostrata_taxonomy` request with an explicit authenticated principal and optional `ThalamicBus`.
+pub async fn handle_taxonomy_with_auth_and_bus(
+    arguments: &Value,
+    authenticated_principal: &str,
+    emb: Arc<dyn Embedder>,
+    store: Arc<dyn VectorStore>,
+    bus: Option<Arc<ThalamicBus>>,
 ) -> String {
     let Some(ns_raw) = arguments
         .get("namespace")
@@ -85,6 +107,52 @@ pub async fn handle_taxonomy_with_auth(
 
     match execute_taxonomy(lb_store, emb.as_ref(), req, &security).await {
         Ok(val) => {
+            if let Some(ref b) = bus {
+                let op = val.get("operation").and_then(|v| v.as_str()).unwrap_or("");
+                if op == "set_thesis" {
+                    if let Some(new_id) = val.get("thesis_id").and_then(|v| v.as_str()) {
+                        b.emit(
+                            ThalamicPulse::Created {
+                                id: new_id.to_string(),
+                                namespace: namespace.clone(),
+                                kind: "thesis".to_string(),
+                            },
+                            &RecursionToken::root(),
+                        );
+                        if let Some(old_id) = val.get("superseded_id").and_then(|v| v.as_str()) {
+                            b.emit(
+                                ThalamicPulse::Superseded {
+                                    old_id: old_id.to_string(),
+                                    new_id: new_id.to_string(),
+                                    namespace: namespace.clone(),
+                                },
+                                &RecursionToken::root(),
+                            );
+                        }
+                    }
+                } else if op == "upsert_concept" {
+                    if let Some(new_id) = val.get("concept_id").and_then(|v| v.as_str()) {
+                        b.emit(
+                            ThalamicPulse::Created {
+                                id: new_id.to_string(),
+                                namespace: namespace.clone(),
+                                kind: "concept".to_string(),
+                            },
+                            &RecursionToken::root(),
+                        );
+                        if let Some(old_id) = val.get("superseded_id").and_then(|v| v.as_str()) {
+                            b.emit(
+                                ThalamicPulse::Superseded {
+                                    old_id: old_id.to_string(),
+                                    new_id: new_id.to_string(),
+                                    namespace: namespace.clone(),
+                                },
+                                &RecursionToken::root(),
+                            );
+                        }
+                    }
+                }
+            }
             crate::task::record_graph_query(&store, &namespace, "neurostrata_taxonomy", &hint)
                 .await;
             serde_json::to_string_pretty(&val)

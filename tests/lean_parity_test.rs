@@ -604,14 +604,17 @@ fn generate_rust_truth_table() -> Vec<String> {
         }
     }
 
-    // TAXONOMY_DAG: 6 rows
-    let dag_cases: [(&str, &[(u32, u32)]); 6] = [
+    // TAXONOMY_DAG: 9 rows
+    let dag_cases: [(&str, &[(u32, u32)]); 9] = [
         ("empty", &[] as &[(u32, u32)]),
         ("single_edge", &[(1, 2)]),
         ("self_loop", &[(1, 1)]),
         ("two_cycle", &[(1, 2), (2, 1)]),
         ("three_cycle", &[(1, 2), (2, 3), (3, 1)]),
         ("diamond", &[(1, 2), (1, 3), (2, 4), (3, 4)]),
+        ("four_cycle", &[(1, 2), (2, 3), (3, 4), (4, 1)]),
+        ("disconnected_cycle", &[(1, 2), (3, 4), (4, 5), (5, 3)]),
+        ("multi_parent_dag", &[(1, 3), (2, 3), (3, 4), (1, 4)]),
     ];
     for (label, edges) in dag_cases.iter() {
         lines.push(format!(
@@ -621,7 +624,23 @@ fn generate_rust_truth_table() -> Vec<String> {
         ));
     }
 
-    // TAXONOMY_SKOS: broader chain 0 -> 1 -> 2
+    // TAXONOMY_DAG_3NODE: all 64 3-node non-self directed graph topologies
+    let candidate_3_edges: [(u32, u32); 6] = [(0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1)];
+    for mask in 0u32..64u32 {
+        let mut edges = Vec::new();
+        for (bit, &edge) in candidate_3_edges.iter().enumerate() {
+            if (mask >> bit) & 1 == 1 {
+                edges.push(edge);
+            }
+        }
+        lines.push(format!(
+            "TAXONOMY_DAG_3NODE|{}|{}",
+            mask,
+            formal_kernel::validate_taxonomy_dag(&edges)
+        ));
+    }
+
+    // TAXONOMY_SKOS: broader chain 0 -> 1 -> 2 + cyclic broader rejection
     let skos_broader: &[(u32, u32)] = &[(0, 1), (1, 2)];
     let skos_cases: [(&str, &[(u32, u32)], &[(u32, u32)]); 10] = [
         ("related_direct", &[(0, 1)], &[] as &[(u32, u32)]),
@@ -642,6 +661,15 @@ fn generate_rust_truth_table() -> Vec<String> {
             formal_kernel::validate_skos_disjointness(skos_broader, rel, con)
         ));
     }
+    let cyclic_broader: &[(u32, u32)] = &[(0, 1), (1, 0)];
+    lines.push(format!(
+        "TAXONOMY_SKOS|cyclic_broader_empty|{}",
+        formal_kernel::validate_skos_disjointness(cyclic_broader, &[], &[])
+    ));
+    lines.push(format!(
+        "TAXONOMY_SKOS|cyclic_broader_unrelated|{}",
+        formal_kernel::validate_skos_disjointness(cyclic_broader, &[(2, 3)], &[])
+    ));
 
     // TAXONOMY_COVERAGE: 7 rows
     let coverage_cases: [(&str, Vec<EpistemicStatus>, u32); 7] = [
@@ -753,8 +781,8 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
     let rust_lines = generate_rust_truth_table();
     assert_eq!(
         rust_lines.len(),
-        910,
-        "expected 910 canonical lines (859 legacy + 51 taxonomy)"
+        979,
+        "expected 979 canonical lines (859 legacy + 120 taxonomy)"
     );
 
     // Section-count verification: 64 TASK_FSM + 16 LIFECYCLE + 128 MESH_MERGE
@@ -1091,4 +1119,108 @@ fn lean_proof_sources_contain_no_sorry_or_axiom() {
         "placeholder declarations found:\n{}",
         offenders.join("\n")
     );
+}
+
+#[test]
+fn exhaustive_three_node_dag_and_monotonicity_properties() {
+    // 1. Exhaustive 2^9 = 512 3-node directed graphs (including self-loops)
+    let all_9_edges: [(u32, u32); 9] = [
+        (0, 0),
+        (0, 1),
+        (0, 2),
+        (1, 0),
+        (1, 1),
+        (1, 2),
+        (2, 0),
+        (2, 1),
+        (2, 2),
+    ];
+    let mut valid_dag_count = 0usize;
+    for mask in 0u32..512u32 {
+        let mut edges = Vec::new();
+        for (bit, &edge) in all_9_edges.iter().enumerate() {
+            if (mask >> bit) & 1 == 1 {
+                edges.push(edge);
+            }
+        }
+        let is_dag = formal_kernel::validate_taxonomy_dag(&edges);
+        if is_dag {
+            valid_dag_count += 1;
+        } else {
+            // Cyclic broader hierarchy must always be rejected by validate_skos_disjointness
+            assert!(
+                !formal_kernel::validate_skos_disjointness(&edges, &[], &[]),
+                "cyclic broader mask {mask} must be rejected by validate_skos_disjointness"
+            );
+        }
+    }
+    // Exactly 25 labeled DAGs exist on 3 vertices
+    assert_eq!(valid_dag_count, 25, "3 vertices have exactly 25 labeled DAGs");
+
+    // 2. Pairwise boolean monotonicity for classify_epistemic_status (256 pairs)
+    for m1 in 0u8..16 {
+        let (d1, t1, s1, g1) = (m1 & 1 != 0, m1 & 2 != 0, m1 & 4 != 0, m1 & 8 != 0);
+        for m2 in 0u8..16 {
+            let (d2, t2, s2, g2) = (m2 & 1 != 0, m2 & 2 != 0, m2 & 4 != 0, m2 & 8 != 0);
+            if (!d1 || d2) && (!t1 || t2) && (!s1 || s2) && (!g1 || g2) {
+                let st1 = formal_kernel::classify_epistemic_status(d1, t1, s1, g1);
+                let st2 = formal_kernel::classify_epistemic_status(d2, t2, s2, g2);
+                assert!(st1 <= st2);
+                assert!(st1.weight_bps() <= st2.weight_bps());
+            }
+        }
+    }
+
+    // 3. Pairwise 5-argument monotonicity and gating for compute_frontier_leverage_bps
+    let axes = [0u32, 2500, 7000, 10000, 15000];
+    let gaps = [0u32, 2000, 2500, 6000, 7500, 10000, 12000];
+    let conns = [0u32, 1, 5, 10, 15];
+    for &a1 in &axes {
+        for &a2 in &axes {
+            if a1 > a2 {
+                continue;
+            }
+            for &g1 in &gaps {
+                for &g2 in &gaps {
+                    if g1 > g2 {
+                        continue;
+                    }
+                    for &c1 in &conns {
+                        for &c2 in &conns {
+                            if c1 > c2 {
+                                continue;
+                            }
+                            for &f1 in &[false, true] {
+                                for &f2 in &[false, true] {
+                                    if f1 && !f2 {
+                                        continue;
+                                    }
+                                    for &r1 in &[false, true] {
+                                        for &r2 in &[false, true] {
+                                            if r1 && !r2 {
+                                                continue;
+                                            }
+                                            let v1 =
+                                                formal_kernel::compute_frontier_leverage_bps(
+                                                    a1, g1, c1, f1, r1,
+                                                );
+                                            let v2 =
+                                                formal_kernel::compute_frontier_leverage_bps(
+                                                    a2, g2, c2, f2, r2,
+                                                );
+                                            assert!(
+                                                v1 <= v2,
+                                                "monotonicity violated: ({a1},{g1},{c1},{f1},{r1})={v1} > ({a2},{g2},{c2},{f2},{r2})={v2}"
+                                            );
+                                            assert!(v2 <= 10000);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

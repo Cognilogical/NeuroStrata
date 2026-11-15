@@ -366,6 +366,96 @@ pub async fn check_domain(
     Err(rejection(namespace, &still_missing[0], &cached))
 }
 
+/// Build an updated `domain_registry` `MemoryPayload` merging `new_slugs` into `existing_meta`
+/// while preserving any existing v2 domain entries and unrelated metadata keys.
+pub fn build_merged_registry_payload(
+    namespace: &str,
+    existing_meta: Option<&Value>,
+    new_slugs: &[String],
+) -> MemoryPayload {
+    let existing_meta = existing_meta
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let existing_domains_slugs: Vec<String> = if existing_meta.get("domain_registry").is_some() {
+        registry_domain_entries(&existing_meta)
+            .iter()
+            .filter_map(|e| e.get("slug").and_then(|s| s.as_str()).map(|s| s.to_string()))
+            .collect()
+    } else {
+        vec![]
+    };
+    let is_v2 = existing_meta
+        .get("domain_registry")
+        .and_then(|r| r.get("version"))
+        .and_then(|v| v.as_u64())
+        == Some(2)
+        || existing_meta
+            .get("domain_registry")
+            .and_then(|r| r.get("domains"))
+            .and_then(|d| d.as_array())
+            .map(|a| a.iter().any(|v| v.is_object()))
+            .unwrap_or(false);
+
+    let mut wanted_slugs = merge(&existing_domains_slugs, new_slugs);
+    let v1_slugs = registry_domains(&existing_meta);
+    wanted_slugs = merge(&wanted_slugs, &v1_slugs);
+
+    let mut meta = existing_meta.clone();
+    if !meta.is_object() {
+        meta = serde_json::json!({});
+    }
+    if let Some(obj) = meta.as_object_mut() {
+        if is_v2
+            || obj
+                .get("domain_registry")
+                .and_then(|r| r.get("domains"))
+                .and_then(|d| d.as_array())
+                .map(|a| a.iter().any(|v| v.is_object()))
+                .unwrap_or(false)
+        {
+            let mut entries = registry_domain_entries(&existing_meta);
+            for slug in &wanted_slugs {
+                if !entries.iter().any(|e| {
+                    e.get("slug").and_then(|s| s.as_str()) == Some(slug.as_str())
+                }) {
+                    entries.push(serde_json::json!({
+                        "slug": slug,
+                        "parent": serde_json::Value::Null,
+                        "aliases": [],
+                        "concept_iri": serde_json::Value::Null,
+                    }));
+                }
+            }
+            entries.sort_by(|a, b| {
+                let sa = a.get("slug").and_then(|v| v.as_str()).unwrap_or("");
+                let sb = b.get("slug").and_then(|v| v.as_str()).unwrap_or("");
+                sa.cmp(sb)
+            });
+            let v2meta = registry_metadata_v2(&entries);
+            if let Some(dr) = v2meta.get("domain_registry").cloned() {
+                obj.insert("domain_registry".to_string(), dr);
+            }
+            obj.insert("eligibility".to_string(), serde_json::json!("private"));
+        } else {
+            let v1meta = registry_metadata(&wanted_slugs);
+            if let Some(dr) = v1meta.get("domain_registry").cloned() {
+                obj.insert("domain_registry".to_string(), dr);
+            }
+            obj.insert("eligibility".to_string(), serde_json::json!("private"));
+        }
+    }
+
+    MemoryPayload {
+        content: registry_content(namespace),
+        user_id: "system".to_string(),
+        memory_type: "fact".to_string(),
+        agent_name: None,
+        location: String::new(),
+        location_lines: String::new(),
+        metadata: meta,
+    }
+}
+
 /// Read-merge-write the registry under a process-wide mutex (the guard is held
 /// across awaits, so this is a `tokio` mutex). `None` on success; `Some(warning)`
 /// when the cache did not stick -- the write it belongs to has already been

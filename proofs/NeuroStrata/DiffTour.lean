@@ -66,6 +66,6 @@ theorem diff_tour_foundations_precede_core_and_surface
   unfold classifyTourStop
   cases inDeg with
   | zero => contradiction
-  | succ _ => rfl
+  | succ _ => simp
 
 end NeuroStrata

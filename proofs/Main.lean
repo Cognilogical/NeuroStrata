@@ -166,15 +166,24 @@ def main : IO Unit := do
         for g in [false, true] do
           let st := classifyEpistemicStatus d t s g |>.asStr
           IO.println s!"TAXONOMY_CLASSIFY|{boolToStr d}|{boolToStr t}|{boolToStr s}|{boolToStr g}|{st}"
-  let dagCases : List (String × List (Nat × Nat)) := [("empty", []), ("single_edge", [(1, 2)]), ("self_loop", [(1, 1)]), ("two_cycle", [(1, 2), (2, 1)]), ("three_cycle", [(1, 2), (2, 3), (3, 1)]), ("diamond", [(1, 2), (1, 3), (2, 4), (3, 4)])]
+  let dagCases : List (String × List (Nat × Nat)) := [("empty", []), ("single_edge", [(1, 2)]), ("self_loop", [(1, 1)]), ("two_cycle", [(1, 2), (2, 1)]), ("three_cycle", [(1, 2), (2, 3), (3, 1)]), ("diamond", [(1, 2), (1, 3), (2, 4), (3, 4)]), ("four_cycle", [(1, 2), (2, 3), (3, 4), (4, 1)]), ("disconnected_cycle", [(1, 2), (3, 4), (4, 5), (5, 3)]), ("multi_parent_dag", [(1, 3), (2, 3), (3, 4), (1, 4)])]
   for (label, edges) in dagCases do
     let dagValid := validateTaxonomyDag edges
     IO.println s!"TAXONOMY_DAG|{label}|{boolToStr dagValid}"
+  let candidate3Edges : List (Nat × Nat) := [(0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1)]
+  for mask in List.range 64 do
+    let edges := (List.range 6).filterMap (fun bit =>
+      if (mask / (2 ^ bit)) % 2 == 1 then candidate3Edges[bit]? else none)
+    let dagValid := validateTaxonomyDag edges
+    IO.println s!"TAXONOMY_DAG_3NODE|{mask}|{boolToStr dagValid}"
   let skosBroader : List (Nat × Nat) := [(0, 1), (1, 2)]
   let skosCases : List (String × List (Nat × Nat) × List (Nat × Nat)) := [("related_direct", [(0, 1)], []), ("related_trans", [(0, 2)], []), ("related_reverse", [(1, 0)], []), ("related_reverse_trans", [(2, 0)], []), ("related_self", [(0, 0)], []), ("contrast_trans", [], [(0, 2)]), ("contrast_reverse", [], [(2, 1)]), ("contrast_self", [], [(1, 1)]), ("unrelated", [(0, 5)], []), ("empty_all", [], [])]
   for (label, rel, con) in skosCases do
     let skosValid := validateSkosDisjointness skosBroader rel con
     IO.println s!"TAXONOMY_SKOS|{label}|{boolToStr skosValid}"
+  let cyclicBroader : List (Nat × Nat) := [(0, 1), (1, 0)]
+  IO.println s!"TAXONOMY_SKOS|cyclic_broader_empty|{boolToStr (validateSkosDisjointness cyclicBroader [] [])}"
+  IO.println s!"TAXONOMY_SKOS|cyclic_broader_unrelated|{boolToStr (validateSkosDisjointness cyclicBroader [(2, 3)] [])}"
   let coverageCases : List (String × List EpistemicStatus × Nat) := [("empty_zero", [], 0), ("seed", [.seed], 0), ("verified", [.verified], 0), ("seed_verified", [.seed, .verified], 0), ("seed_verified_unmapped", [.seed, .verified], 1), ("four_seed", [.seed, .seed, .seed, .seed], 0), ("mixed", [.seed, .defined, .synthesized, .verified], 0)]
   for (label, statuses, unmapped) in coverageCases do
     IO.println s!"TAXONOMY_COVERAGE|{label}|{computeEpistemicCoverageBps statuses unmapped}"

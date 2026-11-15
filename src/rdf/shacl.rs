@@ -400,6 +400,127 @@ pub fn validate_memory(payload: &MemoryPayload) -> Vec<ShaclViolation> {
                 why,
             }),
         },
+        "thesis" => match payload.metadata.get("thesis") {
+            Some(Value::Object(t)) => {
+                let primary_domain = t
+                    .get("primary_domain")
+                    .or_else(|| t.get("domain_summary"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false);
+                if !primary_domain {
+                    out.push(ShaclViolation {
+                        field: "metadata.thesis.primary_domain".to_string(),
+                        why: "primary_domain is required and must be a non-empty string"
+                            .to_string(),
+                    });
+                }
+                let mission = t
+                    .get("mission")
+                    .or_else(|| t.get("project_purpose"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false);
+                if !mission {
+                    out.push(ShaclViolation {
+                        field: "metadata.thesis.mission".to_string(),
+                        why: "mission is required and must be a non-empty string".to_string(),
+                    });
+                }
+                let direction = t
+                    .get("direction")
+                    .and_then(|v| v.as_str())
+                    .map(|s| !s.trim().is_empty())
+                    .or_else(|| {
+                        t.get("architectural_tenets")
+                            .and_then(|v| v.as_array())
+                            .map(|a| !a.is_empty())
+                    })
+                    .unwrap_or(false);
+                if !direction {
+                    out.push(ShaclViolation {
+                        field: "metadata.thesis.direction".to_string(),
+                        why: "direction is required and must be a non-empty string".to_string(),
+                    });
+                }
+                let core_pillars = t
+                    .get("core_pillars")
+                    .or_else(|| t.get("canonical_concepts"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        !a.is_empty()
+                            && a.iter().all(|v| {
+                                v.as_str()
+                                    .and_then(crate::domain::normalize_domain_slug)
+                                    .is_some()
+                            })
+                    })
+                    .unwrap_or(false);
+                if !core_pillars {
+                    out.push(ShaclViolation {
+                        field: "metadata.thesis.core_pillars".to_string(),
+                        why: "core_pillars is required and must be a non-empty array of valid domain slugs".to_string(),
+                    });
+                }
+            }
+            _ => out.push(ShaclViolation {
+                field: "metadata.thesis".to_string(),
+                why: "thesis object is required for a thesis memory".to_string(),
+            }),
+        },
+        "concept" => match payload.metadata.get("concept") {
+            Some(Value::Object(c)) => {
+                let valid_slug = c
+                    .get("slug")
+                    .and_then(|v| v.as_str())
+                    .and_then(crate::domain::normalize_domain_slug)
+                    .is_some();
+                if !valid_slug {
+                    out.push(ShaclViolation {
+                        field: "metadata.concept.slug".to_string(),
+                        why: "slug is required and must be a valid lowercase-kebab slug"
+                            .to_string(),
+                    });
+                }
+                let valid_label = c
+                    .get("pref_label")
+                    .and_then(|v| v.as_str())
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false);
+                if !valid_label {
+                    out.push(ShaclViolation {
+                        field: "metadata.concept.pref_label".to_string(),
+                        why: "pref_label is required and must be a non-empty string".to_string(),
+                    });
+                }
+                let valid_def = c
+                    .get("definition")
+                    .and_then(|v| v.as_str())
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false);
+                if !valid_def {
+                    out.push(ShaclViolation {
+                        field: "metadata.concept.definition".to_string(),
+                        why: "definition is required and must be a non-empty string".to_string(),
+                    });
+                }
+                if let Some(rs) = c.get("realization_status").and_then(|v| v.as_str()) {
+                    if !matches!(
+                        rs,
+                        "unknown" | "unimplemented" | "partial" | "implemented" | "external_only"
+                    ) {
+                        out.push(ShaclViolation {
+                            field: "metadata.concept.realization_status".to_string(),
+                            why: "realization_status must be unknown, unimplemented, partial, implemented, or external_only".to_string(),
+                        });
+                    }
+                }
+            }
+            _ => out.push(ShaclViolation {
+                field: "metadata.concept".to_string(),
+                why: "concept object is required for a concept memory".to_string(),
+            }),
+        },
         _ => {}
     }
 

@@ -26715,7 +26715,11 @@ impl LadybugStore {
                     now_ts,
                 );
             }
-            if w.payload.memory_type == "action_type" || w.id == rid {
+            if w.payload.memory_type == "action_type"
+                || w.payload.memory_type == "thesis"
+                || w.payload.memory_type == "concept"
+                || w.id == rid
+            {
                 refresh_ont = true;
             }
             lexical_docs.push(Self::lexical_doc(&ns, &w.id, &w.payload));
@@ -27009,7 +27013,11 @@ impl LadybugStore {
 
                     // 3. Apply staged memory writes inside the transaction.
                     let mut writes_done = 0usize;
+                    let mut touches_taxonomy = false;
                     for w in &writes {
+                        if w.payload.memory_type == "thesis" || w.payload.memory_type == "concept" {
+                            touches_taxonomy = true;
+                        }
                         conn_upsert_action_row(
                             conn,
                             &ns_for_tx,
@@ -27024,6 +27032,93 @@ impl LadybugStore {
                             return Err(ActionError::Storage(format!(
                                 "injected action batch fault after {writes_done} writes"
                             )));
+                        }
+                    }
+
+                    // 3b. Enforce post-image taxonomy invariants (singleton active thesis,
+                    // unique active concept slug, and global DAG + SKOS S27 disjointness)
+                    // inside the single-writer transaction before COMMIT.
+                    if touches_taxonomy {
+                        let q_tax = format!(
+                            "MATCH (m:Memory {{namespace: '{safe_ns}'}}) WHERE m.memory_type = 'thesis' OR m.memory_type = 'concept' RETURN m.id, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata"
+                        );
+                        let mut res_tax = conn
+                            .query(&q_tax)
+                            .map_err(|e| ActionError::Storage(e.to_string()))?;
+                        let mut active_thesis_ids: Vec<String> = Vec::new();
+                        let mut seen_concept_slugs: std::collections::BTreeMap<String, String> =
+                            std::collections::BTreeMap::new();
+                        let mut post_forest: std::collections::BTreeMap<
+                            String,
+                            crate::rdf::taxonomy::ConceptSpec,
+                        > = std::collections::BTreeMap::new();
+                        while let Some(trow) = res_tax.next() {
+                            let tid = format!("{}", trow[0]);
+                            let content = format!("{}", trow[1]);
+                            let user_id = format!("{}", trow[2]);
+                            let memory_type = format!("{}", trow[3]);
+                            let agent_name_str = format!("{}", trow[4]);
+                            let location = format!("{}", trow[5]);
+                            let location_lines = format!("{}", trow[6]);
+                            let meta_str = format!("{}", trow[7]);
+                            let metadata: Value = serde_json::from_str(&meta_str)
+                                .unwrap_or_else(|_| serde_json::json!({}));
+                            let agent_name =
+                                if agent_name_str.is_empty() || agent_name_str == "unknown" {
+                                    None
+                                } else {
+                                    Some(agent_name_str)
+                                };
+                            let pl = MemoryPayload {
+                                content,
+                                user_id,
+                                memory_type: memory_type.clone(),
+                                agent_name,
+                                location,
+                                location_lines,
+                                metadata,
+                            };
+                            if !crate::rdf::action::is_active_payload(&pl, now_ts) {
+                                continue;
+                            }
+                            if memory_type == "thesis" {
+                                active_thesis_ids.push(tid);
+                            } else if memory_type == "concept" {
+                                if let Some(spec) =
+                                    crate::rdf::taxonomy::ConceptSpec::from_payload(&pl)
+                                {
+                                    if let Some(prev_id) =
+                                        seen_concept_slugs.insert(spec.slug.clone(), tid.clone())
+                                    {
+                                        return Err(ActionError::ConflictWithNewerVersion {
+                                            receipt_id: tid,
+                                            superseded_by: format!(
+                                                "duplicate_active_concept_slug:{}:{prev_id}",
+                                                spec.slug
+                                            ),
+                                        });
+                                    }
+                                    post_forest.insert(spec.slug.clone(), spec);
+                                }
+                            }
+                        }
+                        if active_thesis_ids.len() > 1 {
+                            active_thesis_ids.sort();
+                            return Err(ActionError::ConflictWithNewerVersion {
+                                receipt_id: "thesis".to_string(),
+                                superseded_by: format!(
+                                    "multiple_active_theses:{}",
+                                    active_thesis_ids.join(",")
+                                ),
+                            });
+                        }
+                        if !post_forest.is_empty() {
+                            crate::rdf::taxonomy::validate_concept_forest(&post_forest).map_err(
+                                |e| ActionError::ConflictWithNewerVersion {
+                                    receipt_id: "taxonomy_forest".to_string(),
+                                    superseded_by: e,
+                                },
+                            )?;
                         }
                     }
 

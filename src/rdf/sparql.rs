@@ -262,10 +262,18 @@ pub async fn project_sparql_dataset_with_meta_async(
         .map(|m| (m.id.clone(), m.payload.clone()))
         .collect();
     let twin_schemas = crate::digital_twin::collect_twin_schemas_from_rows(&kept_rows);
-    let edges = if !twin_schemas.is_empty() {
+    let has_concepts = kept_rows.iter().any(|(_, p)| p.memory_type == "concept");
+    let edges = if !twin_schemas.is_empty() || has_concepts {
         store.list_edges(namespace).await.unwrap_or_default()
     } else {
         Vec::new()
+    };
+    let tax_view = if has_concepts {
+        Some(crate::rdf::taxonomy::build_principal_taxonomy_view(
+            &kept_rows, &edges, "admin",
+        ))
+    } else {
+        None
     };
 
     for m in kept_memories {
@@ -298,6 +306,19 @@ pub async fn project_sparql_dataset_with_meta_async(
                 if !qs.contains(&eq) {
                     qs.push(eq);
                 }
+            }
+        }
+        if let Some(ref view) = tax_view {
+            if payload.memory_type == "concept" {
+                crate::rdf::projection::reconcile_concept_quads_with_view(
+                    &m.id,
+                    &payload,
+                    namespace,
+                    crate::rdf::types::Tier::Domain,
+                    0,
+                    view,
+                    &mut qs,
+                );
             }
         }
         for q in qs {
@@ -336,6 +357,7 @@ pub async fn project_scenario_sparql_dataset_async(
     let mut dataset = Dataset::new();
     let mut meta_map = std::collections::HashMap::new();
     let twin_schemas = crate::digital_twin::collect_twin_schemas_from_rows(&merged_rows);
+    let has_concepts = merged_rows.iter().any(|(_, p)| p.memory_type == "concept");
     let prov_edges: Vec<(
         String,
         String,
@@ -345,6 +367,15 @@ pub async fn project_scenario_sparql_dataset_async(
         .iter()
         .map(|(s, r, t, _w)| (s.clone(), r.clone(), t.clone(), None))
         .collect();
+    let tax_view = if has_concepts {
+        Some(crate::rdf::taxonomy::build_principal_taxonomy_view(
+            &merged_rows,
+            &prov_edges,
+            "admin",
+        ))
+    } else {
+        None
+    };
 
     for (id, payload) in &merged_rows {
         meta_map.insert(
@@ -375,6 +406,19 @@ pub async fn project_scenario_sparql_dataset_async(
                 if !qs.contains(&eq) {
                     qs.push(eq);
                 }
+            }
+        }
+        if let Some(ref view) = tax_view {
+            if payload.memory_type == "concept" {
+                crate::rdf::projection::reconcile_concept_quads_with_view(
+                    id,
+                    payload,
+                    namespace,
+                    crate::rdf::types::Tier::Domain,
+                    0,
+                    view,
+                    &mut qs,
+                );
             }
         }
         for q in qs {

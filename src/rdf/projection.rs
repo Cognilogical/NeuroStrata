@@ -831,20 +831,18 @@ pub fn memory_to_quads(
                     .map(|s| !s.trim().is_empty())
                     .unwrap_or(false)
             };
-            let has_definition = def_str.trim().len() >= 20;
+            let has_definition = !def_str.trim().is_empty();
             let has_taxonomy_link = non_empty_str(c.get("domain"))
                 || !broader_vec.is_empty()
-                || !related_vec.is_empty()
-                || !contrasts_vec.is_empty();
+                || non_empty_arr(c.get("narrower"))
+                || !related_vec.is_empty();
             let has_synthesis = non_empty_arr(c.get("tradeoffs"))
-                || non_empty_str(c.get("chosen_approach"))
-                || non_empty_str(c.get("rationale"));
-            let has_empirical_grounding = non_empty_arr(payload.metadata.get("governs"))
-                || !payload.location.trim().is_empty()
-                || non_empty_arr(c.get("references"))
-                || non_empty_arr(c.get("comparable_implementations"))
-                || non_empty_arr(c.get("implemented_interfaces"))
-                || non_empty_arr(c.get("linked_action_types"));
+                && (!contrasts_vec.is_empty()
+                    || non_empty_arr(c.get("references"))
+                    || non_empty_arr(c.get("comparable_implementations")));
+            let has_empirical_grounding = has_synthesis
+                && (non_empty_arr(c.get("evidence_refs"))
+                    || non_empty_arr(payload.metadata.get("governs")));
             let ep_status = crate::formal_kernel::classify_epistemic_status(
                 has_definition,
                 has_taxonomy_link,
@@ -1194,6 +1192,159 @@ pub fn twin_schema_and_reducer_quads_for_row(
     quads
 }
 
+/// Reconcile a `concept` row's projected RDF quads (`ns:epistemicStatus`, derived `skos:narrower`,
+/// and symmetrized `skos:related` / `ns:contrastsWith`) against the multi-row
+/// [`crate::rdf::taxonomy::PrincipalTaxonomyView`] so SPARQL and dataset exports agree 100%
+/// with `neurostrata_taxonomy` operations.
+pub fn reconcile_concept_quads_with_view(
+    id: &str,
+    payload: &MemoryPayload,
+    namespace: &str,
+    tier: Tier,
+    generation: u64,
+    view: &crate::rdf::taxonomy::PrincipalTaxonomyView,
+    quads: &mut Vec<Quad>,
+) {
+    if payload.memory_type != "concept" {
+        return;
+    }
+    let Some(c) = payload.metadata.get("concept").and_then(|v| v.as_object()) else {
+        return;
+    };
+    let slug = c.get("slug").and_then(|v| v.as_str()).unwrap_or(id);
+    let Some(hydrated) = view.concepts.get(slug) else {
+        return;
+    };
+    if hydrated.id != id {
+        return;
+    }
+
+    let graph_iri = format!(
+        "urn:neurostrata:graph:{}:{}:gen:{}",
+        namespace,
+        tier.as_str(),
+        generation
+    );
+    let graph = GraphName::NamedNode(NamedNode::new_unchecked(graph_iri));
+    let subject = NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(format!(
+        "urn:neurostrata:memory:{id}"
+    )));
+    let concept_subject_iri = c
+        .get("concept_iri")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty() && NamedNode::new(*s).is_ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("urn:neurostrata:concept:{}", sanitize_iri_suffix(slug)));
+    let concept_subject =
+        NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(concept_subject_iri));
+
+    let ep_pred = NamedNode::new_unchecked(ns_predicate("epistemicStatus"));
+    quads.retain(|q| q.predicate != ep_pred);
+
+    let ep_lit = Term::Literal(Literal::new_typed_literal(
+        &hydrated.epistemic_status,
+        NamedNode::new_unchecked(XSD_STRING),
+    ));
+    let q1 = Quad::new(concept_subject.clone(), ep_pred.clone(), ep_lit.clone(), graph.clone());
+    if !quads.contains(&q1) {
+        quads.push(q1);
+    }
+    let q2 = Quad::new(subject.clone(), ep_pred, ep_lit, graph.clone());
+    if !quads.contains(&q2) {
+        quads.push(q2);
+    }
+
+    let skos_narrower =
+        NamedNode::new_unchecked("http://www.w3.org/2004/02/skos/core#narrower");
+    let skos_related =
+        NamedNode::new_unchecked("http://www.w3.org/2004/02/skos/core#related");
+    let ns_contrasts = NamedNode::new_unchecked(ns_predicate("contrastsWith"));
+
+    let concept_node_for_slug = |target_slug: &str| -> NamedNode {
+        if let Some(tc) = view.concepts.get(target_slug) {
+            if let Some(ref iri) = tc.concept_iri {
+                if !iri.trim().is_empty() && NamedNode::new(iri).is_ok() {
+                    return NamedNode::new_unchecked(iri.clone());
+                }
+            }
+        }
+        if NamedNode::new(target_slug).is_ok() && target_slug.contains(':') {
+            NamedNode::new_unchecked(target_slug.to_string())
+        } else {
+            NamedNode::new_unchecked(format!(
+                "urn:neurostrata:concept:{}",
+                sanitize_iri_suffix(target_slug)
+            ))
+        }
+    };
+
+    for n_slug in &hydrated.narrower {
+        let child_nn = concept_node_for_slug(n_slug);
+        let q_c = Quad::new(
+            concept_subject.clone(),
+            skos_narrower.clone(),
+            Term::NamedNode(child_nn.clone()),
+            graph.clone(),
+        );
+        if !quads.contains(&q_c) {
+            quads.push(q_c);
+        }
+        let q_s = Quad::new(
+            subject.clone(),
+            skos_narrower.clone(),
+            Term::NamedNode(child_nn),
+            graph.clone(),
+        );
+        if !quads.contains(&q_s) {
+            quads.push(q_s);
+        }
+    }
+
+    for r_slug in &hydrated.related_concepts {
+        let rel_nn = concept_node_for_slug(r_slug);
+        let q_c = Quad::new(
+            concept_subject.clone(),
+            skos_related.clone(),
+            Term::NamedNode(rel_nn.clone()),
+            graph.clone(),
+        );
+        if !quads.contains(&q_c) {
+            quads.push(q_c);
+        }
+        let q_s = Quad::new(
+            subject.clone(),
+            skos_related.clone(),
+            Term::NamedNode(rel_nn),
+            graph.clone(),
+        );
+        if !quads.contains(&q_s) {
+            quads.push(q_s);
+        }
+    }
+
+    for cw_slug in &hydrated.contrasts_with {
+        let cw_nn = concept_node_for_slug(cw_slug);
+        let q_c = Quad::new(
+            concept_subject.clone(),
+            ns_contrasts.clone(),
+            Term::NamedNode(cw_nn.clone()),
+            graph.clone(),
+        );
+        if !quads.contains(&q_c) {
+            quads.push(q_c);
+        }
+        let q_s = Quad::new(
+            subject.clone(),
+            ns_contrasts.clone(),
+            Term::NamedNode(cw_nn),
+            graph.clone(),
+        );
+        if !quads.contains(&q_s) {
+            quads.push(q_s);
+        }
+    }
+}
+
 /// Combine node + edge quads for a namespace snapshot.
 /// Returns legacy `crate::rdf::types::Quad` for backward compatibility with LadybugStore API.
 pub fn rows_to_quads(
@@ -1205,6 +1356,14 @@ pub fn rows_to_quads(
 ) -> Vec<super::types::Quad> {
     let mut out = Vec::new();
     let schemas = crate::digital_twin::collect_twin_schemas_from_rows(rows);
+    let has_concepts = rows.iter().any(|(_, p)| p.memory_type == "concept");
+    let tax_view = if has_concepts {
+        Some(crate::rdf::taxonomy::build_principal_taxonomy_view(
+            rows, edges, "admin",
+        ))
+    } else {
+        None
+    };
     for (id, payload) in rows {
         let mut qs = memory_to_quads(id, payload, namespace, tier, generation);
         if !schemas.is_empty() && payload.memory_type == "digital_twin" {
@@ -1215,6 +1374,13 @@ pub fn rows_to_quads(
                 if !qs.contains(&eq) {
                     qs.push(eq);
                 }
+            }
+        }
+        if let Some(ref view) = tax_view {
+            if payload.memory_type == "concept" {
+                reconcile_concept_quads_with_view(
+                    id, payload, namespace, tier, generation, view, &mut qs,
+                );
             }
         }
         out.extend(quads_to_legacy(&qs));

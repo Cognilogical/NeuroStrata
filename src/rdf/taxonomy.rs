@@ -567,7 +567,7 @@ fn collect_active_action_slugs(active_rows: &[(String, MemoryPayload)]) -> BTree
 
 /// Validates that the candidate concept forest (all active concepts with `candidate` inserted)
 /// satisfies `validate_taxonomy_dag` and `validate_skos_disjointness`.
-fn validate_concept_forest(
+pub(crate) fn validate_concept_forest(
     concepts_by_slug: &BTreeMap<String, ConceptSpec>,
 ) -> Result<(), String> {
     let mut slug_to_num: BTreeMap<String, u32> = BTreeMap::new();
@@ -1331,6 +1331,36 @@ async fn execute_set_thesis(
         payload: new_payload,
     });
 
+    // Atomically register core_pillars in the namespace domain_registry row under CAS.
+    let registry_id = crate::registry::registry_row_id(namespace);
+    let existing_reg = store
+        .get(namespace, &registry_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let existing_reg_payload = existing_reg.as_ref().map(|(_, p)| p);
+    let reg_fp = crate::rdf::scenario::fingerprint_live_row(existing_reg_payload, now_ts);
+    expected_heads.push(ExpectedHead::RowFingerprint {
+        row_id: registry_id.clone(),
+        expected_fingerprint: reg_fp,
+    });
+    let reg_payload = crate::registry::build_merged_registry_payload(
+        namespace,
+        existing_reg_payload.map(|p| &p.metadata),
+        &core_pillars,
+    );
+    let reg_vec = match existing_reg {
+        Some((v, _)) if !v.is_empty() => v,
+        _ => embedder
+            .embed(&reg_payload.content)
+            .await
+            .unwrap_or_else(|_| vec![0.0; embedder.dimensions()]),
+    };
+    writes.push(StagedMemoryWrite {
+        id: registry_id,
+        vector: reg_vec,
+        payload: reg_payload,
+    });
+
     store
         .commit_action_batch(
             namespace,
@@ -1588,6 +1618,7 @@ async fn execute_upsert_concept(
 
     // Collect existing active concept rows in namespace and check global DAG + SKOS S27 disjointness
     let mut existing_for_slug: Vec<(u64, i64, String, MemoryPayload)> = Vec::new();
+    let mut other_concept_heads: Vec<(String, u64)> = Vec::new();
     let mut candidate_forest: BTreeMap<String, ConceptSpec> = BTreeMap::new();
     for (rid, pl) in &active_rows {
         if pl.memory_type == "concept" {
@@ -1605,6 +1636,8 @@ async fn execute_upsert_concept(
                         .unwrap_or(0);
                     existing_for_slug.push((ver, vf, rid.clone(), pl.clone()));
                 } else {
+                    let fp = crate::rdf::scenario::fingerprint_live_row(Some(pl), now_ts);
+                    other_concept_heads.push((rid.clone(), fp));
                     candidate_forest.insert(spec.slug.clone(), spec);
                 }
             }
@@ -1626,6 +1659,12 @@ async fn execute_upsert_concept(
     let mut expected_heads: Vec<ExpectedHead> = vec![ExpectedHead::AbsentOrInactive {
         row_id: new_id.clone(),
     }];
+    for (other_id, other_fp) in other_concept_heads {
+        expected_heads.push(ExpectedHead::RowFingerprint {
+            row_id: other_id,
+            expected_fingerprint: other_fp,
+        });
+    }
     let mut writes: Vec<StagedMemoryWrite> = Vec::new();
 
     for (_ver, _vf, old_id, mut old_payload) in existing_for_slug {
@@ -3312,6 +3351,7 @@ mod tests {
     use crate::rdf::action::ActionSecurityContext;
     use crate::store::ladybug::LadybugStore;
     use crate::traits::{Embedder, VectorStore};
+    use std::sync::Arc;
 
     struct DummyEmbedder(usize);
     #[async_trait::async_trait]
@@ -4094,5 +4134,322 @@ mod tests {
         assert!(prompt_sec.chars().count() <= 1200);
         assert!(prompt_sec.contains("public-rrf-fusion"));
         assert!(!prompt_sec.contains("confidential-proprietary-kernel"));
+    }
+
+    #[tokio::test]
+    async fn set_thesis_registers_core_pillars_atomically_so_check_registry_accepts_memories() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(LadybugStore::new(&tmp.path().join("db"), 4).expect("store"));
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-reg-test";
+        store.init(ns).await.expect("init");
+
+        execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "set_thesis".to_string(),
+                namespace: ns.to_string(),
+                primary_domain: Some("cognitive-memory".to_string()),
+                mission: Some("Verifiable cognitive memory engine".to_string()),
+                direction: Some("Deterministic graph reasoning".to_string()),
+                core_pillars: Some(vec![
+                    "graph-rag".to_string(),
+                    "formal-verification".to_string(),
+                ]),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("set_thesis");
+
+        let dyn_store: Arc<dyn crate::traits::VectorStore> = store.clone();
+        let dc = crate::registry::check_domain(
+            &dyn_store,
+            ns,
+            &json!(["graph-rag", "formal-verification"]),
+            false,
+        )
+        .await
+        .expect("core_pillars must be registered in domain_registry atomically by set_thesis");
+        assert!(
+            dc.cache.is_none(),
+            "cache should already be current after set_thesis: {:?}",
+            dc.cache
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_action_batch_enforces_post_image_taxonomy_dag_and_singleton_thesis() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-postimage-cas";
+        store.init(ns).await.expect("init");
+
+        execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "set_thesis".to_string(),
+                namespace: ns.to_string(),
+                primary_domain: Some("cognitive-memory".to_string()),
+                mission: Some("Mission 1".to_string()),
+                direction: Some("Direction 1".to_string()),
+                core_pillars: Some(vec!["retrieval".to_string()]),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("set_thesis v1");
+
+        // Attempting to commit a second active thesis row without superseding thesis-v1
+        // must be rejected inside commit_action_batch before COMMIT.
+        let rogue_thesis = MemoryPayload {
+            content: "Rogue second active thesis".to_string(),
+            user_id: "alice".to_string(),
+            memory_type: "thesis".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: json!({
+                "valid_from": 100,
+                "thesis_version": 99,
+                "thesis": {
+                    "primary_domain": "other",
+                    "mission": "m",
+                    "direction": "d",
+                    "core_pillars": ["retrieval"]
+                }
+            }),
+        };
+        let err = store
+            .commit_action_batch(
+                ns,
+                ActionWriteSet {
+                    expected_heads: vec![],
+                    writes: vec![StagedMemoryWrite {
+                        id: "thesis-v99".to_string(),
+                        vector: vec![0.1, 0.2, 0.3, 0.4],
+                        payload: rogue_thesis,
+                    }],
+                    edge_deltas: vec![],
+                },
+            )
+            .await
+            .expect_err("multiple active theses must be rejected inside commit_action_batch");
+        assert!(format!("{err:?}").contains("multiple_active_theses"));
+        assert!(store.get(ns, "thesis-v99").await.unwrap().is_none());
+
+        // Attempting to commit two mutually cyclic concept rows in a batch must also fail before COMMIT.
+        let c_a = MemoryPayload {
+            content: "Concept A".to_string(),
+            user_id: "alice".to_string(),
+            memory_type: "concept".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: json!({
+                "valid_from": 100,
+                "concept_version": 1,
+                "concept": {
+                    "slug": "cycle-a",
+                    "pref_label": "Cycle A",
+                    "definition": "A",
+                    "broader": ["cycle-b"]
+                }
+            }),
+        };
+        let c_b = MemoryPayload {
+            content: "Concept B".to_string(),
+            user_id: "alice".to_string(),
+            memory_type: "concept".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: json!({
+                "valid_from": 100,
+                "concept_version": 1,
+                "concept": {
+                    "slug": "cycle-b",
+                    "pref_label": "Cycle B",
+                    "definition": "B",
+                    "broader": ["cycle-a"]
+                }
+            }),
+        };
+        let cyc_err = store
+            .commit_action_batch(
+                ns,
+                ActionWriteSet {
+                    expected_heads: vec![],
+                    writes: vec![
+                        StagedMemoryWrite {
+                            id: "concept-cycle-a-v1".to_string(),
+                            vector: vec![0.1, 0.2, 0.3, 0.4],
+                            payload: c_a,
+                        },
+                        StagedMemoryWrite {
+                            id: "concept-cycle-b-v1".to_string(),
+                            vector: vec![0.1, 0.2, 0.3, 0.4],
+                            payload: c_b,
+                        },
+                    ],
+                    edge_deltas: vec![],
+                },
+            )
+            .await
+            .expect_err("post-image cycle must be rejected inside commit_action_batch");
+        assert!(format!("{cyc_err:?}").contains("taxonomy DAG cycle"));
+        assert!(store.get(ns, "concept-cycle-a-v1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn sparql_and_rows_to_quads_reconcile_epistemic_status_and_symmetry_with_taxonomy_view() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-sparql-parity";
+        store.init(ns).await.expect("init");
+
+        // Create active governing rule
+        store
+            .upsert(
+                ns,
+                "rule-gov-1",
+                vec![0.1, 0.2, 0.3, 0.4],
+                MemoryPayload {
+                    content: "Governing rule for child concept".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "rule".to_string(),
+                    agent_name: None,
+                    location: "src/rdf/taxonomy.rs".to_string(),
+                    location_lines: String::new(),
+                    metadata: json!({ "valid_from": 100 }),
+                },
+            )
+            .await
+            .expect("rule-gov-1");
+
+        // Parent concept (no narrower declared on parent)
+        execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "upsert_concept".to_string(),
+                namespace: ns.to_string(),
+                slug: Some("parent-concept".to_string()),
+                pref_label: Some("Parent Concept".to_string()),
+                definition: Some("Short def".to_string()),
+                domain: Some("retrieval".to_string()),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("parent-concept");
+
+        // Child concept with broader=["parent-concept"], synthesis, and evidence_refs=["rule-gov-1"]
+        execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "upsert_concept".to_string(),
+                namespace: ns.to_string(),
+                slug: Some("child-concept".to_string()),
+                pref_label: Some("Child Concept".to_string()),
+                definition: Some("Short def".to_string()),
+                domain: Some("retrieval".to_string()),
+                broader: Some(vec!["parent-concept".to_string()]),
+                tradeoffs: Some(vec!["Tradeoff 1".to_string()]),
+                references: Some(vec!["Ref 1".to_string()]),
+                evidence_refs: Some(vec!["rule-gov-1".to_string()]),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("child-concept");
+
+        let (sparql_str, count, _, _) = crate::rdf::sparql::execute_sparql_query(
+            "SELECT ?status ?child WHERE { <urn:neurostrata:concept:child-concept> <urn:neurostrata:ns#epistemicStatus> ?status . <urn:neurostrata:concept:parent-concept> <http://www.w3.org/2004/02/skos/core#narrower> ?child }",
+            ns,
+            sparesults::QueryResultsFormat::Json,
+            false,
+            false,
+            &store,
+        )
+        .await
+        .expect("execute_sparql_query");
+        assert_eq!(count, 1, "expected 1 SPARQL binding row: {sparql_str}");
+        assert!(
+            sparql_str.contains("\"verified\""),
+            "SPARQL must report verified epistemicStatus matching taxonomy view: {sparql_str}"
+        );
+        assert!(
+            sparql_str.contains("urn:neurostrata:concept:child-concept"),
+            "SPARQL must project inverse skos:narrower on parent-concept: {sparql_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shacl_mesh_uuid_and_thalamic_bus_pulse_integration_for_thesis_and_concept() {
+        assert!(crate::synaptic_mesh::frame::PERMITTED_MESH_MEMORY_TYPES.contains(&"thesis"));
+        assert!(crate::synaptic_mesh::frame::PERMITTED_MESH_MEMORY_TYPES.contains(&"concept"));
+        assert!(crate::synaptic_mesh::outbox::is_shareable_memory_type("thesis"));
+        assert!(crate::synaptic_mesh::outbox::is_shareable_memory_type("concept"));
+
+        // Deterministic UUIDv5 mapping for non-UUID taxonomy row IDs
+        let u1 = crate::synaptic_mesh::worker::parse_or_derive_mesh_uuid(
+            "NeuroStrata",
+            "thesis",
+            "thesis-v1",
+        )
+        .expect("UUIDv5 for thesis-v1");
+        let u2 = crate::synaptic_mesh::worker::parse_or_derive_mesh_uuid(
+            "NeuroStrata",
+            "thesis",
+            "thesis-v1",
+        )
+        .expect("deterministic UUIDv5");
+        assert_eq!(u1, u2);
+        assert!(crate::synaptic_mesh::worker::parse_or_derive_mesh_uuid(
+            "NeuroStrata",
+            "rule",
+            "not-a-uuid"
+        )
+        .is_none());
+
+        // SHACL validation for thesis & concept
+        let bad_thesis = MemoryPayload {
+            content: "bad".to_string(),
+            user_id: "alice".to_string(),
+            memory_type: "thesis".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: json!({ "thesis": { "primary_domain": "" } }),
+        };
+        assert!(!crate::rdf::shacl::validate_memory(&bad_thesis).is_empty());
+
+        let bad_concept = MemoryPayload {
+            content: "bad".to_string(),
+            user_id: "alice".to_string(),
+            memory_type: "concept".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: json!({
+                "concept": {
+                    "slug": "valid-slug",
+                    "pref_label": "Label",
+                    "definition": "Def",
+                    "realization_status": "invalid_enum"
+                }
+            }),
+        };
+        assert!(!crate::rdf::shacl::validate_memory(&bad_concept).is_empty());
     }
 }

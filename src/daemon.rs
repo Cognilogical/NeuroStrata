@@ -2226,9 +2226,13 @@ async fn handle_http_taxonomy(
     State(state): State<AppState>,
     Json(req): Json<serde_json::Value>,
 ) -> impl axum::response::IntoResponse {
-    let body =
-        crate::server::handle_taxonomy(&req, state.embedder.clone(), state.vector_store.clone())
-            .await;
+    let body = crate::handlers::taxonomy::handle_taxonomy_with_bus(
+        &req,
+        state.embedder.clone(),
+        state.vector_store.clone(),
+        Some(state.bus.clone()),
+    )
+    .await;
     (
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         body,
