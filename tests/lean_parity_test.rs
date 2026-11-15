@@ -24,15 +24,17 @@ use formal_kernel::{
     action_gate_tag, action_revert_tag, action_task_effect_tag, allocate_hybrid_slots,
     claim_decision_tag, claim_scope_verdict_tag, classify_merge_decision_tag, classify_tour_stop,
     epoch_gate_tag, evaluate_action_gate, evaluate_action_revert, evaluate_action_task_effect,
-    evaluate_claim_decision, evaluate_claim_scope_gate, evaluate_import_precheck,
-    evaluate_insight_define, evaluate_procedure_fire, evaluate_reducer_total,
-    evaluate_retention_gate, evaluate_scenario_commit, evaluate_seq_continuity,
-    evaluate_sovereignty_gate, import_precheck_tag, intersect_var_bounds,
-    is_action_memory_shareable, is_memory_valid_at, join_task_status, lifecycle_can_transition,
-    procedure_fire_tag, resolve_cross_file_call, resolve_scenario_row, retention_verdict_tag,
-    seq_decision_tag, sovereignty_decision_tag, task_step_tag, ActionMemoryKind,
-    ActionReceiptState, ActionTaskTargetStatus, EpistemicStatus, KernelProcedureTrust,
-    ReducerOpKind, TwinBoundError,
+    evaluate_claim_decision, evaluate_claim_scope_gate, evaluate_connector_post_gate,
+    evaluate_connector_pre_gate, evaluate_import_precheck, evaluate_insight_define,
+    evaluate_procedure_fire, evaluate_reducer_total, evaluate_retention_gate,
+    evaluate_scenario_commit, evaluate_seq_continuity, evaluate_sovereignty_gate,
+    import_precheck_tag, intersect_var_bounds, is_action_memory_shareable, is_memory_valid_at,
+    join_task_status, lifecycle_can_transition, procedure_fire_tag, resolve_cross_file_call,
+    resolve_scenario_row, retention_verdict_tag, seq_decision_tag, sovereignty_decision_tag,
+    task_step_tag, ActionMemoryKind, ActionReceiptState, ActionTaskTargetStatus, EpistemicStatus,
+    KernelActionReceiptState, KernelConnectorOp, KernelConnectorPostGateInput,
+    KernelConnectorPostVerdict, KernelConnectorPreGateInput, KernelConnectorPreVerdict,
+    KernelProcedureTrust, ReducerOpKind, TwinBoundError,
 };
 
 /// The statuses in the exact order used by `proofs/Main.lean`.
@@ -1213,6 +1215,196 @@ fn lean_proof_sources_contain_no_sorry_or_axiom() {
         "placeholder declarations found:\n{}",
         offenders.join("\n")
     );
+}
+
+#[test]
+fn data_connector_gate_parity() {
+    // Test Pre-Gate Verdicts
+    assert_eq!(evaluate_connector_pre_gate(KernelConnectorPreGateInput {
+        connector_registered: true,
+        rebac_allowed: true,
+        op: KernelConnectorOp::RegisterPointer,
+        pool_writable: false,
+        receipt_state: KernelActionReceiptState::NotRequired,
+        requested_rows: 0,
+        max_slice_rows: 100,
+        requested_bytes: 0,
+        max_slice_bytes: 1000,
+        clock_skew_future: false,
+        age_secs: 0,
+        max_staleness_secs: 0,
+    }), KernelConnectorPreVerdict::AllowPreRegister);
+
+    assert_eq!(evaluate_connector_pre_gate(KernelConnectorPreGateInput {
+        connector_registered: false,
+        rebac_allowed: true,
+        op: KernelConnectorOp::ResolveSlice,
+        pool_writable: true,
+        receipt_state: KernelActionReceiptState::NotRequired,
+        requested_rows: 0,
+        max_slice_rows: 100,
+        requested_bytes: 0,
+        max_slice_bytes: 1000,
+        clock_skew_future: false,
+        age_secs: 0,
+        max_staleness_secs: 0,
+    }), KernelConnectorPreVerdict::DenyUnregisteredConnector);
+
+    assert_eq!(evaluate_connector_pre_gate(KernelConnectorPreGateInput {
+        connector_registered: true,
+        rebac_allowed: false,
+        op: KernelConnectorOp::ResolveSlice,
+        pool_writable: true,
+        receipt_state: KernelActionReceiptState::NotRequired,
+        requested_rows: 0,
+        max_slice_rows: 100,
+        requested_bytes: 0,
+        max_slice_bytes: 1000,
+        clock_skew_future: false,
+        age_secs: 0,
+        max_staleness_secs: 0,
+    }), KernelConnectorPreVerdict::DenyRebacAccess);
+
+    assert_eq!(evaluate_connector_pre_gate(KernelConnectorPreGateInput {
+        connector_registered: true,
+        rebac_allowed: true,
+        op: KernelConnectorOp::ApplyWriteBack,
+        pool_writable: false,
+        receipt_state: KernelActionReceiptState::NotRequired,
+        requested_rows: 0,
+        max_slice_rows: 100,
+        requested_bytes: 0,
+        max_slice_bytes: 1000,
+        clock_skew_future: false,
+        age_secs: 0,
+        max_staleness_secs: 0,
+    }), KernelConnectorPreVerdict::DenyReadOnlyPool);
+
+    assert_eq!(evaluate_connector_pre_gate(KernelConnectorPreGateInput {
+        connector_registered: true,
+        rebac_allowed: true,
+        op: KernelConnectorOp::ApplyWriteBack,
+        pool_writable: true,
+        receipt_state: KernelActionReceiptState::ActiveBound,
+        requested_rows: 0,
+        max_slice_rows: 100,
+        requested_bytes: 0,
+        max_slice_bytes: 1000,
+        clock_skew_future: false,
+        age_secs: 0,
+        max_staleness_secs: 0,
+    }), KernelConnectorPreVerdict::AllowPreWriteBack);
+
+    assert_eq!(evaluate_connector_pre_gate(KernelConnectorPreGateInput {
+        connector_registered: true,
+        rebac_allowed: true,
+        op: KernelConnectorOp::ResolveSlice,
+        pool_writable: true,
+        receipt_state: KernelActionReceiptState::NotRequired,
+        requested_rows: 101, // exceeds max_slice_rows
+        max_slice_rows: 100,
+        requested_bytes: 0,
+        max_slice_bytes: 1000,
+        clock_skew_future: false,
+        age_secs: 0,
+        max_staleness_secs: 0,
+    }), KernelConnectorPreVerdict::DenySliceLimitExceeded);
+
+    assert_eq!(evaluate_connector_pre_gate(KernelConnectorPreGateInput {
+        connector_registered: true,
+        rebac_allowed: true,
+        op: KernelConnectorOp::ResolveSlice,
+        pool_writable: true,
+        receipt_state: KernelActionReceiptState::NotRequired,
+        requested_rows: 1,
+        max_slice_rows: 100,
+        requested_bytes: 1,
+        max_slice_bytes: 1000,
+        clock_skew_future: true, // future clock skew
+        age_secs: 0,
+        max_staleness_secs: 0,
+    }), KernelConnectorPreVerdict::DenyClockSkewFuture);
+
+    assert_eq!(evaluate_connector_pre_gate(KernelConnectorPreGateInput {
+        connector_registered: true,
+        rebac_allowed: true,
+        op: KernelConnectorOp::ResolveSlice,
+        pool_writable: true,
+        receipt_state: KernelActionReceiptState::NotRequired,
+        requested_rows: 1,
+        max_slice_rows: 100,
+        requested_bytes: 1,
+        max_slice_bytes: 1000,
+        clock_skew_future: false,
+        age_secs: 1000,
+        max_staleness_secs: 0,
+    }), KernelConnectorPreVerdict::AllowPreResolve); // not stale yet
+
+    assert_eq!(evaluate_connector_pre_gate(KernelConnectorPreGateInput {
+        connector_registered: true,
+        rebac_allowed: true,
+        op: KernelConnectorOp::ResolveSlice,
+        pool_writable: true,
+        receipt_state: KernelActionReceiptState::NotRequired,
+        requested_rows: 1,
+        max_slice_rows: 100,
+        requested_bytes: 1,
+        max_slice_bytes: 1000,
+        clock_skew_future: false,
+        age_secs: 1000,
+        max_staleness_secs: 1, // stale
+    }), KernelConnectorPreVerdict::DenyPointerStale);
+
+    // Test Post-Gate Verdicts
+    assert_eq!(evaluate_connector_post_gate(KernelConnectorPostGateInput {
+        op: KernelConnectorOp::ResolveSlice,
+        observed_rows: 0,
+        max_slice_rows: 100,
+        observed_bytes: 0,
+        max_slice_bytes: 1000,
+        source_digest_matches: true,
+        cas_expected_matches: true,
+    }), KernelConnectorPostVerdict::AllowPostOutput);
+
+    assert_eq!(evaluate_connector_post_gate(KernelConnectorPostGateInput {
+        op: KernelConnectorOp::ResolveSlice,
+        observed_rows: 101, // exceeds max_slice_rows
+        max_slice_rows: 100,
+        observed_bytes: 0,
+        max_slice_bytes: 1000,
+        source_digest_matches: true,
+        cas_expected_matches: true,
+    }), KernelConnectorPostVerdict::DenyObservedBoundsExceeded);
+
+    assert_eq!(evaluate_connector_post_gate(KernelConnectorPostGateInput {
+        op: KernelConnectorOp::ResolveSlice,
+        observed_rows: 0,
+        max_slice_rows: 100,
+        observed_bytes: 0,
+        max_slice_bytes: 1000,
+        source_digest_matches: false, // digest mismatch
+        cas_expected_matches: true,
+    }), KernelConnectorPostVerdict::DenySourceDigestMismatch);
+
+    assert_eq!(evaluate_connector_post_gate(KernelConnectorPostGateInput {
+        op: KernelConnectorOp::ApplyWriteBack,
+        observed_rows: 0,
+        max_slice_rows: 100,
+        observed_bytes: 0,
+        max_slice_bytes: 1000,
+        source_digest_matches: true,
+        cas_expected_matches: false, // CAS conflict
+    }), KernelConnectorPostVerdict::DenyCasConflict);
+
+    assert_eq!(evaluate_connector_post_gate(KernelConnectorPostGateInput {
+        op: KernelConnectorOp::ApplyWriteBack,
+        observed_rows: 0,
+        max_slice_rows: 100,
+        observed_bytes: 0,
+        max_slice_bytes: 1000,
+        source_digest_matches: true,
+        cas_expected_matches: true,
+    }), KernelConnectorPostVerdict::AllowPostOutput);
 }
 
 #[test]

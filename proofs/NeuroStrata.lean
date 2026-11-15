@@ -16,3 +16,4 @@ import NeuroStrata.DiffTour
 import NeuroStrata.Insights
 import NeuroStrata.Taxonomy
 import NeuroStrata.WorkflowStage
+import NeuroStrata.DataConnector
