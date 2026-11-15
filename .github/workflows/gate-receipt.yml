@@ -3,9 +3,13 @@ name: gate-receipt
 # GitHub Actions has no review-thread-resolution trigger:
 # `pull_request_review_thread` is a webhook event only, and listing it under
 # `on:` makes the workflow invalid. A bare resolve/unresolve therefore
-# re-evaluates on the next review, inline comment, PR edit, issue comment, or
-# a manual workflow_dispatch. A `fixed@`/`filed`/`ruled:` reply is an inline
-# comment, so the receipt path re-runs the check without an unrelated push.
+# re-evaluates on the next review, inline comment, or PR edit. A
+# `fixed@`/`filed`/`ruled:` reply is an inline comment, so the receipt path
+# re-runs the check without an unrelated push.
+#
+# No privileged-context triggers (`issue_comment`, `workflow_dispatch`) are
+# subscribed here: they would execute a PR-supplied checkout in a context with
+# default-branch authority. Use a review/inline reply (or a push) to re-run.
 on:
   pull_request_review:
     types: [submitted, edited, dismissed]
@@ -13,14 +17,6 @@ on:
     types: [created, edited, deleted]
   pull_request:
     types: [opened, synchronize, reopened, edited]
-  issue_comment:
-    types: [created, edited, deleted]
-  workflow_dispatch:
-    inputs:
-      pr:
-        description: Pull request number to re-evaluate
-        required: true
-        type: string
 
 permissions:
   contents: read
@@ -35,22 +31,12 @@ jobs:
       # Bootstrap: this workflow lands in the PR that adds the script, so PR and
       # review events run the head. After this lands, switch that checkout to
       # the base ref so a PR cannot edit the gate that checks it.
-      - name: Checkout the PR head (PR and review events)
-        if: github.event_name != 'issue_comment' && github.event_name != 'workflow_dispatch'
+      - name: Checkout the PR head
         uses: actions/checkout@v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
-      # issue_comment and workflow_dispatch are privileged default-branch
-      # contexts: run the trusted default-branch script against the PR number,
-      # never a caller-supplied PR head.
-      - name: Checkout the default branch (privileged events)
-        if: github.event_name == 'issue_comment' || github.event_name == 'workflow_dispatch'
-        uses: actions/checkout@v7.0.1
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-
       - name: Require a receipt for every gating marker
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash scripts/gate-receipt.sh --pr "${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}"
+        run: bash scripts/gate-receipt.sh --pr "${{ github.event.pull_request.number }}"
