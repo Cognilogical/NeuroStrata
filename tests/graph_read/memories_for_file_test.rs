@@ -9,7 +9,7 @@
 mod memories_for_file;
 
 use memories_for_file::{
-    freshness_priority, memory_type_priority, rank_hits, GraphMatchKind, MemoryHit,
+    fan_out_bucket, freshness_priority, memory_type_priority, rank_hits, GraphMatchKind, MemoryHit,
     DEFAULT_LIMIT, DEFAULT_MEMORY_TYPES, MAX_LIMIT,
 };
 use serde_json::{json, Value};
@@ -32,6 +32,93 @@ fn hit(
         conceptual_bridges: Vec::new(),
         linked_files: 0,
     }
+}
+
+/// A hit with the fan-out count `set_linked_files` would have measured.
+fn hit_with_fan_out(
+    id: &str,
+    kind: GraphMatchKind,
+    memory_type: &str,
+    metadata: Value,
+    linked_files: usize,
+) -> MemoryHit {
+    let mut h = hit(id, kind, memory_type, 0, metadata);
+    h.linked_files = linked_files;
+    h
+}
+
+#[test]
+fn rank_hits_orders_enforced_rule_before_narrow_advisory() {
+    // Same match kind: a broad ENFORCED rule (4 linked files, fan-out bucket
+    // 1) must outrank a one-file PARTIAL advisory rule (bucket 0). Before
+    // #208 the fan-out segment sat above the type segment, so the advisory won.
+    let mut hits = vec![
+        hit_with_fan_out(
+            "narrow-advisory",
+            GraphMatchKind::ExactFile,
+            "rule",
+            json!({ "enforcement": "PARTIAL" }),
+            1,
+        ),
+        hit_with_fan_out(
+            "broad-enforced",
+            GraphMatchKind::ExactFile,
+            "rule",
+            json!({ "enforcement": "ENFORCED" }),
+            4,
+        ),
+    ];
+    assert_eq!(fan_out_bucket(1), fan_out_bucket(4) - 1, "buckets must differ");
+    rank_hits(&mut hits);
+    let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+    assert_eq!(ids, vec!["broad-enforced", "narrow-advisory"]);
+}
+
+#[test]
+fn enforced_rule_survives_top_five_truncation() {
+    // The default page is five hits. Five narrow advisory rules must not push
+    // the one ENFORCED rule off the page.
+    let mut hits = vec![hit_with_fan_out(
+        "enforced-broad",
+        GraphMatchKind::ExactFile,
+        "rule",
+        json!({ "enforcement": "ENFORCED" }),
+        4,
+    )];
+    for i in 0..5 {
+        hits.push(hit_with_fan_out(
+            &format!("advisory-{i}"),
+            GraphMatchKind::ExactFile,
+            "rule",
+            json!({ "enforcement": "PARTIAL" }),
+            1,
+        ));
+    }
+    rank_hits(&mut hits);
+    hits.truncate(DEFAULT_LIMIT);
+    let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+    assert!(ids.contains(&"enforced-broad"), "page was {ids:?}");
+    assert_eq!(hits.len(), DEFAULT_LIMIT);
+}
+
+#[test]
+fn fan_out_still_breaks_ties_within_one_enforcement_class() {
+    // Both PARTIAL rules share a type priority, so fan-out is still the
+    // tiebreaker: the one-file rule says more about the file than the four-file
+    // rule.
+    let narrow = json!({ "enforcement": "PARTIAL" });
+    let broad = json!({ "enforcement": "PARTIAL" });
+    assert_eq!(
+        memory_type_priority("rule", &narrow),
+        memory_type_priority("rule", &broad)
+    );
+    let mut hits = vec![
+        hit_with_fan_out("broad-partial", GraphMatchKind::ExactFile, "rule", broad, 4),
+        hit_with_fan_out("narrow-partial", GraphMatchKind::ExactFile, "rule", narrow, 1),
+    ];
+    rank_hits(&mut hits);
+    let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+    assert_eq!(ids, vec!["narrow-partial", "broad-partial"]);
 }
 
 #[test]

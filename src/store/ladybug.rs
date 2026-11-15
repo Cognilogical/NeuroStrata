@@ -10887,25 +10887,29 @@ fn add_metadata_fallback_conn(
     Ok(())
 }
 
+/// The most memory ids one `linked_files` census query carries.
+///
+/// The hit count is bounded only by how many memories govern one file, and it
+/// is the *pre-limit* set (fan-out feeds the ranking, so it cannot be measured
+/// after truncation). Concatenating it into one `IN [...]` would therefore grow
+/// a query string without bound. The ids are batched instead: every query keeps
+/// at most this many ids, the per-namespace generation cache is shared across
+/// batches, and the batches union into the same exact per-hit count. The costs
+/// are `ceil(hits / 128)` reads instead of one, which is one read for any file
+/// with up to 128 governing memories.
+const LINKED_FILES_ID_BATCH: usize = 128;
+
 /// Sets each hit's `linked_files`: the distinct active files its `GOVERNS` and
 /// `RELATES_TO` edges reach (a symbol counts as its file, a linked memory as
 /// one, keyed by project/source and file path so equal relative paths across
 /// namespaces do not collapse). A directory link reaches every file under it,
 /// so it counts as ten, enough for the widest fan-out bucket. Inactive or
-/// superseded targets are ignored. One read for all hits.
+/// superseded targets are ignored. One read per `LINKED_FILES_ID_BATCH` ids,
+/// unioned across batches, so the count is exact for any hit count.
 fn set_linked_files(conn: &Connection, hits: &mut [MemoryHit]) -> Result<()> {
     if hits.is_empty() {
         return Ok(());
     }
-    let id_list = hits
-        .iter()
-        .map(|h| format!("'{}'", escape_ladybug_string(&h.id)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let query = format!(
-        "MATCH (m:Memory)-[:GOVERNS|RELATES_TO]-(t:Memory) WHERE m.id IN [{}] RETURN DISTINCT m.id, t.id, t.namespace, t.location, t.memory_type, t.metadata",
-        id_list
-    );
     let now = chrono::Utc::now().timestamp();
     let mut active_by_ns: std::collections::HashMap<String, ActiveGenerations> =
         std::collections::HashMap::new();
@@ -10917,51 +10921,62 @@ fn set_linked_files(conn: &Connection, hits: &mut [MemoryHit]) -> Result<()> {
         String,
         std::collections::HashSet<(String, String, String)>,
     > = std::collections::HashMap::new();
-    let mut rows = conn.query(&query)?;
-    while let Some(row) = rows.next() {
-        let id = format!("{}", row[0]);
-        let target = format!("{}", row[1]);
-        let target_ns = format!("{}", row[2]);
-        let location = format!("{}", row[3]);
-        let target_type = format!("{}", row[4]);
-        let metadata = parse_metadata_or_warn(&format!("{}", row[5]), "metadata");
-        if is_archived(&metadata)
-            || is_retired_at(&metadata, now)
-            || is_mesh_conflicting(&metadata)
-            || is_registry_row(&metadata)
-        {
-            continue;
-        }
-        let owner_ns = split_scoped_id(&target)
-            .map(|(ns, _, _)| ns)
-            .or_else(|| {
-                target
-                    .split_once(crate::parser::ingest::NAMESPACE_SEPARATOR)
-                    .map(|(ns, _)| ns.to_string())
-            })
-            .unwrap_or_else(|| target_ns.clone());
-        let active = active_by_ns
-            .entry(owner_ns.clone())
-            .or_insert_with(|| ActiveGenerations::read(conn, &owner_ns));
-        if !active.reaches(&target, &owner_ns, &target_type, &metadata) {
-            continue;
-        }
-        let source_key = row_source_key(&metadata).unwrap_or("").to_string();
-        let raw_path = if location.is_empty() {
-            crate::parser::ingest::logical_path_of(&target)
-        } else {
-            location.as_str()
-        };
-        let file_path = raw_path
-            .split_once('#')
-            .map(|(f, _)| f)
-            .unwrap_or(raw_path)
-            .to_string();
-        let key = (owner_ns, source_key, file_path);
-        if target_type == "directory" {
-            directories.entry(id).or_default().insert(key);
-        } else {
-            files.entry(id).or_default().insert(key);
+    for batch in hits.chunks(LINKED_FILES_ID_BATCH) {
+        let id_list = batch
+            .iter()
+            .map(|h| format!("'{}'", escape_ladybug_string(&h.id)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
+            "MATCH (m:Memory)-[:GOVERNS|RELATES_TO]-(t:Memory) WHERE m.id IN [{}] RETURN DISTINCT m.id, t.id, t.namespace, t.location, t.memory_type, t.metadata",
+            id_list
+        );
+        let mut rows = conn.query(&query)?;
+        while let Some(row) = rows.next() {
+            let id = format!("{}", row[0]);
+            let target = format!("{}", row[1]);
+            let target_ns = format!("{}", row[2]);
+            let location = format!("{}", row[3]);
+            let target_type = format!("{}", row[4]);
+            let metadata = parse_metadata_or_warn(&format!("{}", row[5]), "metadata");
+            if is_archived(&metadata)
+                || is_retired_at(&metadata, now)
+                || is_mesh_conflicting(&metadata)
+                || is_registry_row(&metadata)
+            {
+                continue;
+            }
+            let owner_ns = split_scoped_id(&target)
+                .map(|(ns, _, _)| ns)
+                .or_else(|| {
+                    target
+                        .split_once(crate::parser::ingest::NAMESPACE_SEPARATOR)
+                        .map(|(ns, _)| ns.to_string())
+                })
+                .unwrap_or_else(|| target_ns.clone());
+            let active = active_by_ns
+                .entry(owner_ns.clone())
+                .or_insert_with(|| ActiveGenerations::read(conn, &owner_ns));
+            if !active.reaches(&target, &owner_ns, &target_type, &metadata) {
+                continue;
+            }
+            let source_key = row_source_key(&metadata).unwrap_or("").to_string();
+            let raw_path = if location.is_empty() {
+                crate::parser::ingest::logical_path_of(&target)
+            } else {
+                location.as_str()
+            };
+            let file_path = raw_path
+                .split_once('#')
+                .map(|(f, _)| f)
+                .unwrap_or(raw_path)
+                .to_string();
+            let key = (owner_ns, source_key, file_path);
+            if target_type == "directory" {
+                directories.entry(id).or_default().insert(key);
+            } else {
+                files.entry(id).or_default().insert(key);
+            }
         }
     }
     for hit in hits.iter_mut() {
