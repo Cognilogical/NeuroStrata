@@ -104,6 +104,10 @@ pub struct ObjectViewResponse {
     pub location: Option<String>,
     pub location_lines: Option<String>,
     pub twin_state: Option<TwinObjectState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concept: Option<crate::rdf::taxonomy::HydratedConcept>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thesis: Option<crate::rdf::taxonomy::ThesisSpec>,
     pub links: BTreeMap<String, Vec<LinkedObjectSummary>>,
     pub governance: ObjectGovernanceSummary,
     pub lineage: ObjectLineageSummary,
@@ -344,22 +348,73 @@ pub async fn hydrate_object_view(
         }
         if let Some((_, rid, pl)) = best_twin {
             (rid, pl)
-        } else if req.scenario_id.is_none() {
-            if let Some((_vec, pl)) = store
-                .get(namespace, query_id)
-                .await
-                .map_err(|e| format!("failed to get '{query_id}': {e}"))?
-            {
-                (query_id.to_string(), pl)
+        } else {
+            let mut best_concept_or_thesis: Option<(u64, i64, String, MemoryPayload)> = None;
+            let norm_query_slug = crate::domain::normalize_domain_slug(query_id);
+            for (rid, pl) in &active_rows {
+                if pl.memory_type == "concept" {
+                    if let Some(spec) = crate::rdf::taxonomy::ConceptSpec::from_payload(pl) {
+                        if Some(spec.slug.as_str()) == norm_query_slug.as_deref()
+                            || spec.slug == query_id
+                        {
+                            let ver = pl
+                                .metadata
+                                .get("concept_version")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(1);
+                            let vf = pl
+                                .metadata
+                                .get("valid_from")
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or(0);
+                            if best_concept_or_thesis.as_ref().map_or(
+                                true,
+                                |(bv, bvf, brid, _)| {
+                                    (ver, vf, rid.as_str()) > (*bv, *bvf, brid.as_str())
+                                },
+                            ) {
+                                best_concept_or_thesis =
+                                    Some((ver, vf, rid.clone(), pl.clone()));
+                            }
+                        }
+                    }
+                } else if pl.memory_type == "thesis" && query_id == "thesis" {
+                    let ver = pl
+                        .metadata
+                        .get("thesis_version")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(1);
+                    let vf = pl
+                        .metadata
+                        .get("valid_from")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    if best_concept_or_thesis.as_ref().map_or(true, |(bv, bvf, brid, _)| {
+                        (ver, vf, rid.as_str()) > (*bv, *bvf, brid.as_str())
+                    }) {
+                        best_concept_or_thesis = Some((ver, vf, rid.clone(), pl.clone()));
+                    }
+                }
+            }
+            if let Some((_, _, rid, pl)) = best_concept_or_thesis {
+                (rid, pl)
+            } else if req.scenario_id.is_none() {
+                if let Some((_vec, pl)) = store
+                    .get(namespace, query_id)
+                    .await
+                    .map_err(|e| format!("failed to get '{query_id}': {e}"))?
+                {
+                    (query_id.to_string(), pl)
+                } else {
+                    return Err(format!(
+                        "object '{query_id}' not found in namespace '{namespace}'"
+                    ));
+                }
             } else {
                 return Err(format!(
-                    "object '{query_id}' not found in namespace '{namespace}'"
+                    "object '{query_id}' not found in scenario overlay for namespace '{namespace}'"
                 ));
             }
-        } else {
-            return Err(format!(
-                "object '{query_id}' not found in scenario overlay for namespace '{namespace}'"
-            ));
         }
     };
 
@@ -510,6 +565,29 @@ pub async fn hydrate_object_view(
     } else {
         None
     };
+
+    // 4b. Subject-Matter Concept & Project Thesis hydration (`neurostrata-f0bn`).
+    let mut hydrated_concept: Option<crate::rdf::taxonomy::HydratedConcept> = None;
+    let mut hydrated_thesis: Option<crate::rdf::taxonomy::ThesisSpec> = None;
+    if root_payload.memory_type == "concept" {
+        let tax_view = crate::rdf::taxonomy::build_principal_taxonomy_view(
+            &active_rows,
+            &active_edges,
+            &principal,
+        );
+        if let Some(spec) = crate::rdf::taxonomy::ConceptSpec::from_payload(&root_payload) {
+            if let Some(c) = tax_view.concepts.get(&spec.slug).cloned() {
+                for iface in &c.implemented_interfaces {
+                    if !iface.trim().is_empty() {
+                        implemented_interfaces.insert(iface.trim().to_string());
+                    }
+                }
+                hydrated_concept = Some(c);
+            }
+        }
+    } else if root_payload.memory_type == "thesis" {
+        hydrated_thesis = crate::rdf::taxonomy::ThesisSpec::from_payload(&root_payload);
+    }
 
     let implemented_interfaces_vec: Vec<String> = implemented_interfaces.into_iter().collect();
 
@@ -970,6 +1048,8 @@ pub async fn hydrate_object_view(
         location,
         location_lines,
         twin_state,
+        concept: hydrated_concept,
+        thesis: hydrated_thesis,
         links,
         governance,
         lineage,
@@ -1403,5 +1483,119 @@ mod tests {
         assert_eq!(act.slug, "recalibrate-cooling-loop");
         assert!(!act.authorized);
         assert!(act.preconditions_met);
+    }
+
+    #[tokio::test]
+    async fn object_view_hydrates_concept_and_thesis_with_derived_skos_metrics() {
+        use crate::rdf::taxonomy::{execute_taxonomy, TaxonomyRequest};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "obj-view-tax-test";
+        store.init(ns).await.expect("init");
+
+        let sec = ActionSecurityContext {
+            authenticated_principal: "alice".to_string(),
+            requested_principal: Some("alice".to_string()),
+        };
+
+        execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "set_thesis".to_string(),
+                namespace: ns.to_string(),
+                primary_domain: Some("cognitive-memory".to_string()),
+                mission: Some("Verifiable memory".to_string()),
+                direction: Some("Graph reasoning".to_string()),
+                core_pillars: Some(vec!["retrieval".to_string()]),
+                ..Default::default()
+            },
+            &sec,
+        )
+        .await
+        .expect("set_thesis");
+
+        execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "upsert_concept".to_string(),
+                namespace: ns.to_string(),
+                slug: Some("retrieval".to_string()),
+                pref_label: Some("Information Retrieval".to_string()),
+                definition: Some("Parent retrieval concept.".to_string()),
+                domain: Some("retrieval".to_string()),
+                ..Default::default()
+            },
+            &sec,
+        )
+        .await
+        .expect("parent concept");
+
+        execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "upsert_concept".to_string(),
+                namespace: ns.to_string(),
+                slug: Some("hybrid-rrf".to_string()),
+                pref_label: Some("Hybrid RRF".to_string()),
+                definition: Some("Reciprocal Rank Fusion.".to_string()),
+                domain: Some("retrieval".to_string()),
+                broader: Some(vec!["retrieval".to_string()]),
+                ..Default::default()
+            },
+            &sec,
+        )
+        .await
+        .expect("child concept");
+
+        // Hydrate parent concept by slug
+        let parent_view = hydrate_object_view(
+            &store,
+            &ObjectViewRequest {
+                namespace: ns.to_string(),
+                id: "retrieval".to_string(),
+                scenario_id: None,
+                include_history_limit: None,
+                evaluate_action_preconditions: Some(false),
+                max_bytes: None,
+                project_root: None,
+                principal: Some("alice".to_string()),
+            },
+            "alice",
+        )
+        .await
+        .expect("hydrate parent concept");
+
+        assert_eq!(parent_view.memory_type, "concept");
+        let hc = parent_view.concept.expect("hydrated concept");
+        assert_eq!(hc.slug, "retrieval");
+        assert_eq!(hc.narrower, vec!["hybrid-rrf".to_string()]);
+        assert_eq!(hc.descendant_count, 1);
+
+        // Hydrate thesis by "thesis" alias
+        let thesis_view = hydrate_object_view(
+            &store,
+            &ObjectViewRequest {
+                namespace: ns.to_string(),
+                id: "thesis".to_string(),
+                scenario_id: None,
+                include_history_limit: None,
+                evaluate_action_preconditions: Some(false),
+                max_bytes: None,
+                project_root: None,
+                principal: Some("alice".to_string()),
+            },
+            "alice",
+        )
+        .await
+        .expect("hydrate thesis");
+
+        assert_eq!(thesis_view.memory_type, "thesis");
+        let ts = thesis_view.thesis.expect("hydrated thesis");
+        assert_eq!(ts.primary_domain, "cognitive-memory");
     }
 }

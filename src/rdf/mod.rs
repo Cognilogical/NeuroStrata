@@ -10,6 +10,7 @@ pub mod reasoning;
 pub mod scenario;
 pub mod shacl;
 pub mod sparql;
+pub mod taxonomy;
 pub mod types;
 pub mod types_oxrdf;
 
@@ -21,4 +22,5 @@ pub use ontology::*;
 pub use projection::*;
 pub use scenario::*;
 pub use shacl::*;
+pub use taxonomy::*;
 pub use types::*;
