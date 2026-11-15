@@ -467,7 +467,14 @@ async fn store_new_task(
 }
 
 /// Memory types treated as normative (governing constraints) for reserved slots.
-const NORMATIVE_MEMORY_TYPES: &[&str] = &["rule", "fact", "decision", "procedure"];
+const NORMATIVE_MEMORY_TYPES: &[&str] = &[
+    "rule",
+    "fact",
+    "decision",
+    "procedure",
+    "thesis",
+    "concept",
+];
 /// Memory types treated as structural evidence anchors.
 const STRUCTURAL_MEMORY_TYPES: &[&str] = &["code_ast", "doc_section"];
 /// Max normative memories reserved in `auto_retrieved_context`.
@@ -788,6 +795,14 @@ pub async fn build_task_graph_context(
     // retrieved seed memories to normative targets in a disjoint domain.
     let conceptual_bridges = synthesize_conceptual_bridges(store, namespace, &hits_json).await;
 
+    // Context-budgeted (<= 1200 chars) unrestricted Project Thesis & matched SKOS concepts (`neurostrata-f0bn`).
+    let (project_thesis, domain_concepts, taxonomy_prompt) =
+        if let Some(lb) = VectorStore::as_any(&**store).downcast_ref::<LadybugStore>() {
+            crate::rdf::taxonomy::build_task_taxonomy_context(lb, namespace, &payload.content).await
+        } else {
+            (Value::Null, Value::Array(Vec::new()), String::new())
+        };
+
     let auto_retrieved_context = json!({
         "query": payload.content,
         "golden_rules": golden_json,
@@ -796,6 +811,8 @@ pub async fn build_task_graph_context(
         "normative_memories": normative_memories,
         "structural_anchors": structural_anchors,
         "conceptual_bridges": conceptual_bridges,
+        "project_thesis": project_thesis,
+        "domain_concepts": domain_concepts,
     });
 
     let bridges_prompt = conceptual_bridges
@@ -820,10 +837,10 @@ pub async fn build_task_graph_context(
     let subagent_prompt = format!(
         "### NeuroStrata Task & Graph Context (PASTE INTO ALL SUBAGENT PROMPTS)\n\
          - Namespace: `{}` | Task ID: `{}` | Goal: {}\n\
-         - Auto-Retrieved Governing Rules & Graph Nodes:\n{}{}\n\
+         - Auto-Retrieved Governing Rules & Graph Nodes:\n{}{}{}\n\
          - Mandatory Graph-First Lookup Rule: Before editing any file, check whether its path and governing memory IDs (`mem-...`) are already listed under `### NeuroStrata Task & Graph Context` in your prompt. For any file you touch that is NOT listed in that block, call `neurostrata_memories_for_file` first (or `neurostrata_related` / `neurostrata_search_memory` with `include_related: true` / `neurostrata_sparql_query`).\
          \n- Formal Verification Reflex: When adding or modifying a state machine, gate, sovereignty/ACL check, CRDT/merge rule, lease/claim rule, or conservation invariant, evaluate whether to extract the pure decision into `src/formal_kernel.rs`, prove its theorems in `proofs/NeuroStrata/*.lean` (zero `sorry`/`axiom`), and extend `tests/lean_parity_test.rs`.",
-        namespace, task_id, payload.content, hits_block, bridges_prompt
+        namespace, task_id, payload.content, hits_block, bridges_prompt, taxonomy_prompt
     );
     (auto_retrieved_context, subagent_prompt)
 }

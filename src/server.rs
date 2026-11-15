@@ -1148,6 +1148,86 @@ pub async fn process_mcp_request(
                             },
                             "required": ["namespace", "action"]
                         }
+                    },
+                    {
+                        "name": "neurostrata_taxonomy",
+                        "description": "Manage and query the project's Subject-Matter Domain Expertise, SKOS Concept Taxonomy, Epistemic Briefings, Multi-Perspective Comparative Matrices, Epistemic Coverage & Anti-Pattern Gaps, and SME Frontier Opportunity Advisor ('set_thesis', 'upsert_concept', 'tree', 'briefing', 'compare', 'gaps', 'advise').",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "Project namespace." },
+                                "operation": {
+                                    "type": "string",
+                                    "enum": ["set_thesis", "upsert_concept", "tree", "briefing", "compare", "gaps", "advise"],
+                                    "description": "Taxonomy operation to execute."
+                                },
+                                "principal": { "type": "string", "description": "Optional requested principal (honored only for admin callers)." },
+                                "primary_domain": { "type": "string", "description": "Primary domain slug (required for set_thesis)." },
+                                "mission": { "type": "string", "description": "Project mission statement (required for set_thesis)." },
+                                "direction": { "type": "string", "description": "Strategic & architectural direction (required for set_thesis)." },
+                                "core_pillars": { "type": "array", "items": { "type": "string" }, "description": "Core subject-matter pillar slugs (required for set_thesis)." },
+                                "adjacent_domains": { "type": "array", "items": { "type": "string" }, "description": "Adjacent research/engineering domain slugs (set_thesis)." },
+                                "evaluation_axes": { "type": "array", "items": { "type": "string" }, "description": "Architectural evaluation axis slugs (set_thesis)." },
+                                "non_goals": { "type": "array", "items": { "type": "string" }, "description": "Explicit project non-goals (set_thesis)." },
+                                "open_questions": { "type": "array", "items": { "type": "string" }, "description": "Open strategic/domain questions (set_thesis)." },
+                                "slug": { "type": "string", "description": "Canonical kebab-case concept slug (required for upsert_concept)." },
+                                "pref_label": { "type": "string", "description": "Preferred SKOS label (required for upsert_concept)." },
+                                "definition": { "type": "string", "description": "Rigorous subject-matter definition (required for upsert_concept)." },
+                                "domain": { "type": "string", "description": "Domain/pillar slug (upsert_concept, tree, briefing, advise)." },
+                                "content": { "type": "string", "description": "Optional full Markdown synthesis for the concept or thesis." },
+                                "aliases": { "type": "array", "items": { "type": "string" }, "description": "SKOS altLabel aliases/acronyms (upsert_concept)." },
+                                "broader": { "type": "array", "items": { "type": "string" }, "description": "Canonical broader parent concept slugs in the SKOS DAG (upsert_concept)." },
+                                "related_concepts": { "type": "array", "items": { "type": "string" }, "description": "Associative SKOS related concept slugs (upsert_concept)." },
+                                "contrasts_with": { "type": "array", "items": { "type": "string" }, "description": "Competing/alternative paradigm concept slugs (upsert_concept)." },
+                                "tradeoffs": { "type": "array", "items": { "type": "string" }, "description": "Architectural and theoretical tradeoffs (upsert_concept)." },
+                                "references": { "type": "array", "items": { "type": "string" }, "description": "Academic papers, RFCs, W3C specs, or benchmarks (upsert_concept)." },
+                                "comparable_implementations": {
+                                    "type": "array",
+                                    "description": "Comparable external libraries/systems with SPDX license provenance (upsert_concept).",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "name": { "type": "string" },
+                                            "kind": { "type": "string", "enum": ["library", "paper_artifact", "specification", "system_architecture"] },
+                                            "license": { "type": "string" },
+                                            "license_compatible": { "type": "boolean" },
+                                            "adopt_or_adapt": { "type": "string", "enum": ["adopt_library", "adapt_algorithm", "reference_only"] },
+                                            "reference": { "type": "string" },
+                                            "strengths": { "type": "array", "items": { "type": "string" } },
+                                            "gaps_vs_thesis": { "type": "array", "items": { "type": "string" } }
+                                        },
+                                        "required": ["name", "kind", "license", "reference"]
+                                    }
+                                },
+                                "realization_status": {
+                                    "type": "string",
+                                    "enum": ["unimplemented", "partial", "production", "superseded"],
+                                    "description": "Current project implementation maturity for this concept (upsert_concept)."
+                                },
+                                "current_limitations": { "type": "array", "items": { "type": "string" }, "description": "Known current architectural/implementation limitations (upsert_concept)." },
+                                "frontier_opportunities": { "type": "array", "items": { "type": "string" }, "description": "Concrete SME-grade frontier advancement opportunities (upsert_concept)." },
+                                "implemented_interfaces": { "type": "array", "items": { "type": "string" }, "description": "Active Ontology Interface names realized by this concept (upsert_concept)." },
+                                "linked_action_types": { "type": "array", "items": { "type": "string" }, "description": "Active Kinetic ActionType slugs governed by this concept (upsert_concept)." },
+                                "evaluation_scores": { "type": "object", "description": "Map of evaluation_axis slug -> score in 0..=10000 bps (upsert_concept)." },
+                                "evidence_refs": { "type": "array", "items": { "type": "string" }, "description": "Empirical evidence references/tests/benchmarks (upsert_concept)." },
+                                "governs": { "type": "array", "items": { "type": "string" }, "description": "Governed memory/symbol/file IDs (upsert_concept)." },
+                                "related_to": { "type": "array", "items": { "type": "string" }, "description": "Related memory IDs (upsert_concept)." },
+                                "extracted_from": { "type": "array", "items": { "type": "string" }, "description": "Task IDs from which this concept or thesis was extracted (Lock 2)." },
+                                "locations": { "type": "array", "items": { "type": "object" }, "description": "Optional file/line/symbol anchors (upsert_concept)." },
+                                "eligibility": { "type": "string", "enum": ["private", "shareable"], "description": "SynapticMesh sharing eligibility (defaults to 'private')." },
+                                "access_policy": { "type": "object", "description": "Optional ReBAC access_policy object." },
+                                "visible_to": { "type": "array", "items": { "type": "string" }, "description": "Optional ReBAC visible_to ACL list." },
+                                "root_slug": { "type": "string", "description": "Optional root concept slug filter (tree)." },
+                                "query": { "type": "string", "description": "Topic or natural-language query (briefing, advise)." },
+                                "topic": { "type": "string", "description": "Alias for query (briefing, advise)." },
+                                "max_hops": { "type": "integer", "default": 2, "description": "Multi-hop SKOS expansion radius 1..=4 (briefing, default 2)." },
+                                "limit": { "type": "integer", "default": 8, "description": "Max seed concepts to match (briefing, default 8)." },
+                                "slugs": { "type": "array", "items": { "type": "string" }, "description": "2 or more concept slugs to compare (compare)." },
+                                "axes": { "type": "array", "items": { "type": "string" }, "description": "Optional evaluation axes override (compare)." },
+                                "top_k": { "type": "integer", "default": 5, "description": "Max ranked SME recommendations to return (advise, default 5, max 20)." }
+                            },
+                            "required": ["namespace", "operation"]
+                        }
                     }
                 ]
             });
@@ -1630,6 +1710,14 @@ pub async fn process_mcp_request(
                         }
                         "neurostrata_insights" => {
                             result_text = handle_insights(&arguments, store.clone()).await;
+                        }
+                        "neurostrata_taxonomy" => {
+                            result_text = crate::handlers::taxonomy::handle_taxonomy(
+                                &arguments,
+                                emb.clone(),
+                                store.clone(),
+                            )
+                            .await;
                         }
                         // SynapticMesh: the handler is a pure string-in/
                         // string-out dispatch (filesystem + git only; no
@@ -4957,12 +5045,22 @@ async fn handle_get_snapshot(
         String::new()
     };
 
+    let taxonomy_section = match crate::traits::VectorStore::as_any(store.as_ref())
+        .downcast_ref::<crate::store::ladybug::LadybugStore>()
+    {
+        Some(ls) => crate::rdf::taxonomy::render_snapshot_taxonomy_section(ls, namespace).await,
+        None => String::new(),
+    };
+
     let mut parts: Vec<String> = vec![task_head.to_string()];
     if !hooks_line.is_empty() {
         parts.push(hooks_line.clone());
     }
     if !golden_section.is_empty() {
         parts.push(golden_section);
+    }
+    if !taxonomy_section.is_empty() {
+        parts.push(taxonomy_section);
     }
     if let Some(dr) = &doctor_report {
         parts.push(dr.clone());
@@ -7617,6 +7715,14 @@ pub(crate) async fn handle_insights_with_auth(
         })
         .to_string(),
     }
+}
+
+pub(crate) async fn handle_taxonomy(
+    arguments: &Value,
+    emb: Arc<dyn crate::traits::Embedder>,
+    store: Arc<dyn VectorStore>,
+) -> String {
+    crate::handlers::taxonomy::handle_taxonomy(arguments, emb, store).await
 }
 
 pub(crate) async fn handle_metrics_query(arguments: &Value, store: Arc<dyn VectorStore>) -> String {
@@ -12040,7 +12146,7 @@ mod tests {
         );
         assert_eq!(
             ALL_METRIC_KINDS.len(),
-            6,
+            7,
             "the sweep table tracks every MetricKind variant"
         );
 
@@ -14694,6 +14800,7 @@ mod tests {
                 "neurostrata_locate",
                 "neurostrata_diff_tour",
                 "neurostrata_insights",
+                "neurostrata_taxonomy",
                 // SynapticMesh: appended by `tools.extend(synaptic_mesh_tool
                 // _definitions())` — this order IS the append order, so it
                 // pins where the mesh module's list enters the surface.

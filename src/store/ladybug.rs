@@ -5098,7 +5098,14 @@ pub(crate) fn row_source_key(metadata: &Value) -> Option<&str> {
 /// Normative memory types that the recall path reserves result slots for.
 /// Stated once here so the search ranker and the task gate can agree on the
 /// same predicate (see the FEATURE-4 provenance contract in `src/traits.rs`).
-const NORMATIVE_MEMORY_TYPES: [&str; 4] = ["rule", "fact", "decision", "procedure"];
+const NORMATIVE_MEMORY_TYPES: [&str; 6] = [
+    "rule",
+    "fact",
+    "decision",
+    "procedure",
+    "thesis",
+    "concept",
+];
 
 /// Relevance floor (similarity) below which a normative candidate is eligible
 /// for a reserved search slot. Scores are distances (lower = better, [0.0, 1.0]

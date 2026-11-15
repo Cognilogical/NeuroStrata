@@ -1,5 +1,5 @@
 // Increase recursion limit for large JSON literals in tools/list
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 mod attempt;
 mod bench;
@@ -569,6 +569,13 @@ enum Commands {
         /// Optional requested principal
         #[arg(long)]
         principal: Option<String>,
+    },
+
+    /// Manage and query Subject-Matter Domain Expertise, SKOS Concept Taxonomy & SME Frontier Advisor
+    #[command(name = "taxonomy")]
+    Taxonomy {
+        #[command(subcommand)]
+        taxonomy: TaxonomyCommands,
     },
 }
 
@@ -1182,6 +1189,356 @@ fn scenario_command_to_json(scenario: &ScenarioCommands) -> anyhow::Result<serde
             "namespace": namespace,
             "action": "list",
         })),
+    }
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+enum TaxonomyCommands {
+    /// Set or atomically supersede the singleton Project Thesis for a namespace
+    #[command(name = "set-thesis")]
+    SetThesis {
+        /// Target namespace
+        namespace: String,
+        /// Optional JSON payload string or @file path
+        #[arg(long)]
+        payload: Option<String>,
+        /// Primary domain slug
+        #[arg(long)]
+        primary_domain: Option<String>,
+        /// Project mission statement
+        #[arg(long)]
+        mission: Option<String>,
+        /// Strategic and architectural direction
+        #[arg(long)]
+        direction: Option<String>,
+        /// Comma-separated core pillar slugs
+        #[arg(long, value_delimiter = ',')]
+        core_pillars: Vec<String>,
+        /// Comma-separated adjacent domain slugs
+        #[arg(long, value_delimiter = ',')]
+        adjacent_domains: Vec<String>,
+        /// Comma-separated evaluation axis slugs
+        #[arg(long, value_delimiter = ',')]
+        evaluation_axes: Vec<String>,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+    /// Upsert or atomically supersede a SKOS subject-matter concept
+    #[command(name = "upsert-concept")]
+    UpsertConcept {
+        /// Target namespace
+        namespace: String,
+        /// Optional JSON payload string or @file path
+        #[arg(long)]
+        payload: Option<String>,
+        /// Canonical kebab-case concept slug
+        #[arg(long)]
+        slug: Option<String>,
+        /// Preferred SKOS label
+        #[arg(long)]
+        pref_label: Option<String>,
+        /// Subject-matter definition
+        #[arg(long)]
+        definition: Option<String>,
+        /// Domain/pillar slug
+        #[arg(long)]
+        domain: Option<String>,
+        /// Comma-separated broader parent concept slugs
+        #[arg(long, value_delimiter = ',')]
+        broader: Vec<String>,
+        /// Comma-separated related concept slugs
+        #[arg(long, value_delimiter = ',')]
+        related_concepts: Vec<String>,
+        /// Comma-separated contrasting concept slugs
+        #[arg(long, value_delimiter = ',')]
+        contrasts_with: Vec<String>,
+        /// Realization status (unimplemented|partial|production|superseded)
+        #[arg(long)]
+        realization_status: Option<String>,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+    /// Render the hierarchical SKOS taxonomy tree
+    Tree {
+        /// Target namespace
+        namespace: String,
+        /// Optional domain filter
+        #[arg(long)]
+        domain: Option<String>,
+        /// Optional root concept slug
+        #[arg(long)]
+        root_slug: Option<String>,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+    /// Generate an Ontology-Augmented Subject-Matter Briefing
+    Briefing {
+        /// Target namespace
+        namespace: String,
+        /// Topic or natural-language query
+        #[arg(long)]
+        query: Option<String>,
+        /// Optional domain filter
+        #[arg(long)]
+        domain: Option<String>,
+        /// Multi-hop expansion radius (1..=4, default 2)
+        #[arg(long, default_value_t = 2)]
+        max_hops: usize,
+        /// Max seed concepts (default 8)
+        #[arg(long, default_value_t = 8)]
+        limit: usize,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+    /// Generate a Multi-Perspective Comparative Matrix across 2 or more concepts
+    Compare {
+        /// Target namespace
+        namespace: String,
+        /// Comma-separated concept slugs to compare (2 or more)
+        #[arg(long, value_delimiter = ',', required = true)]
+        slugs: Vec<String>,
+        /// Optional comma-separated evaluation axis slugs
+        #[arg(long, value_delimiter = ',')]
+        axes: Vec<String>,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+    /// Compute Epistemic Coverage & Ontology Anti-Pattern Gaps
+    Gaps {
+        /// Target namespace
+        namespace: String,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+    /// Run SME Opportunity & Frontier Synthesis Advisor
+    Advise {
+        /// Target namespace
+        namespace: String,
+        /// Optional query or topic focus
+        #[arg(long)]
+        query: Option<String>,
+        /// Optional domain filter
+        #[arg(long)]
+        domain: Option<String>,
+        /// Max ranked recommendations to return (default 5, max 20)
+        #[arg(long, default_value_t = 5)]
+        top_k: usize,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+}
+
+fn parse_inline_or_file_json(raw: &str) -> anyhow::Result<serde_json::Value> {
+    let trimmed = raw.trim();
+    let content = if let Some(path) = trimmed.strip_prefix('@') {
+        std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("failed to read JSON file '{path}': {e}"))?
+    } else {
+        trimmed.to_string()
+    };
+    serde_json::from_str(&content).map_err(|e| anyhow::anyhow!("invalid JSON payload: {e}"))
+}
+
+fn taxonomy_command_to_json(taxonomy: &TaxonomyCommands) -> anyhow::Result<serde_json::Value> {
+    match taxonomy {
+        TaxonomyCommands::SetThesis {
+            namespace,
+            payload,
+            primary_domain,
+            mission,
+            direction,
+            core_pillars,
+            adjacent_domains,
+            evaluation_axes,
+            principal,
+        } => {
+            let mut body = if let Some(raw) = payload {
+                parse_inline_or_file_json(raw)?
+            } else {
+                serde_json::json!({})
+            };
+            body["namespace"] = serde_json::json!(namespace);
+            body["operation"] = serde_json::json!("set_thesis");
+            if let Some(v) = primary_domain {
+                body["primary_domain"] = serde_json::json!(v);
+            }
+            if let Some(v) = mission {
+                body["mission"] = serde_json::json!(v);
+            }
+            if let Some(v) = direction {
+                body["direction"] = serde_json::json!(v);
+            }
+            if !core_pillars.is_empty() {
+                body["core_pillars"] = serde_json::json!(core_pillars);
+            }
+            if !adjacent_domains.is_empty() {
+                body["adjacent_domains"] = serde_json::json!(adjacent_domains);
+            }
+            if !evaluation_axes.is_empty() {
+                body["evaluation_axes"] = serde_json::json!(evaluation_axes);
+            }
+            if let Some(p) = principal {
+                body["principal"] = serde_json::json!(p);
+            }
+            Ok(body)
+        }
+        TaxonomyCommands::UpsertConcept {
+            namespace,
+            payload,
+            slug,
+            pref_label,
+            definition,
+            domain,
+            broader,
+            related_concepts,
+            contrasts_with,
+            realization_status,
+            principal,
+        } => {
+            let mut body = if let Some(raw) = payload {
+                parse_inline_or_file_json(raw)?
+            } else {
+                serde_json::json!({})
+            };
+            body["namespace"] = serde_json::json!(namespace);
+            body["operation"] = serde_json::json!("upsert_concept");
+            if let Some(v) = slug {
+                body["slug"] = serde_json::json!(v);
+            }
+            if let Some(v) = pref_label {
+                body["pref_label"] = serde_json::json!(v);
+            }
+            if let Some(v) = definition {
+                body["definition"] = serde_json::json!(v);
+            }
+            if let Some(v) = domain {
+                body["domain"] = serde_json::json!(v);
+            }
+            if !broader.is_empty() {
+                body["broader"] = serde_json::json!(broader);
+            }
+            if !related_concepts.is_empty() {
+                body["related_concepts"] = serde_json::json!(related_concepts);
+            }
+            if !contrasts_with.is_empty() {
+                body["contrasts_with"] = serde_json::json!(contrasts_with);
+            }
+            if let Some(v) = realization_status {
+                body["realization_status"] = serde_json::json!(v);
+            }
+            if let Some(p) = principal {
+                body["principal"] = serde_json::json!(p);
+            }
+            Ok(body)
+        }
+        TaxonomyCommands::Tree {
+            namespace,
+            domain,
+            root_slug,
+            principal,
+        } => {
+            let mut body = serde_json::json!({
+                "namespace": namespace,
+                "operation": "tree",
+            });
+            if let Some(d) = domain {
+                body["domain"] = serde_json::json!(d);
+            }
+            if let Some(r) = root_slug {
+                body["root_slug"] = serde_json::json!(r);
+            }
+            if let Some(p) = principal {
+                body["principal"] = serde_json::json!(p);
+            }
+            Ok(body)
+        }
+        TaxonomyCommands::Briefing {
+            namespace,
+            query,
+            domain,
+            max_hops,
+            limit,
+            principal,
+        } => {
+            let mut body = serde_json::json!({
+                "namespace": namespace,
+                "operation": "briefing",
+                "max_hops": max_hops,
+                "limit": limit,
+            });
+            if let Some(q) = query {
+                body["query"] = serde_json::json!(q);
+            }
+            if let Some(d) = domain {
+                body["domain"] = serde_json::json!(d);
+            }
+            if let Some(p) = principal {
+                body["principal"] = serde_json::json!(p);
+            }
+            Ok(body)
+        }
+        TaxonomyCommands::Compare {
+            namespace,
+            slugs,
+            axes,
+            principal,
+        } => {
+            let mut body = serde_json::json!({
+                "namespace": namespace,
+                "operation": "compare",
+                "slugs": slugs,
+            });
+            if !axes.is_empty() {
+                body["axes"] = serde_json::json!(axes);
+            }
+            if let Some(p) = principal {
+                body["principal"] = serde_json::json!(p);
+            }
+            Ok(body)
+        }
+        TaxonomyCommands::Gaps {
+            namespace,
+            principal,
+        } => {
+            let mut body = serde_json::json!({
+                "namespace": namespace,
+                "operation": "gaps",
+            });
+            if let Some(p) = principal {
+                body["principal"] = serde_json::json!(p);
+            }
+            Ok(body)
+        }
+        TaxonomyCommands::Advise {
+            namespace,
+            query,
+            domain,
+            top_k,
+            principal,
+        } => {
+            let mut body = serde_json::json!({
+                "namespace": namespace,
+                "operation": "advise",
+                "top_k": top_k,
+            });
+            if let Some(q) = query {
+                body["query"] = serde_json::json!(q);
+            }
+            if let Some(d) = domain {
+                body["domain"] = serde_json::json!(d);
+            }
+            if let Some(p) = principal {
+                body["principal"] = serde_json::json!(p);
+            }
+            Ok(body)
+        }
     }
 }
 
@@ -3357,6 +3714,34 @@ mod tests {
                 assert_eq!(limit, 25);
             }
             other => panic!("expected Action::Log, got {:?}", other),
+        }
+
+        let tax_adv = Cli::try_parse_from([
+            "neurostrata-mcp",
+            "taxonomy",
+            "advise",
+            "NeuroStrata",
+            "--query",
+            "top 5 improvements",
+            "--top-k",
+            "5",
+        ])
+        .expect("taxonomy advise parses");
+        match tax_adv.command {
+            Some(Commands::Taxonomy {
+                taxonomy:
+                    TaxonomyCommands::Advise {
+                        namespace,
+                        query,
+                        top_k,
+                        ..
+                    },
+            }) => {
+                assert_eq!(namespace, "NeuroStrata");
+                assert_eq!(query.as_deref(), Some("top 5 improvements"));
+                assert_eq!(top_k, 5);
+            }
+            other => panic!("expected Taxonomy::Advise, got {:?}", other),
         }
     }
 
@@ -6229,6 +6614,23 @@ async fn run() -> anyhow::Result<()> {
                             }
                             std::process::exit(1);
                         }
+                        Commands::Taxonomy { taxonomy } => {
+                            let req_body = taxonomy_command_to_json(taxonomy)?;
+                            let res = daemon_http_client()
+                                .post(format!("http://{DAEMON_ADDR}/taxonomy"))
+                                .json(&req_body)
+                                .send()
+                                .await
+                                .map_err(|e| anyhow::anyhow!("taxonomy request failed: {e}"))?;
+                            let body = res.text().await.unwrap_or_default();
+                            println!("{}", body);
+                            let parsed: serde_json::Value =
+                                serde_json::from_str(&body).unwrap_or_default();
+                            if parsed.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+                                return Ok(());
+                            }
+                            std::process::exit(1);
+                        }
                         _ => {}
                     }
                     eprintln!("CRITICAL ERROR: The NeuroStrata daemon is currently running (likely via OpenCode) and holds the database lock.");
@@ -6532,6 +6934,23 @@ async fn run() -> anyhow::Result<()> {
                         }
                         let out =
                             crate::server::handle_insights(&args, vector_store.clone()).await;
+                        println!("{}", out);
+                        let parsed: serde_json::Value =
+                            serde_json::from_str(&out).unwrap_or_default();
+                        if parsed.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                            std::process::exit(1);
+                        }
+                    }
+                    Commands::Taxonomy { taxonomy } => {
+                        let embedder = build_embedder()?;
+                        bind_fallback_serving_descriptor(&vector_store, &embedder);
+                        let args = taxonomy_command_to_json(&taxonomy)?;
+                        let out = crate::server::handle_taxonomy(
+                            &args,
+                            embedder.clone(),
+                            vector_store.clone(),
+                        )
+                        .await;
                         println!("{}", out);
                         let parsed: serde_json::Value =
                             serde_json::from_str(&out).unwrap_or_default();

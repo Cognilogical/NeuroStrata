@@ -253,7 +253,9 @@ pub struct ResearchPrompt {
 /// Unified request payload for `neurostrata_taxonomy` (MCP, HTTP Daemon, and CLI).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TaxonomyRequest {
+    #[serde(default, alias = "action")]
     pub operation: String,
+    #[serde(default)]
     pub namespace: String,
     #[serde(default)]
     pub principal: Option<String>,
@@ -1093,7 +1095,7 @@ pub async fn execute_taxonomy(
             .or(security.requested_principal.as_deref()),
     );
 
-    match op.as_str() {
+    let mut res = match op.as_str() {
         "set_thesis" => {
             execute_set_thesis(store, embedder, &namespace, &req, &effective_principal).await
         }
@@ -1110,7 +1112,11 @@ pub async fn execute_taxonomy(
         other => Err(format!(
             "unknown taxonomy operation '{other}': expected set_thesis|upsert_concept|tree|briefing|compare|gaps|advise"
         )),
+    }?;
+    if let Some(obj) = res.as_object_mut() {
+        obj.insert("ok".to_string(), json!(true));
     }
+    Ok(res)
 }
 
 async fn execute_set_thesis(
@@ -3105,6 +3111,201 @@ async fn execute_advise(
     }))
 }
 
+/// Render the context-budgeted `### Project Thesis & Domain Expertise:` section (`<= 800` chars)
+/// for `neurostrata_get_snapshot`. Only includes unrestricted (`is_public_access_policy`) rows.
+pub async fn render_snapshot_taxonomy_section(store: &LadybugStore, namespace: &str) -> String {
+    let now_ts = chrono::Utc::now().timestamp();
+    let Ok((active_rows, active_edges)) = load_active_rows_and_edges(store, namespace, now_ts).await
+    else {
+        return String::new();
+    };
+    let unrestricted_rows: Vec<(String, MemoryPayload)> = active_rows
+        .into_iter()
+        .filter(|(_id, pl)| is_public_access_policy(&pl.metadata))
+        .collect();
+    let view = build_principal_taxonomy_view(&unrestricted_rows, &active_edges, "admin");
+    if view.thesis.is_none() && view.concepts.is_empty() {
+        return String::new();
+    }
+
+    let statuses: Vec<EpistemicStatus> = view
+        .concepts
+        .values()
+        .map(|c| match c.epistemic_status.as_str() {
+            "defined" => EpistemicStatus::Defined,
+            "synthesized" => EpistemicStatus::Synthesized,
+            "verified" => EpistemicStatus::Verified,
+            _ => EpistemicStatus::Seed,
+        })
+        .collect();
+    let unmapped_pillars = view
+        .thesis
+        .as_ref()
+        .map(|t| {
+            t.core_pillars
+                .iter()
+                .filter(|p| {
+                    !view
+                        .concepts
+                        .values()
+                        .any(|c| &c.slug == *p || c.domain.as_deref() == Some(p.as_str()))
+                })
+                .count() as u32
+        })
+        .unwrap_or(0);
+    let coverage_bps =
+        crate::formal_kernel::compute_epistemic_coverage_bps(&statuses, unmapped_pillars);
+
+    let mut lines: Vec<String> = vec!["### Project Thesis & Domain Expertise:".to_string()];
+    if let Some(t) = &view.thesis {
+        lines.push(format!(
+            "  - Primary Domain: `{}` | Epistemic Coverage: {} bps ({} unrestricted concepts)",
+            t.primary_domain,
+            coverage_bps,
+            view.concepts.len()
+        ));
+        let dir_snip: String = t.direction.replace('\n', " ").chars().take(200).collect();
+        lines.push(format!("  - Direction: {}", dir_snip));
+        if !t.core_pillars.is_empty() {
+            lines.push(format!(
+                "  - Core Pillars: {}",
+                t.core_pillars.iter().take(6).cloned().collect::<Vec<_>>().join(", ")
+            ));
+        }
+    } else {
+        lines.push(format!(
+            "  - Epistemic Coverage: {} bps ({} unrestricted concepts)",
+            coverage_bps,
+            view.concepts.len()
+        ));
+    }
+
+    let mut gap_items: Vec<String> = Vec::new();
+    if let Some(t) = &view.thesis {
+        for p in &t.core_pillars {
+            let has_concept = view
+                .concepts
+                .values()
+                .any(|c| &c.slug == p || c.domain.as_deref() == Some(p.as_str()));
+            if !has_concept && gap_items.len() < 4 {
+                gap_items.push(format!("unanchored_pillar:{p}"));
+            }
+        }
+    }
+    for (slug, c) in &view.concepts {
+        if (c.epistemic_status == "seed" || c.epistemic_status == "defined")
+            && gap_items.len() < 4
+        {
+            gap_items.push(format!("shallow:{slug}({})", c.epistemic_status));
+        }
+    }
+    if gap_items.is_empty() {
+        lines.push("  - Top Epistemic Gaps: none (all concepts synthesized/verified)".to_string());
+    } else {
+        lines.push(format!("  - Top Epistemic Gaps: {}", gap_items.join(", ")));
+    }
+
+    let out = lines.join("\n");
+    if out.chars().count() > 800 {
+        let mut s: String = out.chars().take(797).collect();
+        s.push_str("...");
+        s
+    } else {
+        out
+    }
+}
+
+/// Build context-budgeted (`<= 1200` chars) unrestricted Project Thesis and up to 3 matched
+/// SKOS concepts for `build_task_graph_context` (`neurostrata_task_create` / `neurostrata_task_claim`).
+pub async fn build_task_taxonomy_context(
+    store: &LadybugStore,
+    namespace: &str,
+    task_text: &str,
+) -> (Value, Value, String) {
+    let now_ts = chrono::Utc::now().timestamp();
+    let Ok((active_rows, active_edges)) = load_active_rows_and_edges(store, namespace, now_ts).await
+    else {
+        return (Value::Null, Value::Array(Vec::new()), String::new());
+    };
+    let unrestricted_rows: Vec<(String, MemoryPayload)> = active_rows
+        .into_iter()
+        .filter(|(_id, pl)| is_public_access_policy(&pl.metadata))
+        .collect();
+    let view = build_principal_taxonomy_view(&unrestricted_rows, &active_edges, "admin");
+    if view.thesis.is_none() && view.concepts.is_empty() {
+        return (Value::Null, Value::Array(Vec::new()), String::new());
+    }
+
+    let thesis_json = view
+        .thesis
+        .as_ref()
+        .and_then(|t| serde_json::to_value(t).ok())
+        .unwrap_or(Value::Null);
+
+    let tokens = tokenize_query(task_text);
+    let mut ranked: Vec<(u32, u32, usize, String)> = view
+        .concepts
+        .iter()
+        .map(|(slug, c)| {
+            let score = score_concept_match(c, task_text, &tokens);
+            (score, c.epistemic_weight_bps, c.grounding_count, slug.clone())
+        })
+        .collect();
+    ranked.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| a.3.cmp(&b.3))
+    });
+
+    let has_lexical_hit = ranked.first().is_some_and(|r| r.0 > 0);
+    let selected_slugs: Vec<String> = ranked
+        .into_iter()
+        .filter(|r| !has_lexical_hit || r.0 > 0)
+        .take(3)
+        .map(|r| r.3)
+        .collect();
+
+    let mut concepts_json: Vec<Value> = Vec::new();
+    let mut lines: Vec<String> = vec!["\n### Project Thesis & Domain Expertise".to_string()];
+    if let Some(t) = &view.thesis {
+        let mission_snip: String = t.mission.replace('\n', " ").chars().take(160).collect();
+        let dir_snip: String = t.direction.replace('\n', " ").chars().take(160).collect();
+        lines.push(format!(
+            "- Primary Domain: `{}` | Mission: {}",
+            t.primary_domain, mission_snip
+        ));
+        lines.push(format!("- Direction: {}", dir_snip));
+    }
+    for slug in &selected_slugs {
+        if let Some(c) = view.concepts.get(slug) {
+            if let Ok(val) = serde_json::to_value(c) {
+                concepts_json.push(val);
+            }
+            let def_snip: String = c.definition.replace('\n', " ").chars().take(160).collect();
+            lines.push(format!(
+                "  - [concept:{} | {}] `{}` ({}): {}",
+                c.epistemic_status,
+                c.realization_status,
+                c.slug,
+                c.pref_label,
+                def_snip
+            ));
+        }
+    }
+
+    let raw_section = lines.join("\n");
+    let capped_section = if raw_section.chars().count() > 1200 {
+        let mut s: String = raw_section.chars().take(1197).collect();
+        s.push_str("...");
+        s
+    } else {
+        raw_section
+    };
+
+    (thesis_json, Value::Array(concepts_json), capped_section)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3809,5 +4010,89 @@ mod tests {
             .filter_map(|v| v.as_str().map(String::from))
             .collect();
         assert!(insuff.contains(&"retrieval".to_string()));
+    }
+
+    #[tokio::test]
+    async fn auto_briefing_enforces_character_budgets_and_excludes_restricted_concepts() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-autobrief-test";
+        store.init(ns).await.expect("init");
+
+        execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "set_thesis".to_string(),
+                namespace: ns.to_string(),
+                primary_domain: Some("cognitive-memory".to_string()),
+                mission: Some("Verifiable cognitive memory engine".to_string()),
+                direction: Some("Graph-first reasoning and formal verification".to_string()),
+                core_pillars: Some(vec!["retrieval".to_string(), "ontology".to_string()]),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("set_thesis");
+
+        execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "upsert_concept".to_string(),
+                namespace: ns.to_string(),
+                slug: Some("public-rrf-fusion".to_string()),
+                pref_label: Some("Public RRF Fusion".to_string()),
+                definition: Some("Unrestricted public concept for reciprocal rank fusion.".to_string()),
+                domain: Some("retrieval".to_string()),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("public concept");
+
+        execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "upsert_concept".to_string(),
+                namespace: ns.to_string(),
+                slug: Some("confidential-proprietary-kernel".to_string()),
+                pref_label: Some("Confidential Proprietary Kernel".to_string()),
+                definition: Some("Top secret restricted concept.".to_string()),
+                domain: Some("retrieval".to_string()),
+                access_policy: Some(json!({
+                    "public": false,
+                    "allowed_users": ["alice"]
+                })),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("restricted concept");
+
+        let snap_sec = render_snapshot_taxonomy_section(&store, ns).await;
+        assert!(!snap_sec.is_empty());
+        assert!(snap_sec.chars().count() <= 800);
+        assert!(snap_sec.contains("cognitive-memory"));
+        assert!(!snap_sec.contains("confidential-proprietary-kernel"));
+
+        let (thesis_json, concepts_json, prompt_sec) = build_task_taxonomy_context(
+            &store,
+            ns,
+            "Improve reciprocal rank fusion and confidential-proprietary-kernel",
+        )
+        .await;
+        assert!(!thesis_json.is_null());
+        let arr = concepts_json.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["slug"], "public-rrf-fusion");
+        assert!(prompt_sec.chars().count() <= 1200);
+        assert!(prompt_sec.contains("public-rrf-fusion"));
+        assert!(!prompt_sec.contains("confidential-proprietary-kernel"));
     }
 }
