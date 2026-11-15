@@ -1101,7 +1101,9 @@ pub async fn execute_taxonomy(
             execute_upsert_concept(store, embedder, &namespace, &req, &effective_principal).await
         }
         "tree" => execute_tree(store, &namespace, &req, &effective_principal).await,
-        "briefing" => execute_briefing(store, &namespace, &req, &effective_principal).await,
+        "briefing" => {
+            execute_briefing(store, embedder, &namespace, &req, &effective_principal).await
+        }
         "compare" => execute_compare(store, &namespace, &req, &effective_principal).await,
         "gaps" => execute_gaps(store, &namespace, &req, &effective_principal).await,
         "advise" => execute_advise(store, &namespace, &req, &effective_principal).await,
@@ -2017,6 +2019,7 @@ fn score_concept_match(c: &HydratedConcept, query_raw: &str, tokens: &[String]) 
 
 async fn execute_briefing(
     store: &LadybugStore,
+    embedder: &dyn Embedder,
     namespace: &str,
     req: &TaxonomyRequest,
     principal: &str,
@@ -2039,6 +2042,56 @@ async fn execute_briefing(
         .trim();
     let tokens = tokenize_query(query_str);
 
+    // Hybrid RRF + OntologyIndex concept_aliases seed boost
+    let ontology = store.get_ontology(namespace);
+    let mut ontology_matched_slugs: BTreeSet<String> = BTreeSet::new();
+    if !query_str.is_empty() {
+        if let Some(canon) = ontology.canonical_slug(query_str) {
+            ontology_matched_slugs.insert(canon);
+        }
+        for exp in ontology.expand_concept_query_terms(query_str) {
+            if let Some(norm) = domain::normalize_domain_slug(&exp) {
+                ontology_matched_slugs.insert(norm);
+            }
+        }
+        for tok in &tokens {
+            if let Some(canon) = ontology.canonical_slug(tok) {
+                ontology_matched_slugs.insert(canon);
+            }
+        }
+    }
+
+    let mut rrf_boost_by_slug: BTreeMap<String, u32> = BTreeMap::new();
+    if !query_str.is_empty() {
+        if let Ok(q_vec) = embedder.embed(query_str).await {
+            if let Ok(rrf_out) = store
+                .search_hybrid_with_domain(
+                    namespace,
+                    q_vec,
+                    limit.saturating_mul(2).max(10),
+                    false,
+                    false,
+                    false,
+                    &[],
+                    Some(query_str),
+                    false,
+                    crate::traits::SearchMode::Hybrid,
+                )
+                .await
+            {
+                for (rank_idx, hit) in rrf_out.results.iter().enumerate() {
+                    let rrf_pts = (300usize.saturating_sub(rank_idx * 25)).max(25) as u32;
+                    for (slug, c) in &view.concepts {
+                        if c.id == hit.id || c.verified_grounding_ids.contains(&hit.id) {
+                            let entry = rrf_boost_by_slug.entry(slug.clone()).or_insert(0);
+                            *entry = (*entry).max(rrf_pts);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let mut scored_seeds: Vec<(u32, u32, usize, String)> = Vec::new();
     for (slug, c) in &view.concepts {
         if let Some(ref dom) = domain_filter {
@@ -2046,7 +2099,15 @@ async fn execute_briefing(
                 continue;
             }
         }
-        let match_score = score_concept_match(c, query_str, &tokens);
+        let mut match_score = score_concept_match(c, query_str, &tokens);
+        if ontology_matched_slugs.contains(slug) {
+            match_score += 250;
+        }
+        if let Some(&rrf_pts) = rrf_boost_by_slug.get(slug) {
+            if match_score > 0 || tokens.is_empty() {
+                match_score += rrf_pts;
+            }
+        }
         if match_score > 0 {
             scored_seeds.push((
                 match_score,
