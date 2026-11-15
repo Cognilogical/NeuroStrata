@@ -85,4 +85,35 @@ if bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/codex-finding-marke
   exit 1
 fi
 bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/codex-finding-filed.json" >/dev/null
+
+# Fetch-layer fixtures: the shape GitHub actually returns for Codex findings.
+fix="$root/scripts/fixtures/gate-receipt"
+if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/p1-unresolved" >/dev/null 2>&1; then
+  echo "FAIL: unresolved P1 review thread without receipt passed" >&2
+  exit 1
+fi
+bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/p1-resolved" >/dev/null
+bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/p1-filed" >/dev/null
+bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/quoted-prose" >/dev/null
+
+out=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/pr-201" 2>&1 >/dev/null || true)
+case "$out" in
+  *"4 gating marker(s)"*) : ;;
+  *) echo "FAIL: #201-shaped fixture should gate on 4 badges: $out" >&2; exit 1 ;;
+esac
+out=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/pr-204" 2>&1 >/dev/null || true)
+case "$out" in
+  *"2 gating marker(s)"*) : ;;
+  *) echo "FAIL: #204-shaped fixture should gate on 2 badges: $out" >&2; exit 1 ;;
+esac
+out=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/pr-204-fallback" 2>&1 >/dev/null || true)
+case "$out" in
+  *"2 gating marker(s)"*) : ;;
+  *) echo "FAIL: fallback should still count 2 inline badges: $out" >&2; exit 1 ;;
+esac
+case "$out" in
+  *"review-thread resolution unavailable"*) : ;;
+  *) echo "FAIL: fallback must announce that threads were not resolved: $out" >&2; exit 1 ;;
+esac
+
 echo "gate-receipt self-test: PASS"

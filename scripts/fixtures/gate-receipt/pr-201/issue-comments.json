@@ -1,0 +1,10 @@
+[
+  {
+    "body": "<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {\"code_review\":{\"has_any_findings\":true,\"has_unresolved_findings\":true}} -->\n\nCodex Review Summary: Completed\n",
+    "author_association": "NONE"
+  },
+  {
+    "body": "Merged with three P1 and one P2 unresolved Codex threads and no author replies.\nThe gate script was green because it only recognised the old merge-blocking words.",
+    "author_association": "MEMBER"
+  }
+]
