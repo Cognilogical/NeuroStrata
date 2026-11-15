@@ -1263,3 +1263,58 @@ pub const fn classify_tour_stop(
         TourStopCategory::CoreLogic
     }
 }
+
+/// Decision for registering a custom `InsightDefinition` (`neurostrata-kx2n`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsightDefineDecision {
+    DefineAllowed,
+    RejectedEmptyQuery,
+    RejectedBuiltinCollision,
+    RejectedQuotaExceeded,
+}
+
+impl InsightDefineDecision {
+    pub const fn as_tag(self) -> &'static str {
+        match self {
+            Self::DefineAllowed => "DEFINE_ALLOWED",
+            Self::RejectedEmptyQuery => "REJECTED_EMPTY_QUERY",
+            Self::RejectedBuiltinCollision => "REJECTED_BUILTIN_COLLISION",
+            Self::RejectedQuotaExceeded => "REJECTED_QUOTA_EXCEEDED",
+        }
+    }
+}
+
+/// Evaluate whether a custom `InsightDefinition` may be stored (`neurostrata-kx2n`).
+///
+/// 1. Empty query strings are rejected (`RejectedEmptyQuery`).
+/// 2. Collisions with the 4 built-in insight slugs are rejected (`RejectedBuiltinCollision`).
+/// 3. Exceeding `max_custom_insights` (16) when creating a new slug is rejected
+///    (`RejectedQuotaExceeded`); updating an existing slug (`is_existing_slug == true`) is allowed.
+pub const fn evaluate_insight_define(
+    query_non_empty: bool,
+    is_builtin_slug: bool,
+    is_existing_slug: bool,
+    existing_custom_count: u32,
+    max_custom_insights: u32,
+) -> InsightDefineDecision {
+    if !query_non_empty {
+        InsightDefineDecision::RejectedEmptyQuery
+    } else if is_builtin_slug {
+        InsightDefineDecision::RejectedBuiltinCollision
+    } else if !is_existing_slug && existing_custom_count >= max_custom_insights {
+        InsightDefineDecision::RejectedQuotaExceeded
+    } else {
+        InsightDefineDecision::DefineAllowed
+    }
+}
+
+/// Bitemporal point-in-time validity check (`valid_from <= as_of_ts < valid_to`)
+/// used by `neurostrata_insights` retroactive `as_of` evaluation (`neurostrata-kx2n`).
+pub const fn is_memory_valid_at(
+    valid_from: i64,
+    has_valid_to: bool,
+    valid_to: i64,
+    as_of_ts: i64,
+) -> bool {
+    valid_from <= as_of_ts && (!has_valid_to || valid_to > as_of_ts)
+}

@@ -12,6 +12,7 @@ pub enum MetricKind {
     RetrievalDistance,
     MemoryCount,
     IngestLatencyMs,
+    ArchitecturalInsight,
 }
 
 #[allow(non_upper_case_globals)]
@@ -26,6 +27,7 @@ impl MetricKind {
             MetricKind::RetrievalDistance => "retrieval_distance",
             MetricKind::MemoryCount => "memory_count",
             MetricKind::IngestLatencyMs => "ingest_latency_ms",
+            MetricKind::ArchitecturalInsight => "architectural_insight",
         }
     }
 }
@@ -40,6 +42,7 @@ impl std::str::FromStr for MetricKind {
             "retrieval_distance" => Ok(MetricKind::RetrievalDistance),
             "memory_count" => Ok(MetricKind::MemoryCount),
             "ingest_latency_ms" => Ok(MetricKind::IngestLatencyMs),
+            "architectural_insight" => Ok(MetricKind::ArchitecturalInsight),
             _ => Err(format!("unknown MetricKind: {}", s)),
         }
     }
@@ -217,13 +220,18 @@ impl AnomalyDetector {
         }
     }
 
-    pub fn observe(&self, namespace: &str, metric: MetricKind, stage: &str, sample: f64) -> Option<AnomalyEvent> {
+    pub fn observe(
+        &self,
+        namespace: &str,
+        metric: MetricKind,
+        stage: &str,
+        sample: f64,
+    ) -> Option<AnomalyEvent> {
         let key = (namespace.to_string(), metric, stage.to_string());
-        let mut map = self
-            .stats
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-        let stats = map.entry(key).or_insert_with(|| RollingStats::new(self.alpha, self.z_threshold, self.cooldown));
+        let mut map = self.stats.write().unwrap_or_else(|e| e.into_inner());
+        let stats = map
+            .entry(key)
+            .or_insert_with(|| RollingStats::new(self.alpha, self.z_threshold, self.cooldown));
         stats.record(namespace, metric, stage, sample, Instant::now())
     }
 }
@@ -282,16 +290,34 @@ mod tests {
         s.record("ns", MetricKind::MemoryCount, "s", 10.0, now);
         // Stable samples
         for _ in 0..10 {
-            s.record("ns", MetricKind::MemoryCount, "s", 10.0, now + Duration::from_millis(1));
+            s.record(
+                "ns",
+                MetricKind::MemoryCount,
+                "s",
+                10.0,
+                now + Duration::from_millis(1),
+            );
         }
         // Big outlier
-        let ev = s.record("ns", MetricKind::MemoryCount, "s", 100.0, now + Duration::from_millis(100));
+        let ev = s.record(
+            "ns",
+            MetricKind::MemoryCount,
+            "s",
+            100.0,
+            now + Duration::from_millis(100),
+        );
         assert!(ev.is_some());
         let ev = ev.unwrap();
         assert_eq!(ev.metric, MetricKind::MemoryCount);
         assert!(ev.z_score > 3.0);
         // Same instant should be blocked by cooldown
-        let ev2 = s.record("ns", MetricKind::MemoryCount, "s", 100.0, now + Duration::from_millis(100));
+        let ev2 = s.record(
+            "ns",
+            MetricKind::MemoryCount,
+            "s",
+            100.0,
+            now + Duration::from_millis(100),
+        );
         assert!(ev2.is_none());
     }
 }

@@ -1127,6 +1127,27 @@ pub async fn process_mcp_request(
                             },
                             "required": ["namespace"]
                         }
+                    },
+                    {
+                        "name": "neurostrata_insights",
+                        "description": "Evaluate and track longitudinal Architectural & Governance Code Insights over the bitemporal graph (4 built-in series: governance_coverage_pct, deferred_edge_debt, ungoverned_hotspot_count, task_knowledge_yield; plus custom SPARQL, lexical, and AST-call insights with bitemporal as_of backfill).",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "Project namespace." },
+                                "action": { "type": "string", "enum": ["snapshot", "series", "define", "remove"], "description": "Insight operation: 'snapshot', 'series', 'define', or 'remove'." },
+                                "name": { "type": "string", "description": "Insight slug (optional filter on snapshot/series; required on define/remove)." },
+                                "title": { "type": "string", "description": "Human-readable title when defining a custom insight." },
+                                "query_kind": { "type": "string", "enum": ["sparql", "lexical", "ast_calls"], "description": "Custom insight query kind ('sparql', 'lexical', or 'ast_calls')." },
+                                "query": { "type": "string", "description": "Custom insight query string (SPARQL SELECT, lexical query, or called symbol name)." },
+                                "path_prefix": { "type": "string", "description": "Optional file/directory path prefix filter for lexical or ast_calls insights." },
+                                "from_ts": { "type": "integer", "description": "Optional start unix timestamp (seconds) for series query or bitemporal backfill." },
+                                "to_ts": { "type": "integer", "description": "Optional end unix timestamp (seconds) for series query or bitemporal backfill." },
+                                "backfill_points": { "type": "integer", "description": "Optional number of bitemporal as_of backfill steps across [from_ts, to_ts] (2..=64)." },
+                                "principal": { "type": "string", "description": "Optional requested principal (honored only for admin callers)." }
+                            },
+                            "required": ["namespace", "action"]
+                        }
                     }
                 ]
             });
@@ -1606,6 +1627,9 @@ pub async fn process_mcp_request(
                         }
                         "neurostrata_diff_tour" => {
                             result_text = handle_diff_tour(&arguments, store.clone()).await;
+                        }
+                        "neurostrata_insights" => {
+                            result_text = handle_insights(&arguments, store.clone()).await;
                         }
                         // SynapticMesh: the handler is a pure string-in/
                         // string-out dispatch (filesystem + git only; no
@@ -7512,6 +7536,84 @@ pub(crate) async fn handle_diff_tour_with_auth(
         Err(e) => serde_json::json!({
             "ok": false,
             "error": e.to_string(),
+        })
+        .to_string(),
+    }
+}
+
+pub(crate) async fn handle_insights(arguments: &Value, store: Arc<dyn VectorStore>) -> String {
+    handle_insights_with_auth(arguments, Some("admin"), store).await
+}
+
+pub(crate) async fn handle_insights_with_auth(
+    arguments: &Value,
+    trusted_principal: Option<&str>,
+    store: Arc<dyn VectorStore>,
+) -> String {
+    let Some(ns_raw) = arguments
+        .get("namespace")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return serde_json::json!({"ok": false, "error": "namespace required"}).to_string();
+    };
+    let Some(action_raw) = arguments
+        .get("action")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return serde_json::json!({"ok": false, "error": "action required ('snapshot', 'series', 'define', or 'remove')"}).to_string();
+    };
+
+    let query_kind: Option<crate::telemetry::insights::InsightQueryKind> = arguments
+        .get("query_kind")
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+
+    let req = crate::telemetry::insights::InsightsRequest {
+        namespace: ns_raw.to_string(),
+        action: action_raw.to_string(),
+        name: arguments
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        title: arguments
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        query_kind,
+        query: arguments
+            .get("query")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        path_prefix: arguments
+            .get("path_prefix")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        from_ts: arguments.get("from_ts").and_then(|v| v.as_i64()),
+        to_ts: arguments.get("to_ts").and_then(|v| v.as_i64()),
+        backfill_points: arguments
+            .get("backfill_points")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize),
+        principal: arguments
+            .get("principal")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+    };
+
+    match crate::telemetry::insights::execute_insights(&store, &req, trusted_principal).await {
+        Ok(resp) => serde_json::json!({
+            "ok": true,
+            "namespace": resp.namespace,
+            "action": resp.action,
+            "series": resp.series,
+            "defined": resp.defined,
+            "removed": resp.removed,
+        })
+        .to_string(),
+        Err(e) => serde_json::json!({
+            "ok": false,
+            "error": e,
         })
         .to_string(),
     }
@@ -14591,6 +14693,7 @@ mod tests {
                 "neurostrata_object_view",
                 "neurostrata_locate",
                 "neurostrata_diff_tour",
+                "neurostrata_insights",
                 // SynapticMesh: appended by `tools.extend(synaptic_mesh_tool
                 // _definitions())` — this order IS the append order, so it
                 // pins where the mesh module's list enters the surface.

@@ -2130,6 +2130,13 @@ pub async fn ingest_directory(
         tracing::warn!("enrichment_commit failed for '{namespace}': {e}");
     }
 
+    crate::telemetry::insights::sample_insights_after_ingest(
+        &vector_store,
+        namespace,
+        Some(generation),
+    )
+    .await;
+
     Ok(())
 }
 

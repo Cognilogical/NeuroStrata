@@ -24,13 +24,14 @@ use formal_kernel::{
     action_gate_tag, action_revert_tag, action_task_effect_tag, allocate_hybrid_slots,
     claim_decision_tag, classify_merge_decision_tag, classify_tour_stop, epoch_gate_tag,
     evaluate_action_gate, evaluate_action_revert, evaluate_action_task_effect,
-    evaluate_claim_decision, evaluate_import_precheck, evaluate_procedure_fire,
-    evaluate_reducer_total, evaluate_retention_gate, evaluate_scenario_commit,
-    evaluate_seq_continuity, evaluate_sovereignty_gate, import_precheck_tag, intersect_var_bounds,
-    is_action_memory_shareable, join_task_status, lifecycle_can_transition, procedure_fire_tag,
-    resolve_cross_file_call, resolve_scenario_row, retention_verdict_tag, seq_decision_tag,
-    sovereignty_decision_tag, task_step_tag, ActionMemoryKind, ActionReceiptState,
-    ActionTaskTargetStatus, KernelProcedureTrust, ReducerOpKind, TwinBoundError,
+    evaluate_claim_decision, evaluate_import_precheck, evaluate_insight_define,
+    evaluate_procedure_fire, evaluate_reducer_total, evaluate_retention_gate,
+    evaluate_scenario_commit, evaluate_seq_continuity, evaluate_sovereignty_gate,
+    import_precheck_tag, intersect_var_bounds, is_action_memory_shareable, is_memory_valid_at,
+    join_task_status, lifecycle_can_transition, procedure_fire_tag, resolve_cross_file_call,
+    resolve_scenario_row, retention_verdict_tag, seq_decision_tag, sovereignty_decision_tag,
+    task_step_tag, ActionMemoryKind, ActionReceiptState, ActionTaskTargetStatus,
+    KernelProcedureTrust, ReducerOpKind, TwinBoundError,
 };
 
 /// The statuses in the exact order used by `proofs/Main.lean`.
@@ -541,6 +542,48 @@ fn generate_rust_truth_table() -> Vec<String> {
         }
     }
 
+    for &q_non_empty in [false, true].iter() {
+        for &is_builtin in [false, true].iter() {
+            for &is_existing in [false, true].iter() {
+                for &existing_count in [0u32, 15, 16, 17].iter() {
+                    let dec = evaluate_insight_define(
+                        q_non_empty,
+                        is_builtin,
+                        is_existing,
+                        existing_count,
+                        16,
+                    );
+                    lines.push(format!(
+                        "INSIGHT_DEFINE|{}|{}|{}|{}|{}",
+                        bool_str(q_non_empty),
+                        bool_str(is_builtin),
+                        bool_str(is_existing),
+                        existing_count,
+                        dec.as_tag()
+                    ));
+                }
+            }
+        }
+    }
+
+    for &vf in [10i64, 20].iter() {
+        for &has_vt in [false, true].iter() {
+            for &vt in [15i64, 25].iter() {
+                for &as_of in [5i64, 15, 20, 25].iter() {
+                    let valid = is_memory_valid_at(vf, has_vt, vt, as_of);
+                    lines.push(format!(
+                        "INSIGHT_VALID_AT|{}|{}|{}|{}|{}",
+                        vf,
+                        bool_str(has_vt),
+                        vt,
+                        as_of,
+                        bool_str(valid)
+                    ));
+                }
+            }
+        }
+    }
+
     lines
 }
 
@@ -594,8 +637,8 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
     let rust_lines = generate_rust_truth_table();
     assert_eq!(
         rust_lines.len(),
-        795,
-        "expected 795 canonical lines (64+16+128+3+24+32+8+60+16+6+32+32+32+16+4+72+5+21+96+8+48+72)"
+        859,
+        "expected 859 canonical lines (64+16+128+3+24+32+8+60+16+6+32+32+32+16+4+72+5+21+96+8+48+72+32+32)"
     );
 
     // Section-count verification: 64 TASK_FSM + 16 LIFECYCLE + 128 MESH_MERGE
@@ -717,6 +760,16 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
         *section_counts.get("DIFF_TOUR").unwrap_or(&0),
         72,
         "expected 72 DIFF_TOUR rows"
+    );
+    assert_eq!(
+        *section_counts.get("INSIGHT_DEFINE").unwrap_or(&0),
+        32,
+        "expected 32 INSIGHT_DEFINE rows"
+    );
+    assert_eq!(
+        *section_counts.get("INSIGHT_VALID_AT").unwrap_or(&0),
+        32,
+        "expected 32 INSIGHT_VALID_AT rows"
     );
 
     let lake = find_lake().expect(

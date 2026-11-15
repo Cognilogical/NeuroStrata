@@ -13,3 +13,4 @@ import NeuroStrata.TwinInterface
 import NeuroStrata.CrossFileEdge
 import NeuroStrata.ScenarioOverlay
 import NeuroStrata.DiffTour
+import NeuroStrata.Insights

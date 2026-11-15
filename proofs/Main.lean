@@ -147,3 +147,15 @@ def main : IO Unit := do
           for outDeg in [0, 1, 2] do
             let cat := classifyTourStop isTestOrDoc isFoundation isEntrypoint inDeg outDeg
             IO.println s!"DIFF_TOUR|{boolToStr isTestOrDoc}|{boolToStr isFoundation}|{boolToStr isEntrypoint}|{inDeg}|{outDeg}|{cat.asTag}|{cat.stopNumber}"
+  for qNonEmpty in [false, true] do
+    for isBuiltin in [false, true] do
+      for isExisting in [false, true] do
+        for existingCount in [0, 15, 16, 17] do
+          let dec := evaluateInsightDefine qNonEmpty isBuiltin isExisting existingCount 16
+          IO.println s!"INSIGHT_DEFINE|{boolToStr qNonEmpty}|{boolToStr isBuiltin}|{boolToStr isExisting}|{existingCount}|{dec.asTag}"
+  for vf in ([10, 20] : List Int) do
+    for hasVt in [false, true] do
+      for vt in ([15, 25] : List Int) do
+        for asOf in ([5, 15, 20, 25] : List Int) do
+          let valid := isMemoryValidAt vf hasVt vt asOf
+          IO.println s!"INSIGHT_VALID_AT|{vf}|{boolToStr hasVt}|{vt}|{asOf}|{boolToStr valid}"

@@ -378,6 +378,8 @@ pub async fn ingest_scip_bytes(
         }
     }
 
+    crate::telemetry::insights::sample_insights_after_ingest(&vector_store, namespace, None).await;
+
     Ok(report)
 }
 

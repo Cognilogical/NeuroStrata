@@ -533,6 +533,43 @@ enum Commands {
         #[arg(long)]
         principal: Option<String>,
     },
+
+    /// Evaluate and manage longitudinal Architectural & Governance Code Insights
+    #[command(name = "insights")]
+    Insights {
+        /// Target namespace
+        namespace: String,
+        /// Action: snapshot | series | define | remove
+        #[arg(default_value = "snapshot")]
+        action: String,
+        /// Insight slug (optional filter on snapshot/series; required on define/remove)
+        #[arg(long)]
+        name: Option<String>,
+        /// Human-readable title when defining a custom insight
+        #[arg(long)]
+        title: Option<String>,
+        /// Custom insight query kind (sparql | lexical | ast_calls)
+        #[arg(long)]
+        query_kind: Option<String>,
+        /// Custom insight query string
+        #[arg(long)]
+        query: Option<String>,
+        /// Optional file/directory path prefix filter
+        #[arg(long)]
+        path_prefix: Option<String>,
+        /// Optional start unix timestamp (seconds)
+        #[arg(long)]
+        from_ts: Option<i64>,
+        /// Optional end unix timestamp (seconds)
+        #[arg(long)]
+        to_ts: Option<i64>,
+        /// Optional number of bitemporal as_of backfill steps across [from_ts, to_ts]
+        #[arg(long)]
+        backfill_points: Option<usize>,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone, PartialEq)]
@@ -3407,6 +3444,10 @@ mod tests {
         ])
         .expect("diff-tour parses");
         assert!(matches!(dt.command, Some(Commands::DiffTour { .. })));
+
+        let ins = Cli::try_parse_from(["neurostrata-mcp", "insights", "MyProj", "snapshot"])
+            .expect("insights parses");
+        assert!(matches!(ins.command, Some(Commands::Insights { .. })));
     }
 
     /// Step 4's contract, both halves: with a daemon answering, stdout is that
@@ -6129,6 +6170,65 @@ async fn run() -> anyhow::Result<()> {
                             }
                             std::process::exit(1);
                         }
+                        Commands::Insights {
+                            namespace,
+                            action,
+                            name,
+                            title,
+                            query_kind,
+                            query,
+                            path_prefix,
+                            from_ts,
+                            to_ts,
+                            backfill_points,
+                            principal,
+                        } => {
+                            let mut req_body = serde_json::json!({
+                                "namespace": namespace,
+                                "action": action,
+                            });
+                            if let Some(v) = name {
+                                req_body["name"] = serde_json::json!(v);
+                            }
+                            if let Some(v) = title {
+                                req_body["title"] = serde_json::json!(v);
+                            }
+                            if let Some(v) = query_kind {
+                                req_body["query_kind"] = serde_json::json!(v);
+                            }
+                            if let Some(v) = query {
+                                req_body["query"] = serde_json::json!(v);
+                            }
+                            if let Some(v) = path_prefix {
+                                req_body["path_prefix"] = serde_json::json!(v);
+                            }
+                            if let Some(v) = from_ts {
+                                req_body["from_ts"] = serde_json::json!(v);
+                            }
+                            if let Some(v) = to_ts {
+                                req_body["to_ts"] = serde_json::json!(v);
+                            }
+                            if let Some(v) = backfill_points {
+                                req_body["backfill_points"] = serde_json::json!(v);
+                            }
+                            if let Some(v) = principal {
+                                req_body["principal"] = serde_json::json!(v);
+                            }
+                            let res = daemon_http_client()
+                                .post(format!("http://{DAEMON_ADDR}/insights"))
+                                .json(&req_body)
+                                .send()
+                                .await
+                                .map_err(|e| anyhow::anyhow!("insights request failed: {e}"))?;
+                            let body = res.text().await.unwrap_or_default();
+                            println!("{}", body);
+                            let parsed: serde_json::Value =
+                                serde_json::from_str(&body).unwrap_or_default();
+                            if parsed.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+                                return Ok(());
+                            }
+                            std::process::exit(1);
+                        }
                         _ => {}
                     }
                     eprintln!("CRITICAL ERROR: The NeuroStrata daemon is currently running (likely via OpenCode) and holds the database lock.");
@@ -6379,6 +6479,59 @@ async fn run() -> anyhow::Result<()> {
                         }
                         let out =
                             crate::server::handle_diff_tour(&args, vector_store.clone()).await;
+                        println!("{}", out);
+                        let parsed: serde_json::Value =
+                            serde_json::from_str(&out).unwrap_or_default();
+                        if parsed.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                            std::process::exit(1);
+                        }
+                    }
+                    Commands::Insights {
+                        namespace,
+                        action,
+                        name,
+                        title,
+                        query_kind,
+                        query,
+                        path_prefix,
+                        from_ts,
+                        to_ts,
+                        backfill_points,
+                        principal,
+                    } => {
+                        let mut args = serde_json::json!({
+                            "namespace": namespace,
+                            "action": action,
+                        });
+                        if let Some(v) = name {
+                            args["name"] = serde_json::json!(v);
+                        }
+                        if let Some(v) = title {
+                            args["title"] = serde_json::json!(v);
+                        }
+                        if let Some(v) = query_kind {
+                            args["query_kind"] = serde_json::json!(v);
+                        }
+                        if let Some(v) = query {
+                            args["query"] = serde_json::json!(v);
+                        }
+                        if let Some(v) = path_prefix {
+                            args["path_prefix"] = serde_json::json!(v);
+                        }
+                        if let Some(v) = from_ts {
+                            args["from_ts"] = serde_json::json!(v);
+                        }
+                        if let Some(v) = to_ts {
+                            args["to_ts"] = serde_json::json!(v);
+                        }
+                        if let Some(v) = backfill_points {
+                            args["backfill_points"] = serde_json::json!(v);
+                        }
+                        if let Some(v) = principal {
+                            args["principal"] = serde_json::json!(v);
+                        }
+                        let out =
+                            crate::server::handle_insights(&args, vector_store.clone()).await;
                         println!("{}", out);
                         let parsed: serde_json::Value =
                             serde_json::from_str(&out).unwrap_or_default();
