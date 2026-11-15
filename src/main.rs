@@ -13,6 +13,7 @@ mod daemon;
 mod diagnostic;
 mod did;
 mod digital_twin;
+mod doc_gate;
 mod domain;
 mod embed;
 mod events;
@@ -577,6 +578,40 @@ enum Commands {
     Taxonomy {
         #[command(subcommand)]
         taxonomy: TaxonomyCommands,
+    },
+
+    /// Validate the 3-tier Documentation Manifest and surface-diff gate
+    #[command(name = "doc-gate")]
+    DocGate {
+        /// Optional project root directory (defaults to git root or current directory)
+        #[arg(long)]
+        root: Option<std::path::PathBuf>,
+        /// Output JSON report
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Inspect and drive the pluggable workflow lifecycle state machine and connector
+    #[command(name = "workflow")]
+    Workflow {
+        #[command(subcommand)]
+        action: WorkflowCommands,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+enum WorkflowCommands {
+    /// Show active workflow connector, captured scope, state digest, and changed paths
+    Status {
+        #[arg(long)]
+        root: Option<std::path::PathBuf>,
+    },
+    /// Print the formal workflow stage transition table
+    Transitions,
+    /// Install or verify lifecycle triggers for the active workflow connector
+    Install {
+        #[arg(long)]
+        root: Option<std::path::PathBuf>,
     },
 }
 
@@ -6068,6 +6103,102 @@ async fn run() -> anyhow::Result<()> {
                     }
                 }
             }
+            Commands::DocGate { root, json } => {
+                let target_root = root
+                    .or_else(git_toplevel)
+                    .or_else(|| std::env::current_dir().ok())
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                let report = crate::doc_gate::evaluate_doc_gate(&target_root, None);
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&report).unwrap_or_default()
+                    );
+                } else if report.passed {
+                    println!(
+                        "PASS doc-gate (connector={}, tiers={}, rules={})",
+                        report.connector_id, report.checked_tiers, report.checked_rules
+                    );
+                } else {
+                    eprintln!(
+                        "FAIL doc-gate (connector={}, violations={}):",
+                        report.connector_id,
+                        report.violations.len()
+                    );
+                    for v in &report.violations {
+                        eprintln!("  - [{} / {}] {}: {}", v.rule_id, v.kind, v.path, v.detail);
+                    }
+                }
+                if !report.passed {
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
+            Commands::Workflow { action } => {
+                match action {
+                    WorkflowCommands::Status { root } => {
+                        let target_root = root
+                            .or_else(git_toplevel)
+                            .or_else(|| std::env::current_dir().ok())
+                            .unwrap_or_else(|| std::path::PathBuf::from("."));
+                        let connector =
+                            crate::workflow::resolve_workflow_connector(&target_root);
+                        let scope = connector.capture_scope(&target_root);
+                        let (revision_id, dirty_state_hash) =
+                            connector.capture_state_digest(&target_root);
+                        let changed_paths = connector.changed_paths(&target_root);
+                        let payload = serde_json::json!({
+                            "connector_id": connector.connector_id(),
+                            "scope": scope,
+                            "state_digest": {
+                                "revision_id": revision_id,
+                                "dirty_state_hash": dirty_state_hash,
+                            },
+                            "changed_paths": changed_paths,
+                        });
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&payload).unwrap_or_default()
+                        );
+                    }
+                    WorkflowCommands::Transitions => {
+                        let sample = crate::workflow::evaluate_workflow_transition(
+                            crate::workflow::WorkflowStage::Unpreflighted,
+                            crate::workflow::WorkflowEvent::LoadContext,
+                        );
+                        let payload = serde_json::json!({
+                            "initial_stage": sample.from,
+                            "after_load_context": sample.to,
+                            "edges": crate::workflow::WORKFLOW_TABLE,
+                        });
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&payload).unwrap_or_default()
+                        );
+                    }
+                    WorkflowCommands::Install { root } => {
+                        let target_root = root
+                            .or_else(git_toplevel)
+                            .or_else(|| std::env::current_dir().ok())
+                            .unwrap_or_else(|| std::path::PathBuf::from("."));
+                        let connector =
+                            crate::workflow::resolve_workflow_connector(&target_root);
+                        match connector.install_triggers(&target_root) {
+                            Ok(report) => {
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&report).unwrap_or_default()
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("ERROR: {e}");
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                }
+                return Ok(());
+            }
             Commands::Hooks { action } => match action {
                 HooksCommands::Install { force } => {
                     let root = match git_toplevel().or_else(|| std::env::current_dir().ok()) {
@@ -7416,6 +7547,8 @@ async fn run() -> anyhow::Result<()> {
                     | Commands::ProjectContext { .. }
                     | Commands::BusMetrics
                     | Commands::Kge { .. }
+                    | Commands::DocGate { .. }
+                    | Commands::Workflow { .. }
                     | Commands::Hooks { .. }
                     | Commands::Bench { .. }
                     // THE OUTER match already handles Learn (src/main.rs ~2822);

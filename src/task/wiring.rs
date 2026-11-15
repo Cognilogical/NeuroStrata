@@ -9,7 +9,7 @@
 //!
 //! Rule: never hand a project a reminder where a machine will do.
 //!
-//! Registry size: 13 automatic wires and 7 reminder wires. The counts are
+//! Registry size: 14 automatic wires and 7 reminder wires. The counts are
 //! stated here so a stale "four wires" claim in prose cannot outlive the
 //! registry it describes.
 
@@ -132,6 +132,12 @@ pub const AUTOMATIC_WIRES: &[Wire] = &[
         runs_in: RunsIn::ProjectPipeline,
         blocks: true,
         reason: "a gate that passes its own test is not a gate: plant a violation, expect fail, prove byte-identical restore",
+    },
+    Wire {
+        id: "doc-manifest-gate",
+        runs_in: RunsIn::ProjectPipeline,
+        blocks: true,
+        reason: "public surface and extension changes must satisfy docs/manifest.json across vision, features-api, and extend tiers without loose unclassified docs",
     },
 ];
 
