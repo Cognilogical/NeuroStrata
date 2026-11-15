@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # gate-receipt: fail a PR when a gating review marker has no recorded receipt.
 #
-# A gating marker is CHANGES-NEEDED / CHANGES NEEDED / DO-NOT-MERGE / DO NOT MERGE.
+# A gating marker is CHANGES-NEEDED / CHANGES NEEDED / DO-NOT-MERGE / DO NOT MERGE,
+# or a review finding badge: P1 Badge / P2 Badge (optionally wrapped in ** or
+# preceded by the codex-code-review-finding marker comment).
 # Receipts: fixed@<sha> and filed #<issue> from anyone; ruled: <reason> only
 # from a maintainer (OWNER / MEMBER / COLLABORATOR). One receipt per marker.
 #
@@ -42,10 +44,13 @@ else
     exit 1
   }
   entries=$(printf '%s\n%s\n' "$reviews" "$comments")
+  # Unresolved-thread state is not queried; markers come from review/comment
+  # bodies. Say so instead of implying thread resolution was checked.
+  echo "gate-receipt: review-thread resolution not inspected; using body markers" >&2
 fi
 
 all_text=$(printf '%s\n' "$entries" | jq -r '.body' 2>/dev/null || true)
-markers=$(printf '%s\n' "$all_text" | grep -Eoi 'CHANGES[-_ ]?NEEDED|DO[-_ ]?NOT[-_ ]?MERGE' | wc -l | tr -d ' ' || true)
+markers=$(printf '%s\n' "$all_text" | grep -Eoi 'CHANGES[-_ ]?NEEDED|DO[-_ ]?NOT[-_ ]?MERGE|P[12][[:space:]]*-?[[:space:]]*Badge' | wc -l | tr -d ' ' || true)
 fixed_filed=$(printf '%s\n' "$all_text" | grep -Eoi 'fixed@[0-9a-f]{7,}|filed[[:space:]]+#[0-9]+' | wc -l | tr -d ' ' || true)
 ruled=$(printf '%s\n' "$entries" | jq -r 'select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR") | .body' 2>/dev/null | grep -Eoi 'ruled:' | wc -l | tr -d ' ' || true)
 markers=${markers:-0}
