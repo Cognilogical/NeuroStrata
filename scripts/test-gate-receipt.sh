@@ -117,29 +117,36 @@ case "$out" in
 esac
 
 # Malformed fixture shapes must fail closed, not clear the gate silently.
-mkdir -p "$tmp/malformed-threads" "$tmp/malformed-fallback"
-printf '[]\n' > "$tmp/malformed-threads/reviews.json"
-printf '[]\n' > "$tmp/malformed-threads/issue-comments.json"
-printf '{"oops":1}\n' > "$tmp/malformed-threads/threads.json"
-printf '[]\n' > "$tmp/malformed-fallback/reviews.json"
-printf '[]\n' > "$tmp/malformed-fallback/issue-comments.json"
-printf '{"oops":1}\n' > "$tmp/malformed-fallback/pull-comments.json"
+expect_shape_error() {
+  local label=$1 dir=$2 needle=$3 rc=0 err
+  err=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$dir" 2>&1 >/dev/null) || rc=$?
+  if [ "$rc" -ne 2 ]; then
+    echo "FAIL: $label exited $rc, expected 2: $err" >&2
+    exit 1
+  fi
+  case "$err" in
+    *"$needle"*) : ;;
+    *) echo "FAIL: $label did not name the shape error: $err" >&2; exit 1 ;;
+  esac
+}
 
-rc=0
-err=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$tmp/malformed-threads" 2>&1 >/dev/null) || rc=$?
-if [ "$rc" -ne 2 ]; then
-  echo "FAIL: malformed threads.json exited $rc, expected 2: $err" >&2
-  exit 1
-fi
-case "$err" in
-  *"must be a JSON array"*) : ;;
-  *) echo "FAIL: malformed threads.json did not name the shape error: $err" >&2; exit 1 ;;
-esac
-rc=0
-err=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$tmp/malformed-fallback" 2>&1 >/dev/null) || rc=$?
-if [ "$rc" -ne 2 ]; then
-  echo "FAIL: malformed pull-comments.json exited $rc, expected 2: $err" >&2
-  exit 1
-fi
+mkdir -p "$tmp/malformed-threads" "$tmp/malformed-fallback" \
+  "$tmp/malformed-thread-element" "$tmp/malformed-reviews" "$tmp/malformed-thread-comments"
+for d in malformed-threads malformed-fallback malformed-thread-element \
+  malformed-reviews malformed-thread-comments; do
+  printf '[]\n' > "$tmp/$d/reviews.json"
+  printf '[]\n' > "$tmp/$d/issue-comments.json"
+done
+printf '{"oops":1}\n' > "$tmp/malformed-threads/threads.json"
+printf '{"oops":1}\n' > "$tmp/malformed-fallback/pull-comments.json"
+printf '[{"oops":1}]\n' > "$tmp/malformed-thread-element/threads.json"
+printf '{"oops":1}\n' > "$tmp/malformed-reviews/reviews.json"
+printf '[{"isResolved":false,"comments":{"body":"not an array"}}]\n' > "$tmp/malformed-thread-comments/threads.json"
+
+expect_shape_error "object threads.json" "$tmp/malformed-threads" "must be a JSON array of threads"
+expect_shape_error "object pull-comments.json" "$tmp/malformed-fallback" "must be a JSON array of objects with a string body"
+expect_shape_error "thread element without isResolved/comments" "$tmp/malformed-thread-element" "must be a JSON array of threads"
+expect_shape_error "object reviews.json" "$tmp/malformed-reviews" "must be a JSON array of objects with a string body"
+expect_shape_error "thread comments not an array" "$tmp/malformed-thread-comments" "must be a JSON array of threads"
 
 echo "gate-receipt self-test: PASS"

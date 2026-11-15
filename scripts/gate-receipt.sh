@@ -47,6 +47,28 @@ thread_entries() {
   fi
 }
 
+# Fixture shapes are validated strictly: a typo in a fixture must fail the
+# gate, never silently produce "no gating marker".
+require_comment_array() {
+  if ! jq -e 'type == "array" and all(.[]; (type == "object") and ((.body | type) == "string"))' "$1" >/dev/null 2>&1; then
+    echo "gate-receipt: $1 must be a JSON array of objects with a string body" >&2
+    return 1
+  fi
+}
+
+require_thread_array() {
+  if ! jq -e 'type == "array" and all(.[];
+      (type == "object")
+      and (has("isResolved") or has("comments"))
+      and ((has("isResolved") | not) or ((.isResolved | type) == "boolean"))
+      and ((has("comments") | not) or (((.comments | type) == "array")
+           and all(.comments[]; (type == "object") and ((.body | type) == "string"))))
+    )' "$1" >/dev/null 2>&1; then
+    echo "gate-receipt: $1 must be a JSON array of threads: {isResolved?: boolean, comments?: [{body: string}]}" >&2
+    return 1
+  fi
+}
+
 reviews_entries=""
 comment_entries=""
 threads_json=""
@@ -67,24 +89,16 @@ elif [ -n "$fixtures_dir" ]; then
   [ -d "$fixtures_dir" ] || { echo "no such fixture directory: $fixtures_dir" >&2; exit 2; }
   for f in reviews.json issue-comments.json; do
     [ -f "$fixtures_dir/$f" ] || { echo "missing $fixtures_dir/$f" >&2; exit 2; }
+    require_comment_array "$fixtures_dir/$f" || exit 2
   done
   reviews_entries=$(json_entries "$fixtures_dir/reviews.json")
   comment_entries=$(json_entries "$fixtures_dir/issue-comments.json")
   if [ -f "$fixtures_dir/threads.json" ]; then
-    threads_json=$(jq -c . "$fixtures_dir/threads.json" 2>/dev/null) || {
-      echo "gate-receipt: $fixtures_dir/threads.json is not valid JSON" >&2
-      exit 2
-    }
-    if ! printf '%s' "$threads_json" | jq -e 'type == "array"' >/dev/null 2>&1; then
-      echo "gate-receipt: $fixtures_dir/threads.json must be a JSON array of threads" >&2
-      exit 2
-    fi
+    require_thread_array "$fixtures_dir/threads.json" || exit 2
+    threads_json=$(jq -c . "$fixtures_dir/threads.json")
     thread_mode=threads
   elif [ -f "$fixtures_dir/pull-comments.json" ]; then
-    if ! jq -e 'type == "array"' "$fixtures_dir/pull-comments.json" >/dev/null 2>&1; then
-      echo "gate-receipt: $fixtures_dir/pull-comments.json must be a JSON array of comments" >&2
-      exit 2
-    fi
+    require_comment_array "$fixtures_dir/pull-comments.json" || exit 2
     pull_entries=$(json_entries "$fixtures_dir/pull-comments.json")
     thread_mode=fallback
   else

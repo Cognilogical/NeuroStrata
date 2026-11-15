@@ -18,9 +18,10 @@ posted as `COMMENTED` therefore cannot block a merge.
 
 A review or comment that says `CHANGES-NEEDED`, `CHANGES NEEDED`,
 `DO-NOT-MERGE`, or `DO NOT MERGE` is a gating marker, and so is a P1 or P2
-finding badge (`**P1 Badge**`, `**P2 Badge**`, or the Codex
-`<!-- codex-code-review-finding:v1 -->` body). The PR body is not scanned: it
-often describes the gate itself. Each marker needs one receipt in a review or
+finding badge (`**P1 Badge**`, `**P2 Badge**`). The Codex
+`<!-- codex-code-review-finding:v1 -->` comment is not a marker by itself: the
+badge inside the finding it annotates is the marker. The PR body is not scanned:
+it often describes the gate itself. Each marker needs one receipt in a review or
 comment:
 
 - `fixed@<sha>` — the finding is fixed at that commit;
@@ -40,7 +41,12 @@ stderr; it never treats an unresolved thread as clearance.
 For offline checks, `--reviews-file <path>` takes a legacy body fixture and
 `--fixtures-dir <dir>` takes `reviews.json`, `issue-comments.json`, and either
 `threads.json` or `pull-comments.json` with the same payload shapes as the API.
-Malformed fixture shapes exit 2 rather than passing. `GATE_RECEIPT_REPO=owner/name`
+Every fixture file is validated before it is used: `reviews.json`,
+`issue-comments.json`, and `pull-comments.json` must be arrays of objects with a
+string `body`; `threads.json` must be an array of objects that carry
+`isResolved` and/or `comments`, where `isResolved` is boolean when present and
+`comments` is an array of objects with a string `body` when present. A file that
+fails validation exits 2 instead of passing. `GATE_RECEIPT_REPO=owner/name`
 overrides the repository used by `--pr`, so a fork checkout can check the
 upstream PR.
 
