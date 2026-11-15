@@ -461,6 +461,30 @@ enum Commands {
         #[command(subcommand)]
         scenario: ScenarioCommands,
     },
+
+    /// Hydrate a 360-degree Ontology Object View for a memory, symbol, file, task, or digital twin
+    #[command(name = "object-view")]
+    ObjectView {
+        /// Target namespace
+        namespace: String,
+        /// Memory ID or digital twin_id to inspect
+        id: String,
+        /// Optional counterfactual scenario ID
+        #[arg(long)]
+        scenario_id: Option<String>,
+        /// Max recent action receipts to include in lineage (default 5, max 25)
+        #[arg(long, default_value_t = 5)]
+        include_history_limit: usize,
+        /// Evaluate ActionType preconditions (default true)
+        #[arg(long, default_value_t = true)]
+        evaluate_action_preconditions: bool,
+        /// Maximum serialized response bytes before truncation (default 8192)
+        #[arg(long, default_value_t = 8192)]
+        max_bytes: usize,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone, PartialEq)]
@@ -3303,6 +3327,17 @@ mod tests {
                 scenario: ScenarioCommands::Diff { .. }
             })
         ));
+
+        let ov = Cli::try_parse_from([
+            "neurostrata-mcp",
+            "object-view",
+            "MyProj",
+            "loop-a",
+            "--principal",
+            "bob",
+        ])
+        .expect("object-view parses");
+        assert!(matches!(ov.command, Some(Commands::ObjectView { .. })));
     }
 
     /// Step 4's contract, both halves: with a daemon answering, stdout is that
@@ -5897,6 +5932,43 @@ async fn run() -> anyhow::Result<()> {
                             }
                             std::process::exit(1);
                         }
+                        Commands::ObjectView {
+                            namespace,
+                            id,
+                            scenario_id,
+                            include_history_limit,
+                            evaluate_action_preconditions,
+                            max_bytes,
+                            principal,
+                        } => {
+                            let mut req_body = serde_json::json!({
+                                "namespace": namespace,
+                                "id": id,
+                                "include_history_limit": include_history_limit,
+                                "evaluate_action_preconditions": evaluate_action_preconditions,
+                                "max_bytes": max_bytes,
+                            });
+                            if let Some(s) = scenario_id {
+                                req_body["scenario_id"] = serde_json::json!(s);
+                            }
+                            if let Some(p) = principal {
+                                req_body["principal"] = serde_json::json!(p);
+                            }
+                            let res = daemon_http_client()
+                                .post(format!("http://{DAEMON_ADDR}/object-view"))
+                                .json(&req_body)
+                                .send()
+                                .await
+                                .map_err(|e| anyhow::anyhow!("object-view request failed: {e}"))?;
+                            let body = res.text().await.unwrap_or_default();
+                            println!("{}", body);
+                            let parsed: serde_json::Value =
+                                serde_json::from_str(&body).unwrap_or_default();
+                            if parsed.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+                                return Ok(());
+                            }
+                            std::process::exit(1);
+                        }
                         _ => {}
                     }
                     eprintln!("CRITICAL ERROR: The NeuroStrata daemon is currently running (likely via OpenCode) and holds the database lock.");
@@ -6031,6 +6103,37 @@ async fn run() -> anyhow::Result<()> {
                             vector_store.clone(),
                         )
                         .await;
+                        println!("{}", out);
+                        let parsed: serde_json::Value =
+                            serde_json::from_str(&out).unwrap_or_default();
+                        if parsed.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                            std::process::exit(1);
+                        }
+                    }
+                    Commands::ObjectView {
+                        namespace,
+                        id,
+                        scenario_id,
+                        include_history_limit,
+                        evaluate_action_preconditions,
+                        max_bytes,
+                        principal,
+                    } => {
+                        let mut args = serde_json::json!({
+                            "namespace": namespace,
+                            "id": id,
+                            "include_history_limit": include_history_limit,
+                            "evaluate_action_preconditions": evaluate_action_preconditions,
+                            "max_bytes": max_bytes,
+                        });
+                        if let Some(s) = scenario_id {
+                            args["scenario_id"] = serde_json::json!(s);
+                        }
+                        if let Some(p) = principal {
+                            args["principal"] = serde_json::json!(p);
+                        }
+                        let out =
+                            crate::server::handle_object_view(&args, vector_store.clone()).await;
                         println!("{}", out);
                         let parsed: serde_json::Value =
                             serde_json::from_str(&out).unwrap_or_default();

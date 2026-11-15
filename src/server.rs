@@ -1062,6 +1062,24 @@ pub async fn process_mcp_request(
                             },
                             "required": ["namespace", "action"]
                         }
+                    },
+                    {
+                        "name": "neurostrata_object_view",
+                        "description": "Hydrate a 360-degree Ontology Object View for any memory, AST symbol, file, task, or digital twin in one call (identity, twin state & reducers, 1-hop links, governance & SHACL, lineage & action receipts, metrics, and available legal ActionTypes).",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "Project namespace." },
+                                "id": { "type": "string", "description": "Memory ID or digital twin_id to inspect." },
+                                "scenario_id": { "type": "string", "description": "Optional counterfactual scenario ID to resolve Copy-on-Write overlay state." },
+                                "include_history_limit": { "type": "integer", "default": 5, "description": "Max recent action receipts to include in lineage (default 5, max 25)." },
+                                "evaluate_action_preconditions": { "type": "boolean", "default": true, "description": "Evaluate TwinVarPrecondition and SparqlAsk criteria for candidate ActionTypes (default true)." },
+                                "max_bytes": { "type": "integer", "default": 8192, "description": "Maximum serialized response bytes before budget truncation (default 8192)." },
+                                "project_root": { "type": "string", "description": "Optional project root directory." },
+                                "principal": { "type": "string", "description": "Optional requested principal (honored only for admin callers)." }
+                            },
+                            "required": ["namespace", "id"]
+                        }
                     }
                 ]
             });
@@ -1531,6 +1549,9 @@ pub async fn process_mcp_request(
                         "neurostrata_scenario" => {
                             result_text =
                                 handle_scenario(&arguments, emb.clone(), store.clone()).await;
+                        }
+                        "neurostrata_object_view" => {
+                            result_text = handle_object_view(&arguments, store.clone()).await;
                         }
                         // SynapticMesh: the handler is a pure string-in/
                         // string-out dispatch (filesystem + git only; no
@@ -7204,6 +7225,95 @@ pub(crate) async fn handle_scenario_with_auth(
         other => serde_json::json!({
             "ok": false,
             "error": format!("unknown scenario operation '{other}' (expected create|stage_memory|stage_twin|apply_action|evaluate_sparql|diff|commit|drop|list)")
+        })
+        .to_string(),
+    }
+}
+
+pub(crate) async fn handle_object_view(arguments: &Value, store: Arc<dyn VectorStore>) -> String {
+    handle_object_view_with_auth(arguments, "admin", store).await
+}
+
+pub(crate) async fn handle_object_view_with_auth(
+    arguments: &Value,
+    authenticated_principal: &str,
+    store: Arc<dyn VectorStore>,
+) -> String {
+    let Some(ns_raw) = arguments
+        .get("namespace")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return serde_json::json!({"ok": false, "error": "namespace required"}).to_string();
+    };
+    let Some(id_raw) = arguments
+        .get("id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return serde_json::json!({"ok": false, "error": "id required"}).to_string();
+    };
+    let namespace = resolve_namespace(&store, ns_raw).await;
+    let Some(lb_store) = crate::traits::VectorStore::as_any(store.as_ref())
+        .downcast_ref::<crate::store::ladybug::LadybugStore>()
+    else {
+        return serde_json::json!({"ok": false, "error": "object_view requires LadybugStore backend"}).to_string();
+    };
+
+    let req = crate::graph_read::object_view::ObjectViewRequest {
+        namespace,
+        id: id_raw.to_string(),
+        scenario_id: arguments
+            .get("scenario_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.to_string()),
+        include_history_limit: arguments
+            .get("include_history_limit")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize),
+        evaluate_action_preconditions: arguments
+            .get("evaluate_action_preconditions")
+            .and_then(|v| v.as_bool()),
+        max_bytes: arguments
+            .get("max_bytes")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize),
+        project_root: arguments
+            .get("project_root")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        principal: arguments
+            .get("principal")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+    };
+
+    match crate::graph_read::object_view::hydrate_object_view(
+        lb_store,
+        &req,
+        authenticated_principal,
+    )
+    .await
+    {
+        Ok(view) => {
+            let hint = view.location.as_deref().unwrap_or(&view.id);
+            crate::task::record_graph_query(
+                &store,
+                &req.namespace,
+                "neurostrata_object_view",
+                hint,
+            )
+            .await;
+            serde_json::json!({
+                "ok": true,
+                "object_view": view,
+            })
+            .to_string()
+        }
+        Err(e) => serde_json::json!({
+            "ok": false,
+            "error": e,
         })
         .to_string(),
     }
@@ -14279,6 +14389,7 @@ mod tests {
                 "neurostrata_context_plan",
                 "neurostrata_action",
                 "neurostrata_scenario",
+                "neurostrata_object_view",
                 // SynapticMesh: appended by `tools.extend(synaptic_mesh_tool
                 // _definitions())` — this order IS the append order, so it
                 // pins where the mesh module's list enters the surface.
