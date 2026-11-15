@@ -898,7 +898,7 @@ function extractBalancedCallArgs(code: string, startAfterOpenParen: number): str
  */
 export function inspectCodeModeExecution(code: string): CodeModeInspection {
   const result: CodeModeInspection = { queriedFiles: [] };
-  const callRe = /\b(neurostrata_(?:task_claim|task_update|task_complete|memories_for_file|archive_memory|add_memory|supersede_memory|update_memory))\b(?:\s*["']\s*\])?\s*\(/g;
+  const callRe = /\b(neurostrata_(?:task_claim|task_update|task_complete|memories_for_file|locate|archive_memory|add_memory|supersede_memory|update_memory))\b(?:\s*["']\s*\])?\s*\(/g;
   let match: RegExpExecArray | null;
   while ((match = callRe.exec(code)) !== null) {
     const tool = match[1];
@@ -909,7 +909,7 @@ export function inspectCodeModeExecution(code: string): CodeModeInspection {
     const idMatch = argSlice.match(/(?:^|[^\w$])["']?id["']?\s*:\s*["']([^"']+)["']/);
     const sessionMatch = argSlice.match(/(?:^|[^\w$])["']?session_id["']?\s*:\s*["']([^"']+)["']/);
     const noteMatch = argSlice.match(/(?:^|[^\w$])["']?note["']?\s*:\s*["']([^"']*)["']/);
-    const pathMatch = argSlice.match(/(?:^|[^\w$])["']?path["']?\s*:\s*["']([^"']+)["']/);
+    const pathMatch = argSlice.match(/(?:^|[^\w$])["']?(?:path|path_prefix|query)["']?\s*:\s*["']([^"']+)["']/);
 
     if (tool === "neurostrata_task_claim") {
       if (idMatch && sessionMatch) {
@@ -925,7 +925,7 @@ export function inspectCodeModeExecution(code: string): CodeModeInspection {
       if (noteMatch) result.note = noteMatch[1];
     } else if (tool === "neurostrata_task_complete") {
       result.taskCompleted = true;
-    } else if (tool === "neurostrata_memories_for_file") {
+    } else if (tool === "neurostrata_memories_for_file" || tool === "neurostrata_locate") {
       if (pathMatch) result.queriedFiles.push(pathMatch[1]);
     } else if (tool === "neurostrata_archive_memory" || tool === "neurostrata_add_memory" || tool === "neurostrata_supersede_memory" || tool === "neurostrata_update_memory") {
       result.memoryMutated = true;
@@ -1914,6 +1914,7 @@ const NEUROSTRATA_NATIVE_TOOLS = new Set([
   "neurostrata_update_memory",
   "neurostrata_guard_validate",
   "neurostrata_memories_for_file",
+  "neurostrata_locate",
 ]);
 
 /**

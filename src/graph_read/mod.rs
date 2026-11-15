@@ -20,3 +20,6 @@ pub mod propagate;
 
 /// Single-call 360-degree Ontology Object View hub (`neurostrata_object_view`).
 pub mod object_view;
+
+/// Compound single-call Code Finder, Blast-Radius & Governance Locator (`neurostrata_locate`).
+pub mod locate;

@@ -1080,6 +1080,24 @@ pub async fn process_mcp_request(
                             },
                             "required": ["namespace", "id"]
                         }
+                    },
+                    {
+                        "name": "neurostrata_locate",
+                        "description": "Single-call compound Code Finder, Blast-Radius & Governance Locator. Runs Hybrid RRF across AST symbols/files and normative anchors, expands 1-2 hop call/import neighborhood, hydrates governing rules and failed-attempt hazards, and records all returned paths in the Graph-First ledger.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "Project namespace." },
+                                "query": { "type": "string", "description": "Symbol name, file path, or natural-language localization query." },
+                                "path_prefix": { "type": "string", "description": "Optional directory or file path prefix filter." },
+                                "symbols_only": { "type": "boolean", "default": false, "description": "Only return spans anchored to a specific AST symbol." },
+                                "max_locations": { "type": "integer", "default": 8, "description": "Maximum ranked locations to return (default 8, max 20)." },
+                                "max_bytes": { "type": "integer", "default": 6144, "description": "Maximum serialized response byte budget (default 6144)." },
+                                "project_root": { "type": "string", "description": "Optional project root directory for .NeuroStrata/session_queries.json." },
+                                "principal": { "type": "string", "description": "Optional requested principal (honored only for admin callers)." }
+                            },
+                            "required": ["namespace", "query"]
+                        }
                     }
                 ]
             });
@@ -1552,6 +1570,10 @@ pub async fn process_mcp_request(
                         }
                         "neurostrata_object_view" => {
                             result_text = handle_object_view(&arguments, store.clone()).await;
+                        }
+                        "neurostrata_locate" => {
+                            result_text =
+                                handle_locate(&arguments, emb.clone(), store.clone()).await;
                         }
                         // SynapticMesh: the handler is a pure string-in/
                         // string-out dispatch (filesystem + git only; no
@@ -7314,6 +7336,84 @@ pub(crate) async fn handle_object_view_with_auth(
         Err(e) => serde_json::json!({
             "ok": false,
             "error": e,
+        })
+        .to_string(),
+    }
+}
+
+pub(crate) async fn handle_locate(
+    arguments: &Value,
+    embedder: Arc<dyn Embedder>,
+    store: Arc<dyn VectorStore>,
+) -> String {
+    handle_locate_with_auth(arguments, Some("admin"), Some(&embedder), store).await
+}
+
+pub(crate) async fn handle_locate_with_auth(
+    arguments: &Value,
+    trusted_principal: Option<&str>,
+    embedder: Option<&Arc<dyn Embedder>>,
+    store: Arc<dyn VectorStore>,
+) -> String {
+    let Some(ns_raw) = arguments
+        .get("namespace")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return serde_json::json!({"ok": false, "error": "namespace required"}).to_string();
+    };
+    let Some(query_raw) = arguments
+        .get("query")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return serde_json::json!({"ok": false, "error": "query required"}).to_string();
+    };
+
+    let req = crate::graph_read::locate::LocateRequest {
+        namespace: ns_raw.to_string(),
+        query: query_raw.to_string(),
+        path_prefix: arguments
+            .get("path_prefix")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.to_string()),
+        symbols_only: arguments.get("symbols_only").and_then(|v| v.as_bool()),
+        max_locations: arguments
+            .get("max_locations")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize),
+        max_bytes: arguments
+            .get("max_bytes")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize),
+        project_root: arguments
+            .get("project_root")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        principal: arguments
+            .get("principal")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+    };
+
+    match crate::graph_read::locate::execute_locate(&store, embedder, &req, trusted_principal).await
+    {
+        Ok(resp) => serde_json::json!({
+            "ok": true,
+            "namespace": resp.namespace,
+            "query": resp.query,
+            "locations": resp.locations,
+            "governing_rules": resp.governing_rules,
+            "failed_attempts": resp.failed_attempts,
+            "conceptual_bridges": resp.conceptual_bridges,
+            "ast_ingested": resp.ast_ingested,
+            "truncated_by_budget": resp.truncated_by_budget,
+        })
+        .to_string(),
+        Err(e) => serde_json::json!({
+            "ok": false,
+            "error": e.to_string(),
         })
         .to_string(),
     }
@@ -14340,6 +14440,7 @@ mod tests {
                 "neurostrata_get_memory",
                 "neurostrata_get_snapshot",
                 "neurostrata_ingest_directory",
+                "neurostrata_ingest_scip",
                 "neurostrata_list_namespaces",
                 "neurostrata_search_memory",
                 "neurostrata_rebuild_lexical_index",
@@ -14390,6 +14491,7 @@ mod tests {
                 "neurostrata_action",
                 "neurostrata_scenario",
                 "neurostrata_object_view",
+                "neurostrata_locate",
                 // SynapticMesh: appended by `tools.extend(synaptic_mesh_tool
                 // _definitions())` — this order IS the append order, so it
                 // pins where the mesh module's list enters the surface.

@@ -485,6 +485,32 @@ enum Commands {
         #[arg(long)]
         principal: Option<String>,
     },
+
+    /// Single-call compound Code Finder, Blast-Radius & Governance Locator
+    Locate {
+        /// Target namespace
+        namespace: String,
+        /// Symbol name, file path, or natural-language localization query
+        query: String,
+        /// Optional directory or file path prefix filter
+        #[arg(long)]
+        path_prefix: Option<String>,
+        /// Only return spans anchored to a specific AST symbol
+        #[arg(long, default_value_t = false)]
+        symbols_only: bool,
+        /// Maximum ranked locations to return (default 8, max 20)
+        #[arg(long, default_value_t = 8)]
+        max_locations: usize,
+        /// Maximum serialized response byte budget (default 6144)
+        #[arg(long, default_value_t = 6144)]
+        max_bytes: usize,
+        /// Optional project root directory
+        #[arg(long)]
+        project_root: Option<String>,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone, PartialEq)]
@@ -3338,6 +3364,17 @@ mod tests {
         ])
         .expect("object-view parses");
         assert!(matches!(ov.command, Some(Commands::ObjectView { .. })));
+
+        let loc = Cli::try_parse_from([
+            "neurostrata-mcp",
+            "locate",
+            "MyProj",
+            "check_caller_path",
+            "--max-locations",
+            "5",
+        ])
+        .expect("locate parses");
+        assert!(matches!(loc.command, Some(Commands::Locate { .. })));
     }
 
     /// Step 4's contract, both halves: with a daemon answering, stdout is that
@@ -5969,6 +6006,47 @@ async fn run() -> anyhow::Result<()> {
                             }
                             std::process::exit(1);
                         }
+                        Commands::Locate {
+                            namespace,
+                            query,
+                            path_prefix,
+                            symbols_only,
+                            max_locations,
+                            max_bytes,
+                            project_root,
+                            principal,
+                        } => {
+                            let mut req_body = serde_json::json!({
+                                "namespace": namespace,
+                                "query": query,
+                                "symbols_only": symbols_only,
+                                "max_locations": max_locations,
+                                "max_bytes": max_bytes,
+                            });
+                            if let Some(p) = path_prefix {
+                                req_body["path_prefix"] = serde_json::json!(p);
+                            }
+                            if let Some(r) = project_root {
+                                req_body["project_root"] = serde_json::json!(r);
+                            }
+                            if let Some(p) = principal {
+                                req_body["principal"] = serde_json::json!(p);
+                            }
+                            let res = daemon_http_client()
+                                .post(format!("http://{DAEMON_ADDR}/locate"))
+                                .json(&req_body)
+                                .send()
+                                .await
+                                .map_err(|e| anyhow::anyhow!("locate request failed: {e}"))?;
+                            let body = res.text().await.unwrap_or_default();
+                            println!("{}", body);
+                            let parsed: serde_json::Value =
+                                serde_json::from_str(&body).unwrap_or_default();
+                            if parsed.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+                                return Ok(());
+                            }
+                            std::process::exit(1);
+                        }
                         _ => {}
                     }
                     eprintln!("CRITICAL ERROR: The NeuroStrata daemon is currently running (likely via OpenCode) and holds the database lock.");
@@ -6134,6 +6212,47 @@ async fn run() -> anyhow::Result<()> {
                         }
                         let out =
                             crate::server::handle_object_view(&args, vector_store.clone()).await;
+                        println!("{}", out);
+                        let parsed: serde_json::Value =
+                            serde_json::from_str(&out).unwrap_or_default();
+                        if parsed.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                            std::process::exit(1);
+                        }
+                    }
+                    Commands::Locate {
+                        namespace,
+                        query,
+                        path_prefix,
+                        symbols_only,
+                        max_locations,
+                        max_bytes,
+                        project_root,
+                        principal,
+                    } => {
+                        let mut args = serde_json::json!({
+                            "namespace": namespace,
+                            "query": query,
+                            "symbols_only": symbols_only,
+                            "max_locations": max_locations,
+                            "max_bytes": max_bytes,
+                        });
+                        if let Some(p) = path_prefix {
+                            args["path_prefix"] = serde_json::json!(p);
+                        }
+                        if let Some(r) = project_root {
+                            args["project_root"] = serde_json::json!(r);
+                        }
+                        if let Some(p) = principal {
+                            args["principal"] = serde_json::json!(p);
+                        }
+                        let embedder = build_embedder().ok();
+                        let out = crate::server::handle_locate_with_auth(
+                            &args,
+                            Some("admin"),
+                            embedder.as_ref(),
+                            vector_store.clone(),
+                        )
+                        .await;
                         println!("{}", out);
                         let parsed: serde_json::Value =
                             serde_json::from_str(&out).unwrap_or_default();
