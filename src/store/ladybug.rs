@@ -2342,73 +2342,140 @@ fn allocate_wal_artifact_path(wal_file: &std::path::Path, kind: &str) -> std::pa
     std::path::PathBuf::from(fallback_os)
 }
 
-/// Copies a leftover write-ahead log aside before it is replayed and truncated.
-/// Best effort by design: failing to keep the copy is not a reason to refuse to
-/// open the database. Returns the preserved `.wal.unclean.<ts>` path when an
-/// active `<db>.wal` was preserved (or deduplicated against the latest existing
-/// `.wal.unclean.<ts>` copy with identical SHA-256).
-fn preserve_unclean_wal(local_path: &std::path::Path) -> Option<std::path::PathBuf> {
-    let mut ckpt_os = local_path.to_path_buf().into_os_string();
-    ckpt_os.push(".wal.checkpoint");
-    let ckpt_file = std::path::PathBuf::from(ckpt_os);
-    if let Ok(meta) = std::fs::symlink_metadata(&ckpt_file) {
-        if !meta.file_type().is_symlink() && meta.file_type().is_file() && meta.len() > 0 {
-            let ckpt_copy = allocate_wal_artifact_path(&ckpt_file, "unclean");
-            let _ = copy_regular_file_create_new_0600(&ckpt_file, &ckpt_copy);
+/// Which WAL file of the pair a preservation or restore step is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalSide {
+    Active,
+    Frozen,
+}
+
+impl WalSide {
+    fn path(self, local_path: &std::path::Path) -> std::path::PathBuf {
+        let mut os = local_path.to_path_buf().into_os_string();
+        os.push(self.suffix());
+        std::path::PathBuf::from(os)
+    }
+
+    const fn suffix(self) -> &'static str {
+        match self {
+            WalSide::Active => ".wal",
+            WalSide::Frozen => ".wal.checkpoint",
         }
     }
 
-    let mut wal_path = local_path.to_path_buf().into_os_string();
-    wal_path.push(".wal");
-    let wal_file = std::path::PathBuf::from(wal_path);
+    const fn artifact_marker(self) -> &'static str {
+        match self {
+            WalSide::Active => ".wal.unclean.",
+            WalSide::Frozen => ".wal.checkpoint.unclean.",
+        }
+    }
+}
 
+/// Both preserved copies of a WAL pair (`#207` B8). A refusing arm restores
+/// only the sides it needs from here; both are recorded so the operator message
+/// can name them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[allow(dead_code)] // consumed when Phase B wires the refusal protocol (#207)
+struct PreservedPair {
+    active: Option<std::path::PathBuf>,
+    frozen: Option<std::path::PathBuf>,
+}
+
+impl PreservedPair {
+    #[allow(dead_code)]
+    fn get(&self, side: WalSide) -> Option<&std::path::PathBuf> {
+        match side {
+            WalSide::Active => self.active.as_ref(),
+            WalSide::Frozen => self.frozen.as_ref(),
+        }
+    }
+}
+
+/// Copies one WAL side aside with the hardened primitive (`create_new`, `0600`,
+/// `O_NOFOLLOW`).
+///
+/// A missing or empty file is `Ok(None)`. A non-regular or symlinked WAL is a
+/// hard error rather than a silent skip, and an identical existing artifact is
+/// reused (repeated strict-refusal startups must not grow a copy per second,
+/// `#193`).
+fn preserve_wal_side(
+    local_path: &std::path::Path,
+    side: WalSide,
+) -> std::io::Result<Option<std::path::PathBuf>> {
+    let wal_file = side.path(local_path);
     let meta = match std::fs::symlink_metadata(&wal_file) {
-        Ok(m) => m,
-        Err(_) => return None,
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
     };
     if meta.file_type().is_symlink() || !meta.file_type().is_file() {
-        eprintln!(
-            "WARNING: refusing to preserve non-regular or symlink WAL at {:?}",
-            wal_file
-        );
-        return None;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to preserve non-regular or symlink WAL {:?}",
+                wal_file
+            ),
+        ));
     }
-    let size = meta.len();
-    if size == 0 {
-        return None;
+    if meta.len() == 0 {
+        return Ok(None);
     }
 
-    // Repeated strict-refusal startups against the same untouched WAL would
-    // otherwise create a new `.wal.unclean.<ts>` copy every second (#193).
-    // Reuse the latest preserved `.unclean.` artifact if its content matches.
+    let marker = side.artifact_marker();
     let existing = crate::storage::snapshot::list_wal_recovery_artifacts(local_path);
-    if let Some((latest_unclean, _, _)) = existing.iter().rev().find(|(p, _, _)| {
+    for (candidate, _, _) in existing.iter().filter(|(p, _, _)| {
         p.file_name()
-            .is_some_and(|n| n.to_string_lossy().contains(".wal.unclean."))
+            .is_some_and(|n| n.to_string_lossy().contains(marker))
     }) {
         if let (Some(src_hash), Some(prev_hash)) = (
             sha256_regular_file(&wal_file),
-            sha256_regular_file(latest_unclean),
+            sha256_regular_file(candidate),
         ) {
             if src_hash == prev_hash {
-                return Some(latest_unclean.clone());
+                return Ok(Some(candidate.clone()));
             }
         }
     }
 
     let copy_file = allocate_wal_artifact_path(&wal_file, "unclean");
-    eprintln!(
-        "WARNING: the last shutdown was not clean -- a {} byte write-ahead log was left behind. Recovering what it still holds.",
-        size
-    );
-    let preserved = match copy_regular_file_create_new_0600(&wal_file, &copy_file) {
-        Ok(_) => {
-            eprintln!(
-                "A copy was kept at {:?} in case recovery is incomplete.",
-                copy_file
-            );
+    copy_regular_file_create_new_0600(&wal_file, &copy_file)?;
+    Ok(Some(copy_file))
+}
+
+/// Copies a leftover write-ahead log aside before it is replayed and truncated.
+/// Best effort by design: failing to keep the copy is not a reason to refuse to
+/// open the database. Returns the preserved `.wal.unclean.<ts>` path when an
+/// active `<db>.wal` was preserved (or deduplicated against an existing
+/// `.wal.unclean.<ts>` copy with identical SHA-256).
+fn preserve_unclean_wal(local_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let frozen_file = WalSide::Frozen.path(local_path);
+    if let Ok(meta) = std::fs::symlink_metadata(&frozen_file) {
+        if !meta.file_type().is_symlink() && meta.file_type().is_file() && meta.len() > 0 {
+            if let Err(e) = preserve_wal_side(local_path, WalSide::Frozen) {
+                eprintln!("WARNING: could not preserve the frozen write-ahead log: {e}");
+            }
+        }
+    }
+
+    let active_file = WalSide::Active.path(local_path);
+    let size = std::fs::metadata(&active_file)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let preserved = match preserve_wal_side(local_path, WalSide::Active) {
+        Ok(Some(copy_file)) => {
+            if size > 0 {
+                eprintln!(
+                    "WARNING: the last shutdown was not clean -- a {} byte write-ahead log was left behind. Recovering what it still holds.",
+                    size
+                );
+                eprintln!(
+                    "A copy was kept at {:?} in case recovery is incomplete.",
+                    copy_file
+                );
+            }
             Some(copy_file)
         }
+        Ok(None) => None,
         Err(e) => {
             eprintln!("WARNING: could not keep a copy of it: {}", e);
             None
@@ -2417,6 +2484,32 @@ fn preserve_unclean_wal(local_path: &std::path::Path) -> Option<std::path::PathB
     let keep = LadybugStore::configured_snapshot_retention_count();
     let _ = crate::storage::snapshot::prune_wal_recovery_artifacts(local_path, keep);
     preserved
+}
+
+/// Mandatory preservation for a refusing arm (`#207` B8).
+///
+/// Returns **both** preserved paths and fails when an existing non-empty WAL
+/// cannot be copied. A refusal that cannot preserve is not a refusal: the arm
+/// turns this error into a refused open that names the failure.
+#[allow(dead_code)] // consumed when Phase B wires the refusal protocol (#207)
+fn preserve_wal_pair(local_path: &std::path::Path) -> Result<PreservedPair> {
+    let mut preserved = PreservedPair::default();
+    for side in [WalSide::Active, WalSide::Frozen] {
+        let path = side.path(local_path);
+        let copy = preserve_wal_side(local_path, side).map_err(|e| {
+            anyhow::anyhow!(
+                "refusing to open: could not preserve the write-ahead log at {}: {e}",
+                path.display()
+            )
+        })?;
+        match side {
+            WalSide::Active => preserved.active = copy,
+            WalSide::Frozen => preserved.frozen = copy,
+        }
+    }
+    let keep = LadybugStore::configured_snapshot_retention_count();
+    let _ = crate::storage::snapshot::prune_wal_recovery_artifacts(local_path, keep);
+    Ok(preserved)
 }
 
 impl Drop for LadybugStore {
@@ -26860,8 +26953,7 @@ mod wal_zero_record {
     };
     use super::*;
     use crate::store::wal_accounting::{
-        classify_pair, scan_wal, CommitEvidence, SideObservation, WalAccounting,
-        WalPairObservation,
+        classify_pair, scan_wal, CommitEvidence, SideObservation, WalAccounting, WalPairObservation,
     };
     use crate::store::wal_header::{
         select_header_source, HeaderConflict, HeaderProbe, HeaderSource, WAL_HEADER_BYTES,
@@ -26993,9 +27085,90 @@ mod wal_zero_record {
         );
         assert_eq!(scan.commit_evidence(), CommitEvidence::Some);
 
+        // B1: the checksum port is verified against bytes the pinned engine
+        // wrote. The header trailer and every frame trailer must match.
+        assert!(
+            scan.header_verified,
+            "the engine-written header checksum must verify"
+        );
+        assert_eq!(
+            scan.verified_frames, scan.frames_parsed,
+            "every complete frame's trailer must verify against the engine's checksum"
+        );
+        assert_eq!(
+            crate::store::wal_accounting::wal_checksum(&bytes[..16 + 1]),
+            u64::from_ne_bytes(bytes[17..25].try_into().unwrap()),
+            "header trailer = checksum(17-byte header)"
+        );
+
+        // B1: the judge's counterexample — flipping bit 4 of the final COMMIT's
+        // type byte (0x02 -> 0x12, a known variable-payload type) used to be
+        // accepted without a trailer check. The checksum must refuse it.
+        let len = bytes.len();
+        let commit_type_offset = len - 25 + 8;
+        assert_eq!(
+            bytes[commit_type_offset], 0x02,
+            "the fixture must end with a 25-byte COMMIT frame"
+        );
+        let mut flipped = bytes.clone();
+        flipped[commit_type_offset] ^= 0x10;
+        let flipped_scan = scan_wal(&flipped);
+        assert!(
+            !matches!(
+                flipped_scan.tail,
+                crate::store::wal_accounting::WalTail::Clean
+            ),
+            "the flipped frame must not walk clean: {:?}",
+            flipped_scan
+        );
+        // The walk stops at the corrupted frame; whatever committed earlier is
+        // still positive evidence, and the flip itself can never read as
+        // "nothing committed".
+        assert_ne!(
+            flipped_scan.commit_evidence(),
+            CommitEvidence::None,
+            "a flipped COMMIT type must never read as 'nothing committed': {:?}",
+            flipped_scan
+        );
+        let verdict = crate::store::wal_accounting::classify_side(
+            crate::store::wal_accounting::SideObservation {
+                pre: len as u64,
+                post: 0,
+                scan: Some(flipped_scan),
+                foreign: false,
+            },
+        );
+        assert!(
+            matches!(
+                verdict,
+                crate::store::wal_accounting::SideVerdict::CommittedLost { .. }
+                    | crate::store::wal_accounting::SideVerdict::Unknown { .. }
+            ),
+            "a flipped COMMIT type must be refused, got {verdict:?}"
+        );
+
+        // B1: every single-bit flip anywhere in the record area must be refused.
+        let mut refused = 0usize;
+        for offset in WAL_HEADER_CHECKSUMMED_BYTES as usize..len {
+            let mut mutated = bytes.clone();
+            mutated[offset] ^= 0x10;
+            let scan = scan_wal(&mutated);
+            assert_ne!(
+                scan.commit_evidence(),
+                CommitEvidence::None,
+                "flip 0x10 at byte {offset} claimed a verified empty WAL: {:?}",
+                scan
+            );
+            refused += 1;
+        }
+        assert!(refused > 400, "the fixture must have real record bytes");
+
         // Header intact, records unreadable: the `#207` shape.
         let mut corrupt = bytes.clone();
-        for byte in corrupt.iter_mut().skip(WAL_HEADER_CHECKSUMMED_BYTES as usize) {
+        for byte in corrupt
+            .iter_mut()
+            .skip(WAL_HEADER_CHECKSUMMED_BYTES as usize)
+        {
             *byte = 0xFF;
         }
         let scan = scan_wal(&corrupt);
@@ -27113,7 +27286,10 @@ mod wal_zero_record {
 
         // Keep the header (checksum flag) and destroy every record.
         let mut corrupt = seeded.clone();
-        for byte in corrupt.iter_mut().skip(WAL_HEADER_CHECKSUMMED_BYTES as usize) {
+        for byte in corrupt
+            .iter_mut()
+            .skip(WAL_HEADER_CHECKSUMMED_BYTES as usize)
+        {
             *byte = 0xFF;
         }
         std::fs::write(&ckpt, &corrupt).expect("corrupt the frozen WAL records");
@@ -27282,7 +27458,10 @@ mod wal_zero_record {
             scan.commits - 1,
             "the tear must remove exactly the final COMMIT"
         );
-        assert!(torn.frames_parsed >= 2, "a BEGIN/insert prefix must survive");
+        assert!(
+            torn.frames_parsed >= 2,
+            "a BEGIN/insert prefix must survive"
+        );
         torn
     }
 
@@ -27327,8 +27506,11 @@ mod wal_zero_record {
     /// recovery arm: `is_wal_integrity_failure` (`ladybug.rs:2240-2244`) does
     /// not recognise "Reading past the end of the file", so `with_system_config`
     /// returns that engine error verbatim and the database stays unopenable.
-    /// Phase B must classify the torn tail before choosing an arm; widening the
-    /// integrity predicate is part of that.
+    ///
+    /// Phase B routes this by the **pre-flight scan** (readable header + a
+    /// validated `TornTail`), not by widening `is_wal_integrity_failure`: that
+    /// predicate also sees DB and shadow I/O errors, so adding the phrase there
+    /// would route unrelated failures into WAL recovery (#207 B9).
     #[tokio::test]
     #[ignore = "red until Phase B wires the classifier into with_system_config (#207)"]
     async fn torn_commit_checksum_tail_opens_instead_of_an_unclassified_error() {
@@ -27361,10 +27543,7 @@ mod wal_zero_record {
 
     /// Shared contract for both torn-COMMIT shapes: nothing committed was lost,
     /// so the store opens through the lenient arm and the torn row is absent.
-    async fn assert_torn_commit_opens(
-        result: Result<LadybugStore>,
-        db: &std::path::Path,
-    ) {
+    async fn assert_torn_commit_opens(result: Result<LadybugStore>, db: &std::path::Path) {
         let store = match result {
             Ok(store) => store,
             Err(e) => panic!(
@@ -27417,10 +27596,7 @@ mod wal_zero_record {
         drop(_wal_env_serial);
 
         let store = result.expect("a delete-only WAL must still open (#207)");
-        assert_eq!(
-            store.open_provenance(),
-            OpenProvenance::UnverifiedWalReplay
-        );
+        assert_eq!(store.open_provenance(), OpenProvenance::UnverifiedWalReplay);
         assert_eq!(memory_count(&store, "wal-only-").await, 0);
         assert_eq!(memory_count(&store, "wal-prefix-sentinel").await, 0);
 
@@ -27539,6 +27715,131 @@ mod wal_zero_record {
 
         let _ = std::fs::remove_dir_all(&root);
         restore_model_env(previous_model);
+    }
+}
+
+/// `#207` B8/P4: mandatory pair preservation for a refusing arm. Sibling of
+/// `mod tests` for the same eval-filter reason as `wal_zero_record`.
+#[cfg(test)]
+mod wal_preservation {
+    use super::*;
+
+    fn fixture(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-wal-preserve-pair-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn artifacts(db: &std::path::Path) -> Vec<std::path::PathBuf> {
+        crate::storage::snapshot::list_wal_recovery_artifacts(db)
+            .into_iter()
+            .map(|(path, _, _)| path)
+            .collect()
+    }
+
+    #[test]
+    fn preserve_wal_pair_copies_both_sides_and_dedupes() {
+        let root = fixture("both");
+        let db = root.join("pair.lbug");
+        std::fs::write(&db, b"db").unwrap();
+        let active = WalSide::Active.path(&db);
+        let frozen = WalSide::Frozen.path(&db);
+        std::fs::write(&active, b"active-wal-bytes").unwrap();
+        std::fs::write(&frozen, b"frozen-wal-bytes-longer").unwrap();
+
+        let first = preserve_wal_pair(&db).expect("preserve both sides");
+        let active_copy = first.active.clone().expect("active copy path");
+        let frozen_copy = first.frozen.clone().expect("frozen copy path");
+        assert_eq!(
+            std::fs::read(&active_copy).unwrap(),
+            b"active-wal-bytes".to_vec()
+        );
+        assert_eq!(
+            std::fs::read(&frozen_copy).unwrap(),
+            b"frozen-wal-bytes-longer".to_vec()
+        );
+        assert_eq!(first.get(WalSide::Active), Some(&active_copy));
+        assert_eq!(first.get(WalSide::Frozen), Some(&frozen_copy));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for path in [&active_copy, &frozen_copy] {
+                assert_eq!(
+                    std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    0o600,
+                    "preserved artifacts must be 0600"
+                );
+            }
+        }
+
+        let second = preserve_wal_pair(&db).expect("second preservation dedupes");
+        assert_eq!(second.active, first.active);
+        assert_eq!(second.frozen, first.frozen);
+        assert_eq!(
+            artifacts(&db).len(),
+            2,
+            "one artifact per side, no duplicates"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn preserve_wal_pair_reports_absent_sides() {
+        let root = fixture("absent");
+        let db = root.join("absent.lbug");
+        std::fs::write(&db, b"db").unwrap();
+        let preserved = preserve_wal_pair(&db).expect("nothing to preserve is not an error");
+        assert_eq!(preserved, PreservedPair::default());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preserve_wal_pair_refuses_a_symlinked_side() {
+        let root = fixture("symlink");
+        let db = root.join("sym.lbug");
+        std::fs::write(&db, b"db").unwrap();
+        let secret = root.join("secret.txt");
+        std::fs::write(&secret, b"secret-content").unwrap();
+        let active = WalSide::Active.path(&db);
+        std::os::unix::fs::symlink(&secret, &active).unwrap();
+
+        let err = preserve_wal_pair(&db).expect_err("a symlinked WAL must fail the refusal path");
+        let text = err.to_string();
+        assert!(
+            text.contains("could not preserve"),
+            "the error must name preservation: {text}"
+        );
+        assert!(
+            text.contains(".wal"),
+            "the error must name the side: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn copy_primitive_refuses_an_occupied_destination() {
+        // Deterministic copy failure: `create_new` cannot replace a directory.
+        let root = fixture("occupied");
+        let src = root.join("src");
+        std::fs::write(&src, b"payload").unwrap();
+        let dst = root.join("dst");
+        std::fs::create_dir(&dst).unwrap();
+        assert!(
+            copy_regular_file_create_new_0600(&src, &dst).is_err(),
+            "an occupied destination must fail rather than overwrite"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 

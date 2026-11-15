@@ -105,7 +105,14 @@ impl HeaderProbe {
     }
 
     /// A probe built directly from the bytes the caller read.
+    ///
+    /// An empty file is [`HeaderProbe::ABSENT`], not `present(0, None)`: a
+    /// 0-byte `.wal` with no `.wal.checkpoint` must classify as `NoWal`, not as
+    /// an unusable header the open would refuse.
     pub fn from_bytes(bytes: &[u8]) -> Self {
+        if bytes.is_empty() {
+            return Self::ABSENT;
+        }
         Self::present(bytes.len() as u64, wal_checksum_flag(bytes))
     }
 
@@ -306,6 +313,15 @@ mod tests {
         assert_eq!(
             source,
             HeaderSource::Conflict(HeaderConflict::NoUsableHeader)
+        );
+    }
+
+    #[test]
+    fn header_source_is_none_for_two_zero_byte_files() {
+        // A 0-byte `.wal` must not become `Conflict(NoUsableHeader)`.
+        assert_eq!(
+            select_header_source(HeaderProbe::from_bytes(&[]), HeaderProbe::from_bytes(&[])),
+            HeaderSource::None
         );
     }
 
