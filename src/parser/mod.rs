@@ -1,6 +1,7 @@
 pub mod generation;
 pub mod ingest;
 pub mod schema;
+pub mod scip;
 
 use tree_sitter::Language;
 

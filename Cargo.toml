@@ -138,6 +138,9 @@ petgraph = { version = "0.8" }
 leiden-rs = { version = "0.8", default-features = false, features = ["petgraph"] }
 rand = { version = "0.10" }
 tantivy = { version = "0.27" }
+scip = "0.10"
+protobuf = "=3.7.2"
+unidiff = "0.4"
 openssl = { version = "0.10.81", features = ["vendored"] }
 
 [dev-dependencies]

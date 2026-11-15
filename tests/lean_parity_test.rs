@@ -27,9 +27,10 @@ use formal_kernel::{
     evaluate_import_precheck, evaluate_procedure_fire, evaluate_reducer_total,
     evaluate_retention_gate, evaluate_seq_continuity, evaluate_sovereignty_gate,
     import_precheck_tag, intersect_var_bounds, is_action_memory_shareable, join_task_status,
-    lifecycle_can_transition, procedure_fire_tag, retention_verdict_tag, seq_decision_tag,
-    sovereignty_decision_tag, task_step_tag, ActionMemoryKind, ActionReceiptState,
-    ActionTaskTargetStatus, KernelProcedureTrust, ReducerOpKind, TwinBoundError,
+    lifecycle_can_transition, procedure_fire_tag, resolve_cross_file_call, retention_verdict_tag,
+    seq_decision_tag, sovereignty_decision_tag, task_step_tag, ActionMemoryKind,
+    ActionReceiptState, ActionTaskTargetStatus, KernelProcedureTrust, ReducerOpKind,
+    TwinBoundError,
 };
 
 /// The statuses in the exact order used by `proofs/Main.lean`.
@@ -440,6 +441,34 @@ fn generate_rust_truth_table() -> Vec<String> {
         }
     }
 
+    // CROSS_FILE_CALL: 96 rows (2 self × 2 same × 2 imported × 3 ws_count × 2 ident_len × 2 is_std)
+    for &self_call in [false, true].iter() {
+        for &same_file in [false, true].iter() {
+            for &imported in [false, true].iter() {
+                for &ws_count in [0u32, 1, 2].iter() {
+                    for &ident_len in [3u32, 6].iter() {
+                        for &is_std in [false, true].iter() {
+                            let tag = resolve_cross_file_call(
+                                self_call, same_file, imported, ws_count, ident_len, is_std,
+                            )
+                            .as_tag();
+                            lines.push(format!(
+                                "CROSS_FILE_CALL|{}|{}|{}|{}|{}|{}|{}",
+                                bool_str(self_call),
+                                bool_str(same_file),
+                                bool_str(imported),
+                                ws_count,
+                                ident_len,
+                                bool_str(is_std),
+                                tag
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     lines
 }
 
@@ -493,8 +522,8 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
     let rust_lines = generate_rust_truth_table();
     assert_eq!(
         rust_lines.len(),
-        571,
-        "expected 571 canonical lines (64+16+128+3+24+32+8+60+16+6+32+32+32+16+4+72+5+21)"
+        667,
+        "expected 667 canonical lines (64+16+128+3+24+32+8+60+16+6+32+32+32+16+4+72+5+21+96)"
     );
 
     // Section-count verification: 64 TASK_FSM + 16 LIFECYCLE + 128 MESH_MERGE
@@ -596,6 +625,11 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
         *section_counts.get("TWIN_REDUCER").unwrap_or(&0),
         21,
         "expected 21 TWIN_REDUCER rows"
+    );
+    assert_eq!(
+        *section_counts.get("CROSS_FILE_CALL").unwrap_or(&0),
+        96,
+        "expected 96 CROSS_FILE_CALL rows"
     );
 
     let lake = find_lake().expect(

@@ -10,6 +10,7 @@ open NeuroStrata.Retention
 open NeuroStrata.KineticAction
 open NeuroStrata.HybridSlots
 open NeuroStrata.TwinInterface
+open NeuroStrata
 
 def boolToStr (b : Bool) : String := if b then "true" else "false"
 
@@ -119,3 +120,11 @@ def main : IO Unit := do
     for (label, cnt, sumV, minV, maxV, oob) in reducerInputs do
       let out := evaluateReducerTotal op cnt sumV minV maxV oob
       IO.println s!"TWIN_REDUCER|{op.asStr}|{label}|{out.numericVal}|{boolToStr out.boolVal}|{boolToStr out.isDefined}"
+  for selfCall in [false, true] do
+    for sameFile in [false, true] do
+      for imported in [false, true] do
+        for wsCount in [0, 1, 2] do
+          for identLen in [3, 6] do
+            for isStd in [false, true] do
+              let tag := resolveCrossFileCall selfCall sameFile imported wsCount identLen isStd |>.asTag
+              IO.println s!"CROSS_FILE_CALL|{boolToStr selfCall}|{boolToStr sameFile}|{boolToStr imported}|{wsCount}|{identLen}|{boolToStr isStd}|{tag}"

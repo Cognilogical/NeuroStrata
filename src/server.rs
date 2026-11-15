@@ -207,6 +207,18 @@ pub async fn process_mcp_request(
                         }
                     },
                     {
+                        "name": "neurostrata_ingest_scip",
+                        "description": "Ingest a compiler-produced SCIP protobuf index (.scip) into a namespace, linking exact cross-file/cross-module definitions, references, and implementations onto code_ast symbols.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "scip_path": { "type": "string", "description": "Path to the .scip protobuf index file (e.g., index.scip)." },
+                                "namespace": { "type": "string", "description": "The project namespace." }
+                            },
+                            "required": ["scip_path", "namespace"]
+                        }
+                    },
+                    {
                         "name": "neurostrata_list_namespaces",
                         "description": "List all existing project namespaces in the database. Use this to prevent hallucinating namespace names.",
                         "inputSchema": {
@@ -1144,6 +1156,36 @@ pub async fn process_mcp_request(
                                 Some(bus.clone()),
                             )
                             .await;
+                        }
+                        "neurostrata_ingest_scip" => {
+                            let ns_raw = arguments
+                                .get("namespace")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("global");
+                            let ns = resolve_namespace(&store, ns_raw).await;
+                            let scip_path = arguments
+                                .get("scip_path")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            if scip_path.is_empty() {
+                                result_text = "Error: scip_path is required".to_string();
+                            } else {
+                                match crate::parser::scip::ingest_scip_index(
+                                    store.clone(),
+                                    &ns,
+                                    std::path::Path::new(scip_path),
+                                )
+                                .await
+                                {
+                                    Ok(report) => {
+                                        result_text = serde_json::to_string_pretty(&report)
+                                            .unwrap_or_else(|_| format!("{:?}", report));
+                                    }
+                                    Err(e) => {
+                                        result_text = format!("Error ingesting SCIP index: {e}");
+                                    }
+                                }
+                            }
                         }
                         "neurostrata_search_memory" => {
                             result_text =

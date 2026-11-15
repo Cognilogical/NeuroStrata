@@ -1073,3 +1073,53 @@ pub const fn evaluate_reducer_total(
         }
     }
 }
+
+/// Resolution tier for Tier-1 cross-file call graph linking (`neurostrata-rbde`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CrossFileResolution {
+    SameFile,
+    ImportedFile,
+    WorkspaceUnique,
+    UnresolvedSelfCall,
+    UnresolvedAmbiguousOrStd,
+}
+
+impl CrossFileResolution {
+    pub const fn as_tag(self) -> &'static str {
+        match self {
+            Self::SameFile => "SAME_FILE",
+            Self::ImportedFile => "IMPORTED_FILE",
+            Self::WorkspaceUnique => "WORKSPACE_UNIQUE",
+            Self::UnresolvedSelfCall => "UNRESOLVED_SELF_CALL",
+            Self::UnresolvedAmbiguousOrStd => "UNRESOLVED_AMBIGUOUS_OR_STD",
+        }
+    }
+}
+
+/// Pure priority-ordered cross-file call resolution kernel (`neurostrata-rbde`).
+///
+/// 1. Self-calls are rejected (`UnresolvedSelfCall`) to prevent self-loops.
+/// 2. Same-file definitions take highest priority (`SameFile`).
+/// 3. Imported-file definitions (`dependency_map`) take second priority (`ImportedFile`).
+/// 4. Unambiguous workspace definitions (`workspace_match_count == 1`) with
+///    `ident_len >= 4` and `!is_common_std` resolve as `WorkspaceUnique`.
+pub const fn resolve_cross_file_call(
+    is_self_call: bool,
+    in_same_file: bool,
+    in_imported_file: bool,
+    workspace_match_count: u32,
+    ident_len: u32,
+    is_common_std: bool,
+) -> CrossFileResolution {
+    if is_self_call {
+        CrossFileResolution::UnresolvedSelfCall
+    } else if in_same_file {
+        CrossFileResolution::SameFile
+    } else if in_imported_file {
+        CrossFileResolution::ImportedFile
+    } else if workspace_match_count == 1 && ident_len >= 4 && !is_common_std {
+        CrossFileResolution::WorkspaceUnique
+    } else {
+        CrossFileResolution::UnresolvedAmbiguousOrStd
+    }
+}
