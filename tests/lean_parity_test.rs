@@ -67,7 +67,7 @@ fn repo_root() -> PathBuf {
 /// Generates the canonical 1011-line truth table in `proofs/Main.lean` order:
 /// 891 base/action/code-intel/ontology rows + 120 taxonomy rows.
 fn generate_rust_truth_table() -> Vec<String> {
-    let mut lines: Vec<String> = Vec::with_capacity(1011);
+    let mut lines: Vec<String> = Vec::with_capacity(1091);
 
     for &from in TASK_STATUSES.iter() {
         for &to in TASK_STATUSES.iter() {
@@ -756,6 +756,56 @@ fn generate_rust_truth_table() -> Vec<String> {
         ));
     }
 
+    // WORKFLOW_STAGE: 80 rows (8 stages × 10 events)
+    let wf_stages: [formal_kernel::KernelWorkflowStage; 8] = [
+        formal_kernel::KernelWorkflowStage::Unpreflighted,
+        formal_kernel::KernelWorkflowStage::ContextLoaded,
+        formal_kernel::KernelWorkflowStage::Claimed,
+        formal_kernel::KernelWorkflowStage::Mutating,
+        formal_kernel::KernelWorkflowStage::BreathRequired,
+        formal_kernel::KernelWorkflowStage::PreCheckpoint,
+        formal_kernel::KernelWorkflowStage::PrePublish,
+        formal_kernel::KernelWorkflowStage::Completed,
+    ];
+    let wf_events: [(&str, formal_kernel::KernelWorkflowEvent); 10] = [
+        ("load_context", formal_kernel::KernelWorkflowEvent::LoadContext),
+        ("claim_ok", formal_kernel::KernelWorkflowEvent::ClaimTask { has_valid_scope: true }),
+        ("claim_bad_scope", formal_kernel::KernelWorkflowEvent::ClaimTask { has_valid_scope: false }),
+        ("mutate_under_limit", formal_kernel::KernelWorkflowEvent::Mutate { mutations_since_note_after: 1, breath_limit: 5 }),
+        ("mutate_at_limit", formal_kernel::KernelWorkflowEvent::Mutate { mutations_since_note_after: 5, breath_limit: 5 }),
+        ("record_breath", formal_kernel::KernelWorkflowEvent::RecordBreathNote),
+        ("pre_publish_ok", formal_kernel::KernelWorkflowEvent::TriggerPrePublish { task_gate_ok: true, doc_gate_ok: true }),
+        ("pre_publish_bad_doc", formal_kernel::KernelWorkflowEvent::TriggerPrePublish { task_gate_ok: true, doc_gate_ok: false }),
+        ("complete_ok", formal_kernel::KernelWorkflowEvent::CompleteTask { has_extracted_memory: true, dirty_targets: 0 }),
+        ("complete_no_mem", formal_kernel::KernelWorkflowEvent::CompleteTask { has_extracted_memory: false, dirty_targets: 0 }),
+    ];
+    fn wf_stage_str(s: formal_kernel::KernelWorkflowStage) -> &'static str {
+        match s {
+            formal_kernel::KernelWorkflowStage::Unpreflighted => "unpreflighted",
+            formal_kernel::KernelWorkflowStage::ContextLoaded => "context_loaded",
+            formal_kernel::KernelWorkflowStage::Claimed => "claimed",
+            formal_kernel::KernelWorkflowStage::Mutating => "mutating",
+            formal_kernel::KernelWorkflowStage::BreathRequired => "breath_required",
+            formal_kernel::KernelWorkflowStage::PreCheckpoint => "pre_checkpoint",
+            formal_kernel::KernelWorkflowStage::PrePublish => "pre_publish",
+            formal_kernel::KernelWorkflowStage::Completed => "completed",
+        }
+    }
+    for stage in wf_stages.iter() {
+        for (label, event) in wf_events.iter() {
+            let tag = match formal_kernel::evaluate_workflow_stage_transition(*stage, *event) {
+                Ok(next) => format!("ok:{}", wf_stage_str(next)),
+                Err(e) => format!("err:{e}"),
+            };
+            lines.push(format!(
+                "WORKFLOW_STAGE|{}|{}|{}",
+                wf_stage_str(*stage),
+                label,
+                tag
+            ));
+        }
+    }
+
     lines
 }
 
@@ -809,8 +859,8 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
     let rust_lines = generate_rust_truth_table();
     assert_eq!(
         rust_lines.len(),
-        1011,
-        "expected 1011 canonical lines (891 base/action/code-intel/ontology + 120 taxonomy)"
+        1091,
+        "expected 1091 canonical lines (891 base/action/code-intel/ontology + 120 taxonomy + 80 workflow)"
     );
 
     // Section-count verification: 64 TASK_FSM + 16 LIFECYCLE + 128 MESH_MERGE
@@ -947,6 +997,11 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
         *section_counts.get("INSIGHT_VALID_AT").unwrap_or(&0),
         32,
         "expected 32 INSIGHT_VALID_AT rows"
+    );
+    assert_eq!(
+        *section_counts.get("WORKFLOW_STAGE").unwrap_or(&0),
+        80,
+        "expected 80 WORKFLOW_STAGE rows"
     );
 
     let lake = find_lake().expect(

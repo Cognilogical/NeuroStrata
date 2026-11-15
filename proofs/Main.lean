@@ -13,6 +13,7 @@ open NeuroStrata.HybridSlots
 open NeuroStrata.TwinInterface
 open NeuroStrata
 open NeuroStrata.Taxonomy
+open NeuroStrata.WorkflowStage
 
 def boolToStr (b : Bool) : String := if b then "true" else "false"
 
@@ -201,3 +202,19 @@ def main : IO Unit := do
   let frontierCases : List (String × Nat × Nat × Nat × Bool × Bool) := [("zero_gap", 5000, 0, 3, true, true), ("low_gap_no_frontier", 5000, 2000, 3, false, true), ("low_gap_frontier", 5000, 2000, 3, true, true), ("full", 10000, 10000, 10, true, true), ("capped", 20000, 20000, 20, true, true), ("partial", 3000, 5000, 2, false, false)]
   for (label, axis, gap, conn, frontier, cite) in frontierCases do
     IO.println s!"TAXONOMY_FRONTIER|{label}|{computeFrontierLeverageBps axis gap conn frontier cite}"
+  let wfStages : List WorkflowStage := [.unpreflighted, .contextLoaded, .claimed, .mutating, .breathRequired, .preCheckpoint, .prePublish, .completed]
+  let wfEvents : List (String × WorkflowEvent) :=
+    [ ("load_context", .loadContext)
+    , ("claim_ok", .claimTask true)
+    , ("claim_bad_scope", .claimTask false)
+    , ("mutate_under_limit", .mutate 1 5)
+    , ("mutate_at_limit", .mutate 5 5)
+    , ("record_breath", .recordBreathNote)
+    , ("pre_publish_ok", .triggerPrePublish true true)
+    , ("pre_publish_bad_doc", .triggerPrePublish true false)
+    , ("complete_ok", .completeTask true 0)
+    , ("complete_no_mem", .completeTask false 0)
+    ]
+  for st in wfStages do
+    for (evLabel, ev) in wfEvents do
+      IO.println s!"WORKFLOW_STAGE|{st.asStr}|{evLabel}|{workflowTransitionTag st ev}"

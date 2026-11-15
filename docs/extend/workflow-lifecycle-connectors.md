@@ -2,7 +2,7 @@
 
 ## Formal Workflow State Machine (`WorkflowStage`)
 
-The workflow lifecycle is a finite state machine with 9 stages and 23 legal edges:
+The workflow lifecycle is a finite state machine with 8 stages and 23 legal edges:
 
 | Stage | Description |
 |-------|-------------|
