@@ -1418,6 +1418,10 @@ pub fn validate_skos_disjointness(
     related_edges: &[(u32, u32)],
     contrast_edges: &[(u32, u32)],
 ) -> bool {
+    // Cycle guard: reject if broader_edges contain cycles (self-loop or cycles)
+    if !validate_taxonomy_dag(broader_edges) {
+        return false;
+    }
     use std::collections::{HashMap, HashSet};
 
     // Build adjacency for broader hierarchy
@@ -1500,14 +1504,13 @@ pub fn compute_epistemic_coverage_bps(statuses: &[EpistemicStatus], unmapped_dom
 }
 
 /// Returns realization status gap in basis points.
-/// NOTE: Not `const fn` — stable Rust cannot match on `&str` in const contexts.
-pub fn realization_status_gap_bps(status: &str) -> u32 {
-    match status {
-        "unimplemented" => 10000,
-        "partial" => 7500,
-        "unknown" => 6000,
-        "implemented" => 2500,
-        "external_only" => 0,
+pub const fn realization_status_gap_bps(status: &str) -> u32 {
+    match status.as_bytes() {
+        b"unimplemented" => 10000,
+        b"partial" => 7500,
+        b"unknown" => 6000,
+        b"implemented" => 2500,
+        b"external_only" => 0,
         _ => 6000,
     }
 }
@@ -1548,5 +1551,94 @@ pub const fn compute_frontier_leverage_bps(
         10000
     } else {
         raw as u32
+    }
+}
+// Unit tests for formal_kernel.rs – covering classify_epistemic_status, validate_taxonomy_dag, validate_skos_disjointness, compute_epistemic_coverage_bps, realization_status_gap_bps, compute_frontier_leverage_bps
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_classify_epistemic_status() {
+        assert_eq!(classify_epistemic_status(false, false, false, false), EpistemicStatus::Seed);
+        assert_eq!(classify_epistemic_status(true, false, false, false), EpistemicStatus::Seed);
+        assert_eq!(classify_epistemic_status(true, true, false, false), EpistemicStatus::Defined);
+        assert_eq!(classify_epistemic_status(true, true, true, false), EpistemicStatus::Synthesized);
+        assert_eq!(classify_epistemic_status(true, true, true, true), EpistemicStatus::Verified);
+        // Monotonic progression as pillars are added
+        assert!(EpistemicStatus::Seed < classify_epistemic_status(true, true, false, false));
+        assert!(EpistemicStatus::Defined < classify_epistemic_status(true, true, true, false));
+        assert!(EpistemicStatus::Synthesized < classify_epistemic_status(true, true, true, true));
+        assert_eq!(EpistemicStatus::Verified.as_str(), "verified");
+    }
+
+    #[test]
+    fn test_validate_taxonomy_dag() {
+        assert!(!validate_taxonomy_dag(&[(1, 1)]));
+        assert!(validate_taxonomy_dag(&[(1, 2)]));
+        assert!(!validate_taxonomy_dag(&[(1, 2), (2, 1)]));
+        assert!(!validate_taxonomy_dag(&[(1, 2), (2, 3), (3, 1)]));
+        assert!(validate_taxonomy_dag(&[(1, 2), (1, 3), (2, 4), (3, 4)]));
+    }
+
+    #[test]
+    fn test_validate_skos_disjointness() {
+        // direct overlap broader == related -> violation -> false
+        assert!(!validate_skos_disjointness(&[(0, 1)], &[(0, 1)], &[]));
+        // transitive violation: broader 0->1->2, related (0,2) comparable -> false
+        assert!(!validate_skos_disjointness(&[(0, 1), (1, 2)], &[(0, 2)], &[]));
+        // reverse transitive violation: related (2,0), 2 reachable from 0 -> false
+        assert!(!validate_skos_disjointness(&[(0, 1), (1, 2)], &[(2, 0)], &[]));
+        // unrelated distinct pair -> true
+        assert!(validate_skos_disjointness(&[(0, 1)], &[(2, 3)], &[]));
+        // empty related/contrast with broader -> true
+        assert!(validate_skos_disjointness(&[(0, 1)], &[], &[]));
+        // contrast overlapping -> false
+        assert!(!validate_skos_disjointness(&[(0, 1)], &[], &[(0, 1)]));
+        // contrast trans violation -> false
+        assert!(!validate_skos_disjointness(&[(0, 1), (1, 2)], &[], &[(0, 2)]));
+    }
+
+    #[test]
+    fn test_validate_skos_disjointness_cycle_guard() {
+        assert!(!validate_skos_disjointness(&[(0, 1), (1, 2), (2, 0)], &[], &[]));
+        assert!(!validate_skos_disjointness(&[(0, 1), (1, 0)], &[], &[]));
+        assert!(!validate_skos_disjointness(&[(0, 0)], &[], &[]));
+    }
+
+    #[test]
+    fn test_compute_epistemic_coverage_bps() {
+        assert_eq!(compute_epistemic_coverage_bps(&[], 0), 0);
+        assert_eq!(compute_epistemic_coverage_bps(&[], 5), 0);
+        assert_eq!(compute_epistemic_coverage_bps(&[EpistemicStatus::Seed], 0), 2500);
+        assert_eq!(compute_epistemic_coverage_bps(&[EpistemicStatus::Verified, EpistemicStatus::Verified], 0), 10000);
+        assert_eq!(compute_epistemic_coverage_bps(&[EpistemicStatus::Seed, EpistemicStatus::Verified], 0), 6250);
+        assert_eq!(compute_epistemic_coverage_bps(&[EpistemicStatus::Seed; 3], 0), 2500);
+        assert_eq!(compute_epistemic_coverage_bps(&[EpistemicStatus::Seed, EpistemicStatus::Seed], 1), 1666);
+    }
+
+    #[test]
+    fn test_realization_status_gap_bps() {
+        assert_eq!(realization_status_gap_bps("unimplemented"), 10000);
+        assert_eq!(realization_status_gap_bps("partial"), 7500);
+        assert_eq!(realization_status_gap_bps("unknown"), 6000);
+        assert_eq!(realization_status_gap_bps("implemented"), 2500);
+        assert_eq!(realization_status_gap_bps("external_only"), 0);
+        assert_eq!(realization_status_gap_bps("unknown_status"), 6000);
+        assert_eq!(realization_status_gap_bps("UNIMPLEMENTED"), 6000);
+    }
+
+    #[test]
+    fn test_realization_status_gap_bps_const_context() {
+        const GAP: u32 = realization_status_gap_bps("implemented");
+        assert_eq!(GAP, 2500);
+    }
+
+    #[test]
+    fn test_compute_frontier_leverage_bps() {
+        assert_eq!(compute_frontier_leverage_bps(5000, 0, 3, true, true), 0);
+        assert_eq!(compute_frontier_leverage_bps(5000, 2500, 3, false, false), 0);
+        assert_eq!(compute_frontier_leverage_bps(5000, 2500, 3, true, true), 4975);
+        assert_eq!(compute_frontier_leverage_bps(20000, 20000, 3, true, true), 8600);
+        assert_eq!(compute_frontier_leverage_bps(20000, 20000, 3, false, false), 6600);
     }
 }
