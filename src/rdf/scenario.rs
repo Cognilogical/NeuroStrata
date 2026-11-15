@@ -298,6 +298,27 @@ pub fn sha256_fingerprint(payload: &MemoryPayload) -> String {
         .collect()
 }
 
+fn fingerprint_digest_u64(fingerprint: &str) -> u64 {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(fingerprint.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(bytes)
+}
+
+/// Row-level content fingerprint for the transactional
+/// `ExpectedHead::RowFingerprint` CAS arm. Absent (or retired) rows collapse to
+/// the sentinel fingerprint so staged scenarios can expect either state.
+pub(crate) fn fingerprint_live_row(live: Option<&MemoryPayload>, now_ts: i64) -> u64 {
+    let fingerprint = match live {
+        Some(p) if is_active_payload(p, now_ts) => sha256_fingerprint(p),
+        _ => ABSENT_FINGERPRINT.to_string(),
+    };
+    fingerprint_digest_u64(&fingerprint)
+}
+
 pub async fn current_live_fingerprint(
     store: &crate::store::ladybug::LadybugStore,
     namespace: &str,
@@ -1806,7 +1827,11 @@ pub async fn commit_scenario(
     for (uid, payload) in &scenario.staged_upserts {
         if matches!(
             payload.memory_type.as_str(),
-            "action_type" | "digital_twin_schema" | "ontology"
+            "action_type"
+                | "digital_twin_schema"
+                | "ontology"
+                | "concept"
+                | "thesis"
         ) {
             refresh_ontology_needed = true;
         }
@@ -1839,17 +1864,48 @@ pub async fn commit_scenario(
         .await
         .map_err(|e| format!("failed to init store for scenario commit '{scenario_id}': {e}"))?;
 
-    store
+    let expected_heads: Vec<crate::rdf::action::ExpectedHead> = scenario
+        .base_fingerprints
+        .iter()
+        .map(|(row_id, expected_fp)| crate::rdf::action::ExpectedHead::RowFingerprint {
+            row_id: row_id.clone(),
+            expected_fingerprint: fingerprint_digest_u64(expected_fp),
+        })
+        .collect();
+
+    let commit_outcome = store
         .commit_action_batch(
             namespace,
             crate::rdf::action::ActionWriteSet {
-                expected_heads: Vec::new(),
+                expected_heads,
                 writes,
                 edge_deltas,
             },
         )
-        .await
-        .map_err(|e| format!("failed to commit scenario '{scenario_id}': {e:?}"))?;
+        .await;
+
+    if let Err(crate::rdf::action::ActionError::ConflictWithNewerVersion { receipt_id, .. }) =
+        commit_outcome
+    {
+        let mut base_conflicts = detect_base_conflicts(store, namespace, &scenario, now_ts)
+            .await
+            .unwrap_or_default();
+        if base_conflicts.is_empty() {
+            base_conflicts.push(receipt_id.clone());
+        }
+        return Ok(ScenarioCommitOutcome::Rejected {
+            scenario_id: scenario_id.to_string(),
+            decision: ScenarioCommitDecision::RejectedBaseConflict.as_tag().to_string(),
+            base_conflicts,
+            shacl_violations,
+            message: format!(
+                "scenario '{scenario_id}' aborted on transactional CAS conflict for '{receipt_id}'"
+            ),
+        });
+    }
+    if let Err(e) = commit_outcome {
+        return Err(format!("failed to commit scenario '{scenario_id}': {e:?}"));
+    }
 
     if refresh_ontology_needed {
         store.refresh_ontology(namespace).await;
@@ -2155,5 +2211,151 @@ mod tests {
             Some(&110.0)
         );
         assert!(store.scenarios().get(ns, "scen-nominal", 2000).is_err());
+    }
+
+    #[tokio::test]
+    async fn commit_scenario_rejects_live_mutation_via_transactional_expected_heads() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "scen-cas-tx";
+        store.init(ns).await.expect("init");
+        let sec = admin_sec();
+
+        let schema_payload = MemoryPayload {
+            content: "ThermalPump schema".to_string(),
+            user_id: "bosun".to_string(),
+            memory_type: "digital_twin_schema".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: serde_json::json!({
+                "twin_schema": {
+                    "schema_id": "ThermalPump",
+                    "variables": {
+                        "temperature": { "min": 0.0, "max": 120.0, "unit": "C" }
+                    }
+                }
+            }),
+        };
+        store
+            .upsert(ns, "schema-thermal-pump", vec![0.1; 4], schema_payload)
+            .await
+            .expect("seed schema");
+
+        let twin_payload = MemoryPayload {
+            content: "Pump-1 twin".to_string(),
+            user_id: "bosun".to_string(),
+            memory_type: "digital_twin".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: serde_json::json!({
+                "twin": {
+                    "id": "pump-1",
+                    "schema_id": "ThermalPump",
+                    "version": 1,
+                    "variables": { "temperature": 72.0 },
+                    "last_updated": 1000
+                },
+                "digital_twin": {
+                    "twin_id": "pump-1",
+                    "schema_id": "ThermalPump",
+                    "version": 1,
+                    "variables": { "temperature": 72.0 },
+                    "properties": { "temperature": 72.0 },
+                    "updated_at": 1000
+                }
+            }),
+        };
+        store
+            .upsert(ns, "pump-1", vec![0.1; 4], twin_payload)
+            .await
+            .expect("seed twin");
+
+        let summary = create_scenario(
+            &store,
+            ns,
+            Some("scen-cas-tx".to_string()),
+            Some("CAS Tx".to_string()),
+            Some(1800),
+            &sec,
+        )
+        .expect("create scenario");
+        assert_eq!(summary.scenario_id, "scen-cas-tx");
+
+        let mut new_vars = BTreeMap::new();
+        new_vars.insert("temperature".to_string(), 180.0);
+        let stage_twin_out = stage_scenario_twin(
+            &store,
+            ns,
+            "scen-cas-tx",
+            "pump-1",
+            new_vars,
+            None,
+            true,
+            None,
+            None,
+            &sec,
+        )
+        .await
+        .expect("stage twin warn-first");
+        assert_eq!(stage_twin_out.twin_deltas.len(), 1);
+
+        let bad_head_commit = store
+            .commit_action_batch(
+                ns,
+                crate::rdf::action::ActionWriteSet {
+                    expected_heads: vec![crate::rdf::action::ExpectedHead::RowFingerprint {
+                        row_id: "pump-1".to_string(),
+                        expected_fingerprint: 4242,
+                    }],
+                    writes: Vec::new(),
+                    edge_deltas: Vec::new(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(bad_head_commit, Err(ActionError::ConflictWithNewerVersion { .. })),
+            "expected ConflictWithNewerVersion on mismatched RowFingerprint head, got {bad_head_commit:?}"
+        );
+
+        let (_v, live_pump) = store
+            .get(ns, "pump-1")
+            .await
+            .expect("get")
+            .expect("live pump");
+
+        let mut concurrent_vars = BTreeMap::new();
+        concurrent_vars.insert("temperature".to_string(), 85.0);
+        let (_, _, _, concurrent_payload, _) = crate::digital_twin::stage_twin_mutation(
+            "pump-1",
+            &live_pump,
+            &concurrent_vars,
+            true,
+            Some("live_sensor"),
+            1005,
+        );
+        store
+            .upsert(ns, "pump-1", vec![0.1; 4], concurrent_payload)
+            .await
+            .expect("concurrent live update");
+
+        let conflict_commit = commit_scenario(&store, &embedder, ns, "scen-cas-tx", true, &sec)
+            .await
+            .expect("commit outcome");
+        match conflict_commit {
+            ScenarioCommitOutcome::Rejected {
+                decision,
+                base_conflicts,
+                ..
+            } => {
+                assert_eq!(decision, "REJECTED_BASE_CONFLICT");
+                assert_eq!(base_conflicts, vec!["pump-1".to_string()]);
+            }
+            other => panic!("expected RejectBaseConflict, got {other:?}"),
+        }
+
+        assert!(store.scenarios().get(ns, "scen-cas-tx", 2000).is_ok());
     }
 }

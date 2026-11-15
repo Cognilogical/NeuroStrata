@@ -26882,6 +26882,53 @@ impl LadybugStore {
                                     }
                                 }
                             }
+                            ExpectedHead::RowFingerprint { row_id, expected_fingerprint } => {
+                                let safe_id = escape_ladybug_string(row_id);
+                                let q = format!(
+                                    "MATCH (m:Memory {{id: '{safe_id}', namespace: '{safe_ns}'}}) RETURN m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata LIMIT 1"
+                                );
+                                let mut res = conn
+                                    .query(&q)
+                                    .map_err(|e| ActionError::Storage(e.to_string()))?;
+                                let live_payload: Option<MemoryPayload> = res
+                                    .next()
+                                    .and_then(|row| {
+                                        let content = format!("{}", row[0]);
+                                        let user_id = format!("{}", row[1]);
+                                        let memory_type = format!("{}", row[2]);
+                                        let agent_name_str = format!("{}", row[3]);
+                                        let location = format!("{}", row[4]);
+                                        let location_lines = format!("{}", row[5]);
+                                        let metadata_str = format!("{}", row[6]);
+                                        let metadata: Value =
+                                            serde_json::from_str(&metadata_str)
+                                                .unwrap_or_else(|_| serde_json::json!({}));
+                                        let agent_name = if agent_name_str.is_empty()
+                                            || agent_name_str == "unknown"
+                                        {
+                                            None
+                                        } else {
+                                            Some(agent_name_str)
+                                        };
+                                        Some(MemoryPayload {
+                                            content,
+                                            user_id,
+                                            memory_type,
+                                            agent_name,
+                                            location,
+                                            location_lines,
+                                            metadata,
+                                        })
+                                    });
+                                let actual_fp =
+                                    crate::rdf::scenario::fingerprint_live_row(live_payload.as_ref(), now_ts);
+                                if actual_fp != *expected_fingerprint {
+                                    return Err(ActionError::ConflictWithNewerVersion {
+                                        receipt_id: row_id.clone(),
+                                        superseded_by: format!("fingerprint:{actual_fp:016x}"),
+                                    });
+                                }
+                            }
                             ExpectedHead::EdgeState {
                                 source,
                                 relation,

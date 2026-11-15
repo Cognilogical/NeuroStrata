@@ -616,6 +616,10 @@ pub enum ExpectedHead {
         target: String,
         expected_exists: bool,
     },
+    RowFingerprint {
+        row_id: String,
+        expected_fingerprint: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
