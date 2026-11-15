@@ -26860,8 +26860,12 @@ mod wal_zero_record {
     };
     use super::*;
     use crate::store::wal_accounting::{
-        classify, scan_wal, select_header_source, CommitEvidence, HeaderConflict, HeaderProbe,
-        HeaderSource, WalAccounting, WalBytes, WAL_HEADER_BYTES, WAL_HEADER_CHECKSUMMED_BYTES,
+        classify_pair, scan_wal, CommitEvidence, SideObservation, WalAccounting,
+        WalPairObservation,
+    };
+    use crate::store::wal_header::{
+        select_header_source, HeaderConflict, HeaderProbe, HeaderSource, WAL_HEADER_BYTES,
+        WAL_HEADER_CHECKSUMMED_BYTES,
     };
 
     fn wal_of(db: &std::path::Path) -> std::path::PathBuf {
@@ -26975,7 +26979,10 @@ mod wal_zero_record {
         let scan = scan_wal(&bytes);
         assert_eq!(
             scan.header,
-            crate::store::wal_accounting::WalHeader::Readable { checksums: true },
+            crate::store::wal_header::HeaderRead::Readable {
+                checksums: true,
+                header_bytes: 25
+            },
             "the default config writes a checksummed WAL; byte 16 is the flag"
         );
         assert_eq!(scan.tail, crate::store::wal_accounting::WalTail::Clean);
@@ -26998,6 +27005,61 @@ mod wal_zero_record {
             "a WAL whose frames cannot be attributed must never be read as \
              'nothing committed'"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+        restore_model_env(previous_model);
+    }
+
+    /// `#207` B6 — arm A (the plain verified open) is **not** a classification
+    /// case. A WAL that verifies is replayed by the engine and the open is
+    /// `Verified`; routing a successful open through `classify_pair` would
+    /// report `Replayed` and invite an arm to "account" for a healthy open.
+    #[tokio::test]
+    async fn valid_wal_opens_verified_with_its_committed_row() {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-wal-valid-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("valid.lbug");
+        let previous_model = without_model_env();
+        store_with_checkpointed_schema(&db, &root).await;
+
+        let cfg = SystemConfig::default()
+            .max_db_size(512 * 1024 * 1024)
+            .buffer_pool_size(64 * 1024 * 1024)
+            .throw_on_wal_replay_failure(true);
+        let raw = Database::new(&db, cfg).expect("raw open to seed the WAL");
+        let conn = Connection::new(&raw).expect("raw connection");
+        conn.query(&memory_row("valid-wal-0"))
+            .expect("seed a committed WAL-only row");
+        conn.query("CALL force_checkpoint_on_close=false")
+            .expect("turn off checkpoint on close");
+        drop(conn);
+        drop(raw);
+
+        let seeded = std::fs::read(wal_of(&db)).expect("read the unclean WAL");
+        assert!(seeded.len() > 25, "the fixture leaves a non-empty WAL");
+        assert_eq!(
+            scan_wal(&seeded).commit_evidence(),
+            CommitEvidence::Some,
+            "the fixture WAL holds a committed record"
+        );
+
+        // No recovery env at all: the verified open replays it.
+        let store = LadybugStore::for_testing(&db, 8).expect("a valid WAL replays");
+        assert_eq!(
+            store.open_provenance(),
+            OpenProvenance::Verified,
+            "a WAL that verifies is not a recovery case (#207 B6)"
+        );
+        assert_eq!(memory_count(&store, "valid-wal-").await, 1);
+        drop(store);
 
         let _ = std::fs::remove_dir_all(&root);
         restore_model_env(previous_model);
@@ -27388,12 +27450,10 @@ mod wal_zero_record {
 
         let store = LadybugStore::for_testing(&db, 8).expect("a store with no WAL opens");
         assert_eq!(store.open_provenance(), OpenProvenance::Verified);
-        let verdict = classify(
-            WalBytes::ZERO,
-            WalBytes::ZERO,
-            CommitEvidence::None,
-            false,
-        );
+        let verdict = classify_pair(WalPairObservation::new(
+            SideObservation::empty(),
+            SideObservation::empty(),
+        ));
         assert_eq!(verdict, WalAccounting::NoWal);
 
         let _ = std::fs::remove_dir_all(&root);
