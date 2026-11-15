@@ -27198,6 +27198,41 @@ impl LadybugStore {
                                     });
                                 }
                             }
+                            ExpectedHead::UniqueActionSlug { slug } => {
+                                let q = format!(
+                                    "MATCH (m:Memory {{namespace: '{safe_ns}', memory_type: 'action_type'}}) RETURN m.metadata"
+                                );
+                                let mut res = conn
+                                    .query(&q)
+                                    .map_err(|e| ActionError::Storage(e.to_string()))?;
+                                while let Some(row) = res.next() {
+                                    let meta_str = format!("{}", row[0]);
+                                    let meta: Value = serde_json::from_str(&meta_str)
+                                        .unwrap_or_else(|_| serde_json::json!({}));
+                                    let dummy_payload = MemoryPayload {
+                                        content: String::new(),
+                                        user_id: String::new(),
+                                        memory_type: "action_type".to_string(),
+                                        agent_name: None,
+                                        location: String::new(),
+                                        location_lines: String::new(),
+                                        metadata: meta.clone(),
+                                    };
+                                    if !crate::rdf::action::is_active_payload(&dummy_payload, now_ts) {
+                                        continue;
+                                    }
+                                    let row_slug = meta
+                                        .get("action_type")
+                                        .and_then(|v| v.get("slug"))
+                                        .and_then(|v| v.as_str());
+                                    if row_slug == Some(slug.as_str()) {
+                                        return Err(ActionError::DuplicateActionSlug {
+                                            namespace: ns_for_tx.clone(),
+                                            slug: slug.clone(),
+                                        });
+                                    }
+                                }
+                            }
                         }
                     }
 
