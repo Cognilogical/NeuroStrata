@@ -1108,6 +1108,7 @@ pub(crate) async fn start_daemon_on(
         .route("/scenario", post(handle_http_scenario))
         .route("/object-view", post(handle_http_object_view))
         .route("/locate", post(handle_http_locate))
+        .route("/diff-tour", post(handle_http_diff_tour))
         .route("/shutdown", post(handle_shutdown))
         .with_state(state.clone())
         .layer(axum::middleware::from_fn_with_state(state, auth_middleware));
@@ -2173,6 +2174,36 @@ async fn handle_http_locate(
         crate::server::handle_locate(&req, state.embedder.clone(), state.vector_store.clone())
             .await;
     (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+}
+
+async fn handle_http_diff_tour(
+    State(state): State<AppState>,
+    Json(mut req): Json<serde_json::Value>,
+) -> impl axum::response::IntoResponse {
+    if let Some(raw_root) = req
+        .get("project_root")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+    {
+        match caller_path_refusal(&state, raw_root) {
+            Ok(canonical) => {
+                req["project_root"] = serde_json::json!(canonical.to_string_lossy().into_owned());
+            }
+            Err((status, msg)) => {
+                return (
+                    status,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    serde_json::json!({ "ok": false, "error": msg }).to_string(),
+                );
+            }
+        }
+    }
+    let body = crate::server::handle_diff_tour(&req, state.vector_store.clone()).await;
+    (
+        axum::http::StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         body,
     )

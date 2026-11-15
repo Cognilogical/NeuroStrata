@@ -1206,3 +1206,60 @@ pub const fn evaluate_scenario_commit(
         ScenarioCommitDecision::CommitAllowed
     }
 }
+
+/// Four-stage guided diff tour stop category (`neurostrata-737r`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TourStopCategory {
+    Foundations,
+    CoreLogic,
+    SurfaceAndCallers,
+    TestsAndDocs,
+}
+
+impl TourStopCategory {
+    pub const fn as_tag(self) -> &'static str {
+        match self {
+            Self::Foundations => "FOUNDATIONS",
+            Self::CoreLogic => "CORE_LOGIC",
+            Self::SurfaceAndCallers => "SURFACE_AND_CALLERS",
+            Self::TestsAndDocs => "TESTS_AND_DOCS",
+        }
+    }
+
+    pub const fn stop_number(self) -> u8 {
+        match self {
+            Self::Foundations => 1,
+            Self::CoreLogic => 2,
+            Self::SurfaceAndCallers => 3,
+            Self::TestsAndDocs => 4,
+        }
+    }
+}
+
+/// Pure 4-stage stop classifier for `neurostrata_diff_tour` (`neurostrata-737r`).
+///
+/// 1. Tests and documentation (`is_test_or_doc`) always route to Stop 4 (`TestsAndDocs`).
+/// 2. Non-test foundation symbols (`is_foundation_kind_or_path`) or pure dependency
+///    sinks in the diff subgraph (`in_degree_in_diff > 0 && out_degree_in_diff == 0`)
+///    route to Stop 1 (`Foundations`).
+/// 3. Non-test entrypoint paths (`is_entrypoint_path`) or pure callers in the diff
+///    subgraph (`in_degree_in_diff == 0 && out_degree_in_diff > 0`) route to Stop 3
+///    (`SurfaceAndCallers`).
+/// 4. Remaining modified symbols route to Stop 2 (`CoreLogic`).
+pub const fn classify_tour_stop(
+    is_test_or_doc: bool,
+    is_foundation_kind_or_path: bool,
+    is_entrypoint_path: bool,
+    in_degree_in_diff: u32,
+    out_degree_in_diff: u32,
+) -> TourStopCategory {
+    if is_test_or_doc {
+        TourStopCategory::TestsAndDocs
+    } else if is_foundation_kind_or_path || (in_degree_in_diff > 0 && out_degree_in_diff == 0) {
+        TourStopCategory::Foundations
+    } else if is_entrypoint_path || (in_degree_in_diff == 0 && out_degree_in_diff > 0) {
+        TourStopCategory::SurfaceAndCallers
+    } else {
+        TourStopCategory::CoreLogic
+    }
+}

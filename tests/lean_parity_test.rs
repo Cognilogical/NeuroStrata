@@ -22,11 +22,11 @@ use std::process::Command;
 
 use formal_kernel::{
     action_gate_tag, action_revert_tag, action_task_effect_tag, allocate_hybrid_slots,
-    claim_decision_tag, classify_merge_decision_tag, epoch_gate_tag, evaluate_action_gate,
-    evaluate_action_revert, evaluate_action_task_effect, evaluate_claim_decision,
-    evaluate_import_precheck, evaluate_procedure_fire, evaluate_reducer_total,
-    evaluate_retention_gate, evaluate_scenario_commit, evaluate_seq_continuity,
-    evaluate_sovereignty_gate, import_precheck_tag, intersect_var_bounds,
+    claim_decision_tag, classify_merge_decision_tag, classify_tour_stop, epoch_gate_tag,
+    evaluate_action_gate, evaluate_action_revert, evaluate_action_task_effect,
+    evaluate_claim_decision, evaluate_import_precheck, evaluate_procedure_fire,
+    evaluate_reducer_total, evaluate_retention_gate, evaluate_scenario_commit,
+    evaluate_seq_continuity, evaluate_sovereignty_gate, import_precheck_tag, intersect_var_bounds,
     is_action_memory_shareable, join_task_status, lifecycle_can_transition, procedure_fire_tag,
     resolve_cross_file_call, resolve_scenario_row, retention_verdict_tag, seq_decision_tag,
     sovereignty_decision_tag, task_step_tag, ActionMemoryKind, ActionReceiptState,
@@ -513,6 +513,34 @@ fn generate_rust_truth_table() -> Vec<String> {
         }
     }
 
+    for &is_test_or_doc in [false, true].iter() {
+        for &is_foundation in [false, true].iter() {
+            for &is_entrypoint in [false, true].iter() {
+                for &in_deg in [0u32, 1, 2].iter() {
+                    for &out_deg in [0u32, 1, 2].iter() {
+                        let cat = classify_tour_stop(
+                            is_test_or_doc,
+                            is_foundation,
+                            is_entrypoint,
+                            in_deg,
+                            out_deg,
+                        );
+                        lines.push(format!(
+                            "DIFF_TOUR|{}|{}|{}|{}|{}|{}|{}",
+                            bool_str(is_test_or_doc),
+                            bool_str(is_foundation),
+                            bool_str(is_entrypoint),
+                            in_deg,
+                            out_deg,
+                            cat.as_tag(),
+                            cat.stop_number()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     lines
 }
 
@@ -566,8 +594,8 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
     let rust_lines = generate_rust_truth_table();
     assert_eq!(
         rust_lines.len(),
-        723,
-        "expected 723 canonical lines (64+16+128+3+24+32+8+60+16+6+32+32+32+16+4+72+5+21+96+8+48)"
+        795,
+        "expected 795 canonical lines (64+16+128+3+24+32+8+60+16+6+32+32+32+16+4+72+5+21+96+8+48+72)"
     );
 
     // Section-count verification: 64 TASK_FSM + 16 LIFECYCLE + 128 MESH_MERGE
@@ -684,6 +712,11 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
         *section_counts.get("SCENARIO_COMMIT").unwrap_or(&0),
         48,
         "expected 48 SCENARIO_COMMIT rows"
+    );
+    assert_eq!(
+        *section_counts.get("DIFF_TOUR").unwrap_or(&0),
+        72,
+        "expected 72 DIFF_TOUR rows"
     );
 
     let lake = find_lake().expect(

@@ -511,6 +511,28 @@ enum Commands {
         #[arg(long)]
         principal: Option<String>,
     },
+
+    /// Generate a 4-stop dependency-ordered Guided Diff Tour with blast-radius & GOVERNS audit
+    #[command(name = "diff-tour")]
+    DiffTour {
+        /// Target namespace
+        namespace: String,
+        /// Optional path to a unified diff file (or '-' for stdin)
+        #[arg(long)]
+        diff_file: Option<String>,
+        /// Inline unified diff text
+        #[arg(long)]
+        diff_text: Option<String>,
+        /// Optional project root directory
+        #[arg(long)]
+        project_root: Option<String>,
+        /// Maximum unchanged callers to list per item (default 15)
+        #[arg(long, default_value_t = 15)]
+        max_blast_radius_callers: usize,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone, PartialEq)]
@@ -3375,6 +3397,16 @@ mod tests {
         ])
         .expect("locate parses");
         assert!(matches!(loc.command, Some(Commands::Locate { .. })));
+
+        let dt = Cli::try_parse_from([
+            "neurostrata-mcp",
+            "diff-tour",
+            "MyProj",
+            "--max-blast-radius-callers",
+            "10",
+        ])
+        .expect("diff-tour parses");
+        assert!(matches!(dt.command, Some(Commands::DiffTour { .. })));
     }
 
     /// Step 4's contract, both halves: with a daemon answering, stdout is that
@@ -6047,6 +6079,56 @@ async fn run() -> anyhow::Result<()> {
                             }
                             std::process::exit(1);
                         }
+                        Commands::DiffTour {
+                            namespace,
+                            diff_file,
+                            diff_text,
+                            project_root,
+                            max_blast_radius_callers,
+                            principal,
+                        } => {
+                            let resolved_diff = if let Some(t) = diff_text {
+                                Some(t.clone())
+                            } else if let Some(f) = diff_file {
+                                if f == "-" {
+                                    use std::io::Read;
+                                    let mut buf = String::new();
+                                    let _ = std::io::stdin().read_to_string(&mut buf);
+                                    Some(buf)
+                                } else {
+                                    std::fs::read_to_string(f).ok()
+                                }
+                            } else {
+                                None
+                            };
+                            let mut req_body = serde_json::json!({
+                                "namespace": namespace,
+                                "max_blast_radius_callers": max_blast_radius_callers,
+                            });
+                            if let Some(d) = resolved_diff {
+                                req_body["diff_text"] = serde_json::json!(d);
+                            }
+                            if let Some(r) = project_root {
+                                req_body["project_root"] = serde_json::json!(r);
+                            }
+                            if let Some(p) = principal {
+                                req_body["principal"] = serde_json::json!(p);
+                            }
+                            let res = daemon_http_client()
+                                .post(format!("http://{DAEMON_ADDR}/diff-tour"))
+                                .json(&req_body)
+                                .send()
+                                .await
+                                .map_err(|e| anyhow::anyhow!("diff-tour request failed: {e}"))?;
+                            let body = res.text().await.unwrap_or_default();
+                            println!("{}", body);
+                            let parsed: serde_json::Value =
+                                serde_json::from_str(&body).unwrap_or_default();
+                            if parsed.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+                                return Ok(());
+                            }
+                            std::process::exit(1);
+                        }
                         _ => {}
                     }
                     eprintln!("CRITICAL ERROR: The NeuroStrata daemon is currently running (likely via OpenCode) and holds the database lock.");
@@ -6253,6 +6335,50 @@ async fn run() -> anyhow::Result<()> {
                             vector_store.clone(),
                         )
                         .await;
+                        println!("{}", out);
+                        let parsed: serde_json::Value =
+                            serde_json::from_str(&out).unwrap_or_default();
+                        if parsed.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                            std::process::exit(1);
+                        }
+                    }
+                    Commands::DiffTour {
+                        namespace,
+                        diff_file,
+                        diff_text,
+                        project_root,
+                        max_blast_radius_callers,
+                        principal,
+                    } => {
+                        let resolved_diff = if let Some(t) = diff_text {
+                            Some(t)
+                        } else if let Some(f) = diff_file {
+                            if f == "-" {
+                                use std::io::Read;
+                                let mut buf = String::new();
+                                let _ = std::io::stdin().read_to_string(&mut buf);
+                                Some(buf)
+                            } else {
+                                std::fs::read_to_string(&f).ok()
+                            }
+                        } else {
+                            None
+                        };
+                        let mut args = serde_json::json!({
+                            "namespace": namespace,
+                            "max_blast_radius_callers": max_blast_radius_callers,
+                        });
+                        if let Some(d) = resolved_diff {
+                            args["diff_text"] = serde_json::json!(d);
+                        }
+                        if let Some(r) = project_root {
+                            args["project_root"] = serde_json::json!(r);
+                        }
+                        if let Some(p) = principal {
+                            args["principal"] = serde_json::json!(p);
+                        }
+                        let out =
+                            crate::server::handle_diff_tour(&args, vector_store.clone()).await;
                         println!("{}", out);
                         let parsed: serde_json::Value =
                             serde_json::from_str(&out).unwrap_or_default();

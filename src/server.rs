@@ -1098,6 +1098,35 @@ pub async fn process_mcp_request(
                             },
                             "required": ["namespace", "query"]
                         }
+                    },
+                    {
+                        "name": "neurostrata_diff_tour",
+                        "description": "Generate a 4-stop dependency-ordered Guided Diff Tour (Foundations -> Core Implementation -> Surface & Blast Radius -> Tests & Documentation) with unchanged-caller warnings, GOVERNS rule audit, failed-attempt hazards, and untested modified symbols.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "Project namespace." },
+                                "diff_text": { "type": "string", "description": "Raw unified diff text (preferred, 100% VCS-agnostic)." },
+                                "changed_spans": {
+                                    "type": "array",
+                                    "description": "Optional explicit changed file spans when already parsed.",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "path": { "type": "string" },
+                                            "old_lines": { "type": "array", "items": { "type": "integer" } },
+                                            "new_lines": { "type": "array", "items": { "type": "integer" } },
+                                            "change_kind": { "type": "string" }
+                                        },
+                                        "required": ["path", "change_kind"]
+                                    }
+                                },
+                                "project_root": { "type": "string", "description": "Optional project root directory." },
+                                "max_blast_radius_callers": { "type": "integer", "default": 15, "description": "Maximum unchanged callers to list per item (default 15)." },
+                                "principal": { "type": "string", "description": "Optional requested principal (honored only for admin callers)." }
+                            },
+                            "required": ["namespace"]
+                        }
                     }
                 ]
             });
@@ -1574,6 +1603,9 @@ pub async fn process_mcp_request(
                         "neurostrata_locate" => {
                             result_text =
                                 handle_locate(&arguments, emb.clone(), store.clone()).await;
+                        }
+                        "neurostrata_diff_tour" => {
+                            result_text = handle_diff_tour(&arguments, store.clone()).await;
                         }
                         // SynapticMesh: the handler is a pure string-in/
                         // string-out dispatch (filesystem + git only; no
@@ -7409,6 +7441,72 @@ pub(crate) async fn handle_locate_with_auth(
             "conceptual_bridges": resp.conceptual_bridges,
             "ast_ingested": resp.ast_ingested,
             "truncated_by_budget": resp.truncated_by_budget,
+        })
+        .to_string(),
+        Err(e) => serde_json::json!({
+            "ok": false,
+            "error": e.to_string(),
+        })
+        .to_string(),
+    }
+}
+
+pub(crate) async fn handle_diff_tour(arguments: &Value, store: Arc<dyn VectorStore>) -> String {
+    handle_diff_tour_with_auth(arguments, Some("admin"), store).await
+}
+
+pub(crate) async fn handle_diff_tour_with_auth(
+    arguments: &Value,
+    trusted_principal: Option<&str>,
+    store: Arc<dyn VectorStore>,
+) -> String {
+    let Some(ns_raw) = arguments
+        .get("namespace")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return serde_json::json!({"ok": false, "error": "namespace required"}).to_string();
+    };
+
+    let changed_spans: Option<Vec<crate::graph_read::diff_tour::ChangedFileSpan>> = arguments
+        .get("changed_spans")
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+
+    let diff_text = arguments
+        .get("diff_text")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let req = crate::graph_read::diff_tour::DiffTourRequest {
+        namespace: ns_raw.to_string(),
+        project_root: arguments
+            .get("project_root")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        diff_text,
+        changed_spans,
+        max_blast_radius_callers: arguments
+            .get("max_blast_radius_callers")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize),
+        principal: arguments
+            .get("principal")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+    };
+
+    match crate::graph_read::diff_tour::execute_diff_tour(&store, &req, trusted_principal).await {
+        Ok(resp) => serde_json::json!({
+            "ok": true,
+            "namespace": resp.namespace,
+            "total_files_changed": resp.total_files_changed,
+            "total_symbols_touched": resp.total_symbols_touched,
+            "stops": resp.stops,
+            "governing_rules": resp.governing_rules,
+            "failed_attempts": resp.failed_attempts,
+            "untested_modified_symbols": resp.untested_modified_symbols,
+            "uningested_files": resp.uningested_files,
+            "truncated": resp.truncated,
         })
         .to_string(),
         Err(e) => serde_json::json!({
@@ -14492,6 +14590,7 @@ mod tests {
                 "neurostrata_scenario",
                 "neurostrata_object_view",
                 "neurostrata_locate",
+                "neurostrata_diff_tour",
                 // SynapticMesh: appended by `tools.extend(synaptic_mesh_tool
                 // _definitions())` — this order IS the append order, so it
                 // pins where the mesh module's list enters the surface.

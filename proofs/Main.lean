@@ -140,3 +140,10 @@ def main : IO Unit := do
           for shaclViolations in [0, 1, 2] do
             let tag := evaluateScenarioCommit expired casMatch rebacOk enforceShacl shaclViolations |>.asTag
             IO.println s!"SCENARIO_COMMIT|{boolToStr expired}|{boolToStr casMatch}|{boolToStr rebacOk}|{boolToStr enforceShacl}|{shaclViolations}|{tag}"
+  for isTestOrDoc in [false, true] do
+    for isFoundation in [false, true] do
+      for isEntrypoint in [false, true] do
+        for inDeg in [0, 1, 2] do
+          for outDeg in [0, 1, 2] do
+            let cat := classifyTourStop isTestOrDoc isFoundation isEntrypoint inDeg outDeg
+            IO.println s!"DIFF_TOUR|{boolToStr isTestOrDoc}|{boolToStr isFoundation}|{boolToStr isEntrypoint}|{inDeg}|{outDeg}|{cat.asTag}|{cat.stopNumber}"

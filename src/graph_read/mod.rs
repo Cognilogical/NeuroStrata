@@ -23,3 +23,6 @@ pub mod object_view;
 
 /// Compound single-call Code Finder, Blast-Radius & Governance Locator (`neurostrata_locate`).
 pub mod locate;
+
+/// Dependency-ordered 4-stop Guided Diff Tour (`neurostrata_diff_tour`).
+pub mod diff_tour;
