@@ -27,7 +27,7 @@ Work is NOT complete until `neurostrata_task_complete` succeeded, the task gate 
 - **Never Strand Work:** Never stop before pushing. Never say "ready to push when you are" (the agent must do it).
 
 ## 3. NeuroStrata Memory & The 3 Resilient Soft Locks
-Memory architecture is the single most important aspect of this system. It is NON-OPTIONAL. You MUST use the `neurostrata_add_memory` tool for explicit architectural rules and decisions, and the `neurostrata_append_log` tool for conversational context.
+Memory architecture is the single most important aspect of this system. It is NON-OPTIONAL. **NeuroStrata is a general-purpose, project-oriented memory, knowledge-base, and ontology system (`b76e9591-bc17-4aa5-941d-1b13ce1e6308`):** while it has first-class support for coding and document projects, a project does NOT have to be coding- or document-oriented. When a user tells the agent domain facts, entities, operational knowledge, preferences, or rules in conversation, store and link them directly in the project knowledge base via `neurostrata_add_memory` (where `locations` are optional and used only when anchoring to specific files or code symbols), digital twins, ontology scenarios, and kinetic actions, and use `neurostrata_append_log` for conversational transcripts.
 
 - **CRITICAL RESTRICTION**: NEVER use `bd remember` to store memories. That tool is deprecated for agent use. You MUST use the dedicated `neurostrata_add_memory` tool.
 - **Lock 1 (Pre-Push Hook):** The Supervisory Attentional System gates `git push` (`neurostrata-mcp task gate --strict`, installed via `neurostrata-mcp hooks install`). If a push is blocked, resolve the reported Goal violations — complete with extraction, unclaim, or unblock — before retrying.

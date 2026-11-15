@@ -2637,6 +2637,7 @@ pub fn snapshot_prefix(memories: &[SearchResult]) -> String {
     });
 
     let mut out = String::from("Zero-Action Start: claim or create a task before editing.\n");
+    out.push_str("General-Purpose Project Memory: NeuroStrata is a general-purpose, project-oriented memory, knowledge-base, and ontology system — projects do not need to be coding or document-oriented. Store user-provided facts, domain knowledge, entities, digital twins, and rules directly via neurostrata_add_memory (`locations` are optional and only needed when anchoring to files/symbols).\n");
     out.push_str("Task recognition: a statement of future/deferred work ('TODO:', 'we should also', 'later we need to', 'remaining work:', ...) is a task, not a note — capture it with neurostrata_task_create.\n");
     out.push_str("Graph-First & Subagent Propagation: before blind grep/glob or editing files, query neurostrata_memories_for_file, neurostrata_related, neurostrata_search_memory (include_related: true), or neurostrata_sparql_query for GOVERNS/DEPENDS_ON/calls/imports edges. Write this into your session plan and paste the `subagent_prompt_injection` block from neurostrata_task_claim into EVERY subagent prompt you spawn.\n");
     out.push_str("Formal Verification Reflex: when adding or modifying a state machine, gate, sovereignty/ACL rule, CRDT/merge rule, lease/claim rule, or conservation invariant, evaluate whether to factor the pure decision into src/formal_kernel.rs, prove its invariants in proofs/NeuroStrata/*.lean (zero sorry/axiom), and add parity rows in tests/lean_parity_test.rs.\n");
@@ -2713,9 +2714,13 @@ conversational transcript via `neurostrata_append_log`. The task record IS
 Tier-3 task memory -- recover a session with `neurostrata_task_list` +
 `neurostrata_get_memory`, not log archaeology.
 
-## 4. Memory & Automatic Graph-First Propagation
-Architectural rules, decisions, and fixes -> `neurostrata_add_memory`
-(correct outdated rules via `neurostrata_supersede_memory`; never bulk-delete).
+## 4. Memory, Knowledge Base & Automatic Graph-First Propagation
+NeuroStrata is a general-purpose, project-oriented memory, knowledge-base, and
+ontology system — projects do not need to be coding or document-oriented.
+Domain facts, user-told knowledge, entities, digital twins, architectural rules,
+decisions, and fixes -> `neurostrata_add_memory` (`locations` are optional and
+used only when anchoring to specific files or code symbols; correct outdated
+records via `neurostrata_supersede_memory`; never bulk-delete).
 - **Graph-First Lookup:** Before blind `grep`/`glob` or editing files, query `neurostrata_memories_for_file`, `neurostrata_related`, `neurostrata_trace_call_chain`, `neurostrata_impact_analysis`, `neurostrata_search_memory` (`include_related: true`), or `neurostrata_sparql_query` for `GOVERNS`, `DEPENDS_ON`, and AST `calls`/`imports` edges.
 - **Subagent Prompt Propagation:** Subagents start with a blank context window. Write the Graph-First rule into your session plan on init, and paste the `subagent_prompt_injection` block returned by `neurostrata_task_claim` into EVERY subagent prompt you spawn.
 - **Zero-Touch Harness Plugin Auto-Install & Hooks:** On init (`neurostrata_bootstrap`, `neurostrata_task_setup`, and `neurostrata_get_snapshot`), NeuroStrata automatically detects the active CLI/terminal agent harness (`opencode`, `openclaw`, `claude`, `hermes`, `codex`, `github-cli`), installs/wires the zero-dependency plugin under `.NeuroStrata/plugins/<harness>/`, and self-heals both `.git/hooks/pre-push` and `.git/hooks/pre-commit`.

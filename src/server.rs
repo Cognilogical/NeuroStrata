@@ -129,7 +129,7 @@ pub async fn process_mcp_request(
                 "tools": [
                     {
                         "name": "neurostrata_add_memory",
-                        "description": "Store an architectural rule, project pattern, or task insight. Task recognition: if the content contains a task-shaped statement (TODO:, 'we should also', 'later we need to', 'remaining work:', 'defer'/'deferred'), consider neurostrata_task_create instead of or in addition to storing it as a memory.",
+                        "description": "Store a domain fact, knowledge-base entry, architectural rule, project pattern, procedure, or task insight. NeuroStrata is a general-purpose, project-oriented memory and ontology system — memories do not require code or documents and can capture pure conversational or domain knowledge. Task recognition: if the content contains a task-shaped statement (TODO:, 'we should also', 'later we need to', 'remaining work:', 'defer'/'deferred'), consider neurostrata_task_create instead of or in addition to storing it as a memory.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -151,7 +151,7 @@ pub async fn process_mcp_request(
                                             "source_context": { "type": "object", "description": "Optional opaque provenance from a configured source provider (for example, revision/worktree identity). Core stores and exports it without assuming Git or interpreting provider fields." }
                                         }
                                     },
-                                    "description": "An array of file paths, line numbers, and symbols this memory governs. Memories MUST reference the specific documents they belong to."
+                                    "description": "Optional array of file paths, line numbers, and symbols this memory governs when the memory applies to code or documents. Omit for conversational, domain, entity, or documentless knowledge-base memories."
                                 },
                                 "domain": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Optional category or domain(s) this rule belongs to. Stored normalized to lowercase-kebab slug(s)." },
                                 "register_domain": { "type": "boolean", "description": "Set to true ONLY if the domain is genuinely new for this namespace; the registry rejects any other unregistered domain." },
@@ -178,7 +178,7 @@ pub async fn process_mcp_request(
                     },
                     {
                         "name": "neurostrata_get_snapshot",
-                        "description": "Get a pre-computed cognitive snapshot of the most important active architectural rules for a project. Use this immediately upon starting a new task to ground yourself in the project's core architecture before searching.",
+                        "description": "Get a pre-computed cognitive snapshot of the most important active rules, facts, procedures, and tasks for a project (whether a pure conversational knowledge base, domain ontology, document workspace, or codebase). Use this immediately upon starting a new task to ground yourself in the project's knowledge and constraints before acting.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -228,7 +228,7 @@ pub async fn process_mcp_request(
                     },
                     {
                         "name": "neurostrata_search_memory",
-                        "description": "Search the project's long-term memory for architectural rules.",
+                        "description": "Search the project's long-term memory and knowledge base for domain facts, rules, entities, procedures, and structural anchors.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -484,7 +484,7 @@ pub async fn process_mcp_request(
                                         "content": { "type": "string", "description": "What did you learn? What rule does this task prove?" },
                                         "memory_type": { "type": "string", "description": "Defaults to 'fact'." },
                                         "metadata": { "type": "object", "description": "Optional key-value map persisted exactly as neurostrata_add_memory persists one (e.g. source {kind, ref, captured_at} for a Source-necessary rule); extracted_from is stamped with this task if absent." },
-                                        "locations": { "type": "array", "items": { "type": "object" }, "description": "The same location anchors neurostrata_add_memory accepts." }
+                                        "locations": { "type": "array", "items": { "type": "object" }, "description": "Optional file/symbol location anchors (same as neurostrata_add_memory; omit for conversational or documentless knowledge-base memories)." }
                                     },
                                     "required": ["content"]
                                 },
@@ -14808,6 +14808,17 @@ mod tests {
         assert!(
             mem_type_desc.contains("procedure"),
             "memory_type description must mention `procedure` (vocab v4): {mem_type_desc:?}"
+        );
+        let loc_desc = add_memory["inputSchema"]["properties"]["locations"]["description"]
+            .as_str()
+            .expect("locations has a description");
+        assert!(
+            loc_desc.contains("Optional") && loc_desc.contains("documentless"),
+            "locations description must clarify optionality for documentless knowledge bases: {loc_desc:?}"
+        );
+        assert!(
+            !loc_desc.contains("Memories MUST reference"),
+            "locations description must never claim memories MUST reference documents: {loc_desc:?}"
         );
     }
 
