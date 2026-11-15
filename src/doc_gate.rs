@@ -545,4 +545,17 @@ mod tests {
             "surface_changed_without_doc_update"
         );
     }
+
+    #[test]
+    fn doc_gate_passes_on_live_repository() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let report = evaluate_doc_gate(root, Some(vec![]));
+        assert!(
+            report.passed,
+            "live repository failed doc-gate: {:?}",
+            report.violations
+        );
+        assert_eq!(report.checked_tiers, 3);
+        assert!(report.checked_rules >= 8);
+    }
 }

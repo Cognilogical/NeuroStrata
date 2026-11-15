@@ -1,0 +1,159 @@
+{
+  "schema_version": 1,
+  "allowed_root_files": ["README.md", "manifest.json"],
+  "tiers": {
+    "vision": {
+      "dir": "docs/vision",
+      "description": "Tier 1: Product Vision and core cognitive science thesis",
+      "required_files": [
+        "product-vision.md",
+        "cognitive-architecture.md",
+        "why-memory-fails.md",
+        "nomenclature.md",
+        "tri-strata.md"
+      ]
+    },
+    "features_api": {
+      "dir": "docs/features-api",
+      "description": "Tier 2: Internal features and major MCP/HTTP API surface",
+      "required_files": [
+        "mcp-and-http-api.md",
+        "cli-reference.md",
+        "feature-catalog.md",
+        "ui-guide.md",
+        "episodic-recall.md",
+        "limitations.md",
+        "subsystems/central-executive.md",
+        "subsystems/kinetic-actions.md",
+        "subsystems/taxonomy-advisor.md",
+        "subsystems/digital-twins.md",
+        "ops/building.md",
+        "ops/security.md"
+      ]
+    },
+    "extend": {
+      "dir": "docs/extend",
+      "description": "Tier 3: Extensibility, third-party connectors and interfaces",
+      "required_files": [
+        "overview.md",
+        "workflow-lifecycle-connectors.md",
+        "harness-plugins.md",
+        "providers-and-ontologies.md"
+      ]
+    }
+  },
+  "support_dirs": ["docs/releases", "docs/assets", "docs/archive"],
+  "prohibited_filename_substrings": ["cognee", "oxirs", "mem0", "zep", "langmem"],
+  "surface_rules": [
+    {
+      "id": "vision-core-thesis",
+      "tier": "vision",
+      "watch_paths": ["src/formal_kernel.rs"],
+      "target_doc": "docs/vision/product-vision.md",
+      "required_headings": [
+        "# NeuroStrata Product Vision",
+        "## Core Thesis",
+        "## General-Purpose Project Memory & Ontology"
+      ],
+      "required_tokens": ["SynapticGraph", "Central Executive", "WorkflowConnector"],
+      "require_co_change_on_touch": false
+    },
+    {
+      "id": "mcp-and-http-api-surface",
+      "tier": "features_api",
+      "watch_paths": ["src/server.rs", "src/daemon.rs"],
+      "target_doc": "docs/features-api/mcp-and-http-api.md",
+      "required_headings": [
+        "# MCP Tools & HTTP Daemon API Reference",
+        "## Core Memory & Graph Retrieval Tools",
+        "## Central Executive Task & Procedure Tools",
+        "## Enterprise Ontology, Digital Twins, Scenarios & Kinetic Actions",
+        "## Subject-Matter Domain Expertise & SKOS Taxonomy"
+      ],
+      "required_tokens": [
+        "neurostrata_add_memory",
+        "neurostrata_search_memory",
+        "neurostrata_task_complete",
+        "neurostrata_action",
+        "neurostrata_taxonomy",
+        "neurostrata_twin",
+        "neurostrata_scenario",
+        "neurostrata_call_hierarchy"
+      ],
+      "require_co_change_on_touch": false
+    },
+    {
+      "id": "cli-reference-surface",
+      "tier": "features_api",
+      "watch_paths": ["src/main.rs"],
+      "target_doc": "docs/features-api/cli-reference.md",
+      "required_headings": ["## Workflow, Documentation Gate & Ontology Commands"],
+      "required_tokens": ["doc-gate", "workflow", "action", "taxonomy", "scenario", "twin"],
+      "require_co_change_on_touch": false
+    },
+    {
+      "id": "kinetic-actions-subsystem",
+      "tier": "features_api",
+      "watch_paths": ["src/rdf/action.rs"],
+      "target_doc": "docs/features-api/subsystems/kinetic-actions.md",
+      "required_headings": [
+        "# Kinetic Action Types & Bitemporal Revert Log",
+        "## 5-Stage Fail-Closed Gate"
+      ],
+      "required_tokens": ["neurostrata_action", "ActionTypeDefinition", "SparqlAsk", "action_receipt"],
+      "require_co_change_on_touch": false
+    },
+    {
+      "id": "taxonomy-advisor-subsystem",
+      "tier": "features_api",
+      "watch_paths": ["src/rdf/taxonomy.rs"],
+      "target_doc": "docs/features-api/subsystems/taxonomy-advisor.md",
+      "required_headings": ["# Subject-Matter Domain Expertise & SKOS Taxonomy Advisor"],
+      "required_tokens": ["neurostrata_taxonomy", "set_thesis", "upsert_concept", "advise"],
+      "require_co_change_on_touch": false
+    },
+    {
+      "id": "workflow-connector-extension",
+      "tier": "extend",
+      "watch_paths": ["src/workflow/connector.rs", "src/workflow/machine.rs"],
+      "target_doc": "docs/extend/workflow-lifecycle-connectors.md",
+      "required_headings": [
+        "# Pluggable Workflow & Lifecycle Connectors",
+        "## Formal Workflow State Machine (`WorkflowStage`)",
+        "## The `WorkflowConnector` Trait",
+        "## Writing a Custom Third-Party Workflow Connector"
+      ],
+      "required_tokens": [
+        "WorkflowConnector",
+        "WorkflowStage",
+        "WorkflowEvent",
+        "GitWorkflowConnector",
+        "ManifestWorkflowConnector",
+        "resolve_workflow_connector",
+        "workflow-connector.json"
+      ],
+      "require_co_change_on_touch": false
+    },
+    {
+      "id": "harness-plugin-extension",
+      "tier": "extend",
+      "watch_paths": ["plugins/core/index.ts"],
+      "target_doc": "docs/extend/harness-plugins.md",
+      "required_headings": [
+        "# Agent Harness Plugin Interface",
+        "## Implementing a New Harness Adapter"
+      ],
+      "required_tokens": ["createHarnessPlugin", "handleHookEvent", "resolveProjectRoot"],
+      "require_co_change_on_touch": false
+    },
+    {
+      "id": "provider-traits-extension",
+      "tier": "extend",
+      "watch_paths": ["src/traits.rs"],
+      "target_doc": "docs/extend/providers-and-ontologies.md",
+      "required_headings": ["# Custom Providers, Ontologies & Action Packs"],
+      "required_tokens": ["VectorStore", "Embedder", "JudgmentProvider", "ActionTypeDefinition"],
+      "require_co_change_on_touch": false
+    }
+  ]
+}

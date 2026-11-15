@@ -206,3 +206,81 @@ Creates a checkpointed snapshot (`CHECKPOINT` + store copy + `manifest.json`) or
 neurostrata-mcp backup <backup_dir>
 neurostrata-mcp restore <backup_dir> --into <new_db_path>
 ```
+
+---
+
+## Workflow, Documentation Gate & Ontology Commands
+
+### `doc-gate`
+Evaluates the Documentation Manifest against the live repository. Checks required files, prohibited filename substrings, and surface-diff rules.
+```bash
+neurostrata-mcp doc-gate [--root <path>] [--json]
+```
+* **Exit `0`:** All tiers pass; required files present; no prohibited substrings.
+* **Exit `1`:** Manifest violation (missing required files, prohibited substrings, surface-diff failures).
+* `--json`: Machine-readable report for CI integration.
+
+### `workflow`
+Queries and manipulates the pluggable workflow lifecycle state machine.
+```bash
+neurostrata-mcp workflow transitions [--json]
+neurostrata-mcp workflow stage <stage> --event <event> [--json]
+neurostrata-mcp workflow install-triggers [--root <path>]
+```
+* `transitions`: Print the static `WORKFLOW_TABLE` edges.
+* `stage`: Evaluate a single `WorkflowEvent` from a given `WorkflowStage`.
+* `install-triggers`: Install Git hooks (pre-commit, pre-push) for the configured `WorkflowConnector`.
+
+### `action`
+Defines, validates, applies, and reverts Kinetic Action Types.
+```bash
+neurostrata-mcp action define <definition.json>  # strict validation, stores ActionTypeDefinition
+neurostrata-mcp action validate <action_type> <parameters.json>
+neurostrata-mcp action apply <action_type> <parameters.json>
+neurostrata-mcp action revert <receipt_id> [--force]
+neurostrata-mcp action log [--limit 100]
+```
+The 5-stage fail-closed gate (ReBAC → Typed Parameters → Offline SPARQL ASK → TwinVarPrecondition → Post-Image SHACL) runs on `validate` and `apply`.
+
+### `taxonomy`
+Manages SKOS domain taxonomies and invokes the SME Frontier Advisor.
+```bash
+neurostrata-mcp taxonomy set-thesis <thesis.json>
+neurostrata-mcp taxonomy upsert-concept <concept.json>
+neurostrata-mcp taxonomy tree [--concept <iri>]
+neurostrata-mcp taxonomy briefing [--json]
+neurostrata-mcp taxonomy compare <other_graph>
+neurostrata-mcp taxonomy gaps
+neurostrata-mcp taxonomy advise [--top-k 5]
+neurostrata-mcp taxonomy validate-dag
+```
+
+### `scenario`
+Creates and evaluates counterfactual ontology scenarios.
+```bash
+neurostrata-mcp scenario create <name> [--base <twin_id>]
+neurostrata-mcp scenario apply-action <scenario_id> <action_type> <parameters.json>
+neurostrata-mcp scenario evaluate-sparql <scenario_id> <query.rq>
+neurostrata-mcp scenario diff <scenario_id> [--against <twin_id>]
+```
+
+### `twin`
+Manages polymorphic digital twins and telemetry ingestion.
+```bash
+neurostrata-mcp twin create <schema.json>
+neurostrata-mcp twin ingest <twin_id> <telemetry.json>
+neurostrata-mcp twin state <twin_id>
+neurostrata-mcp twin history <twin_id> [--limit 50]
+```
+
+### `task`
+Central Executive task lifecycle commands.
+```bash
+neurostrata-mcp task create <namespace> --title "<title>" [--description "<desc>"] [--priority <0-3>] [--labels <labels>] [--parent <id>] [--blocked-by <id>]
+neurostrata-mcp task list <namespace> [--status <open|in_progress|blocked|done>] [--ready] [--assignee <id>]
+neurostrata-mcp task claim <namespace> <id>
+neurostrata-mcp task update <namespace> <id> --status <open|in_progress|blocked> [--note "<note>"]
+neurostrata-mcp task complete <namespace> <id> --extracted-memory <memory_id>
+neurostrata-mcp task validate <namespace>
+neurostrata-mcp task gate <namespace> [--strict] [--self-test]
+```
