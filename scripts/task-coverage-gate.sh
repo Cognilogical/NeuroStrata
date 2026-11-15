@@ -37,7 +37,11 @@ while IFS= read -r file; do
             echo "task-coverage-gate: untracked work item in $file: $line" >&2
             COUNT=$((COUNT + 1))
         fi
-    done < <(git log --no-merges -p "$RANGE" "${EXCLUDE_MAIN[@]}" -- "$file" | grep -E '^\+' | grep -vE '^\+\+\+' | grep -iE '(next move|todo:|todo :|fixme:|action item:|deferred:|open item|follow-up|remaining|next step|we should also|later we need to|still need to|must also fix|need to follow up)' || true)
+    # --find-renames: a pure rename (100% similarity) produces no content
+        # diff, so its pre-existing prose is never scanned as "added". Without
+        # this flag git reports the whole file as + lines and the gate fires on
+        # legacy wording that was already in the repo under the old path.
+        done < <(git log --no-merges -p --find-renames "$RANGE" "${EXCLUDE_MAIN[@]}" -- "$file" | grep -E '^\+' | grep -vE '^\+\+\+' | grep -iE '(next move|todo:|todo :|fixme:|action item:|deferred:|open item|follow-up|remaining|next step|we should also|later we need to|still need to|must also fix|need to follow up)' || true)
 done <<< "$CHANGED"
 else
     echo "task-coverage-gate: no markdown files changed — markdown check skipped"
