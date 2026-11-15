@@ -28,15 +28,26 @@ comment:
 - `filed #<issue>` — the finding is tracked in an issue;
 - `ruled: <reason>` — the maintainer explicitly accepts the residual.
 
-`scripts/gate-receipt.sh --pr <n>` counts markers and receipts and fails when
-receipts < markers. `.github/workflows/gate-receipt.yml` runs it as the required
-`gate-receipt` check. A review body may contain both the marker and its receipt.
+`scripts/gate-receipt.sh --pr <n>` counts markers and receipts and fails when a
+finding has no receipt. `.github/workflows/gate-receipt.yml` runs it as the
+required `gate-receipt` check. A review body may contain both the marker and its
+receipt. A receipt quoted as an example inside inline code is not a receipt.
+
+Receipts are bound to their finding. In thread mode each unresolved review
+thread needs its own `fixed@`/`filed`/maintainer `ruled:` reply: a receipt in
+thread A does not clear a marker in thread B, and review/issue-comment bodies
+form a separate pool that neither borrows nor lends receipts. Resolved threads
+contribute nothing — neither markers nor receipts — so fixing one thread can
+never authorize merging another unfixed finding. The legacy `--reviews-file`
+mode keeps the older global receipt pool.
 
 Inline findings are counted from unresolved review threads when the GraphQL
-`reviewThreads` query answers: a resolved thread no longer gates, while a
-`fixed@`/`filed`/`ruled:` reply still counts as a receipt. If GraphQL is
-unavailable, every inline finding counts (over-gating) and the script says so on
-stderr; it never treats an unresolved thread as clearance.
+`reviewThreads` query answers. The query follows `pageInfo` cursors (at most 50
+pages) and requests up to 100 comments per thread; if a thread reports more
+comments than were returned, the script exits 1 instead of under-counting
+receipts or findings. If GraphQL is unavailable, every inline finding counts
+(over-gating) and the script says so on stderr; it never treats an unresolved
+thread as clearance.
 
 GitHub Actions has no thread-resolution trigger: `pull_request_review_thread`
 is a webhook event only, and listing it in `on:` makes the workflow invalid. A
@@ -55,9 +66,11 @@ Every fixture file is validated before it is used: `reviews.json`,
 string `body`; `threads.json` must be an array of objects that carry
 `isResolved` and/or `comments`, where `isResolved` is boolean when present and
 `comments` is an array of objects with a string `body` when present. A file that
-fails validation exits 2 instead of passing. `GATE_RECEIPT_REPO=owner/name`
-overrides the repository used by `--pr`, so a fork checkout can check the
-upstream PR.
+fails validation exits 2 instead of passing. A `threads.json` envelope may carry
+`pageInfo`/`nodes` and `comments.totalCount` like the API; if it claims another
+page or more comments than it contains, it is treated as truncated and exits 1.
+`GATE_RECEIPT_REPO=owner/name` overrides the repository used by `--pr`, so a
+fork checkout can check the upstream PR.
 
 ## Why
 

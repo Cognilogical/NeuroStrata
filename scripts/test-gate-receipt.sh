@@ -94,27 +94,72 @@ if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/p1-unresolved" >/de
 fi
 bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/p1-resolved" >/dev/null
 bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/p1-filed" >/dev/null
+bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/envelope-thread-receipt" >/dev/null
 bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/quoted-prose" >/dev/null
 
 out=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/pr-201" 2>&1 >/dev/null || true)
 case "$out" in
-  *"4 gating marker(s)"*) : ;;
+  *"4 outstanding finding(s)"*) : ;;
   *) echo "FAIL: #201-shaped fixture should gate on 4 badges: $out" >&2; exit 1 ;;
 esac
 out=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/pr-204" 2>&1 >/dev/null || true)
 case "$out" in
-  *"2 gating marker(s)"*) : ;;
+  *"2 outstanding finding(s)"*) : ;;
   *) echo "FAIL: #204-shaped fixture should gate on 2 badges: $out" >&2; exit 1 ;;
 esac
 out=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/pr-204-fallback" 2>&1 >/dev/null || true)
 case "$out" in
-  *"2 gating marker(s)"*) : ;;
+  *"2 outstanding finding(s)"*) : ;;
   *) echo "FAIL: fallback should still count 2 inline badges: $out" >&2; exit 1 ;;
 esac
 case "$out" in
   *"review-thread resolution unavailable"*) : ;;
   *) echo "FAIL: fallback must announce that threads were not resolved: $out" >&2; exit 1 ;;
 esac
+
+# Receipts are bound to their finding, not pooled across threads (#218).
+if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/resolved-receipt-does-not-clear-an-unresolved-finding" >/dev/null 2>&1; then
+  echo "FAIL: a resolved thread's receipt cleared an unresolved finding" >&2
+  exit 1
+fi
+out=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/unresolved-receipt-is-thread-local" 2>&1 >/dev/null || true)
+case "$out" in
+  *"1 outstanding finding(s)"*) : ;;
+  *) echo "FAIL: a receipt in thread A cleared a marker in thread B: $out" >&2; exit 1 ;;
+esac
+bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/each-unresolved-thread-has-its-own-receipt" >/dev/null
+if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/top-level-marker-not-cleared-by-thread-receipt" >/dev/null 2>&1; then
+  echo "FAIL: a thread receipt cleared a top-level marker" >&2
+  exit 1
+fi
+if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/thread-marker-not-cleared-by-top-level-receipt" >/dev/null 2>&1; then
+  echo "FAIL: a top-level receipt cleared a thread marker" >&2
+  exit 1
+fi
+if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/quoted-receipt-is-not-a-receipt" >/dev/null 2>&1; then
+  echo "FAIL: a receipt quoted inside inline code cleared a finding" >&2
+  exit 1
+fi
+
+# Truncated review data must fail closed instead of under-counting (#218 P2).
+out=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/truncated-threads" 2>&1 >/dev/null || true)
+case "$out" in
+  *"truncated"*) : ;;
+  *) echo "FAIL: a threads fixture with pageInfo.hasNextPage passed: $out" >&2; exit 1 ;;
+esac
+if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/truncated-threads" >/dev/null 2>&1; then
+  echo "FAIL: truncated thread pages exited 0" >&2
+  exit 1
+fi
+out=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/truncated-comments" 2>&1 >/dev/null || true)
+case "$out" in
+  *"truncated"*) : ;;
+  *) echo "FAIL: a thread with comments.totalCount > nodes passed: $out" >&2; exit 1 ;;
+esac
+if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/truncated-comments" >/dev/null 2>&1; then
+  echo "FAIL: a truncated comment list exited 0" >&2
+  exit 1
+fi
 
 # Malformed fixture shapes must fail closed, not clear the gate silently.
 expect_shape_error() {
