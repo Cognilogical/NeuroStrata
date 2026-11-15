@@ -4,7 +4,7 @@ use std::fs;
 fn v8_validates_decision_shape() {
     let raw = fs::read_to_string("src/schemas/memory-vocabulary.v3.json").unwrap();
     let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
-    assert_eq!(v["vocabulary_version"], 10);
+    assert_eq!(v["vocabulary_version"], 11);
     let fact_fields = v["memory_types"]["fact"]["fields"].as_object().unwrap();
     assert!(fact_fields.contains_key("decision"));
     let decision = &fact_fields["decision"];
@@ -32,7 +32,7 @@ fn vocabulary_version_and_tool_summaries_are_consistent() {
     let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
 
     // The current vocabulary version.
-    assert_eq!(v["vocabulary_version"], 10);
+    assert_eq!(v["vocabulary_version"], 11);
 
     // tool_summaries exists and is non-empty, and every entry is a real
     // non-blank summary rather than a placeholder.

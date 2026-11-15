@@ -529,6 +529,347 @@ pub fn memory_to_quads(
         }
     }
 
+    // Thesis RDF projection
+    if payload.memory_type == "thesis" {
+        let thesis_obj = payload
+            .metadata
+            .get("thesis")
+            .and_then(|v| v.as_object());
+        let get_field = |key: &str| -> Option<&serde_json::Value> {
+            payload
+                .metadata
+                .get(key)
+                .or_else(|| thesis_obj.and_then(|o| o.get(key)))
+        };
+        if let Some(s) = get_field("project_purpose").and_then(|v| v.as_str()) {
+            lit_quad!(
+                ns_predicate("projectPurpose"),
+                s.to_string(),
+                xsd_string.clone()
+            );
+        }
+        if let Some(s) = get_field("domain_summary").and_then(|v| v.as_str()) {
+            lit_quad!(
+                ns_predicate("domainSummary"),
+                s.to_string(),
+                xsd_string.clone()
+            );
+        }
+        if let Some(to) = get_field("target_outcomes").and_then(|v| v.as_array()) {
+            for (idx, outcome) in to.iter().enumerate() {
+                if let Some(s) = outcome.as_str() {
+                    lit_quad!(
+                        ns_predicate(&format!("targetOutcome_{idx}")),
+                        s.to_string(),
+                        xsd_string.clone()
+                    );
+                }
+            }
+        }
+        if let Some(at) = get_field("architectural_tenets").and_then(|v| v.as_array()) {
+            for (idx, tenet) in at.iter().enumerate() {
+                if let Some(s) = tenet.as_str() {
+                    lit_quad!(
+                        ns_predicate(&format!("architecturalTenet_{idx}")),
+                        s.to_string(),
+                        xsd_string.clone()
+                    );
+                }
+            }
+        }
+        if let Some(cc) = get_field("canonical_concepts").and_then(|v| v.as_array()) {
+            for concept in cc {
+                if let Some(s) = concept.as_str() {
+                    iri_quad!(ns_predicate("canonicalConcept"), s.to_string());
+                }
+            }
+        }
+        if let Some(er) = get_field("external_references").and_then(|v| v.as_array()) {
+            for ref_obj in er {
+                if let Some(obj) = ref_obj.as_object() {
+                    if let Some(doi) = obj.get("doi").and_then(|v| v.as_str()) {
+                        lit_quad!(
+                            ns_predicate("externalReferenceDoi"),
+                            doi.to_string(),
+                            xsd_string.clone()
+                        );
+                    }
+                    if let Some(title) = obj.get("title").and_then(|v| v.as_str()) {
+                        lit_quad!(
+                            ns_predicate("externalReferenceTitle"),
+                            title.to_string(),
+                            xsd_string.clone()
+                        );
+                    }
+                }
+            }
+        }
+        quads.push(Quad {
+            subject: subject.clone(),
+            predicate: NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+            object: Term::NamedNode(NamedNode::new_unchecked(ns_predicate("Thesis"))),
+            graph_name: graph.clone(),
+        });
+        quads.push(Quad {
+            subject: subject.clone(),
+            predicate: NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+            object: Term::NamedNode(NamedNode::new_unchecked(ns_predicate("ProjectThesis"))),
+            graph_name: graph.clone(),
+        });
+    }
+
+    // Concept RDF projection (W3C SKOS):
+    //
+    // Active visible `concept` rows project W3C SKOS triples into the
+    // namespace RDF graph.
+    if payload.memory_type == "concept" {
+        let skos = |name: &str| -> String {
+            format!("http://www.w3.org/2004/02/skos/core#{name}")
+        };
+        let concept_node_for_slug = |slug_str: &str| -> NamedNode {
+            NamedNode::new_unchecked(format!(
+                "urn:neurostrata:concept:{}:{}",
+                sanitize_iri_suffix(namespace),
+                sanitize_iri_suffix(slug_str)
+            ))
+        };
+        if let Some(c) = payload.metadata.get("concept").and_then(|v| v.as_object()) {
+            let slug = c
+                .get("slug")
+                .and_then(|v| v.as_str())
+                .unwrap_or(id)
+                .to_string();
+            let concept_nn = concept_node_for_slug(&slug);
+            let concept_subject = NamedOrBlankNode::NamedNode(concept_nn.clone());
+            macro_rules! push_concept_quad {
+                ($subj:expr, $pred:expr, $obj:expr) => {
+                    quads.push(Quad {
+                        subject: ($subj).clone(),
+                        predicate: NamedNode::new_unchecked(($pred).to_string()),
+                        object: $obj,
+                        graph_name: graph.clone(),
+                    });
+                };
+            }
+
+            // Emit rdf:type skos:Concept on both the concept IRI subject and memory subject
+            push_concept_quad!(
+                &concept_subject,
+                "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                Term::NamedNode(NamedNode::new_unchecked(skos("Concept")))
+            );
+            push_concept_quad!(
+                &subject,
+                "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                Term::NamedNode(NamedNode::new_unchecked(skos("Concept")))
+            );
+
+            if let Some(s) = c.get("slug").and_then(|v| v.as_str()) {
+                iri_quad!(ns_predicate("conceptSlug"), s.to_string());
+            }
+            if let Some(pref_label) = c.get("pref_label").and_then(|v| v.as_str()) {
+                lit_quad!(
+                    ns_predicate("prefLabel"),
+                    pref_label.to_string(),
+                    xsd_string.clone()
+                );
+                let lit = Term::Literal(Literal::new_typed_literal(
+                    pref_label.to_string(),
+                    xsd_string.clone(),
+                ));
+                push_concept_quad!(&concept_subject, &skos("prefLabel"), lit.clone());
+                push_concept_quad!(&subject, &skos("prefLabel"), lit);
+            }
+            if let Some(alt_labels) = c.get("alt_labels").and_then(|v| v.as_array()) {
+                for (idx, alt) in alt_labels.iter().enumerate() {
+                    if let Some(s) = alt.as_str() {
+                        lit_quad!(
+                            ns_predicate(&format!("altLabel_{idx}")),
+                            s.to_string(),
+                            xsd_string.clone()
+                        );
+                        let lit = Term::Literal(Literal::new_typed_literal(
+                            s.to_string(),
+                            xsd_string.clone(),
+                        ));
+                        push_concept_quad!(&concept_subject, &skos("altLabel"), lit.clone());
+                        push_concept_quad!(&subject, &skos("altLabel"), lit);
+                    }
+                }
+            }
+            let def_str = c
+                .get("definition")
+                .and_then(|v| v.as_str())
+                .unwrap_or(payload.content.as_str());
+            if !def_str.is_empty() {
+                lit_quad!(
+                    ns_predicate("definition"),
+                    def_str.to_string(),
+                    xsd_string.clone()
+                );
+                let lit = Term::Literal(Literal::new_typed_literal(
+                    def_str.to_string(),
+                    xsd_string.clone(),
+                ));
+                push_concept_quad!(&concept_subject, &skos("definition"), lit.clone());
+                push_concept_quad!(&subject, &skos("definition"), lit);
+            }
+            if let Some(domain) = c.get("domain").and_then(|v| v.as_str()) {
+                lit_quad!(
+                    ns_predicate("domain"),
+                    domain.to_string(),
+                    xsd_string.clone()
+                );
+            }
+            if let Some(ext_iri) = c.get("concept_iri").and_then(|v| v.as_str()) {
+                if !ext_iri.trim().is_empty() {
+                    iri_quad!(ns_predicate("conceptIri"), ext_iri.to_string());
+                    let ext_nn = Term::NamedNode(NamedNode::new_unchecked(ext_iri.to_string()));
+                    push_concept_quad!(&concept_subject, &skos("exactMatch"), ext_nn.clone());
+                    push_concept_quad!(&subject, &skos("exactMatch"), ext_nn);
+                }
+            }
+
+            let broader_vec: Vec<String> = c
+                .get("broader")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for (idx, b_slug) in broader_vec.iter().enumerate() {
+                iri_quad!(ns_predicate(&format!("broaderConcept_{idx}")), b_slug.clone());
+                let parent_nn = concept_node_for_slug(b_slug);
+                let parent_subj = NamedOrBlankNode::NamedNode(parent_nn.clone());
+                push_concept_quad!(
+                    &concept_subject,
+                    &skos("broader"),
+                    Term::NamedNode(parent_nn.clone())
+                );
+                push_concept_quad!(&subject, &skos("broader"), Term::NamedNode(parent_nn));
+                // Derived inverse skos:narrower on the parent concept node
+                push_concept_quad!(
+                    &parent_subj,
+                    &skos("narrower"),
+                    Term::NamedNode(concept_nn.clone())
+                );
+            }
+
+            let related_vec: Vec<String> = c
+                .get("related")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for (idx, r_slug) in related_vec.iter().enumerate() {
+                iri_quad!(ns_predicate(&format!("relatedConcept_{idx}")), r_slug.clone());
+                let rel_nn = concept_node_for_slug(r_slug);
+                let rel_subj = NamedOrBlankNode::NamedNode(rel_nn.clone());
+                push_concept_quad!(
+                    &concept_subject,
+                    &skos("related"),
+                    Term::NamedNode(rel_nn.clone())
+                );
+                push_concept_quad!(&subject, &skos("related"), Term::NamedNode(rel_nn));
+                push_concept_quad!(
+                    &rel_subj,
+                    &skos("related"),
+                    Term::NamedNode(concept_nn.clone())
+                );
+            }
+
+            let contrasts_vec: Vec<String> = c
+                .get("contrasts_with")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for (idx, cw_slug) in contrasts_vec.iter().enumerate() {
+                iri_quad!(
+                    ns_predicate(&format!("contrastsWith_{idx}")),
+                    cw_slug.clone()
+                );
+                let cw_nn = concept_node_for_slug(cw_slug);
+                let cw_subj = NamedOrBlankNode::NamedNode(cw_nn.clone());
+                let pred_cw = ns_predicate("contrastsWith");
+                push_concept_quad!(&concept_subject, &pred_cw, Term::NamedNode(cw_nn.clone()));
+                push_concept_quad!(&subject, &pred_cw, Term::NamedNode(cw_nn));
+                push_concept_quad!(&cw_subj, &pred_cw, Term::NamedNode(concept_nn.clone()));
+            }
+
+            let realization_status = c
+                .get("realization_status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let rs_lit = Term::Literal(Literal::new_typed_literal(
+                realization_status.to_string(),
+                xsd_string.clone(),
+            ));
+            push_concept_quad!(
+                &concept_subject,
+                &ns_predicate("realizationStatus"),
+                rs_lit.clone()
+            );
+            push_concept_quad!(&subject, &ns_predicate("realizationStatus"), rs_lit);
+
+            // Dynamic read-time epistemic_status projection
+            let non_empty_arr = |val: Option<&serde_json::Value>| -> bool {
+                val.and_then(|v| v.as_array())
+                    .map(|a| !a.is_empty())
+                    .unwrap_or(false)
+            };
+            let non_empty_str = |val: Option<&serde_json::Value>| -> bool {
+                val.and_then(|v| v.as_str())
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false)
+            };
+            let has_definition = def_str.trim().len() >= 20;
+            let has_taxonomy_link = non_empty_str(c.get("domain"))
+                || !broader_vec.is_empty()
+                || !related_vec.is_empty()
+                || !contrasts_vec.is_empty();
+            let has_synthesis = non_empty_arr(c.get("tradeoffs"))
+                || non_empty_str(c.get("chosen_approach"))
+                || non_empty_str(c.get("rationale"));
+            let has_empirical_grounding = non_empty_arr(payload.metadata.get("governs"))
+                || !payload.location.trim().is_empty()
+                || non_empty_arr(c.get("references"))
+                || non_empty_arr(c.get("comparable_implementations"))
+                || non_empty_arr(c.get("implemented_interfaces"))
+                || non_empty_arr(c.get("linked_action_types"));
+            let ep_status = crate::formal_kernel::classify_epistemic_status(
+                has_definition,
+                has_taxonomy_link,
+                has_synthesis,
+                has_empirical_grounding,
+            );
+            let ep_lit = Term::Literal(Literal::new_typed_literal(
+                ep_status.as_str().to_string(),
+                xsd_string.clone(),
+            ));
+            push_concept_quad!(
+                &concept_subject,
+                &ns_predicate("epistemicStatus"),
+                ep_lit.clone()
+            );
+            push_concept_quad!(&subject, &ns_predicate("epistemicStatus"), ep_lit);
+        }
+        quads.push(Quad {
+            subject: subject.clone(),
+            predicate: NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+            object: Term::NamedNode(NamedNode::new_unchecked(ns_predicate("Concept"))),
+            graph_name: graph.clone(),
+        });
+    }
+
     // Multimodal attachment RDF projection
     if let Some(atts) = payload
         .metadata
@@ -1255,6 +1596,183 @@ mod tests {
             q.predicate.as_str() == "urn:neurostrata:ns#mutatedTwin"
                 && matches!(&q.object, Term::Literal(l) if l.value() == "loop-a")
         }));
+    }
+
+    #[test]
+    fn thesis_projects_rdf_type_and_key_fields() {
+        let thesis_payload = MemoryPayload {
+            content: "Project north star: distributed knowledge graph".to_string(),
+            user_id: "alice".to_string(),
+            memory_type: "thesis".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: json!({
+                "project_purpose": "Enable decentralized semantic reasoning",
+                "domain_summary": "Knowledge graphs for AI reasoning",
+                "target_outcomes": ["latency < 100ms", "throughput > 10K QPS"],
+                "architectural_tenets": ["modular", "extensible", "observability"],
+                "canonical_concepts": ["concept-knowledge-graph", "concept-reasoning"],
+                "external_references": [
+                    { "doi": "10.1234/abc", "title": "Foundations of Knowledge Graphs" },
+                    { "doi": "10.5678/def", "title": "Semantic Web Standards" }
+                ]
+            }),
+        };
+        let qs = memory_to_quads("thesis-1", &thesis_payload, "ns", Tier::Domain, 0);
+
+        // Should project Thesis rdf:type
+        assert!(
+            qs.iter().any(|q| {
+                q.predicate.as_str() == "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+                    && matches!(&q.object, Term::NamedNode(nn) if nn.as_str() == "urn:neurostrata:ns#Thesis")
+            }),
+            "thesis must project rdf:type ns:Thesis"
+        );
+        // Should project projectPurpose
+        assert!(
+            qs.iter().any(|q| {
+                q.predicate.as_str() == "urn:neurostrata:ns#projectPurpose"
+                    && matches!(&q.object, Term::Literal(l) if l.value() == "Enable decentralized semantic reasoning")
+            }),
+            "thesis must project projectPurpose"
+        );
+        // Should project domainSummary
+        assert!(
+            qs.iter().any(|q| {
+                q.predicate.as_str() == "urn:neurostrata:ns#domainSummary"
+                    && matches!(&q.object, Term::Literal(l) if l.value() == "Knowledge graphs for AI reasoning")
+            }),
+            "thesis must project domainSummary"
+        );
+        // Should project targetOutcome_0
+        assert!(
+            qs.iter().any(|q| {
+                q.predicate.as_str() == "urn:neurostrata:ns#targetOutcome_0"
+                    && matches!(&q.object, Term::Literal(l) if l.value() == "latency < 100ms")
+            }),
+            "thesis must project targetOutcome_0"
+        );
+        // Should project architecturalTenet_0
+        assert!(
+            qs.iter().any(|q| {
+                q.predicate.as_str() == "urn:neurostrata:ns#architecturalTenet_0"
+                    && matches!(&q.object, Term::Literal(l) if l.value() == "modular")
+            }),
+            "thesis must project architecturalTenet_0"
+        );
+        // Should project canonicalConcept
+        assert!(
+            qs.iter().any(|q| {
+                q.predicate.as_str() == "urn:neurostrata:ns#canonicalConcept"
+                    && matches!(&q.object, Term::NamedNode(nn) if nn.as_str() == "concept-knowledge-graph")
+            }),
+            "thesis must project canonicalConcept"
+        );
+        // Should project externalReferenceDoi
+        assert!(
+            qs.iter().any(|q| {
+                q.predicate.as_str() == "urn:neurostrata:ns#externalReferenceDoi"
+                    && matches!(&q.object, Term::Literal(l) if l.value() == "10.1234/abc")
+            }),
+            "thesis must project externalReferenceDoi"
+        );
+        // Should project externalReferenceTitle
+        assert!(
+            qs.iter().any(|q| {
+                q.predicate.as_str() == "urn:neurostrata:ns#externalReferenceTitle"
+                    && matches!(&q.object, Term::Literal(l) if l.value() == "Foundations of Knowledge Graphs")
+            }),
+            "thesis must project externalReferenceTitle"
+        );
+    }
+
+    #[test]
+    fn concept_projects_rdf_type_and_skos_fields() {
+        let concept_payload = MemoryPayload {
+            content: "SKOS concept for knowledge graph reasoning".to_string(),
+            user_id: "alice".to_string(),
+            memory_type: "concept".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: json!({
+                "concept": {
+                    "slug": "concept-knowledge-graph",
+                    "pref_label": "Knowledge Graph Concept",
+                    "alt_labels": ["KG Concept", "Graph Concept"],
+                    "definition": "A concept for knowledge graph reasoning",
+                    "domain": "knowledge-graphs",
+                    "concept_iri": "urn:example:kg-concept"
+                }
+            }),
+        };
+        let qs = memory_to_quads("concept-1", &concept_payload, "ns", Tier::Domain, 0);
+
+        // Should project Concept rdf:type
+        assert!(
+            qs.iter().any(|q| {
+                q.predicate.as_str() == "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+                    && matches!(&q.object, Term::NamedNode(nn) if nn.as_str() == "urn:neurostrata:ns#Concept")
+            }),
+            "concept must project rdf:type ns:Concept"
+        );
+        // Should project conceptSlug
+        assert!(
+            qs.iter().any(|q| {
+                q.predicate.as_str() == "urn:neurostrata:ns#conceptSlug"
+                    && matches!(&q.object, Term::NamedNode(nn) if nn.as_str() == "concept-knowledge-graph")
+            }),
+            "concept must project conceptSlug"
+        );
+        // Should project prefLabel
+        assert!(
+            qs.iter().any(|q| {
+                q.predicate.as_str() == "urn:neurostrata:ns#prefLabel"
+                    && matches!(&q.object, Term::Literal(l) if l.value() == "Knowledge Graph Concept")
+            }),
+            "concept must project prefLabel"
+        );
+        // Should project altLabel_0
+        assert!(
+            qs.iter().any(|q| {
+                q.predicate.as_str() == "urn:neurostrata:ns#altLabel_0"
+                    && matches!(&q.object, Term::Literal(l) if l.value() == "KG Concept")
+            }),
+            "concept must project altLabel_0"
+        );
+        // Should project altLabel_1
+        assert!(
+            qs.iter().any(|q| {
+                q.predicate.as_str() == "urn:neurostrata:ns#altLabel_1"
+                    && matches!(&q.object, Term::Literal(l) if l.value() == "Graph Concept")
+            }),
+            "concept must project altLabel_1"
+        );
+        // Should project definition
+        assert!(
+            qs.iter().any(|q| {
+                q.predicate.as_str() == "urn:neurostrata:ns#definition"
+                    && matches!(&q.object, Term::Literal(l) if l.value() == "A concept for knowledge graph reasoning")
+            }),
+            "concept must project definition"
+        );
+        // Should project domain
+        assert!(
+            qs.iter().any(|q| {
+                q.predicate.as_str() == "urn:neurostrata:ns#domain"
+                    && matches!(&q.object, Term::Literal(l) if l.value() == "knowledge-graphs")
+            }),
+            "concept must project domain"
+        );
+        // Should project conceptIri
+        assert!(
+            qs.iter().any(|q| {
+                q.predicate.as_str() == "urn:neurostrata:ns#conceptIri"
+                    && matches!(&q.object, Term::NamedNode(nn) if nn.as_str() == "urn:example:kg-concept")
+            }),
+            "concept must project conceptIri"
+        );
     }
 
     #[tokio::test]

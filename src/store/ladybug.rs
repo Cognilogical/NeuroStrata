@@ -26388,10 +26388,11 @@ impl LadybugStore {
 impl LadybugStore {
     pub async fn refresh_ontology(&self, namespace: &str) {
         let namespace_owned = namespace.to_string();
-        let (metadata, action_rows) = self
+        let (metadata, action_rows, concept_rows) = self
             .with_conn(
                 move |conn: &Connection| -> Result<(
                     Option<serde_json::Value>,
+                    Vec<(String, MemoryPayload)>,
                     Vec<(String, MemoryPayload)>,
                 )> {
                     let safe_ns = escape_ladybug_string(&namespace_owned);
@@ -26448,12 +26449,49 @@ impl LadybugStore {
                         }
                     }
 
-                    Ok((reg_meta, actions))
+                    let mut concepts = Vec::new();
+                    let concept_query = format!(
+                        "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.memory_type = 'concept' RETURN m.id, m.content, m.user_id, m.agent_name, m.location, m.location_lines, m.metadata",
+                        safe_ns
+                    );
+                    if let Ok(rows) = conn.query(&concept_query) {
+                        for row in rows {
+                            let id = format!("{}", row[0]);
+                            let content = format!("{}", row[1]);
+                            let user_id = format!("{}", row[2]);
+                            let agent_name_str = format!("{}", row[3]);
+                            let location = format!("{}", row[4]);
+                            let location_lines = format!("{}", row[5]);
+                            let meta_str = format!("{}", row[6]);
+                            let metadata = serde_json::from_str::<serde_json::Value>(&meta_str)
+                                .unwrap_or_else(|_| serde_json::json!({}));
+                            concepts.push((
+                                id,
+                                MemoryPayload {
+                                    content,
+                                    user_id,
+                                    memory_type: "concept".to_string(),
+                                    agent_name: if agent_name_str.is_empty()
+                                        || agent_name_str == "unknown"
+                                    {
+                                        None
+                                    } else {
+                                        Some(agent_name_str)
+                                    },
+                                    location,
+                                    location_lines,
+                                    metadata,
+                                },
+                            ));
+                        }
+                    }
+
+                    Ok((reg_meta, actions, concepts))
                 },
             )
             .await
             .ok()
-            .unwrap_or((None, Vec::new()));
+            .unwrap_or((None, Vec::new(), Vec::new()));
         let mut idx = metadata
             .as_ref()
             .map(|m| crate::rdf::OntologyIndex::from_registry_metadata(m))
@@ -26481,8 +26519,11 @@ impl LadybugStore {
             }
         }
 
-        // Compile active action_type rows in deterministic (valid_from, id) order.
+        // Hydrate concept taxonomy rows into the OntologyIndex cache.
         let now_ts = chrono::Utc::now().timestamp();
+        idx.load_concept_rows(&concept_rows, now_ts);
+
+        // Compile active action_type rows in deterministic (valid_from, id) order.
         let mut active_actions: Vec<(i64, String, MemoryPayload)> = action_rows
             .into_iter()
             .filter_map(|(id, payload)| {

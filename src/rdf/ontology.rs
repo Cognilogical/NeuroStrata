@@ -50,6 +50,21 @@ struct PendingShapeProp {
     in_tokens: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct ConceptIndexEntry {
+    pub memory_id: String,
+    pub slug: String,
+    pub pref_label: String,
+    pub alt_labels: Vec<String>,
+    pub definition: String,
+    pub domain: Option<String>,
+    pub concept_iri: Option<String>,
+    pub broader: Vec<String>,
+    pub related: Vec<String>,
+    pub contrasts_with: Vec<String>,
+    pub realization_status: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct OntologyIndex {
     pub domains: Vec<DomainEntry>,
@@ -70,6 +85,11 @@ pub struct OntologyIndex {
     exact_match: BTreeMap<String, BTreeSet<String>>,
     broader: BTreeMap<String, BTreeSet<String>>,
     narrower: BTreeMap<String, BTreeSet<String>>,
+    // Concept taxonomy fields (Task 3)
+    pub concepts: BTreeMap<String, ConceptIndexEntry>,
+    pub concept_aliases: BTreeMap<String, BTreeSet<String>>,
+    pub related: BTreeMap<String, BTreeSet<String>>,
+    pub contrasts_with: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl OntologyIndex {
@@ -167,6 +187,10 @@ impl OntologyIndex {
                 narrower: BTreeMap::new(),
                 shacl_shapes: Vec::new(),
                 action_types: BTreeMap::new(),
+                concepts: BTreeMap::new(),
+                concept_aliases: BTreeMap::new(),
+                related: BTreeMap::new(),
+                contrasts_with: BTreeMap::new(),
             }
         };
 
@@ -613,6 +637,443 @@ impl OntologyIndex {
         let mut v: Vec<String> = out.into_iter().collect();
         v.sort();
         v
+    }
+
+    /// Add related concepts to the ontology index.
+    pub fn add_related(&mut self, a: &str, b: &str) {
+        self.related
+            .entry(a.to_string())
+            .or_default()
+            .insert(b.to_string());
+        self.related
+            .entry(b.to_string())
+            .or_default()
+            .insert(a.to_string());
+    }
+
+    /// Add contrast relationships to the ontology index.
+    pub fn add_contrasts_with(&mut self, a: &str, b: &str) {
+        self.contrasts_with
+            .entry(a.to_string())
+            .or_default()
+            .insert(b.to_string());
+        self.contrasts_with
+            .entry(b.to_string())
+            .or_default()
+            .insert(a.to_string());
+    }
+
+    /// Get all broader concepts (ancestors) for a concept, excluding the concept itself.
+    pub fn concept_broader_of(&self, slug: &str) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        let mut queue = VecDeque::new();
+        let mut visited = BTreeSet::new();
+        
+        queue.push_back(slug.to_string());
+        visited.insert(slug.to_string());
+        
+        while let Some(cur) = queue.pop_front() {
+            if let Some(broader) = self.broader.get(&cur) {
+                for b in broader {
+                    if !visited.contains(b) {
+                        visited.insert(b.clone());
+                        out.insert(b.clone());
+                        queue.push_back(b.clone());
+                    }
+                }
+            }
+        }
+        
+        out
+    }
+
+    /// Get all narrower concepts (descendants) for a concept, excluding the concept itself.
+    pub fn concept_narrower_of(&self, slug: &str) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        let mut queue = VecDeque::new();
+        let mut visited = BTreeSet::new();
+        
+        queue.push_back(slug.to_string());
+        visited.insert(slug.to_string());
+        
+        while let Some(cur) = queue.pop_front() {
+            if let Some(narrower) = self.narrower.get(&cur) {
+                for n in narrower {
+                    if !visited.contains(n) {
+                        visited.insert(n.clone());
+                        out.insert(n.clone());
+                        queue.push_back(n.clone());
+                    }
+                }
+            }
+        }
+        
+        out
+    }
+
+    /// Expand concept query terms to include the concept itself, its direct narrower/related concepts,
+    /// and their direct labels and alternative labels.
+    pub fn expand_concept_query_terms(&self, query: &str) -> BTreeSet<String> {
+        let mut result = BTreeSet::new();
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            return result;
+        }
+        let mut matched_slugs = BTreeSet::new();
+        let normalized_query = trimmed.to_lowercase();
+
+        if self.concepts.contains_key(&normalized_query) {
+            matched_slugs.insert(normalized_query.clone());
+        }
+        if let Some(slug) = domain::normalize_domain_slug(trimmed) {
+            if self.concepts.contains_key(&slug) {
+                matched_slugs.insert(slug.clone());
+            }
+            if let Some(targets) = self.concept_aliases.get(&slug) {
+                matched_slugs.extend(targets.iter().cloned());
+            }
+        }
+        if let Some(targets) = self.concept_aliases.get(&normalized_query) {
+            matched_slugs.extend(targets.iter().cloned());
+        }
+        if let Some(targets) = self.concept_aliases.get(trimmed) {
+            matched_slugs.extend(targets.iter().cloned());
+        }
+        for tok in normalized_query
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
+            .filter(|t| t.len() >= 2)
+        {
+            if self.concepts.contains_key(tok) {
+                matched_slugs.insert(tok.to_string());
+            }
+            if let Some(targets) = self.concept_aliases.get(tok) {
+                matched_slugs.extend(targets.iter().cloned());
+            }
+        }
+
+        for slug in matched_slugs {
+            result.insert(slug.clone());
+            if let Some(concept) = self.concepts.get(&slug) {
+                if !concept.pref_label.is_empty() {
+                    result.insert(concept.pref_label.clone());
+                }
+                for alt in &concept.alt_labels {
+                    if !alt.is_empty() {
+                        result.insert(alt.clone());
+                    }
+                }
+            }
+            if let Some(narrower) = self.narrower.get(&slug) {
+                for n in narrower {
+                    result.insert(n.clone());
+                    if let Some(nc) = self.concepts.get(n) {
+                        if !nc.pref_label.is_empty() {
+                            result.insert(nc.pref_label.clone());
+                        }
+                        for alt in &nc.alt_labels {
+                            if !alt.is_empty() {
+                                result.insert(alt.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(related) = self.related.get(&slug) {
+                for r in related {
+                    result.insert(r.clone());
+                    if let Some(rc) = self.concepts.get(r) {
+                        if !rc.pref_label.is_empty() {
+                            result.insert(rc.pref_label.clone());
+                        }
+                        for alt in &rc.alt_labels {
+                            if !alt.is_empty() {
+                                result.insert(alt.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Load concept rows from memory payloads, filtering out archived, retired, conflicting, and non-public concepts.
+    /// Validates taxonomy DAG and SKOS disjointness constraints.
+    pub fn load_concept_rows(&mut self, rows: &[(String, MemoryPayload)], now_ts: i64) {
+        let mut active_rows: Vec<(i64, String, MemoryPayload)> = rows
+            .iter()
+            .filter_map(|(id, payload)| {
+                if payload
+                    .metadata
+                    .get("archived")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    return None;
+                }
+                if let Some(v) = payload.metadata.get("valid_to") {
+                    if !v.is_null() {
+                        let retired = v.as_i64().map(|ts| ts > 0 && ts <= now_ts).unwrap_or(true);
+                        if retired {
+                            return None;
+                        }
+                    }
+                }
+                if crate::synaptic_mesh::conflict::is_conflicting_metadata(&payload.metadata) {
+                    return None;
+                }
+                // Privacy-safe OntologyIndex hydration: exclude any concept row with a non-public access_policy.
+                if let Some(ap) = payload.metadata.get("access_policy") {
+                    if !ap.is_null() {
+                        let is_public = match ap.as_object() {
+                            Some(obj) if obj.is_empty() => true,
+                            Some(obj) => {
+                                obj.get("public").and_then(|v| v.as_bool()) == Some(true)
+                                    && obj
+                                        .get("allowed_users")
+                                        .and_then(|v| v.as_array())
+                                        .map(|a| a.is_empty())
+                                        .unwrap_or(true)
+                                    && obj
+                                        .get("allowed_roles")
+                                        .and_then(|v| v.as_array())
+                                        .map(|a| a.is_empty())
+                                        .unwrap_or(true)
+                            }
+                            None => false,
+                        };
+                        if !is_public {
+                            return None;
+                        }
+                    }
+                }
+                let vf = payload
+                    .metadata
+                    .get("valid_from")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                Some((vf, id.clone(), payload.clone()))
+            })
+            .collect();
+
+        // Sort ascending by (valid_from, id) so later active rows overwrite earlier ones for the same slug.
+        active_rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+        let mut deduped_by_slug: BTreeMap<String, (String, MemoryPayload)> = BTreeMap::new();
+        for (_vf, id, payload) in active_rows {
+            let Some(c_obj) = payload.metadata.get("concept").and_then(|v| v.as_object()) else {
+                continue;
+            };
+            let Some(raw_slug) = c_obj.get("slug").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(slug) = domain::normalize_domain_slug(raw_slug) else {
+                tracing::warn!("skipping concept row '{}' with invalid slug '{}'", id, raw_slug);
+                continue;
+            };
+            deduped_by_slug.insert(slug, (id, payload));
+        }
+
+        let mut slug_to_num: BTreeMap<String, u32> = BTreeMap::new();
+        let mut next_id: u32 = 1;
+        let mut intern_slug = |s: &str| -> u32 {
+            if let Some(&id) = slug_to_num.get(s) {
+                id
+            } else {
+                let id = next_id;
+                next_id += 1;
+                slug_to_num.insert(s.to_string(), id);
+                id
+            }
+        };
+
+        // Pass 1: validate broader DAG incrementally and collect accepted broader edges per slug.
+        let mut accepted_broader_pairs: Vec<(u32, u32)> = Vec::new();
+        let mut accepted_broader_by_slug: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut rejected_cyclic_slugs: BTreeSet<String> = BTreeSet::new();
+
+        for (slug, (row_id, payload)) in &deduped_by_slug {
+            let Some(c_obj) = payload.metadata.get("concept").and_then(|v| v.as_object()) else {
+                continue;
+            };
+            let u = intern_slug(slug);
+            let mut valid_parents = Vec::new();
+            if let Some(arr) = c_obj.get("broader").and_then(|v| v.as_array()) {
+                for item in arr {
+                    let Some(raw_p) = item.as_str() else { continue };
+                    let Some(p_slug) = domain::normalize_domain_slug(raw_p) else { continue };
+                    let v = intern_slug(&p_slug);
+                    let mut candidate = accepted_broader_pairs.clone();
+                    candidate.push((u, v));
+                    if crate::formal_kernel::validate_taxonomy_dag(&candidate) {
+                        accepted_broader_pairs = candidate;
+                        valid_parents.push(p_slug);
+                    } else {
+                        tracing::warn!(
+                            "skipping cyclic SKOS broader edge '{}' -> '{}' on concept row '{}'",
+                            slug,
+                            p_slug,
+                            row_id
+                        );
+                        rejected_cyclic_slugs.insert(slug.clone());
+                    }
+                }
+            }
+            accepted_broader_by_slug.insert(slug.clone(), valid_parents);
+        }
+
+        // Pass 2: validate SKOS S27 disjointness for related and contrasts_with and populate OntologyIndex.
+        for (slug, (row_id, payload)) in &deduped_by_slug {
+            let Some(c_obj) = payload.metadata.get("concept").and_then(|v| v.as_object()) else {
+                continue;
+            };
+            let valid_broader = accepted_broader_by_slug
+                .get(slug)
+                .cloned()
+                .unwrap_or_default();
+            if rejected_cyclic_slugs.contains(slug) && valid_broader.is_empty() {
+                continue;
+            }
+            let u = intern_slug(slug);
+
+            for parent in &valid_broader {
+                // Canonical SKOS broader only — never add_sub_class!
+                self.add_broader(slug, parent);
+            }
+
+            let mut valid_related = Vec::new();
+            if let Some(arr) = c_obj.get("related").and_then(|v| v.as_array()) {
+                for item in arr {
+                    let Some(raw_r) = item.as_str() else { continue };
+                    let Some(r_slug) = domain::normalize_domain_slug(raw_r) else { continue };
+                    let v = intern_slug(&r_slug);
+                    if crate::formal_kernel::validate_skos_disjointness(
+                        &accepted_broader_pairs,
+                        &[(u, v)],
+                        &[],
+                    ) {
+                        self.add_related(slug, &r_slug);
+                        valid_related.push(r_slug);
+                    } else {
+                        tracing::warn!(
+                            "skipping SKOS S27 conflicting related edge '{}' <-> '{}' on concept row '{}'",
+                            slug,
+                            r_slug,
+                            row_id
+                        );
+                    }
+                }
+            }
+
+            let mut valid_contrasts = Vec::new();
+            if let Some(arr) = c_obj.get("contrasts_with").and_then(|v| v.as_array()) {
+                for item in arr {
+                    let Some(raw_c) = item.as_str() else { continue };
+                    let Some(c_slug) = domain::normalize_domain_slug(raw_c) else { continue };
+                    let v = intern_slug(&c_slug);
+                    if crate::formal_kernel::validate_skos_disjointness(
+                        &accepted_broader_pairs,
+                        &[],
+                        &[(u, v)],
+                    ) {
+                        self.add_contrasts_with(slug, &c_slug);
+                        valid_contrasts.push(c_slug);
+                    } else {
+                        tracing::warn!(
+                            "skipping SKOS S27 conflicting contrasts_with edge '{}' <-> '{}' on concept row '{}'",
+                            slug,
+                            c_slug,
+                            row_id
+                        );
+                    }
+                }
+            }
+
+            let pref_label = c_obj
+                .get("pref_label")
+                .and_then(|v| v.as_str())
+                .unwrap_or(slug.as_str())
+                .to_string();
+            let alt_labels: Vec<String> = c_obj
+                .get("alt_labels")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let definition = c_obj
+                .get("definition")
+                .and_then(|v| v.as_str())
+                .unwrap_or(payload.content.as_str())
+                .to_string();
+            let domain_opt = c_obj
+                .get("domain")
+                .and_then(|v| v.as_str())
+                .and_then(domain::normalize_domain_slug);
+            let concept_iri = c_obj
+                .get("concept_iri")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.to_string());
+            let realization_status = c_obj
+                .get("realization_status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+
+            // Multi-target concept_aliases collision preservation (both lowercased and raw)
+            self.concept_aliases
+                .entry(slug.to_lowercase())
+                .or_default()
+                .insert(slug.clone());
+            if !pref_label.trim().is_empty() {
+                self.concept_aliases
+                    .entry(pref_label.trim().to_lowercase())
+                    .or_default()
+                    .insert(slug.clone());
+                self.concept_aliases
+                    .entry(pref_label.trim().to_string())
+                    .or_default()
+                    .insert(slug.clone());
+            }
+            for alt in &alt_labels {
+                let trimmed = alt.trim();
+                if !trimmed.is_empty() {
+                    self.concept_aliases
+                        .entry(trimmed.to_lowercase())
+                        .or_default()
+                        .insert(slug.clone());
+                    self.concept_aliases
+                        .entry(trimmed.to_string())
+                        .or_default()
+                        .insert(slug.clone());
+                    self.add_alt_label(slug, trimmed);
+                }
+            }
+            if let Some(ref iri) = concept_iri {
+                self.add_exact_match(slug, iri);
+            }
+
+            self.concepts.insert(
+                slug.clone(),
+                ConceptIndexEntry {
+                    memory_id: row_id.clone(),
+                    slug: slug.clone(),
+                    pref_label,
+                    alt_labels,
+                    definition,
+                    domain: domain_opt,
+                    concept_iri,
+                    broader: valid_broader,
+                    related: valid_related,
+                    contrasts_with: valid_contrasts,
+                    realization_status,
+                },
+            );
+        }
     }
 
     pub fn canonical_slug(&self, raw: &str) -> Option<String> {
@@ -1211,6 +1672,7 @@ pub fn clear_shacl_shapes(&mut self) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn subclasses_of_returns_descendants_and_superclasses_ancestors() {
@@ -1261,6 +1723,277 @@ mod tests {
             Some(&["ENFORCED".to_string(), "PARTIAL".to_string()][..]),
             "sh:in list values must be parsed, not left empty: {:?}",
             shapes[0].in_values
+        );
+    }
+
+    #[test]
+    fn add_related_sets_symmetric_relationships() {
+        let mut idx = OntologyIndex::from_entries(Vec::new());
+        idx.add_related("concept-a", "concept-b");
+        
+        assert_eq!(idx.related.get("concept-a"), Some(&BTreeSet::from(["concept-b".to_string()])));
+        assert_eq!(idx.related.get("concept-b"), Some(&BTreeSet::from(["concept-a".to_string()])));
+    }
+
+    #[test]
+    fn add_contrasts_with_sets_symmetric_relationships() {
+        let mut idx = OntologyIndex::from_entries(Vec::new());
+        idx.add_contrasts_with("concept-a", "concept-b");
+        
+        assert_eq!(idx.contrasts_with.get("concept-a"), Some(&BTreeSet::from(["concept-b".to_string()])));
+        assert_eq!(idx.contrasts_with.get("concept-b"), Some(&BTreeSet::from(["concept-a".to_string()])));
+    }
+
+    #[test]
+    fn concept_broader_of_returns_all_ancestors() {
+        let mut idx = OntologyIndex::from_entries(Vec::new());
+        idx.add_broader("child", "parent");
+        idx.add_broader("grandchild", "child");
+        
+        let broader = idx.concept_broader_of("grandchild");
+        assert!(broader.contains("child"));
+        assert!(broader.contains("parent"));
+        assert!(!broader.contains("grandchild"));
+    }
+
+    #[test]
+    fn concept_narrower_of_returns_all_descendants() {
+        let mut idx = OntologyIndex::from_entries(Vec::new());
+        idx.add_broader("child", "parent");
+        idx.add_broader("grandchild", "child");
+        
+        let narrower = idx.concept_narrower_of("parent");
+        assert!(narrower.contains("child"));
+        assert!(narrower.contains("grandchild"));
+        assert!(!narrower.contains("parent"));
+    }
+
+    #[test]
+    fn expand_concept_query_terms_with_direct_match() {
+        let mut idx = OntologyIndex::from_entries(Vec::new());
+        let entry = ConceptIndexEntry {
+            memory_id: "m1".to_string(),
+            slug: "concept-a".to_string(),
+            pref_label: "Concept Alpha".to_string(),
+            alt_labels: vec!["Alpha Concept".to_string(), "Concept A".to_string()],
+            definition: "A test concept".to_string(),
+            domain: None,
+            concept_iri: None,
+            broader: Vec::new(),
+            related: Vec::new(),
+            contrasts_with: Vec::new(),
+            realization_status: "unknown".to_string(),
+        };
+        idx.concepts.insert("concept-a".to_string(), entry);
+        
+        let expanded = idx.expand_concept_query_terms("concept-a");
+        assert!(expanded.contains("concept-a"));
+        assert!(expanded.contains("Concept Alpha"));
+        assert!(expanded.contains("Alpha Concept"));
+        assert!(expanded.contains("Concept A"));
+    }
+
+    #[test]
+    fn expand_concept_query_terms_with_related() {
+        let mut idx = OntologyIndex::from_entries(Vec::new());
+        let entry1 = ConceptIndexEntry {
+            memory_id: "m1".to_string(),
+            slug: "concept-a".to_string(),
+            pref_label: "Concept Alpha".to_string(),
+            alt_labels: vec![],
+            definition: "A test concept".to_string(),
+            domain: None,
+            concept_iri: None,
+            broader: Vec::new(),
+            related: Vec::new(),
+            contrasts_with: Vec::new(),
+            realization_status: "unknown".to_string(),
+        };
+        let entry2 = ConceptIndexEntry {
+            memory_id: "m2".to_string(),
+            slug: "concept-b".to_string(),
+            pref_label: "Concept Beta".to_string(),
+            alt_labels: vec!["Beta Concept".to_string()],
+            definition: "Another test concept".to_string(),
+            domain: None,
+            concept_iri: None,
+            broader: Vec::new(),
+            related: Vec::new(),
+            contrasts_with: Vec::new(),
+            realization_status: "unknown".to_string(),
+        };
+        idx.concepts.insert("concept-a".to_string(), entry1);
+        idx.concepts.insert("concept-b".to_string(), entry2);
+        idx.add_related("concept-a", "concept-b");
+        
+        let expanded = idx.expand_concept_query_terms("concept-a");
+        assert!(expanded.contains("concept-b"));
+        assert!(expanded.contains("Concept Beta"));
+        assert!(expanded.contains("Beta Concept"));
+    }
+
+    #[test]
+    fn load_concept_rows_filters_archived() {
+        let rows = vec![(
+            "mem-1".to_string(),
+            MemoryPayload {
+                content: "test".to_string(),
+                user_id: "user-1".to_string(),
+                memory_type: "concept".to_string(),
+                agent_name: None,
+                location: String::new(),
+                location_lines: String::new(),
+                metadata: json!({
+                    "archived": true,
+                    "concept": {"slug": "archived-concept"}
+                }),
+            },
+        )];
+        
+        let mut idx = OntologyIndex::from_entries(Vec::new());
+        idx.load_concept_rows(&rows, 1730000000);
+        
+        assert!(idx.concepts.is_empty());
+    }
+
+    #[test]
+    fn load_concept_rows_filters_non_public_access_policy() {
+        let rows = vec![(
+            "mem-1".to_string(),
+            MemoryPayload {
+                content: "test".to_string(),
+                user_id: "user-1".to_string(),
+                memory_type: "concept".to_string(),
+                agent_name: None,
+                location: String::new(),
+                location_lines: String::new(),
+                metadata: json!({
+                    "access_policy": {"public": false},
+                    "concept": {"slug": "private-concept"}
+                }),
+            },
+        )];
+        
+        let mut idx = OntologyIndex::from_entries(Vec::new());
+        idx.load_concept_rows(&rows, 1730000000);
+        
+        assert!(idx.concepts.is_empty());
+    }
+
+    #[test]
+    fn load_concept_rows_validates_dag() {
+        let rows = vec![(
+            "mem-1".to_string(),
+            MemoryPayload {
+                content: "test".to_string(),
+                user_id: "user-1".to_string(),
+                memory_type: "concept".to_string(),
+                agent_name: None,
+                location: String::new(),
+                location_lines: String::new(),
+                metadata: json!({
+                    "concept": {"slug": "concept-a", "broader": ["concept-a"]}
+                }),
+            },
+        )];
+        
+        let mut idx = OntologyIndex::from_entries(Vec::new());
+        idx.load_concept_rows(&rows, 1730000000);
+        
+        // Concept with self-loop broader should not be loaded
+        assert!(idx.concepts.is_empty());
+    }
+
+    #[test]
+    fn load_concept_rows_preserves_multi_target_alias_collisions_and_separates_subclasses() {
+        let rows = vec![
+            (
+                "mem-1".to_string(),
+                MemoryPayload {
+                    content: "Parent concept".to_string(),
+                    user_id: "user-1".to_string(),
+                    memory_type: "concept".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({
+                        "concept": {
+                            "slug": "consensus",
+                            "pref_label": "Distributed Consensus",
+                            "alt_labels": ["paxos-family"],
+                            "definition": "Agreement protocol across fault-tolerant nodes."
+                        }
+                    }),
+                },
+            ),
+            (
+                "mem-2".to_string(),
+                MemoryPayload {
+                    content: "Child concept A".to_string(),
+                    user_id: "user-1".to_string(),
+                    memory_type: "concept".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({
+                        "concept": {
+                            "slug": "raft-consensus",
+                            "pref_label": "Raft Consensus",
+                            "alt_labels": ["shared-alias", "paxos-family"],
+                            "broader": ["consensus"],
+                            "related": ["consensus"],
+                            "definition": "Leader-based consensus protocol."
+                        }
+                    }),
+                },
+            ),
+            (
+                "mem-3".to_string(),
+                MemoryPayload {
+                    content: "Child concept B".to_string(),
+                    user_id: "user-1".to_string(),
+                    memory_type: "concept".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({
+                        "concept": {
+                            "slug": "multi-paxos",
+                            "pref_label": "Multi-Paxos",
+                            "alt_labels": ["shared-alias", "paxos-family"],
+                            "broader": ["consensus"],
+                            "definition": "Multi-decree Paxos protocol."
+                        }
+                    }),
+                },
+            ),
+        ];
+
+        let mut idx = OntologyIndex::from_entries(Vec::new());
+        idx.load_concept_rows(&rows, 1730000000);
+
+        // Multi-target alias collision preserved (both raft-consensus and multi-paxos under "shared-alias")
+        let shared_targets = idx
+            .concept_aliases
+            .get("shared-alias")
+            .expect("shared-alias must exist");
+        assert!(shared_targets.contains("raft-consensus"));
+        assert!(shared_targets.contains("multi-paxos"));
+
+        // Derived narrower from canonical broader
+        let narrower = idx.concept_narrower_of("consensus");
+        assert!(narrower.contains("raft-consensus"));
+        assert!(narrower.contains("multi-paxos"));
+
+        // Strict separation from RDFS subClassOf
+        assert!(idx.subclasses_of("consensus").is_empty());
+
+        // SKOS S27 disjointness: related edge between raft-consensus and its ancestor consensus is rejected
+        assert!(
+            idx.related
+                .get("raft-consensus")
+                .map(|s| !s.contains("consensus"))
+                .unwrap_or(true)
         );
     }
 }

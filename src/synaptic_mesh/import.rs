@@ -62,7 +62,7 @@ pub const IMPORT_CURSOR_SCHEMA_VERSION: &str = "synaptic-mesh-import-cursor/v1";
 /// definitions). `action_receipt` and `structural` records are strictly
 /// node-local and never travel; anything unknown (future vocabulary) is
 /// rejected at import (hard error), never applied, never crash.
-const SHAREABLE_MEMORY_TYPES: [&str; 4] = ["rule", "fact", "procedure", "action_type"];
+const SHAREABLE_MEMORY_TYPES: [&str; 6] = ["rule", "fact", "procedure", "action_type", "thesis", "concept"];
 
 /// Runtime procedure counters are strictly local (spec §"Record format":
 /// "they never leave the node"). A shared record carrying ANY of these keys
