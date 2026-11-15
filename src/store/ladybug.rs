@@ -1601,6 +1601,18 @@ pub struct LadybugStore {
     /// use. The sidecar is the setup-time model choice's lock record:
     /// see `crate::model_choice::store_has_data`.
     store_state: Arc<std::sync::Mutex<Option<CachedStoreState>>>,
+    #[cfg(test)]
+    test_cleanup_dir: Option<TestCleanupDir>,
+}
+
+#[cfg(test)]
+struct TestCleanupDir(PathBuf);
+
+#[cfg(test)]
+impl Drop for TestCleanupDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// The store-state sidecar as this process knows it.
@@ -3143,6 +3155,8 @@ impl LadybugStore {
             db_preexisting,
             open_provenance,
             store_state: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            test_cleanup_dir: None,
         })
     }
 
@@ -5946,7 +5960,7 @@ impl LadybugStore {
         let mut out = Vec::new();
         for m in memories {
             let mt = m.payload.memory_type.as_str();
-            if !matches!(mt, "code_ast" | "markdown" | "directory" | "file") {
+            if !matches!(mt, "code_ast" | "symbol" | "markdown" | "directory" | "file") {
                 continue;
             }
             match crate::parser::ingest::split_scoped_id(&m.id) {
@@ -8235,7 +8249,29 @@ impl VectorStore for LadybugStore {
         // Parse shape warnings from the ORIGINAL payload before the write.
         let mut payload = payload;
         // AC3: canonicalize resolvable (unqualified) edge targets at write time.
-        {
+        let mut cached_symbol_ids: Option<std::sync::Arc<Vec<String>>> = None;
+        let has_unqualified_edge_target = [
+            "related_to",
+            "contained_by",
+            "governs",
+            "extracted_from",
+            "depends_on",
+        ]
+        .iter()
+        .any(|key| {
+            payload
+                .metadata
+                .get(*key)
+                .and_then(|v| v.as_array())
+                .map_or(false, |arr| {
+                    arr.iter().any(|item| {
+                        item.as_str().map_or(false, |s| {
+                            !s.contains(crate::parser::ingest::NAMESPACE_SEPARATOR)
+                        })
+                    })
+                })
+        });
+        if has_unqualified_edge_target {
             let ids = self.mention_symbol_ids(&namespace).await;
             let known = crate::store::ladybug::KnownIds::new(ids.iter().map(|s| s.as_str()));
             for key in [
@@ -8268,6 +8304,7 @@ impl VectorStore for LadybugStore {
                     }
                 }
             }
+            cached_symbol_ids = Some(ids);
         }
         // Capture raw topology before canonicalization (F17 preserve raw).
         let raw_topology_original: Option<serde_json::Value> = payload
@@ -8434,7 +8471,10 @@ impl VectorStore for LadybugStore {
         // Mention detection (OxiRS §1.8): only for agent/user-written rows.
         let mut mentions_for_write: Vec<String> = Vec::new();
         if payload.user_id != "auto-ingestor" {
-            let ids = self.mention_symbol_ids(&namespace).await;
+            let ids = match cached_symbol_ids {
+                Some(ids) => ids,
+                None => self.mention_symbol_ids(&namespace).await,
+            };
             let known = crate::store::ladybug::KnownIds::new(ids.iter().map(|s| s.as_str()));
             let mut mentions =
                 crate::mention::detect_mentions(&payload.content, &payload.location, &known);
@@ -8877,27 +8917,30 @@ impl VectorStore for LadybugStore {
 
             // Materialize mention edges (always delete old mention-detector rows,
             // then create fresh ones only if there are mentions to write).
-            // Deleting unconditionally is required: a re-upsert with no mentions
-            // must clear edges left from a previous upsert that did have them.
-            let del_q = format!(
-                "MATCH (a:Memory {{id: '{}'}})-[r:RELATES_TO]->(b:Memory) WHERE r.extractor = 'mention-detector' DELETE r",
-                escape_ladybug_string(&id)
-            );
-            if let Err(e) = conn.query(&del_q) {
-                tracing::warn!("stale mention-edge cleanup failed for '{namespace}:{id}': {e}");
-            }
-            for m in &mentions_for_write {
-                let m_safe = escape_ladybug_string(m);
-                let q = format!(
-                    "MATCH (a:Memory {{id: '{}'}}), (b:Memory {{id: '{}'}}) CREATE (a)-[:RELATES_TO {{source: '{}', valid_from: {}, valid_to: 0, generation: 0, extractor: 'mention-detector', evidence_id: '{}'}}]->(b)",
-                    escape_ladybug_string(&id),
-                    m_safe,
-                    escape_ladybug_string(&namespace),
-                    edge_now,
-                    escape_ladybug_string(&id),
+            // Deleting unconditionally is required for non-ingested rows: a
+            // re-upsert with no mentions must clear edges left from a previous
+            // upsert that did have them. Ingested rows never carry mention edges.
+            if payload.user_id != "auto-ingestor" {
+                let del_q = format!(
+                    "MATCH (a:Memory {{id: '{}'}})-[r:RELATES_TO]->(b:Memory) WHERE r.extractor = 'mention-detector' DELETE r",
+                    escape_ladybug_string(&id)
                 );
-                if let Err(e) = conn.query(&q) {
-                    tracing::warn!("mention-edge creation failed for '{namespace}:{id}': {e}");
+                if let Err(e) = conn.query(&del_q) {
+                    tracing::warn!("stale mention-edge cleanup failed for '{namespace}:{id}': {e}");
+                }
+                for m in &mentions_for_write {
+                    let m_safe = escape_ladybug_string(m);
+                    let q = format!(
+                        "MATCH (a:Memory {{id: '{}'}}), (b:Memory {{id: '{}'}}) CREATE (a)-[:RELATES_TO {{source: '{}', valid_from: {}, valid_to: 0, generation: 0, extractor: 'mention-detector', evidence_id: '{}'}}]->(b)",
+                        escape_ladybug_string(&id),
+                        m_safe,
+                        escape_ladybug_string(&namespace),
+                        edge_now,
+                        escape_ladybug_string(&id),
+                    );
+                    if let Err(e) = conn.query(&q) {
+                        tracing::warn!("mention-edge creation failed for '{namespace}:{id}': {e}");
+                    }
                 }
             }
 
@@ -9698,7 +9741,9 @@ impl VectorStore for LadybugStore {
                         mention_pairs.push((memory.id.clone(), m.clone()));
                     }
                 }
-                mention_updates.push((memory.id.clone(), meta.to_string()));
+                if meta != memory.payload.metadata {
+                    mention_updates.push((memory.id.clone(), meta.to_string()));
+                }
             }
         }
 
@@ -9719,16 +9764,38 @@ impl VectorStore for LadybugStore {
 
         let namespace_owned = namespace.to_string();
         self.write_with_deadline("relinking the graph", move |conn| {
-            // Update mentions metadata rows.
-            for (id, meta) in &mention_updates {
-                let q = format!(
-                    "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' SET m.metadata = '{}'",
-                    escape_ladybug_string(&namespace_owned),
-                    escape_ladybug_string(id),
-                    escape_ladybug_string(meta)
+            // Update only mentions metadata rows that actually changed, batched
+            // via UNWIND to avoid a separate write transaction per memory.
+            for chunk in mention_updates.chunks(100) {
+                let list = chunk
+                    .iter()
+                    .map(|(id, meta)| {
+                        format!(
+                            "{{id: '{}', meta: '{}'}}",
+                            escape_ladybug_string(id),
+                            escape_ladybug_string(meta)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let batch_q = format!(
+                    "UNWIND [{}] AS u MATCH (m:Memory {{id: u.id}}) WHERE m.namespace = '{}' SET m.metadata = u.meta",
+                    list,
+                    escape_ladybug_string(&namespace_owned)
                 );
-                if let Err(e) = conn.query(&q) {
-                    tracing::warn!("relink: mentions metadata write failed for {id}: {e}");
+                if let Err(e) = conn.query(&batch_q) {
+                    tracing::warn!("relink: mentions metadata batch write failed ({e}), falling back to per-row");
+                    for (id, meta) in chunk {
+                        let q = format!(
+                            "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' SET m.metadata = '{}'",
+                            escape_ladybug_string(&namespace_owned),
+                            escape_ladybug_string(id),
+                            escape_ladybug_string(meta)
+                        );
+                        if let Err(row_err) = conn.query(&q) {
+                            tracing::warn!("relink: mentions metadata write failed for {id}: {row_err}");
+                        }
+                    }
                 }
             }
             // Retire stubs before replaying edges: the replayed declaration
@@ -9739,15 +9806,33 @@ impl VectorStore for LadybugStore {
             for (rel_type, pairs) in &wanted {
                 created += create_missing_edges(conn, rel_type, pairs, &namespace_owned, active_gen, relink_now, "relink")?;
             }
-            // Delete old mention-detector edges, then recreate.
-            let del_q = format!(
-                "MATCH (a:Memory)-[r:RELATES_TO]->(b:Memory) WHERE a.namespace = '{}' AND r.extractor = 'mention-detector' DELETE r",
+            // Only delete existing mention-detector edges if any are stale
+            // (not present in the current mention_pairs set).
+            let wanted_mention_set: std::collections::HashSet<&(String, String)> =
+                mention_pairs.iter().collect();
+            let existing_mention_q = format!(
+                "MATCH (a:Memory)-[r:RELATES_TO]->(b:Memory) WHERE a.namespace = '{}' AND r.extractor = 'mention-detector' RETURN a.id, b.id",
                 escape_ladybug_string(&namespace_owned)
             );
-            if let Err(e) = conn.query(&del_q) {
-                tracing::warn!("relink: mention-detector edge cleanup failed: {e}");
+            let has_stale_mention_edges = match conn.query(&existing_mention_q) {
+                Ok(rows) => rows.into_iter().any(|row| {
+                    let pair = (format!("{}", row[0]), format!("{}", row[1]));
+                    !wanted_mention_set.contains(&pair)
+                }),
+                Err(_) => true,
+            };
+            if has_stale_mention_edges {
+                let del_q = format!(
+                    "MATCH (a:Memory)-[r:RELATES_TO]->(b:Memory) WHERE a.namespace = '{}' AND r.extractor = 'mention-detector' DELETE r",
+                    escape_ladybug_string(&namespace_owned)
+                );
+                if let Err(e) = conn.query(&del_q) {
+                    tracing::warn!("relink: mention-detector edge cleanup failed: {e}");
+                }
             }
-            created += create_missing_edges(conn, "RELATES_TO", &mention_pairs, &namespace_owned, active_gen, relink_now, "mention-detector")?;
+            if !mention_pairs.is_empty() {
+                created += create_missing_edges(conn, "RELATES_TO", &mention_pairs, &namespace_owned, active_gen, relink_now, "mention-detector")?;
+            }
             Ok(created)
         })
         .await
@@ -13342,7 +13427,10 @@ eurostrata\src\daemon.rs",
 
     async fn retired_test_store() -> LadybugStore {
         let dir = std::env::temp_dir().join(format!("ns-retired-{}", uuid::Uuid::new_v4()));
-        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        std::fs::create_dir_all(&dir).expect("create temp test dir");
+        let mut store =
+            LadybugStore::for_testing(dir.join("db"), 4).expect("open temp database");
+        store.test_cleanup_dir = Some(TestCleanupDir(dir));
         store.init("probe").await.expect("create the schema");
         store
     }
@@ -15421,7 +15509,10 @@ eurostrata\src\daemon.rs",
     /// it -- absolute -- and the file itself.
     async fn store_with_two_declarations() -> LadybugStore {
         let dir = std::env::temp_dir().join(format!("ns-relink-{}", uuid::Uuid::new_v4()));
-        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        std::fs::create_dir_all(&dir).expect("create temp test dir");
+        let mut store =
+            LadybugStore::for_testing(dir.join("db"), 4).expect("open temp database");
+        store.test_cleanup_dir = Some(TestCleanupDir(dir));
         store.init("probe").await.expect("create the schema");
 
         let seed = |id: &str, metadata: &str| {
@@ -15510,6 +15601,102 @@ eurostrata\src\daemon.rs",
         assert_eq!(governs_count(&store).await, 2);
     }
 
+    #[tokio::test]
+    async fn relinking_twice_with_mentions_creates_nothing_the_second_time() {
+        let store = retired_test_store().await;
+        let sym_id = crate::parser::ingest::generation_scoped_id(
+            "probe",
+            1,
+            "src/a.rs#functions:compute_relink_digest",
+        );
+        store
+            .upsert(
+                "probe",
+                &sym_id,
+                vec![0.0; 4],
+                retired_test_payload("symbol", "auto-ingestor", json!({})),
+            )
+            .await
+            .unwrap();
+        store
+            .publish_generation("probe", PROBE_SOURCE, 1)
+            .await
+            .unwrap();
+
+        let mut rule_payload = retired_test_payload("rule", "agent", json!({}));
+        rule_payload.content = "Always validate compute_relink_digest before publishing.".into();
+        store
+            .upsert("probe", "rule-mention", vec![0.0; 4], rule_payload)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .relink_edges("probe", PROBE_SOURCE)
+                .await
+                .expect("first relink after upsert with mentions"),
+            0,
+            "upsert already created the mention-detector edge, so relink creates nothing"
+        );
+        assert_eq!(
+            store
+                .relink_edges("probe", PROBE_SOURCE)
+                .await
+                .expect("second relink"),
+            0,
+            "repeating relink does not delete and recreate unchanged mention-detector edges"
+        );
+
+        // Publish generation 2 so the mentioned symbol's scoped ID changes:
+        // relink_edges must update metadata["mentions"] via UNWIND and replace
+        // the stale gen-1 mention edge once, then do nothing on a repeat pass.
+        let sym_id_gen2 = crate::parser::ingest::generation_scoped_id(
+            "probe",
+            2,
+            "src/a.rs#functions:compute_relink_digest",
+        );
+        store
+            .upsert(
+                "probe",
+                &sym_id_gen2,
+                vec![0.0; 4],
+                retired_test_payload("symbol", "auto-ingestor", json!({})),
+            )
+            .await
+            .unwrap();
+        store
+            .publish_generation("probe", PROBE_SOURCE, 2)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .relink_edges("probe", PROBE_SOURCE)
+                .await
+                .expect("relink after gen 2"),
+            1,
+            "new generation re-targets the mention edge once"
+        );
+        let updated_rule = store
+            .get("probe", "rule-mention")
+            .await
+            .unwrap()
+            .expect("rule exists");
+        assert_eq!(
+            updated_rule.1.metadata.get("mentions"),
+            Some(&json!([sym_id_gen2])),
+            "mentions metadata updated to generation 2 symbol id"
+        );
+        assert_eq!(
+            store
+                .relink_edges("probe", PROBE_SOURCE)
+                .await
+                .expect("repeat relink after gen 2"),
+            0,
+            "repeating relink after gen 2 creates nothing"
+        );
+    }
+
     /// Regression guard for task neurostrata-c8te (parallel-test mmap flake):
     /// `LadybugStore::for_testing` MUST use a small enough max_db_size +
     /// buffer_pool_size that N parallel opens don't trip the 8 TiB mmap
@@ -15536,10 +15723,13 @@ eurostrata\src\daemon.rs",
                     std::process::id(),
                     i
                 ));
+                let _ = std::fs::create_dir_all(&dir);
                 b.wait();
-                LadybugStore::for_testing(&dir, 4)
+                let res = LadybugStore::for_testing(dir.join("db"), 4)
                     .map(|_| ())
-                    .map_err(|e| format!("thread {} failed to open: {}", i, e))
+                    .map_err(|e| format!("thread {} failed to open: {}", i, e));
+                let _ = std::fs::remove_dir_all(&dir);
+                res
             }));
         }
         for h in handles {
