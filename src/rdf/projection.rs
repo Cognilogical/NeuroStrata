@@ -627,11 +627,7 @@ pub fn memory_to_quads(
             format!("http://www.w3.org/2004/02/skos/core#{name}")
         };
         let concept_node_for_slug = |slug_str: &str| -> NamedNode {
-            NamedNode::new_unchecked(format!(
-                "urn:neurostrata:concept:{}:{}",
-                sanitize_iri_suffix(namespace),
-                sanitize_iri_suffix(slug_str)
-            ))
+            canonical_concept_node(namespace, slug_str, None)
         };
         if let Some(c) = payload.metadata.get("concept").and_then(|v| v.as_object()) {
             let slug = c
@@ -639,7 +635,11 @@ pub fn memory_to_quads(
                 .and_then(|v| v.as_str())
                 .unwrap_or(id)
                 .to_string();
-            let concept_nn = concept_node_for_slug(&slug);
+            let concept_nn = canonical_concept_node(
+                namespace,
+                &slug,
+                c.get("concept_iri").and_then(|v| v.as_str()),
+            );
             let concept_subject = NamedOrBlankNode::NamedNode(concept_nn.clone());
             macro_rules! push_concept_quad {
                 ($subj:expr, $pred:expr, $obj:expr) => {
@@ -1192,6 +1192,28 @@ pub fn twin_schema_and_reducer_quads_for_row(
     quads
 }
 
+/// Construct the canonical SKOS concept IRI (`urn:neurostrata:concept:{namespace}:{slug}`)
+/// per Spec §4.2, honoring an explicit valid `custom_iri` when present.
+pub fn canonical_concept_node(
+    namespace: &str,
+    slug: &str,
+    custom_iri: Option<&str>,
+) -> NamedNode {
+    if let Some(iri) = custom_iri.map(str::trim).filter(|s| !s.is_empty()) {
+        if NamedNode::new(iri).is_ok() {
+            return NamedNode::new_unchecked(iri.to_string());
+        }
+    }
+    if slug.contains(':') && NamedNode::new(slug).is_ok() {
+        return NamedNode::new_unchecked(slug.to_string());
+    }
+    NamedNode::new_unchecked(format!(
+        "urn:neurostrata:concept:{}:{}",
+        sanitize_iri_suffix(namespace),
+        sanitize_iri_suffix(slug)
+    ))
+}
+
 /// Reconcile a `concept` row's projected RDF quads (`ns:epistemicStatus`, derived `skos:narrower`,
 /// and symmetrized `skos:related` / `ns:contrastsWith`) against the multi-row
 /// [`crate::rdf::taxonomy::PrincipalTaxonomyView`] so SPARQL and dataset exports agree 100%
@@ -1229,14 +1251,13 @@ pub fn reconcile_concept_quads_with_view(
     let subject = NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(format!(
         "urn:neurostrata:memory:{id}"
     )));
-    let concept_subject_iri = c
-        .get("concept_iri")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.trim().is_empty() && NamedNode::new(*s).is_ok())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("urn:neurostrata:concept:{}", sanitize_iri_suffix(slug)));
-    let concept_subject =
-        NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(concept_subject_iri));
+    let concept_subject = NamedOrBlankNode::NamedNode(canonical_concept_node(
+        namespace,
+        slug,
+        c.get("concept_iri")
+            .and_then(|v| v.as_str())
+            .or(hydrated.concept_iri.as_deref()),
+    ));
 
     let ep_pred = NamedNode::new_unchecked(ns_predicate("epistemicStatus"));
     quads.retain(|q| q.predicate != ep_pred);
@@ -1261,21 +1282,13 @@ pub fn reconcile_concept_quads_with_view(
     let ns_contrasts = NamedNode::new_unchecked(ns_predicate("contrastsWith"));
 
     let concept_node_for_slug = |target_slug: &str| -> NamedNode {
-        if let Some(tc) = view.concepts.get(target_slug) {
-            if let Some(ref iri) = tc.concept_iri {
-                if !iri.trim().is_empty() && NamedNode::new(iri).is_ok() {
-                    return NamedNode::new_unchecked(iri.clone());
-                }
-            }
-        }
-        if NamedNode::new(target_slug).is_ok() && target_slug.contains(':') {
-            NamedNode::new_unchecked(target_slug.to_string())
-        } else {
-            NamedNode::new_unchecked(format!(
-                "urn:neurostrata:concept:{}",
-                sanitize_iri_suffix(target_slug)
-            ))
-        }
+        canonical_concept_node(
+            namespace,
+            target_slug,
+            view.concepts
+                .get(target_slug)
+                .and_then(|tc| tc.concept_iri.as_deref()),
+        )
     };
 
     for n_slug in &hydrated.narrower {

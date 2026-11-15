@@ -422,7 +422,9 @@ fn build_record(
 
     let mut relationships: Vec<Relationship> = Vec::new();
     if let Some(supersedes) = entry.metadata.get("supersedes").and_then(|v| v.as_str()) {
-        if let Ok(target) = Uuid::parse_str(supersedes) {
+        if let Some(target) =
+            parse_or_derive_mesh_uuid(&entry.namespace, &entry.memory_type, supersedes)
+        {
             relationships.push(Relationship {
                 kind: "supersedes".to_string(),
                 target,

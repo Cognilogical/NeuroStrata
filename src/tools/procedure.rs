@@ -290,7 +290,7 @@ pub(crate) fn procedures_due_strap_filtered(
                 };
                 domains.iter().any(|d| {
                     let slug = crate::domain::normalize_domain_slug(d).unwrap_or_else(|| d.to_lowercase());
-                    slug == needle || needle == slug || d.to_lowercase() == needle
+                    slug == needle || d.to_lowercase() == needle
                 })
             }).unwrap_or(false);
             trigger.contains(&needle) || content_ok || domain_ok

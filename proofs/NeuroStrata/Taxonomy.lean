@@ -195,6 +195,21 @@ theorem verified_requires_all_pillars (d : Bool) (t : Bool) (s : Bool) (g : Bool
 ## 2. Taxonomy DAG General Cycle-Rejection Theorems
 -/
 
+/-- External inductive multi-step directed walk of length `steps` in `edges`. -/
+inductive DirectedWalk (edges : List (Nat × Nat)) : Nat → Nat → Nat → Prop where
+  | refl (u : Nat) : DirectedWalk edges 0 u u
+  | step {k u v w : Nat} :
+      (u, v) ∈ edges →
+      DirectedWalk edges k v w →
+      DirectedWalk edges (k + 1) u w
+
+theorem list_contains_of_mem
+    (xs : List Nat)
+    (x : Nat)
+    (hx : x ∈ xs) :
+    xs.contains x = true := by
+  exact List.contains_iff_mem.mpr hx
+
 theorem mem_reachableWithin_of_mem
     (fuel : Nat)
     (edges : List (Nat × Nat))
@@ -232,6 +247,45 @@ theorem mem_reachableWithin_step
   apply mem_reachableWithin_of_mem
   exact List.mem_append_right _ (stepTargets_mem_of_edge edges frontier e hEdge hSrc)
 
+theorem directedWalk_mem_reachableWithin
+    {edges : List (Nat × Nat)}
+    {k u w : Nat}
+    (hWalk : DirectedWalk edges k u w)
+    (fuel : Nat)
+    (frontier : List Nat)
+    (hFuel : k ≤ fuel)
+    (hu : u ∈ frontier) :
+    w ∈ reachableWithin fuel edges frontier := by
+  induction hWalk generalizing fuel frontier with
+  | refl u =>
+    exact mem_reachableWithin_of_mem fuel edges frontier u hu
+  | @step k' u' v' w' hEdge hRest ih =>
+    cases fuel with
+    | zero => omega
+    | succ fuel' =>
+      have hFuel' : k' ≤ fuel' := by omega
+      unfold reachableWithin
+      apply ih fuel' (frontier ++ stepTargets edges frontier) hFuel'
+      apply List.mem_append_right
+      have hContains : frontier.contains (u', v').1 = true :=
+        list_contains_of_mem frontier u' hu
+      exact stepTargets_mem_of_edge edges frontier (u', v') hEdge hContains
+
+theorem directedWalk_implies_broaderReaches
+    (edges : List (Nat × Nat))
+    (k src dst : Nat)
+    (hLen : k ≤ edges.length + 1)
+    (hWalk : DirectedWalk edges k src dst) :
+    broaderReaches edges src dst = true := by
+  unfold broaderReaches
+  apply list_contains_of_mem
+  exact directedWalk_mem_reachableWithin
+    hWalk
+    (edges.length + 1)
+    [src]
+    hLen
+    (List.mem_singleton.mpr rfl)
+
 theorem dag_rejects_self_loop_edge
     (edges : List (Nat × Nat))
     (e : Nat × Nat)
@@ -257,6 +311,30 @@ theorem dag_rejects_directed_cycle_edge
   by_cases hSelf : hasSelfLoop edges = true
   · simp [hSelf]
   · simp [hSelf, hCyc]
+
+theorem dag_rejects_cycle_walk
+    (edges : List (Nat × Nat))
+    (k u v : Nat)
+    (hEdge : (u, v) ∈ edges)
+    (hLen : k ≤ edges.length + 1)
+    (hReturnWalk : DirectedWalk edges k v u) :
+    validateTaxonomyDag edges = false := by
+  have hReach : broaderReaches edges v u = true :=
+    directedWalk_implies_broaderReaches edges k v u hLen hReturnWalk
+  exact dag_rejects_directed_cycle_edge edges (u, v) hEdge hReach
+
+theorem dag_valid_no_nonempty_closed_walk
+    (edges : List (Nat × Nat))
+    (hValid : validateTaxonomyDag edges = true)
+    (k u : Nat)
+    (hLen : k ≤ edges.length + 1)
+    (hClosed : DirectedWalk edges (k + 1) u u) :
+    False := by
+  cases hClosed with
+  | step hEdge hRest =>
+    have hRej := dag_rejects_cycle_walk edges k u _ hEdge hLen hRest
+    rw [hValid] at hRej
+    contradiction
 
 theorem dag_valid_implies_no_self_loop_or_cycle
     (edges : List (Nat × Nat))
@@ -374,6 +452,43 @@ theorem skos_disjointness_sound
     | false =>
       have hRej := skos_disjointness_rejects_contrast_violation broader related contrast e hMem hPair
       rw [hOk] at hRej
+      contradiction
+
+theorem skos_disjointness_sound_for_all_walks
+    (broader : List (Nat × Nat))
+    (related : List (Nat × Nat))
+    (contrast : List (Nat × Nat))
+    (hOk : validateSkosDisjointness broader related contrast = true) :
+    (∀ k u, k ≤ broader.length + 1 → ¬ DirectedWalk broader (k + 1) u u) ∧
+    (∀ e ∈ related, ∀ k, k ≤ broader.length + 1 →
+      ¬ DirectedWalk broader k e.1 e.2 ∧ ¬ DirectedWalk broader k e.2 e.1) ∧
+    (∀ e ∈ contrast, ∀ k, k ≤ broader.length + 1 →
+      ¬ DirectedWalk broader k e.1 e.2 ∧ ¬ DirectedWalk broader k e.2 e.1) := by
+  have ⟨hDag, hRel, hCon⟩ := skos_disjointness_sound broader related contrast hOk
+  refine ⟨?_, ?_, ?_⟩
+  · intro k u hLen hClosed
+    exact dag_valid_no_nonempty_closed_walk broader hDag k u hLen hClosed
+  · intro e hMem k hLen
+    have ⟨_, hNoFwd, hNoRev⟩ := hRel e hMem
+    constructor
+    · intro hWalkFwd
+      have hR := directedWalk_implies_broaderReaches broader k e.1 e.2 hLen hWalkFwd
+      rw [hNoFwd] at hR
+      contradiction
+    · intro hWalkRev
+      have hR := directedWalk_implies_broaderReaches broader k e.2 e.1 hLen hWalkRev
+      rw [hNoRev] at hR
+      contradiction
+  · intro e hMem k hLen
+    have ⟨_, hNoFwd, hNoRev⟩ := hCon e hMem
+    constructor
+    · intro hWalkFwd
+      have hR := directedWalk_implies_broaderReaches broader k e.1 e.2 hLen hWalkFwd
+      rw [hNoFwd] at hR
+      contradiction
+    · intro hWalkRev
+      have hR := directedWalk_implies_broaderReaches broader k e.2 e.1 hLen hWalkRev
+      rw [hNoRev] at hR
       contradiction
 
 /-!

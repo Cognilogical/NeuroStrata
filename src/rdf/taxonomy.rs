@@ -622,6 +622,7 @@ pub(crate) fn validate_concept_forest(
 
 /// Internal principal-filtered snapshot of a namespace's thesis, hydrated concepts, and active rows.
 pub struct PrincipalTaxonomyView {
+    #[allow(dead_code)]
     pub thesis_id: Option<String>,
     pub thesis: Option<ThesisSpec>,
     pub thesis_is_public: bool,
@@ -4373,8 +4374,36 @@ mod tests {
         .await
         .expect("child-concept");
 
+        let (active_rows, active_edges) =
+            load_active_rows_and_edges(&store, ns, chrono::Utc::now().timestamp())
+                .await
+                .unwrap();
+        let quads = crate::rdf::projection::rows_to_quads(
+            &active_rows,
+            ns,
+            crate::rdf::Tier::Domain,
+            1,
+            &active_edges,
+        );
+        let canonical_child_iri = "urn:neurostrata:concept:tax-sparql-parity:child-concept";
+        assert!(
+            quads.iter().any(|q| {
+                q.subject == canonical_child_iri
+                    && q.predicate == "urn:neurostrata:ns#epistemicStatus"
+                    && matches!(&q.object, crate::rdf::QuadObject::Literal { value, .. } if value == "verified")
+            }),
+            "rows_to_quads must attach reconciled verified epistemicStatus to canonical concept IRI: {quads:?}"
+        );
+        assert!(
+            !quads.iter().any(|q| {
+                q.subject == "urn:neurostrata:concept:child-concept"
+                    || matches!(&q.object, crate::rdf::QuadObject::Iri(iri) if iri == "urn:neurostrata:concept:child-concept")
+            }),
+            "rows_to_quads must not emit non-namespace concept IRIs: {quads:?}"
+        );
+
         let (sparql_str, count, _, _) = crate::rdf::sparql::execute_sparql_query(
-            "SELECT ?status ?child WHERE { <urn:neurostrata:concept:child-concept> <urn:neurostrata:ns#epistemicStatus> ?status . <urn:neurostrata:concept:parent-concept> <http://www.w3.org/2004/02/skos/core#narrower> ?child }",
+            "SELECT ?status ?child WHERE { <urn:neurostrata:concept:tax-sparql-parity:child-concept> <urn:neurostrata:ns#epistemicStatus> ?status . <urn:neurostrata:concept:tax-sparql-parity:parent-concept> <http://www.w3.org/2004/02/skos/core#narrower> ?child }",
             ns,
             sparesults::QueryResultsFormat::Json,
             false,
@@ -4389,8 +4418,8 @@ mod tests {
             "SPARQL must report verified epistemicStatus matching taxonomy view: {sparql_str}"
         );
         assert!(
-            sparql_str.contains("urn:neurostrata:concept:child-concept"),
-            "SPARQL must project inverse skos:narrower on parent-concept: {sparql_str}"
+            sparql_str.contains("urn:neurostrata:concept:tax-sparql-parity:child-concept"),
+            "SPARQL must project inverse skos:narrower on canonical parent-concept IRI: {sparql_str}"
         );
     }
 
@@ -4421,6 +4450,213 @@ mod tests {
             "not-a-uuid"
         )
         .is_none());
+
+        // End-to-end ThalamicBus + CLI outbox tee -> drain_once -> apply_changed round-trip
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src_store: Arc<dyn VectorStore> =
+            Arc::new(LadybugStore::new(&tmp.path().join("src_db"), 4).expect("src_store"));
+        let peer_lb = Arc::new(LadybugStore::new(&tmp.path().join("peer_db"), 4).expect("peer_lb"));
+        let peer_store: Arc<dyn VectorStore> = peer_lb.clone();
+        let emb: Arc<dyn Embedder> = Arc::new(DummyEmbedder(4));
+        let ns = "tax-mesh-rt";
+        src_store.init(ns).await.expect("init src");
+        peer_store.init(ns).await.expect("init peer");
+
+        let mesh_base = tmp.path().join("mesh_base");
+        std::fs::create_dir_all(&mesh_base).unwrap();
+        let mesh = crate::synaptic_mesh::storage::MeshStorage::init(
+            &mesh_base,
+            "node-author",
+            "team",
+            &[ns.to_string()],
+            None,
+        )
+        .expect("init mesh");
+        let project_root = tmp.path().join("proj");
+        std::fs::create_dir_all(project_root.join(".NeuroStrata")).unwrap();
+        crate::synaptic_mesh::storage::MeshStorage::write_pointer(
+            &project_root,
+            mesh.manifest().mesh_id,
+            mesh.root(),
+            None,
+        )
+        .expect("write pointer");
+        let outbox_dir = crate::synaptic_mesh::outbox::outbox_dir_for(mesh.root());
+        let outbox = crate::synaptic_mesh::outbox::Outbox::open(&outbox_dir).expect("open outbox");
+
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let bus = Arc::new(crate::events::ThalamicBus::new(16));
+        bus.attach_store(src_store.clone());
+        bus.register(Box::new(
+            crate::events::subscribers::MeshOutbox::new(
+                outbox_dir.clone(),
+                wake,
+                mesh.manifest().epoch,
+            )
+            .expect("mesh outbox subscriber"),
+        ));
+
+        // 1. Write shareable thesis via handle_taxonomy_with_bus (daemon/MCP path)
+        let thesis_out = crate::handlers::taxonomy::handle_taxonomy_with_bus(
+            &json!({
+                "operation": "set_thesis",
+                "namespace": ns,
+                "primary_domain": "cognitive-memory",
+                "mission": "Shared mission across mesh",
+                "direction": "Deterministic ontology sync",
+                "core_pillars": ["graph-rag"],
+                "eligibility": "shareable"
+            }),
+            emb.clone(),
+            src_store.clone(),
+            Some(bus.clone()),
+        )
+        .await;
+        assert!(thesis_out.contains("\"ok\": true"), "thesis_out: {thesis_out}");
+
+        // 2. Write shareable concept via handle_taxonomy + tee_taxonomy_pulse_to_project_outbox (CLI fallback path)
+        let concept_out = crate::handlers::taxonomy::handle_taxonomy_with_bus(
+            &json!({
+                "operation": "upsert_concept",
+                "namespace": ns,
+                "slug": "shared-concept",
+                "pref_label": "Shared Concept",
+                "definition": "Concept exported over SynapticMesh",
+                "domain": "graph-rag",
+                "realization_status": "partial",
+                "frontier_opportunities": ["Cross-node SKOS alignment"],
+                "eligibility": "shareable"
+            }),
+            emb.clone(),
+            src_store.clone(),
+            None,
+        )
+        .await;
+        assert!(concept_out.contains("\"ok\": true"), "concept_out: {concept_out}");
+        crate::handlers::taxonomy::tee_taxonomy_pulse_to_project_outbox(
+            &project_root,
+            src_store.as_ref(),
+            ns,
+            &crate::events::ThalamicPulse::Created {
+                id: "concept-shared-concept-v1".to_string(),
+                namespace: ns.to_string(),
+                kind: "concept".to_string(),
+            },
+        )
+        .await;
+
+        // Wait briefly for the bus dispatcher to flush thesis-v1 to outbox.wal
+        for _ in 0..20 {
+            if outbox.pending().unwrap().len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            outbox.pending().unwrap().len() >= 2,
+            "both thesis and concept must be queued in outbox.wal"
+        );
+
+        let drain_rep =
+            crate::synaptic_mesh::worker::drain_once(&outbox, &mesh, "node-author").expect("drain");
+        assert_eq!(drain_rep.applied, 2, "drain_rep: {drain_rep:?}");
+        assert!(drain_rep.committed);
+
+        let import_rep = crate::synaptic_mesh::import::apply_changed(
+            &mesh,
+            &[ns.to_string()],
+            peer_store.clone(),
+            emb.clone(),
+        )
+        .await
+        .expect("apply_changed");
+        assert_eq!(import_rep.applied, 2, "import_rep: {import_rep:?}");
+
+        let peer_briefing = execute_taxonomy(
+            &peer_lb,
+            emb.as_ref(),
+            TaxonomyRequest {
+                operation: "briefing".to_string(),
+                namespace: ns.to_string(),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("peer briefing");
+        assert_eq!(
+            peer_briefing["thesis"]["mission"].as_str(),
+            Some("Shared mission across mesh")
+        );
+        assert_eq!(
+            peer_briefing["matched_concepts"].as_array().map(|a| a.len()),
+            Some(1)
+        );
+        assert_eq!(
+            peer_briefing["matched_concepts"][0]["slug"].as_str(),
+            Some("shared-concept")
+        );
+
+        // 3. Supersede thesis-v1 -> thesis-v2 via handle_taxonomy_with_bus (single Superseded pulse)
+        let thesis_v2_out = crate::handlers::taxonomy::handle_taxonomy_with_bus(
+            &json!({
+                "operation": "set_thesis",
+                "namespace": ns,
+                "primary_domain": "cognitive-memory",
+                "mission": "Updated mission v2 across mesh",
+                "direction": "Deterministic ontology sync v2",
+                "core_pillars": ["graph-rag"],
+                "eligibility": "shareable"
+            }),
+            emb.clone(),
+            src_store.clone(),
+            Some(bus.clone()),
+        )
+        .await;
+        assert!(
+            thesis_v2_out.contains("\"superseded_id\": \"thesis-v1\""),
+            "thesis_v2_out: {thesis_v2_out}"
+        );
+        for _ in 0..20 {
+            if outbox.pending().unwrap().len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            outbox.pending().unwrap().len(),
+            2,
+            "single Superseded pulse must queue exactly 2 outbox entries (OP_SUPERSEDED + OP_CREATED)"
+        );
+        let drain_rep_v2 =
+            crate::synaptic_mesh::worker::drain_once(&outbox, &mesh, "node-author")
+                .expect("drain v2");
+        assert_eq!(drain_rep_v2.applied, 2, "drain_rep_v2: {drain_rep_v2:?}");
+        let import_rep_v2 = crate::synaptic_mesh::import::apply_changed(
+            &mesh,
+            &[ns.to_string()],
+            peer_store.clone(),
+            emb.clone(),
+        )
+        .await
+        .expect("apply_changed v2");
+        assert_eq!(import_rep_v2.applied, 2, "import_rep_v2: {import_rep_v2:?}");
+        let peer_briefing_v2 = execute_taxonomy(
+            &peer_lb,
+            emb.as_ref(),
+            TaxonomyRequest {
+                operation: "briefing".to_string(),
+                namespace: ns.to_string(),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("peer briefing v2");
+        assert_eq!(
+            peer_briefing_v2["thesis"]["mission"].as_str(),
+            Some("Updated mission v2 across mesh")
+        );
 
         // SHACL validation for thesis & concept
         let bad_thesis = MemoryPayload {
