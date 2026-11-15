@@ -159,4 +159,72 @@ theorem liveSuccessor_two_node_cycle_returns_none (now : Int) :
   unfold liveSuccessor
   simp
 
+inductive ClaimScopeVerdict where
+  | blockUnscoped
+  | blockUncapturableScope
+  | blockLegacyUnattributed
+  | blockBranchMatch
+  | blockWorktreeMatch
+  | allowIsolatedScope
+  deriving DecidableEq, Repr
+
+def ClaimScopeVerdict.blocks : ClaimScopeVerdict → Bool
+  | .allowIsolatedScope => false
+  | _ => true
+
+def ClaimScopeVerdict.asTag : ClaimScopeVerdict → String
+  | .blockUnscoped => "block_unscoped"
+  | .blockUncapturableScope => "block_uncapturable_scope"
+  | .blockLegacyUnattributed => "block_legacy_unattributed"
+  | .blockBranchMatch => "block_branch_match"
+  | .blockWorktreeMatch => "block_worktree_match"
+  | .allowIsolatedScope => "allow_isolated_scope"
+
+@[simp]
+def evaluateClaimScopeGate
+    (isScoped callerId claimAttr branchMatch wtMatch : Bool) : ClaimScopeVerdict :=
+  if !isScoped then .blockUnscoped
+  else if !callerId then .blockUncapturableScope
+  else if !claimAttr then .blockLegacyUnattributed
+  else if branchMatch then .blockBranchMatch
+  else if wtMatch then .blockWorktreeMatch
+  else .allowIsolatedScope
+
+theorem unscoped_always_blocks :
+    ∀ (callerId claimAttr branchMatch wtMatch : Bool),
+      (evaluateClaimScopeGate false callerId claimAttr branchMatch wtMatch).blocks = true := by
+  intro callerId claimAttr branchMatch wtMatch
+  rfl
+
+theorem uncapturable_caller_fails_closed :
+    ∀ (claimAttr branchMatch wtMatch : Bool),
+      (evaluateClaimScopeGate true false claimAttr branchMatch wtMatch).blocks = true := by
+  intro claimAttr branchMatch wtMatch
+  rfl
+
+theorem legacy_unattributed_claim_fails_closed :
+    ∀ (branchMatch wtMatch : Bool),
+      (evaluateClaimScopeGate true true false branchMatch wtMatch).blocks = true := by
+  intro branchMatch wtMatch
+  rfl
+
+theorem matching_branch_always_blocks :
+    ∀ (wtMatch : Bool),
+      (evaluateClaimScopeGate true true true true wtMatch).blocks = true := by
+  intro wtMatch
+  rfl
+
+theorem matching_worktree_always_blocks :
+    (evaluateClaimScopeGate true true true false true).blocks = true := by
+  rfl
+
+theorem claim_scope_isolation_soundness :
+    ∀ (isScoped callerId claimAttr branchMatch wtMatch : Bool),
+      (evaluateClaimScopeGate isScoped callerId claimAttr branchMatch wtMatch).blocks = false ↔
+        (isScoped = true ∧ callerId = true ∧ claimAttr = true ∧
+          branchMatch = false ∧ wtMatch = false) := by
+  intro isScoped callerId claimAttr branchMatch wtMatch
+  cases isScoped <;> cases callerId <;> cases claimAttr <;> cases branchMatch <;>
+    cases wtMatch <;> decide
+
 end NeuroStrata.TaskGate

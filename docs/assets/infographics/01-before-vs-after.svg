@@ -1,0 +1,173 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 680" width="100%" height="100%">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0b0f19"/>
+      <stop offset="50%" stop-color="#111827"/>
+      <stop offset="100%" stop-color="#0f172a"/>
+    </linearGradient>
+    <linearGradient id="leftCard" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#1f1218"/>
+      <stop offset="100%" stop-color="#160d12"/>
+    </linearGradient>
+    <linearGradient id="rightCard" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#0d1f22"/>
+      <stop offset="100%" stop-color="#0a1622"/>
+    </linearGradient>
+    <linearGradient id="redAccent" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#ef4444"/>
+      <stop offset="100%" stop-color="#f97316"/>
+    </linearGradient>
+    <linearGradient id="greenAccent" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#10b981"/>
+      <stop offset="50%" stop-color="#06b6d4"/>
+      <stop offset="100%" stop-color="#6366f1"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1200" height="680" rx="18" fill="url(#bgGrad)"/>
+
+  <!-- Header -->
+  <text x="600" y="48" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="28" font-weight="800" fill="#f8fafc" letter-spacing="0.5">
+    WHY NEUROSTRATA? — THE 5-SECOND COMPARISON
+  </text>
+  <text x="600" y="76" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="15" fill="#94a3b8">
+    Flat Markdown Files &amp; Prompt Wishes vs. One Unified MCP Interface with Built-In Cognitive Locks
+  </text>
+
+  <!-- LEFT PANEL: ORDINARY AI AGENT -->
+  <g transform="translate(40, 100)">
+    <rect width="535" height="540" rx="16" fill="url(#leftCard)" stroke="#ef4444" stroke-width="1.5" stroke-opacity="0.45"/>
+    <rect width="535" height="8" rx="4" fill="url(#redAccent)"/>
+
+    <!-- Badge -->
+    <rect x="24" y="24" width="250" height="32" rx="16" fill="#451a22" stroke="#ef4444" stroke-width="1"/>
+    <text x="149" y="45" text-anchor="middle" font-family="system-ui, sans-serif" font-size="13" font-weight="700" fill="#fca5a5" letter-spacing="0.8">
+      ✗ ORDINARY CODING AGENT
+    </text>
+    <text x="510" y="45" text-anchor="end" font-family="system-ui, sans-serif" font-size="12" fill="#f87171">
+      Stateless &amp; Fragile
+    </text>
+
+    <!-- Row 1 -->
+    <g transform="translate(24, 74)">
+      <rect width="487" height="78" rx="10" fill="#26141b" stroke="#7f1d1d" stroke-width="1"/>
+      <circle cx="38" cy="39" r="20" fill="#451a22" stroke="#ef4444" stroke-width="1.5"/>
+      <text x="38" y="45" text-anchor="middle" font-family="system-ui, sans-serif" font-size="18" font-weight="800" fill="#f87171">1</text>
+      <text x="74" y="28" font-family="system-ui, sans-serif" font-size="15" font-weight="700" fill="#fecaca">Session Amnesia &amp; Compaction Wipeout</text>
+      <text x="74" y="49" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">Flat <tspan font-family="monospace" font-size="11" fill="#fca5a5">MEMORY.md</tspan> files rot; agent repeats the exact same</text>
+      <text x="74" y="66" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">failed experiments after context compaction or new sessions.</text>
+    </g>
+
+    <!-- Row 2 -->
+    <g transform="translate(24, 164)">
+      <rect width="487" height="78" rx="10" fill="#26141b" stroke="#7f1d1d" stroke-width="1"/>
+      <circle cx="38" cy="39" r="20" fill="#451a22" stroke="#ef4444" stroke-width="1.5"/>
+      <text x="38" y="45" text-anchor="middle" font-family="system-ui, sans-serif" font-size="18" font-weight="800" fill="#f87171">2</text>
+      <text x="74" y="28" font-family="system-ui, sans-serif" font-size="15" font-weight="700" fill="#fecaca">Blind Grep Loops &amp; Hidden Regressions</text>
+      <text x="74" y="49" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">Burns 20+ tool calls grepping text; edits functions without</text>
+      <text x="74" y="66" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">seeing callers 3 hops away or governing project rules.</text>
+    </g>
+
+    <!-- Row 3 -->
+    <g transform="translate(24, 254)">
+      <rect width="487" height="78" rx="10" fill="#26141b" stroke="#7f1d1d" stroke-width="1"/>
+      <circle cx="38" cy="39" r="20" fill="#451a22" stroke="#ef4444" stroke-width="1.5"/>
+      <text x="38" y="45" text-anchor="middle" font-family="system-ui, sans-serif" font-size="18" font-weight="800" fill="#f87171">3</text>
+      <text x="74" y="28" font-family="system-ui, sans-serif" font-size="15" font-weight="700" fill="#fecaca">Rationalized Prompts &amp; Abandoned TODOs</text>
+      <text x="74" y="49" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">Leaves <tspan font-family="monospace" font-size="11" fill="#fca5a5">// TODO: fix later</tspan> stubs, skips verification, and</text>
+      <text x="74" y="66" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">marks work "done" without recording what was learned.</text>
+    </g>
+
+    <!-- Row 4 -->
+    <g transform="translate(24, 344)">
+      <rect width="487" height="78" rx="10" fill="#26141b" stroke="#7f1d1d" stroke-width="1"/>
+      <circle cx="38" cy="39" r="20" fill="#451a22" stroke="#ef4444" stroke-width="1.5"/>
+      <text x="38" y="45" text-anchor="middle" font-family="system-ui, sans-serif" font-size="18" font-weight="800" fill="#f87171">4</text>
+      <text x="74" y="28" font-family="system-ui, sans-serif" font-size="15" font-weight="700" fill="#fecaca">Blank-Brain Subagents</text>
+      <text x="74" y="49" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">Spawned worker/checker subagents start with zero memory</text>
+      <text x="74" y="66" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">of architectural rules and immediately violate invariants.</text>
+    </g>
+
+    <!-- Row 5 -->
+    <g transform="translate(24, 434)">
+      <rect width="487" height="78" rx="10" fill="#26141b" stroke="#7f1d1d" stroke-width="1"/>
+      <circle cx="38" cy="39" r="20" fill="#451a22" stroke="#ef4444" stroke-width="1.5"/>
+      <text x="38" y="45" text-anchor="middle" font-family="system-ui, sans-serif" font-size="18" font-weight="800" fill="#f87171">5</text>
+      <text x="74" y="28" font-family="system-ui, sans-serif" font-size="15" font-weight="700" fill="#fecaca">Multi-Service Glue Stacks &amp; Unchecked Edits</text>
+      <text x="74" y="49" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">Requires external DB servers &amp; custom scripts, or executes</text>
+      <text x="74" y="66" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">risky shell commands directly against the live workspace.</text>
+    </g>
+  </g>
+
+  <!-- VS Badge in Center -->
+  <g transform="translate(600, 370)">
+    <circle r="24" fill="#1e293b" stroke="#475569" stroke-width="2"/>
+    <text x="0" y="5" text-anchor="middle" font-family="system-ui, sans-serif" font-size="14" font-weight="800" fill="#e2e8f0">VS</text>
+  </g>
+
+  <!-- RIGHT PANEL: NEUROSTRATA AGENT -->
+  <g transform="translate(625, 100)">
+    <rect width="535" height="540" rx="16" fill="url(#rightCard)" stroke="#10b981" stroke-width="1.5" stroke-opacity="0.6"/>
+    <rect width="535" height="8" rx="4" fill="url(#greenAccent)"/>
+
+    <!-- Badge -->
+    <rect x="24" y="24" width="265" height="32" rx="16" fill="#06392f" stroke="#10b981" stroke-width="1"/>
+    <text x="156" y="45" text-anchor="middle" font-family="system-ui, sans-serif" font-size="13" font-weight="700" fill="#6ee7b7" letter-spacing="0.8">
+      ✓ NEUROSTRATA-POWERED AGENT
+    </text>
+    <text x="510" y="45" text-anchor="end" font-family="system-ui, sans-serif" font-size="12" fill="#34d399" font-weight="600">
+      One MCP Interface · Zero Config
+    </text>
+
+    <!-- Row 1 (Violet/Indigo: Tri-Strata Memory) -->
+    <g transform="translate(24, 74)">
+      <rect width="487" height="78" rx="10" fill="#131c31" stroke="#6366f1" stroke-width="1.2"/>
+      <circle cx="38" cy="39" r="20" fill="#1e1b4b" stroke="#818cf8" stroke-width="1.5"/>
+      <text x="38" y="45" text-anchor="middle" font-family="system-ui, sans-serif" font-size="18" font-weight="800" fill="#a5b4fc">1</text>
+      <text x="74" y="28" font-family="system-ui, sans-serif" font-size="15" font-weight="700" fill="#c7d2fe">Tri-Strata Memory + Negative Exemplars</text>
+      <text x="74" y="49" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">Global, Project &amp; Task strata with HNSW/Tantivy/BM25 recall,</text>
+      <text x="74" y="66" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">SPARQL 1.1 logic, and failed-attempt immunization.</text>
+    </g>
+
+    <!-- Row 2 (Cyan: AST Blast Radius) -->
+    <g transform="translate(24, 164)">
+      <rect width="487" height="78" rx="10" fill="#0c2434" stroke="#06b6d4" stroke-width="1.2"/>
+      <circle cx="38" cy="39" r="20" fill="#083344" stroke="#22d3ee" stroke-width="1.5"/>
+      <text x="38" y="45" text-anchor="middle" font-family="system-ui, sans-serif" font-size="18" font-weight="800" fill="#67e8f9">2</text>
+      <text x="74" y="28" font-family="system-ui, sans-serif" font-size="15" font-weight="700" fill="#a5f3fc">1-Call AST &amp; Rule Blast Radius</text>
+      <text x="74" y="49" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">6-language Tree-sitter graph + <tspan font-family="monospace" font-size="11" fill="#67e8f9">memories_for_file</tspan> reveals</text>
+      <text x="74" y="66" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">governing rules, callers, callees &amp; impact before editing.</text>
+    </g>
+
+    <!-- Row 3 (Emerald: 3 Soft Locks) -->
+    <g transform="translate(24, 254)">
+      <rect width="487" height="78" rx="10" fill="#0c2924" stroke="#10b981" stroke-width="1.2"/>
+      <circle cx="38" cy="39" r="20" fill="#064e3b" stroke="#34d399" stroke-width="1.5"/>
+      <text x="38" y="45" text-anchor="middle" font-family="system-ui, sans-serif" font-size="18" font-weight="800" fill="#6ee7b7">3</text>
+      <text x="74" y="28" font-family="system-ui, sans-serif" font-size="15" font-weight="700" fill="#a7f3d0">Central Executive &amp; 3 Binary Locks</text>
+      <text x="74" y="49" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">Zero-Action Start, Breath checkpoints, mandatory rule</text>
+      <text x="74" y="66" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">extraction on <tspan font-family="monospace" font-size="11" fill="#6ee7b7">task_complete</tspan>, and strict pre-push git gate.</text>
+    </g>
+
+    <!-- Row 4 (Pink/Magenta: Subagent Injection) -->
+    <g transform="translate(24, 344)">
+      <rect width="487" height="78" rx="10" fill="#27132a" stroke="#ec4899" stroke-width="1.2"/>
+      <circle cx="38" cy="39" r="20" fill="#500724" stroke="#f472b6" stroke-width="1.5"/>
+      <text x="38" y="45" text-anchor="middle" font-family="system-ui, sans-serif" font-size="18" font-weight="800" fill="#f9a8d4">4</text>
+      <text x="74" y="28" font-family="system-ui, sans-serif" font-size="15" font-weight="700" fill="#fbcfe8">Auto-Injected Subagent Context &amp; Mesh</text>
+      <text x="74" y="49" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">6 harness plugins auto-prepend <tspan font-family="monospace" font-size="11" fill="#f9a8d4">subagent_prompt_injection</tspan></text>
+      <text x="74" y="66" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">into every spawned subagent; <tspan font-family="monospace" font-size="11" fill="#f9a8d4">SynapticMesh</tspan> syncs via git.</text>
+    </g>
+
+    <!-- Row 5 (Amber: Prefrontal Sandbox & Zero-Touch) -->
+    <g transform="translate(24, 434)">
+      <rect width="487" height="78" rx="10" fill="#291d0e" stroke="#f59e0b" stroke-width="1.2"/>
+      <circle cx="38" cy="39" r="20" fill="#451a03" stroke="#fbbf24" stroke-width="1.5"/>
+      <text x="38" y="45" text-anchor="middle" font-family="system-ui, sans-serif" font-size="18" font-weight="800" fill="#fde68a">5</text>
+      <text x="74" y="28" font-family="system-ui, sans-serif" font-size="15" font-weight="700" fill="#fef08a">Podman Dry-Run Sandbox &amp; 1-Sentence Setup</text>
+      <text x="74" y="49" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">Rootless <tspan font-family="monospace" font-size="11" fill="#fde68a">podman --network=none</tspan> command dry-runs, Digital</text>
+      <text x="74" y="66" font-family="system-ui, sans-serif" font-size="12" fill="#cbd5e1">Twins, and 100% automated harness &amp; hook self-upgrading.</text>
+    </g>
+  </g>
+</svg>

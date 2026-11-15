@@ -202,13 +202,27 @@ fn arena_disabled_for(value: Option<&str>) -> bool {
     !enabled
 }
 
+/// Shared process-wide ONNX Runtime [`ort::environment::Environment`].
+///
+/// `ort 2.0.0-rc.15` enforces a single `Environment` per process (`ort::init().build()`).
+/// Sharing this singleton across `FastEmbedder`, `GlinerExtractor`, and `LayaOnnx`
+/// guarantees they never collide regardless of initialization order.
+pub fn shared_ort_environment() -> Result<&'static ort::environment::Environment> {
+    static ORT_ENV: std::sync::OnceLock<std::result::Result<ort::environment::Environment, String>> =
+        std::sync::OnceLock::new();
+    match ORT_ENV.get_or_init(|| ort::init().build().map_err(|e| e.to_string())) {
+        Ok(env) => Ok(env),
+        Err(msg) => Err(anyhow!("Failed to initialize ONNX Runtime environment: {msg}")),
+    }
+}
+
 /// The execution-provider list the constructor installs for the arena
 /// decision: a pinned CPU provider with the arena allocator off, or `None` to
 /// leave fastembed's default. Extracted so the decision-to-wiring path is a
 /// value a test can inspect without loading a model.
 fn arena_execution_providers(
     disabled: bool,
-) -> Option<Vec<ort::execution_providers::ExecutionProviderDispatch>> {
+) -> Option<Vec<ort::ep::ExecutionProviderDispatch>> {
     if disabled {
         Some(vec![ort::ep::CPU::default()
             .with_arena_allocator(false)
@@ -392,7 +406,9 @@ impl FastEmbedder {
         // local embedding (ingest, daemon queries, MCP calls), not only
         // ingest. Set NEUROSTRATA_EMBED_ARENA=1 to keep the previous
         // default; any other value (or unset) disables the arena.
+        let ort_env = shared_ort_environment()?.clone();
         let mut init = TextInitOptions::new(model_enum.clone())
+            .with_environment(ort_env)
             .with_cache_dir(cache_dir.clone())
             .with_max_length(MAX_EMBED_TOKENS);
         // Deliberately pin the CPU execution provider: arena allocation is a

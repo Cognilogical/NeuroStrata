@@ -16,12 +16,12 @@
   "keywords": ["neurostrata", "opencode", "plugin", "task-tracking", "guard"],
   "license": "MIT",
   "peerDependencies": {
-    "@opencode/plugin": "^2.0.0"
+    "@opencode/plugin": "^2.3.0"
   },
   "devDependencies": {
-    "@opencode/plugin": "^2.0.0",
-    "@types/node": "^20.0.0",
-    "typescript": "^5.0.0"
+    "@opencode/plugin": "^2.3.0",
+    "@types/node": "^26.6.6",
+    "typescript": "~6.0.3"
   },
   "engines": {
     "node": ">=18.0.0"

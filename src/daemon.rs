@@ -201,6 +201,19 @@ pub(crate) fn credential_file_test_lock() -> std::sync::MutexGuard<'static, ()> 
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// `std::env` is process-global, so tests that mutate or depend on
+/// `NEUROSTRATA_PROJECT_ROOT` (`PROJECT_ROOT_ENV`) across modules must share a
+/// single lock.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn project_root_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Constant-time equality for credential comparison: a wrong token must
 /// not leak how much of it was right through response timing.
 fn token_eq(provided: &str, expected: &str) -> bool {
@@ -1964,6 +1977,9 @@ struct TaskGateReq {
     /// it, because one gate serves MCP, CLI, and the hook (section 4).
     #[serde(default)]
     strict: bool,
+    /// Caller-supplied Git identity; absent keeps the legacy global verdict.
+    #[serde(default)]
+    scope: Option<crate::task::gate::GateScope>,
 }
 
 /// POST /tasks/gate -- what the pre-push hook sees (section 4).
@@ -1978,7 +1994,7 @@ async fn handle_tasks_gate(
     Json(req): Json<TaskGateReq>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
     let namespace = crate::server::resolve_namespace(&state.vector_store, &req.namespace).await;
-    let report = crate::task::gate::run(&state.vector_store, &namespace)
+    let report = crate::task::gate::run_scoped(&state.vector_store, &namespace, req.scope.as_ref())
         .await
         .map_err(|e| {
             eprintln!("[neurostrata:gate] gate for '{}' failed: {}", namespace, e);
@@ -2268,17 +2284,29 @@ async fn handle_http_learning_control(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gate_scope_is_optional_for_older_cli_callers() {
+        let old: TaskGateReq = serde_json::from_value(serde_json::json!({
+            "namespace": "NeuroStrata",
+            "strict": true,
+        }))
+        .unwrap();
+        assert_eq!(old.scope, None);
+
+        let scoped: TaskGateReq = serde_json::from_value(serde_json::json!({
+            "namespace": "NeuroStrata",
+            "strict": true,
+            "scope": { "branch": "main", "worktree": "/repo/main" },
+        }))
+        .unwrap();
+        assert_eq!(scoped.scope.unwrap().branch.as_deref(), Some("main"));
+    }
+
     use super::*;
     use crate::events::{RecursionToken, ThalamicPulse};
     use crate::traits::{MemoryPayload, RelocateOutcome, SearchResult};
     use async_trait::async_trait;
     use std::time::{Duration, Instant};
-
-    /// `std::env` is process-global, so tests that mutate `PROJECT_ROOT_ENV`
-    /// must not run concurrently: one test's `remove_var` strands another's
-    /// `expect`. Held for the full body of every env-mutating test; poisoning
-    /// (a panic while holding it) is tolerated so one failure cannot cascade.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn daemon_token_tests_never_touch_real_home_config() {

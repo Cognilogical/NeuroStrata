@@ -20,7 +20,7 @@ Contributors (human and AI agents) dogfood NeuroStrata on itself (see [`AGENTS.m
 - **Graph-First Exploration**: Query `neurostrata_memories_for_file`, `neurostrata_related`, or `neurostrata_sparql_query` before blind `grep`/`glob` or editing a file. Propagate `subagent_prompt_injection` into every spawned subagent prompt.
 - **Lock 3 (Breath Checkpoints)**: Every 3–5 steps, record a state checkpoint on the active task via `neurostrata_task_update`.
 - **Lock 2 (Mandatory Memory Extraction)**: Completing a task (`neurostrata_task_complete`) requires extracting at least one architectural rule or fact (`neurostrata_add_memory` or inline `memory.content`).
-- **Lock 1 (Pre-Push Gate & Task Coverage Gate)**: `.git/hooks/pre-push` runs `neurostrata-mcp task gate <namespace> --strict` and `scripts/task-coverage-gate.sh`. Any `in_progress` task, `done` task without an extracted memory, or unlinked deferral marker blocks the push unless paired with a task ID (e.g. `ns-p680`).
+- **Lock 1 (Pre-Push Gate & Task Coverage Gate)**: `.git/hooks/pre-push` runs `neurostrata-mcp task gate <namespace> --strict` and `scripts/task-coverage-gate.sh`. An `in_progress` task on the current branch/worktree (or an unattributed legacy claim), any `done` task without an extracted memory, or an unlinked deferral marker blocks the push unless paired with a task ID (e.g. `ns-p680`).
 - **The Prime Directive (No Unfiled Deferrals)**: Never leave silent stubs or untracked deferrals; every piece of unfinished work must either be completed in-branch or filed as a tracked task with an explicit ID (e.g. `ns-p680`).
 
 ## 3. Test-Driven Development (TDD) & Verification Gates

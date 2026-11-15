@@ -44,6 +44,62 @@ pub mod traits {
 }
 
 // Import SHACL validation module directly from source (binary crate can't import crate::)
+pub mod domain {
+    pub fn normalize_domain_slug(raw: &str) -> Option<String> {
+        let mut slug = String::with_capacity(raw.len());
+        let mut separator_pending = false;
+        for ch in raw.to_lowercase().chars() {
+            if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
+                if separator_pending && !slug.is_empty() {
+                    slug.push('-');
+                }
+                separator_pending = false;
+                slug.push(ch);
+            } else {
+                separator_pending = true;
+            }
+        }
+        if slug.is_empty() {
+            None
+        } else {
+            Some(slug)
+        }
+    }
+}
+
+pub mod rdf {
+    pub mod action {
+        use crate::shacl::ShaclViolation;
+        use crate::traits::MemoryPayload;
+
+        pub struct ActionTypeDefinition;
+        impl ActionTypeDefinition {
+            pub fn from_payload(payload: &MemoryPayload) -> Result<Self, String> {
+                match payload.metadata.get("action_type") {
+                    Some(v) if v.is_object() => Ok(Self),
+                    _ => Err("action_type object is required".to_string()),
+                }
+            }
+            pub fn validate_definition(&self) -> Vec<ShaclViolation> {
+                Vec::new()
+            }
+        }
+
+        pub struct ActionReceiptPayload;
+        impl ActionReceiptPayload {
+            pub fn from_payload(payload: &MemoryPayload) -> Result<Self, String> {
+                match payload.metadata.get("action_receipt") {
+                    Some(v) if v.is_object() => Ok(Self),
+                    _ => Err("action_receipt object is required".to_string()),
+                }
+            }
+            pub fn validate_receipt(&self, _payload: &MemoryPayload) -> Vec<ShaclViolation> {
+                Vec::new()
+            }
+        }
+    }
+}
+
 #[path = "../src/rebac.rs"]
 pub mod rebac;
 #[path = "../src/multimodal/mod.rs"]

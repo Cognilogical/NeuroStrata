@@ -13,9 +13,55 @@
 
 use crate::task::machine::Status;
 use crate::traits::{MemoryPayload, SearchResult, VectorStore};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
+
+/// The Git identity of the work entering the strict push gate. A branch match
+/// joins worktrees of the same effort; the canonical path also covers detached
+/// HEADs and branch switches within one worktree.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateScope {
+    pub branch: Option<String>,
+    pub worktree: Option<String>,
+}
+
+impl GateScope {
+    pub fn capture(root: &std::path::Path) -> Self {
+        let root = root.canonicalize().ok();
+        let git_root = root.as_ref().and_then(|root| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(["rev-parse", "--show-toplevel"])
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .and_then(|out| String::from_utf8(out.stdout).ok())
+                .map(|path| std::path::PathBuf::from(path.trim()))
+        });
+        git_root
+            .map(|git_root| {
+                let worktree = git_root
+                    .canonicalize()
+                    .ok()
+                    .map(|path| path.to_string_lossy().into_owned());
+                let branch = worktree.as_ref().and_then(|worktree| {
+                    std::process::Command::new("git")
+                        .args(["-C", worktree, "branch", "--show-current"])
+                        .output()
+                        .ok()
+                        .filter(|out| out.status.success())
+                        .and_then(|out| String::from_utf8(out.stdout).ok())
+                        .map(|name| name.trim().to_string())
+                        .filter(|name| !name.is_empty())
+                });
+                Self { branch, worktree }
+            })
+            .unwrap_or_default()
+    }
+}
 
 /// A blocking rule break: exactly the shape POST /tasks/gate returns.
 #[derive(Debug, Clone, PartialEq)]
@@ -291,8 +337,49 @@ pub(crate) fn age_secs(meta: Option<&Value>, keys: &[&str], now: i64) -> Option<
     None
 }
 
+fn non_empty<'a>(value: Option<&'a Value>) -> Option<&'a str> {
+    value.and_then(Value::as_str).filter(|s| !s.is_empty())
+}
+
+fn claim_blocks_scope(meta: Option<&Value>, scope: Option<&GateScope>) -> bool {
+    let scoped = scope.is_some();
+    let caller_branch = scope
+        .and_then(|s| s.branch.as_deref())
+        .filter(|s| !s.is_empty());
+    let caller_worktree = scope
+        .and_then(|s| s.worktree.as_deref())
+        .filter(|s| !s.is_empty());
+    let caller_identifiable = caller_branch.is_some() || caller_worktree.is_some();
+
+    let claim_branch = non_empty(meta.and_then(|m| m.get("branch")));
+    let claim_worktree = non_empty(meta.and_then(|m| m.get("worktree")));
+    let claim_attributed = claim_branch.is_some() || claim_worktree.is_some();
+
+    let branch_matches = claim_branch.is_some() && claim_branch == caller_branch;
+    let worktree_matches = claim_worktree.is_some() && claim_worktree == caller_worktree;
+
+    crate::formal_kernel::evaluate_claim_scope_gate(
+        scoped,
+        caller_identifiable,
+        claim_attributed,
+        branch_matches,
+        worktree_matches,
+    )
+    .blocks()
+}
+
 /// The whole gate: three blocking rules plus the advisory staleness list.
 pub fn evaluate(memories: &[SearchResult], now: i64) -> GateReport {
+    evaluate_scoped(memories, now, None)
+}
+
+/// Strict pushes scope only the in-progress rule. All other checks remain
+/// namespace-wide, and counts/staleness still describe every task.
+pub fn evaluate_scoped(
+    memories: &[SearchResult],
+    now: i64,
+    scope: Option<&GateScope>,
+) -> GateReport {
     let mut report = GateReport::default();
 
     for row in memories {
@@ -343,14 +430,16 @@ pub fn evaluate(memories: &[SearchResult], now: i64) -> GateReport {
                     .and_then(|t| t.get("assignee"))
                     .and_then(|a| a.as_str())
                     .unwrap_or("unknown");
-                report.violations.push(Violation {
-                    id: row.id.clone(),
-                    kind: "in_progress",
-                    detail: format!(
-                        "task '{}' is claimed by {} and unfinished; finish it via neurostrata_task_complete or release it (task_update status open).",
-                        content, assignee
-                    ),
-                });
+                if claim_blocks_scope(meta, scope) {
+                    report.violations.push(Violation {
+                        id: row.id.clone(),
+                        kind: "in_progress",
+                        detail: format!(
+                            "task '{}' is claimed by {} and unfinished in this branch/worktree; finish it via neurostrata_task_complete or release it (task_update status open).",
+                            content, assignee
+                        ),
+                    });
+                }
                 if age_secs(meta, &["updated_at", "created_at"], now)
                     .map(|a| a > STALE_AFTER_SECS)
                     .unwrap_or(false)
@@ -711,11 +800,23 @@ pub fn self_test() -> SelfTestReport {
 
 /// Runs the engine against a store: one `list`, no embedder, milliseconds.
 pub async fn run(store: &Arc<dyn VectorStore>, namespace: &str) -> Result<GateReport, String> {
+    run_scoped(store, namespace, None).await
+}
+
+pub async fn run_scoped(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    scope: Option<&GateScope>,
+) -> Result<GateReport, String> {
     let memories = store
         .list(namespace, None, None)
         .await
         .map_err(|e| format!("could not list tasks in '{}': {}", namespace, e))?;
-    Ok(evaluate(&memories, chrono::Utc::now().timestamp()))
+    Ok(evaluate_scoped(
+        &memories,
+        chrono::Utc::now().timestamp(),
+        scope,
+    ))
 }
 
 #[cfg(test)]
@@ -1445,6 +1546,155 @@ mod tests {
         assert_eq!(report.violations.len(), 1);
         assert_eq!(report.violations[0].kind, "in_progress");
         assert_eq!(report.counts.in_progress, 1);
+    }
+
+    #[test]
+    fn scope_capture_uses_the_git_toplevel_from_a_subdirectory() {
+        let dir = tempfile::tempdir().unwrap();
+        let initialized = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(initialized.success());
+        let subdirectory = dir.path().join("src/nested");
+        std::fs::create_dir_all(&subdirectory).unwrap();
+
+        let scope = GateScope::capture(&subdirectory);
+        assert_eq!(
+            scope.worktree,
+            Some(dir.path().canonicalize().unwrap().to_string_lossy().into_owned())
+        );
+    }
+
+    #[test]
+    fn scope_capture_returns_default_outside_git() {
+        let dir = tempfile::tempdir().unwrap();
+        let scope = GateScope::capture(dir.path());
+        assert_eq!(scope, GateScope::default());
+        assert_eq!(scope.worktree, None);
+        assert_eq!(scope.branch, None);
+    }
+
+    #[test]
+    fn strict_scope_blocks_only_claims_from_the_same_branch_or_worktree() {
+        let current = GateScope {
+            branch: Some("release/v1.17.3".to_string()),
+            worktree: Some("/repo/release".to_string()),
+        };
+        let cases = [
+            (
+                "same-branch",
+                json!({ "branch": "release/v1.17.3", "worktree": "/repo/other" }),
+                true,
+            ),
+            (
+                "same-worktree",
+                json!({ "branch": "feature/other", "worktree": "/repo/release" }),
+                true,
+            ),
+            (
+                "independent",
+                json!({ "branch": "feature/other", "worktree": "/repo/other" }),
+                false,
+            ),
+            ("legacy-without-attribution", json!({}), true),
+        ];
+
+        for (id, attribution, should_block) in cases {
+            let mut task_meta = json!({
+                "status": "in_progress",
+                "assignee": "agent-a",
+                "updated_at": iso(60),
+            });
+            task_meta
+                .as_object_mut()
+                .unwrap()
+                .extend(attribution.as_object().unwrap().clone());
+            let report = evaluate_scoped(&[task(id, task_meta)], NOW, Some(&current));
+            assert_eq!(
+                report.violations.iter().any(|v| v.kind == "in_progress"),
+                should_block,
+                "unexpected verdict for {}: {:?}",
+                id,
+                report.violations
+            );
+            assert_eq!(report.counts.in_progress, 1);
+        }
+    }
+
+    #[test]
+    fn an_uncapturable_caller_scope_fails_closed() {
+        let memories = vec![task(
+            "attributed-claim",
+            json!({
+                "status": "in_progress",
+                "updated_at": iso(60),
+                "branch": "feature/other",
+                "worktree": "/repo/other",
+            }),
+        )];
+        let report = evaluate_scoped(&memories, NOW, Some(&GateScope::default()));
+        assert!(report
+            .violations
+            .iter()
+            .any(|v| v.kind == "in_progress"));
+    }
+
+    #[test]
+    fn detached_claims_use_the_worktree_when_no_branch_exists() {
+        let current = GateScope {
+            branch: None,
+            worktree: Some("/repo/detached".to_string()),
+        };
+        let memories = vec![
+            task(
+                "same-detached-worktree",
+                json!({
+                    "status": "in_progress",
+                    "updated_at": iso(60),
+                    "worktree": "/repo/detached",
+                }),
+            ),
+            task(
+                "other-detached-worktree",
+                json!({
+                    "status": "in_progress",
+                    "updated_at": iso(60),
+                    "worktree": "/repo/other",
+                }),
+            ),
+        ];
+        let report = evaluate_scoped(&memories, NOW, Some(&current));
+        let blocking: Vec<&str> = report
+            .violations
+            .iter()
+            .filter(|v| v.kind == "in_progress")
+            .map(|v| v.id.as_str())
+            .collect();
+        assert_eq!(blocking, vec!["same-detached-worktree"]);
+    }
+
+    #[test]
+    fn scoping_in_progress_does_not_hide_extraction_debt() {
+        let current = GateScope {
+            branch: Some("release/v1.17.3".to_string()),
+            worktree: Some("/repo/release".to_string()),
+        };
+        let memories = vec![task(
+            "done-on-other-branch",
+            json!({
+                "status": "done",
+                "branch": "feature/other",
+                "worktree": "/repo/other",
+                "created_at": iso(60),
+            }),
+        )];
+        let report = evaluate_scoped(&memories, NOW, Some(&current));
+        assert!(report
+            .violations
+            .iter()
+            .any(|v| v.kind == "done_without_extraction"));
     }
 
     #[test]

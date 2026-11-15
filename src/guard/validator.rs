@@ -216,21 +216,589 @@ impl GuardValidator {
         }
 
         // A rule fires when its trigger pattern matches the action type (the
-        // action type contains the pattern, not the reverse) or appears in the
-        // payload. The previous implementation used `pattern.contains(action)`,
-        // which caused any rule whose trigger_pattern mentioned an action type
-        // (e.g. "bash rm -rf") to fire on EVERY action of that type (e.g.
-        // every "bash" command), bricking validation.
-        let action_lower = action_type.to_lowercase();
-        let payload_lower = payload.to_lowercase();
-
-        trigger_pattern
+        // action type contains the pattern, not the reverse) or matches the
+        // action-appropriate target surface of the payload.
+        let action_lower = action_type.trim().to_lowercase();
+        let branches: Vec<String> = trigger_pattern
             .split('|')
             .filter(|branch| !branch.trim().is_empty())
-            .any(|branch| {
-                let b = branch.to_lowercase();
-                action_lower.contains(&b) || payload_lower.contains(&b)
-            })
+            .map(|branch| branch.to_lowercase())
+            .collect();
+
+        if branches.iter().any(|b| action_lower.contains(b.as_str())) {
+            return true;
+        }
+
+        if Self::is_file_mutation_action(&action_lower) {
+            let (paths, shebangs) = Self::extract_file_mutation_targets_and_shebangs(payload);
+            return branches
+                .iter()
+                .any(|b| Self::file_mutation_matches_branch(b, &paths, &shebangs));
+        }
+
+        if Self::is_shell_action(&action_lower) {
+            let commands = Self::extract_shell_commands(payload);
+            return commands.iter().any(|cmd| {
+                let surfaces = Self::unquoted_command_surfaces(cmd);
+                branches
+                    .iter()
+                    .any(|b| Self::shell_surfaces_match_branch(b, &surfaces))
+            });
+        }
+
+        let payload_lower = payload.to_lowercase();
+        branches.iter().any(|b| payload_lower.contains(b.as_str()))
+    }
+
+    fn is_file_mutation_action(action_lower: &str) -> bool {
+        matches!(
+            action_lower,
+            "write"
+                | "write_file"
+                | "create_file"
+                | "create"
+                | "edit"
+                | "multiedit"
+                | "edit_file"
+                | "str_replace_editor"
+                | "patch"
+                | "patch_file"
+                | "apply_patch"
+                | "replace_string_in_file"
+                | "insert_edit_into_file"
+                | "notebookedit"
+        )
+    }
+
+    fn is_shell_action(action_lower: &str) -> bool {
+        matches!(
+            action_lower,
+            "bash"
+                | "shell"
+                | "local_shell"
+                | "exec_command"
+                | "run_shell_command"
+                | "run_command"
+                | "execute_command"
+                | "terminal"
+                | "gh_exec"
+                | "exec"
+                | "script"
+        )
+    }
+
+    fn path_matches_extension(path: &str, ext_branch: &str) -> bool {
+        let normalized = path
+            .trim()
+            .trim_matches(|c| c == '"' || c == '\'')
+            .replace('\\', "/");
+        let filename = normalized
+            .rsplit('/')
+            .next()
+            .unwrap_or(normalized.as_str())
+            .to_lowercase();
+        filename.ends_with(ext_branch) && filename.len() > ext_branch.len()
+    }
+
+    fn extract_patch_targets_and_shebangs(
+        patch_text: &str,
+        paths: &mut Vec<String>,
+        shebangs: &mut Vec<String>,
+    ) {
+        for line in patch_text.lines() {
+            let trimmed = line.trim();
+            for prefix in [
+                "*** Update File:",
+                "*** Add File:",
+                "*** Move to:",
+                "+++ b/",
+                "+++ ",
+            ] {
+                if let Some(rest) = trimmed.strip_prefix(prefix) {
+                    let candidate = rest.trim();
+                    if !candidate.is_empty() && candidate != "/dev/null" {
+                        paths.push(candidate.to_lowercase());
+                    }
+                }
+            }
+            if let Some(added) = line.strip_prefix('+') {
+                if !line.starts_with("+++") {
+                    let added_trimmed = added.trim();
+                    if let Some(rest) = added_trimmed.strip_prefix("#!") {
+                        shebangs.push(rest.trim().to_lowercase());
+                    }
+                }
+            }
+        }
+    }
+
+    fn collect_shebang_from_content(content: &str, shebangs: &mut Vec<String>) {
+        if let Some(first_line) = content.lines().find(|l| !l.trim().is_empty()) {
+            if let Some(rest) = first_line.trim().strip_prefix("#!") {
+                shebangs.push(rest.trim().to_lowercase());
+            }
+        }
+    }
+
+    fn extract_file_mutation_targets_and_shebangs(payload: &str) -> (Vec<String>, Vec<String>) {
+        let mut paths = Vec::new();
+        let mut shebangs = Vec::new();
+
+        if let Ok(serde_json::Value::Object(map)) =
+            serde_json::from_str::<serde_json::Value>(payload)
+        {
+            const PATH_KEYS: &[&str] = &[
+                "path",
+                "file_path",
+                "filePath",
+                "filepath",
+                "target_file",
+                "targetFile",
+                "filename",
+                "notebook_path",
+                "notebookPath",
+            ];
+            const CONTENT_KEYS: &[&str] = &[
+                "content",
+                "newString",
+                "new_string",
+                "new_str",
+                "replacement",
+                "insert_text",
+            ];
+            const PATCH_KEYS: &[&str] = &["patchText", "patch", "diff"];
+
+            for key in PATH_KEYS {
+                if let Some( s) = map.get(*key).and_then(|v| v.as_str()) {
+                    paths.push(s.trim().to_lowercase());
+                }
+            }
+            for key in CONTENT_KEYS {
+                if let Some(s) = map.get(*key).and_then(|v| v.as_str()) {
+                    Self::collect_shebang_from_content(s, &mut shebangs);
+                }
+            }
+            for key in PATCH_KEYS {
+                if let Some(s) = map.get(*key).and_then(|v| v.as_str()) {
+                    Self::extract_patch_targets_and_shebangs(s, &mut paths, &mut shebangs);
+                }
+            }
+            for array_key in ["edits", "files", "changes"] {
+                if let Some(serde_json::Value::Array(items)) = map.get(array_key) {
+                    for item in items {
+                        if let serde_json::Value::Object(sub) = item {
+                            for key in PATH_KEYS {
+                                if let Some(s) = sub.get(*key).and_then(|v| v.as_str()) {
+                                    paths.push(s.trim().to_lowercase());
+                                }
+                            }
+                            for key in CONTENT_KEYS {
+                                if let Some(s) = sub.get(*key).and_then(|v| v.as_str()) {
+                                    Self::collect_shebang_from_content(s, &mut shebangs);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return (paths, shebangs);
+        }
+
+        if payload.contains("*** Update File:")
+            || payload.contains("*** Add File:")
+            || payload.contains("+++ ")
+        {
+            Self::extract_patch_targets_and_shebangs(payload, &mut paths, &mut shebangs);
+            return (paths, shebangs);
+        }
+
+        Self::collect_shebang_from_content(payload, &mut shebangs);
+        if !payload.contains('\n') && !payload.trim().is_empty() {
+            paths.push(payload.trim().to_lowercase());
+        }
+        (paths, shebangs)
+    }
+
+    fn file_mutation_matches_branch(
+        branch_lower: &str,
+        paths: &[String],
+        shebangs: &[String],
+    ) -> bool {
+        let trimmed = branch_lower.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        if trimmed.starts_with('.') && trimmed.len() > 1 {
+            return paths.iter().any(|p| Self::path_matches_extension(p, trimmed));
+        }
+
+        if paths.iter().any(|p| {
+            let normalized = p.replace('\\', "/");
+            let filename = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
+            filename == trimmed
+        }) {
+            return true;
+        }
+
+        shebangs.iter().any(|shebang| {
+            let surfaces = Self::unquoted_command_surfaces(shebang);
+            Self::shell_surfaces_match_branch(branch_lower, &surfaces)
+        })
+    }
+
+    fn extract_shell_commands(payload: &str) -> Vec<String> {
+        if let Ok(serde_json::Value::Object(map)) =
+            serde_json::from_str::<serde_json::Value>(payload)
+        {
+            let mut cmds = Vec::new();
+            for key in ["command", "cmd", "script", "code"] {
+                if let Some(s) = map.get(key).and_then(|v| v.as_str()) {
+                    if !s.trim().is_empty() {
+                        cmds.push(s.to_string());
+                    }
+                }
+            }
+            if cmds.is_empty() {
+                if let Some(serde_json::Value::Array(args)) = map.get("args") {
+                    let joined: Vec<&str> = args.iter().filter_map(|v| v.as_str()).collect();
+                    if !joined.is_empty() {
+                        cmds.push(joined.join(" "));
+                    }
+                }
+            }
+            return cmds;
+        }
+        vec![payload.to_string()]
+    }
+
+    fn split_shell_segments(cmd: &str) -> Vec<String> {
+        let mut segments = Vec::new();
+        let mut current = String::new();
+        let mut chars = cmd.chars().peekable();
+        let mut in_single = false;
+        let mut in_double = false;
+        let mut escaped = false;
+
+        while let Some(c) = chars.next() {
+            if escaped {
+                current.push(c);
+                escaped = false;
+                continue;
+            }
+            if c == '\\' && !in_single {
+                current.push(c);
+                escaped = true;
+                continue;
+            }
+            if c == '\'' && !in_double {
+                in_single = !in_single;
+                current.push(c);
+                continue;
+            }
+            if c == '"' && !in_single {
+                in_double = !in_double;
+                current.push(c);
+                continue;
+            }
+            if !in_single && !in_double {
+                if c == ';' || c == '\n' {
+                    if !current.trim().is_empty() {
+                        segments.push(std::mem::take(&mut current));
+                    } else {
+                        current.clear();
+                    }
+                    continue;
+                }
+                if c == '|' || c == '&' {
+                    if chars.peek() == Some(&c) {
+                        let _ = chars.next();
+                    }
+                    if !current.trim().is_empty() {
+                        segments.push(std::mem::take(&mut current));
+                    } else {
+                        current.clear();
+                    }
+                    continue;
+                }
+            }
+            current.push(c);
+        }
+        if !current.trim().is_empty() {
+            segments.push(current);
+        }
+        segments
+    }
+
+    fn tokenize_shell_segment(segment: &str) -> Vec<(String, bool)> {
+        let mut tokens = Vec::new();
+        let mut current = String::new();
+        let mut was_quoted = false;
+        let mut in_token = false;
+        let mut chars = segment.chars().peekable();
+        let mut in_single = false;
+        let mut in_double = false;
+        let mut escaped = false;
+
+        while let Some(c) = chars.next() {
+            if escaped {
+                current.push(c);
+                in_token = true;
+                escaped = false;
+                continue;
+            }
+            if c == '\\' && !in_single {
+                escaped = true;
+                in_token = true;
+                continue;
+            }
+            if c == '\'' && !in_double {
+                in_single = !in_single;
+                was_quoted = true;
+                in_token = true;
+                continue;
+            }
+            if c == '"' && !in_single {
+                in_double = !in_double;
+                was_quoted = true;
+                in_token = true;
+                continue;
+            }
+            if !in_single && !in_double && c.is_whitespace() {
+                if in_token {
+                    tokens.push((std::mem::take(&mut current), was_quoted));
+                    was_quoted = false;
+                    in_token = false;
+                }
+                continue;
+            }
+            current.push(c);
+            in_token = true;
+        }
+        if in_token {
+            tokens.push((current, was_quoted));
+        }
+        tokens
+    }
+
+    fn is_env_assignment(token: &str) -> bool {
+        if let Some((lhs, _)) = token.split_once('=') {
+            !lhs.is_empty()
+                && lhs
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && !lhs.chars().next().unwrap_or('0').is_ascii_digit()
+        } else {
+            false
+        }
+    }
+
+    fn is_command_wrapper(base: &str) -> bool {
+        matches!(
+            base,
+            "sudo"
+                | "env"
+                | "nohup"
+                | "time"
+                | "nice"
+                | "command"
+                | "exec"
+                | "xargs"
+                | "uv"
+                | "poetry"
+                | "pipx"
+                | "conda"
+        )
+    }
+
+    fn is_wrapper_subcommand(wrapper: &str, token: &str) -> bool {
+        matches!(
+            (wrapper, token),
+            ("uv" | "poetry" | "pipx" | "conda", "run")
+        )
+    }
+
+    fn is_shell_interpreter(base: &str) -> bool {
+        matches!(base, "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish")
+    }
+
+    fn extract_command_substitutions(cmd: &str) -> Vec<String> {
+        let mut subs = Vec::new();
+        let mut chars = cmd.chars().peekable();
+        let mut in_single = false;
+        let mut escaped = false;
+
+        while let Some(c) = chars.next() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if c == '\\' && !in_single {
+                escaped = true;
+                continue;
+            }
+            if c == '\'' {
+                in_single = !in_single;
+                continue;
+            }
+            if !in_single && c == '$' && chars.peek() == Some(&'(') {
+                let _ = chars.next();
+                let mut depth = 1usize;
+                let mut inner = String::new();
+                while let Some(ic) = chars.next() {
+                    if ic == '(' {
+                        depth += 1;
+                    } else if ic == ')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    inner.push(ic);
+                }
+                if !inner.trim().is_empty() {
+                    subs.push(inner);
+                }
+            } else if !in_single && c == '`' {
+                let mut inner = String::new();
+                let mut bt_escaped = false;
+                while let Some(ic) = chars.next() {
+                    if bt_escaped {
+                        inner.push(ic);
+                        bt_escaped = false;
+                        continue;
+                    }
+                    if ic == '\\' {
+                        bt_escaped = true;
+                        continue;
+                    }
+                    if ic == '`' {
+                        break;
+                    }
+                    inner.push(ic);
+                }
+                if !inner.trim().is_empty() {
+                    subs.push(inner);
+                }
+            }
+        }
+        subs
+    }
+
+    fn unquoted_command_surfaces(cmd: &str) -> Vec<Vec<String>> {
+        let mut surfaces = Vec::new();
+        for sub in Self::extract_command_substitutions(cmd) {
+            surfaces.extend(Self::unquoted_command_surfaces(&sub));
+        }
+        for seg in Self::split_shell_segments(cmd) {
+            let trimmed_seg = seg
+                .trim()
+                .trim_start_matches('(')
+                .trim_end_matches(')')
+                .trim();
+            let tokens = Self::tokenize_shell_segment(trimmed_seg);
+            if tokens.is_empty() {
+                continue;
+            }
+            let mut idx = 0;
+            while idx < tokens.len() {
+                let (ref tok, quoted) = tokens[idx];
+                if !quoted && Self::is_env_assignment(tok) {
+                    idx += 1;
+                    continue;
+                }
+                let base = tok.rsplit('/').next().unwrap_or(tok.as_str()).to_lowercase();
+                if !quoted && Self::is_command_wrapper(&base) {
+                    idx += 1;
+                    while idx < tokens.len() && !tokens[idx].1 && tokens[idx].0.starts_with('-') {
+                        idx += 1;
+                    }
+                    if idx < tokens.len()
+                        && !tokens[idx].1
+                        && Self::is_wrapper_subcommand(&base, &tokens[idx].0.to_lowercase())
+                    {
+                        idx += 1;
+                        while idx < tokens.len()
+                            && !tokens[idx].1
+                            && tokens[idx].0.starts_with('-')
+                        {
+                            idx += 1;
+                        }
+                    }
+                    continue;
+                }
+                break;
+            }
+            if idx >= tokens.len() {
+                continue;
+            }
+
+            let head_raw = tokens[idx].0.to_lowercase();
+            let head_base = head_raw
+                .rsplit('/')
+                .next()
+                .unwrap_or(head_raw.as_str())
+                .to_string();
+
+            if Self::is_shell_interpreter(&head_base) {
+                let mut j = idx + 1;
+                while j < tokens.len() {
+                    let (ref flag, flag_quoted) = tokens[j];
+                    if !flag_quoted
+                        && (flag == "-c"
+                            || flag == "--command"
+                            || (flag.starts_with('-')
+                                && !flag.starts_with("--")
+                                && flag.ends_with('c')))
+                    {
+                        if let Some((script, _)) = tokens.get(j + 1) {
+                            surfaces.extend(Self::unquoted_command_surfaces(script));
+                        }
+                        break;
+                    }
+                    j += 1;
+                }
+            } else if head_base == "eval" {
+                let rest: Vec<&str> = tokens[idx + 1..].iter().map(|(t, _)| t.as_str()).collect();
+                if !rest.is_empty() {
+                    surfaces.extend(Self::unquoted_command_surfaces(&rest.join(" ")));
+                }
+            }
+
+            let mut surface_tokens = vec![head_base];
+            for (tok, quoted) in &tokens[idx + 1..] {
+                if !*quoted {
+                    surface_tokens.push(tok.to_lowercase());
+                }
+            }
+            surfaces.push(surface_tokens);
+        }
+        surfaces
+    }
+
+    fn shell_surfaces_match_branch(branch_lower: &str, surfaces: &[Vec<String>]) -> bool {
+        let trimmed = branch_lower.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        if trimmed.starts_with('.') && trimmed.len() > 1 {
+            return surfaces.iter().any(|tokens| {
+                tokens
+                    .iter()
+                    .any(|tok| Self::path_matches_extension(tok, trimmed))
+            });
+        }
+        if trimmed.starts_with('-') || trimmed.starts_with('/') {
+            let needle = format!(" {trimmed} ");
+            return surfaces.iter().any(|tokens| {
+                let padded = format!(" {} ", tokens.join(" "));
+                padded.contains(&needle)
+            });
+        }
+        let prefix = format!("{trimmed} ");
+        surfaces.iter().any(|tokens| {
+            let joined = format!("{} ", tokens.join(" "));
+            joined.starts_with(&prefix)
+        })
     }
 
     /// Add a new behavioral rule to the guard namespace
@@ -584,5 +1152,195 @@ mod tests {
             "guard_rule must still be matched even when >3 non-rule memories precede it in search()"
         );
         assert!(matches!(verdict, ValidateVerdict::DeterministicReject { .. }));
+    }
+
+    fn no_py_trigger() -> String {
+        "python |python3 |pytest |pip install|.py".to_string()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_and_edit_json_payloads_ignore_prose_mentions_of_banned_language() {
+        let (_store, validator) = validator_with(vec![rule(
+            "global-no-python",
+            &no_py_trigger(),
+            "Never use Python code",
+            "active",
+        )])
+        .await;
+
+        let write_payload = serde_json::json!({
+            "path": "/workspace/README.md",
+            "content": "Architecture note: Python is banned; do not run python3, pytest, or pip install, and do not commit .py files."
+        })
+        .to_string();
+        let (v_write, f_write) = validator
+            .validate("write", &write_payload, "/workspace", false)
+            .await;
+        assert!(
+            f_write.is_empty(),
+            "prose inside write content must not fire command/extension rules: {:?}",
+            f_write
+        );
+        assert!(matches!(v_write, ValidateVerdict::SandboxPassHighFidelity { .. }));
+
+        let edit_payload = serde_json::json!({
+            "path": "/workspace/src/guard/validator.rs",
+            "oldString": "fn old() {}",
+            "newString": "// Rejects actual Python scripts (*.py) and python3 invocations without blocking prose."
+        })
+        .to_string();
+        let (v_edit, f_edit) = validator
+            .validate("edit", &edit_payload, "/workspace", false)
+            .await;
+        assert!(
+            f_edit.is_empty(),
+            "prose inside edit oldString/newString must not fire: {:?}",
+            f_edit
+        );
+        assert!(matches!(v_edit, ValidateVerdict::SandboxPassHighFidelity { .. }));
+
+        let non_py_ext_payload = serde_json::json!({
+            "path": "/workspace/docs/no.python.md",
+            "content": "markdown doc"
+        })
+        .to_string();
+        let (_v_doc, f_doc) = validator
+            .validate("write", &non_py_ext_payload, "/workspace", false)
+            .await;
+        assert!(
+            f_doc.is_empty(),
+            "filename containing .py substring before another extension must not fire: {:?}",
+            f_doc
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_and_edit_json_payloads_reject_target_py_files_and_shebangs() {
+        let (_store, validator) = validator_with(vec![rule(
+            "global-no-python",
+            &no_py_trigger(),
+            "Never use Python code",
+            "active",
+        )])
+        .await;
+
+        let write_py_json = serde_json::json!({
+            "path": "/workspace/scripts/helper.py",
+            "content": "x = 1\n"
+        })
+        .to_string();
+        let (v1, f1) = validator
+            .validate("write", &write_py_json, "/workspace", false)
+            .await;
+        assert_eq!(f1, vec!["global-no-python".to_string()]);
+        assert!(matches!(v1, ValidateVerdict::DeterministicReject { .. }));
+
+        let edit_py_json = serde_json::json!({
+            "file_path": "tools/migrate.py",
+            "old_string": "a = 1",
+            "new_string": "a = 2"
+        })
+        .to_string();
+        let (v2, f2) = validator
+            .validate("Edit", &edit_py_json, "/workspace", false)
+            .await;
+        assert_eq!(f2, vec!["global-no-python".to_string()]);
+        assert!(matches!(v2, ValidateVerdict::DeterministicReject { .. }));
+
+        let write_shebang_json = serde_json::json!({
+            "path": "/workspace/scripts/run-tool",
+            "content": "#!/usr/bin/env python3\nimport sys\n"
+        })
+        .to_string();
+        let (v3, f3) = validator
+            .validate("write", &write_shebang_json, "/workspace", false)
+            .await;
+        assert_eq!(f3, vec!["global-no-python".to_string()]);
+        assert!(matches!(v3, ValidateVerdict::DeterministicReject { .. }));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shell_json_payloads_ignore_prose_descriptions_and_commit_messages_but_reject_invocations() {
+        let (_store, validator) = validator_with(vec![rule(
+            "global-no-python",
+            &no_py_trigger(),
+            "Never use Python code",
+            "active",
+        )])
+        .await;
+
+        let commit_payload = serde_json::json!({
+            "command": "git commit -m \"fix(guard): allow Python and .py in prose edits\"",
+            "description": "Commit Python guard fix for .py prose"
+        })
+        .to_string();
+        let (v_commit, f_commit) = validator
+            .validate("shell", &commit_payload, "/workspace", false)
+            .await;
+        assert!(
+            f_commit.is_empty(),
+            "git commit message and tool description must not fire command guard: {:?}",
+            f_commit
+        );
+        assert!(matches!(v_commit, ValidateVerdict::SandboxPassHighFidelity { .. }));
+
+        let invoke_payload = serde_json::json!({
+            "command": "cargo test && python3 -m http.server",
+            "description": "run server"
+        })
+        .to_string();
+        let (v_invoke, f_invoke) = validator
+            .validate("shell", &invoke_payload, "/workspace", false)
+            .await;
+        assert_eq!(f_invoke, vec!["global-no-python".to_string()]);
+        assert!(matches!(v_invoke, ValidateVerdict::DeterministicReject { .. }));
+
+        let subshell_payload = serde_json::json!({
+            "command": "sh -c \"pip install requests\"",
+            "description": "install package in subshell"
+        })
+        .to_string();
+        let (v_sub, f_sub) = validator
+            .validate("bash", &subshell_payload, "/workspace", false)
+            .await;
+        assert_eq!(f_sub, vec!["global-no-python".to_string()]);
+        assert!(matches!(v_sub, ValidateVerdict::DeterministicReject { .. }));
+
+        let cmd_sub_payload = serde_json::json!({
+            "command": "echo \"$(python3 -c 'print(1)')\"",
+            "description": "command substitution"
+        })
+        .to_string();
+        let (v_csub, f_csub) = validator
+            .validate("bash", &cmd_sub_payload, "/workspace", false)
+            .await;
+        assert_eq!(f_csub, vec!["global-no-python".to_string()]);
+        assert!(matches!(v_csub, ValidateVerdict::DeterministicReject { .. }));
+
+        let runner_payload = serde_json::json!({
+            "command": "uv run pytest",
+            "description": "uv runner"
+        })
+        .to_string();
+        let (v_runner, f_runner) = validator
+            .validate("bash", &runner_payload, "/workspace", false)
+            .await;
+        assert_eq!(f_runner, vec!["global-no-python".to_string()]);
+        assert!(matches!(v_runner, ValidateVerdict::DeterministicReject { .. }));
+
+        let search_and_test_payload = serde_json::json!({
+            "command": "rg python3 src/ && cargo test global_no_python --nocapture",
+            "description": "search and cargo test filter"
+        })
+        .to_string();
+        let (v_search, f_search) = validator
+            .validate("bash", &search_and_test_payload, "/workspace", false)
+            .await;
+        assert!(
+            f_search.is_empty(),
+            "search arguments and cargo test filters must not fire command guard: {:?}",
+            f_search
+        );
+        assert!(matches!(v_search, ValidateVerdict::SandboxPassHighFidelity { .. }));
     }
 }

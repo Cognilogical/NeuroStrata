@@ -173,7 +173,9 @@ async fn handle_task_setup(args: Value, emb: Arc<dyn Embedder>, store: Arc<dyn V
 ```
 
 **neurostrata_task_claim** — `{id, namespace, assignee, session_id}` →
-transition open→in_progress. Error if claimed by another live session.
+transition open→in_progress. Error if claimed by another live session. A
+successful claim records the caller's current Git branch and canonical worktree
+path for strict-gate scoping (§5.3).
 
 **neurostrata_task_update**
 ```json
@@ -305,11 +307,14 @@ agent. Keeps the MCP surface side-effect-light and auditable.
 `src/daemon.rs` gains one route beside `/backup`:
 
 ```
-POST /tasks/gate  { "namespace": "ns", "strict": true }
+POST /tasks/gate  { "namespace": "ns", "strict": true,
+                    "scope": { "branch": "main", "worktree": "/repo/main" } }
               ->  { "ok": bool, "violations": [ { "id", "kind", "detail" } ] }
 ```
 
 Pure metadata query over `list` — no embedder, no judgment, milliseconds.
+`scope` is optional for older callers; omitting it preserves the legacy global
+verdict. The CLI captures it from its own working directory, not the daemon's.
 
 ## 5. Git Hook (Q4)
 
@@ -367,7 +372,12 @@ exit 0   # 0 and 2 both pass here unless --strict flips 2 to blocking
 ### 5.3 Gate rules (`src/task/gate.rs`, shared engine)
 
 Violation iff:
-1. Any task `in_progress` in the namespace (unfinished claimed work).
+1. A strict caller-supplied branch/worktree scope matches an unfinished
+   `in_progress` claim's branch or canonical worktree. Matching either identity
+   blocks: a branch joins its worktrees, while the path also covers detached
+   HEADs and branch switches in one worktree. Claims with neither attribution
+   field predate scoping and fail closed. Advisory `task validate` calls without
+   a scope retain the legacy namespace-wide in-progress report.
 2. Any `done` task with zero inbound EXTRACTED_FROM edges — impossible by
    construction via `task_complete`, checked anyway because import paths and
    hand edits exist. `grandfathered: true` (beads import) exempt.

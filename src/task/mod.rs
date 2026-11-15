@@ -1390,6 +1390,44 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
     }
     match evaluate_claim_decision(k_status, same_session, age, gate::STALE_AFTER_SECS) {
         KernelClaimDecision::IdempotentSameSession => {
+            // Legacy rows written before attribution existed keep the holder
+            // but not the branch/worktree: backfill what is missing so the
+            // strict gate can judge them, persist it, and leave already
+            // attributed rows exactly as they are.
+            let scope = gate::GateScope::capture(&crate::daemon::resolve_project_root());
+            let obj = task_obj_mut(&mut task.payload);
+            let branch_missing = obj
+                .get("branch")
+                .and_then(Value::as_str)
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true);
+            let worktree_missing = obj
+                .get("worktree")
+                .and_then(Value::as_str)
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true);
+            let mut backfilled = false;
+            if branch_missing && scope.branch.is_some() {
+                obj.insert("branch".to_string(), json!(scope.branch));
+                backfilled = true;
+            }
+            if worktree_missing && scope.worktree.is_some() {
+                obj.insert("worktree".to_string(), json!(scope.worktree));
+                backfilled = true;
+            }
+            if backfilled {
+                if let Err(e) = save_task(
+                    &store,
+                    &namespace,
+                    &id,
+                    vector.clone(),
+                    task.payload.clone(),
+                )
+                .await
+                {
+                    return e;
+                }
+            }
             let body = json!({
                 "id": id,
                 "namespace": namespace,
@@ -1458,10 +1496,13 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
         Err(e) => return format!("ERROR: {}", e),
     };
     task = claimed;
+    let scope = gate::GateScope::capture(&crate::daemon::resolve_project_root());
     {
         let obj = task_obj_mut(&mut task.payload);
         obj.insert("assignee".to_string(), json!(assignee));
         obj.insert("session_id".to_string(), json!(session));
+        obj.insert("branch".to_string(), json!(scope.branch));
+        obj.insert("worktree".to_string(), json!(scope.worktree));
     }
 
     // No re-read guard here: the per-task claim lock above is held across
@@ -1644,6 +1685,8 @@ pub async fn handle_task_update(
                     let obj = task_obj_mut(&mut moved.payload);
                     obj.remove("assignee");
                     obj.remove("session_id");
+                    obj.remove("branch");
+                    obj.remove("worktree");
                     task = moved;
                 }
                 // Claiming through task_update must not hollow the machine:
@@ -1662,6 +1705,12 @@ pub async fn handle_task_update(
                         .and_then(Value::as_str)
                         .map(|s| s.trim().is_empty())
                         .unwrap_or(true);
+                    // A scope is attributable only to a real new session
+                    // claim: an Open row with no holder and a caller-provided
+                    // session. A holder-less transition stamps nothing, and a
+                    // row still claimed by another holder keeps that holder's
+                    // attribution untouched.
+                    let new_claim = unclaimed && caller_session.is_some();
                     if unclaimed {
                         if let Some(session) = &caller_session {
                             obj.insert("session_id".to_string(), json!(session));
@@ -1676,6 +1725,12 @@ pub async fn handle_task_update(
                                 obj.insert("assignee".to_string(), json!(a));
                             }
                         }
+                    }
+                    if new_claim {
+                        let scope =
+                            gate::GateScope::capture(&crate::daemon::resolve_project_root());
+                        obj.insert("branch".to_string(), json!(scope.branch));
+                        obj.insert("worktree".to_string(), json!(scope.worktree));
                     }
                     task = moved;
                 } else {
@@ -5916,6 +5971,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn claim_stamps_the_current_branch_and_worktree() {
+        let _env_guard = crate::daemon::project_root_env_test_lock();
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        let expected = gate::GateScope::capture(&crate::daemon::resolve_project_root());
+
+        let reply = handle_task_claim(
+            json!({ "namespace": "MyProj", "id": id, "assignee": "agent-a", "session_id": "ses_a" }),
+            store.clone(),
+        )
+        .await;
+        assert!(reply.contains("\"status\": \"in_progress\""), "{}", reply);
+
+        let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+        assert_eq!(payload.metadata["task"]["branch"], json!(expected.branch));
+        assert_eq!(
+            payload.metadata["task"]["worktree"],
+            json!(expected.worktree)
+        );
+    }
+
+    #[tokio::test]
+    async fn holderless_open_to_in_progress_update_stays_unattributed_and_fails_closed() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+
+        // No session_id: the transition has no holder, so it is not a claim.
+        let reply = handle_task_update(
+            json!({ "namespace": "MyProj", "id": id, "status": "in_progress" }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        assert!(reply.contains("\"status\": \"in_progress\""), "{}", reply);
+
+        let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+        let task_meta = &payload.metadata["task"];
+        assert!(
+            task_meta.get("session_id").is_none(),
+            "holder-less transition must not stamp a session: {}",
+            task_meta
+        );
+        assert!(
+            task_meta.get("branch").is_none() && task_meta.get("worktree").is_none(),
+            "holder-less transition must not stamp scope: {}",
+            task_meta
+        );
+        // The strict gate cannot prove a holder-less claim independent, so it
+        // keeps blocking no matter which scope is pushed.
+        let independent = gate::GateScope {
+            branch: Some("feature/independent".to_string()),
+            worktree: Some("/repo/independent".to_string()),
+        };
+        let report = gate::run_scoped(&store, "MyProj", Some(&independent))
+            .await
+            .unwrap();
+        assert!(report.violations.iter().any(|v| v.kind == "in_progress"));
+    }
+
+    #[tokio::test]
+    async fn task_update_open_to_in_progress_never_clobbers_another_holders_attribution() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+
+        // Seed an Open row that still carries a prior holder's attribution.
+        let (vector, mut payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+        payload.metadata["task"]["assignee"] = json!("agent-other");
+        payload.metadata["task"]["session_id"] = json!("ses_other");
+        payload.metadata["task"]["branch"] = json!("other/branch");
+        payload.metadata["task"]["worktree"] = json!("/repo/other");
+        store.upsert("MyProj", &id, vector, payload).await.unwrap();
+
+        let reply = handle_task_update(
+            json!({
+                "namespace": "MyProj",
+                "id": id,
+                "status": "in_progress",
+                "assignee": "agent-new",
+                "session_id": "ses_new"
+            }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        assert!(!reply.starts_with("ERROR"), "{}", reply);
+
+        let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+        let task_meta = &payload.metadata["task"];
+        assert_eq!(task_meta["branch"], json!("other/branch"));
+        assert_eq!(task_meta["worktree"], json!("/repo/other"));
+        assert_eq!(task_meta["session_id"], json!("ses_other"));
+    }
+
+    #[tokio::test]
+    async fn task_update_claim_stamps_scope_for_the_strict_gate() {
+        let _env_guard = crate::daemon::project_root_env_test_lock();
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        let expected = gate::GateScope::capture(&crate::daemon::resolve_project_root());
+
+        let reply = handle_task_update(
+            json!({
+                "namespace": "MyProj",
+                "id": id,
+                "status": "in_progress",
+                "assignee": "agent-a",
+                "session_id": "ses_a"
+            }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        assert!(reply.contains("\"status\": \"in_progress\""), "{}", reply);
+
+        let same_scope = gate::run_scoped(&store, "MyProj", Some(&expected))
+            .await
+            .unwrap();
+        assert!(same_scope
+            .violations
+            .iter()
+            .any(|v| v.kind == "in_progress"));
+        let independent = gate::GateScope {
+            branch: Some("feature/independent".to_string()),
+            worktree: Some("/repo/independent".to_string()),
+        };
+        let other_scope = gate::run_scoped(&store, "MyProj", Some(&independent))
+            .await
+            .unwrap();
+        assert!(!other_scope
+            .violations
+            .iter()
+            .any(|v| v.kind == "in_progress"));
+    }
+
+    #[tokio::test]
     async fn claim_is_refused_while_another_live_session_holds_the_task() {
         let store = store_with_namespace("MyProj").await;
         let id = create_task(&store, "MyProj", "the work", 2).await;
@@ -6053,6 +6243,69 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn same_session_reclaim_backfills_missing_legacy_attribution_and_preserves_existing() {
+        let _env_guard = crate::daemon::project_root_env_test_lock();
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        let args = json!({ "namespace": "MyProj", "id": id, "assignee": "agent-a", "session_id": "ses_a" });
+
+        handle_task_claim(args.clone(), store.clone()).await;
+
+        // Simulate a legacy row: attribution dropped, claim intact.
+        let expected = gate::GateScope::capture(&crate::daemon::resolve_project_root());
+        let (vector, mut payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+        payload.metadata["task"]
+            .as_object_mut()
+            .unwrap()
+            .remove("branch");
+        payload.metadata["task"]
+            .as_object_mut()
+            .unwrap()
+            .remove("worktree");
+        store.upsert("MyProj", &id, vector, payload).await.unwrap();
+
+        let backfill = handle_task_claim(args.clone(), store.clone()).await;
+        assert!(
+            backfill.contains("already claimed by this session"),
+            "{}",
+            backfill
+        );
+
+        let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+        assert_eq!(
+            payload.metadata["task"]["branch"],
+            json!(expected.branch),
+            "legacy branch attribution must be backfilled"
+        );
+        assert_eq!(
+            payload.metadata["task"]["worktree"],
+            json!(expected.worktree),
+            "legacy worktree attribution must be backfilled"
+        );
+
+        // Idempotency: an already-attributed row keeps its exact attribution.
+        let (vector, mut payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+        payload.metadata["task"]["branch"] = json!("legacy/branch");
+        payload.metadata["task"]["worktree"] = json!("/legacy/worktree");
+        store.upsert("MyProj", &id, vector, payload).await.unwrap();
+
+        let again = handle_task_claim(args, store.clone()).await;
+        assert!(
+            again.contains("already claimed by this session"),
+            "{}",
+            again
+        );
+
+        let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+        assert_eq!(payload.metadata["task"]["branch"], json!("legacy/branch"));
+        assert_eq!(
+            payload.metadata["task"]["worktree"],
+            json!("/legacy/worktree"),
+            "existing attribution must not be overwritten"
         );
     }
 
@@ -7589,6 +7842,8 @@ impl crate::traits::AsAny for ListHidingStore {
             payload.metadata["task"]
         );
         assert!(payload.metadata["task"].get("session_id").is_none());
+        assert!(payload.metadata["task"].get("branch").is_none());
+        assert!(payload.metadata["task"].get("worktree").is_none());
     }
 
     // ── task_validate (the advisory twin of the gate) ───────────────────
