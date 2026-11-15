@@ -1318,3 +1318,235 @@ pub const fn is_memory_valid_at(
 ) -> bool {
     valid_from <= as_of_ts && (!has_valid_to || valid_to > as_of_ts)
 }
+
+/// Epistemic maturity status of a taxonomy concept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EpistemicStatus {
+    Seed,
+    Defined,
+    Synthesized,
+    Verified,
+}
+
+impl EpistemicStatus {
+    /// Weight in basis points (0-10000).
+    pub const fn weight_bps(self) -> u32 {
+        match self {
+            EpistemicStatus::Seed => 2500,
+            EpistemicStatus::Defined => 5000,
+            EpistemicStatus::Synthesized => 8000,
+            EpistemicStatus::Verified => 10000,
+        }
+    }
+
+    /// String representation.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            EpistemicStatus::Seed => "seed",
+            EpistemicStatus::Defined => "defined",
+            EpistemicStatus::Synthesized => "synthesized",
+            EpistemicStatus::Verified => "verified",
+        }
+    }
+}
+
+/// Classifies epistemic status from four boolean pillars.
+pub const fn classify_epistemic_status(
+    has_definition: bool,
+    has_taxonomy_link: bool,
+    has_synthesis: bool,
+    has_empirical_grounding: bool,
+) -> EpistemicStatus {
+    if !has_definition || !has_taxonomy_link {
+        EpistemicStatus::Seed
+    } else if !has_synthesis {
+        EpistemicStatus::Defined
+    } else if !has_empirical_grounding {
+        EpistemicStatus::Synthesized
+    } else {
+        EpistemicStatus::Verified
+    }
+}
+
+/// Validates that `broader_edges` form a DAG (no self-loops, no cycles).
+pub fn validate_taxonomy_dag(broader_edges: &[(u32, u32)]) -> bool {
+    // Check self-loops
+    for &(u, v) in broader_edges {
+        if u == v {
+            return false;
+        }
+    }
+    // Detect cycles using DFS with color marking
+    use std::collections::HashMap;
+    let mut adj: HashMap<u32, Vec<u32>> = HashMap::new();
+    for &(u, v) in broader_edges {
+        adj.entry(u).or_default().push(v);
+    }
+    let mut color: HashMap<u32, u8> = HashMap::new(); // 0=unvisited, 1=visiting, 2=done
+    fn dfs(u: u32, adj: &HashMap<u32, Vec<u32>>, color: &mut HashMap<u32, u8>) -> bool {
+        color.insert(u, 1);
+        if let Some(neighbors) = adj.get(&u) {
+            for &v in neighbors {
+                match color.get(&v) {
+                    Some(1) => return false, // back edge = cycle
+                    Some(2) => {}
+                    _ => {
+                        if !dfs(v, adj, color) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        color.insert(u, 2);
+        true
+    }
+    for &u in adj.keys() {
+        if !color.contains_key(&u) {
+            if !dfs(u, &adj, &mut color) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Validates SKOS disjointness: related/contrast edges must not overlap with
+/// transitive broader hierarchy in either direction.
+pub fn validate_skos_disjointness(
+    broader_edges: &[(u32, u32)],
+    related_edges: &[(u32, u32)],
+    contrast_edges: &[(u32, u32)],
+) -> bool {
+    use std::collections::{HashMap, HashSet};
+
+    // Build adjacency for broader hierarchy
+    let mut adj: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut rev_adj: HashMap<u32, Vec<u32>> = HashMap::new();
+    for &(u, v) in broader_edges {
+        adj.entry(u).or_default().push(v);
+        rev_adj.entry(v).or_default().push(u);
+    }
+
+    // Compute transitive reachability: for each node, all nodes reachable via broader+
+    let mut reachable: HashMap<u32, HashSet<u32>> = HashMap::new();
+
+    fn compute_reachable(
+        u: u32,
+        adj: &HashMap<u32, Vec<u32>>,
+        memo: &mut HashMap<u32, HashSet<u32>>,
+    ) -> HashSet<u32> {
+        if let Some(cached) = memo.get(&u) {
+            return cached.clone();
+        }
+        let mut set = HashSet::new();
+        if let Some(neighbors) = adj.get(&u) {
+            for &v in neighbors {
+                set.insert(v);
+                let child_reachable = compute_reachable(v, adj, memo);
+                set.extend(child_reachable);
+            }
+        }
+        memo.insert(u, set.clone());
+        set
+    }
+
+    // Compute for all nodes in adj
+    for &u in adj.keys() {
+        compute_reachable(u, &adj, &mut reachable);
+    }
+
+    // A related/contrast pair is a violation when the two concepts are comparable
+    // in the broader hierarchy in either direction, or identical.
+    let pair_disjoint = |u: u32, v: u32| -> bool {
+        if u == v {
+            return false;
+        }
+        if let Some(reach_u) = reachable.get(&u) {
+            if reach_u.contains(&v) {
+                return false;
+            }
+        }
+        if let Some(reach_v) = reachable.get(&v) {
+            if reach_v.contains(&u) {
+                return false;
+            }
+        }
+        true
+    };
+
+    for &(u, v) in related_edges {
+        if !pair_disjoint(u, v) {
+            return false;
+        }
+    }
+    for &(u, v) in contrast_edges {
+        if !pair_disjoint(u, v) {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Computes epistemic coverage in basis points.
+pub fn compute_epistemic_coverage_bps(statuses: &[EpistemicStatus], unmapped_domain_count: u32) -> u32 {
+    if statuses.is_empty() && unmapped_domain_count == 0 {
+        return 0;
+    }
+    let sum_weights: u64 = statuses.iter().map(|s| s.weight_bps() as u64).sum();
+    let denom: u64 = statuses.len() as u64 + unmapped_domain_count as u64;
+    ((sum_weights / denom) as u32).min(10000)
+}
+
+/// Returns realization status gap in basis points.
+/// NOTE: Not `const fn` — stable Rust cannot match on `&str` in const contexts.
+pub fn realization_status_gap_bps(status: &str) -> u32 {
+    match status {
+        "unimplemented" => 10000,
+        "partial" => 7500,
+        "unknown" => 6000,
+        "implemented" => 2500,
+        "external_only" => 0,
+        _ => 6000,
+    }
+}
+
+/// Computes frontier leverage score in basis points.
+pub const fn compute_frontier_leverage_bps(
+    axis_alignment_bps: u32,
+    realization_gap_bps: u32,
+    canonical_connectivity_count: u32,
+    has_frontier_or_limitation: bool,
+    has_references_or_comparables: bool,
+) -> u32 {
+    if realization_gap_bps == 0
+        || (realization_gap_bps <= 2500 && !has_frontier_or_limitation)
+    {
+        return 0;
+    }
+    let align = if axis_alignment_bps > 10000 {
+        10000u64
+    } else {
+        axis_alignment_bps as u64
+    };
+    let gap = if realization_gap_bps > 10000 {
+        10000u64
+    } else {
+        realization_gap_bps as u64
+    };
+    let conn_capped = if canonical_connectivity_count > 10 {
+        10u64
+    } else {
+        canonical_connectivity_count as u64
+    };
+    let conn_bps = conn_capped * 1000;
+    let frontier_bps = if has_frontier_or_limitation { 10000u64 } else { 0u64 };
+    let cite_bps = if has_references_or_comparables { 10000u64 } else { 0u64 };
+    let raw = (35 * align + 25 * gap + 20 * conn_bps + 10 * frontier_bps + 10 * cite_bps) / 100;
+    if raw > 10000 {
+        10000
+    } else {
+        raw as u32
+    }
+}

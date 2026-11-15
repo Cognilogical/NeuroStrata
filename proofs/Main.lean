@@ -11,6 +11,7 @@ open NeuroStrata.KineticAction
 open NeuroStrata.HybridSlots
 open NeuroStrata.TwinInterface
 open NeuroStrata
+open NeuroStrata.Taxonomy
 
 def boolToStr (b : Bool) : String := if b then "true" else "false"
 
@@ -159,3 +160,27 @@ def main : IO Unit := do
         for asOf in ([5, 15, 20, 25] : List Int) do
           let valid := isMemoryValidAt vf hasVt vt asOf
           IO.println s!"INSIGHT_VALID_AT|{vf}|{boolToStr hasVt}|{vt}|{asOf}|{boolToStr valid}"
+  for d in [false, true] do
+    for t in [false, true] do
+      for s in [false, true] do
+        for g in [false, true] do
+          let st := classifyEpistemicStatus d t s g |>.asStr
+          IO.println s!"TAXONOMY_CLASSIFY|{boolToStr d}|{boolToStr t}|{boolToStr s}|{boolToStr g}|{st}"
+  let dagCases : List (String × List (Nat × Nat)) := [("empty", []), ("single_edge", [(1, 2)]), ("self_loop", [(1, 1)]), ("two_cycle", [(1, 2), (2, 1)]), ("three_cycle", [(1, 2), (2, 3), (3, 1)]), ("diamond", [(1, 2), (1, 3), (2, 4), (3, 4)])]
+  for (label, edges) in dagCases do
+    let dagValid := validateTaxonomyDag edges
+    IO.println s!"TAXONOMY_DAG|{label}|{boolToStr dagValid}"
+  let skosBroader : List (Nat × Nat) := [(0, 1), (1, 2)]
+  let skosCases : List (String × List (Nat × Nat) × List (Nat × Nat)) := [("related_direct", [(0, 1)], []), ("related_trans", [(0, 2)], []), ("related_reverse", [(1, 0)], []), ("related_reverse_trans", [(2, 0)], []), ("related_self", [(0, 0)], []), ("contrast_trans", [], [(0, 2)]), ("contrast_reverse", [], [(2, 1)]), ("contrast_self", [], [(1, 1)]), ("unrelated", [(0, 5)], []), ("empty_all", [], [])]
+  for (label, rel, con) in skosCases do
+    let skosValid := validateSkosDisjointness skosBroader rel con
+    IO.println s!"TAXONOMY_SKOS|{label}|{boolToStr skosValid}"
+  let coverageCases : List (String × List EpistemicStatus × Nat) := [("empty_zero", [], 0), ("seed", [.seed], 0), ("verified", [.verified], 0), ("seed_verified", [.seed, .verified], 0), ("seed_verified_unmapped", [.seed, .verified], 1), ("four_seed", [.seed, .seed, .seed, .seed], 0), ("mixed", [.seed, .defined, .synthesized, .verified], 0)]
+  for (label, statuses, unmapped) in coverageCases do
+    IO.println s!"TAXONOMY_COVERAGE|{label}|{computeEpistemicCoverageBps statuses unmapped}"
+  let realizationCases : List String := ["unimplemented", "partial", "unknown", "implemented", "external_only", "other"]
+  for status in realizationCases do
+    IO.println s!"TAXONOMY_REALIZATION|{status}|{realizationStatusGapBps status}"
+  let frontierCases : List (String × Nat × Nat × Nat × Bool × Bool) := [("zero_gap", 5000, 0, 3, true, true), ("low_gap_no_frontier", 5000, 2000, 3, false, true), ("low_gap_frontier", 5000, 2000, 3, true, true), ("full", 10000, 10000, 10, true, true), ("capped", 20000, 20000, 20, true, true), ("partial", 3000, 5000, 2, false, false)]
+  for (label, axis, gap, conn, frontier, cite) in frontierCases do
+    IO.println s!"TAXONOMY_FRONTIER|{label}|{computeFrontierLeverageBps axis gap conn frontier cite}"

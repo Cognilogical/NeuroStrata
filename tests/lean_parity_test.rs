@@ -30,7 +30,7 @@ use formal_kernel::{
     import_precheck_tag, intersect_var_bounds, is_action_memory_shareable, is_memory_valid_at,
     join_task_status, lifecycle_can_transition, procedure_fire_tag, resolve_cross_file_call,
     resolve_scenario_row, retention_verdict_tag, seq_decision_tag, sovereignty_decision_tag,
-    task_step_tag, ActionMemoryKind, ActionReceiptState, ActionTaskTargetStatus,
+    task_step_tag, ActionMemoryKind, ActionReceiptState, ActionTaskTargetStatus, EpistemicStatus,
     KernelProcedureTrust, ReducerOpKind, TwinBoundError,
 };
 
@@ -63,8 +63,9 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// Generates the canonical 389-line truth table in `proofs/Main.lean` order:
-/// 64 `TASK_FSM` + 16 `LIFECYCLE` + 128 `MESH_MERGE` + 3 `EPOCH_GATE` + 24 `TASK_CLAIM` + 32 `SOVEREIGNTY_GATE` + 8 `IMPORT_PRECHECK` + 60 `PROCEDURE_FIRE` + 16 `TWIN_CRDT_STATUS` + 6 `TWIN_CRDT_SEQ` + 32 `RETENTION_GATE`.
+/// Generates the canonical 910-line truth table in `proofs/Main.lean` order:
+/// 859 legacy rows + 51 taxonomy rows (16 `TAXONOMY_CLASSIFY` + 6 `TAXONOMY_DAG` +
+/// 10 `TAXONOMY_SKOS` + 7 `TAXONOMY_COVERAGE` + 6 `TAXONOMY_REALIZATION` + 6 `TAXONOMY_FRONTIER`).
 fn generate_rust_truth_table() -> Vec<String> {
     let mut lines: Vec<String> = Vec::with_capacity(389);
 
@@ -584,6 +585,121 @@ fn generate_rust_truth_table() -> Vec<String> {
         }
     }
 
+    // TAXONOMY_CLASSIFY: 16 rows (4 bools)
+    for d in [false, true] {
+        for t in [false, true] {
+            for s in [false, true] {
+                for g in [false, true] {
+                    let st = formal_kernel::classify_epistemic_status(d, t, s, g);
+                    lines.push(format!(
+                        "TAXONOMY_CLASSIFY|{}|{}|{}|{}|{}",
+                        bool_str(d),
+                        bool_str(t),
+                        bool_str(s),
+                        bool_str(g),
+                        st.as_str()
+                    ));
+                }
+            }
+        }
+    }
+
+    // TAXONOMY_DAG: 6 rows
+    let dag_cases: [(&str, &[(u32, u32)]); 6] = [
+        ("empty", &[] as &[(u32, u32)]),
+        ("single_edge", &[(1, 2)]),
+        ("self_loop", &[(1, 1)]),
+        ("two_cycle", &[(1, 2), (2, 1)]),
+        ("three_cycle", &[(1, 2), (2, 3), (3, 1)]),
+        ("diamond", &[(1, 2), (1, 3), (2, 4), (3, 4)]),
+    ];
+    for (label, edges) in dag_cases.iter() {
+        lines.push(format!(
+            "TAXONOMY_DAG|{}|{}",
+            label,
+            formal_kernel::validate_taxonomy_dag(edges)
+        ));
+    }
+
+    // TAXONOMY_SKOS: broader chain 0 -> 1 -> 2
+    let skos_broader: &[(u32, u32)] = &[(0, 1), (1, 2)];
+    let skos_cases: [(&str, &[(u32, u32)], &[(u32, u32)]); 10] = [
+        ("related_direct", &[(0, 1)], &[] as &[(u32, u32)]),
+        ("related_trans", &[(0, 2)], &[] as &[(u32, u32)]),
+        ("related_reverse", &[(1, 0)], &[] as &[(u32, u32)]),
+        ("related_reverse_trans", &[(2, 0)], &[] as &[(u32, u32)]),
+        ("related_self", &[(0, 0)], &[] as &[(u32, u32)]),
+        ("contrast_trans", &[] as &[(u32, u32)], &[(0, 2)]),
+        ("contrast_reverse", &[] as &[(u32, u32)], &[(2, 1)]),
+        ("contrast_self", &[] as &[(u32, u32)], &[(1, 1)]),
+        ("unrelated", &[(0, 5)], &[] as &[(u32, u32)]),
+        ("empty_all", &[] as &[(u32, u32)], &[] as &[(u32, u32)]),
+    ];
+    for (label, rel, con) in skos_cases.iter() {
+        lines.push(format!(
+            "TAXONOMY_SKOS|{}|{}",
+            label,
+            formal_kernel::validate_skos_disjointness(skos_broader, rel, con)
+        ));
+    }
+
+    // TAXONOMY_COVERAGE: 7 rows
+    let coverage_cases: [(&str, Vec<EpistemicStatus>, u32); 7] = [
+        ("empty_zero", Vec::new(), 0),
+        ("seed", vec![EpistemicStatus::Seed], 0),
+        ("verified", vec![EpistemicStatus::Verified], 0),
+        ("seed_verified", vec![EpistemicStatus::Seed, EpistemicStatus::Verified], 0),
+        ("seed_verified_unmapped", vec![EpistemicStatus::Seed, EpistemicStatus::Verified], 1),
+        ("four_seed", vec![EpistemicStatus::Seed; 4], 0),
+        (
+            "mixed",
+            vec![
+                EpistemicStatus::Seed,
+                EpistemicStatus::Defined,
+                EpistemicStatus::Synthesized,
+                EpistemicStatus::Verified,
+            ],
+            0,
+        ),
+    ];
+    for (label, statuses, unmapped) in coverage_cases.iter() {
+        lines.push(format!(
+            "TAXONOMY_COVERAGE|{}|{}",
+            label,
+            formal_kernel::compute_epistemic_coverage_bps(statuses, *unmapped)
+        ));
+    }
+
+    // TAXONOMY_REALIZATION: 6 rows
+    let realization_cases: [&str; 6] =
+        ["unimplemented", "partial", "unknown", "implemented", "external_only", "other"];
+    for status in realization_cases.iter() {
+        lines.push(format!(
+            "TAXONOMY_REALIZATION|{}|{}",
+            status,
+            formal_kernel::realization_status_gap_bps(status)
+        ));
+    }
+
+    // TAXONOMY_FRONTIER: 6 rows
+    let frontier_cases: [(u32, u32, u32, bool, bool); 6] = [
+        (5000, 0, 3, true, true),
+        (5000, 2000, 3, false, true),
+        (5000, 2000, 3, true, true),
+        (10000, 10000, 10, true, true),
+        (20000, 20000, 20, true, true),
+        (3000, 5000, 2, false, false),
+    ];
+    let frontier_labels: [&str; 6] =
+        ["zero_gap", "low_gap_no_frontier", "low_gap_frontier", "full", "capped", "partial"];
+    for (i, (axis, gap, conn, frontier, cite)) in frontier_cases.iter().enumerate() {
+        lines.push(format!(
+            "TAXONOMY_FRONTIER|{}|{}",
+            frontier_labels[i],
+            formal_kernel::compute_frontier_leverage_bps(*axis, *gap, *conn, *frontier, *cite)
+        ));
+    }
+
     lines
 }
 
@@ -637,8 +753,8 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
     let rust_lines = generate_rust_truth_table();
     assert_eq!(
         rust_lines.len(),
-        859,
-        "expected 859 canonical lines (64+16+128+3+24+32+8+60+16+6+32+32+32+16+4+72+5+21+96+8+48+72+32+32)"
+        910,
+        "expected 910 canonical lines (859 legacy + 51 taxonomy)"
     );
 
     // Section-count verification: 64 TASK_FSM + 16 LIFECYCLE + 128 MESH_MERGE
