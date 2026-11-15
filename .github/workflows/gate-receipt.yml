@@ -32,29 +32,23 @@ jobs:
     if: github.event_name != 'issue_comment' || github.event.issue.pull_request
     runs-on: ubuntu-latest
     steps:
-      # Bootstrap: this workflow lands in the PR that adds the script, so the
-      # first run must use the head. After this lands, pin to base.ref so a PR
-      # cannot edit the gate that checks it.
-      - name: Resolve the PR head for comment and dispatch events
-        id: resolve
-        if: github.event_name == 'issue_comment' || github.event_name == 'workflow_dispatch'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.issue.number || inputs.pr }}
-        run: |
-          case "$PR_NUMBER" in
-            ''|*[!0-9]*)
-              echo "::error::PR number is missing or not numeric: '$PR_NUMBER'"
-              exit 2
-              ;;
-          esac
-          sha=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER" --jq .head.sha)
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-
-      - name: Checkout PR head (bootstrap; pin to base after merge)
+      # Bootstrap: this workflow lands in the PR that adds the script, so PR and
+      # review events run the head. After this lands, switch that checkout to
+      # the base ref so a PR cannot edit the gate that checks it.
+      - name: Checkout the PR head (PR and review events)
+        if: github.event_name != 'issue_comment' && github.event_name != 'workflow_dispatch'
         uses: actions/checkout@v7.0.1
         with:
-          ref: ${{ github.event.pull_request.head.sha || steps.resolve.outputs.sha }}
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      # issue_comment and workflow_dispatch are privileged default-branch
+      # contexts: run the trusted default-branch script against the PR number,
+      # never a caller-supplied PR head.
+      - name: Checkout the default branch (privileged events)
+        if: github.event_name == 'issue_comment' || github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
 
       - name: Require a receipt for every gating marker
         env:
