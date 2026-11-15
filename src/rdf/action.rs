@@ -620,6 +620,9 @@ pub enum ExpectedHead {
         row_id: String,
         expected_fingerprint: u64,
     },
+    UniqueActionSlug {
+        slug: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3729,10 +3732,21 @@ pub async fn define_action(
         .await
         .map_err(|e| ActionError::Storage(e.to_string()))?;
     store
-        .upsert(namespace, &row_id, vector, payload)
-        .await
-        .map_err(|e| ActionError::Storage(e.to_string()))?;
-    store.refresh_ontology(namespace).await;
+        .commit_action_batch(
+            namespace,
+            ActionWriteSet {
+                expected_heads: vec![ExpectedHead::UniqueActionSlug {
+                    slug: definition.slug.clone(),
+                }],
+                writes: vec![StagedMemoryWrite {
+                    id: row_id.clone(),
+                    vector,
+                    payload,
+                }],
+                edge_deltas: Vec::new(),
+            },
+        )
+        .await?;
 
     Ok(ActionDefinedOutcome {
         id: row_id,
@@ -7137,6 +7151,74 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "rejected apply must write zero receipts"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn concurrent_define_action_same_slug_rejects_duplicate_atomically() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ns-action-concurrent-slug-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&tmp, 4).expect("store"),
+        );
+        store.init("ns-conc-slug").await.unwrap();
+
+        let def_json = json!({
+            "slug": "atomic-slug-check",
+            "title": "Atomic Slug Check",
+            "description": "Verifies transactional slug reservation",
+            "required_role": "editor",
+            "parameters": {},
+            "submission_criteria": [],
+            "effects": [
+                {
+                    "op": "upsert_memory",
+                    "memory_type": "fact",
+                    "content_template": "ok",
+                    "metadata_template": { "domain": "ops" }
+                }
+            ]
+        });
+        let sec = ActionSecurityContext {
+            authenticated_principal: "alice".to_string(),
+            requested_principal: None,
+        };
+
+        let s1 = store.clone();
+        let d1 = def_json.clone();
+        let sec1 = sec.clone();
+        let s2 = store.clone();
+        let d2 = def_json.clone();
+        let sec2 = sec.clone();
+
+        let (r1, r2) = tokio::join!(
+            define_action(&s1, "ns-conc-slug", &sec1, &d1, &DummyActionEmbedder),
+            define_action(&s2, "ns-conc-slug", &sec2, &d2, &DummyActionEmbedder),
+        );
+
+        let successes = usize::from(r1.is_ok()) + usize::from(r2.is_ok());
+        assert_eq!(
+            successes, 1,
+            "expected exactly one concurrent define_action to succeed: r1={r1:?}, r2={r2:?}"
+        );
+        let dup_err = r1.err().or_else(|| r2.err()).expect("one duplicate error");
+        assert!(
+            matches!(dup_err, ActionError::DuplicateActionSlug { .. }),
+            "expected DuplicateActionSlug, got {dup_err:?}"
+        );
+
+        let rows = store
+            .list("ns-conc-slug", None, Some("action_type"))
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "store must contain exactly one active action_type row"
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }

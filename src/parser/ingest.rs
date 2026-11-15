@@ -1369,25 +1369,27 @@ async fn run_consumer(
                 file_sha256,
             } => {
                 if !sections.is_empty() {
-                    let summaries: Vec<String> = sections
+                    let full_contents: Vec<String> = sections
                         .iter()
-                        .map(|section| {
-                            truncate_for_embedding(&format!("{}\n\n{}", section.heading, section.text))
-                        })
+                        .map(|section| format!("{}\n\n{}", section.heading, section.text))
+                        .collect();
+                    let embed_inputs: Vec<String> = full_contents
+                        .iter()
+                        .map(|c| truncate_for_embedding(c))
                         .collect();
                     let embeddings = embedder
-                        .embed_batch(&summaries)
+                        .embed_batch(&embed_inputs)
                         .await
                         .map_err(|e| anyhow::anyhow!("failed to embed doc section batch: {}", e))?;
-                    if embeddings.len() != summaries.len() {
+                    if embeddings.len() != full_contents.len() {
                         anyhow::bail!(
                             "embedder returned {} embeddings for {} doc sections",
                             embeddings.len(),
-                            summaries.len()
+                            full_contents.len()
                         );
                     }
                     for ((section, summary), embedding) in
-                        sections.into_iter().zip(summaries).zip(embeddings)
+                        sections.into_iter().zip(full_contents).zip(embeddings)
                     {
                         let id = generation_scoped_id(
                             namespace,
@@ -1868,19 +1870,103 @@ pub async fn ingest_directory(
                                 serde_json::Value::Array(updated),
                             );
                         }
-                        // Fix depends_on generation prefixes (F2).
-                        if let Some(serde_json::Value::Array(arr)) = o.get("depends_on").cloned() {
-                            let updated: Vec<serde_json::Value> = arr
-                                .iter()
-                                .filter_map(|v| v.as_str())
-                                .map(|s| {
-                                    serde_json::Value::String(s.replace(&old_gen_str, &new_gen_str))
-                                })
-                                .collect();
-                            o.insert("depends_on".to_string(), serde_json::Value::Array(updated));
-                        }
-                        if let Some(serde_json::Value::Array(arr)) =
-                            o.get("calls_resolved").cloned()
+                        // Fix depends_on and calls_resolved generation prefixes (F2):
+                        // For `code_ast` symbols, keep only same-file targets here and strip
+                        // stale cross-file targets (`cross_file_callees` / `cross_file_callers`);
+                        // `resolve_cross_file_calls_for_generation` rebuilds cross-file edges
+                        // from the current generation's `staged_symbols` so removed or renamed
+                        // callees never leave dangling dependencies.
+                        // For `file` rows, `depends_on` is rebuilt from `imports` filtered by
+                        // `current_paths` below so deleted target files are dropped.
+                        if row_kind == "code_ast" {
+                            let same_file_prefix = format!("{new_gen_str}{file_path}#");
+                            if let Some(serde_json::Value::Array(arr)) =
+                                o.get("depends_on").cloned()
+                            {
+                                let updated: Vec<serde_json::Value> = arr
+                                    .iter()
+                                    .filter_map(|v| v.as_str())
+                                    .map(|s| s.replace(&old_gen_str, &new_gen_str))
+                                    .filter(|s| s.starts_with(&same_file_prefix))
+                                    .map(serde_json::Value::String)
+                                    .collect();
+                                if updated.is_empty() {
+                                    o.remove("depends_on");
+                                } else {
+                                    o.insert(
+                                        "depends_on".to_string(),
+                                        serde_json::Value::Array(updated),
+                                    );
+                                }
+                            }
+                            if let Some(serde_json::Value::Array(arr)) =
+                                o.get("calls_resolved").cloned()
+                            {
+                                let updated: Vec<serde_json::Value> = arr
+                                    .iter()
+                                    .filter_map(|v| v.as_str())
+                                    .map(|s| s.replace(&old_gen_str, &new_gen_str))
+                                    .filter(|s| s.starts_with(&same_file_prefix))
+                                    .map(serde_json::Value::String)
+                                    .collect();
+                                if updated.is_empty() {
+                                    o.remove("calls_resolved");
+                                } else {
+                                    o.insert(
+                                        "calls_resolved".to_string(),
+                                        serde_json::Value::Array(updated),
+                                    );
+                                }
+                            }
+                            o.remove("cross_file_callees");
+                            o.remove("cross_file_callers");
+                        } else if row_kind == "file" {
+                            if let Some(serde_json::Value::Array(arr)) =
+                                o.get("depends_on").cloned()
+                            {
+                                let updated: Vec<serde_json::Value> = arr
+                                    .iter()
+                                    .filter_map(|v| v.as_str())
+                                    .filter(|s| {
+                                        s.strip_prefix(&old_gen_str)
+                                            .map(|rel| current_paths.contains(rel))
+                                            .unwrap_or(false)
+                                    })
+                                    .map(|s| {
+                                        serde_json::Value::String(
+                                            s.replace(&old_gen_str, &new_gen_str),
+                                        )
+                                    })
+                                    .collect();
+                                if updated.is_empty() {
+                                    o.remove("depends_on");
+                                } else {
+                                    o.insert(
+                                        "depends_on".to_string(),
+                                        serde_json::Value::Array(updated),
+                                    );
+                                }
+                            }
+                            if let Some(serde_json::Value::Array(arr)) =
+                                o.get("imports").cloned()
+                            {
+                                let updated: Vec<serde_json::Value> = arr
+                                    .iter()
+                                    .filter_map(|v| v.as_str())
+                                    .filter(|p| current_paths.contains(*p))
+                                    .map(|p| serde_json::Value::String(p.to_string()))
+                                    .collect();
+                                if updated.is_empty() {
+                                    o.remove("imports");
+                                } else {
+                                    o.insert(
+                                        "imports".to_string(),
+                                        serde_json::Value::Array(updated),
+                                    );
+                                }
+                            }
+                        } else if let Some(serde_json::Value::Array(arr)) =
+                            o.get("depends_on").cloned()
                         {
                             let updated: Vec<serde_json::Value> = arr
                                 .iter()
@@ -1889,10 +1975,7 @@ pub async fn ingest_directory(
                                     serde_json::Value::String(s.replace(&old_gen_str, &new_gen_str))
                                 })
                                 .collect();
-                            o.insert(
-                                "calls_resolved".to_string(),
-                                serde_json::Value::Array(updated),
-                            );
+                            o.insert("depends_on".to_string(), serde_json::Value::Array(updated));
                         }
                     });
                     let new_id =
@@ -4928,6 +5011,111 @@ use super::x;"#;
             "all sections share one batch: {batches:?}"
         );
         drop(batches);
+
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn incremental_ingest_clears_dangling_cross_file_depends_on_when_callee_removed() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ns-inc-callee-removed-src-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let db = std::env::temp_dir().join(format!(
+            "ns-inc-callee-removed-db-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        std::fs::write(
+            tmp.join("caller.rs"),
+            "use crate::callee::compute_target;\npub fn invoke_caller() { compute_target(); }\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.join("callee.rs"), "pub fn compute_target() {}\n").unwrap();
+
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).unwrap());
+        store.init("inc-deps-ns").await.unwrap();
+        let (embedder, _) = batch_recording_embedder();
+        let schema =
+            ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+
+        ingest_directory(
+            &tmp,
+            &schema,
+            embedder.clone(),
+            store.clone(),
+            "inc-deps-ns",
+            None,
+            &[],
+        )
+        .await
+        .expect("gen 1 ingest");
+
+        let gen1_rows = store.list("inc-deps-ns", None, Some("code_ast")).await.unwrap();
+        let caller_gen1 = gen1_rows
+            .iter()
+            .find(|r| r.payload.metadata.get("symbol").and_then(|v| v.as_str()) == Some("invoke_caller"))
+            .expect("invoke_caller in gen 1");
+        let gen1_deps = caller_gen1
+            .payload
+            .metadata
+            .get("depends_on")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        assert_eq!(gen1_deps, 1, "gen 1 caller must depend on compute_target");
+
+        // Rename `compute_target` in `callee.rs` without touching `caller.rs`.
+        std::fs::write(tmp.join("callee.rs"), "pub fn renamed_other_fn() {}\n").unwrap();
+
+        ingest_directory(
+            &tmp,
+            &schema,
+            embedder,
+            store.clone(),
+            "inc-deps-ns",
+            None,
+            &[],
+        )
+        .await
+        .expect("gen 2 incremental ingest");
+
+        let gen2_rows = store.list("inc-deps-ns", None, Some("code_ast")).await.unwrap();
+        let caller_gen2 = gen2_rows
+            .iter()
+            .find(|r| r.payload.metadata.get("symbol").and_then(|v| v.as_str()) == Some("invoke_caller"))
+            .expect("invoke_caller carried into gen 2");
+        let gen2_deps = caller_gen2
+            .payload
+            .metadata
+            .get("depends_on")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let gen2_calls_resolved = caller_gen2
+            .payload
+            .metadata
+            .get("calls_resolved")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        assert_eq!(
+            gen2_deps, 0,
+            "carried caller must not retain dangling depends_on after callee removal: {:?}",
+            caller_gen2.payload.metadata
+        );
+        assert_eq!(
+            gen2_calls_resolved, 0,
+            "carried caller must not retain dangling calls_resolved after callee removal: {:?}",
+            caller_gen2.payload.metadata
+        );
+        assert!(
+            caller_gen2.payload.metadata.get("cross_file_callees").is_none(),
+            "carried caller must clear stale cross_file_callees"
+        );
 
         std::fs::remove_dir_all(&tmp).ok();
         std::fs::remove_dir_all(&db).ok();
