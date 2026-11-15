@@ -10897,6 +10897,11 @@ fn add_metadata_fallback_conn(
 /// batches, and the batches union into the same exact per-hit count. The costs
 /// are `ceil(hits / 128)` reads instead of one, which is one read for any file
 /// with up to 128 governing memories.
+///
+/// 128 is a transport cap, not a semantic limit: it keeps every generated
+/// query far below the engine's statement-length headroom while staying one
+/// batch for any realistic governing set. Hit counts above it only add
+/// batches; they never change a per-hit count.
 const LINKED_FILES_ID_BATCH: usize = 128;
 
 /// Sets each hit's `linked_files`: the distinct active files its `GOVERNS` and
@@ -10907,9 +10912,21 @@ const LINKED_FILES_ID_BATCH: usize = 128;
 /// superseded targets are ignored. One read per `LINKED_FILES_ID_BATCH` ids,
 /// unioned across batches, so the count is exact for any hit count.
 fn set_linked_files(conn: &Connection, hits: &mut [MemoryHit]) -> Result<()> {
+    set_linked_files_batched(conn, hits, LINKED_FILES_ID_BATCH)
+}
+
+/// `set_linked_files` with the batch width spelled out, so the boundary the
+/// census crosses between batches can be tested at a small size as well as at
+/// `LINKED_FILES_ID_BATCH`. The batching itself must not change any count.
+fn set_linked_files_batched(
+    conn: &Connection,
+    hits: &mut [MemoryHit],
+    batch_size: usize,
+) -> Result<()> {
     if hits.is_empty() {
         return Ok(());
     }
+    let batch_size = batch_size.max(1);
     let now = chrono::Utc::now().timestamp();
     let mut active_by_ns: std::collections::HashMap<String, ActiveGenerations> =
         std::collections::HashMap::new();
@@ -10921,7 +10938,7 @@ fn set_linked_files(conn: &Connection, hits: &mut [MemoryHit]) -> Result<()> {
         String,
         std::collections::HashSet<(String, String, String)>,
     > = std::collections::HashMap::new();
-    for batch in hits.chunks(LINKED_FILES_ID_BATCH) {
+    for batch in hits.chunks(batch_size) {
         let id_list = batch
             .iter()
             .map(|h| format!("'{}'", escape_ladybug_string(&h.id)))
@@ -15214,6 +15231,89 @@ eurostrata\src\daemon.rs",
         assert_eq!(ids, vec!["single_project", "cross_project"]);
         assert_eq!(hits[0].linked_files, 1);
         assert_eq!(hits[1].linked_files, 3);
+    }
+
+    /// The `linked_files` census batches the hit ids at `LINKED_FILES_ID_BATCH`,
+    /// so the seam between two batches must neither drop nor double-count a hit.
+    /// Every memory here governs the same two files (`src/a.rs`, `src/b.rs`), so
+    /// every count must be exactly 2 -- once through the production entry point
+    /// (`LINKED_FILES_ID_BATCH`, i.e. two batches because the hit set is one
+    /// batch plus a remainder) and once at width 3, which splits the same hits
+    /// into many batches. A dropped id reads 0; a double-count reads 4.
+    #[tokio::test]
+    async fn linked_files_census_stays_exact_across_the_id_batch_boundary() {
+        let store = retired_test_store().await;
+        let hit_count = LINKED_FILES_ID_BATCH + 3;
+        for path in ["src/a.rs", "src/b.rs"] {
+            let mut file_payload = retired_test_payload("file", "auto-ingestor", json!({}));
+            file_payload.location = path.to_string();
+            store
+                .upsert(
+                    "probe",
+                    &format!("probe::{path}"),
+                    vec![0.0; 4],
+                    file_payload,
+                )
+                .await
+                .unwrap();
+        }
+        for i in 0..hit_count {
+            store
+                .upsert(
+                    "probe",
+                    &format!("boundary-{i:03}"),
+                    vec![0.0; 4],
+                    retired_test_payload(
+                        "rule",
+                        "agent",
+                        json!({
+                            "governs": ["probe::src/a.rs", "probe::src/b.rs"],
+                            "valid_from": 1_700_000_000,
+                        }),
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+        let seeded: Vec<MemoryHit> = (0..hit_count)
+            .map(|i| MemoryHit {
+                id: format!("boundary-{i:03}"),
+                memory_type: "rule".to_string(),
+                content: String::new(),
+                match_kind: GraphMatchKind::ExactFile,
+                access_count: 0,
+                explanation: String::new(),
+                metadata: json!({}),
+                conceptual_bridges: Vec::new(),
+                linked_files: 0,
+            })
+            .collect();
+
+        let mut hits = seeded.clone();
+        let production = store
+            .with_conn(move |conn| {
+                set_linked_files(conn, &mut hits)?;
+                Ok(hits)
+            })
+            .await
+            .expect("census succeeds");
+        assert_eq!(production.len(), hit_count);
+        for hit in &production {
+            assert_eq!(hit.linked_files, 2, "production batch, id {}", hit.id);
+        }
+
+        let mut hits = seeded;
+        let split = store
+            .with_conn(move |conn| {
+                set_linked_files_batched(conn, &mut hits, 3)?;
+                Ok(hits)
+            })
+            .await
+            .expect("census succeeds");
+        assert_eq!(split.len(), hit_count);
+        for hit in &split {
+            assert_eq!(hit.linked_files, 2, "batched-by-3, id {}", hit.id);
+        }
     }
 
     /// Spec §3.2: an unqualified `GOVERNS` target that resolves to `Missing`

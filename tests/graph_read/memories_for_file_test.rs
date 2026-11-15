@@ -68,7 +68,11 @@ fn rank_hits_orders_enforced_rule_before_narrow_advisory() {
             4,
         ),
     ];
-    assert_eq!(fan_out_bucket(1), fan_out_bucket(4) - 1, "buckets must differ");
+    assert_eq!(
+        fan_out_bucket(1),
+        fan_out_bucket(4) - 1,
+        "buckets must differ"
+    );
     rank_hits(&mut hits);
     let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
     assert_eq!(ids, vec!["broad-enforced", "narrow-advisory"]);
@@ -114,7 +118,13 @@ fn fan_out_still_breaks_ties_within_one_enforcement_class() {
     );
     let mut hits = vec![
         hit_with_fan_out("broad-partial", GraphMatchKind::ExactFile, "rule", broad, 4),
-        hit_with_fan_out("narrow-partial", GraphMatchKind::ExactFile, "rule", narrow, 1),
+        hit_with_fan_out(
+            "narrow-partial",
+            GraphMatchKind::ExactFile,
+            "rule",
+            narrow,
+            1,
+        ),
     ];
     rank_hits(&mut hits);
     let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
