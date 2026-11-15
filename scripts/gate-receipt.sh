@@ -71,9 +71,20 @@ elif [ -n "$fixtures_dir" ]; then
   reviews_entries=$(json_entries "$fixtures_dir/reviews.json")
   comment_entries=$(json_entries "$fixtures_dir/issue-comments.json")
   if [ -f "$fixtures_dir/threads.json" ]; then
-    threads_json=$(jq -c . "$fixtures_dir/threads.json")
+    threads_json=$(jq -c . "$fixtures_dir/threads.json" 2>/dev/null) || {
+      echo "gate-receipt: $fixtures_dir/threads.json is not valid JSON" >&2
+      exit 2
+    }
+    if ! printf '%s' "$threads_json" | jq -e 'type == "array"' >/dev/null 2>&1; then
+      echo "gate-receipt: $fixtures_dir/threads.json must be a JSON array of threads" >&2
+      exit 2
+    fi
     thread_mode=threads
   elif [ -f "$fixtures_dir/pull-comments.json" ]; then
+    if ! jq -e 'type == "array"' "$fixtures_dir/pull-comments.json" >/dev/null 2>&1; then
+      echo "gate-receipt: $fixtures_dir/pull-comments.json must be a JSON array of comments" >&2
+      exit 2
+    fi
     pull_entries=$(json_entries "$fixtures_dir/pull-comments.json")
     thread_mode=fallback
   else

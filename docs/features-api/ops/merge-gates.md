@@ -17,9 +17,11 @@ posted as `COMMENTED` therefore cannot block a merge.
 ## Gate receipt
 
 A review or comment that says `CHANGES-NEEDED`, `CHANGES NEEDED`,
-`DO-NOT-MERGE`, or `DO NOT MERGE` is a gating marker. The PR body is not
-scanned: it often describes the gate itself. Each marker needs one receipt in a
-review or comment:
+`DO-NOT-MERGE`, or `DO NOT MERGE` is a gating marker, and so is a P1 or P2
+finding badge (`**P1 Badge**`, `**P2 Badge**`, or the Codex
+`<!-- codex-code-review-finding:v1 -->` body). The PR body is not scanned: it
+often describes the gate itself. Each marker needs one receipt in a review or
+comment:
 
 - `fixed@<sha>` — the finding is fixed at that commit;
 - `filed #<issue>` — the finding is tracked in an issue;
@@ -28,6 +30,19 @@ review or comment:
 `scripts/gate-receipt.sh --pr <n>` counts markers and receipts and fails when
 receipts < markers. `.github/workflows/gate-receipt.yml` runs it as the required
 `gate-receipt` check. A review body may contain both the marker and its receipt.
+
+Inline findings are counted from unresolved review threads when the GraphQL
+`reviewThreads` query answers: a resolved thread no longer gates, while a
+`fixed@`/`filed`/`ruled:` reply still counts as a receipt. If GraphQL is
+unavailable, every inline finding counts (over-gating) and the script says so on
+stderr; it never treats an unresolved thread as clearance.
+
+For offline checks, `--reviews-file <path>` takes a legacy body fixture and
+`--fixtures-dir <dir>` takes `reviews.json`, `issue-comments.json`, and either
+`threads.json` or `pull-comments.json` with the same payload shapes as the API.
+Malformed fixture shapes exit 2 rather than passing. `GATE_RECEIPT_REPO=owner/name`
+overrides the repository used by `--pr`, so a fork checkout can check the
+upstream PR.
 
 ## Why
 

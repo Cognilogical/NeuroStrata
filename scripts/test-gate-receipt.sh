@@ -116,4 +116,30 @@ case "$out" in
   *) echo "FAIL: fallback must announce that threads were not resolved: $out" >&2; exit 1 ;;
 esac
 
+# Malformed fixture shapes must fail closed, not clear the gate silently.
+mkdir -p "$tmp/malformed-threads" "$tmp/malformed-fallback"
+printf '[]\n' > "$tmp/malformed-threads/reviews.json"
+printf '[]\n' > "$tmp/malformed-threads/issue-comments.json"
+printf '{"oops":1}\n' > "$tmp/malformed-threads/threads.json"
+printf '[]\n' > "$tmp/malformed-fallback/reviews.json"
+printf '[]\n' > "$tmp/malformed-fallback/issue-comments.json"
+printf '{"oops":1}\n' > "$tmp/malformed-fallback/pull-comments.json"
+
+rc=0
+err=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$tmp/malformed-threads" 2>&1 >/dev/null) || rc=$?
+if [ "$rc" -ne 2 ]; then
+  echo "FAIL: malformed threads.json exited $rc, expected 2: $err" >&2
+  exit 1
+fi
+case "$err" in
+  *"must be a JSON array"*) : ;;
+  *) echo "FAIL: malformed threads.json did not name the shape error: $err" >&2; exit 1 ;;
+esac
+rc=0
+err=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$tmp/malformed-fallback" 2>&1 >/dev/null) || rc=$?
+if [ "$rc" -ne 2 ]; then
+  echo "FAIL: malformed pull-comments.json exited $rc, expected 2: $err" >&2
+  exit 1
+fi
+
 echo "gate-receipt self-test: PASS"
