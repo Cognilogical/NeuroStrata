@@ -1105,6 +1105,7 @@ pub(crate) async fn start_daemon_on(
         .route("/learning/status", get(handle_http_learning_status))
         .route("/learning/control", post(handle_http_learning_control))
         .route("/action", post(handle_http_action))
+        .route("/scenario", post(handle_http_scenario))
         .route("/shutdown", post(handle_shutdown))
         .with_state(state.clone())
         .layer(axum::middleware::from_fn_with_state(state, auth_middleware));
@@ -2131,6 +2132,19 @@ async fn handle_http_action(
 ) -> impl axum::response::IntoResponse {
     let body =
         crate::server::handle_action(&req, state.embedder.clone(), state.vector_store.clone())
+            .await;
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+}
+
+async fn handle_http_scenario(
+    State(state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> impl axum::response::IntoResponse {
+    let body =
+        crate::server::handle_scenario(&req, state.embedder.clone(), state.vector_store.clone())
             .await;
     (
         [(axum::http::header::CONTENT_TYPE, "application/json")],

@@ -1012,6 +1012,56 @@ pub async fn process_mcp_request(
                             },
                             "required": ["namespace", "action"]
                         }
+                    },
+                    {
+                        "name": "neurostrata_scenario",
+                        "description": "Create, stage, evaluate SPARQL, diff, commit, drop, or list counterfactual Copy-on-Write Ontology Scenarios.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "Project namespace." },
+                                "action": {
+                                    "type": "string",
+                                    "enum": ["create", "stage_memory", "stage_twin", "apply_action", "evaluate_sparql", "diff", "commit", "drop", "list"],
+                                    "description": "Scenario operation to perform."
+                                },
+                                "scenario_id": { "type": "string", "description": "Scenario ID (optional on create, required on stage_memory/stage_twin/apply_action/evaluate_sparql/diff/commit/drop)." },
+                                "title": { "type": "string", "description": "Human-readable scenario title (used on create)." },
+                                "ttl_secs": { "type": "integer", "description": "Scenario TTL in seconds (default 1800, max 86400)." },
+                                "memory_id": { "type": "string", "description": "Target memory ID when action is 'stage_memory'." },
+                                "memory_type": { "type": "string", "description": "Memory type when action is 'stage_memory' (default 'fact')." },
+                                "content": { "type": "string", "description": "Memory content when action is 'stage_memory'." },
+                                "metadata": { "type": "object", "description": "Memory metadata when action is 'stage_memory'." },
+                                "retire_id": { "type": "string", "description": "Optional live/staged memory ID to retire/supersede when action is 'stage_memory'." },
+                                "edges": {
+                                    "type": "array",
+                                    "description": "Optional staged edges [{source, relation, target}] when action is 'stage_memory'.",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "source": { "type": "string" },
+                                            "relation": { "type": "string" },
+                                            "target": { "type": "string" }
+                                        },
+                                        "required": ["source", "relation", "target"]
+                                    }
+                                },
+                                "twin_id": { "type": "string", "description": "Digital twin ID when action is 'stage_twin'." },
+                                "variables": { "type": "object", "description": "Numeric variable map (f64) when action is 'stage_twin'." },
+                                "attributes": { "type": "object", "description": "Optional attribute map when action is 'stage_twin'." },
+                                "merge": { "type": "boolean", "default": true, "description": "Whether to merge variables into existing twin state (default true)." },
+                                "schema_id": { "type": "string", "description": "Optional TwinSchema ID when action is 'stage_twin'." },
+                                "source": { "type": "string", "description": "Optional provenance source tag when action is 'stage_twin'." },
+                                "slug": { "type": "string", "description": "ActionType slug when action is 'apply_action'." },
+                                "params": { "type": "object", "description": "ActionType parameter map when action is 'apply_action'." },
+                                "query": { "type": "string", "description": "SPARQL SELECT/ASK/CONSTRUCT query when action is 'evaluate_sparql'." },
+                                "format": { "type": "string", "enum": ["json", "xml", "csv", "tsv"], "default": "json", "description": "SPARQL result format when action is 'evaluate_sparql'." },
+                                "compare_to_scenario_id": { "type": "string", "description": "Optional second scenario ID for side-by-side diff (defaults to comparing against live)." },
+                                "enforce_shacl_on_commit": { "type": "boolean", "default": true, "description": "Reject commit if staged rows have SHACL violations (default true)." },
+                                "principal": { "type": "string", "description": "Optional requested principal (honored only for admin callers)." }
+                            },
+                            "required": ["namespace", "action"]
+                        }
                     }
                 ]
             });
@@ -1477,6 +1527,10 @@ pub async fn process_mcp_request(
                         "neurostrata_action" => {
                             result_text =
                                 handle_action(&arguments, emb.clone(), store.clone()).await;
+                        }
+                        "neurostrata_scenario" => {
+                            result_text =
+                                handle_scenario(&arguments, emb.clone(), store.clone()).await;
                         }
                         // SynapticMesh: the handler is a pure string-in/
                         // string-out dispatch (filesystem + git only; no
@@ -6672,6 +6726,484 @@ pub(crate) async fn handle_action_with_auth(
         other => serde_json::json!({
             "ok": false,
             "error": format!("unknown action operation '{other}' (expected define|validate|apply|revert|log)")
+        })
+        .to_string(),
+    }
+}
+
+pub(crate) async fn handle_scenario(
+    arguments: &Value,
+    emb: Arc<dyn crate::traits::Embedder>,
+    store: Arc<dyn VectorStore>,
+) -> String {
+    handle_scenario_with_auth(arguments, "admin", emb, store).await
+}
+
+pub(crate) async fn handle_scenario_with_auth(
+    arguments: &Value,
+    authenticated_principal: &str,
+    emb: Arc<dyn crate::traits::Embedder>,
+    store: Arc<dyn VectorStore>,
+) -> String {
+    let Some(ns_raw) = arguments
+        .get("namespace")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return serde_json::json!({"ok": false, "error": "namespace required"}).to_string();
+    };
+    let Some(op) = arguments
+        .get("action")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return serde_json::json!({"ok": false, "error": "action required"}).to_string();
+    };
+    let namespace = resolve_namespace(&store, ns_raw).await;
+    let Some(lb_store) = crate::traits::VectorStore::as_any(store.as_ref())
+        .downcast_ref::<crate::store::ladybug::LadybugStore>()
+    else {
+        return serde_json::json!({"ok": false, "error": "ontology scenarios require LadybugStore backend"}).to_string();
+    };
+
+    let requested_principal = arguments
+        .get("principal")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let resolved_principal =
+        crate::rebac::resolve_principal(authenticated_principal, requested_principal.as_deref());
+    let security = crate::rdf::action::ActionSecurityContext {
+        authenticated_principal: authenticated_principal.to_string(),
+        requested_principal: Some(resolved_principal),
+    };
+
+    match op {
+        "create" => {
+            let scenario_id = arguments
+                .get("scenario_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let title = arguments
+                .get("title")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let ttl_secs = arguments.get("ttl_secs").and_then(|v| v.as_i64());
+            match crate::rdf::scenario::create_scenario(
+                lb_store,
+                &namespace,
+                scenario_id,
+                title,
+                ttl_secs,
+                &security,
+            ) {
+                Ok(summary) => serde_json::json!({
+                    "ok": true,
+                    "action": "create",
+                    "scenario": summary,
+                })
+                .to_string(),
+                Err(e) => serde_json::json!({
+                    "ok": false,
+                    "action": "create",
+                    "error": e,
+                })
+                .to_string(),
+            }
+        }
+        "stage_memory" => {
+            let Some(scenario_id) = arguments
+                .get("scenario_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return serde_json::json!({
+                    "ok": false,
+                    "action": "stage_memory",
+                    "error": "scenario_id required for 'stage_memory'"
+                })
+                .to_string();
+            };
+            let Some(content) = arguments
+                .get("content")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return serde_json::json!({
+                    "ok": false,
+                    "action": "stage_memory",
+                    "error": "content required for 'stage_memory'"
+                })
+                .to_string();
+            };
+            let memory_id = arguments
+                .get("memory_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let memory_type = arguments
+                .get("memory_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("fact");
+            let metadata = arguments
+                .get("metadata")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let retire_id = arguments
+                .get("retire_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.to_string());
+            let edges: Vec<crate::rdf::scenario::StagedEdge> = arguments
+                .get("edges")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            match crate::rdf::scenario::stage_scenario_memory(
+                lb_store,
+                &namespace,
+                scenario_id,
+                memory_id,
+                memory_type,
+                content,
+                metadata,
+                retire_id,
+                edges,
+                &security,
+            )
+            .await
+            {
+                Ok(out) => serde_json::json!({
+                    "ok": true,
+                    "action": "stage_memory",
+                    "staged": out,
+                })
+                .to_string(),
+                Err(e) => serde_json::json!({
+                    "ok": false,
+                    "action": "stage_memory",
+                    "error": e,
+                })
+                .to_string(),
+            }
+        }
+        "stage_twin" => {
+            let Some(scenario_id) = arguments
+                .get("scenario_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return serde_json::json!({
+                    "ok": false,
+                    "action": "stage_twin",
+                    "error": "scenario_id required for 'stage_twin'"
+                })
+                .to_string();
+            };
+            let Some(twin_id) = arguments
+                .get("twin_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return serde_json::json!({
+                    "ok": false,
+                    "action": "stage_twin",
+                    "error": "twin_id required for 'stage_twin'"
+                })
+                .to_string();
+            };
+            let Some(vars_obj) = arguments.get("variables").and_then(|v| v.as_object()) else {
+                return serde_json::json!({
+                    "ok": false,
+                    "action": "stage_twin",
+                    "error": "variables object required for 'stage_twin'"
+                })
+                .to_string();
+            };
+            let mut variables = std::collections::BTreeMap::new();
+            for (k, v) in vars_obj {
+                let Some(f) = v.as_f64().filter(|n| n.is_finite()) else {
+                    return serde_json::json!({
+                        "ok": false,
+                        "action": "stage_twin",
+                        "error": format!("variable '{k}' must be a finite number")
+                    })
+                    .to_string();
+                };
+                variables.insert(k.clone(), f);
+            }
+            let attributes: Option<
+                std::collections::BTreeMap<String, crate::digital_twin::TwinAttrValue>,
+            > = arguments
+                .get("attributes")
+                .and_then(|v| serde_json::from_value(v.clone()).ok());
+            let merge = arguments
+                .get("merge")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let schema_id = arguments
+                .get("schema_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.to_string());
+            let source = arguments
+                .get("source")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.to_string());
+            match crate::rdf::scenario::stage_scenario_twin(
+                lb_store,
+                &namespace,
+                scenario_id,
+                twin_id,
+                variables,
+                attributes,
+                merge,
+                schema_id,
+                source,
+                &security,
+            )
+            .await
+            {
+                Ok(out) => serde_json::json!({
+                    "ok": true,
+                    "action": "stage_twin",
+                    "staged": out,
+                })
+                .to_string(),
+                Err(e) => serde_json::json!({
+                    "ok": false,
+                    "action": "stage_twin",
+                    "error": e,
+                })
+                .to_string(),
+            }
+        }
+        "apply_action" => {
+            let Some(scenario_id) = arguments
+                .get("scenario_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return serde_json::json!({
+                    "ok": false,
+                    "action": "apply_action",
+                    "error": "scenario_id required for 'apply_action'"
+                })
+                .to_string();
+            };
+            let Some(slug) = arguments
+                .get("slug")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return serde_json::json!({
+                    "ok": false,
+                    "action": "apply_action",
+                    "error": "slug required for 'apply_action'"
+                })
+                .to_string();
+            };
+            let params: std::collections::BTreeMap<String, Value> = arguments
+                .get("params")
+                .and_then(|v| v.as_object())
+                .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                .unwrap_or_default();
+            match crate::rdf::scenario::apply_action_in_scenario(
+                lb_store,
+                &namespace,
+                scenario_id,
+                slug,
+                params,
+                &security,
+            )
+            .await
+            {
+                Ok(out) => serde_json::json!({
+                    "ok": true,
+                    "action": "apply_action",
+                    "staged": out,
+                })
+                .to_string(),
+                Err(crate::rdf::action::ActionError::SubmissionRejected(failures)) => {
+                    serde_json::json!({
+                        "ok": false,
+                        "action": "apply_action",
+                        "submission_failures": failures,
+                    })
+                    .to_string()
+                }
+                Err(e) => serde_json::json!({
+                    "ok": false,
+                    "action": "apply_action",
+                    "error": e.to_string(),
+                })
+                .to_string(),
+            }
+        }
+        "evaluate_sparql" => {
+            let Some(scenario_id) = arguments
+                .get("scenario_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return serde_json::json!({
+                    "ok": false,
+                    "action": "evaluate_sparql",
+                    "error": "scenario_id required for 'evaluate_sparql'"
+                })
+                .to_string();
+            };
+            let Some(query) = arguments
+                .get("query")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return serde_json::json!({
+                    "ok": false,
+                    "action": "evaluate_sparql",
+                    "error": "query required for 'evaluate_sparql'"
+                })
+                .to_string();
+            };
+            let fmt = arguments.get("format").and_then(|v| v.as_str());
+            match crate::rdf::scenario::evaluate_scenario_sparql(
+                lb_store,
+                &namespace,
+                scenario_id,
+                query,
+                fmt,
+            )
+            .await
+            {
+                Ok(out) => serde_json::json!({
+                    "ok": true,
+                    "action": "evaluate_sparql",
+                    "evaluation": out,
+                })
+                .to_string(),
+                Err(e) => serde_json::json!({
+                    "ok": false,
+                    "action": "evaluate_sparql",
+                    "error": e,
+                })
+                .to_string(),
+            }
+        }
+        "diff" => {
+            let Some(scenario_id) = arguments
+                .get("scenario_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return serde_json::json!({
+                    "ok": false,
+                    "action": "diff",
+                    "error": "scenario_id required for 'diff'"
+                })
+                .to_string();
+            };
+            let compare_to = arguments
+                .get("compare_to_scenario_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty());
+            match crate::rdf::scenario::diff_scenario(lb_store, &namespace, scenario_id, compare_to)
+                .await
+            {
+                Ok(diff) => serde_json::json!({
+                    "ok": true,
+                    "action": "diff",
+                    "diff": diff,
+                })
+                .to_string(),
+                Err(e) => serde_json::json!({
+                    "ok": false,
+                    "action": "diff",
+                    "error": e,
+                })
+                .to_string(),
+            }
+        }
+        "commit" => {
+            let Some(scenario_id) = arguments
+                .get("scenario_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return serde_json::json!({
+                    "ok": false,
+                    "action": "commit",
+                    "error": "scenario_id required for 'commit'"
+                })
+                .to_string();
+            };
+            let enforce_shacl = arguments
+                .get("enforce_shacl_on_commit")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            match crate::rdf::scenario::commit_scenario(
+                lb_store,
+                emb.as_ref(),
+                &namespace,
+                scenario_id,
+                enforce_shacl,
+                &security,
+            )
+            .await
+            {
+                Ok(outcome) => {
+                    let ok = matches!(
+                        outcome,
+                        crate::rdf::scenario::ScenarioCommitOutcome::Committed { .. }
+                    );
+                    serde_json::json!({
+                        "ok": ok,
+                        "action": "commit",
+                        "outcome": outcome,
+                    })
+                    .to_string()
+                }
+                Err(e) => serde_json::json!({
+                    "ok": false,
+                    "action": "commit",
+                    "error": e,
+                })
+                .to_string(),
+            }
+        }
+        "drop" => {
+            let Some(scenario_id) = arguments
+                .get("scenario_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return serde_json::json!({
+                    "ok": false,
+                    "action": "drop",
+                    "error": "scenario_id required for 'drop'"
+                })
+                .to_string();
+            };
+            let dropped = crate::rdf::scenario::drop_scenario(lb_store, &namespace, scenario_id);
+            serde_json::json!({
+                "ok": true,
+                "action": "drop",
+                "scenario_id": scenario_id,
+                "dropped": dropped,
+            })
+            .to_string()
+        }
+        "list" => {
+            let now_ts = chrono::Utc::now().timestamp();
+            let scenarios = lb_store.scenarios().list(&namespace, now_ts);
+            serde_json::json!({
+                "ok": true,
+                "action": "list",
+                "namespace": namespace,
+                "scenarios": scenarios,
+            })
+            .to_string()
+        }
+        other => serde_json::json!({
+            "ok": false,
+            "error": format!("unknown scenario operation '{other}' (expected create|stage_memory|stage_twin|apply_action|evaluate_sparql|diff|commit|drop|list)")
         })
         .to_string(),
     }
@@ -13746,6 +14278,7 @@ mod tests {
                 "neurostrata_export_wasm_snapshot",
                 "neurostrata_context_plan",
                 "neurostrata_action",
+                "neurostrata_scenario",
                 // SynapticMesh: appended by `tools.extend(synaptic_mesh_tool
                 // _definitions())` — this order IS the append order, so it
                 // pins where the mesh module's list enters the surface.

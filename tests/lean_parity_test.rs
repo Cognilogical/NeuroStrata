@@ -25,12 +25,12 @@ use formal_kernel::{
     claim_decision_tag, classify_merge_decision_tag, epoch_gate_tag, evaluate_action_gate,
     evaluate_action_revert, evaluate_action_task_effect, evaluate_claim_decision,
     evaluate_import_precheck, evaluate_procedure_fire, evaluate_reducer_total,
-    evaluate_retention_gate, evaluate_seq_continuity, evaluate_sovereignty_gate,
-    import_precheck_tag, intersect_var_bounds, is_action_memory_shareable, join_task_status,
-    lifecycle_can_transition, procedure_fire_tag, resolve_cross_file_call, retention_verdict_tag,
-    seq_decision_tag, sovereignty_decision_tag, task_step_tag, ActionMemoryKind,
-    ActionReceiptState, ActionTaskTargetStatus, KernelProcedureTrust, ReducerOpKind,
-    TwinBoundError,
+    evaluate_retention_gate, evaluate_scenario_commit, evaluate_seq_continuity,
+    evaluate_sovereignty_gate, import_precheck_tag, intersect_var_bounds,
+    is_action_memory_shareable, join_task_status, lifecycle_can_transition, procedure_fire_tag,
+    resolve_cross_file_call, resolve_scenario_row, retention_verdict_tag, seq_decision_tag,
+    sovereignty_decision_tag, task_step_tag, ActionMemoryKind, ActionReceiptState,
+    ActionTaskTargetStatus, KernelProcedureTrust, ReducerOpKind, TwinBoundError,
 };
 
 /// The statuses in the exact order used by `proofs/Main.lean`.
@@ -469,6 +469,50 @@ fn generate_rust_truth_table() -> Vec<String> {
         }
     }
 
+    for &live_present in [false, true].iter() {
+        for &staged_retired in [false, true].iter() {
+            for &staged_upsert in [false, true].iter() {
+                let tag =
+                    resolve_scenario_row(live_present, staged_retired, staged_upsert).as_tag();
+                lines.push(format!(
+                    "SCENARIO_ROW|{}|{}|{}|{}",
+                    bool_str(live_present),
+                    bool_str(staged_retired),
+                    bool_str(staged_upsert),
+                    tag
+                ));
+            }
+        }
+    }
+
+    for &expired in [false, true].iter() {
+        for &cas_match in [false, true].iter() {
+            for &rebac_ok in [false, true].iter() {
+                for &enforce_shacl in [false, true].iter() {
+                    for &shacl_violations in [0u32, 1, 2].iter() {
+                        let tag = evaluate_scenario_commit(
+                            expired,
+                            cas_match,
+                            rebac_ok,
+                            enforce_shacl,
+                            shacl_violations,
+                        )
+                        .as_tag();
+                        lines.push(format!(
+                            "SCENARIO_COMMIT|{}|{}|{}|{}|{}|{}",
+                            bool_str(expired),
+                            bool_str(cas_match),
+                            bool_str(rebac_ok),
+                            bool_str(enforce_shacl),
+                            shacl_violations,
+                            tag
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     lines
 }
 
@@ -522,8 +566,8 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
     let rust_lines = generate_rust_truth_table();
     assert_eq!(
         rust_lines.len(),
-        667,
-        "expected 667 canonical lines (64+16+128+3+24+32+8+60+16+6+32+32+32+16+4+72+5+21+96)"
+        723,
+        "expected 723 canonical lines (64+16+128+3+24+32+8+60+16+6+32+32+32+16+4+72+5+21+96+8+48)"
     );
 
     // Section-count verification: 64 TASK_FSM + 16 LIFECYCLE + 128 MESH_MERGE
@@ -630,6 +674,16 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
         *section_counts.get("CROSS_FILE_CALL").unwrap_or(&0),
         96,
         "expected 96 CROSS_FILE_CALL rows"
+    );
+    assert_eq!(
+        *section_counts.get("SCENARIO_ROW").unwrap_or(&0),
+        8,
+        "expected 8 SCENARIO_ROW rows"
+    );
+    assert_eq!(
+        *section_counts.get("SCENARIO_COMMIT").unwrap_or(&0),
+        48,
+        "expected 48 SCENARIO_COMMIT rows"
     );
 
     let lake = find_lake().expect(

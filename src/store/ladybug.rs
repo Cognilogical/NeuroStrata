@@ -1524,6 +1524,8 @@ pub struct LadybugStore {
     /// Compiled ontology index per namespace (domain DAG, aliases, sub-properties).
     /// Swapped on `refresh_ontology`; read lock-free via ArcSwap.
     ontology: Arc<arc_swap::ArcSwap<std::collections::BTreeMap<String, crate::rdf::OntologyIndex>>>,
+    /// Per-namespace counterfactual scenario overlays (`neurostrata_scenario`).
+    scenarios: Arc<crate::rdf::scenario::ScenarioRegistry>,
     /// Cached active-generation symbol ids for mention detection, per
     /// namespace. A generation counter is per namespace, so two namespaces can
     /// share a generation set; the namespace is part of the key.
@@ -3122,6 +3124,7 @@ impl LadybugStore {
             ontology: Arc::new(arc_swap::ArcSwap::from_pointee(
                 std::collections::BTreeMap::new(),
             )),
+            scenarios: Arc::new(crate::rdf::scenario::ScenarioRegistry::new()),
             mention_symbol_ids: Arc::new(tokio::sync::RwLock::new(Default::default())),
             lexical: Arc::new(std::sync::RwLock::new(crate::fts::LexicalIndex::new())),
             lexical_loaded: Arc::new(std::sync::RwLock::new(std::collections::BTreeSet::new())),
@@ -26556,6 +26559,11 @@ impl LadybugStore {
     pub fn get_ontology(&self, namespace: &str) -> crate::rdf::OntologyIndex {
         let cur = self.ontology.load();
         cur.get(namespace).cloned().unwrap_or_default()
+    }
+
+    /// Access the counterfactual scenario overlay registry for this store.
+    pub fn scenarios(&self) -> &crate::rdf::scenario::ScenarioRegistry {
+        &self.scenarios
     }
 
     /// Check whether a directed relationship `(from)-[r:relation]->(to)` exists between two rows in `namespace`.

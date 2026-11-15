@@ -128,3 +128,15 @@ def main : IO Unit := do
             for isStd in [false, true] do
               let tag := resolveCrossFileCall selfCall sameFile imported wsCount identLen isStd |>.asTag
               IO.println s!"CROSS_FILE_CALL|{boolToStr selfCall}|{boolToStr sameFile}|{boolToStr imported}|{wsCount}|{identLen}|{boolToStr isStd}|{tag}"
+  for livePresent in [false, true] do
+    for stagedRetired in [false, true] do
+      for stagedUpsert in [false, true] do
+        let tag := resolveScenarioRow livePresent stagedRetired stagedUpsert |>.asTag
+        IO.println s!"SCENARIO_ROW|{boolToStr livePresent}|{boolToStr stagedRetired}|{boolToStr stagedUpsert}|{tag}"
+  for expired in [false, true] do
+    for casMatch in [false, true] do
+      for rebacOk in [false, true] do
+        for enforceShacl in [false, true] do
+          for shaclViolations in [0, 1, 2] do
+            let tag := evaluateScenarioCommit expired casMatch rebacOk enforceShacl shaclViolations |>.asTag
+            IO.println s!"SCENARIO_COMMIT|{boolToStr expired}|{boolToStr casMatch}|{boolToStr rebacOk}|{boolToStr enforceShacl}|{shaclViolations}|{tag}"

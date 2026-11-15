@@ -312,6 +312,92 @@ pub async fn project_sparql_dataset_with_meta_async(
     Ok((dataset, meta_map))
 }
 
+/// Project the merged Copy-on-Write dataset for a counterfactual `ScenarioOverlay`
+/// (`neurostrata_scenario`), combining active live LadybugDB rows with the
+/// scenario's `staged_retirements`, `staged_upserts`, and `staged_edges`.
+pub async fn project_scenario_sparql_dataset_async(
+    namespace: &str,
+    scenario_id: &str,
+    store: &crate::store::ladybug::LadybugStore,
+) -> Result<
+    (
+        Dataset,
+        std::collections::HashMap<String, serde_json::Value>,
+    ),
+    String,
+> {
+    let now_ts = chrono::Utc::now().timestamp();
+    let scenario = store.scenarios().get(namespace, scenario_id, now_ts)?;
+    let (merged_rows, merged_edges) = crate::rdf::scenario::collect_merged_scenario_rows_and_edges(
+        store, namespace, &scenario, now_ts,
+    )
+    .await?;
+
+    let mut dataset = Dataset::new();
+    let mut meta_map = std::collections::HashMap::new();
+    let twin_schemas = crate::digital_twin::collect_twin_schemas_from_rows(&merged_rows);
+    let prov_edges: Vec<(
+        String,
+        String,
+        String,
+        Option<crate::rdf::types::EdgeProvenance>,
+    )> = merged_edges
+        .iter()
+        .map(|(s, r, t, _w)| (s.clone(), r.clone(), t.clone(), None))
+        .collect();
+
+    for (id, payload) in &merged_rows {
+        meta_map.insert(
+            format!("urn:neurostrata:memory:{id}"),
+            payload.metadata.clone(),
+        );
+        meta_map.insert(id.clone(), payload.metadata.clone());
+
+        let mut qs = crate::rdf::projection::memory_to_quads(
+            id,
+            payload,
+            namespace,
+            crate::rdf::types::Tier::Domain,
+            0,
+        );
+        if !twin_schemas.is_empty() && payload.memory_type == "digital_twin" {
+            let extra = crate::rdf::projection::twin_schema_and_reducer_quads_for_row(
+                id,
+                payload,
+                namespace,
+                crate::rdf::types::Tier::Domain,
+                0,
+                &twin_schemas,
+                &merged_rows,
+                &prov_edges,
+            );
+            for eq in extra {
+                if !qs.contains(&eq) {
+                    qs.push(eq);
+                }
+            }
+        }
+        for q in qs {
+            dataset.insert(&q);
+        }
+    }
+
+    let edge_graph = Some(oxrdf::GraphName::NamedNode(
+        oxrdf::NamedNode::new_unchecked(format!(
+            "urn:neurostrata:graph:{}:{}:gen:0",
+            namespace,
+            crate::rdf::types::Tier::Domain.as_str()
+        )),
+    ));
+    for (s, r, t, _w) in &merged_edges {
+        for q in crate::rdf::projection::edge_to_quads(s, r, t, None, edge_graph.clone()) {
+            dataset.insert(&q);
+        }
+    }
+
+    Ok((dataset, meta_map))
+}
+
 /// Build a QueryEvaluator with the 3 NeuroStrata custom functions registered.
 pub fn evaluator_with_custom_functions(
     meta_map: std::sync::Arc<std::collections::HashMap<String, serde_json::Value>>,
@@ -677,6 +763,250 @@ pub async fn execute_action_ask(
     if dataset.len() > config.max_dataset_quads {
         return Err(format!(
             "SPARQL ASK dataset exceeded max_dataset_quads budget ({} > {})",
+            dataset.len(),
+            config.max_dataset_quads
+        ));
+    }
+
+    let meta_arc = std::sync::Arc::new(meta_map);
+    let bindings_owned: Vec<(Variable, oxrdf::Term)> = bindings.to_vec();
+    let cancel_token = spareval::CancellationToken::new();
+    let timed_out_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let timeout_ms = config.timeout_ms;
+    let timer_handle = tokio::spawn({
+        let timed_out_flag = timed_out_flag.clone();
+        let cancel_token = cancel_token.clone();
+        async move {
+            tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)).await;
+            timed_out_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            cancel_token.cancel();
+        }
+    });
+
+    let cancel_token_for_blocking = cancel_token.clone();
+    let timed_out_flag_for_blocking = timed_out_flag.clone();
+    let eval_join = tokio::task::spawn_blocking(move || -> Result<bool, String> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let evaluator = evaluator_with_custom_functions(meta_arc, now)
+            .with_cancellation_token(cancel_token_for_blocking);
+        let mut prepared = evaluator.prepare(&query);
+        for (var, term) in &bindings_owned {
+            prepared = prepared.substitute_variable(var.clone(), term.clone());
+        }
+        prepared.dataset_mut().set_default_graph_as_union();
+
+        match prepared.execute(&dataset) {
+            Ok(spareval::QueryResults::Boolean(b)) => {
+                if timed_out_flag_for_blocking.load(std::sync::atomic::Ordering::SeqCst) {
+                    Err("SPARQL ASK timed out".to_string())
+                } else {
+                    Ok(b)
+                }
+            }
+            Ok(_) => Err("SPARQL action query did not return a boolean ASK result".to_string()),
+            Err(e) => {
+                if timed_out_flag_for_blocking.load(std::sync::atomic::Ordering::SeqCst) {
+                    Err("SPARQL ASK timed out".to_string())
+                } else {
+                    Err(format!("SPARQL ASK evaluation error: {e}"))
+                }
+            }
+        }
+    })
+    .await;
+
+    timer_handle.abort();
+
+    match eval_join {
+        Ok(inner) => inner,
+        Err(e) => Err(format!("SPARQL ASK task panicked: {e}")),
+    }
+}
+
+/// Evaluate a read-only SPARQL query over a counterfactual scenario overlay dataset.
+pub async fn execute_scenario_sparql_query_with_config(
+    store: &crate::store::ladybug::LadybugStore,
+    namespace: &str,
+    scenario_id: &str,
+    query_str: &str,
+    format: QueryResultsFormat,
+    config: SparqlConfig,
+) -> Result<(String, usize, bool, bool), String> {
+    let query = parser_with_prefixes()
+        .parse_query(query_str)
+        .map_err(|e| format!("SPARQL parse error: {e}"))?;
+
+    let algebra_nodes = count_algebra_nodes(sparql_pattern(&query));
+    if algebra_nodes > config.max_algebra_nodes {
+        return Err(format!(
+            "SPARQL query exceeded max_algebra_nodes budget ({algebra_nodes} > {})",
+            config.max_algebra_nodes
+        ));
+    }
+
+    let service_endpoints = crate::rdf::federation::inspect_service_clauses(&query)
+        .map_err(|e| format!("SPARQL federation error: {e}"))?;
+
+    let (dataset, meta_map) =
+        project_scenario_sparql_dataset_async(namespace, scenario_id, store).await?;
+    let meta_arc = std::sync::Arc::new(meta_map);
+
+    if dataset.len() > config.max_dataset_quads {
+        return Err(format!(
+            "Scenario dataset projection exceeded max_dataset_quads budget ({} > {})",
+            dataset.len(),
+            config.max_dataset_quads
+        ));
+    }
+
+    let cancel_token = spareval::CancellationToken::new();
+    let timed_out_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let timeout_ms = config.timeout_ms;
+    let timer_handle = tokio::spawn({
+        let timed_out_flag = timed_out_flag.clone();
+        let cancel_token = cancel_token.clone();
+        async move {
+            tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)).await;
+            timed_out_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            cancel_token.cancel();
+        }
+    });
+
+    let cancel_token_for_blocking = cancel_token.clone();
+    let timed_out_flag_for_blocking = timed_out_flag.clone();
+    let eval_join =
+        tokio::task::spawn_blocking(move || -> Result<(String, usize, bool, bool), String> {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            let evaluator = if !service_endpoints.is_empty() {
+                let handler = crate::rdf::federation::HttpServiceHandler {
+                    config: crate::rdf::federation::FederationConfig {
+                        timeout_ms: config.timeout_ms,
+                        max_solutions: config.max_solutions,
+                        max_dataset_quads: config.max_dataset_quads,
+                        ..Default::default()
+                    },
+                };
+                evaluator_with_custom_functions_and_service(meta_arc.clone(), now, handler)
+            } else {
+                evaluator_with_custom_functions(meta_arc, now)
+            };
+            let evaluator = evaluator.with_cancellation_token(cancel_token_for_blocking);
+
+            let mut prepared = evaluator.prepare(&query);
+            prepared.dataset_mut().set_default_graph_as_union();
+            let results = prepared
+                .execute(&dataset)
+                .map_err(|e| format!("SPARQL evaluation error: {e}"))?;
+
+            let mut output = Vec::new();
+            let serializer = QueryResultsSerializer::from_format(format);
+            let results_vars: Vec<Variable> = match &results {
+                spareval::QueryResults::Solutions(sol_iter) => sol_iter.variables().to_vec(),
+                _ => Vec::new(),
+            };
+
+            let mut solution_count: usize = 0;
+            let mut timed_out = false;
+            let mut truncated = false;
+
+            match results {
+                spareval::QueryResults::Boolean(b) => {
+                    serializer
+                        .serialize_boolean_to_writer(&mut output, b)
+                        .map_err(|e| format!("serialize boolean: {e}"))?;
+                }
+                spareval::QueryResults::Solutions(solutions) => {
+                    let mut collected: Vec<_> = Vec::new();
+                    for item in solutions.take(config.max_solutions + 1) {
+                        match item {
+                            Ok(sol) => collected.push(sol),
+                            Err(e) => {
+                                if timed_out_flag_for_blocking
+                                    .load(std::sync::atomic::Ordering::SeqCst)
+                                {
+                                    timed_out = true;
+                                    break;
+                                }
+                                return Err(format!("evaluation error: {e}"));
+                            }
+                        }
+                    }
+                    truncated = collected.len() > config.max_solutions;
+                    if truncated {
+                        collected.truncate(config.max_solutions);
+                    }
+                    let mut serializer_solutions = serializer
+                        .serialize_solutions_to_writer(&mut output, results_vars)
+                        .map_err(|e| format!("serialize solutions start: {e}"))?;
+                    for sol in &collected {
+                        serializer_solutions
+                            .serialize(sol)
+                            .map_err(|e| format!("serialize solution: {e}"))?;
+                    }
+                    solution_count = collected.len();
+                    serializer_solutions
+                        .finish()
+                        .map_err(|e| format!("serialize finish: {e}"))?;
+                }
+                spareval::QueryResults::Graph(triples) => {
+                    for triple in triples {
+                        if timed_out_flag_for_blocking.load(std::sync::atomic::Ordering::SeqCst) {
+                            timed_out = true;
+                            break;
+                        }
+                        let t = triple.map_err(|e| format!("graph evaluation error: {e}"))?;
+                        output.extend_from_slice(format!("{t} .\n").as_bytes());
+                        solution_count += 1;
+                    }
+                }
+            }
+
+            let results_string =
+                String::from_utf8(output).map_err(|e| format!("UTF-8 error: {e}"))?;
+            let timed_out =
+                timed_out || timed_out_flag_for_blocking.load(std::sync::atomic::Ordering::SeqCst);
+
+            Ok((results_string, solution_count, truncated, timed_out))
+        })
+        .await;
+
+    timer_handle.abort();
+
+    match eval_join {
+        Ok(inner) => inner,
+        Err(e) => Err(format!("SPARQL scenario evaluation task panicked: {e}")),
+    }
+}
+
+/// Evaluate a bound SPARQL `ASK` submission criterion against a scenario overlay dataset.
+pub async fn execute_scenario_action_ask(
+    store: &crate::store::ladybug::LadybugStore,
+    namespace: &str,
+    scenario_id: &str,
+    query_str: &str,
+    bindings: &[(Variable, oxrdf::Term)],
+    config: SparqlConfig,
+) -> Result<bool, String> {
+    let query = crate::rdf::action::validate_sparql_ask_syntax_and_budget(
+        query_str,
+        config.max_algebra_nodes,
+    )?;
+
+    if config.timeout_ms == 0 {
+        return Err("SPARQL ASK timed out (timeout_ms budget is 0)".to_string());
+    }
+
+    let (dataset, meta_map) =
+        project_scenario_sparql_dataset_async(namespace, scenario_id, store).await?;
+    if dataset.len() > config.max_dataset_quads {
+        return Err(format!(
+            "SPARQL ASK scenario dataset exceeded max_dataset_quads budget ({} > {})",
             dataset.len(),
             config.max_dataset_quads
         ));

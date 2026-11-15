@@ -4,14 +4,32 @@ use serde_json::Value;
 use std::sync::OnceLock;
 
 static EMBEDDED_SHAPES: &[(&str, &str)] = &[
-    ("memory-shapes.v1.ttl", include_str!("../schemas/shacl/memory-shapes.v1.ttl")),
+    (
+        "memory-shapes.v1.ttl",
+        include_str!("../schemas/shacl/memory-shapes.v1.ttl"),
+    ),
     ("fact.ttl", include_str!("../schemas/shacl/fact.ttl")),
     ("rule.ttl", include_str!("../schemas/shacl/rule.ttl")),
-    ("attempt-shapes.v1.ttl", include_str!("../schemas/shacl/attempt-shapes.v1.ttl")),
-    ("edge-shapes.v1.ttl", include_str!("../schemas/shacl/edge-shapes.v1.ttl")),
-    ("topology-shapes.v1.ttl", include_str!("../schemas/shacl/topology-shapes.v1.ttl")),
-    ("mesh-record-shapes.v1.ttl", include_str!("../schemas/shacl/mesh-record-shapes.v1.ttl")),
-    ("multimodal-shapes.v1.ttl", include_str!("../schemas/shacl/multimodal-shapes.v1.ttl")),
+    (
+        "attempt-shapes.v1.ttl",
+        include_str!("../schemas/shacl/attempt-shapes.v1.ttl"),
+    ),
+    (
+        "edge-shapes.v1.ttl",
+        include_str!("../schemas/shacl/edge-shapes.v1.ttl"),
+    ),
+    (
+        "topology-shapes.v1.ttl",
+        include_str!("../schemas/shacl/topology-shapes.v1.ttl"),
+    ),
+    (
+        "mesh-record-shapes.v1.ttl",
+        include_str!("../schemas/shacl/mesh-record-shapes.v1.ttl"),
+    ),
+    (
+        "multimodal-shapes.v1.ttl",
+        include_str!("../schemas/shacl/multimodal-shapes.v1.ttl"),
+    ),
 ];
 
 pub fn embedded_ttl_shapes() -> &'static [(&'static str, &'static str)] {
@@ -40,7 +58,7 @@ pub fn parse_embedded_shapes() -> usize {
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShaclViolation {
     pub field: String,
     pub why: String,
@@ -90,7 +108,10 @@ pub fn validate_memory(payload: &MemoryPayload) -> Vec<ShaclViolation> {
         });
     }
     if payload.location_lines.trim().is_empty() && !payload.location.trim().is_empty() {
-        tracing::debug!("location '{}' present without location_lines; location implies lines", payload.location);
+        tracing::debug!(
+            "location '{}' present without location_lines; location implies lines",
+            payload.location
+        );
     }
 
     match &payload.metadata {
@@ -319,7 +340,13 @@ pub fn validate_memory(payload: &MemoryPayload) -> Vec<ShaclViolation> {
                 .or_else(|| payload.metadata.get("twin"));
             if let Some(dt) = dt {
                 if let Some(obj) = dt.as_object() {
-                    if obj.get("twin_id").or_else(|| obj.get("id")).and_then(|v| v.as_str()).map(|s| s.trim().is_empty()).unwrap_or(true) {
+                    if obj
+                        .get("twin_id")
+                        .or_else(|| obj.get("id"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim().is_empty())
+                        .unwrap_or(true)
+                    {
                         out.push(ShaclViolation {
                             field: "metadata.digital_twin.twin_id".to_string(),
                             why: "twin_id is required and must be a non-empty string".to_string(),
@@ -328,10 +355,15 @@ pub fn validate_memory(payload: &MemoryPayload) -> Vec<ShaclViolation> {
                     let observed_at = obj
                         .get("observed_at")
                         .or_else(|| payload.metadata.get("valid_from"));
-                    if observed_at.and_then(|v| v.as_i64()).map(|ts| ts <= 0).unwrap_or(true) {
+                    if observed_at
+                        .and_then(|v| v.as_i64())
+                        .map(|ts| ts <= 0)
+                        .unwrap_or(true)
+                    {
                         out.push(ShaclViolation {
                             field: "metadata.digital_twin.observed_at".to_string(),
-                            why: "observed_at is required and must be a positive integer".to_string(),
+                            why: "observed_at is required and must be a positive integer"
+                                .to_string(),
                         });
                     }
                     let properties = obj.get("properties").or_else(|| obj.get("variables"));
@@ -361,15 +393,13 @@ pub fn validate_memory(payload: &MemoryPayload) -> Vec<ShaclViolation> {
                 why,
             }),
         },
-        "action_receipt" => {
-            match crate::rdf::action::ActionReceiptPayload::from_payload(payload) {
-                Ok(receipt) => out.extend(receipt.validate_receipt(payload)),
-                Err(why) => out.push(ShaclViolation {
-                    field: "metadata.action_receipt".to_string(),
-                    why,
-                }),
-            }
-        }
+        "action_receipt" => match crate::rdf::action::ActionReceiptPayload::from_payload(payload) {
+            Ok(receipt) => out.extend(receipt.validate_receipt(payload)),
+            Err(why) => out.push(ShaclViolation {
+                field: "metadata.action_receipt".to_string(),
+                why,
+            }),
+        },
         _ => {}
     }
 
@@ -397,9 +427,23 @@ pub fn validate_memory(payload: &MemoryPayload) -> Vec<ShaclViolation> {
     out
 }
 
-const ARTIFACT_TYPES: [&str; 6] = ["file", "directory", "markdown", "symbol", "code_ast", "doc_section"];
+const ARTIFACT_TYPES: [&str; 6] = [
+    "file",
+    "directory",
+    "markdown",
+    "symbol",
+    "code_ast",
+    "doc_section",
+];
 const CONTAINER_TYPES: [&str; 3] = ["directory", "file", "markdown"];
-const CONTAINED_TYPES: [&str; 6] = ["directory", "file", "markdown", "symbol", "code_ast", "doc_section"];
+const CONTAINED_TYPES: [&str; 6] = [
+    "directory",
+    "file",
+    "markdown",
+    "symbol",
+    "code_ast",
+    "doc_section",
+];
 
 fn is_structural(t: &str) -> bool {
     ARTIFACT_TYPES.contains(&t)
@@ -415,24 +459,38 @@ fn is_structural(t: &str) -> bool {
 pub fn endpoint_role_allowed(rel_type: &str, source_type: &str, target_type: &str) -> bool {
     match rel_type {
         "GOVERNS" => source_type == "rule" || source_type == "fact",
-        "CONTAINS" => (CONTAINED_TYPES.contains(&source_type) && CONTAINER_TYPES.contains(&target_type))
-            || (source_type == "task" && target_type == "task"),
+        "CONTAINS" => {
+            (CONTAINED_TYPES.contains(&source_type) && CONTAINER_TYPES.contains(&target_type))
+                || (source_type == "task" && target_type == "task")
+        }
         "EXTRACTED_FROM" => !is_structural(source_type) && target_type == "task",
         _ => true,
     }
 }
 
 /// Enforce shapes at a boundary: returns Err if any violations.
-pub fn enforce(payload: &crate::traits::MemoryPayload) -> std::result::Result<(), Vec<ShaclViolation>> {
+pub fn enforce(
+    payload: &crate::traits::MemoryPayload,
+) -> std::result::Result<(), Vec<ShaclViolation>> {
     let v = validate_memory(payload);
-    if v.is_empty() { Ok(()) } else { Err(v) }
+    if v.is_empty() {
+        Ok(())
+    } else {
+        Err(v)
+    }
 }
 
 /// Infer a minimal shape report from a payload (field presence).
 pub fn infer_shape(payload: &crate::traits::MemoryPayload) -> Vec<String> {
-    let mut fields = vec!["content".to_string(), "user_id".to_string(), "memory_type".to_string()];
+    let mut fields = vec![
+        "content".to_string(),
+        "user_id".to_string(),
+        "memory_type".to_string(),
+    ];
     if let Some(obj) = payload.metadata.as_object() {
-        for k in obj.keys() { fields.push(format!("metadata.{}", k)); }
+        for k in obj.keys() {
+            fields.push(format!("metadata.{}", k));
+        }
     }
     fields
 }
@@ -443,13 +501,22 @@ mod tests {
 
     #[test]
     fn parse_embedded_shapes_returns_count() {
-        assert!(parse_embedded_shapes() > 0, "embedded SHACL .ttl shapes must parse");
+        assert!(
+            parse_embedded_shapes() > 0,
+            "embedded SHACL .ttl shapes must parse"
+        );
     }
 
     #[test]
     fn endpoint_contains_task_task_and_rejects_invalid() {
-        assert!(endpoint_role_allowed("CONTAINS", "task", "task"), "task contains task should be valid");
-        assert!(!endpoint_role_allowed("CONTAINS", "rule", "fact"), "rule contains fact should be invalid");
+        assert!(
+            endpoint_role_allowed("CONTAINS", "task", "task"),
+            "task contains task should be valid"
+        );
+        assert!(
+            !endpoint_role_allowed("CONTAINS", "rule", "fact"),
+            "rule contains fact should be invalid"
+        );
     }
 
     #[test]
@@ -464,7 +531,11 @@ mod tests {
             metadata: serde_json::json!({ "source": { "kind": "release-run", "ref": "v1.16.0" } }),
         };
         let v = validate_memory(&payload);
-        assert!(v.iter().all(|vi| vi.field != "metadata.source"), "object source must be sourced: {:?}", v);
+        assert!(
+            v.iter().all(|vi| vi.field != "metadata.source"),
+            "object source must be sourced: {:?}",
+            v
+        );
     }
 
     #[test]
@@ -479,7 +550,12 @@ mod tests {
             metadata: serde_json::json!({ "source": {} }),
         };
         let v = validate_memory(&payload);
-        assert!(v.iter().any(|vi| vi.field == "metadata.source" && vi.why.contains("must be non-blank")), "empty object source is blank: {:?}", v);
+        assert!(
+            v.iter()
+                .any(|vi| vi.field == "metadata.source" && vi.why.contains("must be non-blank")),
+            "empty object source is blank: {:?}",
+            v
+        );
     }
 
     #[test]
@@ -494,7 +570,12 @@ mod tests {
             metadata: serde_json::json!({ "source": "   " }),
         };
         let v = validate_memory(&payload);
-        assert!(v.iter().any(|vi| vi.field == "metadata.source" && vi.why.contains("must be non-blank")), "whitespace string is blank: {:?}", v);
+        assert!(
+            v.iter()
+                .any(|vi| vi.field == "metadata.source" && vi.why.contains("must be non-blank")),
+            "whitespace string is blank: {:?}",
+            v
+        );
     }
 
     #[test]
@@ -509,7 +590,11 @@ mod tests {
             metadata: serde_json::json!({ "source": "owner 2026-10-08" }),
         };
         let v = validate_memory(&payload);
-        assert!(v.iter().all(|vi| vi.field != "metadata.source"), "string source must be sourced: {:?}", v);
+        assert!(
+            v.iter().all(|vi| vi.field != "metadata.source"),
+            "string source must be sourced: {:?}",
+            v
+        );
     }
 
     #[test]
@@ -524,7 +609,12 @@ mod tests {
             metadata: serde_json::json!({}),
         };
         let v = validate_memory(&payload);
-        assert!(v.iter().any(|vi| vi.field == "metadata.source" && vi.why.contains("source is required")), "missing source is required: {:?}", v);
+        assert!(
+            v.iter()
+                .any(|vi| vi.field == "metadata.source" && vi.why.contains("source is required")),
+            "missing source is required: {:?}",
+            v
+        );
     }
 
     #[test]
@@ -543,8 +633,18 @@ mod tests {
             metadata: serde_json::json!({ "source": null }),
         };
         let v = validate_memory(&payload);
-        assert!(v.iter().any(|vi| vi.field == "metadata.source" && vi.why.contains("must be non-blank")), "a null source is present but unusable: {:?}", v);
-        assert!(!v.iter().any(|vi| vi.field == "metadata.source" && vi.why.contains("source is required")), "a present source is not a missing source: {:?}", v);
+        assert!(
+            v.iter()
+                .any(|vi| vi.field == "metadata.source" && vi.why.contains("must be non-blank")),
+            "a null source is present but unusable: {:?}",
+            v
+        );
+        assert!(
+            !v.iter()
+                .any(|vi| vi.field == "metadata.source" && vi.why.contains("source is required")),
+            "a present source is not a missing source: {:?}",
+            v
+        );
     }
 
     #[test]
@@ -559,6 +659,10 @@ mod tests {
             metadata: serde_json::Value::Object(serde_json::Map::new()),
         };
         let v = validate_memory(&payload);
-        assert!(v.iter().all(|vi| vi.field != "content"), "structural file with empty content must not emit content violation: got {:?}", v);
+        assert!(
+            v.iter().all(|vi| vi.field != "content"),
+            "structural file with empty content must not emit content violation: got {:?}",
+            v
+        );
     }
 }

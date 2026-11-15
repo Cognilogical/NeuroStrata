@@ -486,10 +486,18 @@ pub fn set_state(
     }
 
     let current_version = twin.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
-    twin.insert(
-        "version".to_string(),
-        serde_json::json!(current_version + 1),
-    );
+    let next_ver = current_version + 1;
+    twin.insert("version".to_string(), serde_json::json!(next_ver));
+    let vars_snapshot = twin
+        .get("variables")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    if let Some(dt) = meta.get_mut("digital_twin").and_then(|v| v.as_object_mut()) {
+        dt.insert("variables".to_string(), vars_snapshot.clone());
+        dt.insert("properties".to_string(), vars_snapshot);
+        dt.insert("version".to_string(), serde_json::json!(next_ver));
+    }
 
     Ok(())
 }
@@ -989,6 +997,10 @@ pub fn stage_twin_mutation(
             if let Some(src) = source {
                 twin_obj.insert("source".to_string(), serde_json::json!(src));
             }
+        }
+        if let Some(dt_obj) = meta.get_mut("digital_twin").and_then(|t| t.as_object_mut()) {
+            dt_obj.insert("twin_id".to_string(), serde_json::json!(twin_id));
+            dt_obj.insert("observed_at".to_string(), serde_json::json!(now_ts.max(1)));
         }
     }
     next_payload.content = format!(

@@ -1123,3 +1123,86 @@ pub const fn resolve_cross_file_call(
         CrossFileResolution::UnresolvedAmbiguousOrStd
     }
 }
+
+/// Copy-on-Write row visibility inside a counterfactual `ScenarioOverlay` (`neurostrata-ai0v`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScenarioRowVisibility {
+    VisibleStaged,
+    HiddenRetired,
+    VisibleLive,
+    Absent,
+}
+
+impl ScenarioRowVisibility {
+    pub const fn as_tag(self) -> &'static str {
+        match self {
+            Self::VisibleStaged => "VISIBLE_STAGED",
+            Self::HiddenRetired => "HIDDEN_RETIRED",
+            Self::VisibleLive => "VISIBLE_LIVE",
+            Self::Absent => "ABSENT",
+        }
+    }
+}
+
+/// Pure Copy-on-Write precedence kernel for `ScenarioOverlay` (`neurostrata-ai0v`):
+/// 1. `staged_upsert` overrides both retirement and live state (`VisibleStaged`).
+/// 2. `staged_retired` masks `live_present` (`HiddenRetired`).
+/// 3. Otherwise visibility equals `live_present` (`VisibleLive` vs `Absent`).
+pub const fn resolve_scenario_row(
+    live_present: bool,
+    staged_retired: bool,
+    staged_upsert: bool,
+) -> ScenarioRowVisibility {
+    if staged_upsert {
+        ScenarioRowVisibility::VisibleStaged
+    } else if staged_retired {
+        ScenarioRowVisibility::HiddenRetired
+    } else if live_present {
+        ScenarioRowVisibility::VisibleLive
+    } else {
+        ScenarioRowVisibility::Absent
+    }
+}
+
+/// Decision outcome for optimistic CAS scenario commit (`neurostrata-ai0v`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScenarioCommitDecision {
+    CommitAllowed,
+    RejectedExpired,
+    RejectedBaseConflict,
+    RejectedUnauthorized,
+    RejectedShaclViolations,
+}
+
+impl ScenarioCommitDecision {
+    pub const fn as_tag(self) -> &'static str {
+        match self {
+            Self::CommitAllowed => "COMMIT_ALLOWED",
+            Self::RejectedExpired => "REJECTED_EXPIRED",
+            Self::RejectedBaseConflict => "REJECTED_BASE_CONFLICT",
+            Self::RejectedUnauthorized => "REJECTED_UNAUTHORIZED",
+            Self::RejectedShaclViolations => "REJECTED_SHACL_VIOLATIONS",
+        }
+    }
+}
+
+/// Pure optimistic CAS + ReBAC + SHACL commit gate for `ScenarioOverlay` (`neurostrata-ai0v`).
+pub const fn evaluate_scenario_commit(
+    expired: bool,
+    all_base_fingerprints_match: bool,
+    rebac_authorized: bool,
+    enforce_shacl: bool,
+    shacl_violation_count: u32,
+) -> ScenarioCommitDecision {
+    if expired {
+        ScenarioCommitDecision::RejectedExpired
+    } else if !all_base_fingerprints_match {
+        ScenarioCommitDecision::RejectedBaseConflict
+    } else if !rebac_authorized {
+        ScenarioCommitDecision::RejectedUnauthorized
+    } else if enforce_shacl && shacl_violation_count > 0 {
+        ScenarioCommitDecision::RejectedShaclViolations
+    } else {
+        ScenarioCommitDecision::CommitAllowed
+    }
+}

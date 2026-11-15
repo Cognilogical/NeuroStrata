@@ -454,6 +454,13 @@ enum Commands {
         #[command(subcommand)]
         action: ActionCommands,
     },
+
+    /// Create, stage, evaluate SPARQL, diff, commit, drop, or list counterfactual Ontology Scenarios
+    #[command(name = "scenario")]
+    Scenario {
+        #[command(subcommand)]
+        scenario: ScenarioCommands,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone, PartialEq)]
@@ -769,6 +776,303 @@ fn action_command_to_json(action: &ActionCommands) -> anyhow::Result<serde_json:
             }
             Ok(body)
         }
+    }
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+enum ScenarioCommands {
+    /// Create a new counterfactual scenario overlay in a namespace
+    Create {
+        /// Target namespace
+        namespace: String,
+        /// Optional explicit scenario ID
+        #[arg(long)]
+        scenario_id: Option<String>,
+        /// Optional human-readable scenario title
+        #[arg(long)]
+        title: Option<String>,
+        /// Optional TTL in seconds (default 1800, max 86400)
+        #[arg(long)]
+        ttl_secs: Option<i64>,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+    /// Stage a memory upsert/retirement inside a scenario overlay
+    #[command(name = "stage-memory")]
+    StageMemory {
+        /// Target namespace
+        namespace: String,
+        /// Scenario ID
+        scenario_id: String,
+        /// Memory content
+        content: String,
+        /// Optional explicit memory ID
+        #[arg(long)]
+        memory_id: Option<String>,
+        /// Memory type (default "fact")
+        #[arg(long, default_value = "fact")]
+        memory_type: String,
+        /// Optional metadata JSON object
+        #[arg(long, default_value = "{}")]
+        metadata: String,
+        /// Optional live/staged memory ID to retire/supersede
+        #[arg(long)]
+        retire_id: Option<String>,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+    /// Stage a digital twin state mutation inside a scenario overlay
+    #[command(name = "stage-twin")]
+    StageTwin {
+        /// Target namespace
+        namespace: String,
+        /// Scenario ID
+        scenario_id: String,
+        /// Digital twin ID
+        twin_id: String,
+        /// Variables JSON object (map of variable name -> finite f64)
+        #[arg(long)]
+        variables: String,
+        /// Merge variables into existing state (default true)
+        #[arg(long, default_value_t = true)]
+        merge: bool,
+        /// Optional TwinSchema ID
+        #[arg(long)]
+        schema_id: Option<String>,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+    /// Dry-run apply a kinetic ActionType inside a scenario overlay
+    #[command(name = "apply-action")]
+    ApplyAction {
+        /// Target namespace
+        namespace: String,
+        /// Scenario ID
+        scenario_id: String,
+        /// ActionType slug
+        slug: String,
+        /// Action parameters JSON object
+        #[arg(long, default_value = "{}")]
+        params: String,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+    /// Evaluate a SPARQL query over the merged live + scenario RDF dataset
+    #[command(name = "eval")]
+    Eval {
+        /// Target namespace
+        namespace: String,
+        /// Scenario ID
+        scenario_id: String,
+        /// SPARQL query string
+        query: String,
+        /// Result format (json|xml|csv|tsv)
+        #[arg(long, default_value = "json")]
+        format: String,
+    },
+    /// Compute diff of a scenario against live state or another scenario
+    Diff {
+        /// Target namespace
+        namespace: String,
+        /// Scenario ID
+        scenario_id: String,
+        /// Optional second scenario ID for side-by-side diff
+        #[arg(long)]
+        compare_to: Option<String>,
+    },
+    /// Atomically commit a scenario overlay to the live store with CAS + SHACL + ReBAC gates
+    Commit {
+        /// Target namespace
+        namespace: String,
+        /// Scenario ID
+        scenario_id: String,
+        /// Enforce SHACL validation on commit (default true)
+        #[arg(long, default_value_t = true)]
+        enforce_shacl: bool,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+    /// Drop a scenario overlay without touching the live store
+    Drop {
+        /// Target namespace
+        namespace: String,
+        /// Scenario ID
+        scenario_id: String,
+    },
+    /// List active scenario overlays in a namespace
+    List {
+        /// Target namespace
+        namespace: String,
+    },
+}
+
+fn scenario_command_to_json(scenario: &ScenarioCommands) -> anyhow::Result<serde_json::Value> {
+    match scenario {
+        ScenarioCommands::Create {
+            namespace,
+            scenario_id,
+            title,
+            ttl_secs,
+            principal,
+        } => {
+            let mut body = serde_json::json!({
+                "namespace": namespace,
+                "action": "create",
+            });
+            if let Some(id) = scenario_id {
+                body["scenario_id"] = serde_json::json!(id);
+            }
+            if let Some(t) = title {
+                body["title"] = serde_json::json!(t);
+            }
+            if let Some(ttl) = ttl_secs {
+                body["ttl_secs"] = serde_json::json!(ttl);
+            }
+            if let Some(p) = principal {
+                body["principal"] = serde_json::json!(p);
+            }
+            Ok(body)
+        }
+        ScenarioCommands::StageMemory {
+            namespace,
+            scenario_id,
+            content,
+            memory_id,
+            memory_type,
+            metadata,
+            retire_id,
+            principal,
+        } => {
+            let meta_val: serde_json::Value = serde_json::from_str(metadata)
+                .map_err(|e| anyhow::anyhow!("Invalid metadata JSON: {e}"))?;
+            let mut body = serde_json::json!({
+                "namespace": namespace,
+                "action": "stage_memory",
+                "scenario_id": scenario_id,
+                "content": content,
+                "memory_type": memory_type,
+                "metadata": meta_val,
+            });
+            if let Some(id) = memory_id {
+                body["memory_id"] = serde_json::json!(id);
+            }
+            if let Some(rid) = retire_id {
+                body["retire_id"] = serde_json::json!(rid);
+            }
+            if let Some(p) = principal {
+                body["principal"] = serde_json::json!(p);
+            }
+            Ok(body)
+        }
+        ScenarioCommands::StageTwin {
+            namespace,
+            scenario_id,
+            twin_id,
+            variables,
+            merge,
+            schema_id,
+            principal,
+        } => {
+            let vars_val: serde_json::Value = serde_json::from_str(variables)
+                .map_err(|e| anyhow::anyhow!("Invalid variables JSON: {e}"))?;
+            let mut body = serde_json::json!({
+                "namespace": namespace,
+                "action": "stage_twin",
+                "scenario_id": scenario_id,
+                "twin_id": twin_id,
+                "variables": vars_val,
+                "merge": merge,
+            });
+            if let Some(sid) = schema_id {
+                body["schema_id"] = serde_json::json!(sid);
+            }
+            if let Some(p) = principal {
+                body["principal"] = serde_json::json!(p);
+            }
+            Ok(body)
+        }
+        ScenarioCommands::ApplyAction {
+            namespace,
+            scenario_id,
+            slug,
+            params,
+            principal,
+        } => {
+            let params_val: serde_json::Value = serde_json::from_str(params)
+                .map_err(|e| anyhow::anyhow!("Invalid params JSON: {e}"))?;
+            let mut body = serde_json::json!({
+                "namespace": namespace,
+                "action": "apply_action",
+                "scenario_id": scenario_id,
+                "slug": slug,
+                "params": params_val,
+            });
+            if let Some(p) = principal {
+                body["principal"] = serde_json::json!(p);
+            }
+            Ok(body)
+        }
+        ScenarioCommands::Eval {
+            namespace,
+            scenario_id,
+            query,
+            format,
+        } => Ok(serde_json::json!({
+            "namespace": namespace,
+            "action": "evaluate_sparql",
+            "scenario_id": scenario_id,
+            "query": query,
+            "format": format,
+        })),
+        ScenarioCommands::Diff {
+            namespace,
+            scenario_id,
+            compare_to,
+        } => {
+            let mut body = serde_json::json!({
+                "namespace": namespace,
+                "action": "diff",
+                "scenario_id": scenario_id,
+            });
+            if let Some(other) = compare_to {
+                body["compare_to_scenario_id"] = serde_json::json!(other);
+            }
+            Ok(body)
+        }
+        ScenarioCommands::Commit {
+            namespace,
+            scenario_id,
+            enforce_shacl,
+            principal,
+        } => {
+            let mut body = serde_json::json!({
+                "namespace": namespace,
+                "action": "commit",
+                "scenario_id": scenario_id,
+                "enforce_shacl_on_commit": enforce_shacl,
+            });
+            if let Some(p) = principal {
+                body["principal"] = serde_json::json!(p);
+            }
+            Ok(body)
+        }
+        ScenarioCommands::Drop {
+            namespace,
+            scenario_id,
+        } => Ok(serde_json::json!({
+            "namespace": namespace,
+            "action": "drop",
+            "scenario_id": scenario_id,
+        })),
+        ScenarioCommands::List { namespace } => Ok(serde_json::json!({
+            "namespace": namespace,
+            "action": "list",
+        })),
     }
 }
 
@@ -2945,6 +3249,60 @@ mod tests {
             }
             other => panic!("expected Action::Log, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn the_scenario_commands_parse() {
+        let create = Cli::try_parse_from([
+            "neurostrata-mcp",
+            "scenario",
+            "create",
+            "MyProj",
+            "--scenario-id",
+            "scen-1",
+            "--title",
+            "Cooling loop sandbox",
+        ])
+        .expect("scenario create parses");
+        assert!(matches!(
+            create.command,
+            Some(Commands::Scenario {
+                scenario: ScenarioCommands::Create { .. }
+            })
+        ));
+
+        let eval = Cli::try_parse_from([
+            "neurostrata-mcp",
+            "scenario",
+            "eval",
+            "MyProj",
+            "scen-1",
+            "ASK { ?s a ns:TwinState }",
+        ])
+        .expect("scenario eval parses");
+        assert!(matches!(
+            eval.command,
+            Some(Commands::Scenario {
+                scenario: ScenarioCommands::Eval { .. }
+            })
+        ));
+
+        let diff = Cli::try_parse_from([
+            "neurostrata-mcp",
+            "scenario",
+            "diff",
+            "MyProj",
+            "scen-1",
+            "--compare-to",
+            "scen-2",
+        ])
+        .expect("scenario diff parses");
+        assert!(matches!(
+            diff.command,
+            Some(Commands::Scenario {
+                scenario: ScenarioCommands::Diff { .. }
+            })
+        ));
     }
 
     /// Step 4's contract, both halves: with a daemon answering, stdout is that
@@ -5522,6 +5880,23 @@ async fn run() -> anyhow::Result<()> {
                             }
                             std::process::exit(1);
                         }
+                        Commands::Scenario { scenario } => {
+                            let req_body = scenario_command_to_json(scenario)?;
+                            let res = daemon_http_client()
+                                .post(format!("http://{DAEMON_ADDR}/scenario"))
+                                .json(&req_body)
+                                .send()
+                                .await
+                                .map_err(|e| anyhow::anyhow!("scenario request failed: {e}"))?;
+                            let body = res.text().await.unwrap_or_default();
+                            println!("{}", body);
+                            let parsed: serde_json::Value =
+                                serde_json::from_str(&body).unwrap_or_default();
+                            if parsed.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+                                return Ok(());
+                            }
+                            std::process::exit(1);
+                        }
                         _ => {}
                     }
                     eprintln!("CRITICAL ERROR: The NeuroStrata daemon is currently running (likely via OpenCode) and holds the database lock.");
@@ -5634,6 +6009,23 @@ async fn run() -> anyhow::Result<()> {
                         bind_fallback_serving_descriptor(&vector_store, &embedder);
                         let args = action_command_to_json(&action)?;
                         let out = crate::server::handle_action(
+                            &args,
+                            embedder.clone(),
+                            vector_store.clone(),
+                        )
+                        .await;
+                        println!("{}", out);
+                        let parsed: serde_json::Value =
+                            serde_json::from_str(&out).unwrap_or_default();
+                        if parsed.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                            std::process::exit(1);
+                        }
+                    }
+                    Commands::Scenario { scenario } => {
+                        let embedder = build_embedder()?;
+                        bind_fallback_serving_descriptor(&vector_store, &embedder);
+                        let args = scenario_command_to_json(&scenario)?;
+                        let out = crate::server::handle_scenario(
                             &args,
                             embedder.clone(),
                             vector_store.clone(),

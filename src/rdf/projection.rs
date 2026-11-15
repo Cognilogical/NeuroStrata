@@ -300,11 +300,22 @@ pub fn memory_to_quads(
                 .and_then(|v| v.as_object())
             {
                 for (k, v) in props {
+                    let sfx = sanitize_iri_suffix(k);
                     json_quad!(
-                        ns_predicate(&format!("twinProp_{}", sanitize_iri_suffix(k))),
+                        ns_predicate(&format!("twinProp_{sfx}")),
                         v.to_string(),
                         ldp_json.clone()
                     );
+                    if let Some(f) = v.as_f64().filter(|n| n.is_finite()) {
+                        quads.push(Quad {
+                            subject: subject.clone(),
+                            predicate: NamedNode::new_unchecked(ns_predicate(&format!(
+                                "twinVar_{sfx}"
+                            ))),
+                            object: Term::Literal(Literal::from(f)),
+                            graph_name: graph.clone(),
+                        });
+                    }
                 }
             }
             if let Some(attrs) = dt.get("attributes").and_then(|v| v.as_object()) {
