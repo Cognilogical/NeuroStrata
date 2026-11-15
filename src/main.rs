@@ -56,6 +56,7 @@ mod telemetry;
 mod time_series;
 mod tools;
 mod traits;
+mod workflow;
 
 use crate::traits::SearchResult;
 use crate::traits::VectorStore;

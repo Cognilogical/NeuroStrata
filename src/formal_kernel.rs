@@ -1373,6 +1373,87 @@ pub const fn is_memory_valid_at(
     valid_from <= as_of_ts && (!has_valid_to || valid_to > as_of_ts)
 }
 
+/// Workflow lifecycle stage in the pluggable workflow state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelWorkflowStage {
+    Unpreflighted,
+    ContextLoaded,
+    Claimed,
+    Mutating,
+    BreathRequired,
+    PreCheckpoint,
+    PrePublish,
+    Completed,
+}
+
+/// Workflow lifecycle event in the pluggable workflow state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelWorkflowEvent {
+    LoadContext,
+    ClaimTask { has_valid_scope: bool },
+    Mutate { mutations_since_note_after: usize, breath_limit: usize },
+    RecordBreathNote,
+    TriggerPreCheckpoint { has_receipt: bool },
+    CheckpointPassed,
+    TriggerPrePublish { task_gate_ok: bool, doc_gate_ok: bool },
+    PublishPassed,
+    CompleteTask { has_extracted_memory: bool, dirty_targets: usize },
+}
+
+/// Evaluates a workflow stage transition in the pure kernel.
+/// Returns `Ok(next_stage)` on allowed transition, or `Err(static_error_str)` on guard failure.
+pub const fn evaluate_workflow_stage_transition(
+    stage: KernelWorkflowStage,
+    event: KernelWorkflowEvent,
+) -> Result<KernelWorkflowStage, &'static str> {
+    use KernelWorkflowStage::*;
+    use KernelWorkflowEvent::*;
+
+    match (stage, event) {
+        (Unpreflighted, LoadContext) => Ok(ContextLoaded),
+        (ContextLoaded, LoadContext) => Ok(ContextLoaded),
+        (ContextLoaded, ClaimTask { has_valid_scope: true }) => Ok(Claimed),
+        (Claimed, ClaimTask { has_valid_scope: true }) => Ok(Claimed),
+        (Mutating, ClaimTask { has_valid_scope: true }) => Ok(Claimed),
+        (_, ClaimTask { has_valid_scope: false }) => Err("ClaimRequiresValidWorkspaceScope"),
+        (Unpreflighted, ClaimTask { .. }) => Err("PreflightRequiredBeforeClaim"),
+        (Claimed, Mutate { mutations_since_note_after, breath_limit }) => {
+            if mutations_since_note_after >= breath_limit {
+                Ok(BreathRequired)
+            } else {
+                Ok(Mutating)
+            }
+        }
+        (Mutating, Mutate { mutations_since_note_after, breath_limit }) => {
+            if mutations_since_note_after >= breath_limit {
+                Ok(BreathRequired)
+            } else {
+                Ok(Mutating)
+            }
+        }
+        (BreathRequired, Mutate { .. }) => Err("BreathNoteRequiredBeforeFurtherMutation"),
+        (Unpreflighted | ContextLoaded, Mutate { .. }) => Err("ClaimedTaskRequiredBeforeMutation"),
+        (BreathRequired | Mutating | Claimed, RecordBreathNote) => Ok(Mutating),
+        (Claimed, TriggerPreCheckpoint { has_receipt: true }) => Ok(PreCheckpoint),
+        (Mutating, TriggerPreCheckpoint { has_receipt: true }) => Ok(PreCheckpoint),
+        (_, TriggerPreCheckpoint { has_receipt: false }) => Err("CheckpointRequiresValidReceipt"),
+        (PreCheckpoint, CheckpointPassed) => Ok(Mutating),
+        (Claimed, TriggerPrePublish { task_gate_ok: true, doc_gate_ok: true }) => Ok(PrePublish),
+        (Mutating, TriggerPrePublish { task_gate_ok: true, doc_gate_ok: true }) => Ok(PrePublish),
+        (PreCheckpoint, TriggerPrePublish { task_gate_ok: true, doc_gate_ok: true }) => Ok(PrePublish),
+        (_, TriggerPrePublish { task_gate_ok: false, .. }) => Err("PublishBlockedByTaskGate"),
+        (_, TriggerPrePublish { doc_gate_ok: false, .. }) => Err("PublishBlockedByDocumentationGate"),
+        (PrePublish, PublishPassed) => Ok(Mutating),
+        (Claimed, CompleteTask { has_extracted_memory: true, dirty_targets: 0 }) => Ok(Completed),
+        (Mutating, CompleteTask { has_extracted_memory: true, dirty_targets: 0 }) => Ok(Completed),
+        (PreCheckpoint, CompleteTask { has_extracted_memory: true, dirty_targets: 0 }) => Ok(Completed),
+        (PrePublish, CompleteTask { has_extracted_memory: true, dirty_targets: 0 }) => Ok(Completed),
+        (_, CompleteTask { has_extracted_memory: false, .. }) => Err("CompletionRequiresExtractedMemory"),
+        (_, CompleteTask { dirty_targets, .. }) if dirty_targets > 0 => Err("CompletionBlockedByDirtyTargets"),
+        _ => Err("IllegalWorkflowStageTransition"),
+    }
+}
+
 /// Epistemic maturity status of a taxonomy concept.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EpistemicStatus {
@@ -1694,5 +1775,97 @@ mod tests {
         assert_eq!(compute_frontier_leverage_bps(5000, 2500, 3, true, true), 4975);
         assert_eq!(compute_frontier_leverage_bps(20000, 20000, 3, true, true), 8600);
         assert_eq!(compute_frontier_leverage_bps(20000, 20000, 3, false, false), 6600);
+    }
+
+    #[test]
+    fn workflow_stage_transition_legal_path() {
+        use KernelWorkflowEvent::*;
+        use KernelWorkflowStage::*;
+        assert_eq!(
+            evaluate_workflow_stage_transition(Unpreflighted, LoadContext),
+            Ok(ContextLoaded)
+        );
+        assert_eq!(
+            evaluate_workflow_stage_transition(ContextLoaded, LoadContext),
+            Ok(ContextLoaded)
+        );
+        assert_eq!(
+            evaluate_workflow_stage_transition(ContextLoaded, ClaimTask { has_valid_scope: true }),
+            Ok(Claimed)
+        );
+        assert_eq!(
+            evaluate_workflow_stage_transition(Claimed, Mutate { mutations_since_note_after: 2, breath_limit: 5 }),
+            Ok(Mutating)
+        );
+        assert_eq!(
+            evaluate_workflow_stage_transition(Mutating, Mutate { mutations_since_note_after: 5, breath_limit: 5 }),
+            Ok(BreathRequired)
+        );
+        assert_eq!(
+            evaluate_workflow_stage_transition(BreathRequired, RecordBreathNote),
+            Ok(Mutating)
+        );
+        assert_eq!(
+            evaluate_workflow_stage_transition(Mutating, TriggerPreCheckpoint { has_receipt: true }),
+            Ok(PreCheckpoint)
+        );
+        assert_eq!(
+            evaluate_workflow_stage_transition(PreCheckpoint, TriggerPrePublish { task_gate_ok: true, doc_gate_ok: true }),
+            Ok(PrePublish)
+        );
+        assert_eq!(
+            evaluate_workflow_stage_transition(PrePublish, PublishPassed),
+            Ok(Mutating)
+        );
+        assert_eq!(
+            evaluate_workflow_stage_transition(Mutating, CompleteTask { has_extracted_memory: true, dirty_targets: 0 }),
+            Ok(Completed)
+        );
+    }
+
+    #[test]
+    fn workflow_stage_transition_guard_rejections() {
+        use KernelWorkflowEvent::*;
+        use KernelWorkflowStage::*;
+        assert_eq!(
+            evaluate_workflow_stage_transition(BreathRequired, Mutate { mutations_since_note_after: 0, breath_limit: 5 }),
+            Err("BreathNoteRequiredBeforeFurtherMutation")
+        );
+        assert_eq!(
+            evaluate_workflow_stage_transition(Claimed, TriggerPrePublish { task_gate_ok: false, doc_gate_ok: true }),
+            Err("PublishBlockedByTaskGate")
+        );
+        assert_eq!(
+            evaluate_workflow_stage_transition(Claimed, TriggerPrePublish { task_gate_ok: true, doc_gate_ok: false }),
+            Err("PublishBlockedByDocumentationGate")
+        );
+        assert_eq!(
+            evaluate_workflow_stage_transition(Claimed, CompleteTask { has_extracted_memory: false, dirty_targets: 0 }),
+            Err("CompletionRequiresExtractedMemory")
+        );
+        assert_eq!(
+            evaluate_workflow_stage_transition(Claimed, CompleteTask { has_extracted_memory: true, dirty_targets: 3 }),
+            Err("CompletionBlockedByDirtyTargets")
+        );
+        assert_eq!(
+            evaluate_workflow_stage_transition(Unpreflighted, ClaimTask { has_valid_scope: true }),
+            Err("PreflightRequiredBeforeClaim")
+        );
+        assert_eq!(
+            evaluate_workflow_stage_transition(ContextLoaded, Mutate { mutations_since_note_after: 0, breath_limit: 5 }),
+            Err("ClaimedTaskRequiredBeforeMutation")
+        );
+        assert_eq!(
+            evaluate_workflow_stage_transition(Claimed, TriggerPreCheckpoint { has_receipt: false }),
+            Err("CheckpointRequiresValidReceipt")
+        );
+        assert_eq!(
+            evaluate_workflow_stage_transition(ContextLoaded, ClaimTask { has_valid_scope: false }),
+            Err("ClaimRequiresValidWorkspaceScope")
+        );
+        assert_eq!(
+            evaluate_workflow_stage_transition(Completed, LoadContext),
+            Err("IllegalWorkflowStageTransition")
+        );
     }
 }
