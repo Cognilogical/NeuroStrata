@@ -566,20 +566,13 @@ impl SecretScanner {
     fn detect_jwt(&self, text: &str) -> Option<&'static str> {
         // Find all dot-separated triplets that look base64url.
         // We look for the pattern: non-dot+ . non-dot+ . non-dot+
-        let mut start = 0;
-        while start < text.len() {
-            let rest = &text[start..];
-            if let Some(mat) = self.jwt_re.find(rest) {
-                let jwt_str = mat.as_str();
-                // Validate it's actually a JWT by decoding segment 1.
-                if let Some(dots) = find_jwt_segments(jwt_str) {
-                    if is_valid_jwt_header(dots.0) {
-                        return Some("jwt");
-                    }
+        for mat in self.jwt_re.find_iter(text) {
+            let jwt_str = mat.as_str();
+            // Validate it's actually a JWT by decoding segment 1.
+            if let Some(dots) = find_jwt_segments(jwt_str) {
+                if is_valid_jwt_header(dots.0) {
+                    return Some("jwt");
                 }
-                start += jwt_str.len();
-            } else {
-                break;
             }
         }
         None
@@ -1374,6 +1367,25 @@ mod tests {
                 .unwrap_or_else(|| panic!("wrapped token accepted: {wrapped}"));
             assert_eq!(rejection.category, "github_pat");
         }
+    }
+
+    #[test]
+    fn detect_jwt_with_multibyte_utf8_and_non_jwt_eyj_triplet_does_not_panic() {
+        // Reproduces the exact char-boundary panic when `jwt_re` matches a
+        // non-JWT `eyJ...eyJ...` triplet after multi-byte UTF-8 box-drawing
+        // characters (`─`, 3 bytes each), followed by a valid JWT.
+        let prefix = "─── ".repeat(10);
+        let non_jwt_triplet = "eyJnotjson.eyJpayload.sig123";
+        let header = base64_encode(br#"{"alg":"HS256","typ":"JWT"}"#);
+        let payload = base64_encode(br#"{"sub":"123"}"#);
+        let valid_jwt = format!("{header}.{payload}.sig456");
+
+        let clean_doc = format!("{prefix}\n{non_jwt_triplet}\n");
+        assert!(SecretScanner::scan_str(&clean_doc, "content").is_none());
+
+        let dirty_doc = format!("{prefix}\n{non_jwt_triplet}\n{valid_jwt}\n");
+        let r = SecretScanner::scan_str(&dirty_doc, "content").expect("valid jwt after non-jwt");
+        assert_eq!(r.category, "jwt");
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────

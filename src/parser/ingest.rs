@@ -1371,7 +1371,9 @@ async fn run_consumer(
                 if !sections.is_empty() {
                     let summaries: Vec<String> = sections
                         .iter()
-                        .map(|section| format!("{}\n\n{}", section.heading, section.text))
+                        .map(|section| {
+                            truncate_for_embedding(&format!("{}\n\n{}", section.heading, section.text))
+                        })
                         .collect();
                     let embeddings = embedder
                         .embed_batch(&summaries)

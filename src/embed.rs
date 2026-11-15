@@ -184,6 +184,13 @@ pub fn configured_dimensions() -> Result<usize> {
 /// Token ceiling for one embedding. Roughly covers MAX_SYMBOL_CHARS of source
 const MAX_EMBED_TOKENS: usize = 2048;
 
+/// Forward-pass micro-batch size for local ONNX inference (`FastEmbedder::embed_batch`).
+/// `fastembed` defaults `None` to `batch_size = 256` and pads every item in a batch
+/// up to the longest item's token length (up to `MAX_EMBED_TOKENS = 2048`), which
+/// allocates `[256, 12, 2048, 2048]` self-attention tensors (>22 GB) and OOM-kills
+/// the daemon on large files. `1` embeds each text at its own actual token length.
+const FAST_EMBED_BATCH_SIZE: usize = 1;
+
 /// Arena allocation is disabled by default; `NEUROSTRATA_EMBED_ARENA` with
 /// one of the house truthy spellings restores it for operators who measured a
 /// benefit. Mirrors the HYBRID_SEARCH convention (1/true/yes/on).
@@ -458,7 +465,7 @@ impl Embedder for FastEmbedder {
                 .lock()
                 .map_err(|e| anyhow::anyhow!("model lock poisoned: {}", e))?;
             guard
-                .embed(texts, None)
+                .embed(texts, Some(FAST_EMBED_BATCH_SIZE))
                 .context("fastembed embed_batch call failed")
         })
         .await
@@ -911,6 +918,26 @@ mod tests {
         assert!(
             ctor_body.contains(&call_needle) && ctor_body.contains(&wiring_needle),
             "FastEmbedder::new must wire the arena provider decision into the embedding options"
+        );
+    }
+
+    #[test]
+    fn embed_batch_bounds_fastembed_forward_pass_batch_size_to_one() {
+        assert_eq!(
+            super::FAST_EMBED_BATCH_SIZE,
+            1,
+            "FAST_EMBED_BATCH_SIZE must stay 1 so embed_batch never pads a multi-hundred-symbol file to [256, 2048]"
+        );
+        let src = include_str!("embed.rs");
+        let batch_body = src
+            .split("async fn embed_batch(&self, texts: &[String])")
+            .nth(1)
+            .and_then(|s| s.split("fn dimensions(&self)").next())
+            .expect("FastEmbedder::embed_batch present");
+        let needle = format!(".embed(texts, Some({}))", "FAST_EMBED_BATCH_SIZE");
+        assert!(
+            batch_body.contains(&needle),
+            "FastEmbedder::embed_batch must pass Some(FAST_EMBED_BATCH_SIZE) to guard.embed"
         );
     }
 
