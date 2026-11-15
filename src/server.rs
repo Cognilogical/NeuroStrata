@@ -1188,7 +1188,7 @@ pub async fn process_mcp_request(
                                         "type": "object",
                                         "properties": {
                                             "name": { "type": "string" },
-                                            "kind": { "type": "string", "enum": ["library", "paper_artifact", "specification", "system_architecture"] },
+                                            "kind": { "type": "string", "enum": ["library", "standard", "reference_system"] },
                                             "license": { "type": "string" },
                                             "license_compatible": { "type": "boolean" },
                                             "adopt_or_adapt": { "type": "string", "enum": ["adopt_library", "adapt_algorithm", "reference_only"] },
@@ -1201,7 +1201,7 @@ pub async fn process_mcp_request(
                                 },
                                 "realization_status": {
                                     "type": "string",
-                                    "enum": ["unimplemented", "partial", "production", "superseded"],
+                                    "enum": ["unknown", "unimplemented", "partial", "implemented", "external_only"],
                                     "description": "Current project implementation maturity for this concept (upsert_concept)."
                                 },
                                 "current_limitations": { "type": "array", "items": { "type": "string" }, "description": "Known current architectural/implementation limitations (upsert_concept)." },
