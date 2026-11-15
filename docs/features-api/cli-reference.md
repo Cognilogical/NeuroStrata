@@ -91,10 +91,11 @@ neurostrata-mcp delete <namespace> <id>
 
 ## 3. Codebase Ingestion & Graph Export
 
-### `ingest`
-Scans a source directory with the six-language Tree-sitter AST engine (`rust`, `typescript`, `tsx`, `python`, `go`, `java`), extracts structural symbols (`function`, `class`, `struct`, `interface`, `trait`, `method`, `calls`, `imports`), and indexes them into the namespace.
+### `ingest` & `ingest-scip`
+Scans a source directory with the six-language Tree-sitter AST engine (`rust`, `typescript`, `tsx`, `python`, `go`, `java`), extracts structural symbols (`function`, `class`, `struct`, `interface`, `trait`, `method`, `calls`, `imports`), and indexes them into the namespace, or ingests a precomputed SCIP index (`ingest-scip`).
 ```bash
 neurostrata-mcp ingest <dir_path> <namespace> [schema_path]
+neurostrata-mcp ingest-scip <scip_path> <namespace>
 ```
 *Example:*
 ```bash
@@ -221,15 +222,17 @@ neurostrata-mcp doc-gate [--root <path>] [--json]
 * `--json`: Machine-readable report for CI integration.
 
 ### `workflow`
-Queries and manipulates the pluggable workflow lifecycle state machine.
+Queries and manipulates the pluggable workflow lifecycle state machine and connector (`GitWorkflowConnector`, `ManifestWorkflowConnector`).
 ```bash
+neurostrata-mcp workflow status [--root <path>] [--json]
+neurostrata-mcp workflow connector [--root <path>] [--json]
 neurostrata-mcp workflow transitions [--json]
-neurostrata-mcp workflow stage <stage> --event <event> [--json]
-neurostrata-mcp workflow install-triggers [--root <path>]
+neurostrata-mcp workflow install [--root <path>] [--json]
+neurostrata-mcp workflow install-triggers [--root <path>] [--json]
 ```
-* `transitions`: Print the static `WORKFLOW_TABLE` edges.
-* `stage`: Evaluate a single `WorkflowEvent` from a given `WorkflowStage`.
-* `install-triggers`: Install Git hooks (pre-commit, pre-push) for the configured `WorkflowConnector`.
+* `status` (alias `connector`): Inspect active connector ID, captured scope (`branch`, `worktree`), state digest (`revision_id`, `dirty_state_hash`), and `changed_paths`.
+* `transitions`: Print the static 8-stage, 23-edge `WORKFLOW_TABLE` transition table.
+* `install` (alias `install-triggers`): Install and verify lifecycle triggers (Git `pre-push` and `pre-commit` hooks + `.NeuroStrata/workflow-triggers.json`) for the configured `WorkflowConnector`.
 
 ### `action`
 Defines, validates, applies, and reverts Kinetic Action Types.
@@ -255,13 +258,18 @@ neurostrata-mcp taxonomy advise [--top-k 5]
 neurostrata-mcp taxonomy validate-dag
 ```
 
-### `scenario`
-Creates and evaluates counterfactual ontology scenarios.
+### `scenario`, `object-view`, `diff-tour` & `insights`
+Creates and evaluates counterfactual ontology scenarios (`create`, `stage-memory`, `stage-twin`, `apply-action`, `eval`, `diff`, `commit`), polymorphic object views (`object-view`), structural diff tours (`diff-tour`), and repository architectural insights (`insights`). Additional administration commands include `set-metadata`, `normalize-metadata`, `storage`, `chat`, `metrics`, `graphql`, and `kge`.
 ```bash
 neurostrata-mcp scenario create <name> [--base <twin_id>]
+neurostrata-mcp scenario stage-memory <scenario_id> <memory.json>
+neurostrata-mcp scenario stage-twin <scenario_id> <twin.json>
 neurostrata-mcp scenario apply-action <scenario_id> <action_type> <parameters.json>
-neurostrata-mcp scenario evaluate-sparql <scenario_id> <query.rq>
+neurostrata-mcp scenario eval <scenario_id> <query.rq>
 neurostrata-mcp scenario diff <scenario_id> [--against <twin_id>]
+neurostrata-mcp object-view <namespace> <id>
+neurostrata-mcp diff-tour <namespace> [--range <rev_range>]
+neurostrata-mcp insights <namespace>
 ```
 
 ### `twin`

@@ -89,5 +89,18 @@ if echo "$ALL_CHANGED" | grep -qE "^(src/formal_kernel\.rs|proofs/|${GOVERNED_AL
     fi
 fi
 
+# Documentation Manifest & Surface-Diff Gate
+if [ -f "$ROOT/docs/manifest.json" ]; then
+    if [ -x "$ROOT/target/release/neurostrata-mcp" ] && "$ROOT/target/release/neurostrata-mcp" doc-gate --help >/dev/null 2>&1; then
+        "$ROOT/target/release/neurostrata-mcp" doc-gate --root "$ROOT" || exit 1
+    elif [ -x "$ROOT/target/debug/neurostrata-mcp" ] && "$ROOT/target/debug/neurostrata-mcp" doc-gate --help >/dev/null 2>&1; then
+        "$ROOT/target/debug/neurostrata-mcp" doc-gate --root "$ROOT" || exit 1
+    elif command -v neurostrata-mcp >/dev/null 2>&1 && neurostrata-mcp doc-gate --help >/dev/null 2>&1; then
+        neurostrata-mcp doc-gate --root "$ROOT" || exit 1
+    else
+        cargo test --quiet --bin neurostrata-mcp doc_gate::tests::doc_gate_passes_on_live_repository -- --exact || exit 1
+    fi
+fi
+
 echo "task-coverage-gate: no untracked work items found"
 exit 0

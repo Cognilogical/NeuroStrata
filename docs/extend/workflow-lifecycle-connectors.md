@@ -50,19 +50,29 @@ The shipped implementations are:
 
 ## Configuring Non-Git Workspaces (`.NeuroStrata/workflow-connector.json`)
 
-Non-git workspaces declare their connector in a manifest file:
+Non-git workspaces declare their connector in `.NeuroStrata/workflow-connector.json` (or via `NEUROSTRATA_WORKFLOW_CONNECTOR_FILE`):
 
 ```json
 {
-  "connector": "manifest",
-  "scope": ["src/**", "docs/**", "Cargo.toml"],
+  "connector_id": "manifest",
+  "stream": "main",
+  "workspace": "/workspace/project",
+  "revision_id": "rev-001",
+  "dirty_state_hash": "clean-001",
+  "changed_paths": ["src/workflow/mod.rs"],
   "triggers": {
-    "pre-commit": "neurostrata-mcp workflow install-triggers"
+    "pre-checkpoint": "neurostrata-mcp task validate MyProject",
+    "pre-publish": "neurostrata-mcp task gate MyProject --strict && neurostrata-mcp doc-gate"
   }
 }
 ```
 
-The `ManifestWorkflowConnector` reads this file, uses `scope` for `capture_scope`, and installs the declared trigger hooks.
+`WorkflowConnectorManifest` accepts:
+- `connector_id` (or alias `connector`, default `"manifest"`)
+- `stream` + `workspace` (or `scope: { "branch": "...", "worktree": "..." }`)
+- `revision_id` and `dirty_state_hash` (optional overrides for deterministic state digests)
+- `changed_paths` (explicit list of modified paths for surface-diff gates)
+- `triggers` as either a stage-to-command map (`{ "pre-checkpoint": "...", "pre-publish": "..." }`) or a list of stage names (`["pre-checkpoint", "pre-publish"]`)
 
 ## Writing a Custom Third-Party Workflow Connector
 

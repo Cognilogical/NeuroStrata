@@ -137,7 +137,7 @@ pub const AUTOMATIC_WIRES: &[Wire] = &[
         id: "doc-manifest-gate",
         runs_in: RunsIn::ProjectPipeline,
         blocks: true,
-        reason: "public surface and extension changes must satisfy docs/manifest.json across vision, features-api, and extend tiers without loose unclassified docs",
+        reason: "enforced by task gate --strict, scripts/task-coverage-gate.sh, and neurostrata-mcp doc-gate across vision, features-api, and extend tiers",
     },
 ];
 

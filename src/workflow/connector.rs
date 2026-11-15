@@ -151,6 +151,7 @@ impl WorkflowConnector for GitWorkflowConnector {
     }
 
     fn install_triggers(&self, root: &Path) -> Result<TriggerInstallReport> {
+        let _ = crate::task::hook_hygiene(root);
         let hooks_dir = run_git(root, &["rev-parse", "--git-path", "hooks"])
             .and_then(|o| {
                 if o.status.success() {
@@ -175,15 +176,39 @@ impl WorkflowConnector for GitWorkflowConnector {
                 hooks_dir.display()
             ));
         }
+        let pre_push_path = hooks_dir.join("pre-push");
+        if !pre_push_path.exists() {
+            std::fs::write(&pre_push_path, crate::task::SCAFFOLDED_PRE_PUSH_HOOK)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &pre_push_path,
+                    std::fs::Permissions::from_mode(0o755),
+                );
+            }
+        }
+        let pre_commit_path = hooks_dir.join("pre-commit");
+        if !pre_commit_path.exists() {
+            std::fs::write(&pre_commit_path, crate::task::SCAFFOLDED_PRE_COMMIT_HOOK)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &pre_commit_path,
+                    std::fs::Permissions::from_mode(0o755),
+                );
+            }
+        }
         let ns_dir = root.join(".NeuroStrata");
         std::fs::create_dir_all(&ns_dir)?;
         let triggers_path = ns_dir.join("workflow-triggers.json");
         let mut installed_paths = vec![triggers_path.to_string_lossy().to_string()];
-        if hooks_dir.join("pre-push").exists() {
-            installed_paths.push(hooks_dir.join("pre-push").to_string_lossy().to_string());
+        if pre_push_path.exists() {
+            installed_paths.push(pre_push_path.to_string_lossy().to_string());
         }
-        if hooks_dir.join("pre-commit").exists() {
-            installed_paths.push(hooks_dir.join("pre-commit").to_string_lossy().to_string());
+        if pre_commit_path.exists() {
+            installed_paths.push(pre_commit_path.to_string_lossy().to_string());
         }
         let json = serde_json::json!({
             "connector_id": GIT_CONNECTOR_ID,
@@ -194,18 +219,40 @@ impl WorkflowConnector for GitWorkflowConnector {
         Ok(TriggerInstallReport {
             connector_id: GIT_CONNECTOR_ID.to_string(),
             installed_paths,
-            details: "Git hooks verified, .NeuroStrata/workflow-triggers.json written".to_string(),
+            details: "Git pre-push and pre-commit hooks installed/verified, .NeuroStrata/workflow-triggers.json written".to_string(),
         })
     }
 }
 
 // ---------- Manifest connector ----------
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ManifestTriggers {
+    List(Vec<String>),
+    Map(std::collections::BTreeMap<String, String>),
+}
+
+impl Default for ManifestTriggers {
+    fn default() -> Self {
+        Self::List(default_triggers())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ManifestScope {
+    Gate(GateScope),
+    Paths(Vec<String>),
+}
+
 /// Config struct for the manifest connector.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorkflowConnectorManifest {
-    #[serde(default = "default_connector_id")]
+    #[serde(default = "default_connector_id", alias = "connector")]
     pub connector_id: String,
+    #[serde(default)]
+    pub scope: Option<ManifestScope>,
     #[serde(default)]
     pub stream: Option<String>,
     #[serde(default)]
@@ -216,8 +263,8 @@ pub struct WorkflowConnectorManifest {
     pub dirty_state_hash: Option<String>,
     #[serde(default)]
     pub changed_paths: Vec<String>,
-    #[serde(default = "default_triggers")]
-    pub triggers: Vec<String>,
+    #[serde(default)]
+    pub triggers: ManifestTriggers,
 }
 
 fn default_connector_id() -> String {
@@ -273,13 +320,22 @@ impl WorkflowConnector for ManifestWorkflowConnector {
     }
 
     fn capture_scope(&self, root: &Path) -> GateScope {
-        let stream = self.manifest.stream.clone();
-        let workspace = self.manifest.workspace.clone().or_else(|| {
-            root.canonicalize()
-                .ok()
-                .map(|p| p.to_string_lossy().into_owned())
-                .or_else(|| Some(root.to_string_lossy().to_string()))
-        });
+        let scope_gate = match &self.manifest.scope {
+            Some(ManifestScope::Gate(g)) => Some(g),
+            _ => None,
+        };
+        let stream = scope_gate
+            .and_then(|s| s.branch.clone())
+            .or_else(|| self.manifest.stream.clone());
+        let workspace = scope_gate
+            .and_then(|s| s.worktree.clone())
+            .or_else(|| self.manifest.workspace.clone())
+            .or_else(|| {
+                root.canonicalize()
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .or_else(|| Some(root.to_string_lossy().to_string()))
+            });
         GateScope {
             branch: stream,
             worktree: workspace,
@@ -396,5 +452,53 @@ mod tests {
 
         let changed = connector.changed_paths(root);
         assert_eq!(changed, vec!["src/workflow/mod.rs".to_string()]);
+    }
+
+    #[test]
+    fn manifest_connector_parses_documented_object_triggers_and_scope() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let manifest_path = root.join(".NeuroStrata").join("workflow-connector.json");
+        std::fs::create_dir_all(root.join(".NeuroStrata")).unwrap();
+        std::fs::write(
+            &manifest_path,
+            serde_json::json!({
+                "connector": "jj",
+                "scope": { "branch": "feat/custom", "worktree": "/workspace/project" },
+                "triggers": {
+                    "pre_checkpoint": "jj status",
+                    "pre_publish": "neurostrata-mcp task gate MyProject --strict && neurostrata-mcp doc-gate"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let connector = resolve_workflow_connector(root);
+        assert_eq!(connector.connector_id(), "jj");
+        let scope = connector.capture_scope(root);
+        assert_eq!(scope.branch.as_deref(), Some("feat/custom"));
+        assert_eq!(scope.worktree.as_deref(), Some("/workspace/project"));
+    }
+
+    #[test]
+    fn git_connector_install_triggers_writes_hooks_in_fresh_repo() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let hooks_dir = root.join(".git").join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+
+        let report = GitWorkflowConnector.install_triggers(root).unwrap();
+        assert_eq!(report.connector_id, "git");
+        assert!(hooks_dir.join("pre-push").is_file());
+        assert!(hooks_dir.join("pre-commit").is_file());
+        assert!(report
+            .installed_paths
+            .iter()
+            .any(|p| p.ends_with("pre-push")));
+        assert!(report
+            .installed_paths
+            .iter()
+            .any(|p| p.ends_with("pre-commit")));
     }
 }

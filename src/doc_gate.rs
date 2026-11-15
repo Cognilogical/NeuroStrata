@@ -89,6 +89,92 @@ fn collect_files_recursive(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
     }
 }
 
+/// Extracts public surface identifiers (CLI `#[command(name = "...")]` subcommands,
+/// MCP `"name": "neurostrata_..."` tool identifiers, and `pub trait <Name>` declarations)
+/// from added diff lines or source text.
+pub fn extract_public_surface_identifiers(text: &str) -> Vec<String> {
+    let mut idents = std::collections::BTreeSet::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(idx) = trimmed.find("#[command(name = \"") {
+            let rest = &trimmed[idx + "#[command(name = \"".len()..];
+            if let Some(end) = rest.find('"') {
+                let name = &rest[..end];
+                if !name.is_empty() && name != "neurostrata-mcp" {
+                    idents.insert(name.to_string());
+                }
+            }
+        }
+        if let Some(idx) = trimmed.find("\"name\": \"neurostrata_") {
+            let rest = &trimmed[idx + "\"name\": \"".len()..];
+            if let Some(end) = rest.find('"') {
+                let name = &rest[..end];
+                if !name.is_empty() {
+                    idents.insert(name.to_string());
+                }
+            }
+        }
+        if let Some(idx) = trimmed.find("pub trait ") {
+            let rest = &trimmed[idx + "pub trait ".len()..];
+            let ident: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if !ident.is_empty() && ident != "AsAny" {
+                idents.insert(ident);
+            }
+        }
+    }
+    idents.into_iter().collect()
+}
+
+fn watched_added_lines(root: &Path, rel_path: &str) -> String {
+    if root.join(".git").exists() {
+        let mut added = Vec::new();
+        let range = if std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet", "@{u}"])
+            .current_dir(root)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            "@{u}..HEAD"
+        } else if std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet", "origin/main"])
+            .current_dir(root)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            "origin/main..HEAD"
+        } else {
+            "HEAD~1..HEAD"
+        };
+        for args in [
+            vec!["diff", "-U0", range, "--", rel_path],
+            vec!["diff", "-U0", "HEAD", "--", rel_path],
+        ] {
+            if let Ok(out) = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(root)
+                .output()
+            {
+                if out.status.success() {
+                    for line in String::from_utf8_lossy(&out.stdout).lines() {
+                        if line.starts_with('+') && !line.starts_with("+++") {
+                            added.push(line[1..].to_string());
+                        }
+                    }
+                }
+            }
+        }
+        if !added.is_empty() {
+            return added.join("\n");
+        }
+    }
+    std::fs::read_to_string(root.join(rel_path)).unwrap_or_default()
+}
+
 pub fn evaluate_doc_gate(
     root: &Path,
     changed_paths_override: Option<Vec<String>>,
@@ -287,6 +373,28 @@ pub fn evaluate_doc_gate(
                     path: target_doc_path.to_string_lossy().to_string(),
                     detail: format!("required token '{}' missing in {}", token, rule.target_doc),
                 });
+            }
+        }
+        for cp in &changed_paths {
+            let matches_watch = rule
+                .watch_paths
+                .iter()
+                .any(|wp| cp == wp || cp.starts_with(wp));
+            if matches_watch {
+                let added = watched_added_lines(root, cp);
+                for ident in extract_public_surface_identifiers(&added) {
+                    if !content.contains(&ident) {
+                        violations.push(DocViolation {
+                            rule_id: rule.id.clone(),
+                            kind: "undocumented_public_identifier".to_string(),
+                            path: rule.target_doc.clone(),
+                            detail: format!(
+                                "added public identifier '{}' in '{}' is not documented in {}",
+                                ident, cp, rule.target_doc
+                            ),
+                        });
+                    }
+                }
             }
         }
     }
@@ -547,9 +655,63 @@ mod tests {
     }
 
     #[test]
+    fn rejects_undocumented_added_public_identifier_in_watched_source() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let docs_dir = tmp_dir.path().join("docs");
+        let src_dir = tmp_dir.path().join("src");
+        std::fs::create_dir_all(docs_dir.join("vision")).unwrap();
+        std::fs::create_dir_all(docs_dir.join("features-api")).unwrap();
+        std::fs::create_dir_all(docs_dir.join("extend")).unwrap();
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(
+            docs_dir.join("features-api").join("cli-reference.md"),
+            "## Workflow, Documentation Gate & Ontology Commands\ndoc-gate workflow",
+        )
+        .unwrap();
+        std::fs::write(
+            src_dir.join("main.rs"),
+            "#[command(name = \"undocumented-new-cmd\")]\nstruct Foo;",
+        )
+        .unwrap();
+        let manifest = r###"{
+            "schema_version": 1,
+            "allowed_root_files": ["README.md", "manifest.json"],
+            "tiers": {
+                "vision": { "dir": "docs/vision", "description": "Vision tier", "required_files": [] },
+                "features_api": { "dir": "docs/features-api", "description": "Features API tier", "required_files": [] },
+                "extend": { "dir": "docs/extend", "description": "Extend tier", "required_files": [] }
+            },
+            "support_dirs": ["docs/releases", "docs/assets"],
+            "prohibited_filename_substrings": [],
+            "surface_rules": [
+                {
+                    "id": "cli-reference-surface",
+                    "tier": "features_api",
+                    "watch_paths": ["src/main.rs"],
+                    "target_doc": "docs/features-api/cli-reference.md",
+                    "required_headings": ["## Workflow, Documentation Gate & Ontology Commands"],
+                    "required_tokens": ["doc-gate", "workflow"],
+                    "require_co_change_on_touch": false
+                }
+            ]
+        }"###;
+        std::fs::write(docs_dir.join("manifest.json"), manifest).unwrap();
+
+        let report = evaluate_doc_gate(
+            tmp_dir.path(),
+            Some(vec!["src/main.rs".to_string()]),
+        );
+        assert!(!report.passed);
+        assert!(report.violations.iter().any(|v| {
+            v.kind == "undocumented_public_identifier"
+                && v.detail.contains("undocumented-new-cmd")
+        }));
+    }
+
+    #[test]
     fn doc_gate_passes_on_live_repository() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let report = evaluate_doc_gate(root, Some(vec![]));
+        let report = evaluate_doc_gate(root, None);
         assert!(
             report.passed,
             "live repository failed doc-gate: {:?}",

@@ -602,16 +602,25 @@ enum Commands {
 #[derive(Subcommand, Debug, Clone, PartialEq)]
 enum WorkflowCommands {
     /// Show active workflow connector, captured scope, state digest, and changed paths
+    #[command(alias = "connector")]
     Status {
         #[arg(long)]
         root: Option<std::path::PathBuf>,
+        #[arg(long)]
+        json: bool,
     },
     /// Print the formal workflow stage transition table
-    Transitions,
+    Transitions {
+        #[arg(long)]
+        json: bool,
+    },
     /// Install or verify lifecycle triggers for the active workflow connector
+    #[command(alias = "install-triggers")]
     Install {
         #[arg(long)]
         root: Option<std::path::PathBuf>,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -5867,7 +5876,19 @@ async fn run() -> anyhow::Result<()> {
                     });
 
                     match outcome {
-                        Ok(violations) => {
+                        Ok(mut violations) => {
+                            if strict && cwd.join("docs").join("manifest.json").is_file() {
+                                let doc_report = crate::doc_gate::evaluate_doc_gate(&cwd, None);
+                                if !doc_report.passed {
+                                    for v in &doc_report.violations {
+                                        violations.push(serde_json::json!({
+                                            "kind": format!("doc_gate:{}", v.kind),
+                                            "id": v.rule_id,
+                                            "detail": format!("{}: {}", v.path, v.detail),
+                                        }));
+                                    }
+                                }
+                            }
                             for violation in &violations {
                                 println!(
                                     "- [{}] {}: {}",
@@ -6136,7 +6157,7 @@ async fn run() -> anyhow::Result<()> {
             }
             Commands::Workflow { action } => {
                 match action {
-                    WorkflowCommands::Status { root } => {
+                    WorkflowCommands::Status { root, json: _ } => {
                         let target_root = root
                             .or_else(git_toplevel)
                             .or_else(|| std::env::current_dir().ok())
@@ -6161,7 +6182,7 @@ async fn run() -> anyhow::Result<()> {
                             serde_json::to_string_pretty(&payload).unwrap_or_default()
                         );
                     }
-                    WorkflowCommands::Transitions => {
+                    WorkflowCommands::Transitions { json: _ } => {
                         let sample = crate::workflow::evaluate_workflow_transition(
                             crate::workflow::WorkflowStage::Unpreflighted,
                             crate::workflow::WorkflowEvent::LoadContext,
@@ -6176,7 +6197,7 @@ async fn run() -> anyhow::Result<()> {
                             serde_json::to_string_pretty(&payload).unwrap_or_default()
                         );
                     }
-                    WorkflowCommands::Install { root } => {
+                    WorkflowCommands::Install { root, json: _ } => {
                         let target_root = root
                             .or_else(git_toplevel)
                             .or_else(|| std::env::current_dir().ok())
