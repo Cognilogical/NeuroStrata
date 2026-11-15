@@ -21379,13 +21379,13 @@ eurostrata\src\daemon.rs",
 
     /// NEUROSTRATA_MODEL would override the file's first entry; the
     /// file-based tests pin it out of the way and restore it after.
-    fn without_model_env() -> Option<String> {
+    pub(super) fn without_model_env() -> Option<String> {
         let previous = std::env::var("NEUROSTRATA_MODEL").ok();
         std::env::remove_var("NEUROSTRATA_MODEL");
         previous
     }
 
-    fn restore_model_env(previous: Option<String>) {
+    pub(super) fn restore_model_env(previous: Option<String>) {
         match previous {
             Some(value) => std::env::set_var("NEUROSTRATA_MODEL", value),
             None => std::env::remove_var("NEUROSTRATA_MODEL"),
@@ -23471,7 +23471,11 @@ eurostrata\src\daemon.rs",
     /// a checksum error while the unverified replay still opens —
     /// presenting an empty table (the recovery shape of upstream
     /// issue #69, measured recovering 0 of 6 WAL-only records).
-    fn plant_corrupted_uncheckpointed_wal(db: &std::path::Path, rows: usize, delete_rows: bool) {
+    pub(super) fn plant_corrupted_uncheckpointed_wal(
+        db: &std::path::Path,
+        rows: usize,
+        delete_rows: bool,
+    ) {
         let mut wal_os = db.to_path_buf().into_os_string();
         wal_os.push(".wal");
         let wal = std::path::PathBuf::from(wal_os);
@@ -23594,9 +23598,9 @@ eurostrata\src\daemon.rs",
     /// read makes the strict verifier fire on a variable the test
     /// just set. tokio's mutex so the guard may be held across the
     /// engine calls inside the guarded section.
-    static WAL_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    pub(super) static WAL_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-    fn allow_unverified_wal_recovery() -> (Option<String>, Option<String>) {
+    pub(super) fn allow_unverified_wal_recovery() -> (Option<String>, Option<String>) {
         let previous = (
             std::env::var("NEUROSTRATA_STRICT_WAL").ok(),
             std::env::var("NEUROSTRATA_ALLOW_UNVERIFIED_WAL").ok(),
@@ -23606,7 +23610,7 @@ eurostrata\src\daemon.rs",
         previous
     }
 
-    fn restore_wal_env(previous: (Option<String>, Option<String>)) {
+    pub(super) fn restore_wal_env(previous: (Option<String>, Option<String>)) {
         match previous.0 {
             Some(value) => std::env::set_var("NEUROSTRATA_STRICT_WAL", value),
             None => std::env::remove_var("NEUROSTRATA_STRICT_WAL"),
@@ -26840,6 +26844,641 @@ eurostrata\src\daemon.rs",
             "slot reservation must preserve the 1-hop GOVERNS rule in top-10 despite 10 structural code_ast hits: {:?}",
             result_ids(&top10)
         );
+    }
+}
+
+/// `#207` integration tests: one zero-record accounting across every recovery
+/// arm. They live in their own module, not in [`tests`], because the
+/// `lexical-generation` eval suite runs `store::ladybug::tests` with an
+/// `ignored: 0` threshold and most of these must stay `#[ignore]`d until
+/// Phase B wires the classifier into `with_system_config`.
+#[cfg(test)]
+mod wal_zero_record {
+    use super::tests::{
+        allow_unverified_wal_recovery, plant_corrupted_uncheckpointed_wal, restore_model_env,
+        restore_wal_env, without_model_env, WAL_ENV_LOCK,
+    };
+    use super::*;
+    use crate::store::wal_accounting::{
+        classify, scan_wal, select_header_source, CommitEvidence, HeaderConflict, HeaderProbe,
+        HeaderSource, WalAccounting, WalBytes, WAL_HEADER_BYTES, WAL_HEADER_CHECKSUMMED_BYTES,
+    };
+
+    fn wal_of(db: &std::path::Path) -> std::path::PathBuf {
+        let mut os = db.to_path_buf().into_os_string();
+        os.push(".wal");
+        std::path::PathBuf::from(os)
+    }
+
+    fn ckpt_of(db: &std::path::Path) -> std::path::PathBuf {
+        let mut os = db.to_path_buf().into_os_string();
+        os.push(".wal.checkpoint");
+        std::path::PathBuf::from(os)
+    }
+
+    fn file_len(path: &std::path::Path) -> u64 {
+        std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+    }
+
+    fn wal_files_in(root: &std::path::Path, prefix: &str) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(root)
+            .expect("read the fixture dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().starts_with(prefix))
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    /// A store whose `Memory` schema is checkpointed into the main DB, so the
+    /// recovery open reports `has_memory_table = true` for reasons unrelated to
+    /// the WAL (the shape `#207` was reported in).
+    async fn store_with_checkpointed_schema(db: &std::path::Path, root: &std::path::Path) {
+        let embed = root.join("embed");
+        std::fs::create_dir_all(&embed).expect("create the embed config dir");
+        std::fs::write(
+            embed.join("embedders.json"),
+            "[{\"model_name\":\"ModelA\",\"dimensions\":8}]",
+        )
+        .expect("write the fixture embedders.json");
+        let creator = LadybugStore::for_testing(db, 8)
+            .expect("open temp database")
+            .with_embed_config_dir(&embed);
+        creator.init("probe").await.expect("init");
+        drop(creator);
+    }
+
+    fn memory_row(id: &str) -> String {
+        format!(
+            "CREATE (m:Memory {{id: '{id}', namespace: 'probe', content: 'row', user_id: '', memory_type: 'fact', agent_name: '', location: '', location_lines: '', metadata: '{{}}', embedding: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]}})"
+        )
+    }
+
+    async fn memory_count(store: &LadybugStore, prefix: &str) -> i64 {
+        let prefix = prefix.to_string();
+        store
+            .with_conn(move |conn| {
+                let mut rows = conn.query(&format!(
+                    "MATCH (m:Memory) WHERE m.id STARTS WITH '{prefix}' RETURN count(m);"
+                ))?;
+                match rows.next() {
+                    Some(row) => match row.first() {
+                        Some(lbug::Value::Int64(n)) => Ok(*n),
+                        other => anyhow::bail!("unexpected count cell: {other:?}"),
+                    },
+                    None => Ok(0),
+                }
+            })
+            .await
+            .expect("query the Memory row count")
+    }
+
+    /// The `#207` reproduction: six committed rows living only in `<db>.wal`,
+    /// moved to the frozen `<db>.wal.checkpoint`, header intact, every record
+    /// byte replaced with `0xFF`. Checking this in as a *scanner* contract keeps
+    /// the byte-layout assumption honest against bytes the pinned engine wrote.
+    #[tokio::test]
+    async fn scanner_reads_a_real_wal_written_by_the_pinned_engine() {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-wal-scan-real-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("scan.lbug");
+        let previous_model = without_model_env();
+        store_with_checkpointed_schema(&db, &root).await;
+
+        let cfg = SystemConfig::default()
+            .max_db_size(512 * 1024 * 1024)
+            .buffer_pool_size(64 * 1024 * 1024)
+            .throw_on_wal_replay_failure(true);
+        let raw = Database::new(&db, cfg).expect("raw open to seed the WAL");
+        let conn = Connection::new(&raw).expect("raw connection");
+        for i in 0..3 {
+            conn.query(&memory_row(&format!("scan-only-{i}")))
+                .expect("seed a committed WAL-only row");
+        }
+        conn.query("CALL force_checkpoint_on_close=false")
+            .expect("turn off checkpoint on close");
+        drop(conn);
+        drop(raw);
+
+        let bytes = std::fs::read(wal_of(&db)).expect("read the seeded WAL");
+        let scan = scan_wal(&bytes);
+        assert_eq!(
+            scan.header,
+            crate::store::wal_accounting::WalHeader::Readable { checksums: true },
+            "the default config writes a checksummed WAL; byte 16 is the flag"
+        );
+        assert_eq!(scan.tail, crate::store::wal_accounting::WalTail::Clean);
+        assert!(
+            scan.commits >= 3,
+            "three committed rows must be at least three COMMIT frames, saw {}",
+            scan.commits
+        );
+        assert_eq!(scan.commit_evidence(), CommitEvidence::Some);
+
+        // Header intact, records unreadable: the `#207` shape.
+        let mut corrupt = bytes.clone();
+        for byte in corrupt.iter_mut().skip(WAL_HEADER_CHECKSUMMED_BYTES as usize) {
+            *byte = 0xFF;
+        }
+        let scan = scan_wal(&corrupt);
+        assert_eq!(
+            scan.commit_evidence(),
+            CommitEvidence::Unknown,
+            "a WAL whose frames cannot be attributed must never be read as \
+             'nothing committed'"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        restore_model_env(previous_model);
+    }
+
+    /// `#207` row 1 — a frozen-only zero-record replay must refuse and keep a
+    /// full pre-replay copy of `.wal.checkpoint` on disk.
+    ///
+    /// Today the open succeeds, reports `UnverifiedWalReplay`, and the engine
+    /// deletes the canonical frozen WAL (`wal_replayer.cpp:674-679`) because
+    /// `pre_replay_active_wal_bytes == 0` and `has_memory_table` is true.
+    #[tokio::test]
+    #[ignore = "red until Phase B wires the classifier into with_system_config (#207)"]
+    async fn frozen_only_zero_record_replay_refuses_and_preserves_the_frozen_wal() {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-wal-frozen-zero-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("frozen-zero.lbug");
+        let previous_model = without_model_env();
+        store_with_checkpointed_schema(&db, &root).await;
+
+        let cfg = SystemConfig::default()
+            .max_db_size(512 * 1024 * 1024)
+            .buffer_pool_size(64 * 1024 * 1024)
+            .throw_on_wal_replay_failure(true);
+        let raw = Database::new(&db, cfg).expect("raw open to seed the WAL");
+        let conn = Connection::new(&raw).expect("raw connection");
+        for i in 0..6 {
+            conn.query(&memory_row(&format!("frozen-zero-{i}")))
+                .expect("seed a WAL-only row");
+        }
+        conn.query("CALL force_checkpoint_on_close=false")
+            .expect("turn off checkpoint on close");
+        drop(conn);
+        drop(raw);
+
+        let wal = wal_of(&db);
+        let ckpt = ckpt_of(&db);
+        let seeded = std::fs::read(&wal).expect("read the seeded WAL");
+        let pre_len = seeded.len() as u64;
+        assert!(pre_len > WAL_HEADER_CHECKSUMMED_BYTES);
+        std::fs::rename(&wal, &ckpt).expect("move .wal to .wal.checkpoint");
+        assert!(!wal.exists(), "no active .wal on disk");
+
+        // Keep the header (checksum flag) and destroy every record.
+        let mut corrupt = seeded.clone();
+        for byte in corrupt.iter_mut().skip(WAL_HEADER_CHECKSUMMED_BYTES as usize) {
+            *byte = 0xFF;
+        }
+        std::fs::write(&ckpt, &corrupt).expect("corrupt the frozen WAL records");
+
+        let _wal_env_serial = WAL_ENV_LOCK.lock().await;
+        let previous_wal = allow_unverified_wal_recovery();
+        let result = LadybugStore::for_testing(&db, 8);
+        restore_wal_env(previous_wal);
+        drop(_wal_env_serial);
+
+        let err = match result {
+            Ok(store) => panic!(
+                "a zero-record replay of a frozen .wal.checkpoint must be refused, \
+                 not accepted as {:?} (#207)",
+                store.open_provenance()
+            ),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("WAL"),
+            "the refusal must say what was refused: {err}"
+        );
+        assert_eq!(
+            file_len(&ckpt),
+            pre_len,
+            "the canonical frozen .wal.checkpoint must be restored with every \
+             pre-replay byte (#207)"
+        );
+        assert_eq!(
+            std::fs::read(&ckpt).expect("read the restored frozen WAL"),
+            corrupt,
+            "the restored frozen WAL must be byte-identical to the pre-replay file"
+        );
+        let copies = wal_files_in(&root, "frozen-zero.lbug.wal.checkpoint.unclean.");
+        assert_eq!(
+            copies.len(),
+            1,
+            "the preserved .wal.checkpoint.unclean.<ts> copy must survive (#207)"
+        );
+        assert_eq!(file_len(&copies[0]), pre_len);
+
+        let _ = std::fs::remove_dir_all(&root);
+        restore_model_env(previous_model);
+    }
+
+    /// `#207` row 2 — the checksum-mismatch arm: a `enableChecksums=false` WAL
+    /// whose records are unreadable must not be checkpointed as a successful
+    /// recovery. Today the arm goes `Database::new(unverified_config())` →
+    /// `CHECKPOINT;` → verified reopen with no record accounting.
+    #[tokio::test]
+    #[ignore = "red until Phase B wires the classifier into with_system_config (#207)"]
+    async fn checksum_mismatch_arm_refuses_unreadable_records_before_checkpointing() {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-wal-checksum-arm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("checksum-arm.lbug");
+        let previous_model = without_model_env();
+        store_with_checkpointed_schema(&db, &root).await;
+
+        // The main DB does not carry the checksum flag (#191): only the WAL
+        // header does. Write this WAL under enableChecksums=false.
+        let cfg = SystemConfig::default()
+            .max_db_size(512 * 1024 * 1024)
+            .buffer_pool_size(64 * 1024 * 1024)
+            .enable_checksums(false)
+            .throw_on_wal_replay_failure(true);
+        let raw = Database::new(&db, cfg).expect("raw open with checksums off");
+        let conn = Connection::new(&raw).expect("raw connection");
+        conn.query(&memory_row("checksum-arm-0"))
+            .expect("seed a WAL-only row");
+        conn.query("CALL force_checkpoint_on_close=false")
+            .expect("turn off checkpoint on close");
+        drop(conn);
+        drop(raw);
+
+        let wal = wal_of(&db);
+        let seeded = std::fs::read(&wal).expect("read the seeded WAL");
+        let pre_len = seeded.len() as u64;
+        assert_eq!(
+            seeded.get(16).copied(),
+            Some(0),
+            "the fixture WAL must carry enableChecksums=false"
+        );
+        let mut corrupt = seeded.clone();
+        for byte in corrupt.iter_mut().skip(WAL_HEADER_BYTES as usize) {
+            *byte = 0xFF;
+        }
+        std::fs::write(&wal, &corrupt).expect("corrupt the WAL records in place");
+
+        let _wal_env_serial = WAL_ENV_LOCK.lock().await;
+        let previous_wal = allow_unverified_wal_recovery();
+        let result = LadybugStore::for_testing(&db, 8);
+        restore_wal_env(previous_wal);
+        drop(_wal_env_serial);
+
+        let err = match result {
+            Ok(store) => panic!(
+                "the checksum-mismatch arm must not checkpoint an empty replay as {:?} (#207)",
+                store.open_provenance()
+            ),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("WAL"),
+            "the refusal must say what was refused: {err}"
+        );
+        assert_eq!(
+            file_len(&wal),
+            pre_len,
+            "the active .wal must be restored with every pre-replay byte (#207)"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        restore_model_env(previous_model);
+    }
+
+    /// Seeds one committed `Memory` write in `<db>.wal`, then cuts `cut` bytes
+    /// off the end so the transaction's `COMMIT` record never completes.
+    /// Returns the torn WAL's scan so the test can state which tear shape it
+    /// built.
+    async fn torn_only_commit_fixture(
+        db: &std::path::Path,
+        root: &std::path::Path,
+        cut: u64,
+    ) -> crate::store::wal_accounting::WalScan {
+        store_with_checkpointed_schema(db, root).await;
+        let cfg = SystemConfig::default()
+            .max_db_size(512 * 1024 * 1024)
+            .buffer_pool_size(64 * 1024 * 1024)
+            .throw_on_wal_replay_failure(true);
+        let raw = Database::new(db, cfg).expect("raw open to seed the WAL");
+        let conn = Connection::new(&raw).expect("raw connection");
+        conn.query(&memory_row("torn-only-0"))
+            .expect("seed the uncommitted row");
+        conn.query("CALL force_checkpoint_on_close=false")
+            .expect("turn off checkpoint on close");
+        drop(conn);
+        drop(raw);
+
+        let wal = wal_of(db);
+        let seeded = std::fs::read(&wal).expect("read the seeded WAL");
+        let scan = scan_wal(&seeded);
+        assert!(scan.commits >= 1, "the fixture must contain a COMMIT");
+        assert_eq!(
+            scan.last_complete_type,
+            Some(crate::store::wal_accounting::COMMIT_RECORD_TYPE),
+            "the tear must land on the final COMMIT record"
+        );
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&wal)
+            .expect("open the WAL to truncate");
+        file.set_len((seeded.len() as u64) - cut)
+            .expect("tear the last record");
+        drop(file);
+        let torn = scan_wal(&std::fs::read(&wal).expect("read the torn WAL"));
+        assert_eq!(
+            torn.commits,
+            scan.commits - 1,
+            "the tear must remove exactly the final COMMIT"
+        );
+        assert!(torn.frames_parsed >= 2, "a BEGIN/insert prefix must survive");
+        torn
+    }
+
+    /// `#207` row 3a — a WAL whose only COMMIT record is torn *inside its
+    /// payload* lost nothing that committed. At `1787f1b2` the lenient replay
+    /// truncates to 0 and the active-WAL guard refuses it as `DATA LOSS`.
+    #[tokio::test]
+    #[ignore = "red until Phase B wires the classifier into with_system_config (#207)"]
+    async fn torn_only_commit_wal_opens_without_a_data_loss_refusal() {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-wal-torn-commit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("torn-commit.lbug");
+        let previous_model = without_model_env();
+        // A COMMIT frame is `u64 len | u8 type | u64 ownerLen | u64 checksum`
+        // = 25 bytes; 9 bytes off the end cuts the payload, which is the shape
+        // the `#207` probe measured as a DATA LOSS refusal.
+        let torn = torn_only_commit_fixture(&db, &root, 9).await;
+        assert_eq!(torn.tail, crate::store::wal_accounting::WalTail::TornTail);
+
+        let _wal_env_serial = WAL_ENV_LOCK.lock().await;
+        let previous_wal = allow_unverified_wal_recovery();
+        let result = LadybugStore::for_testing(&db, 8);
+        restore_wal_env(previous_wal);
+        drop(_wal_env_serial);
+
+        assert_torn_commit_opens(result, &db).await;
+
+        let _ = std::fs::remove_dir_all(&root);
+        restore_model_env(previous_model);
+    }
+
+    /// `#207` row 3b — the same torn COMMIT, but the tear only removes the
+    /// trailing checksum. At `1787f1b2` this shape does not even reach a
+    /// recovery arm: `is_wal_integrity_failure` (`ladybug.rs:2240-2244`) does
+    /// not recognise "Reading past the end of the file", so `with_system_config`
+    /// returns that engine error verbatim and the database stays unopenable.
+    /// Phase B must classify the torn tail before choosing an arm; widening the
+    /// integrity predicate is part of that.
+    #[tokio::test]
+    #[ignore = "red until Phase B wires the classifier into with_system_config (#207)"]
+    async fn torn_commit_checksum_tail_opens_instead_of_an_unclassified_error() {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-wal-torn-checksum-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("torn-checksum.lbug");
+        let previous_model = without_model_env();
+        let torn = torn_only_commit_fixture(&db, &root, 2).await;
+        assert_eq!(torn.tail, crate::store::wal_accounting::WalTail::TornTail);
+
+        let _wal_env_serial = WAL_ENV_LOCK.lock().await;
+        let previous_wal = allow_unverified_wal_recovery();
+        let result = LadybugStore::for_testing(&db, 8);
+        restore_wal_env(previous_wal);
+        drop(_wal_env_serial);
+
+        assert_torn_commit_opens(result, &db).await;
+
+        let _ = std::fs::remove_dir_all(&root);
+        restore_model_env(previous_model);
+    }
+
+    /// Shared contract for both torn-COMMIT shapes: nothing committed was lost,
+    /// so the store opens through the lenient arm and the torn row is absent.
+    async fn assert_torn_commit_opens(
+        result: Result<LadybugStore>,
+        db: &std::path::Path,
+    ) {
+        let store = match result {
+            Ok(store) => store,
+            Err(e) => panic!(
+                "a torn-only-COMMIT WAL at {} has nothing committed to lose and \
+                 must open, got: {e} (#207)",
+                db.display()
+            ),
+        };
+        assert_eq!(
+            store.open_provenance(),
+            OpenProvenance::UnverifiedWalReplay,
+            "the open still records that it went through the lenient replay"
+        );
+        assert_eq!(
+            memory_count(&store, "torn-only-").await,
+            0,
+            "the torn transaction must not appear"
+        );
+    }
+
+    /// `#207` row 4 — a delete-only WAL still opens. Green at baseline; this is
+    /// the over-refusal guard for Phase B.
+    #[tokio::test]
+    async fn delete_only_wal_still_opens() {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-wal-delete-only-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("delete-only.lbug");
+        let previous_model = without_model_env();
+        store_with_checkpointed_schema(&db, &root).await;
+
+        // The fixture commits a sentinel insert+delete prefix, then rows that
+        // are inserted and deleted inside the same WAL, then a corrupt tail.
+        plant_corrupted_uncheckpointed_wal(&db, 2, true);
+        let wal = wal_of(&db);
+        let pre_len = file_len(&wal);
+        assert!(pre_len > 0);
+
+        let _wal_env_serial = WAL_ENV_LOCK.lock().await;
+        let previous_wal = allow_unverified_wal_recovery();
+        let result = LadybugStore::for_testing(&db, 8);
+        restore_wal_env(previous_wal);
+        drop(_wal_env_serial);
+
+        let store = result.expect("a delete-only WAL must still open (#207)");
+        assert_eq!(
+            store.open_provenance(),
+            OpenProvenance::UnverifiedWalReplay
+        );
+        assert_eq!(memory_count(&store, "wal-only-").await, 0);
+        assert_eq!(memory_count(&store, "wal-prefix-sentinel").await, 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+        restore_model_env(previous_model);
+    }
+
+    /// `#207` row 5 — the no-WAL fallback still opens and is classified as
+    /// `NoWal`. Green at baseline; over-refusal guard for Phase B.
+    #[tokio::test]
+    async fn no_wal_store_still_opens_verified() {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-wal-none-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("no-wal.lbug");
+        let previous_model = without_model_env();
+        store_with_checkpointed_schema(&db, &root).await;
+        assert_eq!(file_len(&wal_of(&db)), 0, "a clean close leaves no WAL");
+        assert_eq!(file_len(&ckpt_of(&db)), 0, "and no frozen WAL");
+
+        let store = LadybugStore::for_testing(&db, 8).expect("a store with no WAL opens");
+        assert_eq!(store.open_provenance(), OpenProvenance::Verified);
+        let verdict = classify(
+            WalBytes::ZERO,
+            WalBytes::ZERO,
+            CommitEvidence::None,
+            false,
+        );
+        assert_eq!(verdict, WalAccounting::NoWal);
+
+        let _ = std::fs::remove_dir_all(&root);
+        restore_model_env(previous_model);
+    }
+
+    /// `#207` row 6 — a mixed pair that disagrees on `enableChecksums` must be
+    /// refused, not defaulted to the active `.wal`'s flag while the frozen WAL
+    /// is silently deleted.
+    #[tokio::test]
+    #[ignore = "red until Phase B wires the classifier into with_system_config (#207)"]
+    async fn mixed_header_pair_is_refused_and_both_wals_survive() {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-wal-mixed-header-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("mixed-header.lbug");
+        let previous_model = without_model_env();
+        store_with_checkpointed_schema(&db, &root).await;
+
+        let cfg = SystemConfig::default()
+            .max_db_size(512 * 1024 * 1024)
+            .buffer_pool_size(64 * 1024 * 1024)
+            .throw_on_wal_replay_failure(true);
+        let raw = Database::new(&db, cfg).expect("raw open to seed the WAL");
+        let conn = Connection::new(&raw).expect("raw connection");
+        conn.query(&memory_row("mixed-header-0"))
+            .expect("seed a WAL-only row");
+        conn.query("CALL force_checkpoint_on_close=false")
+            .expect("turn off checkpoint on close");
+        drop(conn);
+        drop(raw);
+
+        let wal = wal_of(&db);
+        let ckpt = ckpt_of(&db);
+        let seeded = std::fs::read(&wal).expect("read the seeded WAL");
+        std::fs::copy(&wal, &ckpt).expect("copy .wal to .wal.checkpoint");
+        // Both files now exist; flip the active file's checksum flag so the pair
+        // disagrees. This is the shape a config change between runs leaves.
+        let mut flipped = seeded.clone();
+        flipped[16] = 0;
+        std::fs::write(&wal, &flipped).expect("flip the active WAL's checksum flag");
+        assert_eq!(
+            select_header_source(
+                HeaderProbe::present(file_len(&wal), Some(false)),
+                HeaderProbe::present(file_len(&ckpt), Some(true)),
+            ),
+            HeaderSource::Conflict(HeaderConflict::ChecksumsDisagree)
+        );
+
+        let _wal_env_serial = WAL_ENV_LOCK.lock().await;
+        let previous_wal = allow_unverified_wal_recovery();
+        let result = LadybugStore::for_testing(&db, 8);
+        restore_wal_env(previous_wal);
+        drop(_wal_env_serial);
+
+        match result {
+            Ok(store) => panic!(
+                "a mixed-enableChecksums pair must be refused, not opened as {:?} (#207)",
+                store.open_provenance()
+            ),
+            Err(err) => assert!(
+                err.to_string().contains("WAL"),
+                "the refusal must say what was refused: {err}"
+            ),
+        }
+        assert_eq!(
+            file_len(&wal),
+            seeded.len() as u64,
+            "the active .wal must survive the refusal"
+        );
+        assert_eq!(
+            file_len(&ckpt),
+            seeded.len() as u64,
+            "the frozen .wal.checkpoint must survive the refusal"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        restore_model_env(previous_model);
     }
 }
 

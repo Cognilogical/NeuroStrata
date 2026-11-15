@@ -203,6 +203,50 @@
       "thresholds": {
         "ignored": 0
       }
+    },
+    "wal-zero-record": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp wal_accounting -- --test-threads=1"
+      ],
+      "tests": [
+        "store::wal_accounting::tests::no_wal_when_nothing_existed_before_or_after",
+        "store::wal_accounting::tests::nothing_committed_when_the_discarded_bytes_held_no_commit",
+        "store::wal_accounting::tests::committed_lost_when_a_commit_existed_and_no_bytes_survive",
+        "store::wal_accounting::tests::committed_lost_also_for_the_active_side_of_the_pair",
+        "store::wal_accounting::tests::a_consumed_checkpoint_is_a_replay_not_a_loss",
+        "store::wal_accounting::tests::replayed_when_bytes_survive_untouched",
+        "store::wal_accounting::tests::replayed_reports_the_torn_tail_it_dropped",
+        "store::wal_accounting::tests::unknown_when_the_bytes_cannot_be_attributed",
+        "store::wal_accounting::tests::unknown_when_an_unreadable_pair_still_has_residual_bytes",
+        "store::wal_accounting::tests::unknown_when_bytes_appear_without_a_pre_replay_wal",
+        "store::wal_accounting::tests::unknown_when_the_post_state_grows",
+        "store::wal_accounting::tests::every_verdict_has_a_stable_slug",
+        "store::wal_accounting::tests::scan_reads_a_checksummed_wal_frame_by_frame",
+        "store::wal_accounting::tests::scan_reads_a_plain_wal_frame_by_frame",
+        "store::wal_accounting::tests::scan_of_a_header_only_wal_is_clean_and_commitless",
+        "store::wal_accounting::tests::scan_treats_an_empty_file_as_no_records",
+        "store::wal_accounting::tests::scan_refuses_a_truncated_header",
+        "store::wal_accounting::tests::scan_sees_a_torn_commit_as_no_commit_after_a_sound_prefix",
+        "store::wal_accounting::tests::scan_calls_an_unattributable_first_frame_unknown",
+        "store::wal_accounting::tests::scan_calls_an_unknown_record_type_corrupt",
+        "store::wal_accounting::tests::scan_keeps_a_proven_commit_when_the_tail_is_corrupt",
+        "store::wal_accounting::tests::scan_recognises_a_trailing_checkpoint",
+        "store::wal_accounting::tests::scan_of_a_torn_record_after_a_checkpoint_still_ends_in_checkpoint",
+        "store::wal_accounting::tests::merge_prefers_a_commit_over_an_unreadable_peer",
+        "store::wal_accounting::tests::merge_stays_pessimistic_when_neither_side_proves_anything",
+        "store::wal_accounting::tests::header_source_uses_the_only_usable_side",
+        "store::wal_accounting::tests::header_source_accepts_a_pair_that_agrees",
+        "store::wal_accounting::tests::header_source_refuses_a_mixed_pair",
+        "store::wal_accounting::tests::header_source_refuses_a_short_active_with_no_frozen_peer",
+        "store::wal_accounting::tests::header_source_is_none_only_when_neither_wal_exists"
+      ],
+      "thresholds": {
+        "truth_table_verdicts": 5,
+        "classifier_rows": 12,
+        "scanner_contract_rows": 13,
+        "header_rule_rows": 5,
+        "ignored": 0
+      }
     }
   }
 }
