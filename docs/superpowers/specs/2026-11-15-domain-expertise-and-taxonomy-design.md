@@ -66,13 +66,19 @@ Represents a higher-order unit of domain knowledge in the project's W3C SKOS/OWL
   - `contrasts_with` (`array<string>`, optional): Competing paradigms, alternative algorithms, or differential concepts (`ns:contrastsWith`). Must be disjoint from `broader`/`narrower`.
   - `tradeoffs` (`array<string>`, optional): Key strengths, failure modes, and decision boundaries (when to use vs. when to avoid).
   - `references` (`array<string>`, optional): Foundational papers, clinical protocols, standards, or benchmarks (`dcterms:references`).
+  - `comparable_implementations` (`array<string>`, optional): License-compatible libraries, reference systems, or domain exemplars that realize or inform this concept.
+  - `realization_status` (`"unimplemented" | "partial" | "implemented" | "external_reference"`, optional, defaults to `"implemented"` when anchored to project rules/locations, else `"partial"`): Tracks how completely the project currently realizes this domain concept.
+  - `current_limitations` (`array<string>`, optional): Known architectural, theoretical, or operational ceilings in the project's current realization of the concept.
+  - `frontier_opportunities` (`array<string>`, optional): Concrete, SME-grade advancement vectors grounded in domain research, libraries, and the project's canonical ontology.
   - `implemented_interfaces` (`array<string>`, optional): Polymorphic `interface_def` names associated with this domain concept when it maps to concrete digital-twin entities.
+  - `linked_action_types` (`array<string>`, optional): Kinetic `action_type` slugs governed or informed by this domain concept.
   - `evaluation_scores` (`object<string, integer>`, optional): Basis-point ratings (`0..10000`) keyed by `thesis.evaluation_axes` slugs.
   - `epistemic_status` (`"seed" | "defined" | "synthesized" | "verified"`, optional): Computed deterministically by the formal kernel from the concept's structural completeness and empirical grounding.
 - **Derived Read-Time Properties:**
   - `descendant_count`: Transitive count of active `narrower` concepts in the taxonomy DAG.
-  - `grounding_count`: Count of active governing `rule`, `fact`, `procedure`, and code/document anchor connections.
+  - `grounding_count`: Count of active governing `rule`, `fact`, `procedure`, `interface_def`, `action_type`, and code/document anchor connections.
   - `epistemic_weight_bps`: Formal kernel basis-point weight (`2500 | 5000 | 8000 | 10000`).
+  - `frontier_leverage_bps`: Formal kernel priority score (`0..10000`) ranking how impactful advancing this concept is for the project.
 - **Graph Relations:**
   - `concept` rows can carry standard `metadata.governs`, `metadata.related_to`, `metadata.depends_on`, and `metadata.extracted_from` edges, plus optional `locations` when a domain concept is anchored to specific files or symbols.
 
@@ -101,14 +107,16 @@ The pure function `classify_epistemic_status(has_definition, has_taxonomy_link, 
 - `validate_taxonomy_dag(edges: &[(u32, u32)]) -> bool`: Pure cycle-detection kernel over `broader` (`child -> parent`) edges. Any self-loop or directed cycle is rejected deterministically on `upsert_concept`, while `OntologyIndex` hydration sanitizes legacy cycles fail-softly.
 - `validate_skos_disjointness(hierarchical_edges: &[(u32, u32)], associative_edges: &[(u32, u32)]) -> bool`: Enforces W3C SKOS S27 integrity—no concept pair `(u, v)` connected in `broader`/`narrower` (in either direction) may simultaneously appear in `related_concepts` or `contrasts_with`.
 - `compute_epistemic_coverage_bps(statuses: &[EpistemicStatus], unmapped_domain_count: usize) -> u32`: Computes overall namespace epistemic maturity in basis points `[0..10000]`, penalizing registered domains that have rules/tasks but zero `concept` nodes.
+- `compute_frontier_leverage_bps(axis_alignment_bps: u32, realization_gap_bps: u32, canonical_connectivity_count: u32, has_frontier_or_limitation: bool, has_references_or_comparables: bool) -> u32`: Computes a deterministic `[0..10000]` leverage score for ranking SME improvement recommendations in `neurostrata_taxonomy(operation: "advise")`, rewarding concepts that combine high `thesis.evaluation_axes` alignment, unrealized or partial implementation ceiling (`unimplemented` / `partial` / explicit `current_limitations` & `frontier_opportunities`), strong connectivity to canonical project entities (`interfaces`, `action_types`, `rules`, `locations`), and grounded citations/comparable libraries.
 
 ### 3.3 Lean 4 Theorems (`proofs/NeuroStrata/Taxonomy.lean`)
 
 1. `classify_epistemic_monotonic`: Adding definition, taxonomy links, synthesis, or grounding never decreases `EpistemicStatus`.
-2. `epistemic_status_weight_bounded`: Every status weight and `compute_epistemic_coverage_bps` output is strictly bounded within `[0, 10000]`.
+2. `epistemic_status_weight_bounded`: Every status weight, `compute_epistemic_coverage_bps`, and `compute_frontier_leverage_bps` output is strictly bounded within `[0, 10000]`.
 3. `verified_requires_all_pillars`: `classify_epistemic_status == Verified` implies `has_definition ∧ has_taxonomy_link ∧ has_synthesis ∧ has_empirical_grounding`.
 4. `dag_rejects_self_loop_and_two_cycle`: `validate_taxonomy_dag` rejects all self-loops and directed cycles.
 5. `skos_disjointness_sound`: `validate_skos_disjointness` returns `false` whenever any hierarchical pair overlaps a symmetric associative/contrast pair.
+6. `frontier_leverage_monotonic_in_alignment`: Increasing `axis_alignment_bps` or adding grounded references/frontier vectors never decreases `compute_frontier_leverage_bps`.
 
 ---
 
@@ -185,6 +193,18 @@ All three surfaces (`neurostrata_taxonomy` MCP tool, `POST /taxonomy` in `src/da
      - `dangling_concept_refs`: Concept slugs referenced in `broader`, `narrower`, `related_concepts`, or `contrasts_with` that have not yet been defined as `concept` rows.
      - `shallow_concepts`: Concepts still at `"seed"` or `"defined"` status that lack `tradeoffs`, `contrasts_with`, or `references`.
      - `anti_patterns`: Deterministic ontology design lints (`OrphanConcept`, `OverloadedUmbrella`, `UnanchoredPillar`, `SymmetricConflict`).
+7. **`advise` (Subject-Matter Expert Opportunity & Frontier Synthesis)**
+   - Inputs: `namespace`, optional `query` / `topic`, optional `domain`, optional `top_k` (default `5`, max `20`).
+   - Behavior: Answers questions like *"What are the top 5 ways we could improve this project?"* at a domain subject-matter expert, principal architect, and product specialist level—never generic boilerplate—by joining the **Subject-Matter Taxonomy & External Frontier** with the **Project's Canonical Ontology & Implementation**:
+     - Evaluates every candidate concept in the taxonomy (filtered by `domain`/`query` if provided) using `formal_kernel::compute_frontier_leverage_bps`.
+     - Returns `recommendations: Vec<ExpertRecommendation>` (top `top_k` ranked by `leverage_score_bps`), where each recommendation card contains:
+       - `rank`, `concept_slug`, `pref_label`, `domain_pillar`, `epistemic_status`, `realization_status`, and `leverage_score_bps`.
+       - `canonical_grounding`: Exact project entities connected to this subject (`implemented_interfaces`, `linked_action_types`, governing `rule`/`fact` IDs & summaries, `locations` in code/docs, and open `task` IDs).
+       - `current_state_and_limitations`: What the project currently implements and the specific domain/architectural ceilings recorded in `current_limitations`.
+       - `frontier_recommendations`: Concrete SME-grade advancements from `frontier_opportunities` and `tradeoffs`, contrasted against `contrasts_with` alternatives.
+       - `references_and_comparables`: Academic papers, clinical/industry standards (`references`), and license-compatible libraries or exemplar systems (`comparable_implementations`).
+       - `thesis_alignment`: Explicit breakdown against `thesis.direction`, `thesis.evaluation_axes` (`evaluation_scores`), and confirmation of zero conflict with `thesis.non_goals`.
+     - Also returns `external_research_agenda: Vec<ResearchPrompt>`: Targeted search queries for domains/pillars with unmapped gaps or missing literature/library comparables, enabling the agent to actively run literature/library discovery (`websearch` / `context7`), ingest the new domain knowledge via `upsert_concept`, and re-run `advise`.
 
 ---
 
@@ -197,10 +217,14 @@ All three surfaces (`neurostrata_taxonomy` MCP tool, `POST /taxonomy` in `src/da
      - `project_thesis`: Concise summary of the active `thesis` (`primary_domain`, `direction`, `evaluation_axes`).
      - `domain_concepts`: Up to 3 matched `concept` rows relevant to the task, formatted with their definition, `broader`/`related_concepts`/`contrasts_with`, and `tradeoffs`.
    - Every subagent spawned with `subagent_prompt_injection` immediately receives both the operational rules AND the domain-expertise briefing.
-3. **Lock 2 Done-Funnel (`neurostrata_task_complete`):**
+3. **Expert-to-Expert Advisory Protocol (`.agents/skills/neurostrata/SKILL.md` & `AGENTS.md`):**
+   - When the owner asks strategic, architectural, or domain-improvement questions (e.g., *"What are the top 5 ways we could improve this project?"*), the agent:
+     1. Calls `neurostrata_taxonomy(operation: "advise", top_k: 5)` to retrieve ontology-grounded recommendations and any `external_research_agenda` gaps.
+     2. If external research is warranted or requested, investigates current papers, standards, and license-compatible libraries (`websearch`, `context7`), persists those findings into the concept graph via `neurostrata_taxonomy(operation: "upsert_concept")` (recording `references`, `comparable_implementations`, `current_limitations`, `frontier_opportunities`, and links to canonical project entities), and synthesizes recommendations grounded simultaneously in the domain literature, the project's canonical ontology, and the technology stack.
+4. **Lock 2 Done-Funnel (`neurostrata_task_complete`):**
    - Explicitly documents and supports extracting `memory_type: "concept"` (or linking a `concept` created via `neurostrata_taxonomy`) to satisfy Lock 2 when completing research, domain-modeling, or architectural tasks.
-4. **360° Object View (`src/graph_read/object_view.rs`):**
-   - Hydrates `concept` and `thesis` entities with their taxonomic hierarchy (`broader`, `narrower`, `related_concepts`, `contrasts_with`, `tradeoffs`, `epistemic_status`, `descendant_count`, `grounding_count`).
+5. **360° Object View (`src/graph_read/object_view.rs`):**
+   - Hydrates `concept` and `thesis` entities with their taxonomic hierarchy (`broader`, `narrower`, `related_concepts`, `contrasts_with`, `tradeoffs`, `epistemic_status`, `realization_status`, `current_limitations`, `frontier_opportunities`, `comparable_implementations`, `descendant_count`, `grounding_count`, `frontier_leverage_bps`).
 
 ---
 
