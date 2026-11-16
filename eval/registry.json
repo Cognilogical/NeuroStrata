@@ -330,7 +330,10 @@
         "store::ladybug::wal_zero_record::foreign_active_and_frozen_are_both_quarantined",
         "store::ladybug::wal_zero_record::oversized_wal_refuses_after_a_failed_verified_open",
         "store::ladybug::wal_zero_record::refusal_keeps_the_active_wal_when_it_still_has_bytes",
-        "storage::snapshot::tests::prune_wal_recovery_artifacts_except_never_removes_a_protected_path"
+        "storage::snapshot::tests::prune_wal_recovery_artifacts_except_never_removes_a_protected_path",
+        "store::ladybug::tests::a_clean_foreign_open_still_honours_the_verdict",
+        "store::ladybug::wal_zero_record::a_checksummed_flipped_database_id_is_refused_not_quarantined",
+        "store::ladybug::wal_zero_record::a_foreign_frozen_wal_with_an_unknown_active_peer_is_refused_not_quarantined"
       ],
       "thresholds": {
         "ignored": 0,

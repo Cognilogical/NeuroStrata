@@ -3061,6 +3061,39 @@ enum LenientFailure {
     ArmD,
 }
 
+/// What the clean-foreign arm may do with the pair snapshot it already
+/// computed (`#207` C4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanForeignAction {
+    /// The pair's bytes cannot be attributed, or a committed loss is
+    /// proven: refuse with the accounting verdict instead of quarantining
+    /// on the engine's foreign attribution alone.
+    Refuse,
+    /// The pair is attributable and no loss is proven: arm D's quarantine
+    /// of the foreign side stands.
+    Quarantine,
+}
+
+fn clean_foreign_action(
+    verdict: crate::store::wal_accounting::WalAccounting,
+) -> CleanForeignAction {
+    use crate::store::wal_accounting::WalAccounting;
+
+    match verdict {
+        // `Deferred` is refused by the funnel before this arm is reached;
+        // it maps to `Refuse` here too so no future call site can turn an
+        // unclassifiable pair into a quarantine by reaching this function
+        // first.
+        WalAccounting::CommittedLost { .. }
+        | WalAccounting::Unknown { .. }
+        | WalAccounting::Deferred { .. } => CleanForeignAction::Refuse,
+        WalAccounting::ForeignWal { .. }
+        | WalAccounting::NoWal
+        | WalAccounting::NothingCommitted { .. }
+        | WalAccounting::Replayed { .. } => CleanForeignAction::Quarantine,
+    }
+}
+
 fn lenient_failure_action(verdict: crate::store::wal_accounting::WalAccounting) -> LenientFailure {
     use crate::store::wal_accounting::WalAccounting;
 
@@ -3134,10 +3167,32 @@ fn recover_from_wal_failure(
     }
 
     // A clean foreign WAL fails the verified open on the database id and never
-    // reaches a replay: quarantine it and reopen (arm D; `#207` BC-2).
+    // reaches a replay: quarantine it and reopen (arm D; `#207` BC-2). But the
+    // engine's attribution alone is not enough: when the pair snapshot the
+    // funnel already computed cannot attribute the bytes (`Unknown`) or
+    // proves a committed loss (`CommittedLost`), the named side's scan
+    // evidence outranks the attribution — the same gate `classify_side_with`
+    // applies per side — and the arm refuses instead of quarantining
+    // (`#207` C4).
     if arm_a_foreign.is_some() && !checksum_mismatch && !integrity_failure {
-        let db = open_after_quarantine(local_path, foreign, true)?;
-        return Ok((db, OpenProvenance::DiscardedUnreadableWal));
+        match clean_foreign_action(snapshot) {
+            CleanForeignAction::Refuse => {
+                let restore = sides_to_restore(pre, post);
+                return Err(wal_refusal(
+                    local_path,
+                    snapshot,
+                    pre,
+                    post,
+                    preserved,
+                    restore,
+                    "Refusing to open: the write-ahead log was attributed to another database, but the accounting cannot prove the pair is only foreign",
+                ));
+            }
+            CleanForeignAction::Quarantine => {
+                let db = open_after_quarantine(local_path, foreign, true)?;
+                return Ok((db, OpenProvenance::DiscardedUnreadableWal));
+            }
+        }
     }
 
     let lenient_provenance = if checksum_mismatch {
@@ -25134,6 +25189,64 @@ eurostrata\src\daemon.rs",
         );
     }
 
+    /// `#207` C4: the clean-foreign arm must act on the pair snapshot it
+    /// already computed — a pair whose bytes cannot be attributed, or
+    /// whose committed loss is proven, is refused, not quarantined on the
+    /// engine's foreign attribution alone.
+    #[test]
+    fn a_clean_foreign_open_still_honours_the_verdict() {
+        use crate::store::wal_accounting::{SideSet, UnknownReason, WalAccounting};
+
+        assert_eq!(
+            clean_foreign_action(WalAccounting::Unknown {
+                reason: UnknownReason::CommitEvidenceUnreadable,
+                sides: SideSet::ACTIVE
+            }),
+            CleanForeignAction::Refuse
+        );
+        assert_eq!(
+            clean_foreign_action(WalAccounting::CommittedLost {
+                pre_bytes: 1,
+                sides: SideSet::ACTIVE
+            }),
+            CleanForeignAction::Refuse
+        );
+        assert_eq!(
+            clean_foreign_action(WalAccounting::Deferred {
+                pre_bytes: 1,
+                sides: SideSet::ACTIVE
+            }),
+            CleanForeignAction::Refuse
+        );
+        assert_eq!(
+            clean_foreign_action(WalAccounting::ForeignWal {
+                pre_bytes: 1,
+                sides: SideSet::FROZEN
+            }),
+            CleanForeignAction::Quarantine
+        );
+        assert_eq!(
+            clean_foreign_action(WalAccounting::Replayed {
+                pre_bytes: 1,
+                residual_bytes: 1,
+                truncated_bytes: 0,
+                checkpoint: None
+            }),
+            CleanForeignAction::Quarantine
+        );
+        assert_eq!(
+            clean_foreign_action(WalAccounting::NothingCommitted {
+                uncommitted_bytes: 1,
+                sides: SideSet::ACTIVE
+            }),
+            CleanForeignAction::Quarantine
+        );
+        assert_eq!(
+            clean_foreign_action(WalAccounting::NoWal),
+            CleanForeignAction::Quarantine
+        );
+    }
+
     /// `#207` C5: the drop flag must be *known* to be applied. A failed CALL
     /// leaks the handle instead of letting `~Database()` checkpoint the WAL.
     #[test]
@@ -25538,6 +25651,10 @@ eurostrata\src\daemon.rs",
         assert!(
             funnel.contains("lenient_failure_action("),
             "a failed lenient open acts on its verdict instead of always quarantining (#207 C3)"
+        );
+        assert!(
+            funnel.contains("clean_foreign_action("),
+            "the clean-foreign arm acts on its pair snapshot instead of always quarantining (#207 C4)"
         );
         assert!(
             funnel.contains("release_handle("),
@@ -28725,6 +28842,248 @@ mod wal_zero_record {
         );
         assert_eq!(file_len(&corrupted[0]), pre_len);
         drop(store);
+
+        let _ = std::fs::remove_dir_all(&root);
+        restore_model_env(previous_model);
+    }
+
+    /// `#207` C4(ii): a **checksummed** WAL with a flipped database-id byte
+    /// is this store's own WAL until the scan proves otherwise — and here
+    /// the scan cannot: flipping a header byte breaks the header checksum,
+    /// so the side's evidence is `Unknown`. The clean-foreign arm must not
+    /// quarantine it; the funnel must refuse and preserve, per the
+    /// accounting. (The checksums-off sibling above stays quarantined:
+    /// there the records are still attributable, evidence `Some`.)
+    #[tokio::test]
+    async fn a_checksummed_flipped_database_id_is_refused_not_quarantined() {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-wal-checksummed-flipped-id-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("checksummed-flipped.lbug");
+        let previous_model = without_model_env();
+        store_with_checkpointed_schema(&db, &root).await;
+
+        // Checksums on (the default): the seeded WAL is checksummed.
+        let cfg = SystemConfig::default()
+            .max_db_size(512 * 1024 * 1024)
+            .buffer_pool_size(64 * 1024 * 1024)
+            .throw_on_wal_replay_failure(true);
+        let raw = Database::new(&db, cfg).expect("raw open with checksums on");
+        let conn = Connection::new(&raw).expect("raw connection");
+        conn.query(&memory_row("checksummed-flipped-0"))
+            .expect("seed a committed WAL-only row");
+        conn.query("CALL force_checkpoint_on_close=false")
+            .expect("turn off checkpoint on close");
+        drop(conn);
+        drop(raw);
+
+        // Frozen side only: the engine's database-id check names the
+        // temporary file it replays the frozen WAL through, which is the
+        // attribution the clean-foreign arm acts on. (An active-side flip
+        // never reaches that arm — the header failure refuses earlier;
+        // verified when this test was first run against the active side.)
+        let wal = wal_of(&db);
+        let ckpt = ckpt_of(&db);
+        let mut bytes = std::fs::read(&wal).expect("read the seeded WAL");
+        assert!(bytes.len() > WAL_HEADER_CHECKSUMMED_BYTES as usize);
+        std::fs::rename(&wal, &ckpt).expect("move .wal to .wal.checkpoint");
+        assert!(!wal.exists(), "no active .wal on disk");
+        bytes[0] ^= 0x01; // one byte of the 16-byte database id
+        assert_eq!(
+            scan_wal(&bytes).commit_evidence(),
+            CommitEvidence::Unknown,
+            "a flipped id byte breaks the checksummed header, so the scan \
+             cannot attribute these bytes (#207 C4)"
+        );
+        std::fs::write(&ckpt, &bytes).expect("flip the database id in place");
+        let pre_len = bytes.len() as u64;
+
+        let _wal_env_serial = WAL_ENV_LOCK.lock().await;
+        let previous_wal = allow_unverified_wal_recovery();
+        let result = LadybugStore::for_testing(&db, 8);
+        restore_wal_env(previous_wal);
+        drop(_wal_env_serial);
+
+        let err = match result {
+            Ok(store) => panic!(
+                "a checksummed WAL with a flipped database id and `Unknown` \
+                 scan evidence must be refused, not quarantined as {:?} \
+                 (#207 C4)",
+                store.open_provenance()
+            ),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("unknown"),
+            "the refusal must name the `unknown` accounting verdict: {err}"
+        );
+        let corrupted = wal_files_in(&root, "checksummed-flipped.lbug.wal.checkpoint.corrupted.");
+        assert_eq!(
+            corrupted.len(),
+            0,
+            "no .corrupted.<ts> quarantine artifact may be created: {corrupted:?}"
+        );
+        assert_eq!(file_len(&ckpt), pre_len, "the frozen WAL stays in place");
+        assert_eq!(
+            std::fs::read(&ckpt).expect("read the refused frozen WAL"),
+            bytes,
+            "the refused frozen WAL must be byte-identical to the pre-open file"
+        );
+        let copies = wal_files_in(&root, "checksummed-flipped.lbug.wal.checkpoint.unclean.");
+        assert_eq!(
+            copies.len(),
+            1,
+            "the preserved .unclean copy must survive: {copies:?}"
+        );
+        assert_eq!(
+            std::fs::read(&copies[0]).expect("read the preserved copy"),
+            bytes,
+            "the preserved copy must hold the pre-open bytes"
+        );
+        drop(bytes);
+
+        let _ = std::fs::remove_dir_all(&root);
+        restore_model_env(previous_model);
+    }
+
+    /// `#207` C4(ii) — the compound the clean-foreign arm actually reaches:
+    /// a genuinely foreign **frozen** WAL (attributable, evidence `Some`;
+    /// the engine names it on the verified open) paired with this store's
+    /// own **active** WAL whose records are destroyed (evidence `Unknown`).
+    /// The pair snapshot is `Unknown` — the fold ranks `Unknown` above
+    /// `ForeignWal` — so quarantining the foreign side on the strength of
+    /// the engine's attribution alone would act on a pair the accounting
+    /// cannot prove is only foreign. The arm must refuse and preserve
+    /// instead. (A single-side flipped database id never reaches this
+    /// arm: the checksummed header fails verification first and the
+    /// integrity arm refuses — see the sibling test above and the cycle's
+    /// RED log.)
+    #[tokio::test]
+    async fn a_foreign_frozen_wal_with_an_unknown_active_peer_is_refused_not_quarantined() {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-wal-foreign-plus-unknown-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let previous_model = without_model_env();
+
+        // Donor: a healthy checksummed WAL with one committed row, from
+        // another database (genuinely foreign, fully attributable).
+        let donor_db = root.join("donor.lbug");
+        store_with_checkpointed_schema(&donor_db, &root).await;
+        let make_cfg = || {
+            SystemConfig::default()
+                .max_db_size(512 * 1024 * 1024)
+                .buffer_pool_size(64 * 1024 * 1024)
+                .throw_on_wal_replay_failure(true)
+        };
+        let raw = Database::new(&donor_db, make_cfg()).expect("raw open to seed the donor WAL");
+        let conn = Connection::new(&raw).expect("raw connection");
+        conn.query(&memory_row("donor-c4-0"))
+            .expect("seed a committed donor row");
+        conn.query("CALL force_checkpoint_on_close=false")
+            .expect("turn off checkpoint on close");
+        drop(conn);
+        drop(raw);
+        let donor = std::fs::read(wal_of(&donor_db)).expect("read the donor WAL");
+        assert_eq!(
+            scan_wal(&donor).commit_evidence(),
+            CommitEvidence::Some,
+            "the donor WAL is attributable"
+        );
+
+        // Destination: its own committed WAL, records destroyed (header
+        // kept), planted as the active side; the donor WAL as frozen.
+        let db = root.join("foreign-plus-unknown.lbug");
+        store_with_checkpointed_schema(&db, &root).await;
+        let raw = Database::new(&db, make_cfg()).expect("raw open to seed the own WAL");
+        let conn = Connection::new(&raw).expect("raw connection");
+        conn.query(&memory_row("own-c4-0"))
+            .expect("seed a committed WAL-only row");
+        conn.query("CALL force_checkpoint_on_close=false")
+            .expect("turn off checkpoint on close");
+        drop(conn);
+        drop(raw);
+        let wal = wal_of(&db);
+        let ckpt = ckpt_of(&db);
+        let seeded = std::fs::read(&wal).expect("read the seeded own WAL");
+        let mut corrupt = seeded.clone();
+        for byte in corrupt
+            .iter_mut()
+            .skip(WAL_HEADER_CHECKSUMMED_BYTES as usize)
+        {
+            *byte = 0xFF;
+        }
+        assert_eq!(
+            scan_wal(&corrupt).commit_evidence(),
+            CommitEvidence::Unknown,
+            "destroyed records make the own side's evidence `Unknown`"
+        );
+        std::fs::write(&wal, &corrupt).expect("plant the corrupted own WAL");
+        std::fs::write(&ckpt, &donor).expect("plant the foreign frozen WAL");
+
+        let _wal_env_serial = WAL_ENV_LOCK.lock().await;
+        let previous_wal = allow_unverified_wal_recovery();
+        let result = LadybugStore::for_testing(&db, 8);
+        restore_wal_env(previous_wal);
+        drop(_wal_env_serial);
+
+        let err = match result {
+            Ok(store) => panic!(
+                "a foreign-plus-unknown pair must be refused, not opened as \
+                 {:?} (#207 C4)",
+                store.open_provenance()
+            ),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("unknown"),
+            "the refusal must name the `unknown` accounting verdict: {err}"
+        );
+        let corrupted_active = wal_files_in(&root, "foreign-plus-unknown.lbug.wal.corrupted.");
+        let corrupted_frozen =
+            wal_files_in(&root, "foreign-plus-unknown.lbug.wal.checkpoint.corrupted.");
+        assert_eq!(
+            corrupted_active.len() + corrupted_frozen.len(),
+            0,
+            "no side may be quarantined on an `Unknown` pair verdict: \
+             active {corrupted_active:?}, frozen {corrupted_frozen:?}"
+        );
+        assert_eq!(
+            std::fs::read(&wal).expect("read the refused active WAL"),
+            corrupt,
+            "the active WAL must be byte-identical to the pre-open file"
+        );
+        assert_eq!(
+            std::fs::read(&ckpt).expect("read the refused frozen WAL"),
+            donor,
+            "the frozen WAL must be byte-identical to the pre-open file"
+        );
+        let copies_active = wal_files_in(&root, "foreign-plus-unknown.lbug.wal.unclean.");
+        let copies_frozen =
+            wal_files_in(&root, "foreign-plus-unknown.lbug.wal.checkpoint.unclean.");
+        assert_eq!(
+            copies_active.len(),
+            1,
+            "active preserved copy: {copies_active:?}"
+        );
+        assert_eq!(
+            copies_frozen.len(),
+            1,
+            "frozen preserved copy: {copies_frozen:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
         restore_model_env(previous_model);
