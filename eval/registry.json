@@ -445,7 +445,10 @@
         "tests::restore_copy_refuses_a_one_sided_snapshot_carrying_the_frozen_member",
         "tests::restore_copy_refuses_a_both_wal_snapshot_missing_the_active_side",
         "tests::the_fallback_arm_is_gated_before_any_file_copy",
-        "tests::the_fallback_refuses_when_the_lock_probe_errors"
+        "tests::the_fallback_refuses_when_the_lock_probe_errors",
+        "storage::snapshot::tests::a_none_manifest_with_a_wal_member_is_refused",
+        "tests::restore_copy_refuses_a_none_wal_snapshot_carrying_a_wal_member",
+        "tests::restore_copy_restores_a_clean_none_wal_snapshot"
       ],
       "thresholds": {
         "ignored": 0,

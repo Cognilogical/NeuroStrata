@@ -5224,6 +5224,63 @@ mod tests {
     }
 
     #[test]
+    fn restore_copy_refuses_a_none_wal_snapshot_carrying_a_wal_member() {
+        // #209 (Codex P2): the manifest says there is no WAL, so a WAL member
+        // is refused before any file is staged rather than silently dropped.
+        let (root, snapshot_dir, target) = restore_copy_fixture("none-with-wal");
+        std::fs::write(snapshot_dir.join("ladybug.store.wal"), b"unexpected-wal").unwrap();
+        std::fs::write(
+            snapshot_dir.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"wal_kind\":\"none\"}}",
+                crate::storage::snapshot::SNAPSHOT_FORMAT,
+                crate::storage::snapshot::SNAPSHOT_VERSION
+            ),
+        )
+        .unwrap();
+
+        let err = copy_snapshot_into_place(&snapshot_dir, &target)
+            .expect_err("a none-wal snapshot carrying a WAL is refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("none") && message.contains("ladybug.store.wal"),
+            "the refusal names the inconsistency: {message}"
+        );
+        assert!(
+            !target.exists(),
+            "a refused restore places no store at the target"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restore_copy_restores_a_clean_none_wal_snapshot() {
+        let (root, snapshot_dir, target) = restore_copy_fixture("none-clean");
+        std::fs::write(
+            snapshot_dir.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"wal_kind\":\"none\"}}",
+                crate::storage::snapshot::SNAPSHOT_FORMAT,
+                crate::storage::snapshot::SNAPSHOT_VERSION
+            ),
+        )
+        .unwrap();
+
+        copy_snapshot_into_place(&snapshot_dir, &target).expect("restore copy");
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"snapshot-db");
+        assert!(
+            !restore_companion_path(&target, ".wal").exists(),
+            "a none-wal snapshot places no active WAL"
+        );
+        assert!(
+            !restore_companion_path(&target, ".wal.checkpoint").exists(),
+            "a none-wal snapshot places no frozen WAL"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn restore_copy_refuses_a_one_sided_snapshot_carrying_the_frozen_member() {
         // #209 (J7): `active` plus a leftover frozen member is not a pair this
         // reader owns; restoring it would place bytes the manifest never
@@ -5697,6 +5754,14 @@ fn copy_snapshot_into_place(
     };
     let snapshot_wal = snapshot_dir.join("ladybug.store.wal");
     let snapshot_checkpoint_wal = snapshot_dir.join("ladybug.store.wal.checkpoint");
+    // #209 (Codex P2): `none` promises no WAL member. Refuse it before staging
+    // instead of restoring the store and silently leaving the WAL out.
+    if wal_kind.as_deref() == Some(crate::storage::snapshot::WAL_KIND_NONE) && snapshot_wal.exists()
+    {
+        return Err(anyhow::anyhow!(
+            "the snapshot records wal_kind \"none\" but carries ladybug.store.wal; refusing to restore a WAL the manifest says does not exist",
+        ));
+    }
     if declares_both && !snapshot_wal.exists() {
         return Err(anyhow::anyhow!(
             "the snapshot records wal_kind \"both\" but carries no active ladybug.store.wal"

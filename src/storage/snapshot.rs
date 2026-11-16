@@ -900,6 +900,16 @@ pub fn verify_snapshot(dir: &Path) -> Result<SnapshotVerifyReport, SnapshotError
         wal_kind.as_deref(),
         Some(WAL_KIND_ACTIVE) | Some(WAL_KIND_FROZEN)
     );
+    let declares_none = wal_kind.as_deref() == Some(WAL_KIND_NONE);
+    // #209 (Codex P2): `none` means the snapshot owns no WAL. A WAL member (or
+    // a checksum naming one) under that manifest is an inconsistency, not a
+    // stray file to ignore: restore would silently leave it out.
+    if declares_none && (wal.exists() || checksums.wal_sha256.is_some()) {
+        return Err(SnapshotError::InvalidManifest(format!(
+            "wal_kind \"{}\" but the snapshot carries ladybug.store.wal (or its checksum); a snapshot with no WAL must not ship one",
+            WAL_KIND_NONE
+        )));
+    }
     let wal_mentioned =
         checksums.wal_sha256.is_some() || wal.exists() || declares_single || declares_both;
     if wal_mentioned {
@@ -1785,6 +1795,58 @@ mod tests {
             matches!(result, Err(SnapshotError::InvalidManifest(ref m)) if m.contains("version")),
             "an unknown future version is refused with a version message: {result:?}"
         );
+    }
+
+    #[test]
+    fn a_none_manifest_with_a_wal_member_is_refused() {
+        // #209 (Codex P2): `wal_kind: none` promises no WAL member. A WAL (or
+        // a checksum naming one) under that manifest is inconsistent, and a
+        // restore would silently leave it out.
+        let d = temp_dir("none-with-wal");
+        write_store(&d);
+        fs::write(
+            d.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"wal_kind\":\"none\"}}",
+                SNAPSHOT_FORMAT, SNAPSHOT_VERSION
+            ),
+        )
+        .unwrap();
+        fs::write(d.join("ladybug.store.wal"), b"unexpected-wal").unwrap();
+        write_checksums(&d).unwrap();
+
+        match verify_snapshot(&d) {
+            Err(SnapshotError::InvalidManifest(message)) => {
+                assert!(
+                    message.contains("none") && message.contains("ladybug.store.wal"),
+                    "the refusal names the inconsistency: {message}"
+                );
+            }
+            other => panic!("a none manifest carrying a WAL must be refused: {other:?}"),
+        }
+
+        // Same rule when only the checksum names a WAL: the member the
+        // manifest says cannot exist is still named.
+        fs::remove_file(d.join("ladybug.store.wal")).unwrap();
+        let checksums_path = d.join("checksums.json");
+        let mut checksums: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&checksums_path).unwrap()).unwrap();
+        checksums["wal_sha256"] =
+            serde_json::json!("0000000000000000000000000000000000000000000000000000000000000000");
+        fs::write(
+            &checksums_path,
+            serde_json::to_string_pretty(&checksums).unwrap(),
+        )
+        .unwrap();
+        match verify_snapshot(&d) {
+            Err(SnapshotError::InvalidManifest(message)) => assert!(
+                message.contains("none") && message.contains("ladybug.store.wal"),
+                "the checksum-only case names the inconsistency: {message}"
+            ),
+            other => {
+                panic!("a none manifest whose checksums name a WAL must be refused: {other:?}")
+            }
+        }
     }
 
     #[test]
