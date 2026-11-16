@@ -109,6 +109,12 @@ Two policies are worth knowing before interpreting a refusal:
   happens. If it fails, the WAL is not classified and the arm must not
   checkpoint it: treat the store like a `committed_lost` case and use the
   preserved copy / snapshot path above.
+- **A preservation failure refuses the open before any replay.** If the active
+  or frozen WAL cannot be copied aside (a symlink, a directory, an I/O error),
+  the daemon refuses with `could not preserve <path>: …; the <side> copy was
+  kept at <path>` and leaves every copy it did make in place, unpruned. Fix the
+  cause (remove the symlink, free the space) and retry; do not delete the
+  partial `.wal.unclean.<ts>`/`.wal.checkpoint.unclean.<ts>` copies.
 - **A quarantined `foreign_wal` is preserved, not "nothing lost".** The message
   says nothing of *this* store was discarded, because a WAL carrying another
   database's id is not this store's data. If the attribution itself is wrong —

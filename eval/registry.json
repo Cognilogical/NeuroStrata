@@ -298,6 +298,7 @@
         "store::ladybug::wal_preservation::quarantine_wal_side_picks_the_message_from_the_attribution",
         "store::ladybug::wal_preservation::quarantine_message_distinguishes_foreign_from_same_database",
         "store::ladybug::wal_preservation::preserve_wal_pair_keeps_both_current_copies_with_retention_one",
+        "store::ladybug::wal_preservation::pair_preservation_failure_refuses_before_replay_and_keeps_the_partial_copy",
         "store::ladybug::wal_preservation::preserve_wal_pair_reports_absent_sides",
         "store::ladybug::wal_preservation::preserve_wal_pair_refuses_a_symlinked_side",
         "store::ladybug::wal_preservation::preserve_unclean_wal_prunes_stale_artifacts_even_with_no_wal",

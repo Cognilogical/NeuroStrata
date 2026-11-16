@@ -2444,21 +2444,71 @@ fn preserve_wal_side(
     Ok(Some(copy_file))
 }
 
+/// Why a pair preservation stopped, plus every copy that was still made.
+///
+/// A partial result must never be thrown away: the copy of the side that did
+/// succeed is the only evidence a later refusal can restore from.
+#[derive(Debug)]
+struct PairPreserveFailure {
+    source: anyhow::Error,
+    failed_path: std::path::PathBuf,
+    preserved: PreservedPair,
+}
+
+impl std::fmt::Display for PairPreserveFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "could not preserve {}: {}",
+            self.failed_path.display(),
+            self.source
+        )?;
+        let kept: Vec<String> = [
+            ("active", self.preserved.active.as_ref()),
+            ("frozen", self.preserved.frozen.as_ref()),
+        ]
+        .into_iter()
+        .filter_map(|(label, path)| {
+            path.map(|p| format!("the {label} copy was kept at {}", p.display()))
+        })
+        .collect();
+        if kept.is_empty() {
+            write!(f, "; no copy could be kept")
+        } else {
+            write!(f, "; {}", kept.join("; "))
+        }
+    }
+}
+
+impl std::error::Error for PairPreserveFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 /// Mandatory preservation for a refusing arm (`#207` B8).
 ///
-/// Returns **both** preserved paths and fails when an existing non-empty WAL
-/// cannot be copied. A refusal that cannot preserve is not a refusal: the arm
-/// turns this error into a refused open that names the failure.
-fn preserve_wal_pair(local_path: &std::path::Path) -> Result<PreservedPair> {
+/// Returns **both** preserved paths, or [`PairPreserveFailure`] carrying the
+/// error *and* the copies already made. The caller must stop before the first
+/// engine open on failure: continuing would let a replay empty a WAL whose only
+/// backup is the partial copy.
+fn preserve_wal_pair(
+    local_path: &std::path::Path,
+) -> std::result::Result<PreservedPair, PairPreserveFailure> {
     let mut preserved = PreservedPair::default();
     for side in [WalSide::Active, WalSide::Frozen] {
         let path = side.path(local_path);
-        let copy = preserve_wal_side(local_path, side).map_err(|e| {
-            anyhow::anyhow!(
-                "refusing to open: could not preserve the write-ahead log at {}: {e}",
-                path.display()
-            )
-        })?;
+        let copy = match preserve_wal_side(local_path, side) {
+            Ok(copy) => copy,
+            Err(e) => {
+                // No pruning here: the partial copies are evidence.
+                return Err(PairPreserveFailure {
+                    source: e.into(),
+                    failed_path: path,
+                    preserved,
+                });
+            }
+        };
         match side {
             WalSide::Active => preserved.active = copy,
             WalSide::Frozen => preserved.frozen = copy,
@@ -2898,14 +2948,14 @@ fn wal_refusal(
         crate::store::wal_accounting::SideObservation,
     ),
     post: (u64, u64),
-    preserved: &std::result::Result<PreservedPair, anyhow::Error>,
+    preserved: &PreservedPair,
     restore: crate::store::wal_accounting::SideSet,
     headline: &str,
 ) -> anyhow::Error {
     let pre_total = pre.0.pre.saturating_add(pre.1.pre);
     let scanned_total = pre.0.bytes_scanned.saturating_add(pre.1.bytes_scanned);
     let post_total = post.0.saturating_add(post.1);
-    let pair = preserved.as_ref().ok();
+    let pair = Some(preserved);
 
     let mut restored = Vec::new();
     let mut unrestored = Vec::new();
@@ -2936,20 +2986,19 @@ fn wal_refusal(
         .and_then(|p| p.active.as_ref().or(p.frozen.as_ref()))
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| format!("{}.wal.unclean.<none>", local_path.display()));
-    let preservation_note = match preserved {
-        Ok(p) => format!(
-            "preserved copies: active {}, frozen {}",
-            p.active
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "<none>".to_string()),
-            p.frozen
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "<none>".to_string())
-        ),
-        Err(e) => format!("no pre-open copy could be made ({e})"),
-    };
+    let preservation_note = format!(
+        "preserved copies: active {}, frozen {}",
+        preserved
+            .active
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<none>".to_string()),
+        preserved
+            .frozen
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<none>".to_string())
+    );
 
     let mut message = format!(
         "{headline}: verdict `{}` on {} ({pre_total} bytes before, {post_total} after the replay, {scanned_total} bytes scanned). Refusing to checkpoint over the WAL.",
@@ -2981,7 +3030,7 @@ fn recover_from_wal_failure(
         crate::store::wal_accounting::SideObservation,
         crate::store::wal_accounting::SideObservation,
     ),
-    preserved: &std::result::Result<PreservedPair, anyhow::Error>,
+    preserved: &PreservedPair,
 ) -> Result<(Database, OpenProvenance)> {
     use crate::store::wal_accounting::{
         classify_pair, consumed_sides, disposition, Disposition, SideSet, WalAccounting,
@@ -3107,9 +3156,7 @@ fn recover_from_wal_failure(
             drop(unverified_db);
             if pre_total > 0 {
                 let preserved_display = preserved
-                    .as_ref()
-                    .ok()
-                    .and_then(|p| p.get(WalSide::Active))
+                    .get(WalSide::Active)
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| format!("{}.wal.unclean.<none>", local_path.display()));
                 eprintln!(
@@ -3583,24 +3630,24 @@ impl LadybugStore {
         // are taken before the first engine call, so a refusal can restore bytes
         // the engine would otherwise delete.
         preflight_wal_headers(&local_path)?;
-        let preserved = preserve_wal_pair(&local_path);
-        match &preserved {
-            Ok(pair) => {
-                if let Some(active) = &pair.active {
-                    eprintln!(
-                        "WARNING: the last shutdown was not clean -- a {} byte write-ahead log was left behind. Recovering what it still holds.",
-                        std::fs::metadata(active).map(|m| m.len()).unwrap_or(0)
-                    );
-                    eprintln!(
-                        "A copy was kept at {:?} in case recovery is incomplete.",
-                        active
-                    );
-                }
+        // A preservation failure stops the open *before* the first engine call:
+        // replaying a WAL whose backup only partially exists could destroy the
+        // bytes a refusal would restore (#207 P2).
+        let preserved = match preserve_wal_pair(&local_path) {
+            Ok(preserved) => preserved,
+            Err(failure) => {
+                return Err(anyhow::anyhow!("refusing to open: {failure}"));
             }
-            Err(e) => eprintln!(
-                "WARNING: could not preserve the write-ahead log beside {:?}: {e}. A refusal will not be able to restore it (#207).",
-                local_path
-            ),
+        };
+        if let Some(active) = &preserved.active {
+            eprintln!(
+                "WARNING: the last shutdown was not clean -- a {} byte write-ahead log was left behind. Recovering what it still holds.",
+                std::fs::metadata(active).map(|m| m.len()).unwrap_or(0)
+            );
+            eprintln!(
+                "A copy was kept at {:?} in case recovery is incomplete.",
+                active
+            );
         }
         let pre = (
             observe_wal_side(&local_path, WalSide::Active),
@@ -28911,6 +28958,75 @@ mod wal_preservation {
             Some(value) => std::env::set_var("NEUROSTRATA_SNAPSHOT_RETENTION_COUNT", value),
             None => std::env::remove_var("NEUROSTRATA_SNAPSHOT_RETENTION_COUNT"),
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `#207` P2: when the active copy succeeds and the frozen copy fails, the
+    /// open must refuse **before** the first engine call and keep the partial
+    /// active copy; the canonical WAL is untouched.
+    #[cfg(unix)]
+    #[test]
+    fn pair_preservation_failure_refuses_before_replay_and_keeps_the_partial_copy() {
+        let root = fixture("pair-failure");
+        let db = root.join("fail.lbug");
+        std::fs::write(&db, b"db").unwrap();
+        let active = WalSide::Active.path(&db);
+        // A 40-byte checksums-off header, so the pre-flight sees a usable active
+        // side and only the frozen side is unusable.
+        let active_bytes = vec![0u8; 40];
+        std::fs::write(&active, &active_bytes).unwrap();
+
+        let frozen = WalSide::Frozen.path(&db);
+        let short = root.join("short.bin");
+        std::fs::write(&short, b"1234").unwrap();
+        std::os::unix::fs::symlink(&short, &frozen).unwrap();
+
+        let err = match LadybugStore::with_system_config(&db, 8, verifying_config()) {
+            Ok(_) => panic!("a pair-preservation failure must refuse the open"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("could not preserve"),
+            "the refusal must name the failure: {err}"
+        );
+        assert!(
+            err.contains(".wal.checkpoint"),
+            "the refusal must name the failed side: {err}"
+        );
+
+        let copies: Vec<std::path::PathBuf> = artifacts(&db)
+            .into_iter()
+            .filter(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().starts_with("fail.lbug.wal.unclean."))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(
+            copies.len(),
+            1,
+            "the partial active copy must be retained: {:?}",
+            copies
+        );
+        assert_eq!(
+            std::fs::read(&copies[0]).unwrap(),
+            active_bytes,
+            "the partial copy holds the original active bytes"
+        );
+        assert!(
+            err.contains(&copies[0].display().to_string()),
+            "the refusal must name the kept copy: {err}"
+        );
+
+        // No engine open happened: the canonical active WAL still has its bytes.
+        assert_eq!(std::fs::read(&active).unwrap(), active_bytes);
+        assert!(
+            !artifacts(&db)
+                .iter()
+                .any(|p| p.to_string_lossy().contains(".corrupted.")),
+            "nothing was quarantined"
+        );
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
