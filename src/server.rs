@@ -10999,7 +10999,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let db = root.join("cli.lbug");
         std::fs::write(&db, b"db").unwrap();
-        crate::model_choice::write_store_state(
+        crate::model_choice::write_store_state_identity(
             &db,
             &crate::model_choice::StoreState::new(
                 true,

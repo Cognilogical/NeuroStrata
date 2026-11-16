@@ -304,10 +304,11 @@ const fn is_zero_u32(value: &u32) -> bool {
 
 impl StoreState {
     /// A state carrying only the identity fields this module has always
-    /// owned. The health fields start empty; [`write_store_state`]
-    /// preserves whatever a previous writer recorded for them, so a
-    /// plain identity write (stamp, flip, pristine adoption) never erases
-    /// the persisted recovery/checkpoint provenance.
+    /// owned. The health fields start empty; [`write_store_state_identity`]
+    /// never takes health from the caller anyway — it always copies the
+    /// sidecar's current health forward — so a plain identity write (stamp,
+    /// flip, pristine adoption) can neither erase nor roll back the
+    /// persisted recovery/checkpoint provenance.
     pub(crate) fn new(has_data: bool, descriptor: crate::traits::EmbeddingDescriptor) -> Self {
         Self {
             version: STORE_STATE_VERSION,
@@ -318,15 +319,6 @@ impl StoreState {
             last_checkpoint_duration_ms: None,
             checkpoint_failures: 0,
         }
-    }
-
-    /// Whether this state carries no health at all — the shape
-    /// [`write_store_state`] fills in from the file it is about to replace.
-    fn has_no_health(&self) -> bool {
-        self.last_recovery.is_none()
-            && self.last_checkpoint_at.is_none()
-            && self.last_checkpoint_duration_ms.is_none()
-            && self.checkpoint_failures == 0
     }
 }
 
@@ -395,41 +387,48 @@ pub(crate) fn store_state_unparseable_error(db_path: &Path, reason: &str) -> any
 
 /// Serializes every in-process writer of a store-state sidecar (`#212`).
 ///
-/// The recovery and checkpoint recorders are read-modify-write updates
-/// that an open and a checkpoint can issue concurrently with the store's
-/// own identity writes (the pristine stamp, the data flip, pristine
-/// adoption). One process owns the store, so one process-wide turn is
-/// enough to keep every update whole and to keep
-/// [`write_store_state`]'s health-preserving merge from reading a state
-/// another writer is between read and write.
+/// The health writers are read-modify-write updates that an open and a
+/// checkpoint can issue concurrently with the store's own identity writes
+/// (the pristine stamp, the data flip, pristine adoption). One process owns
+/// the store, so one process-wide turn is enough to keep every update whole
+/// and to keep [`write_store_state_identity`]'s health copy from reading
+/// a state another writer is between read and write.
 static STORE_STATE_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Write the sidecar atomically (the same temp + fsync + rename pattern
-/// as the embedders file).
+/// Write the sidecar's identity fields (`has_data` / `descriptor`) while
+/// **always** carrying the health currently on disk (`#212`, Codex P2).
 ///
-/// Health preservation (`#212`): a caller that records only identity
-/// (`has_data` / `descriptor` — every pre-`#212` writer) must not erase
-/// the persisted recovery/checkpoint fields, so a state with no health of
-/// its own inherits the health of the sidecar it replaces. A caller that
-/// does carry health writes it verbatim.
-pub(crate) fn write_store_state(db_path: &Path, state: &StoreState) -> anyhow::Result<()> {
+/// The split matters: identity writers stamp, flip, and adopt, and some of
+/// them pass a state that was cached earlier in the process. That cached
+/// state also contains whatever health the file held when it was loaded, and
+/// it can be stale — a checkpoint updates the file without touching the
+/// cache. Taking health from the caller would then roll the file back to the
+/// older timestamps; taking it from disk under the same lock cannot.
+///
+/// The health fields of `state` are therefore ignored, deliberately: a
+/// caller cannot pass a health payload through this door. Recovery and
+/// checkpoint outcomes are written by [`record_store_state_recovery`] /
+/// [`record_store_state_checkpoint`], which own those fields.
+pub(crate) fn write_store_state_identity(db_path: &Path, state: &StoreState) -> anyhow::Result<()> {
     let _guard = STORE_STATE_WRITE_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    write_store_state_locked(db_path, state)
+    let mut merged = StoreState::new(state.has_data, state.descriptor.clone());
+    merged.version = state.version;
+    if let StoreStateRead::Recorded(existing) = read_store_state_file(db_path) {
+        merged.last_recovery = existing.last_recovery;
+        merged.last_checkpoint_at = existing.last_checkpoint_at;
+        merged.last_checkpoint_duration_ms = existing.last_checkpoint_duration_ms;
+        merged.checkpoint_failures = existing.checkpoint_failures;
+    }
+    write_store_state_locked(db_path, &merged)
 }
 
+/// Write a complete state verbatim. The caller holds
+/// [`STORE_STATE_WRITE_LOCK`]; only the health recorders use this, after
+/// reading the state they are about to extend.
 fn write_store_state_locked(db_path: &Path, state: &StoreState) -> anyhow::Result<()> {
-    let mut state = state.clone();
-    if state.has_no_health() {
-        if let StoreStateRead::Recorded(existing) = read_store_state_file(db_path) {
-            state.last_recovery = existing.last_recovery;
-            state.last_checkpoint_at = existing.last_checkpoint_at;
-            state.last_checkpoint_duration_ms = existing.last_checkpoint_duration_ms;
-            state.checkpoint_failures = existing.checkpoint_failures;
-        }
-    }
-    let serialized = serde_json::to_string_pretty(&state)?;
+    let serialized = serde_json::to_string_pretty(state)?;
     write_file_atomically(&store_state_path(db_path), &serialized, false)
 }
 
@@ -1750,7 +1749,7 @@ mod tests {
         fs::create_dir_all(&store_dir).expect("create store dir");
         let db_path = store_dir.join("ladybug.db");
         write_bare_db(&db_path);
-        write_store_state(&db_path, &StoreState::new(true, fp32_recorded_descriptor()))
+        write_store_state_identity(&db_path, &StoreState::new(true, fp32_recorded_descriptor()))
             .expect("write the data-bearing sidecar");
 
         // The Q configuration, written the setup way — against a
@@ -1798,7 +1797,7 @@ mod tests {
             "[{\"model_name\":\"NomicEmbedTextV15Q\",\"dimensions\":768}]",
         )
         .expect("restore the Q config");
-        write_store_state(
+        write_store_state_identity(
             &db_path,
             &StoreState::new(false, fp32_recorded_descriptor()),
         )
@@ -1831,7 +1830,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("temp dir");
         let db_path = tmp.path().join("ladybug.db");
         write_bare_db(&db_path);
-        write_store_state(&db_path, &StoreState::new(true, fp32_recorded_descriptor()))
+        write_store_state_identity(&db_path, &StoreState::new(true, fp32_recorded_descriptor()))
             .expect("write the data-bearing sidecar");
         let (_cfg_tmp, config_dir) = fresh_config_dir("a5-preflight-incommensurate");
 
@@ -2106,7 +2105,7 @@ mod tests {
         let db_path = tmp.path().join("ladybug.db");
         fs::write(&db_path, b"db").expect("seed bare db");
         let descriptor = fp32_recorded_descriptor();
-        write_store_state(&db_path, &StoreState::new(true, descriptor.clone()))
+        write_store_state_identity(&db_path, &StoreState::new(true, descriptor.clone()))
             .expect("write the identity-only sidecar");
 
         let recovery_at = "2026-11-15T00:00:00Z";
@@ -2145,7 +2144,7 @@ mod tests {
 
         // The store's own identity writers record no health; they must not
         // erase the provenance a recovery just persisted.
-        write_store_state(&db_path, &StoreState::new(false, descriptor.clone()))
+        write_store_state_identity(&db_path, &StoreState::new(false, descriptor.clone()))
             .expect("plain identity write");
         let after_identity = match read_store_state(&db_path) {
             StoreStateRead::Recorded(state) => state,
@@ -2256,13 +2255,86 @@ mod tests {
         );
     }
 
+    /// Codex P2 (`#222`): an identity writer can be handed a state that was
+    /// cached earlier in the process, and that cached state also carries
+    /// whatever health the file held when it was loaded. A checkpoint can
+    /// land between the load and the write without touching the cache, so the
+    /// identity write must take health from the sidecar under its own lock —
+    /// never from the caller's payload — or it rolls the file back.
+    #[test]
+    fn identity_writes_always_merge_current_health() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("ladybug.db");
+        fs::write(&db_path, b"db").expect("seed bare db");
+        let descriptor = fp32_recorded_descriptor();
+        write_store_state_identity(&db_path, &StoreState::new(true, descriptor.clone()))
+            .expect("seed the identity");
+        record_store_state_recovery(
+            &db_path,
+            "unverified_wal_replay",
+            4096,
+            "2026-11-15T00:00:00Z",
+        )
+        .expect("record the first recovery");
+        record_store_state_checkpoint(&db_path, "2026-11-15T00:00:00Z", 5, false)
+            .expect("record the first checkpoint");
+
+        // The caller's cached copy, read before the newer events below.
+        let mut cached = match read_store_state(&db_path) {
+            StoreStateRead::Recorded(state) => state,
+            other => panic!("expected a recorded sidecar, got {other:?}"),
+        };
+        record_store_state_recovery(
+            &db_path,
+            "discarded_unreadable_wal",
+            8192,
+            "2026-11-15T00:00:10Z",
+        )
+        .expect("record the newer recovery");
+        record_store_state_checkpoint(&db_path, "2026-11-15T00:00:09Z", 9, true)
+            .expect("record the newer checkpoint");
+
+        // The first data write flips this cached state to data-bearing.
+        cached.has_data = true;
+        write_store_state_identity(&db_path, &cached)
+            .expect("identity write from the cached state");
+
+        let after = match read_store_state(&db_path) {
+            StoreStateRead::Recorded(state) => state,
+            other => panic!("expected a recorded sidecar, got {other:?}"),
+        };
+        assert!(after.has_data, "the identity write lands");
+        assert_eq!(
+            after.last_checkpoint_at.as_deref(),
+            Some("2026-11-15T00:00:09Z"),
+            "the newer checkpoint survives an identity write from a stale cache (#212)"
+        );
+        assert_eq!(
+            after.last_checkpoint_duration_ms,
+            Some(9),
+            "the newer duration survives"
+        );
+        assert_eq!(
+            after.checkpoint_failures, 1,
+            "the recorded failure count is not rolled back"
+        );
+        assert_eq!(
+            after
+                .last_recovery
+                .as_ref()
+                .map(|r| (r.kind.as_str(), r.at.as_str())),
+            Some(("discarded_unreadable_wal", "2026-11-15T00:00:10Z")),
+            "the newer recovery history survives an identity write too"
+        );
+    }
+
     #[test]
     fn write_file_atomically_concurrent_same_process_safety() {
         // #92: the temp name used to key on the pid alone, so every
         // concurrent caller in one process staged into the same
         // `.tmp-<pid>` file and clobbered each other (the daemon and
         // its in-process fallback arms share a pid). Threads racing
-        // `write_store_state` at the same sidecar path must all
+        // `write_store_state_identity` at the same sidecar path must all
         // succeed, and the file left behind must parse as one whole
         // state — never a splice of two.
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -2286,7 +2358,7 @@ mod tests {
         for i in 0..16u64 {
             let db_path = db_path.clone();
             handles.push(std::thread::spawn(move || {
-                write_store_state(&db_path, &state(i))
+                write_store_state_identity(&db_path, &state(i))
                     .expect("concurrent sidecar write succeeds without ENOENT or corruption");
             }));
         }

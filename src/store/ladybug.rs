@@ -4016,7 +4016,7 @@ impl FirstWriteFlip {
         match self.cached_store_state() {
             CachedStoreState::Recorded(mut recorded) if !recorded.has_data => {
                 recorded.has_data = true;
-                if let Err(e) = crate::model_choice::write_store_state(&self.local_path, &recorded)
+                if let Err(e) = crate::model_choice::write_store_state_identity(&self.local_path, &recorded)
                 {
                     tracing::error!(
                         "store-state sidecar flip failed after a successful write; the store has data but its sidecar still reads pristine: {e}"
@@ -4043,7 +4043,7 @@ impl FirstWriteFlip {
                 };
                 if let Some(descriptor) = descriptor {
                     let state = crate::model_choice::StoreState::new(true, descriptor);
-                    if let Err(e) = crate::model_choice::write_store_state(&self.local_path, &state)
+                    if let Err(e) = crate::model_choice::write_store_state_identity(&self.local_path, &state)
                     {
                         tracing::error!(
                             "store-state sidecar flip failed after a successful write; the store has data but no sidecar records it: {e}"
@@ -4188,7 +4188,7 @@ impl LockedUnknownStamp {
             return;
         }
         let state = crate::model_choice::StoreState::new(false, serving.clone());
-        match crate::model_choice::write_store_state(&self.local_path, &state) {
+        match crate::model_choice::write_store_state_identity(&self.local_path, &state) {
             Ok(()) => self.set_cached_store_state(CachedStoreState::Recorded(state)),
             Err(e) => {
                 tracing::warn!("store-state sidecar write failed: {e}")
@@ -4248,7 +4248,7 @@ impl LockedUnknownMigration {
             return Ok(false);
         }
         let state = crate::model_choice::StoreState::new(true, self.serving.clone());
-        match crate::model_choice::write_store_state(&self.local_path, &state) {
+        match crate::model_choice::write_store_state_identity(&self.local_path, &state) {
             Ok(()) => {
                 let mut cache = self.store_state.lock().unwrap_or_else(|e| e.into_inner());
                 *cache = Some(CachedStoreState::Recorded(state));
@@ -4597,7 +4597,7 @@ impl LadybugStore {
                 if let Some(serving) = self.serving_descriptor() {
                     if serving != recorded.descriptor && self.serving_matches_configured(&serving) {
                         let state = crate::model_choice::StoreState::new(false, serving.clone());
-                        match crate::model_choice::write_store_state(&self.local_path, &state) {
+                        match crate::model_choice::write_store_state_identity(&self.local_path, &state) {
                             Ok(()) => {
                                 self.set_cached_store_state(CachedStoreState::Recorded(state))
                             }
@@ -4612,7 +4612,7 @@ impl LadybugStore {
                 if let Some(serving) = self.serving_descriptor() {
                     if self.serving_matches_configured(&serving) {
                         let state = crate::model_choice::StoreState::new(false, serving.clone());
-                        match crate::model_choice::write_store_state(&self.local_path, &state) {
+                        match crate::model_choice::write_store_state_identity(&self.local_path, &state) {
                             Ok(()) => {
                                 self.set_cached_store_state(CachedStoreState::Recorded(state))
                             }
@@ -23540,7 +23540,7 @@ eurostrata\src\daemon.rs",
         blank.init("probe").await.expect("init creates the schema");
         drop(blank);
         let remote = remote_descriptor_for("RemoteModel");
-        crate::model_choice::write_store_state(
+        crate::model_choice::write_store_state_identity(
             &fx.db,
             &crate::model_choice::StoreState::new(true, remote.clone()),
         )
@@ -23691,7 +23691,7 @@ eurostrata\src\daemon.rs",
         // the cache is lazy, so corrupting it after construction —
         // before the first identity-consulting call — is what init
         // must classify.
-        crate::model_choice::write_store_state(
+        crate::model_choice::write_store_state_identity(
             &fx.db,
             &crate::model_choice::StoreState::new(false, serving_descriptor_for("ModelA")),
         )
@@ -25152,6 +25152,85 @@ eurostrata\src\daemon.rs",
             None => std::env::remove_var("NEUROSTRATA_ALLOW_UNVERIFIED_WAL"),
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Codex P2 (`#222`): the first-write flip caches the store-state sidecar
+    /// when it loads, but a checkpoint can update the file afterwards without
+    /// touching that cache. The first data write must not carry the cached
+    /// (stale) health back over the newer file.
+    #[tokio::test]
+    async fn first_data_write_preserves_health_recorded_after_the_cache_loaded() {
+        let previous = without_model_env();
+        let fx = store_state_fixture("a5-flip-health", "ModelA");
+        // The sidecar a previous process left behind: pristine identity plus
+        // checkpoint history.
+        crate::model_choice::write_store_state_identity(
+            &fx.db,
+            &crate::model_choice::StoreState::new(false, serving_descriptor_for("ModelA")),
+        )
+        .expect("seed the pristine sidecar");
+        crate::model_choice::record_store_state_checkpoint(
+            &fx.db,
+            "2026-11-15T00:00:00Z",
+            5,
+            false,
+        )
+        .expect("record the old checkpoint");
+
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        store.init("probe").await.expect("init");
+        // `init` loaded and cached the sidecar, health included.
+        assert!(
+            !crate::model_choice::store_has_data(&fx.db),
+            "the fixture is pristine before the first write"
+        );
+
+        // A checkpoint lands after the cache was loaded: the file moves, the
+        // in-process cache cannot know.
+        crate::model_choice::record_store_state_checkpoint(&fx.db, "2026-11-15T00:00:09Z", 9, true)
+            .expect("record the newer checkpoint");
+        assert_eq!(
+            read_sidecar(&fx.db)["last_checkpoint_at"],
+            json!("2026-11-15T00:00:09Z")
+        );
+
+        store
+            .upsert(
+                "probe",
+                "m1",
+                vec![0.1, 0.2, 0.3, 0.4],
+                store_state_payload(),
+            )
+            .await
+            .expect("the first data write lands");
+
+        let after = read_sidecar(&fx.db);
+        assert_eq!(
+            after["has_data"],
+            json!(true),
+            "the first write flipped the recorded identity"
+        );
+        assert_eq!(
+            after["last_checkpoint_at"],
+            json!("2026-11-15T00:00:09Z"),
+            "the first data write must not roll the checkpoint back to the cached copy (#212)"
+        );
+        assert_eq!(
+            after["last_checkpoint_duration_ms"],
+            json!(9),
+            "the newer checkpoint duration survives the flip"
+        );
+        assert_eq!(
+            after["checkpoint_failures"],
+            json!(1),
+            "the recorded failure count survives the flip"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
     }
 
     /// `#212`: a live store and a path-only query answer different questions.
@@ -26835,7 +26914,7 @@ eurostrata\src\daemon.rs",
         drop(creator);
 
         // Hand-rewrite the sidecar to the stale pristine label.
-        crate::model_choice::write_store_state(
+        crate::model_choice::write_store_state_identity(
             &fx.db,
             &crate::model_choice::StoreState::new(false, serving_descriptor_dims("ModelA", 768)),
         )

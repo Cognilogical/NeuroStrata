@@ -1100,7 +1100,7 @@ mod tests {
         let dir = temp_dir("persisted-status");
         let store = dir.join("persisted.lbug");
         fs::write(&store, b"db").unwrap();
-        crate::model_choice::write_store_state(
+        crate::model_choice::write_store_state_identity(
             &store,
             &crate::model_choice::StoreState::new(true, test_descriptor()),
         )

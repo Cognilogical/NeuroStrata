@@ -4433,7 +4433,7 @@ mod tests {
         drop(seed);
         // The stale label: the sidecar reads pristine under ModelA
         // although the table holds the seeded row.
-        crate::model_choice::write_store_state(
+        crate::model_choice::write_store_state_identity(
             &db_path,
             &crate::model_choice::StoreState::new(false, descriptor("ModelA")),
         )
@@ -4647,7 +4647,7 @@ mod tests {
         drop(seed);
         // The stale label: the sidecar reads pristine under ModelA
         // although the table holds the seeded row.
-        crate::model_choice::write_store_state(
+        crate::model_choice::write_store_state_identity(
             &db_path,
             &crate::model_choice::StoreState::new(false, descriptor("ModelA")),
         )
