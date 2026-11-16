@@ -848,6 +848,109 @@ impl ActionTaskTargetStatus {
 
 /// Error from evaluating an `ActionEffectTemplate::TransitionTask` transition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelConnectorOp {
+    RegisterPointer,
+    ResolveSlice,
+    ApplyWriteBack,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelActionReceiptState {
+    NotRequired,
+    ActiveBound,
+    MissingOrNotFound,
+    RevertedOrSuperseded,
+    TargetMismatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KernelConnectorPreGateInput {
+    pub connector_registered: bool,
+    pub rebac_allowed: bool,
+    pub op: KernelConnectorOp,
+    pub pool_writable: bool,
+    pub receipt_state: KernelActionReceiptState,
+    pub requested_rows: u32,
+    pub max_slice_rows: u32,
+    pub requested_bytes: u32,
+    pub max_slice_bytes: u32,
+    pub clock_skew_future: bool,
+    pub age_secs: u64,
+    pub max_staleness_secs: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelConnectorPreVerdict {
+    AllowPreRegister,
+    AllowPreResolve,
+    AllowPreWriteBack,
+    DenyUnregisteredConnector,
+    DenyRebacAccess,
+    DenyReadOnlyPool,
+    DenyInvalidActionReceipt,
+    DenySliceLimitExceeded,
+    DenyClockSkewFuture,
+    DenyPointerStale,
+}
+
+pub const fn evaluate_connector_pre_gate(input: KernelConnectorPreGateInput) -> KernelConnectorPreVerdict {
+    if !input.connector_registered {
+        KernelConnectorPreVerdict::DenyUnregisteredConnector
+    } else if !input.rebac_allowed {
+        KernelConnectorPreVerdict::DenyRebacAccess
+    } else if matches!(input.op, KernelConnectorOp::RegisterPointer) {
+        KernelConnectorPreVerdict::AllowPreRegister
+    } else if matches!(input.op, KernelConnectorOp::ApplyWriteBack) && !input.pool_writable {
+        KernelConnectorPreVerdict::DenyReadOnlyPool
+    } else if matches!(input.op, KernelConnectorOp::ApplyWriteBack) && !matches!(input.receipt_state, KernelActionReceiptState::ActiveBound) {
+        KernelConnectorPreVerdict::DenyInvalidActionReceipt
+    } else if matches!(input.op, KernelConnectorOp::ResolveSlice) && (input.requested_rows == 0 || input.requested_rows > input.max_slice_rows || input.requested_bytes == 0 || input.requested_bytes > input.max_slice_bytes) {
+        KernelConnectorPreVerdict::DenySliceLimitExceeded
+    } else if input.clock_skew_future {
+        KernelConnectorPreVerdict::DenyClockSkewFuture
+    } else if input.max_staleness_secs > 0 && input.age_secs > input.max_staleness_secs {
+        KernelConnectorPreVerdict::DenyPointerStale
+    } else {
+        match input.op {
+            KernelConnectorOp::ResolveSlice => KernelConnectorPreVerdict::AllowPreResolve,
+            KernelConnectorOp::ApplyWriteBack => KernelConnectorPreVerdict::AllowPreWriteBack,
+            _ => KernelConnectorPreVerdict::AllowPreResolve,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KernelConnectorPostGateInput {
+    pub op: KernelConnectorOp,
+    pub observed_rows: u32,
+    pub max_slice_rows: u32,
+    pub observed_bytes: u32,
+    pub max_slice_bytes: u32,
+    pub source_digest_matches: bool,
+    pub cas_expected_matches: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelConnectorPostVerdict {
+    AllowPostOutput,
+    DenyObservedBoundsExceeded,
+    DenySourceDigestMismatch,
+    DenyCasConflict,
+}
+
+pub const fn evaluate_connector_post_gate(input: KernelConnectorPostGateInput) -> KernelConnectorPostVerdict {
+    if matches!(input.op, KernelConnectorOp::ResolveSlice) && (input.observed_rows > input.max_slice_rows || input.observed_bytes > input.max_slice_bytes) {
+        KernelConnectorPostVerdict::DenyObservedBoundsExceeded
+    } else if !input.source_digest_matches {
+        KernelConnectorPostVerdict::DenySourceDigestMismatch
+    } else if matches!(input.op, KernelConnectorOp::ApplyWriteBack) && !input.cas_expected_matches {
+        KernelConnectorPostVerdict::DenyCasConflict
+    } else {
+        KernelConnectorPostVerdict::AllowPostOutput
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActionTaskEffectError {
     DoneRequiresComplete,
     IllegalTransition,
@@ -1373,6 +1476,87 @@ pub const fn is_memory_valid_at(
     valid_from <= as_of_ts && (!has_valid_to || valid_to > as_of_ts)
 }
 
+/// Workflow lifecycle stage in the pluggable workflow state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelWorkflowStage {
+    Unpreflighted,
+    ContextLoaded,
+    Claimed,
+    Mutating,
+    BreathRequired,
+    PreCheckpoint,
+    PrePublish,
+    Completed,
+}
+
+/// Workflow lifecycle event in the pluggable workflow state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelWorkflowEvent {
+    LoadContext,
+    ClaimTask { has_valid_scope: bool },
+    Mutate { mutations_since_note_after: usize, breath_limit: usize },
+    RecordBreathNote,
+    TriggerPreCheckpoint { has_receipt: bool },
+    CheckpointPassed,
+    TriggerPrePublish { task_gate_ok: bool, doc_gate_ok: bool },
+    PublishPassed,
+    CompleteTask { has_extracted_memory: bool, dirty_targets: usize },
+}
+
+/// Evaluates a workflow stage transition in the pure kernel.
+/// Returns `Ok(next_stage)` on allowed transition, or `Err(static_error_str)` on guard failure.
+pub const fn evaluate_workflow_stage_transition(
+    stage: KernelWorkflowStage,
+    event: KernelWorkflowEvent,
+) -> Result<KernelWorkflowStage, &'static str> {
+    use KernelWorkflowStage::*;
+    use KernelWorkflowEvent::*;
+
+    match (stage, event) {
+        (Unpreflighted, LoadContext) => Ok(ContextLoaded),
+        (ContextLoaded, LoadContext) => Ok(ContextLoaded),
+        (ContextLoaded, ClaimTask { has_valid_scope: true }) => Ok(Claimed),
+        (Claimed, ClaimTask { has_valid_scope: true }) => Ok(Claimed),
+        (Mutating, ClaimTask { has_valid_scope: true }) => Ok(Claimed),
+        (_, ClaimTask { has_valid_scope: false }) => Err("ClaimRequiresValidWorkspaceScope"),
+        (Unpreflighted, ClaimTask { .. }) => Err("PreflightRequiredBeforeClaim"),
+        (Claimed, Mutate { mutations_since_note_after, breath_limit }) => {
+            if mutations_since_note_after >= breath_limit {
+                Ok(BreathRequired)
+            } else {
+                Ok(Mutating)
+            }
+        }
+        (Mutating, Mutate { mutations_since_note_after, breath_limit }) => {
+            if mutations_since_note_after >= breath_limit {
+                Ok(BreathRequired)
+            } else {
+                Ok(Mutating)
+            }
+        }
+        (BreathRequired, Mutate { .. }) => Err("BreathNoteRequiredBeforeFurtherMutation"),
+        (Unpreflighted | ContextLoaded, Mutate { .. }) => Err("ClaimedTaskRequiredBeforeMutation"),
+        (BreathRequired | Mutating | Claimed, RecordBreathNote) => Ok(Mutating),
+        (Claimed, TriggerPreCheckpoint { has_receipt: true }) => Ok(PreCheckpoint),
+        (Mutating, TriggerPreCheckpoint { has_receipt: true }) => Ok(PreCheckpoint),
+        (_, TriggerPreCheckpoint { has_receipt: false }) => Err("CheckpointRequiresValidReceipt"),
+        (PreCheckpoint, CheckpointPassed) => Ok(Mutating),
+        (Claimed, TriggerPrePublish { task_gate_ok: true, doc_gate_ok: true }) => Ok(PrePublish),
+        (Mutating, TriggerPrePublish { task_gate_ok: true, doc_gate_ok: true }) => Ok(PrePublish),
+        (PreCheckpoint, TriggerPrePublish { task_gate_ok: true, doc_gate_ok: true }) => Ok(PrePublish),
+        (_, TriggerPrePublish { task_gate_ok: false, .. }) => Err("PublishBlockedByTaskGate"),
+        (_, TriggerPrePublish { doc_gate_ok: false, .. }) => Err("PublishBlockedByDocumentationGate"),
+        (PrePublish, PublishPassed) => Ok(Mutating),
+        (Claimed, CompleteTask { has_extracted_memory: true, dirty_targets: 0 }) => Ok(Completed),
+        (Mutating, CompleteTask { has_extracted_memory: true, dirty_targets: 0 }) => Ok(Completed),
+        (PreCheckpoint, CompleteTask { has_extracted_memory: true, dirty_targets: 0 }) => Ok(Completed),
+        (PrePublish, CompleteTask { has_extracted_memory: true, dirty_targets: 0 }) => Ok(Completed),
+        (_, CompleteTask { has_extracted_memory: false, .. }) => Err("CompletionRequiresExtractedMemory"),
+        (_, CompleteTask { dirty_targets, .. }) if dirty_targets > 0 => Err("CompletionBlockedByDirtyTargets"),
+        _ => Err("IllegalWorkflowStageTransition"),
+    }
+}
+
 /// Epistemic maturity status of a taxonomy concept.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EpistemicStatus {
@@ -1695,4 +1879,286 @@ mod tests {
         assert_eq!(compute_frontier_leverage_bps(20000, 20000, 3, true, true), 8600);
         assert_eq!(compute_frontier_leverage_bps(20000, 20000, 3, false, false), 6600);
     }
+
+    #[test]
+    fn workflow_stage_transition_legal_path() {
+        use KernelWorkflowEvent::*;
+        use KernelWorkflowStage::*;
+        assert_eq!(
+            evaluate_workflow_stage_transition(Unpreflighted, LoadContext),
+            Ok(ContextLoaded)
+        );
+        assert_eq!(
+            evaluate_workflow_stage_transition(ContextLoaded, LoadContext),
+            Ok(ContextLoaded)
+        );
+        assert_eq!(
+            evaluate_workflow_stage_transition(ContextLoaded, ClaimTask { has_valid_scope: true }),
+            Ok(Claimed)
+        );
+        assert_eq!(
+            evaluate_workflow_stage_transition(Claimed, Mutate { mutations_since_note_after: 2, breath_limit: 5 }),
+            Ok(Mutating)
+        );
+        assert_eq!(
+            evaluate_workflow_stage_transition(Mutating, Mutate { mutations_since_note_after: 5, breath_limit: 5 }),
+            Ok(BreathRequired)
+        );
+        assert_eq!(
+            evaluate_workflow_stage_transition(BreathRequired, RecordBreathNote),
+            Ok(Mutating)
+        );
+        assert_eq!(
+            evaluate_workflow_stage_transition(Mutating, TriggerPreCheckpoint { has_receipt: true }),
+            Ok(PreCheckpoint)
+        );
+        assert_eq!(
+            evaluate_workflow_stage_transition(PreCheckpoint, TriggerPrePublish { task_gate_ok: true, doc_gate_ok: true }),
+            Ok(PrePublish)
+        );
+        assert_eq!(
+            evaluate_workflow_stage_transition(PrePublish, PublishPassed),
+            Ok(Mutating)
+        );
+        assert_eq!(
+            evaluate_workflow_stage_transition(Mutating, CompleteTask { has_extracted_memory: true, dirty_targets: 0 }),
+            Ok(Completed)
+        );
+    }
+
+    #[test]
+    fn workflow_stage_transition_guard_rejections() {
+        use KernelWorkflowEvent::*;
+        use KernelWorkflowStage::*;
+        assert_eq!(
+            evaluate_workflow_stage_transition(BreathRequired, Mutate { mutations_since_note_after: 0, breath_limit: 5 }),
+            Err("BreathNoteRequiredBeforeFurtherMutation")
+        );
+        assert_eq!(
+            evaluate_workflow_stage_transition(Claimed, TriggerPrePublish { task_gate_ok: false, doc_gate_ok: true }),
+            Err("PublishBlockedByTaskGate")
+        );
+        assert_eq!(
+            evaluate_workflow_stage_transition(Claimed, TriggerPrePublish { task_gate_ok: true, doc_gate_ok: false }),
+            Err("PublishBlockedByDocumentationGate")
+        );
+        assert_eq!(
+            evaluate_workflow_stage_transition(Claimed, CompleteTask { has_extracted_memory: false, dirty_targets: 0 }),
+            Err("CompletionRequiresExtractedMemory")
+        );
+        assert_eq!(
+            evaluate_workflow_stage_transition(Claimed, CompleteTask { has_extracted_memory: true, dirty_targets: 3 }),
+            Err("CompletionBlockedByDirtyTargets")
+        );
+        assert_eq!(
+            evaluate_workflow_stage_transition(Unpreflighted, ClaimTask { has_valid_scope: true }),
+            Err("PreflightRequiredBeforeClaim")
+        );
+        assert_eq!(
+            evaluate_workflow_stage_transition(ContextLoaded, Mutate { mutations_since_note_after: 0, breath_limit: 5 }),
+            Err("ClaimedTaskRequiredBeforeMutation")
+        );
+        assert_eq!(
+            evaluate_workflow_stage_transition(Claimed, TriggerPreCheckpoint { has_receipt: false }),
+            Err("CheckpointRequiresValidReceipt")
+        );
+        assert_eq!(
+            evaluate_workflow_stage_transition(ContextLoaded, ClaimTask { has_valid_scope: false }),
+            Err("ClaimRequiresValidWorkspaceScope")
+        );
+        assert_eq!(
+            evaluate_workflow_stage_transition(Completed, LoadContext),
+            Err("IllegalWorkflowStageTransition")
+        );
+    }
+
+    #[test]
+    fn data_connector_gate_parity() {
+        // Test Pre-Gate Verdicts
+        assert_eq!(evaluate_connector_pre_gate(KernelConnectorPreGateInput {
+            connector_registered: true,
+            rebac_allowed: true,
+            op: KernelConnectorOp::RegisterPointer,
+            pool_writable: false,
+            receipt_state: KernelActionReceiptState::NotRequired,
+            requested_rows: 0,
+            max_slice_rows: 100,
+            requested_bytes: 0,
+            max_slice_bytes: 1000,
+            clock_skew_future: false,
+            age_secs: 0,
+            max_staleness_secs: 0,
+        }), KernelConnectorPreVerdict::AllowPreRegister);
+
+        assert_eq!(evaluate_connector_pre_gate(KernelConnectorPreGateInput {
+            connector_registered: false,
+            rebac_allowed: true,
+            op: KernelConnectorOp::ResolveSlice,
+            pool_writable: true,
+            receipt_state: KernelActionReceiptState::NotRequired,
+            requested_rows: 0,
+            max_slice_rows: 100,
+            requested_bytes:  0,
+            max_slice_bytes: 1000,
+            clock_skew_future: false,
+            age_secs: 0,
+            max_staleness_secs: 0,
+        }), KernelConnectorPreVerdict::DenyUnregisteredConnector);
+
+        assert_eq!(evaluate_connector_pre_gate(KernelConnectorPreGateInput {
+            connector_registered: true,
+            rebac_allowed: false,
+            op: KernelConnectorOp::ResolveSlice,
+            pool_writable: true,
+            receipt_state: KernelActionReceiptState::NotRequired,
+            requested_rows: 0,
+            max_slice_rows: 100,
+            requested_bytes: 0,
+            max_slice_bytes: 1000,
+            clock_skew_future: false,
+            age_secs: 0,
+            max_staleness_secs: 0,
+        }), KernelConnectorPreVerdict::DenyRebacAccess);
+
+        assert_eq!(evaluate_connector_pre_gate(KernelConnectorPreGateInput {
+            connector_registered: true,
+            rebac_allowed: true,
+            op: KernelConnectorOp::ApplyWriteBack,
+            pool_writable: false,
+            receipt_state: KernelActionReceiptState::NotRequired,
+            requested_rows: 0,
+            max_slice_rows: 100,
+            requested_bytes: 0,
+            max_slice_bytes: 1000,
+            clock_skew_future: false,
+            age_secs: 0,
+            max_staleness_secs: 0,
+        }), KernelConnectorPreVerdict::DenyReadOnlyPool);
+
+        assert_eq!(evaluate_connector_pre_gate(KernelConnectorPreGateInput {
+            connector_registered: true,
+            rebac_allowed: true,
+            op: KernelConnectorOp::ApplyWriteBack,
+            pool_writable: true,
+            receipt_state: KernelActionReceiptState::ActiveBound,
+            requested_rows: 0,
+            max_slice_rows: 100,
+            requested_bytes: 0,
+            max_slice_bytes: 1000,
+            clock_skew_future: false,
+            age_secs: 0,
+            max_staleness_secs: 0,
+        }), KernelConnectorPreVerdict::AllowPreWriteBack);
+
+        assert_eq!(evaluate_connector_pre_gate(KernelConnectorPreGateInput {
+            connector_registered: true,
+            rebac_allowed: true,
+            op: KernelConnectorOp::ResolveSlice,
+            pool_writable: true,
+            receipt_state: KernelActionReceiptState::NotRequired,
+            requested_rows: 101,
+            max_slice_rows: 100,
+            requested_bytes: 0,
+            max_slice_bytes: 1000,
+            clock_skew_future: false,
+            age_secs: 0,
+            max_staleness_secs: 0,
+        }), KernelConnectorPreVerdict::DenySliceLimitExceeded);
+
+        assert_eq!(evaluate_connector_pre_gate(KernelConnectorPreGateInput {
+            connector_registered: true,
+            rebac_allowed: true,
+            op: KernelConnectorOp::ResolveSlice,
+            pool_writable: true,
+            receipt_state: KernelActionReceiptState::NotRequired,
+            requested_rows: 1,
+            max_slice_rows: 100,
+            requested_bytes: 1,
+            max_slice_bytes: 1000,
+            clock_skew_future: true,
+            age_secs: 0,
+            max_staleness_secs: 0,
+        }), KernelConnectorPreVerdict::DenyClockSkewFuture);
+
+        assert_eq!(evaluate_connector_pre_gate(KernelConnectorPreGateInput {
+            connector_registered: true,
+            rebac_allowed: true,
+            op: KernelConnectorOp::ResolveSlice,
+            pool_writable: true,
+            receipt_state: KernelActionReceiptState::NotRequired,
+            requested_rows: 1,
+            max_slice_rows: 100,
+            requested_bytes: 1,
+            max_slice_bytes: 1000,
+            clock_skew_future: false,
+            age_secs: 1000,
+            max_staleness_secs: 0,
+        }), KernelConnectorPreVerdict::AllowPreResolve);
+
+        assert_eq!(evaluate_connector_pre_gate(KernelConnectorPreGateInput {
+            connector_registered: true,
+            rebac_allowed: true,
+            op: KernelConnectorOp::ResolveSlice,
+            pool_writable: true,
+            receipt_state: KernelActionReceiptState::NotRequired,
+            requested_rows: 1,
+            max_slice_rows: 100,
+            requested_bytes: 1,
+            max_slice_bytes: 1000,
+            clock_skew_future: false,
+            age_secs: 1000,
+            max_staleness_secs: 1,
+        }), KernelConnectorPreVerdict::DenyPointerStale);
+     
+        // Test Post-Gate Verdicts
+        assert_eq!(evaluate_connector_post_gate(KernelConnectorPostGateInput {
+            op: KernelConnectorOp::ResolveSlice,
+            observed_rows: 0,
+            max_slice_rows: 100,
+            observed_bytes: 0,
+            max_slice_bytes: 1000,
+            source_digest_matches: true,
+            cas_expected_matches: true,
+        }), KernelConnectorPostVerdict::AllowPostOutput);
+         
+         assert_eq!(evaluate_connector_post_gate(KernelConnectorPostGateInput {
+             op: KernelConnectorOp::ResolveSlice,
+             observed_rows: 101,
+             max_slice_rows: 100,
+             observed_bytes: 0,
+             max_slice_bytes: 1000,
+             source_digest_matches: true,
+             cas_expected_matches: true,
+         }), KernelConnectorPostVerdict::DenyObservedBoundsExceeded);
+         
+         assert_eq!(evaluate_connector_post_gate(KernelConnectorPostGateInput {
+             op: KernelConnectorOp::ResolveSlice,
+             observed_rows: 0,
+             max_slice_rows: 100,
+             observed_bytes: 0,
+             max_slice_bytes: 1000,
+             source_digest_matches: false,
+             cas_expected_matches: true,
+         }), KernelConnectorPostVerdict::DenySourceDigestMismatch);
+         
+         assert_eq!(evaluate_connector_post_gate(KernelConnectorPostGateInput {
+             op: KernelConnectorOp::ApplyWriteBack,
+             observed_rows: 0,
+             max_slice_rows: 100,
+             observed_bytes: 0,
+             max_slice_bytes: 1000,
+             source_digest_matches: true,
+             cas_expected_matches: false,
+         }), KernelConnectorPostVerdict::DenyCasConflict);
+         
+         assert_eq!(evaluate_connector_post_gate(KernelConnectorPostGateInput {
+             op: KernelConnectorOp::ApplyWriteBack,
+             observed_rows: 0,
+             max_slice_rows: 100,
+             observed_bytes: 0,
+             max_slice_bytes: 1000,
+             source_digest_matches: true,
+             cas_expected_matches: true,
+         }), KernelConnectorPostVerdict::AllowPostOutput);
+     }
 }

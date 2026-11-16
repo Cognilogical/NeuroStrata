@@ -43,6 +43,57 @@ pub struct MemoryPayload {
     pub metadata: Value,
 }
 
+/// One row of the task ledger as the executive port sees it: the task's id and
+/// its stored payload, without the surrounding vector or evidence paths.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskSummaryRow {
+    pub id: String,
+    pub payload: MemoryPayload,
+}
+
+/// Read-side task ledger surface (spec §3.1). Separate from `VectorStore` so
+/// the central kernel's executive port can read tasks and count extractions
+/// without reaching into the concrete `LadybugStore`.
+#[async_trait]
+pub trait TaskStore: Send + Sync {
+    /// Load one task row's payload by id, or `None` when it does not exist.
+    async fn load_task_row(&self, namespace: &str, task_id: &str) -> Result<Option<MemoryPayload>>;
+
+    /// List every task row in the namespace.
+    async fn list_task_rows(&self, namespace: &str) -> Result<Vec<TaskSummaryRow>>;
+
+    /// Count the live memories that name `task_id` in `metadata.extracted_from`,
+    /// excluding the task row itself (the Lock 2 extraction count).
+    async fn count_extracted_memories_for_task(
+        &self,
+        namespace: &str,
+        task_id: &str,
+    ) -> Result<usize>;
+}
+
+/// Read/write ontology surface (spec §3.1): typed memory listing and scoped
+/// writes used by the central kernel's ontology port.
+#[async_trait]
+pub trait OntologyStore: Send + Sync {
+    /// List memories whose `memory_type` is one of `memory_types`, as `(id, payload)`.
+    async fn list_memories_by_types(
+        &self,
+        namespace: &str,
+        memory_types: &[&str],
+    ) -> Result<Vec<(String, MemoryPayload)>>;
+
+    /// Load one memory's payload by id.
+    async fn get_memory_by_id(&self, namespace: &str, id: &str) -> Result<Option<MemoryPayload>>;
+
+    /// Upsert one memory under the given scoped id.
+    async fn put_scoped_memory(
+        &self,
+        namespace: &str,
+        id: &str,
+        payload: &MemoryPayload,
+    ) -> Result<()>;
+}
+
 /// FEATURE-4: does this memory say where it came from?
 ///
 /// A memory is an assertion until it names its origin, so `source` is the

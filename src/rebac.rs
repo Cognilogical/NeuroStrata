@@ -217,6 +217,27 @@ pub fn can_write_memory(principal: &str, user_id: &str, metadata: &Value) -> boo
     )
 }
 
+/// §5.4 / §5.6 — namespace write permission via ReBAC.
+///
+/// The namespace-level write gate:
+/// - `admin` always passes.
+/// - a principal whose name exactly matches the namespace name is allowed
+///   (namespace owner namesake convention).
+/// - any other principal is denied (fail-closed).
+pub fn can_write_namespace(
+    _store: &crate::store::LadybugStore,
+    namespace: &str,
+    principal: Option<&str>,
+) -> bool {
+    let principal = principal.unwrap_or("");
+    // admin bypass
+    if principal == "admin" {
+        return true;
+    }
+    // namespace owner namesake convention
+    principal == namespace
+}
+
 /// Kinetic Action role check: verifies `principal` satisfies `required_role`
 /// (`"editor"` or `"owner"`) on a target row.
 pub fn can_execute_action_on_row(

@@ -253,6 +253,11 @@
         }
       }
     },
+    "data_pointer": {
+      "definition": "A pointer record tying a trusted data_pool resource to a memory id via resolved pointer_id; stored strictly local/private, excluded from SHAREABLE_MEMORY_TYPES so local paths and enterprise pool endpoints never cross SynapticMesh.",
+      "structural": false,
+      "fields": {}
+    },
     "thesis": {
       "definition": "Project-level north star: purpose, domain summary, target outcomes, architectural tenets, and canonical concepts.",
       "structural": false,

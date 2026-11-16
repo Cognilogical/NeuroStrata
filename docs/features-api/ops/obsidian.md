@@ -71,4 +71,4 @@ In addition to individual Markdown notes, the planned export would produce Open 
 - **Leiden Communities:** Automatically clustered thematic neighborhoods discovered by the graph community detector (`src/community.rs`).
 - **Source File Governance:** Architectural rules positioned directly alongside the AST file/symbol nodes they govern.
 
-See the [Visual Interface & UI Guide](../UI_GUIDE.md) for using the standalone Web UI and Tauri Desktop 3D Force Graph alongside Obsidian.
+See the [Visual Interface & UI Guide](../ui-guide.md) for using the standalone Web UI and Tauri Desktop 3D Force Graph alongside Obsidian.

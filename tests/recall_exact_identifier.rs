@@ -28,8 +28,8 @@ use search::{
 };
 
 use recall_metrics::{
-    record_domain_query, record_promotion, record_recall, recall_snapshot,
-    domain_filter_snapshot,
+    acquire_test_lock, domain_filter_snapshot, record_domain_query, record_promotion,
+    record_recall, recall_snapshot,
 };
 
 /// The recall→promotion join: a promotion of an id that a previous recall in
@@ -37,6 +37,7 @@ use recall_metrics::{
 /// that was never recalled does not.
 #[test]
 fn promotion_joins_a_previous_recall() {
+    let _guard = acquire_test_lock();
     let ns = "r12-join-ns";
     record_recall(ns, &["11111111-1111-1111-1111-111111111111".to_string()]);
 
@@ -74,6 +75,7 @@ fn empty_recall_response_records_nothing_joinable() {
 /// query from a fallback — the two open questions R12 measures.
 #[test]
 fn counters_reflect_recorded_events() {
+    let _guard = acquire_test_lock();
     let before = recall_snapshot();
     let before_promoted = before["recall_promotions"].as_u64().unwrap_or(0);
 

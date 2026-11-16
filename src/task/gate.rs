@@ -29,37 +29,10 @@ pub struct GateScope {
 
 impl GateScope {
     pub fn capture(root: &std::path::Path) -> Self {
-        let root = root.canonicalize().ok();
-        let git_root = root.as_ref().and_then(|root| {
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(root)
-                .args(["rev-parse", "--show-toplevel"])
-                .output()
-                .ok()
-                .filter(|out| out.status.success())
-                .and_then(|out| String::from_utf8(out.stdout).ok())
-                .map(|path| std::path::PathBuf::from(path.trim()))
-        });
-        git_root
-            .map(|git_root| {
-                let worktree = git_root
-                    .canonicalize()
-                    .ok()
-                    .map(|path| path.to_string_lossy().into_owned());
-                let branch = worktree.as_ref().and_then(|worktree| {
-                    std::process::Command::new("git")
-                        .args(["-C", worktree, "branch", "--show-current"])
-                        .output()
-                        .ok()
-                        .filter(|out| out.status.success())
-                        .and_then(|out| String::from_utf8(out.stdout).ok())
-                        .map(|name| name.trim().to_string())
-                        .filter(|name| !name.is_empty())
-                });
-                Self { branch, worktree }
-            })
-            .unwrap_or_default()
+        // Gate scope is a trust-bearing gate input (PR #206 V-3): observe
+        // via the Git connector, never a repo-supplied manifest connector.
+        use crate::workflow::connector::WorkflowConnector as _;
+        crate::workflow::connector::GitWorkflowConnector.capture_scope(root)
     }
 }
 

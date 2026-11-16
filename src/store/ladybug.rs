@@ -10,7 +10,7 @@ use lbug::{Connection, Database, SystemConfig};
 use crate::parser::ingest::split_scoped_id;
 use crate::traits::{
     DomainMatchMode, DomainSearchOutcome, GraphMatchKind, GraphRead, MemoryHit, MemoryPayload,
-    RelocateOutcome, SearchResult, VectorStore,
+    OntologyStore, RelocateOutcome, SearchResult, TaskStore, TaskSummaryRow, VectorStore,
 };
 
 /// Parse metadata JSON string with error handling and logging
@@ -10991,6 +10991,85 @@ fn dedup_hits(hits: &mut Vec<MemoryHit>) {
     hits.extend(best.into_values());
 }
 
+#[async_trait]
+impl TaskStore for LadybugStore {
+    async fn load_task_row(&self, namespace: &str, task_id: &str) -> Result<Option<MemoryPayload>> {
+        self.get(namespace, task_id)
+            .await
+            .map(|opt| opt.map(|(_, payload)| payload))
+    }
+
+    async fn list_task_rows(&self, namespace: &str) -> Result<Vec<TaskSummaryRow>> {
+        let rows = self.list(namespace, None, Some("task")).await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| TaskSummaryRow {
+                id: r.id,
+                payload: r.payload,
+            })
+            .collect())
+    }
+
+    async fn count_extracted_memories_for_task(
+        &self,
+        namespace: &str,
+        task_id: &str,
+    ) -> Result<usize> {
+        let rows = self.list(namespace, None, None).await?;
+        let now = chrono::Utc::now().timestamp();
+        Ok(rows
+            .into_iter()
+            .filter(|r| {
+                r.id != task_id
+                    && !is_retired_at(&r.payload.metadata, now)
+                    && r.payload
+                        .metadata
+                        .get("extracted_from")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| arr.iter().any(|t| t.as_str() == Some(task_id)))
+                        .unwrap_or(false)
+            })
+            .count())
+    }
+}
+
+#[async_trait]
+impl OntologyStore for LadybugStore {
+    async fn list_memories_by_types(
+        &self,
+        namespace: &str,
+        memory_types: &[&str],
+    ) -> Result<Vec<(String, MemoryPayload)>> {
+        if memory_types.is_empty() {
+            return Ok(Vec::new());
+        }
+        let allowed: std::collections::HashSet<&str> = memory_types.iter().copied().collect();
+        let rows = self.list(namespace, None, None).await?;
+        Ok(rows
+            .into_iter()
+            .filter(|r| allowed.contains(r.payload.memory_type.as_str()))
+            .map(|r| (r.id, r.payload))
+            .collect())
+    }
+
+    async fn get_memory_by_id(&self, namespace: &str, id: &str) -> Result<Option<MemoryPayload>> {
+        self.get(namespace, id)
+            .await
+            .map(|opt| opt.map(|(_, payload)| payload))
+    }
+
+    async fn put_scoped_memory(
+        &self,
+        namespace: &str,
+        id: &str,
+        payload: &MemoryPayload,
+    ) -> Result<()> {
+        self.upsert(namespace, id, vec![0.0; self.dimensions], payload.clone())
+            .await
+            .map(|_| ())
+    }
+}
+
 #[async_trait::async_trait]
 impl GraphRead for LadybugStore {
     async fn memories_for_file(
@@ -13007,6 +13086,7 @@ fn bump_access_count(metadata: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::memory_vocabulary;
     use serde_json::json;
 
     /// The canonical source key used by the relink/publish seed helpers. A real
@@ -13499,6 +13579,133 @@ eurostrata\src\daemon.rs",
             location_lines: String::new(),
             metadata,
         }
+    }
+
+    /// Task 2: TaskStore and OntologyStore round-trip against a temporary
+    /// LadybugStore, plus vocabulary acceptance for the new `data_pointer`
+    /// memory type. `data_pointer` is private: it is never in
+    /// `SHAREABLE_MEMORY_TYPES`, so a row of that type is a local pointer
+    /// record and never crosses SynapticMesh.
+    #[tokio::test]
+    async fn task_store_and_ontology_store_round_trip_and_data_pointer_is_accepted() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("traits.lbug"), 4).unwrap();
+        store.init("probe").await.unwrap();
+
+        // --- Vocabulary acceptance: `data_pointer` parses and is private.
+        let vocab = memory_vocabulary();
+        let types = vocab["memory_types"].as_object().unwrap();
+        assert!(
+            types.contains_key("data_pointer"),
+            "the vocabulary must declare the data_pointer memory type"
+        );
+        assert!(
+            !types["data_pointer"]["structural"].as_bool().unwrap(),
+            "data_pointer is non-structural"
+        );
+
+        // --- TaskStore: write a task row and an extracted memory.
+        let task_payload = retired_test_payload("task", "agent", json!({}));
+        store
+            .upsert("probe", "task-1", vec![0.0; 4], task_payload.clone())
+            .await
+            .unwrap();
+
+        let lesson_payload = retired_test_payload(
+            "fact",
+            "agent",
+            json!({ "extracted_from": ["task-1"] }),
+        );
+        store
+            .upsert("probe", "lesson-1", vec![0.0; 4], lesson_payload)
+            .await
+            .unwrap();
+
+        let load = TaskStore::load_task_row(&store, "probe", "task-1")
+            .await
+            .expect("load_task_row");
+        assert!(load.is_some(), "load_task_row finds the task");
+        assert_eq!(load.as_ref().unwrap().memory_type, "task");
+        assert!(
+            TaskStore::load_task_row(&store, "probe", "missing-task")
+                .await
+                .unwrap()
+                .is_none(),
+            "load_task_row returns None for a missing task"
+        );
+
+        let rows = TaskStore::list_task_rows(&store, "probe")
+            .await
+            .expect("list_task_rows");
+        assert_eq!(rows.len(), 1, "list_task_rows returns only task rows");
+        assert_eq!(rows[0].id, "task-1");
+
+        // The task row itself is excluded from the extraction count: only
+        // lesson-1 names task-1 in metadata.extracted_from.
+        assert_eq!(
+            TaskStore::count_extracted_memories_for_task(&store, "probe", "task-1")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            TaskStore::count_extracted_memories_for_task(&store, "probe", "missing-task")
+                .await
+                .unwrap(),
+            0
+        );
+
+        // --- OntologyStore: typed listing and scoped writes.
+        let concept_payload = retired_test_payload("concept", "agent", json!({}));
+        store
+            .upsert("probe", "concept-1", vec![0.0; 4], concept_payload.clone())
+            .await
+            .unwrap();
+
+        let listed = OntologyStore::list_memories_by_types(&store, "probe", &["concept", "task"])
+            .await
+            .expect("list_memories_by_types");
+        let ids: std::collections::HashSet<String> =
+            listed.iter().map(|(id, _)| id.clone()).collect();
+        assert!(ids.contains("concept-1"), "concept-1 is listed");
+        assert!(ids.contains("task-1"), "task-1 is listed");
+        assert!(
+            !ids.contains("lesson-1"),
+            "lesson-1 is filtered out by type"
+        );
+        assert!(
+            OntologyStore::list_memories_by_types(&store, "probe", &[])
+                .await
+                .unwrap()
+                .is_empty(),
+            "an empty type list returns nothing"
+        );
+
+        let got = OntologyStore::get_memory_by_id(&store, "probe", "concept-1")
+            .await
+            .expect("get_memory_by_id");
+        assert!(got.is_some(), "get_memory_by_id finds the concept");
+        assert_eq!(got.as_ref().unwrap().memory_type, "concept");
+        assert!(
+            OntologyStore::get_memory_by_id(&store, "probe", "missing-concept")
+                .await
+                .unwrap()
+                .is_none(),
+            "get_memory_by_id returns None for a missing id"
+        );
+
+        // put_scoped_memory writes through the same upsert path.
+        let mut put_payload = retired_test_payload("fact", "agent", json!({}));
+        put_payload.content = "a put-scoped memory".to_string();
+        OntologyStore::put_scoped_memory(&store, "probe", "put-1", &put_payload)
+            .await
+            .expect("put_scoped_memory");
+        let put_back = OntologyStore::get_memory_by_id(&store, "probe", "put-1")
+            .await
+            .expect("read back put_scoped_memory")
+            .expect("put_scoped_memory round-trips");
+        assert_eq!(put_back.content, "a put-scoped memory");
+        assert_eq!(put_back.memory_type, "fact");
     }
 
     #[tokio::test]

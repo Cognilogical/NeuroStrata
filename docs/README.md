@@ -4,66 +4,98 @@ Welcome to the official documentation for **NeuroStrata** — the single-binary 
 
 ---
 
-## 1. Product Overview & Getting Started
+## Documentation Layout
+
+NeuroStrata documentation is organized into **three canonical tiers**, strictly separated, plus an archive for historical records:
+
+| Tier | Directory | Purpose |
+|------|-----------|---------|
+| **Tier 1 — Vision** | [`docs/vision/`](vision/) | Product vision, core thesis, cognitive architecture, and scientific rationale. Audience: product owners, architects, evaluators. |
+| **Tier 2 — Features & API** | [`docs/features-api/`](features-api/) | Internal features, major subsystems, MCP/HTTP API reference, CLI reference, and ops runbooks. Audience: developers, contributors, operators. |
+| **Tier 3 — Extend** | [`docs/extend/`](extend/) | Third-party extensibility: workflow/lifecycle connectors, harness plugins, custom providers and ontologies. Audience: plugin authors, integrators. |
+| **Archive** | `docs/archive/` | Historical verdicts, superseded specs, plans, and design records. Read-only; do not link to from active docs. |
+
+The machine-readable documentation manifest lives at [`docs/manifest.json`](manifest.json). It enumerates required files per tier, prohibited filename substrings (competitor-naming guard), and surface-diff rules that bind code changes to documentation updates. The documentation gate (`neurostrata-mcp doc-gate`) consumes this manifest.
+
+---
+
+## Tier 1 — Product Vision
 
 | Document | Description |
-| :--- | :--- |
-| [**Main README (`../README.md`)**](../README.md) | 60-second quickstart, zero-touch installation, and high-level system overview. |
-| [**Complete Feature & Benefit Catalog (`FEATURES.md`)**](FEATURES.md) | Exhaustive inventory of v1.18.0 features, MCP tools, and codebase module mappings. |
-| [**Building from Source (`BUILDING.md`)**](BUILDING.md) | Toolchain prerequisites (Rust, CMake, C++20) and cross-platform build scripts (`scripts/build.sh`, `scripts/build.ps1`). |
-| [**Visual Interface & Obsidian Guide (`UI_GUIDE.md`)**](UI_GUIDE.md) | Using the 3D/2D SynapticGraph Web UI and the Task Board. (The Obsidian NeuroVault sync is planned, not implemented — see `ops/obsidian.md`.) |
+|:---|:---|
+| [`product-vision.md`](vision/product-vision.md) | NeuroStrata product vision: single-binary local-first cognitive memory, ontology, digital-twin, kinetic-action, and domain-expertise engine. |
+| [`cognitive-architecture.md`](vision/cognitive-architecture.md) | Formal specification of the neuroscience-inspired three-strata architecture and SynapticGraph retrieval. |
+| [`why-memory-fails.md`](vision/why-memory-fails.md) | Why traditional flat Markdown and naive RAG memory fails — and how NeuroStrata fixes it. |
+| [`nomenclature.md`](vision/nomenclature.md) | Translation table between neuroscience nomenclature and Rust systems-engineering primitives. |
+| [`tri-strata.md`](vision/tri-strata.md) | Global / Domain / Task memory partitioning plus multi-worktree source anchoring. |
 
 ---
 
-## 2. Architecture & Cognitive Science
+## Tier 2 — Internal Features & Major API
 
 | Document | Description |
-| :--- | :--- |
-| [**Cognitive Architecture (`COGNITIVE_ARCHITECTURE.md`)**](COGNITIVE_ARCHITECTURE.md) | Formal specification of the 15 neuroscience-inspired mechanisms powering NeuroStrata. |
-| [**SynapticGraph Engine (`architecture/synapticgraph.md`)**](architecture/synapticgraph.md) | Embedded LadybugDB storage, bi-temporal validity (`valid_from`/`valid_to`), six-language Tree-sitter AST graph, and W3C RDF/SPARQL/OWL/SHACL reasoning. |
-| [**Tri-Strata Isolation (`architecture/tri-strata.md`)**](architecture/tri-strata.md) | Global, Domain/Project, and Task memory partitioning plus multi-worktree source anchoring. |
-| [**Episodic Log Recall (`recall.md`)**](recall.md) | How `neurostrata_append_log` piggybacks tag-matched memory recall onto every conversational turn. |
-| [**Why Traditional AI Memory Fails (`science/why-memory-fails.md`)**](science/why-memory-fails.md) | Analysis of the 5 failure modes of flat Markdown and naive RAG—and how NeuroStrata eliminates them. |
-| [**Biological Nomenclature (`science/nomenclature.md`)**](science/nomenclature.md) | 1-to-1 translation table between neuroscience nomenclature and Rust systems-engineering primitives. |
+|:---|:---|
+| [`mcp-and-http-api.md`](features-api/mcp-and-http-api.md) | MCP Tools & HTTP Daemon API Reference — all 30 MCP tools and HTTP daemon endpoints. |
+| [`cli-reference.md`](features-api/cli-reference.md) | CLI Reference for `neurostrata-mcp` — including workflow, documentation gate, action, taxonomy, scenario, twin, task, and synaptic-mesh commands. |
+| [`feature-catalog.md`](features-api/feature-catalog.md) | Exhaustive inventory of v1.18.0 features, MCP tools, and codebase module mappings. |
+| [`ui-guide.md`](features-api/ui-guide.md) | Visual Interface & Obsidian Guide — using the 3D/2D SynapticGraph Web UI and the Task Board. |
+| [`episodic-recall.md`](features-api/episodic-recall.md) | How `neurostrata_append_log` piggybacks tag-matched memory recall onto every conversational turn. |
+| [`limitations.md`](features-api/limitations.md) | Known limitations and non-goals. |
+| `subsystems/central-executive.md` | Central Executive — 4-state Task FSM, Zero-Action Start, claim leases, Lock 1/2/3, subagent context injection. |
+| `subsystems/kinetic-actions.md` | Kinetic Action Types & Bitemporal Revert Log — 5-stage fail-closed gate, atomic apply & revert receipts. |
+| `subsystems/taxonomy-advisor.md` | Subject-Matter Domain Expertise & SKOS Taxonomy Advisor — concept graph, disjointness, SME frontier `advise`. |
+| `subsystems/digital-twins.md` | Digital Twins & Counterfactual Ontology Scenarios — state schemas, telemetry ingestion, CoW scenario overlays. |
+| `subsystems/judgment-providers.md` | Judgment providers — Laya local ONNX and TypeSafe Jev duplicate-judgment providers. |
+| `subsystems/local-learning.md` | Local learning — experience capture, dataset curation, evidence-gated model promotion. |
+| `subsystems/core-installer.md` | Core installer and harness plugin architecture. |
+| `subsystems/prescribed-wire-recipes.md` | Reference recipes for project-level enforcement gates. |
+| `subsystems/synapticgraph.md` | SynapticGraph Engine — embedded LadybugDB, bi-temporal validity, Tree-sitter AST graph, W3C RDF/SPARQL/OWL/SHACL. |
+| `subsystems/synaptic-mesh.md` | SynapticMesh Team Sync — brokerless Git team memory synchronization, private row sovereignty, conflict preservation. |
+| `subsystems/dendritic-bridge.md` | Dendritic Bridge — embedding backends and retrieval surfaces. |
+| `subsystems/thalamic-bus.md` | Thalamic Bus — typed pub/sub event relay, post-ingest edge normalizer, export-freshness gate. |
+| `subsystems/procedural-memory.md` | Procedural Memory — triggered engineering habits with finite rehearsal budgets. |
+| `subsystems/self-reinforced-testing.md` | Self-reinforced behavioral verification architecture. |
+| `ops/building.md` | Building from source — toolchain prerequisites and cross-platform build scripts. |
+| `ops/security.md` | Security & OWASP mitigations — bearer auth, Caller-Path Authority (`J6`), fail-closed secret rejection. |
+| `ops/upgrading.md` | Zero-touch upgrading — schema migration, git hook self-healing, harness plugin refresh. |
 
 ---
 
-## 3. The Five Cognitive Organs
+## Tier 3 — Extend (Third-Party Connectors & Interfaces)
 
-| Organ | Document | Role |
-| :--- | :--- | :--- |
-| **Central Executive** | [`organs/central-executive.md`](organs/central-executive.md) | 4-state Task FSM, Zero-Action Start, 60-minute claim leases, Lock 1 (`pre-push` gate), Lock 2 (`EXTRACTED_FROM` done-funnel), Lock 3 (Breath notes), and subagent context injection. |
-| **Prefrontal Cortex** | [`organs/prefrontal-cortex.md`](organs/prefrontal-cortex.md) | Semantic & pattern action interceptor (`neurostrata_guard_validate`), learned behavioral-rule enforcement, and Podman sandboxing. |
-| **Dendritic Bridge** | [`organs/dendritic-bridge.md`](organs/dendritic-bridge.md) | Local FastEmbed ONNX (`NomicEmbedTextV15`, 768 dims) + external embedders, and three alternative retrieval surfaces (HNSW vector, Tantivy lexical, in-house BM25) with a bounded graph expansion. |
-| **Thalamic Bus** | [`organs/thalamic-bus.md`](organs/thalamic-bus.md) | Non-blocking in-process typed pub/sub event relay, post-ingest edge normalizer, and export-freshness gate. |
-| **Procedural Memory** | [`organs/procedural-memory.md`](organs/procedural-memory.md) | Triggered engineering habits (`memory_type: "procedure"`) with finite rehearsal budgets (`neurostrata_procedure_perform`). |
-
----
-
-## 4. Operations, CLI, Team Sync & Security
+Tier 3 is kept strictly separate from the internal feature docs above. It describes surfaces external integrators can extend without modifying the NeuroStrata core.
 
 | Document | Description |
-| :--- | :--- |
-| [**CLI Reference (`ops/cli-reference.md`)**](ops/cli-reference.md) | Complete guide to all `neurostrata-mcp` subcommands (`daemon`, `status`, `namespaces`, `ingest`, `export-graph`, `task gate`, `synaptic-mesh`, `learn`, `kge`, `storage`, `metrics`, `backup`, `doctor`, etc.). |
-| [**Zero-Touch Upgrading (`ops/upgrading.md`)**](ops/upgrading.md) | Automatic in-place schema migration, git hook self-healing, and harness plugin refresh on startup. |
-| [**SynapticMesh Team Sync (`mesh/synaptic-mesh.md`)**](mesh/synaptic-mesh.md) | Brokerless Git team memory synchronization, private row sovereignty, and conflict preservation. |
-| [**Security & OWASP Mitigations (`ops/security.md`)**](ops/security.md) | Loopback bearer auth, Caller-Path Authority (`J6`), fail-closed secret rejection, query escaping, and non-destructive MCP design. |
-| [**Obsidian & NeuroVault (`ops/obsidian.md`)**](ops/obsidian.md) | *Planned, not implemented.* No `neurostrata_sync_obsidian` tool or `obsidian-sync` command ships today — tracked by task `neurostrata-dlag`. |
-| [**Crash Recovery (`ops/crashes.md`)**](ops/crashes.md) | Crash breadcrumbs (`~/.config/NeuroStrata/data/db/crash/`), lock recovery, and checkpointed backups. |
-| [**WAL Recovery Runbook (`runbooks/wal-recovery.md`)**](runbooks/wal-recovery.md) | Step-by-step runbook for inspecting and recovering quarantined LadybugDB write-ahead logs. |
-| [**Release Changelogs (`releases/changelog/`)**](releases/changelog/) | Per-version release notes and historical changelog archive. |
+|:---|:---|
+| [`overview.md`](extend/overview.md) | Extension philosophy and the three extension surfaces (WorkflowConnector, harness plugins, Embedder/JudgmentProvider). |
+| [`workflow-lifecycle-connectors.md`](extend/workflow-lifecycle-connectors.md) | Pluggable Workflow & Lifecycle Connectors — `WorkflowStage` state machine, `WorkflowConnector` trait, `.NeuroStrata/workflow-connector.json`, writing custom connectors. |
+| [`harness-plugins.md`](extend/harness-plugins.md) | Agent Harness Plugin Interface — `createHarnessPlugin`, `handleHookEvent`, `resolveProjectRoot`, `discoverProjectNamespace`. |
+| [`providers-and-ontologies.md`](extend/providers-and-ontologies.md) | Custom `Embedder` & `VectorStore` implementations, `JudgmentProvider` adapters, domain ontologies, and kinetic action packs (`ActionTypeDefinition`). |
 
 ---
 
-## 5. Domain Specifications & Engineering Design Records
+## Archive
 
-- **Domain Specifications (`architecture/domains/`):**
-  - [`core_installer.md`](architecture/domains/core_installer.md) — Zero-touch installer and harness plugin architecture.
-  - [`judgment-providers.md`](architecture/domains/judgment-providers.md) — Laya local ONNX and TypeSafe Jev duplicate-judgment providers.
-  - [`local-learning.md`](architecture/domains/local-learning.md) — Local experience capture, dataset curation, and evidence-gated model promotion.
-- **Subsystem Specifications:**
-  - [`design-task-subsystem.md`](design-task-subsystem.md) — Central Executive task state machine and gate specification.
-  - [`design-wiring-panel.md`](design-wiring-panel.md) — Prescribed guard & gate wiring contract.
-  - [`architecture/prescribed-wire-recipes.md`](architecture/prescribed-wire-recipes.md) — Reference recipes for project-level enforcement gates.
-  - [`architecture/self_reinforced_testing_framework.md`](architecture/self_reinforced_testing_framework.md) — Self-reinforced behavioral verification architecture.
-  - [`superpowers/specs/`](superpowers/specs/) — Detailed engineering specs for SynapticMesh, SPARQL 1.1, Leiden Community Detection, TransE KGE, GLiNER, and Local Self-Improvement.
+Historical verdicts, superseded specifications, plans, and design records live under `docs/archive/`. These documents describe work that has been retired, superseded, or completed. Read-only — do not link to archive records from active-tier docs.
+
+---
+
+## Operations & Releases
+
+| Document | Description |
+|:---|:---|
+| [`docs/releases/changelog/`](releases/changelog/) | Per-version release notes and historical changelog archive. |
+| [`docs/assets/`](assets/) | Project banner, logos, and infographics (before/after, cognitive strata, soft locks, graph-first blast radius, zero-touch subagent mesh). |
+
+---
+
+## Getting Started
+
+1. Read [`vision/product-vision.md`](vision/product-vision.md) to understand what NeuroStrata is and why it exists.
+2. Read [`cli-reference.md`](features-api/cli-reference.md) to learn the `neurostrata-mcp` CLI commands.
+3. Read [`docs/manifest.json`](manifest.json) to see the documentation manifest and surface-diff rules.
+4. Run the documentation gate: `neurostrata-mcp doc-gate`.
+
+---
+
+For the project-level README with build instructions and zero-touch setup, see [`../README.md`](../README.md).

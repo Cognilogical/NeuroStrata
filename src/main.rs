@@ -6,6 +6,7 @@ mod bench;
 mod buffer;
 mod community;
 mod compression;
+mod connectors;
 mod config;
 mod context;
 mod crash;
@@ -13,10 +14,12 @@ mod daemon;
 mod diagnostic;
 mod did;
 mod digital_twin;
+mod doc_gate;
 mod domain;
 mod embed;
 mod events;
 mod formal_kernel;
+mod kernel;
 mod fts;
 mod gliner;
 mod graph_read;
@@ -56,6 +59,7 @@ mod telemetry;
 mod time_series;
 mod tools;
 mod traits;
+mod workflow;
 
 use crate::traits::SearchResult;
 use crate::traits::VectorStore;
@@ -576,6 +580,194 @@ enum Commands {
     Taxonomy {
         #[command(subcommand)]
         taxonomy: TaxonomyCommands,
+    },
+
+    /// Validate the 3-tier Documentation Manifest and surface-diff gate
+    #[command(name = "doc-gate")]
+    DocGate {
+        /// Optional project root directory (defaults to git root or current directory)
+        #[arg(long)]
+        root: Option<std::path::PathBuf>,
+        /// Output JSON report
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Inspect and drive the pluggable workflow lifecycle state machine and connector
+    #[command(name = "workflow")]
+    Workflow {
+        #[command(subcommand)]
+        action: WorkflowCommands,
+    },
+    /// Interact with external data pools via registered DataConnectors
+    #[command(name = "data-connector")]
+    DataConnector {
+        #[command(subcommand)]
+        action: DataConnectorCommands,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+enum WorkflowCommands {
+    /// Show active workflow connector, captured scope, state digest, and changed paths
+    #[command(alias = "connector")]
+    Status {
+        #[arg(long)]
+        root: Option<std::path::PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the formal workflow stage transition table
+    Transitions {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Install or verify lifecycle triggers for the active workflow connector
+    #[command(alias = "install-triggers")]
+    Install {
+        #[arg(long)]
+        root: Option<std::path::PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+enum DataConnectorCommands {
+    /// List all registered data connectors.
+    List,
+    /// Describe a registered pool on a connector.
+    #[command(name = "describe")]
+    Describe {
+        /// Connector ID (from `list`)
+        #[arg(long)]
+        connector_id: String,
+        /// Pool ID to describe
+        #[arg(long)]
+        pool_id: String,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+    /// Register a data pointer under the kernel's ReBAC + pre-gate enforcement.
+    #[command(name = "register-pointer")]
+    RegisterPointer {
+        /// Target namespace
+        namespace: String,
+        /// Optional JSON payload string or @file path
+        #[arg(long)]
+        payload: Option<String>,
+        /// Connector ID
+        #[arg(long)]
+        connector_id: Option<String>,
+        /// Pointer ID
+        #[arg(long)]
+        pointer_id: Option<String>,
+        /// Pool ID
+        #[arg(long)]
+        pool_id: Option<String>,
+        /// Pointer URI
+        #[arg(long)]
+        pointer_uri: Option<String>,
+        /// Entity type
+        #[arg(long)]
+        entity_type: Option<String>,
+        /// Captured-at timestamp in epoch seconds
+        #[arg(long)]
+        captured_at_secs: Option<u64>,
+        /// Maximum staleness in seconds
+        #[arg(long)]
+        max_staleness_secs: Option<u64>,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+    /// Resolve a bounded slice from a trusted pointer.
+    #[command(name = "resolve")]
+    Resolve {
+        /// Target namespace
+        namespace: String,
+        /// Pointer ID
+        #[arg(long)]
+        pointer_id: String,
+        /// Offset into the slice (default 0)
+        #[arg(long, default_value_t = 0)]
+        offset: u32,
+        /// Maximum rows to resolve
+        #[arg(long)]
+        limit: u32,
+        /// Maximum bytes to resolve
+        #[arg(long)]
+        max_bytes: u32,
+        /// Optional captured-at timestamp (epoch seconds) for staleness override
+        #[arg(long)]
+        now_secs: Option<u64>,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+    /// Apply an external write-back guarded by receipt + CAS + pre/post gates.
+    #[command(name = "apply-effect")]
+    ApplyEffect {
+        /// Target namespace
+        namespace: String,
+        /// Pointer ID
+        #[arg(long)]
+        pointer_id: String,
+        /// Operation name (e.g. "append", "replace")
+        #[arg(long)]
+        operation: String,
+        /// Optional JSON payload string or @file path
+        #[arg(long)]
+        payload: Option<String>,
+        /// Action receipt ID
+        #[arg(long)]
+        action_receipt_id: String,
+        /// Idempotency key
+        #[arg(long)]
+        idempotency_key: String,
+        /// Expected source SHA-256
+        #[arg(long)]
+        expected_source_sha256: Option<String>,
+        /// Optional captured-at timestamp (epoch seconds) for staleness override
+        #[arg(long)]
+        now_secs: Option<u64>,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+    /// Mediate a workflow transition + bounded data slice resolution.
+    #[command(name = "mediate")]
+    Mediate {
+        /// Target namespace
+        namespace: String,
+        /// From workflow stage
+        #[arg(long)]
+        from_stage: String,
+        /// To workflow stage
+        #[arg(long)]
+        to_stage: String,
+        /// Whether the transition gate passed
+        #[arg(long)]
+        gate_passed: bool,
+        /// Pointer ID
+        #[arg(long)]
+        pointer_id: String,
+        /// Offset into the slice (default 0)
+        #[arg(long, default_value_t = 0)]
+        offset: u32,
+        /// Maximum rows to resolve
+        #[arg(long)]
+        limit: u32,
+        /// Maximum bytes to resolve
+        #[arg(long)]
+        max_bytes: u32,
+        /// Optional captured-at timestamp (epoch seconds) for staleness override
+        #[arg(long)]
+        now_secs: Option<u64>,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
     },
 }
 
@@ -5831,7 +6023,19 @@ async fn run() -> anyhow::Result<()> {
                     });
 
                     match outcome {
-                        Ok(violations) => {
+                        Ok(mut violations) => {
+                            if strict && cwd.join("docs").join("manifest.json").is_file() {
+                                let doc_report = crate::doc_gate::evaluate_doc_gate(&cwd, None);
+                                if !doc_report.passed {
+                                    for v in &doc_report.violations {
+                                        violations.push(serde_json::json!({
+                                            "kind": format!("doc_gate:{}", v.kind),
+                                            "id": v.rule_id,
+                                            "detail": format!("{}: {}", v.path, v.detail),
+                                        }));
+                                    }
+                                }
+                            }
                             for violation in &violations {
                                 println!(
                                     "- [{}] {}: {}",
@@ -6067,6 +6271,103 @@ async fn run() -> anyhow::Result<()> {
                     }
                 }
             }
+            Commands::DocGate { root, json } => {
+                let target_root = root
+                    .or_else(git_toplevel)
+                    .or_else(|| std::env::current_dir().ok())
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                let report = crate::doc_gate::evaluate_doc_gate(&target_root, None);
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&report).unwrap_or_default()
+                    );
+                } else if report.passed {
+                    println!(
+                        "PASS doc-gate (connector={}, tiers={}, rules={})",
+                        report.connector_id, report.checked_tiers, report.checked_rules
+                    );
+                } else {
+                    eprintln!(
+                        "FAIL doc-gate (connector={}, violations={}):",
+                        report.connector_id,
+                        report.violations.len()
+                    );
+                    for v in &report.violations {
+                        eprintln!("  - [{} / {}] {}: {}", v.rule_id, v.kind, v.path, v.detail);
+                    }
+                }
+                if !report.passed {
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
+            Commands::Workflow { action } => {
+                match action {
+                    WorkflowCommands::Status { root, json: _ } => {
+                        let target_root = root
+                            .or_else(git_toplevel)
+                            .or_else(|| std::env::current_dir().ok())
+                            .unwrap_or_else(|| std::path::PathBuf::from("."));
+                        let connector =
+                            crate::workflow::resolve_workflow_connector(&target_root);
+                        let scope = connector.capture_scope(&target_root);
+                        let (revision_id, dirty_state_hash) =
+                            connector.capture_state_digest(&target_root);
+                        let changed_paths = connector.changed_paths(&target_root);
+                        let payload = serde_json::json!({
+                            "connector_id": connector.connector_id(),
+                            "scope": scope,
+                            "state_digest": {
+                                "revision_id": revision_id,
+                                "dirty_state_hash": dirty_state_hash,
+                            },
+                            "changed_paths": changed_paths,
+                        });
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&payload).unwrap_or_default()
+                        );
+                    }
+                    WorkflowCommands::Transitions { json: _ } => {
+                        let sample = crate::workflow::evaluate_workflow_transition(
+                            crate::workflow::WorkflowStage::Unpreflighted,
+                            crate::workflow::WorkflowEvent::LoadContext,
+                        );
+                        let payload = serde_json::json!({
+                            "initial_stage": sample.from,
+                            "after_load_context": sample.to,
+                            "edges": crate::workflow::WORKFLOW_TABLE,
+                        });
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&payload).unwrap_or_default()
+                        );
+                    }
+                    WorkflowCommands::Install { root, json: _ } => {
+                        let target_root = root
+                            .or_else(git_toplevel)
+                            .or_else(|| std::env::current_dir().ok())
+                            .unwrap_or_else(|| std::path::PathBuf::from("."));
+                        let connector =
+                            crate::workflow::resolve_workflow_connector(&target_root);
+                        match connector.install_triggers(&target_root) {
+                            Ok(report) => {
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&report).unwrap_or_default()
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("ERROR: {e}");
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            Commands::DataConnector { .. } => { /* handled after store open */ }
             Commands::Hooks { action } => match action {
                 HooksCommands::Install { force } => {
                     let root = match git_toplevel().or_else(|| std::env::current_dir().ok()) {
@@ -6675,7 +6976,7 @@ async fn run() -> anyhow::Result<()> {
                     eprintln!("{}", DAEMON_BUSY_MESSAGE);
                     std::process::exit(1);
                 }
-                let vector_store: Arc<dyn VectorStore> = match LadybugStore::new(
+                let concrete_store: Arc<LadybugStore> = match LadybugStore::new(
                     config.db_path.to_string_lossy().to_string(),
                     embed::configured_dimensions()?,
                 ) {
@@ -6701,6 +7002,133 @@ async fn run() -> anyhow::Result<()> {
                         return Err(e);
                     }
                 };
+                let vector_store: Arc<dyn VectorStore> = concrete_store.clone();
+
+                if let Commands::DataConnector { action } = &other {
+                    let workspace_root =
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    let (namespace, args_json, principal) = match action {
+                        DataConnectorCommands::List => (
+                            "NeuroStrata".to_string(),
+                            serde_json::json!({ "operation": "list_connectors" }),
+                            None,
+                        ),
+                        DataConnectorCommands::Describe { connector_id, pool_id, principal } => (
+                            "NeuroStrata".to_string(),
+                            serde_json::json!({
+                                "operation": "describe_pool",
+                                "connector_id": connector_id,
+                                "pool_id": pool_id,
+                            }),
+                            principal.clone(),
+                        ),
+                        DataConnectorCommands::RegisterPointer { namespace, payload, connector_id, pointer_id, pool_id, pointer_uri, entity_type, captured_at_secs, max_staleness_secs, principal } => {
+                            let payload_value: serde_json::Value = match payload {
+                                Some(raw) => {
+                                    let text = if let Some(file_path) = raw.strip_prefix('@') {
+                                        std::fs::read_to_string(file_path)
+                                            .map_err(|e| anyhow::anyhow!("read payload file {}: {}", file_path, e))?
+                                    } else {
+                                        raw.clone()
+                                    };
+                                    serde_json::from_str(&text)
+                                        .context("data-connector register-pointer payload must be valid JSON")?
+                                }
+                                None => serde_json::json!({}),
+                            };
+                            let pointer_id_value = pointer_id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                            let record = serde_json::json!({
+                                "pointer_id": pointer_id_value,
+                                "connector_id": connector_id.clone().unwrap_or_else(|| "memory_pool".to_string()),
+                                "pool_id": pool_id.clone().unwrap_or_else(|| "default".to_string()),
+                                "pointer_uri": pointer_uri.clone().unwrap_or_else(|| "records".to_string()),
+                                "entity_type": entity_type.clone().unwrap_or_else(|| "json_record".to_string()),
+                                "expected_source_sha256": payload_value.get("expected_source_sha256").cloned().unwrap_or(serde_json::Value::Null),
+                                "captured_at_secs": captured_at_secs.unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()),
+                                "max_staleness_secs": max_staleness_secs.unwrap_or(0),
+                            });
+                            (namespace.clone(), serde_json::json!({ "operation": "register_pointer", "record": record }), principal.clone())
+                        }
+                        DataConnectorCommands::Resolve { namespace, pointer_id, offset, limit, max_bytes, now_secs, principal } => (
+                            namespace.clone(),
+                            serde_json::json!({
+                                "operation": "resolve_pointer",
+                                "req": {
+                                    "pointer_id": pointer_id,
+                                    "offset": offset,
+                                    "limit": limit,
+                                    "max_bytes": max_bytes,
+                                },
+                                "now_secs": now_secs.unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()),
+                            }),
+                            principal.clone(),
+                        ),
+                        DataConnectorCommands::ApplyEffect { namespace, pointer_id, operation, payload, action_receipt_id, idempotency_key, expected_source_sha256, now_secs, principal } => {
+                            let payload_value: serde_json::Value = match payload {
+                                Some(raw) => {
+                                    let text = if let Some(file_path) = raw.strip_prefix('@') {
+                                        std::fs::read_to_string(file_path)
+                                            .map_err(|e| anyhow::anyhow!("read payload file {}: {}", file_path, e))?
+                                    } else {
+                                        raw.clone()
+                                    };
+                                    serde_json::from_str(&text)
+                                        .context("data-connector apply-effect payload must be valid JSON")?
+                                }
+                                None => serde_json::json!({}),
+                            };
+                            (
+                                namespace.clone(),
+                                serde_json::json!({
+                                    "operation": "apply_effect",
+                                    "req": {
+                                        "pointer_id": pointer_id,
+                                        "operation": operation,
+                                        "payload": payload_value,
+                                        "action_receipt_id": action_receipt_id,
+                                        "expected_source_sha256": expected_source_sha256,
+                                        "idempotency_key": idempotency_key,
+                                    },
+                                    "now_secs": now_secs.unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()),
+                                }),
+                                principal.clone(),
+                            )
+                        }
+                        DataConnectorCommands::Mediate { namespace, from_stage, to_stage, gate_passed, pointer_id, offset, limit, max_bytes, now_secs, principal } => (
+                            namespace.clone(),
+                            serde_json::json!({
+                                "operation": "mediate",
+                                "from_stage": from_stage,
+                                "to_stage": to_stage,
+                                "gate_passed": gate_passed,
+                                "slice_req": {
+                                    "pointer_id": pointer_id,
+                                    "offset": offset,
+                                    "limit": limit,
+                                    "max_bytes": max_bytes,
+                                },
+                                "now_secs": now_secs.unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()),
+                            }),
+                            principal.clone(),
+                        ),
+                    };
+                    let bus = Arc::new(crate::events::ThalamicBus::new(daemon::BUS_CAPACITY));
+                    let kernel = crate::kernel::AgentKernel::new(concrete_store.clone(), bus, workspace_root);
+                    match kernel
+                        .execute_connector_command(&namespace, &args_json, principal.as_deref())
+                        .await
+                    {
+                        Ok(value) => {
+                            println!("{}", serde_json::to_string_pretty(&value).unwrap_or_default());
+                        }
+                        Err(e) => {
+                            eprintln!("data-connector error: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                    return Ok(());
+                }
+
                 let read = ReadSource::Direct(vector_store.clone());
 
                 // CLI fallback: hook hygiene against the CWD git root (daemon down).
@@ -7415,6 +7843,9 @@ async fn run() -> anyhow::Result<()> {
                     | Commands::ProjectContext { .. }
                     | Commands::BusMetrics
                     | Commands::Kge { .. }
+                    | Commands::DocGate { .. }
+                    | Commands::Workflow { .. }
+                    | Commands::DataConnector { .. }
                     | Commands::Hooks { .. }
                     | Commands::Bench { .. }
                     // THE OUTER match already handles Learn (src/main.rs ~2822);

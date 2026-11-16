@@ -91,10 +91,11 @@ neurostrata-mcp delete <namespace> <id>
 
 ## 3. Codebase Ingestion & Graph Export
 
-### `ingest`
-Scans a source directory with the six-language Tree-sitter AST engine (`rust`, `typescript`, `tsx`, `python`, `go`, `java`), extracts structural symbols (`function`, `class`, `struct`, `interface`, `trait`, `method`, `calls`, `imports`), and indexes them into the namespace.
+### `ingest` & `ingest-scip`
+Scans a source directory with the six-language Tree-sitter AST engine (`rust`, `typescript`, `tsx`, `python`, `go`, `java`), extracts structural symbols (`function`, `class`, `struct`, `interface`, `trait`, `method`, `calls`, `imports`), and indexes them into the namespace, or ingests a precomputed SCIP index (`ingest-scip`).
 ```bash
 neurostrata-mcp ingest <dir_path> <namespace> [schema_path]
+neurostrata-mcp ingest-scip <scip_path> <namespace>
 ```
 *Example:*
 ```bash
@@ -205,4 +206,104 @@ Creates a checkpointed snapshot (`CHECKPOINT` + store copy + `manifest.json`) or
 ```bash
 neurostrata-mcp backup <backup_dir>
 neurostrata-mcp restore <backup_dir> --into <new_db_path>
+```
+
+---
+
+## Workflow, Documentation Gate & Ontology Commands
+
+### `doc-gate`
+Evaluates the Documentation Manifest against the live repository. Checks required files, prohibited filename substrings, and surface-diff rules.
+```bash
+neurostrata-mcp doc-gate [--root <path>] [--json]
+```
+* **Exit `0`:** All tiers pass; required files present; no prohibited substrings.
+* **Exit `1`:** Manifest violation (missing required files, prohibited substrings, surface-diff failures).
+* `--json`: Machine-readable report for CI integration.
+
+### `workflow`
+Queries and manipulates the pluggable workflow lifecycle state machine and connector (`GitWorkflowConnector`, `ManifestWorkflowConnector`).
+```bash
+neurostrata-mcp workflow status [--root <path>] [--json]
+neurostrata-mcp workflow connector [--root <path>] [--json]
+neurostrata-mcp workflow transitions [--json]
+neurostrata-mcp workflow install [--root <path>] [--json]
+neurostrata-mcp workflow install-triggers [--root <path>] [--json]
+```
+* `status` (alias `connector`): Inspect active connector ID, captured scope (`branch`, `worktree`), state digest (`revision_id`, `dirty_state_hash`), and `changed_paths`.
+* `transitions`: Print the static 8-stage, 23-edge `WORKFLOW_TABLE` transition table.
+* `install` (alias `install-triggers`): Install and verify lifecycle triggers (Git `pre-push` and `pre-commit` hooks + `.NeuroStrata/workflow-triggers.json`) for the configured `WorkflowConnector`.
+
+### `action`
+Defines, validates, applies, and reverts Kinetic Action Types.
+```bash
+neurostrata-mcp action define <definition.json>  # strict validation, stores ActionTypeDefinition
+neurostrata-mcp action validate <action_type> <parameters.json>
+neurostrata-mcp action apply <action_type> <parameters.json>
+neurostrata-mcp action revert <receipt_id> [--force]
+neurostrata-mcp action log [--limit 100]
+```
+The 5-stage fail-closed gate (ReBAC → Typed Parameters → Offline SPARQL ASK → TwinVarPrecondition → Post-Image SHACL) runs on `validate` and `apply`.
+
+### `taxonomy`
+Manages SKOS domain taxonomies and invokes the SME Frontier Advisor.
+```bash
+neurostrata-mcp taxonomy set-thesis <thesis.json>
+neurostrata-mcp taxonomy upsert-concept <concept.json>
+neurostrata-mcp taxonomy tree [--concept <iri>]
+neurostrata-mcp taxonomy briefing [--json]
+neurostrata-mcp taxonomy compare <other_graph>
+neurostrata-mcp taxonomy gaps
+neurostrata-mcp taxonomy advise [--top-k 5]
+neurostrata-mcp taxonomy validate-dag
+```
+
+### `scenario`, `object-view`, `diff-tour` & `insights`
+Creates and evaluates counterfactual ontology scenarios (`create`, `stage-memory`, `stage-twin`, `apply-action`, `eval`, `diff`, `commit`), polymorphic object views (`object-view`), structural diff tours (`diff-tour`), and repository architectural insights (`insights`). Additional administration commands include `set-metadata`, `normalize-metadata`, `storage`, `chat`, `metrics`, `graphql`, and `kge`.
+```bash
+neurostrata-mcp scenario create <name> [--base <twin_id>]
+neurostrata-mcp scenario stage-memory <scenario_id> <memory.json>
+neurostrata-mcp scenario stage-twin <scenario_id> <twin.json>
+neurostrata-mcp scenario apply-action <scenario_id> <action_type> <parameters.json>
+neurostrata-mcp scenario eval <scenario_id> <query.rq>
+neurostrata-mcp scenario diff <scenario_id> [--against <twin_id>]
+neurostrata-mcp object-view <namespace> <id>
+neurostrata-mcp diff-tour <namespace> [--range <rev_range>]
+neurostrata-mcp insights <namespace>
+```
+
+### `twin`
+Manages polymorphic digital twins and telemetry ingestion.
+```bash
+neurostrata-mcp twin create <schema.json>
+neurostrata-mcp twin ingest <twin_id> <telemetry.json>
+neurostrata-mcp twin state <twin_id>
+neurostrata-mcp twin history <twin_id> [--limit 50]
+```
+
+### `task`
+Central Executive task lifecycle commands.
+```bash
+neurostrata-mcp task create <namespace> --title "<title>" [--description "<desc>"] [--priority <0-3>] [--labels <labels>] [--parent <id>] [--blocked-by <id>]
+neurostrata-mcp task list <namespace> [--status <open|in_progress|blocked|done>] [--ready] [--assignee <id>]
+neurostrata-mcp task claim <namespace> <id>
+neurostrata-mcp task update <namespace> <id> --status <open|in_progress|blocked> [--note "<note>"]
+neurostrata-mcp task complete <namespace> <id> --extracted-memory <memory_id>
+neurostrata-mcp task validate <namespace>
+neurostrata-mcp task gate <namespace> [--strict] [--self-test]
+```
+
+---
+
+## 8. Data Connectors & Agent Kernel
+
+### `data-connector`
+Interact with external data pools via registered DataConnectors.
+```bash
+neurostrata-mcp data-connector list
+neurostrata-mcp data-connector describe --connector-id <connector_id> --pool-id <pool_id>
+neurostrata-mcp data-connector register-pointer --namespace <namespace> --payload @pointer.json --connector-id <connector_id> --pool-id <pool_id> --pointer-id <pointer_id> --pointer-uri <uri> --entity-type <entity_type> --captured-at-secs <captured_at_secs> --max-staleness-secs <max_staleness_secs>
+neurostrata-mcp data-connector resolve --namespace <namespace> --pointer-id <pointer_id> --offset <offset> --limit <limit> --max-bytes <max_bytes> --now-secs <now_secs>
+neurostrata-mcp data-connector apply-effect --namespace <namespace> --pointer-id <pointer_id> --operation <operation> --payload @effect.json --action-receipt-id <action_receipt_id> --idempotency-key <idempotency_key> --expected-source-sha256 <expected_source_sha256> --now-secs <now_secs>
+neurostrata-mcp data-connector mediate --namespace <namespace> --from-stage <from_stage> --to-stage <to_stage> --gate-passed <bool> --pointer-id <pointer_id> --offset <offset> --limit <limit> --max-bytes <max_bytes> --now-secs <now_secs>
 ```

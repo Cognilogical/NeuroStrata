@@ -621,6 +621,26 @@ pub async fn process_mcp_request(
                         }
                     },
                     {
+                        "name": "neurostrata_data_connector",
+                        "description": "Execute a data-connector operation (list_connectors, describe_pool, register_pointer, list_pointers, resolve_pointer, apply_effect, mediate) under the kernel's ReBAC + pre-gate enforcement. Wraps AgentKernel::execute_connector_command.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata')." },
+                                "principal": { "type": "string", "description": "Optional requested principal." },
+                                "args": {
+                                    "type": "object",
+                                    "description": "Connector operation arguments with 'operation' field.",
+                                    "properties": {
+                                        "operation": { "type": "string", "description": "Connector operation (list_connectors, describe_pool, register_pointer, list_pointers, resolve_pointer, apply_effect, mediate)." }
+                                    },
+                                    "required": ["operation"]
+                                }
+                            },
+                            "required": ["namespace", "args"]
+                        }
+                    },
+                    {
                         "name": "neurostrata_archive_memory",
                         "description": "Mark a memory as archived by writing a tombstone beside it. The row keeps its content, id and metadata; archived is merged in rather than replacing what it was there. Retrieval paths filter archived rows unless include_archived is true.",
                         "inputSchema": {
@@ -1720,6 +1740,14 @@ pub async fn process_mcp_request(
                             )
                             .await;
                         }
+                        "neurostrata_data_connector" => {
+                            result_text = handle_data_connector(
+                                &arguments,
+                                store.clone(),
+                                bus.clone(),
+                            )
+                            .await;
+                        }
                         // SynapticMesh: the handler is a pure string-in/
                         // string-out dispatch (filesystem + git only; no
                         // store, no bus, no daemon dependency), so it owns
@@ -1828,6 +1856,37 @@ pub async fn process_mcp_request(
         _ => serde_json::json!({}),
     }
 }
+
+pub(crate) async fn handle_data_connector(
+    arguments: &Value,
+    store: Arc<dyn VectorStore>,
+    bus: Arc<crate::events::ThalamicBus>,
+) -> String {
+    let namespace = arguments
+        .get("namespace")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("global");
+    let Some(args) = arguments.get("args") else {
+        return serde_json::json!({"ok": false, "error": "args object required"}).to_string();
+    };
+    let principal = arguments
+        .get("principal")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty());
+    let workspace_root = crate::daemon::resolve_project_root();
+    let kernel = crate::kernel::AgentKernel::new(store.clone(), bus.clone(), workspace_root);
+    match kernel
+        .execute_connector_command(namespace, args, principal)
+        .await
+    {
+        Ok(value) => serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()),
+        Err(e) => serde_json::json!({"ok": false, "error": e.to_string()}).to_string(),
+    }
+}
+
+#[allow(dead_code)]
+fn handle_context_plan_marker_do_not_remove() {}
 
 async fn handle_context_plan(
     arguments: &Value,
@@ -14721,7 +14780,7 @@ mod tests {
     /// Clients pin this list; a silent rename orphans their wiring.
     /// Keep in sync with the entries in `process_mcp_request` -> `"tools/list"`.
     #[tokio::test]
-    async fn tools_list_carries_all_thirty_six_tools_in_a_stable_order() {
+    async fn tools_list_carries_all_thirty_seven_tools_in_a_stable_order() {
         let (store, _) = store_with_one_rule("probe").await;
         let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
         let request = JsonRpcRequest {
@@ -14770,6 +14829,7 @@ mod tests {
                 "neurostrata_guard_validate",
                 "neurostrata_guard_learn",
                 "neurostrata_guard_list_rules",
+                "neurostrata_data_connector",
                 "neurostrata_archive_memory",
                 "neurostrata_feedback",
                 "neurostrata_distill",
