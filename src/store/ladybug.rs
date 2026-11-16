@@ -1500,8 +1500,9 @@ pub struct LadybugStore {
     dimensions: usize,
     db: Arc<Database>,
     dirty: Dirty,
-    /// Set by `stop_checkpoints_after_pool_failure`; no checkpoint runs after.
-    checkpoints_stopped: Arc<std::sync::atomic::AtomicBool>,
+    /// Set by `stop_checkpoints_after_pool_failure`; no checkpoint runs after
+    /// it except one standalone probe (#198, #211).
+    checkpoints: CheckpointLatch,
     /// LadybugDB allows exactly one write transaction and REFUSES a second
     /// rather than queueing it, so two writers that overlap produce "Cannot
     /// start a new write transaction in the system" for whichever arrives
@@ -1873,26 +1874,104 @@ fn explain_engine_error(e: anyhow::Error) -> anyhow::Error {
     )
 }
 
-/// After a checkpoint runs out of buffer pool, stop checkpointing for the rest
-/// of this process. Such a checkpoint fails part way, keeps the pages it had
+/// The buffer-pool latch (#198, surfaced by #211).
+///
+/// A checkpoint that runs out of buffer pool stops checkpointing for the rest
+/// of the process: such a checkpoint fails part way, keeps the pages it had
 /// already added to ladybug.db, and leaves the WAL as it was, so every retry
 /// fails the same way and grows the file again. The engine retries after each
 /// write commit once the WAL is past its auto-checkpoint threshold (16 MB), and
-/// the daemon every 30 s, so the file keeps growing for as long as writes come in.
-/// The writes stay in the WAL, and a restart with a bigger pool checkpoints them.
+/// the daemon every 30 s, so the file keeps growing for as long as writes come
+/// in. The writes stay in the WAL, and a restart with a bigger pool
+/// checkpoints them.
+///
+/// The latch is process-local and in memory: nothing persists it, so a new
+/// process starts with the engine's checkpointing at its defaults.
+#[derive(Clone)]
+struct CheckpointLatch {
+    /// The store this latch belongs to. The status mirror is keyed by path, so
+    /// two stores in one process cannot report each other's state.
+    store_path: Arc<PathBuf>,
+    /// Set once a checkpoint ran out of buffer pool; no checkpoint is attempted
+    /// after it except the single `probe` below.
+    stopped: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether one standalone CHECKPOINT may still be tried. Set when the
+    /// failure came from the engine's post-commit checkpoint: that one runs
+    /// inside a write, with the write's memory already held, while a standalone
+    /// CHECKPOINT afterwards has the pool to itself and may well fit. It is
+    /// taken (cleared) by the first attempt, so a second out-of-pool failure
+    /// leaves the latch set and nothing retries -- the loop #198 removed.
+    probe: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl CheckpointLatch {
+    fn new(store_path: PathBuf) -> Self {
+        Self {
+            store_path: Arc::new(store_path),
+            stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            probe: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    fn store_path(&self) -> &std::path::Path {
+        self.store_path.as_path()
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.stopped.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Latch after a buffer-pool failure. Returns whether this call engaged the
+    /// latch: a repeated failure finds it already set and changes nothing, so
+    /// the config CALLs and the warning stay once-per-process.
+    fn engage(&self, explicit: bool) -> bool {
+        if self.stopped.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return false;
+        }
+        self.probe
+            .store(!explicit, std::sync::atomic::Ordering::Release);
+        crate::storage::snapshot::record_checkpoints_stopped(self.store_path(), true);
+        true
+    }
+
+    /// Consume the one allowed standalone attempt, if there is one.
+    fn take_probe(&self) -> bool {
+        self.probe.swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    /// A checkpoint succeeded while the latch was set and the engine's
+    /// checkpointing is back on: clear the latch. The skip count stays, like
+    /// every other running total in the status.
+    fn clear(&self) {
+        self.probe
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.stopped
+            .store(false, std::sync::atomic::Ordering::Release);
+        crate::storage::snapshot::record_checkpoints_stopped(self.store_path(), false);
+    }
+
+    /// Count a checkpoint the latch skipped (#211). Distinct from a failure:
+    /// nothing was attempted, so `checkpoint_failures` must not move.
+    fn record_skip(&self) {
+        crate::storage::snapshot::record_checkpoint_skip(self.store_path());
+    }
+}
+
+/// After a checkpoint runs out of buffer pool, stop checkpointing for the rest
+/// of this process (see [`CheckpointLatch`] for why).
 ///
 /// `explicit` is our own CHECKPOINT; otherwise only the engine's post-commit
 /// checkpoint counts, not an ordinary query that ran out of pool.
 fn stop_checkpoints_after_pool_failure(
     conn: &Connection,
-    stopped: &std::sync::atomic::AtomicBool,
+    latch: &CheckpointLatch,
     err: &anyhow::Error,
     explicit: bool,
 ) {
     let text = err.to_string();
     if !text.contains("buffer pool is full")
         || !(explicit || text.contains("post-commit checkpoint failed"))
-        || stopped.swap(true, std::sync::atomic::Ordering::AcqRel)
+        || !latch.engage(explicit)
     {
         return;
     }
@@ -1905,27 +1984,71 @@ fn stop_checkpoints_after_pool_failure(
     }
     eprintln!(
         "WARNING: a checkpoint ran out of buffer pool. Each failed attempt leaves pages behind in \
-         ladybug.db, so checkpoints are off until restart; writes still reach the write-ahead log. \
-         Raise NEUROSTRATA_BUFFER_POOL_MB (or storage_hygiene.buffer_pool_mb; 0 lets the engine \
-         size it) and restart to checkpoint them."
+         ladybug.db, so checkpoints are off until one succeeds or the process restarts; writes \
+         still reach the write-ahead log, which is why storage status now reports \
+         checkpoints_stopped and counts skipped checkpoints in checkpoint_skips. Raise \
+         NEUROSTRATA_BUFFER_POOL_MB (or storage_hygiene.buffer_pool_mb; 0 lets the engine size it) \
+         and restart to checkpoint them. See docs/ops/checkpoint-latch.md."
     );
+}
+
+/// Turn the engine's checkpointing back on after one succeeded while the latch
+/// was set (#211). Nothing else re-enables it: the latch switched off
+/// `auto_checkpoint` and `force_checkpoint_on_close` on the shared database
+/// config, and leaving them off is what made a clean close leave a WAL behind.
+///
+/// If either CALL fails the latch stays, because the engine is still not
+/// checkpointing on its own; the operator's restart is the recovery either way.
+fn re_enable_checkpoints(conn: &Connection, latch: &CheckpointLatch) {
+    let auto = conn.query("CALL auto_checkpoint=true");
+    let on_close = conn.query("CALL force_checkpoint_on_close=true");
+    if let Err(e) = &auto {
+        tracing::warn!("could not turn the engine's auto-checkpoint back on: {e}");
+    }
+    if let Err(e) = &on_close {
+        tracing::warn!("could not turn the engine's checkpoint-on-close back on: {e}");
+    }
+    if auto.is_err() || on_close.is_err() {
+        return;
+    }
+    latch.clear();
+    tracing::info!(
+        "a checkpoint fit the buffer pool again; the engine's checkpointing is back on and the \
+         buffer-pool latch is cleared"
+    );
+}
+
+/// What [`guarded_checkpoint`] did (#211). A skip is not a failure: the latch
+/// prevented the attempt, so the caller must not record a failed outcome.
+enum CheckpointRun {
+    /// The latch is set and its one probe is spent: no CHECKPOINT was issued.
+    Skipped,
+    /// A CHECKPOINT was issued; this is its result.
+    Attempted(Result<()>),
 }
 
 /// Our CHECKPOINT, skipped once checkpoints are stopped and stopping them on
 /// a buffer-pool failure. Runs under the connection lock, so a write that
 /// stopped them while this waited is seen.
-fn guarded_checkpoint(conn: &Connection, stopped: &std::sync::atomic::AtomicBool) -> Result<()> {
-    if stopped.load(std::sync::atomic::Ordering::Acquire) {
-        anyhow::bail!("checkpoint skipped: an earlier one ran out of buffer pool");
+fn guarded_checkpoint(conn: &Connection, latch: &CheckpointLatch) -> CheckpointRun {
+    let was_stopped = latch.is_stopped();
+    if was_stopped && !latch.take_probe() {
+        latch.record_skip();
+        return CheckpointRun::Skipped;
     }
     let result = conn
         .query("CHECKPOINT")
         .map(|_| ())
         .map_err(anyhow::Error::from);
-    if let Err(e) = &result {
-        stop_checkpoints_after_pool_failure(conn, stopped, e, true);
+    match &result {
+        Err(e) => stop_checkpoints_after_pool_failure(conn, latch, e, true),
+        // The probe is what makes this reachable: a checkpoint issued while the
+        // latch is set succeeded, so the pool has room and the engine's own
+        // checkpointing can come back (#211).
+        Ok(()) if was_stopped => re_enable_checkpoints(conn, latch),
+        Ok(()) => {}
     }
-    result
+    CheckpointRun::Attempted(result)
 }
 
 #[cfg(test)]
@@ -2044,6 +2167,9 @@ mod buffer_pool_tests {
     #[tokio::test]
     async fn a_checkpoint_out_of_pool_is_not_retried() {
         use crate::traits::VectorStore;
+        // `checkpoint_failures` is process-global, and the latch tests assert
+        // it does not move for a skip (#211).
+        let _guard = super::checkpoint_latch_tests::counter_lock();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("ladybug.db");
         let pool = |mb: u64| {
@@ -2141,6 +2267,300 @@ mod buffer_pool_tests {
         let on_close = size() as i64 - at_stop as i64;
         eprintln!("close changed ladybug.db by {on_close} bytes");
         assert_eq!(on_close, 0, "closing the store retried the checkpoint");
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_latch_tests {
+    use super::*;
+
+    /// `checkpoint_failures` is process-global, so a test that reads it must
+    /// not run beside the one test that deliberately fails checkpoints. A
+    /// poisoned lock is recovered: a panic elsewhere is not a reason to hide
+    /// this assertion.
+    pub(super) fn counter_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// What the engine says when a standalone CHECKPOINT cannot fit.
+    fn pool_error() -> anyhow::Error {
+        anyhow::anyhow!(
+            "Buffer manager exception: Unable to allocate memory! The buffer pool is full and no \
+             memory could be freed!"
+        )
+    }
+
+    /// What a write's post-commit checkpoint says when it cannot fit. That
+    /// failure leaves one standalone probe, because the standalone CHECKPOINT
+    /// does not hold the write's memory.
+    fn post_commit_pool_error() -> anyhow::Error {
+        anyhow::anyhow!("post-commit checkpoint failed: {}", pool_error())
+    }
+
+    fn wal_path(store: &std::path::Path) -> PathBuf {
+        let mut os = store.as_os_str().to_os_string();
+        os.push(".wal");
+        PathBuf::from(os)
+    }
+
+    fn wal_len(store: &std::path::Path) -> u64 {
+        std::fs::metadata(wal_path(store))
+            .map(|m| m.len())
+            .unwrap_or(0)
+    }
+
+    /// Reads an engine setting back through `current_setting`, which is how the
+    /// `CALL auto_checkpoint=...` the latch issues takes effect.
+    async fn setting(store: &LadybugStore, name: &'static str) -> String {
+        store
+            .with_conn(move |conn| {
+                let mut rows = conn.query(&format!("CALL current_setting('{name}') RETURN *"))?;
+                let row = rows.next().expect("current_setting returns one row");
+                Ok(format!("{}", row[0]).to_lowercase())
+            })
+            .await
+            .expect("read the setting")
+    }
+
+    /// #211: the latch is visible in status, and a skip is counted as a skip.
+    ///
+    /// At the baseline the field does not exist, so this does not compile; with
+    /// the latch wired into the status it reports `checkpoints_stopped` and a
+    /// skip count that `checkpoint_failures` does not move for.
+    #[tokio::test]
+    async fn a_skipped_checkpoint_counts_as_a_skip_not_a_failure() {
+        use crate::traits::VectorStore;
+        let _guard = counter_lock();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("ladybug.db");
+        let store = LadybugStore::for_testing(&path, 4).unwrap();
+        let cfg = crate::storage::StorageHygieneConfig::default();
+        let before = crate::storage::compute_storage_status(&path, &cfg);
+
+        // An out-of-pool CHECKPOINT of our own latches with no probe left.
+        let latch = store.checkpoints.clone();
+        store
+            .with_conn(move |conn| {
+                stop_checkpoints_after_pool_failure(conn, &latch, &pool_error(), true);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(store.checkpoints.is_stopped(), "the latch must be set");
+
+        let err = store
+            .checkpoint()
+            .await
+            .expect_err("a latched checkpoint must be skipped");
+        assert!(err.to_string().contains("checkpoint skipped"), "{err}");
+
+        let after = crate::storage::compute_storage_status(&path, &cfg);
+        assert!(
+            after.checkpoints_stopped,
+            "status must say checkpoints are stopped (#211)"
+        );
+        assert_eq!(
+            after.checkpoint_skips,
+            before.checkpoint_skips + 1,
+            "a skipped checkpoint is counted (#211)"
+        );
+        assert_eq!(
+            after.checkpoint_failures, before.checkpoint_failures,
+            "a skip is not a failed attempt, so it must not move checkpoint_failures (#211)"
+        );
+        assert_eq!(
+            after.last_checkpoint_duration_ms, before.last_checkpoint_duration_ms,
+            "no checkpoint ran, so no outcome is recorded"
+        );
+    }
+
+    /// #211: a checkpoint that fits while the latch is set puts the engine's
+    /// checkpointing back and clears the latch.
+    #[tokio::test]
+    async fn a_successful_checkpoint_after_the_latch_reenables_the_engine() {
+        use crate::traits::VectorStore;
+        let _guard = counter_lock();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("ladybug.db");
+        let store = LadybugStore::for_testing(&path, 4).unwrap();
+        let cfg = crate::storage::StorageHygieneConfig::default();
+
+        // A post-commit failure: the latch turns both settings off, exactly as
+        // the real one does, and leaves one standalone probe.
+        let latch = store.checkpoints.clone();
+        store
+            .with_conn(move |conn| {
+                stop_checkpoints_after_pool_failure(conn, &latch, &post_commit_pool_error(), false);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(store.checkpoints.is_stopped());
+        assert!(
+            store
+                .checkpoints
+                .probe
+                .load(std::sync::atomic::Ordering::Acquire),
+            "a post-commit failure allows one standalone attempt"
+        );
+        assert_eq!(setting(&store, "auto_checkpoint").await, "false");
+        assert_eq!(setting(&store, "force_checkpoint_on_close").await, "false");
+
+        // The standalone CHECKPOINT has the pool to itself and fits.
+        store
+            .checkpoint()
+            .await
+            .expect("the probe must run the checkpoint");
+
+        assert!(
+            !store.checkpoints.is_stopped(),
+            "a successful checkpoint clears the latch (#211)"
+        );
+        assert_eq!(
+            setting(&store, "auto_checkpoint").await,
+            "true",
+            "auto-checkpoint is back on after the success (#211)"
+        );
+        assert_eq!(
+            setting(&store, "force_checkpoint_on_close").await,
+            "true",
+            "checkpoint-on-close is back on after the success (#211)"
+        );
+        let status = crate::storage::compute_storage_status(&path, &cfg);
+        assert!(!status.checkpoints_stopped);
+        assert_eq!(
+            status.checkpoint_skips, 0,
+            "the probe was an attempt, not a skip"
+        );
+    }
+
+    /// #211/#198: the probe is not a retry loop. A second out-of-pool failure
+    /// keeps the latch, disarms the probe, and the next checkpoint is skipped
+    /// without touching the database.
+    #[tokio::test]
+    async fn a_repeated_out_of_pool_failure_keeps_the_latch() {
+        use crate::traits::VectorStore;
+        let _guard = counter_lock();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("ladybug.db");
+        let store = LadybugStore::for_testing(&path, 4).unwrap();
+        let cfg = crate::storage::StorageHygieneConfig::default();
+
+        let latch = store.checkpoints.clone();
+        store
+            .with_conn(move |conn| {
+                stop_checkpoints_after_pool_failure(conn, &latch, &post_commit_pool_error(), false);
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        // The probe runs, and runs out of pool again: the latch stays and no
+        // further attempt is armed.
+        let latch = store.checkpoints.clone();
+        store
+            .with_conn(move |conn| {
+                assert!(latch.take_probe(), "the probe was armed");
+                stop_checkpoints_after_pool_failure(conn, &latch, &pool_error(), true);
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            store.checkpoints.is_stopped(),
+            "a repeated out-of-pool failure keeps the latch (#198)"
+        );
+        assert!(
+            !store
+                .checkpoints
+                .probe
+                .load(std::sync::atomic::Ordering::Acquire),
+            "the probe is armed once, so nothing retries"
+        );
+
+        let before = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let skipped = crate::storage::compute_storage_status(&path, &cfg);
+        let err = store
+            .checkpoint()
+            .await
+            .expect_err("a latched checkpoint is skipped, not retried");
+        assert!(err.to_string().contains("checkpoint skipped"), "{err}");
+        let after = crate::storage::compute_storage_status(&path, &cfg);
+        assert_eq!(
+            after.checkpoint_skips,
+            skipped.checkpoint_skips + 1,
+            "the skip is counted"
+        );
+        assert_eq!(
+            after.checkpoint_failures, skipped.checkpoint_failures,
+            "the skip is not a failure"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+            before,
+            "a skipped checkpoint must not touch ladybug.db"
+        );
+    }
+
+    /// #211: after the re-enable, a clean close checkpoints on the way out, so
+    /// the next open has nothing to replay and does not call it unclean.
+    #[tokio::test]
+    async fn a_clean_close_after_the_re_enable_leaves_no_write_ahead_log() {
+        use crate::traits::VectorStore;
+        let _guard = counter_lock();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("ladybug.db");
+        {
+            let store = LadybugStore::for_testing(&path, 4).unwrap();
+            let latch = store.checkpoints.clone();
+            store
+                .with_conn(move |conn| {
+                    conn.query("CALL auto_checkpoint=false")?;
+                    conn.query("CREATE NODE TABLE L (id STRING, PRIMARY KEY (id))")?;
+                    conn.query("CREATE (:L {id: 'a'})")?;
+                    stop_checkpoints_after_pool_failure(
+                        conn,
+                        &latch,
+                        &post_commit_pool_error(),
+                        false,
+                    );
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            assert!(
+                wal_len(&path) > 0,
+                "the write is in the WAL before the checkpoint"
+            );
+            assert!(store.checkpoints.is_stopped());
+
+            store
+                .checkpoint()
+                .await
+                .expect("the probe must run the checkpoint");
+            assert!(
+                !store.checkpoints.is_stopped(),
+                "the close is only clean because the latch cleared"
+            );
+        }
+
+        assert_eq!(
+            wal_len(&path),
+            0,
+            "a clean close after the re-enable leaves no WAL (#211)"
+        );
+        let preserved: Vec<_> = std::fs::read_dir(root.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".wal.unclean."))
+            .collect();
+        assert!(
+            preserved.is_empty(),
+            "the next open must not treat this close as unclean: {preserved:?}"
+        );
     }
 }
 
@@ -3380,10 +3800,21 @@ fn recover_from_wal_failure(
 
 impl Drop for LadybugStore {
     fn drop(&mut self) {
-        let stopped = self
-            .checkpoints_stopped
-            .load(std::sync::atomic::Ordering::Acquire);
-        if self.dirty.take() && !stopped {
+        let dirty = self.dirty.take();
+        if dirty && self.checkpoints.is_stopped() {
+            // Nothing retries the checkpoint: a retry is what grew
+            // ladybug.db on the way into the latch (#198). Say what the
+            // operator is left with, since this is a clean close.
+            eprintln!(
+                "WARNING: closing with checkpoints stopped after a buffer-pool failure. The writes \
+                 stay in the write-ahead log, so the next open replays them and reports an unclean \
+                 shutdown. That report is expected here: restart with a larger pool \
+                 (NEUROSTRATA_BUFFER_POOL_MB or storage_hygiene.buffer_pool_mb; 0 lets the engine \
+                 size it) and the log is checkpointed. See docs/ops/checkpoint-latch.md."
+            );
+            return;
+        }
+        if dirty {
             if let Ok(conn) = Connection::new(&self.db) {
                 if let Err(e) = conn.query("CHECKPOINT;") {
                     tracing::warn!("LadybugStore drop CHECKPOINT failed: {e}");
@@ -3826,6 +4257,17 @@ impl LadybugStore {
                 "A copy was kept at {:?} in case recovery is incomplete.",
                 active
             );
+            // A checkpoint that ran out of buffer pool latches checkpointing
+            // off for the rest of that process (#198, #211), so a clean close
+            // then leaves exactly this WAL behind. The shutdown was not
+            // unclean, so name the likelier cause with its recovery step.
+            eprintln!(
+                "If that process logged `checkpoints_stopped` or a checkpoint running out of \
+                 buffer pool, it stopped checkpointing on purpose and this log is what it left. \
+                 Restart with a larger pool (NEUROSTRATA_BUFFER_POOL_MB or \
+                 storage_hygiene.buffer_pool_mb; 0 lets the engine size it) so the replay is \
+                 checkpointed; see docs/ops/checkpoint-latch.md."
+            );
         }
         let pre = (
             observe_wal_side(&local_path, WalSide::Active),
@@ -3850,12 +4292,13 @@ impl LadybugStore {
             open_provenance.recovery_kind_slug(),
         );
 
+        let checkpoints = CheckpointLatch::new(local_path.clone());
         Ok(Self {
             local_path,
             dimensions,
             db: Arc::new(db),
             dirty: Dirty::default(),
-            checkpoints_stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            checkpoints,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             schema_ready: std::sync::atomic::AtomicBool::new(false),
             ontology: Arc::new(arc_swap::ArcSwap::from_pointee(
@@ -4474,7 +4917,7 @@ impl LadybugStore {
     {
         let write_lock = Arc::clone(&self.write_lock);
         let db = self.db.clone();
-        let stopped = Arc::clone(&self.checkpoints_stopped);
+        let latch = self.checkpoints.clone();
 
         let outcome = bounded(what, write_timeout(), async move {
             // One writer at a time, because the engine refuses the second
@@ -4492,7 +4935,7 @@ impl LadybugStore {
             let mut attempt = 0;
             loop {
                 let (returned, result) =
-                    Self::write_owning_turn(db.clone(), stopped.clone(), turn, f.clone()).await?;
+                    Self::write_owning_turn(db.clone(), latch.clone(), turn, f.clone()).await?;
                 turn = returned;
 
                 match result {
@@ -4536,7 +4979,7 @@ impl LadybugStore {
     /// should be allowed to start.
     async fn write_owning_turn<T, F>(
         db: Arc<Database>,
-        stopped: Arc<std::sync::atomic::AtomicBool>,
+        latch: CheckpointLatch,
         turn: tokio::sync::OwnedMutexGuard<()>,
         f: F,
     ) -> Result<(tokio::sync::OwnedMutexGuard<()>, Result<T>)>
@@ -4559,7 +5002,7 @@ impl LadybugStore {
                 let conn = Connection::new(&db)?;
                 let result = f(&conn);
                 if let Err(e) = &result {
-                    stop_checkpoints_after_pool_failure(&conn, &stopped, e, false);
+                    stop_checkpoints_after_pool_failure(&conn, &latch, e, false);
                 }
                 result
             })()
@@ -4589,7 +5032,7 @@ impl LadybugStore {
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,
     {
         let db = self.db.clone();
-        let stopped = Arc::clone(&self.checkpoints_stopped);
+        let latch = self.checkpoints.clone();
         // Held across the engine call on purpose: lbug's C++
         // DictionaryColumn::scan / BufferManager::optimisticRead segfaults
         // when a read Connection races a concurrent write Connection on the
@@ -4610,7 +5053,7 @@ impl LadybugStore {
                 let conn = Connection::new(&db)?;
                 let result = f(&conn);
                 if let Err(e) = &result {
-                    stop_checkpoints_after_pool_failure(&conn, &stopped, e, false);
+                    stop_checkpoints_after_pool_failure(&conn, &latch, e, false);
                 }
                 result
             })()
@@ -10283,21 +10726,32 @@ impl VectorStore for LadybugStore {
         // mid-copy; the metadata bracket on the copy catches that.
         let mut turn = Arc::clone(&self.write_lock).lock_owned().await;
         let started = std::time::Instant::now();
-        let stopped = Arc::clone(&self.checkpoints_stopped);
-        let checkpoint_result: Result<()> = {
+        let latch = self.checkpoints.clone();
+        let checkpoint_run: CheckpointRun = {
             let (returned, outcome) =
-                Self::write_owning_turn(self.db.clone(), Arc::clone(&stopped), turn, move |conn| {
-                    guarded_checkpoint(conn, &stopped)
+                Self::write_owning_turn(self.db.clone(), latch.clone(), turn, move |conn| {
+                    Ok(guarded_checkpoint(conn, &latch))
                 })
                 .await?;
             turn = returned;
-            outcome
+            outcome?
         };
-        crate::storage::snapshot::record_checkpoint_outcome(
-            started.elapsed().as_millis() as u64,
-            checkpoint_result.is_ok(),
-        );
-        checkpoint_result?;
+        match checkpoint_run {
+            // A skip is not a failed checkpoint: nothing was attempted (#211).
+            CheckpointRun::Skipped => {
+                anyhow::bail!(
+                    "checkpoint skipped: an earlier one ran out of buffer pool and a retry would \
+                     grow ladybug.db; raise NEUROSTRATA_BUFFER_POOL_MB and restart"
+                );
+            }
+            CheckpointRun::Attempted(result) => {
+                crate::storage::snapshot::record_checkpoint_outcome(
+                    started.elapsed().as_millis() as u64,
+                    result.is_ok(),
+                );
+                result?;
+            }
+        }
         // Still held: no writer of this process reaches the copies below.
         let _write_guard = turn;
 
@@ -10305,15 +10759,6 @@ impl VectorStore for LadybugStore {
     }
 
     async fn checkpoint(&self) -> Result<()> {
-        if self
-            .checkpoints_stopped
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            anyhow::bail!(
-                "checkpoint skipped: an earlier one ran out of buffer pool and a retry would grow \
-                 ladybug.db; raise NEUROSTRATA_BUFFER_POOL_MB and restart"
-            );
-        }
         // Cleared first: a write that lands while the engine is flushing must
         // survive, and clearing afterwards would drop its mark.
         let had_writes = self.dirty.take();
@@ -10321,14 +10766,39 @@ impl VectorStore for LadybugStore {
         // The duration and success of every real checkpoint is recorded so
         // `compute_storage_status` reports actual hygiene, not constants.
         let started = std::time::Instant::now();
-        let stopped = Arc::clone(&self.checkpoints_stopped);
-        let outcome = self
-            .with_conn(move |conn| guarded_checkpoint(conn, &stopped))
+        let latch = self.checkpoints.clone();
+        let run = self
+            .with_conn(move |conn| Ok(guarded_checkpoint(conn, &latch)))
             .await;
-        crate::storage::snapshot::record_checkpoint_outcome(
-            started.elapsed().as_millis() as u64,
-            outcome.is_ok(),
-        );
+        let outcome = match run {
+            // The latch skipped it: no CHECKPOINT ran, so nothing is recorded
+            // as a failed one. The latch counted the skip itself (#211).
+            Ok(CheckpointRun::Skipped) => {
+                if had_writes {
+                    self.dirty.mark();
+                }
+                anyhow::bail!(
+                    "checkpoint skipped: an earlier one ran out of buffer pool and a retry would \
+                     grow ladybug.db; raise NEUROSTRATA_BUFFER_POOL_MB and restart"
+                );
+            }
+            Ok(CheckpointRun::Attempted(result)) => {
+                crate::storage::snapshot::record_checkpoint_outcome(
+                    started.elapsed().as_millis() as u64,
+                    result.is_ok(),
+                );
+                result
+            }
+            // A checkpoint the engine refused to even start is a failed
+            // attempt in the same accounting as one that failed inside it.
+            Err(e) => {
+                crate::storage::snapshot::record_checkpoint_outcome(
+                    started.elapsed().as_millis() as u64,
+                    false,
+                );
+                Err(e)
+            }
+        };
 
         if outcome.is_err() && had_writes {
             self.dirty.mark();

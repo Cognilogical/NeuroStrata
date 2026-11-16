@@ -74,6 +74,20 @@ pub struct StorageStatus {
     /// recovery artifacts sitting beside the store (#195).
     #[serde(default)]
     pub wal_recovery_artifact_bytes: u64,
+    /// Whether this process stopped checkpointing because one ran out of
+    /// buffer pool (#211). While set, the engine's `auto_checkpoint` and
+    /// `force_checkpoint_on_close` are off on the shared database config, so
+    /// writes stay in the write-ahead log until a later checkpoint succeeds or
+    /// the process is restarted with a larger pool. Defaults to `false` so
+    /// older clients deserialize the status unchanged.
+    #[serde(default)]
+    pub checkpoints_stopped: bool,
+    /// Checkpoints skipped because `checkpoints_stopped` was set (#211). A
+    /// skip is not an attempt: it is counted here and never in
+    /// `checkpoint_failures`, which only moves when a CHECKPOINT ran and
+    /// failed. Monotonic for the life of the process.
+    #[serde(default)]
+    pub checkpoint_skips: u64,
 }
 
 static RECOVERY_PROVENANCE_BY_PATH: std::sync::OnceLock<
@@ -210,6 +224,57 @@ static LAST_CHECKPOINT_AT_SECS: std::sync::atomic::AtomicU64 =
 static CHECKPOINT_FAILURES: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
 
+/// The checkpoint latch as `compute_storage_status` can see it (#211): whether
+/// the store stopped checkpointing, and how many checkpoints that stopped.
+///
+/// The latch itself lives in `store::ladybug` as a process-local atomic on the
+/// store handle. This is the mirror the status read consults, because
+/// `compute_storage_status` is handed a path and nothing else. Keyed by path so
+/// two stores opened in one process -- the test suite, a backup export -- never
+/// report each other's latch.
+#[derive(Debug, Clone, Copy, Default)]
+struct CheckpointLatchStatus {
+    stopped: bool,
+    skips: u64,
+}
+
+static CHECKPOINT_LATCH_BY_PATH: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, CheckpointLatchStatus>>,
+> = std::sync::OnceLock::new();
+
+type CheckpointLatchMap =
+    std::sync::Mutex<std::collections::HashMap<PathBuf, CheckpointLatchStatus>>;
+
+fn checkpoint_latch_map() -> &'static CheckpointLatchMap {
+    CHECKPOINT_LATCH_BY_PATH.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Record that this process stopped (or resumed) checkpointing `store_path`
+/// after a checkpoint ran out of buffer pool (#211). Resuming does not reset
+/// the skip count: it is a running total for the process, like
+/// `checkpoint_failures`.
+pub fn record_checkpoints_stopped(store_path: &Path, stopped: bool) {
+    let map = checkpoint_latch_map();
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    guard.entry(store_path.to_path_buf()).or_default().stopped = stopped;
+}
+
+/// Count one checkpoint that the latch skipped (#211). Separate from
+/// `record_checkpoint_outcome` on purpose: a skip issues no CHECKPOINT, so
+/// counting it as a failure would misreport the store as repeatedly trying.
+pub fn record_checkpoint_skip(store_path: &Path) {
+    let map = checkpoint_latch_map();
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = guard.entry(store_path.to_path_buf()).or_default();
+    entry.skips = entry.skips.saturating_add(1);
+}
+
+fn recorded_checkpoint_latch(store_path: &Path) -> CheckpointLatchStatus {
+    let map = checkpoint_latch_map();
+    let guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    guard.get(store_path).copied().unwrap_or_default()
+}
+
 /// Record a finished checkpoint. Called from the store's checkpoint path so
 /// `compute_storage_status` reports real hygiene data instead of constants.
 pub fn record_checkpoint_outcome(duration_ms: u64, ok: bool) {
@@ -241,6 +306,7 @@ pub fn compute_storage_status(
     let wal_recovery_artifact_count = wal_artifacts.len();
     let wal_recovery_artifact_bytes: u64 = wal_artifacts.iter().map(|(_, len, _)| *len).sum();
     let recovery_provenance = recorded_recovery_provenance(store_path);
+    let checkpoint_latch = recorded_checkpoint_latch(store_path);
     let snapshot_dir = store_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -330,6 +396,8 @@ pub fn compute_storage_status(
         recovery_provenance,
         wal_recovery_artifact_count,
         wal_recovery_artifact_bytes,
+        checkpoints_stopped: checkpoint_latch.stopped,
+        checkpoint_skips: checkpoint_latch.skips,
     }
 }
 
@@ -714,6 +782,58 @@ pub fn prune_expired_snapshots(root: &Path, keep: usize) -> Result<Vec<PathBuf>,
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// #211: the buffer-pool latch is visible in status, its skip count is
+    /// separate from the failure count, and a payload written before the fields
+    /// existed still deserializes (they carry serde defaults).
+    #[test]
+    fn storage_status_reports_the_checkpoint_latch() {
+        let dir = temp_dir("checkpoint-latch-status");
+        let store = dir.join("s.lbug");
+        fs::write(&store, b"db").unwrap();
+        let cfg = StorageHygieneConfig::default();
+
+        let clean = compute_storage_status(&store, &cfg);
+        assert!(!clean.checkpoints_stopped);
+        assert_eq!(clean.checkpoint_skips, 0);
+
+        record_checkpoint_skip(&store);
+        record_checkpoint_skip(&store);
+        let failures_before = CHECKPOINT_FAILURES.load(std::sync::atomic::Ordering::Relaxed);
+        record_checkpoints_stopped(&store, true);
+        let latched = compute_storage_status(&store, &cfg);
+        assert!(
+            latched.checkpoints_stopped,
+            "the latch must be visible in status (#211)"
+        );
+        assert_eq!(latched.checkpoint_skips, 2, "skips are counted (#211)");
+        assert_eq!(
+            latched.checkpoint_failures, failures_before,
+            "a skip is not a failure (#211)"
+        );
+
+        record_checkpoints_stopped(&store, false);
+        let resumed = compute_storage_status(&store, &cfg);
+        assert!(!resumed.checkpoints_stopped);
+        assert_eq!(
+            resumed.checkpoint_skips, 2,
+            "clearing the latch keeps the process's running skip count"
+        );
+
+        let mut value = serde_json::to_value(&resumed).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("checkpoints_stopped");
+        object.remove("checkpoint_skips");
+        let old: StorageStatus = serde_json::from_value(value).unwrap();
+        assert!(
+            !old.checkpoints_stopped,
+            "an old payload defaults to no latch"
+        );
+        assert_eq!(
+            old.checkpoint_skips, 0,
+            "an old payload defaults to no skips"
+        );
+    }
 
     #[test]
     fn prune_wal_recovery_artifacts_except_never_removes_a_protected_path() {
