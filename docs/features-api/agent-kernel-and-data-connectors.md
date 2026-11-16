@@ -28,7 +28,7 @@ Central Agentic Kernel (`AgentKernel`) unifies workflow lifecycle, cognitive rec
 
 ## Two-Phase DataConnector Gate
 
-- Pre-I/O gate: `evaluate_connector_pre_gate` (`KernelConnectorOp`, `KernelConnectorPreVerdict`). Early unregistered-connector/ReBAC denials abort before `describe_pool`; the remaining pre-gate checks run after schema lookup but before `resolve_slice`/`apply_external_effect`.
+- Pre-I/O gate: `evaluate_connector_pre_gate` (`KernelConnectorOp`, `KernelConnectorPreVerdict`). Early unregistered-connector/ReBAC denials abort before `describe_pool`; subsequent pre-gate checks run after schema lookup but before `resolve_slice`/`apply_external_effect`.
 - Post-I/O gate: `evaluate_connector_post_gate` (`KernelConnectorPostVerdict`). Enforces observed slice bounds, source SHA-256 digest match, CAS expectations.
 
 ## Fail-Closed Guarantees
