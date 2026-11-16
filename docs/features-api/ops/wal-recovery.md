@@ -74,7 +74,7 @@ message carries one of seven machine-readable slugs:
 | `nothing_committed` | bytes were replayed, nothing had committed | none; the replay is lossless |
 | `committed_lost` | a committed record existed and no bytes survived | stop, inspect the preserved copy |
 | `replayed` | bytes survived, or a completed checkpoint was consumed | none; the message reports the truncation |
-| `foreign_wal` | the WAL belongs to another database (DB-ID mismatch) | the WAL is quarantined as `.corrupted.<ts>`; nothing of this store was lost |
+| `foreign_wal` | the engine reports a different database id for the WAL | the WAL is quarantined as `.corrupted.<ts>` with every byte kept; confirm the attribution before deleting it |
 | `unknown` | the bytes could not be attributed | stop, inspect the preserved copy |
 | `deferred` | the WAL is larger than the 64 MiB scan cap, so it was not classified | the verified open ran; if it failed, treat the store as `committed_lost` |
 

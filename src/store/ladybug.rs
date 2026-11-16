@@ -2798,7 +2798,7 @@ fn quarantine_message(
 ) -> String {
     if foreign {
         format!(
-            "ERROR: the write-ahead log at {:?} belongs to another database; {} bytes were set aside and kept at {:?} -- nothing of this store was discarded.",
+            "ERROR: the write-ahead log at {:?} was set aside as foreign: the engine reports a different database id ({} bytes kept at {:?}). Nothing was deleted. If this store's own WAL was misattributed, restore it from that artifact.",
             target, dropped_bytes, corrupted
         )
     } else {
@@ -2903,16 +2903,42 @@ fn run_recovery_checkpoint(unverified_db: &Database) -> Result<()> {
 /// `force_checkpoint_on_close` is the only supported switch and it needs a
 /// connection. If that connection cannot be opened, the handle is leaked: a
 /// leaked lock is recoverable, a checkpoint over the preserved bytes is not.
-fn release_without_checkpoint(unverified_db: Database) {
-    let disabled = Connection::new(&unverified_db).map(|conn| {
-        let _ = conn.query("CALL force_checkpoint_on_close=false");
-    });
-    if let Err(e) = disabled {
+#[cfg(test)]
+static LEAKED_RECOVERY_HANDLES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Drops a lenient handle only when `force_checkpoint_on_close=false` is known
+/// to have been applied; otherwise the handle is leaked, because `~Database()`
+/// would checkpoint over the WAL a refusal is trying to preserve.
+///
+/// The query result matters: ignoring it would make a failed `CALL` look like a
+/// successful one and drop the handle anyway (`#207` C5).
+fn release_handle(unverified_db: Database, apply_flag: impl FnOnce(&Connection) -> bool) {
+    let applied = match Connection::new(&unverified_db) {
+        Ok(conn) => {
+            let applied = apply_flag(&conn);
+            drop(conn);
+            applied
+        }
+        Err(e) => {
+            eprintln!("WARNING: could not open a connection to disable checkpoint-on-close ({e}).");
+            false
+        }
+    };
+    if !applied {
         eprintln!(
-            "WARNING: could not disable checkpoint-on-close ({e}); leaking the recovery handle so ~Database() cannot checkpoint over the preserved WAL (#207)."
+            "WARNING: could not disable checkpoint-on-close; leaking the recovery handle so ~Database() cannot checkpoint over the preserved WAL (#207)."
         );
+        #[cfg(test)]
+        LEAKED_RECOVERY_HANDLES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         std::mem::forget(unverified_db);
     }
+}
+
+fn release_without_checkpoint(unverified_db: Database) {
+    release_handle(unverified_db, |conn| {
+        conn.query("CALL force_checkpoint_on_close=false").is_ok()
+    });
 }
 
 /// The strict-mode refusal, unchanged in substance plus the accounting slug.
@@ -3020,6 +3046,33 @@ fn wal_refusal(
     message.push_str(" See docs/runbooks/wal-recovery.md.");
     eprintln!("ERROR: DATA LOSS. {message}");
     anyhow::anyhow!(message)
+}
+
+/// What a lenient open that failed even unverified must do with the verdict it
+/// already computed (`#207` C3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LenientFailure {
+    /// Committed records may have been lost, or the bytes cannot be attributed.
+    Refuse,
+    /// The engine attributed the WAL to another database.
+    Quarantine,
+    /// No proven loss and no foreign side: arm D's rename is the only way to
+    /// reopen, and the bytes are preserved.
+    ArmD,
+}
+
+fn lenient_failure_action(verdict: crate::store::wal_accounting::WalAccounting) -> LenientFailure {
+    use crate::store::wal_accounting::WalAccounting;
+
+    match verdict {
+        WalAccounting::CommittedLost { .. }
+        | WalAccounting::Unknown { .. }
+        | WalAccounting::Deferred { .. } => LenientFailure::Refuse,
+        WalAccounting::ForeignWal { .. } => LenientFailure::Quarantine,
+        WalAccounting::NoWal
+        | WalAccounting::NothingCommitted { .. }
+        | WalAccounting::Replayed { .. } => LenientFailure::ArmD,
+    }
 }
 
 /// The recovery funnel after the verified open failed (`#207`).
@@ -3131,27 +3184,51 @@ fn recover_from_wal_failure(
     let unverified_db = match lenient {
         Ok(handle) => handle,
         Err(retry_e) => {
-            // Arm D exemption (`#207` B10): a WAL that cannot be opened even
-            // leniently is set aside and the store reopens, as it does today. A
-            // foreign WAL is attributed by the engine and quarantined the same
-            // way; the ladder also catches the second foreign side.
             eprintln!(
                 "ERROR: the write-ahead log could not be replayed even unverified: {retry_e}"
             );
-            let initial_foreign = quarantine_is_foreign(&foreign);
-            let initial = if initial_foreign {
-                foreign
-            } else {
-                arm_d_target(local_path)
+            // The verdict was computed from the pre-replay scan and the sizes
+            // measured right after the attempt; a failed lenient open does not
+            // make it irrelevant (`#207` C3).
+            return match lenient_failure_action(verdict) {
+                LenientFailure::Refuse => {
+                    let restore = sides_to_restore(pre, post);
+                    Err(wal_refusal(
+                        local_path,
+                        verdict,
+                        pre,
+                        post,
+                        preserved,
+                        restore,
+                        "Refusing to open: the write-ahead log could not be replayed even unverified and accounting cannot prove nothing was lost",
+                    ))
+                }
+                LenientFailure::Quarantine => {
+                    let db = open_after_quarantine(local_path, foreign, true)?;
+                    Ok((db, OpenProvenance::DiscardedUnreadableWal))
+                }
+                LenientFailure::ArmD => {
+                    // No handle and no proven loss: arm D's rename is still the
+                    // only way to reopen, and the bytes are preserved.
+                    let initial_foreign = quarantine_is_foreign(&foreign);
+                    let initial = if initial_foreign {
+                        foreign
+                    } else {
+                        arm_d_target(local_path)
+                    };
+                    let db = open_after_quarantine(local_path, initial, initial_foreign)?;
+                    Ok((db, OpenProvenance::DiscardedUnreadableWal))
+                }
             };
-            let db = open_after_quarantine(local_path, initial, initial_foreign)?;
-            return Ok((db, OpenProvenance::DiscardedUnreadableWal));
         }
     };
 
     match disposition(verdict, pair) {
         Disposition::Proceed => {
             eprintln!("Recovered by replaying the write-ahead log with lenient tail truncation.");
+            if let Some(note) = verdict.checkpoint_label() {
+                eprintln!("WAL accounting: {note}.");
+            }
             run_recovery_checkpoint(&unverified_db)?;
             drop(unverified_db);
             if pre_total > 0 {
@@ -25001,6 +25078,134 @@ eurostrata\src\daemon.rs",
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// `#207` C3: a lenient open that fails even unverified must still act on
+    /// the verdict it computed, instead of always quarantining.
+    #[test]
+    fn a_failed_lenient_open_still_honours_the_verdict() {
+        use crate::store::wal_accounting::{SideSet, UnknownReason, WalAccounting};
+
+        assert_eq!(
+            lenient_failure_action(WalAccounting::CommittedLost {
+                pre_bytes: 1,
+                sides: SideSet::ACTIVE
+            }),
+            LenientFailure::Refuse
+        );
+        assert_eq!(
+            lenient_failure_action(WalAccounting::Unknown {
+                reason: UnknownReason::CommitEvidenceUnreadable,
+                sides: SideSet::ACTIVE
+            }),
+            LenientFailure::Refuse
+        );
+        assert_eq!(
+            lenient_failure_action(WalAccounting::Deferred {
+                pre_bytes: 1,
+                sides: SideSet::ACTIVE
+            }),
+            LenientFailure::Refuse
+        );
+        assert_eq!(
+            lenient_failure_action(WalAccounting::ForeignWal {
+                pre_bytes: 1,
+                sides: SideSet::ACTIVE
+            }),
+            LenientFailure::Quarantine
+        );
+        assert_eq!(
+            lenient_failure_action(WalAccounting::Replayed {
+                pre_bytes: 1,
+                residual_bytes: 1,
+                truncated_bytes: 0,
+                checkpoint: None
+            }),
+            LenientFailure::ArmD
+        );
+        assert_eq!(
+            lenient_failure_action(WalAccounting::NothingCommitted {
+                uncommitted_bytes: 1,
+                sides: SideSet::ACTIVE
+            }),
+            LenientFailure::ArmD
+        );
+        assert_eq!(
+            lenient_failure_action(WalAccounting::NoWal),
+            LenientFailure::ArmD
+        );
+    }
+
+    /// `#207` C5: the drop flag must be *known* to be applied. A failed CALL
+    /// leaks the handle instead of letting `~Database()` checkpoint the WAL.
+    #[test]
+    fn release_handle_leaks_when_the_flag_call_is_not_known_to_succeed() {
+        use std::sync::atomic::Ordering;
+
+        let root = std::env::temp_dir().join(format!(
+            "lbug-release-leak-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("leak.lbug");
+        let raw = Database::new(
+            &db,
+            SystemConfig::default()
+                .max_db_size(512 * 1024 * 1024)
+                .buffer_pool_size(64 * 1024 * 1024),
+        )
+        .expect("open a disposable database");
+
+        let before = LEAKED_RECOVERY_HANDLES.load(Ordering::SeqCst);
+        release_handle(raw, |_| false);
+        assert_eq!(
+            LEAKED_RECOVERY_HANDLES.load(Ordering::SeqCst),
+            before + 1,
+            "a failed `force_checkpoint_on_close=false` must leak the handle, not drop it"
+        );
+
+        // The leaked handle owns the file, so directory removal is best-effort:
+        // the test pins the decision, not the engine's checkpoint behaviour.
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn release_handle_drops_when_the_flag_call_succeeds() {
+        use std::sync::atomic::Ordering;
+
+        let root = std::env::temp_dir().join(format!(
+            "lbug-release-ok-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("ok.lbug");
+        let raw = Database::new(
+            &db,
+            SystemConfig::default()
+                .max_db_size(512 * 1024 * 1024)
+                .buffer_pool_size(64 * 1024 * 1024),
+        )
+        .expect("open a disposable database");
+
+        let before = LEAKED_RECOVERY_HANDLES.load(Ordering::SeqCst);
+        release_handle(raw, |_| true);
+        assert_eq!(
+            LEAKED_RECOVERY_HANDLES.load(Ordering::SeqCst),
+            before,
+            "a successful flag call must drop the handle normally"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// `#207` V3b: the wiring seam cannot mark the active side consumed.
     /// `consumed_sides` answers "nothing consumed" for an active-only change, so
     /// `classify_pair` still refuses the proven commit; widening the set at the
@@ -25329,6 +25534,14 @@ eurostrata\src\daemon.rs",
             funnel.contains("let initial_foreign = quarantine_is_foreign(&foreign);"),
             "arm D's wording branch comes from the attribution seam at the call site, \
              not a literal (#207)"
+        );
+        assert!(
+            funnel.contains("lenient_failure_action("),
+            "a failed lenient open acts on its verdict instead of always quarantining (#207 C3)"
+        );
+        assert!(
+            funnel.contains("release_handle("),
+            "the drop flag is applied through `release_handle`, which leaks on failure (#207 C5)"
         );
         assert!(
             !funnel.contains("SideSet::BOTH"),
@@ -28441,6 +28654,82 @@ mod wal_zero_record {
         let _ = std::fs::remove_dir_all(&root);
         restore_model_env(previous_model);
     }
+    /// `#207` C4: a flipped database id on this store's own checksums-off WAL is
+    /// reported as foreign by `verifyDatabaseID`, but the scan can still
+    /// attribute the records. The arm quarantines with the bytes kept (and a
+    /// hedged message) instead of ever claiming "nothing was discarded".
+    #[tokio::test]
+    async fn a_flipped_database_id_is_quarantined_with_the_bytes_kept() {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-wal-flipped-id-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("flipped-id.lbug");
+        let previous_model = without_model_env();
+        store_with_checkpointed_schema(&db, &root).await;
+
+        let cfg = SystemConfig::default()
+            .max_db_size(512 * 1024 * 1024)
+            .buffer_pool_size(64 * 1024 * 1024)
+            .enable_checksums(false)
+            .throw_on_wal_replay_failure(true);
+        let raw = Database::new(&db, cfg).expect("raw open with checksums off");
+        let conn = Connection::new(&raw).expect("raw connection");
+        conn.query(&memory_row("flipped-id-0"))
+            .expect("seed a committed WAL-only row");
+        conn.query("CALL force_checkpoint_on_close=false")
+            .expect("turn off checkpoint on close");
+        drop(conn);
+        drop(raw);
+
+        let wal = wal_of(&db);
+        let mut bytes = std::fs::read(&wal).expect("read the seeded WAL");
+        assert!(bytes.len() > WAL_HEADER_BYTES as usize);
+        bytes[0] ^= 0x01; // one byte of the 16-byte database id
+        std::fs::write(&wal, &bytes).expect("flip the database id in place");
+        let pre_len = bytes.len() as u64;
+        assert_eq!(
+            scan_wal(&bytes).commit_evidence(),
+            CommitEvidence::Some,
+            "the checksums-off records are still attributable"
+        );
+
+        let _wal_env_serial = WAL_ENV_LOCK.lock().await;
+        let previous_wal = allow_unverified_wal_recovery();
+        let result = LadybugStore::for_testing(&db, 8);
+        restore_wal_env(previous_wal);
+        drop(_wal_env_serial);
+
+        let store = result.expect("an attributable foreign WAL is quarantined, not refused");
+        assert_eq!(
+            store.open_provenance(),
+            OpenProvenance::DiscardedUnreadableWal
+        );
+        let corrupted = wal_files_in(&root, "flipped-id.lbug.wal.corrupted.");
+        assert_eq!(
+            corrupted.len(),
+            1,
+            "one quarantine artifact: {:?}",
+            corrupted
+        );
+        assert_eq!(
+            std::fs::read(&corrupted[0]).expect("read the quarantine artifact"),
+            bytes,
+            "the flipped bytes are preserved, not discarded"
+        );
+        assert_eq!(file_len(&corrupted[0]), pre_len);
+        drop(store);
+
+        let _ = std::fs::remove_dir_all(&root);
+        restore_model_env(previous_model);
+    }
+
     /// `#207` BC-2 (P-1): under strict verification a clean foreign WAL stays a
     /// refusal, with the accounting slug attached and the bytes untouched.
     #[tokio::test]
@@ -28863,14 +29152,14 @@ mod wal_preservation {
             .expect("quarantine a foreign WAL")
             .expect("the WAL exists");
         assert!(
-            foreign.message.contains("belongs to another database"),
+            foreign.message.contains("set aside as foreign"),
             "{}",
             foreign.message
         );
         assert!(
             foreign
                 .message
-                .contains("nothing of this store was discarded"),
+                .contains("If this store's own WAL was misattributed"),
             "{}",
             foreign.message
         );
@@ -28888,10 +29177,12 @@ mod wal_preservation {
         let target = std::path::Path::new("/tmp/x.lbug.wal");
         let corrupted = std::path::Path::new("/tmp/x.lbug.wal.corrupted.1");
         let foreign = quarantine_message(true, target, 10, corrupted);
-        assert!(foreign.contains("belongs to another database"), "{foreign}");
+        assert!(foreign.contains("set aside as foreign"), "{foreign}");
+        assert!(foreign.contains("different database id"), "{foreign}");
+        assert!(foreign.contains("Nothing was deleted"), "{foreign}");
         assert!(
-            foreign.contains("nothing of this store was discarded"),
-            "{foreign}"
+            foreign.contains("If this store's own WAL was misattributed"),
+            "the message must hedge the attribution: {foreign}"
         );
         assert!(!foreign.contains("DATA LOSS"), "{foreign}");
 

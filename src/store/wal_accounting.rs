@@ -23,8 +23,11 @@
 //! CommittedLost  >  Unknown  >  ForeignWal  >  Deferred  >  Replayed  >  NothingCommitted  >  NoWal
 //! ```
 //!
-//! `checkpoint_terminated` is attributed **per side**: a completed `CHECKPOINT`
-//! record in the active WAL says nothing about a frozen WAL that vanished.
+//! A checkpoint claim is attributed **per side** and typed: `Observed` means the
+//! scan saw a complete `CHECKPOINT` record, `InferredByDeletion` means the
+//! engine removed a frozen WAL a successful replay had read. A completed
+//! `CHECKPOINT` record in the active WAL says nothing about a frozen WAL that
+//! vanished.
 //!
 //! # Evidence is checksum-verified
 //!
@@ -631,7 +634,7 @@ pub enum SideVerdict {
         pre_bytes: u64,
         residual_bytes: u64,
         truncated_bytes: u64,
-        checkpoint_terminated: bool,
+        checkpoint: Option<CheckpointEvidence>,
     },
     /// Refuse or report; never silently accept.
     Unknown { reason: UnknownReason },
@@ -642,6 +645,21 @@ pub enum SideVerdict {
 pub enum DeferralReason {
     /// The file exceeds [`MAX_SCAN_BYTES`].
     ScanTooLarge,
+}
+
+/// How the "this side ended in a checkpoint" claim is supported.
+///
+/// The two are not interchangeable: `Observed` is a complete `CHECKPOINT` record
+/// at the end of the WAL, while `InferredByDeletion` is the weaker fact that a
+/// successful lenient open removed a frozen WAL whose commits the scan could
+/// read. Operator text must not call the latter an observed checkpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointEvidence {
+    /// The scan saw a complete `CHECKPOINT_RECORD` as the last record.
+    Observed,
+    /// The engine removed the frozen WAL after a successful replay; no
+    /// `CHECKPOINT` record was seen.
+    InferredByDeletion,
 }
 
 /// Per-side inputs.
@@ -726,9 +744,6 @@ fn classify_side_with(observation: SideObservation, consumed_by_engine: bool) ->
             SideVerdict::FreshWal { bytes: post }
         };
     }
-    if foreign {
-        return SideVerdict::ForeignWal { pre_bytes: pre };
-    }
     let scan = match scan {
         Some(scan) => scan,
         None => {
@@ -752,17 +767,33 @@ fn classify_side_with(observation: SideObservation, consumed_by_engine: bool) ->
         };
     }
     let evidence = scan.commit_evidence();
-    let checkpoint_terminated = scan.ended_in_checkpoint();
+    // A foreign attribution is only safe when the bytes are attributable. A
+    // one-byte flip in the 16-byte database id of this store's own WAL trips
+    // `verifyDatabaseID` too, and quarantining that would discard this store's
+    // data with a "belongs to another database" message. Unattributable bytes
+    // are refused as `Unknown` instead, with the preserved copy named.
+    if foreign && !matches!(evidence, CommitEvidence::Unknown) {
+        return SideVerdict::ForeignWal { pre_bytes: pre };
+    }
+    let checkpoint = if scan.ended_in_checkpoint() {
+        Some(CheckpointEvidence::Observed)
+    } else {
+        None
+    };
     // A side a successful open consumed held committed records that the engine
     // replayed before removing the file; `replayFrozenWAL` only deletes without
     // replaying when it read nothing, which the scan reports as `Unknown` (and
-    // this arm refuses there). The flag is never set for `Unknown` evidence.
+    // this arm refuses there). Every other side is judged on its own bytes.
+    //
+    // This is *not* an observed checkpoint: no `CHECKPOINT` record was seen, so
+    // the evidence is `InferredByDeletion` and the operator text says the frozen
+    // WAL was consumed by a successful replay.
     if consumed_by_engine && post == 0 && matches!(evidence, CommitEvidence::Some) {
         return SideVerdict::Replayed {
             pre_bytes: pre,
             residual_bytes: 0,
             truncated_bytes: pre,
-            checkpoint_terminated: true,
+            checkpoint: Some(CheckpointEvidence::InferredByDeletion),
         };
     }
     match (evidence, post) {
@@ -777,14 +808,15 @@ fn classify_side_with(observation: SideObservation, consumed_by_engine: bool) ->
         (CommitEvidence::None, 0) => SideVerdict::NothingCommitted {
             uncommitted_bytes: pre,
         },
-        (CommitEvidence::Some, 0) if !checkpoint_terminated => {
+        // `Some` with no observed checkpoint is a loss, never a replay.
+        (CommitEvidence::Some, 0) if checkpoint.is_none() => {
             SideVerdict::CommittedLost { pre_bytes: pre }
         }
         _ => SideVerdict::Replayed {
             pre_bytes: pre,
             residual_bytes: post,
             truncated_bytes: pre.saturating_sub(post),
-            checkpoint_terminated,
+            checkpoint,
         },
     }
 }
@@ -815,13 +847,31 @@ pub enum WalAccounting {
         pre_bytes: u64,
         residual_bytes: u64,
         truncated_bytes: u64,
-        checkpoint_terminated: bool,
+        checkpoint: Option<CheckpointEvidence>,
     },
     /// Refuse or report; never silently accept.
     Unknown {
         reason: UnknownReason,
         sides: SideSet,
     },
+}
+
+/// The stronger of two checkpoint claims: an observed record beats a deletion
+/// inference, which beats nothing.
+const fn strongest_checkpoint(
+    a: Option<CheckpointEvidence>,
+    b: Option<CheckpointEvidence>,
+) -> Option<CheckpointEvidence> {
+    match (a, b) {
+        (Some(CheckpointEvidence::Observed), _) | (_, Some(CheckpointEvidence::Observed)) => {
+            Some(CheckpointEvidence::Observed)
+        }
+        (Some(CheckpointEvidence::InferredByDeletion), _)
+        | (_, Some(CheckpointEvidence::InferredByDeletion)) => {
+            Some(CheckpointEvidence::InferredByDeletion)
+        }
+        (None, None) => None,
+    }
 }
 
 /// Folds the two side verdicts into one accounting verdict.
@@ -899,7 +949,7 @@ pub fn fold_side_verdicts(active: SideVerdict, frozen: SideVerdict) -> WalAccoun
     let mut pre_bytes = 0u64;
     let mut residual_bytes = 0u64;
     let mut truncated_bytes = 0u64;
-    let mut checkpoint_terminated = false;
+    let mut checkpoint: Option<CheckpointEvidence> = None;
     let mut moved = false;
     for (_, verdict) in sides {
         match verdict {
@@ -907,13 +957,14 @@ pub fn fold_side_verdicts(active: SideVerdict, frozen: SideVerdict) -> WalAccoun
                 pre_bytes: pre,
                 residual_bytes: residual,
                 truncated_bytes: truncated,
-                checkpoint_terminated: ckpt,
+                checkpoint: side_checkpoint,
             } => {
                 moved = true;
                 pre_bytes = pre_bytes.saturating_add(pre);
                 residual_bytes = residual_bytes.saturating_add(residual);
                 truncated_bytes = truncated_bytes.saturating_add(truncated);
-                checkpoint_terminated |= ckpt;
+                // An observed record outranks the deletion inference.
+                checkpoint = strongest_checkpoint(checkpoint, side_checkpoint);
             }
             SideVerdict::FreshWal { bytes } => {
                 moved = true;
@@ -927,7 +978,7 @@ pub fn fold_side_verdicts(active: SideVerdict, frozen: SideVerdict) -> WalAccoun
             pre_bytes,
             residual_bytes,
             truncated_bytes,
-            checkpoint_terminated,
+            checkpoint,
         };
     }
 
@@ -1010,6 +1061,22 @@ impl WalAccounting {
             WalAccounting::Deferred { .. } => "deferred",
             WalAccounting::Replayed { .. } => "replayed",
             WalAccounting::Unknown { .. } => "unknown",
+        }
+    }
+
+    /// Operator text for how the checkpoint claim is supported. `None` when the
+    /// verdict carries no checkpoint claim at all.
+    pub const fn checkpoint_label(self) -> Option<&'static str> {
+        match self {
+            WalAccounting::Replayed {
+                checkpoint: Some(CheckpointEvidence::Observed),
+                ..
+            } => Some("a completed CHECKPOINT record was observed"),
+            WalAccounting::Replayed {
+                checkpoint: Some(CheckpointEvidence::InferredByDeletion),
+                ..
+            } => Some("the frozen WAL was consumed by a successful replay"),
+            _ => None,
         }
     }
 
@@ -1169,12 +1236,25 @@ mod tests {
         }
     }
 
+    /// A foreign WAL the scan can still attribute (readable committed records).
     fn foreign_side(pre: u64, post: u64) -> SideObservation {
         SideObservation {
             pre,
-            bytes_scanned: 0,
+            bytes_scanned: pre.min(MAX_SCAN_BYTES + 1),
             post,
-            scan: None,
+            scan: Some(scan_checksums_off_commit()),
+            foreign: true,
+        }
+    }
+
+    /// A foreign attribution whose bytes cannot be attributed: a flipped
+    /// database id on an otherwise unreadable WAL looks exactly like this.
+    fn unattributable_foreign_side(pre: u64, post: u64) -> SideObservation {
+        SideObservation {
+            pre,
+            bytes_scanned: pre.min(MAX_SCAN_BYTES + 1),
+            post,
+            scan: Some(scan_unattributable()),
             foreign: true,
         }
     }
@@ -1677,7 +1757,8 @@ mod tests {
     #[test]
     fn a_frozen_side_consumed_by_a_successful_open_is_a_completed_checkpoint() {
         // `#191`: a frozen WAL with readable commits that a successful lenient
-        // open removed was replayed and checkpointed; it is not a loss.
+        // open removed was replayed; the checkpoint is *inferred by deletion*,
+        // not observed in the scan.
         let verdict = frozen_consumed_verdict(942, 0, Some(scan_checksums_off_commit()));
         assert_eq!(
             verdict,
@@ -1685,8 +1766,12 @@ mod tests {
                 pre_bytes: 942,
                 residual_bytes: 0,
                 truncated_bytes: 942,
-                checkpoint_terminated: true
+                checkpoint: Some(CheckpointEvidence::InferredByDeletion)
             }
+        );
+        assert_eq!(
+            verdict.checkpoint_label(),
+            Some("the frozen WAL was consumed by a successful replay")
         );
         assert!(verdict.may_proceed());
     }
@@ -1745,8 +1830,29 @@ mod tests {
                 pre_bytes: 3103,
                 residual_bytes: 0,
                 truncated_bytes: 3103,
-                checkpoint_terminated: true
+                checkpoint: Some(CheckpointEvidence::Observed)
             }
+        );
+        let pair = WalPairObservation::new(
+            SideObservation::empty(),
+            side(3103, 0, Some(scan_with_checkpoint())),
+        );
+        assert_eq!(
+            classify_pair(pair).checkpoint_label(),
+            Some("a completed CHECKPOINT record was observed")
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_observed_in_the_scan_outranks_a_deletion_inference() {
+        // One side observed a CHECKPOINT record; the other was inferred by the
+        // engine removing it. The pair reports the stronger claim.
+        let observed = side(3103, 0, Some(scan_with_checkpoint()));
+        let inferred = side(0, 0, None);
+        let pair = WalPairObservation::new(observed, inferred);
+        assert_eq!(
+            classify_pair(pair).checkpoint_label(),
+            Some("a completed CHECKPOINT record was observed")
         );
     }
 
@@ -1759,7 +1865,7 @@ mod tests {
                 pre_bytes: 530,
                 residual_bytes: 530,
                 truncated_bytes: 0,
-                checkpoint_terminated: false
+                checkpoint: None
             }
         );
     }
@@ -1773,7 +1879,7 @@ mod tests {
                 pre_bytes: 2530,
                 residual_bytes: 530,
                 truncated_bytes: 2000,
-                checkpoint_terminated: false
+                checkpoint: None
             }
         );
     }
@@ -1790,7 +1896,7 @@ mod tests {
                 pre_bytes: 0,
                 residual_bytes: 25,
                 truncated_bytes: 0,
-                checkpoint_terminated: false
+                checkpoint: None
             }
         );
         assert!(verdict.may_proceed());
@@ -1810,7 +1916,7 @@ mod tests {
                 pre_bytes: 3103,
                 residual_bytes: 25,
                 truncated_bytes: 3078,
-                checkpoint_terminated: false
+                checkpoint: None
             }
         );
         assert!(verdict_may_proceed(measured_late), "the hazard is real");
@@ -1980,6 +2086,37 @@ mod tests {
     }
 
     #[test]
+    fn a_foreign_side_with_an_unattributable_scan_is_refused() {
+        // `#207` C4: a one-byte flip in the database id of this store's own WAL
+        // also trips verifyDatabaseID; quarantining unattributable bytes would
+        // discard this store's data under a "another database" message.
+        let verdict = classify_side(unattributable_foreign_side(539, 539));
+        assert_eq!(
+            verdict,
+            SideVerdict::Unknown {
+                reason: UnknownReason::CommitEvidenceUnreadable
+            }
+        );
+        let pair = WalPairObservation::new(
+            unattributable_foreign_side(539, 539),
+            SideObservation::empty(),
+        );
+        assert!(matches!(classify_pair(pair), WalAccounting::Unknown { .. }));
+    }
+
+    #[test]
+    fn a_foreign_side_with_no_scan_is_refused() {
+        let verdict = classify_side(SideObservation {
+            pre: 539,
+            bytes_scanned: 0,
+            post: 539,
+            scan: None,
+            foreign: true,
+        });
+        assert!(matches!(verdict, SideVerdict::Unknown { .. }));
+    }
+
+    #[test]
     fn a_proven_loss_outranks_a_foreign_peer() {
         let pair = WalPairObservation::new(
             foreign_side(539, 0),
@@ -2087,9 +2224,6 @@ mod tests {
                 SideVerdict::FreshWal { bytes: post }
             };
         }
-        if foreign {
-            return SideVerdict::ForeignWal { pre_bytes: pre };
-        }
         if matches!(shape, Shape::EmptyScan) {
             return SideVerdict::Unknown {
                 reason: UnknownReason::CommitEvidenceUnreadable,
@@ -2101,7 +2235,12 @@ mod tests {
                 reason: DeferralReason::ScanTooLarge,
             };
         }
-        let (evidence, checkpoint) = shape_evidence(shape);
+        let (evidence, observed_checkpoint) = shape_evidence(shape);
+        let checkpoint = if observed_checkpoint {
+            Some(CheckpointEvidence::Observed)
+        } else {
+            None
+        };
         let evidence = match evidence {
             Some(e) => e,
             None => {
@@ -2110,20 +2249,23 @@ mod tests {
                 }
             }
         };
+        if foreign && !matches!(evidence, CommitEvidence::Unknown) {
+            return SideVerdict::ForeignWal { pre_bytes: pre };
+        }
         match (evidence, post == 0) {
             (CommitEvidence::None, false) | (CommitEvidence::Unverifiable, false) => {
                 SideVerdict::Replayed {
                     pre_bytes: pre,
                     residual_bytes: post,
                     truncated_bytes: pre.saturating_sub(post),
-                    checkpoint_terminated: checkpoint,
+                    checkpoint,
                 }
             }
             (CommitEvidence::Some, false) => SideVerdict::Replayed {
                 pre_bytes: pre,
                 residual_bytes: post,
                 truncated_bytes: pre.saturating_sub(post),
-                checkpoint_terminated: checkpoint,
+                checkpoint,
             },
             (CommitEvidence::None, true) => SideVerdict::NothingCommitted {
                 uncommitted_bytes: pre,
@@ -2134,14 +2276,14 @@ mod tests {
             (CommitEvidence::Unknown, _) => SideVerdict::Unknown {
                 reason: UnknownReason::CommitEvidenceUnreadable,
             },
-            (CommitEvidence::Some, true) if !checkpoint => {
+            (CommitEvidence::Some, true) if checkpoint.is_none() => {
                 SideVerdict::CommittedLost { pre_bytes: pre }
             }
             (CommitEvidence::Some, true) => SideVerdict::Replayed {
                 pre_bytes: pre,
                 residual_bytes: 0,
                 truncated_bytes: pre,
-                checkpoint_terminated: true,
+                checkpoint,
             },
         }
     }
@@ -2355,7 +2497,7 @@ mod tests {
                 pre_bytes: 0,
                 residual_bytes: 0,
                 truncated_bytes: 0,
-                checkpoint_terminated: false
+                checkpoint: None
             }
             .slug(),
             "replayed"
