@@ -3373,6 +3373,12 @@ fn run_recovery_checkpoint_with(
 static LEAKED_RECOVERY_HANDLES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Serializes the tests that read `LEAKED_RECOVERY_HANDLES`: the counter is
+/// process-global, so a concurrent leak from another flag-discipline test used
+/// to race the drop-side assertions under full-suite parallelism.
+#[cfg(test)]
+static RECOVERY_HANDLE_FLAG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Drops a lenient handle only when `force_checkpoint_on_close=false` is known
 /// to have been applied; otherwise the handle is leaked, because `~Database()`
 /// would checkpoint over the WAL a refusal is trying to preserve.
@@ -25769,6 +25775,8 @@ eurostrata\src\daemon.rs",
     fn release_handle_leaks_when_the_flag_call_is_not_known_to_succeed() {
         use std::sync::atomic::Ordering;
 
+        let _guard = RECOVERY_HANDLE_FLAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
         let root = std::env::temp_dir().join(format!(
             "lbug-release-leak-{}-{}",
             std::process::id(),
@@ -25804,6 +25812,8 @@ eurostrata\src\daemon.rs",
     #[test]
     fn release_handle_drops_when_the_flag_call_succeeds() {
         use std::sync::atomic::Ordering;
+
+        let _guard = RECOVERY_HANDLE_FLAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let root = std::env::temp_dir().join(format!(
             "lbug-release-ok-{}-{}",
@@ -25842,6 +25852,8 @@ eurostrata\src\daemon.rs",
     #[test]
     fn recovery_checkpoint_failure_leaks_when_the_flag_call_is_not_known_to_succeed() {
         use std::sync::atomic::Ordering;
+
+        let _guard = RECOVERY_HANDLE_FLAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let root = std::env::temp_dir().join(format!(
             "lbug-ckpt-fail-leak-{}-{}",
@@ -25889,6 +25901,8 @@ eurostrata\src\daemon.rs",
     fn recovery_checkpoint_failure_drops_when_the_flag_call_succeeds() {
         use std::sync::atomic::Ordering;
 
+        let _guard = RECOVERY_HANDLE_FLAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
         let root = std::env::temp_dir().join(format!(
             "lbug-ckpt-fail-drop-{}-{}",
             std::process::id(),
@@ -25927,6 +25941,8 @@ eurostrata\src\daemon.rs",
     #[test]
     fn recovery_checkpoint_success_returns_the_handle() {
         use std::sync::atomic::Ordering;
+
+        let _guard = RECOVERY_HANDLE_FLAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let root = std::env::temp_dir().join(format!(
             "lbug-ckpt-ok-{}-{}",
