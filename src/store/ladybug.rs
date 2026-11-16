@@ -8941,6 +8941,89 @@ fn reconcile_pristine_embedding_width(
     Ok(())
 }
 
+/// Copy one snapshot member, bracketed by its source `(len, mtime)` (#95, #209).
+///
+/// A writer mutating the member between the stat calls means the copied bytes
+/// are not one instant. One observed change is retried (the second attempt may
+/// catch a settled file); a second change aborts the snapshot rather than
+/// pairing a torn member with the rest of the set.
+fn copy_file_bracketed_with<F: FnMut(&std::path::Path)>(
+    source: &std::path::Path,
+    dest: &std::path::Path,
+    label: &str,
+    mut between: F,
+) -> Result<()> {
+    let stamp = |path: &std::path::Path| -> Result<(u64, Option<std::time::SystemTime>)> {
+        let meta = std::fs::metadata(path).map_err(|e| {
+            anyhow::anyhow!(
+                "could not stat the {} {:?} during the snapshot copy: {}",
+                label,
+                path,
+                e
+            )
+        })?;
+        Ok((meta.len(), meta.modified().ok()))
+    };
+
+    let mut attempts = 0u8;
+    loop {
+        let before = stamp(source)?;
+        std::fs::copy(source, dest).map_err(|e| {
+            anyhow::anyhow!(
+                "could not copy the {} {:?} into the snapshot: {}",
+                label,
+                source,
+                e
+            )
+        })?;
+        // Production runs no hook; the seam exists so the retry/abort
+        // arithmetic is testable without racing a real writer.
+        between(source);
+        let after = stamp(source)?;
+        if before == after {
+            return Ok(());
+        }
+        attempts += 1;
+        if attempts > 1 {
+            return Err(anyhow::anyhow!(
+                "the {} {:?} changed during the snapshot copy twice; its bytes are not one instant, so the snapshot is aborted (#209)",
+                label,
+                source
+            ));
+        }
+    }
+}
+
+/// [`copy_file_bracketed_with`] with no hook: the production copy.
+fn copy_file_bracketed(
+    source: &std::path::Path,
+    dest: &std::path::Path,
+    label: &str,
+) -> Result<()> {
+    copy_file_bracketed_with(source, dest, label, |_| {})
+}
+
+/// Append a literal suffix to a path (never `with_extension`, which would
+/// rewrite a name that already carries one).
+fn append_suffix(base: &std::path::Path, suffix: &str) -> PathBuf {
+    let mut os = base.as_os_str().to_os_string();
+    os.push(suffix);
+    PathBuf::from(os)
+}
+
+/// Which WAL role a store presents on disk right now (#209). `.wal` wins over
+/// `.wal.checkpoint`: any store that passed the engine's pair checks has at
+/// most one of them, and a mixed pair refuses to open.
+fn wal_role_on_disk(source: &std::path::Path) -> &'static str {
+    if append_suffix(source, ".wal").exists() {
+        crate::storage::snapshot::WAL_KIND_ACTIVE
+    } else if append_suffix(source, ".wal.checkpoint").exists() {
+        crate::storage::snapshot::WAL_KIND_FROZEN
+    } else {
+        crate::storage::snapshot::WAL_KIND_NONE
+    }
+}
+
 impl LadybugStore {
     /// The snapshot retention budget `export_database` prunes with. The
     /// operator override `NEUROSTRATA_SNAPSHOT_RETENTION_COUNT` wins over
@@ -8970,62 +9053,38 @@ impl LadybugStore {
     /// Used both by `export_database` (after an online `CHECKPOINT`) and by
     /// `neurostrata-mcp backup --no-open` when strict WAL verification refuses
     /// to open the store (`#196`).
+    ///
+    /// This is the uncoordinated entry point: the caller does not hold the
+    /// store, so the manifest records `coordinated: false` (#209).
     pub fn export_database_files(source: &std::path::Path, dir: &std::path::Path) -> Result<()> {
+        Self::export_database_files_with_provenance(source, dir, false)
+    }
+
+    /// [`Self::export_database_files`] with an explicit provenance: `true`
+    /// only when the caller holds the store for the whole copy (the online
+    /// `export_database` path).
+    fn export_database_files_with_provenance(
+        source: &std::path::Path,
+        dir: &std::path::Path,
+        coordinated: bool,
+    ) -> Result<()> {
         std::fs::create_dir_all(dir)?;
         let target = dir.join("ladybug.store");
-        // Bracket the copy with the source's (len, mtime): an external
-        // writer mutating the file between the stat calls means the copy
-        // is torn, so retry once and abort the snapshot if it still
-        // changes (issue #95).
-        let mut copy_attempts = 0;
-        loop {
-            let before = std::fs::metadata(source).map_err(|e| {
-                anyhow::anyhow!(
-                    "could not stat {:?} before the snapshot copy: {}",
-                    source,
-                    e
-                )
-            })?;
-            std::fs::copy(source, &target).map_err(|e| {
-                anyhow::anyhow!("could not copy {:?} into the snapshot: {}", source, e)
-            })?;
-            let after = std::fs::metadata(source).map_err(|e| {
-                anyhow::anyhow!("could not stat {:?} after the snapshot copy: {}", source, e)
-            })?;
-            if (before.len(), before.modified().ok()) == (after.len(), after.modified().ok()) {
-                break;
-            }
-            copy_attempts += 1;
-            if copy_attempts > 1 {
-                return Err(anyhow::anyhow!(
-                    "source store changed during export_database copy"
-                ));
-            }
-        }
+        // Bracketed copy: an external writer mutating the file between the
+        // stat calls means the copy is torn, so retry once and abort the
+        // snapshot if it still changes (issue #95).
+        copy_file_bracketed(source, &target, "source store")?;
+
         // A WAL left behind after the checkpoint (or before recovery in
         // `--no-open` mode) rides along, so a restore replays or preserves it.
-        let mut wal = source.to_path_buf().into_os_string();
-        wal.push(".wal");
-        let wal = std::path::PathBuf::from(wal);
-        let mut ckpt_wal = source.to_path_buf().into_os_string();
-        ckpt_wal.push(".wal.checkpoint");
-        let ckpt_wal = std::path::PathBuf::from(ckpt_wal);
-        if wal.exists() {
-            std::fs::copy(&wal, dir.join("ladybug.store.wal")).map_err(|e| {
-                anyhow::anyhow!(
-                    "could not copy the write-ahead log into the snapshot: {}",
-                    e
-                )
-            })?;
-        } else if ckpt_wal.exists() {
-            std::fs::copy(&ckpt_wal, dir.join("ladybug.store.wal")).map_err(|e| {
-                anyhow::anyhow!(
-                    "could not copy the frozen checkpoint write-ahead log into the snapshot: {}",
-                    e
-                )
-            })?;
-        } else {
-            let dest_wal = dir.join("ladybug.store.wal");
+        // Its role is recorded (#209): `.wal` is active, `.wal.checkpoint` is
+        // the frozen WAL of a crashed checkpoint, and restore has to put it
+        // back under the same name. The copy gets the same bracket as the
+        // database: a WAL copied at a different instant than the database is
+        // exactly the tear this snapshot must refuse.
+        let wal_kind = wal_role_on_disk(source);
+        let dest_wal = dir.join("ladybug.store.wal");
+        if wal_kind == crate::storage::snapshot::WAL_KIND_NONE {
             if dest_wal.exists() {
                 std::fs::remove_file(&dest_wal).map_err(|e| {
                     anyhow::anyhow!(
@@ -9034,7 +9093,57 @@ impl LadybugStore {
                     )
                 })?;
             }
+        } else {
+            let wal_suffix = if wal_kind == crate::storage::snapshot::WAL_KIND_FROZEN {
+                ".wal.checkpoint"
+            } else {
+                ".wal"
+            };
+            copy_file_bracketed(
+                &append_suffix(source, wal_suffix),
+                &dest_wal,
+                "write-ahead log",
+            )?;
         }
+        // The pair must not have moved under the copies: if `<db>.wal`
+        // appeared or vanished while the snapshot ran, the recorded role
+        // describes a different instant than the copied WAL.
+        let wal_kind_after = wal_role_on_disk(source);
+        if wal_kind_after != wal_kind {
+            return Err(anyhow::anyhow!(
+                "the write-ahead log role changed during the snapshot copy ({} -> {}); the snapshot is aborted (#209)",
+                wal_kind,
+                wal_kind_after
+            ));
+        }
+
+        // The checkpoint shadow and its pinned marker are the engine's record
+        // of a checkpoint that had committed but not yet been applied (#209):
+        // without them a restored crashed store cannot replay the
+        // checkpointed prefix, so they ride along under their own names.
+        for (suffix, member, label) in [
+            (".shadow", "ladybug.store.shadow", "checkpoint shadow"),
+            (
+                ".pinned.tmp",
+                "ladybug.store.pinned.tmp",
+                "pinned-checkpoint marker",
+            ),
+        ] {
+            let from = append_suffix(source, suffix);
+            let to = dir.join(member);
+            if from.exists() {
+                copy_file_bracketed(&from, &to, label)?;
+            } else if to.exists() {
+                std::fs::remove_file(&to).map_err(|e| {
+                    anyhow::anyhow!(
+                        "could not remove the stale {} from the snapshot: {}",
+                        member,
+                        e
+                    )
+                })?;
+            }
+        }
+
         let sidecar = crate::model_choice::store_state_path(source);
         let dest_sidecar = dir.join("ladybug.store.store-state.json");
         if sidecar.exists() {
@@ -9052,12 +9161,20 @@ impl LadybugStore {
                 )
             })?;
         }
+        let provenance = if coordinated {
+            crate::storage::snapshot::PROVENANCE_COORDINATED
+        } else {
+            crate::storage::snapshot::PROVENANCE_UNVERIFIED
+        };
         let manifest = serde_json::json!({
-            "format": "neurostrata-snapshot",
-            "version": 1,
+            "format": crate::storage::snapshot::SNAPSHOT_FORMAT,
+            "version": crate::storage::snapshot::SNAPSHOT_VERSION,
             "created_at": chrono::Utc::now().to_rfc3339(),
             "source": source.display().to_string(),
             "bytes": std::fs::metadata(&target).map(|m| m.len()).unwrap_or(0),
+            "coordinated": coordinated,
+            "provenance": provenance,
+            "wal_kind": wal_kind,
         });
         std::fs::write(
             dir.join("manifest.json"),
@@ -10829,7 +10946,7 @@ impl VectorStore for LadybugStore {
         // Still held: no writer of this process reaches the copies below.
         let _write_guard = turn;
 
-        Self::export_database_files(&source, &dir)
+        Self::export_database_files_with_provenance(&source, &dir, true)
     }
 
     async fn checkpoint(&self) -> Result<()> {
@@ -26569,13 +26686,194 @@ eurostrata\src\daemon.rs",
             .expect("no-open backup succeeds on WAL-refused store (#196)");
         let report =
             crate::storage::verify_snapshot(&backup_dir).expect("verify no-open backup snapshot");
-        assert!(report.valid, "no-open backup snapshot must verify cleanly");
+        assert!(
+            report.integrity_ok,
+            "the no-open backup's bytes match their checksums"
+        );
+        assert!(
+            !report.valid,
+            "a --no-open snapshot is uncoordinated, so it is never fully valid (#209)"
+        );
+        assert_eq!(report.provenance, "unverified");
         assert!(
             backup_dir.join("ladybug.store.wal").exists(),
             "no-open backup must include the unrecovered WAL"
         );
 
         restore_wal_env(previous);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #209: a no-open export of a crashed checkpoint copies the frozen WAL
+    /// under the role it holds, plus the shadow the engine needs to replay
+    /// that checkpoint, and records that it was taken uncoordinated.
+    #[test]
+    fn no_open_export_preserves_the_frozen_wal_role_and_the_checkpoint_shadow() {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-no-open-export-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("crashed.lbug");
+        std::fs::write(&db, b"db-image").unwrap();
+        std::fs::write(append_suffix(&db, ".wal.checkpoint"), b"frozen-wal").unwrap();
+        std::fs::write(append_suffix(&db, ".shadow"), b"shadow-pages").unwrap();
+        std::fs::write(append_suffix(&db, ".pinned.tmp"), b"pinned-marker").unwrap();
+        let out = root.join("snap");
+
+        LadybugStore::export_database_files(&db, &out).expect("no-open export");
+
+        assert_eq!(
+            std::fs::read(out.join("ladybug.store.wal")).unwrap(),
+            b"frozen-wal",
+            "the frozen checkpoint WAL rides along"
+        );
+        assert_eq!(
+            std::fs::read(out.join("ladybug.store.shadow")).unwrap(),
+            b"shadow-pages",
+            "the checkpoint shadow rides along (#209)"
+        );
+        assert_eq!(
+            std::fs::read(out.join("ladybug.store.pinned.tmp")).unwrap(),
+            b"pinned-marker",
+            "the pinned-checkpoint marker rides along (#209)"
+        );
+
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(out.join("manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            manifest["wal_kind"], "frozen",
+            "the manifest records which WAL role was captured"
+        );
+        assert_eq!(
+            manifest["coordinated"], false,
+            "a --no-open export is not coordinated"
+        );
+        assert_eq!(manifest["provenance"], "unverified");
+
+        let report = crate::storage::verify_snapshot(&out).expect("integrity checks");
+        assert!(report.integrity_ok);
+        assert!(
+            !report.valid,
+            "a --no-open export must not verify as fully valid (#209)"
+        );
+        assert_eq!(report.wal_kind.as_deref(), Some("frozen"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #209: the WAL copy is bracketed by `(len, mtime)` exactly like the DB
+    /// copy. A writer that appends throughout must make the export abort
+    /// rather than pair a database image with a WAL from a different instant.
+    #[test]
+    fn a_wal_that_keeps_changing_aborts_the_export() {
+        use std::io::Write as _;
+
+        let root = std::env::temp_dir().join(format!(
+            "lbug-wal-bracket-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("live.lbug");
+        std::fs::write(&db, vec![7u8; 4096]).unwrap();
+        let wal = append_suffix(&db, ".wal");
+        std::fs::write(&wal, vec![1u8; 16 * 1024 * 1024]).unwrap();
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer_stop = Arc::clone(&stop);
+        let writer_writing = Arc::clone(&writing);
+        let writer_path = wal.clone();
+        let writer = std::thread::spawn(move || {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&writer_path)
+                .expect("open the WAL for the writer");
+            let buffer = [2u8; 256 * 1024];
+            let mut wrote = false;
+            while !writer_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                file.write_all(&buffer).expect("append to the WAL");
+                if !wrote {
+                    wrote = true;
+                    writer_writing.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                // Paced: the WAL keeps changing through every copy attempt
+                // without growing faster than the copy can read it.
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        });
+        while !writing.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::yield_now();
+        }
+
+        let out = root.join("snap");
+        let result = LadybugStore::export_database_files(&db, &out);
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().expect("the writer thread joins");
+
+        let err = result.expect_err(
+            "a WAL that changes during every copy attempt must abort the export (#209)",
+        );
+        assert!(
+            err.to_string().to_lowercase().contains("write-ahead log"),
+            "the abort names the WAL rather than the store: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #209: the bracket is one helper for the DB and the WAL. A single
+    /// observed change is retried; a second change aborts the snapshot.
+    #[test]
+    fn copy_file_bracketed_retries_once_and_aborts_on_a_second_change() {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-bracket-helper-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source");
+        std::fs::write(&source, b"first-generation").unwrap();
+
+        let converged = root.join("converged");
+        let mut changes = 0;
+        copy_file_bracketed_with(&source, &converged, "test member", |path| {
+            if changes == 0 {
+                changes += 1;
+                std::fs::write(path, b"second-generation").unwrap();
+            }
+        })
+        .expect("one observed change is retried");
+        assert_eq!(std::fs::read(&converged).unwrap(), b"second-generation");
+
+        let aborted = root.join("aborted");
+        let mut changes = 0;
+        let err = copy_file_bracketed_with(&source, &aborted, "test member", |path| {
+            changes += 1;
+            std::fs::write(path, format!("generation-{changes}")).unwrap();
+        })
+        .expect_err("a second observed change aborts the snapshot");
+        assert!(
+            err.to_string().contains("test member"),
+            "the abort names the member that never settled: {err}"
+        );
+
         let _ = std::fs::remove_dir_all(&root);
     }
 

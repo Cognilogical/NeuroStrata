@@ -2225,6 +2225,12 @@ fn cli_ingest_root(dir: &str) -> String {
 
 const DAEMON_BUSY_MESSAGE: &str = "A NeuroStrata daemon holds the database but did not answer within 500ms, so it is busy rather than gone, and opening the database from here would contend with it. Retry in a moment, or run `neurostrata-mcp shutdown` and let it finish.";
 
+/// Refusal for `backup --no-open` while the daemon lock is held (#209). The
+/// copy is uncoordinated: the mmapped database, its WAL, and the checkpoint
+/// shadow would be read at different instants while the daemon may be
+/// mid-checkpoint, producing a snapshot that verifies but cannot be restored.
+const NO_OPEN_LOCK_HELD_MESSAGE: &str = "Refusing --no-open while a process holds the store lock: the store may be mid-checkpoint, so the database, its write-ahead log, and the checkpoint shadow could be copied at different instants. Take a coordinated backup instead with `neurostrata-mcp backup <dir>` (without --no-open), or run `neurostrata-mcp shutdown` and take the no-open copy once it has exited.";
+
 /// What `hooks install` writes, and where: the scaffolded hook text — the
 /// same bytes the task-setup payload ships — into the directory git
 /// actually runs hooks from (`git_hooks_dir`, which honors
@@ -4847,6 +4853,202 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn restore_verify_accepts_an_uncoordinated_snapshot_whose_integrity_holds() {
+        // #209: a `--no-open` snapshot is exactly what an operator restores
+        // after a crash, so the restore path accepts integrity even when the
+        // snapshot is not coordinated. It must not, however, claim full
+        // validity: the pair was captured without the store lock.
+        let (root, snapshot_dir) = restore_verify_fixture("uncoordinated");
+        let manifest = std::fs::read_to_string(snapshot_dir.join("manifest.json")).unwrap();
+        let manifest = manifest.replacen(
+            "{\"format\"",
+            "{\"coordinated\":false,\"provenance\":\"unverified\",\"wal_kind\":\"none\",\"format\"",
+            1,
+        );
+        std::fs::write(snapshot_dir.join("manifest.json"), manifest).unwrap();
+        crate::storage::snapshot::write_checksums(&snapshot_dir).unwrap();
+
+        let report = crate::storage::verify_snapshot(&snapshot_dir).expect("integrity holds");
+        assert!(report.integrity_ok);
+        assert!(
+            !report.valid,
+            "an uncoordinated snapshot is not fully valid (#209)"
+        );
+        ensure_snapshot_verified(&snapshot_dir)
+            .expect("an uncoordinated but intact snapshot stays restorable");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn no_open_backup_refuses_while_the_daemon_lock_is_held() {
+        // #209: `--no-open` used to skip both coordination gates and copy the
+        // mmapped database and its WAL at different instants. While a process
+        // holds the store lock the store may be mid-checkpoint, so the
+        // uncoordinated file copy is refused; a quiescent store still exports.
+        let root = std::env::temp_dir().join(format!("ns-no-open-lock-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("ladybug.store");
+
+        let lock = open_daemon_lock(&db).expect("create the daemon lock");
+        lock.lock().expect("hold the daemon lock");
+        assert!(
+            daemon_holds_lock(&db),
+            "precondition: the lock probe sees the holder"
+        );
+
+        let err = refuse_no_open_when_locked(daemon_holds_lock(&db))
+            .expect_err("--no-open must be refused while the store lock is held");
+        assert!(
+            err.to_string().contains("--no-open"),
+            "the refusal names the flag: {err}"
+        );
+        assert!(
+            err.to_string().contains("without --no-open"),
+            "the refusal names the coordinated route: {err}"
+        );
+        drop(lock);
+
+        let quiescent = root.join("quiescent.store");
+        refuse_no_open_when_locked(daemon_holds_lock(&quiescent))
+            .expect("a quiescent store still backs up without opening");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_backup_arm_refuses_no_open_before_any_file_copy() {
+        // The refusal has to run before the first `export_database_files`
+        // call: a check that fires after the copy is not a gate (#209).
+        let src = include_str!("main.rs");
+        // Match the dispatch arms by their indentation: the test's own
+        // pattern literals are un-indented, so they cannot shadow these.
+        let arm = src
+            .split("\n            Commands::Backup { dir, no_open } => {")
+            .nth(1)
+            .expect("the Backup arm is dispatched");
+        let arm = &arm[..arm
+            .find("\n            Commands::Restore { dir, into } => {")
+            .expect("Restore follows Backup")];
+        let gate = arm
+            .find("refuse_no_open_when_locked")
+            .expect("the --no-open arm is gated by the store lock (#209)");
+        let first_copy = arm
+            .find("export_database_files")
+            .expect("the no-open arm exports the database files");
+        assert!(
+            gate < first_copy,
+            "the --no-open refusal must run before the first file copy"
+        );
+    }
+
+    fn restore_companion_path(target: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+        let mut path = target.as_os_str().to_os_string();
+        path.push(suffix);
+        std::path::PathBuf::from(path)
+    }
+
+    #[test]
+    fn restore_copy_preserves_a_frozen_wal_and_the_checkpoint_shadow() {
+        // #209: a snapshot of a crashed checkpoint restores its WAL under the
+        // frozen name, together with the shadow and pinned marker the engine
+        // needs to replay the checkpointed prefix.
+        let (root, snapshot_dir, target) = restore_copy_fixture("frozen");
+        std::fs::write(snapshot_dir.join("ladybug.store.wal"), b"frozen-wal").unwrap();
+        std::fs::write(snapshot_dir.join("ladybug.store.shadow"), b"shadow-pages").unwrap();
+        std::fs::write(
+            snapshot_dir.join("ladybug.store.pinned.tmp"),
+            b"pinned-marker",
+        )
+        .unwrap();
+        std::fs::write(
+            snapshot_dir.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"coordinated\":false,\"provenance\":\"unverified\",\"wal_kind\":\"frozen\"}}",
+                crate::storage::snapshot::SNAPSHOT_FORMAT,
+                crate::storage::snapshot::SNAPSHOT_VERSION
+            ),
+        )
+        .unwrap();
+
+        copy_snapshot_into_place(&snapshot_dir, &target).expect("restore copy");
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"snapshot-db");
+        assert_eq!(
+            std::fs::read(restore_companion_path(&target, ".wal.checkpoint")).unwrap(),
+            b"frozen-wal",
+            "a frozen checkpoint WAL is restored under its frozen name (#209)"
+        );
+        assert!(
+            !restore_companion_path(&target, ".wal").exists(),
+            "a frozen WAL must never be restored as the active WAL"
+        );
+        assert_eq!(
+            std::fs::read(restore_companion_path(&target, ".shadow")).unwrap(),
+            b"shadow-pages",
+            "the checkpoint shadow is restored beside the store"
+        );
+        assert_eq!(
+            std::fs::read(restore_companion_path(&target, ".pinned.tmp")).unwrap(),
+            b"pinned-marker",
+            "the pinned-checkpoint marker is restored beside the store"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restore_copy_keeps_an_active_wal_active() {
+        // Legacy snapshots carry no `wal_kind`; their WAL was copied from the
+        // active `<db>.wal`, so it restores under that name as before.
+        let (root, snapshot_dir, target) = restore_copy_fixture("active");
+        std::fs::write(snapshot_dir.join("ladybug.store.wal"), b"active-wal").unwrap();
+
+        copy_snapshot_into_place(&snapshot_dir, &target).expect("restore copy");
+
+        assert_eq!(
+            std::fs::read(restore_companion_path(&target, ".wal")).unwrap(),
+            b"active-wal"
+        );
+        assert!(!restore_companion_path(&target, ".wal.checkpoint").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restore_copy_drops_a_stale_active_wal_when_the_snapshot_wal_is_frozen() {
+        // A leftover active `.wal` beside the target would pair with the
+        // restored frozen `.wal.checkpoint` and make the engine refuse the
+        // store, so the restore set owns both names (#209).
+        let (root, snapshot_dir, target) = restore_copy_fixture("stale-active");
+        std::fs::write(snapshot_dir.join("ladybug.store.wal"), b"frozen-wal").unwrap();
+        std::fs::write(
+            snapshot_dir.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"coordinated\":false,\"provenance\":\"unverified\",\"wal_kind\":\"frozen\"}}",
+                crate::storage::snapshot::SNAPSHOT_FORMAT,
+                crate::storage::snapshot::SNAPSHOT_VERSION
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            restore_companion_path(&target, ".wal"),
+            b"orphan-active-wal",
+        )
+        .unwrap();
+
+        copy_snapshot_into_place(&snapshot_dir, &target).expect("restore copy");
+
+        assert!(
+            !restore_companion_path(&target, ".wal").exists(),
+            "a stale active WAL must not survive a frozen-WAL restore"
+        );
+        assert_eq!(
+            std::fs::read(restore_companion_path(&target, ".wal.checkpoint")).unwrap(),
+            b"frozen-wal"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 /// Where every CLI HTTP call goes. A constant because `bus-metrics` names it
@@ -5017,6 +5219,20 @@ fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
         .build()?)
 }
 
+/// Refuse an uncoordinated file-copy backup while a process holds the store
+/// lock (#209).
+///
+/// `--no-open` skips the daemon gates and copies the mmapped database, its
+/// WAL, and the checkpoint shadow straight from disk. While a daemon holds the
+/// lock it may be mid-checkpoint, so those files would be captured at
+/// different instants. A coordinated backup routes through the daemon instead.
+fn refuse_no_open_when_locked(lock_held: bool) -> anyhow::Result<()> {
+    if lock_held {
+        return Err(anyhow::anyhow!("{}", NO_OPEN_LOCK_HELD_MESSAGE));
+    }
+    Ok(())
+}
+
 /// Verify a snapshot directory before a restore copies anything from it.
 ///
 /// Export writes `manifest.json` and `checksums.json` precisely so an
@@ -5027,7 +5243,20 @@ fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
 /// verification completed but judged the snapshot invalid.
 fn ensure_snapshot_verified(dir: &std::path::Path) -> anyhow::Result<()> {
     match crate::storage::verify_snapshot(dir) {
-        Ok(report) if report.valid => Ok(()),
+        Ok(report) if report.integrity_ok => {
+            // #209: an uncoordinated (`--no-open`) snapshot is precisely what
+            // an operator restores after a crash, so integrity is the bar for
+            // restoring. It is not a full `valid` verdict, and the restore
+            // says so rather than silently promoting the snapshot.
+            if !report.coordinated {
+                eprintln!(
+                    "WARN: snapshot in {} is uncoordinated ({}): its bytes match their checksums, but it was taken without the store lock, so the database, WAL, and shadow came from separate instants.",
+                    dir.display(),
+                    report.provenance
+                );
+            }
+            Ok(())
+        }
         Ok(report) => Err(anyhow::anyhow!(
             "{}",
             report
@@ -5039,178 +5268,184 @@ fn ensure_snapshot_verified(dir: &std::path::Path) -> anyhow::Result<()> {
 }
 
 /// Copy a snapshot's files into place for a restore: the store file, its
-/// WAL when the snapshot carries one, and its store-state sidecar when it
-/// carries one. Extracted from the Restore arm so the copy logic is
-/// testable without driving the whole CLI.
+/// WAL under the role the snapshot recorded, the checkpoint shadow and its
+/// pinned marker, and the store-state sidecar. Extracted from the Restore arm
+/// so the copy logic is testable without driving the whole CLI.
 ///
 /// The copies are staged at temporary sibling paths (`<target>.restore-tmp-<pid>`)
 /// and renamed into place only after the whole set copied: a companion
 /// copy that fails must not leave the store file (or a half-written
 /// companion) at the target, and a failed restore must not trample a
 /// pre-existing store's companions (issue #87).
+///
+/// Companion names belong to the restore set as a group (#209): a snapshot
+/// whose WAL was frozen restores `<db>.wal.checkpoint`, so a stale
+/// `<db>.wal` at the target is removed with the set rather than left to pair
+/// with it. Snapshots written before #209 carry no `wal_kind`; their WAL was
+/// copied from the active `<db>.wal`, so they restore under that name.
 fn copy_snapshot_into_place(
     snapshot_dir: &std::path::Path,
     target: &std::path::Path,
 ) -> anyhow::Result<()> {
     let pid = std::process::id();
-    let stage_path = |suffix: &str| {
-        let mut staged = target.as_os_str().to_os_string();
-        staged.push(suffix);
-        std::path::PathBuf::from(staged)
-    };
-    let staged_store = stage_path(&format!(".restore-tmp-{pid}"));
-    let staged_wal = stage_path(&format!(".wal.restore-tmp-{pid}"));
-    let staged_sidecar = stage_path(&format!(".store-state.json.restore-tmp-{pid}"));
-    // On any failure the staged set is removed as a unit and nothing at
-    // the target paths is touched.
-    let cleanup_staged = |produced_wal: bool, produced_sidecar: bool| {
-        let _ = std::fs::remove_file(&staged_store);
-        if produced_wal {
-            let _ = std::fs::remove_file(&staged_wal);
-        }
-        if produced_sidecar {
-            let _ = std::fs::remove_file(&staged_sidecar);
-        }
+    let appended = |base: &std::path::Path, suffix: &str| {
+        let mut os = base.as_os_str().to_os_string();
+        os.push(suffix);
+        std::path::PathBuf::from(os)
     };
 
-    let snapshot = snapshot_dir.join("ladybug.store");
-    if let Err(e) = std::fs::copy(&snapshot, &staged_store) {
-        cleanup_staged(false, false);
-        return Err(e.into());
-    }
-    let mut wal = snapshot.clone().into_os_string();
-    wal.push(".wal");
-    let wal = std::path::PathBuf::from(wal);
-    let mut produced_wal = false;
-    if wal.exists() {
-        if let Err(e) = std::fs::copy(&wal, &staged_wal) {
-            cleanup_staged(true, false);
-            return Err(e.into());
-        }
-        produced_wal = true;
-    }
-    let snapshot_sidecar = snapshot_dir.join("ladybug.store.store-state.json");
-    let mut produced_sidecar = false;
-    if snapshot_sidecar.exists() {
-        if let Err(e) = std::fs::copy(&snapshot_sidecar, &staged_sidecar) {
-            cleanup_staged(produced_wal, true);
-            return Err(e.into());
-        }
-        produced_sidecar = true;
-    }
-
-    // Every staged copy succeeded: the set commits now. The commit is
-    // rollback-safe (issue #95): if a rename fails after an earlier one
-    // succeeded, the partially moved target files are removed and any
-    // pre-existing companions stashed in Step A are restored, so the
-    // target is left exactly as it was before this call. Stale
-    // companions the snapshot does not carry are removed by moving them
-    // aside in Step A and discarding them in Step C — not before, so a
-    // failed restore keeps whatever happened to sit at the companion
-    // paths.
-    let target_wal = {
-        let mut path = target.as_os_str().to_os_string();
-        path.push(".wal");
-        std::path::PathBuf::from(path)
+    // Which name the snapshot's WAL belongs under (#209). Absent kind means a
+    // legacy snapshot, whose WAL was the active `.wal`.
+    let wal_suffix = match snapshot_wal_kind(snapshot_dir)?.as_deref() {
+        Some(crate::storage::snapshot::WAL_KIND_FROZEN) => ".wal.checkpoint",
+        Some(crate::storage::snapshot::WAL_KIND_NONE) => "",
+        _ => ".wal",
     };
-    let target_sidecar = crate::model_choice::store_state_path(target);
 
-    // Step A: stash any pre-existing orphan companions aside, and refuse
-    // a directory at either path BEFORE touching target. A directory at
-    // the WAL or sidecar path means remove_file/rename cannot succeed, so
-    // the commit would fail partway and leave target half-committed.
-    let prev_wal = target.with_extension(format!("wal.prev-tmp-{pid}"));
-    if target_wal.exists() {
-        if target_wal.is_dir() {
-            cleanup_staged(produced_wal, produced_sidecar);
+    // (snapshot member, target path) for every file the restore may place.
+    let mut members: Vec<(std::path::PathBuf, std::path::PathBuf)> =
+        vec![(snapshot_dir.join("ladybug.store"), target.to_path_buf())];
+    if !wal_suffix.is_empty() {
+        members.push((
+            snapshot_dir.join("ladybug.store.wal"),
+            appended(target, wal_suffix),
+        ));
+    }
+    members.push((
+        snapshot_dir.join("ladybug.store.store-state.json"),
+        crate::model_choice::store_state_path(target),
+    ));
+    members.push((
+        snapshot_dir.join("ladybug.store.shadow"),
+        appended(target, ".shadow"),
+    ));
+    members.push((
+        snapshot_dir.join("ladybug.store.pinned.tmp"),
+        appended(target, ".pinned.tmp"),
+    ));
+
+    // Every companion name the target could hold, whether or not this
+    // snapshot produces it: stale siblings of the wrong role, or from an
+    // older store, must not survive the commit.
+    let companion_suffixes = [
+        ".wal",
+        ".wal.checkpoint",
+        ".store-state.json",
+        ".shadow",
+        ".pinned.tmp",
+    ];
+
+    // Step A0: refuse a directory at any companion path BEFORE touching
+    // anything. remove_file/rename cannot succeed there, so the commit would
+    // fail partway and leave the target half-committed.
+    for suffix in companion_suffixes {
+        let path = appended(target, suffix);
+        if path.is_dir() {
             return Err(anyhow::anyhow!(
-                "the restore target's write-ahead log path is a directory: {}",
-                target_wal.display()
+                "the restore target's {} path is a directory: {}",
+                suffix,
+                path.display()
             ));
         }
-        if let Err(e) = std::fs::rename(&target_wal, &prev_wal) {
-            cleanup_staged(produced_wal, produced_sidecar);
+    }
+
+    // Step A: stage every member the snapshot carries beside the target.
+    let mut staged: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+    for (index, (from, to)) in members.iter().enumerate() {
+        if index > 0 && !from.exists() {
+            continue;
+        }
+        let stage = appended(to, &format!(".restore-tmp-{pid}"));
+        if let Err(e) = std::fs::copy(from, &stage) {
+            for (_, staged_path) in &staged {
+                let _ = std::fs::remove_file(staged_path);
+            }
+            let _ = std::fs::remove_file(&stage);
+            return Err(e.into());
+        }
+        staged.push((to.clone(), stage));
+    }
+
+    // Step A2: stash any pre-existing companion aside so the commit can
+    // replace it or drop it, and a refused commit can put it back.
+    let mut stashed: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+    for suffix in companion_suffixes {
+        let path = appended(target, suffix);
+        if !path.exists() {
+            continue;
+        }
+        let prev = appended(target, &format!("{}.prev-tmp-{pid}", suffix));
+        if let Err(e) = std::fs::rename(&path, &prev) {
+            for (_, staged_path) in &staged {
+                let _ = std::fs::remove_file(staged_path);
+            }
+            for (prev_path, dest) in &stashed {
+                let _ = std::fs::rename(prev_path, dest);
+            }
             return Err(anyhow::anyhow!(
-                "could not move the existing write-ahead log out of the way: {}",
+                "could not move the existing {} out of the way: {}",
+                suffix,
                 e
             ));
         }
-    }
-    let prev_sidecar = target.with_extension(format!("store-state.json.prev-tmp-{pid}"));
-    if target_sidecar.exists() {
-        if target_sidecar.is_dir() {
-            // Restore the stashed WAL (if any) before bailing: the
-            // pre-existing target_wal must survive a sidecar-directory
-            // refusal untouched.
-            if prev_wal.exists() {
-                let _ = std::fs::rename(&prev_wal, &target_wal);
-            }
-            cleanup_staged(produced_wal, produced_sidecar);
-            return Err(anyhow::anyhow!(
-                "the restore target's store-state sidecar path is a directory: {}",
-                target_sidecar.display()
-            ));
-        }
-        if let Err(e) = std::fs::rename(&target_sidecar, &prev_sidecar) {
-            if prev_wal.exists() {
-                let _ = std::fs::rename(&prev_wal, &target_wal);
-            }
-            cleanup_staged(produced_wal, produced_sidecar);
-            return Err(anyhow::anyhow!(
-                "could not move the existing store-state sidecar out of the way: {}",
-                e
-            ));
-        }
+        stashed.push((prev, path));
     }
 
     // Step B: commit the staged set with full rollback on error.
-    let rollback_commit = || {
+    let rollback = |committed: usize| {
         // Remove any target files created by a partial commit.
-        let _ = std::fs::remove_file(target);
-        if produced_wal {
-            let _ = std::fs::remove_file(&target_wal);
-        }
-        if produced_sidecar {
-            let _ = std::fs::remove_file(&target_sidecar);
+        for (dest, _) in staged.iter().take(committed) {
+            let _ = std::fs::remove_file(dest);
         }
         // Restore stashed companions, if any.
-        if prev_wal.exists() {
-            let _ = std::fs::rename(&prev_wal, &target_wal);
+        for (prev, dest) in &stashed {
+            let _ = std::fs::rename(prev, dest);
         }
-        if prev_sidecar.exists() {
-            let _ = std::fs::rename(&prev_sidecar, &target_sidecar);
+        for (_, stage) in &staged {
+            let _ = std::fs::remove_file(stage);
         }
-        cleanup_staged(produced_wal, produced_sidecar);
     };
 
-    std::fs::rename(&staged_store, target).map_err(|e| {
-        rollback_commit();
-        anyhow::anyhow!("could not move the staged store into place: {}", e)
-    })?;
-    if produced_wal {
-        std::fs::rename(&staged_wal, &target_wal).map_err(|e| {
-            rollback_commit();
-            anyhow::anyhow!(
-                "could not move the staged write-ahead log into place: {}",
+    for (index, (dest, stage)) in staged.iter().enumerate() {
+        if let Err(e) = std::fs::rename(stage, dest) {
+            rollback(index);
+            return Err(anyhow::anyhow!(
+                "could not move the staged {} into place: {}",
+                dest.display(),
                 e
-            )
-        })?;
-    }
-    if produced_sidecar {
-        std::fs::rename(&staged_sidecar, &target_sidecar).map_err(|e| {
-            rollback_commit();
-            anyhow::anyhow!(
-                "could not move the staged store-state sidecar into place: {}",
-                e
-            )
-        })?;
+            ));
+        }
     }
 
     // Step C: the commit succeeded; the stashed companions are now
     // superseded by the new set, so discard them.
-    let _ = std::fs::remove_file(&prev_wal);
-    let _ = std::fs::remove_file(&prev_sidecar);
+    for (prev, _) in &stashed {
+        let _ = std::fs::remove_file(prev);
+    }
     Ok(())
+}
+
+/// The WAL role a snapshot recorded in its manifest (#209): `active` or
+/// `frozen`, or `None` for snapshots written before the field existed (and for
+/// a snapshot directory with no manifest at all, which `ensure_snapshot_verified`
+/// refuses on the real restore path anyway).
+fn snapshot_wal_kind(snapshot_dir: &std::path::Path) -> anyhow::Result<Option<String>> {
+    let manifest_path = snapshot_dir.join("manifest.json");
+    if !manifest_path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(&manifest_path).map_err(|e| {
+        anyhow::anyhow!(
+            "could not read the snapshot manifest {:?} to learn its WAL role: {}",
+            manifest_path,
+            e
+        )
+    })?;
+    let manifest: serde_json::Value = serde_json::from_str(&raw)?;
+    Ok(manifest
+        .get("wal_kind")
+        .and_then(|v| v.as_str())
+        .map(str::to_string))
 }
 
 fn main() -> anyhow::Result<()> {
@@ -5764,6 +5999,16 @@ async fn run() -> anyhow::Result<()> {
                     std::process::exit(1);
                 }
                 if no_open {
+                    // #209: an uncoordinated copy is only honest when nobody
+                    // else owns the store. While the daemon lock is held the
+                    // database, its WAL, and the checkpoint shadow can be
+                    // read at different instants, which is exactly the
+                    // verify-but-cannot-restore pair this refuses. A
+                    // coordinated backup goes through the daemon above.
+                    if let Err(e) = refuse_no_open_when_locked(daemon_holds_lock(&config.db_path)) {
+                        eprintln!("{}", e);
+                        std::process::exit(1);
+                    }
                     LadybugStore::export_database_files(
                         &config.db_path,
                         std::path::Path::new(&dir),
@@ -5849,9 +6094,15 @@ async fn run() -> anyhow::Result<()> {
                         // #87); the snapshot itself is untouched and the
                         // restore can be retried.
                         let _ = std::fs::remove_file(&target);
-                        let mut target_wal = target.as_os_str().to_os_string();
-                        target_wal.push(".wal");
-                        let _ = std::fs::remove_file(std::path::PathBuf::from(target_wal));
+                        // Every companion the restore set may have placed,
+                        // in either WAL role plus the checkpoint state (#209):
+                        // a failed restore leaves the target absent rather
+                        // than parking an unopenable partial set.
+                        for suffix in [".wal", ".wal.checkpoint", ".shadow", ".pinned.tmp"] {
+                            let mut companion = target.as_os_str().to_os_string();
+                            companion.push(suffix);
+                            let _ = std::fs::remove_file(std::path::PathBuf::from(companion));
+                        }
                         let _ =
                             std::fs::remove_file(crate::model_choice::store_state_path(&target));
                         return Err(e);
@@ -6509,16 +6760,22 @@ async fn run() -> anyhow::Result<()> {
                         }
                         StorageCommands::VerifySnapshot { dir } => {
                             match crate::storage::verify_snapshot(std::path::Path::new(&dir)) {
+                                Ok(report) if report.valid => {
+                                    println!("Verified snapshot in {}: valid", dir);
+                                }
+                                Ok(report) if report.integrity_ok => {
+                                    // #209: the bytes match their checksums,
+                                    // but the snapshot was taken without the
+                                    // store lock. That is restorable and it is
+                                    // not a full `valid` verdict.
+                                    println!(
+                                        "Verified snapshot in {}: integrity ok, uncoordinated ({}) -- the bytes match their checksums, but the database, WAL, and checkpoint state were captured without the store lock, so this is not a coordinated snapshot",
+                                        dir, report.provenance
+                                    );
+                                }
                                 Ok(report) => {
-                                    if report.valid {
-                                        println!("Verified snapshot in {}: valid", dir);
-                                    } else {
-                                        eprintln!(
-                                            "Snapshot verification failed: {:?}",
-                                            report.error
-                                        );
-                                        std::process::exit(1);
-                                    }
+                                    eprintln!("Snapshot verification failed: {:?}", report.error);
+                                    std::process::exit(1);
                                 }
                                 Err(e) => {
                                     eprintln!("Snapshot verification failed: {}", e);

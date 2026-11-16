@@ -9,6 +9,23 @@ use sha2::{Digest, Sha256};
 pub const SNAPSHOT_FORMAT: &str = "neurostrata-snapshot";
 pub const SNAPSHOT_VERSION: u32 = 1;
 
+/// Manifest provenance (#209).
+///
+/// `coordinated` means the export ran while this process held the store (the
+/// online `export_database` path, checkpoint included), so the database and
+/// its companions were captured under one lock. `unverified` means the files
+/// were copied straight off disk (`backup --no-open`, or its fallback when
+/// strict WAL verification refuses the open): the bytes are checksummed, but
+/// nothing proves the database, WAL, and shadow came from the same instant.
+pub const PROVENANCE_COORDINATED: &str = "coordinated";
+pub const PROVENANCE_UNVERIFIED: &str = "unverified";
+
+/// The WAL role a snapshot captured (#209): the active `<db>.wal`, the frozen
+/// `<db>.wal.checkpoint` a crashed checkpoint left behind, or no WAL at all.
+pub const WAL_KIND_ACTIVE: &str = "active";
+pub const WAL_KIND_FROZEN: &str = "frozen";
+pub const WAL_KIND_NONE: &str = "none";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StorageHygieneConfig {
@@ -546,11 +563,29 @@ pub struct SnapshotChecksums {
     /// files) deserialize and verify exactly as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_state_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotVerifyReport {
+    /// Fully valid: the checksums match **and** the snapshot was taken under
+    /// the store lock. Uncoordinated (`--no-open`) snapshots never set this.
     pub valid: bool,
+    /// The copied bytes match `checksums.json` (#209).
+    #[serde(default)]
+    pub integrity_ok: bool,
+    /// The manifest records that a daemon held the store for the export.
+    #[serde(default)]
+    pub coordinated: bool,
+    /// `coordinated` or `unverified`, as recorded in the manifest.
+    #[serde(default)]
+    pub provenance: String,
+    /// The WAL role the snapshot captured (`active`, `frozen`, or `none`).
+    #[serde(default)]
+    pub wal_kind: Option<String>,
     pub dir: PathBuf,
     pub checksums: Option<SnapshotChecksums>,
     pub error: Option<String>,
@@ -683,12 +718,29 @@ pub fn write_checksums(dir: &Path) -> Result<SnapshotChecksums, SnapshotError> {
     } else {
         None
     };
+    // The checkpoint shadow and its pinned marker are part of a crashed
+    // checkpoint's recovery state (#209): a tampered or truncated shadow must
+    // fail verification, not restore as a torn checkpoint.
+    let shadow = dir.join("ladybug.store.shadow");
+    let shadow_sha = if shadow.exists() {
+        Some(sha256_file(&shadow)?)
+    } else {
+        None
+    };
+    let pinned = dir.join("ladybug.store.pinned.tmp");
+    let pinned_sha = if pinned.exists() {
+        Some(sha256_file(&pinned)?)
+    } else {
+        None
+    };
 
     let checksums = SnapshotChecksums {
         ladybug_store_sha256: ladybug_sha,
         wal_sha256: wal_sha,
         manifest_sha256: manifest_sha,
         store_state_sha256: store_state_sha,
+        shadow_sha256: shadow_sha,
+        pinned_sha256: pinned_sha,
     };
 
     let checksums_path = dir.join("checksums.json");
@@ -727,6 +779,35 @@ pub fn verify_snapshot(dir: &Path) -> Result<SnapshotVerifyReport, SnapshotError
         )));
     }
 
+    // Provenance (#209). Snapshots written before this field existed carry
+    // neither flag; they verify exactly as before, so an old backup does not
+    // turn invalid merely because the field was added.
+    let coordinated = manifest
+        .get("coordinated")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let provenance = manifest
+        .get("provenance")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if coordinated {
+                PROVENANCE_COORDINATED.to_string()
+            } else {
+                PROVENANCE_UNVERIFIED.to_string()
+            }
+        });
+    let wal_kind = match manifest.get("wal_kind").and_then(|v| v.as_str()) {
+        Some(kind @ (WAL_KIND_ACTIVE | WAL_KIND_FROZEN | WAL_KIND_NONE)) => Some(kind.to_string()),
+        Some(other) => {
+            return Err(SnapshotError::InvalidManifest(format!(
+                "unrecognized wal_kind {:?}: expected {}, {} or {}",
+                other, WAL_KIND_ACTIVE, WAL_KIND_FROZEN, WAL_KIND_NONE
+            )))
+        }
+        None => None,
+    };
+
     let checksums_path = dir.join("checksums.json");
     if !checksums_path.exists() {
         return Err(SnapshotError::MissingFile(
@@ -764,7 +845,12 @@ pub fn verify_snapshot(dir: &Path) -> Result<SnapshotVerifyReport, SnapshotError
         });
     }
 
-    let wal_mentioned = checksums.wal_sha256.is_some() || wal.exists();
+    let wal_mentioned = checksums.wal_sha256.is_some()
+        || wal.exists()
+        || matches!(
+            wal_kind.as_deref(),
+            Some(WAL_KIND_ACTIVE) | Some(WAL_KIND_FROZEN)
+        );
     if wal_mentioned {
         if !wal.exists() {
             return Err(SnapshotError::ChecksumMismatch {
@@ -806,6 +892,42 @@ pub fn verify_snapshot(dir: &Path) -> Result<SnapshotVerifyReport, SnapshotError
         }
     }
 
+    // The checkpoint shadow and pinned marker, under the same rule as the
+    // sidecar: a snapshot that carries one (or whose checksums name one) must
+    // produce it intact (#209).
+    for (name, path, recorded) in [
+        (
+            "ladybug.store.shadow",
+            dir.join("ladybug.store.shadow"),
+            checksums.shadow_sha256.as_ref(),
+        ),
+        (
+            "ladybug.store.pinned.tmp",
+            dir.join("ladybug.store.pinned.tmp"),
+            checksums.pinned_sha256.as_ref(),
+        ),
+    ] {
+        let mentioned = recorded.is_some() || path.exists();
+        if !mentioned {
+            continue;
+        }
+        if !path.exists() {
+            return Err(SnapshotError::ChecksumMismatch {
+                file: name.to_string(),
+                expected: recorded.cloned().unwrap_or_default(),
+                actual: "<missing>".into(),
+            });
+        }
+        let computed = sha256_file(&path)?;
+        if Some(&computed) != recorded {
+            return Err(SnapshotError::ChecksumMismatch {
+                file: name.to_string(),
+                expected: recorded.cloned().unwrap_or_default(),
+                actual: computed,
+            });
+        }
+    }
+
     // If a zstd-compressed manifest copy is present, verify it decompresses
     // within the bounded snapshot size cap AND that its content matches the
     // plain `manifest.json` bytes: a compressed copy drifting from the manifest
@@ -829,7 +951,15 @@ pub fn verify_snapshot(dir: &Path) -> Result<SnapshotVerifyReport, SnapshotError
     }
 
     Ok(SnapshotVerifyReport {
-        valid: true,
+        // The bytes match their checksums (every check above returned Err
+        // otherwise), but only a coordinated snapshot earns the `valid`
+        // verdict: an uncoordinated pair cannot prove its members came from
+        // one instant (#209).
+        valid: coordinated,
+        integrity_ok: true,
+        coordinated,
+        provenance,
+        wal_kind,
         dir: dir.to_path_buf(),
         checksums: Some(checksums),
         error: None,
@@ -1305,6 +1435,102 @@ mod tests {
             result,
             Err(SnapshotError::InvalidManifest(..))
         ));
+    }
+
+    #[test]
+    fn an_uncoordinated_manifest_never_verifies_as_fully_valid() {
+        // #209: a `--no-open` export records `coordinated: false` /
+        // `provenance: "unverified"`. Its bytes still have to match
+        // `checksums.json`, but the snapshot was captured without the store
+        // lock, so `verify-snapshot` must not call it fully `valid`.
+        let d = temp_dir("uncoordinated");
+        write_store(&d);
+        fs::write(
+            d.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"coordinated\":false,\"provenance\":\"unverified\",\"wal_kind\":\"active\"}}",
+                SNAPSHOT_FORMAT, SNAPSHOT_VERSION
+            ),
+        )
+        .unwrap();
+        fs::write(d.join("ladybug.store.wal"), b"wal-bytes").unwrap();
+        write_checksums(&d).unwrap();
+
+        let report = verify_snapshot(&d).expect("the copied bytes still verify");
+        assert!(report.integrity_ok, "the checksums still match");
+        assert!(
+            !report.coordinated,
+            "the manifest says it was uncoordinated"
+        );
+        assert!(
+            !report.valid,
+            "an uncoordinated snapshot must not report as fully valid (#209)"
+        );
+        assert_eq!(report.provenance, "unverified");
+        assert_eq!(report.wal_kind.as_deref(), Some("active"));
+    }
+
+    #[test]
+    fn a_coordinated_manifest_still_verifies_as_valid() {
+        let d = temp_dir("coordinated");
+        write_store(&d);
+        fs::write(
+            d.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"coordinated\":true,\"provenance\":\"coordinated\",\"wal_kind\":\"none\"}}",
+                SNAPSHOT_FORMAT, SNAPSHOT_VERSION
+            ),
+        )
+        .unwrap();
+        write_checksums(&d).unwrap();
+
+        let report = verify_snapshot(&d).expect("a coordinated snapshot verifies");
+        assert!(report.integrity_ok);
+        assert!(report.coordinated);
+        assert!(
+            report.valid,
+            "coordination is what buys the `valid` verdict"
+        );
+        assert_eq!(report.provenance, "coordinated");
+    }
+
+    #[test]
+    fn the_checkpoint_shadow_and_pinned_marker_are_snapshot_members() {
+        // #209: a crashed checkpoint leaves `<db>.shadow` and `<db>.pinned.tmp`
+        // beside the WAL. They are part of the snapshot, so they are
+        // checksummed like every other member and a tampered shadow fails
+        // verification instead of restoring as a torn checkpoint.
+        let d = temp_dir("shadow-members");
+        write_store(&d);
+        fs::write(
+            d.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"coordinated\":false,\"provenance\":\"unverified\",\"wal_kind\":\"frozen\"}}",
+                SNAPSHOT_FORMAT, SNAPSHOT_VERSION
+            ),
+        )
+        .unwrap();
+        fs::write(d.join("ladybug.store.wal"), b"frozen-wal").unwrap();
+        fs::write(d.join("ladybug.store.shadow"), b"shadow-pages").unwrap();
+        fs::write(d.join("ladybug.store.pinned.tmp"), b"pinned-marker").unwrap();
+
+        let checksums = write_checksums(&d).unwrap();
+        assert!(
+            checksums.shadow_sha256.is_some(),
+            "the checkpoint shadow is checksummed"
+        );
+        assert!(
+            checksums.pinned_sha256.is_some(),
+            "the pinned-checkpoint marker is checksummed"
+        );
+        verify_snapshot(&d).expect("an intact checkpoint set verifies");
+
+        fs::write(d.join("ladybug.store.shadow"), b"tampered-pages").unwrap();
+        let result = verify_snapshot(&d);
+        assert!(
+            matches!(result, Err(SnapshotError::ChecksumMismatch { .. })),
+            "a tampered shadow fails verification: {result:?}"
+        );
     }
 
     #[test]

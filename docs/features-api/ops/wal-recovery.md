@@ -39,9 +39,29 @@ before recovery.
    neurostrata-mcp storage verify-snapshot /path/to/pre-recovery-backup
    ```
    `backup --no-open` (and `backup` automatically when strict WAL verification
-   refuses an open) copies `<db>`, `<db>.wal` / `<db>.wal.checkpoint`, and
+   refuses an open) copies `<db>`, `<db>.wal` / `<db>.wal.checkpoint`, the
+   checkpoint state (`<db>.shadow` and `<db>.pinned.tmp` when present), and
    `<db>.store-state.json` directly into a checksummed snapshot directory
    without opening or checkpointing the store.
+
+   `--no-open` **refuses while a process holds the store lock** (`#209`): the
+   store may be mid-checkpoint, so the database, its WAL, and the shadow would
+   be copied at different instants. Run `backup <dir>` without `--no-open` to
+   have the daemon take a coordinated snapshot, or `shutdown` first — the
+   recovery path in this runbook runs with the daemon down, so it is not
+   affected.
+
+   The snapshot manifest records `coordinated: false` and
+   `provenance: "unverified"` for these copies, plus `wal_kind`
+   (`active` / `frozen` / `none`). `storage verify-snapshot` prints
+   `integrity ok, uncoordinated` for them rather than `valid`: the bytes match
+   their checksums, but nothing proves they came from one instant. They remain
+   restorable, and `restore` warns when it places one.
+
+   The WAL is always stored as `ladybug.store.wal` inside the snapshot; its
+   `wal_kind` decides where `restore` puts it back (`<db>.wal` for `active`,
+   `<db>.wal.checkpoint` for `frozen`), together with the shadow and pinned
+   marker when the snapshot carries them.
 
 3. **Recover committed WAL prefix records with lenient tail truncation (operator opt-in):**
    ```sh
