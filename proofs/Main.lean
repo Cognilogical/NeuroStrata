@@ -210,10 +210,18 @@ def main : IO Unit := do
     , ("mutate_under_limit", .mutate 1 5)
     , ("mutate_at_limit", .mutate 5 5)
     , ("record_breath", .recordBreathNote)
+    , ("pre_checkpoint_ok", .triggerPreCheckpoint true)
+    , ("pre_checkpoint_no_receipt", .triggerPreCheckpoint false)
+    , ("checkpoint_passed", .checkpointPassed)
     , ("pre_publish_ok", .triggerPrePublish true true)
     , ("pre_publish_bad_doc", .triggerPrePublish true false)
+    , ("pre_publish_bad_task", .triggerPrePublish false true)
+    , ("pre_publish_both_bad", .triggerPrePublish false false)
+    , ("publish_passed", .publishPassed)
     , ("complete_ok", .completeTask true 0)
     , ("complete_no_mem", .completeTask false 0)
+    , ("complete_dirty", .completeTask true 1)
+    , ("complete_no_mem_dirty", .completeTask false 1)
     ]
   for st in wfStages do
     for (evLabel, ev) in wfEvents do

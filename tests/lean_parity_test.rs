@@ -69,7 +69,7 @@ fn repo_root() -> PathBuf {
 /// Generates the canonical 1011-line truth table in `proofs/Main.lean` order:
 /// 891 base/action/code-intel/ontology rows + 120 taxonomy rows.
 fn generate_rust_truth_table() -> Vec<String> {
-    let mut lines: Vec<String> = Vec::with_capacity(1091);
+    let mut lines: Vec<String> = Vec::with_capacity(1155);
 
     for &from in TASK_STATUSES.iter() {
         for &to in TASK_STATUSES.iter() {
@@ -758,7 +758,8 @@ fn generate_rust_truth_table() -> Vec<String> {
         ));
     }
 
-    // WORKFLOW_STAGE: 80 rows (8 stages × 10 events)
+    // WORKFLOW_STAGE: 144 rows (8 stages × 18 event instances — the full
+    // guard-relevant space of KernelWorkflowEvent)
     let wf_stages: [formal_kernel::KernelWorkflowStage; 8] = [
         formal_kernel::KernelWorkflowStage::Unpreflighted,
         formal_kernel::KernelWorkflowStage::ContextLoaded,
@@ -769,17 +770,25 @@ fn generate_rust_truth_table() -> Vec<String> {
         formal_kernel::KernelWorkflowStage::PrePublish,
         formal_kernel::KernelWorkflowStage::Completed,
     ];
-    let wf_events: [(&str, formal_kernel::KernelWorkflowEvent); 10] = [
+    let wf_events: [(&str, formal_kernel::KernelWorkflowEvent); 18] = [
         ("load_context", formal_kernel::KernelWorkflowEvent::LoadContext),
         ("claim_ok", formal_kernel::KernelWorkflowEvent::ClaimTask { has_valid_scope: true }),
         ("claim_bad_scope", formal_kernel::KernelWorkflowEvent::ClaimTask { has_valid_scope: false }),
         ("mutate_under_limit", formal_kernel::KernelWorkflowEvent::Mutate { mutations_since_note_after: 1, breath_limit: 5 }),
         ("mutate_at_limit", formal_kernel::KernelWorkflowEvent::Mutate { mutations_since_note_after: 5, breath_limit: 5 }),
         ("record_breath", formal_kernel::KernelWorkflowEvent::RecordBreathNote),
+        ("pre_checkpoint_ok", formal_kernel::KernelWorkflowEvent::TriggerPreCheckpoint { has_receipt: true }),
+        ("pre_checkpoint_no_receipt", formal_kernel::KernelWorkflowEvent::TriggerPreCheckpoint { has_receipt: false }),
+        ("checkpoint_passed", formal_kernel::KernelWorkflowEvent::CheckpointPassed),
         ("pre_publish_ok", formal_kernel::KernelWorkflowEvent::TriggerPrePublish { task_gate_ok: true, doc_gate_ok: true }),
         ("pre_publish_bad_doc", formal_kernel::KernelWorkflowEvent::TriggerPrePublish { task_gate_ok: true, doc_gate_ok: false }),
+        ("pre_publish_bad_task", formal_kernel::KernelWorkflowEvent::TriggerPrePublish { task_gate_ok: false, doc_gate_ok: true }),
+        ("pre_publish_both_bad", formal_kernel::KernelWorkflowEvent::TriggerPrePublish { task_gate_ok: false, doc_gate_ok: false }),
+        ("publish_passed", formal_kernel::KernelWorkflowEvent::PublishPassed),
         ("complete_ok", formal_kernel::KernelWorkflowEvent::CompleteTask { has_extracted_memory: true, dirty_targets: 0 }),
         ("complete_no_mem", formal_kernel::KernelWorkflowEvent::CompleteTask { has_extracted_memory: false, dirty_targets: 0 }),
+        ("complete_dirty", formal_kernel::KernelWorkflowEvent::CompleteTask { has_extracted_memory: true, dirty_targets: 1 }),
+        ("complete_no_mem_dirty", formal_kernel::KernelWorkflowEvent::CompleteTask { has_extracted_memory: false, dirty_targets: 1 }),
     ];
     fn wf_stage_str(s: formal_kernel::KernelWorkflowStage) -> &'static str {
         match s {
@@ -861,8 +870,8 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
     let rust_lines = generate_rust_truth_table();
     assert_eq!(
         rust_lines.len(),
-        1091,
-        "expected 1091 canonical lines (891 base/action/code-intel/ontology + 120 taxonomy + 80 workflow)"
+        1155,
+        "expected 1155 canonical lines (891 base/action/code-intel/ontology + 120 taxonomy + 144 workflow)"
     );
 
     // Section-count verification: 64 TASK_FSM + 16 LIFECYCLE + 128 MESH_MERGE
@@ -1002,8 +1011,8 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
     );
     assert_eq!(
         *section_counts.get("WORKFLOW_STAGE").unwrap_or(&0),
-        80,
-        "expected 80 WORKFLOW_STAGE rows"
+        144,
+        "expected 144 WORKFLOW_STAGE rows"
     );
 
     let lake = find_lake().expect(
