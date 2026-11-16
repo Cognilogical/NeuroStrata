@@ -780,10 +780,14 @@ fn classify_side_with(observation: SideObservation, consumed_by_engine: bool) ->
     } else {
         None
     };
-    // A side a successful open consumed held committed records that the engine
-    // replayed before removing the file; `replayFrozenWAL` only deletes without
-    // replaying when it read nothing, which the scan reports as `Unknown` (and
-    // this arm refuses there). Every other side is judged on its own bytes.
+    // A side a successful open consumed is *inferred* to have been replayed:
+    // the engine removed the file, the open succeeded, and the scan saw
+    // committed records (`Some`). The inference has a known hole — a
+    // byte-valid WAL whose replay fails at apply time (e.g. an unknown
+    // table) also deserialises cleanly and scans `Some`, yet the engine can
+    // still remove the file with those records unapplied; distinguishing
+    // that case needs an engine-side replay signal and is tracked in #228.
+    // Every other side is judged on its own bytes.
     //
     // This is *not* an observed checkpoint: no `CHECKPOINT` record was seen, so
     // the evidence is `InferredByDeletion` and the operator text says the frozen
