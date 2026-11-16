@@ -97,6 +97,15 @@ stays handle-scoped:
   would have to invent an embedding identity this process cannot attest, and a
   false `has_data` would unlock model choice. For those stores the in-process
   map is still the only provenance layer.
+- The live flag and kind are **handle-derived**, but the map behind them is
+  **process-scoped**: a live status reflects any handle this process opened for
+  that path, and both the flag and the map vanish when the process exits —
+  only the sidecar (and therefore `last_recovery_at`) survives.
+- A **downgraded** build that predates `#212` does not know the health fields:
+  its identity writes (the pristine stamp, the data flip, pristine adoption)
+  rewrite the sidecar without them, so the persisted provenance and checkpoint
+  health are dropped by the first such write after a downgrade. Re-upgrading
+  starts the history over from the next recovery/checkpoint.
 - `last_recovery` is history, not the state of the current process: a later
   verified open does not erase it. **Two fields carry it, and they mean
   different things:**

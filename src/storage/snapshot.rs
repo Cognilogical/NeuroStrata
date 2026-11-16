@@ -91,14 +91,18 @@ pub struct StorageStatus {
     #[serde(default)]
     pub wal_recovery_artifact_bytes: u64,
     /// Age in whole seconds of the newest active/frozen WAL file beside the
-    /// store (`<store>.wal`, `<store>.wal.checkpoint`; #212). `None` when
+    /// store (`<store>.wal`, `<store>.wal.checkpoint`; #212). `null` when
     /// neither exists. Measured over regular files only: a symlink at either
     /// name is not a WAL this store wrote and contributes no age, while
     /// `wal_bytes` (unchanged by #212) follows the names as the engine does
     /// and therefore can count a symlink's target. Read the pair as "how
     /// long has this store been dirty", remembering that the two fields do
     /// not necessarily describe the same file set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// Serialized even when absent, as `"wal_age_secs": null`: the runbook
+    /// promises the key, and a consumer polling a healthy (WAL-free) store
+    /// must see the field it would see on a dirty one.
+    #[serde(default)]
     pub wal_age_secs: Option<u64>,
     /// Whether this process stopped checkpointing because one ran out of
     /// buffer pool (#211). While set, the engine's `auto_checkpoint` and
@@ -1022,6 +1026,16 @@ mod tests {
             compute_storage_status(&store, &cfg).wal_age_secs,
             None,
             "a store with no WAL has no WAL age"
+        );
+        let json = serde_json::to_value(compute_storage_status(&store, &cfg)).unwrap();
+        assert!(
+            json.get("wal_age_secs").is_some(),
+            "wal_age_secs is serialized even when absent (#212)"
+        );
+        assert_eq!(
+            json["wal_age_secs"],
+            serde_json::Value::Null,
+            "absence is `null`, not an omitted key (#212)"
         );
 
         let active = dir.join("age.lbug.wal");

@@ -11068,6 +11068,25 @@ mod tests {
             value["process"].is_object(),
             "the CLI payload still carries the process block"
         );
+
+        // A healthy (WAL-free) store: the key stays in the payload as `null`
+        // rather than disappearing, which is what the runbook promises (#212).
+        std::fs::remove_file(&wal).unwrap();
+        let out = path_only_storage_status(
+            &db,
+            &crate::storage::snapshot::StorageHygieneConfig::default(),
+        );
+        let value: serde_json::Value = serde_json::from_str(&out).expect("the CLI payload is JSON");
+        assert_eq!(value["wal_bytes"], serde_json::json!(0));
+        assert!(
+            value.get("wal_age_secs").is_some(),
+            "wal_age_secs is never omitted (#212)"
+        );
+        assert_eq!(
+            value["wal_age_secs"],
+            serde_json::Value::Null,
+            "a store with no WAL reports wal_age_secs as null (#212)"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

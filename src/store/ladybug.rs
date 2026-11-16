@@ -2755,8 +2755,10 @@ fn copy_regular_file_create_new_0600(
 /// remains between that check and the open.
 ///
 /// The mode on `create` applies only to a *new* file, so an existing target
-/// is tightened explicitly with `set_permissions(0600)` after the copy: a
-/// restore must not leave the WAL at whatever mode the file it replaced had.
+/// is tightened explicitly — `writer.set_permissions(0600)` on the open
+/// handle, before the sync — because a restore must not leave the WAL at
+/// whatever mode the file it replaced had. Doing it on the handle rather than
+/// by path keeps the chmod and the write on one inode.
 fn restore_regular_file_no_follow(
     src: &std::path::Path,
     dst: &std::path::Path,
@@ -2807,16 +2809,17 @@ fn restore_regular_file_no_follow(
         .open(dst)?;
 
     let copied = std::io::copy(&mut reader, &mut writer)?;
-    writer.sync_all()?;
-    drop(writer);
     // `create` granted 0600 only because the file did not exist; an existing
-    // target keeps the mode it had. Tighten it here so the restored WAL is
-    // always 0600, as the preserved copies are (#212).
+    // target keeps the mode it had. Tighten the mode on the open handle
+    // (fchmod) before the bytes are declared durable: no path lookup, so no
+    // window in which the path names a different inode than the one written
+    // (#212).
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o600))?;
+        writer.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
+    writer.sync_all()?;
     Ok(copied)
 }
 
