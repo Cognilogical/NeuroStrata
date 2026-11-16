@@ -4925,7 +4925,7 @@ mod tests {
         }
     }
 
-    fn git_in(dir: &std::path::Path, args: &[&str]) -> String {
+    fn git_stdout_in(dir: &std::path::Path, args: &[&str]) -> String {
         let out = std::process::Command::new("git")
             .current_dir(dir)
             .args(args)
@@ -4972,17 +4972,17 @@ mod tests {
         std::fs::create_dir_all(repo.join("src").join("a")).unwrap();
         std::fs::create_dir_all(repo.join(".NeuroStrata")).unwrap();
         std::fs::create_dir_all(&hooks_off).unwrap();
-        git_in(&repo, &["init", "-q"]);
-        git_in(&repo, &["config", "user.email", "t@example.invalid"]);
-        git_in(&repo, &["config", "user.name", "t"]);
-        git_in(&repo, &["config", "core.hooksPath", &hooks_off.to_string_lossy()]);
+        git_stdout_in(&repo, &["init", "-q"]);
+        git_stdout_in(&repo, &["config", "user.email", "t@example.invalid"]);
+        git_stdout_in(&repo, &["config", "user.name", "t"]);
+        git_stdout_in(&repo, &["config", "core.hooksPath", &hooks_off.to_string_lossy()]);
         for f in ["a1", "a2", "a3", "a4", "a5", "a6", "Ä7"] {
             std::fs::write(repo.join("src").join("a").join(format!("{f}.rs")), "x").unwrap();
         }
         std::fs::write(repo.join("none.rs"), "x").unwrap();
-        git_in(&repo, &["config", "core.quotePath", "false"]);
+        git_stdout_in(&repo, &["config", "core.quotePath", "false"]);
 
-        let root = git_in(&repo, &["rev-parse", "--show-toplevel"]);
+        let root = git_stdout_in(&repo, &["rev-parse", "--show-toplevel"]);
         let back = root.replace('/', "\\");
         let mut queries = vec![
             json!({"tool": "neurostrata_memories_for_file", "query": format!(r"{back}\src\a\a1.rs")}),
@@ -5013,7 +5013,7 @@ mod tests {
         let hook = base.join("pre-commit");
         std::fs::write(&hook, SCAFFOLDED_PRE_COMMIT_HOOK).unwrap();
 
-        git_in(&repo, &["add", "src", "none.rs"]);
+        git_stdout_in(&repo, &["add", "src", "none.rs"]);
         let stderr = run_pre_commit(&bash, &hook, &repo);
         assert!(stderr.contains("file 'none.rs' has no recorded"), "{stderr}");
         for f in ["a1", "a2", "a3", "a4", "a5", "a6", "Ä7"] {
