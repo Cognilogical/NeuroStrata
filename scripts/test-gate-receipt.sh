@@ -309,4 +309,28 @@ if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$tmp/multiline-code-span
   exit 1
 fi
 
+# Private-org-member co-author (CONTRIBUTOR under GITHUB_TOKEN without read:org)
+# who pushed a commit on the PR (in pr_authors) clears; an unrelated CONTRIBUTOR
+# not in pr_authors does not.
+mkdir -p "$tmp/coauthor-receipt-ok" "$tmp/bystander-contributor-rejected"
+for d in coauthor-receipt-ok bystander-contributor-rejected; do
+  printf '[]\n' > "$tmp/$d/reviews.json"
+  printf '[]\n' > "$tmp/$d/issue-comments.json"
+  printf '{"shas":["abcdef1"],"issues":[],"pr_authors":["pr-opener","pr-coauthor"]}\n' > "$tmp/$d/valid-targets.json"
+done
+cat > "$tmp/coauthor-receipt-ok/threads.json" <<'JSON'
+[{"isResolved":false,"comments":[{"body":"**![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)** finding","author_association":"NONE"},{"body":"fixed@abcdef1","author_association":"CONTRIBUTOR","author":"pr-coauthor"}]}]
+JSON
+cat > "$tmp/bystander-contributor-rejected/threads.json" <<'JSON'
+[{"isResolved":false,"comments":[{"body":"**![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)** finding","author_association":"NONE"},{"body":"fixed@abcdef1","author_association":"CONTRIBUTOR","author":"bystander"}]}]
+JSON
+if ! bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$tmp/coauthor-receipt-ok" >/dev/null 2>&1; then
+  echo "FAIL: a PR commit co-author with CONTRIBUTOR association was rejected" >&2
+  exit 1
+fi
+if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$tmp/bystander-contributor-rejected" >/dev/null 2>&1; then
+  echo "FAIL: an unrelated CONTRIBUTOR not in pr_authors cleared a finding" >&2
+  exit 1
+fi
+
 echo "gate-receipt self-test: PASS"

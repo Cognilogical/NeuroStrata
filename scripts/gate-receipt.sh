@@ -100,9 +100,9 @@ jq_defs="${tokenizer_def}"'
     [scan("fixed@[0-9a-f]{7,}|filed[[:space:]]+#[0-9]+"; "i")
      | select(if $validate == 1 then receipt_ok else true end)] | length;
   def allowed:
-    (if $mode == "pr" then
+    (if ($mode == "pr" or ($pr_authors | length) > 0) then
        (.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR"
-        or ((.author // "") != "" and (.author // "") == $pr_author))
+        or ((.author // "") as $a | $a != "" and (($pr_authors | index($a)) != null)))
      else (.author_association != "NONE") end)
     and (.author_association != "NONE");
   def cstats($same_comment):
@@ -118,7 +118,7 @@ jq_defs="${tokenizer_def}"'
 jq_args=()
 
 set_jq_args() {
-  jq_args=(--arg mode "$mode" --arg pr_author "$pr_author" --argjson validate "$validate" \
+  jq_args=(--arg mode "$mode" --argjson pr_authors "$pr_authors" --argjson validate "$validate" \
            --argjson ok_shas "$ok_shas" --argjson ok_issues "$ok_issues")
 }
 
@@ -217,6 +217,7 @@ thread_mode=""
 marker_entries=""
 mode="legacy"
 pr_author=""
+pr_authors="[]"
 validate=0
 ok_shas="[]"
 ok_issues="[]"
@@ -249,6 +250,10 @@ elif [ -n "$fixtures_dir" ]; then
     }
     ok_issues=$(jq -c '(.issues // []) - (.pull_requests // [])' "$fixtures_dir/valid-targets.json" 2>/dev/null) || {
       echo "gate-receipt: $fixtures_dir/valid-targets.json must contain {shas: [..], issues: [..], pull_requests?: [..]}" >&2
+      exit 2
+    }
+    pr_authors=$(jq -ce 'if has("pr_authors") then (if (.pr_authors | type) == "array" and all(.pr_authors[]; type == "string") then .pr_authors else error("bad pr_authors") end) else [] end' "$fixtures_dir/valid-targets.json" 2>/dev/null) || {
+      echo "gate-receipt: $fixtures_dir/valid-targets.json pr_authors must be an array of strings" >&2
       exit 2
     }
     echo "gate-receipt: fixture mode: receipt targets validated against valid-targets.json" >&2
@@ -286,6 +291,12 @@ else
   }
   pr_author=$(printf '%s' "$meta" | jq -r '.author')
   head_sha=$(printf '%s' "$meta" | jq -r '.head')
+  # GITHUB_TOKEN in Actions lacks read:org, so private org members receive
+  # author_association CONTRIBUTOR instead of MEMBER. Include PR commit
+  # authors/committers alongside the PR creator so co-authors who push a fix
+  # commit to the PR branch can receipt it.
+  commit_authors=$(gh api "repos/$repo/pulls/$pr/commits" --paginate --jq '[.[].author.login // empty, .[].committer.login // empty]' 2>/dev/null | jq -sc 'add // []' || printf '[]')
+  pr_authors=$(jq -cn --arg a "$pr_author" --argjson ca "$commit_authors" '([$a] + $ca) | map(select(. != "")) | unique')
   # Reviews and comments only. The PR body often describes the gate itself
   # ("one receipt per CHANGES-NEEDED marker") and must not count as a marker.
   # Fail closed: unavailable evidence is not clearance.
