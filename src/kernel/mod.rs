@@ -1,6 +1,7 @@
 //! Central Agentic Kernel – Mediates between ports, workflow, and connectors.
 
 use anyhow::Result;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -20,6 +21,7 @@ use crate::kernel::ports::{
     LadybugOntologyPort, MemoryPort, OntologyPort,
 };
 use crate::store::LadybugStore;
+use crate::traits::VectorStore;
 use crate::workflow::connector::{GitWorkflowConnector, WorkflowConnector};
 use crate::workflow::machine::WorkflowStage;
 
@@ -71,7 +73,7 @@ impl WorkflowRegistry {
 
 /// Central Agentic Kernel facade.
 pub struct AgentKernel {
-    store: Arc<LadybugStore>,
+    store: Arc<dyn VectorStore>,
     memory: Arc<dyn MemoryPort>,
     executive: Arc<dyn ExecutivePort>,
     ontology: Arc<dyn OntologyPort>,
@@ -82,8 +84,12 @@ pub struct AgentKernel {
 
 impl AgentKernel {
     /// Construct kernel with default ports/registry.
+    ///
+    /// Accepts the serving layers' trait object (`Arc<dyn VectorStore>`).
+    /// The backend is resolved privately and the kernel fails closed on any
+    /// backend other than the LadybugDB concrete store.
     pub fn new(
-        store: Arc<LadybugStore>,
+        store: Arc<dyn VectorStore>,
         bus: Arc<ThalamicBus>,
         workspace_root: PathBuf,
     ) -> Self {
@@ -103,7 +109,7 @@ impl AgentKernel {
     }
 
     pub fn with_ports(
-        store: Arc<LadybugStore>,
+        store: Arc<dyn VectorStore>,
         bus: Arc<ThalamicBus>,
         memory: Arc<dyn MemoryPort>,
         executive: Arc<dyn ExecutivePort>,
@@ -120,6 +126,13 @@ impl AgentKernel {
             connectors,
             bus,
         }
+    }
+
+    /// Return the concrete LadybugStore behind the trait object; fail closed on mismatch.
+    fn ladybug_store(&self) -> &crate::store::ladybug::LadybugStore {
+        crate::traits::VectorStore::as_any(self.store.as_ref())
+            .downcast_ref::<crate::store::ladybug::LadybugStore>()
+            .expect("kinetic kernel requires the LadybugDB store backend")
     }
 
     pub fn memory(&self) -> &Arc<dyn MemoryPort> {
@@ -154,7 +167,7 @@ impl AgentKernel {
         principal: Option<&str>,
     ) -> Result<KernelConnectorPreVerdict> {
         let connector_registered = self.connectors.get(&record.connector_id).is_some();
-        let rebac_allowed = crate::rebac::can_write_namespace(self.store.as_ref(), namespace, principal);
+        let rebac_allowed = crate::rebac::can_write_namespace(self.ladybug_store(), namespace, principal);
         Ok(evaluate_connector_pre_gate(KernelConnectorPreGateInput {
             connector_registered,
             rebac_allowed,
@@ -284,7 +297,7 @@ impl AgentKernel {
             .await?
             .ok_or_else(|| anyhow::anyhow!("pointer_id '{}' not found", req.pointer_id))?;
         let connector_opt = self.connectors.get(&pointer.connector_id);
-        let rebac_allowed = crate::rebac::can_write_namespace(self.store.as_ref(), namespace, principal);
+        let rebac_allowed = crate::rebac::can_write_namespace(self.ladybug_store(), namespace, principal);
         // Fail closed on unregistered connector or ReBAC denial BEFORE any
         // connector I/O (not even describe_pool runs in that case).
         if connector_opt.is_none() || !rebac_allowed {
@@ -347,6 +360,129 @@ impl AgentKernel {
         let mut receipt = receipt;
         receipt.pointer_id = pointer.pointer_id.clone();
         Ok(receipt)
+    }
+
+    /// Execute a connector command dispatching on `args["operation"]`.
+    /// Supported operations: list_connectors, describe_pool, register_pointer,
+    /// list_pointers, resolve_pointer, apply_effect, mediate.
+    pub async fn execute_connector_command(
+        &self,
+        namespace: &str,
+        args: &serde_json::Value,
+        principal: Option<&str>,
+    ) -> anyhow::Result<serde_json::Value> {
+        let operation = args
+            .get("operation")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("missing 'operation' in args"))?;
+        match operation {
+            "list_connectors" => Ok(serde_json::json!(
+                self.connectors().list_connector_ids()
+            )),
+            "describe_pool" => {
+                let pool_id = args
+                    .get("pool_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("missing 'pool_id' in args"))?;
+                let connector_id = args
+                    .get("connector_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("missing 'connector_id' in args"))?;
+                let connector = self
+                    .connectors()
+                    .get(connector_id)
+                    .ok_or_else(|| anyhow::anyhow!("connector '{}' not found", connector_id))?;
+                let schema = connector.describe_pool(pool_id).await?;
+                Ok(serde_json::to_value(&schema)?)
+            }
+            "register_pointer" => {
+                let record: DataPointerRecord = args
+                    .get("record")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .ok_or_else(|| anyhow::anyhow!("missing or invalid 'record' in args"))?;
+                let result = self.register_pointer(namespace, &record, principal).await?;
+                Ok(serde_json::to_value(&result)?)
+            }
+            "list_pointers" => {
+                let pointers =
+                    self
+                        .memory
+                        .list_data_pointers(namespace, None, principal)
+                        .await?;
+                Ok(serde_json::json!(pointers))
+            }
+            "resolve_pointer" => {
+                let req: DataSliceRequest = args
+                    .get("req")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .ok_or_else(|| anyhow::anyhow!("missing or invalid 'req' in args"))?;
+                let now_secs = args
+                    .get("now_secs")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let result = self.resolve_pointer(namespace, &req, now_secs, principal).await?;
+                Ok(serde_json::to_value(&result)?)
+            }
+            "apply_effect" => {
+                let req: ExternalEffectRequest = args
+                    .get("req")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .ok_or_else(|| anyhow::anyhow!("missing or invalid 'req' in args"))?;
+                let now_secs = args
+                    .get("now_secs")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let result = self.apply_external_effect(namespace, &req, now_secs, principal).await?;
+                Ok(serde_json::to_value(&result)?)
+            }
+            "mediate" => {
+                let from_stage: WorkflowStage = match args.get("from_stage").and_then(|v| v.as_str()) {
+                    Some(s) => match s.to_lowercase().as_str() {
+                        "unpreflighted" => WorkflowStage::Unpreflighted,
+                        "contextloaded" => WorkflowStage::ContextLoaded,
+                        "claimed" => WorkflowStage::Claimed,
+                        "mutating" => WorkflowStage::Mutating,
+                        "breathrequired" => WorkflowStage::BreathRequired,
+                        "precheckpoint" => WorkflowStage::PreCheckpoint,
+                        "prepublish" => WorkflowStage::PrePublish,
+                        "completed" => WorkflowStage::Completed,
+                        _ => anyhow::bail!("invalid 'from_stage' value: {}", s),
+                    },
+                    None => anyhow::bail!("missing 'from_stage' in args"),
+                };
+                let to_stage: WorkflowStage = match args.get("to_stage").and_then(|v| v.as_str()) {
+                    Some(s) => match s.to_lowercase().as_str() {
+                        "unpreflighted" => WorkflowStage::Unpreflighted,
+                        "contextloaded" => WorkflowStage::ContextLoaded,
+                        "claimed" => WorkflowStage::Claimed,
+                        "mutating" => WorkflowStage::Mutating,
+                        "breathrequired" => WorkflowStage::BreathRequired,
+                        "precheckpoint" => WorkflowStage::PreCheckpoint,
+                        "prepublish" => WorkflowStage::PrePublish,
+                        "completed" => WorkflowStage::Completed,
+                        _ => anyhow::bail!("invalid 'to_stage' value: {}", s),
+                    },
+                    None => anyhow::bail!("missing 'to_stage' in args"),
+                };
+                let gate_passed = args
+                    .get("gate_passed")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let slice_req: DataSliceRequest = args
+                    .get("slice_req")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .ok_or_else(|| anyhow::anyhow!("missing or invalid 'slice_req' in args"))?;
+                let now_secs = args
+                    .get("now_secs")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let (_, slice) = self
+                    .mediate_workflow_data(namespace, from_stage, to_stage, gate_passed, &slice_req, now_secs, principal)
+                    .await?;
+                Ok(serde_json::to_value(&slice)?)
+            }
+            _ => anyhow::bail!("unknown connector operation: {}", operation),
+        }
     }
 
     /// End-to-end: workflow gate -> data slice resolution.
@@ -761,5 +897,118 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("Post-gate"), "unexpected: {err}");
+    }
+
+    #[tokio::test]
+    async fn trusted_pointer_id_resolution_and_writeback_with_active_receipt() {
+        let ns = "ns1";
+        let spy = Arc::new(SpyConnector::new("spy", DataPoolAccessMode::ReadWrite, 10, 1024));
+        let (kernel, store, _dir) = build_kernel(spy.clone());
+        store.init(ns).await.expect("init");
+        // Register pointer
+        kernel
+            .register_pointer(ns, &pointer_record("ptr_trusted", "spy", 1000, 100), Some(ns))
+            .await
+            .expect("register");
+        // Seed an active, target-bound action_receipt
+        seed_receipt(&store, ns, "rcpt_active", "ptr_trusted", "pool1", false).await;
+        // resolve_pointer works
+        let slice = kernel
+            .resolve_pointer(ns, &slice_request("ptr_trusted", 1, 64), 1000, Some(ns))
+            .await
+            .expect("resolve");
+        assert_eq!(slice.pointer_id, "ptr_trusted");
+        // apply_external_effect with active receipt succeeds
+        let receipt = kernel
+            .apply_external_effect(ns, &writeback_request("ptr_trusted", "rcpt_active"), 1000, Some(ns))
+            .await
+            .expect("writeback");
+        assert!(receipt.applied);
+        assert_eq!(spy.apply_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn duplicate_pointer_id_registration_rejected() {
+        let ns = "ns1";
+        let spy = Arc::new(SpyConnector::new("spy", DataPoolAccessMode::ReadWrite, 10, 1024));
+        let (kernel, store, _dir) = build_kernel(spy.clone());
+        store.init(ns).await.expect("init");
+        // First registration succeeds
+        kernel
+            .register_pointer(ns, &pointer_record("dup_ptr", "spy", 1000, 100), Some(ns))
+            .await
+            .expect("first register");
+        // Second registration of same pointer_id fails
+        let err = kernel
+            .register_pointer(ns, &pointer_record("dup_ptr", "spy", 1000, 100), Some(ns))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("already exists"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mediate_workflow_data_end_to_end() {
+        let ns = "ns1";
+        let spy = Arc::new(SpyConnector::new("spy", DataPoolAccessMode::ReadWrite, 10, 1024));
+        let (kernel, store, _dir) = build_kernel(spy.clone());
+        store.init(ns).await.expect("init");
+        kernel
+            .register_pointer(ns, &pointer_record("ptr_wf", "spy", 1000, 100), Some(ns))
+            .await
+            .expect("register");
+        // Claimed -> Mutating with gate_passed=true should succeed
+        let (stage, slice) = kernel
+            .mediate_workflow_data(
+                ns,
+                WorkflowStage::Claimed,
+                WorkflowStage::Mutating,
+                true,
+                &slice_request("ptr_wf", 1, 64),
+                1000,
+                Some(ns),
+            )
+            .await
+            .expect("mediate");
+        assert_eq!(stage, WorkflowStage::Mutating);
+        assert_eq!(slice.pointer_id, "ptr_wf");
+        assert_eq!(spy.resolve_calls.load(Ordering::SeqCst), 1);
+        // Illegal transition (e.g., Claimed -> Claimed with gate_passed=false) should reject and make zero resolve_slice calls
+        let err = kernel
+            .mediate_workflow_data(
+                ns,
+                WorkflowStage::Claimed,
+                WorkflowStage::Claimed,
+                false,
+                &slice_request("ptr_wf", 1, 64),
+                1000,
+                Some(ns),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Workflow transition denied"), "unexpected: {err}");
+        assert_eq!(spy.resolve_calls.load(Ordering::SeqCst), 1); // no additional call
+    }
+
+    #[tokio::test]
+    async fn kernel_construction_and_execution_accept_trait_object_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // The serving layers (MCP / daemon / CLI) hold the store as the trait
+        // object; the kernel must accept that shape and fail closed on backends
+        // that are not the LadybugDB concrete store.
+        let store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(dir.path().join("db"), 4).expect("store init"));
+        let bus = Arc::new(ThalamicBus::new(64));
+        let kernel = AgentKernel::new(store, bus, std::path::PathBuf::from("."));
+        let value = kernel
+            .execute_connector_command(
+                "NeuroStrata",
+                &json!({ "operation": "list_connectors" }),
+                None,
+            )
+            .await
+            .expect("list_connectors");
+        assert!(value.as_array().map(|a| a.is_empty()).unwrap_or(false));
     }
 }

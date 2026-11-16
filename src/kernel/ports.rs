@@ -15,8 +15,7 @@ use std::sync::Arc;
 use crate::connectors::DataPointerRecord;
 use crate::formal_kernel::KernelActionReceiptState;
 use crate::rebac::can_read_memory;
-use crate::store::LadybugStore;
-use crate::traits::{MemoryPayload, OntologyStore, TaskStore, TaskSummaryRow};
+use crate::traits::{MemoryPayload, OntologyStore, TaskStore, TaskSummaryRow, VectorStore};
 use crate::workflow::machine::WorkflowStage;
 
 /// Kernel workflow verdict – allows or denies a transition based on gate.
@@ -77,23 +76,29 @@ pub trait OntologyPort: Send + Sync {
 
 /// Persistent `MemoryPort` backed by `LadybugStore`.
 pub struct LadybugMemoryPort {
-    store: Arc<LadybugStore>,
+    store: Arc<dyn VectorStore>,
 }
 
 impl LadybugMemoryPort {
     /// Create a new `LadybugMemoryPort` backed by the given store.
-    pub fn new(store: Arc<LadybugStore>) -> Self {
+    pub fn new(store: Arc<dyn VectorStore>) -> Self {
+        // Fail closed on non-Ladybug backends.
+        crate::traits::VectorStore::as_any(store.as_ref())
+            .downcast_ref::<crate::store::ladybug::LadybugStore>()
+            .expect("memory port requires the LadybugDB store backend");
         LadybugMemoryPort { store }
     }
 
     /// Trusted internal path – no authentication, no ReBAC.
     async fn trusted_get_memory(&self, namespace: &str, id: &str) -> Result<Option<MemoryPayload>> {
-        self.store.get_memory_by_id(namespace, id).await
+        let lb = self.ladybug_store();
+        lb.get_memory_by_id(namespace, id).await
     }
 
     /// ReBAC‑checked path – returns `None` when principal lacks visibility.
     async fn rebac_get_memory(&self, namespace: &str, id: &str, principal: Option<&str>) -> Result<Option<MemoryPayload>> {
-        let Some(payload) = self.store.get_memory_by_id(namespace, id).await? else {
+        let lb = self.ladybug_store();
+        let Some(payload) = lb.get_memory_by_id(namespace, id).await? else {
             return Ok(None);
         };
         let visible = match principal {
@@ -101,6 +106,12 @@ impl LadybugMemoryPort {
             Some(p) => can_read_memory(p, payload.user_id.as_str(), &payload.metadata),
         };
         Ok(visible.then(|| payload))
+    }
+
+    fn ladybug_store(&self) -> &crate::store::ladybug::LadybugStore {
+        crate::traits::VectorStore::as_any(self.store.as_ref())
+            .downcast_ref::<crate::store::ladybug::LadybugStore>()
+            .expect("memory port requires the LadybugDB store backend")
     }
 }
 
@@ -115,8 +126,9 @@ impl MemoryPort for LadybugMemoryPort {
     }
 
     async fn register_data_pointer(&self, namespace: &str, record: &DataPointerRecord, principal: Option<&str>) -> Result<DataPointerRecord> {
+        let lb = self.ladybug_store();
         // Namespace‑level write gate via ReBAC (§5.4 / §5.6).
-        if !crate::rebac::can_write_namespace(self.store.as_ref(), namespace, principal) {
+        if !crate::rebac::can_write_namespace(lb, namespace, principal) {
             anyhow::bail!("write denied for namespace '{}'", namespace);
         }
         // Reject duplicate active pointer IDs in the namespace.
@@ -145,7 +157,7 @@ impl MemoryPort for LadybugMemoryPort {
             location_lines: String::new(),
             metadata,
         };
-        self.store.put_scoped_memory(namespace, &record.pointer_id, &payload).await?;
+        self.ladybug_store().put_scoped_memory(namespace, &record.pointer_id, &payload).await?;
         Ok(record.clone())
     }
 
@@ -177,8 +189,9 @@ impl MemoryPort for LadybugMemoryPort {
 
     async fn list_data_pointers(&self, namespace: &str, pool_id: Option<&str>, principal: Option<&str>) -> Result<Vec<DataPointerRecord>> {
         let mut out = Vec::new();
+        let lb = self.ladybug_store();
         // List all memory_type == "data_pointer" in the namespace.
-        let rows = self.store.list_memories_by_types(namespace, &["data_pointer"]).await?;
+        let rows = lb.list_memories_by_types(namespace, &["data_pointer"]).await?;
         for (_id, payload) in rows {
             // ReBAC filtering: principal == None => trusted (include all) else require can_read_memory.
             let include = match principal {
@@ -201,12 +214,16 @@ impl MemoryPort for LadybugMemoryPort {
 
 /// Persistent `ExecutivePort` backed by `LadybugStore`.
 pub struct LadybugExecutivePort {
-    store: Arc<LadybugStore>,
+    store: Arc<dyn VectorStore>,
 }
 
 impl LadybugExecutivePort {
     /// Create a new `LadybugExecutivePort` backed by the given store.
-    pub fn new(store: Arc<LadybugStore>) -> Self {
+    pub fn new(store: Arc<dyn VectorStore>) -> Self {
+        // Fail closed on non-Ladybug backends.
+        crate::traits::VectorStore::as_any(store.as_ref())
+            .downcast_ref::<crate::store::ladybug::LadybugStore>()
+            .expect("executive port requires the LadybugDB store backend");
         LadybugExecutivePort { store }
     }
 
@@ -229,12 +246,19 @@ impl LadybugExecutivePort {
             _ => WE::LoadContext,
         }
     }
+
+    fn ladybug_store(&self) -> &crate::store::ladybug::LadybugStore {
+        crate::traits::VectorStore::as_any(self.store.as_ref())
+            .downcast_ref::<crate::store::ladybug::LadybugStore>()
+            .expect("executive port requires the LadybugDB store backend")
+    }
 }
 
 #[async_trait]
 impl ExecutivePort for LadybugExecutivePort {
     async fn list_tasks(&self, namespace: &str, principal: Option<&str>) -> Result<Vec<TaskSummaryRow>> {
-        let rows = self.store.list_task_rows(namespace).await?;
+        let lb = self.ladybug_store();
+        let rows = lb.list_task_rows(namespace).await?;
         let mut filtered = Vec::new();
         for row in rows {
             let visible = match principal {
@@ -247,7 +271,7 @@ impl ExecutivePort for LadybugExecutivePort {
     }
 
     async fn get_task(&self, namespace: &str, task_id: &str, principal: Option<&str>) -> Result<Option<MemoryPayload>> {
-        if let Some(payload) = self.store.load_task_row(namespace, task_id).await? {
+        if let Some(payload) = self.ladybug_store().load_task_row(namespace, task_id).await? {
             let visible = match principal {
                 None => false,
                 Some(p) => can_read_memory(p, payload.user_id.as_str(), &payload.metadata),
@@ -257,7 +281,7 @@ impl ExecutivePort for LadybugExecutivePort {
     }
 
     async fn verify_task_extraction_count(&self, namespace: &str, task_id: &str) -> Result<usize> {
-        self.store.count_extracted_memories_for_task(namespace, task_id).await
+        self.ladybug_store().count_extracted_memories_for_task(namespace, task_id).await
     }
 
     async fn evaluate_workflow_transition(&self, from: WorkflowStage, to: WorkflowStage, gate_passed: bool) -> KernelWorkflowTransitionVerdict {
@@ -269,20 +293,31 @@ impl ExecutivePort for LadybugExecutivePort {
 
 /// Persistent `OntologyPort` backed by `LadybugStore`.
 pub struct LadybugOntologyPort {
-    store: Arc<LadybugStore>,
+    store: Arc<dyn VectorStore>,
 }
 
 impl LadybugOntologyPort {
     /// Create a new `LadybugOntologyPort` backed by the given store.
-    pub fn new(store: Arc<LadybugStore>) -> Self {
+    pub fn new(store: Arc<dyn VectorStore>) -> Self {
+        // Fail closed on non-Ladybug backends.
+        crate::traits::VectorStore::as_any(store.as_ref())
+            .downcast_ref::<crate::store::ladybug::LadybugStore>()
+            .expect("ontology port requires the LadybugDB store backend");
         LadybugOntologyPort { store }
+    }
+
+    fn ladybug_store(&self) -> &crate::store::ladybug::LadybugStore {
+        crate::traits::VectorStore::as_any(self.store.as_ref())
+            .downcast_ref::<crate::store::ladybug::LadybugStore>()
+            .expect("ontology port requires the LadybugDB store backend")
     }
 }
 
 #[async_trait]
 impl OntologyPort for LadybugOntologyPort {
     async fn list_ontology_entities(&self, namespace: &str, memory_types: &[&str], principal: Option<&str>) -> Result<Vec<(String, MemoryPayload)>> {
-        let mut rows = self.store.list_memories_by_types(namespace, memory_types).await?;
+        let lb = self.ladybug_store();
+        let mut rows = lb.list_memories_by_types(namespace, memory_types).await?;
         // ReBAC filtering – if principal is None, treat as unauthenticated (no reads).
         if let Some(p) = principal {
             rows.retain(|(_, payload)| can_read_memory(p, payload.user_id.as_str(), &payload.metadata));
@@ -291,7 +326,7 @@ impl OntologyPort for LadybugOntologyPort {
     }
 
     async fn get_ontology_entity(&self, namespace: &str, id: &str, principal: Option<&str>) -> Result<Option<MemoryPayload>> {
-        let Some(payload) = self.store.get_memory_by_id(namespace, id).await? else { return Ok(None); };
+        let Some(payload) = self.ladybug_store().get_memory_by_id(namespace, id).await? else { return Ok(None); };
         let visible = match principal {
             None => false,
             Some(p) => can_read_memory(p, payload.user_id.as_str(), &payload.metadata),
@@ -303,7 +338,7 @@ impl OntologyPort for LadybugOntologyPort {
         if receipt_id.trim().is_empty() {
             return Ok(KernelActionReceiptState::MissingOrNotFound);
         }
-        let Some(payload) = self.store.get_memory_by_id(namespace, receipt_id).await? else {
+        let Some(payload) = self.ladybug_store().get_memory_by_id(namespace, receipt_id).await? else {
             return Ok(KernelActionReceiptState::MissingOrNotFound);
         };
         if payload.memory_type != "action_receipt" {

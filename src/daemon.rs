@@ -1124,6 +1124,7 @@ pub(crate) async fn start_daemon_on(
         .route("/diff-tour", post(handle_http_diff_tour))
         .route("/insights", post(handle_http_insights))
         .route("/taxonomy", post(handle_http_taxonomy))
+        .route("/data-connector", post(handle_http_data_connector))
         .route("/shutdown", post(handle_shutdown))
         .with_state(state.clone())
         .layer(axum::middleware::from_fn_with_state(state, auth_middleware));
@@ -2154,6 +2155,22 @@ async fn handle_http_action(
     let body =
         crate::server::handle_action(&req, state.embedder.clone(), state.vector_store.clone())
             .await;
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+}
+
+async fn handle_http_data_connector(
+    State(state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> impl axum::response::IntoResponse {
+    let body = crate::server::handle_data_connector(
+        &req,
+        state.vector_store.clone(),
+        state.bus.clone(),
+    )
+    .await;
     (
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         body,
