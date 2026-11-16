@@ -214,7 +214,8 @@
         "cargo test --locked --bin neurostrata-mcp wal_zero_record -- --test-threads=1",
         "cargo test --locked --bin neurostrata-mcp prune_wal_recovery_artifacts_except -- --test-threads=1",
         "cargo test --locked --bin neurostrata-mcp honours_the_verdict -- --test-threads=1",
-        "cargo test --locked --bin neurostrata-mcp release_handle -- --test-threads=1"
+        "cargo test --locked --bin neurostrata-mcp release_handle -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp recovery_checkpoint_ -- --test-threads=1"
       ],
       "tests": [
         "store::wal_accounting::tests::checksum_of_an_empty_buffer_is_the_dbs_seed",
