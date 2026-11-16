@@ -36,7 +36,7 @@ before recovery.
 2. **Take a no-open snapshot backup before attempting recovery:**
    ```sh
    neurostrata-mcp backup /path/to/pre-recovery-backup --no-open
-   neurostrata-mcp storage verify-snapshot /path/to/pre-recovery-backup
+   neurostrata-mcp storage verify-snapshot --dir /path/to/pre-recovery-backup
    ```
    `backup --no-open` (and `backup` automatically when strict WAL verification
    refuses an open) copies `<db>`, `<db>.wal` / `<db>.wal.checkpoint`, the
@@ -53,15 +53,20 @@ before recovery.
 
    The snapshot manifest records `coordinated: false` and
    `provenance: "unverified"` for these copies, plus `wal_kind`
-   (`active` / `frozen` / `none`). `storage verify-snapshot` prints
+   (`active` / `frozen` / `both` / `none`). `storage verify-snapshot` prints
    `integrity ok, uncoordinated` for them rather than `valid`: the bytes match
    their checksums, but nothing proves they came from one instant. They remain
    restorable, and `restore` warns when it places one.
 
-   The WAL is always stored as `ladybug.store.wal` inside the snapshot; its
-   `wal_kind` decides where `restore` puts it back (`<db>.wal` for `active`,
-   `<db>.wal.checkpoint` for `frozen`), together with the shadow and pinned
-   marker when the snapshot carries them.
+   A one-sided WAL is stored as `ladybug.store.wal` inside the snapshot. A
+   **mixed pair** (`<db>.wal` and `<db>.wal.checkpoint` both present, which the
+   engine can accept as one store) is recorded as `wal_kind: "both"` and keeps
+   both byte streams: the active side in `ladybug.store.wal`, the frozen side
+   in `ladybug.store.wal.checkpoint`, each checksummed. `restore` puts the
+   stream(s) back under their own names (`<db>.wal` for `active`,
+   `<db>.wal.checkpoint` for `frozen`, both for `both`) and drops stale
+   companions of any other role, together with the shadow and pinned marker
+   when the snapshot carries them.
 
 3. **Recover committed WAL prefix records with lenient tail truncation (operator opt-in):**
    ```sh

@@ -21,9 +21,11 @@ pub const PROVENANCE_COORDINATED: &str = "coordinated";
 pub const PROVENANCE_UNVERIFIED: &str = "unverified";
 
 /// The WAL role a snapshot captured (#209): the active `<db>.wal`, the frozen
-/// `<db>.wal.checkpoint` a crashed checkpoint left behind, or no WAL at all.
+/// `<db>.wal.checkpoint` a crashed checkpoint left behind, both sides of a
+/// mixed pair, or no WAL at all.
 pub const WAL_KIND_ACTIVE: &str = "active";
 pub const WAL_KIND_FROZEN: &str = "frozen";
+pub const WAL_KIND_BOTH: &str = "both";
 pub const WAL_KIND_NONE: &str = "none";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -567,6 +569,8 @@ pub struct SnapshotChecksums {
     pub shadow_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wal_checkpoint_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -733,6 +737,14 @@ pub fn write_checksums(dir: &Path) -> Result<SnapshotChecksums, SnapshotError> {
     } else {
         None
     };
+    // A mixed pair keeps its frozen side under its own member (#209): the
+    // `ladybug.store.wal` member alone cannot hold both byte streams.
+    let checkpoint_wal = dir.join("ladybug.store.wal.checkpoint");
+    let wal_checkpoint_sha = if checkpoint_wal.exists() {
+        Some(sha256_file(&checkpoint_wal)?)
+    } else {
+        None
+    };
 
     let checksums = SnapshotChecksums {
         ladybug_store_sha256: ladybug_sha,
@@ -741,6 +753,7 @@ pub fn write_checksums(dir: &Path) -> Result<SnapshotChecksums, SnapshotError> {
         store_state_sha256: store_state_sha,
         shadow_sha256: shadow_sha,
         pinned_sha256: pinned_sha,
+        wal_checkpoint_sha256: wal_checkpoint_sha,
     };
 
     let checksums_path = dir.join("checksums.json");
@@ -798,11 +811,13 @@ pub fn verify_snapshot(dir: &Path) -> Result<SnapshotVerifyReport, SnapshotError
             }
         });
     let wal_kind = match manifest.get("wal_kind").and_then(|v| v.as_str()) {
-        Some(kind @ (WAL_KIND_ACTIVE | WAL_KIND_FROZEN | WAL_KIND_NONE)) => Some(kind.to_string()),
+        Some(kind @ (WAL_KIND_ACTIVE | WAL_KIND_FROZEN | WAL_KIND_BOTH | WAL_KIND_NONE)) => {
+            Some(kind.to_string())
+        }
         Some(other) => {
             return Err(SnapshotError::InvalidManifest(format!(
-                "unrecognized wal_kind {:?}: expected {}, {} or {}",
-                other, WAL_KIND_ACTIVE, WAL_KIND_FROZEN, WAL_KIND_NONE
+                "unrecognized wal_kind {:?}: expected {}, {}, {} or {}",
+                other, WAL_KIND_ACTIVE, WAL_KIND_FROZEN, WAL_KIND_BOTH, WAL_KIND_NONE
             )))
         }
         None => None,
@@ -845,12 +860,13 @@ pub fn verify_snapshot(dir: &Path) -> Result<SnapshotVerifyReport, SnapshotError
         });
     }
 
-    let wal_mentioned = checksums.wal_sha256.is_some()
-        || wal.exists()
-        || matches!(
-            wal_kind.as_deref(),
-            Some(WAL_KIND_ACTIVE) | Some(WAL_KIND_FROZEN)
-        );
+    let declares_both = wal_kind.as_deref() == Some(WAL_KIND_BOTH);
+    let declares_single = matches!(
+        wal_kind.as_deref(),
+        Some(WAL_KIND_ACTIVE) | Some(WAL_KIND_FROZEN)
+    );
+    let wal_mentioned =
+        checksums.wal_sha256.is_some() || wal.exists() || declares_single || declares_both;
     if wal_mentioned {
         if !wal.exists() {
             return Err(SnapshotError::ChecksumMismatch {
@@ -865,6 +881,37 @@ pub fn verify_snapshot(dir: &Path) -> Result<SnapshotVerifyReport, SnapshotError
                 file: "ladybug.store.wal".into(),
                 expected: checksums.wal_sha256.clone().unwrap_or_default(),
                 actual: computed_wal,
+            });
+        }
+    }
+
+    // The frozen side of a mixed pair is a member of its own (#209): a
+    // `wal_kind: both` manifest must produce both streams, and a one-sided
+    // manifest must not carry the frozen member at all. Otherwise a restore
+    // could place a pair the manifest never promised.
+    let checkpoint_wal = dir.join("ladybug.store.wal.checkpoint");
+    if checkpoint_wal.exists() && !declares_both {
+        return Err(SnapshotError::InvalidManifest(format!(
+            "the snapshot carries ladybug.store.wal.checkpoint but its wal_kind is {:?}; a mixed pair is recorded as wal_kind \"{}\"",
+            wal_kind, WAL_KIND_BOTH
+        )));
+    }
+    let checkpoint_mentioned =
+        checksums.wal_checkpoint_sha256.is_some() || checkpoint_wal.exists() || declares_both;
+    if checkpoint_mentioned {
+        if !checkpoint_wal.exists() {
+            return Err(SnapshotError::ChecksumMismatch {
+                file: "ladybug.store.wal.checkpoint".into(),
+                expected: checksums.wal_checkpoint_sha256.clone().unwrap_or_default(),
+                actual: "<missing>".into(),
+            });
+        }
+        let computed_checkpoint = sha256_file(&checkpoint_wal)?;
+        if Some(&computed_checkpoint) != checksums.wal_checkpoint_sha256.as_ref() {
+            return Err(SnapshotError::ChecksumMismatch {
+                file: "ladybug.store.wal.checkpoint".into(),
+                expected: checksums.wal_checkpoint_sha256.clone().unwrap_or_default(),
+                actual: computed_checkpoint,
             });
         }
     }
@@ -1530,6 +1577,44 @@ mod tests {
         assert!(
             matches!(result, Err(SnapshotError::ChecksumMismatch { .. })),
             "a tampered shadow fails verification: {result:?}"
+        );
+    }
+
+    #[test]
+    fn a_both_wal_manifest_verifies_only_with_both_sides() {
+        // #209 (V5): a mixed WAL pair (`<db>.wal` + `<db>.wal.checkpoint`)
+        // preflights as a usable single store, so the export must carry BOTH
+        // byte streams. A `wal_kind: both` manifest is only verifiable when
+        // both members are present and checksummed.
+        let d = temp_dir("both-wal");
+        write_store(&d);
+        fs::write(
+            d.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"coordinated\":false,\"provenance\":\"unverified\",\"wal_kind\":\"both\"}}",
+                SNAPSHOT_FORMAT, SNAPSHOT_VERSION
+            ),
+        )
+        .unwrap();
+        fs::write(d.join("ladybug.store.wal"), b"active-bytes").unwrap();
+        fs::write(d.join("ladybug.store.wal.checkpoint"), b"frozen-bytes").unwrap();
+
+        let checksums = write_checksums(&d).unwrap();
+        assert!(
+            checksums.wal_checkpoint_sha256.is_some(),
+            "the frozen side of a mixed pair is checksummed"
+        );
+        let report = verify_snapshot(&d).expect("both sides verify together");
+        assert!(report.integrity_ok);
+        assert_eq!(report.wal_kind.as_deref(), Some("both"));
+
+        // Dropping either side leaves a snapshot that claims more than it
+        // holds; that is a mismatch, never a quiet pass.
+        fs::remove_file(d.join("ladybug.store.wal.checkpoint")).unwrap();
+        let result = verify_snapshot(&d);
+        assert!(
+            matches!(result, Err(SnapshotError::ChecksumMismatch { .. })),
+            "a both-kind manifest with the frozen side missing fails: {result:?}"
         );
     }
 

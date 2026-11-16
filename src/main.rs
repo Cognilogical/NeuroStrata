@@ -2113,6 +2113,31 @@ fn daemon_holds_lock(db_path: &std::path::Path) -> bool {
     }
 }
 
+/// Fallible store-lock probe for the `--no-open` gate (#209).
+///
+/// [`daemon_holds_lock`] answers "held or not" and treats a probe failure as
+/// "not held", which is right for status reporting but wrong for a gate: a
+/// probe that cannot answer proves nothing about the store's owner, so the
+/// caller must refuse rather than copy.
+fn daemon_lock_probe(db_path: &std::path::Path) -> anyhow::Result<bool> {
+    let lock_path = daemon_lock_path(db_path);
+    // Read-only gating must not create the lock file either.
+    if !lock_path.exists() {
+        return Ok(false);
+    }
+    let file = open_daemon_lock(db_path)
+        .map_err(|e| anyhow::anyhow!("could not open {:?} to probe it: {}", lock_path, e))?;
+    match file.try_lock() {
+        Ok(()) => Ok(false),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(true),
+        Err(std::fs::TryLockError::Error(e)) => Err(anyhow::anyhow!(
+            "could not probe the store lock {:?}: {}",
+            lock_path,
+            e
+        )),
+    }
+}
+
 /// A daemon that holds the database but did not answer the probe is busy, not
 /// gone, and opening the database from here would contend with its writer. An
 /// answering daemon is not busy in this sense: it can be asked to do the work.
@@ -4899,7 +4924,7 @@ mod tests {
             "precondition: the lock probe sees the holder"
         );
 
-        let err = refuse_no_open_when_locked(daemon_holds_lock(&db))
+        let err = refuse_no_open_when_locked(&db)
             .expect_err("--no-open must be refused while the store lock is held");
         assert!(
             err.to_string().contains("--no-open"),
@@ -4912,8 +4937,34 @@ mod tests {
         drop(lock);
 
         let quiescent = root.join("quiescent.store");
-        refuse_no_open_when_locked(daemon_holds_lock(&quiescent))
+        refuse_no_open_when_locked(&quiescent)
             .expect("a quiescent store still backs up without opening");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn no_open_backup_fails_closed_when_the_lock_probe_errors() {
+        // #209 (V5): a probe that cannot answer is not "the lock is free". The
+        // refusal must surface the probe failure rather than let the copy run
+        // against a store whose owner cannot be established.
+        let root = std::env::temp_dir().join(format!("ns-no-open-probe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("ladybug.store");
+        // A directory where the lock file belongs: the probe cannot open it.
+        std::fs::create_dir_all(daemon_lock_path(&db)).unwrap();
+
+        let err = refuse_no_open_when_locked(&db)
+            .expect_err("a probe that cannot answer must refuse --no-open");
+        let message = err.to_string();
+        assert!(
+            message.contains("probe"),
+            "the refusal names the failed probe: {message}"
+        );
+        assert!(
+            message.contains("--no-open"),
+            "the refusal names the flag: {message}"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -4942,6 +4993,87 @@ mod tests {
             gate < first_copy,
             "the --no-open refusal must run before the first file copy"
         );
+    }
+
+    #[test]
+    fn restore_copy_places_both_wal_sides_and_drops_stale_ones() {
+        // #209 (V5): a `wal_kind: both` snapshot restores both byte streams
+        // under their own names. The restore set owns both companion names, so
+        // whatever the target held before is replaced or dropped as a unit.
+        let (root, snapshot_dir, target) = restore_copy_fixture("both-wal");
+        std::fs::write(snapshot_dir.join("ladybug.store.wal"), b"active-bytes").unwrap();
+        std::fs::write(
+            snapshot_dir.join("ladybug.store.wal.checkpoint"),
+            b"frozen-bytes",
+        )
+        .unwrap();
+        std::fs::write(
+            snapshot_dir.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"coordinated\":false,\"provenance\":\"unverified\",\"wal_kind\":\"both\"}}",
+                crate::storage::snapshot::SNAPSHOT_FORMAT,
+                crate::storage::snapshot::SNAPSHOT_VERSION
+            ),
+        )
+        .unwrap();
+        // Stale one-sided state at the target: an old active WAL, an old
+        // frozen WAL, and a shadow the snapshot does not carry. All three are
+        // superseded by the restore set.
+        std::fs::write(restore_companion_path(&target, ".wal"), b"stale-active").unwrap();
+        std::fs::write(
+            restore_companion_path(&target, ".wal.checkpoint"),
+            b"stale-frozen",
+        )
+        .unwrap();
+        std::fs::write(restore_companion_path(&target, ".shadow"), b"stale-shadow").unwrap();
+
+        copy_snapshot_into_place(&snapshot_dir, &target).expect("restore copy");
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"snapshot-db");
+        assert_eq!(
+            std::fs::read(restore_companion_path(&target, ".wal")).unwrap(),
+            b"active-bytes",
+            "the active side lands under <db>.wal"
+        );
+        assert_eq!(
+            std::fs::read(restore_companion_path(&target, ".wal.checkpoint")).unwrap(),
+            b"frozen-bytes",
+            "the frozen side lands under <db>.wal.checkpoint"
+        );
+        assert!(
+            !restore_companion_path(&target, ".shadow").exists(),
+            "a stale shadow the snapshot does not carry is dropped"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restore_copy_refuses_a_both_wal_snapshot_missing_a_side() {
+        // Fail closed: a manifest that promises both sides but carries one must
+        // not restore as a homogeneous pair.
+        let (root, snapshot_dir, target) = restore_copy_fixture("both-missing");
+        std::fs::write(snapshot_dir.join("ladybug.store.wal"), b"active-bytes").unwrap();
+        std::fs::write(
+            snapshot_dir.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"coordinated\":false,\"provenance\":\"unverified\",\"wal_kind\":\"both\"}}",
+                crate::storage::snapshot::SNAPSHOT_FORMAT,
+                crate::storage::snapshot::SNAPSHOT_VERSION
+            ),
+        )
+        .unwrap();
+
+        let err = copy_snapshot_into_place(&snapshot_dir, &target)
+            .expect_err("a both-kind snapshot with one side is refused");
+        assert!(
+            err.to_string().contains("frozen"),
+            "the refusal names the missing side: {err}"
+        );
+        assert!(
+            !target.exists(),
+            "a refused restore places no store at the target"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn restore_companion_path(target: &std::path::Path, suffix: &str) -> std::path::PathBuf {
@@ -5226,11 +5358,17 @@ fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
 /// WAL, and the checkpoint shadow straight from disk. While a daemon holds the
 /// lock it may be mid-checkpoint, so those files would be captured at
 /// different instants. A coordinated backup routes through the daemon instead.
-fn refuse_no_open_when_locked(lock_held: bool) -> anyhow::Result<()> {
-    if lock_held {
-        return Err(anyhow::anyhow!("{}", NO_OPEN_LOCK_HELD_MESSAGE));
+fn refuse_no_open_when_locked(db_path: &std::path::Path) -> anyhow::Result<()> {
+    match daemon_lock_probe(db_path) {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(anyhow::anyhow!("{}", NO_OPEN_LOCK_HELD_MESSAGE)),
+        // Fail closed (#209, V5): an unanswerable probe is not evidence that
+        // the store is free, so the copy does not run.
+        Err(e) => Err(anyhow::anyhow!(
+            "Refusing --no-open: the store lock probe failed ({}), so it cannot be shown that no daemon holds the store. Take a coordinated backup with `neurostrata-mcp backup <dir>` (without --no-open), or run `neurostrata-mcp shutdown` first.",
+            e
+        )),
     }
-    Ok(())
 }
 
 /// Verify a snapshot directory before a restore copies anything from it.
@@ -5281,8 +5419,9 @@ fn ensure_snapshot_verified(dir: &std::path::Path) -> anyhow::Result<()> {
 /// Companion names belong to the restore set as a group (#209): a snapshot
 /// whose WAL was frozen restores `<db>.wal.checkpoint`, so a stale
 /// `<db>.wal` at the target is removed with the set rather than left to pair
-/// with it. Snapshots written before #209 carry no `wal_kind`; their WAL was
-/// copied from the active `<db>.wal`, so they restore under that name.
+/// with it; a mixed pair (`wal_kind: both`) restores both streams. Snapshots
+/// written before #209 carry no `wal_kind`; their WAL was copied from the
+/// active `<db>.wal`, so they restore under that name.
 fn copy_snapshot_into_place(
     snapshot_dir: &std::path::Path,
     target: &std::path::Path,
@@ -5294,22 +5433,43 @@ fn copy_snapshot_into_place(
         std::path::PathBuf::from(os)
     };
 
-    // Which name the snapshot's WAL belongs under (#209). Absent kind means a
-    // legacy snapshot, whose WAL was the active `.wal`.
-    let wal_suffix = match snapshot_wal_kind(snapshot_dir)?.as_deref() {
+    // Which name(s) the snapshot's WAL belongs under (#209). Absent kind
+    // means a legacy snapshot, whose WAL was the active `.wal`. A mixed pair
+    // (`both`) places its active and frozen streams under their own names.
+    let wal_kind = snapshot_wal_kind(snapshot_dir)?;
+    let declares_both = wal_kind.as_deref() == Some(crate::storage::snapshot::WAL_KIND_BOTH);
+    let wal_suffix = match wal_kind.as_deref() {
         Some(crate::storage::snapshot::WAL_KIND_FROZEN) => ".wal.checkpoint",
         Some(crate::storage::snapshot::WAL_KIND_NONE) => "",
         _ => ".wal",
     };
+    let snapshot_wal = snapshot_dir.join("ladybug.store.wal");
+    let snapshot_checkpoint_wal = snapshot_dir.join("ladybug.store.wal.checkpoint");
+    if declares_both && !snapshot_wal.exists() {
+        return Err(anyhow::anyhow!(
+            "the snapshot records wal_kind \"both\" but carries no active ladybug.store.wal"
+        ));
+    }
+    if declares_both && !snapshot_checkpoint_wal.exists() {
+        return Err(anyhow::anyhow!(
+            "the snapshot records wal_kind \"both\" but carries no frozen ladybug.store.wal.checkpoint"
+        ));
+    }
+    if !declares_both && snapshot_checkpoint_wal.exists() {
+        return Err(anyhow::anyhow!(
+            "the snapshot carries ladybug.store.wal.checkpoint but its wal_kind is {:?}; a mixed pair is recorded as \"both\"",
+            wal_kind
+        ));
+    }
 
     // (snapshot member, target path) for every file the restore may place.
     let mut members: Vec<(std::path::PathBuf, std::path::PathBuf)> =
         vec![(snapshot_dir.join("ladybug.store"), target.to_path_buf())];
     if !wal_suffix.is_empty() {
-        members.push((
-            snapshot_dir.join("ladybug.store.wal"),
-            appended(target, wal_suffix),
-        ));
+        members.push((snapshot_wal.clone(), appended(target, wal_suffix)));
+    }
+    if declares_both {
+        members.push((snapshot_checkpoint_wal, appended(target, ".wal.checkpoint")));
     }
     members.push((
         snapshot_dir.join("ladybug.store.store-state.json"),
@@ -6005,7 +6165,7 @@ async fn run() -> anyhow::Result<()> {
                     // read at different instants, which is exactly the
                     // verify-but-cannot-restore pair this refuses. A
                     // coordinated backup goes through the daemon above.
-                    if let Err(e) = refuse_no_open_when_locked(daemon_holds_lock(&config.db_path)) {
+                    if let Err(e) = refuse_no_open_when_locked(&config.db_path) {
                         eprintln!("{}", e);
                         std::process::exit(1);
                     }

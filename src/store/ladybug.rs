@@ -9011,16 +9011,42 @@ fn append_suffix(base: &std::path::Path, suffix: &str) -> PathBuf {
     PathBuf::from(os)
 }
 
-/// Which WAL role a store presents on disk right now (#209). `.wal` wins over
-/// `.wal.checkpoint`: any store that passed the engine's pair checks has at
-/// most one of them, and a mixed pair refuses to open.
-fn wal_role_on_disk(source: &std::path::Path) -> &'static str {
-    if append_suffix(source, ".wal").exists() {
-        crate::storage::snapshot::WAL_KIND_ACTIVE
-    } else if append_suffix(source, ".wal.checkpoint").exists() {
-        crate::storage::snapshot::WAL_KIND_FROZEN
-    } else {
-        crate::storage::snapshot::WAL_KIND_NONE
+/// Which WAL sides a store presents on disk right now (#209).
+///
+/// A store does **not** always have at most one side: the engine's
+/// `preflight_wal_headers` accepts a mixed pair (both sides parse and agree on
+/// the checksum flag) as a usable single store. So a snapshot records `Both`
+/// and carries both byte streams; preferring the active side here would drop
+/// committed data from the copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalRole {
+    Active,
+    Frozen,
+    Both,
+    None,
+}
+
+impl WalRole {
+    fn on_disk(source: &std::path::Path) -> Self {
+        match (
+            append_suffix(source, ".wal").exists(),
+            append_suffix(source, ".wal.checkpoint").exists(),
+        ) {
+            (true, true) => WalRole::Both,
+            (true, false) => WalRole::Active,
+            (false, true) => WalRole::Frozen,
+            (false, false) => WalRole::None,
+        }
+    }
+
+    /// The `wal_kind` value this role records in the manifest.
+    fn as_manifest(self) -> &'static str {
+        match self {
+            WalRole::Active => crate::storage::snapshot::WAL_KIND_ACTIVE,
+            WalRole::Frozen => crate::storage::snapshot::WAL_KIND_FROZEN,
+            WalRole::Both => crate::storage::snapshot::WAL_KIND_BOTH,
+            WalRole::None => crate::storage::snapshot::WAL_KIND_NONE,
+        }
     }
 }
 
@@ -9078,42 +9104,68 @@ impl LadybugStore {
         // A WAL left behind after the checkpoint (or before recovery in
         // `--no-open` mode) rides along, so a restore replays or preserves it.
         // Its role is recorded (#209): `.wal` is active, `.wal.checkpoint` is
-        // the frozen WAL of a crashed checkpoint, and restore has to put it
-        // back under the same name. The copy gets the same bracket as the
-        // database: a WAL copied at a different instant than the database is
-        // exactly the tear this snapshot must refuse.
-        let wal_kind = wal_role_on_disk(source);
+        // the frozen WAL of a crashed checkpoint, and a mixed pair carries
+        // BOTH byte streams (`wal_kind: both`) — the frozen side is never
+        // silently dropped. The copies get the same bracket as the database: a
+        // WAL copied at a different instant than the database is exactly the
+        // tear this snapshot must refuse.
+        let wal_role = WalRole::on_disk(source);
         let dest_wal = dir.join("ladybug.store.wal");
-        if wal_kind == crate::storage::snapshot::WAL_KIND_NONE {
-            if dest_wal.exists() {
-                std::fs::remove_file(&dest_wal).map_err(|e| {
+        let dest_checkpoint_wal = dir.join("ladybug.store.wal.checkpoint");
+        // A member this export does not produce must not survive from an
+        // earlier export into the same directory.
+        let remove_stale = |path: &std::path::Path| -> Result<()> {
+            if path.exists() {
+                std::fs::remove_file(path).map_err(|e| {
                     anyhow::anyhow!(
-                        "could not remove the stale write-ahead log from the snapshot: {}",
+                        "could not remove the stale snapshot member {}: {}",
+                        path.display(),
                         e
                     )
                 })?;
             }
-        } else {
-            let wal_suffix = if wal_kind == crate::storage::snapshot::WAL_KIND_FROZEN {
-                ".wal.checkpoint"
-            } else {
-                ".wal"
-            };
-            copy_file_bracketed(
-                &append_suffix(source, wal_suffix),
-                &dest_wal,
-                "write-ahead log",
-            )?;
+            Ok(())
+        };
+        match wal_role {
+            WalRole::None => {
+                remove_stale(&dest_wal)?;
+                remove_stale(&dest_checkpoint_wal)?;
+            }
+            WalRole::Active | WalRole::Frozen => {
+                let wal_suffix = if wal_role == WalRole::Frozen {
+                    ".wal.checkpoint"
+                } else {
+                    ".wal"
+                };
+                copy_file_bracketed(
+                    &append_suffix(source, wal_suffix),
+                    &dest_wal,
+                    "write-ahead log",
+                )?;
+                remove_stale(&dest_checkpoint_wal)?;
+            }
+            WalRole::Both => {
+                copy_file_bracketed(
+                    &append_suffix(source, ".wal"),
+                    &dest_wal,
+                    "active write-ahead log",
+                )?;
+                copy_file_bracketed(
+                    &append_suffix(source, ".wal.checkpoint"),
+                    &dest_checkpoint_wal,
+                    "frozen write-ahead log",
+                )?;
+            }
         }
-        // The pair must not have moved under the copies: if `<db>.wal`
-        // appeared or vanished while the snapshot ran, the recorded role
-        // describes a different instant than the copied WAL.
-        let wal_kind_after = wal_role_on_disk(source);
-        if wal_kind_after != wal_kind {
+        // The pair must not have moved under the copies: if a side appeared
+        // or vanished while the snapshot ran, the recorded role describes a
+        // different instant than the copied WAL.
+        let wal_role_after = WalRole::on_disk(source);
+        if wal_role_after != wal_role {
             return Err(anyhow::anyhow!(
                 "the write-ahead log role changed during the snapshot copy ({} -> {}); the snapshot is aborted (#209)",
-                wal_kind,
-                wal_kind_after
+                wal_role.as_manifest(),
+                wal_role_after.as_manifest()
             ));
         }
 
@@ -9174,7 +9226,7 @@ impl LadybugStore {
             "bytes": std::fs::metadata(&target).map(|m| m.len()).unwrap_or(0),
             "coordinated": coordinated,
             "provenance": provenance,
-            "wal_kind": wal_kind,
+            "wal_kind": wal_role.as_manifest(),
         });
         std::fs::write(
             dir.join("manifest.json"),
@@ -26620,7 +26672,9 @@ eurostrata\src\daemon.rs",
 
     /// #196: when strict WAL verification refuses to open a store, path-only
     /// `compute_storage_status` and `LadybugStore::export_database_files`
-    /// (`backup --no-open`) still succeed and produce a valid snapshot.
+    /// (`backup --no-open`) still succeed and produce an intact snapshot —
+    /// whose bytes must match their checksums, while its provenance stays
+    /// uncoordinated, so it is never a fully `valid` snapshot (#209).
     #[tokio::test]
     async fn storage_status_and_no_open_backup_succeed_on_strict_wal_refused_store() {
         let _env_guard = WAL_ENV_LOCK.lock().await;
@@ -26764,6 +26818,62 @@ eurostrata\src\daemon.rs",
             "a --no-open export must not verify as fully valid (#209)"
         );
         assert_eq!(report.wal_kind.as_deref(), Some("frozen"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #209 (V5): a mixed WAL pair preflights as a usable single store, so it
+    /// must not be silently reduced to its active side. Both byte streams are
+    /// exported, the frozen side under the checkpoint member, and the manifest
+    /// records `wal_kind: both`.
+    #[test]
+    fn a_mixed_wal_pair_exports_both_sides() {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-mixed-wal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("mixed.lbug");
+        std::fs::write(&db, b"db-image").unwrap();
+        std::fs::write(append_suffix(&db, ".wal"), b"active-bytes").unwrap();
+        std::fs::write(append_suffix(&db, ".wal.checkpoint"), b"frozen-bytes").unwrap();
+        let out = root.join("snap");
+
+        LadybugStore::export_database_files(&db, &out).expect("no-open export of a mixed pair");
+
+        assert_eq!(
+            std::fs::read(out.join("ladybug.store.wal")).unwrap(),
+            b"active-bytes",
+            "the active side keeps the wal member"
+        );
+        assert_eq!(
+            std::fs::read(out.join("ladybug.store.wal.checkpoint")).unwrap(),
+            b"frozen-bytes",
+            "the frozen side is a snapshot member, never dropped (#209)"
+        );
+
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(out.join("manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest["wal_kind"], "both");
+
+        let checksums: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(out.join("checksums.json")).unwrap())
+                .unwrap();
+        assert!(
+            checksums["wal_checkpoint_sha256"].is_string(),
+            "the frozen side is checksummed: {checksums}"
+        );
+
+        let report = crate::storage::verify_snapshot(&out).expect("mixed pair verifies");
+        assert!(report.integrity_ok);
+        assert!(!report.valid, "a --no-open export is uncoordinated (#209)");
+        assert_eq!(report.wal_kind.as_deref(), Some("both"));
 
         let _ = std::fs::remove_dir_all(&root);
     }
