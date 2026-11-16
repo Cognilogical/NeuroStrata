@@ -1148,6 +1148,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_pointers_excludes_retired_rows_and_keeps_active_visible() {
+        let now = now_epoch();
+        let ns = "ns1";
+        let spy = Arc::new(SpyConnector::new("spy", DataPoolAccessMode::ReadWrite, 10, 1024));
+        let (kernel, store, _dir) = build_kernel(spy.clone());
+        store.init(ns).await.expect("init");
+
+        // One active visible pointer and one retired pointer, both owned by
+        // the caller and readable under ReBAC: only retirement — not ReBAC —
+        // may hide the retired row.
+        let active = pointer_record("ptr_active", "spy", now, 3600);
+        seed_pointer(&store, ns, &active, "alice", None).await;
+        let retired = pointer_record("ptr_retired", "spy", now, 3600);
+        let mut retired_metadata = json!({
+            "eligibility": "private",
+            "pointer": serde_json::to_value(&retired).unwrap(),
+            "source": {"kind": "data_connector", "ref": retired.pointer_uri},
+        });
+        retired_metadata["valid_to"] = json!(now.saturating_sub(1));
+        let retired_payload = MemoryPayload {
+            content: format!("data pointer {}", retired.pointer_id),
+            user_id: "alice".to_string(),
+            memory_type: "data_pointer".to_string(),
+            agent_name: None,
+            location: retired.pointer_uri.clone(),
+            location_lines: String::new(),
+            metadata: retired_metadata,
+        };
+        store
+            .put_scoped_memory(ns, &retired.pointer_id, &retired_payload)
+            .await
+            .expect("seed retired pointer");
+
+        let value = kernel
+            .execute_connector_command(ns, &json!({ "operation": "list_pointers" }), Some("alice"))
+            .await
+            .expect("list_pointers");
+        let ids: Vec<&str> = value
+            .as_array()
+            .expect("pointers array")
+            .iter()
+            .map(|v| v["pointer_id"].as_str().expect("pointer_id"))
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["ptr_active"],
+            "retired data pointers are history, not live connector locators"
+        );
+    }
+
+    #[tokio::test]
     async fn kernel_construction_and_execution_accept_trait_object_store() {
         let dir = tempfile::tempdir().expect("tempdir");
         // The serving layers (MCP / daemon / CLI) hold the store as the trait

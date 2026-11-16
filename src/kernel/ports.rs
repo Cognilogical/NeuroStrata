@@ -190,9 +190,15 @@ impl MemoryPort for LadybugMemoryPort {
     async fn list_data_pointers(&self, namespace: &str, pool_id: Option<&str>, principal: Option<&str>) -> Result<Vec<DataPointerRecord>> {
         let mut out = Vec::new();
         let lb = self.ladybug_store();
+        // Retired rows are history, not live connector locators. Capture the
+        // query instant before materializing rows for consistent filtering.
+        let now = chrono::Utc::now().timestamp();
         // List all memory_type == "data_pointer" in the namespace.
         let rows = lb.list_memories_by_types(namespace, &["data_pointer"]).await?;
         for (_id, payload) in rows {
+            if crate::store::ladybug::is_retired_at(&payload.metadata, now) {
+                continue;
+            }
             // ReBAC filtering: principal == None => trusted (include all) else require can_read_memory.
             let include = match principal {
                 None => true,

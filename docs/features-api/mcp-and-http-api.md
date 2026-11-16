@@ -43,7 +43,7 @@
 
 ## Central Agentic Kernel & DataConnector Tools
 
-- `neurostrata_data_connector` — execute an `AgentKernel` connector command: `list_connectors`, `describe_pool`, `register_pointer`, `list_pointers`, `resolve_pointer`, `apply_effect`, `mediate`.
+- `neurostrata_data_connector` — execute an `AgentKernel` connector command: `list_connectors`, `describe_pool`, `register_pointer`, `list_pointers`, `resolve_pointer`, `apply_effect`, `mediate`. The MCP `tools/list` disclosure for its `args` object is operation-discriminated (`oneOf` on `operation`): each variant lists its own required fields and the nested `DataPointerRecord`, `DataSliceRequest`, and `ExternalEffectRequest` layouts. Optional `now_secs` (u64) on `resolve_pointer`, `apply_effect`, and `mediate` defaults to the current epoch when omitted; the schema is discovery-only and runtime validation is unchanged.
 
 ## Subject-Matter Domain Expertise & SKOS Taxonomy
 

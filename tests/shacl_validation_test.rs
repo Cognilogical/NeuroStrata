@@ -71,6 +71,18 @@ pub mod store {
     /// Dummy LadybugStore type for the test. The function `can_write_namespace` in
     /// `src/rebac.rs` references this type; it is unused in the test anyway.
     pub struct LadybugStore;
+
+    impl LadybugStore {
+        /// Stand-in for `store::ladybug::LadybugStore::new` so the rebac unit tests
+        /// copied into this crate can construct the type. The namespace write gate
+        /// never touches the store.
+        pub fn new(
+            _local_path: impl Into<std::path::PathBuf>,
+            _dimensions: usize,
+        ) -> Result<Self, String> {
+            Ok(Self)
+        }
+    }
 }
 
 pub mod rdf {

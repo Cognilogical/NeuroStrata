@@ -630,11 +630,116 @@ pub async fn process_mcp_request(
                                 "principal": { "type": "string", "description": "Optional requested principal." },
                                 "args": {
                                     "type": "object",
-                                    "description": "Connector operation arguments with 'operation' field.",
-                                    "properties": {
-                                        "operation": { "type": "string", "description": "Connector operation (list_connectors, describe_pool, register_pointer, list_pointers, resolve_pointer, apply_effect, mediate)." }
-                                    },
-                                    "required": ["operation"]
+                                    "description": "Connector operation arguments discriminated by 'operation'; each variant declares its own required fields. Omitting 'now_secs' defaults it to the current epoch. Runtime also accepts extra fields not listed here.",
+                                    "oneOf": [
+                                        {
+                                            "type": "object",
+                                            "properties": {
+                                                "operation": { "const": "list_connectors", "description": "List every registered connector id." }
+                                            },
+                                            "required": ["operation"]
+                                        },
+                                        {
+                                            "type": "object",
+                                            "properties": {
+                                                "operation": { "const": "list_pointers", "description": "List visible data pointers (retired pointers are omitted)." }
+                                            },
+                                            "required": ["operation"]
+                                        },
+                                        {
+                                            "type": "object",
+                                            "properties": {
+                                                "operation": { "const": "describe_pool", "description": "Describe one pool's schema on a connector." },
+                                                "pool_id": { "type": "string", "description": "Pool to describe." },
+                                                "connector_id": { "type": "string", "description": "Registered connector id (from list_connectors)." }
+                                            },
+                                            "required": ["operation", "pool_id", "connector_id"]
+                                        },
+                                        {
+                                            "type": "object",
+                                            "properties": {
+                                                "operation": { "const": "register_pointer", "description": "Register a data pointer under ReBAC + pre-gate enforcement." },
+                                                "record": {
+                                                    "type": "object",
+                                                    "description": "The DataPointerRecord to register.",
+                                                    "properties": {
+                                                        "pointer_id": { "type": "string", "description": "Stable pointer id." },
+                                                        "connector_id": { "type": "string", "description": "Owning connector id." },
+                                                        "pool_id": { "type": "string", "description": "Pool the pointer lives in." },
+                                                        "pointer_uri": { "type": "string", "description": "Connector-facing uri of the entity." },
+                                                        "entity_type": { "type": "string", "description": "Pool entity type." },
+                                                        "expected_source_sha256": { "type": ["string", "null"], "description": "Optional expected source digest for write-back CAS." },
+                                                        "captured_at_secs": { "type": "integer", "minimum": 0, "description": "u64 epoch seconds when the pointer was captured." },
+                                                        "max_staleness_secs": { "type": "integer", "minimum": 0, "description": "u64 seconds before the pointer is considered stale." }
+                                                    },
+                                                    "required": ["pointer_id", "connector_id", "pool_id", "pointer_uri", "entity_type", "captured_at_secs", "max_staleness_secs"]
+                                                }
+                                            },
+                                            "required": ["operation", "record"]
+                                        },
+                                        {
+                                            "type": "object",
+                                            "properties": {
+                                                "operation": { "const": "resolve_pointer", "description": "Resolve a bounded data slice from a pointer." },
+                                                "req": {
+                                                    "type": "object",
+                                                    "description": "The DataSliceRequest to resolve.",
+                                                    "properties": {
+                                                        "pointer_id": { "type": "string", "description": "Pointer to resolve." },
+                                                        "offset": { "type": "integer", "minimum": 0, "maximum": 4294967295u64, "description": "u32 zero-based row offset." },
+                                                        "limit": { "type": "integer", "minimum": 0, "maximum": 4294967295u64, "description": "u32 maximum rows to return." },
+                                                        "max_bytes": { "type": "integer", "minimum": 0, "maximum": 4294967295u64, "description": "u32 maximum serialized payload bytes." }
+                                                    },
+                                                    "required": ["pointer_id", "offset", "limit", "max_bytes"]
+                                                },
+                                                "now_secs": { "type": ["integer", "null"], "minimum": 0, "description": "Optional u64 epoch seconds for staleness checks; omitted => current epoch." }
+                                            },
+                                            "required": ["operation", "req"]
+                                        },
+                                        {
+                                            "type": "object",
+                                            "properties": {
+                                                "operation": { "const": "apply_effect", "description": "Apply an external effect through the connector (write-back)." },
+                                                "req": {
+                                                    "type": "object",
+                                                    "description": "The ExternalEffectRequest to apply.",
+                                                    "properties": {
+                                                        "pointer_id": { "type": "string", "description": "Pointer whose entity the effect targets." },
+                                                        "operation": { "type": "string", "description": "Connector-side operation name (e.g. 'append')." },
+                                                        "payload": { "description": "JSON value of any shape; the connector interprets it." },
+                                                        "action_receipt_id": { "type": "string", "description": "Action receipt id recording this effect." },
+                                                        "expected_source_sha256": { "type": ["string", "null"], "description": "Optional expected prior source digest for CAS." },
+                                                        "idempotency_key": { "type": "string", "description": "Client-supplied idempotency key." }
+                                                    },
+                                                    "required": ["pointer_id", "operation", "payload", "action_receipt_id", "idempotency_key"]
+                                                },
+                                                "now_secs": { "type": ["integer", "null"], "minimum": 0, "description": "Optional u64 epoch seconds for staleness checks; omitted => current epoch." }
+                                            },
+                                            "required": ["operation", "req"]
+                                        },
+                                        {
+                                            "type": "object",
+                                            "properties": {
+                                                "operation": { "const": "mediate", "description": "Run the workflow transition gate, then resolve a bounded slice." },
+                                                "from_stage": { "type": "string", "description": "Origin workflow stage; runtime matches case-insensitively: unpreflighted, contextloaded, claimed, mutating, breathrequired, precheckpoint, prepublish, completed." },
+                                                "to_stage": { "type": "string", "description": "Target workflow stage; same case-insensitive stage names as from_stage." },
+                                                "slice_req": {
+                                                    "type": "object",
+                                                    "description": "The DataSliceRequest resolved after the gate.",
+                                                    "properties": {
+                                                        "pointer_id": { "type": "string", "description": "Pointer to resolve." },
+                                                        "offset": { "type": "integer", "minimum": 0, "maximum": 4294967295u64, "description": "u32 zero-based row offset." },
+                                                        "limit": { "type": "integer", "minimum": 0, "maximum": 4294967295u64, "description": "u32 maximum rows to return." },
+                                                        "max_bytes": { "type": "integer", "minimum": 0, "maximum": 4294967295u64, "description": "u32 maximum serialized payload bytes." }
+                                                    },
+                                                    "required": ["pointer_id", "offset", "limit", "max_bytes"]
+                                                },
+                                                "gate_passed": { "type": ["boolean", "null"], "description": "Optional gate precondition; runtime defaults to false when omitted or null." },
+                                                "now_secs": { "type": ["integer", "null"], "minimum": 0, "description": "Optional u64 epoch seconds for staleness checks; omitted => current epoch." }
+                                            },
+                                            "required": ["operation", "from_stage", "to_stage", "slice_req"]
+                                        }
+                                    ]
                                 }
                             },
                             "required": ["namespace", "args"]
@@ -14987,6 +15092,318 @@ mod tests {
         assert!(
             !loc_desc.contains("Memories MUST reference"),
             "locations description must never claim memories MUST reference documents: {loc_desc:?}"
+        );
+    }
+
+    /// The connector tool's `args` object is the only contract a client
+    /// reads before calling it. An underspecified schema turns every
+    /// operation-specific required field into a runtime error instead of
+    /// a dispatch-time rejection. `args` therefore discriminates on
+    /// `operation`, and each variant declares the fields
+    /// AgentKernel::execute_connector_command actually reads, with the
+    /// nested serde records spelled out. A missing variant, a dropped
+    /// required field, or a wrong integer width fails here.
+    #[tokio::test]
+    async fn data_connector_schema_is_operation_specific() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: "tools/list".to_string(),
+            params: Some(serde_json::json!({})),
+        };
+        let (bus, _seen) = recording_bus();
+        let response =
+            process_mcp_request(request, Arc::new(StubEmbedder), store, ingests, None, bus).await;
+        let tools = response["result"]["tools"]
+            .as_array()
+            .expect("tools/list returns an array");
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == "neurostrata_data_connector")
+            .expect("connector tool is exposed");
+        // Hand-derived from AgentKernel::execute_connector_command and the
+        // serde records in src/connectors/mod.rs — not from the emitted schema.
+        // Each row: (op, required, declared top-level properties in the variant).
+        // Exact property sets pin discovery: a spurious now_secs on the wrong op fails here.
+        let expected: &[(&str, &[&str], &[&str])] = &[
+            ("list_connectors", &["operation"], &["operation"]),
+            ("list_pointers", &["operation"], &["operation"]),
+            (
+                "describe_pool",
+                &["operation", "pool_id", "connector_id"],
+                &["operation", "pool_id", "connector_id"],
+            ),
+            (
+                "register_pointer",
+                &["operation", "record"],
+                &["operation", "record"],
+            ),
+            (
+                "resolve_pointer",
+                &["operation", "req"],
+                &["operation", "req", "now_secs"],
+            ),
+            (
+                "apply_effect",
+                &["operation", "req"],
+                &["operation", "req", "now_secs"],
+            ),
+            (
+                "mediate",
+                &["operation", "from_stage", "to_stage", "slice_req"],
+                &[
+                    "operation",
+                    "from_stage",
+                    "to_stage",
+                    "slice_req",
+                    "gate_passed",
+                    "now_secs",
+                ],
+            ),
+        ];
+        // Nullable parity helper: Option<String> accepts null; as_u64()/as_bool()
+        // on null map to the runtime default — discovery must not forbid null.
+        let assert_nullable =
+            |value: &serde_json::Value, want: &[&str], what: &str| {
+                let types: Vec<&str> = value["type"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{what}: type must be a nullable array, got {}", value["type"]))
+                    .iter()
+                    .map(|t| t.as_str().expect("type is a string"))
+                    .collect();
+                let mut got = types;
+                got.sort();
+                let mut want_sorted = want.to_vec();
+                want_sorted.sort();
+                assert_eq!(got, want_sorted, "{what}: nullable type set");
+            };
+        let sorted = |value: &serde_json::Value, what: &str| -> Vec<String> {
+            let mut keys: Vec<String> = value
+                .as_object()
+                .unwrap_or_else(|| panic!("{what}: expected an object"))
+                .keys()
+                .cloned()
+                .collect();
+            keys.sort();
+            keys
+        };
+        let args = &tool["inputSchema"]["properties"]["args"];
+        let one_of = args["oneOf"]
+            .as_array()
+            .expect("args discriminates on operation via oneOf");
+        assert_eq!(
+            one_of.len(),
+            expected.len(),
+            "exactly the seven wire operations are declared"
+        );
+        for (op, required, declared) in expected {
+            let variant = one_of
+                .iter()
+                .find(|v| v["properties"]["operation"]["const"] == *op)
+                .unwrap_or_else(|| panic!("oneOf carries a variant for {op}"));
+            let req: Vec<&str> = variant["required"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{op} declares required fields"))
+                .iter()
+                .map(|v| v.as_str().expect("a required field name"))
+                .collect();
+            assert_eq!(&req, required, "{op} required fields");
+            let mut got_props = sorted(&variant["properties"], "variant properties");
+            let mut want_props: Vec<String> =
+                declared.iter().map(|s| s.to_string()).collect();
+            got_props.sort();
+            want_props.sort();
+            assert_eq!(got_props, want_props, "{op} declares exactly these properties");
+            if variant["properties"]["now_secs"].is_object() {
+                assert_nullable(
+                    &variant["properties"]["now_secs"],
+                    &["integer", "null"],
+                    &format!("{op} now_secs"),
+                );
+                assert_eq!(
+                    variant["properties"]["now_secs"]["minimum"],
+                    serde_json::json!(0),
+                    "{op} now_secs is a u64 epoch with minimum 0"
+                );
+                let desc = variant["properties"]["now_secs"]["description"]
+                    .as_str()
+                    .expect("now_secs documents its default");
+                assert!(
+                    desc.contains("current epoch"),
+                    "{op} now_secs documents the current-epoch default: {desc}"
+                );
+            }
+        }
+        // DataPointerRecord: the exact required set the serde derive
+        // enforces; expected_source_sha256 stays optional and nullable.
+        let register = one_of
+            .iter()
+            .find(|v| v["properties"]["operation"]["const"] == "register_pointer")
+            .expect("register_pointer variant");
+        let record = &register["properties"]["record"];
+        let mut record_required: Vec<&str> = record["required"]
+            .as_array()
+            .expect("record declares required fields")
+            .iter()
+            .map(|v| v.as_str().expect("a required field name"))
+            .collect();
+        record_required.sort();
+        let mut want_record = vec![
+            "captured_at_secs",
+            "connector_id",
+            "entity_type",
+            "max_staleness_secs",
+            "pointer_id",
+            "pointer_uri",
+            "pool_id",
+        ];
+        want_record.sort();
+        assert_eq!(record_required, want_record, "DataPointerRecord required");
+        let record_props = sorted(&record["properties"], "DataPointerRecord properties");
+        let mut want_record_props: Vec<String> = want_record
+            .iter()
+            .map(|s| s.to_string())
+            .chain(std::iter::once("expected_source_sha256".to_string()))
+            .collect();
+        want_record_props.sort();
+        assert_eq!(record_props, want_record_props, "DataPointerRecord declares exactly these fields");
+        assert_nullable(
+            &record["properties"]["expected_source_sha256"],
+            &["string", "null"],
+            "DataPointerRecord expected_source_sha256",
+        );
+        for f in ["captured_at_secs", "max_staleness_secs"] {
+            assert_eq!(
+                record["properties"][f]["type"],
+                "integer",
+                "{f} is a u64, serialized as an integer"
+            );
+            assert_eq!(
+                record["properties"][f]["minimum"],
+                serde_json::json!(0),
+                "{f} is a u64 with minimum 0"
+            );
+        }
+        // DataSliceRequest, shared by resolve_pointer.req and mediate.slice_req.
+        let slice_variations = [
+            (
+                "resolve_pointer",
+                &one_of
+                    .iter()
+                    .find(|v| v["properties"]["operation"]["const"] == "resolve_pointer")
+                    .expect("resolve_pointer variant")["properties"]["req"],
+            ),
+            (
+                "mediate",
+                &one_of
+                    .iter()
+                    .find(|v| v["properties"]["operation"]["const"] == "mediate")
+                    .expect("mediate variant")["properties"]["slice_req"],
+            ),
+        ];
+        for (op, slice_schema) in slice_variations {
+            let mut slice_required: Vec<&str> = slice_schema["required"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{op} slice request declares required fields"))
+                .iter()
+                .map(|v| v.as_str().expect("a required field name"))
+                .collect();
+            slice_required.sort();
+            let mut want_slice = vec!["limit", "max_bytes", "offset", "pointer_id"];
+            want_slice.sort();
+            assert_eq!(slice_required, want_slice, "{op} DataSliceRequest required");
+            assert_eq!(
+                sorted(&slice_schema["properties"], "DataSliceRequest properties"),
+                want_slice.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                "{op} DataSliceRequest declares exactly these fields"
+            );
+            for f in ["offset", "limit", "max_bytes"] {
+                assert_eq!(
+                    slice_schema["properties"][f]["type"],
+                    "integer",
+                    "{op} {f} is a u32, serialized as an integer"
+                );
+                assert_eq!(
+                    slice_schema["properties"][f]["minimum"],
+                    serde_json::json!(0),
+                    "{op} {f} minimum 0"
+                );
+                assert_eq!(
+                    slice_schema["properties"][f]["maximum"],
+                    serde_json::json!(4294967295u64),
+                    "{op} {f} maximum 4294967295 (u32)"
+                );
+            }
+        }
+        // ExternalEffectRequest.
+        let apply = one_of
+            .iter()
+            .find(|v| v["properties"]["operation"]["const"] == "apply_effect")
+            .expect("apply_effect variant");
+        let eff = &apply["properties"]["req"];
+        let mut eff_required: Vec<&str> = eff["required"]
+            .as_array()
+            .expect("effect request declares required fields")
+            .iter()
+            .map(|v| v.as_str().expect("a required field name"))
+            .collect();
+        eff_required.sort();
+        let mut want_eff = vec![
+            "action_receipt_id",
+            "idempotency_key",
+            "operation",
+            "payload",
+            "pointer_id",
+        ];
+        want_eff.sort();
+        assert_eq!(eff_required, want_eff, "ExternalEffectRequest required");
+        let eff_props = sorted(&eff["properties"], "ExternalEffectRequest properties");
+        let mut want_eff_props: Vec<String> = want_eff
+            .iter()
+            .map(|s| s.to_string())
+            .chain(std::iter::once("expected_source_sha256".to_string()))
+            .collect();
+        want_eff_props.sort();
+        assert_eq!(eff_props, want_eff_props, "ExternalEffectRequest declares exactly these fields");
+        assert_nullable(
+            &eff["properties"]["expected_source_sha256"],
+            &["string", "null"],
+            "ExternalEffectRequest expected_source_sha256",
+        );
+        assert!(
+            eff["properties"]["payload"].get("type").is_none(),
+            "payload is any JSON value; the schema must not constrain it"
+        );
+        // mediate: stage strings stay unconstrained at the schema layer because
+        // the runtime matches case-insensitively; gate_passed is nullable
+        // (as_bool() on null maps to the false default) and documents it.
+        let mediate = one_of
+            .iter()
+            .find(|v| v["properties"]["operation"]["const"] == "mediate")
+            .expect("mediate variant");
+        assert_eq!(mediate["properties"]["from_stage"]["type"], "string");
+        assert_eq!(mediate["properties"]["to_stage"]["type"], "string");
+        assert!(
+            mediate["properties"]["from_stage"].get("enum").is_none(),
+            "from_stage must not carry an enum (runtime matches case-insensitively)"
+        );
+        assert!(
+            mediate["properties"]["to_stage"].get("enum").is_none(),
+            "to_stage must not carry an enum (runtime matches case-insensitively)"
+        );
+        assert_nullable(
+            &mediate["properties"]["gate_passed"],
+            &["boolean", "null"],
+            "mediate gate_passed",
+        );
+        let gate_desc = mediate["properties"]["gate_passed"]["description"]
+            .as_str()
+            .expect("gate_passed documents its default");
+        assert!(
+            gate_desc.contains("false"),
+            "gate_passed documents the false default: {gate_desc}"
         );
     }
 
