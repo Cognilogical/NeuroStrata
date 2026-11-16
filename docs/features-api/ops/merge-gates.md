@@ -42,7 +42,8 @@ never counts, and the comment that carries the finding cannot supply its own
 exception — a maintainer may rule in the finding's own body, because that is an
 explicit acceptance rather than a claim of repair.
 In `--pr` mode the script validates every commit and issue target against the
-API; fixture and legacy modes enforce authorship only and say on stderr that
+API; a `filed` number that resolves to a pull request does not count as an
+issue. Fixture and legacy modes enforce authorship only and say on stderr that
 targets were not validated (fixtures may supply `valid-targets.json` to
 simulate that check).
 

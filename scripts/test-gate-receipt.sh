@@ -206,6 +206,10 @@ if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/double-backtick-rec
   echo "FAIL: a double-backtick span in a reply cleared a finding" >&2
   exit 1
 fi
+if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/pr-number-receipt" >/dev/null 2>&1; then
+  echo "FAIL: filed #218 cleared a finding although #218 is a pull request, not an issue" >&2
+  exit 1
+fi
 
 # Truncated review data must fail closed instead of under-counting (#218 P2).
 out=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/truncated-threads" 2>&1 >/dev/null || true)

@@ -13,9 +13,12 @@ self-test exercises the same branching as `--pr` without network access.
   its own markers and needs its own receipt.
 - `pull-comments.json` — fallback when `threads.json` is absent: every inline
   finding counts, receipts pool globally, and the script says so.
-- `valid-targets.json` — optional `{shas: [..], issues: [..]}`. When present,
-  `fixed@`/`filed` receipts must name one of these targets, simulating the
-  `--pr` API validation.
+- `valid-targets.json` — optional `{shas: [..], issues: [..],
+  pull_requests: [..]}`. When present, `fixed@`/`filed` receipts must name
+  one of these targets, simulating the `--pr` API validation. Numbers in
+  `pull_requests` resolve through the issues endpoint but are pull
+  requests, not issues, so they are subtracted from `issues` and never
+  validate a `filed` receipt.
 
 Markers and receipts are read from the same tokenized text: ```/~~~ fences (any
 run, unclosed to EOF), 4-space/tab indented lines, and one-or-more-backtick
@@ -44,6 +47,7 @@ targets were not validated.
 | `unvalidated-sha-receipt` | `fixed@0000000` not in `valid-targets.json` → fail |
 | `unknown-issue-receipt` | `filed #999999` not in `valid-targets.json` → fail |
 | `validated-target-receipt` | `fixed@abcdef1` in `valid-targets.json` → cleared |
+| `pr-number-receipt` | `filed #218` naming a pull request, not an issue → fail |
 | `pr-201` | #201 thread surface: 3 P1 + 1 P2 unresolved, no receipts → fail |
 | `pr-204` | #204 shape: 2 unresolved P2 threads, no receipts → fail |
 | `pr-204-fallback` | two P2 findings via `pull-comments.json` (global pool) → fail with notice |

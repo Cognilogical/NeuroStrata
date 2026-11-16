@@ -15,8 +15,9 @@
 # (OWNER / MEMBER / COLLABORATOR), never from an association-less account, and
 # never from the comment that carries the finding. ruled: <reason> is the one
 # receipt allowed in the finding's own body; it is maintainer-only. In --pr mode
-# fixed@ is a commit on the PR history and filed # must exist; fixture and
-# legacy modes enforce authorship but cannot validate targets.
+# fixed@ is a commit on the PR history and filed # must exist as an issue (a
+# pull-request number does not count); fixture and legacy modes enforce
+# authorship but cannot validate targets.
 #
 # Accounting: each review thread (resolved or not) must carry receipts for its
 # own markers, and top-level review/comment bodies form a separate pool.
@@ -245,8 +246,8 @@ elif [ -n "$fixtures_dir" ]; then
       echo "gate-receipt: $fixtures_dir/valid-targets.json must contain {shas: [..], issues: [..]}" >&2
       exit 2
     }
-    ok_issues=$(jq -c '.issues // []' "$fixtures_dir/valid-targets.json" 2>/dev/null) || {
-      echo "gate-receipt: $fixtures_dir/valid-targets.json must contain {shas: [..], issues: [..]}" >&2
+    ok_issues=$(jq -c '(.issues // []) - (.pull_requests // [])' "$fixtures_dir/valid-targets.json" 2>/dev/null) || {
+      echo "gate-receipt: $fixtures_dir/valid-targets.json must contain {shas: [..], issues: [..], pull_requests?: [..]}" >&2
       exit 2
     }
     echo "gate-receipt: fixture mode: receipt targets validated against valid-targets.json" >&2
@@ -370,10 +371,13 @@ else
     esac
   done
   for n in $(printf '%s\n' "$receipt_text" | clean_stream | grep -Eoi 'filed[[:space:]]+#[0-9]+' | grep -Eo '[0-9]+' | sort -u); do
-    if gh api "repos/$repo/issues/$n" >/dev/null 2>&1; then
+    # The issues endpoint also resolves pull requests; a filed receipt must
+    # name an issue, so an object carrying a pull_request key is rejected.
+    if issue_obj=$(gh api "repos/$repo/issues/$n" 2>/dev/null) \
+       && ! printf '%s' "$issue_obj" | jq -e 'has("pull_request")' >/dev/null; then
       ok_issues=$(printf '%s' "$ok_issues" | jq -c --argjson n "$n" '. + [$n]')
     else
-      echo "gate-receipt: ignoring filed #$n (no such issue in $repo)" >&2
+      echo "gate-receipt: ignoring filed #$n (no such issue in $repo, or the number is a pull request)" >&2
     fi
   done
 fi
