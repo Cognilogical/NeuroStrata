@@ -1,0 +1,15 @@
+[
+  {
+    "isResolved": false,
+    "comments": [
+      {
+        "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Open finding**\n\nFixed.\n\n<!-- codex-code-review-finding:v1 -->",
+        "author_association": "NONE"
+      },
+      {
+        "body": "fixed@abcdef1",
+        "author_association": "CONTRIBUTOR"
+      }
+    ]
+  }
+]

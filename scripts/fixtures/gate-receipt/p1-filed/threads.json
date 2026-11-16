@@ -1,3 +1,15 @@
 [
-  {"isResolved": false, "comments": [{"body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Refuse no-open backup while the daemon owns the store**\n\nWhen `backup --no-open` runs while the daemon is active, it can copy an inconsistent database and WAL snapshot.\n\n<!-- codex-code-review-finding:v1 -->", "author_association": "NONE"}, {"body": "filed #207", "author_association": "NONE"}]}
+  {
+    "isResolved": false,
+    "comments": [
+      {
+        "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Refuse no-open backup while the daemon owns the store**\n\nWhen `backup --no-open` runs while the daemon is active, it can copy an inconsistent database and WAL snapshot.\n\n<!-- codex-code-review-finding:v1 -->",
+        "author_association": "NONE"
+      },
+      {
+        "body": "filed #207",
+        "author_association": "CONTRIBUTOR"
+      }
+    ]
+  }
 ]

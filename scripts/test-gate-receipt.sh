@@ -25,6 +25,14 @@ cat > "$tmp/multi-both.json" <<'JSON'
 [{"author_association":"CONTRIBUTOR","body":"CHANGES-NEEDED DO-NOT-MERGE\nfixed@deadbeef fixed@cafebabe"}]
 JSON
 
+# Bold P1/P2 without the word "Badge", and code/fence stripping.
+printf '**P1** error swallowed on retry\nNo receipt.\n' > "$tmp/bold-p1.txt"
+printf '**P1** error swallowed on retry\nfiled #207\n' > "$tmp/bold-p1-filed.txt"
+printf '**P2** slow query path\nNo receipt.\n' > "$tmp/bold-p2.txt"
+printf 'Nothing to see.\n```\n**P1 Badge** hidden finding\nfixed@deadbeef\n```\n' > "$tmp/fenced-only.txt"
+printf '**P1 Badge** real finding\n`fixed@deadbeef`\n' > "$tmp/inline-code-receipt.txt"
+printf '**P1 Badge** real finding\n```\nfixed@deadbeef\n```\n' > "$tmp/fenced-receipt.txt"
+
 # Problem badges are gating markers too (#201 merged with P1/P2 threads open).
 printf '**P1 Badge** unbounded retry loop in ingest\nNo receipt.\n' > "$tmp/p1-no-receipt.txt"
 printf '**P1 Badge** unbounded retry loop in ingest\nfiled #207\n' > "$tmp/p1-filed.txt"
@@ -86,13 +94,36 @@ if bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/codex-finding-marke
 fi
 bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/codex-finding-filed.json" >/dev/null
 
+if bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/bold-p1.txt" >/dev/null 2>&1; then
+  echo "FAIL: **P1** without receipt passed" >&2
+  exit 1
+fi
+bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/bold-p1-filed.txt" >/dev/null
+if bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/bold-p2.txt" >/dev/null 2>&1; then
+  echo "FAIL: **P2** without receipt passed" >&2
+  exit 1
+fi
+bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/fenced-only.txt" >/dev/null
+if bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/inline-code-receipt.txt" >/dev/null 2>&1; then
+  echo "FAIL: a receipt inside inline code cleared a finding" >&2
+  exit 1
+fi
+if bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/fenced-receipt.txt" >/dev/null 2>&1; then
+  echo "FAIL: a fenced receipt cleared a finding" >&2
+  exit 1
+fi
+
 # Fetch-layer fixtures: the shape GitHub actually returns for Codex findings.
 fix="$root/scripts/fixtures/gate-receipt"
 if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/p1-unresolved" >/dev/null 2>&1; then
   echo "FAIL: unresolved P1 review thread without receipt passed" >&2
   exit 1
 fi
-bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/p1-resolved" >/dev/null
+if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/p1-resolved" >/dev/null 2>&1; then
+  echo "FAIL: resolution alone cleared a P1 finding with no receipt" >&2
+  exit 1
+fi
+bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/p1-resolved-filed" >/dev/null
 bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/p1-filed" >/dev/null
 bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/envelope-thread-receipt" >/dev/null
 bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/quoted-prose" >/dev/null
@@ -140,6 +171,21 @@ if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/quoted-receipt-is-n
   echo "FAIL: a receipt quoted inside inline code cleared a finding" >&2
   exit 1
 fi
+
+# Receipt authorship and target validation (#218 P1.2).
+if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/none-author-receipt" >/dev/null 2>&1; then
+  echo "FAIL: an association-less (NONE) receipt cleared a finding" >&2
+  exit 1
+fi
+if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/unvalidated-sha-receipt" >/dev/null 2>&1; then
+  echo "FAIL: fixed@0000000 cleared a finding without a validated commit" >&2
+  exit 1
+fi
+if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/unknown-issue-receipt" >/dev/null 2>&1; then
+  echo "FAIL: filed #999999 cleared a finding without an existing issue" >&2
+  exit 1
+fi
+bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/validated-target-receipt" >/dev/null
 
 # Truncated review data must fail closed instead of under-counting (#218 P2).
 out=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/truncated-threads" 2>&1 >/dev/null || true)
