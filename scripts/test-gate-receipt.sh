@@ -187,6 +187,10 @@ if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/quoted-receipt-is-n
   echo "FAIL: a receipt quoted inside inline code cleared a finding" >&2
   exit 1
 fi
+if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/self-receipt-in-finding-body" >/dev/null 2>&1; then
+  echo "FAIL: a receipt token inside the finding comment itself cleared a finding" >&2
+  exit 1
+fi
 
 # Receipt authorship and target validation (#218 P1.2).
 if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/none-author-receipt" >/dev/null 2>&1; then

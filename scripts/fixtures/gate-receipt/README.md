@@ -44,6 +44,7 @@ targets were not validated.
 | `thread-marker-not-cleared-by-top-level-receipt` | thread badge, receipt only at top level → fail |
 | `quoted-receipt-is-not-a-receipt` | body quotes `` `fixed@abcdef1` `` in inline code → fail |
 | `double-backtick-receipt` | ``fixed@abcdef1`` in a double-backtick span, valid target → still fail |
+| `self-receipt-in-finding-body` | badge + unquoted `fixed@abcdef1` in the same comment → fail |
 | `none-author-receipt` | `filed #207` from `NONE` → fail |
 | `unvalidated-sha-receipt` | `fixed@0000000` not in `valid-targets.json` → fail |
 | `unknown-issue-receipt` | `filed #999999` not in `valid-targets.json` → fail |
