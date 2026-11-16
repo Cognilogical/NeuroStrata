@@ -114,6 +114,10 @@ dump_ledger_paths() {
     elif command -v python3 >/dev/null 2>&1; then
         python3 -c '
 import json, os, re, sys
+# Bash compares these lines byte for byte (grep -x): write UTF-8 and plain
+# newlines even where a Windows Python defaults to the ANSI code page and CRLF.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", newline="\n")
 ledger = os.environ["LEDGER"]
 win = os.environ.get("FOLD") == "1"
 def fold(s):
