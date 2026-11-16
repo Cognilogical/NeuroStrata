@@ -131,29 +131,16 @@ pub fn extract_public_surface_identifiers(text: &str) -> Vec<String> {
 fn watched_added_lines(root: &Path, rel_path: &str) -> String {
     if root.join(".git").exists() {
         let mut added = Vec::new();
-        let range = if std::process::Command::new("git")
-            .args(["rev-parse", "--verify", "--quiet", "@{u}"])
-            .current_dir(root)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-        {
-            "@{u}..HEAD"
-        } else if std::process::Command::new("git")
-            .args(["rev-parse", "--verify", "--quiet", "origin/main"])
-            .current_dir(root)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-        {
-            "origin/main..HEAD"
-        } else {
-            "HEAD~1..HEAD"
-        };
-        for args in [
-            vec!["diff", "-U0", range, "--", rel_path],
-            vec!["diff", "-U0", "HEAD", "--", rel_path],
-        ] {
+        // Shared committed baseline (connector::committed_diff_range):
+        // @{u}..HEAD, else origin/main..HEAD, else no committed range —
+        // deliberately no silent HEAD~1..HEAD degradation.
+        let range = crate::workflow::connector::committed_diff_range(root);
+        let mut diffs: Vec<Vec<String>> = Vec::new();
+        if let Some(range) = &range {
+            diffs.push(vec!["diff".into(), "-U0".into(), range.clone(), "--".into(), rel_path.to_string()]);
+        }
+        diffs.push(vec!["diff".into(), "-U0".into(), "HEAD".into(), "--".into(), rel_path.to_string()]);
+        for args in diffs.iter().map(|v| v.iter().map(|s| s.as_str()).collect::<Vec<_>>()) {
             if let Ok(out) = std::process::Command::new("git")
                 .args(&args)
                 .current_dir(root)
@@ -706,6 +693,77 @@ mod tests {
             v.kind == "undocumented_public_identifier"
                 && v.detail.contains("undocumented-new-cmd")
         }));
+    }
+
+    #[test]
+    fn committed_surface_change_without_doc_update_blocks_on_production_path() {
+        // No changed_paths_override: the gate must see a real committed
+        // changed set (baseline pinned at refs/remotes/origin/main).
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        let docs_dir = root.join("docs");
+        std::fs::create_dir_all(docs_dir.join("vision")).unwrap();
+        std::fs::create_dir_all(docs_dir.join("features-api")).unwrap();
+        std::fs::create_dir_all(docs_dir.join("extend")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            docs_dir.join("vision").join("target_doc.md"),
+            "## Introduction\nThe target_doc surface.",
+        )
+        .unwrap();
+        std::fs::write(root.join("src").join("server.rs"), "fn v1() {}\n").unwrap();
+        let manifest = r###"{
+            "schema_version": 1,
+            "allowed_root_files": ["README.md", "manifest.json"],
+            "tiers": {
+                "vision": { "dir": "docs/vision", "description": "Vision tier", "required_files": [] },
+                "features_api": { "dir": "docs/features-api", "description": "Features API tier", "required_files": [] },
+                "extend": { "dir": "docs/extend", "description": "Extend tier", "required_files": [] }
+            },
+            "support_dirs": ["docs/releases", "docs/assets"],
+            "prohibited_filename_substrings": [],
+            "surface_rules": [
+                {
+                    "id": "test-rule-1",
+                    "tier": "vision",
+                    "watch_paths": ["src/server.rs"],
+                    "target_doc": "docs/vision/target_doc.md",
+                    "required_headings": ["## Introduction"],
+                    "required_tokens": ["target_doc"],
+                    "require_co_change_on_touch": true
+                }
+            ]
+        }"###;
+        std::fs::write(docs_dir.join("manifest.json"), manifest).unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .expect("git available in test env");
+            assert!(out.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "worker@example.com"]);
+        run(&["config", "user.name", "worker"]);
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "baseline"]);
+        run(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        std::fs::write(root.join("src").join("server.rs"), "fn v2() {}\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "surface change without doc update"]);
+
+        let report = evaluate_doc_gate(root, None);
+        assert!(
+            report.changed_paths.iter().any(|p| p == "src/server.rs"),
+            "production changed set must include the committed change, got {:?}",
+            report.changed_paths
+        );
+        assert!(!report.passed);
+        assert!(report.violations.iter().any(|v| {
+            v.kind == "surface_changed_without_doc_update" && v.rule_id == "test-rule-1"
+        }), "expected co-change violation, got {:?}", report.violations);
     }
 
     #[test]

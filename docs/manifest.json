@@ -56,7 +56,7 @@
         "## General-Purpose Project Memory & Ontology"
       ],
       "required_tokens": ["SynapticGraph", "Central Executive", "WorkflowConnector"],
-      "require_co_change_on_touch": false
+      "require_co_change_on_touch": true
     },
     {
       "id": "mcp-and-http-api-surface",
@@ -80,7 +80,7 @@
         "neurostrata_scenario",
         "neurostrata_call_hierarchy"
       ],
-      "require_co_change_on_touch": false
+      "require_co_change_on_touch": true
     },
     {
       "id": "cli-reference-surface",
@@ -89,7 +89,7 @@
       "target_doc": "docs/features-api/cli-reference.md",
       "required_headings": ["## Workflow, Documentation Gate & Ontology Commands"],
       "required_tokens": ["doc-gate", "workflow", "action", "taxonomy", "scenario", "twin"],
-      "require_co_change_on_touch": false
+      "require_co_change_on_touch": true
     },
     {
       "id": "kinetic-actions-subsystem",
@@ -101,7 +101,7 @@
         "## 5-Stage Fail-Closed Gate"
       ],
       "required_tokens": ["neurostrata_action", "ActionTypeDefinition", "SparqlAsk", "action_receipt"],
-      "require_co_change_on_touch": false
+      "require_co_change_on_touch": true
     },
     {
       "id": "taxonomy-advisor-subsystem",
@@ -110,7 +110,7 @@
       "target_doc": "docs/features-api/subsystems/taxonomy-advisor.md",
       "required_headings": ["# Subject-Matter Domain Expertise & SKOS Taxonomy Advisor"],
       "required_tokens": ["neurostrata_taxonomy", "set_thesis", "upsert_concept", "advise"],
-      "require_co_change_on_touch": false
+      "require_co_change_on_touch": true
     },
     {
       "id": "workflow-connector-extension",
@@ -132,7 +132,7 @@
         "resolve_workflow_connector",
         "workflow-connector.json"
       ],
-      "require_co_change_on_touch": false
+      "require_co_change_on_touch": true
     },
     {
       "id": "harness-plugin-extension",
@@ -144,7 +144,7 @@
         "## Implementing a New Harness Adapter"
       ],
       "required_tokens": ["createHarnessPlugin", "handleHookEvent", "resolveProjectRoot"],
-      "require_co_change_on_touch": false
+      "require_co_change_on_touch": true
     },
     {
       "id": "provider-traits-extension",
@@ -153,7 +153,7 @@
       "target_doc": "docs/extend/providers-and-ontologies.md",
       "required_headings": ["# Custom Providers, Ontologies & Action Packs"],
       "required_tokens": ["VectorStore", "Embedder", "JudgmentProvider", "ActionTypeDefinition"],
-      "require_co_change_on_touch": false
+      "require_co_change_on_touch": true
     }
   ]
 }

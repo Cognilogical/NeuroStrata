@@ -48,6 +48,27 @@ fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
+/// The ONE shared committed-diff baseline for changed-set consumers
+/// (Git connector `changed_paths`, doc gate `watched_added_lines`).
+///
+/// Baseline, named deliberately: `@{u}..HEAD` when an upstream resolves,
+/// else `origin/main..HEAD` when `origin/main` resolves, else `None`.
+/// There is deliberately NO silent `HEAD~1..HEAD` degradation: a one-commit
+/// range would make enforcement depend on checkout shape and under-report
+/// multi-commit work. `None` means "no committed range is knowable here";
+/// callers fall back to the uncommitted (porcelain) set only.
+pub(crate) fn committed_diff_range(root: &Path) -> Option<String> {
+    for candidate in ["@{u}", "origin/main"] {
+        let ok = run_git(root, &["rev-parse", "--verify", "--quiet", candidate])
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
+            return Some(format!("{candidate}..HEAD"));
+        }
+    }
+    None
+}
+
 fn normalize_path(p: &str) -> String {
     let p = p.trim();
     let p = if p.starts_with('"') && p.ends_with('"') && p.len() >= 2 {
@@ -125,6 +146,21 @@ impl WorkflowConnector for GitWorkflowConnector {
 
     fn changed_paths(&self, root: &Path) -> Vec<String> {
         let mut paths = std::collections::BTreeSet::new();
+        // Committed changed set against the shared baseline (see
+        // committed_diff_range): a clean/committed checkout — CI, a merged
+        // PR, the strict task gate — must not report an empty changed set.
+        if let Some(range) = committed_diff_range(root) {
+            if let Some(out) = run_git(root, &["diff", "--name-only", &range]) {
+                if out.status.success() {
+                    for line in String::from_utf8_lossy(&out.stdout).lines() {
+                        let norm = normalize_path(line);
+                        if !norm.is_empty() {
+                            paths.insert(norm);
+                        }
+                    }
+                }
+            }
+        }
         if let Some(out) = run_git(root, &["status", "--porcelain"]) {
             if out.status.success() {
                 for line in String::from_utf8_lossy(&out.stdout).lines() {
@@ -479,6 +515,38 @@ mod tests {
         let scope = connector.capture_scope(root);
         assert_eq!(scope.branch.as_deref(), Some("feat/custom"));
         assert_eq!(scope.worktree.as_deref(), Some("/workspace/project"));
+    }
+
+    #[test]
+    fn git_connector_changed_paths_include_committed_changes() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .expect("git available in test env");
+            assert!(out.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "worker@example.com"]);
+        run(&["config", "user.name", "worker"]);
+        std::fs::write(root.join("watched.txt"), "v1").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "baseline"]);
+        // Pin the deliberate baseline: origin/main at the baseline commit.
+        run(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        std::fs::write(root.join("watched.txt"), "v2").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "committed surface change"]);
+        // Tree is clean: a porcelain-only changed set would be empty here.
+        let changed = GitWorkflowConnector.changed_paths(root);
+        assert!(
+            changed.iter().any(|p| p == "watched.txt"),
+            "committed change must be in changed_paths, got {changed:?}"
+        );
     }
 
     #[test]
