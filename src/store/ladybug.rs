@@ -3545,9 +3545,10 @@ impl LadybugStore {
     }
 
     /// Open the database with a custom `SystemConfig`. Production paths go
-    /// through `new`; tests go through `for_testing`. The fallback path
-    /// (WAL verification failure) always uses the hardcoded `unverified_config`
-    /// recovery path; only the *initial* open is parameterized.
+    /// through `new`; tests go through `for_testing`. Only the *initial* open is
+    /// parameterized: after a WAL failure, the recovery funnel selects the
+    /// checksum flag from the WAL header and classifies the replay before any
+    /// checkpoint (#207).
     pub fn with_system_config(
         local_path: impl Into<PathBuf>,
         dimensions: usize,
