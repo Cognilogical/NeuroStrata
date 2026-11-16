@@ -333,7 +333,10 @@
         "storage::snapshot::tests::prune_wal_recovery_artifacts_except_never_removes_a_protected_path",
         "store::ladybug::tests::a_clean_foreign_open_still_honours_the_verdict",
         "store::ladybug::wal_zero_record::a_checksummed_flipped_database_id_is_refused_not_quarantined",
-        "store::ladybug::wal_zero_record::a_foreign_frozen_wal_with_an_unknown_active_peer_is_refused_not_quarantined"
+        "store::ladybug::wal_zero_record::a_foreign_frozen_wal_with_an_unknown_active_peer_is_refused_not_quarantined",
+        "store::ladybug::tests::recovery_checkpoint_failure_leaks_when_the_flag_call_is_not_known_to_succeed",
+        "store::ladybug::tests::recovery_checkpoint_failure_drops_when_the_flag_call_succeeds",
+        "store::ladybug::tests::recovery_checkpoint_success_returns_the_handle"
       ],
       "thresholds": {
         "ignored": 0,

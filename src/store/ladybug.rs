@@ -2880,21 +2880,67 @@ fn open_after_quarantine(
 }
 
 /// Runs the post-recovery `CHECKPOINT` on the lenient handle.
-fn run_recovery_checkpoint(unverified_db: &Database) -> Result<()> {
-    let conn = Connection::new(unverified_db).map_err(|e| {
-        anyhow::anyhow!("Failed to open connection for post-recovery CHECKPOINT: {e}")
-    })?;
+///
+/// Takes the handle by value and returns it on success, so the failure
+/// path owns the release decision: when the `CHECKPOINT` fails, the
+/// handle is released through [`release_handle`] — dropped only when
+/// `force_checkpoint_on_close=false` is known to have been applied,
+/// leaked otherwise — instead of being dropped by the caller with the
+/// flag's result discarded (`#207` C5, second call site).
+fn run_recovery_checkpoint(unverified_db: Database) -> Result<Database> {
     let ckpt_started = std::time::Instant::now();
-    let ckpt_res = conn.query("CHECKPOINT;");
-    crate::storage::snapshot::record_checkpoint_outcome(
-        ckpt_started.elapsed().as_millis() as u64,
-        ckpt_res.is_ok(),
-    );
-    if let Err(e) = ckpt_res {
-        let _ = conn.query("CALL force_checkpoint_on_close=false");
-        return Err(anyhow::anyhow!("WAL recovery CHECKPOINT failed: {e}"));
+    run_recovery_checkpoint_with(
+        unverified_db,
+        |conn| {
+            let ckpt_res = conn.query("CHECKPOINT;");
+            crate::storage::snapshot::record_checkpoint_outcome(
+                ckpt_started.elapsed().as_millis() as u64,
+                ckpt_res.is_ok(),
+            );
+            ckpt_res.map(|_| ()).map_err(|e| e.to_string())
+        },
+        |conn| conn.query("CALL force_checkpoint_on_close=false").is_ok(),
+    )
+}
+
+/// The testable core of [`run_recovery_checkpoint`]: the checkpoint and
+/// flag operations are injected so a test can drive a `CHECKPOINT`
+/// failure deterministically (a real engine failure cannot be forced
+/// reliably), in the style of [`release_handle`]'s own tests.
+fn run_recovery_checkpoint_with(
+    unverified_db: Database,
+    checkpoint: impl FnOnce(&Connection) -> std::result::Result<(), String>,
+    apply_flag: impl FnOnce(&Connection) -> bool,
+) -> Result<Database> {
+    // The connection borrows the handle, so the checkpoint outcome is
+    // computed in a scope that ends before the handle can move.
+    enum CheckpointStep {
+        OpenFailed(String),
+        Done(std::result::Result<(), String>),
     }
-    Ok(())
+    let step = match Connection::new(&unverified_db) {
+        Ok(conn) => {
+            let ckpt_res = checkpoint(&conn);
+            drop(conn);
+            CheckpointStep::Done(ckpt_res)
+        }
+        Err(e) => CheckpointStep::OpenFailed(e.to_string()),
+    };
+    match step {
+        CheckpointStep::OpenFailed(e) => {
+            // No connection, no checkpoint — and no known flag either:
+            // the handle leaves through the same release discipline.
+            release_handle(unverified_db, apply_flag);
+            Err(anyhow::anyhow!(
+                "Failed to open connection for post-recovery CHECKPOINT: {e}"
+            ))
+        }
+        CheckpointStep::Done(Ok(())) => Ok(unverified_db),
+        CheckpointStep::Done(Err(e)) => {
+            release_handle(unverified_db, apply_flag);
+            Err(anyhow::anyhow!("WAL recovery CHECKPOINT failed: {e}"))
+        }
+    }
 }
 
 /// Drops a lenient handle without letting `~Database()` checkpoint over the
@@ -3284,7 +3330,7 @@ fn recover_from_wal_failure(
             if let Some(note) = verdict.checkpoint_label() {
                 eprintln!("WAL accounting: {note}.");
             }
-            run_recovery_checkpoint(&unverified_db)?;
+            let unverified_db = run_recovery_checkpoint(unverified_db)?;
             drop(unverified_db);
             if pre_total > 0 {
                 let preserved_display = preserved
@@ -25314,6 +25360,131 @@ eurostrata\src\daemon.rs",
             LEAKED_RECOVERY_HANDLES.load(Ordering::SeqCst),
             before,
             "a successful flag call must drop the handle normally"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `#207` C5, second call site: when the post-recovery `CHECKPOINT`
+    /// fails, the handle must be released through the same flag discipline
+    /// as a refusal — a failed `force_checkpoint_on_close=false` CALL leaks
+    /// it instead of letting `~Database()` checkpoint over the WAL.
+    #[test]
+    fn recovery_checkpoint_failure_leaks_when_the_flag_call_is_not_known_to_succeed() {
+        use std::sync::atomic::Ordering;
+
+        let root = std::env::temp_dir().join(format!(
+            "lbug-ckpt-fail-leak-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("ckpt-fail-leak.lbug");
+        let raw = Database::new(
+            &db,
+            SystemConfig::default()
+                .max_db_size(512 * 1024 * 1024)
+                .buffer_pool_size(64 * 1024 * 1024),
+        )
+        .expect("open a disposable database");
+
+        let before = LEAKED_RECOVERY_HANDLES.load(Ordering::SeqCst);
+        let result = run_recovery_checkpoint_with(
+            raw,
+            |_| Err("injected checkpoint failure".to_string()),
+            |_| false,
+        );
+        let err = match result {
+            Ok(_) => panic!("a failed CHECKPOINT must return an error"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("WAL recovery CHECKPOINT failed"),
+            "the original checkpoint error must be reported: {err}"
+        );
+        assert_eq!(
+            LEAKED_RECOVERY_HANDLES.load(Ordering::SeqCst),
+            before + 1,
+            "a failed flag CALL after a failed CHECKPOINT must leak the handle, not drop it"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn recovery_checkpoint_failure_drops_when_the_flag_call_succeeds() {
+        use std::sync::atomic::Ordering;
+
+        let root = std::env::temp_dir().join(format!(
+            "lbug-ckpt-fail-drop-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("ckpt-fail-drop.lbug");
+        let raw = Database::new(
+            &db,
+            SystemConfig::default()
+                .max_db_size(512 * 1024 * 1024)
+                .buffer_pool_size(64 * 1024 * 1024),
+        )
+        .expect("open a disposable database");
+
+        let before = LEAKED_RECOVERY_HANDLES.load(Ordering::SeqCst);
+        let result = run_recovery_checkpoint_with(
+            raw,
+            |_| Err("injected checkpoint failure".to_string()),
+            |_| true,
+        );
+        assert!(result.is_err(), "a failed CHECKPOINT must return an error");
+        assert_eq!(
+            LEAKED_RECOVERY_HANDLES.load(Ordering::SeqCst),
+            before,
+            "a successful flag CALL must drop the handle normally"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn recovery_checkpoint_success_returns_the_handle() {
+        use std::sync::atomic::Ordering;
+
+        let root = std::env::temp_dir().join(format!(
+            "lbug-ckpt-ok-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("ckpt-ok.lbug");
+        let raw = Database::new(
+            &db,
+            SystemConfig::default()
+                .max_db_size(512 * 1024 * 1024)
+                .buffer_pool_size(64 * 1024 * 1024),
+        )
+        .expect("open a disposable database");
+
+        let before = LEAKED_RECOVERY_HANDLES.load(Ordering::SeqCst);
+        let returned = run_recovery_checkpoint_with(raw, |_| Ok(()), |_| true)
+            .expect("a successful CHECKPOINT returns the handle to the caller");
+        drop(returned);
+        assert_eq!(
+            LEAKED_RECOVERY_HANDLES.load(Ordering::SeqCst),
+            before,
+            "a successful CHECKPOINT must not leak the handle"
         );
 
         let _ = std::fs::remove_dir_all(&root);
