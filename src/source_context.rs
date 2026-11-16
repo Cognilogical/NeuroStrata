@@ -501,10 +501,14 @@ mod tests {
         assert_ne!(std::fs::canonicalize(&noncanonical).unwrap(), noncanonical);
         let contexts = HashMap::from([("source".to_string(), noncanonical.clone())]);
 
+        // Join one component at a time: on a non-verbatim Windows root,
+        // join("src/lib.rs") keeps the `/`, while the export joins normalized
+        // components and so uses the native separator.
         let expected = noncanonical
             .parent()
             .unwrap()
-            .join("src/lib.rs")
+            .join("src")
+            .join("lib.rs")
             .to_string_lossy()
             .into_owned();
         assert_eq!(
