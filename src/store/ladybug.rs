@@ -15234,12 +15234,19 @@ eurostrata\src\daemon.rs",
     }
 
     /// The `linked_files` census batches the hit ids at `LINKED_FILES_ID_BATCH`,
-    /// so the seam between two batches must neither drop nor double-count a hit.
-    /// Every memory here governs the same two files (`src/a.rs`, `src/b.rs`), so
-    /// every count must be exactly 2 -- once through the production entry point
-    /// (`LINKED_FILES_ID_BATCH`, i.e. two batches because the hit set is one
-    /// batch plus a remainder) and once at width 3, which splits the same hits
-    /// into many batches. A dropped id reads 0; a double-count reads 4.
+    /// so the seam between two batches must not lose a hit: every memory here
+    /// governs the same two files (`src/a.rs`, `src/b.rs`), and every count must
+    /// be exactly 2 -- once through the production entry point (two batches,
+    /// because the hit set is one batch plus a remainder) and once at width 3,
+    /// which splits the same hits into many batches. A hit dropped from the
+    /// census reads 0 instead of 2, which is what `take(1)` on the batch loop
+    /// trips here at `boundary-128`.
+    ///
+    /// Double-counting is structurally impossible rather than test-proven: the
+    /// chunks are disjoint, each id accumulates into its own `HashSet`, and the
+    /// query is `RETURN DISTINCT`, so no seam mutant in this shape can produce
+    /// a 4. The test therefore witnesses the drop seam only; it does not prove
+    /// a doubling immunity that the structure already guarantees.
     #[tokio::test]
     async fn linked_files_census_stays_exact_across_the_id_batch_boundary() {
         let store = retired_test_store().await;
