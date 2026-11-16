@@ -3098,6 +3098,37 @@ mod tests {
         stop_test_daemon(&base, daemon).await;
     }
 
+    /// An explicit `"id": null` is a request id, not the notification marker
+    /// (an *omitted* `id`): it must be answered with a real response whose
+    /// top-level `id` is `null`, not swallowed as a 202 empty-body notification.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_explicit_id_null_request_is_answered_not_treated_as_a_notification() {
+        let (base, authed, daemon, _credential_guard) = spawn_test_daemon().await;
+
+        let explicit_null = authed
+            .post(format!("{base}/mcp"))
+            .json(&serde_json::json!({"jsonrpc": "2.0", "id": null, "method": "server/discover"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            explicit_null.status(),
+            axum::http::StatusCode::OK,
+            "{explicit_null:?}"
+        );
+        let body: serde_json::Value = explicit_null.json().await.unwrap();
+        assert!(body.get("id").is_some(), "{body}");
+        assert_eq!(body["id"], serde_json::Value::Null, "{body}");
+        assert_eq!(body["error"]["code"], serde_json::json!(-32601), "{body}");
+        assert_eq!(
+            body["error"]["message"],
+            serde_json::json!("Method not found: server/discover"),
+            "{body}"
+        );
+
+        stop_test_daemon(&base, daemon).await;
+    }
+
     /// Task 1: no credential at all is a 401 on authenticated routes --
     /// a representative read route and /mcp, the product's primary surface.
     #[tokio::test(flavor = "multi_thread")]

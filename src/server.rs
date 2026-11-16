@@ -16,9 +16,23 @@ use crate::task::intake::{
     ListCandidatesRequest, ProvenanceSpan, ResolveCandidateRequest, ReviewState, SourceKind,
 };
 
+/// Deserializes a JSON-RPC request's `id` member while keeping an explicit
+/// JSON `null` distinct from an omitted member. `Option<Value>`'s default
+/// deserializer folds both into `None`, which would classify a request
+/// carrying `"id": null` as a notification and drop its reply; JSON-RPC 2.0
+/// marks a notification by the *absence* of `id`, so an explicit null must
+/// survive as `Some(Value::Null)` and be echoed back.
+fn deserialize_id_explicit_null<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Value::deserialize(deserializer)?))
+}
+
 #[derive(Deserialize)]
 pub struct JsonRpcRequest {
     jsonrpc: String,
+    #[serde(default, deserialize_with = "deserialize_id_explicit_null")]
     pub id: Option<Value>,
     pub method: String,
     pub params: Option<Value>,
@@ -14790,6 +14804,38 @@ mod tests {
         .await;
         assert_eq!(response["id"], serde_json::json!("p"), "{response}");
         assert_eq!(response["result"], serde_json::json!({}), "{response}");
+    }
+
+    /// An explicit `id: null` is a request id, not the notification marker
+    /// (which is an *omitted* `id`): dispatch answers it with an error that
+    /// echoes `"id": null` instead of suppressing the reply.
+    #[tokio::test]
+    async fn an_explicit_id_null_is_a_request_answered_with_id_null() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::Value::Null),
+            method: "server/discover".to_string(),
+            params: None,
+        };
+        let (bus, _seen) = recording_bus();
+        let response =
+            process_mcp_request(request, Arc::new(StubEmbedder), store, ingests, None, bus).await;
+        assert_eq!(response["jsonrpc"], serde_json::json!("2.0"), "{response}");
+        assert!(response.get("id").is_some(), "{response}");
+        assert_eq!(response["id"], serde_json::Value::Null, "{response}");
+        assert_eq!(
+            response["error"]["code"],
+            serde_json::json!(METHOD_NOT_FOUND),
+            "{response}"
+        );
+        assert_eq!(
+            response["error"]["message"],
+            serde_json::json!("Method not found: server/discover"),
+            "{response}"
+        );
+        assert!(response.get("result").is_none(), "{response}");
     }
 
     /// The mesh dispatch arm is the only production route from the wire to
