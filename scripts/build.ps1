@@ -33,6 +33,14 @@
     Overrides: set NEUROSTRATA_CMAKE or NEUROSTRATA_NINJA to the full path of an
     executable to bypass discovery for that tool.
 
+.PARAMETER Command
+    build (default) or test. test runs cargo test with the same toolchain,
+    profile and --locked handling as a build.
+
+.PARAMETER ProjectRoot
+    The checkout to build or test. Defaults to the repository this script
+    lives in. Lets one copy of the script serve another worktree.
+
 .PARAMETER Configuration
     release (default) or debug.
 
@@ -57,9 +65,26 @@
 .EXAMPLE
     .\scripts\build.ps1 -Configuration debug --features something
     Arguments this script does not define are passed through to cargo.
+
+.EXAMPLE
+    .\scripts\build.ps1 -Command test -- store::ladybug
+    Release test run, filtered to tests whose names contain store::ladybug.
+    PowerShell consumes the first --; a second one reaches cargo, so
+    -Command test -- store::ladybug -- --nocapture works as expected.
+
+.EXAMPLE
+    .\scripts\build.ps1 -Command test -ProjectRoot C:\src\other-worktree --no-fail-fast
+    Run the whole test suite of another checkout.
 #>
-[CmdletBinding()]
+# PositionalBinding off: otherwise a pass-through argument such as
+# --no-fail-fast binds to -Configuration (or -VcToolsVersion) by position.
+[CmdletBinding(PositionalBinding = $false)]
 param(
+    [ValidateSet('build', 'test')]
+    [string]$Command = 'build',
+
+    [string]$ProjectRoot,
+
     [ValidateSet('release', 'debug')]
     [string]$Configuration = 'release',
 
@@ -101,7 +126,14 @@ function Add-ToPathFront {
     $env:PATH = '{0};{1}' -f $Directory, $env:PATH
 }
 
-$repoRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+if ($ProjectRoot) {
+    if (-not (Test-Path (Join-Path $ProjectRoot 'Cargo.toml'))) {
+        Fail "-ProjectRoot has no Cargo.toml: $ProjectRoot"
+    }
+    $repoRoot = (Resolve-Path $ProjectRoot).Path
+} else {
+    $repoRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+}
 
 Write-Host ''
 Write-Host 'neurostrata-mcp build (Windows)' -ForegroundColor White
@@ -395,9 +427,10 @@ if ($CheckOnly) {
 }
 
 # ---------------------------------------------------------------------------
-# 6. Build
+# 6. Build or test
 # ---------------------------------------------------------------------------
-$cargoArgList = @('build')
+# ValidateSet accepts any case (-Command Test); cargo subcommands are lowercase.
+$cargoArgList = @($Command.ToLowerInvariant())
 if ($Configuration -eq 'release') {
     $cargoArgList += '--release'
 } else {
@@ -410,7 +443,15 @@ if ($Configuration -eq 'release') {
     Write-Host '          LNK1248 after a full compile. Use -Configuration release.' -ForegroundColor Yellow
 }
 if (-not $NoLocked) { $cargoArgList += '--locked' }
-if ($CargoArgs) { $cargoArgList += ($CargoArgs | Where-Object { $_ -ne '--' }) }
+if ($CargoArgs) {
+    if ($Command -eq 'test') {
+        # Kept as given: a -- here separates cargo's arguments from the test
+        # binary's (--nocapture, --test-threads).
+        $cargoArgList += $CargoArgs
+    } else {
+        $cargoArgList += ($CargoArgs | Where-Object { $_ -ne '--' })
+    }
+}
 
 Step ('cargo ' + ($cargoArgList -join ' '))
 Write-Host '    A cold build compiles lbug''s C++ engine from source. Expect several minutes.' -ForegroundColor DarkGray
@@ -433,7 +474,12 @@ if ($exitCode -ne 0) {
     exit $exitCode
 }
 
-$binary = Join-Path $repoRoot ('target\{0}\neurostrata-mcp.exe' -f $Configuration)
+if ($Command -eq 'test') { exit 0 }
+
+# Combine, not Join-Path: CARGO_TARGET_DIR may be absolute.
+$targetDir = Join-Path $repoRoot 'target'
+if ($env:CARGO_TARGET_DIR) { $targetDir = [System.IO.Path]::Combine($repoRoot, $env:CARGO_TARGET_DIR) }
+$binary = Join-Path $targetDir ('{0}\neurostrata-mcp.exe' -f $Configuration)
 Write-Host ''
 if (Test-Path $binary) {
     $sizeMb = [math]::Round((Get-Item $binary).Length / 1MB, 1)
