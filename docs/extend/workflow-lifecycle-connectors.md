@@ -76,7 +76,7 @@ Non-git workspaces declare their connector in `.NeuroStrata/workflow-connector.j
 
 ## Writing a Custom Third-Party Workflow Connector
 
-To implement a custom connector, define a struct that implements `WorkflowConnector` and register it via `resolve_workflow_connector`:
+To implement a custom connector, define a struct that implements `WorkflowConnector`. Note that there is **no connector registry**: `resolve_workflow_connector` is a hardcoded two-way switch — it returns a `ManifestWorkflowConnector` when a manifest is configured (via `NEUROSTRATA_WORKFLOW_CONNECTOR_FILE` or `.NeuroStrata/workflow-connector.json`), and `GitWorkflowConnector` otherwise. Wiring a custom connector therefore requires editing `resolve_workflow_connector` in core code; it cannot be registered from outside the crate:
 
 ```rust
 use crate::workflow::connector::WorkflowConnector;
@@ -92,4 +92,4 @@ impl WorkflowConnector for MyCustomConnector {
 }
 ```
 
-`resolve_workflow_connector` inspects `.NeuroStrata/workflow-connector.json` (or falls back to `git`), constructs the appropriate connector, and returns it. The connector is then used by the workflow state machine to capture scope, detect changes, and install triggers.
+`resolve_workflow_connector` inspects `.NeuroStrata/workflow-connector.json` (or falls back to `git`), constructs the appropriate connector, and returns it for non-trust uses such as `workflow status` display. The connector is **not** used by the workflow state machine: `src/workflow/machine.rs` and `src/workflow/connector.rs` never reference each other, and the machine is evaluated only through `evaluate_workflow_transition` (for example by the `workflow transitions` CLI sample). Trust-bearing consumers — receipt binding (`compute_worktree_state`), retention re-verification, gate scope (`GateScope::capture`), and the documentation gate's changed set — use `GitWorkflowConnector` directly, so a manifest connector cannot attest the state those consumers bind to.

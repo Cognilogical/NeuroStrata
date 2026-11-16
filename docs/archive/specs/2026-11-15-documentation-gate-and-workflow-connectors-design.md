@@ -50,6 +50,15 @@ Strictly separated from internal feature documentation. Written for third-party 
 ### 3.1 Formal Workflow Lifecycle State Machine (`WorkflowStage` & `WorkflowEvent`)
 We factor the end-to-end lifecycle into a deterministic state machine (`src/workflow/machine.rs` + pure decision mirror in `src/formal_kernel.rs`):
 
+> **Correction (PR #206 remediation, V-7):** this state machine is a **new
+> formalisation**, not an extraction of an existing FSM — no workflow state
+> machine existed in the codebase before this work. It **supersedes** the
+> 2026-10-26 state-machine spec
+> (`docs/archive/specs/2026-10-26-state-machine-agent-workflow-design.md`):
+> that spec's `Verifying` stage is dropped, and `PreCheckpoint` /
+> `PrePublish` are added. The only verbatim extractions in this work are
+> the two git functions named in §3.3.
+
 - **States (`WorkflowStage`):**
   1. `Unpreflighted` — Session has not loaded project snapshot/context.
   2. `ContextLoaded` — Snapshot/memory preflight satisfied; ready to claim a task.
@@ -88,7 +97,7 @@ pub trait WorkflowConnector: Send + Sync {
 ```
 
 ### 3.3 Built-in Connectors & Configuration
-1. **`GitWorkflowConnector` (`connector_id = "git"`):** Default when `.git` is present and no override connector is configured. Preserves 100% backward compatibility with existing `GateScope::capture`, `compute_worktree_state`, and `hooks install`.
+1. **`GitWorkflowConnector` (`connector_id = "git"`):** Default when `.git` is present and no override connector is configured. Backward compatibility is claimed **only** for the two extracted git functions — `GateScope::capture` and `compute_worktree_state` — and **only** on the no-manifest Git path (no `.NeuroStrata/workflow-connector.json` override present); the `WorkflowConnector` trait routing itself is new, and no broader compatibility claim is made.
 2. **`ManifestWorkflowConnector` (`connector_id = "manifest"`):** Reads `.NeuroStrata/workflow-connector.json` (or `NEUROSTRATA_WORKFLOW_CONNECTOR` env) allowing non-Git workspaces or third-party plugins to supply static or command-driven `stream`/`workspace` scope, state digest, changed files, and webhook/CLI trigger bindings.
 3. **CLI & MCP Surface:** `neurostrata-mcp workflow <status|transitions|fire|install>` lets external systems inspect the active connector, query the state machine table, and fire lifecycle stage checks (`pre-checkpoint`, `pre-publish`) directly without Git hooks.
 
