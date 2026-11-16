@@ -25,8 +25,12 @@ if [ "$CURRENT_BRANCH" != "main" ] && git rev-parse --verify --quiet origin/main
     EXCLUDE_MAIN=("^origin/main")
 fi
 
-# Use -M --diff-filter=AM so pure file moves/renames (R100) do not re-trigger on legacy lines
-CHANGED=$(git diff -M --name-only --diff-filter=AM "$RANGE" | grep -E '\.md$' || true)
+# Include renames so modified renames expose additions; R100 diffs have no added lines.
+CHANGED=$(git diff -M --name-only --diff-filter=AMR "$RANGE" | grep -E '\.md$' || true)
+declare -A RENAME_SOURCES=()
+while IFS=$'\t' read -r _status old new; do
+    RENAME_SOURCES["$new"]="$old"
+done < <(git diff -M --name-status --diff-filter=R "$RANGE")
 
 COUNT=0
 if [ -n "$CHANGED" ]; then
@@ -37,13 +41,18 @@ while IFS= read -r file; do
     # Skip the archive directory — it contains historical records whose prose
     # is intentionally un-cited and should never trigger the gate.
     [[ "$file" =~ ^docs/archive/ ]] && { continue; }
+    diff_paths=("$file")
+    if [[ -n "${RENAME_SOURCES[$file]+present}" ]]; then
+        # Destination-only pathspecs hide the old side and turn R100 into an add.
+        diff_paths=("${RENAME_SOURCES[$file]}" "$file")
+    fi
     while IFS= read -r line; do
         [ -n "$line" ] || continue
         if ! grep -qE '(ns|neurostrata)-[0-9a-zA-Z]{4,}' <<< "$line"; then
             echo "task-coverage-gate: untracked work item in $file: $line" >&2
             COUNT=$((COUNT + 1))
         fi
-    done < <(git diff -M "$RANGE" -- "$file" | grep -E '^\+' | grep -vE '^\+\+\+' | grep -iE '(next move|todo:|todo :|fixme:|action item:|deferred:|open item|follow-up|remaining|next step|we should also|later we need to|still need to|must also fix|need to follow up)' || true)
+    done < <(git diff -M "$RANGE" -- "${diff_paths[@]}" | grep -E '^\+' | grep -vE '^\+\+\+' | grep -iE '(next move|todo:|todo :|fixme:|action item:|deferred:|open item|follow-up|remaining|next step|we should also|later we need to|still need to|must also fix|need to follow up)' || true)
 done <<< "$CHANGED"
 else
     echo "task-coverage-gate: no markdown files changed — markdown check skipped"

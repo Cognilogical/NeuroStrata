@@ -1,12 +1,12 @@
 # Prescribed-Wire Recipes — project-pipeline gates
 
 Status: **written** (task `neurostrata-wimj`). Companion to
-[`docs/design-wiring-panel.md`](../design-wiring-panel.md), which enumerates the
+`docs/archive/specs/design-wiring-panel.md`, which enumerates the
 wires and assigns them to homes; this page is the recipe for each
 `project-pipeline` wire a project must implement itself.
 
 **Constraint honored:** core stays project-agnostic. Nothing here ships in the
-Rust server. The panels in `docs/design-wiring-panel.md` Q3 assign A2/A3/A4/
+Rust server. The panels in `docs/archive/specs/design-wiring-panel.md` Q3 assign A2/A3/A4/
 A5-residual/A7 to `runs_in: project-pipeline` for exactly one reason — each one
 needs to know what *this* project's files are called and where its rulings live.
 NeuroStrata ships the **query surface** (the export carries `absolute_path`,
@@ -23,7 +23,7 @@ NeuroStrata.
 ## The contract every prescribed gate obeys
 
 Stated once, so each recipe below only states its delta. This is the A8 split
-from [`docs/design-wiring-panel.md`](../design-wiring-panel.md) Q4: core ships
+from `docs/archive/specs/design-wiring-panel.md` Q4: core ships
 the **contract and its own self-test**, never the file-mutating runner.
 
 | Rule | Value | Source |
@@ -183,7 +183,7 @@ warning names the refresh command.
 Do not let the freshness check absorb a fidelity check. dogfood's export gate
 originally did both and collapsed into a re-check of a bug already fixed
 upstream; the shipped version does only the fidelity job
-([`docs/design-wiring-panel.md`](../design-wiring-panel.md) Q3, "A1 shrinks… A5
+(`docs/archive/specs/design-wiring-panel.md` Q3, "A1 shrinks… A5
 shrinks to a thin check on the export's own markers", and the "Killed" list:
 *do not ship a check for a bug we fixed*).
 
@@ -380,7 +380,7 @@ compiles" is not "it works".
 
 ## Sources
 
-- `docs/design-wiring-panel.md` — Q1 schema, Q3 core/project split, Q4 A8
+- `docs/archive/specs/design-wiring-panel.md` — Q1 schema, Q3 core/project split, Q4 A8
   contract, Q5 verification, Q6 "file as tasks".
 - `src/task/wiring.rs` — the shipped registry: ids, `runs_in`, `blocks`,
   `reason` strings quoted above.

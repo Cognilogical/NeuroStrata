@@ -12,7 +12,7 @@ nothing.
 | --- | --- |
 | Linux / macOS | `scripts/build.sh` |
 | Windows | `powershell -ExecutionPolicy Bypass -File scripts\build.ps1` |
-| Container, no host toolchain | see [Dockerfile.build](../Dockerfile.build) |
+| Container, no host toolchain | see [Dockerfile.build](../../../Dockerfile.build) |
 
 `--check` / `-CheckOnly` reports the resolved toolchain and builds nothing.
 Output lands in `target/release/` (`.exe` on Windows).

@@ -74,7 +74,7 @@ All six plugins ship compiled inside the binary and under `plugins/` with zero e
 
 | Feature | Engineering Primitive | Benefit — What It Means For You | Source / Docs |
 | :--- | :--- | :--- | :--- |
-| **4-State Task Machine** | `open → in_progress → blocked → done` (`src/task/machine.rs`) | Strict state transitions prevent phantom completions; `neurostrata_task_update` refuses `status: "done"` and points the agent to the guarded completion funnel. | [Central Executive](organs/central-executive.md) |
+| **4-State Task Machine** | `open → in_progress → blocked → done` (`src/task/machine.rs`) | Strict state transitions prevent phantom completions; `neurostrata_task_update` refuses `status: "done"` and points the agent to the guarded completion funnel. | [Central Executive](subsystems/central-executive.md) |
 | **Zero-Action Start & Exclusive Claim Leases** | `neurostrata_task_claim` (60-min stale lease takeover) | Agents cannot edit files without a claimed task; concurrent sessions cannot accidentally clobber the same task. | `src/task/mod.rs` |
 | **Lock 1 — SAS Pre-Push Git Gate** | `neurostrata-mcp task gate <ns> --strict` | Blocks `git push` if any task is still `in_progress`, any `done` task lacks an extracted memory, or any P0 task has been open > 24h. | `src/task/gate.rs` |
 | **Lock 2 — Done-Funnel Mandatory Extraction** | `neurostrata_task_complete` (`ExtractionRequired`) | A task *cannot* transition to `done` unless it extracts or links at least one architectural rule, fix, or fact (`EXTRACTED_FROM`). Every finished task makes the repo smarter. | `src/task/mod.rs` |
@@ -88,8 +88,8 @@ All six plugins ship compiled inside the binary and under `plugins/` with zero e
 
 | Feature | Engineering Primitive | Benefit — What It Means For You | Source / Docs |
 | :--- | :--- | :--- | :--- |
-| **Embedded LadybugDB Vector + Graph Store** | In-process C++20 columnar HNSW vector + property graph engine | Runs inside the single Rust binary—zero Docker containers, zero Postgres/Qdrant setup, sub-millisecond local reads. | [SynapticGraph](architecture/synapticgraph.md) |
-| **Tri-Strata Isolation & Domain Registry** | Global / Domain / Task strata + per-namespace domain slug registry | Separates machine-wide preferences (`global`), domain architecture rules, and ephemeral task state; rejects typoed domains with a clear remedy. | [Tri-Strata](architecture/tri-strata.md) |
+| **Embedded LadybugDB Vector + Graph Store** | In-process C++20 columnar HNSW vector + property graph engine | Runs inside the single Rust binary—zero Docker containers, zero Postgres/Qdrant setup, sub-millisecond local reads. | [SynapticGraph](subsystems/synapticgraph.md) |
+| **Tri-Strata Isolation & Domain Registry** | Global / Domain / Task strata + per-namespace domain slug registry | Separates machine-wide preferences (`global`), domain architecture rules, and ephemeral task state; rejects typoed domains with a clear remedy. | [Tri-Strata](../vision/tri-strata.md) |
 | **Pointer-Wiki Engrams** | `locations: [{path, lines, symbol}]` + `GOVERNS` edges | Stores compact architectural rules anchored to exact file/line/symbol coordinates instead of bloating context windows with raw document dumps. | `src/server.rs` |
 | **Deterministic Retrieval — Three Surfaces, Not One Fused Pipeline** | `mode: vector` (LadybugDB HNSW + boosted distance) / `mode: lexical` (Tantivy full-text) / `mode: lexical-inhouse` (5-field BM25), plus bounded 1–2 hop graph expansion | The three modes are alternatives, not a fusion — the caller picks one. The vector surface filters row classes first, then subtracts a usage-and-provenance gain (capped at 0.5 × distance) and a decision-shape boost; the graph expansion is a bounded walk over `RELATES_TO` / `CONTAINS` / `GOVERNS` / `EXTRACTED_FROM` with per-family caps, ranked by co-occurrence count. **There is no rank fusion (RRF), no Personalized PageRank, and no neural reranker in the search path.** | `src/server.rs`, `src/store/ladybug.rs`, `src/search.rs`, `src/fts/mod.rs`, `src/lexical.rs` |
 | **Eidetic Recall Boot Snapshot** | `neurostrata_get_snapshot` + Leiden community hubs | Grounds every new session in milliseconds with active tasks, due procedures, domain map, community hubs, and top high-salience rules. | `src/community.rs`, `src/server.rs` |
@@ -125,7 +125,7 @@ All six plugins ship compiled inside the binary and under `plugins/` with zero e
 
 | Feature | Engineering Primitive | Benefit — What It Means For You | Source / Docs |
 | :--- | :--- | :--- | :--- |
-| **Semantic Guard Rules (`guard_rule`)** | `neurostrata_guard_validate` (+ `neurostrata_guard_learn`, `neurostrata_guard_list_rules`) | Evaluates proposed commands and file mutations against natural-language safety rules stored in your memory graph before execution. | [Prefrontal Cortex](organs/prefrontal-cortex.md) |
+| **Semantic Guard Rules (`guard_rule`)** | `neurostrata_guard_validate` (+ `neurostrata_guard_learn`, `neurostrata_guard_list_rules`) | Evaluates proposed commands and file mutations against natural-language safety rules stored in your memory graph before execution. | [Prefrontal Cortex](subsystems/prefrontal-cortex.md) |
 | **Rootless Podman Dry-Run Sandbox** | `podman run --rm --network=none -v=<cwd>:/workspace:ro --tmpfs=/tmp` (5s timeout, fail-closed) | Borderline shell commands are dry-run inside an ephemeral, network-isolated container before touching your real workspace. | `src/guard/sandbox.rs` |
 | **Hostile-Path Canonicalization** | Symlink + `../` traversal resolution | Prevents agents from bypassing protected-path rules via symlinks or relative path tricks. | `src/guard/` |
 
@@ -145,9 +145,9 @@ All six plugins ship compiled inside the binary and under `plugins/` with zero e
 
 | Feature | Engineering Primitive | Benefit — What It Means For You | Source / Docs |
 | :--- | :--- | :--- | :--- |
-| **Triggered Procedural Memory** | `memory_type: "procedure"` + `neurostrata_procedure_perform` | Encodes recurring habits (`session-start`, `before-edit`, `after-mutation`, `every-n-sessions:N`, `every-n-days:N`) with finite rehearsal budgets (`remaining_fires`) surfaced automatically in every snapshot. | [Procedural Memory](organs/procedural-memory.md) | ns-dad0 |
+| **Triggered Procedural Memory** | `memory_type: "procedure"` + `neurostrata_procedure_perform` | Encodes recurring habits (`session-start`, `before-edit`, `after-mutation`, `every-n-sessions:N`, `every-n-days:N`) with finite rehearsal budgets (`remaining_fires`) surfaced automatically in every snapshot. | [Procedural Memory](subsystems/procedural-memory.md) | ns-dad0 |
 | **Local Laya Duplicate & Contradiction Judge** | `src/judgment/laya_onnx.rs` + `neurostrata-mcp laya <model>` (fetches and verifies the pinned ONNX bundle) | Scores candidate memories for duplicates or contradictions locally against the bundled ONNX model—100% offline. A pure-Rust training loop lives in `src/learning/trainer.rs` and is driven by `neurostrata-mcp learn train`. | `src/judgment/laya_onnx.rs` |
-| **Optional TypeSafe Jev Judgment Bridge** | `src/judgment/typesafe_jev.rs` | Optional remote duplicate judgment integration via TypeSafe AI without moving your vector database off-machine. | [Judgment Providers](architecture/domains/judgment-providers.md) |
+| **Optional TypeSafe Jev Judgment Bridge** | `src/judgment/typesafe_jev.rs` | Optional remote duplicate judgment integration via TypeSafe AI without moving your vector database off-machine. | [Judgment Providers](subsystems/judgment-providers.md) |
 
 ---
 
@@ -155,7 +155,7 @@ All six plugins ship compiled inside the binary and under `plugins/` with zero e
 
 | Feature | Engineering Primitive | Benefit — What It Means For You | Source / Docs |
 | :--- | :--- | :--- | :--- |
-| **Git-Transport Team Memory Sharing** | `synaptic-mesh-record/v1` + durable WAL outbox | Syncs `eligibility: "shareable"` rules, facts, and procedure definitions across teammates over standard `git pull --ff-only` and `git push`—no SaaS or message broker required. | [SynapticMesh](mesh/synaptic-mesh.md) |
+| **Git-Transport Team Memory Sharing** | `synaptic-mesh-record/v1` + durable WAL outbox | Syncs `eligibility: "shareable"` rules, facts, and procedure definitions across teammates over standard `git pull --ff-only` and `git push`—no SaaS or message broker required. | [SynapticMesh](subsystems/synaptic-mesh.md) |
 | **Sovereign Private Rows & Loud Conflict Preservation** | `neurostrata_synaptic_mesh_status` + the `neurostrata-mcp synaptic-mesh` CLI | Private memories, tasks, and local procedure counters never leave your machine; conflicting edits between teammates are preserved visibly and never silently overwritten. | `src/synaptic_mesh/` |
 
 ---
@@ -164,7 +164,7 @@ All six plugins ship compiled inside the binary and under `plugins/` with zero e
 
 | Feature | Engineering Primitive | Benefit — What It Means For You | Source / Docs |
 | :--- | :--- | :--- | :--- |
-| **Thalamic In-Process Event Bus** | `Arc<ThalamicBus>` (`Created`, `Superseded`, `Archived`, `GuardedActionFired`) | Automatically updates episodic pointers, marks graph exports dirty, and logs guard events whenever a memory mutates. | [Thalamic Bus](organs/thalamic-bus.md) |
+| **Thalamic In-Process Event Bus** | `Arc<ThalamicBus>` (`Created`, `Superseded`, `Archived`, `GuardedActionFired`) | Automatically updates episodic pointers, marks graph exports dirty, and logs guard events whenever a memory mutates. | [Thalamic Bus](subsystems/thalamic-bus.md) |
 | **Episodic Buffer Session Logs** | `neurostrata_append_log` + `### 🔄 Topic Switch` + 500 KB rollover | Maintains a rolling, searchable Markdown transcript of reasoning and topic switches in `.NeuroStrata/sessions/`. | `src/server.rs` |
 | **Obsidian / NeuroVault Sync — *planned, not implemented*** | — | **Not shipped.** There is no `neurostrata_sync_obsidian` MCP tool, no `obsidian-sync` CLI subcommand, and no `src/obsidian.rs` module. The feature is tracked by task `neurostrata-dlag`; use the web UI or `neurostrata-mcp export-graph` to read the graph today. | [Obsidian Integration](ops/obsidian.md) |
 | **Loopback-Only Daemon & Secret Rejection** | `127.0.0.1:34343` + regex/entropy secret scanner + Cypher string escaping | **Rejects** any write whose payload contains an API key, token, JWT or other credential, so the secret never reaches a vector index, the Episodic Buffer or a Git-shared mesh record; enforces strict Host/Origin headers, and exposes store health (`neurostrata_storage_status`). | [Security](ops/security.md) |
@@ -175,23 +175,23 @@ All six plugins ship compiled inside the binary and under `plugins/` with zero e
 ## Complete Technical Documentation Index
 
 - **Architecture & Core Science**
-  - [Cognitive Architecture Overview](COGNITIVE_ARCHITECTURE.md)
-  - [SynapticGraph — Embedded Vector & Graph Engine](architecture/synapticgraph.md)
-  - [Tri-Strata — Global, Domain, and Task Isolation](architecture/tri-strata.md)
-  - [Why Agent Memory Fails](science/why-memory-fails.md)
-  - [Cognitive Nomenclature Guide](science/nomenclature.md)
+  - [Cognitive Architecture Overview](../vision/cognitive-architecture.md)
+  - [SynapticGraph — Embedded Vector & Graph Engine](subsystems/synapticgraph.md)
+  - [Tri-Strata — Global, Domain, and Task Isolation](../vision/tri-strata.md)
+  - [Why Agent Memory Fails](../vision/why-memory-fails.md)
+  - [Cognitive Nomenclature Guide](../vision/nomenclature.md)
 - **The Cognitive Organs**
-  - [Central Executive — Task Lifecycle & Soft Locks](organs/central-executive.md)
-  - [Prefrontal Cortex — Semantic Guard & Podman Sandbox](organs/prefrontal-cortex.md)
-  - [Dendritic Bridge — Local & Remote Embedding Providers](organs/dendritic-bridge.md)
-  - [Thalamic Bus — In-Process Pub/Sub & Freshness Gate](organs/thalamic-bus.md)
-  - [Procedural Memory — Triggered Habits & Rehearsal Budgets](organs/procedural-memory.md)
+  - [Central Executive — Task Lifecycle & Soft Locks](subsystems/central-executive.md)
+  - [Prefrontal Cortex — Semantic Guard & Podman Sandbox](subsystems/prefrontal-cortex.md)
+  - [Dendritic Bridge — Local & Remote Embedding Providers](subsystems/dendritic-bridge.md)
+  - [Thalamic Bus — In-Process Pub/Sub & Freshness Gate](subsystems/thalamic-bus.md)
+  - [Procedural Memory — Triggered Habits & Rehearsal Budgets](subsystems/procedural-memory.md)
 - **Team Sync & Operations**
-  - [SynapticMesh — Brokerless Git Team Memory](mesh/synaptic-mesh.md)
-  - [CLI Reference](ops/cli-reference.md)
+  - [SynapticMesh — Brokerless Git Team Memory](subsystems/synaptic-mesh.md)
+  - [CLI Reference](cli-reference.md)
   - [Security & OWASP LLM Mitigations](ops/security.md)
   - [Upgrading & Zero-Touch Migrations](ops/upgrading.md)
   - [Obsidian Vault Sync — planned, not implemented](ops/obsidian.md)
   - [Crash Diagnostics & WAL Recovery](ops/crashes.md)
-  - [Building from Source](BUILDING.md)
-  - [Release Changelogs](releases/changelog/)
+  - [Building from Source](ops/building.md)
+  - [Release Changelogs](../releases/changelog/)

@@ -128,18 +128,59 @@ pub fn extract_public_surface_identifiers(text: &str) -> Vec<String> {
     idents.into_iter().collect()
 }
 
+fn rename_source(root: &Path, range: &str, rel_path: &str) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args([
+            "diff",
+            "-M",
+            "--name-status",
+            "--diff-filter=R",
+            range,
+        ])
+        .current_dir(root)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).lines().find_map(|line| {
+        let fields: Vec<_> = line.split('\t').collect();
+        (fields.len() == 3 && fields[2] == rel_path).then(|| fields[1].to_string())
+    })
+}
+
 fn watched_added_lines(root: &Path, rel_path: &str) -> String {
     if root.join(".git").exists() {
+        let tracked = std::process::Command::new("git")
+            .args(["ls-files", "--error-unmatch", "--", rel_path])
+            .current_dir(root)
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false);
         let mut added = Vec::new();
+        let mut inspected = false;
         // Shared committed baseline (connector::committed_diff_range):
         // @{u}..HEAD, else origin/main..HEAD, else no committed range —
         // deliberately no silent HEAD~1..HEAD degradation.
         let range = crate::workflow::connector::committed_diff_range(root);
+        let mut diff_paths = vec![rel_path.to_string()];
+        if let Some(source) = range
+            .as_deref()
+            .and_then(|range| rename_source(root, range, rel_path))
+            .or_else(|| rename_source(root, "HEAD", rel_path))
+        {
+            // Both endpoints are required for Git to recognize pure renames.
+            diff_paths.insert(0, source);
+        }
         let mut diffs: Vec<Vec<String>> = Vec::new();
         if let Some(range) = &range {
-            diffs.push(vec!["diff".into(), "-U0".into(), range.clone(), "--".into(), rel_path.to_string()]);
+            let mut args = vec!["diff".into(), "-U0".into(), "-M".into(), range.clone(), "--".into()];
+            args.extend(diff_paths.clone());
+            diffs.push(args);
         }
-        diffs.push(vec!["diff".into(), "-U0".into(), "HEAD".into(), "--".into(), rel_path.to_string()]);
+        let mut args = vec!["diff".into(), "-U0".into(), "-M".into(), "HEAD".into(), "--".into()];
+        args.extend(diff_paths);
+        diffs.push(args);
         for args in diffs.iter().map(|v| v.iter().map(|s| s.as_str()).collect::<Vec<_>>()) {
             if let Ok(out) = std::process::Command::new("git")
                 .args(&args)
@@ -147,6 +188,7 @@ fn watched_added_lines(root: &Path, rel_path: &str) -> String {
                 .output()
             {
                 if out.status.success() {
+                    inspected = true;
                     for line in String::from_utf8_lossy(&out.stdout).lines() {
                         if line.starts_with('+') && !line.starts_with("+++") {
                             added.push(line[1..].to_string());
@@ -155,7 +197,9 @@ fn watched_added_lines(root: &Path, rel_path: &str) -> String {
                 }
             }
         }
-        if !added.is_empty() {
+        // Successful Git inspection is authoritative, including deletion-only
+        // diffs. Only new/untracked files or failed Git inspection fall back.
+        if tracked && inspected {
             return added.join("\n");
         }
     }
@@ -458,6 +502,27 @@ mod tests {
             surface_rules_json
         );
         std::fs::write(docs_dir.join("manifest.json"), manifest).unwrap();
+    }
+
+    fn run_git(root: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .expect("git available in test env");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn init_git_repo(root: &Path) {
+        run_git(root, &["init", "-q"]);
+        run_git(root, &["config", "user.email", "worker@example.com"]);
+        run_git(root, &["config", "user.name", "worker"]);
     }
 
     #[test]
@@ -768,6 +833,126 @@ mod tests {
         assert!(report.violations.iter().any(|v| {
             v.kind == "surface_changed_without_doc_update" && v.rule_id == "test-rule-1"
         }), "expected co-change violation, got {:?}", report.violations);
+    }
+
+    #[test]
+    fn deletion_only_watched_change_does_not_scan_remaining_source() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        let docs_dir = root.join("docs");
+        std::fs::create_dir_all(docs_dir.join("vision")).unwrap();
+        std::fs::create_dir_all(docs_dir.join("features-api")).unwrap();
+        std::fs::create_dir_all(docs_dir.join("extend")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            docs_dir.join("features-api").join("target.md"),
+            "# Target\nNo public identifiers documented here.",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src").join("main.rs"),
+            "pub trait LegacyTrait {}\nfn remove_me() {}\n",
+        )
+        .unwrap();
+        write_manifest(
+            &docs_dir,
+            r#"[{
+                "id": "cli-surface",
+                "tier": "features_api",
+                "watch_paths": ["src/main.rs"],
+                "target_doc": "docs/features-api/target.md",
+                "required_headings": [],
+                "required_tokens": [],
+                "require_co_change_on_touch": false
+            }]"#,
+        );
+        init_git_repo(root);
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-q", "-m", "baseline"]);
+        run_git(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        std::fs::write(
+            root.join("src").join("main.rs"),
+            "pub trait LegacyTrait {}\n",
+        )
+        .unwrap();
+        run_git(root, &["add", "src/main.rs"]);
+        run_git(root, &["commit", "-q", "-m", "deletion only"]);
+
+        let report = evaluate_doc_gate(root, None);
+        assert!(
+            report.passed,
+            "deletion-only diff produced violations: {:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn pure_rename_does_not_treat_existing_source_as_added() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src").join("old.rs"), "pub trait LegacyTrait {}\n")
+            .unwrap();
+        init_git_repo(root);
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-q", "-m", "baseline"]);
+        run_git(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        run_git(root, &["mv", "src/old.rs", "src/new.rs"]);
+        run_git(root, &["commit", "-q", "-m", "pure rename"]);
+
+        let added = watched_added_lines(root, "src/new.rs");
+        assert!(
+            added.is_empty(),
+            "pure rename treated existing source as added: {added:?}"
+        );
+    }
+
+    #[test]
+    fn untracked_watched_file_still_scans_new_public_identifiers() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        let docs_dir = root.join("docs");
+        std::fs::create_dir_all(docs_dir.join("vision")).unwrap();
+        std::fs::create_dir_all(docs_dir.join("features-api")).unwrap();
+        std::fs::create_dir_all(docs_dir.join("extend")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            docs_dir.join("features-api").join("target.md"),
+            "# Target\nNo public identifiers documented here.",
+        )
+        .unwrap();
+        write_manifest(
+            &docs_dir,
+            r#"[{
+                "id": "cli-surface",
+                "tier": "features_api",
+                "watch_paths": ["src/main.rs"],
+                "target_doc": "docs/features-api/target.md",
+                "required_headings": [],
+                "required_tokens": [],
+                "require_co_change_on_touch": false
+            }]"#,
+        );
+        std::fs::write(root.join("src").join("keep.rs"), "fn keep() {}\n").unwrap();
+        init_git_repo(root);
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-q", "-m", "baseline"]);
+        run_git(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        std::fs::write(
+            root.join("src").join("main.rs"),
+            "pub trait UndocumentedNewTrait {}\n",
+        )
+        .unwrap();
+
+        let report = evaluate_doc_gate(root, None);
+        assert!(
+            report.violations.iter().any(|v| {
+                v.kind == "undocumented_public_identifier"
+                    && v.detail.contains("UndocumentedNewTrait")
+            }),
+            "untracked file was not scanned: {:?}",
+            report
+        );
     }
 
     #[test]

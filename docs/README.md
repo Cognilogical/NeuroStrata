@@ -13,7 +13,7 @@ NeuroStrata documentation is organized into **three canonical tiers**, strictly 
 | **Tier 1 — Vision** | [`docs/vision/`](vision/) | Product vision, core thesis, cognitive architecture, and scientific rationale. Audience: product owners, architects, evaluators. |
 | **Tier 2 — Features & API** | [`docs/features-api/`](features-api/) | Internal features, major subsystems, MCP/HTTP API reference, CLI reference, and ops runbooks. Audience: developers, contributors, operators. |
 | **Tier 3 — Extend** | [`docs/extend/`](extend/) | Third-party extensibility: workflow/lifecycle connectors, harness plugins, custom providers and ontologies. Audience: plugin authors, integrators. |
-| **Archive** | [`docs/archive/`](archive/) | Historical verdicts, superseded specs, plans, and design records. Read-only; do not link to from active docs. |
+| **Archive** | `docs/archive/` | Historical verdicts, superseded specs, plans, and design records. Read-only; do not link to from active docs. |
 
 The machine-readable documentation manifest lives at [`docs/manifest.json`](manifest.json). It enumerates required files per tier, prohibited filename substrings (competitor-naming guard), and surface-diff rules that bind code changes to documentation updates. The documentation gate (`neurostrata-mcp doc-gate`) consumes this manifest.
 
@@ -76,7 +76,7 @@ Tier 3 is kept strictly separate from the internal feature docs above. It descri
 
 ## Archive
 
-Historical verdicts, superseded specifications, plans, and design records live under [`docs/archive/`](archive/). These documents describe work that has been retired, superseded, or completed. Read-only — do not link to archive records from active-tier docs.
+Historical verdicts, superseded specifications, plans, and design records live under `docs/archive/`. These documents describe work that has been retired, superseded, or completed. Read-only — do not link to archive records from active-tier docs.
 
 ---
 

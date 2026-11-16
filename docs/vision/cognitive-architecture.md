@@ -105,4 +105,4 @@ Beyond associative recall, NeuroStrata embeds four higher-order cognitive facult
 
 ## Cognitive-name glossary
 
-See [`docs/science/nomenclature.md`](science/nomenclature.md) for the canonical translation table mapping every biological term to its Rust systems-engineering primitive.
+See [`docs/vision/nomenclature.md`](nomenclature.md) for the canonical translation table mapping every biological term to its Rust systems-engineering primitive.

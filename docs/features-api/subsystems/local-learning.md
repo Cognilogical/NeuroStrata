@@ -13,7 +13,7 @@ governs_paths:
 
 **Status:** owner-directed design; written spec awaiting review. No product
 implementation is implied. The full design is
-[`docs/superpowers/specs/2026-10-18-local-self-improvement-design.md`](../../superpowers/specs/2026-10-18-local-self-improvement-design.md).
+`docs/archive/specs/2026-10-18-local-self-improvement-design.md`.
 
 ## Source facts and design constraints
 

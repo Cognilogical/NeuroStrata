@@ -52,9 +52,9 @@ LadybugDB maintains a write-ahead log (`*.wal`) alongside the main database file
 1. **Clean WAL Replay:** Valid uncommitted transactions are replayed and checkpointed automatically.
 2. **Quarantined / Unverified WAL Refusal:** If `NEUROSTRATA_STRICT_WAL=1` (the default safety posture) detects a truncated or corrupt WAL frame, NeuroStrata **refuses to open or overwrite the WAL**, leaving the file untouched on disk for inspection:
    ```text
-   Refusing to open: the write-ahead log did not verify. The log has been left in place for inspection. To recover the writes without verification, set NEUROSTRATA_STRICT_WAL=0 (or NEUROSTRATA_ALLOW_UNVERIFIED_WAL=1). See docs/runbooks/wal-recovery.md.
+   Refusing to open: the write-ahead log did not verify. The log has been left in place for inspection. To recover the writes without verification, set NEUROSTRATA_STRICT_WAL=0 (or NEUROSTRATA_ALLOW_UNVERIFIED_WAL=1). See docs/features-api/ops/wal-recovery.md.
    ```
-3. **Guided Recovery:** Follow the step-by-step runbook in [`docs/runbooks/wal-recovery.md`](../runbooks/wal-recovery.md) to quarantine the damaged WAL or replay verified frames using `NEUROSTRATA_ALLOW_UNVERIFIED_WAL=1`.
+3. **Guided Recovery:** Follow the step-by-step runbook in [`docs/features-api/ops/wal-recovery.md`](wal-recovery.md) to quarantine the damaged WAL or replay verified frames using `NEUROSTRATA_ALLOW_UNVERIFIED_WAL=1`.
 
 ---
 
