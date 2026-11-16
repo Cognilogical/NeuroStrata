@@ -63,6 +63,34 @@ before recovery.
      Then update `db_path` in `~/.config/neurostrata/config.json` after
      inspecting the restored store.
 
+## Accounting verdicts (`#207`)
+
+Every recovery arm classifies the WAL pair before it checkpoints. The refusal
+message carries one of six machine-readable slugs:
+
+| slug | meaning | operator action |
+|---|---|---|
+| `no_wal` | no WAL before or after the open | none |
+| `nothing_committed` | bytes were replayed, nothing had committed | none; the replay is lossless |
+| `committed_lost` | a committed record existed and no bytes survived | stop, inspect the preserved copy |
+| `replayed` | bytes survived, or a completed checkpoint was consumed | none; the message reports the truncation |
+| `foreign_wal` | the WAL belongs to another database (DB-ID mismatch) | the WAL is quarantined as `.corrupted.<ts>`; nothing of this store was lost |
+| `unknown` | the bytes could not be attributed | stop, inspect the preserved copy |
+
+Two policies are worth knowing before interpreting a refusal:
+
+- **A WAL written without checksums cannot be verified.** If such a WAL is
+  discarded and no commit record is found, the verdict is `unknown`
+  (`UnverifiableWal`) even when the WAL was legitimately empty. This
+  over-refusal is deliberate: an unchecksummed WAL is indistinguishable from one
+  whose commit record was destroyed. Inspect the preserved copy, then either
+  restore it or delete it to let the store open.
+- **A WAL larger than 64 MiB is not scanned.** The recovery pre-flight defers to
+  the normal verified open (`deferred`); if that open succeeds, nothing else
+  happens. If it fails, the WAL is not classified and the arm must not
+  checkpoint it: treat the store like a `committed_lost` case and use the
+  preserved copy / snapshot path above.
+
 ## Configuration
 
 | Variable | Effect |

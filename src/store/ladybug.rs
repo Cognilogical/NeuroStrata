@@ -2160,43 +2160,63 @@ fn unverified_config() -> SystemConfig {
     )
 }
 
+/// Reads at most the first 25 bytes of a WAL and hands them to the header rule.
+fn read_wal_header_probe(path: &std::path::Path) -> crate::store::wal_header::HeaderProbe {
+    use crate::store::wal_header::HeaderProbe;
+    use std::io::Read;
+
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return HeaderProbe::ABSENT,
+    };
+    let cap = crate::store::wal_header::WAL_HEADER_CHECKSUMMED_BYTES as usize;
+    let mut buf = [0u8; 25];
+    let mut filled = 0usize;
+    while filled < cap {
+        match file.read(&mut buf[filled..cap]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return HeaderProbe::ABSENT,
+        }
+    }
+    HeaderProbe::from_bytes(&buf[..filled])
+}
+
+/// The `enable_checksums` value [`unverified_replay_config_for`] uses.
+///
+/// `#207` BC-3: the flag lives at byte 16, so a 17-byte checksums-off WAL is
+/// enough; 25 bytes are required only when the flag says checksums are on. The
+/// old reader asked `read_exact(&mut [0u8; 25])` and defaulted to `true` on any
+/// short read, which replayed a 17-24-byte checksums-off WAL as checksums-on and
+/// discarded every record. A 0-byte active `.wal` no longer hides a frozen
+/// `.wal.checkpoint`.
+///
+/// A conflict falls back to checksums-on (fail closed); the recovery pre-flight
+/// refuses such a pair before a replay reads it.
+fn unverified_replay_checksums_for(local_path: &std::path::Path) -> bool {
+    use crate::store::wal_header::{select_header_source, HeaderSource};
+
+    let active = read_wal_header_probe(&WalSide::Active.path(local_path));
+    let frozen = read_wal_header_probe(&WalSide::Frozen.path(local_path));
+    match select_header_source(active, frozen) {
+        HeaderSource::Single { checksums, .. } => checksums,
+        HeaderSource::None | HeaderSource::Conflict(_) => true,
+    }
+}
+
 /// Lenient WAL replay configuration that matches the WAL header's
-/// `enableChecksums` flag (byte 16 of the 25-byte header) while setting
+/// `enableChecksums` flag (byte 16 of the header) while setting
 /// `throw_on_wal_replay_failure(false)` so `WALReplayer::dryReplay` replays
 /// every valid committed prefix record and truncates only a corrupted tail
 /// (`#189`). Using `enable_checksums(false)` on a checksummed WAL causes the
 /// engine's `Deserializer` to mis-parse the 8-byte checksum framing after the
 /// header and discard every record.
 fn unverified_replay_config_for(local_path: &std::path::Path) -> SystemConfig {
-    let mut wal_os = local_path.to_path_buf().into_os_string();
-    wal_os.push(".wal");
-    let wal_file = std::path::PathBuf::from(wal_os);
-    let mut ckpt_os = local_path.to_path_buf().into_os_string();
-    ckpt_os.push(".wal.checkpoint");
-    let ckpt_file = std::path::PathBuf::from(ckpt_os);
-
-    let header_source = if wal_file.exists() {
-        Some(wal_file)
-    } else if ckpt_file.exists() {
-        Some(ckpt_file)
-    } else {
-        None
-    };
-
-    let wal_has_checksums = header_source
-        .and_then(|p| {
-            use std::io::Read;
-            let mut f = std::fs::File::open(p).ok()?;
-            let mut hdr = [0u8; 25];
-            f.read_exact(&mut hdr).ok()?;
-            Some(hdr[16] != 0)
-        })
-        .unwrap_or(true);
-
     with_buffer_pool(
         SystemConfig::default()
             .throw_on_wal_replay_failure(false)
-            .enable_checksums(wal_has_checksums),
+            .enable_checksums(unverified_replay_checksums_for(local_path)),
     )
 }
 
@@ -24455,6 +24475,98 @@ eurostrata\src\daemon.rs",
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    fn write_wal_header(path: &std::path::Path, checksums: bool, len: usize) {
+        let mut bytes = vec![0x2au8; 16];
+        bytes.push(u8::from(checksums));
+        if checksums {
+            bytes.extend_from_slice(&[0u8; 8]);
+        }
+        bytes.resize(len.max(bytes.len()), 0);
+        std::fs::write(path, &bytes).unwrap();
+    }
+
+    /// `#207` BC-3: the lenient replay picks `enable_checksums` from the WAL
+    /// header, whose flag lives at byte 16. A 17-byte checksums-off WAL must
+    /// select `false`; the old reader required 25 bytes and defaulted to `true`,
+    /// which replayed it as checksums-on and discarded every record.
+    #[test]
+    fn unverified_replay_selects_checksums_off_for_a_seventeen_byte_wal() {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-wal-header-17-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("h17.lbug");
+        std::fs::write(&db, b"db").unwrap();
+        write_wal_header(&WalSide::Active.path(&db), false, 17);
+
+        assert!(
+            !unverified_replay_checksums_for(&db),
+            "a 17-byte checksums-off WAL must replay with enable_checksums(false)"
+        );
+
+        // Same header, checksums on: 25 bytes are needed and the flag is read.
+        write_wal_header(&WalSide::Active.path(&db), true, 25);
+        assert!(
+            unverified_replay_checksums_for(&db),
+            "a checksums-on WAL must replay with enable_checksums(true)"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `#207` BC-3: a 0-byte active `.wal` must not hide a frozen header, and an
+    /// unreadable or mixed pair stays fail-closed (checksums on).
+    #[test]
+    fn unverified_replay_header_selection_handles_hidden_and_mixed_pairs() {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-wal-header-pair-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("hpair.lbug");
+        std::fs::write(&db, b"db").unwrap();
+
+        // No WAL at all: fail closed.
+        assert!(unverified_replay_checksums_for(&db));
+
+        // 0-byte active + a 17-byte checksums-off frozen WAL.
+        std::fs::write(WalSide::Active.path(&db), b"").unwrap();
+        write_wal_header(&WalSide::Frozen.path(&db), false, 17);
+        assert!(
+            !unverified_replay_checksums_for(&db),
+            "a 0-byte active .wal must not hide the frozen header"
+        );
+
+        // Mixed pair: fail closed, the pre-flight refuses it before a replay.
+        write_wal_header(&WalSide::Active.path(&db), true, 25);
+        assert!(
+            unverified_replay_checksums_for(&db),
+            "a disagreeing pair must fall back to checksums-on (fail closed)"
+        );
+
+        // Short file only: unusable header, fail closed.
+        let short = root.join("short.lbug");
+        std::fs::write(&short, b"db").unwrap();
+        std::fs::write(WalSide::Active.path(&short), [0u8; 12]).unwrap();
+        assert!(
+            unverified_replay_checksums_for(&short),
+            "a 12-byte file has no readable flag and must fail closed"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// #193 + #195: `preserve_unclean_wal` sets `0600` permissions, deduplicates
     /// identical `.wal.unclean.<ts>` copies across repeated calls, refuses
     /// symlink WALs, and prunes old artifacts to the retention budget.
@@ -27238,6 +27350,83 @@ mod wal_zero_record {
         restore_model_env(previous_model);
     }
 
+    /// `#207` BC-2 — a **clean** foreign WAL is a hard refusal today: the
+    /// verified `dryReplay` succeeds, `verifyDatabaseID` throws, and the DB-ID
+    /// text does not match `is_wal_integrity_failure`, so `with_system_config`
+    /// returns the engine error verbatim. Phase B learns `foreign` from that
+    /// failure and turns it into arm D's quarantine (an intentional relaxation:
+    /// a WAL that belongs to another database is not this store's data).
+    #[tokio::test]
+    #[ignore = "red until Phase B wires the classifier into with_system_config (#207)"]
+    async fn clean_foreign_wal_is_quarantined_and_the_store_opens() {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-wal-clean-foreign-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let previous_model = without_model_env();
+
+        // Donor: a healthy WAL with one committed row, from another database.
+        let donor_db = root.join("donor.lbug");
+        store_with_checkpointed_schema(&donor_db, &root).await;
+        let cfg = SystemConfig::default()
+            .max_db_size(512 * 1024 * 1024)
+            .buffer_pool_size(64 * 1024 * 1024)
+            .throw_on_wal_replay_failure(true);
+        let raw = Database::new(&donor_db, cfg).expect("raw open to seed the donor WAL");
+        let conn = Connection::new(&raw).expect("raw connection");
+        conn.query(&memory_row("donor-0"))
+            .expect("seed a committed donor row");
+        conn.query("CALL force_checkpoint_on_close=false")
+            .expect("turn off checkpoint on close");
+        drop(conn);
+        drop(raw);
+        let donor = std::fs::read(wal_of(&donor_db)).expect("read the donor WAL");
+        assert!(donor.len() > 25);
+        assert_eq!(scan_wal(&donor).commit_evidence(), CommitEvidence::Some);
+
+        // Destination: its own schema, a clean close, then the donor's WAL.
+        let db = root.join("foreign.lbug");
+        store_with_checkpointed_schema(&db, &root).await;
+        assert_eq!(file_len(&wal_of(&db)), 0, "the destination closed cleanly");
+        std::fs::write(wal_of(&db), &donor).expect("plant the foreign WAL");
+        let pre_len = donor.len() as u64;
+
+        let _wal_env_serial = WAL_ENV_LOCK.lock().await;
+        let previous_wal = allow_unverified_wal_recovery();
+        let result = LadybugStore::for_testing(&db, 8);
+        restore_wal_env(previous_wal);
+        drop(_wal_env_serial);
+
+        let store = match result {
+            Ok(store) => store,
+            Err(e) => {
+                panic!("a clean foreign WAL must be quarantined, not refused; got: {e} (#207 BC-2)")
+            }
+        };
+        assert_eq!(
+            store.open_provenance(),
+            OpenProvenance::DiscardedUnreadableWal,
+            "arm D reports the discard"
+        );
+        let corrupted = wal_files_in(&root, "foreign.lbug.wal.corrupted.");
+        assert_eq!(
+            corrupted.len(),
+            1,
+            "exactly one .corrupted.<ts> artifact must hold the donor WAL"
+        );
+        assert_eq!(file_len(&corrupted[0]), pre_len);
+        drop(store);
+
+        let _ = std::fs::remove_dir_all(&root);
+        restore_model_env(previous_model);
+    }
+
     /// `#207` row 1 — a frozen-only zero-record replay must refuse and keep a
     /// full pre-replay copy of `.wal.checkpoint` on disk.
     ///
@@ -27823,6 +28012,34 @@ mod wal_preservation {
         assert!(
             text.contains(".wal"),
             "the error must name the side: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn preserve_unclean_wal_prunes_stale_artifacts_even_with_no_wal() {
+        // Delta vs. the pre-#207 helper: it returned before pruning when the
+        // active WAL was missing, so stale artifacts outlived every open.
+        let root = fixture("stale");
+        let db = root.join("stale.lbug");
+        std::fs::write(&db, b"db").unwrap();
+        let keep = LadybugStore::configured_snapshot_retention_count();
+        for ts in 0..(keep + 5) {
+            std::fs::write(
+                root.join(format!("stale.lbug.wal.unclean.{ts}")),
+                format!("payload-{ts}"),
+            )
+            .unwrap();
+        }
+        assert_eq!(artifacts(&db).len(), keep + 5);
+        assert!(
+            preserve_unclean_wal(&db).is_none(),
+            "no active WAL means nothing to preserve"
+        );
+        let remaining = artifacts(&db).len();
+        assert!(
+            remaining <= keep,
+            "stale artifacts must still be pruned with no WAL: {remaining} > {keep}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

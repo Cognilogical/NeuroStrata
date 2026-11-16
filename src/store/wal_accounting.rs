@@ -106,9 +106,15 @@ pub const MIN_RECORD_LEN: u64 = 9;
 /// `Corrupt` (refuse) instead of a "torn" frame (which could be accepted).
 pub const MAX_PLAUSIBLE_RECORD_BYTES: u64 = 1 << 30;
 
-/// Largest WAL the scanner will walk. The caller reads at most `cap + 1` bytes;
-/// anything larger is refused rather than read.
-pub const MAX_SCAN_BYTES: u64 = 8 << 20;
+/// Largest WAL the scanner will walk.
+///
+/// Headroom over the engine's own auto-checkpoint threshold: `autoCheckpoint`
+/// defaults to true with `checkpointThreshold = 16777216` (16 MiB,
+/// `include/main/database.h:81`; `lbug/src/database.rs:60-63`), so a healthy
+/// crash can leave a WAL at or above 16 MiB. 64 MiB keeps a fully verifiable
+/// 16–64 MiB WAL classifiable; anything larger is *deferred*, never refused.
+/// The caller reads at most `cap + 1` bytes.
+pub const MAX_SCAN_BYTES: u64 = 64 << 20;
 
 /// The `WALRecordType` values the pinned engine can write
 /// (`wal_record_base.h:18-40`). `0` (`INVALID_RECORD`) is deliberately absent.
@@ -534,6 +540,12 @@ pub enum SideVerdict {
     /// The side belongs to another database (the engine's `verifyDatabaseID`
     /// refused it). Arm D's contract: rename aside and report, do not refuse.
     ForeignWal { pre_bytes: u64 },
+    /// The side is too large to classify before the open. Defer to the verified
+    /// open; accounting is only needed if that open fails.
+    Deferred {
+        pre_bytes: u64,
+        reason: DeferralReason,
+    },
     /// Bytes survive, or the engine consumed a completed checkpoint.
     Replayed {
         pre_bytes: u64,
@@ -543,6 +555,13 @@ pub enum SideVerdict {
     },
     /// Refuse or report; never silently accept.
     Unknown { reason: UnknownReason },
+}
+
+/// Why a side could not be classified before the open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferralReason {
+    /// The file exceeds [`MAX_SCAN_BYTES`].
+    ScanTooLarge,
 }
 
 /// Per-side inputs.
@@ -613,6 +632,20 @@ pub fn classify_side(observation: SideObservation) -> SideVerdict {
             }
         }
     };
+    // A scan of zero bytes cannot account for `pre > 0`: the caller must scan
+    // the whole side. Without this, `Some(WalScan::EMPTY)` would claim
+    // "nothing committed" for bytes that were never looked at.
+    if matches!(scan.header, HeaderRead::Absent) {
+        return SideVerdict::Unknown {
+            reason: UnknownReason::CommitEvidenceUnreadable,
+        };
+    }
+    if scan.oversized {
+        return SideVerdict::Deferred {
+            pre_bytes: pre,
+            reason: DeferralReason::ScanTooLarge,
+        };
+    }
     let evidence = scan.commit_evidence();
     let checkpoint_terminated = scan.ended_in_checkpoint();
     match (evidence, post) {
@@ -655,6 +688,9 @@ pub enum WalAccounting {
     /// A side belongs to another database. Arm D's contract: quarantine it and
     /// reopen as `DiscardedUnreadableWal`.
     ForeignWal { pre_bytes: u64, sides: SideSet },
+    /// At least one side is too large to classify. Run the verified open; do not
+    /// checkpoint on the strength of this verdict.
+    Deferred { pre_bytes: u64, sides: SideSet },
     /// Bytes survived, or the engine consumed a completed checkpoint. Proceed;
     /// report what changed. `pre_bytes == 0` with `residual_bytes > 0` is a fresh
     /// WAL header created by the open.
@@ -728,6 +764,21 @@ pub fn fold_side_verdicts(active: SideVerdict, frozen: SideVerdict) -> WalAccoun
         };
     }
 
+    let mut deferred_sides = SideSet::EMPTY;
+    let mut deferred_bytes = 0u64;
+    for (side, verdict) in sides {
+        if let SideVerdict::Deferred { pre_bytes, .. } = verdict {
+            deferred_sides = deferred_sides.union(side);
+            deferred_bytes = deferred_bytes.saturating_add(pre_bytes);
+        }
+    }
+    if !deferred_sides.is_empty() {
+        return WalAccounting::Deferred {
+            pre_bytes: deferred_bytes,
+            sides: deferred_sides,
+        };
+    }
+
     let mut pre_bytes = 0u64;
     let mut residual_bytes = 0u64;
     let mut truncated_bytes = 0u64;
@@ -796,6 +847,10 @@ pub enum Disposition {
     /// Arm D: rename the named sides aside to `.corrupted.<ts>` and reopen with
     /// `OpenProvenance::DiscardedUnreadableWal`. No `CHECKPOINT`.
     Quarantine { sides: SideSet },
+    /// Too large to classify before the open: run the verified open as today.
+    /// Accounting is only needed if that open fails, and a failed open may not
+    /// `CHECKPOINT` on an unaccounted WAL.
+    DeferToVerifiedOpen { sides: SideSet },
     /// Refuse before any `CHECKPOINT`, and keep both WALs. `restore` names the
     /// sides that lost **all** of their bytes and may therefore be restored from
     /// the preserved copy; a side with residual bytes must not be restored over
@@ -807,6 +862,7 @@ pub enum Disposition {
 pub fn disposition(verdict: WalAccounting, pair: WalPairObservation) -> Disposition {
     match verdict {
         WalAccounting::ForeignWal { sides, .. } => Disposition::Quarantine { sides },
+        WalAccounting::Deferred { sides, .. } => Disposition::DeferToVerifiedOpen { sides },
         WalAccounting::CommittedLost { .. } | WalAccounting::Unknown { .. } => {
             let mut restore = SideSet::EMPTY;
             if pair.active.pre > 0 && pair.active.post == 0 {
@@ -831,6 +887,7 @@ impl WalAccounting {
             WalAccounting::NothingCommitted { .. } => "nothing_committed",
             WalAccounting::CommittedLost { .. } => "committed_lost",
             WalAccounting::ForeignWal { .. } => "foreign_wal",
+            WalAccounting::Deferred { .. } => "deferred",
             WalAccounting::Replayed { .. } => "replayed",
             WalAccounting::Unknown { .. } => "unknown",
         }
@@ -854,6 +911,7 @@ impl WalAccounting {
         match self {
             WalAccounting::CommittedLost { sides, .. }
             | WalAccounting::ForeignWal { sides, .. }
+            | WalAccounting::Deferred { sides, .. }
             | WalAccounting::Unknown { sides, .. }
             | WalAccounting::NothingCommitted { sides, .. } => sides,
             WalAccounting::NoWal | WalAccounting::Replayed { .. } => SideSet::BOTH,
@@ -962,6 +1020,10 @@ mod tests {
         let mut bytes = header(true);
         bytes.extend(std::iter::repeat(0xFFu8).take(512));
         scan_wal(&bytes)
+    }
+
+    fn scan_oversized() -> WalScan {
+        scan_wal_with_cap(&wal(true, &[1, 2]), 8)
     }
 
     fn scan_checksums_off_no_commit() -> WalScan {
@@ -1216,7 +1278,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_refuses_a_wal_larger_than_the_cap() {
+    fn scan_marks_a_wal_over_the_cap_as_oversized() {
         let bytes = wal(true, &[1, 2]);
         let scan = scan_wal_with_cap(&bytes, 32);
         assert!(scan.oversized);
@@ -1225,11 +1287,63 @@ mod tests {
     }
 
     #[test]
-    fn scan_refuses_a_file_larger_than_the_default_cap() {
-        let bytes = vec![0u8; MAX_SCAN_BYTES as usize + 1];
+    fn the_default_cap_has_headroom_over_the_engine_checkpoint_threshold() {
+        // `include/main/database.h:81`: checkpointThreshold defaults to 16 MiB
+        // with autoCheckpoint on, so a healthy crash routinely leaves a WAL at
+        // or above 16 MiB. The cap must not sit below it.
+        assert!(
+            MAX_SCAN_BYTES >= 64 << 20,
+            "cap {MAX_SCAN_BYTES} must leave headroom over the 16 MiB threshold"
+        );
+        assert!(MAX_SCAN_BYTES > 16 << 20);
+    }
+
+    #[test]
+    fn a_seventeen_megabyte_wal_is_within_the_default_cap() {
+        // Just over the engine's auto-checkpoint threshold: the walk is allowed
+        // (it is refused as `Corrupt` only because the bytes are zeros, which is
+        // irrelevant here - the assertion is that the cap did not fire).
+        let bytes = vec![0u8; (17 << 20) as usize];
         let scan = scan_wal(&bytes);
+        assert!(!scan.oversized, "17 MiB must be classifiable");
+    }
+
+    #[test]
+    fn an_oversized_wal_defers_to_the_verified_open() {
+        let scan = scan_oversized();
         assert!(scan.oversized);
-        assert_eq!(scan.commit_evidence(), CommitEvidence::Unknown);
+        let pair = WalPairObservation::new(side(140, 140, Some(scan)), SideObservation::empty());
+        let verdict = classify_pair(pair);
+        assert_eq!(
+            verdict,
+            WalAccounting::Deferred {
+                pre_bytes: 140,
+                sides: SideSet::ACTIVE
+            }
+        );
+        assert_eq!(
+            disposition(verdict, pair),
+            Disposition::DeferToVerifiedOpen {
+                sides: SideSet::ACTIVE
+            }
+        );
+        assert!(
+            !verdict.may_proceed(),
+            "a deferred WAL is not permission to CHECKPOINT"
+        );
+        assert_eq!(verdict.slug(), "deferred");
+    }
+
+    #[test]
+    fn a_proven_loss_still_outranks_a_deferred_peer() {
+        let pair = WalPairObservation::new(
+            side(140, 140, Some(scan_oversized())),
+            side(3103, 0, Some(scan_with_commit())),
+        );
+        assert!(matches!(
+            classify_pair(pair),
+            WalAccounting::CommittedLost { .. }
+        ));
     }
 
     #[test]
@@ -1315,7 +1429,9 @@ mod tests {
     fn verdict_may_proceed(verdict: SideVerdict) -> bool {
         !matches!(
             verdict,
-            SideVerdict::CommittedLost { .. } | SideVerdict::Unknown { .. }
+            SideVerdict::CommittedLost { .. }
+                | SideVerdict::Unknown { .. }
+                | SideVerdict::Deferred { .. }
         )
     }
 
@@ -1426,6 +1542,18 @@ mod tests {
             }
         );
         assert!(verdict_may_proceed(measured_late), "the hazard is real");
+    }
+
+    #[test]
+    fn unknown_when_a_positive_pre_has_no_scan_header() {
+        // A caller that scanned nothing cannot claim `pre` bytes held no commit.
+        let verdict = classify_side(side(530, 0, Some(WalScan::EMPTY)));
+        assert_eq!(
+            verdict,
+            SideVerdict::Unknown {
+                reason: UnknownReason::CommitEvidenceUnreadable
+            }
+        );
     }
 
     #[test]
@@ -1629,9 +1757,10 @@ mod tests {
         ChecksumsOffNoCommit,
         ChecksumsOffCommit,
         Oversized,
+        EmptyScan,
     }
 
-    const SHAPES: [Shape; 10] = [
+    const SHAPES: [Shape; 11] = [
         Shape::NoScan,
         Shape::CleanNoCommit,
         Shape::CleanCommit,
@@ -1642,6 +1771,7 @@ mod tests {
         Shape::ChecksumsOffNoCommit,
         Shape::ChecksumsOffCommit,
         Shape::Oversized,
+        Shape::EmptyScan,
     ];
 
     fn scan_shape(shape: Shape) -> Option<WalScan> {
@@ -1655,7 +1785,8 @@ mod tests {
             Shape::Corrupt => Some(scan_unattributable()),
             Shape::ChecksumsOffNoCommit => Some(scan_checksums_off_no_commit()),
             Shape::ChecksumsOffCommit => Some(scan_checksums_off_commit()),
-            Shape::Oversized => Some(scan_wal_with_cap(&wal(true, &[1, 2]), 8)),
+            Shape::Oversized => Some(scan_oversized()),
+            Shape::EmptyScan => Some(WalScan::EMPTY),
         }
     }
 
@@ -1671,6 +1802,7 @@ mod tests {
             Shape::TornUnvalidated | Shape::Corrupt | Shape::Oversized => {
                 (Some(CommitEvidence::Unknown), false)
             }
+            Shape::EmptyScan => (Some(CommitEvidence::None), false),
         }
     }
 
@@ -1685,6 +1817,17 @@ mod tests {
         }
         if foreign {
             return SideVerdict::ForeignWal { pre_bytes: pre };
+        }
+        if matches!(shape, Shape::EmptyScan) {
+            return SideVerdict::Unknown {
+                reason: UnknownReason::CommitEvidenceUnreadable,
+            };
+        }
+        if matches!(shape, Shape::Oversized) {
+            return SideVerdict::Deferred {
+                pre_bytes: pre,
+                reason: DeferralReason::ScanTooLarge,
+            };
         }
         let (evidence, checkpoint) = shape_evidence(shape);
         let evidence = match evidence {
@@ -1767,7 +1910,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(rows, 10 * 2 * 4 * 5);
+        assert_eq!(rows, 11 * 2 * 4 * 5);
     }
 
     #[test]
@@ -1798,6 +1941,10 @@ mod tests {
                 sides: swap_sides(sides),
             },
             WalAccounting::ForeignWal { pre_bytes, sides } => WalAccounting::ForeignWal {
+                pre_bytes,
+                sides: swap_sides(sides),
+            },
+            WalAccounting::Deferred { pre_bytes, sides } => WalAccounting::Deferred {
                 pre_bytes,
                 sides: swap_sides(sides),
             },
@@ -1838,7 +1985,9 @@ mod tests {
                 let side_proceeds = |shape: Shape| {
                     !matches!(
                         classify_side(side(530, 0, scan_shape(shape))),
-                        SideVerdict::CommittedLost { .. } | SideVerdict::Unknown { .. }
+                        SideVerdict::CommittedLost { .. }
+                            | SideVerdict::Unknown { .. }
+                            | SideVerdict::Deferred { .. }
                     )
                 };
                 assert_eq!(

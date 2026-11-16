@@ -209,7 +209,8 @@
         "cargo test --locked --bin neurostrata-mcp wal_accounting -- --test-threads=1",
         "cargo test --locked --bin neurostrata-mcp wal_header -- --test-threads=1",
         "cargo test --locked --bin neurostrata-mcp wal_preservation -- --test-threads=1",
-        "cargo test --locked --bin neurostrata-mcp wal_zero_record -- --test-threads=1 --skip frozen_only_zero_record_replay_refuses_and_preserves_the_frozen_wal --skip checksum_mismatch_arm_refuses_unreadable_records_before_checkpointing --skip torn_only_commit_wal_opens_without_a_data_loss_refusal --skip torn_commit_checksum_tail_opens_instead_of_an_unclassified_error --skip mixed_header_pair_is_refused_and_both_wals_survive"
+        "cargo test --locked --bin neurostrata-mcp unverified_replay -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp wal_zero_record -- --test-threads=1 --skip clean_foreign_wal_is_quarantined_and_the_store_opens --skip frozen_only_zero_record_replay_refuses_and_preserves_the_frozen_wal --skip checksum_mismatch_arm_refuses_unreadable_records_before_checkpointing --skip torn_only_commit_wal_opens_without_a_data_loss_refusal --skip torn_commit_checksum_tail_opens_instead_of_an_unclassified_error --skip mixed_header_pair_is_refused_and_both_wals_survive"
       ],
       "tests": [
         "store::wal_accounting::tests::checksum_of_an_empty_buffer_is_the_dbs_seed",
@@ -234,8 +235,11 @@
         "store::wal_accounting::tests::scan_keeps_a_proven_commit_when_the_tail_is_corrupt",
         "store::wal_accounting::tests::scan_recognises_a_trailing_checkpoint",
         "store::wal_accounting::tests::scan_of_a_torn_record_after_a_checkpoint_still_ends_in_checkpoint",
-        "store::wal_accounting::tests::scan_refuses_a_wal_larger_than_the_cap",
-        "store::wal_accounting::tests::scan_refuses_a_file_larger_than_the_default_cap",
+        "store::wal_accounting::tests::scan_marks_a_wal_over_the_cap_as_oversized",
+        "store::wal_accounting::tests::the_default_cap_has_headroom_over_the_engine_checkpoint_threshold",
+        "store::wal_accounting::tests::a_seventeen_megabyte_wal_is_within_the_default_cap",
+        "store::wal_accounting::tests::an_oversized_wal_defers_to_the_verified_open",
+        "store::wal_accounting::tests::a_proven_loss_still_outranks_a_deferred_peer",
         "store::wal_accounting::tests::every_single_byte_mutation_of_a_length_or_type_byte_is_refused",
         "store::wal_accounting::tests::every_single_byte_mutation_of_a_checksums_off_wal_is_refused_or_kept_open",
         "store::wal_accounting::tests::no_wal_when_nothing_existed_before_or_after",
@@ -246,6 +250,7 @@
         "store::wal_accounting::tests::partial_active_truncation_is_a_replay_with_a_loss_report",
         "store::wal_accounting::tests::a_fresh_wal_is_reported_not_refused",
         "store::wal_accounting::tests::measuring_post_after_a_fresh_header_would_mask_a_loss",
+        "store::wal_accounting::tests::unknown_when_a_positive_pre_has_no_scan_header",
         "store::wal_accounting::tests::unknown_when_the_bytes_cannot_be_attributed",
         "store::wal_accounting::tests::unknown_when_an_unreadable_side_still_has_residual_bytes",
         "store::wal_accounting::tests::a_checksums_off_wal_with_no_surviving_bytes_is_unverifiable",
@@ -282,18 +287,22 @@
         "store::ladybug::wal_preservation::preserve_wal_pair_copies_both_sides_and_dedupes",
         "store::ladybug::wal_preservation::preserve_wal_pair_reports_absent_sides",
         "store::ladybug::wal_preservation::preserve_wal_pair_refuses_a_symlinked_side",
+        "store::ladybug::wal_preservation::preserve_unclean_wal_prunes_stale_artifacts_even_with_no_wal",
         "store::ladybug::wal_preservation::copy_primitive_refuses_an_occupied_destination",
+        "store::ladybug::tests::unverified_replay_selects_checksums_off_for_a_seventeen_byte_wal",
+        "store::ladybug::tests::unverified_replay_header_selection_handles_hidden_and_mixed_pairs",
         "store::ladybug::wal_zero_record::scanner_reads_a_real_wal_written_by_the_pinned_engine",
         "store::ladybug::wal_zero_record::valid_wal_opens_verified_with_its_committed_row",
         "store::ladybug::wal_zero_record::delete_only_wal_still_opens",
         "store::ladybug::wal_zero_record::no_wal_store_still_opens_verified"
       ],
       "thresholds": {
-        "truth_table_verdicts": 6,
-        "per_side_combination_checks": 400,
+        "truth_table_verdicts": 7,
+        "per_side_combination_checks": 440,
         "mutation_masks": 255,
         "header_rows": 11,
-        "preservation_rows": 4,
+        "preservation_rows": 5,
+        "header_selection_rows": 2,
         "integration_rows": 4,
         "ignored": 0
       }
