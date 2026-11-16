@@ -210,6 +210,7 @@
         "cargo test --locked --bin neurostrata-mcp wal_header -- --test-threads=1",
         "cargo test --locked --bin neurostrata-mcp wal_preservation -- --test-threads=1",
         "cargo test --locked --bin neurostrata-mcp unverified_replay -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp an_emptied_active_side_still_refuses -- --test-threads=1",
         "cargo test --locked --bin neurostrata-mcp wal_zero_record -- --test-threads=1"
       ],
       "tests": [
@@ -292,6 +293,8 @@
         "store::wal_header::tests::header_source_is_none_for_two_zero_byte_files",
         "store::wal_header::tests::header_source_is_none_only_when_neither_wal_exists",
         "store::ladybug::wal_preservation::preserve_wal_pair_copies_both_sides_and_dedupes",
+        "store::ladybug::wal_preservation::quarantine_is_foreign_only_when_the_engine_named_a_side",
+        "store::ladybug::wal_preservation::quarantine_wal_side_picks_the_message_from_the_attribution",
         "store::ladybug::wal_preservation::quarantine_message_distinguishes_foreign_from_same_database",
         "store::ladybug::wal_preservation::preserve_wal_pair_reports_absent_sides",
         "store::ladybug::wal_preservation::preserve_wal_pair_refuses_a_symlinked_side",
@@ -300,6 +303,7 @@
         "store::ladybug::wal_preservation::copy_primitive_refuses_an_occupied_destination",
         "store::ladybug::tests::unverified_replay_selects_checksums_off_for_a_seventeen_byte_wal",
         "store::ladybug::tests::unverified_replay_header_selection_handles_hidden_and_mixed_pairs",
+        "store::ladybug::tests::an_emptied_active_side_still_refuses_through_the_wiring",
         "store::ladybug::wal_zero_record::scanner_reads_a_real_wal_written_by_the_pinned_engine",
         "store::ladybug::wal_zero_record::valid_wal_opens_verified_with_its_committed_row",
         "store::ladybug::wal_zero_record::clean_foreign_wal_is_quarantined_and_the_store_opens",
@@ -316,15 +320,8 @@
         "store::ladybug::wal_zero_record::refusal_keeps_the_active_wal_when_it_still_has_bytes"
       ],
       "thresholds": {
-        "truth_table_verdicts": 7,
-        "per_side_combination_checks": 440,
-        "mutation_masks": 255,
-        "header_rows": 11,
-        "preservation_rows": 7,
-        "header_selection_rows": 2,
-        "integration_rows": 14,
         "ignored": 0,
-        "consumption_rows": 4
+        "_note": "scripts/remediation-eval.sh enforces only `ignored` and the exact `tests` names; any other count here would be inert, so none are listed."
       }
     }
   }

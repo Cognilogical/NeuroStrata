@@ -2654,7 +2654,6 @@ fn pair_observation(
     ),
     post: (u64, u64),
     foreign: crate::store::wal_accounting::SideSet,
-    consumed: crate::store::wal_accounting::SideSet,
 ) -> crate::store::wal_accounting::WalPairObservation {
     use crate::store::wal_accounting::{SideObservation, SideSet, WalPairObservation};
 
@@ -2662,13 +2661,11 @@ fn pair_observation(
         SideObservation {
             post: post.0,
             foreign: foreign.contains(SideSet::ACTIVE),
-            consumed_by_engine: consumed.contains(SideSet::ACTIVE),
             ..pre.0
         },
         SideObservation {
             post: post.1,
             foreign: foreign.contains(SideSet::FROZEN),
-            consumed_by_engine: consumed.contains(SideSet::FROZEN),
             ..pre.1
         },
     )
@@ -2680,7 +2677,7 @@ fn quarantine_wal_side(
     local_path: &std::path::Path,
     side: WalSide,
     foreign: bool,
-) -> Result<Option<PathBuf>> {
+) -> Result<Option<QuarantinedSide>> {
     let target = side.path(local_path);
     let meta = match std::fs::symlink_metadata(&target) {
         Ok(meta) => meta,
@@ -2708,11 +2705,26 @@ fn quarantine_wal_side(
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&corrupted_file, std::fs::Permissions::from_mode(0o600));
     }
-    eprintln!(
-        "{}",
-        quarantine_message(foreign, &target, dropped_bytes, &corrupted_file)
-    );
-    Ok(Some(corrupted_file))
+    let message = quarantine_message(foreign, &target, dropped_bytes, &corrupted_file);
+    Ok(Some(QuarantinedSide {
+        artifact: corrupted_file,
+        message,
+    }))
+}
+
+/// One side set aside by arm D. The message is returned rather than printed so a
+/// test can assert the attribution branch without a stderr sink.
+struct QuarantinedSide {
+    #[allow(dead_code)] // read by tests; the caller prints `message`
+    artifact: PathBuf,
+    message: String,
+}
+
+/// Whether a quarantine starts from a foreign attribution. Only a side the
+/// engine named with `verifyDatabaseID` is foreign; a same-database WAL that
+/// merely cannot be replayed keeps the discard wording.
+fn quarantine_is_foreign(foreign: &crate::store::wal_accounting::SideSet) -> bool {
+    !foreign.is_empty()
 }
 
 /// What the quarantine message must say. A foreign WAL is not this store's data;
@@ -2762,10 +2774,11 @@ fn open_after_quarantine(
     for attempt in 0..3 {
         let mut moved = false;
         for side in [WalSide::Active, WalSide::Frozen] {
-            if pending.contains(wal_side_set(side))
-                && quarantine_wal_side(local_path, side, pending_foreign)?.is_some()
-            {
-                moved = true;
+            if pending.contains(wal_side_set(side)) {
+                if let Some(quarantined) = quarantine_wal_side(local_path, side, pending_foreign)? {
+                    eprintln!("{}", quarantined.message);
+                    moved = true;
+                }
             }
         }
         if !moved && attempt > 0 {
@@ -2975,7 +2988,7 @@ fn recover_from_wal_failure(
     }
 
     if strict_wal_verification() {
-        let verdict = classify_pair(pair_observation(pre, post, foreign, SideSet::EMPTY));
+        let verdict = classify_pair(pair_observation(pre, post, foreign));
         return Err(strict_wal_refusal(
             &err_msg,
             checksum_mismatch,
@@ -2986,7 +2999,7 @@ fn recover_from_wal_failure(
 
     // Too large to classify: the verified open already failed, so refuse before
     // any lenient replay could checkpoint an unaccounted WAL.
-    let snapshot = classify_pair(pair_observation(pre, post, foreign, SideSet::EMPTY));
+    let snapshot = classify_pair(pair_observation(pre, post, foreign));
     if matches!(snapshot, WalAccounting::Deferred { .. }) {
         let restore = sides_to_restore(pre, post);
         return Err(wal_refusal(
@@ -3045,7 +3058,7 @@ fn recover_from_wal_failure(
         },
         lenient.is_ok(),
     );
-    let pair = pair_observation(pre, post, foreign, consumed);
+    let pair = pair_observation(pre, post, foreign).consumed(consumed);
     let verdict = classify_pair(pair);
 
     let unverified_db = match lenient {
@@ -3058,7 +3071,7 @@ fn recover_from_wal_failure(
             eprintln!(
                 "ERROR: the write-ahead log could not be replayed even unverified: {retry_e}"
             );
-            let initial_foreign = !foreign.is_empty();
+            let initial_foreign = quarantine_is_foreign(&foreign);
             let initial = if initial_foreign {
                 foreign
             } else {
@@ -24922,6 +24935,62 @@ eurostrata\src\daemon.rs",
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// `#207` V3b: the wiring seam cannot mark the active side consumed.
+    /// `consumed_sides` answers "nothing consumed" for an active-only change, so
+    /// `classify_pair` still refuses the proven commit; widening the set at the
+    /// call site (`.union(SideSet::ACTIVE)`) does not compile because
+    /// [`crate::store::wal_accounting::ConsumedSides`] has no set algebra.
+    #[test]
+    fn an_emptied_active_side_still_refuses_through_the_wiring() {
+        use crate::store::wal_accounting::{
+            classify_pair, consumed_sides, SideObservation, SideSet, WalAccounting, WalPairBytes,
+        };
+
+        let active = SideObservation {
+            pre: 530,
+            bytes_scanned: 530,
+            post: 0,
+            scan: Some(checksums_off_scan_with_commit()),
+            foreign: false,
+        };
+        let pair = pair_observation(&(active, SideObservation::empty()), (0, 0), SideSet::EMPTY)
+            .consumed(consumed_sides(
+                &WalPairBytes {
+                    active: 530,
+                    frozen: 0,
+                },
+                &WalPairBytes {
+                    active: 0,
+                    frozen: 0,
+                },
+                true,
+            ));
+        assert_eq!(
+            classify_pair(pair),
+            WalAccounting::CommittedLost {
+                pre_bytes: 530,
+                sides: SideSet::ACTIVE
+            },
+            "an emptied active side is a loss, never a consumed checkpoint"
+        );
+    }
+
+    /// A minimal checksums-off WAL with one committed record.
+    fn checksums_off_scan_with_commit() -> crate::store::wal_accounting::WalScan {
+        fn frame(record_type: u8) -> Vec<u8> {
+            let mut payload = vec![record_type];
+            payload.extend_from_slice(&0u64.to_ne_bytes());
+            let mut out = (payload.len() as u64).to_ne_bytes().to_vec();
+            out.extend_from_slice(&payload);
+            out
+        }
+        let mut bytes = vec![0u8; 16];
+        bytes.push(0); // 17-byte checksums-off header
+        bytes.extend_from_slice(&frame(1)); // BEGIN
+        bytes.extend_from_slice(&frame(2)); // COMMIT
+        crate::store::wal_accounting::scan_wal(&bytes)
+    }
+
     /// #193 + #195: `preserve_unclean_wal` sets `0600` permissions, deduplicates
     /// identical `.wal.unclean.<ts>` copies across repeated calls, refuses
     /// symlink WALs, and prunes old artifacts to the retention budget.
@@ -25185,6 +25254,15 @@ eurostrata\src\daemon.rs",
         assert!(
             funnel.contains("consumed_sides("),
             "the consumed-side decision is the pure `consumed_sides`, not an inline set (#207)"
+        );
+        assert!(
+            funnel.contains(".consumed("),
+            "the sealed consumption is attached to the pair observation (#207)"
+        );
+        assert!(
+            funnel.contains("let initial_foreign = quarantine_is_foreign(&foreign);"),
+            "arm D's wording branch comes from the attribution seam at the call site, \
+             not a literal (#207)"
         );
         assert!(
             !funnel.contains("SideSet::BOTH"),
@@ -27639,7 +27717,6 @@ mod wal_zero_record {
                 post: 0,
                 scan: Some(flipped_scan),
                 foreign: false,
-                consumed_by_engine: false,
             },
         );
         assert!(
@@ -28679,6 +28756,62 @@ mod wal_preservation {
             artifacts(&db).len(),
             2,
             "one artifact per side, no duplicates"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn quarantine_is_foreign_only_when_the_engine_named_a_side() {
+        use crate::store::wal_accounting::SideSet;
+        assert!(!quarantine_is_foreign(&SideSet::EMPTY));
+        assert!(quarantine_is_foreign(&SideSet::ACTIVE));
+        assert!(quarantine_is_foreign(&SideSet::FROZEN));
+        assert!(quarantine_is_foreign(&SideSet::BOTH));
+    }
+
+    /// The attribution branch through the production function: the message is
+    /// returned (not printed), so both branches are asserted end to end.
+    #[test]
+    fn quarantine_wal_side_picks_the_message_from_the_attribution() {
+        let root = fixture("message");
+        let db = root.join("message.lbug");
+        std::fs::write(&db, b"db").unwrap();
+        let wal = WalSide::Active.path(&db);
+
+        std::fs::write(&wal, b"same-db-bytes").unwrap();
+        let own = quarantine_wal_side(&db, WalSide::Active, false)
+            .expect("quarantine a same-database WAL")
+            .expect("the WAL exists");
+        assert!(
+            own.message
+                .contains("could not be replayed even unverified"),
+            "{}",
+            own.message
+        );
+        assert!(!own.message.contains("another database"), "{}", own.message);
+        assert!(own.artifact.exists());
+
+        std::fs::write(&wal, b"foreign-bytes").unwrap();
+        let foreign = quarantine_wal_side(&db, WalSide::Active, true)
+            .expect("quarantine a foreign WAL")
+            .expect("the WAL exists");
+        assert!(
+            foreign.message.contains("belongs to another database"),
+            "{}",
+            foreign.message
+        );
+        assert!(
+            foreign
+                .message
+                .contains("nothing of this store was discarded"),
+            "{}",
+            foreign.message
+        );
+        assert!(
+            !foreign.message.contains("DATA LOSS"),
+            "{}",
+            foreign.message
         );
 
         let _ = std::fs::remove_dir_all(&root);

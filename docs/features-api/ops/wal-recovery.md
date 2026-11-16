@@ -66,7 +66,7 @@ before recovery.
 ## Accounting verdicts (`#207`)
 
 Every recovery arm classifies the WAL pair before it checkpoints. The refusal
-message carries one of six machine-readable slugs:
+message carries one of seven machine-readable slugs:
 
 | slug | meaning | operator action |
 |---|---|---|

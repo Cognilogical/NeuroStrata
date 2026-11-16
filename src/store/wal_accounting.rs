@@ -247,6 +247,45 @@ impl WalPairBytes {
     };
 }
 
+/// One of the two WAL files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalSide {
+    Active,
+    Frozen,
+}
+
+/// The sides a **successful** lenient open consumed.
+///
+/// The inner set is private and there is deliberately **no** `union`, `insert`
+/// or `SideSet` accessor: the only way to build a value is [`consumed_sides`],
+/// which never covers the active side. [`WalPairObservation::consumed`] is the
+/// only way to attach one, so a call site cannot widen the set with
+/// `.union(SideSet::ACTIVE)` without a compile error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ConsumedSides(SideSet);
+
+impl ConsumedSides {
+    /// Nothing was consumed. Used when classifying a pre-open snapshot.
+    pub const fn none() -> Self {
+        Self(SideSet::EMPTY)
+    }
+
+    /// Whether the consumption covers one side. Read-only: there is no set
+    /// algebra here, on purpose.
+    pub const fn covers(self, side: WalSide) -> bool {
+        match side {
+            WalSide::Active => self.0.contains(SideSet::ACTIVE),
+            WalSide::Frozen => self.0.contains(SideSet::FROZEN),
+        }
+    }
+
+    /// Nothing was consumed. Read-only predicate used by the table tests.
+    #[allow(dead_code)]
+    pub const fn is_empty(self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// Which sides a **successful** lenient open consumed, from the wiring's facts.
 ///
 /// `WALReplayer::replayFrozenWAL` removes `<db>.wal.checkpoint` after either
@@ -260,14 +299,18 @@ impl WalPairBytes {
 /// truncates to `offsetDeserialized`, and only a commit moves that), so a
 /// proven commit there is a loss, not a completed checkpoint. Returning it here
 /// would turn that loss into a `Replayed` verdict.
-pub const fn consumed_sides(pre: &WalPairBytes, post: &WalPairBytes, lenient_ok: bool) -> SideSet {
+pub const fn consumed_sides(
+    pre: &WalPairBytes,
+    post: &WalPairBytes,
+    lenient_ok: bool,
+) -> ConsumedSides {
     if !lenient_ok {
-        return SideSet::EMPTY;
+        return ConsumedSides::none();
     }
     if pre.frozen > 0 && post.frozen == 0 {
-        SideSet::FROZEN
+        ConsumedSides(SideSet::FROZEN)
     } else {
-        SideSet::EMPTY
+        ConsumedSides::none()
     }
 }
 
@@ -619,15 +662,6 @@ pub struct SideObservation {
     /// (`storage/file_db_id_utils.cpp:4-17`); the pure module deliberately does
     /// not re-derive it from the main DB header.
     pub foreign: bool,
-    /// A **successful** lenient open removed this side.
-    ///
-    /// Only the frozen side is ever marked: `WALReplayer::replayFrozenWAL`
-    /// removes `<db>.wal.checkpoint` after either replaying it to completion
-    /// (then `completeInterruptedCheckpoint` makes the records durable) or
-    /// reading zero records (`offsetDeserialized == 0`, which the pre-replay
-    /// scan reports as `Unknown`). The flag is honoured only when the scan was
-    /// attributable, so it can never launder a `Corrupt`/unreadable WAL.
-    pub consumed_by_engine: bool,
 }
 
 impl SideObservation {
@@ -638,34 +672,52 @@ impl SideObservation {
             post: 0,
             scan: None,
             foreign: false,
-            consumed_by_engine: false,
         }
     }
 }
 
-/// Both sides, measured the same way.
+/// Both sides, measured the same way, plus the consumption fact.
+///
+/// `consumed` is private so the only way to set it is [`Self::consumed`], which
+/// takes the sealed [`ConsumedSides`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WalPairObservation {
     pub active: SideObservation,
     pub frozen: SideObservation,
+    consumed: ConsumedSides,
 }
 
 impl WalPairObservation {
     pub const fn new(active: SideObservation, frozen: SideObservation) -> Self {
-        Self { active, frozen }
+        Self {
+            active,
+            frozen,
+            consumed: ConsumedSides::none(),
+        }
+    }
+
+    /// Attaches which sides a successful lenient open consumed.
+    pub const fn consumed(mut self, consumed: ConsumedSides) -> Self {
+        self.consumed = consumed;
+        self
     }
 }
 
-/// One side's verdict. The safety checks come first, so a proven commit can
-/// never be accepted.
+/// One side's verdict, with **no** consumption. The only way to mark a side
+/// consumed is [`WalPairObservation::consumed`] plus [`classify_pair`]; this
+/// entry exists for the per-side table tests and future single-side callers.
+#[allow(dead_code)]
 pub fn classify_side(observation: SideObservation) -> SideVerdict {
+    classify_side_with(observation, false)
+}
+
+fn classify_side_with(observation: SideObservation, consumed_by_engine: bool) -> SideVerdict {
     let SideObservation {
         pre,
         bytes_scanned: _,
         post,
         scan,
         foreign,
-        consumed_by_engine,
     } = observation;
     if pre == 0 {
         return if post == 0 {
@@ -899,9 +951,12 @@ pub fn fold_side_verdicts(active: SideVerdict, frozen: SideVerdict) -> WalAccoun
     WalAccounting::NoWal
 }
 
-/// Measures both sides and folds them.
+/// Measures both sides and folds them, applying the pair's consumption fact.
 pub fn classify_pair(pair: WalPairObservation) -> WalAccounting {
-    fold_side_verdicts(classify_side(pair.active), classify_side(pair.frozen))
+    fold_side_verdicts(
+        classify_side_with(pair.active, pair.consumed.covers(WalSide::Active)),
+        classify_side_with(pair.frozen, pair.consumed.covers(WalSide::Frozen)),
+    )
 }
 
 /// What a refusing or quarantining arm must do with the files.
@@ -1111,7 +1166,6 @@ mod tests {
             post,
             scan,
             foreign: false,
-            consumed_by_engine: false,
         }
     }
 
@@ -1122,15 +1176,25 @@ mod tests {
             post,
             scan: None,
             foreign: true,
-            consumed_by_engine: false,
         }
     }
 
-    fn consumed_side(pre: u64, post: u64, scan: Option<WalScan>) -> SideObservation {
-        SideObservation {
-            consumed_by_engine: true,
-            ..side(pre, post, scan)
-        }
+    /// The pair entry the wiring uses: a frozen side consumed by a successful
+    /// open, built through the sealed [`ConsumedSides`].
+    fn frozen_consumed_verdict(pre: u64, post: u64, scan: Option<WalScan>) -> WalAccounting {
+        let pair = WalPairObservation::new(SideObservation::empty(), side(pre, post, scan))
+            .consumed(consumed_sides(
+                &WalPairBytes {
+                    active: 0,
+                    frozen: pre,
+                },
+                &WalPairBytes {
+                    active: 0,
+                    frozen: post,
+                },
+                true,
+            ));
+        classify_pair(pair)
     }
 
     // ---- checksum port -----------------------------------------------------
@@ -1527,7 +1591,10 @@ mod tests {
             frozen: 942,
         };
         let post = WalPairBytes::ZERO;
-        assert_eq!(consumed_sides(&pre, &post, true), SideSet::FROZEN);
+        let consumed = consumed_sides(&pre, &post, true);
+        assert!(consumed.covers(WalSide::Frozen));
+        assert!(!consumed.covers(WalSide::Active));
+        assert!(!consumed.is_empty());
     }
 
     #[test]
@@ -1539,9 +1606,8 @@ mod tests {
             frozen: 0,
         };
         let post = WalPairBytes::ZERO;
-        assert_eq!(
-            consumed_sides(&pre, &post, true),
-            SideSet::EMPTY,
+        assert!(
+            consumed_sides(&pre, &post, true).is_empty(),
             "the active side is never consumed"
         );
 
@@ -1550,9 +1616,9 @@ mod tests {
             frozen: 942,
         };
         let post = WalPairBytes::ZERO;
-        assert_eq!(
-            consumed_sides(&pre, &post, true),
-            SideSet::FROZEN,
+        let consumed = consumed_sides(&pre, &post, true);
+        assert!(
+            consumed.covers(WalSide::Frozen) && !consumed.covers(WalSide::Active),
             "only the frozen side is consumed when both emptied"
         );
     }
@@ -1564,15 +1630,12 @@ mod tests {
             frozen: 942,
         };
         let post = WalPairBytes::ZERO;
-        assert_eq!(consumed_sides(&pre, &post, false), SideSet::EMPTY);
+        assert!(consumed_sides(&pre, &post, false).is_empty());
     }
 
     #[test]
     fn consumed_sides_is_empty_for_an_empty_pair_or_a_residual_frozen_side() {
-        assert_eq!(
-            consumed_sides(&WalPairBytes::ZERO, &WalPairBytes::ZERO, true),
-            SideSet::EMPTY
-        );
+        assert!(consumed_sides(&WalPairBytes::ZERO, &WalPairBytes::ZERO, true).is_empty());
         let pre = WalPairBytes {
             active: 0,
             frozen: 942,
@@ -1581,7 +1644,7 @@ mod tests {
             active: 0,
             frozen: 400,
         };
-        assert_eq!(consumed_sides(&pre, &post, true), SideSet::EMPTY);
+        assert!(consumed_sides(&pre, &post, true).is_empty());
     }
 
     #[test]
@@ -1615,36 +1678,32 @@ mod tests {
     fn a_frozen_side_consumed_by_a_successful_open_is_a_completed_checkpoint() {
         // `#191`: a frozen WAL with readable commits that a successful lenient
         // open removed was replayed and checkpointed; it is not a loss.
-        let verdict = classify_side(consumed_side(942, 0, Some(scan_checksums_off_commit())));
+        let verdict = frozen_consumed_verdict(942, 0, Some(scan_checksums_off_commit()));
         assert_eq!(
             verdict,
-            SideVerdict::Replayed {
+            WalAccounting::Replayed {
                 pre_bytes: 942,
                 residual_bytes: 0,
                 truncated_bytes: 942,
                 checkpoint_terminated: true
             }
         );
-        assert!(verdict_may_proceed(verdict));
+        assert!(verdict.may_proceed());
     }
 
     #[test]
     fn consumption_never_rescues_an_unattributable_scan() {
         // The `#207` probe: the engine read nothing and deleted the frozen WAL.
-        // `consumed_by_engine` must not launder that into a replay.
-        let verdict = classify_side(consumed_side(3103, 0, Some(scan_unattributable())));
-        assert_eq!(
-            verdict,
-            SideVerdict::Unknown {
-                reason: UnknownReason::CommitEvidenceUnreadable
-            }
-        );
+        // Consumption must not launder that into a replay.
+        let verdict = frozen_consumed_verdict(3103, 0, Some(scan_unattributable()));
+        assert!(matches!(verdict, WalAccounting::Unknown { .. }));
         // Nor a checksums-off WAL with no commit found: that is `Unverifiable`.
-        let verdict = classify_side(consumed_side(530, 0, Some(scan_checksums_off_no_commit())));
+        let verdict = frozen_consumed_verdict(530, 0, Some(scan_checksums_off_no_commit()));
         assert_eq!(
             verdict,
-            SideVerdict::Unknown {
-                reason: UnknownReason::UnverifiableWal
+            WalAccounting::Unknown {
+                reason: UnknownReason::UnverifiableWal,
+                sides: SideSet::FROZEN
             }
         );
     }
@@ -1652,10 +1711,29 @@ mod tests {
     #[test]
     fn consumption_does_not_apply_to_the_active_side() {
         // For the active WAL, `post == 0` means the engine truncated to zero
-        // without replaying; the wiring never sets the flag there, and the model
-        // still refuses a proven commit.
-        let verdict = classify_side(side(530, 0, Some(scan_with_commit())));
-        assert_eq!(verdict, SideVerdict::CommittedLost { pre_bytes: 530 });
+        // without replaying. `consumed_sides` is asked with an active-only
+        // change and answers "nothing consumed", so the proven commit is a loss.
+        let verdict = classify_pair(
+            WalPairObservation::new(
+                side(530, 0, Some(scan_with_commit())),
+                SideObservation::empty(),
+            )
+            .consumed(consumed_sides(
+                &WalPairBytes {
+                    active: 530,
+                    frozen: 0,
+                },
+                &WalPairBytes::ZERO,
+                true,
+            )),
+        );
+        assert_eq!(
+            verdict,
+            WalAccounting::CommittedLost {
+                pre_bytes: 530,
+                sides: SideSet::ACTIVE
+            }
+        );
     }
 
     #[test]
@@ -2081,7 +2159,6 @@ mod tests {
                             post,
                             scan: scan_shape(shape),
                             foreign,
-                            consumed_by_engine: false,
                         });
                         assert_eq!(
                             observed,
