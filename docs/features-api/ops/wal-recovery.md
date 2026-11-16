@@ -63,6 +63,65 @@ before recovery.
      Then update `db_path` in `~/.config/neurostrata/config.json` after
      inspecting the restored store.
 
+## Accounting verdicts (`#207`)
+
+Every recovery arm classifies the WAL pair before it checkpoints. The refusal
+message carries one of seven machine-readable slugs:
+
+| slug | meaning | operator action |
+|---|---|---|
+| `no_wal` | no WAL before or after the open | none |
+| `nothing_committed` | bytes were replayed, nothing had committed | none; the replay is lossless |
+| `committed_lost` | a committed record existed and no bytes survived | stop, inspect the preserved copy |
+| `replayed` | bytes survived, or a completed checkpoint was consumed | none; the message reports the truncation |
+| `foreign_wal` | the engine reports a different database id for the WAL | the WAL is quarantined as `.corrupted.<ts>` with every byte kept; confirm the attribution before deleting it |
+| `unknown` | the bytes could not be attributed | stop, inspect the preserved copy |
+| `deferred` | the WAL is larger than the 64 MiB scan cap, so it was not classified | the verified open ran; if it failed, treat the store as `committed_lost` |
+
+How the verdict reaches you:
+
+- `committed_lost` and `unknown` **refuse** the open. The message names the
+  verdict, both WAL sizes, the restored side(s), and every preserved
+  `.wal.unclean.<ts>` / `.wal.checkpoint.unclean.<ts>` path. The WAL is never
+  checkpointed over. Any side that lost every byte is restored from its
+  preserved copy, so a zero-record refusal leaves **both** `<db>.wal` and
+  `<db>.wal.checkpoint` on disk again (byte-identical to the pre-replay files);
+  a side that still has bytes is left as the engine truncated it.
+- `foreign_wal` **quarantines**: the named side (active, frozen, or both) is
+  renamed to `.corrupted.<ts>` and the store reopens with
+  `DiscardedUnreadableWal`, exactly as it always has for an unreadable WAL.
+- `deferred` is not a verdict on the data: the WAL is larger than the 64 MiB
+  scan cap, so the normal verified open runs first. Only if that open fails does
+  the arm refuse, because it will not checkpoint a WAL it could not classify.
+- Under `NEUROSTRATA_STRICT_WAL=1` (the default) every one of these is a plain
+  refusal first: strict mode never replays, including a clean foreign WAL.
+
+Two policies are worth knowing before interpreting a refusal:
+
+- **A WAL written without checksums cannot be verified.** If such a WAL is
+  discarded and no commit record is found, the verdict is `unknown`
+  (`UnverifiableWal`) even when the WAL was legitimately empty. This
+  over-refusal is deliberate: an unchecksummed WAL is indistinguishable from one
+  whose commit record was destroyed. Inspect the preserved copy, then either
+  restore it or delete it to let the store open.
+- **A WAL larger than 64 MiB is not scanned.** The recovery pre-flight defers to
+  the normal verified open (`deferred`); if that open succeeds, nothing else
+  happens. If it fails, the WAL is not classified and the arm must not
+  checkpoint it: treat the store like a `committed_lost` case and use the
+  preserved copy / snapshot path above.
+- **A preservation failure refuses the open before any replay.** If the active
+  or frozen WAL cannot be copied aside (a symlink, a directory, an I/O error),
+  the daemon refuses with `could not preserve <path>: …; the <side> copy was
+  kept at <path>` and leaves every copy it did make in place, unpruned. Fix the
+  cause (remove the symlink, free the space) and retry; do not delete the
+  partial `.wal.unclean.<ts>`/`.wal.checkpoint.unclean.<ts>` copies.
+- **A quarantined `foreign_wal` is preserved, not "nothing lost".** The message
+  says nothing of *this* store was discarded, because a WAL carrying another
+  database's id is not this store's data. If the attribution itself is wrong —
+  for example a checksums-off WAL whose database id could not be authenticated —
+  the bytes are still in the `.corrupted.<ts>` artifact. Restore from it instead
+  of treating the message as proof that nothing was lost.
+
 ## Configuration
 
 | Variable | Effect |
