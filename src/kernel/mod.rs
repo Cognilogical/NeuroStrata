@@ -88,15 +88,9 @@ impl AgentKernel {
         workspace_root: PathBuf,
     ) -> Self {
         let workflows = Arc::new(WorkflowRegistry::new_with_defaults(workspace_root));
-        let memory: Arc<dyn MemoryPort> = Arc::new(LadybugMemoryPort {
-            store: store.clone(),
-        });
-        let executive: Arc<dyn ExecutivePort> = Arc::new(LadybugExecutivePort {
-            store: store.clone(),
-        });
-        let ontology: Arc<dyn OntologyPort> = Arc::new(LadybugOntologyPort {
-            store: store.clone(),
-        });
+        let memory: Arc<dyn MemoryPort> = Arc::new(LadybugMemoryPort::new(store.clone()));
+        let executive: Arc<dyn ExecutivePort> = Arc::new(LadybugExecutivePort::new(store.clone()));
+        let ontology: Arc<dyn OntologyPort> = Arc::new(LadybugOntologyPort::new(store.clone()));
         AgentKernel {
             store,
             memory,
@@ -209,15 +203,32 @@ impl AgentKernel {
             .get_data_pointer(namespace, &req.pointer_id, None)
             .await?
             .ok_or_else(|| anyhow::anyhow!("pointer_id '{}' not found", req.pointer_id))?;
+        let connector_opt = self.connectors.get(&pointer.connector_id);
         let rebac_allowed = self
             .memory
             .get_data_pointer(namespace, &req.pointer_id, principal)
             .await?
             .is_some();
-        let connector = self
-            .connectors
-            .get(&pointer.connector_id)
-            .ok_or_else(|| anyhow::anyhow!("connector '{}' not registered", pointer.connector_id))?;
+        // Fail closed on unregistered connector or ReBAC denial BEFORE any
+        // connector I/O (not even describe_pool runs in that case).
+        if connector_opt.is_none() || !rebac_allowed {
+            let pre_verdict = evaluate_connector_pre_gate(KernelConnectorPreGateInput {
+                connector_registered: connector_opt.is_some(),
+                rebac_allowed,
+                op: KernelConnectorOp::ResolveSlice,
+                pool_writable: false,
+                receipt_state: KernelActionReceiptState::NotRequired,
+                requested_rows: req.limit,
+                max_slice_rows: 0,
+                requested_bytes: req.max_bytes,
+                max_slice_bytes: 0,
+                clock_skew_future: now_secs < pointer.captured_at_secs,
+                age_secs: now_secs.saturating_sub(pointer.captured_at_secs),
+                max_staleness_secs: pointer.max_staleness_secs,
+            });
+            anyhow::bail!("Pre-gate denied slice resolution: {:?}", pre_verdict);
+        }
+        let connector = connector_opt.expect("connector present after early-gate check");
         let schema = connector.describe_pool(&pointer.pool_id).await?;
         let pre_input = KernelConnectorPreGateInput {
             connector_registered: true,
@@ -272,15 +283,32 @@ impl AgentKernel {
             .get_data_pointer(namespace, &req.pointer_id, None)
             .await?
             .ok_or_else(|| anyhow::anyhow!("pointer_id '{}' not found", req.pointer_id))?;
+        let connector_opt = self.connectors.get(&pointer.connector_id);
         let rebac_allowed = crate::rebac::can_write_namespace(self.store.as_ref(), namespace, principal);
+        // Fail closed on unregistered connector or ReBAC denial BEFORE any
+        // connector I/O (not even describe_pool runs in that case).
+        if connector_opt.is_none() || !rebac_allowed {
+            let pre_verdict = evaluate_connector_pre_gate(KernelConnectorPreGateInput {
+                connector_registered: connector_opt.is_some(),
+                rebac_allowed,
+                op: KernelConnectorOp::ApplyWriteBack,
+                pool_writable: false,
+                receipt_state: KernelActionReceiptState::NotRequired,
+                requested_rows: 0,
+                max_slice_rows: 0,
+                requested_bytes: 0,
+                max_slice_bytes: 0,
+                clock_skew_future: now_secs < pointer.captured_at_secs,
+                age_secs: now_secs.saturating_sub(pointer.captured_at_secs),
+                max_staleness_secs: pointer.max_staleness_secs,
+            });
+            anyhow::bail!("Pre-gate denied write-back: {:?}", pre_verdict);
+        }
         let receipt_state = self
             .ontology
             .verify_active_action_receipt(namespace, &req.action_receipt_id, &pointer.pointer_id, &pointer.pool_id)
             .await?;
-        let connector = self
-            .connectors
-            .get(&pointer.connector_id)
-            .ok_or_else(|| anyhow::anyhow!("connector '{}' not registered", pointer.connector_id))?;
+        let connector = connector_opt.expect("connector present after early-gate check");
         let schema = connector.describe_pool(&pointer.pool_id).await?;
         let pre_input = KernelConnectorPreGateInput {
             connector_registered: true,
@@ -343,5 +371,395 @@ impl AgentKernel {
             .resolve_pointer(namespace, slice_req, now_secs, principal)
             .await?;
         Ok((to_stage, slice))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connectors::{DataConnector, DataPoolSchema};
+    use crate::traits::{MemoryPayload, OntologyStore, VectorStore};
+    use async_trait::async_trait;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A configurable spy connector that records every `resolve_slice` /
+    /// `apply_external_effect` invocation so the pre-gate can be proven to
+    /// perform zero connector I/O on denial paths.
+    struct SpyConnector {
+        id: String,
+        connector_id: String,
+        pool_id: String,
+        access_mode: DataPoolAccessMode,
+        max_slice_rows: u32,
+        max_slice_bytes: u32,
+        records: Vec<serde_json::Value>,
+        bad_source_digest: bool,
+        inflate_rows: bool,
+        inflate_bytes: bool,
+        resolve_calls: AtomicUsize,
+        apply_calls: AtomicUsize,
+    }
+
+    impl SpyConnector {
+        fn new(id: &str, access_mode: DataPoolAccessMode, max_rows: u32, max_bytes: u32) -> Self {
+            SpyConnector {
+                id: id.to_string(),
+                connector_id: id.to_string(),
+                pool_id: "pool1".to_string(),
+                access_mode,
+                max_slice_rows: max_rows,
+                max_slice_bytes: max_bytes,
+                records: vec![json!({"v": 1})],
+                bad_source_digest: false,
+                inflate_rows: false,
+                inflate_bytes: false,
+                resolve_calls: AtomicUsize::new(0),
+                apply_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn schema(&self) -> DataPoolSchema {
+            DataPoolSchema {
+                connector_id: self.connector_id.clone(),
+                pool_id: self.pool_id.clone(),
+                access_mode: self.access_mode,
+                entity_types: vec![],
+                max_slice_rows: self.max_slice_rows,
+                max_slice_bytes: self.max_slice_bytes,
+                description: "spy".to_string(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl DataConnector for SpyConnector {
+        fn connector_id(&self) -> &str {
+            &self.id
+        }
+
+        async fn describe_pool(&self, _pool_id: &str) -> Result<DataPoolSchema> {
+            Ok(self.schema())
+        }
+
+        async fn resolve_slice(
+            &self,
+            _pool_id: &str,
+            pointer_uri: &str,
+            offset: u32,
+            limit: u32,
+            _max_bytes: u32,
+        ) -> Result<DataSlicePayload> {
+            self.resolve_calls.fetch_add(1, Ordering::SeqCst);
+            let rows = if self.inflate_rows {
+                (0..(self.max_slice_rows + 5) as usize)
+                    .map(|i| json!({"i": i}))
+                    .collect::<Vec<_>>()
+            } else {
+                let start = offset as usize;
+                let end = (offset + limit) as usize;
+                if start >= self.records.len() {
+                    Vec::new()
+                } else {
+                    self.records[start..std::cmp::min(end, self.records.len())].to_vec()
+                }
+            };
+            let payload_bytes = if self.inflate_bytes {
+                self.max_slice_bytes + 4096
+            } else {
+                serde_json::to_vec(&rows).map(|v| v.len() as u32).unwrap_or(0)
+            };
+            let source_sha = if self.bad_source_digest {
+                "bad-source-digest".to_string()
+            } else {
+                "good-source-digest".to_string()
+            };
+            Ok(DataSlicePayload {
+                pointer_id: "unset".to_string(),
+                connector_id: self.connector_id.clone(),
+                pool_id: self.pool_id.clone(),
+                pointer_uri: pointer_uri.to_string(),
+                records: rows,
+                payload_bytes,
+                source_sha256: source_sha,
+                slice_sha256: "slice-sha".to_string(),
+                observed_at_secs: 0,
+            })
+        }
+
+        async fn apply_external_effect(
+            &self,
+            _pool_id: &str,
+            _pointer_uri: &str,
+            req: &ExternalEffectRequest,
+        ) -> Result<ExternalEffectReceipt> {
+            self.apply_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ExternalEffectReceipt {
+                pointer_id: req.pointer_id.clone(),
+                connector_id: self.connector_id.clone(),
+                pool_id: self.pool_id.clone(),
+                operation: req.operation.clone(),
+                idempotency_key: req.idempotency_key.clone(),
+                applied: true,
+                prior_source_sha256: "prior".to_string(),
+                new_source_sha256: "new-source-digest".to_string(),
+                details: "applied".to_string(),
+            })
+        }
+    }
+
+    fn build_kernel(spy: Arc<SpyConnector>) -> (AgentKernel, Arc<LadybugStore>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(LadybugStore::new(dir.path().join("db"), 4).expect("store init"));
+        let bus = Arc::new(ThalamicBus::new(64));
+        let connectors = Arc::new(DataConnectorRegistry::new());
+        connectors.register(spy).expect("register spy");
+        let kernel = AgentKernel::with_ports(
+            store.clone(),
+            bus,
+            Arc::new(LadybugMemoryPort::new(store.clone())),
+            Arc::new(LadybugExecutivePort::new(store.clone())),
+            Arc::new(LadybugOntologyPort::new(store.clone())),
+            Arc::new(WorkflowRegistry::new()),
+            connectors,
+        );
+        (kernel, store, dir)
+    }
+
+    fn pointer_record(pointer_id: &str, connector: &str, captured_at: u64, max_staleness: u64) -> DataPointerRecord {
+        DataPointerRecord {
+            pointer_id: pointer_id.to_string(),
+            connector_id: connector.to_string(),
+            pool_id: "pool1".to_string(),
+            pointer_uri: "uri1".to_string(),
+            entity_type: "item".to_string(),
+            expected_source_sha256: None,
+            captured_at_secs: captured_at,
+            max_staleness_secs: max_staleness,
+        }
+    }
+
+    fn slice_request(pointer_id: &str, limit: u32, max_bytes: u32) -> DataSliceRequest {
+        DataSliceRequest {
+            pointer_id: pointer_id.to_string(),
+            offset: 0,
+            limit,
+            max_bytes,
+        }
+    }
+
+    fn writeback_request(pointer_id: &str, receipt_id: &str) -> ExternalEffectRequest {
+        ExternalEffectRequest {
+            pointer_id: pointer_id.to_string(),
+            operation: "append".to_string(),
+            payload: json!({"v": 2}),
+            action_receipt_id: receipt_id.to_string(),
+            expected_source_sha256: None,
+            idempotency_key: format!("idem-{}", receipt_id),
+        }
+    }
+
+    async fn seed_pointer(
+        store: &LadybugStore,
+        namespace: &str,
+        record: &DataPointerRecord,
+        owner: &str,
+        visible_to: Option<Vec<&str>>,
+    ) {
+        let mut metadata = json!({
+            "eligibility": "private",
+            "pointer": serde_json::to_value(record).unwrap(),
+            "source": {"kind": "data_connector", "ref": record.pointer_uri}
+        });
+        if let Some(vt) = visible_to {
+            metadata["visible_to"] = serde_json::to_value(vt).unwrap();
+        }
+        let payload = MemoryPayload {
+            content: format!("data pointer {}", record.pointer_id),
+            user_id: owner.to_string(),
+            memory_type: "data_pointer".to_string(),
+            agent_name: None,
+            location: record.pointer_uri.clone(),
+            location_lines: String::new(),
+            metadata,
+        };
+        store
+            .put_scoped_memory(namespace, &record.pointer_id, &payload)
+            .await
+            .expect("seed pointer");
+    }
+
+    async fn seed_receipt(
+        store: &LadybugStore,
+        namespace: &str,
+        receipt_id: &str,
+        pointer_id: &str,
+        pool_id: &str,
+        reverted: bool,
+    ) {
+        let mut metadata = json!({"pointer_id": pointer_id, "pool_id": pool_id});
+        if reverted {
+            metadata["reverted_at"] = json!("2026-01-01T00:00:00Z");
+        }
+        let payload = MemoryPayload {
+            content: "receipt".to_string(),
+            user_id: "alice".to_string(),
+            memory_type: "action_receipt".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata,
+        };
+        store
+            .put_scoped_memory(namespace, receipt_id, &payload)
+            .await
+            .expect("seed receipt");
+    }
+
+    #[tokio::test]
+    async fn pre_gate_deny_performs_zero_connector_io() {
+        let spy = Arc::new(SpyConnector::new("spy", DataPoolAccessMode::ReadWrite, 10, 1024));
+        let spy_ro = Arc::new(SpyConnector::new("spy_ro", DataPoolAccessMode::ReadOnly, 10, 1024));
+        let (kernel, store, _dir) = build_kernel(spy.clone());
+        // Register the read-only spy so its write-back can be exercised.
+        kernel.connectors().register(spy_ro.clone()).expect("register ro spy");
+        let ns = "ns1";
+        store.init(ns).await.expect("init");
+
+        // 1. Unregistered connector pointer registration -> denied, 0 spy calls.
+        let ghost = pointer_record("ghost_ptr", "ghost", 1000, 100);
+        let err = kernel.register_pointer(ns, &ghost, Some(ns)).await.unwrap_err();
+        assert!(err.to_string().contains("Pre-gate"), "unexpected: {err}");
+        assert_eq!(spy.resolve_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(spy.apply_calls.load(Ordering::SeqCst), 0);
+
+        // 2. ReBAC denial on resolve_pointer (restricted pointer) -> 0 resolve calls.
+        let restricted = pointer_record("ptr_restricted", "spy", 1000, 100);
+        seed_pointer(&store, ns, &restricted, "alice", Some(vec!["alice"])).await;
+        let err = kernel
+            .resolve_pointer(ns, &slice_request("ptr_restricted", 1, 64), 1000, Some("mallory"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Pre-gate"), "unexpected: {err}");
+        assert_eq!(spy.resolve_calls.load(Ordering::SeqCst), 0);
+
+        // 3. Slice limit exceeded (limit == 0 and limit > max_slice_rows) -> 0 resolve calls.
+        kernel
+            .register_pointer(ns, &pointer_record("ptr_ok", "spy", 1000, 100), Some(ns))
+            .await
+            .expect("register pointer");
+        let err = kernel
+            .resolve_pointer(ns, &slice_request("ptr_ok", 0, 64), 1000, Some(ns))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Pre-gate"), "unexpected: {err}");
+        let err = kernel
+            .resolve_pointer(ns, &slice_request("ptr_ok", 11, 64), 1000, Some(ns))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Pre-gate"), "unexpected: {err}");
+        assert_eq!(spy.resolve_calls.load(Ordering::SeqCst), 0);
+
+        // 4. Future clock skew (now < captured_at) -> 0 resolve calls.
+        let err = kernel
+            .resolve_pointer(ns, &slice_request("ptr_ok", 1, 64), 999, Some(ns))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Pre-gate"), "unexpected: {err}");
+        assert_eq!(spy.resolve_calls.load(Ordering::SeqCst), 0);
+
+        // 5. Stale pointer (now > captured_at + max_staleness) -> 0 resolve calls.
+        let err = kernel
+            .resolve_pointer(ns, &slice_request("ptr_ok", 1, 64), 1101, Some(ns))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Pre-gate"), "unexpected: {err}");
+        assert_eq!(spy.resolve_calls.load(Ordering::SeqCst), 0);
+
+        // 6. Write-back on ReadOnly pool -> denied, 0 apply calls.
+        kernel
+            .register_pointer(ns, &pointer_record("ptr_ro", "spy_ro", 1000, 100), Some(ns))
+            .await
+            .expect("register ro pointer");
+        seed_receipt(&store, ns, "rcpt_ro", "ptr_ro", "pool1", false).await;
+        let err = kernel
+            .apply_external_effect(ns, &writeback_request("ptr_ro", "rcpt_ro"), 1000, Some(ns))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Pre-gate"), "unexpected: {err}");
+        assert_eq!(spy_ro.apply_calls.load(Ordering::SeqCst), 0);
+
+        // 7. Write-back with missing, reverted, and target-mismatched receipts -> 0 apply calls.
+        // missing receipt
+        let err = kernel
+            .apply_external_effect(ns, &writeback_request("ptr_ok", "rcpt_missing"), 1000, Some(ns))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Pre-gate"), "unexpected: {err}");
+        // reverted receipt
+        seed_receipt(&store, ns, "rcpt_reverted", "ptr_ok", "pool1", true).await;
+        let err = kernel
+            .apply_external_effect(ns, &writeback_request("ptr_ok", "rcpt_reverted"), 1000, Some(ns))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Pre-gate"), "unexpected: {err}");
+        // target-mismatched receipt
+        seed_receipt(&store, ns, "rcpt_mismatch", "some_other_pointer", "other_pool", false).await;
+        let err = kernel
+            .apply_external_effect(ns, &writeback_request("ptr_ok", "rcpt_mismatch"), 1000, Some(ns))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Pre-gate"), "unexpected: {err}");
+        assert_eq!(spy.apply_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn post_gate_rejects_source_digest_mismatch_and_observed_bounds() {
+        let ns = "ns1";
+
+        // Source-digest mismatch: pointer expects a digest the spy does not return.
+        let spy = Arc::new(SpyConnector::new("spy", DataPoolAccessMode::ReadWrite, 10, 1024));
+        let (kernel, store, _dir) = build_kernel(spy.clone());
+        store.init(ns).await.expect("init");
+        let mut rec = pointer_record("ptr_digest", "spy", 1000, 100);
+        rec.expected_source_sha256 = Some("expected-digest".to_string());
+        kernel.register_pointer(ns, &rec, Some(ns)).await.expect("register");
+        let err = kernel
+            .resolve_pointer(ns, &slice_request("ptr_digest", 1, 64), 1000, Some(ns))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Post-gate"), "unexpected: {err}");
+
+        // Observed rows exceed max_slice_rows.
+        let mut spy_rows = SpyConnector::new("spy", DataPoolAccessMode::ReadWrite, 10, 1024);
+        spy_rows.inflate_rows = true;
+        let spy_rows = Arc::new(spy_rows);
+        let (kernel_rows, store_rows, _dir) = build_kernel(spy_rows.clone());
+        store_rows.init(ns).await.expect("init");
+        kernel_rows
+            .register_pointer(ns, &pointer_record("ptr_rows", "spy", 1000, 100), Some(ns))
+            .await
+            .expect("register");
+        let err = kernel_rows
+            .resolve_pointer(ns, &slice_request("ptr_rows", 1, 64), 1000, Some(ns))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Post-gate"), "unexpected: {err}");
+
+        // Observed bytes exceed max_slice_bytes.
+        let mut spy_bytes = SpyConnector::new("spy", DataPoolAccessMode::ReadWrite, 10, 1024);
+        spy_bytes.inflate_bytes = true;
+        let spy_bytes = Arc::new(spy_bytes);
+        let (kernel_bytes, store_bytes, _dir) = build_kernel(spy_bytes.clone());
+        store_bytes.init(ns).await.expect("init");
+        kernel_bytes
+            .register_pointer(ns, &pointer_record("ptr_bytes", "spy", 1000, 100), Some(ns))
+            .await
+            .expect("register");
+        let err = kernel_bytes
+            .resolve_pointer(ns, &slice_request("ptr_bytes", 1, 64), 1000, Some(ns))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Post-gate"), "unexpected: {err}");
     }
 }

@@ -77,17 +77,22 @@ pub trait OntologyPort: Send + Sync {
 
 /// Persistent `MemoryPort` backed by `LadybugStore`.
 pub struct LadybugMemoryPort {
-    pub store: Arc<LadybugStore>,
+    store: Arc<LadybugStore>,
 }
 
 impl LadybugMemoryPort {
+    /// Create a new `LadybugMemoryPort` backed by the given store.
+    pub fn new(store: Arc<LadybugStore>) -> Self {
+        LadybugMemoryPort { store }
+    }
+
     /// Trusted internal path – no authentication, no ReBAC.
     async fn trusted_get_memory(&self, namespace: &str, id: &str) -> Result<Option<MemoryPayload>> {
         self.store.get_memory_by_id(namespace, id).await
     }
 
     /// ReBAC‑checked path – returns `None` when principal lacks visibility.
-    async fn reBAC_get_memory(&self, namespace: &str, id: &str, principal: Option<&str>) -> Result<Option<MemoryPayload>> {
+    async fn rebac_get_memory(&self, namespace: &str, id: &str, principal: Option<&str>) -> Result<Option<MemoryPayload>> {
         let Some(payload) = self.store.get_memory_by_id(namespace, id).await? else {
             return Ok(None);
         };
@@ -105,7 +110,7 @@ impl MemoryPort for LadybugMemoryPort {
         // None means trusted kernel internal read – bypass ReBAC.
         match principal {
             None => self.trusted_get_memory(namespace, id).await,
-            Some(p) => self.reBAC_get_memory(namespace, id, Some(p)).await,
+            Some(p) => self.rebac_get_memory(namespace, id, Some(p)).await,
         }
     }
 
@@ -196,10 +201,15 @@ impl MemoryPort for LadybugMemoryPort {
 
 /// Persistent `ExecutivePort` backed by `LadybugStore`.
 pub struct LadybugExecutivePort {
-    pub store: Arc<LadybugStore>,
+    store: Arc<LadybugStore>,
 }
 
 impl LadybugExecutivePort {
+    /// Create a new `LadybugExecutivePort` backed by the given store.
+    pub fn new(store: Arc<LadybugStore>) -> Self {
+        LadybugExecutivePort { store }
+    }
+
     fn transition_event(from: WorkflowStage, to: WorkflowStage, gate_passed: bool) -> crate::workflow::machine::WorkflowEvent {
         use crate::workflow::machine::WorkflowEvent as WE;
         use WorkflowStage::*;
@@ -259,7 +269,14 @@ impl ExecutivePort for LadybugExecutivePort {
 
 /// Persistent `OntologyPort` backed by `LadybugStore`.
 pub struct LadybugOntologyPort {
-    pub store: Arc<LadybugStore>,
+    store: Arc<LadybugStore>,
+}
+
+impl LadybugOntologyPort {
+    /// Create a new `LadybugOntologyPort` backed by the given store.
+    pub fn new(store: Arc<LadybugStore>) -> Self {
+        LadybugOntologyPort { store }
+    }
 }
 
 #[async_trait]
