@@ -1,7 +1,8 @@
 # gate-receipt fetch-layer fixtures
 
 Each directory is fed to `scripts/gate-receipt.sh --fixtures-dir <dir>` so the
-self-test exercises the same branching as `--pr` without network access.
+self-test exercises the same accounting branch as `--pr` without network
+access.
 
 - `reviews.json`, `issue-comments.json` — arrays of
   `{body, author_association, author?}`.
