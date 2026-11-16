@@ -37,9 +37,9 @@ Action packs are domain-scoped: a pack for a physical-asset domain can coexist w
 
 ## Kernel Data Ports: `TaskStore` & `OntologyStore`
 
-The central agentic kernel consumes the serving layer through two narrow async ports, so the kernel can be wired to any backend that implements them:
+The central agentic kernel consumes the serving layer through two narrow async ports (`Send + Sync` public traits in `src/traits.rs`, spec §3.1), so the kernel can be wired to any backend that implements them:
 
-- `TaskStore` (`src/traits.rs`) — task-row access for the kernel's executive port: `load_task_row(namespace, task_id)`, `list_task_rows(namespace)`, and `count_extracted_memories_for_task(namespace, task_id)` (the Lock 2 extraction count over `metadata.extracted_from`, excluding the task row itself).
-- `OntologyStore` (`src/traits.rs`) — typed memory listing and scoped writes for the kernel's ontology port: `list_memories_by_types(namespace, memory_types)` and `get_memory_by_id(namespace, id)` for reads, `put_scoped_memory(namespace, id, payload)` for scoped writes.
+- `TaskStore` — read-only task surface for the kernel's executive port. `load_task_row(namespace, task_id) -> Result<Option<MemoryPayload>>`; `list_task_rows(namespace) -> Result<Vec<TaskSummaryRow>>`; `count_extracted_memories_for_task(namespace, task_id) -> Result<usize>` (the Lock 2 extraction count over `metadata.extracted_from`, excluding the task row itself).
+- `OntologyStore` — typed memory listing and scoped writes for the kernel's ontology port. `list_memories_by_types(namespace, memory_types) -> Result<Vec<(String, MemoryPayload)>>` and `get_memory_by_id(namespace, id) -> Result<Option<MemoryPayload>>` for reads, `put_scoped_memory(namespace, id, payload) -> Result<()>` for scoped writes.
 
-Both ports are implemented by `LadybugStore`; the kernel holds them as `Arc<dyn ...>` trait objects rather than reaching into the concrete store.
+Both ports are implemented by `LadybugStore` (the default backend); the kernel holds them as `Arc<dyn ...>` trait objects rather than reaching into the concrete store, and custom storage backends in the kernel's `VectorStore` path implement the same contracts.
