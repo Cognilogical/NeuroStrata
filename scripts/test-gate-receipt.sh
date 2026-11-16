@@ -268,4 +268,32 @@ expect_shape_error "thread element without isResolved/comments" "$tmp/malformed-
 expect_shape_error "object reviews.json" "$tmp/malformed-reviews" "must be a JSON array of objects with a string body"
 expect_shape_error "thread comments not an array" "$tmp/malformed-thread-comments" "must be a JSON array of threads"
 
+# Codex P2: an unclosed fence in an earlier body must not swallow later targets.
+mkdir -p "$tmp/unclosed-fence-then-receipt"
+printf '[]\n' > "$tmp/unclosed-fence-then-receipt/issue-comments.json"
+printf '{"shas":["abcdef1"],"issues":[]}\n' > "$tmp/unclosed-fence-then-receipt/valid-targets.json"
+cat > "$tmp/unclosed-fence-then-receipt/reviews.json" <<'JSON'
+[{"body":"unrelated review with an unclosed fence\n```\n","author_association":"CONTRIBUTOR"}]
+JSON
+cat > "$tmp/unclosed-fence-then-receipt/threads.json" <<'JSON'
+[{"isResolved":false,"comments":[{"body":"**![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)** finding","author_association":"NONE"},{"body":"fixed@abcdef1","author_association":"CONTRIBUTOR"}]}]
+JSON
+if ! bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$tmp/unclosed-fence-then-receipt" >/dev/null 2>&1; then
+  echo "FAIL: an earlier unclosed fence suppressed a later valid receipt target" >&2
+  exit 1
+fi
+
+# Codex P2: a receipt inside a double-backtick span that contains a shorter run.
+mkdir -p "$tmp/double-backtick-prefix"
+printf '[]\n' > "$tmp/double-backtick-prefix/reviews.json"
+printf '[]\n' > "$tmp/double-backtick-prefix/issue-comments.json"
+printf '{"shas":["abcdef1"],"issues":[]}\n' > "$tmp/double-backtick-prefix/valid-targets.json"
+cat > "$tmp/double-backtick-prefix/threads.json" <<'JSON'
+[{"isResolved":false,"comments":[{"body":"**![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)** finding","author_association":"NONE"},{"body":"`` `prefix` fixed@abcdef1 ``","author_association":"CONTRIBUTOR"}]}]
+JSON
+if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$tmp/double-backtick-prefix" >/dev/null 2>&1; then
+  echo "FAIL: a receipt inside a double-backtick span cleared a finding" >&2
+  exit 1
+fi
+
 echo "gate-receipt self-test: PASS"

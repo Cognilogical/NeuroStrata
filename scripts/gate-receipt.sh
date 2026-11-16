@@ -73,7 +73,7 @@ tokenizer_def='
           (($line | capture("^ {0,3}(?<f>`{3,}|~{3,})").f) as $f
            | .ch = ($f[0:1]) | .n = ($f | length))
         elif ($line | test("^(    |\\t)")) then .
-        else .out += [($line | gsub("(`+)[^`]*?\\1"; ""))] end))
+        else .out += [($line | gsub("(?<!`)(`+)(?!`)(.*?)(?<!`)\\1(?!`)"; ""))] end))
     | .out | join("\n");
 '
 clean_filter="${tokenizer_def}"'clean'
@@ -355,9 +355,11 @@ else
   # Validate every fixed@/filed target once: the commit must exist and be the
   # head or an ancestor; the issue number must exist in this repository.
   validate=1
+  # Clean each body independently: an unclosed fence in one comment must not
+  # swallow receipt targets in a later comment.
   receipt_text=$(
-    printf '%s\n' "$reviews_entries" "$comment_entries" "$pull_entries" | jq -r '.body' 2>/dev/null || true
-    printf '%s' "$threads_json" | jq -r '.[].comments[].body' 2>/dev/null || true
+    printf '%s\n' "$reviews_entries" "$comment_entries" "$pull_entries" | jq -r "${tokenizer_def}"' .body | clean' 2>/dev/null || true
+    printf '%s' "$threads_json" | jq -r "${tokenizer_def}"' .[].comments[].body | clean' 2>/dev/null || true
   )
   for sha in $(printf '%s\n' "$receipt_text" | clean_stream | grep -Eoi 'fixed@[0-9a-f]{7,}' | sed 's/^fixed@//' | tr '[:upper:]' '[:lower:]' | sort -u); do
     if ! gh api "repos/$repo/commits/$sha" --jq .sha >/dev/null 2>&1; then
