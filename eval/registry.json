@@ -210,7 +210,7 @@
         "cargo test --locked --bin neurostrata-mcp wal_header -- --test-threads=1",
         "cargo test --locked --bin neurostrata-mcp wal_preservation -- --test-threads=1",
         "cargo test --locked --bin neurostrata-mcp unverified_replay -- --test-threads=1",
-        "cargo test --locked --bin neurostrata-mcp wal_zero_record -- --test-threads=1 --skip clean_foreign_wal_is_quarantined_and_the_store_opens --skip frozen_only_zero_record_replay_refuses_and_preserves_the_frozen_wal --skip checksum_mismatch_arm_refuses_unreadable_records_before_checkpointing --skip torn_only_commit_wal_opens_without_a_data_loss_refusal --skip torn_commit_checksum_tail_opens_instead_of_an_unclassified_error --skip mixed_header_pair_is_refused_and_both_wals_survive"
+        "cargo test --locked --bin neurostrata-mcp wal_zero_record -- --test-threads=1"
       ],
       "tests": [
         "store::wal_accounting::tests::checksum_of_an_empty_buffer_is_the_dbs_seed",
@@ -245,6 +245,9 @@
         "store::wal_accounting::tests::no_wal_when_nothing_existed_before_or_after",
         "store::wal_accounting::tests::nothing_committed_when_the_uncommitted_bytes_held_no_commit",
         "store::wal_accounting::tests::committed_lost_when_a_commit_existed_and_no_bytes_survive",
+        "store::wal_accounting::tests::a_frozen_side_consumed_by_a_successful_open_is_a_completed_checkpoint",
+        "store::wal_accounting::tests::consumption_never_rescues_an_unattributable_scan",
+        "store::wal_accounting::tests::consumption_does_not_apply_to_the_active_side",
         "store::wal_accounting::tests::a_consumed_checkpoint_is_a_replay_not_a_loss",
         "store::wal_accounting::tests::replayed_when_bytes_survive_untouched",
         "store::wal_accounting::tests::partial_active_truncation_is_a_replay_with_a_loss_report",
@@ -288,22 +291,32 @@
         "store::ladybug::wal_preservation::preserve_wal_pair_reports_absent_sides",
         "store::ladybug::wal_preservation::preserve_wal_pair_refuses_a_symlinked_side",
         "store::ladybug::wal_preservation::preserve_unclean_wal_prunes_stale_artifacts_even_with_no_wal",
+        "store::ladybug::wal_preservation::preserve_wal_pair_dedupes_to_the_newest_identical_artifact",
         "store::ladybug::wal_preservation::copy_primitive_refuses_an_occupied_destination",
         "store::ladybug::tests::unverified_replay_selects_checksums_off_for_a_seventeen_byte_wal",
         "store::ladybug::tests::unverified_replay_header_selection_handles_hidden_and_mixed_pairs",
         "store::ladybug::wal_zero_record::scanner_reads_a_real_wal_written_by_the_pinned_engine",
         "store::ladybug::wal_zero_record::valid_wal_opens_verified_with_its_committed_row",
+        "store::ladybug::wal_zero_record::clean_foreign_wal_is_quarantined_and_the_store_opens",
+        "store::ladybug::wal_zero_record::frozen_only_zero_record_replay_refuses_and_preserves_the_frozen_wal",
+        "store::ladybug::wal_zero_record::checksum_mismatch_arm_refuses_unreadable_records_before_checkpointing",
+        "store::ladybug::wal_zero_record::torn_only_commit_wal_opens_without_a_data_loss_refusal",
+        "store::ladybug::wal_zero_record::torn_commit_checksum_tail_opens_instead_of_an_unclassified_error",
         "store::ladybug::wal_zero_record::delete_only_wal_still_opens",
-        "store::ladybug::wal_zero_record::no_wal_store_still_opens_verified"
+        "store::ladybug::wal_zero_record::no_wal_store_still_opens_verified",
+        "store::ladybug::wal_zero_record::mixed_header_pair_is_refused_and_both_wals_survive",
+        "store::ladybug::wal_zero_record::strict_clean_foreign_wal_is_still_refused",
+        "store::ladybug::wal_zero_record::foreign_active_and_frozen_are_both_quarantined",
+        "store::ladybug::wal_zero_record::oversized_wal_refuses_after_a_failed_verified_open"
       ],
       "thresholds": {
         "truth_table_verdicts": 7,
         "per_side_combination_checks": 440,
         "mutation_masks": 255,
         "header_rows": 11,
-        "preservation_rows": 5,
+        "preservation_rows": 6,
         "header_selection_rows": 2,
-        "integration_rows": 4,
+        "integration_rows": 13,
         "ignored": 0
       }
     }

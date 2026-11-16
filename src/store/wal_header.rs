@@ -1,5 +1,3 @@
-#![allow(dead_code)] // consumed by tests only until Phase B wires it (#207)
-
 //! WAL header rules shared by the recovery arms (`#207`).
 //!
 //! The 25-byte header the recovery code used to assume is only 25 bytes when

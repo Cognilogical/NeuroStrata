@@ -77,6 +77,21 @@ message carries one of six machine-readable slugs:
 | `foreign_wal` | the WAL belongs to another database (DB-ID mismatch) | the WAL is quarantined as `.corrupted.<ts>`; nothing of this store was lost |
 | `unknown` | the bytes could not be attributed | stop, inspect the preserved copy |
 
+How the verdict reaches you:
+
+- `committed_lost` and `unknown` **refuse** the open. The message names the
+  verdict, both WAL sizes, the restored side(s), and every preserved
+  `.wal.unclean.<ts>` / `.wal.checkpoint.unclean.<ts>` path. The WAL is never
+  checkpointed over.
+- `foreign_wal` **quarantines**: the named side (active, frozen, or both) is
+  renamed to `.corrupted.<ts>` and the store reopens with
+  `DiscardedUnreadableWal`, exactly as it always has for an unreadable WAL.
+- `deferred` is not a verdict on the data: the WAL is larger than the 64 MiB
+  scan cap, so the normal verified open runs first. Only if that open fails does
+  the arm refuse, because it will not checkpoint a WAL it could not classify.
+- Under `NEUROSTRATA_STRICT_WAL=1` (the default) every one of these is a plain
+  refusal first: strict mode never replays, including a clean foreign WAL.
+
 Two policies are worth knowing before interpreting a refusal:
 
 - **A WAL written without checksums cannot be verified.** If such a WAL is
@@ -90,6 +105,12 @@ Two policies are worth knowing before interpreting a refusal:
   happens. If it fails, the WAL is not classified and the arm must not
   checkpoint it: treat the store like a `committed_lost` case and use the
   preserved copy / snapshot path above.
+- **A quarantined `foreign_wal` is preserved, not "nothing lost".** The message
+  says nothing of *this* store was discarded, because a WAL carrying another
+  database's id is not this store's data. If the attribution itself is wrong —
+  for example a checksums-off WAL whose database id could not be authenticated —
+  the bytes are still in the `.corrupted.<ts>` artifact. Restore from it instead
+  of treating the message as proof that nothing was lost.
 
 ## Configuration
 

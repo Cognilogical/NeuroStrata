@@ -1,5 +1,3 @@
-#![allow(dead_code)] // consumed by tests only until Phase B wires it (#207)
-
 //! One zero-record accounting model for every WAL recovery arm (`#207`).
 //!
 //! The recovery funnel in [`crate::store::ladybug::LadybugStore::with_system_config`]
@@ -22,7 +20,7 @@
 //! verdict and the pair verdict is a commutative fold:
 //!
 //! ```text
-//! CommittedLost  >  Unknown  >  ForeignWal  >  Replayed  >  NothingCommitted  >  NoWal
+//! CommittedLost  >  Unknown  >  ForeignWal  >  Deferred  >  Replayed  >  NothingCommitted  >  NoWal
 //! ```
 //!
 //! `checkpoint_terminated` is attributed **per side**: a completed `CHECKPOINT`
@@ -54,8 +52,9 @@
 //! distinguished from one whose commit record was destroyed, and the runbook
 //! path (inspect the preserved copy) is cheaper than silent loss.
 //!
-//! The scan is capped at [`MAX_SCAN_BYTES`]; a larger file is
-//! [`CommitEvidence::Unknown`] rather than an unbounded read.
+//! The scan is capped at [`MAX_SCAN_BYTES`]. A larger file is not walked: it
+//! becomes [`SideVerdict::Deferred`] (defer to the verified open), never a
+//! refusal and never an implicit "nothing committed".
 //!
 //! # Why "had a commit?" is the right question
 //!
@@ -300,17 +299,6 @@ impl WalScan {
     pub const fn ended_in_checkpoint(self) -> bool {
         matches!(self.last_complete_type, Some(CHECKPOINT_RECORD_TYPE))
             && !matches!(self.tail, WalTail::Corrupt)
-    }
-
-    /// Whether the walk is checksum-verified end to end.
-    pub const fn is_verified(self) -> bool {
-        matches!(
-            self.header,
-            HeaderRead::Readable {
-                checksums: true,
-                ..
-            }
-        ) && self.header_verified
     }
 
     /// What these bytes prove about committed records.
@@ -569,6 +557,9 @@ pub enum DeferralReason {
 pub struct SideObservation {
     /// Bytes on this side before the recovery open (`0` when absent or empty).
     pub pre: u64,
+    /// Bytes of this side actually handed to the scanner (`min(pre, cap + 1)`).
+    /// Reported so an operator can see that an oversized file was not read.
+    pub bytes_scanned: u64,
     /// Bytes on this side after the open and **before** any `CHECKPOINT`.
     pub post: u64,
     /// The pre-replay scan, required when `pre > 0`.
@@ -579,15 +570,26 @@ pub struct SideObservation {
     /// (`storage/file_db_id_utils.cpp:4-17`); the pure module deliberately does
     /// not re-derive it from the main DB header.
     pub foreign: bool,
+    /// A **successful** lenient open removed this side.
+    ///
+    /// Only the frozen side is ever marked: `WALReplayer::replayFrozenWAL`
+    /// removes `<db>.wal.checkpoint` after either replaying it to completion
+    /// (then `completeInterruptedCheckpoint` makes the records durable) or
+    /// reading zero records (`offsetDeserialized == 0`, which the pre-replay
+    /// scan reports as `Unknown`). The flag is honoured only when the scan was
+    /// attributable, so it can never launder a `Corrupt`/unreadable WAL.
+    pub consumed_by_engine: bool,
 }
 
 impl SideObservation {
     pub const fn empty() -> Self {
         Self {
             pre: 0,
+            bytes_scanned: 0,
             post: 0,
             scan: None,
             foreign: false,
+            consumed_by_engine: false,
         }
     }
 }
@@ -610,9 +612,11 @@ impl WalPairObservation {
 pub fn classify_side(observation: SideObservation) -> SideVerdict {
     let SideObservation {
         pre,
+        bytes_scanned: _,
         post,
         scan,
         foreign,
+        consumed_by_engine,
     } = observation;
     if pre == 0 {
         return if post == 0 {
@@ -648,6 +652,18 @@ pub fn classify_side(observation: SideObservation) -> SideVerdict {
     }
     let evidence = scan.commit_evidence();
     let checkpoint_terminated = scan.ended_in_checkpoint();
+    // A side a successful open consumed held committed records that the engine
+    // replayed before removing the file; `replayFrozenWAL` only deletes without
+    // replaying when it read nothing, which the scan reports as `Unknown` (and
+    // this arm refuses there). The flag is never set for `Unknown` evidence.
+    if consumed_by_engine && post == 0 && matches!(evidence, CommitEvidence::Some) {
+        return SideVerdict::Replayed {
+            pre_bytes: pre,
+            residual_bytes: 0,
+            truncated_bytes: pre,
+            checkpoint_terminated: true,
+        };
+    }
     match (evidence, post) {
         (CommitEvidence::Unknown, _) => SideVerdict::Unknown {
             reason: UnknownReason::CommitEvidenceUnreadable,
@@ -709,8 +725,8 @@ pub enum WalAccounting {
 
 /// Folds the two side verdicts into one accounting verdict.
 ///
-/// A commutative join: `CommittedLost > Unknown > ForeignWal > Replayed >
-/// NothingCommitted > NoWal`. `NoWal` is the identity.
+/// A commutative join: `CommittedLost > Unknown > ForeignWal > Deferred >
+/// Replayed > NothingCommitted > NoWal`. `NoWal` is the identity.
 pub fn fold_side_verdicts(active: SideVerdict, frozen: SideVerdict) -> WalAccounting {
     let sides = [(SideSet::ACTIVE, active), (SideSet::FROZEN, frozen)];
 
@@ -1037,18 +1053,29 @@ mod tests {
     fn side(pre: u64, post: u64, scan: Option<WalScan>) -> SideObservation {
         SideObservation {
             pre,
+            bytes_scanned: pre.min(MAX_SCAN_BYTES + 1),
             post,
             scan,
             foreign: false,
+            consumed_by_engine: false,
         }
     }
 
     fn foreign_side(pre: u64, post: u64) -> SideObservation {
         SideObservation {
             pre,
+            bytes_scanned: 0,
             post,
             scan: None,
             foreign: true,
+            consumed_by_engine: false,
+        }
+    }
+
+    fn consumed_side(pre: u64, post: u64, scan: Option<WalScan>) -> SideObservation {
+        SideObservation {
+            consumed_by_engine: true,
+            ..side(pre, post, scan)
         }
     }
 
@@ -1462,6 +1489,53 @@ mod tests {
     fn committed_lost_when_a_commit_existed_and_no_bytes_survive() {
         let verdict = classify_side(side(3103, 0, Some(scan_with_commit())));
         assert_eq!(verdict, SideVerdict::CommittedLost { pre_bytes: 3103 });
+    }
+
+    #[test]
+    fn a_frozen_side_consumed_by_a_successful_open_is_a_completed_checkpoint() {
+        // `#191`: a frozen WAL with readable commits that a successful lenient
+        // open removed was replayed and checkpointed; it is not a loss.
+        let verdict = classify_side(consumed_side(942, 0, Some(scan_checksums_off_commit())));
+        assert_eq!(
+            verdict,
+            SideVerdict::Replayed {
+                pre_bytes: 942,
+                residual_bytes: 0,
+                truncated_bytes: 942,
+                checkpoint_terminated: true
+            }
+        );
+        assert!(verdict_may_proceed(verdict));
+    }
+
+    #[test]
+    fn consumption_never_rescues_an_unattributable_scan() {
+        // The `#207` probe: the engine read nothing and deleted the frozen WAL.
+        // `consumed_by_engine` must not launder that into a replay.
+        let verdict = classify_side(consumed_side(3103, 0, Some(scan_unattributable())));
+        assert_eq!(
+            verdict,
+            SideVerdict::Unknown {
+                reason: UnknownReason::CommitEvidenceUnreadable
+            }
+        );
+        // Nor a checksums-off WAL with no commit found: that is `Unverifiable`.
+        let verdict = classify_side(consumed_side(530, 0, Some(scan_checksums_off_no_commit())));
+        assert_eq!(
+            verdict,
+            SideVerdict::Unknown {
+                reason: UnknownReason::UnverifiableWal
+            }
+        );
+    }
+
+    #[test]
+    fn consumption_does_not_apply_to_the_active_side() {
+        // For the active WAL, `post == 0` means the engine truncated to zero
+        // without replaying; the wiring never sets the flag there, and the model
+        // still refuses a proven commit.
+        let verdict = classify_side(side(530, 0, Some(scan_with_commit())));
+        assert_eq!(verdict, SideVerdict::CommittedLost { pre_bytes: 530 });
     }
 
     #[test]
@@ -1883,9 +1957,11 @@ mod tests {
                     for post in [0u64, 25, 400, 530, 5000] {
                         let observed = classify_side(SideObservation {
                             pre,
+                            bytes_scanned: pre.min(MAX_SCAN_BYTES + 1),
                             post,
                             scan: scan_shape(shape),
                             foreign,
+                            consumed_by_engine: false,
                         });
                         assert_eq!(
                             observed,
