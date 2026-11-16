@@ -58,7 +58,9 @@
     .\scripts\build.ps1 -Configuration debug --features something
     Arguments this script does not define are passed through to cargo.
 #>
-[CmdletBinding()]
+# PositionalBinding off: otherwise a pass-through argument such as
+# --no-fail-fast binds to -Configuration (or -VcToolsVersion) by position.
+[CmdletBinding(PositionalBinding = $false)]
 param(
     [ValidateSet('release', 'debug')]
     [string]$Configuration = 'release',
@@ -433,7 +435,10 @@ if ($exitCode -ne 0) {
     exit $exitCode
 }
 
-$binary = Join-Path $repoRoot ('target\{0}\neurostrata-mcp.exe' -f $Configuration)
+# Combine, not Join-Path: CARGO_TARGET_DIR may be absolute.
+$targetDir = Join-Path $repoRoot 'target'
+if ($env:CARGO_TARGET_DIR) { $targetDir = [System.IO.Path]::Combine($repoRoot, $env:CARGO_TARGET_DIR) }
+$binary = Join-Path $targetDir ('{0}\neurostrata-mcp.exe' -f $Configuration)
 Write-Host ''
 if (Test-Path $binary) {
     $sizeMb = [math]::Round((Get-Item $binary).Length / 1MB, 1)
