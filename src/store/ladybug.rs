@@ -26861,6 +26861,11 @@ eurostrata\src\daemon.rs",
             serde_json::from_str(&std::fs::read_to_string(out.join("manifest.json")).unwrap())
                 .unwrap();
         assert_eq!(manifest["wal_kind"], "both");
+        assert_eq!(
+            manifest["version"],
+            crate::storage::snapshot::SNAPSHOT_VERSION,
+            "a new export writes the current snapshot format version (#209, J7)"
+        );
 
         let checksums: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(out.join("checksums.json")).unwrap())

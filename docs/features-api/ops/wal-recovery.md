@@ -68,6 +68,16 @@ before recovery.
    companions of any other role, together with the shadow and pinned marker
    when the snapshot carries them.
 
+   **Format version.** New snapshots are written as format version 2, which
+   mandates `wal_kind` and is the only version that can carry the frozen member.
+   Binaries from before #209 pin version 1 and therefore **refuse** a v2
+   snapshot with an unsupported-version error instead of verifying it and then
+   dropping the frozen side on restore. Version 1 snapshots (all backups taken
+   before this change) remain verifiable and restorable: they have no
+   `wal_kind`, and their WAL member is restored as the active `<db>.wal`. A v1
+   manifest that claims `wal_kind: "both"` is refused by both the verifier and
+   the restore.
+
 3. **Recover committed WAL prefix records with lenient tail truncation (operator opt-in):**
    ```sh
    NEUROSTRATA_STRICT_WAL=0 neurostrata-mcp daemon

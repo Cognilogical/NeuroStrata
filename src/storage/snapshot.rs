@@ -7,7 +7,23 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const SNAPSHOT_FORMAT: &str = "neurostrata-snapshot";
-pub const SNAPSHOT_VERSION: u32 = 1;
+
+/// The snapshot format this build writes (#209, J7).
+///
+/// Version 2 records `wal_kind` (mandatory) and may carry a second WAL member
+/// (`ladybug.store.wal.checkpoint`) for a mixed pair. Older builds pin
+/// `version == 1`, so they refuse a v2 snapshot outright instead of verifying
+/// it and then silently dropping the frozen side on restore.
+pub const SNAPSHOT_VERSION: u32 = 2;
+
+/// The only format version written before #209, kept readable forever. A v1
+/// manifest has no `wal_kind`: its WAL member is the active `<db>.wal`.
+pub const SNAPSHOT_VERSION_LEGACY: u32 = 1;
+
+/// Whether this build can read `version` (legacy through current).
+pub fn snapshot_version_supported(version: u32) -> bool {
+    (SNAPSHOT_VERSION_LEGACY..=SNAPSHOT_VERSION).contains(&version)
+}
 
 /// Manifest provenance (#209).
 ///
@@ -785,16 +801,17 @@ pub fn verify_snapshot(dir: &Path) -> Result<SnapshotVerifyReport, SnapshotError
     let manifest: serde_json::Value = serde_json::from_str(&manifest_str)?;
     let format = manifest.get("format").and_then(|v| v.as_str()).unwrap_or("");
     let version = manifest.get("version").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-    if format != SNAPSHOT_FORMAT || version != SNAPSHOT_VERSION {
+    if format != SNAPSHOT_FORMAT || !snapshot_version_supported(version) {
         return Err(SnapshotError::InvalidManifest(format!(
-            "expected format={} version={}, got format={:?} version={:?}",
-            SNAPSHOT_FORMAT, SNAPSHOT_VERSION, format, version
+            "unsupported snapshot: expected format={} version={} (legacy version {} is also readable), got format={:?} version={:?}",
+            SNAPSHOT_FORMAT, SNAPSHOT_VERSION, SNAPSHOT_VERSION_LEGACY, format, version
         )));
     }
+    let legacy = version == SNAPSHOT_VERSION_LEGACY;
 
-    // Provenance (#209). Snapshots written before this field existed carry
-    // neither flag; they verify exactly as before, so an old backup does not
-    // turn invalid merely because the field was added.
+    // Provenance (#209). Version 1 carried neither flag; it verifies exactly
+    // as before, so an old backup does not turn invalid merely because the
+    // field was added.
     let coordinated = manifest
         .get("coordinated")
         .and_then(|v| v.as_bool())
@@ -810,7 +827,25 @@ pub fn verify_snapshot(dir: &Path) -> Result<SnapshotVerifyReport, SnapshotError
                 PROVENANCE_UNVERIFIED.to_string()
             }
         });
-    let wal_kind = match manifest.get("wal_kind").and_then(|v| v.as_str()) {
+    let recorded_wal_kind = manifest.get("wal_kind").and_then(|v| v.as_str());
+    // Version 1 cannot express a mixed pair: a v1 reader (any build before
+    // #209) verifies such a manifest and then restores only the active side,
+    // so claiming `both` in v1 is a downgrade hazard, not a legacy shape.
+    if legacy && recorded_wal_kind == Some(WAL_KIND_BOTH) {
+        return Err(SnapshotError::InvalidManifest(format!(
+            "version {} snapshot claims wal_kind \"{}\", which only format version {} can express; a v1 reader would verify it and drop the frozen side",
+            SNAPSHOT_VERSION_LEGACY, WAL_KIND_BOTH, SNAPSHOT_VERSION
+        )));
+    }
+    // Version 2 makes the role mandatory: the reader must know whether the
+    // WAL member is active or frozen, and whether a second member exists.
+    if !legacy && recorded_wal_kind.is_none() {
+        return Err(SnapshotError::InvalidManifest(format!(
+            "version {} snapshot records no wal_kind; version {} manifests must record {}, {}, {} or {}",
+            version, SNAPSHOT_VERSION, WAL_KIND_ACTIVE, WAL_KIND_FROZEN, WAL_KIND_BOTH, WAL_KIND_NONE
+        )));
+    }
+    let wal_kind = match recorded_wal_kind {
         Some(kind @ (WAL_KIND_ACTIVE | WAL_KIND_FROZEN | WAL_KIND_BOTH | WAL_KIND_NONE)) => {
             Some(kind.to_string())
         }
@@ -1056,7 +1091,7 @@ pub fn select_expired_snapshots(root: &Path, keep: usize) -> Result<Vec<PathBuf>
         };
         let format = manifest.get("format").and_then(|v| v.as_str()).unwrap_or("");
         let version = manifest.get("version").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-        if format != SNAPSHOT_FORMAT || version != SNAPSHOT_VERSION {
+        if format != SNAPSHOT_FORMAT || !snapshot_version_supported(version) {
             continue;
         }
         let created_at = manifest.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
@@ -1371,12 +1406,21 @@ mod tests {
     }
 
     fn make_snapshot_dir(parent: &Path, snap_name: &str, created_at: &str) -> PathBuf {
+        make_snapshot_dir_with_version(parent, snap_name, created_at, SNAPSHOT_VERSION)
+    }
+
+    fn make_snapshot_dir_with_version(
+        parent: &Path,
+        snap_name: &str,
+        created_at: &str,
+        version: u32,
+    ) -> PathBuf {
         let d = parent.join(snap_name);
         fs::create_dir_all(&d).unwrap();
         let mut manifest = File::create(d.join("manifest.json")).unwrap();
         let content = format!(
             "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"{}\"}}",
-            SNAPSHOT_FORMAT, SNAPSHOT_VERSION, created_at
+            SNAPSHOT_FORMAT, version, created_at
         );
         manifest.write_all(content.as_bytes()).unwrap();
         d
@@ -1393,7 +1437,7 @@ mod tests {
         write_store(&d);
         let mut manifest = File::create(d.join("manifest.json")).unwrap();
         let content = format!(
-            "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\"}}",
+            "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"wal_kind\":\"none\"}}",
             SNAPSHOT_FORMAT, SNAPSHOT_VERSION
         );
         manifest.write_all(content.as_bytes()).unwrap();
@@ -1417,7 +1461,7 @@ mod tests {
         write_store(&d);
         let mut manifest = File::create(d.join("manifest.json")).unwrap();
         let content = format!(
-            "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\"}}",
+            "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"wal_kind\":\"none\"}}",
             SNAPSHOT_FORMAT, SNAPSHOT_VERSION
         );
         manifest.write_all(content.as_bytes()).unwrap();
@@ -1454,7 +1498,7 @@ mod tests {
         write_store(&d);
         let mut manifest = File::create(d.join("manifest.json")).unwrap();
         let content = format!(
-            "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\"}}",
+            "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"wal_kind\":\"none\"}}",
             SNAPSHOT_FORMAT, SNAPSHOT_VERSION
         );
         manifest.write_all(content.as_bytes()).unwrap();
@@ -1616,6 +1660,198 @@ mod tests {
             matches!(result, Err(SnapshotError::ChecksumMismatch { .. })),
             "a both-kind manifest with the frozen side missing fails: {result:?}"
         );
+    }
+
+    #[test]
+    fn a_version_1_legacy_snapshot_still_verifies() {
+        // Pre-#209 snapshots are format version 1: no `wal_kind`, and their
+        // WAL member is the active `.wal`. Current code keeps reading them.
+        let d = temp_dir("v1-legacy");
+        write_store(&d);
+        fs::write(
+            d.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\"}}",
+                SNAPSHOT_FORMAT, 1
+            ),
+        )
+        .unwrap();
+        fs::write(d.join("ladybug.store.wal"), b"legacy-wal").unwrap();
+        write_checksums(&d).unwrap();
+
+        let report = verify_snapshot(&d).expect("a version 1 snapshot verifies");
+        assert!(report.integrity_ok);
+        assert_eq!(
+            report.wal_kind, None,
+            "a version 1 manifest records no WAL role; restore treats it as active"
+        );
+    }
+
+    #[test]
+    fn a_version_1_manifest_claiming_both_is_invalid() {
+        // #209 (J7): `both` is only expressible in version 2. A version 1
+        // manifest that claims it describes a pair a v1 reader would truncate,
+        // so it is refused rather than half-read.
+        let d = temp_dir("v1-both");
+        write_store(&d);
+        fs::write(
+            d.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":1,\"created_at\":\"2026-01-01T00:00:00Z\",\"wal_kind\":\"both\"}}",
+                SNAPSHOT_FORMAT
+            ),
+        )
+        .unwrap();
+        fs::write(d.join("ladybug.store.wal"), b"active-bytes").unwrap();
+        fs::write(d.join("ladybug.store.wal.checkpoint"), b"frozen-bytes").unwrap();
+        write_checksums(&d).unwrap();
+
+        let result = verify_snapshot(&d);
+        match result {
+            Err(SnapshotError::InvalidManifest(message)) => assert!(
+                message.contains("both") && message.contains("version 1"),
+                "the refusal names the version/kind mismatch: {message}"
+            ),
+            other => panic!("a version 1 manifest claiming both must be rejected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_version_2_manifest_without_wal_kind_is_invalid() {
+        let d = temp_dir("v2-no-kind");
+        write_store(&d);
+        fs::write(
+            d.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":2,\"created_at\":\"2026-01-01T00:00:00Z\"}}",
+                SNAPSHOT_FORMAT
+            ),
+        )
+        .unwrap();
+        write_checksums(&d).unwrap();
+
+        let result = verify_snapshot(&d);
+        match result {
+            Err(SnapshotError::InvalidManifest(message)) => assert!(
+                message.contains("wal_kind"),
+                "the refusal names the missing field: {message}"
+            ),
+            other => panic!("a version 2 manifest without wal_kind must be rejected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_version_2_manifest_with_an_unknown_wal_kind_is_invalid() {
+        let d = temp_dir("v2-unknown-kind");
+        write_store(&d);
+        fs::write(
+            d.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":2,\"created_at\":\"2026-01-01T00:00:00Z\",\"wal_kind\":\"sometimes\"}}",
+                SNAPSHOT_FORMAT
+            ),
+        )
+        .unwrap();
+        write_checksums(&d).unwrap();
+
+        let result = verify_snapshot(&d);
+        match result {
+            Err(SnapshotError::InvalidManifest(message)) => assert!(
+                message.contains("wal_kind"),
+                "the refusal names the field: {message}"
+            ),
+            other => panic!("an unknown wal_kind must be rejected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unsupported_snapshot_version_is_refused() {
+        // The same rule an old reader applies to version 2: a version this
+        // build does not know is refused, never half-read.
+        let d = temp_dir("v3");
+        write_store(&d);
+        fs::write(
+            d.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":3,\"created_at\":\"2026-01-01T00:00:00Z\",\"wal_kind\":\"none\"}}",
+                SNAPSHOT_FORMAT
+            ),
+        )
+        .unwrap();
+        write_checksums(&d).unwrap();
+
+        let result = verify_snapshot(&d);
+        assert!(
+            matches!(result, Err(SnapshotError::InvalidManifest(ref m)) if m.contains("version")),
+            "an unknown future version is refused with a version message: {result:?}"
+        );
+    }
+
+    #[test]
+    fn a_one_sided_manifest_with_a_frozen_member_is_refused() {
+        // #209 (J7): a `wal_kind: active` manifest that also carries
+        // `ladybug.store.wal.checkpoint` describes a pair it does not own. The
+        // verifier refuses rather than certifying a set restore would treat as
+        // active-only.
+        let d = temp_dir("active-with-frozen-member");
+        write_store(&d);
+        fs::write(
+            d.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"wal_kind\":\"active\"}}",
+                SNAPSHOT_FORMAT, SNAPSHOT_VERSION
+            ),
+        )
+        .unwrap();
+        fs::write(d.join("ladybug.store.wal"), b"active-bytes").unwrap();
+        fs::write(d.join("ladybug.store.wal.checkpoint"), b"leftover-frozen").unwrap();
+        write_checksums(&d).unwrap();
+
+        let result = verify_snapshot(&d);
+        match result {
+            Err(SnapshotError::InvalidManifest(message)) => assert!(
+                message.contains("ladybug.store.wal.checkpoint"),
+                "the refusal names the unexpected member: {message}"
+            ),
+            other => panic!("a one-sided manifest with a frozen member must be refused: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_both_manifest_missing_the_active_side_is_refused() {
+        // A `both` manifest must produce the active member too; half a pair is
+        // not verifiable.
+        let d = temp_dir("both-missing-active");
+        write_store(&d);
+        fs::write(
+            d.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"wal_kind\":\"both\"}}",
+                SNAPSHOT_FORMAT, SNAPSHOT_VERSION
+            ),
+        )
+        .unwrap();
+        fs::write(d.join("ladybug.store.wal.checkpoint"), b"frozen-bytes").unwrap();
+        write_checksums(&d).unwrap();
+
+        let result = verify_snapshot(&d);
+        assert!(
+            matches!(result, Err(SnapshotError::ChecksumMismatch { .. })),
+            "a both manifest without the active member fails: {result:?}"
+        );
+    }
+
+    #[test]
+    fn select_expired_counts_version_1_and_version_2_snapshots() {
+        // Readable v1 snapshots are still snapshots: retention must count
+        // them, not leak them because their version is not the current one.
+        let root = temp_dir("expired_versions");
+        make_snapshot_dir_with_version(&root, "snapshot-v1", "2025-01-01T00:00:00Z", 1);
+        make_snapshot_dir_with_version(&root, "snapshot-v2", "2026-01-01T00:00:00Z", 2);
+
+        let expired = select_expired_snapshots(&root, 1).unwrap();
+        assert_eq!(expired.len(), 1, "both versions are retention candidates");
+        assert!(expired[0].to_string_lossy().contains("v1"));
     }
 
     #[test]
