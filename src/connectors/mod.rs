@@ -3,10 +3,9 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use hex::encode;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, RwLock};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -103,18 +102,18 @@ pub trait DataConnector: Send + Sync {
 }
 
 pub struct DataConnectorRegistry {
-    connectors: HashMap<String, Arc<dyn DataConnector>>,
+    connectors: RwLock<HashMap<String, Arc<dyn DataConnector>>>,
 }
 
 impl DataConnectorRegistry {
     pub fn new() -> Self {
         DataConnectorRegistry {
-            connectors: HashMap::new(),
+            connectors: RwLock::new(HashMap::new()),
         }
     }
 
     pub fn new_with_defaults(workspace_root: PathBuf) -> Self {
-        let mut reg = DataConnectorRegistry::new();
+        let reg = DataConnectorRegistry::new();
         let inmem = Arc::new(InMemoryPoolConnector::new());
         let json = Arc::new(JsonFilePoolConnector::new(workspace_root));
         reg.register(inmem).expect("register in-memory connector");
@@ -122,21 +121,24 @@ impl DataConnectorRegistry {
         reg
     }
 
-    pub fn register(&mut self, connector: Arc<dyn DataConnector>) -> Result<()> {
+    pub fn register(&self, connector: Arc<dyn DataConnector>) -> Result<()> {
         let id = connector.connector_id().to_string();
-        if self.connectors.contains_key(&id) {
+        let mut connectors = self.connectors.write().unwrap();
+        if connectors.contains_key(&id) {
             return Err(anyhow!("connector_id '{}' already registered", id));
         }
-        self.connectors.insert(id, connector);
+        connectors.insert(id, connector);
         Ok(())
     }
 
     pub fn get(&self, connector_id: &str) -> Option<Arc<dyn DataConnector>> {
-        self.connectors.get(connector_id).cloned()
+        let connectors = self.connectors.read().unwrap();
+        connectors.get(connector_id).cloned()
     }
 
     pub fn list_connector_ids(&self) -> Vec<String> {
-        let mut ids: Vec<String> = self.connectors.keys().cloned().collect();
+        let connectors = self.connectors.read().unwrap();
+        let mut ids: Vec<String> = connectors.keys().cloned().collect();
         ids.sort();
         ids
     }
@@ -278,11 +280,11 @@ impl DataConnector for InMemoryPoolConnector {
         let mut pools = self.pools.write().unwrap();
         let pool = pools.get_mut(pool_id).ok_or_else(|| anyhow!("pool '{}' not found", pool_id))?;
         let idempotency_key = format!("{}:{}:{}", pool_id, pointer_uri, req.idempotency_key);
-        if let Some(receipt) = pool.idempotency.get(&idempotency_key) {
-            return Ok(receipt.clone());
-        }
         if pool.schema.access_mode == DataPoolAccessMode::ReadOnly {
             return Err(anyhow!("pool '{}' is read-only", pool_id));
+        }
+        if let Some(receipt) = pool.idempotency.get(&idempotency_key) {
+            return Ok(receipt.clone());
         }
         let all_records = pool.records.get_mut(pointer_uri).ok_or_else(|| {
             anyhow!(
@@ -363,7 +365,24 @@ impl JsonFilePoolConnector {
     }
 
     fn resolve_path(&self, pointer_uri: &str) -> Result<PathBuf> {
+        if pointer_uri.is_empty() {
+            return Err(anyhow!("pointer_uri must not be empty"));
+        }
         let p = PathBuf::from(pointer_uri);
+        for comp in p.components() {
+            match comp {
+                std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    return Err(anyhow!("pointer_uri '{}' must not contain '..'", pointer_uri));
+                }
+                std::path::Component::RootDir => {
+                    return Err(anyhow!("pointer_uri '{}' must be relative to workspace root", pointer_uri));
+                }
+                std::path::Component::Prefix(_) => {
+                    return Err(anyhow!("pointer_uri '{}' must not contain a prefix component", pointer_uri));
+                }
+            }
+        }
         let abs = if p.is_absolute() {
             p
         } else {
@@ -373,7 +392,7 @@ impl JsonFilePoolConnector {
         let canonical = match abs.canonicalize() {
             Ok(c) => c,
             Err(_) => {
-                // If absolute path can't be canonicalized, resolve parent and join file name
+                // If pointer does not exist yet (e.g. for append), resolve the parent and join file name
                 let parent = abs.parent().unwrap_or_else(|| Path::new("."));
                 let file_name = abs.file_name().ok_or_else(|| anyhow!("invalid pointer path '{}'", pointer_uri))?;
                 let parent_canonical = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
@@ -487,6 +506,8 @@ impl DataConnector for JsonFilePoolConnector {
         pointer_uri: &str,
         req: &ExternalEffectRequest,
     ) -> Result<ExternalEffectReceipt> {
+        let idempotency_key = format!("{}:{}:{}", pool_id, pointer_uri, req.idempotency_key);
+        let mut idem = self.idempotency.write().unwrap();
         let schema = {
             let pools = self.pools.read().unwrap();
             pools
@@ -497,12 +518,8 @@ impl DataConnector for JsonFilePoolConnector {
         if schema.access_mode == DataPoolAccessMode::ReadOnly {
             return Err(anyhow!("pool '{}' is read-only", pool_id));
         }
-        let idempotency_key = format!("{}:{}:{}", pool_id, pointer_uri, req.idempotency_key);
-        {
-            let idem = self.idempotency.read().unwrap();
-            if let Some(receipt) = idem.get(&idempotency_key) {
-                return Ok(receipt.clone());
-            }
+        if let Some(receipt) = idem.get(&idempotency_key) {
+            return Ok(receipt.clone());
         }
         let path = self.resolve_path(pointer_uri)?;
         let mut all_records = JsonFilePoolConnector::read_json_file(&path)?;
@@ -550,7 +567,6 @@ impl DataConnector for JsonFilePoolConnector {
             new_source_sha256: new_source_sha,
             details: format!("{} applied to {}", req.operation, path.display()),
         };
-        let mut idem = self.idempotency.write().unwrap();
         idem.insert(idempotency_key, receipt.clone());
         Ok(receipt)
     }
@@ -725,7 +741,7 @@ mod tests {
         assert_eq!(payload.source_sha256, payload.slice_sha256);
         // Path traversal
         let err = rt.block_on(c.resolve_slice("jp", "../outside.json", 0, 10, 1024)).unwrap_err();
-        assert!(err.to_string().contains("outside workspace root"));
+        assert!(err.to_string().contains("must not contain '..'"));
         // Write-back
         let req = ExternalEffectRequest {
             pointer_id: "data.json".into(),
@@ -741,6 +757,42 @@ mod tests {
         let new_content = std::fs::read_to_string(&file_path).unwrap();
         let parsed: Vec<Value> = serde_json::from_str(&new_content).unwrap();
         assert_eq!(parsed.len(), 3);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn test_json_file_connector_path_traversal_rejection() {
+        let dir = std::env::temp_dir();
+        let root = dir.join("ns_json_traversal");
+        std::fs::create_dir_all(&root).unwrap();
+        let file_path = root.join("data.json");
+        let data = vec![json!({"a":1})];
+        std::fs::write(&file_path, serde_json::to_string_pretty(&data).unwrap()).unwrap();
+        let c = JsonFilePoolConnector::new(root.clone());
+        c.register_pool(DataPoolSchema {
+            connector_id: "json_file".into(),
+            pool_id: "jp".into(),
+            access_mode: DataPoolAccessMode::ReadWrite,
+            entity_types: vec![],
+            max_slice_rows: 10,
+            max_slice_bytes: 1024,
+            description: "test".into(),
+        });
+        let rt = rt();
+        let err = rt.block_on(c.resolve_slice("jp", "nonexistent_dir/../../outside.json", 0, 10, 1024)).unwrap_err();
+        assert!(err.to_string().contains("must not contain '..'"));
+        let err = rt.block_on(c.resolve_slice("jp", "/etc/passwd", 0, 10, 1024)).unwrap_err();
+        assert!(err.to_string().contains("must be relative to workspace root"));
+        let req = ExternalEffectRequest {
+            pointer_id: "../outside.json".into(),
+            operation: "append".into(),
+            payload: json!(2),
+            action_receipt_id: "act".into(),
+            expected_source_sha256: None,
+            idempotency_key: "k1".into(),
+        };
+        let err = rt.block_on(c.apply_external_effect("jp", "../outside.json", &req)).unwrap_err();
+        assert!(err.to_string().contains("must not contain '..'"));
         std::fs::remove_dir_all(&root).unwrap();
     }
 }
