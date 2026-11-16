@@ -17,10 +17,17 @@ before recovery.
    ```sh
    neurostrata-mcp storage status
    ```
-   This reports `db_bytes`, `wal_bytes` (including `<db>.wal.checkpoint`),
-   `wal_recovery_artifact_count`, `wal_recovery_artifact_bytes`, and
-   `recovery_provenance` directly from the filesystem without opening the
-   engine.
+   This reports `store_bytes`, `wal_bytes` (including `<db>.wal.checkpoint`),
+   `wal_age_secs`, `wal_recovery_artifact_count`,
+   `wal_recovery_artifact_bytes`, `recovery_provenance`,
+   `last_recovery_at`, and `opened_via_recovery` directly from the filesystem
+   without opening the engine.
+   - `wal_age_secs` is the age of the **newest** regular `<db>.wal` or
+     `<db>.wal.checkpoint` (null when neither exists). A symlink at either
+     name is not counted: it is not a WAL this store wrote. `wal_bytes` is
+     measured over the names as the engine sees them (so it follows a
+     symlink's target); the two fields can therefore describe slightly
+     different file sets.
    - Preserved pre-replay WAL copies are kept at `<db>.wal.unclean.<timestamp>`
      (and `<db>.wal.checkpoint.unclean.<timestamp>`) with `0600` permissions.
    - Unreadable WALs that had to be moved aside during opt-in recovery are kept
@@ -50,7 +57,10 @@ before recovery.
    - If the lenient replay recovers **zero** committed records from a non-empty
      WAL, NeuroStrata refuses to checkpoint over the WAL and restores `<db>.wal`
      from the preserved `<db>.wal.unclean.<timestamp>` copy so no WAL bytes are
-     silently destroyed.
+     silently destroyed. The restore never writes through a symlink planted at
+     `<db>.wal`: a symlink at the target is refused (and named in the refusal),
+     and the target is reopened `O_NOFOLLOW` and left `0600` — explicitly, so a
+     pre-existing looser mode is tightened rather than inherited (`#212`).
 
 4. **Discard an unreadable WAL or restore from a known-good snapshot:**
    - If the WAL cannot be opened even with lenient replay, opt-in recovery
@@ -62,6 +72,55 @@ before recovery.
      ```
      Then update `db_path` in `~/.config/neurostrata/config.json` after
      inspecting the restored store.
+
+## Durable provenance in the store-state sidecar (`#212`)
+
+Recovery provenance used to live only in the process that recovered, so
+`storage status` in a fresh process had no provenance to report. It is now
+also written to `<db>.store-state.json` (`#212`), beside the identity fields
+the model-choice guard already reads — so a path-only status reports
+`recovery_provenance` and `last_recovery_at`, while `opened_via_recovery`
+stays handle-scoped:
+
+| field | meaning |
+|---|---|
+| `last_recovery.at` | RFC 3339 UTC timestamp of the recorded recovery open |
+| `last_recovery.kind` | recovery arm: `checksum_config_mismatch`, `unverified_wal_replay`, or `discarded_unreadable_wal` |
+| `last_recovery.wal_bytes` | bytes across the WAL pair observed before the recovery open |
+| `last_checkpoint_at` | RFC 3339 UTC timestamp of the last recorded checkpoint |
+| `last_checkpoint_duration_ms` | its duration in milliseconds |
+| `checkpoint_failures` | failed checkpoints recorded for this store (monotonic) |
+
+- The fields are `serde(default)`: a sidecar written before `#212` (or by a
+  build without the fields) parses unchanged and reads as "nothing recorded".
+- A store with **no** sidecar does not gain one from a recovery: the recipe
+  would have to invent an embedding identity this process cannot attest, and a
+  false `has_data` would unlock model choice. For those stores the in-process
+  map is still the only provenance layer.
+- The live flag and kind are **handle-derived**, but the map behind them is
+  **process-scoped**: a live status reflects any handle this process opened for
+  that path, and both the flag and the map vanish when the process exits —
+  only the sidecar (and therefore `last_recovery_at`) survives.
+- A **downgraded** build that predates `#212` does not know the health fields:
+  its identity writes (the pristine stamp, the data flip, pristine adoption)
+  rewrite the sidecar without them, so the persisted provenance and checkpoint
+  health are dropped by the first such write after a downgrade. Re-upgrading
+  starts the history over from the next recovery/checkpoint.
+- `last_recovery` is history, not the state of the current process: a later
+  verified open does not erase it. **Two fields carry it, and they mean
+  different things:**
+  - `opened_via_recovery` is **handle-scoped**: `true` only when the live
+    handle that answered this status was opened through recovery. A verified
+    reopen after a recovery reports `false` — a health check on a healthy
+    daemon must not alarm on a past recovery.
+  - `last_recovery_at` is **history**, on every surface: it answers "did this
+    store ever recover, and when?" for a live daemon and a path-only
+    `storage status` alike. `recovery_provenance` carries the live kind when
+    there is one, and the persisted kind for a path-only query (where
+    `opened_via_recovery` is necessarily `false`, because nothing was opened).
+- `last_checkpoint_at` is absent only when neither a checkpoint has been
+  recorded here nor the store directory has a readable mtime; the directory
+  mtime remains the last-resort proxy.
 
 ## Accounting verdicts (`#207`)
 
