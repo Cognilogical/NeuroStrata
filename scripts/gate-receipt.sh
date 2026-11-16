@@ -8,8 +8,9 @@
 # marker or receipt is read.
 #
 # Inline findings come from review threads when GraphQL answers. If it does not,
-# every inline finding counts and receipts pool globally — looser binding than
-# thread mode, so a receipt may clear an unrelated finding.
+# the gate fails closed: an inline finding cannot be bound to a receipt without
+# the thread it belongs to, so the script exits 1 instead of pooling receipts
+# across comments.
 #
 # Receipts: fixed@<sha> and filed #<issue> from the PR author or a maintainer
 # (OWNER / MEMBER / COLLABORATOR), never from an association-less account, and
@@ -20,9 +21,11 @@
 # authorship but cannot validate targets.
 #
 # Accounting: each review thread (resolved or not) must carry receipts for its
-# own markers, and top-level review/comment bodies form a separate pool.
-# Resolution alone never clears a finding. The legacy --reviews-file mode keeps
-# the older global, same-body receipt pool.
+# own markers, and top-level review/comment bodies form a separate pool. One
+# tokenizer and one marker regex serve every mode, so the thread, top-level,
+# fallback, and legacy engines count the same body the same way. Resolution
+# alone never clears a finding. The legacy --reviews-file mode keeps the older
+# global, same-body receipt pool.
 #
 # Usage: scripts/gate-receipt.sh --pr <n>
 #        scripts/gate-receipt.sh --reviews-file <plain-text-or-json-fixture>
@@ -32,6 +35,14 @@
 #        GATE_RECEIPT_REPO=owner/name overrides the repo used by --pr (useful
 #        when a fork checkout wants to check the upstream PR).
 set -euo pipefail
+
+# One marker regex is the engine, used by every mode. The accepted forms are
+# CHANGES-NEEDED / CHANGES NEEDED / CHANGES_NEEDED, DO-NOT-MERGE / DO NOT MERGE
+# / DO_NOT_MERGE, the badge forms P1 Badge / P1-Badge / P1Badge (and the P2
+# equivalents), and the bold **P1** / **P2**. The underscore is not a badge
+# separator, and P0 never gates. scripts/test-gate-receipt.sh pins this regex
+# against the documented surface in docs/features-api/ops/merge-gates.md.
+marker_re='CHANGES[-_ ]?NEEDED|DO[-_ ]?NOT[-_ ]?MERGE|P[12][[:space:]]*-?[[:space:]]*Badge|\*\*P[12]\*\*'
 
 pr=""
 fixture=""
@@ -94,7 +105,7 @@ fixed_sha_targets() {
 # bodies; receipts must come from an allowed author and not from the finding
 # comment; fixed@/filed targets must pass the mode's validation.
 jq_defs="${tokenizer_def}"'
-  def mcount: [scan("CHANGES[-_ ]?NEEDED|DO[-_ ]?NOT[-_ ]?MERGE|P[12][[:space:]]*-?[[:space:]]*Badge|\\*\\*P[12]\\*\\*"; "i")] | length;
+  def mcount: [scan($marker_re; "i")] | length;
   def ucount: [scan("ruled:"; "i")] | length;
   def maint: (. == "OWNER") or (. == "MEMBER") or (. == "COLLABORATOR");
   def receipt_ok:
@@ -125,7 +136,7 @@ jq_defs="${tokenizer_def}"'
 jq_args=()
 
 set_jq_args() {
-  jq_args=(--arg mode "$mode" --argjson pr_authors "$pr_authors" --argjson validate "$validate" \
+  jq_args=(--arg mode "$mode" --arg marker_re "$marker_re" --argjson pr_authors "$pr_authors" --argjson validate "$validate" \
            --argjson ok_shas "$ok_shas" --argjson ok_issues "$ok_issues")
 }
 
@@ -289,7 +300,17 @@ elif [ -n "$fixtures_dir" ]; then
 else
   mode=pr
   [ -n "$pr" ] || { echo "usage: gate-receipt.sh --pr <n> | --reviews-file <path> | --fixtures-dir <path>" >&2; exit 2; }
-  repo=${GATE_RECEIPT_REPO:-$(gh repo view --json nameWithOwner -q .nameWithOwner)}
+  # The repository may be overridden (a fork checkout checks the upstream PR).
+  # An unresolvable repository is a fetch failure, not a clearance.
+  if [ -n "${GATE_RECEIPT_REPO:-}" ]; then
+    repo=$GATE_RECEIPT_REPO
+  else
+    repo=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) || repo=""
+  fi
+  if [ -z "$repo" ]; then
+    echo "gate-receipt: cannot resolve the repository" >&2
+    exit 1
+  fi
   owner=${repo%%/*}
   name=${repo#*/}
   meta=$(gh api "repos/$repo/pulls/$pr" --jq '{author: (.user.login // ""), head: (.head.sha // "")}') || {
@@ -302,7 +323,12 @@ else
   # author_association CONTRIBUTOR instead of MEMBER. Include PR commit
   # authors/committers alongside the PR creator so co-authors who push a fix
   # commit to the PR branch can receipt it.
-  commit_authors=$(gh api "repos/$repo/pulls/$pr/commits" --paginate --jq '[.[].author.login // empty, .[].committer.login // empty]' 2>/dev/null | jq -sc 'add // []' || printf '[]')
+  # A lost commits list only narrows who may receipt a finding, so the gate
+  # over-gates instead of crashing: an unreadable list is treated as empty.
+  commit_authors=$(gh api "repos/$repo/pulls/$pr/commits" --paginate --jq '[.[].author.login // empty, .[].committer.login // empty]' 2>/dev/null | jq -sc 'add // []' 2>/dev/null) || commit_authors=""
+  if ! printf '%s' "$commit_authors" | jq -e 'type == "array"' >/dev/null 2>&1; then
+    commit_authors='[]'
+  fi
   pr_authors=$(jq -cn --arg a "$pr_author" --argjson ca "$commit_authors" '([$a] + $ca) | map(select(. != "")) | unique')
   # Reviews and comments only. The PR body often describes the gate itself
   # ("one receipt per CHANGES-NEEDED marker") and must not count as a marker.
@@ -418,9 +444,20 @@ if [ "$thread_mode" = "threads" ]; then
   receipts=$((top_receipts + thread_receipts))
   outstanding=$((top_outstanding + thread_outstanding))
 elif [ "$thread_mode" = "fallback" ]; then
-  marker_entries=$(combine "$reviews_entries" "$comment_entries" "$pull_entries")
-  echo "gate-receipt: review-thread resolution unavailable; counting every inline finding with a global receipt pool (looser binding than thread mode; may under-gate)" >&2
+  # Fail closed. Without the threads there is no way to bind a receipt to the
+  # finding it answers, so an inline finding is outstanding: pooling receipts
+  # across comments let a receipt for one finding clear an unrelated one.
+  echo "gate-receipt: review-thread resolution unavailable; an inline finding cannot be bound to its own thread" >&2
   set_jq_args
+  inline=$(printf '%s\n' "$pull_entries" | pool_stats true)
+  inline_markers=$(printf '%s' "$inline" | jq -r '.markers')
+  if [ "$inline_markers" -gt 0 ]; then
+    echo "gate-receipt: $inline_markers outstanding finding(s) without a receipt; $inline_markers inline finding(s) cannot be bound to a receipt without their review thread" >&2
+    echo "each marker needs its own fixed@<sha>, filed #<issue>, or maintainer ruled: <reason> from the PR author or a maintainer in its own thread or body" >&2
+    exit 1
+  fi
+  # No inline finding: only the top-level pool is accounted.
+  marker_entries=$(combine "$reviews_entries" "$comment_entries")
   pool=$(printf '%s\n' "$marker_entries" | pool_stats true)
   markers=$(printf '%s' "$pool" | jq -r '.markers')
   receipts=$(printf '%s' "$pool" | jq -r '.receipts')

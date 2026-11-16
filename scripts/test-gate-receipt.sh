@@ -348,4 +348,143 @@ if [ "$out" != "abcdef1" ]; then
   exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# #226: one marker engine, one documented surface, and the pinned rulings.
+#
+# The engine keeps a single regex; the accepted and rejected forms live here
+# and in docs/features-api/ops/merge-gates.md. These assertions fail if the
+# regex and the documented surface drift apart.
+# ---------------------------------------------------------------------------
+marker_re=$(sed -n "s/^marker_re='\(.*\)'\$/\1/p" "$root/scripts/gate-receipt.sh")
+if [ -z "$marker_re" ]; then
+  echo "FAIL: scripts/gate-receipt.sh does not define a single marker_re" >&2
+  exit 1
+fi
+marker_count() {
+  printf '%s' "$1" | jq -Rrs --arg re "$marker_re" '[scan($re; "i")] | length'
+}
+doc="$root/docs/features-api/ops/merge-gates.md"
+for form in "CHANGES-NEEDED" "CHANGES NEEDED" "CHANGES_NEEDED" \
+            "DO-NOT-MERGE" "DO NOT MERGE" "DO_NOT_MERGE" \
+            "P1 Badge" "P1-Badge" "P1Badge" "P2 Badge" "P2-Badge" "P2Badge" \
+            "**P1**" "**P2**"; do
+  if [ "$(marker_count "$form")" -lt 1 ]; then
+    echo "FAIL: the accepted marker form '$form' does not match the engine regex" >&2
+    exit 1
+  fi
+  if ! grep -qF -- "$form" "$doc"; then
+    echo "FAIL: docs/features-api/ops/merge-gates.md does not document '$form'" >&2
+    exit 1
+  fi
+done
+# OWNER ruling (2026-11-16): the underscore is not a badge separator, and P0
+# never gates.
+for form in "P1_Badge" "P2_Badge" "P0 Badge" "P0-Badge" "**P0**" "P0"; do
+  if [ "$(marker_count "$form")" -ne 0 ]; then
+    echo "FAIL: the rejected near-form '$form' matched the engine regex" >&2
+    exit 1
+  fi
+done
+
+# A badge quoted in prose counts; the same badge in a code span or a fence
+# does not. The fixture carries all three shapes.
+out=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/quoted-prose" 2>/dev/null)
+case "$out" in
+  *"1 marker(s), 1 receipt(s)"*) : ;;
+  *) echo "FAIL: the prose-quoted badge was not counted exactly once: $out" >&2; exit 1 ;;
+esac
+
+# The near-forms never gate.
+for d in near-form-p1-underscore p0-never-gates; do
+  if ! out=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/$d" 2>/dev/null); then
+    echo "FAIL: $d gated" >&2
+    exit 1
+  fi
+  case "$out" in
+    *"no gating marker"*) : ;;
+    *) echo "FAIL: $d was counted as a marker: $out" >&2; exit 1 ;;
+  esac
+done
+
+# ---------------------------------------------------------------------------
+# #226: one parser, identical counts on the same bodies across the surfaces.
+# ---------------------------------------------------------------------------
+parity_thr=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/parser-parity-threads" 2>&1 >/dev/null || true)
+parity_fb=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/parser-parity-fallback" 2>&1 >/dev/null || true)
+parity_tb=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/parser-parity-thread-body" 2>&1 >/dev/null || true)
+for pair in "thread-mode:$parity_thr" "fallback-mode:$parity_fb" "thread-body:$parity_tb"; do
+  case "$pair" in
+    *"3 outstanding finding(s)"*"3 marker(s) seen"*) : ;;
+    *) echo "FAIL: the parser counted the same body differently ($pair)" >&2; exit 1 ;;
+  esac
+done
+
+# ---------------------------------------------------------------------------
+# #229: the fallback fails closed; pooled clearance is gone.
+# ---------------------------------------------------------------------------
+if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/pooled-clearance" >/dev/null 2>&1; then
+  echo "FAIL: a receipt pooled from another comment cleared an unrelated inline finding" >&2
+  exit 1
+fi
+out=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/pooled-clearance" 2>&1 >/dev/null || true)
+case "$out" in
+  *"review-thread resolution unavailable"*) : ;;
+  *) echo "FAIL: the fallback must announce the unavailable thread resolution: $out" >&2; exit 1 ;;
+esac
+case "$out" in
+  *"inline finding"*) : ;;
+  *) echo "FAIL: the fallback must fail closed on the inline finding: $out" >&2; exit 1 ;;
+esac
+
+# A marker that lives only in a top-level comment still gates in the fallback.
+out=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/fallback-comment-only-marker" 2>&1 >/dev/null || true)
+case "$out" in
+  *"1 outstanding finding(s)"*) : ;;
+  *) echo "FAIL: a comment-only marker did not gate in fallback mode: $out" >&2; exit 1 ;;
+esac
+bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/fallback-comment-only-marker-receipted" >/dev/null
+
+# ---------------------------------------------------------------------------
+# #225: the fixture corpus is described, and its evidence is stamped.
+# ---------------------------------------------------------------------------
+readme="$root/scripts/fixtures/gate-receipt/README.md"
+if ! grep -q "same accounting branch" "$readme"; then
+  echo "FAIL: the fixtures README does not describe the accounting branch" >&2
+  exit 1
+fi
+if grep -q "same fetch branch" "$readme"; then
+  echo "FAIL: the fixtures README still describes a fetch branch" >&2
+  exit 1
+fi
+evi="$fix/EVIDENCE.json"
+if [ ! -f "$evi" ]; then
+  echo "FAIL: scripts/fixtures/gate-receipt/EVIDENCE.json is missing" >&2
+  exit 1
+fi
+gen=$(jq -r '.corpus_generation // empty' "$evi")
+case "$gen" in
+  ''|*[!0-9]*) echo "FAIL: EVIDENCE.json corpus_generation must be a positive integer" >&2; exit 1 ;;
+esac
+if [ "$gen" -lt 1 ]; then
+  echo "FAIL: EVIDENCE.json corpus_generation must be a positive integer" >&2
+  exit 1
+fi
+base_sha=$(jq -r '.base_sha // empty' "$evi")
+if ! [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "FAIL: EVIDENCE.json base_sha must be a full 40-hex commit sha" >&2
+  exit 1
+fi
+if git -C "$root" cat-file -e "$base_sha^{commit}" 2>/dev/null; then
+  if ! git -C "$root" merge-base --is-ancestor "$base_sha" HEAD; then
+    echo "FAIL: EVIDENCE.json base_sha is not an ancestor of HEAD" >&2
+    exit 1
+  fi
+fi
+listed=$(jq -r '.fixtures[]' "$evi" | sort)
+actual=$(cd "$fix" && for d in */; do printf '%s\n' "${d%/}"; done | sort)
+if [ "$listed" != "$actual" ]; then
+  echo "FAIL: EVIDENCE.json does not list the fixture corpus exactly" >&2
+  exit 1
+fi
+
 echo "gate-receipt self-test: PASS"

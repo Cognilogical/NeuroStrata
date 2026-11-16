@@ -28,13 +28,13 @@ jobs:
     if: github.event_name != 'issue_comment' || github.event.issue.pull_request
     runs-on: ubuntu-latest
     steps:
-      # Bootstrap: this workflow lands in the PR that adds the script, so PR and
-      # review events run the head. After this lands, switch that checkout to
-      # the base ref so a PR cannot edit the gate that checks it.
-      - name: Checkout the PR head
+      # The gate runs the script from the base branch, never from the PR head:
+      # a PR that edits the gate cannot grade itself. The base SHA is pinned
+      # so the checkout is the reviewed base commit, not a moving ref.
+      - name: Checkout the base branch
         uses: actions/checkout@v7.0.1
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.base.sha }}
 
       - name: Require a receipt for every gating marker
         env:
