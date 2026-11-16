@@ -394,6 +394,66 @@
       "thresholds": {
         "ignored": 0
       }
+    },
+    "backup-no-open": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp tests::no_open_backup -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp tests::the_backup_arm_refuses -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp tests::the_fallback_ -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp tests::restore_copy_ -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp tests::restore_verify_ -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::no_open_export -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::a_mixed_wal_pair_exports -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::a_wal_that_keeps_changing -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::copy_file_bracketed -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::storage_status_and_no_open_backup -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp storage::snapshot::tests -- --test-threads=1"
+      ],
+      "tests": [
+        "tests::no_open_backup_refuses_while_the_daemon_lock_is_held",
+        "tests::the_backup_arm_refuses_no_open_before_any_file_copy",
+        "tests::restore_copy_preserves_a_frozen_wal_and_the_checkpoint_shadow",
+        "tests::restore_copy_keeps_an_active_wal_active",
+        "tests::restore_copy_drops_a_stale_active_wal_when_the_snapshot_wal_is_frozen",
+        "tests::restore_copy_overwrites_orphan_target_wal_and_sidecar_from_snapshot",
+        "tests::restore_copy_drops_orphan_target_wal_and_sidecar_when_snapshot_has_none",
+        "tests::restore_copy_without_snapshot_wal_or_sidecar_and_no_orphans_succeeds",
+        "tests::restore_verify_accepts_an_uncoordinated_snapshot_whose_integrity_holds",
+        "store::ladybug::tests::no_open_export_preserves_the_frozen_wal_role_and_the_checkpoint_shadow",
+        "store::ladybug::tests::a_wal_that_keeps_changing_aborts_the_export",
+        "store::ladybug::tests::copy_file_bracketed_retries_once_and_aborts_on_a_second_change",
+        "store::ladybug::tests::storage_status_and_no_open_backup_succeed_on_strict_wal_refused_store",
+        "storage::snapshot::tests::an_uncoordinated_manifest_never_verifies_as_fully_valid",
+        "storage::snapshot::tests::a_coordinated_manifest_still_verifies_as_valid",
+        "storage::snapshot::tests::the_checkpoint_shadow_and_pinned_marker_are_snapshot_members",
+        "tests::no_open_backup_fails_closed_when_the_lock_probe_errors",
+        "tests::restore_copy_places_both_wal_sides_and_drops_stale_ones",
+        "tests::restore_copy_refuses_a_both_wal_snapshot_missing_a_side",
+        "store::ladybug::tests::a_mixed_wal_pair_exports_both_sides",
+        "storage::snapshot::tests::a_both_wal_manifest_verifies_only_with_both_sides",
+        "storage::snapshot::tests::a_version_1_legacy_snapshot_still_verifies",
+        "storage::snapshot::tests::a_version_1_manifest_claiming_both_is_invalid",
+        "storage::snapshot::tests::a_version_2_manifest_without_wal_kind_is_invalid",
+        "storage::snapshot::tests::a_version_2_manifest_with_an_unknown_wal_kind_is_invalid",
+        "storage::snapshot::tests::an_unsupported_snapshot_version_is_refused",
+        "storage::snapshot::tests::select_expired_counts_version_1_and_version_2_snapshots",
+        "tests::restore_copy_reads_a_version_1_legacy_snapshot_as_active",
+        "tests::restore_copy_refuses_a_version_1_manifest_claiming_both",
+        "tests::restore_copy_refuses_a_version_2_manifest_without_wal_kind",
+        "storage::snapshot::tests::a_one_sided_manifest_with_a_frozen_member_is_refused",
+        "storage::snapshot::tests::a_both_manifest_missing_the_active_side_is_refused",
+        "tests::restore_copy_refuses_a_one_sided_snapshot_carrying_the_frozen_member",
+        "tests::restore_copy_refuses_a_both_wal_snapshot_missing_the_active_side",
+        "tests::the_fallback_arm_is_gated_before_any_file_copy",
+        "tests::the_fallback_refuses_when_the_lock_probe_errors",
+        "storage::snapshot::tests::a_none_manifest_with_a_wal_member_is_refused",
+        "tests::restore_copy_refuses_a_none_wal_snapshot_carrying_a_wal_member",
+        "tests::restore_copy_restores_a_clean_none_wal_snapshot"
+      ],
+      "thresholds": {
+        "ignored": 0,
+        "_note": "scripts/remediation-eval.sh enforces only `ignored` and the exact `tests` names; any other count here would be inert, so none are listed."
+      }
     }
   }
 }
