@@ -4433,13 +4433,9 @@ mod tests {
         drop(seed);
         // The stale label: the sidecar reads pristine under ModelA
         // although the table holds the seeded row.
-        crate::model_choice::write_store_state(
+        crate::model_choice::write_store_state_identity(
             &db_path,
-            &crate::model_choice::StoreState {
-                version: crate::model_choice::STORE_STATE_VERSION,
-                has_data: false,
-                descriptor: descriptor("ModelA"),
-            },
+            &crate::model_choice::StoreState::new(false, descriptor("ModelA")),
         )
         .expect("rewrite the sidecar to the pristine label");
 
@@ -4651,13 +4647,9 @@ mod tests {
         drop(seed);
         // The stale label: the sidecar reads pristine under ModelA
         // although the table holds the seeded row.
-        crate::model_choice::write_store_state(
+        crate::model_choice::write_store_state_identity(
             &db_path,
-            &crate::model_choice::StoreState {
-                version: crate::model_choice::STORE_STATE_VERSION,
-                has_data: false,
-                descriptor: descriptor("ModelA"),
-            },
+            &crate::model_choice::StoreState::new(false, descriptor("ModelA")),
         )
         .expect("rewrite the sidecar to the pristine label");
 
@@ -6992,9 +6984,10 @@ async fn run() -> anyhow::Result<()> {
                                 config.db_path, e
                             );
                             eprintln!(
-                                "Storage diagnostics (no-open): store_bytes={}, wal_bytes={}, wal_recovery_artifact_count={}, wal_recovery_artifact_bytes={}",
+                                "Storage diagnostics (no-open): store_bytes={}, wal_bytes={}, wal_age_secs={:?}, wal_recovery_artifact_count={}, wal_recovery_artifact_bytes={}",
                                 status.store_bytes,
                                 status.wal_bytes,
+                                status.wal_age_secs,
                                 status.wal_recovery_artifact_count,
                                 status.wal_recovery_artifact_bytes,
                             );

@@ -54,18 +54,34 @@ pub struct StorageStatus {
     pub last_checkpoint_duration_ms: Option<u64>,
     pub checkpoint_failures: u32,
     pub snapshot_export_dir: String,
-    /// Whether the store was opened through a WAL recovery fallback
-    /// (checksum-mismatch reopen, unverified-WAL replay, or WAL-discard
-    /// reopen) rather than the normal verified open. A recovered open's
-    /// view of the store is unauthenticated; operators should treat it as
-    /// degraded provenance. Defaults to `false`.
+    /// Whether **this process's live handle** was opened through a WAL
+    /// recovery fallback (checksum-mismatch reopen, unverified-WAL replay,
+    /// or WAL-discard reopen) rather than the normal verified open. A
+    /// recovered open's view of the store is unauthenticated; operators
+    /// should treat it as degraded provenance. Defaults to `false`.
+    ///
+    /// Handle-scoped by design (`#212`): it is `false` whenever no live
+    /// handle in this process recorded a recovery, even when the store-state
+    /// sidecar holds one. Use [`Self::last_recovery_at`] for "did this store
+    /// ever recover?"; the sidecar's history must not make a verified daemon
+    /// look degraded.
     #[serde(default)]
     pub opened_via_recovery: bool,
     /// Which recovery arm opened the store (`checksum_config_mismatch`,
     /// `unverified_wal_replay`, or `discarded_unreadable_wal`) when opened via
-    /// recovery (#194).
+    /// recovery (#194). Live layer first: this process's kind when it has
+    /// one, otherwise the persisted `last_recovery.kind` — the answer a
+    /// path-only `storage status` can give. See also
+    /// [`Self::last_recovery_at`], which is always history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_provenance: Option<String>,
+    /// RFC 3339 UTC timestamp of the store's last recorded recovery open
+    /// (`#212`), from the store-state sidecar. History, not live state: it
+    /// survives a verified reopen, so it answers "did this store ever
+    /// recover?" for a live daemon and a path-only query alike. `None` when
+    /// no recovery is recorded (or the store has no sidecar).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_recovery_at: Option<String>,
     /// Number of preserved `.wal.unclean.*` / `.wal.corrupted.*` recovery
     /// artifacts sitting beside the store (#195).
     #[serde(default)]
@@ -74,6 +90,20 @@ pub struct StorageStatus {
     /// recovery artifacts sitting beside the store (#195).
     #[serde(default)]
     pub wal_recovery_artifact_bytes: u64,
+    /// Age in whole seconds of the newest active/frozen WAL file beside the
+    /// store (`<store>.wal`, `<store>.wal.checkpoint`; #212). `null` when
+    /// neither exists. Measured over regular files only: a symlink at either
+    /// name is not a WAL this store wrote and contributes no age, while
+    /// `wal_bytes` (unchanged by #212) follows the names as the engine does
+    /// and therefore can count a symlink's target. Read the pair as "how
+    /// long has this store been dirty", remembering that the two fields do
+    /// not necessarily describe the same file set.
+    ///
+    /// Serialized even when absent, as `"wal_age_secs": null`: the runbook
+    /// promises the key, and a consumer polling a healthy (WAL-free) store
+    /// must see the field it would see on a dirty one.
+    #[serde(default)]
+    pub wal_age_secs: Option<u64>,
     /// Whether this process stopped checkpointing because one ran out of
     /// buffer pool (#211). While set, the engine's `auto_checkpoint` and
     /// `force_checkpoint_on_close` are off on the shared database config, so
@@ -106,6 +136,42 @@ pub fn record_recovery_provenance(store_path: &Path, provenance: Option<&str>) {
         None => {
             guard.remove(store_path);
         }
+    }
+}
+
+/// The RFC 3339 UTC timestamp the durable provenance records (`#212`).
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+/// Record a recovery open for `store_path` (#194, #212).
+///
+/// Two layers, deliberately: the process-local map is the live fallback
+/// (it answers for a store with no sidecar, and for the process that just
+/// opened it), and the store-state sidecar holds the durable record a
+/// fresh, path-only `storage status` reports. A `None` provenance clears
+/// only the live layer: the sidecar's `last_recovery` records history, and
+/// a later verified open does not rewrite what happened.
+pub fn record_recovery_open(store_path: &Path, provenance: Option<&str>, wal_bytes: u64) {
+    record_recovery_provenance(store_path, provenance);
+    let Some(kind) = provenance else {
+        return;
+    };
+    match crate::model_choice::record_store_state_recovery(
+        store_path,
+        kind,
+        wal_bytes,
+        &now_rfc3339(),
+    ) {
+        // The store has no recorded sidecar (fresh or pre-sidecar): the
+        // in-process map is its only provenance layer, and inventing a
+        // sidecar here would claim an identity this process cannot attest.
+        Ok(true) => {}
+        Ok(false) => tracing::debug!(
+            "recovery provenance for {} stays process-local: no recorded store-state sidecar to extend",
+            store_path.display()
+        ),
+        Err(e) => tracing::warn!("store-state recovery provenance write failed: {e}"),
     }
 }
 
@@ -277,7 +343,13 @@ fn recorded_checkpoint_latch(store_path: &Path) -> CheckpointLatchStatus {
 
 /// Record a finished checkpoint. Called from the store's checkpoint path so
 /// `compute_storage_status` reports real hygiene data instead of constants.
-pub fn record_checkpoint_outcome(duration_ms: u64, ok: bool) {
+///
+/// The outcome is also persisted to the store-state sidecar (`#212`), so a
+/// fresh process — where these atomics read 0 — still reports the last real
+/// checkpoint and its failure count. A sidecar write failure is logged, not
+/// propagated: a checkpoint that succeeded must not be reported as failed
+/// because its bookkeeping could not be written.
+pub fn record_checkpoint_outcome(store_path: &Path, duration_ms: u64, ok: bool) {
     use std::sync::atomic::Ordering;
     LAST_CHECKPOINT_DURATION_MS.store(duration_ms, Ordering::Relaxed);
     LAST_CHECKPOINT_AT_SECS.store(
@@ -286,6 +358,14 @@ pub fn record_checkpoint_outcome(duration_ms: u64, ok: bool) {
     );
     if !ok {
         CHECKPOINT_FAILURES.fetch_add(1, Ordering::Relaxed);
+    }
+    if let Err(e) = crate::model_choice::record_store_state_checkpoint(
+        store_path,
+        &now_rfc3339(),
+        duration_ms,
+        ok,
+    ) {
+        tracing::warn!("store-state checkpoint outcome write failed: {e}");
     }
 }
 
@@ -302,11 +382,35 @@ pub fn compute_storage_status(
     let ckpt_wal_path = PathBuf::from(ckpt_wal_os);
     let wal_bytes = fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0)
         + fs::metadata(&ckpt_wal_path).map(|m| m.len()).unwrap_or(0);
+    let wal_age_secs = wal_age_secs(&wal_path, &ckpt_wal_path);
     let wal_artifacts = list_wal_recovery_artifacts(store_path);
     let wal_recovery_artifact_count = wal_artifacts.len();
     let wal_recovery_artifact_bytes: u64 = wal_artifacts.iter().map(|(_, len, _)| *len).sum();
-    let recovery_provenance = recorded_recovery_provenance(store_path);
     let checkpoint_latch = recorded_checkpoint_latch(store_path);
+    // Durable provenance (#212): the store-state sidecar survives the
+    // process that recovered, so a fresh, path-only status reports the last
+    // recovery and the recorded checkpoint health. The in-process map stays
+    // authoritative for this process (it is the live event); the sidecar is
+    // the fallback when the map has nothing.
+    let persisted = match crate::model_choice::read_store_state(store_path) {
+        crate::model_choice::StoreStateRead::Recorded(state) => Some(state),
+        // Absence is legitimate (fresh or pre-sidecar stores); an
+        // unparseable sidecar is an open-time refusal elsewhere and must not
+        // turn a status query into one.
+        crate::model_choice::StoreStateRead::Absent
+        | crate::model_choice::StoreStateRead::Unparseable(_) => None,
+    };
+    let live_recovery_provenance = recorded_recovery_provenance(store_path);
+    let recovery_provenance = live_recovery_provenance.clone().or_else(|| {
+        persisted
+            .as_ref()
+            .and_then(|state| state.last_recovery.as_ref())
+            .map(|recovery| recovery.kind.clone())
+    });
+    let last_recovery_at = persisted
+        .as_ref()
+        .and_then(|state| state.last_recovery.as_ref())
+        .map(|recovery| recovery.at.clone());
     let snapshot_dir = store_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -336,39 +440,41 @@ pub fn compute_storage_status(
             0
         }
     };
-    // Prefer the real checkpoint timestamp recorded in this process; the
-    // store directory's mtime is only a proxy and falls back when no
-    // checkpoint happened yet in this process.
-    let last_checkpoint_at = {
-        let recorded_ts = LAST_CHECKPOINT_AT_SECS.load(std::sync::atomic::Ordering::Relaxed);
-        if recorded_ts > 0 {
-            chrono::DateTime::from_timestamp(recorded_ts as i64, 0)
-                .map(|dt| dt.to_rfc3339())
-                .or_else(|| {
-                    fs::metadata(&snapshot_dir)
-                        .and_then(|m| m.modified())
-                        .ok()
-                        .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| {
-                            let dt = chrono::DateTime::<chrono::Utc>::from(
-                                std::time::UNIX_EPOCH + d,
-                            );
-                            dt.to_rfc3339()
-                        })
-                })
-        } else {
-            fs::metadata(&snapshot_dir)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| {
-                    let dt = chrono::DateTime::<chrono::Utc>::from(
-                        std::time::UNIX_EPOCH + d,
-                    );
-                    dt.to_rfc3339()
-                })
-        }
+    // Prefer the real checkpoint timestamp recorded in this process; then the
+    // durable record a previous process left in the sidecar (#212); then the
+    // store directory's mtime, which is only a proxy (and which remains the
+    // answer for a store that has never recorded a checkpoint here).
+    let dir_mtime = || {
+        fs::metadata(&snapshot_dir)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| {
+                let dt = chrono::DateTime::<chrono::Utc>::from(std::time::UNIX_EPOCH + d);
+                dt.to_rfc3339()
+            })
     };
+    let recorded_checkpoint_ts = LAST_CHECKPOINT_AT_SECS.load(std::sync::atomic::Ordering::Relaxed);
+    let in_process_checkpoint_at = if recorded_checkpoint_ts > 0 {
+        chrono::DateTime::from_timestamp(recorded_checkpoint_ts as i64, 0).map(|dt| dt.to_rfc3339())
+    } else {
+        None
+    };
+    let last_checkpoint_at = in_process_checkpoint_at
+        .or_else(|| {
+            persisted
+                .as_ref()
+                .and_then(|state| state.last_checkpoint_at.clone())
+        })
+        .or_else(dir_mtime);
+    let checkpoint_failures = CHECKPOINT_FAILURES
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .max(
+            persisted
+                .as_ref()
+                .map(|state| state.checkpoint_failures)
+                .unwrap_or(0),
+        );
     StorageStatus {
         store_path: store_path.display().to_string(),
         store_bytes,
@@ -380,25 +486,52 @@ pub fn compute_storage_status(
         checkpoint_interval_secs: config.checkpoint_interval_secs,
         last_checkpoint_at,
         // Only a checkpoint that actually happened in this process claims a
-        // duration: before the first checkpoint the atomic reads 0, and
-        // reporting `Some(0)` would be a fabricated metric. Mirrors the
-        // `last_checkpoint_at` guard above, which falls back to the
-        // directory mtime for the timestamp.
-        last_checkpoint_duration_ms: if LAST_CHECKPOINT_AT_SECS.load(std::sync::atomic::Ordering::Relaxed) > 0
-        {
+        // duration from the atomics: before the first checkpoint they read 0,
+        // and reporting `Some(0)` would be a fabricated metric. The persisted
+        // record answers for a previous process.
+        last_checkpoint_duration_ms: if recorded_checkpoint_ts > 0 {
             Some(LAST_CHECKPOINT_DURATION_MS.load(std::sync::atomic::Ordering::Relaxed))
         } else {
-            None
+            persisted
+                .as_ref()
+                .and_then(|state| state.last_checkpoint_duration_ms)
         },
-        checkpoint_failures: CHECKPOINT_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
+        checkpoint_failures,
         snapshot_export_dir: snapshot_dir.display().to_string(),
-        opened_via_recovery: recovery_provenance.is_some(),
+        // Handle-scoped (`#212`): only a live recovery in this process sets
+        // it. The persisted history is `last_recovery_at` + the path-only
+        // `recovery_provenance` fallback, so a verified daemon never looks
+        // degraded because the store recovered in an earlier process.
+        opened_via_recovery: live_recovery_provenance.is_some(),
         recovery_provenance,
+        last_recovery_at,
         wal_recovery_artifact_count,
         wal_recovery_artifact_bytes,
+        wal_age_secs,
         checkpoints_stopped: checkpoint_latch.stopped,
         checkpoint_skips: checkpoint_latch.skips,
     }
+}
+
+/// Age in whole seconds of the newest regular (non-symlink) WAL file of the
+/// pair (#212), or `None` when neither exists.
+fn wal_age_secs(active: &Path, frozen: &Path) -> Option<u64> {
+    let newest = [active, frozen]
+        .iter()
+        .filter_map(|path| {
+            let meta = fs::symlink_metadata(path).ok()?;
+            if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+                return None;
+            }
+            meta.modified().ok()
+        })
+        .max()?;
+    Some(
+        std::time::SystemTime::now()
+            .duration_since(newest)
+            .unwrap_or_default()
+            .as_secs(),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -878,6 +1011,178 @@ mod tests {
         assert!(!middle.exists());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `#212`: the status reports the age of the newest active/frozen WAL, and
+    /// nothing when the store has no WAL. A symlink is not a WAL this store
+    /// wrote, so it never contributes a size or an age.
+    #[test]
+    fn wal_age_secs_tracks_the_newest_wal_and_is_absent_without_one() {
+        let dir = temp_dir("wal-age");
+        let store = dir.join("age.lbug");
+        fs::write(&store, b"db").unwrap();
+        let cfg = StorageHygieneConfig::default();
+        assert_eq!(
+            compute_storage_status(&store, &cfg).wal_age_secs,
+            None,
+            "a store with no WAL has no WAL age"
+        );
+        let json = serde_json::to_value(compute_storage_status(&store, &cfg)).unwrap();
+        assert!(
+            json.get("wal_age_secs").is_some(),
+            "wal_age_secs is serialized even when absent (#212)"
+        );
+        assert_eq!(
+            json["wal_age_secs"],
+            serde_json::Value::Null,
+            "absence is `null`, not an omitted key (#212)"
+        );
+
+        let active = dir.join("age.lbug.wal");
+        let frozen = dir.join("age.lbug.wal.checkpoint");
+        fs::write(&active, b"active").unwrap();
+        fs::write(&frozen, b"frozen").unwrap();
+        let now = std::time::SystemTime::now();
+        let set_age = |path: &PathBuf, secs: u64| {
+            File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(now - std::time::Duration::from_secs(secs))
+                .unwrap();
+        };
+        set_age(&active, 30);
+        set_age(&frozen, 90);
+
+        let age = compute_storage_status(&store, &cfg)
+            .wal_age_secs
+            .expect("an active WAL has an age");
+        assert!(
+            (29..60).contains(&age),
+            "the age is the newest WAL's, not the older frozen side's: {age}"
+        );
+
+        // The frozen side alone still answers.
+        fs::remove_file(&active).unwrap();
+        let age = compute_storage_status(&store, &cfg)
+            .wal_age_secs
+            .expect("a frozen WAL has an age");
+        assert!(
+            (89..180).contains(&age),
+            "a store whose only WAL is the frozen side still reports its age: {age}"
+        );
+
+        // Neither side: null. A symlink at `.wal` is not counted either.
+        fs::remove_file(&frozen).unwrap();
+        assert_eq!(
+            compute_storage_status(&store, &cfg).wal_age_secs,
+            None,
+            "removing the pair returns the age to null"
+        );
+        #[cfg(unix)]
+        {
+            let victim = dir.join("victim.wal");
+            fs::write(&victim, b"not-this-store's-wal").unwrap();
+            std::os::unix::fs::symlink(&victim, &active).unwrap();
+            assert_eq!(
+                compute_storage_status(&store, &cfg).wal_age_secs,
+                None,
+                "a symlinked .wal is not a WAL this store wrote"
+            );
+        }
+    }
+
+    /// `#212`: a fresh process reading the status from the path alone (no
+    /// in-process map entry) reports the persisted recovery and checkpoint
+    /// health; the live in-process map still wins when it has an entry.
+    #[test]
+    fn storage_status_reads_the_persisted_recovery_and_checkpoint_health() {
+        let dir = temp_dir("persisted-status");
+        let store = dir.join("persisted.lbug");
+        fs::write(&store, b"db").unwrap();
+        crate::model_choice::write_store_state_identity(
+            &store,
+            &crate::model_choice::StoreState::new(true, test_descriptor()),
+        )
+        .expect("write the recorded sidecar");
+        crate::model_choice::record_store_state_recovery(
+            &store,
+            "discarded_unreadable_wal",
+            8192,
+            "2026-11-15T00:00:00Z",
+        )
+        .expect("record the recovery");
+        crate::model_choice::record_store_state_checkpoint(
+            &store,
+            "2026-11-15T00:00:01Z",
+            7,
+            false,
+        )
+        .expect("record the failed checkpoint");
+
+        // The fresh-process shape: the path-only query has no live entry.
+        record_recovery_provenance(&store, None);
+        let status = compute_storage_status(&store, &StorageHygieneConfig::default());
+        assert_eq!(
+            status.recovery_provenance.as_deref(),
+            Some("discarded_unreadable_wal"),
+            "the persisted recovery kind is reported as the fallback"
+        );
+        assert_eq!(
+            status.last_recovery_at.as_deref(),
+            Some("2026-11-15T00:00:00Z"),
+            "the persisted recovery timestamp is history and is reported"
+        );
+        assert!(
+            !status.opened_via_recovery,
+            "opened_via_recovery is handle-scoped: a path-only query never opened the store (#212)"
+        );
+        assert!(
+            status.checkpoint_failures >= 1,
+            "the persisted failure count reaches the status: {}",
+            status.checkpoint_failures
+        );
+        assert!(
+            status.last_checkpoint_at.is_some(),
+            "a recorded checkpoint timestamp is reported"
+        );
+        assert!(
+            status.last_checkpoint_duration_ms.is_some(),
+            "a recorded checkpoint duration is reported"
+        );
+
+        // The live layer is the fallback's superior: it answers for a store
+        // with no durable record, and it wins when both exist. It alone owns
+        // `opened_via_recovery`.
+        record_recovery_provenance(&store, Some("unverified_wal_replay"));
+        let live = compute_storage_status(&store, &StorageHygieneConfig::default());
+        assert_eq!(
+            live.recovery_provenance.as_deref(),
+            Some("unverified_wal_replay"),
+            "the in-process map stays authoritative for the kind"
+        );
+        assert!(
+            live.opened_via_recovery,
+            "a recorded live recovery is the only thing that sets the handle-scoped flag"
+        );
+        assert_eq!(
+            live.last_recovery_at.as_deref(),
+            Some("2026-11-15T00:00:00Z"),
+            "history is unchanged by the live layer"
+        );
+        record_recovery_provenance(&store, None);
+    }
+
+    fn test_descriptor() -> crate::traits::EmbeddingDescriptor {
+        crate::traits::EmbeddingDescriptor {
+            provider: "fastembed".to_string(),
+            model: "ModelA".to_string(),
+            revision: "onnx".to_string(),
+            dims: 4,
+            normalization: "unknown".to_string(),
+            preprocessing: "unknown".to_string(),
+            distance_metric: "cosine".to_string(),
+        }
     }
 
     fn temp_dir(name: &str) -> PathBuf {

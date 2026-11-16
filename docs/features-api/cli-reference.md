@@ -260,6 +260,8 @@ neurostrata-mcp taxonomy validate-dag
 
 ### `scenario`, `object-view`, `diff-tour` & `insights`
 Creates and evaluates counterfactual ontology scenarios (`create`, `stage-memory`, `stage-twin`, `apply-action`, `eval`, `diff`, `commit`), polymorphic object views (`object-view`), structural diff tours (`diff-tour`), and repository architectural insights (`insights`). Additional administration commands include `set-metadata`, `normalize-metadata`, `storage`, `chat`, `metrics`, `graphql`, and `kge`.
+
+`storage status` (no-open surface since #212) reports `wal_bytes` and `wal_age_secs` (regular files only) alongside artifact accounting, and answers "did this store ever recover?" from the store-state sidecar's `last_recovery { at, kind, wal_bytes }` history rather than from any live handle's flag; identity (`has_data`, descriptor) and health (checkpoint outcome) writes are split, and checkpoint outcomes persist to the sidecar so a fresh process reports the last real checkpoint.
 ```bash
 neurostrata-mcp scenario create <name> [--base <twin_id>]
 neurostrata-mcp scenario stage-memory <scenario_id> <memory.json>
