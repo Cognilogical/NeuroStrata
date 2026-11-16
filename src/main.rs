@@ -6,6 +6,7 @@ mod bench;
 mod buffer;
 mod community;
 mod compression;
+mod connectors;
 mod config;
 mod context;
 mod crash;
