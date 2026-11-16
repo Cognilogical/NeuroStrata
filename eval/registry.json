@@ -343,6 +343,25 @@
         "ignored": 0,
         "_note": "scripts/remediation-eval.sh enforces only `ignored` and the exact `tests` names; any other count here would be inert, so none are listed."
       }
+    },
+    "checkpoint-latch": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp checkpoint_latch -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp storage_status_reports_the_checkpoint_latch -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp a_checkpoint_out_of_pool_is_not_retried -- --test-threads=1"
+      ],
+      "tests": [
+        "storage::snapshot::tests::storage_status_reports_the_checkpoint_latch",
+        "store::ladybug::checkpoint_latch_tests::a_skipped_checkpoint_counts_as_a_skip_not_a_failure",
+        "store::ladybug::checkpoint_latch_tests::a_successful_checkpoint_after_the_latch_reenables_the_engine",
+        "store::ladybug::checkpoint_latch_tests::a_repeated_out_of_pool_failure_keeps_the_latch",
+        "store::ladybug::checkpoint_latch_tests::a_clean_close_after_the_re_enable_leaves_no_write_ahead_log",
+        "store::ladybug::buffer_pool_tests::a_checkpoint_out_of_pool_is_not_retried"
+      ],
+      "thresholds": {
+        "ignored": 0,
+        "_note": "scripts/remediation-eval.sh enforces only `ignored` and the exact `tests` names; any other count here would be inert, so none are listed."
+      }
     }
   }
 }
