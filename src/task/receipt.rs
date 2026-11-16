@@ -34,7 +34,12 @@ impl Receipt {
 /// identity — a receipt bound to those values only ever matches itself, so it
 /// never blocks.
 pub fn compute_worktree_state(worktree: &std::path::Path) -> (String, String) {
-    crate::workflow::connector::resolve_workflow_connector(worktree).capture_state_digest(worktree)
+    // Receipt binding is a trust-bearing input: it must be pure git
+    // observation, never a repo-supplied manifest's declared values
+    // (PR #206 V-3). The Git connector preserves the base non-git fallback
+    // (`none-{path_hash}` / `clean-{path_hash}`) inside its digest.
+    use crate::workflow::connector::WorkflowConnector as _;
+    crate::workflow::connector::GitWorkflowConnector.capture_state_digest(worktree)
 }
 
 #[cfg(test)]

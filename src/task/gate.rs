@@ -29,7 +29,10 @@ pub struct GateScope {
 
 impl GateScope {
     pub fn capture(root: &std::path::Path) -> Self {
-        crate::workflow::connector::resolve_workflow_connector(root).capture_scope(root)
+        // Gate scope is a trust-bearing gate input (PR #206 V-3): observe
+        // via the Git connector, never a repo-supplied manifest connector.
+        use crate::workflow::connector::WorkflowConnector as _;
+        crate::workflow::connector::GitWorkflowConnector.capture_scope(root)
     }
 }
 

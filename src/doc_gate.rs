@@ -166,7 +166,11 @@ pub fn evaluate_doc_gate(
     root: &Path,
     changed_paths_override: Option<Vec<String>>,
 ) -> DocGateReport {
-    let connector = crate::workflow::connector::resolve_workflow_connector(root);
+    // The doc gate is a trust-bearing consumer (PR #206 V-3): its changed
+    // set must be observed by the Git connector, never declared by a
+    // repo-supplied manifest connector.
+    use crate::workflow::connector::WorkflowConnector as _;
+    let connector = crate::workflow::connector::GitWorkflowConnector;
     let changed_paths = changed_paths_override.unwrap_or_else(|| connector.changed_paths(root));
 
     let mut violations: Vec<DocViolation> = Vec::new();

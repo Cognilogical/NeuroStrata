@@ -319,17 +319,31 @@ pub struct ManifestWorkflowConnector {
 }
 
 impl ManifestWorkflowConnector {
+    /// Single parse point for every manifest entry path (env var or
+    /// discovered file), so load-time validation cannot be bypassed.
+    fn load_manifest_file(manifest_path: PathBuf) -> Result<Self> {
+        let json = std::fs::read_to_string(&manifest_path)?;
+        let manifest: WorkflowConnectorManifest = serde_json::from_str(&json)?;
+        // A manifest must never impersonate the Git connector: "git" is the
+        // identity of pure git observation, and a repo-supplied file
+        // attesting it would corrupt audit trails that key on connector_id.
+        if manifest.connector_id.eq_ignore_ascii_case(GIT_CONNECTOR_ID) {
+            return Err(anyhow::anyhow!(
+                "workflow-connector manifest must not declare connector_id \"git\""
+            ));
+        }
+        Ok(Self {
+            manifest,
+            manifest_path,
+        })
+    }
+
     pub fn from_file(root: &Path) -> Result<Self> {
         // Check NEUROSTRATA_WORKFLOW_CONNECTOR_FILE env var
         if let Some(env_path) = std::env::var("NEUROSTRATA_WORKFLOW_CONNECTOR_FILE").ok() {
             let env_path = PathBuf::from(env_path);
             if env_path.is_file() {
-                let json = std::fs::read_to_string(&env_path)?;
-                let manifest: WorkflowConnectorManifest = serde_json::from_str(&json)?;
-                return Ok(Self {
-                    manifest,
-                    manifest_path: env_path,
-                });
+                return Self::load_manifest_file(env_path);
             }
         }
         // Check for .NeuroStrata/workflow-connector.json in root and ancestors
@@ -337,12 +351,7 @@ impl ManifestWorkflowConnector {
         for _ in 0..4 {
             let candidate = path.join(".NeuroStrata").join("workflow-connector.json");
             if candidate.is_file() {
-                let json = std::fs::read_to_string(&candidate)?;
-                let manifest: WorkflowConnectorManifest = serde_json::from_str(&json)?;
-                return Ok(Self {
-                    manifest,
-                    manifest_path: candidate,
-                });
+                return Self::load_manifest_file(candidate);
             }
             path.pop();
         }
@@ -471,13 +480,22 @@ mod tests {
         .unwrap();
 
         let connector = resolve_workflow_connector(root);
-        let scope = crate::task::gate::GateScope::capture(root);
+        // The manifest connector's OWN non-trust surface (status display):
+        // it serves its declared scope and digest through the trait.
+        let scope = connector.capture_scope(root);
         assert_eq!(scope.branch.as_deref(), Some("main"));
         assert_eq!(scope.worktree.as_deref(), Some("/custom/workspace"));
 
-        let digest = crate::task::receipt::compute_worktree_state(root);
+        let digest = connector.capture_state_digest(root);
         assert_eq!(digest.0, "manifest-rev-123");
         assert_eq!(digest.1, "manifest-clean-456");
+        // Trust-bearing paths must NOT serve those declared values (V-3):
+        // GateScope::capture and compute_worktree_state observe via Git.
+        let gate_scope = crate::task::gate::GateScope::capture(root);
+        assert_ne!(gate_scope.worktree.as_deref(), Some("/custom/workspace"));
+        let receipt_state = crate::task::receipt::compute_worktree_state(root);
+        assert_ne!(receipt_state.0, "manifest-rev-123");
+        assert_ne!(receipt_state.1, "manifest-clean-456");
 
         let report = connector.install_triggers(root).unwrap();
         assert_eq!(report.connector_id, "manifest");
@@ -515,6 +533,70 @@ mod tests {
         let scope = connector.capture_scope(root);
         assert_eq!(scope.branch.as_deref(), Some("feat/custom"));
         assert_eq!(scope.worktree.as_deref(), Some("/workspace/project"));
+    }
+
+    #[test]
+    fn receipt_state_ignores_manifest_attestation_in_git_repo() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .expect("git available in test env");
+            assert!(out.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "worker@example.com"]);
+        run(&["config", "user.name", "worker"]);
+        std::fs::write(root.join("tracked.txt"), "v1").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "baseline"]);
+        // Plant a manifest connector that attests a static declared state.
+        std::fs::create_dir_all(root.join(".NeuroStrata")).unwrap();
+        std::fs::write(
+            root.join(".NeuroStrata").join("workflow-connector.json"),
+            serde_json::json!({
+                "connector_id": "manifest",
+                "revision_id": "declared-rev-0000",
+                "dirty_state_hash": "declared-clean-hash",
+                "changed_paths": []
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let state = crate::task::receipt::compute_worktree_state(root);
+        assert_ne!(state.0, "declared-rev-0000", "receipt must not bind the declared revision");
+        assert_ne!(state.1, "declared-clean-hash", "receipt must not bind the declared hash");
+        assert_eq!(state, GitWorkflowConnector.capture_state_digest(root));
+        // Dirtying the tree must change the observed state.
+        std::fs::write(root.join("tracked.txt"), "v2").unwrap();
+        let dirty = crate::task::receipt::compute_worktree_state(root);
+        assert_ne!(dirty, state, "receipt state must change when the tree changes");
+        // Committing must change it again (HEAD observation), still not declared.
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "change"]);
+        let committed = crate::task::receipt::compute_worktree_state(root);
+        assert_ne!(committed, dirty);
+        assert_ne!(committed.0, "declared-rev-0000");
+    }
+
+    #[test]
+    fn manifest_connector_rejects_git_connector_id() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".NeuroStrata")).unwrap();
+        std::fs::write(
+            root.join(".NeuroStrata").join("workflow-connector.json"),
+            serde_json::json!({ "connector_id": "git", "revision_id": "x" }).to_string(),
+        )
+        .unwrap();
+        assert!(
+            ManifestWorkflowConnector::from_file(root).is_err(),
+            "a manifest declaring connector_id \"git\" must be rejected at load"
+        );
     }
 
     #[test]
