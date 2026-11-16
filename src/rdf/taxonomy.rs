@@ -3153,7 +3153,25 @@ async fn execute_advise(
 
 /// Render the context-budgeted `### Project Thesis & Domain Expertise:` section (`<= 800` chars)
 /// for `neurostrata_get_snapshot`. Only includes unrestricted (`is_public_access_policy`) rows.
+/// Whether the namespace has any thesis or concept row. The taxonomy view is
+/// built only from those two types, so without them it is empty. Reading by
+/// type keeps get_snapshot and every task block from listing the whole
+/// namespace (code rows included) and all its edges just to find nothing.
+async fn namespace_has_taxonomy_rows(store: &LadybugStore, namespace: &str) -> bool {
+    for memory_type in ["thesis", "concept"] {
+        match store.list(namespace, None, Some(memory_type)).await {
+            Ok(rows) if rows.is_empty() => {}
+            // Rows found, or the narrow read failed: fall back to the full read.
+            _ => return true,
+        }
+    }
+    false
+}
+
 pub async fn render_snapshot_taxonomy_section(store: &LadybugStore, namespace: &str) -> String {
+    if !namespace_has_taxonomy_rows(store, namespace).await {
+        return String::new();
+    }
     let now_ts = chrono::Utc::now().timestamp();
     let Ok((active_rows, active_edges)) = load_active_rows_and_edges(store, namespace, now_ts).await
     else {
@@ -3262,6 +3280,9 @@ pub async fn build_task_taxonomy_context(
     namespace: &str,
     task_text: &str,
 ) -> (Value, Value, String) {
+    if !namespace_has_taxonomy_rows(store, namespace).await {
+        return (Value::Null, Value::Array(Vec::new()), String::new());
+    }
     let now_ts = chrono::Utc::now().timestamp();
     let Ok((active_rows, active_edges)) = load_active_rows_and_edges(store, namespace, now_ts).await
     else {
@@ -4051,6 +4072,58 @@ mod tests {
             .filter_map(|v| v.as_str().map(String::from))
             .collect();
         assert!(insuff.contains(&"retrieval".to_string()));
+    }
+
+    /// A namespace with no thesis or concept rows gets no taxonomy section and
+    /// no task taxonomy context, and the check is by row type. A concept alone,
+    /// without a thesis, still counts.
+    #[tokio::test]
+    async fn auto_briefing_skips_namespaces_without_taxonomy_rows() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-autobrief-none";
+        store.init(ns).await.expect("init");
+        for i in 0..3 {
+            store
+                .upsert(ns, &format!("rule-{i}"), vec![0.1; 4], MemoryPayload {
+                    content: format!("An ordinary rule {i} about retrieval."),
+                    user_id: "kenton".to_string(),
+                    memory_type: "rule".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({}),
+                })
+                .await
+                .expect("seed rule");
+        }
+        assert!(!namespace_has_taxonomy_rows(&store, ns).await);
+        assert_eq!(render_snapshot_taxonomy_section(&store, ns).await, "");
+        let (thesis, concepts, prompt) =
+            build_task_taxonomy_context(&store, ns, "improve retrieval").await;
+        assert!(thesis.is_null());
+        assert_eq!(concepts, json!([]));
+        assert_eq!(prompt, "");
+
+        execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "upsert_concept".to_string(),
+                namespace: ns.to_string(),
+                slug: Some("rrf-fusion".to_string()),
+                pref_label: Some("RRF Fusion".to_string()),
+                definition: Some("Reciprocal rank fusion of retrieval lists.".to_string()),
+                domain: Some("retrieval".to_string()),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("concept without a thesis");
+        assert!(namespace_has_taxonomy_rows(&store, ns).await);
+        assert!(render_snapshot_taxonomy_section(&store, ns).await.contains("1 unrestricted concepts"));
     }
 
     #[tokio::test]
