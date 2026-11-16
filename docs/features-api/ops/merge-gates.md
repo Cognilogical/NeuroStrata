@@ -21,10 +21,12 @@ A review or comment that says `CHANGES-NEEDED`, `CHANGES NEEDED`,
 finding badge (`**P1 Badge**`, `**P2 Badge**`, the bare `P1-Badge` and
 shields.io forms) or a bold `**P1**` / `**P2**`. The Codex
 `<!-- codex-code-review-finding:v1 -->` comment is not a marker by itself: the
-badge inside the finding it annotates is the marker. Fenced code blocks and
-inline code are ignored everywhere, so a marker or receipt quoted in a fence or
-backtick span is not evidence. The PR body is not scanned: it often describes
-the gate itself.
+badge inside the finding it annotates is the marker. One tokenizer strips, in
+every mode: fenced blocks opened with ``` or ~~~ (any run length, and unclosed
+fences run to EOF), lines indented with four spaces or a tab, and inline code
+spans delimited by one or more backticks (the longest opening run wins). A
+marker or receipt inside any of those is not evidence. The PR body is not
+scanned: it often describes the gate itself.
 
 Each marker needs one receipt:
 
@@ -35,8 +37,10 @@ Each marker needs one receipt:
 
 `fixed@` and `filed` must be authored by the PR author or a maintainer
 (`OWNER` / `MEMBER` / `COLLABORATOR`). An association-less (`NONE`) account
-never counts, and the comment that carries the finding cannot receipt itself:
-the receipt must be a separate reply or body. `ruled:` remains maintainer-only.
+never counts, and the comment that carries the finding cannot supply its own
+`fixed@`/`filed`: those must be a separate reply or body. `ruled:` is the
+exception — a maintainer may rule in the finding's own body, because that is an
+explicit acceptance rather than a claim of repair.
 In `--pr` mode the script validates every commit and issue target against the
 API; fixture and legacy modes enforce authorship only and say on stderr that
 targets were not validated (fixtures may supply `valid-targets.json` to
@@ -48,22 +52,26 @@ review, and inline-review-comment events; the ruleset does **not** currently
 require the `gate-receipt` check, so while its result is visible it is not an
 enforced gate until the settings in "Required state" land.
 
-Receipts are bound to their finding. Every review thread, resolved or not, must
+Threads are bound to their findings. Every review thread, resolved or not, must
 carry its own `fixed@`/`filed`/maintainer `ruled:` reply: a receipt in thread A
-does not clear a marker in thread B, and review/issue-comment bodies form a
-separate pool that neither borrows nor lends receipts. Resolution alone never
-clears a finding: a resolved thread without a valid receipt stays outstanding.
-The fallback used when GraphQL is unavailable pools receipts globally across all
-inline comments (over-gating) and announces it; the legacy `--reviews-file` shim
-keeps a global, same-body pool.
+does not clear a marker in thread B. Resolution alone never clears a finding: a
+resolved thread without a valid receipt stays outstanding.
+
+Top-level review and issue-comment bodies are a **pooled count**, not per-body:
+their markers and receipts are summed, so a surplus receipt can clear a later
+marker in the same pool. The fallback used when GraphQL is unavailable pools
+receipts globally across all inline comments too — looser binding than thread
+mode, so it can under-gate by clearing an unrelated finding — and announces it
+on stderr. The legacy `--reviews-file` shim also keeps a global, same-body pool.
 
 Inline findings are counted from review threads when the GraphQL
 `reviewThreads` query answers. The query follows `pageInfo` cursors (at most 50
 pages) and requests up to 100 comments per thread; if a thread reports more
 comments than were returned, the script exits 1 instead of under-counting
 receipts or findings. If GraphQL is unavailable, every inline finding counts
-(over-gating) and the script says so on stderr; it never treats an unresolved
-thread as clearance.
+(scope is over-gated) but receipts are pooled globally (binding is looser than
+thread mode); the script says so on stderr and never treats an unresolved thread
+as clearance.
 
 GitHub Actions has no thread-resolution trigger: `pull_request_review_thread`
 is a webhook event only, and listing it in `on:` makes the workflow invalid. A

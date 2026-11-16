@@ -30,6 +30,11 @@ printf '**P1** error swallowed on retry\nNo receipt.\n' > "$tmp/bold-p1.txt"
 printf '**P1** error swallowed on retry\nfiled #207\n' > "$tmp/bold-p1-filed.txt"
 printf '**P2** slow query path\nNo receipt.\n' > "$tmp/bold-p2.txt"
 printf 'Nothing to see.\n```\n**P1 Badge** hidden finding\nfixed@deadbeef\n```\n' > "$tmp/fenced-only.txt"
+printf 'Nothing to see.\n~~~\n**P1 Badge** hidden finding\nfixed@deadbeef\n~~~\n' > "$tmp/tilde-fenced.txt"
+printf 'Nothing to see.\n~~~\n**P1 Badge** hidden finding\nfixed@deadbeef\n' > "$tmp/unclosed-fence.txt"
+printf '**P1 Badge** real finding\n    fixed@deadbeef\n' > "$tmp/indented-receipt.txt"
+printf '    **P1 Badge** indented finding\nfiled #207\n' > "$tmp/indented-marker.txt"
+printf '**P1 Badge** real finding\n``fixed@deadbeef``\n' > "$tmp/double-backtick-receipt.txt"
 printf '**P1 Badge** real finding\n`fixed@deadbeef`\n' > "$tmp/inline-code-receipt.txt"
 printf '**P1 Badge** real finding\n```\nfixed@deadbeef\n```\n' > "$tmp/fenced-receipt.txt"
 
@@ -104,6 +109,17 @@ if bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/bold-p2.txt" >/dev/
   exit 1
 fi
 bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/fenced-only.txt" >/dev/null
+bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/tilde-fenced.txt" >/dev/null
+bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/unclosed-fence.txt" >/dev/null
+bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/indented-marker.txt" >/dev/null
+if bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/indented-receipt.txt" >/dev/null 2>&1; then
+  echo "FAIL: an indented code line supplied a receipt" >&2
+  exit 1
+fi
+if bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/double-backtick-receipt.txt" >/dev/null 2>&1; then
+  echo "FAIL: a double-backtick span supplied a receipt" >&2
+  exit 1
+fi
 if bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/inline-code-receipt.txt" >/dev/null 2>&1; then
   echo "FAIL: a receipt inside inline code cleared a finding" >&2
   exit 1
@@ -186,6 +202,10 @@ if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/unknown-issue-recei
   exit 1
 fi
 bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/validated-target-receipt" >/dev/null
+if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/double-backtick-receipt" >/dev/null 2>&1; then
+  echo "FAIL: a double-backtick span in a reply cleared a finding" >&2
+  exit 1
+fi
 
 # Truncated review data must fail closed instead of under-counting (#218 P2).
 out=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/truncated-threads" 2>&1 >/dev/null || true)

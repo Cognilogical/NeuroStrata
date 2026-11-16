@@ -17,6 +17,10 @@ self-test exercises the same branching as `--pr` without network access.
   `fixed@`/`filed` receipts must name one of these targets, simulating the
   `--pr` API validation.
 
+Markers and receipts are read from the same tokenized text: ```/~~~ fences (any
+run, unclosed to EOF), 4-space/tab indented lines, and one-or-more-backtick
+spans are stripped in every mode.
+
 Receipt comments must be authored by a non-`NONE` association (fixture mode has
 no PR author), and `fixed@`/`filed` never count in the same comment as the
 finding. Without `valid-targets.json` the script prints that commit/issue
@@ -35,6 +39,7 @@ targets were not validated.
 | `top-level-marker-not-cleared-by-thread-receipt` | top-level `CHANGES-NEEDED`, receipt only in a thread → fail |
 | `thread-marker-not-cleared-by-top-level-receipt` | thread badge, receipt only at top level → fail |
 | `quoted-receipt-is-not-a-receipt` | body quotes `` `fixed@abcdef1` `` in inline code → fail |
+| `double-backtick-receipt` | ``fixed@abcdef1`` in a double-backtick span, valid target → still fail |
 | `none-author-receipt` | `filed #207` from `NONE` → fail |
 | `unvalidated-sha-receipt` | `fixed@0000000` not in `valid-targets.json` → fail |
 | `unknown-issue-receipt` | `filed #999999` not in `valid-targets.json` → fail |

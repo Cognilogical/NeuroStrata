@@ -3,14 +3,20 @@
 #
 # A gating marker is CHANGES-NEEDED / CHANGES NEEDED / DO-NOT-MERGE / DO NOT MERGE,
 # a P1/P2 finding badge (P1 Badge / P1-Badge / shields.io), or a bold **P1** /
-# **P2**. Inline findings come from review threads when GraphQL answers; if it
-# does not, every inline finding counts (over-gating beats a silent pass).
+# **P2**. Fenced blocks (``` and ~~~, any run, unclosed to EOF), indented code
+# lines, and inline code spans of one or more backticks are stripped before any
+# marker or receipt is read.
+#
+# Inline findings come from review threads when GraphQL answers. If it does not,
+# every inline finding counts and receipts pool globally — looser binding than
+# thread mode, so a receipt may clear an unrelated finding.
 #
 # Receipts: fixed@<sha> and filed #<issue> from the PR author or a maintainer
 # (OWNER / MEMBER / COLLABORATOR), never from an association-less account, and
-# never from the comment that carries the finding. ruled: <reason> only from a
-# maintainer. In --pr mode fixed@ is a commit on the PR history and filed # must
-# exist; fixture and legacy modes enforce authorship but cannot validate targets.
+# never from the comment that carries the finding. ruled: <reason> is the one
+# receipt allowed in the finding's own body; it is maintainer-only. In --pr mode
+# fixed@ is a commit on the PR history and filed # must exist; fixture and
+# legacy modes enforce authorship but cannot validate targets.
 #
 # Accounting: each review thread (resolved or not) must carry receipts for its
 # own markers, and top-level review/comment bodies form a separate pool.
@@ -49,25 +55,36 @@ combine() {
   printf '%s\n' "$@" | grep -v '^$' || true
 }
 
-# Fenced code blocks and inline code are not evidence. Applied to every mode.
+# One tokenizer, used by every mode. It drops fenced blocks (``` and ~~~, any
+# run length, unclosed to EOF), 4-space/tab indented lines, and inline code
+# spans delimited by one or more backticks (longest opening run wins).
+tokenizer_def='
+  def clean:
+    (split("\n")) as $lines
+    | (reduce $lines[] as $line ({ch: "", n: 0, out: []};
+        if .ch != "" then
+          if (($line | test("^ {0,3}(`{3,}|~{3,})[ ]*$"))
+              and ((($line | capture("^ {0,3}(?<f>`{3,}|~{3,})[ ]*$").f) as $f
+                    | (($f[0:1]) == .ch) and (($f | length) >= .n)))) then
+            .ch = "" | .n = 0
+          else . end
+        elif ($line | test("^ {0,3}(`{3,}|~{3,})")) then
+          (($line | capture("^ {0,3}(?<f>`{3,}|~{3,})").f) as $f
+           | .ch = ($f[0:1]) | .n = ($f | length))
+        elif ($line | test("^(    |\\t)")) then .
+        else .out += [($line | gsub("(`+)[^`]*?\\1"; ""))] end))
+    | .out | join("\n");
+'
+clean_filter="${tokenizer_def}"'clean'
+
 clean_stream() {
-  awk 'BEGIN { fence = 0 } /^[[:space:]]*```/ { fence = !fence; next } fence == 0' \
-    | sed -e 's/`[^`]*`//g'
-}
-
-count_markers() {
-  clean_stream | grep -Eoi 'CHANGES[-_ ]?NEEDED|DO[-_ ]?NOT[-_ ]?MERGE|P[12][[:space:]]*-?[[:space:]]*Badge|\*\*P[12]\*\*' | wc -l | tr -d ' ' || true
-}
-
-count_receipts() {
-  clean_stream | grep -Eoi 'fixed@[0-9a-f]{7,}|filed[[:space:]]+#[0-9]+' | wc -l | tr -d ' ' || true
+  jq -Rrs "$clean_filter"
 }
 
 # Shared jq definitions. Markers and receipts are extracted only from cleaned
 # bodies; receipts must come from an allowed author and not from the finding
 # comment; fixed@/filed targets must pass the mode's validation.
-jq_defs='
-  def clean: gsub("(?s)```.*?```"; "") | gsub("`[^`]*`"; "");
+jq_defs="${tokenizer_def}"'
   def mcount: [scan("CHANGES[-_ ]?NEEDED|DO[-_ ]?NOT[-_ ]?MERGE|P[12][[:space:]]*-?[[:space:]]*Badge|\\*\\*P[12]\\*\\*"; "i")] | length;
   def ucount: [scan("ruled:"; "i")] | length;
   def maint: (. == "OWNER") or (. == "MEMBER") or (. == "COLLABORATOR");
@@ -377,7 +394,7 @@ if [ "$thread_mode" = "threads" ]; then
   outstanding=$((top_outstanding + thread_outstanding))
 elif [ "$thread_mode" = "fallback" ]; then
   marker_entries=$(combine "$reviews_entries" "$comment_entries" "$pull_entries")
-  echo "gate-receipt: review-thread resolution unavailable; counting every inline finding (global receipt pool, may over-gate)" >&2
+  echo "gate-receipt: review-thread resolution unavailable; counting every inline finding with a global receipt pool (looser binding than thread mode; may under-gate)" >&2
   set_jq_args
   pool=$(printf '%s\n' "$marker_entries" | pool_stats true)
   markers=$(printf '%s' "$pool" | jq -r '.markers')
