@@ -276,11 +276,79 @@ mod tests {
 
     #[test]
     fn workflow_table_matches_kernel_edges() {
-        // Every table row must be a real kernel edge when its guard is satisfied.
+        // Every table row must be a real kernel edge when its guard is
+        // satisfied: evaluate each row through the kernel and check the
+        // exact target stage. (Previously this asserted only that the
+        // row strings were non-empty — any corruption kept it green.)
+        fn parse_stage(s: &str) -> WorkflowStage {
+            match s {
+                "unpreflighted" => WorkflowStage::Unpreflighted,
+                "context_loaded" => WorkflowStage::ContextLoaded,
+                "claimed" => WorkflowStage::Claimed,
+                "mutating" => WorkflowStage::Mutating,
+                "breath_required" => WorkflowStage::BreathRequired,
+                "pre_checkpoint" => WorkflowStage::PreCheckpoint,
+                "pre_publish" => WorkflowStage::PrePublish,
+                "completed" => WorkflowStage::Completed,
+                other => panic!("unknown stage in WORKFLOW_TABLE: {other}"),
+            }
+        }
+        fn stage_str(s: WorkflowStage) -> &'static str {
+            match s {
+                WorkflowStage::Unpreflighted => "unpreflighted",
+                WorkflowStage::ContextLoaded => "context_loaded",
+                WorkflowStage::Claimed => "claimed",
+                WorkflowStage::Mutating => "mutating",
+                WorkflowStage::BreathRequired => "breath_required",
+                WorkflowStage::PreCheckpoint => "pre_checkpoint",
+                WorkflowStage::PrePublish => "pre_publish",
+                WorkflowStage::Completed => "completed",
+            }
+        }
+        // The representative event that satisfies the row's guard.
+        fn representative_event(edge: &WorkflowEdgeSpec) -> WorkflowEvent {
+            match edge.event {
+                "load_context" => WorkflowEvent::LoadContext,
+                "claim_task" => WorkflowEvent::ClaimTask { has_valid_scope: true },
+                "mutate" => {
+                    if edge.to == "breath_required" {
+                        WorkflowEvent::Mutate { mutations_since_note_after: 5, breath_limit: 5 }
+                    } else {
+                        WorkflowEvent::Mutate { mutations_since_note_after: 1, breath_limit: 5 }
+                    }
+                }
+                "record_breath_note" => WorkflowEvent::RecordBreathNote,
+                "trigger_pre_checkpoint" => {
+                    WorkflowEvent::TriggerPreCheckpoint { has_receipt: true }
+                }
+                "checkpoint_passed" => WorkflowEvent::CheckpointPassed,
+                "trigger_pre_publish" => {
+                    WorkflowEvent::TriggerPrePublish { task_gate_ok: true, doc_gate_ok: true }
+                }
+                "publish_passed" => WorkflowEvent::PublishPassed,
+                "complete_task" => {
+                    WorkflowEvent::CompleteTask { has_extracted_memory: true, dirty_targets: 0 }
+                }
+                other => panic!("unknown event in WORKFLOW_TABLE: {other}"),
+            }
+        }
+        assert_eq!(WORKFLOW_TABLE.len(), 23, "WORKFLOW_TABLE must hold 23 edges");
         for edge in WORKFLOW_TABLE {
-            assert!(!edge.from.is_empty());
-            assert!(!edge.event.is_empty());
-            assert!(!edge.to.is_empty());
+            let out = evaluate_workflow_transition(
+                parse_stage(edge.from),
+                representative_event(edge),
+            );
+            assert!(
+                out.allowed,
+                "table row {} --{}--> {} rejected by kernel: {:?}",
+                edge.from, edge.event, edge.to, out.reason
+            );
+            assert_eq!(
+                out.to.map(stage_str),
+                Some(edge.to),
+                "table row {} --{}--> {} lands elsewhere in the kernel",
+                edge.from, edge.event, edge.to
+            );
         }
     }
 }
