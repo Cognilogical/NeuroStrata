@@ -2144,14 +2144,6 @@ mod buffer_pool_tests {
     }
 }
 
-/// Recovery open, used only after verification has already failed. The engine
-/// cannot currently verify a WAL it wrote itself once the process dies without a
-/// clean close: with checksums on, replay restores the catalog and discards
-/// every row; with them off, the same rows come back intact. See
-/// examples/wal_repro.rs, and bead neurostrata-kug for the upstream defect.
-///
-/// This trades tamper-evidence for the writes, so it is never the normal path
-
 /// Reads at most the first 25 bytes of a WAL and hands them to the header rule.
 fn read_wal_header_probe(path: &std::path::Path) -> crate::store::wal_header::HeaderProbe {
     use crate::store::wal_header::HeaderProbe;
@@ -2716,26 +2708,33 @@ fn quarantine_wal_side(
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&corrupted_file, std::fs::Permissions::from_mode(0o600));
     }
-    if foreign {
-        eprintln!(
-            "ERROR: the write-ahead log at {:?} belongs to another database; {} bytes were set aside.",
-            target, dropped_bytes
-        );
-        eprintln!(
-            "ERROR: they were kept at {:?} -- nothing of this store was discarded.",
-            corrupted_file
-        );
-    } else {
-        eprintln!(
-            "ERROR: DATA LOSS. {} bytes of un-checkpointed writes could not be replayed even unverified, and were discarded to reopen the database.",
-            dropped_bytes
-        );
-        eprintln!(
-            "ERROR: they were kept at {:?} -- do not delete it if those writes mattered.",
-            corrupted_file
-        );
-    }
+    eprintln!(
+        "{}",
+        quarantine_message(foreign, &target, dropped_bytes, &corrupted_file)
+    );
     Ok(Some(corrupted_file))
+}
+
+/// What the quarantine message must say. A foreign WAL is not this store's data;
+/// a same-database WAL that merely cannot be replayed *is*, and the message must
+/// not tell the operator otherwise.
+fn quarantine_message(
+    foreign: bool,
+    target: &std::path::Path,
+    dropped_bytes: u64,
+    corrupted: &std::path::Path,
+) -> String {
+    if foreign {
+        format!(
+            "ERROR: the write-ahead log at {:?} belongs to another database; {} bytes were set aside and kept at {:?} -- nothing of this store was discarded.",
+            target, dropped_bytes, corrupted
+        )
+    } else {
+        format!(
+            "ERROR: DATA LOSS. {} bytes of un-checkpointed writes could not be replayed even unverified, and were discarded to reopen the database. They were kept at {:?} -- do not delete it if those writes mattered.",
+            dropped_bytes, corrupted
+        )
+    }
 }
 
 /// The arm-D target when the engine did not name a foreign side: the active
@@ -2756,13 +2755,15 @@ fn arm_d_target(local_path: &std::path::Path) -> crate::store::wal_accounting::S
 fn open_after_quarantine(
     local_path: &std::path::Path,
     initial: crate::store::wal_accounting::SideSet,
+    initial_foreign: bool,
 ) -> Result<Database> {
     let mut pending = initial;
+    let mut pending_foreign = initial_foreign;
     for attempt in 0..3 {
         let mut moved = false;
         for side in [WalSide::Active, WalSide::Frozen] {
             if pending.contains(wal_side_set(side))
-                && quarantine_wal_side(local_path, side, true)?.is_some()
+                && quarantine_wal_side(local_path, side, pending_foreign)?.is_some()
             {
                 moved = true;
             }
@@ -2782,7 +2783,10 @@ fn open_after_quarantine(
                     if pending.contains(wal_side_set(side)) {
                         break;
                     }
+                    // A side the engine names on the retry is foreign by
+                    // definition, whatever the initial attribution was.
                     pending = wal_side_set(side);
+                    pending_foreign = true;
                     continue;
                 }
                 return Err(e.into());
@@ -2949,7 +2953,8 @@ fn recover_from_wal_failure(
     preserved: &std::result::Result<PreservedPair, anyhow::Error>,
 ) -> Result<(Database, OpenProvenance)> {
     use crate::store::wal_accounting::{
-        classify_pair, disposition, Disposition, SideSet, WalAccounting,
+        classify_pair, consumed_sides, disposition, Disposition, SideSet, WalAccounting,
+        WalPairBytes,
     };
 
     let err_msg = error.to_string();
@@ -2998,7 +3003,7 @@ fn recover_from_wal_failure(
     // A clean foreign WAL fails the verified open on the database id and never
     // reaches a replay: quarantine it and reopen (arm D; `#207` BC-2).
     if arm_a_foreign.is_some() && !checksum_mismatch && !integrity_failure {
-        let db = open_after_quarantine(local_path, foreign)?;
+        let db = open_after_quarantine(local_path, foreign, true)?;
         return Ok((db, OpenProvenance::DiscardedUnreadableWal));
     }
 
@@ -3027,12 +3032,19 @@ fn recover_from_wal_failure(
             foreign = foreign.union(wal_side_set(side));
         }
     }
-    // A frozen WAL that a successful open removed was consumed by the engine.
-    let consumed = if lenient.is_ok() && pre.1.pre > 0 && post.1 == 0 {
-        SideSet::FROZEN
-    } else {
-        SideSet::EMPTY
-    };
+    // A frozen WAL that a successful open removed was consumed by the engine;
+    // the active side never is (`consumed_sides` owns that rule).
+    let consumed = consumed_sides(
+        &WalPairBytes {
+            active: pre.0.pre,
+            frozen: pre.1.pre,
+        },
+        &WalPairBytes {
+            active: post.0,
+            frozen: post.1,
+        },
+        lenient.is_ok(),
+    );
     let pair = pair_observation(pre, post, foreign, consumed);
     let verdict = classify_pair(pair);
 
@@ -3046,12 +3058,13 @@ fn recover_from_wal_failure(
             eprintln!(
                 "ERROR: the write-ahead log could not be replayed even unverified: {retry_e}"
             );
-            let initial = if foreign.is_empty() {
-                arm_d_target(local_path)
-            } else {
+            let initial_foreign = !foreign.is_empty();
+            let initial = if initial_foreign {
                 foreign
+            } else {
+                arm_d_target(local_path)
             };
-            let db = open_after_quarantine(local_path, initial)?;
+            let db = open_after_quarantine(local_path, initial, initial_foreign)?;
             return Ok((db, OpenProvenance::DiscardedUnreadableWal));
         }
     };
@@ -3090,7 +3103,7 @@ fn recover_from_wal_failure(
         }
         Disposition::Quarantine { sides } => {
             release_without_checkpoint(unverified_db);
-            let db = open_after_quarantine(local_path, sides)?;
+            let db = open_after_quarantine(local_path, sides, true)?;
             Ok((db, OpenProvenance::DiscardedUnreadableWal))
         }
         Disposition::DeferToVerifiedOpen { .. } => {
@@ -25169,6 +25182,14 @@ eurostrata\src\daemon.rs",
             funnel.contains("force_checkpoint_on_close=false"),
             "a refusing arm never lets ~Database() checkpoint over the WAL"
         );
+        assert!(
+            funnel.contains("consumed_sides("),
+            "the consumed-side decision is the pure `consumed_sides`, not an inline set (#207)"
+        );
+        assert!(
+            !funnel.contains("SideSet::BOTH"),
+            "no arm may mark both sides consumed: the active side is never a \"consumed checkpoint\" (#207)"
+        );
     }
 
     #[tokio::test]
@@ -27423,8 +27444,9 @@ eurostrata\src\daemon.rs",
 /// `#207` integration tests: one zero-record accounting across every recovery
 /// arm. They live in their own module, not in [`tests`], because the
 /// `lexical-generation` eval suite runs `store::ladybug::tests` with an
-/// `ignored: 0` threshold and most of these must stay `#[ignore]`d until
-/// Phase B wires the classifier into `with_system_config`.
+/// `ignored: 0` threshold; keeping them here lets the `wal-zero-record` suite
+/// run them as their own filter. All of them are live since Phase B wired the
+/// classifier into `with_system_config`.
 #[cfg(test)]
 mod wal_zero_record {
     use super::tests::{
@@ -27900,8 +27922,9 @@ mod wal_zero_record {
 
     /// `#207` row 2 — the checksum-mismatch arm: a `enableChecksums=false` WAL
     /// whose records are unreadable must not be checkpointed as a successful
-    /// recovery. Today the arm goes `Database::new(unverified_config())` →
-    /// `CHECKPOINT;` → verified reopen with no record accounting.
+    /// recovery. Before `#207` the arm went `Database::new(unverified_config())`
+    /// → `CHECKPOINT;` → verified reopen with no record accounting; it now
+    /// replays under the WAL's own flag and classifies before any checkpoint.
     #[tokio::test]
     async fn checksum_mismatch_arm_refuses_unreadable_records_before_checkpointing() {
         let root = std::env::temp_dir().join(format!(
@@ -28395,10 +28418,15 @@ mod wal_zero_record {
         let corrupted = wal_files_in(&root, "foreign-pair.lbug.wal.corrupted.");
         let corrupted_frozen = wal_files_in(&root, "foreign-pair.lbug.wal.checkpoint.corrupted.");
         assert_eq!(
-            corrupted.len() + corrupted_frozen.len(),
-            2,
-            "one quarantine artifact per foreign side (active {:?}, frozen {:?})",
-            corrupted,
+            corrupted.len(),
+            1,
+            "exactly one active-side quarantine artifact: {:?}",
+            corrupted
+        );
+        assert_eq!(
+            corrupted_frozen.len(),
+            1,
+            "exactly one frozen-side quarantine artifact: {:?}",
             corrupted_frozen
         );
         for path in corrupted.iter().chain(corrupted_frozen.iter()) {
@@ -28495,6 +28523,90 @@ mod wal_zero_record {
         let _ = std::fs::remove_dir_all(&root);
         restore_model_env(previous_model);
     }
+    /// `#207`: a refusal with **residual** bytes on the active side must not let
+    /// `~Database()` checkpoint the replay over the WAL. This is the mutation
+    /// that removes `force_checkpoint_on_close=false` from
+    /// `release_without_checkpoint`: without it the dropped handle rotates and
+    /// removes `<db>.wal`, and this assertion fails.
+    #[tokio::test]
+    async fn refusal_keeps_the_active_wal_when_it_still_has_bytes() {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-wal-refusal-residual-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("residual.lbug");
+        let previous_model = without_model_env();
+        store_with_checkpointed_schema(&db, &root).await;
+
+        // A fully valid active WAL: the lenient open replays it and truncates it
+        // to its own end, so `post == pre > 0`.
+        let cfg = SystemConfig::default()
+            .max_db_size(512 * 1024 * 1024)
+            .buffer_pool_size(64 * 1024 * 1024)
+            .throw_on_wal_replay_failure(true);
+        let raw = Database::new(&db, cfg).expect("raw open to seed the WAL");
+        let conn = Connection::new(&raw).expect("raw connection");
+        for i in 0..2 {
+            conn.query(&memory_row(&format!("residual-{i}")))
+                .expect("seed a committed WAL-only row");
+        }
+        conn.query("CALL force_checkpoint_on_close=false")
+            .expect("turn off checkpoint on close");
+        drop(conn);
+        drop(raw);
+
+        let wal = wal_of(&db);
+        let ckpt = ckpt_of(&db);
+        let seeded = std::fs::read(&wal).expect("read the seeded WAL");
+        let pre_active = seeded.len() as u64;
+        // The frozen side is unattributable: the pair verdict is `unknown`.
+        let mut corrupt = seeded.clone();
+        for byte in corrupt
+            .iter_mut()
+            .skip(WAL_HEADER_CHECKSUMMED_BYTES as usize)
+        {
+            *byte = 0xFF;
+        }
+        std::fs::write(&ckpt, &corrupt).expect("plant an unreadable frozen WAL");
+
+        let _wal_env_serial = WAL_ENV_LOCK.lock().await;
+        let previous_wal = allow_unverified_wal_recovery();
+        let result = LadybugStore::for_testing(&db, 8);
+        restore_wal_env(previous_wal);
+        drop(_wal_env_serial);
+
+        let err = match result {
+            Ok(store) => panic!(
+                "an unreadable frozen side must refuse, opened as {:?}",
+                store.open_provenance()
+            ),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("verdict `unknown`"),
+            "the refusal must name the verdict: {err}"
+        );
+        assert_eq!(
+            file_len(&wal),
+            pre_active,
+            "the active .wal still holds its residual bytes: a refusing arm must \
+             not checkpoint over it (#207)"
+        );
+        assert_eq!(
+            file_len(&ckpt),
+            corrupt.len() as u64,
+            "the frozen side is restored from its pre-open copy"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        restore_model_env(previous_model);
+    }
 }
 
 /// `#207` B8/P4: mandatory pair preservation for a refusing arm. Sibling of
@@ -28570,6 +28682,27 @@ mod wal_preservation {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn quarantine_message_distinguishes_foreign_from_same_database() {
+        let target = std::path::Path::new("/tmp/x.lbug.wal");
+        let corrupted = std::path::Path::new("/tmp/x.lbug.wal.corrupted.1");
+        let foreign = quarantine_message(true, target, 10, corrupted);
+        assert!(foreign.contains("belongs to another database"), "{foreign}");
+        assert!(
+            foreign.contains("nothing of this store was discarded"),
+            "{foreign}"
+        );
+        assert!(!foreign.contains("DATA LOSS"), "{foreign}");
+
+        let own = quarantine_message(false, target, 10, corrupted);
+        assert!(
+            own.contains("could not be replayed even unverified"),
+            "{own}"
+        );
+        assert!(own.contains("DATA LOSS"), "{own}");
+        assert!(!own.contains("another database"), "{own}");
     }
 
     #[test]

@@ -76,13 +76,17 @@ message carries one of six machine-readable slugs:
 | `replayed` | bytes survived, or a completed checkpoint was consumed | none; the message reports the truncation |
 | `foreign_wal` | the WAL belongs to another database (DB-ID mismatch) | the WAL is quarantined as `.corrupted.<ts>`; nothing of this store was lost |
 | `unknown` | the bytes could not be attributed | stop, inspect the preserved copy |
+| `deferred` | the WAL is larger than the 64 MiB scan cap, so it was not classified | the verified open ran; if it failed, treat the store as `committed_lost` |
 
 How the verdict reaches you:
 
 - `committed_lost` and `unknown` **refuse** the open. The message names the
   verdict, both WAL sizes, the restored side(s), and every preserved
   `.wal.unclean.<ts>` / `.wal.checkpoint.unclean.<ts>` path. The WAL is never
-  checkpointed over.
+  checkpointed over. Any side that lost every byte is restored from its
+  preserved copy, so a zero-record refusal leaves **both** `<db>.wal` and
+  `<db>.wal.checkpoint` on disk again (byte-identical to the pre-replay files);
+  a side that still has bytes is left as the engine truncated it.
 - `foreign_wal` **quarantines**: the named side (active, frozen, or both) is
   renamed to `.corrupted.<ts>` and the store reopens with
   `DiscardedUnreadableWal`, exactly as it always has for an unreadable WAL.

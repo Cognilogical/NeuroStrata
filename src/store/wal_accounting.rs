@@ -230,6 +230,47 @@ impl SideSet {
     }
 }
 
+/// Byte sizes of both WAL sides. `0` covers "absent" and "present but empty"
+/// on purpose: no arm may key on existence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WalPairBytes {
+    pub active: u64,
+    pub frozen: u64,
+}
+
+impl WalPairBytes {
+    /// Both sides empty. Test fixture value.
+    #[allow(dead_code)]
+    pub const ZERO: Self = Self {
+        active: 0,
+        frozen: 0,
+    };
+}
+
+/// Which sides a **successful** lenient open consumed, from the wiring's facts.
+///
+/// `WALReplayer::replayFrozenWAL` removes `<db>.wal.checkpoint` after either
+/// replaying it to completion (`completeInterruptedCheckpoint`, which makes the
+/// records durable) or reading nothing (`offsetDeserialized == 0`, which the
+/// pre-replay scan reports as `Unknown`). Only the frozen side can be consumed
+/// this way.
+///
+/// The active side is **never** consumed: `post == 0` on the active WAL means
+/// the engine truncated it to zero without replaying (`replayActiveWAL`
+/// truncates to `offsetDeserialized`, and only a commit moves that), so a
+/// proven commit there is a loss, not a completed checkpoint. Returning it here
+/// would turn that loss into a `Replayed` verdict.
+pub const fn consumed_sides(pre: &WalPairBytes, post: &WalPairBytes, lenient_ok: bool) -> SideSet {
+    if !lenient_ok {
+        return SideSet::EMPTY;
+    }
+    if pre.frozen > 0 && post.frozen == 0 {
+        SideSet::FROZEN
+    } else {
+        SideSet::EMPTY
+    }
+}
+
 /// What one side's pre-replay bytes prove about committed records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitEvidence {
@@ -279,6 +320,10 @@ pub struct WalScan {
 
 impl WalScan {
     /// A file with no bytes.
+    ///
+    /// Test fixture and diagnostic value; the funnel gets its scans from
+    /// [`scan_wal_with_cap`].
+    #[allow(dead_code)]
     pub const EMPTY: Self = Self {
         header: HeaderRead::Absent,
         header_verified: false,
@@ -338,6 +383,10 @@ impl WalScan {
 }
 
 /// Walks one WAL file's frames with the default [`MAX_SCAN_BYTES`] cap.
+///
+/// Convenience for tests and tooling; the funnel reads a capped prefix and calls
+/// [`scan_wal_with_cap`] so an oversized file is never read whole.
+#[allow(dead_code)]
 pub fn scan_wal(bytes: &[u8]) -> WalScan {
     scan_wal_with_cap(bytes, MAX_SCAN_BYTES)
 }
@@ -912,6 +961,11 @@ impl WalAccounting {
     /// Whether the arm may continue to its reopen. `ForeignWal` proceeds through
     /// arm D's quarantine rather than a plain `CHECKPOINT`; callers must use
     /// [`disposition`] to choose.
+    ///
+    /// The funnel switches on [`Disposition`], which also separates `ForeignWal`
+    /// (quarantine) and `Deferred` (no checkpoint); this stays as the predicate
+    /// the table tests and future arms assert against.
+    #[allow(dead_code)]
     pub const fn may_proceed(self) -> bool {
         matches!(
             self,
@@ -1463,6 +1517,72 @@ mod tests {
     }
 
     // ---- per-side classification ------------------------------------------
+
+    // ---- consumption (a successful open only ever consumes the frozen side)
+
+    #[test]
+    fn consumed_sides_marks_only_the_frozen_side() {
+        let pre = WalPairBytes {
+            active: 0,
+            frozen: 942,
+        };
+        let post = WalPairBytes::ZERO;
+        assert_eq!(consumed_sides(&pre, &post, true), SideSet::FROZEN);
+    }
+
+    #[test]
+    fn consumed_sides_never_marks_the_active_side() {
+        // The dangerous mutation: treating an active WAL truncated to zero as a
+        // consumed checkpoint would accept a lost commit as a replay.
+        let pre = WalPairBytes {
+            active: 530,
+            frozen: 0,
+        };
+        let post = WalPairBytes::ZERO;
+        assert_eq!(
+            consumed_sides(&pre, &post, true),
+            SideSet::EMPTY,
+            "the active side is never consumed"
+        );
+
+        let pre = WalPairBytes {
+            active: 530,
+            frozen: 942,
+        };
+        let post = WalPairBytes::ZERO;
+        assert_eq!(
+            consumed_sides(&pre, &post, true),
+            SideSet::FROZEN,
+            "only the frozen side is consumed when both emptied"
+        );
+    }
+
+    #[test]
+    fn consumed_sides_requires_a_successful_open() {
+        let pre = WalPairBytes {
+            active: 0,
+            frozen: 942,
+        };
+        let post = WalPairBytes::ZERO;
+        assert_eq!(consumed_sides(&pre, &post, false), SideSet::EMPTY);
+    }
+
+    #[test]
+    fn consumed_sides_is_empty_for_an_empty_pair_or_a_residual_frozen_side() {
+        assert_eq!(
+            consumed_sides(&WalPairBytes::ZERO, &WalPairBytes::ZERO, true),
+            SideSet::EMPTY
+        );
+        let pre = WalPairBytes {
+            active: 0,
+            frozen: 942,
+        };
+        let post = WalPairBytes {
+            active: 0,
+            frozen: 400,
+        };
+        assert_eq!(consumed_sides(&pre, &post, true), SideSet::EMPTY);
+    }
 
     #[test]
     fn no_wal_when_nothing_existed_before_or_after() {

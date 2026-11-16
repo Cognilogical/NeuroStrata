@@ -242,6 +242,10 @@
         "store::wal_accounting::tests::a_proven_loss_still_outranks_a_deferred_peer",
         "store::wal_accounting::tests::every_single_byte_mutation_of_a_length_or_type_byte_is_refused",
         "store::wal_accounting::tests::every_single_byte_mutation_of_a_checksums_off_wal_is_refused_or_kept_open",
+        "store::wal_accounting::tests::consumed_sides_marks_only_the_frozen_side",
+        "store::wal_accounting::tests::consumed_sides_never_marks_the_active_side",
+        "store::wal_accounting::tests::consumed_sides_requires_a_successful_open",
+        "store::wal_accounting::tests::consumed_sides_is_empty_for_an_empty_pair_or_a_residual_frozen_side",
         "store::wal_accounting::tests::no_wal_when_nothing_existed_before_or_after",
         "store::wal_accounting::tests::nothing_committed_when_the_uncommitted_bytes_held_no_commit",
         "store::wal_accounting::tests::committed_lost_when_a_commit_existed_and_no_bytes_survive",
@@ -288,6 +292,7 @@
         "store::wal_header::tests::header_source_is_none_for_two_zero_byte_files",
         "store::wal_header::tests::header_source_is_none_only_when_neither_wal_exists",
         "store::ladybug::wal_preservation::preserve_wal_pair_copies_both_sides_and_dedupes",
+        "store::ladybug::wal_preservation::quarantine_message_distinguishes_foreign_from_same_database",
         "store::ladybug::wal_preservation::preserve_wal_pair_reports_absent_sides",
         "store::ladybug::wal_preservation::preserve_wal_pair_refuses_a_symlinked_side",
         "store::ladybug::wal_preservation::preserve_unclean_wal_prunes_stale_artifacts_even_with_no_wal",
@@ -307,17 +312,19 @@
         "store::ladybug::wal_zero_record::mixed_header_pair_is_refused_and_both_wals_survive",
         "store::ladybug::wal_zero_record::strict_clean_foreign_wal_is_still_refused",
         "store::ladybug::wal_zero_record::foreign_active_and_frozen_are_both_quarantined",
-        "store::ladybug::wal_zero_record::oversized_wal_refuses_after_a_failed_verified_open"
+        "store::ladybug::wal_zero_record::oversized_wal_refuses_after_a_failed_verified_open",
+        "store::ladybug::wal_zero_record::refusal_keeps_the_active_wal_when_it_still_has_bytes"
       ],
       "thresholds": {
         "truth_table_verdicts": 7,
         "per_side_combination_checks": 440,
         "mutation_masks": 255,
         "header_rows": 11,
-        "preservation_rows": 6,
+        "preservation_rows": 7,
         "header_selection_rows": 2,
-        "integration_rows": 13,
-        "ignored": 0
+        "integration_rows": 14,
+        "ignored": 0,
+        "consumption_rows": 4
       }
     }
   }
