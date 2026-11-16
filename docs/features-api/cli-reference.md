@@ -292,3 +292,18 @@ neurostrata-mcp task complete <namespace> <id> --extracted-memory <memory_id>
 neurostrata-mcp task validate <namespace>
 neurostrata-mcp task gate <namespace> [--strict] [--self-test]
 ```
+
+---
+
+## 8. Data Connectors & Agent Kernel
+
+### `data-connector`
+Interact with external data pools via registered DataConnectors.
+```bash
+neurostrata-mcp data-connector list
+neurostrata-mcp data-connector describe --connector-id <connector_id> --pool-id <pool_id>
+neurostrata-mcp data-connector register-pointer --namespace <namespace> --payload @pointer.json --connector-id <connector_id> --pool-id <pool_id> --pointer-id <pointer_id> --pointer-uri <uri> --entity-type <entity_type> --captured-at-secs <captured_at_secs> --max-staleness-secs <max_staleness_secs>
+neurostrata-mcp data-connector resolve --namespace <namespace> --pointer-id <pointer_id> --offset <offset> --limit <limit> --max-bytes <max_bytes> --now-secs <now_secs>
+neurostrata-mcp data-connector apply-effect --namespace <namespace> --pointer-id <pointer_id> --operation <operation> --payload @effect.json --action-receipt-id <action_receipt_id> --idempotency-key <idempotency_key> --expected-source-sha256 <expected_source_sha256> --now-secs <now_secs>
+neurostrata-mcp data-connector mediate --namespace <namespace> --from-stage <from_stage> --to-stage <to_stage> --gate-passed <bool> --pointer-id <pointer_id> --offset <offset> --limit <limit> --max-bytes <max_bytes> --now-secs <now_secs>
+```

@@ -41,6 +41,10 @@
 - `neurostrata_scenario` — define counterfactual scenarios.
 - `neurostrata_action` — apply kinetic actions (state-machine mutations) via `POST /action`.
 
+## Central Agentic Kernel & DataConnector Tools
+
+- `neurostrata_data_connector` — execute an `AgentKernel` connector command: `list_connectors`, `describe_pool`, `register_pointer`, `list_pointers`, `resolve_pointer`, `apply_effect`, `mediate`.
+
 ## Subject-Matter Domain Expertise & SKOS Taxonomy
 
 - `neurostrata_taxonomy` — set up SKOS taxonomy (`set_thesis`, `upsert_concept`, `advise`, `validate_taxonomy_dag`).
@@ -57,6 +61,7 @@
 | GET | `/twin` | Digital twin state retrieval |
 | POST | `/scenario` | Create a counterfactual scenario |
 | POST | `/action` | Apply a kinetic action (state machine mutation) |
+| POST | `/data-connector` | Execute a DataConnector command (list/describe/register-pointer/resolve/apply-effect/mediate) |
 | GET | `/taxonomy` | Query SKOS concept graph |
 | POST | `/graphql` | Execute GraphQL queries over the ontology |
 

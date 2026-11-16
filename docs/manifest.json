@@ -42,7 +42,7 @@
       ]
     }
   },
-  "support_dirs": ["docs/releases", "docs/assets", "docs/archive"],
+  "support_dirs": ["docs/releases", "docs/assets", "docs/archive", "docs/superpowers"],
   "prohibited_filename_substrings": ["cognee", "oxirs", "mem0", "zep", "langmem"],
   "surface_rules": [
     {
@@ -154,6 +154,60 @@
       "required_headings": ["# Custom Providers, Ontologies & Action Packs"],
       "required_tokens": ["VectorStore", "Embedder", "JudgmentProvider", "ActionTypeDefinition"],
       "require_co_change_on_touch": true
+    },
+    {
+      "id": "central-agentic-kernel-surface",
+      "tier": "features_api",
+      "watch_paths": ["src/kernel/mod.rs", "src/kernel/ports.rs", "src/connectors/mod.rs", "src/formal_kernel.rs"],
+      "target_doc": "docs/features-api/agent-kernel-and-data-connectors.md",
+      "required_headings": [
+        "# Central Agentic Kernel & DataConnector",
+        "## Internal Storage Traits",
+        "## Principal-Scoped Kernel Ports",
+        "## Central AgentKernel",
+        "## Two-Phase DataConnector Gate",
+        "## Transport Parity"
+      ],
+      "required_tokens": [
+        "AgentKernel",
+        "TaskStore",
+        "OntologyStore",
+        "MemoryPort",
+        "ExecutivePort",
+        "OntologyPort",
+        "DataConnector",
+        "evaluate_connector_pre_gate",
+        "evaluate_connector_post_gate"
+      ],
+      "require_co_change_on_touch": false
+    },
+    {
+      "id": "data-connector-surface",
+      "tier": "extend",
+      "watch_paths": ["src/connectors/mod.rs", "src/kernel/mod.rs"],
+      "target_doc": "docs/extend/data-connectors.md",
+      "required_headings": [
+        "# Southbound DataConnector & Trusted DataPointer Model",
+        "## Fail-Closed Pre/Post Gates",
+        "## Trusted Pointer Model",
+        "## Write-Back Receipts"
+      ],
+      "required_tokens": [
+        "DataConnector",
+        "DataConnectorRegistry",
+        "DataPointerRecord",
+        "DataSliceRequest",
+        "DataSlicePayload",
+        "ExternalEffectRequest",
+        "ExternalEffectReceipt",
+        "DataPoolAccessMode",
+        "DataPoolSchema",
+        "InMemoryPoolConnector",
+        "JsonFilePoolConnector",
+        "evaluate_connector_pre_gate",
+        "evaluate_connector_post_gate"
+      ],
+      "require_co_change_on_touch": false
     }
   ]
 }

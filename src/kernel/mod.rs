@@ -93,7 +93,7 @@ impl AgentKernel {
         bus: Arc<ThalamicBus>,
         workspace_root: PathBuf,
     ) -> Self {
-        let workflows = Arc::new(WorkflowRegistry::new_with_defaults(workspace_root));
+        let workflows = Arc::new(WorkflowRegistry::new_with_defaults(workspace_root.clone()));
         let memory: Arc<dyn MemoryPort> = Arc::new(LadybugMemoryPort::new(store.clone()));
         let executive: Arc<dyn ExecutivePort> = Arc::new(LadybugExecutivePort::new(store.clone()));
         let ontology: Arc<dyn OntologyPort> = Arc::new(LadybugOntologyPort::new(store.clone()));
@@ -103,7 +103,7 @@ impl AgentKernel {
             executive,
             ontology,
             workflows,
-            connectors: Arc::new(DataConnectorRegistry::new()),
+            connectors: Arc::new(DataConnectorRegistry::new_with_defaults(workspace_root)),
             bus,
         }
     }
@@ -133,6 +133,16 @@ impl AgentKernel {
         crate::traits::VectorStore::as_any(self.store.as_ref())
             .downcast_ref::<crate::store::ladybug::LadybugStore>()
             .expect("kinetic kernel requires the LadybugDB store backend")
+    }
+
+    /// Current epoch seconds for dispatcher-level `now_secs` defaults, keeping
+    /// CLI/MCP/HTTP parity: a pre-epoch system clock maps to 0 and the pre-gate
+    /// then fails closed on the resulting future-clock-skew denial.
+    fn current_epoch_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
     }
 
     pub fn memory(&self) -> &Arc<dyn MemoryPort> {
@@ -343,7 +353,7 @@ impl AgentKernel {
         }
         let receipt = connector.apply_external_effect(&pointer.pool_id, &pointer.pointer_uri, req).await?;
         let source_digest_matches = req.expected_source_sha256.as_ref()
-            .map(|exp| exp == &receipt.new_source_sha256)
+            .map(|exp| exp == &receipt.prior_source_sha256)
             .unwrap_or(true);
         let post_input = KernelConnectorPostGateInput {
             op: KernelConnectorOp::ApplyWriteBack,
@@ -419,7 +429,7 @@ impl AgentKernel {
                 let now_secs = args
                     .get("now_secs")
                     .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
+                    .unwrap_or_else(Self::current_epoch_secs);
                 let result = self.resolve_pointer(namespace, &req, now_secs, principal).await?;
                 Ok(serde_json::to_value(&result)?)
             }
@@ -431,7 +441,7 @@ impl AgentKernel {
                 let now_secs = args
                     .get("now_secs")
                     .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
+                    .unwrap_or_else(Self::current_epoch_secs);
                 let result = self.apply_external_effect(namespace, &req, now_secs, principal).await?;
                 Ok(serde_json::to_value(&result)?)
             }
@@ -475,7 +485,7 @@ impl AgentKernel {
                 let now_secs = args
                     .get("now_secs")
                     .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
+                    .unwrap_or_else(Self::current_epoch_secs);
                 let (_, slice) = self
                     .mediate_workflow_data(namespace, from_stage, to_stage, gate_passed, &slice_req, now_secs, principal)
                     .await?;
@@ -992,6 +1002,151 @@ mod tests {
         assert_eq!(spy.resolve_calls.load(Ordering::SeqCst), 1); // no additional call
     }
 
+    fn now_epoch() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time after UNIX epoch")
+            .as_secs()
+    }
+
+    #[tokio::test]
+    async fn write_back_post_gate_compares_expected_digest_against_prior_source() {
+        let ns = "ns1";
+        let spy = Arc::new(SpyConnector::new("spy", DataPoolAccessMode::ReadWrite, 10, 1024));
+        let (kernel, store, _dir) = build_kernel(spy.clone());
+        store.init(ns).await.expect("init");
+        kernel
+            .register_pointer(ns, &pointer_record("ptr_cas", "spy", 1000, 100), Some(ns))
+            .await
+            .expect("register");
+        seed_receipt(&store, ns, "rcpt_cas", "ptr_cas", "pool1", false).await;
+
+        // expected == prior (the CAS digest is the PRE-write source digest) must
+        // pass even though the spy returns a different post-write new digest.
+        let mut req_ok = writeback_request("ptr_cas", "rcpt_cas");
+        req_ok.expected_source_sha256 = Some("prior".to_string());
+        let receipt = kernel
+            .apply_external_effect(ns, &req_ok, 1000, Some(ns))
+            .await
+            .expect("expected==prior must pass the post-gate");
+        assert!(receipt.applied);
+
+        // expected == the post-write new digest must now be rejected, and any
+        // other digest likewise denies at the post-gate.
+        let mut req_new = writeback_request("ptr_cas", "rcpt_cas");
+        req_new.expected_source_sha256 = Some("new-source-digest".to_string());
+        req_new.idempotency_key = "idem-cas-new".to_string();
+        let err = kernel
+            .apply_external_effect(ns, &req_new, 1000, Some(ns))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Post-gate"), "unexpected: {err}");
+    }
+
+    #[tokio::test]
+    async fn omitted_now_secs_defaults_to_current_epoch_for_resolve() {
+        let now = now_epoch();
+        let ns = "ns1";
+        let spy = Arc::new(SpyConnector::new("spy", DataPoolAccessMode::ReadWrite, 10, 1024));
+        let (kernel, store, _dir) = build_kernel(spy.clone());
+        store.init(ns).await.expect("init");
+        kernel
+            .register_pointer(ns, &pointer_record("ptr_now_resolve", "spy", now, 3600), Some(ns))
+            .await
+            .expect("register");
+
+        // Explicit now_secs must still be honored verbatim.
+        let err = kernel
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "resolve_pointer",
+                    "req": {"pointer_id": "ptr_now_resolve", "offset": 0, "limit": 1, "max_bytes": 64},
+                    "now_secs": 0
+                }),
+                Some(ns),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Pre-gate"), "unexpected: {err}");
+
+        // Omitted now_secs must track the current epoch, not 0.
+        let value = kernel
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "resolve_pointer",
+                    "req": {"pointer_id": "ptr_now_resolve", "offset": 0, "limit": 1, "max_bytes": 64}
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("omitted now_secs must resolve against the current epoch");
+        assert_eq!(value["pointer_id"], "ptr_now_resolve");
+    }
+
+    #[tokio::test]
+    async fn omitted_now_secs_defaults_to_current_epoch_for_apply() {
+        let now = now_epoch();
+        let ns = "ns1";
+        let spy = Arc::new(SpyConnector::new("spy", DataPoolAccessMode::ReadWrite, 10, 1024));
+        let (kernel, store, _dir) = build_kernel(spy.clone());
+        store.init(ns).await.expect("init");
+        kernel
+            .register_pointer(ns, &pointer_record("ptr_now_apply", "spy", now, 3600), Some(ns))
+            .await
+            .expect("register");
+        seed_receipt(&store, ns, "rcpt_now", "ptr_now_apply", "pool1", false).await;
+
+        let value = kernel
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "apply_effect",
+                    "req": {
+                        "pointer_id": "ptr_now_apply",
+                        "operation": "append",
+                        "payload": {"v": 3},
+                        "action_receipt_id": "rcpt_now",
+                        "idempotency_key": "idem-now"
+                    }
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("omitted now_secs must apply against the current epoch");
+        assert_eq!(value["applied"], true);
+    }
+
+    #[tokio::test]
+    async fn omitted_now_secs_defaults_to_current_epoch_for_mediate() {
+        let now = now_epoch();
+        let ns = "ns1";
+        let spy = Arc::new(SpyConnector::new("spy", DataPoolAccessMode::ReadWrite, 10, 1024));
+        let (kernel, store, _dir) = build_kernel(spy.clone());
+        store.init(ns).await.expect("init");
+        kernel
+            .register_pointer(ns, &pointer_record("ptr_now_mediate", "spy", now, 3600), Some(ns))
+            .await
+            .expect("register");
+
+        let value = kernel
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "mediate",
+                    "from_stage": "claimed",
+                    "to_stage": "mutating",
+                    "gate_passed": true,
+                    "slice_req": {"pointer_id": "ptr_now_mediate", "offset": 0, "limit": 1, "max_bytes": 64}
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("omitted now_secs must mediate against the current epoch");
+        assert_eq!(value["pointer_id"], "ptr_now_mediate");
+    }
+
     #[tokio::test]
     async fn kernel_construction_and_execution_accept_trait_object_store() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1009,6 +1164,9 @@ mod tests {
             )
             .await
             .expect("list_connectors");
-        assert!(value.as_array().map(|a| a.is_empty()).unwrap_or(false));
+        let ids = value.as_array().expect("connector ids array");
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&json!("json_file")));
+        assert!(ids.contains(&json!("memory_pool")));
     }
 }
