@@ -19,6 +19,7 @@ mod domain;
 mod embed;
 mod events;
 mod formal_kernel;
+mod kernel;
 mod fts;
 mod gliner;
 mod graph_read;

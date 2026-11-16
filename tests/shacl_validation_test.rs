@@ -67,6 +67,12 @@ pub mod domain {
     }
 }
 
+pub mod store {
+    /// Dummy LadybugStore type for the test. The function `can_write_namespace` in
+    /// `src/rebac.rs` references this type; it is unused in the test anyway.
+    pub struct LadybugStore;
+}
+
 pub mod rdf {
     pub mod action {
         use crate::shacl::ShaclViolation;
