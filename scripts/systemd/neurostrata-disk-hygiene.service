@@ -1,0 +1,14 @@
+[Unit]
+Description=NeuroStrata disk hygiene
+Documentation=file://%h/Documents/NeuroStrata/docs/features-api/ops/disk-hygiene.md
+# The script resolves the repository root from its own checkout, so the
+# ExecStart path below is the only thing that has to be right here.
+After=default.target
+
+[Service]
+Type=oneshot
+# --dry-run first: switch the flag off once the reported plan looks right.
+ExecStart=/bin/bash %h/Documents/NeuroStrata/scripts/disk-hygiene.sh --dry-run
+# The script deletes files under the user's own directories; it never needs
+# to be root.
+User=%U

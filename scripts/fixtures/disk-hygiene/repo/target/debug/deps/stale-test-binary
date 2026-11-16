@@ -1,0 +1,1 @@
+fixture binary: cargo owns its dependency artifacts, so disk-hygiene never deletes them

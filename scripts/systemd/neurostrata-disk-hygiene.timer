@@ -1,0 +1,11 @@
+[Unit]
+Description=Run NeuroStrata disk hygiene every six hours
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=6h
+# The script is a no-op while a build is running, so a timer tick that
+# lands during a long compile is harmless.
+
+[Install]
+WantedBy=timers.target

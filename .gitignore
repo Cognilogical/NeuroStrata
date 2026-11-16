@@ -40,6 +40,16 @@ proofs/.lake/
 .neuroplasticity/
 .worktrees/
 
+# The disk-hygiene fixtures mirror the real layout, so they contain a
+# `target/` and a `.worktrees/` that the rules above would swallow. The test
+# copies them into a scratch directory before anything is deleted.
+!scripts/fixtures/disk-hygiene/repo/target/
+!scripts/fixtures/disk-hygiene/repo/target/**
+!scripts/fixtures/disk-hygiene/repo/.worktrees/
+!scripts/fixtures/disk-hygiene/repo/.worktrees/**
+!scripts/fixtures/disk-hygiene/worktrees/
+!scripts/fixtures/disk-hygiene/worktrees/**
+
 .superpowers/
 .neurostrata/
 binaries/

@@ -1,0 +1,46 @@
+# cargo-audit configuration for NeuroStrata.
+#
+# cargo-audit reads the project-local configuration from .cargo/audit.toml
+# (a copy in the repository root is silently ignored — verified with
+# cargo-audit 0.22.1), so `cargo audit` at the repository root applies the
+# same exception list on CI and on a developer machine. Every entry below is
+# dated and justified: an entry without a date and a reason is not an
+# exception, it is an oversight.
+#
+# The list was written from a real `cargo audit --json` run on 2026-11-16
+# with cargo-audit 0.22.1 against advisory-db commit 02e2517f (2026-11-15):
+# exactly two vulnerabilities, both in quick-xml 0.37.5, plus two
+# unmaintained-crate warnings (paste 1.0.15 via tokenizers, and
+# proc-macro-error2 2.0.1) that are deliberately NOT ignored so they keep
+# being visible in the report.
+#
+# Reachability of quick-xml in this dependency graph:
+#   neurostrata-mcp -> sparesults 0.3.5 -> quick-xml 0.37.5
+# sparesults is a direct dependency and its XML result format is used by
+# src/rdf/scenario.rs (QueryResultsFormat::Xml), so the vulnerable parser is
+# compiled into the binary and reachable from a SPARQL query that asks for
+# XML output.
+
+[advisories]
+# RUSTSEC-2026-0194 (published 2026-06-29) — quick-xml 0.37.5: quadratic run
+#   time when checking a start tag for duplicate attribute names.
+#   Availability only: CVSS AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H — no
+#   confidentiality or integrity impact, a crafted XML document can burn CPU.
+# RUSTSEC-2026-0195 (published 2026-06-29) — quick-xml 0.37.5: unbounded
+#   namespace-declaration allocation in NsReader enables a memory-exhaustion
+#   denial of service. Same availability-only CVSS vector as above.
+#
+#   Why these are not fixed yet: upstream fixed both in quick-xml >= 0.41.0,
+#   but oxrdfxml 0.2.5 requires quick-xml ^0.37, and oxrdfxml reaches this
+#   graph through oxrdfio/oxigraph. Taking the patch therefore needs an
+#   upstream oxrdfxml release, not a change on our side.
+#   Mitigation today: the XML result format is opt-in per query; the default
+#   SPARQL result format is JSON, which does not go through quick-xml.
+#   Exception reviewed on: 2026-11-16. Review again by: 2026-12-16, or as
+#   soon as an oxrdfxml release lifts the quick-xml ^0.37 requirement —
+#   whichever comes first. Both entries are deleted from this list at that
+#   point, not extended.
+ignore = [
+  "RUSTSEC-2026-0194",
+  "RUSTSEC-2026-0195",
+]
