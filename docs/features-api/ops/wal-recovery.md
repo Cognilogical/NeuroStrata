@@ -36,12 +36,47 @@ before recovery.
 2. **Take a no-open snapshot backup before attempting recovery:**
    ```sh
    neurostrata-mcp backup /path/to/pre-recovery-backup --no-open
-   neurostrata-mcp storage verify-snapshot /path/to/pre-recovery-backup
+   neurostrata-mcp storage verify-snapshot --dir /path/to/pre-recovery-backup
    ```
    `backup --no-open` (and `backup` automatically when strict WAL verification
-   refuses an open) copies `<db>`, `<db>.wal` / `<db>.wal.checkpoint`, and
+   refuses an open) copies `<db>`, `<db>.wal` / `<db>.wal.checkpoint`, the
+   checkpoint state (`<db>.shadow` and `<db>.pinned.tmp` when present), and
    `<db>.store-state.json` directly into a checksummed snapshot directory
    without opening or checkpointing the store.
+
+   `--no-open` **refuses while a process holds the store lock** (`#209`): the
+   store may be mid-checkpoint, so the database, its WAL, and the shadow would
+   be copied at different instants. Run `backup <dir>` without `--no-open` to
+   have the daemon take a coordinated snapshot, or `shutdown` first — the
+   recovery path in this runbook runs with the daemon down, so it is not
+   affected.
+
+   The snapshot manifest records `coordinated: false` and
+   `provenance: "unverified"` for these copies, plus `wal_kind`
+   (`active` / `frozen` / `both` / `none`). `storage verify-snapshot` prints
+   `integrity ok, uncoordinated` for them rather than `valid`: the bytes match
+   their checksums, but nothing proves they came from one instant. They remain
+   restorable, and `restore` warns when it places one.
+
+   A one-sided WAL is stored as `ladybug.store.wal` inside the snapshot. A
+   **mixed pair** (`<db>.wal` and `<db>.wal.checkpoint` both present, which the
+   engine can accept as one store) is recorded as `wal_kind: "both"` and keeps
+   both byte streams: the active side in `ladybug.store.wal`, the frozen side
+   in `ladybug.store.wal.checkpoint`, each checksummed. `restore` puts the
+   stream(s) back under their own names (`<db>.wal` for `active`,
+   `<db>.wal.checkpoint` for `frozen`, both for `both`) and drops stale
+   companions of any other role, together with the shadow and pinned marker
+   when the snapshot carries them.
+
+   **Format version.** New snapshots are written as format version 2, which
+   mandates `wal_kind` and is the only version that can carry the frozen member.
+   Binaries from before #209 pin version 1 and therefore **refuse** a v2
+   snapshot with an unsupported-version error instead of verifying it and then
+   dropping the frozen side on restore. Version 1 snapshots (all backups taken
+   before this change) remain verifiable and restorable: they have no
+   `wal_kind`, and their WAL member is restored as the active `<db>.wal`. A v1
+   manifest that claims `wal_kind: "both"` is refused by both the verifier and
+   the restore.
 
 3. **Recover committed WAL prefix records with lenient tail truncation (operator opt-in):**
    ```sh

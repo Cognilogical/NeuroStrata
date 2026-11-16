@@ -7,7 +7,42 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const SNAPSHOT_FORMAT: &str = "neurostrata-snapshot";
-pub const SNAPSHOT_VERSION: u32 = 1;
+
+/// The snapshot format this build writes (#209, J7).
+///
+/// Version 2 records `wal_kind` (mandatory) and may carry a second WAL member
+/// (`ladybug.store.wal.checkpoint`) for a mixed pair. Older builds pin
+/// `version == 1`, so they refuse a v2 snapshot outright instead of verifying
+/// it and then silently dropping the frozen side on restore.
+pub const SNAPSHOT_VERSION: u32 = 2;
+
+/// The only format version written before #209, kept readable forever. A v1
+/// manifest has no `wal_kind`: its WAL member is the active `<db>.wal`.
+pub const SNAPSHOT_VERSION_LEGACY: u32 = 1;
+
+/// Whether this build can read `version` (legacy through current).
+pub fn snapshot_version_supported(version: u32) -> bool {
+    (SNAPSHOT_VERSION_LEGACY..=SNAPSHOT_VERSION).contains(&version)
+}
+
+/// Manifest provenance (#209).
+///
+/// `coordinated` means the export ran while this process held the store (the
+/// online `export_database` path, checkpoint included), so the database and
+/// its companions were captured under one lock. `unverified` means the files
+/// were copied straight off disk (`backup --no-open`, or its fallback when
+/// strict WAL verification refuses the open): the bytes are checksummed, but
+/// nothing proves the database, WAL, and shadow came from the same instant.
+pub const PROVENANCE_COORDINATED: &str = "coordinated";
+pub const PROVENANCE_UNVERIFIED: &str = "unverified";
+
+/// The WAL role a snapshot captured (#209): the active `<db>.wal`, the frozen
+/// `<db>.wal.checkpoint` a crashed checkpoint left behind, both sides of a
+/// mixed pair, or no WAL at all.
+pub const WAL_KIND_ACTIVE: &str = "active";
+pub const WAL_KIND_FROZEN: &str = "frozen";
+pub const WAL_KIND_BOTH: &str = "both";
+pub const WAL_KIND_NONE: &str = "none";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -546,11 +581,31 @@ pub struct SnapshotChecksums {
     /// files) deserialize and verify exactly as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_state_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wal_checkpoint_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotVerifyReport {
+    /// Fully valid: the checksums match **and** the snapshot was taken under
+    /// the store lock. Uncoordinated (`--no-open`) snapshots never set this.
     pub valid: bool,
+    /// The copied bytes match `checksums.json` (#209).
+    #[serde(default)]
+    pub integrity_ok: bool,
+    /// The manifest records that a daemon held the store for the export.
+    #[serde(default)]
+    pub coordinated: bool,
+    /// `coordinated` or `unverified`, as recorded in the manifest.
+    #[serde(default)]
+    pub provenance: String,
+    /// The WAL role the snapshot captured (`active`, `frozen`, or `none`).
+    #[serde(default)]
+    pub wal_kind: Option<String>,
     pub dir: PathBuf,
     pub checksums: Option<SnapshotChecksums>,
     pub error: Option<String>,
@@ -683,12 +738,38 @@ pub fn write_checksums(dir: &Path) -> Result<SnapshotChecksums, SnapshotError> {
     } else {
         None
     };
+    // The checkpoint shadow and its pinned marker are part of a crashed
+    // checkpoint's recovery state (#209): a tampered or truncated shadow must
+    // fail verification, not restore as a torn checkpoint.
+    let shadow = dir.join("ladybug.store.shadow");
+    let shadow_sha = if shadow.exists() {
+        Some(sha256_file(&shadow)?)
+    } else {
+        None
+    };
+    let pinned = dir.join("ladybug.store.pinned.tmp");
+    let pinned_sha = if pinned.exists() {
+        Some(sha256_file(&pinned)?)
+    } else {
+        None
+    };
+    // A mixed pair keeps its frozen side under its own member (#209): the
+    // `ladybug.store.wal` member alone cannot hold both byte streams.
+    let checkpoint_wal = dir.join("ladybug.store.wal.checkpoint");
+    let wal_checkpoint_sha = if checkpoint_wal.exists() {
+        Some(sha256_file(&checkpoint_wal)?)
+    } else {
+        None
+    };
 
     let checksums = SnapshotChecksums {
         ladybug_store_sha256: ladybug_sha,
         wal_sha256: wal_sha,
         manifest_sha256: manifest_sha,
         store_state_sha256: store_state_sha,
+        shadow_sha256: shadow_sha,
+        pinned_sha256: pinned_sha,
+        wal_checkpoint_sha256: wal_checkpoint_sha,
     };
 
     let checksums_path = dir.join("checksums.json");
@@ -720,12 +801,62 @@ pub fn verify_snapshot(dir: &Path) -> Result<SnapshotVerifyReport, SnapshotError
     let manifest: serde_json::Value = serde_json::from_str(&manifest_str)?;
     let format = manifest.get("format").and_then(|v| v.as_str()).unwrap_or("");
     let version = manifest.get("version").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-    if format != SNAPSHOT_FORMAT || version != SNAPSHOT_VERSION {
+    if format != SNAPSHOT_FORMAT || !snapshot_version_supported(version) {
         return Err(SnapshotError::InvalidManifest(format!(
-            "expected format={} version={}, got format={:?} version={:?}",
-            SNAPSHOT_FORMAT, SNAPSHOT_VERSION, format, version
+            "unsupported snapshot: expected format={} version={} (legacy version {} is also readable), got format={:?} version={:?}",
+            SNAPSHOT_FORMAT, SNAPSHOT_VERSION, SNAPSHOT_VERSION_LEGACY, format, version
         )));
     }
+    let legacy = version == SNAPSHOT_VERSION_LEGACY;
+
+    // Provenance (#209). Version 1 carried neither flag; it verifies exactly
+    // as before, so an old backup does not turn invalid merely because the
+    // field was added.
+    let coordinated = manifest
+        .get("coordinated")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let provenance = manifest
+        .get("provenance")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if coordinated {
+                PROVENANCE_COORDINATED.to_string()
+            } else {
+                PROVENANCE_UNVERIFIED.to_string()
+            }
+        });
+    let recorded_wal_kind = manifest.get("wal_kind").and_then(|v| v.as_str());
+    // Version 1 cannot express a mixed pair: a v1 reader (any build before
+    // #209) verifies such a manifest and then restores only the active side,
+    // so claiming `both` in v1 is a downgrade hazard, not a legacy shape.
+    if legacy && recorded_wal_kind == Some(WAL_KIND_BOTH) {
+        return Err(SnapshotError::InvalidManifest(format!(
+            "version {} snapshot claims wal_kind \"{}\", which only format version {} can express; a v1 reader would verify it and drop the frozen side",
+            SNAPSHOT_VERSION_LEGACY, WAL_KIND_BOTH, SNAPSHOT_VERSION
+        )));
+    }
+    // Version 2 makes the role mandatory: the reader must know whether the
+    // WAL member is active or frozen, and whether a second member exists.
+    if !legacy && recorded_wal_kind.is_none() {
+        return Err(SnapshotError::InvalidManifest(format!(
+            "version {} snapshot records no wal_kind; version {} manifests must record {}, {}, {} or {}",
+            version, SNAPSHOT_VERSION, WAL_KIND_ACTIVE, WAL_KIND_FROZEN, WAL_KIND_BOTH, WAL_KIND_NONE
+        )));
+    }
+    let wal_kind = match recorded_wal_kind {
+        Some(kind @ (WAL_KIND_ACTIVE | WAL_KIND_FROZEN | WAL_KIND_BOTH | WAL_KIND_NONE)) => {
+            Some(kind.to_string())
+        }
+        Some(other) => {
+            return Err(SnapshotError::InvalidManifest(format!(
+                "unrecognized wal_kind {:?}: expected {}, {}, {} or {}",
+                other, WAL_KIND_ACTIVE, WAL_KIND_FROZEN, WAL_KIND_BOTH, WAL_KIND_NONE
+            )))
+        }
+        None => None,
+    };
 
     let checksums_path = dir.join("checksums.json");
     if !checksums_path.exists() {
@@ -764,7 +895,23 @@ pub fn verify_snapshot(dir: &Path) -> Result<SnapshotVerifyReport, SnapshotError
         });
     }
 
-    let wal_mentioned = checksums.wal_sha256.is_some() || wal.exists();
+    let declares_both = wal_kind.as_deref() == Some(WAL_KIND_BOTH);
+    let declares_single = matches!(
+        wal_kind.as_deref(),
+        Some(WAL_KIND_ACTIVE) | Some(WAL_KIND_FROZEN)
+    );
+    let declares_none = wal_kind.as_deref() == Some(WAL_KIND_NONE);
+    // #209 (Codex P2): `none` means the snapshot owns no WAL. A WAL member (or
+    // a checksum naming one) under that manifest is an inconsistency, not a
+    // stray file to ignore: restore would silently leave it out.
+    if declares_none && (wal.exists() || checksums.wal_sha256.is_some()) {
+        return Err(SnapshotError::InvalidManifest(format!(
+            "wal_kind \"{}\" but the snapshot carries ladybug.store.wal (or its checksum); a snapshot with no WAL must not ship one",
+            WAL_KIND_NONE
+        )));
+    }
+    let wal_mentioned =
+        checksums.wal_sha256.is_some() || wal.exists() || declares_single || declares_both;
     if wal_mentioned {
         if !wal.exists() {
             return Err(SnapshotError::ChecksumMismatch {
@@ -779,6 +926,37 @@ pub fn verify_snapshot(dir: &Path) -> Result<SnapshotVerifyReport, SnapshotError
                 file: "ladybug.store.wal".into(),
                 expected: checksums.wal_sha256.clone().unwrap_or_default(),
                 actual: computed_wal,
+            });
+        }
+    }
+
+    // The frozen side of a mixed pair is a member of its own (#209): a
+    // `wal_kind: both` manifest must produce both streams, and a one-sided
+    // manifest must not carry the frozen member at all. Otherwise a restore
+    // could place a pair the manifest never promised.
+    let checkpoint_wal = dir.join("ladybug.store.wal.checkpoint");
+    if checkpoint_wal.exists() && !declares_both {
+        return Err(SnapshotError::InvalidManifest(format!(
+            "the snapshot carries ladybug.store.wal.checkpoint but its wal_kind is {:?}; a mixed pair is recorded as wal_kind \"{}\"",
+            wal_kind, WAL_KIND_BOTH
+        )));
+    }
+    let checkpoint_mentioned =
+        checksums.wal_checkpoint_sha256.is_some() || checkpoint_wal.exists() || declares_both;
+    if checkpoint_mentioned {
+        if !checkpoint_wal.exists() {
+            return Err(SnapshotError::ChecksumMismatch {
+                file: "ladybug.store.wal.checkpoint".into(),
+                expected: checksums.wal_checkpoint_sha256.clone().unwrap_or_default(),
+                actual: "<missing>".into(),
+            });
+        }
+        let computed_checkpoint = sha256_file(&checkpoint_wal)?;
+        if Some(&computed_checkpoint) != checksums.wal_checkpoint_sha256.as_ref() {
+            return Err(SnapshotError::ChecksumMismatch {
+                file: "ladybug.store.wal.checkpoint".into(),
+                expected: checksums.wal_checkpoint_sha256.clone().unwrap_or_default(),
+                actual: computed_checkpoint,
             });
         }
     }
@@ -806,6 +984,42 @@ pub fn verify_snapshot(dir: &Path) -> Result<SnapshotVerifyReport, SnapshotError
         }
     }
 
+    // The checkpoint shadow and pinned marker, under the same rule as the
+    // sidecar: a snapshot that carries one (or whose checksums name one) must
+    // produce it intact (#209).
+    for (name, path, recorded) in [
+        (
+            "ladybug.store.shadow",
+            dir.join("ladybug.store.shadow"),
+            checksums.shadow_sha256.as_ref(),
+        ),
+        (
+            "ladybug.store.pinned.tmp",
+            dir.join("ladybug.store.pinned.tmp"),
+            checksums.pinned_sha256.as_ref(),
+        ),
+    ] {
+        let mentioned = recorded.is_some() || path.exists();
+        if !mentioned {
+            continue;
+        }
+        if !path.exists() {
+            return Err(SnapshotError::ChecksumMismatch {
+                file: name.to_string(),
+                expected: recorded.cloned().unwrap_or_default(),
+                actual: "<missing>".into(),
+            });
+        }
+        let computed = sha256_file(&path)?;
+        if Some(&computed) != recorded {
+            return Err(SnapshotError::ChecksumMismatch {
+                file: name.to_string(),
+                expected: recorded.cloned().unwrap_or_default(),
+                actual: computed,
+            });
+        }
+    }
+
     // If a zstd-compressed manifest copy is present, verify it decompresses
     // within the bounded snapshot size cap AND that its content matches the
     // plain `manifest.json` bytes: a compressed copy drifting from the manifest
@@ -829,7 +1043,15 @@ pub fn verify_snapshot(dir: &Path) -> Result<SnapshotVerifyReport, SnapshotError
     }
 
     Ok(SnapshotVerifyReport {
-        valid: true,
+        // The bytes match their checksums (every check above returned Err
+        // otherwise), but only a coordinated snapshot earns the `valid`
+        // verdict: an uncoordinated pair cannot prove its members came from
+        // one instant (#209).
+        valid: coordinated,
+        integrity_ok: true,
+        coordinated,
+        provenance,
+        wal_kind,
         dir: dir.to_path_buf(),
         checksums: Some(checksums),
         error: None,
@@ -879,7 +1101,7 @@ pub fn select_expired_snapshots(root: &Path, keep: usize) -> Result<Vec<PathBuf>
         };
         let format = manifest.get("format").and_then(|v| v.as_str()).unwrap_or("");
         let version = manifest.get("version").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-        if format != SNAPSHOT_FORMAT || version != SNAPSHOT_VERSION {
+        if format != SNAPSHOT_FORMAT || !snapshot_version_supported(version) {
             continue;
         }
         let created_at = manifest.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
@@ -1194,12 +1416,21 @@ mod tests {
     }
 
     fn make_snapshot_dir(parent: &Path, snap_name: &str, created_at: &str) -> PathBuf {
+        make_snapshot_dir_with_version(parent, snap_name, created_at, SNAPSHOT_VERSION)
+    }
+
+    fn make_snapshot_dir_with_version(
+        parent: &Path,
+        snap_name: &str,
+        created_at: &str,
+        version: u32,
+    ) -> PathBuf {
         let d = parent.join(snap_name);
         fs::create_dir_all(&d).unwrap();
         let mut manifest = File::create(d.join("manifest.json")).unwrap();
         let content = format!(
             "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"{}\"}}",
-            SNAPSHOT_FORMAT, SNAPSHOT_VERSION, created_at
+            SNAPSHOT_FORMAT, version, created_at
         );
         manifest.write_all(content.as_bytes()).unwrap();
         d
@@ -1216,7 +1447,7 @@ mod tests {
         write_store(&d);
         let mut manifest = File::create(d.join("manifest.json")).unwrap();
         let content = format!(
-            "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\"}}",
+            "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"wal_kind\":\"none\"}}",
             SNAPSHOT_FORMAT, SNAPSHOT_VERSION
         );
         manifest.write_all(content.as_bytes()).unwrap();
@@ -1240,7 +1471,7 @@ mod tests {
         write_store(&d);
         let mut manifest = File::create(d.join("manifest.json")).unwrap();
         let content = format!(
-            "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\"}}",
+            "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"wal_kind\":\"none\"}}",
             SNAPSHOT_FORMAT, SNAPSHOT_VERSION
         );
         manifest.write_all(content.as_bytes()).unwrap();
@@ -1277,7 +1508,7 @@ mod tests {
         write_store(&d);
         let mut manifest = File::create(d.join("manifest.json")).unwrap();
         let content = format!(
-            "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\"}}",
+            "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"wal_kind\":\"none\"}}",
             SNAPSHOT_FORMAT, SNAPSHOT_VERSION
         );
         manifest.write_all(content.as_bytes()).unwrap();
@@ -1305,6 +1536,384 @@ mod tests {
             result,
             Err(SnapshotError::InvalidManifest(..))
         ));
+    }
+
+    #[test]
+    fn an_uncoordinated_manifest_never_verifies_as_fully_valid() {
+        // #209: a `--no-open` export records `coordinated: false` /
+        // `provenance: "unverified"`. Its bytes still have to match
+        // `checksums.json`, but the snapshot was captured without the store
+        // lock, so `verify-snapshot` must not call it fully `valid`.
+        let d = temp_dir("uncoordinated");
+        write_store(&d);
+        fs::write(
+            d.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"coordinated\":false,\"provenance\":\"unverified\",\"wal_kind\":\"active\"}}",
+                SNAPSHOT_FORMAT, SNAPSHOT_VERSION
+            ),
+        )
+        .unwrap();
+        fs::write(d.join("ladybug.store.wal"), b"wal-bytes").unwrap();
+        write_checksums(&d).unwrap();
+
+        let report = verify_snapshot(&d).expect("the copied bytes still verify");
+        assert!(report.integrity_ok, "the checksums still match");
+        assert!(
+            !report.coordinated,
+            "the manifest says it was uncoordinated"
+        );
+        assert!(
+            !report.valid,
+            "an uncoordinated snapshot must not report as fully valid (#209)"
+        );
+        assert_eq!(report.provenance, "unverified");
+        assert_eq!(report.wal_kind.as_deref(), Some("active"));
+    }
+
+    #[test]
+    fn a_coordinated_manifest_still_verifies_as_valid() {
+        let d = temp_dir("coordinated");
+        write_store(&d);
+        fs::write(
+            d.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"coordinated\":true,\"provenance\":\"coordinated\",\"wal_kind\":\"none\"}}",
+                SNAPSHOT_FORMAT, SNAPSHOT_VERSION
+            ),
+        )
+        .unwrap();
+        write_checksums(&d).unwrap();
+
+        let report = verify_snapshot(&d).expect("a coordinated snapshot verifies");
+        assert!(report.integrity_ok);
+        assert!(report.coordinated);
+        assert!(
+            report.valid,
+            "coordination is what buys the `valid` verdict"
+        );
+        assert_eq!(report.provenance, "coordinated");
+    }
+
+    #[test]
+    fn the_checkpoint_shadow_and_pinned_marker_are_snapshot_members() {
+        // #209: a crashed checkpoint leaves `<db>.shadow` and `<db>.pinned.tmp`
+        // beside the WAL. They are part of the snapshot, so they are
+        // checksummed like every other member and a tampered shadow fails
+        // verification instead of restoring as a torn checkpoint.
+        let d = temp_dir("shadow-members");
+        write_store(&d);
+        fs::write(
+            d.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"coordinated\":false,\"provenance\":\"unverified\",\"wal_kind\":\"frozen\"}}",
+                SNAPSHOT_FORMAT, SNAPSHOT_VERSION
+            ),
+        )
+        .unwrap();
+        fs::write(d.join("ladybug.store.wal"), b"frozen-wal").unwrap();
+        fs::write(d.join("ladybug.store.shadow"), b"shadow-pages").unwrap();
+        fs::write(d.join("ladybug.store.pinned.tmp"), b"pinned-marker").unwrap();
+
+        let checksums = write_checksums(&d).unwrap();
+        assert!(
+            checksums.shadow_sha256.is_some(),
+            "the checkpoint shadow is checksummed"
+        );
+        assert!(
+            checksums.pinned_sha256.is_some(),
+            "the pinned-checkpoint marker is checksummed"
+        );
+        verify_snapshot(&d).expect("an intact checkpoint set verifies");
+
+        fs::write(d.join("ladybug.store.shadow"), b"tampered-pages").unwrap();
+        let result = verify_snapshot(&d);
+        assert!(
+            matches!(result, Err(SnapshotError::ChecksumMismatch { .. })),
+            "a tampered shadow fails verification: {result:?}"
+        );
+    }
+
+    #[test]
+    fn a_both_wal_manifest_verifies_only_with_both_sides() {
+        // #209 (V5): a mixed WAL pair (`<db>.wal` + `<db>.wal.checkpoint`)
+        // preflights as a usable single store, so the export must carry BOTH
+        // byte streams. A `wal_kind: both` manifest is only verifiable when
+        // both members are present and checksummed.
+        let d = temp_dir("both-wal");
+        write_store(&d);
+        fs::write(
+            d.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"coordinated\":false,\"provenance\":\"unverified\",\"wal_kind\":\"both\"}}",
+                SNAPSHOT_FORMAT, SNAPSHOT_VERSION
+            ),
+        )
+        .unwrap();
+        fs::write(d.join("ladybug.store.wal"), b"active-bytes").unwrap();
+        fs::write(d.join("ladybug.store.wal.checkpoint"), b"frozen-bytes").unwrap();
+
+        let checksums = write_checksums(&d).unwrap();
+        assert!(
+            checksums.wal_checkpoint_sha256.is_some(),
+            "the frozen side of a mixed pair is checksummed"
+        );
+        let report = verify_snapshot(&d).expect("both sides verify together");
+        assert!(report.integrity_ok);
+        assert_eq!(report.wal_kind.as_deref(), Some("both"));
+
+        // Dropping either side leaves a snapshot that claims more than it
+        // holds; that is a mismatch, never a quiet pass.
+        fs::remove_file(d.join("ladybug.store.wal.checkpoint")).unwrap();
+        let result = verify_snapshot(&d);
+        assert!(
+            matches!(result, Err(SnapshotError::ChecksumMismatch { .. })),
+            "a both-kind manifest with the frozen side missing fails: {result:?}"
+        );
+    }
+
+    #[test]
+    fn a_version_1_legacy_snapshot_still_verifies() {
+        // Pre-#209 snapshots are format version 1: no `wal_kind`, and their
+        // WAL member is the active `.wal`. Current code keeps reading them.
+        let d = temp_dir("v1-legacy");
+        write_store(&d);
+        fs::write(
+            d.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\"}}",
+                SNAPSHOT_FORMAT, 1
+            ),
+        )
+        .unwrap();
+        fs::write(d.join("ladybug.store.wal"), b"legacy-wal").unwrap();
+        write_checksums(&d).unwrap();
+
+        let report = verify_snapshot(&d).expect("a version 1 snapshot verifies");
+        assert!(report.integrity_ok);
+        assert_eq!(
+            report.wal_kind, None,
+            "a version 1 manifest records no WAL role; restore treats it as active"
+        );
+    }
+
+    #[test]
+    fn a_version_1_manifest_claiming_both_is_invalid() {
+        // #209 (J7): `both` is only expressible in version 2. A version 1
+        // manifest that claims it describes a pair a v1 reader would truncate,
+        // so it is refused rather than half-read.
+        let d = temp_dir("v1-both");
+        write_store(&d);
+        fs::write(
+            d.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":1,\"created_at\":\"2026-01-01T00:00:00Z\",\"wal_kind\":\"both\"}}",
+                SNAPSHOT_FORMAT
+            ),
+        )
+        .unwrap();
+        fs::write(d.join("ladybug.store.wal"), b"active-bytes").unwrap();
+        fs::write(d.join("ladybug.store.wal.checkpoint"), b"frozen-bytes").unwrap();
+        write_checksums(&d).unwrap();
+
+        let result = verify_snapshot(&d);
+        match result {
+            Err(SnapshotError::InvalidManifest(message)) => assert!(
+                message.contains("both") && message.contains("version 1"),
+                "the refusal names the version/kind mismatch: {message}"
+            ),
+            other => panic!("a version 1 manifest claiming both must be rejected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_version_2_manifest_without_wal_kind_is_invalid() {
+        let d = temp_dir("v2-no-kind");
+        write_store(&d);
+        fs::write(
+            d.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":2,\"created_at\":\"2026-01-01T00:00:00Z\"}}",
+                SNAPSHOT_FORMAT
+            ),
+        )
+        .unwrap();
+        write_checksums(&d).unwrap();
+
+        let result = verify_snapshot(&d);
+        match result {
+            Err(SnapshotError::InvalidManifest(message)) => assert!(
+                message.contains("wal_kind"),
+                "the refusal names the missing field: {message}"
+            ),
+            other => panic!("a version 2 manifest without wal_kind must be rejected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_version_2_manifest_with_an_unknown_wal_kind_is_invalid() {
+        let d = temp_dir("v2-unknown-kind");
+        write_store(&d);
+        fs::write(
+            d.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":2,\"created_at\":\"2026-01-01T00:00:00Z\",\"wal_kind\":\"sometimes\"}}",
+                SNAPSHOT_FORMAT
+            ),
+        )
+        .unwrap();
+        write_checksums(&d).unwrap();
+
+        let result = verify_snapshot(&d);
+        match result {
+            Err(SnapshotError::InvalidManifest(message)) => assert!(
+                message.contains("wal_kind"),
+                "the refusal names the field: {message}"
+            ),
+            other => panic!("an unknown wal_kind must be rejected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unsupported_snapshot_version_is_refused() {
+        // The same rule an old reader applies to version 2: a version this
+        // build does not know is refused, never half-read.
+        let d = temp_dir("v3");
+        write_store(&d);
+        fs::write(
+            d.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":3,\"created_at\":\"2026-01-01T00:00:00Z\",\"wal_kind\":\"none\"}}",
+                SNAPSHOT_FORMAT
+            ),
+        )
+        .unwrap();
+        write_checksums(&d).unwrap();
+
+        let result = verify_snapshot(&d);
+        assert!(
+            matches!(result, Err(SnapshotError::InvalidManifest(ref m)) if m.contains("version")),
+            "an unknown future version is refused with a version message: {result:?}"
+        );
+    }
+
+    #[test]
+    fn a_none_manifest_with_a_wal_member_is_refused() {
+        // #209 (Codex P2): `wal_kind: none` promises no WAL member. A WAL (or
+        // a checksum naming one) under that manifest is inconsistent, and a
+        // restore would silently leave it out.
+        let d = temp_dir("none-with-wal");
+        write_store(&d);
+        fs::write(
+            d.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"wal_kind\":\"none\"}}",
+                SNAPSHOT_FORMAT, SNAPSHOT_VERSION
+            ),
+        )
+        .unwrap();
+        fs::write(d.join("ladybug.store.wal"), b"unexpected-wal").unwrap();
+        write_checksums(&d).unwrap();
+
+        match verify_snapshot(&d) {
+            Err(SnapshotError::InvalidManifest(message)) => {
+                assert!(
+                    message.contains("none") && message.contains("ladybug.store.wal"),
+                    "the refusal names the inconsistency: {message}"
+                );
+            }
+            other => panic!("a none manifest carrying a WAL must be refused: {other:?}"),
+        }
+
+        // Same rule when only the checksum names a WAL: the member the
+        // manifest says cannot exist is still named.
+        fs::remove_file(d.join("ladybug.store.wal")).unwrap();
+        let checksums_path = d.join("checksums.json");
+        let mut checksums: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&checksums_path).unwrap()).unwrap();
+        checksums["wal_sha256"] =
+            serde_json::json!("0000000000000000000000000000000000000000000000000000000000000000");
+        fs::write(
+            &checksums_path,
+            serde_json::to_string_pretty(&checksums).unwrap(),
+        )
+        .unwrap();
+        match verify_snapshot(&d) {
+            Err(SnapshotError::InvalidManifest(message)) => assert!(
+                message.contains("none") && message.contains("ladybug.store.wal"),
+                "the checksum-only case names the inconsistency: {message}"
+            ),
+            other => {
+                panic!("a none manifest whose checksums name a WAL must be refused: {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn a_one_sided_manifest_with_a_frozen_member_is_refused() {
+        // #209 (J7): a `wal_kind: active` manifest that also carries
+        // `ladybug.store.wal.checkpoint` describes a pair it does not own. The
+        // verifier refuses rather than certifying a set restore would treat as
+        // active-only.
+        let d = temp_dir("active-with-frozen-member");
+        write_store(&d);
+        fs::write(
+            d.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"wal_kind\":\"active\"}}",
+                SNAPSHOT_FORMAT, SNAPSHOT_VERSION
+            ),
+        )
+        .unwrap();
+        fs::write(d.join("ladybug.store.wal"), b"active-bytes").unwrap();
+        fs::write(d.join("ladybug.store.wal.checkpoint"), b"leftover-frozen").unwrap();
+        write_checksums(&d).unwrap();
+
+        let result = verify_snapshot(&d);
+        match result {
+            Err(SnapshotError::InvalidManifest(message)) => assert!(
+                message.contains("ladybug.store.wal.checkpoint"),
+                "the refusal names the unexpected member: {message}"
+            ),
+            other => panic!("a one-sided manifest with a frozen member must be refused: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_both_manifest_missing_the_active_side_is_refused() {
+        // A `both` manifest must produce the active member too; half a pair is
+        // not verifiable.
+        let d = temp_dir("both-missing-active");
+        write_store(&d);
+        fs::write(
+            d.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"wal_kind\":\"both\"}}",
+                SNAPSHOT_FORMAT, SNAPSHOT_VERSION
+            ),
+        )
+        .unwrap();
+        fs::write(d.join("ladybug.store.wal.checkpoint"), b"frozen-bytes").unwrap();
+        write_checksums(&d).unwrap();
+
+        let result = verify_snapshot(&d);
+        assert!(
+            matches!(result, Err(SnapshotError::ChecksumMismatch { .. })),
+            "a both manifest without the active member fails: {result:?}"
+        );
+    }
+
+    #[test]
+    fn select_expired_counts_version_1_and_version_2_snapshots() {
+        // Readable v1 snapshots are still snapshots: retention must count
+        // them, not leak them because their version is not the current one.
+        let root = temp_dir("expired_versions");
+        make_snapshot_dir_with_version(&root, "snapshot-v1", "2025-01-01T00:00:00Z", 1);
+        make_snapshot_dir_with_version(&root, "snapshot-v2", "2026-01-01T00:00:00Z", 2);
+
+        let expired = select_expired_snapshots(&root, 1).unwrap();
+        assert_eq!(expired.len(), 1, "both versions are retention candidates");
+        assert!(expired[0].to_string_lossy().contains("v1"));
     }
 
     #[test]
