@@ -83,6 +83,13 @@ clean_stream() {
   jq -Rrs "$clean_filter"
 }
 
+# Normalize fixed@ receipt targets to lowercase SHAs. The grep match is
+# case-insensitive, so the prefix strip must be too: lowercase first, then
+# strip, or FIXED@<sha> survives with its prefix and never validates.
+fixed_sha_targets() {
+  grep -Eoi 'fixed@[0-9a-f]{7,}' | tr '[:upper:]' '[:lower:]' | sed 's/^fixed@//' | sort -u
+}
+
 # Shared jq definitions. Markers and receipts are extracted only from cleaned
 # bodies; receipts must come from an allowed author and not from the finding
 # comment; fixed@/filed targets must pass the mode's validation.
@@ -373,7 +380,7 @@ else
     printf '%s\n' "$reviews_entries" "$comment_entries" "$pull_entries" | jq -r "${tokenizer_def}"' .body | clean' 2>/dev/null || true
     printf '%s' "$threads_json" | jq -r "${tokenizer_def}"' .[].comments[].body | clean' 2>/dev/null || true
   )
-  for sha in $(printf '%s\n' "$receipt_text" | grep -Eoi 'fixed@[0-9a-f]{7,}' | sed 's/^fixed@//' | tr '[:upper:]' '[:lower:]' | sort -u); do
+  for sha in $(printf '%s\n' "$receipt_text" | fixed_sha_targets); do
     if ! gh api "repos/$repo/commits/$sha" --jq .sha >/dev/null 2>&1; then
       echo "gate-receipt: ignoring fixed@$sha (no such commit in $repo)" >&2
       continue

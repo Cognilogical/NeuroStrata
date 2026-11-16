@@ -333,4 +333,19 @@ if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$tmp/bystander-contribut
   exit 1
 fi
 
+# Codex P2: an authorized uppercase `FIXED@` token must normalize to the
+# lowercase SHA target (the grep is case-insensitive, so the prefix strip
+# must be too, or the target lookup misses and the receipt is ignored).
+fn=$(sed -n '/^fixed_sha_targets()/,/^}/p' "$root/scripts/gate-receipt.sh")
+if [ -z "$fn" ]; then
+  echo "FAIL: scripts/gate-receipt.sh does not define fixed_sha_targets" >&2
+  exit 1
+fi
+eval "$fn"
+out=$(printf 'FIXED@ABCDEF1 fixed@ABCDEF1\n' | fixed_sha_targets)
+if [ "$out" != "abcdef1" ]; then
+  echo "FAIL: an uppercase FIXED@ receipt did not normalize to the lowercase SHA: $out" >&2
+  exit 1
+fi
+
 echo "gate-receipt self-test: PASS"
