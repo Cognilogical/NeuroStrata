@@ -10887,25 +10887,46 @@ fn add_metadata_fallback_conn(
     Ok(())
 }
 
+/// The most memory ids one `linked_files` census query carries.
+///
+/// The hit count is bounded only by how many memories govern one file, and it
+/// is the *pre-limit* set (fan-out feeds the ranking, so it cannot be measured
+/// after truncation). Concatenating it into one `IN [...]` would therefore grow
+/// a query string without bound. The ids are batched instead: every query keeps
+/// at most this many ids, the per-namespace generation cache is shared across
+/// batches, and the batches union into the same exact per-hit count. The costs
+/// are `ceil(hits / 128)` reads instead of one, which is one read for any file
+/// with up to 128 governing memories.
+///
+/// 128 is a transport cap, not a semantic limit: it keeps every generated
+/// query far below the engine's statement-length headroom while staying one
+/// batch for any realistic governing set. Hit counts above it only add
+/// batches; they never change a per-hit count.
+const LINKED_FILES_ID_BATCH: usize = 128;
+
 /// Sets each hit's `linked_files`: the distinct active files its `GOVERNS` and
 /// `RELATES_TO` edges reach (a symbol counts as its file, a linked memory as
 /// one, keyed by project/source and file path so equal relative paths across
 /// namespaces do not collapse). A directory link reaches every file under it,
 /// so it counts as ten, enough for the widest fan-out bucket. Inactive or
-/// superseded targets are ignored. One read for all hits.
+/// superseded targets are ignored. One read per `LINKED_FILES_ID_BATCH` ids,
+/// unioned across batches, so the count is exact for any hit count.
 fn set_linked_files(conn: &Connection, hits: &mut [MemoryHit]) -> Result<()> {
+    set_linked_files_batched(conn, hits, LINKED_FILES_ID_BATCH)
+}
+
+/// `set_linked_files` with the batch width spelled out, so the boundary the
+/// census crosses between batches can be tested at a small size as well as at
+/// `LINKED_FILES_ID_BATCH`. The batching itself must not change any count.
+fn set_linked_files_batched(
+    conn: &Connection,
+    hits: &mut [MemoryHit],
+    batch_size: usize,
+) -> Result<()> {
     if hits.is_empty() {
         return Ok(());
     }
-    let id_list = hits
-        .iter()
-        .map(|h| format!("'{}'", escape_ladybug_string(&h.id)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let query = format!(
-        "MATCH (m:Memory)-[:GOVERNS|RELATES_TO]-(t:Memory) WHERE m.id IN [{}] RETURN DISTINCT m.id, t.id, t.namespace, t.location, t.memory_type, t.metadata",
-        id_list
-    );
+    let batch_size = batch_size.max(1);
     let now = chrono::Utc::now().timestamp();
     let mut active_by_ns: std::collections::HashMap<String, ActiveGenerations> =
         std::collections::HashMap::new();
@@ -10917,51 +10938,62 @@ fn set_linked_files(conn: &Connection, hits: &mut [MemoryHit]) -> Result<()> {
         String,
         std::collections::HashSet<(String, String, String)>,
     > = std::collections::HashMap::new();
-    let mut rows = conn.query(&query)?;
-    while let Some(row) = rows.next() {
-        let id = format!("{}", row[0]);
-        let target = format!("{}", row[1]);
-        let target_ns = format!("{}", row[2]);
-        let location = format!("{}", row[3]);
-        let target_type = format!("{}", row[4]);
-        let metadata = parse_metadata_or_warn(&format!("{}", row[5]), "metadata");
-        if is_archived(&metadata)
-            || is_retired_at(&metadata, now)
-            || is_mesh_conflicting(&metadata)
-            || is_registry_row(&metadata)
-        {
-            continue;
-        }
-        let owner_ns = split_scoped_id(&target)
-            .map(|(ns, _, _)| ns)
-            .or_else(|| {
-                target
-                    .split_once(crate::parser::ingest::NAMESPACE_SEPARATOR)
-                    .map(|(ns, _)| ns.to_string())
-            })
-            .unwrap_or_else(|| target_ns.clone());
-        let active = active_by_ns
-            .entry(owner_ns.clone())
-            .or_insert_with(|| ActiveGenerations::read(conn, &owner_ns));
-        if !active.reaches(&target, &owner_ns, &target_type, &metadata) {
-            continue;
-        }
-        let source_key = row_source_key(&metadata).unwrap_or("").to_string();
-        let raw_path = if location.is_empty() {
-            crate::parser::ingest::logical_path_of(&target)
-        } else {
-            location.as_str()
-        };
-        let file_path = raw_path
-            .split_once('#')
-            .map(|(f, _)| f)
-            .unwrap_or(raw_path)
-            .to_string();
-        let key = (owner_ns, source_key, file_path);
-        if target_type == "directory" {
-            directories.entry(id).or_default().insert(key);
-        } else {
-            files.entry(id).or_default().insert(key);
+    for batch in hits.chunks(batch_size) {
+        let id_list = batch
+            .iter()
+            .map(|h| format!("'{}'", escape_ladybug_string(&h.id)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
+            "MATCH (m:Memory)-[:GOVERNS|RELATES_TO]-(t:Memory) WHERE m.id IN [{}] RETURN DISTINCT m.id, t.id, t.namespace, t.location, t.memory_type, t.metadata",
+            id_list
+        );
+        let mut rows = conn.query(&query)?;
+        while let Some(row) = rows.next() {
+            let id = format!("{}", row[0]);
+            let target = format!("{}", row[1]);
+            let target_ns = format!("{}", row[2]);
+            let location = format!("{}", row[3]);
+            let target_type = format!("{}", row[4]);
+            let metadata = parse_metadata_or_warn(&format!("{}", row[5]), "metadata");
+            if is_archived(&metadata)
+                || is_retired_at(&metadata, now)
+                || is_mesh_conflicting(&metadata)
+                || is_registry_row(&metadata)
+            {
+                continue;
+            }
+            let owner_ns = split_scoped_id(&target)
+                .map(|(ns, _, _)| ns)
+                .or_else(|| {
+                    target
+                        .split_once(crate::parser::ingest::NAMESPACE_SEPARATOR)
+                        .map(|(ns, _)| ns.to_string())
+                })
+                .unwrap_or_else(|| target_ns.clone());
+            let active = active_by_ns
+                .entry(owner_ns.clone())
+                .or_insert_with(|| ActiveGenerations::read(conn, &owner_ns));
+            if !active.reaches(&target, &owner_ns, &target_type, &metadata) {
+                continue;
+            }
+            let source_key = row_source_key(&metadata).unwrap_or("").to_string();
+            let raw_path = if location.is_empty() {
+                crate::parser::ingest::logical_path_of(&target)
+            } else {
+                location.as_str()
+            };
+            let file_path = raw_path
+                .split_once('#')
+                .map(|(f, _)| f)
+                .unwrap_or(raw_path)
+                .to_string();
+            let key = (owner_ns, source_key, file_path);
+            if target_type == "directory" {
+                directories.entry(id).or_default().insert(key);
+            } else {
+                files.entry(id).or_default().insert(key);
+            }
         }
     }
     for hit in hits.iter_mut() {
@@ -15199,6 +15231,96 @@ eurostrata\src\daemon.rs",
         assert_eq!(ids, vec!["single_project", "cross_project"]);
         assert_eq!(hits[0].linked_files, 1);
         assert_eq!(hits[1].linked_files, 3);
+    }
+
+    /// The `linked_files` census batches the hit ids at `LINKED_FILES_ID_BATCH`,
+    /// so the seam between two batches must not lose a hit: every memory here
+    /// governs the same two files (`src/a.rs`, `src/b.rs`), and every count must
+    /// be exactly 2 -- once through the production entry point (two batches,
+    /// because the hit set is one batch plus a remainder) and once at width 3,
+    /// which splits the same hits into many batches. A hit dropped from the
+    /// census reads 0 instead of 2, which is what `take(1)` on the batch loop
+    /// trips here at `boundary-128`.
+    ///
+    /// Double-counting is structurally impossible rather than test-proven: the
+    /// chunks are disjoint, each id accumulates into its own `HashSet`, and the
+    /// query is `RETURN DISTINCT`, so no seam mutant in this shape can produce
+    /// a 4. The test therefore witnesses the drop seam only; it does not prove
+    /// a doubling immunity that the structure already guarantees.
+    #[tokio::test]
+    async fn linked_files_census_stays_exact_across_the_id_batch_boundary() {
+        let store = retired_test_store().await;
+        let hit_count = LINKED_FILES_ID_BATCH + 3;
+        for path in ["src/a.rs", "src/b.rs"] {
+            let mut file_payload = retired_test_payload("file", "auto-ingestor", json!({}));
+            file_payload.location = path.to_string();
+            store
+                .upsert(
+                    "probe",
+                    &format!("probe::{path}"),
+                    vec![0.0; 4],
+                    file_payload,
+                )
+                .await
+                .unwrap();
+        }
+        for i in 0..hit_count {
+            store
+                .upsert(
+                    "probe",
+                    &format!("boundary-{i:03}"),
+                    vec![0.0; 4],
+                    retired_test_payload(
+                        "rule",
+                        "agent",
+                        json!({
+                            "governs": ["probe::src/a.rs", "probe::src/b.rs"],
+                            "valid_from": 1_700_000_000,
+                        }),
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+        let seeded: Vec<MemoryHit> = (0..hit_count)
+            .map(|i| MemoryHit {
+                id: format!("boundary-{i:03}"),
+                memory_type: "rule".to_string(),
+                content: String::new(),
+                match_kind: GraphMatchKind::ExactFile,
+                access_count: 0,
+                explanation: String::new(),
+                metadata: json!({}),
+                conceptual_bridges: Vec::new(),
+                linked_files: 0,
+            })
+            .collect();
+
+        let mut hits = seeded.clone();
+        let production = store
+            .with_conn(move |conn| {
+                set_linked_files(conn, &mut hits)?;
+                Ok(hits)
+            })
+            .await
+            .expect("census succeeds");
+        assert_eq!(production.len(), hit_count);
+        for hit in &production {
+            assert_eq!(hit.linked_files, 2, "production batch, id {}", hit.id);
+        }
+
+        let mut hits = seeded;
+        let split = store
+            .with_conn(move |conn| {
+                set_linked_files_batched(conn, &mut hits, 3)?;
+                Ok(hits)
+            })
+            .await
+            .expect("census succeeds");
+        assert_eq!(split.len(), hit_count);
+        for hit in &split {
+            assert_eq!(hit.linked_files, 2, "batched-by-3, id {}", hit.id);
+        }
     }
 
     /// Spec §3.2: an unqualified `GOVERNS` target that resolves to `Missing`

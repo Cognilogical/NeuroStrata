@@ -179,6 +179,30 @@
         "foreign_rows_deleted": 0,
         "ignored": 0
       }
+    },
+    "recall-fanout": {
+      "commands": [
+        "cargo test --locked --test memories_for_file_test -- --test-threads=1"
+      ],
+      "tests": [
+        "rank_hits_orders_enforced_rule_before_narrow_advisory",
+        "enforced_rule_survives_top_five_truncation",
+        "fan_out_still_breaks_ties_within_one_enforcement_class"
+      ],
+      "thresholds": {
+        "ignored": 0
+      }
+    },
+    "recall-census-boundary": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp linked_files_census_stays_exact_across_the_id_batch_boundary -- --test-threads=1"
+      ],
+      "tests": [
+        "store::ladybug::tests::linked_files_census_stays_exact_across_the_id_batch_boundary"
+      ],
+      "thresholds": {
+        "ignored": 0
+      }
     }
   }
 }
