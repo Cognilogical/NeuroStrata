@@ -249,14 +249,85 @@ fn write_file_atomically(
 /// The sidecar format version written by this build.
 pub(crate) const STORE_STATE_VERSION: u32 = 1;
 
+/// One recorded recovery open (`#212`): the durable half of the recovery
+/// provenance the store used to keep only in a process-local map.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StoreRecovery {
+    /// RFC 3339 UTC timestamp of the open.
+    pub at: String,
+    /// The recovery arm that opened the store (`checksum_config_mismatch`,
+    /// `unverified_wal_replay`, or `discarded_unreadable_wal`).
+    pub kind: String,
+    /// Bytes across the WAL pair observed before the recovery open.
+    #[serde(default)]
+    pub wal_bytes: u64,
+}
+
 /// The content of `ladybug.db.store-state.json`: whether the store has
-/// recorded user data, and the embedding-space descriptor of the model
-/// that created / last legitimately opened it while pristine.
+/// recorded user data, the embedding-space descriptor of the model that
+/// created / last legitimately opened it while pristine, and — since
+/// `#212` — the durable recovery/checkpoint health that a fresh,
+/// path-only `storage status` reports.
+///
+/// The health fields are `serde(default)`: a sidecar written before they
+/// existed parses unchanged and reads as "no recorded recovery, no
+/// recorded checkpoint".
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StoreState {
     pub version: u32,
     pub has_data: bool,
     pub descriptor: crate::traits::EmbeddingDescriptor,
+    /// The last recovery open recorded for this store (`#212`). Absent
+    /// until a recovery arm opens the store. Persisted only onto an
+    /// already-recorded sidecar: a store with no recorded identity has no
+    /// sidecar to extend, and inventing one would claim an identity this
+    /// process cannot attest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_recovery: Option<StoreRecovery>,
+    /// RFC 3339 UTC timestamp of the last checkpoint this store recorded
+    /// (`#212`). Absent means no checkpoint has been recorded here; the
+    /// status falls back to the store directory's mtime, which is only a
+    /// proxy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_checkpoint_at: Option<String>,
+    /// Duration of that checkpoint, in milliseconds (`#212`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_checkpoint_duration_ms: Option<u64>,
+    /// Failed checkpoints recorded for this store (`#212`, monotonic).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub checkpoint_failures: u32,
+}
+
+const fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+impl StoreState {
+    /// A state carrying only the identity fields this module has always
+    /// owned. The health fields start empty; [`write_store_state`]
+    /// preserves whatever a previous writer recorded for them, so a
+    /// plain identity write (stamp, flip, pristine adoption) never erases
+    /// the persisted recovery/checkpoint provenance.
+    pub(crate) fn new(has_data: bool, descriptor: crate::traits::EmbeddingDescriptor) -> Self {
+        Self {
+            version: STORE_STATE_VERSION,
+            has_data,
+            descriptor,
+            last_recovery: None,
+            last_checkpoint_at: None,
+            last_checkpoint_duration_ms: None,
+            checkpoint_failures: 0,
+        }
+    }
+
+    /// Whether this state carries no health at all — the shape
+    /// [`write_store_state`] fills in from the file it is about to replace.
+    fn has_no_health(&self) -> bool {
+        self.last_recovery.is_none()
+            && self.last_checkpoint_at.is_none()
+            && self.last_checkpoint_duration_ms.is_none()
+            && self.checkpoint_failures == 0
+    }
 }
 
 /// The sidecar's path: beside the database file, in the directory the
@@ -322,11 +393,96 @@ pub(crate) fn store_state_unparseable_error(db_path: &Path, reason: &str) -> any
     )
 }
 
+/// Serializes every in-process writer of a store-state sidecar (`#212`).
+///
+/// The recovery and checkpoint recorders are read-modify-write updates
+/// that an open and a checkpoint can issue concurrently with the store's
+/// own identity writes (the pristine stamp, the data flip, pristine
+/// adoption). One process owns the store, so one process-wide turn is
+/// enough to keep every update whole and to keep
+/// [`write_store_state`]'s health-preserving merge from reading a state
+/// another writer is between read and write.
+static STORE_STATE_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Write the sidecar atomically (the same temp + fsync + rename pattern
 /// as the embedders file).
+///
+/// Health preservation (`#212`): a caller that records only identity
+/// (`has_data` / `descriptor` — every pre-`#212` writer) must not erase
+/// the persisted recovery/checkpoint fields, so a state with no health of
+/// its own inherits the health of the sidecar it replaces. A caller that
+/// does carry health writes it verbatim.
 pub(crate) fn write_store_state(db_path: &Path, state: &StoreState) -> anyhow::Result<()> {
-    let serialized = serde_json::to_string_pretty(state)?;
+    let _guard = STORE_STATE_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    write_store_state_locked(db_path, state)
+}
+
+fn write_store_state_locked(db_path: &Path, state: &StoreState) -> anyhow::Result<()> {
+    let mut state = state.clone();
+    if state.has_no_health() {
+        if let StoreStateRead::Recorded(existing) = read_store_state_file(db_path) {
+            state.last_recovery = existing.last_recovery;
+            state.last_checkpoint_at = existing.last_checkpoint_at;
+            state.last_checkpoint_duration_ms = existing.last_checkpoint_duration_ms;
+            state.checkpoint_failures = existing.checkpoint_failures;
+        }
+    }
+    let serialized = serde_json::to_string_pretty(&state)?;
     write_file_atomically(&store_state_path(db_path), &serialized, false)
+}
+
+/// Record a recovery open on the store's sidecar (`#212`), returning
+/// whether a recorded sidecar existed to extend.
+///
+/// A store with no sidecar is left alone: absence is the legitimate state
+/// of a fresh or pre-sidecar store, and writing `has_data: false` with a
+/// descriptor this process cannot attest would silently unlock the
+/// model-choice guard. The in-process map remains the fallback there.
+pub(crate) fn record_store_state_recovery(
+    db_path: &Path,
+    kind: &str,
+    wal_bytes: u64,
+    at: &str,
+) -> anyhow::Result<bool> {
+    let _guard = STORE_STATE_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let StoreStateRead::Recorded(mut state) = read_store_state_file(db_path) else {
+        return Ok(false);
+    };
+    state.last_recovery = Some(StoreRecovery {
+        at: at.to_string(),
+        kind: kind.to_string(),
+        wal_bytes,
+    });
+    write_store_state_locked(db_path, &state)?;
+    Ok(true)
+}
+
+/// Record a finished checkpoint on the store's sidecar (`#212`),
+/// returning whether a recorded sidecar existed to extend. The failure
+/// counter is monotonic: a recorded count is never lowered.
+pub(crate) fn record_store_state_checkpoint(
+    db_path: &Path,
+    at: &str,
+    duration_ms: u64,
+    ok: bool,
+) -> anyhow::Result<bool> {
+    let _guard = STORE_STATE_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let StoreStateRead::Recorded(mut state) = read_store_state_file(db_path) else {
+        return Ok(false);
+    };
+    state.last_checkpoint_at = Some(at.to_string());
+    state.last_checkpoint_duration_ms = Some(duration_ms);
+    if !ok {
+        state.checkpoint_failures = state.checkpoint_failures.saturating_add(1);
+    }
+    write_store_state_locked(db_path, &state)?;
+    Ok(true)
 }
 
 /// Whether the store at `db_path` has recorded user data — the one
@@ -1594,15 +1750,8 @@ mod tests {
         fs::create_dir_all(&store_dir).expect("create store dir");
         let db_path = store_dir.join("ladybug.db");
         write_bare_db(&db_path);
-        write_store_state(
-            &db_path,
-            &StoreState {
-                version: STORE_STATE_VERSION,
-                has_data: true,
-                descriptor: fp32_recorded_descriptor(),
-            },
-        )
-        .expect("write the data-bearing sidecar");
+        write_store_state(&db_path, &StoreState::new(true, fp32_recorded_descriptor()))
+            .expect("write the data-bearing sidecar");
 
         // The Q configuration, written the setup way — against a
         // different, empty db path, as the plan's construction does.
@@ -1651,11 +1800,7 @@ mod tests {
         .expect("restore the Q config");
         write_store_state(
             &db_path,
-            &StoreState {
-                version: STORE_STATE_VERSION,
-                has_data: false,
-                descriptor: fp32_recorded_descriptor(),
-            },
+            &StoreState::new(false, fp32_recorded_descriptor()),
         )
         .expect("rewrite the sidecar as pristine");
         check_daemon_open_identity(&db_path, &config_dir)
@@ -1686,15 +1831,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("temp dir");
         let db_path = tmp.path().join("ladybug.db");
         write_bare_db(&db_path);
-        write_store_state(
-            &db_path,
-            &StoreState {
-                version: STORE_STATE_VERSION,
-                has_data: true,
-                descriptor: fp32_recorded_descriptor(),
-            },
-        )
-        .expect("write the data-bearing sidecar");
+        write_store_state(&db_path, &StoreState::new(true, fp32_recorded_descriptor()))
+            .expect("write the data-bearing sidecar");
         let (_cfg_tmp, config_dir) = fresh_config_dir("a5-preflight-incommensurate");
 
         fs::write(
@@ -1958,6 +2096,166 @@ mod tests {
         assert!(!called.get(), "a wrong-version sidecar is never offered");
     }
 
+    /// `#212`: the sidecar carries the durable recovery/checkpoint health, and
+    /// the health is additive — an identity-only write (the store's pristine
+    /// stamp, data flip, or pristine adoption) must preserve what a recovery
+    /// recorded.
+    #[test]
+    fn store_state_provenance_round_trips_and_survives_a_plain_identity_write() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("ladybug.db");
+        fs::write(&db_path, b"db").expect("seed bare db");
+        let descriptor = fp32_recorded_descriptor();
+        write_store_state(&db_path, &StoreState::new(true, descriptor.clone()))
+            .expect("write the identity-only sidecar");
+
+        let recovery_at = "2026-11-15T00:00:00Z";
+        assert!(
+            record_store_state_recovery(&db_path, "unverified_wal_replay", 4096, recovery_at)
+                .expect("record the recovery"),
+            "a recorded sidecar is extended"
+        );
+        assert!(
+            record_store_state_checkpoint(&db_path, "2026-11-15T00:00:01Z", 12, false)
+                .expect("record the failed checkpoint"),
+            "a recorded sidecar is extended"
+        );
+
+        let recorded = match read_store_state(&db_path) {
+            StoreStateRead::Recorded(state) => state,
+            other => panic!("the sidecar must stay recorded, got {other:?}"),
+        };
+        assert_eq!(
+            recorded.last_recovery,
+            Some(StoreRecovery {
+                at: recovery_at.to_string(),
+                kind: "unverified_wal_replay".to_string(),
+                wal_bytes: 4096,
+            }),
+            "the recovery event round-trips at/kind/wal_bytes"
+        );
+        assert_eq!(
+            recorded.last_checkpoint_at.as_deref(),
+            Some("2026-11-15T00:00:01Z")
+        );
+        assert_eq!(recorded.last_checkpoint_duration_ms, Some(12));
+        assert_eq!(recorded.checkpoint_failures, 1);
+        assert!(recorded.has_data, "the identity fields are untouched");
+        assert_eq!(recorded.descriptor, descriptor);
+
+        // The store's own identity writers record no health; they must not
+        // erase the provenance a recovery just persisted.
+        write_store_state(&db_path, &StoreState::new(false, descriptor.clone()))
+            .expect("plain identity write");
+        let after_identity = match read_store_state(&db_path) {
+            StoreStateRead::Recorded(state) => state,
+            other => panic!("the sidecar must stay recorded, got {other:?}"),
+        };
+        assert_eq!(
+            after_identity.last_recovery, recorded.last_recovery,
+            "an identity-only write preserves the recorded recovery"
+        );
+        assert_eq!(
+            after_identity.last_checkpoint_at, recorded.last_checkpoint_at,
+            "an identity-only write preserves the recorded checkpoint"
+        );
+        assert_eq!(after_identity.checkpoint_failures, 1);
+        assert!(
+            !after_identity.has_data,
+            "the identity write still owns has_data"
+        );
+
+        // A later successful checkpoint moves the timestamp but never lowers
+        // the monotonic failure count.
+        record_store_state_checkpoint(&db_path, "2026-11-15T00:00:02Z", 3, true)
+            .expect("record a successful checkpoint");
+        let after_ok = match read_store_state(&db_path) {
+            StoreStateRead::Recorded(state) => state,
+            other => panic!("the sidecar must stay recorded, got {other:?}"),
+        };
+        assert_eq!(
+            after_ok.last_checkpoint_at.as_deref(),
+            Some("2026-11-15T00:00:02Z")
+        );
+        assert_eq!(after_ok.last_checkpoint_duration_ms, Some(3));
+        assert_eq!(after_ok.checkpoint_failures, 1);
+    }
+
+    /// `#212` backward compatibility: a sidecar written before the health
+    /// fields existed parses unchanged (`serde(default)`), and a sidecar with
+    /// nothing recorded still serializes without the new keys.
+    #[test]
+    fn store_state_provenance_defaults_for_an_older_sidecar() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("ladybug.db");
+        fs::write(&db_path, b"db").expect("seed bare db");
+        let legacy = serde_json::json!({
+            "version": STORE_STATE_VERSION,
+            "has_data": true,
+            "descriptor": serde_json::to_value(fp32_recorded_descriptor())
+                .expect("serialize the descriptor"),
+        });
+        fs::write(
+            store_state_path(&db_path),
+            serde_json::to_string_pretty(&legacy).expect("serialize legacy sidecar"),
+        )
+        .expect("write the pre-#212 sidecar");
+
+        let state = match read_store_state(&db_path) {
+            StoreStateRead::Recorded(state) => state,
+            other => panic!("a legacy sidecar must stay parseable, got {other:?}"),
+        };
+        assert!(state.has_data);
+        assert_eq!(state.last_recovery, None);
+        assert_eq!(state.last_checkpoint_at, None);
+        assert_eq!(state.last_checkpoint_duration_ms, None);
+        assert_eq!(state.checkpoint_failures, 0);
+
+        let unrecorded = serde_json::to_value(StoreState::new(true, fp32_recorded_descriptor()))
+            .expect("serialize a health-less state");
+        for key in [
+            "last_recovery",
+            "last_checkpoint_at",
+            "last_checkpoint_duration_ms",
+            "checkpoint_failures",
+        ] {
+            assert!(
+                unrecorded.get(key).is_none(),
+                "{key} is omitted when nothing is recorded, so an untouched sidecar stays byte-compatible"
+            );
+        }
+    }
+
+    /// `#212`: a store with no recorded sidecar must not gain one from a
+    /// recovery — writing `has_data: false` under a descriptor this process
+    /// cannot attest would silently unlock the model-choice guard. The
+    /// in-process map stays that store's provenance layer.
+    #[test]
+    fn store_state_recovery_is_not_recorded_without_a_recorded_sidecar() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("ladybug.db");
+        fs::write(&db_path, b"db").expect("seed bare db");
+        assert!(
+            !record_store_state_recovery(
+                &db_path,
+                "unverified_wal_replay",
+                16,
+                "2026-11-15T00:00:00Z"
+            )
+            .expect("best-effort recovery record"),
+            "an absent sidecar is not extended"
+        );
+        assert!(
+            !record_store_state_checkpoint(&db_path, "2026-11-15T00:00:01Z", 1, true)
+                .expect("best-effort checkpoint record"),
+            "an absent sidecar is not extended"
+        );
+        assert!(
+            !store_state_path(&db_path).exists(),
+            "a recovery never invents a store-state sidecar"
+        );
+    }
+
     #[test]
     fn write_file_atomically_concurrent_same_process_safety() {
         // #92: the temp name used to key on the pid alone, so every
@@ -1970,18 +2268,19 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let db_path = tmp.path().join("ladybug.db");
         fs::write(&db_path, b"db").expect("seed bare db");
-        let state = |i: u64| StoreState {
-            version: STORE_STATE_VERSION,
-            has_data: i % 2 == 0,
-            descriptor: crate::traits::EmbeddingDescriptor {
-                provider: "fastembed".to_string(),
-                model: format!("Model{i}"),
-                revision: "onnx".to_string(),
-                dims: 4,
-                normalization: "unknown".to_string(),
-                preprocessing: "unknown".to_string(),
-                distance_metric: "cosine".to_string(),
-            },
+        let state = |i: u64| {
+            StoreState::new(
+                i % 2 == 0,
+                crate::traits::EmbeddingDescriptor {
+                    provider: "fastembed".to_string(),
+                    model: format!("Model{i}"),
+                    revision: "onnx".to_string(),
+                    dims: 4,
+                    normalization: "unknown".to_string(),
+                    preprocessing: "unknown".to_string(),
+                    distance_metric: "cosine".to_string(),
+                },
+            )
         };
         let mut handles = Vec::new();
         for i in 0..16u64 {

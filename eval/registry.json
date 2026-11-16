@@ -362,6 +362,34 @@
         "ignored": 0,
         "_note": "scripts/remediation-eval.sh enforces only `ignored` and the exact `tests` names; any other count here would be inert, so none are listed."
       }
+    },
+    "recovery-provenance": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp recovery_provenance -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp verified_reopen_reports_live_state -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store_state_provenance -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store_state_recovery_is_not_recorded -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp wal_age_secs -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp storage_status_reads_the_persisted -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp path_only_storage_status -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp restore_refuses_a_symlinked_wal -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp restore_recreates_the_target_0600 -- --test-threads=1"
+      ],
+      "tests": [
+        "store::ladybug::tests::recovery_provenance_is_persisted_for_a_fresh_path_only_status",
+        "store::ladybug::tests::verified_reopen_reports_live_state_while_path_only_status_keeps_history",
+        "model_choice::tests::store_state_provenance_round_trips_and_survives_a_plain_identity_write",
+        "model_choice::tests::store_state_provenance_defaults_for_an_older_sidecar",
+        "model_choice::tests::store_state_recovery_is_not_recorded_without_a_recorded_sidecar",
+        "storage::snapshot::tests::wal_age_secs_tracks_the_newest_wal_and_is_absent_without_one",
+        "storage::snapshot::tests::storage_status_reads_the_persisted_recovery_and_checkpoint_health",
+        "server::tests::path_only_storage_status_dispatches_wal_age_and_persisted_recovery",
+        "store::ladybug::wal_preservation::restore_refuses_a_symlinked_wal_and_leaves_the_target_intact",
+        "store::ladybug::wal_preservation::restore_recreates_the_target_0600"
+      ],
+      "thresholds": {
+        "ignored": 0
+      }
     }
   }
 }

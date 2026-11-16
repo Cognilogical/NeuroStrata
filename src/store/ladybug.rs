@@ -2740,6 +2740,86 @@ fn copy_regular_file_create_new_0600(
     std::io::copy(&mut reader, &mut writer)
 }
 
+/// Restores one preserved WAL side over `<db>.wal` / `<db>.wal.checkpoint`
+/// under the same hardened rules as preservation (`#212`).
+///
+/// Unlike [`copy_regular_file_create_new_0600`] the destination normally
+/// exists — replacing it is the point of a restore — so it is opened with
+/// `create|truncate` rather than `create_new`. Everything else matches: a
+/// symlinked or non-regular source is refused, a **symlinked destination is
+/// refused and never written through** (this is the `#212a` residual
+/// `std::fs::copy` left open), and the destination is opened `O_NOFOLLOW`
+/// with mode `0600` so a link swapped in before the open fails with `ELOOP`
+/// instead of redirecting the restore. The pre-open `symlink_metadata` check
+/// names the refusal; `O_NOFOLLOW` closes the final-component window that
+/// remains between that check and the open.
+///
+/// The mode on `create` applies only to a *new* file, so an existing target
+/// is tightened explicitly with `set_permissions(0600)` after the copy: a
+/// restore must not leave the WAL at whatever mode the file it replaced had.
+fn restore_regular_file_no_follow(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+) -> std::io::Result<u64> {
+    let src_meta = std::fs::symlink_metadata(src)?;
+    if src_meta.file_type().is_symlink() || !src_meta.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing to restore from non-regular or symlink source {src:?}"),
+        ));
+    }
+    if let Ok(dst_meta) = std::fs::symlink_metadata(dst) {
+        if dst_meta.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("refusing to restore through symlink destination {dst:?}"),
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    let mut reader = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(src)?
+    };
+    #[cfg(not(unix))]
+    let mut reader = std::fs::File::open(src)?;
+
+    #[cfg(unix)]
+    let mut writer = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(dst)?
+    };
+    #[cfg(not(unix))]
+    let mut writer = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(dst)?;
+
+    let copied = std::io::copy(&mut reader, &mut writer)?;
+    writer.sync_all()?;
+    drop(writer);
+    // `create` granted 0600 only because the file did not exist; an existing
+    // target keeps the mode it had. Tighten it here so the restored WAL is
+    // always 0600, as the preserved copies are (#212).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(copied)
+}
+
 fn allocate_wal_artifact_path(wal_file: &std::path::Path, kind: &str) -> std::path::PathBuf {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3307,13 +3387,16 @@ fn open_after_quarantine(
 /// `force_checkpoint_on_close=false` is known to have been applied,
 /// leaked otherwise — instead of being dropped by the caller with the
 /// flag's result discarded (`#207` C5, second call site).
-fn run_recovery_checkpoint(unverified_db: Database) -> Result<Database> {
+/// The checkpoint outcome is also persisted to the store-state sidecar
+/// (`#212`), so a fresh process reports the last real checkpoint.
+fn run_recovery_checkpoint(local_path: &std::path::Path, unverified_db: Database) -> Result<Database> {
     let ckpt_started = std::time::Instant::now();
     run_recovery_checkpoint_with(
         unverified_db,
         |conn| {
             let ckpt_res = conn.query("CHECKPOINT;");
             crate::storage::snapshot::record_checkpoint_outcome(
+                local_path,
                 ckpt_started.elapsed().as_millis() as u64,
                 ckpt_res.is_ok(),
             );
@@ -3465,7 +3548,7 @@ fn wal_refusal(
         match pair.and_then(|p| p.get(side)) {
             Some(copy) => {
                 let target = side.path(local_path);
-                match std::fs::copy(copy, &target) {
+                match restore_regular_file_no_follow(copy, &target) {
                     Ok(_) => restored.push(format!(
                         "the {label} WAL was restored from {}",
                         copy.display()
@@ -3756,7 +3839,7 @@ fn recover_from_wal_failure(
             if let Some(note) = verdict.checkpoint_label() {
                 eprintln!("WAL accounting: {note}.");
             }
-            let unverified_db = run_recovery_checkpoint(unverified_db)?;
+            let unverified_db = run_recovery_checkpoint(local_path, unverified_db)?;
             drop(unverified_db);
             if pre_total > 0 {
                 let preserved_display = preserved
@@ -3956,11 +4039,7 @@ impl FirstWriteFlip {
                     }
                 };
                 if let Some(descriptor) = descriptor {
-                    let state = crate::model_choice::StoreState {
-                        version: crate::model_choice::STORE_STATE_VERSION,
-                        has_data: true,
-                        descriptor,
-                    };
+                    let state = crate::model_choice::StoreState::new(true, descriptor);
                     if let Err(e) = crate::model_choice::write_store_state(&self.local_path, &state)
                     {
                         tracing::error!(
@@ -4105,11 +4184,7 @@ impl LockedUnknownStamp {
         if !self.serving_matches_configured(serving) {
             return;
         }
-        let state = crate::model_choice::StoreState {
-            version: crate::model_choice::STORE_STATE_VERSION,
-            has_data: false,
-            descriptor: serving.clone(),
-        };
+        let state = crate::model_choice::StoreState::new(false, serving.clone());
         match crate::model_choice::write_store_state(&self.local_path, &state) {
             Ok(()) => self.set_cached_store_state(CachedStoreState::Recorded(state)),
             Err(e) => {
@@ -4169,11 +4244,7 @@ impl LockedUnknownMigration {
         if rows == 0 || physical != self.dimensions {
             return Ok(false);
         }
-        let state = crate::model_choice::StoreState {
-            version: crate::model_choice::STORE_STATE_VERSION,
-            has_data: true,
-            descriptor: self.serving.clone(),
-        };
+        let state = crate::model_choice::StoreState::new(true, self.serving.clone());
         match crate::model_choice::write_store_state(&self.local_path, &state) {
             Ok(()) => {
                 let mut cache = self.store_state.lock().unwrap_or_else(|e| e.into_inner());
@@ -4293,9 +4364,10 @@ impl LadybugStore {
             }
         };
 
-        crate::storage::snapshot::record_recovery_provenance(
+        crate::storage::snapshot::record_recovery_open(
             &local_path,
             open_provenance.recovery_kind_slug(),
+            pre.0.pre.saturating_add(pre.1.pre),
         );
 
         let checkpoints = CheckpointLatch::new(local_path.clone());
@@ -4521,11 +4593,7 @@ impl LadybugStore {
             {
                 if let Some(serving) = self.serving_descriptor() {
                     if serving != recorded.descriptor && self.serving_matches_configured(&serving) {
-                        let state = crate::model_choice::StoreState {
-                            version: crate::model_choice::STORE_STATE_VERSION,
-                            has_data: false,
-                            descriptor: serving.clone(),
-                        };
+                        let state = crate::model_choice::StoreState::new(false, serving.clone());
                         match crate::model_choice::write_store_state(&self.local_path, &state) {
                             Ok(()) => {
                                 self.set_cached_store_state(CachedStoreState::Recorded(state))
@@ -4540,11 +4608,7 @@ impl LadybugStore {
             CachedStoreState::FreshUnrecorded => {
                 if let Some(serving) = self.serving_descriptor() {
                     if self.serving_matches_configured(&serving) {
-                        let state = crate::model_choice::StoreState {
-                            version: crate::model_choice::STORE_STATE_VERSION,
-                            has_data: false,
-                            descriptor: serving.clone(),
-                        };
+                        let state = crate::model_choice::StoreState::new(false, serving.clone());
                         match crate::model_choice::write_store_state(&self.local_path, &state) {
                             Ok(()) => {
                                 self.set_cached_store_state(CachedStoreState::Recorded(state))
@@ -10752,6 +10816,7 @@ impl VectorStore for LadybugStore {
             }
             CheckpointRun::Attempted(result) => {
                 crate::storage::snapshot::record_checkpoint_outcome(
+                    &self.local_path,
                     started.elapsed().as_millis() as u64,
                     result.is_ok(),
                 );
@@ -10790,6 +10855,7 @@ impl VectorStore for LadybugStore {
             }
             Ok(CheckpointRun::Attempted(result)) => {
                 crate::storage::snapshot::record_checkpoint_outcome(
+                    &self.local_path,
                     started.elapsed().as_millis() as u64,
                     result.is_ok(),
                 );
@@ -10799,6 +10865,7 @@ impl VectorStore for LadybugStore {
             // attempt in the same accounting as one that failed inside it.
             Err(e) => {
                 crate::storage::snapshot::record_checkpoint_outcome(
+                    &self.local_path,
                     started.elapsed().as_millis() as u64,
                     false,
                 );
@@ -22578,6 +22645,25 @@ eurostrata\src\daemon.rs",
         serde_json::from_str(&content).expect("sidecar parses")
     }
 
+    /// The recorded identity a sidecar owns — everything except the `#212`
+    /// health fields, which a checkpoint or a recovery legitimately advances
+    /// in place. The invariant "this open never moves the recorded identity"
+    /// is about these fields, not about the health bytes beside them.
+    fn sidecar_identity(db: &std::path::Path) -> serde_json::Value {
+        let mut value = read_sidecar(db);
+        if let Some(object) = value.as_object_mut() {
+            for key in [
+                "last_recovery",
+                "last_checkpoint_at",
+                "last_checkpoint_duration_ms",
+                "checkpoint_failures",
+            ] {
+                object.remove(key);
+            }
+        }
+        value
+    }
+
     /// NEUROSTRATA_MODEL would override the file's first entry; the
     /// file-based tests pin it out of the way and restore it after.
     pub(super) fn without_model_env() -> Option<String> {
@@ -23453,11 +23539,7 @@ eurostrata\src\daemon.rs",
         let remote = remote_descriptor_for("RemoteModel");
         crate::model_choice::write_store_state(
             &fx.db,
-            &crate::model_choice::StoreState {
-                version: crate::model_choice::STORE_STATE_VERSION,
-                has_data: true,
-                descriptor: remote.clone(),
-            },
+            &crate::model_choice::StoreState::new(true, remote.clone()),
         )
         .expect("record the remote identity");
 
@@ -23499,8 +23581,7 @@ eurostrata\src\daemon.rs",
         // no serving descriptor) both succeed and never move R.
         let previous = without_model_env();
         let fx = data_bearing_store_fixture("a5-unbound-opens").await;
-        let sidecar_before =
-            std::fs::read(crate::model_choice::store_state_path(&fx.db)).expect("read sidecar");
+        let sidecar_before = sidecar_identity(&fx.db);
         write_embedders_config(&fx.config_dir, "ModelB");
 
         let backup = LadybugStore::for_testing(&fx.db, 4)
@@ -23513,9 +23594,9 @@ eurostrata\src\daemon.rs",
             .expect("the backup open is never refused");
         drop(backup);
         assert_eq!(
-            std::fs::read(crate::model_choice::store_state_path(&fx.db)).expect("re-read sidecar"),
+            sidecar_identity(&fx.db),
             sidecar_before,
-            "backup never moves the recorded descriptor"
+            "backup never moves the recorded descriptor (the checkpoint health beside it may advance, #212)"
         );
 
         let report = LadybugStore::for_testing(&fx.db, 4)
@@ -23527,9 +23608,9 @@ eurostrata\src\daemon.rs",
             .expect("the report open is never refused");
         drop(report);
         assert_eq!(
-            std::fs::read(crate::model_choice::store_state_path(&fx.db)).expect("re-read sidecar"),
+            sidecar_identity(&fx.db),
             sidecar_before,
-            "a report open never moves the recorded descriptor"
+            "a report open never moves the recorded descriptor (the checkpoint health beside it may advance, #212)"
         );
         let _ = std::fs::remove_dir_all(&fx.root);
         restore_model_env(previous);
@@ -23609,11 +23690,7 @@ eurostrata\src\daemon.rs",
         // must classify.
         crate::model_choice::write_store_state(
             &fx.db,
-            &crate::model_choice::StoreState {
-                version: crate::model_choice::STORE_STATE_VERSION,
-                has_data: false,
-                descriptor: serving_descriptor_for("ModelA"),
-            },
+            &crate::model_choice::StoreState::new(false, serving_descriptor_for("ModelA")),
         )
         .expect("write the pristine sidecar");
         let store = LadybugStore::for_testing(&fx.db, 4)
@@ -25074,6 +25151,239 @@ eurostrata\src\daemon.rs",
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// `#212`: a live store and a path-only query answer different questions.
+    /// After one recovery, a *verified* reopen **in the same process** must
+    /// report live state (`opened_via_recovery == false`, no kind), while the
+    /// recorded timestamp survives as history in `last_recovery_at` — on the
+    /// live status and on a path-only query alike.
+    #[tokio::test]
+    async fn verified_reopen_reports_live_state_while_path_only_status_keeps_history() {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-prov-live-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("live.lbug");
+        let previous_model = without_model_env();
+        let embed = root.join("embed");
+        std::fs::create_dir_all(&embed).expect("create the embed config dir");
+        std::fs::write(
+            embed.join("embedders.json"),
+            "[{\"model_name\":\"ModelA\",\"dimensions\":8}]",
+        )
+        .expect("write the fixture embedders.json");
+
+        let creator = LadybugStore::for_testing(&db, 8)
+            .expect("open temp database")
+            .with_embed_config_dir(&embed)
+            .with_serving_descriptor(Some(serving_descriptor_dims("ModelA", 8)));
+        creator.init("probe").await.expect("init");
+        drop(creator);
+        plant_recoverable_wal_with_corrupted_tail(&db, 2);
+
+        let _wal_env_serial = WAL_ENV_LOCK.lock().await;
+        let previous_wal = allow_unverified_wal_recovery();
+        let recovered = LadybugStore::for_testing(&db, 8).expect("recovery open");
+        assert_eq!(
+            recovered.open_provenance(),
+            OpenProvenance::UnverifiedWalReplay,
+            "the fixture must recover once"
+        );
+        drop(recovered);
+        restore_wal_env(previous_wal);
+        drop(_wal_env_serial);
+        let recorded = read_sidecar(&db)["last_recovery"]["at"]
+            .as_str()
+            .map(str::to_string)
+            .expect("the recovery left a durable timestamp in the sidecar");
+
+        // A verified reopen in this same process: the recovery is now only
+        // history, and the live map entry has been cleared by the verified
+        // open.
+        let live =
+            LadybugStore::for_testing(&db, 8).expect("the post-recovery store reopens verified");
+        assert!(
+            !live.opened_via_recovery(),
+            "the reopen after a drained WAL must be verified"
+        );
+        assert_eq!(live.open_provenance().recovery_kind_slug(), None);
+
+        // The live composition: the verified handle owns the provenance pair,
+        // while the recorded timestamp still flows through as history.
+        let live_status = crate::server::live_store_status(
+            crate::storage::compute_storage_status(
+                &db,
+                &crate::storage::StorageHygieneConfig::default(),
+            ),
+            live.opened_via_recovery(),
+            live.open_provenance().recovery_kind_slug(),
+        );
+        assert!(
+            !live_status.opened_via_recovery,
+            "a verified live store must not inherit the persisted recovery flag (#212)"
+        );
+        assert_eq!(
+            live_status.recovery_provenance, None,
+            "a verified live store must not report a persisted recovery kind (#212)"
+        );
+        assert_eq!(
+            live_status.last_recovery_at.as_deref(),
+            Some(recorded.as_str()),
+            "the live status still reports when the store last recovered (#212)"
+        );
+
+        // The path-only query answers from the sidecar: the kind is history,
+        // the handle-scoped flag is false because nothing was opened.
+        let path_only = crate::storage::compute_storage_status(
+            &db,
+            &crate::storage::StorageHygieneConfig::default(),
+        );
+        assert_eq!(
+            path_only.recovery_provenance.as_deref(),
+            Some("unverified_wal_replay"),
+            "a path-only status reports the persisted kind (#212)"
+        );
+        assert!(
+            !path_only.opened_via_recovery,
+            "opened_via_recovery stays handle-scoped for a path-only query (#212)"
+        );
+        assert_eq!(
+            path_only.last_recovery_at.as_deref(),
+            Some(recorded.as_str()),
+            "a path-only status reports the recorded recovery time (#212)"
+        );
+
+        drop(live);
+        let _ = std::fs::remove_dir_all(&root);
+        restore_model_env(previous_model);
+    }
+
+    /// `#212`: a recovery open persists its provenance to the store-state
+    /// sidecar, so a fresh, path-only `storage status` reports the recovery and
+    /// its WAL bytes instead of `opened_via_recovery=false`. The identity
+    /// fields the sidecar already held are untouched.
+    #[tokio::test]
+    async fn recovery_provenance_is_persisted_for_a_fresh_path_only_status() {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-prov-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("prov.lbug");
+        let previous_model = without_model_env();
+        let embed = root.join("embed");
+        std::fs::create_dir_all(&embed).expect("create the embed config dir");
+        std::fs::write(
+            embed.join("embedders.json"),
+            "[{\"model_name\":\"ModelA\",\"dimensions\":8}]",
+        )
+        .expect("write the fixture embedders.json");
+
+        // A sidecar recorded by a prior process — the shape a recovery open
+        // must extend rather than invent.
+        let creator = LadybugStore::for_testing(&db, 8)
+            .expect("open temp database")
+            .with_embed_config_dir(&embed)
+            .with_serving_descriptor(Some(serving_descriptor_dims("ModelA", 8)));
+        creator.init("probe").await.expect("init");
+        drop(creator);
+        assert!(
+            crate::model_choice::store_state_path(&db).exists(),
+            "the fixture records a sidecar before the recovery open"
+        );
+        let sidecar_before = read_sidecar(&db);
+
+        plant_recoverable_wal_with_corrupted_tail(&db, 3);
+        let mut wal_os = db.clone().into_os_string();
+        wal_os.push(".wal");
+        let wal_file = std::path::PathBuf::from(wal_os);
+        let pre_wal_bytes = std::fs::metadata(&wal_file).map(|m| m.len()).unwrap_or(0);
+        assert!(pre_wal_bytes > 0, "the recovery has WAL bytes to report");
+
+        let _wal_env_serial = WAL_ENV_LOCK.lock().await;
+        let previous_wal = allow_unverified_wal_recovery();
+        let store = LadybugStore::for_testing(&db, 8)
+            .expect("the unverified replay recovers the committed prefix");
+        assert_eq!(
+            store.open_provenance(),
+            OpenProvenance::UnverifiedWalReplay,
+            "the fixture must exercise the recovery arm"
+        );
+        drop(store);
+        restore_wal_env(previous_wal);
+        drop(_wal_env_serial);
+
+        let sidecar = read_sidecar(&db);
+        assert_eq!(
+            sidecar["last_recovery"]["kind"],
+            json!("unverified_wal_replay"),
+            "the recovery arm is persisted to the sidecar"
+        );
+        assert_eq!(
+            sidecar["last_recovery"]["wal_bytes"],
+            json!(pre_wal_bytes),
+            "the record carries the WAL bytes the recovery was about"
+        );
+        let at = sidecar["last_recovery"]["at"]
+            .as_str()
+            .expect("the record carries a timestamp");
+        assert!(
+            at.contains('T') && (at.ends_with('Z') || at.ends_with("+00:00")),
+            "the record carries an RFC 3339 UTC timestamp: {at}"
+        );
+        assert!(
+            sidecar["last_checkpoint_at"].is_string(),
+            "the recovery CHECKPOINT records its outcome durably"
+        );
+        assert_eq!(
+            sidecar["has_data"], sidecar_before["has_data"],
+            "the recovery provenance write leaves has_data alone"
+        );
+        assert_eq!(
+            sidecar["descriptor"], sidecar_before["descriptor"],
+            "the recovery provenance write leaves the recorded identity alone"
+        );
+
+        // The fresh-process shape: no live entry for this path, so the kind
+        // and history are answered by the sidecar alone.
+        crate::storage::snapshot::record_recovery_provenance(&db, None);
+        let status = crate::storage::compute_storage_status(
+            &db,
+            &crate::storage::StorageHygieneConfig::default(),
+        );
+        assert_eq!(
+            status.recovery_provenance.as_deref(),
+            Some("unverified_wal_replay"),
+            "a path-only status reports the persisted recovery kind (#212)"
+        );
+        assert!(
+            !status.opened_via_recovery,
+            "opened_via_recovery is handle-scoped and a path-only query opened nothing (#212)"
+        );
+        assert_eq!(
+            status.last_recovery_at.as_deref(),
+            sidecar["last_recovery"]["at"].as_str(),
+            "a path-only status reports when the recovery happened (#212)"
+        );
+        assert!(
+            status.last_checkpoint_at.is_some(),
+            "the persisted checkpoint timestamp reaches the path-only status"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        restore_model_env(previous_model);
+    }
+
     /// #69 + #90: the unverified-WAL replay checkpoints the recovered rows
     /// and then reopens the session under `verifying_config()`, so the
     /// store never keeps serving an unauthenticated configuration, and the
@@ -26524,11 +26834,7 @@ eurostrata\src\daemon.rs",
         // Hand-rewrite the sidecar to the stale pristine label.
         crate::model_choice::write_store_state(
             &fx.db,
-            &crate::model_choice::StoreState {
-                version: crate::model_choice::STORE_STATE_VERSION,
-                has_data: false,
-                descriptor: serving_descriptor_dims("ModelA", 768),
-            },
+            &crate::model_choice::StoreState::new(false, serving_descriptor_dims("ModelA", 768)),
         )
         .expect("rewrite the sidecar to the stale pristine label");
         let sidecar_before =
@@ -30129,6 +30435,88 @@ mod wal_preservation {
             "one artifact per side, no duplicates"
         );
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `#212`: the refusal restore must never write through a symlink planted
+    /// at `<db>.wal`. It refuses, names the side, and leaves both the link and
+    /// its target byte-intact. The pre-#212 restore (`std::fs::copy`, which
+    /// follows the link) fails this test by overwriting the target.
+    #[cfg(unix)]
+    #[test]
+    fn restore_refuses_a_symlinked_wal_and_leaves_the_target_intact() {
+        use crate::store::wal_accounting::{SideObservation, SideSet, WalAccounting};
+        let root = fixture("restore-symlink");
+        let db = root.join("sym.lbug");
+        std::fs::write(&db, b"db").unwrap();
+        let victim = root.join("operator-notes.txt");
+        std::fs::write(&victim, b"operator bytes must survive").unwrap();
+        let target = WalSide::Active.path(&db);
+        std::os::unix::fs::symlink(&victim, &target).unwrap();
+
+        let preserved = root.join("sym.lbug.wal.unclean.100");
+        std::fs::write(&preserved, b"preserved-wal-bytes").unwrap();
+        let pair = PreservedPair {
+            active: Some(preserved.clone()),
+            frozen: None,
+        };
+
+        let message = wal_refusal(
+            &db,
+            WalAccounting::CommittedLost {
+                pre_bytes: 16,
+                sides: SideSet::ACTIVE,
+            },
+            &(SideObservation::empty(), SideObservation::empty()),
+            (0, 0),
+            &pair,
+            SideSet::ACTIVE,
+            "Refusing to open: test fixture",
+        )
+        .to_string();
+        assert!(
+            message.contains("could not be restored"),
+            "the refusal reports the restore failure: {message}"
+        );
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"operator bytes must survive".to_vec(),
+            "the restore must never write through a symlink at .wal (#212)"
+        );
+        assert!(
+            std::fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the planted link is left in place for the operator"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `#212`: the refusal restore recreates its target `0600`. The mode on
+    /// `create` only applies to a *new* file, so a pre-existing looser target
+    /// (0644 here) must be tightened explicitly; `create|truncate` alone
+    /// would silently keep the old mode.
+    #[cfg(unix)]
+    #[test]
+    fn restore_recreates_the_target_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = fixture("restore-mode");
+        let src = root.join("mode.lbug.wal.unclean.100");
+        std::fs::write(&src, b"restored-wal-bytes").unwrap();
+        let dst = WalSide::Active.path(&root.join("mode.lbug"));
+        std::fs::write(&dst, b"stale-bytes").unwrap();
+        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let copied = restore_regular_file_no_follow(&src, &dst)
+            .expect("restore over an existing regular target");
+        assert_eq!(copied, 18, "every preserved byte is restored");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"restored-wal-bytes".to_vec());
+        assert_eq!(
+            std::fs::metadata(&dst).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the restored WAL is 0600 even when the target already existed (#212)"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
