@@ -1226,8 +1226,13 @@ fn lean_proof_sources_contain_no_sorry_or_axiom() {
     );
 }
 
+/// NOT a Lean parity test (renamed in PR #206 remediation, V-9): this
+/// asserts the Rust DataConnector gate verdicts against hard-coded
+/// expectations. It performs no Lean comparison — `proofs/Main.lean` emits
+/// no DATA_CONNECTOR rows and no lake/Lean invocation happens here. A real
+/// Rust↔Lean differential for the connector gates remains future work.
 #[test]
-fn data_connector_gate_parity() {
+fn data_connector_gate_rust_verdicts() {
     // Test Pre-Gate Verdicts
     assert_eq!(evaluate_connector_pre_gate(KernelConnectorPreGateInput {
         connector_registered: true,
