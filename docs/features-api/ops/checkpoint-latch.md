@@ -62,8 +62,10 @@ the attempt is armed once per latch, not per interval.
 
 ## 3. Seeing it in status
 
-`storage_status` (the MCP tool, the daemon's `/health`, and
-`neurostrata-mcp status`) reports two fields for this:
+`storage_status` (the MCP tool and the daemon's `/health`) reports two fields
+for this. The path-only `neurostrata-mcp storage status` cannot see an
+in-process latch, so it reports the defaults; `neurostrata-mcp status` probes
+the daemon/store and does not report these fields.
 
 | Field | Meaning |
 | :--- | :--- |
