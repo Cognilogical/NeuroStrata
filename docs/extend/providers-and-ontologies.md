@@ -34,3 +34,12 @@ A **kinetic action pack** is a named collection of `ActionTypeDefinition` JSON s
 - `effects` — the staged writes (`SupersedeMemory`, `UpsertMemory`, `SetTwinState`, `LinkEdge`, `TransitionTask`)
 
 Action packs are domain-scoped: a pack for a physical-asset domain can coexist with a pack for a code-review domain in the same namespace without conflict. The `neurostrata_action define` command validates an `ActionTypeDefinition` and stores it as a `memory_type = "action_type"` row, refreshing the namespace's `OntologyIndex`.
+
+## Kernel Data Ports: `TaskStore` & `OntologyStore`
+
+The central agentic kernel consumes the serving layer through two narrow async ports, so the kernel can be wired to any backend that implements them:
+
+- `TaskStore` (`src/traits.rs`) — task-row access for the kernel's executive port: `load_task_row(namespace, task_id)`, `list_task_rows(namespace)`, and `count_extracted_memories_for_task(namespace, task_id)` (the Lock 2 extraction count over `metadata.extracted_from`, excluding the task row itself).
+- `OntologyStore` (`src/traits.rs`) — typed memory listing and scoped writes for the kernel's ontology port: `list_memories_by_types(namespace, memory_types)` and `get_memory_by_id(namespace, id)` for reads, `put_scoped_memory(namespace, id, payload)` for scoped writes.
+
+Both ports are implemented by `LadybugStore`; the kernel holds them as `Arc<dyn ...>` trait objects rather than reaching into the concrete store.
