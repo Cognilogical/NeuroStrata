@@ -163,14 +163,33 @@ pub fn list_wal_recovery_artifacts(
 /// Prune WAL recovery artifacts beside `store_path` beyond `keep` (clamped to
 /// at least 1), returning the removed paths (#195).
 pub fn prune_wal_recovery_artifacts(store_path: &Path, keep: usize) -> Vec<PathBuf> {
+    prune_wal_recovery_artifacts_except(store_path, keep, &[])
+}
+
+/// Prune WAL recovery artifacts beyond `keep` **without ever removing a path in
+/// `keep_paths`**, returning the removed paths (#207).
+///
+/// The retained set is the newest `keep` artifacts (as
+/// [`prune_wal_recovery_artifacts`] does) **plus** every protected path, so a
+/// caller that has just recorded copies of the current WAL pair cannot have one
+/// of them deleted by a retention budget of 1. Protected paths that already fall
+/// inside the newest `keep` are not double-counted; ones outside it simply
+/// survive in addition.
+pub fn prune_wal_recovery_artifacts_except(
+    store_path: &Path,
+    keep: usize,
+    keep_paths: &[PathBuf],
+) -> Vec<PathBuf> {
     let keep = keep.max(1);
-    let artifacts = list_wal_recovery_artifacts(store_path);
+    let protected: std::collections::HashSet<&Path> =
+        keep_paths.iter().map(|p| p.as_path()).collect();
     let mut removed = Vec::new();
-    if artifacts.len() > keep {
-        for (path, _, _) in &artifacts[keep..] {
-            if fs::remove_file(path).is_ok() {
-                removed.push(path.clone());
-            }
+    for (index, (path, _, _)) in list_wal_recovery_artifacts(store_path).iter().enumerate() {
+        if index < keep || protected.contains(path.as_path()) {
+            continue;
+        }
+        if fs::remove_file(path).is_ok() {
+            removed.push(path.clone());
         }
     }
     removed
@@ -695,6 +714,51 @@ pub fn prune_expired_snapshots(root: &Path, keep: usize) -> Result<Vec<PathBuf>,
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn prune_wal_recovery_artifacts_except_never_removes_a_protected_path() {
+        let dir = temp_dir("prune-except");
+        let store = dir.join("p.lbug");
+        fs::write(&store, b"db").unwrap();
+        let newest = dir.join("p.lbug.wal.unclean.300");
+        let middle = dir.join("p.lbug.wal.unclean.200");
+        let oldest = dir.join("p.lbug.wal.unclean.100");
+        for (path, payload) in [
+            (&newest, b"newest"),
+            (&middle, b"middle"),
+            (&oldest, b"oldest"),
+        ] {
+            fs::write(path, payload).unwrap();
+        }
+        let now = std::time::SystemTime::now();
+        let set = |path: &PathBuf, secs: u64| {
+            File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(now - std::time::Duration::from_secs(secs))
+                .unwrap();
+        };
+        set(&newest, 1);
+        set(&middle, 60);
+        set(&oldest, 3600);
+
+        // keep=1 would drop `middle` and `oldest`; the protected oldest survives.
+        let removed = prune_wal_recovery_artifacts_except(&store, 1, &[oldest.clone()]);
+        assert_eq!(
+            removed,
+            vec![middle.clone()],
+            "only the unprotected excess goes"
+        );
+        assert!(newest.exists(), "the newest artifact is kept");
+        assert!(
+            oldest.exists(),
+            "a protected path survives beyond the budget"
+        );
+        assert!(!middle.exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let base = std::env::temp_dir().join("neurostrata-snapshot-tests");

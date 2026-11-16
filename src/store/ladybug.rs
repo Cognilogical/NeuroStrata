@@ -2465,7 +2465,17 @@ fn preserve_wal_pair(local_path: &std::path::Path) -> Result<PreservedPair> {
         }
     }
     let keep = LadybugStore::configured_snapshot_retention_count();
-    let _ = crate::storage::snapshot::prune_wal_recovery_artifacts(local_path, keep);
+    // The copies just recorded are the evidence a refusal restores from, so
+    // retention must never delete one of them: with `keep = 1` and both sides
+    // non-empty, the mtime sort would otherwise drop the older of the two
+    // (#207 P1).
+    let protect: Vec<std::path::PathBuf> = [preserved.active.as_ref(), preserved.frozen.as_ref()]
+        .into_iter()
+        .flatten()
+        .cloned()
+        .collect();
+    let _ =
+        crate::storage::snapshot::prune_wal_recovery_artifacts_except(local_path, keep, &protect);
     Ok(preserved)
 }
 
@@ -2771,12 +2781,14 @@ fn open_after_quarantine(
 ) -> Result<Database> {
     let mut pending = initial;
     let mut pending_foreign = initial_foreign;
+    let mut quarantined: Vec<std::path::PathBuf> = Vec::new();
     for attempt in 0..3 {
         let mut moved = false;
         for side in [WalSide::Active, WalSide::Frozen] {
             if pending.contains(wal_side_set(side)) {
-                if let Some(quarantined) = quarantine_wal_side(local_path, side, pending_foreign)? {
-                    eprintln!("{}", quarantined.message);
+                if let Some(set_aside) = quarantine_wal_side(local_path, side, pending_foreign)? {
+                    eprintln!("{}", set_aside.message);
+                    quarantined.push(set_aside.artifact);
                     moved = true;
                 }
             }
@@ -2786,8 +2798,14 @@ fn open_after_quarantine(
         }
         match Database::new(local_path, verifying_config()) {
             Ok(db) => {
+                // Same rule as `preserve_wal_pair`: the artifacts this arm just
+                // wrote are the operator's only copy, so they are exempt.
                 let keep = LadybugStore::configured_snapshot_retention_count();
-                let _ = crate::storage::snapshot::prune_wal_recovery_artifacts(local_path, keep);
+                let _ = crate::storage::snapshot::prune_wal_recovery_artifacts_except(
+                    local_path,
+                    keep,
+                    &quarantined,
+                );
                 return Ok(db);
             }
             Err(e) => {
@@ -13648,7 +13666,7 @@ mod tests {
         );
     }
 
-    static RETENTION_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(super) static RETENTION_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn configured_snapshot_retention_count_honors_small_and_zero_values() {
@@ -28837,6 +28855,63 @@ mod wal_preservation {
         );
         assert!(own.contains("DATA LOSS"), "{own}");
         assert!(!own.contains("another database"), "{own}");
+    }
+
+    /// `#207` P1: with retention 1, both copies `preserve_wal_pair` just
+    /// recorded must survive; an older artifact must still be pruned.
+    #[test]
+    fn preserve_wal_pair_keeps_both_current_copies_with_retention_one() {
+        use std::time::{Duration, SystemTime};
+
+        let _env_guard = super::tests::RETENTION_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var("NEUROSTRATA_SNAPSHOT_RETENTION_COUNT").ok();
+        std::env::set_var("NEUROSTRATA_SNAPSHOT_RETENTION_COUNT", "1");
+
+        let root = fixture("retention-one");
+        let db = root.join("retention.lbug");
+        std::fs::write(&db, b"db").unwrap();
+        std::fs::write(WalSide::Active.path(&db), b"active-bytes").unwrap();
+        std::fs::write(WalSide::Frozen.path(&db), b"frozen-bytes-longer").unwrap();
+
+        // An older artifact that retention must still remove.
+        let stale = root.join("retention.lbug.wal.unclean.100");
+        std::fs::write(&stale, b"stale").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(3600))
+            .unwrap();
+
+        let preserved = preserve_wal_pair(&db).expect("preserve both sides");
+        let active = preserved.active.clone().expect("active copy path");
+        let frozen = preserved.frozen.clone().expect("frozen copy path");
+
+        assert!(
+            active.exists(),
+            "the active copy must survive retention=1 (the P1 regression)"
+        );
+        assert!(
+            frozen.exists(),
+            "the frozen copy must survive retention=1 (the P1 regression)"
+        );
+        assert_eq!(std::fs::read(&active).unwrap(), b"active-bytes".to_vec());
+        assert_eq!(
+            std::fs::read(&frozen).unwrap(),
+            b"frozen-bytes-longer".to_vec()
+        );
+        assert!(
+            !stale.exists(),
+            "an older artifact must still be pruned under retention=1"
+        );
+
+        match previous {
+            Some(value) => std::env::set_var("NEUROSTRATA_SNAPSHOT_RETENTION_COUNT", value),
+            None => std::env::remove_var("NEUROSTRATA_SNAPSHOT_RETENTION_COUNT"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

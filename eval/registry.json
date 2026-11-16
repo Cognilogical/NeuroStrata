@@ -211,7 +211,8 @@
         "cargo test --locked --bin neurostrata-mcp wal_preservation -- --test-threads=1",
         "cargo test --locked --bin neurostrata-mcp unverified_replay -- --test-threads=1",
         "cargo test --locked --bin neurostrata-mcp an_emptied_active_side_still_refuses -- --test-threads=1",
-        "cargo test --locked --bin neurostrata-mcp wal_zero_record -- --test-threads=1"
+        "cargo test --locked --bin neurostrata-mcp wal_zero_record -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp prune_wal_recovery_artifacts_except -- --test-threads=1"
       ],
       "tests": [
         "store::wal_accounting::tests::checksum_of_an_empty_buffer_is_the_dbs_seed",
@@ -296,6 +297,7 @@
         "store::ladybug::wal_preservation::quarantine_is_foreign_only_when_the_engine_named_a_side",
         "store::ladybug::wal_preservation::quarantine_wal_side_picks_the_message_from_the_attribution",
         "store::ladybug::wal_preservation::quarantine_message_distinguishes_foreign_from_same_database",
+        "store::ladybug::wal_preservation::preserve_wal_pair_keeps_both_current_copies_with_retention_one",
         "store::ladybug::wal_preservation::preserve_wal_pair_reports_absent_sides",
         "store::ladybug::wal_preservation::preserve_wal_pair_refuses_a_symlinked_side",
         "store::ladybug::wal_preservation::preserve_unclean_wal_prunes_stale_artifacts_even_with_no_wal",
@@ -317,7 +319,8 @@
         "store::ladybug::wal_zero_record::strict_clean_foreign_wal_is_still_refused",
         "store::ladybug::wal_zero_record::foreign_active_and_frozen_are_both_quarantined",
         "store::ladybug::wal_zero_record::oversized_wal_refuses_after_a_failed_verified_open",
-        "store::ladybug::wal_zero_record::refusal_keeps_the_active_wal_when_it_still_has_bytes"
+        "store::ladybug::wal_zero_record::refusal_keeps_the_active_wal_when_it_still_has_bytes",
+        "storage::snapshot::tests::prune_wal_recovery_artifacts_except_never_removes_a_protected_path"
       ],
       "thresholds": {
         "ignored": 0,
