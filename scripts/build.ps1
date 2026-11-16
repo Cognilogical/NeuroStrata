@@ -429,7 +429,8 @@ if ($CheckOnly) {
 # ---------------------------------------------------------------------------
 # 6. Build or test
 # ---------------------------------------------------------------------------
-$cargoArgList = @($Command)
+# ValidateSet accepts any case (-Command Test); cargo subcommands are lowercase.
+$cargoArgList = @($Command.ToLowerInvariant())
 if ($Configuration -eq 'release') {
     $cargoArgList += '--release'
 } else {
