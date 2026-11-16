@@ -296,4 +296,17 @@ if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$tmp/double-backtick-pre
   exit 1
 fi
 
+# Codex P2: a receipt inside a multiline inline code span must not clear.
+mkdir -p "$tmp/multiline-code-span-receipt"
+printf '[]\n' > "$tmp/multiline-code-span-receipt/reviews.json"
+printf '[]\n' > "$tmp/multiline-code-span-receipt/issue-comments.json"
+printf '{"shas":["abcdef1"],"issues":[]}\n' > "$tmp/multiline-code-span-receipt/valid-targets.json"
+cat > "$tmp/multiline-code-span-receipt/threads.json" <<'JSON'
+[{"isResolved":false,"comments":[{"body":"**![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)** finding","author_association":"NONE"},{"body":"`example\nfixed@abcdef1\nend`","author_association":"OWNER"}]}]
+JSON
+if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$tmp/multiline-code-span-receipt" >/dev/null 2>&1; then
+  echo "FAIL: a receipt inside a multiline inline code span cleared a finding" >&2
+  exit 1
+fi
+
 echo "gate-receipt self-test: PASS"

@@ -73,8 +73,9 @@ tokenizer_def='
           (($line | capture("^ {0,3}(?<f>`{3,}|~{3,})").f) as $f
            | .ch = ($f[0:1]) | .n = ($f | length))
         elif ($line | test("^(    |\\t)")) then .
-        else .out += [($line | gsub("(?<!`)(`+)(?!`)(.*?)(?<!`)\\1(?!`)"; ""))] end))
-    | .out | join("\n");
+        else .out += [$line] end))
+    | .out | join("\n")
+    | gsub("(?<!`)(`+)(?!`)(.*?)(?<!`)\\1(?!`)"; ""; "m");
 '
 clean_filter="${tokenizer_def}"'clean'
 
@@ -361,7 +362,7 @@ else
     printf '%s\n' "$reviews_entries" "$comment_entries" "$pull_entries" | jq -r "${tokenizer_def}"' .body | clean' 2>/dev/null || true
     printf '%s' "$threads_json" | jq -r "${tokenizer_def}"' .[].comments[].body | clean' 2>/dev/null || true
   )
-  for sha in $(printf '%s\n' "$receipt_text" | clean_stream | grep -Eoi 'fixed@[0-9a-f]{7,}' | sed 's/^fixed@//' | tr '[:upper:]' '[:lower:]' | sort -u); do
+  for sha in $(printf '%s\n' "$receipt_text" | grep -Eoi 'fixed@[0-9a-f]{7,}' | sed 's/^fixed@//' | tr '[:upper:]' '[:lower:]' | sort -u); do
     if ! gh api "repos/$repo/commits/$sha" --jq .sha >/dev/null 2>&1; then
       echo "gate-receipt: ignoring fixed@$sha (no such commit in $repo)" >&2
       continue
@@ -372,7 +373,7 @@ else
       *) echo "gate-receipt: ignoring fixed@$sha (not the PR head or an ancestor of it)" >&2 ;;
     esac
   done
-  for n in $(printf '%s\n' "$receipt_text" | clean_stream | grep -Eoi 'filed[[:space:]]+#[0-9]+' | grep -Eo '[0-9]+' | sort -u); do
+  for n in $(printf '%s\n' "$receipt_text" | grep -Eoi 'filed[[:space:]]+#[0-9]+' | grep -Eo '[0-9]+' | sort -u); do
     # The issues endpoint also resolves pull requests; a filed receipt must
     # name an issue, so an object carrying a pull_request key is rejected.
     if issue_obj=$(gh api "repos/$repo/issues/$n" 2>/dev/null) \
