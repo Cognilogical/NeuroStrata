@@ -1,0 +1,20 @@
+[
+  {
+    "isResolved": false,
+    "comments": [
+      {
+        "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Make action-slug uniqueness atomic**\n\nTwo concurrent define_action calls can both reserve the same slug.\n\n<!-- codex-code-review-finding:v1 -->",
+        "author_association": "NONE"
+      }
+    ]
+  },
+  {
+    "isResolved": false,
+    "comments": [
+      {
+        "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Rebuild carried dependencies from the current generation**\n\nIncremental ingest can leave dangling dependencies when a callee no longer resolves.\n\n<!-- codex-code-review-finding:v1 -->",
+        "author_association": "NONE"
+      }
+    ]
+  }
+]

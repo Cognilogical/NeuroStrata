@@ -1,0 +1,10 @@
+[
+  {
+    "body": "<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {\"code_review\":{\"has_any_findings\":true,\"has_unresolved_findings\":true}} -->\n\nCodex Review Summary: Completed\n",
+    "author_association": "NONE"
+  },
+  {
+    "body": "Codex review completed; both findings were addressed in a forward PR.",
+    "author_association": "MEMBER"
+  }
+]

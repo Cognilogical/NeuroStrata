@@ -17,17 +17,89 @@ posted as `COMMENTED` therefore cannot block a merge.
 ## Gate receipt
 
 A review or comment that says `CHANGES-NEEDED`, `CHANGES NEEDED`,
-`DO-NOT-MERGE`, or `DO NOT MERGE` is a gating marker. The PR body is not
-scanned: it often describes the gate itself. Each marker needs one receipt in a
-review or comment:
+`DO-NOT-MERGE`, or `DO NOT MERGE` is a gating marker, and so is a P1 or P2
+finding badge (`**P1 Badge**`, `**P2 Badge**`, the bare `P1-Badge` and
+shields.io forms) or a bold `**P1**` / `**P2**`. The Codex
+`<!-- codex-code-review-finding:v1 -->` comment is not a marker by itself: the
+badge inside the finding it annotates is the marker. One tokenizer strips, in
+every mode: fenced blocks opened with ``` or ~~~ (any run length, and unclosed
+fences run to EOF), lines indented with four spaces or a tab, and inline code
+spans delimited by one or more backticks (the longest opening run wins). A
+marker or receipt inside any of those is not evidence. The PR body is not
+scanned: it often describes the gate itself.
 
-- `fixed@<sha>` — the finding is fixed at that commit;
-- `filed #<issue>` — the finding is tracked in an issue;
+Each marker needs one receipt:
+
+- `fixed@<sha>` — the finding is fixed at that commit, which must exist and be
+  the PR head or an ancestor of it;
+- `filed #<issue>` — the finding is tracked in an existing issue in this repo;
 - `ruled: <reason>` — the maintainer explicitly accepts the residual.
 
-`scripts/gate-receipt.sh --pr <n>` counts markers and receipts and fails when
-receipts < markers. `.github/workflows/gate-receipt.yml` runs it as the required
-`gate-receipt` check. A review body may contain both the marker and its receipt.
+`fixed@` and `filed` must be authored by the PR author or a maintainer
+(`OWNER` / `MEMBER` / `COLLABORATOR`). An association-less (`NONE`) account
+never counts, and the comment that carries the finding cannot supply its own
+`fixed@`/`filed`: those must be a separate reply or body. `ruled:` is the
+exception — a maintainer may rule in the finding's own body, because that is an
+explicit acceptance rather than a claim of repair.
+In `--pr` mode the script validates every commit and issue target against the
+API; a `filed` number that resolves to a pull request does not count as an
+issue. Fixture and legacy modes enforce authorship only and say on stderr that
+targets were not validated (fixtures may supply `valid-targets.json` to
+simulate that check).
+
+`scripts/gate-receipt.sh --pr <n>` counts markers and receipts and fails when a
+finding has no receipt. `.github/workflows/gate-receipt.yml` runs it on PR,
+review, and inline-review-comment events; the ruleset does **not** currently
+require the `gate-receipt` check, so while its result is visible it is not an
+enforced gate until the settings in "Required state" land.
+
+Threads are bound to their findings. Every review thread, resolved or not, must
+carry its own `fixed@`/`filed`/maintainer `ruled:` reply: a receipt in thread A
+does not clear a marker in thread B. Resolution alone never clears a finding: a
+resolved thread without a valid receipt stays outstanding.
+
+Top-level review and issue-comment bodies are a **pooled count**, not per-body:
+their markers and receipts are summed, so a surplus receipt can clear a later
+marker in the same pool. The fallback used when GraphQL is unavailable pools
+receipts globally across all inline comments too — looser binding than thread
+mode, so it can under-gate by clearing an unrelated finding — and announces it
+on stderr. The legacy `--reviews-file` shim also keeps a global, same-body pool.
+
+Inline findings are counted from review threads when the GraphQL
+`reviewThreads` query answers. The query follows `pageInfo` cursors (at most 50
+pages) and requests up to 100 comments per thread; if a thread reports more
+comments than were returned, the script exits 1 instead of under-counting
+receipts or findings. If GraphQL is unavailable, every inline finding counts
+(scope is over-gated) but receipts are pooled globally (binding is looser than
+thread mode); the script says so on stderr and never treats an unresolved thread
+as clearance.
+
+GitHub Actions has no thread-resolution trigger: `pull_request_review_thread`
+is a webhook event only, and listing it in `on:` makes the workflow invalid. A
+bare resolve/unresolve therefore does not re-run the check; it re-evaluates on
+the next review, inline comment, or PR edit. An inline `fixed@`/`filed` reply is
+a review-comment event, so the normal receipt path re-runs the check. A receipt
+posted as a top-level issue comment does not re-run it — `issue_comment` and
+`workflow_dispatch` are deliberately not subscribed, because they would execute
+a PR-supplied checkout with default-branch authority — though such a receipt
+still counts the next time the check does run.
+
+For offline checks, `--reviews-file <path>` takes a legacy body fixture and
+`--fixtures-dir <dir>` takes `reviews.json`, `issue-comments.json`, and either
+`threads.json` or `pull-comments.json` with the same payload shapes as the API.
+Every fixture file is validated before it is used: `reviews.json`,
+`issue-comments.json`, and `pull-comments.json` must be arrays of objects with a
+string `body`; `threads.json` must be an array of objects that carry
+`isResolved` and/or `comments`, where `isResolved` is boolean when present and
+`comments` is an array of objects with a string `body` when present. A file that
+fails validation exits 2 instead of passing. Fixture receipts obey the same
+authorship rule as live ones (`NONE` is rejected). A `threads.json` envelope may
+carry `pageInfo`/`nodes` and `comments.totalCount` like the API; if it claims
+another page or more comments than it contains, it is treated as truncated and
+exits 1.
+
+`GATE_RECEIPT_REPO=owner/name` overrides the repository used by `--pr`, so a
+fork checkout can check the upstream PR.
 
 ## Why
 
