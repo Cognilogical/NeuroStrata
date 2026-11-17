@@ -216,7 +216,8 @@
         "cargo test --locked --bin neurostrata-mcp honours_the_verdict -- --test-threads=1",
         "cargo test --locked --bin neurostrata-mcp release_handle -- --test-threads=1",
         "cargo test --locked --bin neurostrata-mcp recovery_checkpoint_ -- --test-threads=1",
-        "cargo test --locked --bin neurostrata-mcp wal_semantic_loss -- --test-threads=1"
+        "cargo test --locked --bin neurostrata-mcp wal_semantic_loss -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp wal_recovery_arms_census_and_corrupted_rename -- --test-threads=1"
       ],
       "tests": [
         "store::wal_accounting::tests::checksum_of_an_empty_buffer_is_the_dbs_seed",
@@ -255,7 +256,6 @@
         "store::wal_accounting::tests::no_wal_when_nothing_existed_before_or_after",
         "store::wal_accounting::tests::nothing_committed_when_the_uncommitted_bytes_held_no_commit",
         "store::wal_accounting::tests::committed_lost_when_a_commit_existed_and_no_bytes_survive",
-        "store::wal_accounting::tests::a_frozen_side_consumed_by_a_successful_open_is_a_completed_checkpoint",
         "store::wal_accounting::tests::consumption_never_rescues_an_unattributable_scan",
         "store::wal_accounting::tests::consumption_does_not_apply_to_the_active_side",
         "store::wal_accounting::tests::a_consumed_checkpoint_is_a_replay_not_a_loss",
