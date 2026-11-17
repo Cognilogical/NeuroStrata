@@ -4,7 +4,7 @@ use crate::traits::{Embedder, MemoryPayload, VectorStore};
 use ignore::WalkBuilder;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tree_sitter::{Parser, Query, StreamingIterator};
@@ -864,6 +864,78 @@ struct StreamStats {
     peak_buffered: usize,
 }
 
+/// The state the workers and the replay share: how far the replay has got,
+/// and whether it has given up.
+///
+/// One mutex guards both fields, and that is what makes the cancellation
+/// safe. A worker reads the abort flag and waits on the condvar while it
+/// holds this lock, and the canceller takes the same lock before it sets the
+/// flag and notifies. A worker that read "not aborted" therefore cannot sleep
+/// through the notification: the canceller cannot set the flag until the
+/// worker has released the lock inside `Condvar::wait`, and the flag is set
+/// before the notify.
+#[derive(Debug, Default)]
+struct ReplayGateState {
+    /// The index the replay takes next.
+    position: usize,
+    /// Set when the replay gives up: the workers must stop.
+    aborted: bool,
+}
+
+/// The gate the workers wait on: the replay's position and the abort flag
+/// under ONE lock, with the condvar that wakes them.
+///
+/// The lock is what makes the cancellation safe. A worker reads the abort
+/// flag and waits on the condvar while it holds the lock; the replay sets
+/// the flag and notifies. If the flag were set outside that lock, the two
+/// could interleave -- the worker reads "not aborted", the replay sets the
+/// flag and notifies (the worker is not waiting yet, so the notification is
+/// lost), and the worker sleeps through it. Under one lock the replay
+/// cannot set the flag until the worker has released the lock inside
+/// `Condvar::wait`, and the flag is set before the notify.
+struct ReplayGate {
+    state: std::sync::Mutex<ReplayGateState>,
+    advanced: std::sync::Condvar,
+}
+
+impl ReplayGate {
+    fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(ReplayGateState::default()),
+            advanced: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Waits until `idx` is within `window` of the replay position.
+    ///
+    /// Returns `false` when the run was aborted: the worker must stop
+    /// instead of running an index nobody will replay.
+    fn wait_for_slot(&self, idx: usize, window: usize) -> bool {
+        let mut state = self.state.lock().expect("replay gate mutex");
+        while idx >= state.position.saturating_add(window) {
+            if state.aborted {
+                return false;
+            }
+            state = self.advanced.wait(state).expect("replay gate mutex");
+        }
+        !state.aborted
+    }
+
+    /// The replay took `next` as the next index: the workers may run on.
+    fn advance_to(&self, next: usize) {
+        let mut state = self.state.lock().expect("replay gate mutex");
+        state.position = next;
+        self.advanced.notify_all();
+    }
+
+    /// The replay gave up: every worker waiting for it must wake and stop.
+    fn abort(&self) {
+        let mut state = self.state.lock().expect("replay gate mutex");
+        state.aborted = true;
+        self.advanced.notify_all();
+    }
+}
+
 /// Runs `process` over `0..total` on a bounded worker pool and calls `replay`
 /// once per index, in index order.
 ///
@@ -886,6 +958,27 @@ fn stream_in_walk_order<T: Send, P>(
     worker_count: usize,
     window: usize,
     make_process: impl Fn() -> P + Sync,
+    replay: impl FnMut(usize, anyhow::Result<T>) -> anyhow::Result<()>,
+) -> anyhow::Result<StreamStats>
+where
+    P: FnMut(usize) -> anyhow::Result<T> + Send,
+{
+    stream_in_walk_order_bounded(total, worker_count, window, window, make_process, replay)
+}
+
+/// The same run, with the result channel's capacity spelled out separately
+/// from the replay window.
+///
+/// Production ties the two together (the channel holds the window's worth of
+/// results). The seam exists so a test can make the channel the tighter of
+/// the two: then a worker really does block in `send` while the replay is
+/// over, which is the case the abort path has to release.
+fn stream_in_walk_order_bounded<T: Send, P>(
+    total: usize,
+    worker_count: usize,
+    window: usize,
+    channel_capacity: usize,
+    make_process: impl Fn() -> P + Sync,
     mut replay: impl FnMut(usize, anyhow::Result<T>) -> anyhow::Result<()>,
 ) -> anyhow::Result<StreamStats>
 where
@@ -897,27 +990,26 @@ where
     let window = window.max(1);
     let worker_count = worker_count.max(1);
     let next_idx = AtomicUsize::new(0);
-    // The index the replay takes next. A worker waits until its own index is
-    // within `window` of this one.
-    let position = std::sync::Mutex::new(0usize);
-    let advanced = std::sync::Condvar::new();
-    // Set when the replay gives up: the workers waiting for the replay to
-    // catch up must be woken, or the run would wait for a replay that will
-    // never come.
-    let aborted = AtomicBool::new(false);
+    // The gate the workers wait on: the replay's position and the abort flag
+    // under ONE lock, so a cancellation cannot slip between a worker's check
+    // and its wait.
+    let gate = ReplayGate::new();
     // The results that are produced but not yet replayed.
     let buffered = AtomicUsize::new(0);
     let peak = AtomicUsize::new(0);
-    let (result_tx, result_rx) =
-        std::sync::mpsc::sync_channel::<(usize, anyhow::Result<T>)>(window);
 
     std::thread::scope(|scope| -> anyhow::Result<()> {
+        // The channel lives INSIDE the scope: on the abort path the receiver
+        // is dropped before the scope joins the workers, so a worker blocked
+        // in `send` fails and wakes instead of waiting for a receiver that
+        // will never read again. A receiver created outside the scope would
+        // outlive the abort and leave that worker blocked forever.
+        let (result_tx, result_rx) =
+            std::sync::mpsc::sync_channel::<(usize, anyhow::Result<T>)>(channel_capacity.max(1));
         for _ in 0..worker_count {
             let result_tx = result_tx.clone();
             let next_idx = &next_idx;
-            let position = &position;
-            let advanced = &advanced;
-            let aborted = &aborted;
+            let gate = &gate;
             let buffered = &buffered;
             let peak = &peak;
             let make_process = &make_process;
@@ -930,17 +1022,10 @@ where
                     }
                     // Backpressure: do not run more than `window` indices
                     // ahead of the replay.
-                    {
-                        let mut pos = position.lock().expect("replay position mutex");
-                        while idx >= *pos + window {
-                            if aborted.load(Ordering::Relaxed) {
-                                break;
-                            }
-                            pos = advanced.wait(pos).expect("replay position mutex");
-                        }
-                        if aborted.load(Ordering::Relaxed) {
-                            break;
-                        }
+                    if !gate.wait_for_slot(idx, window) {
+                        // The replay gave up: this index will never be
+                        // replayed, so the worker stops.
+                        break;
                     }
                     // A panicking worker must not take the whole run with it:
                     // the panic becomes this entry's error, and the replay
@@ -973,25 +1058,29 @@ where
             buffer.insert(idx, res);
             while let Some(res) = buffer.remove(&next) {
                 if let Err(e) = replay(next, res) {
-                    // The replay is done: wake the workers that are waiting
-                    // for it, so the run can end instead of waiting for a
-                    // replay that will never come.
+                    // The replay is done: the workers that wait for it are
+                    // woken below, so the run can end instead of waiting for
+                    // a replay that will never come.
                     outcome = Err(e);
-                    aborted.store(true, Ordering::Relaxed);
-                    advanced.notify_all();
+                    gate.abort();
                     break;
                 }
                 next += 1;
                 buffered.fetch_sub(1, Ordering::Relaxed);
-                let mut pos = position.lock().expect("replay position mutex");
-                *pos = next;
-                advanced.notify_all();
+                gate.advance_to(next);
             }
             if outcome.is_err() {
                 break;
             }
         }
         if let Err(e) = outcome {
+            // The run is over. Cancel the gate and close the channel BEFORE
+            // the scope joins the workers: the gate wakes the workers that
+            // wait for the replay, and the closed channel fails the `send`
+            // of a worker blocked on a full one, so it wakes instead of
+            // waiting for a receiver that will never read again.
+            gate.abort();
+            drop(result_rx);
             return Err(e);
         }
         if !buffer.is_empty() {
@@ -4087,6 +4176,98 @@ mod tests {
             err.to_string().contains("replay refused"),
             "the error is the replay's own: {err}"
         );
+    }
+
+    /// The cancellation must be set under the lock the workers sleep on.
+    ///
+    /// A worker reads the abort flag and waits on the condvar while it holds
+    /// the gate lock; the replay sets the flag and notifies. If the flag is
+    /// set outside that lock, the two can interleave: the worker reads "not
+    /// aborted", the replay sets the flag and notifies (the worker is not
+    /// waiting yet, so the notification is lost), and the worker then sleeps
+    /// through it -- the run waits for a wakeup that never comes.
+    ///
+    /// The test holds the gate lock (the worker is between its check and its
+    /// wait) and asserts that the abort cannot get past it: an abort that
+    /// takes the lock has to queue behind the waiter, an abort that does not
+    /// takes it goes straight through and the worker sleeps through the
+    /// notification.
+    #[test]
+    fn an_abort_waits_for_the_lock_the_worker_sleeps_on() {
+        let gate = std::sync::Arc::new(ReplayGate::new());
+        let held = gate.state.lock().expect("replay gate mutex");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let gate_for_abort = gate.clone();
+        let aborter = std::thread::spawn(move || {
+            gate_for_abort.abort();
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "the abort must not pass a worker that holds the gate lock"
+        );
+        drop(held);
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the abort completes once the lock is free");
+        aborter.join().unwrap();
+    }
+
+    /// A worker waiting for the replay wakes up when the replay gives up.
+    #[test]
+    fn an_aborted_gate_wakes_the_worker_that_waits_for_it() {
+        let gate = std::sync::Arc::new(ReplayGate::new());
+        let gate_for_worker = gate.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let allowed = gate_for_worker.wait_for_slot(4, 1);
+            let _ = tx.send(allowed);
+        });
+        // The worker is waiting for a slot the replay has not opened yet.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        gate.abort();
+        let allowed = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the waiting worker wakes");
+        assert!(!allowed, "an aborted gate lets no work through");
+        worker.join().unwrap();
+    }
+
+    /// A replay that fails ends the run even when the workers are blocked
+    /// handing their results back.
+    ///
+    /// The result channel is closed before the workers are joined, so a
+    /// worker blocked in `send` fails and wakes instead of waiting for a
+    /// receiver that will never read again. The channel is made the tighter
+    /// bound here (capacity 1 against a replay window of 64), so the workers
+    /// really do pile up on a full channel while the replay is over.
+    ///
+    /// The run happens on its own thread and is waited for with a timeout: a
+    /// run that hangs fails this test instead of hanging the suite.
+    #[test]
+    fn a_failing_replay_ends_the_run_with_a_full_result_channel() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let runner = std::thread::spawn(move || {
+            let outcome = stream_in_walk_order_bounded(
+                512usize,
+                4,
+                64,
+                1,
+                || move |idx: usize| -> anyhow::Result<usize> { Ok(idx) },
+                |idx, _res| {
+                    if idx == 0 {
+                        anyhow::bail!("the replay refused index 0");
+                    }
+                    Ok(())
+                },
+            );
+            let _ = tx.send(outcome.is_err());
+        });
+        let ended = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the run ends instead of hanging");
+        assert!(ended, "the replay failure is reported");
+        runner.join().unwrap();
     }
 
     /// The refusal tally counts every refused embedding and keeps a bounded
