@@ -54,4 +54,8 @@ expect_fail "missing-non-fast-forward" \
   '.rules |= map(select(.type != "non_fast_forward"))' \
   "rules must include 'non_fast_forward'"
 
+expect_fail "excluded-main-ref" \
+  '.conditions.ref_name.exclude = ["refs/heads/main"]' \
+  "conditions.ref_name.exclude must be empty so main cannot be excluded"
+
 echo "test-main-ruleset: all checks passed"

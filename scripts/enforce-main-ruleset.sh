@@ -79,6 +79,10 @@ validate_ruleset_file() {
     failures+=("conditions.ref_name.include must cover ~DEFAULT_BRANCH or refs/heads/main")
   fi
 
+  if ! jq -e '(.conditions.ref_name.exclude | type == "array") and (.conditions.ref_name.exclude | length == 0)' "$target_file" >/dev/null 2>&1; then
+    failures+=("conditions.ref_name.exclude must be empty so main cannot be excluded")
+  fi
+
   if ! jq -e '.rules | map(.type) | index("deletion") != null' "$target_file" >/dev/null 2>&1; then
     failures+=("rules must include 'deletion'")
   fi
