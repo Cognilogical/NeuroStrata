@@ -817,6 +817,39 @@ fn generate_rust_truth_table() -> Vec<String> {
         }
     }
 
+    // WAL_VERDICT: 32 rows (4 commit-evidence values x commit_proved x
+    // checkpoint_observed x applied_at_least_one) — the removed-frozen-WAL
+    // verdict of `#228`, shared with the recovery funnel through the formal
+    // kernel so there is exactly one truth table.
+    let wal_evidences: [formal_kernel::KernelWalCommitEvidence; 4] = [
+        formal_kernel::KernelWalCommitEvidence::CommitSeen,
+        formal_kernel::KernelWalCommitEvidence::NoCommit,
+        formal_kernel::KernelWalCommitEvidence::Unverifiable,
+        formal_kernel::KernelWalCommitEvidence::Unreadable,
+    ];
+    for evidence in wal_evidences.iter() {
+        for commit_proved in [false, true].iter() {
+            for checkpoint_observed in [false, true].iter() {
+                for applied_at_least_one in [false, true].iter() {
+                    let verdict = formal_kernel::evaluate_removed_wal_verdict(
+                        *evidence,
+                        *commit_proved,
+                        *checkpoint_observed,
+                        *applied_at_least_one,
+                    );
+                    lines.push(format!(
+                        "WAL_VERDICT|{}|{}|{}|{}|{}",
+                        formal_kernel::wal_commit_evidence_tag(*evidence),
+                        bool_str(*commit_proved),
+                        bool_str(*checkpoint_observed),
+                        bool_str(*applied_at_least_one),
+                        formal_kernel::removed_wal_verdict_tag(verdict),
+                    ));
+                }
+            }
+        }
+    }
+
     lines
 }
 
@@ -870,8 +903,8 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
     let rust_lines = generate_rust_truth_table();
     assert_eq!(
         rust_lines.len(),
-        1155,
-        "expected 1155 canonical lines (891 base/action/code-intel/ontology + 120 taxonomy + 144 workflow)"
+        1187,
+        "expected 1187 canonical lines (891 base/action/code-intel/ontology + 120 taxonomy + 144 workflow + 32 WAL verdict)"
     );
 
     // Section-count verification: 64 TASK_FSM + 16 LIFECYCLE + 128 MESH_MERGE
@@ -1014,6 +1047,11 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
         144,
         "expected 144 WORKFLOW_STAGE rows"
     );
+    assert_eq!(
+        *section_counts.get("WAL_VERDICT").unwrap_or(&0),
+        32,
+        "expected 32 WAL_VERDICT rows"
+    );
 
     let lake = find_lake().expect(
         "lake not found on PATH or ~/.elan/bin/lake; install elan to run Lean parity tests",
@@ -1111,6 +1149,14 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
         "ACTION_SHAREABLE|action_receipt|false|false",
         "ACTION_SHAREABLE|action_type|true|true",
         "ACTION_SHAREABLE|action_type|false|false",
+        // `#228`: a removed frozen WAL is a replay only on positive evidence.
+        "WAL_VERDICT|commit_seen|true|false|false|committed_lost",
+        "WAL_VERDICT|commit_seen|false|false|false|unknown_unverifiable",
+        "WAL_VERDICT|commit_seen|true|false|true|replayed_inferred",
+        "WAL_VERDICT|no_commit|false|false|false|nothing_committed",
+        "WAL_VERDICT|unverifiable|false|false|false|unknown_unverifiable",
+        "WAL_VERDICT|unreadable|false|false|false|unknown_unreadable",
+        "WAL_VERDICT|commit_seen|true|true|false|replayed_observed",
     ] {
         assert!(
             rust_lines.iter().any(|l| l == expected),

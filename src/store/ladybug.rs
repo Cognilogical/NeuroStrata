@@ -2247,6 +2247,25 @@ fn is_wal_integrity_failure(err: &str) -> bool {
         || err.contains("invalid WAL record type")
 }
 
+/// The engine's *semantic* WAL-replay failure (`#228`).
+///
+/// The pinned engine throws a catalog error when a WAL record names a catalog
+/// entry the database does not have: `CatalogSet::validateExistNoLock` raises
+/// `"<name> does not exist in catalog."` (`catalog_set.cpp:362`), and
+/// `Catalog::getTableCatalogEntry` raises the same text
+/// (`catalog.cpp:149`). Such a replay is *semantic*: the bytes are intact and
+/// the engine refuses to apply them.
+///
+/// The shape is the pinned engine's own message, not a guess. The funnel uses
+/// it only to *name* the failure in the refusal: the accounting and the
+/// refusal do not depend on the label, so a semantic failure and any other
+/// unrecognized failure are treated the same way — accounted, restored,
+/// refused. A semantic failure never reaches the lenient replay: replaying
+/// the same bytes unverified would fail the same way.
+fn is_wal_semantic_failure(err: &str) -> bool {
+    err.contains("does not exist in catalog.")
+}
+
 fn sha256_regular_file(path: &std::path::Path) -> Option<[u8; 32]> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
@@ -3036,6 +3055,87 @@ fn refusal_headline(verdict: &crate::store::wal_accounting::WalAccounting) -> &'
     }
 }
 
+/// Restores the sides that lost every byte from their preserved copies.
+///
+/// Returns what was restored and what could not be restored, so every refusal
+/// names the preserved bytes (`#207`).
+fn restore_lost_sides(
+    local_path: &std::path::Path,
+    restore: crate::store::wal_accounting::SideSet,
+    preserved: &PreservedPair,
+) -> (Vec<String>, Vec<String>) {
+    let mut restored = Vec::new();
+    let mut unrestored = Vec::new();
+    for side in [WalSide::Active, WalSide::Frozen] {
+        if !restore.contains(wal_side_set(side)) {
+            continue;
+        }
+        let label = wal_side_label(side);
+        match preserved.get(side) {
+            Some(copy) => {
+                let target = side.path(local_path);
+                match std::fs::copy(copy, &target) {
+                    Ok(_) => restored.push(format!(
+                        "the {label} WAL was restored from {}",
+                        copy.display()
+                    )),
+                    Err(e) => unrestored.push(format!(
+                        "the {label} WAL could not be restored ({e}); its bytes are at {}",
+                        copy.display()
+                    )),
+                }
+            }
+            None => unrestored.push(format!("the {label} WAL has no preserved copy")),
+        }
+    }
+    (restored, unrestored)
+}
+
+/// The preservation tail every refusal carries: what was restored, where the
+/// preserved copies are, and where to read more (`#207`).
+fn preservation_tail(
+    restored: &[String],
+    unrestored: &[String],
+    preserved: &PreservedPair,
+    local_path: &std::path::Path,
+) -> String {
+    let preserved_display = preserved
+        .active
+        .as_ref()
+        .or(preserved.frozen.as_ref())
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| format!("{}.wal.unclean.<none>", local_path.display()));
+    let preservation_note = format!(
+        "preserved copies: active {}, frozen {}",
+        preserved
+            .active
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<none>".to_string()),
+        preserved
+            .frozen
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<none>".to_string())
+    );
+
+    let mut tail = String::new();
+    if !restored.is_empty() {
+        tail.push(' ');
+        tail.push_str(&restored.join("; "));
+        tail.push('.');
+    }
+    if !unrestored.is_empty() {
+        tail.push(' ');
+        tail.push_str(&unrestored.join("; "));
+        tail.push('.');
+    }
+    tail.push_str(&format!(" {preservation_note}."));
+    tail.push_str(&format!(" Preserved WAL copy: {preserved_display}."));
+    tail.push_str(" See docs/runbooks/wal-recovery.md.");
+    tail
+}
+
 /// Refuses with the accounting verdict, restores the sides that lost every
 /// byte, and keeps the `#189` message contract (the word `zero`, the real
 /// preserved path).
@@ -3054,70 +3154,111 @@ fn wal_refusal(
     let pre_total = pre.0.pre.saturating_add(pre.1.pre);
     let scanned_total = pre.0.bytes_scanned.saturating_add(pre.1.bytes_scanned);
     let post_total = post.0.saturating_add(post.1);
-    let pair = Some(preserved);
 
-    let mut restored = Vec::new();
-    let mut unrestored = Vec::new();
-    for side in [WalSide::Active, WalSide::Frozen] {
-        if !restore.contains(wal_side_set(side)) {
-            continue;
-        }
-        let label = wal_side_label(side);
-        match pair.and_then(|p| p.get(side)) {
-            Some(copy) => {
-                let target = side.path(local_path);
-                match std::fs::copy(copy, &target) {
-                    Ok(_) => restored.push(format!(
-                        "the {label} WAL was restored from {}",
-                        copy.display()
-                    )),
-                    Err(e) => unrestored.push(format!(
-                        "the {label} WAL could not be restored ({e}); its bytes are at {}",
-                        copy.display()
-                    )),
-                }
-            }
-            None => unrestored.push(format!("the {label} WAL has no preserved copy")),
-        }
-    }
-
-    let preserved_display = pair
-        .and_then(|p| p.active.as_ref().or(p.frozen.as_ref()))
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| format!("{}.wal.unclean.<none>", local_path.display()));
-    let preservation_note = format!(
-        "preserved copies: active {}, frozen {}",
-        preserved
-            .active
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "<none>".to_string()),
-        preserved
-            .frozen
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "<none>".to_string())
-    );
+    let (restored, unrestored) = restore_lost_sides(local_path, restore, preserved);
 
     let mut message = format!(
         "{headline}: verdict `{}` on {} ({pre_total} bytes before, {post_total} after the replay, {scanned_total} bytes scanned). Refusing to checkpoint over the WAL.",
         verdict.slug(),
         verdict.sides().label()
     );
-    if !restored.is_empty() {
-        message.push(' ');
-        message.push_str(&restored.join("; "));
-        message.push('.');
-    }
-    if !unrestored.is_empty() {
-        message.push(' ');
-        message.push_str(&unrestored.join("; "));
-        message.push('.');
-    }
-    message.push_str(&format!(" {preservation_note}."));
-    message.push_str(&format!(" Preserved WAL copy: {preserved_display}."));
-    message.push_str(" See docs/runbooks/wal-recovery.md.");
+    message.push_str(&preservation_tail(&restored, &unrestored, preserved, local_path));
     eprintln!("ERROR: DATA LOSS. {message}");
+    anyhow::anyhow!(message)
+}
+
+/// Refuses a failed verified open whose failure the recovery funnel does not
+/// recognize (`#228`).
+///
+/// Fail-closed: the accounting runs on the pair as it stands after the failed
+/// open, the sides that lost every byte are restored from their preserved
+/// copies, and the refusal names the engine's own error. Nothing is replayed
+/// here — the lenient replay is only safe for the recognized failure classes
+/// (the checksum-config mismatch, a WAL integrity failure, a foreign WAL, a
+/// torn tail), and an unrecognized database error must never reach it.
+///
+/// The refusal never claims a replay: the accounting verdict and the engine's
+/// error are the whole story.
+fn refuse_unrecognized_wal_failure(
+    local_path: &std::path::Path,
+    err_msg: &str,
+    pre: &(
+        crate::store::wal_accounting::SideObservation,
+        crate::store::wal_accounting::SideObservation,
+    ),
+    preserved: &PreservedPair,
+) -> anyhow::Error {
+    use crate::store::wal_accounting::{
+        classify_pair_after_failed_open, AppliedRecords, SideSet, WalAccounting,
+    };
+
+    let post = wal_pair_sizes(local_path);
+    // A failed open reports no applied-record count, so the removed-WAL truth
+    // table sees `Unavailable`: absence of a signal is not evidence of a
+    // replay.
+    let verdict = classify_pair_after_failed_open(
+        pair_observation(pre, post, SideSet::EMPTY),
+        AppliedRecords::Unavailable,
+    );
+    let restore = sides_to_restore(pre, post);
+    let (restored, unrestored) = restore_lost_sides(local_path, restore, preserved);
+
+    let pre_total = pre.0.pre.saturating_add(pre.1.pre);
+    let scanned_total = pre.0.bytes_scanned.saturating_add(pre.1.bytes_scanned);
+    let post_total = post.0.saturating_add(post.1);
+    let kind = if is_wal_semantic_failure(err_msg) {
+        "a semantic catalog failure of the pinned engine"
+    } else {
+        "an error the write-ahead log recovery funnel does not recognize"
+    };
+    // The accounting, phrased so that it never claims a replay: the failed
+    // open replayed nothing, and the verdict says what the bytes prove. Only a
+    // loss verdict carries its slug; the no-loss case never names a replay.
+    let accounting = match verdict {
+        WalAccounting::CommittedLost { .. } => format!(
+            "The accounting proved a committed loss (verdict `{}`) on {}",
+            verdict.slug(),
+            verdict.sides().label()
+        ),
+        WalAccounting::Unknown { .. } => format!(
+            "The accounting cannot attribute the bytes (verdict `{}`) on {}",
+            verdict.slug(),
+            verdict.sides().label()
+        ),
+        WalAccounting::Deferred { .. } => format!(
+            "The write-ahead log is too large to classify (verdict `{}`) on {}",
+            verdict.slug(),
+            verdict.sides().label()
+        ),
+        WalAccounting::ForeignWal { .. } => format!(
+            "The write-ahead log was attributed to another database (verdict `{}`) on {}",
+            verdict.slug(),
+            verdict.sides().label()
+        ),
+        WalAccounting::Replayed { .. } => {
+            "The accounting found no committed loss: the write-ahead log's bytes survived the \
+             failed open, or the engine applied a completed checkpoint"
+                .to_string()
+        }
+        WalAccounting::NothingCommitted { .. } => {
+            "The accounting found no committed loss: the write-ahead log held no committed \
+             record"
+                .to_string()
+        }
+        WalAccounting::NoWal => {
+            "The accounting found no committed loss: there was no write-ahead log".to_string()
+        }
+    };
+
+    let mut message = format!(
+        "Refusing to open: the verified open failed with {kind} ({err_msg}), so the write-ahead log accounting cannot prove that zero committed records were recovered. {accounting} ({pre_total} bytes before the failed open, {post_total} bytes after it, {scanned_total} bytes scanned). Refusing to checkpoint over the WAL."
+    );
+    message.push_str(&preservation_tail(&restored, &unrestored, preserved, local_path));
+    let prefix = match verdict {
+        WalAccounting::CommittedLost { .. } | WalAccounting::Unknown { .. } => "ERROR: DATA LOSS.",
+        _ => "ERROR: refusing to open.",
+    };
+    eprintln!("{prefix} {message}");
     anyhow::anyhow!(message)
 }
 
@@ -3361,7 +3502,7 @@ fn recover_from_wal_failure(
 ) -> Result<(Database, OpenProvenance)> {
     use crate::store::wal_accounting::{
         classify_pair, classify_pair_with_applied, consumed_sides, disposition,
-        emulate_applied_records, Disposition, SideSet, WalAccounting, WalPairBytes,
+        emulated_applied_records, Disposition, SideSet, WalAccounting, WalPairBytes,
     };
 
     let err_msg = error.to_string();
@@ -3372,7 +3513,24 @@ fn recover_from_wal_failure(
     let pre_total = pre.0.pre.saturating_add(pre.1.pre);
 
     if !checksum_mismatch && !integrity_failure && arm_a_foreign.is_none() && torn_tail.is_none() {
-        return Err(error);
+        // `#228`: fail closed. The lenient replay is only safe for the failure
+        // classes the funnel recognizes (the checksum-config mismatch, a WAL
+        // integrity failure, a foreign WAL, a torn tail). Any other failure
+        // with a WAL on disk still gets the accounting and the restoration,
+        // and refuses with the verdict — the engine's own error is embedded
+        // in the refusal so the operator still sees the cause.
+        //
+        // With no WAL on either side there is nothing to account for and
+        // nothing to preserve, so the engine's error is the whole truth.
+        if pre_total == 0 {
+            return Err(error);
+        }
+        return Err(refuse_unrecognized_wal_failure(
+            local_path,
+            &err_msg,
+            pre,
+            preserved,
+        ));
     }
 
     let post = wal_pair_sizes(local_path);
@@ -3496,10 +3654,11 @@ fn recover_from_wal_failure(
     //   leaves the records themselves intact, so the engine replays them
     //   under the WAL header's own checksum setting and only then retires the
     //   file.
-    let applied = emulate_applied_records(
-        integrity_failure,
-        pre.1.scan.map(|scan| scan.frames_parsed > 0).unwrap_or(false),
-    );
+    //
+    // The emulation is built on **committed work**, never on "the WAL held
+    // some frames": a lone `BEGIN` frame commits nothing, so the engine
+    // applies nothing and retires the file (`#228`).
+    let applied = emulated_applied_records(integrity_failure, pre.1.scan);
     let verdict = classify_pair_with_applied(pair, applied);
 
     let unverified_db = match lenient {
@@ -30090,6 +30249,139 @@ mod wal_semantic_loss {
 
         let _ = std::fs::remove_dir_all(&root);
         restore_model_env(previous_model);
+    }
+
+    /// A checksummed WAL header, as the pinned engine writes it: a 16-byte
+    /// database id, the `enableChecksums` flag, and the header's own checksum
+    /// (`storage/wal/wal.cpp:394-402`).
+    fn checksummed_header() -> Vec<u8> {
+        let mut header = vec![0u8; 16];
+        header.push(1u8); // `enableChecksums` = true
+        let crc = crate::store::wal_accounting::wal_checksum(&header);
+        header.extend_from_slice(&crc.to_ne_bytes());
+        header
+    }
+
+    /// A frozen WAL whose walk **proves** a committed record: a `BEGIN` frame
+    /// and a `COMMIT` frame, both with a real checksum trailer.
+    fn committed_wal() -> Vec<u8> {
+        let mut out = checksummed_header();
+        let mut begin = vec![crate::store::wal_accounting::BEGIN_TRANSACTION_RECORD_TYPE];
+        begin.extend_from_slice(&0u64.to_ne_bytes());
+        out.extend_from_slice(&frame(&begin));
+        let mut commit = vec![crate::store::wal_accounting::COMMIT_RECORD_TYPE];
+        commit.extend_from_slice(&0u64.to_ne_bytes());
+        out.extend_from_slice(&frame(&commit));
+        out
+    }
+
+    /// `#228` IMPORTANT 1: an unrecognized engine failure is accounted for,
+    /// the side that lost every byte is restored, and the refusal never claims
+    /// a replay.
+    ///
+    /// The pinned engine's *semantic* replay failure — a WAL record naming a
+    /// catalog entry the database does not have — is not a WAL integrity
+    /// failure, so the lenient replay must not run: replaying the same bytes
+    /// unverified fails the same way. The funnel therefore accounts for the
+    /// pair, restores the frozen WAL from its preserved copy, and refuses with
+    /// the verdict and the engine's own error.
+    #[test]
+    fn an_unrecognized_engine_failure_is_accounted_restored_and_never_replayed() {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-wal-unrecognized-failure-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("unrecognized-failure.lbug");
+
+        let crafted = committed_wal();
+
+        // The scanner's contract on the crafted bytes: a *proven* commit.
+        let scan = scan_wal(&crafted);
+        assert_eq!(scan.commit_evidence(), CommitEvidence::Some);
+        assert!(
+            scan.proved_commit(),
+            "the crafted WAL must prove a committed record"
+        );
+        assert!(
+            !scan.ended_in_checkpoint(),
+            "the crafted WAL must not end in a CHECKPOINT record: that would be \
+             positive evidence of a replay"
+        );
+
+        // The frozen side only: the active WAL is gone.
+        std::fs::write(ckpt_of(&db), &crafted).expect("write the crafted frozen WAL");
+
+        // What the funnel observed before the failed open.
+        let pre = (
+            observe_wal_side(&db, WalSide::Active),
+            observe_wal_side(&db, WalSide::Frozen),
+        );
+        assert!(pre.0.pre == 0, "the active side is empty");
+        assert!(pre.1.pre > 0, "the frozen side holds the crafted WAL");
+
+        // The mandatory pair preservation the refusing arm takes.
+        let preserved = preserve_wal_pair(&db).expect("preserve the WAL pair");
+        assert!(
+            preserved.frozen.is_some(),
+            "the frozen WAL must have a preserved copy"
+        );
+
+        // The failed open removed the frozen WAL: the engine retires it when
+        // it cannot apply the records.
+        std::fs::remove_file(ckpt_of(&db)).expect("remove the frozen WAL");
+
+        let err = match recover_from_wal_failure(
+            &db,
+            anyhow::anyhow!("Ghost does not exist in catalog."),
+            &pre,
+            &preserved,
+        ) {
+            Ok((_db, provenance)) => panic!(
+                "an unrecognized failure must refuse, not open as {:?} (#228)",
+                provenance
+            ),
+            Err(e) => e.to_string(),
+        };
+
+        assert!(
+            err.contains("committed_lost"),
+            "the verdict must be a committed loss: {err}"
+        );
+        assert!(
+            err.contains("does not exist in catalog."),
+            "the refusal must name the engine's own error: {err}"
+        );
+        assert!(
+            err.contains("zero"),
+            "the refusal must keep the #189 message contract: {err}"
+        );
+        assert!(
+            !err.contains("successful replay"),
+            "the refusal must never claim a replay: {err}"
+        );
+        assert!(
+            !err.contains("Recovered by replaying"),
+            "the refusal must never claim a recovery: {err}"
+        );
+        assert!(
+            !err.contains("replayed"),
+            "the refusal must never name a replay: {err}"
+        );
+
+        // The frozen WAL survives, byte for byte.
+        assert_eq!(
+            std::fs::read(ckpt_of(&db)).expect("read the frozen WAL"),
+            crafted,
+            "the frozen WAL must be restored with every pre-replay byte (#228)"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 

@@ -342,9 +342,14 @@
         "store::wal_accounting::tests::a_frozen_side_consumed_by_a_successful_open_is_not_a_replay",
         "store::wal_accounting::tests::the_removed_frozen_wal_truth_table",
         "store::wal_accounting::tests::the_emulated_applied_record_count_never_reads_a_record_failure_as_a_replay",
+        "store::wal_accounting::tests::the_applied_record_emulation_needs_committed_work",
+        "store::wal_accounting::tests::an_unauthenticated_commit_frame_is_committed_work_for_the_emulation",
+        "store::wal_accounting::tests::a_lone_begin_wal_is_never_a_replay",
+        "store::wal_accounting::tests::a_failed_open_classifies_a_removed_side_as_a_loss_and_a_surviving_side_as_not",
         "store::wal_accounting::tests::the_operator_text_never_claims_a_successful_replay",
         "store::ladybug::tests::wal_recovery_arms_census_and_corrupted_rename",
-        "store::ladybug::wal_semantic_loss::a_semantic_early_failure_is_a_committed_loss_and_never_a_replay"
+        "store::ladybug::wal_semantic_loss::a_semantic_early_failure_is_a_committed_loss_and_never_a_replay",
+        "store::ladybug::wal_semantic_loss::an_unrecognized_engine_failure_is_accounted_restored_and_never_replayed"
       ],
       "thresholds": {
         "ignored": 0,
