@@ -352,7 +352,21 @@ fn read_store_state_file(db_path: &Path) -> StoreStateRead {
             // directory) is not absence: fail closed.
             return StoreStateRead::Unparseable(format!("it cannot be read: {e}"));
         }
-        Err(_) => return StoreStateRead::Absent,
+        Err(e) => {
+            // `Path::exists` follows symlinks, so a *dangling* symlink
+            // reads as "not there" -- but the sidecar is there, and it is
+            // a pointer to nothing, which is exactly a recorded identity
+            // that cannot be verified (#241). `symlink_metadata` does not
+            // follow the link, so it tells the two apart.
+            match fs::symlink_metadata(&path) {
+                Ok(_) => {
+                    return StoreStateRead::Unparseable(format!(
+                        "it cannot be read: {e} (it is a link to nowhere)"
+                    ));
+                }
+                Err(_) => return StoreStateRead::Absent,
+            }
+        }
     };
     match serde_json::from_str::<StoreState>(&content) {
         Ok(state) if state.version != STORE_STATE_VERSION => StoreStateRead::Unparseable(format!(
@@ -2038,6 +2052,44 @@ mod tests {
             }
             other => panic!("a string-version sidecar reads as unparseable, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_broken_symlinked_sidecar_reads_as_unparseable_not_absent() {
+        // #241: a dangling symlink is a sidecar that is present and cannot
+        // be read. `Path::exists` follows the link, so it used to read as
+        // "no sidecar at all" — and a store whose recorded identity was
+        // broken looked exactly like a fresh one.
+        let (tmp, _config_dir) = fresh_config_dir("broken-symlinked-sidecar");
+        let db_path = tmp.path().join("ladybug.db");
+        std::os::unix::fs::symlink(tmp.path().join("nowhere"), sidecar_path_for(&db_path))
+            .expect("link the sidecar to nowhere");
+
+        match read_store_state(&db_path) {
+            StoreStateRead::Unparseable(reason) => {
+                assert!(
+                    reason.contains("cannot be read"),
+                    "the reason names the read failure: {reason}"
+                );
+            }
+            other => panic!("a broken symlinked sidecar reads as unparseable, got {other:?}"),
+        }
+
+        // The control: a sidecar that is truly not there is still absence.
+        let absent_db = tmp.path().join("absent.db");
+        assert_eq!(
+            read_store_state(&absent_db),
+            StoreStateRead::Absent,
+            "no sidecar at all reads as absent"
+        );
+
+        // The other control: a readable sidecar is still a recorded one.
+        let recorded_db = tmp.path().join("recorded.db");
+        write_sidecar(&recorded_db, false);
+        assert!(
+            matches!(read_store_state(&recorded_db), StoreStateRead::Recorded(_)),
+            "a readable sidecar reads as recorded"
+        );
     }
 
     #[test]
