@@ -204,9 +204,11 @@ neurostrata-mcp bus-metrics
 ### `backup` & `restore`
 Creates a checkpointed snapshot (`CHECKPOINT` + store copy + `manifest.json`) or restores a snapshot into a new database path.
 ```bash
-neurostrata-mcp backup <backup_dir>
+neurostrata-mcp backup <backup_dir> [--no-open]
 neurostrata-mcp restore <backup_dir> --into <new_db_path>
 ```
+
+`backup --no-open` copies the database, its write-ahead log, the checkpoint shadow, and the store-state sidecar directly to disk without opening or checkpointing the store. It **takes the store lock and holds it for the whole copy** (`#209`, `#241`): it refuses while another process holds the lock, and it fails closed when the lock cannot be taken at all, because an untakeable lock is not evidence that the store is free. Holding the lock across the window means a daemon that starts mid-copy cannot change the files being captured. Use a plain `backup <dir>` (daemon-coordinated) or `shutdown` first when the daemon is running.
 
 ---
 

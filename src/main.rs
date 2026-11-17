@@ -5283,7 +5283,7 @@ mod tests {
         std::fs::write(
             snapshot_dir.join("manifest.json"),
             format!(
-                "{{\"format\":\"{}\",\"version\":2,\"created_at\":\"2026-01-01T00:00:00Z\"}}",
+                "{{\"format\":\"{}\",\"version\":2,\"created_at\":\"2026-01-01T00:00:00Z\",\"coordinated\":true}}",
                 crate::storage::snapshot::SNAPSHOT_FORMAT
             ),
         )
@@ -5311,7 +5311,7 @@ mod tests {
         std::fs::write(
             snapshot_dir.join("manifest.json"),
             format!(
-                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"wal_kind\":\"none\"}}",
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"coordinated\":true,\"wal_kind\":\"none\"}}",
                 crate::storage::snapshot::SNAPSHOT_FORMAT,
                 crate::storage::snapshot::SNAPSHOT_VERSION
             ),
@@ -5338,7 +5338,7 @@ mod tests {
         std::fs::write(
             snapshot_dir.join("manifest.json"),
             format!(
-                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"wal_kind\":\"none\"}}",
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"coordinated\":true,\"wal_kind\":\"none\"}}",
                 crate::storage::snapshot::SNAPSHOT_FORMAT,
                 crate::storage::snapshot::SNAPSHOT_VERSION
             ),
@@ -5374,7 +5374,7 @@ mod tests {
         std::fs::write(
             snapshot_dir.join("manifest.json"),
             format!(
-                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"wal_kind\":\"active\"}}",
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"coordinated\":true,\"wal_kind\":\"active\"}}",
                 crate::storage::snapshot::SNAPSHOT_FORMAT,
                 crate::storage::snapshot::SNAPSHOT_VERSION
             ),
@@ -5405,7 +5405,7 @@ mod tests {
         std::fs::write(
             snapshot_dir.join("manifest.json"),
             format!(
-                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"wal_kind\":\"both\"}}",
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"coordinated\":true,\"wal_kind\":\"both\"}}",
                 crate::storage::snapshot::SNAPSHOT_FORMAT,
                 crate::storage::snapshot::SNAPSHOT_VERSION
             ),

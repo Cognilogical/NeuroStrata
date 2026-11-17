@@ -812,10 +812,31 @@ pub fn verify_snapshot(dir: &Path) -> Result<SnapshotVerifyReport, SnapshotError
     // Provenance (#209). Version 1 carried neither flag; it verifies exactly
     // as before, so an old backup does not turn invalid merely because the
     // field was added.
-    let coordinated = manifest
-        .get("coordinated")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
+    //
+    // Version 2 (#241) is the opposite: it *records* how the snapshot was
+    // taken, so the field is mandatory. A version 2 manifest that does not
+    // say whether the copy was coordinated cannot be judged, and defaulting
+    // it to "coordinated" would hand a snapshot the verify-but-cannot-
+    // restore verdict a backup must never carry.
+    let coordinated = match manifest.get("coordinated") {
+        None if legacy => true,
+        None => {
+            return Err(SnapshotError::InvalidManifest(format!(
+                "manifest field \"coordinated\" is required in a version {} snapshot: it records whether the copy was coordinated, and a snapshot that does not say cannot be judged",
+                version
+            )));
+        }
+        Some(value) => match value.as_bool() {
+            Some(flag) => flag,
+            None => {
+                return Err(SnapshotError::InvalidManifest(format!(
+                    "manifest field \"coordinated\" must be a boolean in a version {} snapshot, got {}",
+                    version,
+                    value
+                )));
+            }
+        },
+    };
     let provenance = manifest
         .get("provenance")
         .and_then(|v| v.as_str())
@@ -1447,7 +1468,7 @@ mod tests {
         write_store(&d);
         let mut manifest = File::create(d.join("manifest.json")).unwrap();
         let content = format!(
-            "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"wal_kind\":\"none\"}}",
+            "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"coordinated\":true,\"wal_kind\":\"none\"}}",
             SNAPSHOT_FORMAT, SNAPSHOT_VERSION
         );
         manifest.write_all(content.as_bytes()).unwrap();
@@ -1471,7 +1492,7 @@ mod tests {
         write_store(&d);
         let mut manifest = File::create(d.join("manifest.json")).unwrap();
         let content = format!(
-            "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"wal_kind\":\"none\"}}",
+            "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"coordinated\":true,\"wal_kind\":\"none\"}}",
             SNAPSHOT_FORMAT, SNAPSHOT_VERSION
         );
         manifest.write_all(content.as_bytes()).unwrap();
@@ -1508,7 +1529,7 @@ mod tests {
         write_store(&d);
         let mut manifest = File::create(d.join("manifest.json")).unwrap();
         let content = format!(
-            "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"wal_kind\":\"none\"}}",
+            "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"coordinated\":true,\"wal_kind\":\"none\"}}",
             SNAPSHOT_FORMAT, SNAPSHOT_VERSION
         );
         manifest.write_all(content.as_bytes()).unwrap();
@@ -1691,6 +1712,14 @@ mod tests {
 
         let report = verify_snapshot(&d).expect("a version 1 snapshot verifies");
         assert!(report.integrity_ok);
+        assert!(
+            report.valid,
+            "a version 1 snapshot keeps the legacy default: it is treated as coordinated (#241)"
+        );
+        assert!(
+            report.coordinated,
+            "the legacy default is the coordinated verdict (#241)"
+        );
         assert_eq!(
             report.wal_kind, None,
             "a version 1 manifest records no WAL role; restore treats it as active"
@@ -1733,7 +1762,7 @@ mod tests {
         fs::write(
             d.join("manifest.json"),
             format!(
-                "{{\"format\":\"{}\",\"version\":2,\"created_at\":\"2026-01-01T00:00:00Z\"}}",
+                "{{\"format\":\"{}\",\"version\":2,\"created_at\":\"2026-01-01T00:00:00Z\",\"coordinated\":true}}",
                 SNAPSHOT_FORMAT
             ),
         )
@@ -1751,13 +1780,148 @@ mod tests {
     }
 
     #[test]
+    fn a_version_2_manifest_without_coordinated_is_invalid() {
+        // #241: a version 2 manifest records how the snapshot was taken. A
+        // manifest that does not say whether the copy was coordinated cannot
+        // be judged, and guessing "coordinated" hands a snapshot the
+        // verify-but-cannot-restore verdict a backup must never carry.
+        let d = temp_dir("v2-no-coordinated");
+        write_store(&d);
+        fs::write(
+            d.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":2,\"created_at\":\"2026-01-01T00:00:00Z\",\"wal_kind\":\"none\"}}",
+                SNAPSHOT_FORMAT
+            ),
+        )
+        .unwrap();
+        write_checksums(&d).unwrap();
+
+        let result = verify_snapshot(&d);
+        match result {
+            Err(SnapshotError::InvalidManifest(message)) => assert!(
+                message.contains("coordinated"),
+                "the refusal names the missing field: {message}"
+            ),
+            other => panic!("a version 2 manifest without coordinated must be rejected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_version_2_manifest_with_a_non_boolean_coordinated_is_invalid() {
+        // #241: "coordinated" is a boolean field. A string or a number there
+        // is not a snapshot that says "not coordinated" — it is a snapshot
+        // that says nothing, so it is refused rather than read.
+        let d = temp_dir("v2-bad-coordinated");
+        write_store(&d);
+        fs::write(
+            d.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":2,\"created_at\":\"2026-01-01T00:00:00Z\",\"coordinated\":\"true\",\"wal_kind\":\"none\"}}",
+                SNAPSHOT_FORMAT
+            ),
+        )
+        .unwrap();
+        write_checksums(&d).unwrap();
+
+        let result = verify_snapshot(&d);
+        match result {
+            Err(SnapshotError::InvalidManifest(message)) => assert!(
+                message.contains("coordinated") && message.contains("boolean"),
+                "the refusal names the field and its type: {message}"
+            ),
+            other => panic!("a version 2 manifest with a non-boolean coordinated must be rejected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_version_1_manifest_with_a_non_boolean_coordinated_is_invalid() {
+        // #241: version 1 predates the field, so a missing one keeps the
+        // legacy default. A present-but-unreadable one is refused rather
+        // than defaulted: "coordinated": "no" is not a coordinated snapshot.
+        let d = temp_dir("v1-bad-coordinated");
+        write_store(&d);
+        fs::write(
+            d.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":1,\"created_at\":\"2026-01-01T00:00:00Z\",\"coordinated\":1}}",
+                SNAPSHOT_FORMAT
+            ),
+        )
+        .unwrap();
+        write_checksums(&d).unwrap();
+
+        let result = verify_snapshot(&d);
+        match result {
+            Err(SnapshotError::InvalidManifest(message)) => assert!(
+                message.contains("coordinated") && message.contains("boolean"),
+                "the refusal names the field and its type: {message}"
+            ),
+            other => panic!("a version 1 manifest with a non-boolean coordinated must be rejected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_version_2_manifest_that_is_not_coordinated_is_intact_but_not_valid() {
+        // #241: an uncoordinated copy is honest about what it is. Its bytes
+        // can still match their checksums, but it never earns the `valid`
+        // verdict, because it cannot prove its members came from one instant.
+        let d = temp_dir("v2-uncoordinated");
+        write_store(&d);
+        fs::write(
+            d.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":2,\"created_at\":\"2026-01-01T00:00:00Z\",\"coordinated\":false,\"wal_kind\":\"none\"}}",
+                SNAPSHOT_FORMAT
+            ),
+        )
+        .unwrap();
+        write_checksums(&d).unwrap();
+
+        let report = verify_snapshot(&d).expect("an uncoordinated snapshot still verifies its bytes");
+        assert!(report.integrity_ok, "the bytes match their checksums");
+        assert!(!report.valid, "an uncoordinated snapshot is not fully valid");
+        assert!(!report.coordinated, "the verdict reports it as uncoordinated");
+        assert_eq!(
+            report.provenance, PROVENANCE_UNVERIFIED,
+            "an uncoordinated snapshot records the unverified provenance"
+        );
+    }
+
+    #[test]
+    fn a_version_2_manifest_that_is_coordinated_is_valid() {
+        // The control for the two refusals above: an explicit `true` is a
+        // coordinated snapshot and earns the full verdict.
+        let d = temp_dir("v2-coordinated");
+        write_store(&d);
+        fs::write(
+            d.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":2,\"created_at\":\"2026-01-01T00:00:00Z\",\"coordinated\":true,\"wal_kind\":\"none\"}}",
+                SNAPSHOT_FORMAT
+            ),
+        )
+        .unwrap();
+        write_checksums(&d).unwrap();
+
+        let report = verify_snapshot(&d).expect("a coordinated snapshot verifies");
+        assert!(report.integrity_ok, "the bytes match their checksums");
+        assert!(report.valid, "a coordinated snapshot is fully valid");
+        assert!(report.coordinated, "the verdict reports it as coordinated");
+        assert_eq!(
+            report.provenance, PROVENANCE_COORDINATED,
+            "a coordinated snapshot records the coordinated provenance"
+        );
+    }
+
+    #[test]
     fn a_version_2_manifest_with_an_unknown_wal_kind_is_invalid() {
         let d = temp_dir("v2-unknown-kind");
         write_store(&d);
         fs::write(
             d.join("manifest.json"),
             format!(
-                "{{\"format\":\"{}\",\"version\":2,\"created_at\":\"2026-01-01T00:00:00Z\",\"wal_kind\":\"sometimes\"}}",
+                "{{\"format\":\"{}\",\"version\":2,\"created_at\":\"2026-01-01T00:00:00Z\",\"coordinated\":true,\"wal_kind\":\"sometimes\"}}",
                 SNAPSHOT_FORMAT
             ),
         )
@@ -1807,7 +1971,7 @@ mod tests {
         fs::write(
             d.join("manifest.json"),
             format!(
-                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"wal_kind\":\"none\"}}",
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"coordinated\":true,\"wal_kind\":\"none\"}}",
                 SNAPSHOT_FORMAT, SNAPSHOT_VERSION
             ),
         )
@@ -1860,7 +2024,7 @@ mod tests {
         fs::write(
             d.join("manifest.json"),
             format!(
-                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"wal_kind\":\"active\"}}",
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"coordinated\":true,\"wal_kind\":\"active\"}}",
                 SNAPSHOT_FORMAT, SNAPSHOT_VERSION
             ),
         )
@@ -1888,7 +2052,7 @@ mod tests {
         fs::write(
             d.join("manifest.json"),
             format!(
-                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"wal_kind\":\"both\"}}",
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"coordinated\":true,\"wal_kind\":\"both\"}}",
                 SNAPSHOT_FORMAT, SNAPSHOT_VERSION
             ),
         )
