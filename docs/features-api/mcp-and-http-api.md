@@ -27,7 +27,7 @@
 - `neurostrata_task_complete` — finish a task (requires extracted memory → Lock 2).
 - `neurostrata_task_validate` — advisory gate report for a task.
 - `neurostrata_procedure_perform` — fire a recurring procedure.
-- `neurostrata_guard_validate` — validate PreToolUse actions against behavioral rules and Zero-Action Start (`git push`/`pull`/`fetch`/`status`/`log`/`diff`/`show`/`rev-parse` and `neurostrata-mcp task` commands are exempt from requiring an `in_progress` task so post-completion pushes pass without skipping the gate).
+- `neurostrata_guard_validate` — validate PreToolUse actions against behavioral rules and Zero-Action Start (`git push`/`pull`/`fetch`/`status`/`log`/`diff`/`show`/`rev-parse` without file-output or exec-override flags like `--output`/`-c`, plus `neurostrata-mcp task` commands, are exempt from requiring an `in_progress` task so post-completion pushes pass without skipping the gate).
 
 ## Code Intelligence & SCIP Call-Graph Tools
 

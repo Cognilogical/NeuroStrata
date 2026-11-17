@@ -10555,6 +10555,21 @@ fn is_env_assignment_token(tok: &str) -> bool {
         && !name.chars().next().unwrap().is_ascii_digit()
 }
 
+fn is_disallowed_git_subcommand_arg(arg: &str) -> bool {
+    arg == "--output"
+        || arg.starts_with("--output=")
+        || arg.starts_with("-O")
+        || arg == "--ext-diff"
+        || arg == "--textconv"
+        || arg == "--exec"
+        || arg.starts_with("--exec=")
+        || arg == "-x"
+        || arg == "--upload-pack"
+        || arg.starts_with("--upload-pack=")
+        || arg == "--receive-pack"
+        || arg.starts_with("--receive-pack=")
+}
+
 fn is_zero_action_exempt_shell_segment(segment: &str) -> bool {
     let mut tokens = segment
         .split_whitespace()
@@ -10569,11 +10584,21 @@ fn is_zero_action_exempt_shell_segment(segment: &str) -> bool {
     match bin {
         "git" => {
             let mut rest: Vec<&str> = tokens.collect();
-            while rest.len() >= 2 && matches!(rest[0], "-C" | "-c" | "--git-dir" | "--work-tree") {
-                rest.drain(..2);
+            loop {
+                if rest.len() >= 2 && matches!(rest[0], "-C" | "--git-dir" | "--work-tree") {
+                    rest.drain(..2);
+                } else if !rest.is_empty()
+                    && (matches!(rest[0], "--no-pager" | "-P" | "--no-optional-locks")
+                        || rest[0].starts_with("--git-dir=")
+                        || rest[0].starts_with("--work-tree="))
+                {
+                    rest.remove(0);
+                } else {
+                    break;
+                }
             }
-            while !rest.is_empty() && rest[0].starts_with('-') {
-                rest.remove(0);
+            if rest.first().is_some_and(|t| t.starts_with('-')) {
+                return false;
             }
             let Some(&subcmd) = rest.first() else {
                 return false;
@@ -10581,7 +10606,9 @@ fn is_zero_action_exempt_shell_segment(segment: &str) -> bool {
             matches!(
                 subcmd,
                 "push" | "pull" | "fetch" | "status" | "log" | "diff" | "show" | "rev-parse"
-            )
+            ) && !rest[1..]
+                .iter()
+                .any(|arg| is_disallowed_git_subcommand_arg(arg))
         }
         "neurostrata-mcp" => matches!(tokens.next(), Some("task")),
         _ => false,

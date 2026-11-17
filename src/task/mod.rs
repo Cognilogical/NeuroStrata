@@ -6325,6 +6325,22 @@ mod tests {
             "git push > /tmp/pwn"
         ));
         assert!(!crate::server::is_zero_action_exempt_shell_payload(
+            "bash",
+            "git diff --output=src/file.rs"
+        ));
+        assert!(!crate::server::is_zero_action_exempt_shell_payload(
+            "bash",
+            "git show --output src/file.rs"
+        ));
+        assert!(!crate::server::is_zero_action_exempt_shell_payload(
+            "bash",
+            "git log --output=src/file.rs"
+        ));
+        assert!(!crate::server::is_zero_action_exempt_shell_payload(
+            "bash",
+            "git -c core.sshCommand=evil push"
+        ));
+        assert!(!crate::server::is_zero_action_exempt_shell_payload(
             "edit",
             "git push"
         ));
