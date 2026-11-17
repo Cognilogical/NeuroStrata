@@ -33,18 +33,34 @@ having looked at the wrong directory is worse than no run at all.
 | Incremental caches | Directories under `<repo>/target/debug/incremental` older than the cache threshold. |
 | Podman | Exited containers and dangling (`<none>`) image layers. |
 
-Cargo's dependency artifacts are deliberately left alone. Cargo owns that
+In the **main checkout**, Cargo's dependency artifacts
+(`<repo>/target/debug/deps`) are deliberately left alone. Cargo owns that
 directory; deleting files from it turns the next build into a full rebuild
 and buys nothing that `cargo clean` does not buy better.
+
+The scope of that guarantee is the main checkout only. An idle worktree's
+`target/` tree is removed **as a whole**, so a worktree's own dependency
+cache goes with it — that cache is exactly what makes a worktree
+idle-but-fat, and cargo rebuilds it on demand.
 
 ## Safety rules
 
 * **The active-build check is re-run immediately before every destructive
   step.** A build that starts while the script runs is never raced: the
-  removal is skipped and reported. Zombie (`Z`) `cargo`/`rustc` processes do
-  not count as an active build.
+  removal is skipped and reported. The check covers the toolchains this
+  project uses — `cargo`/`rustc`, the native C/C++ toolchain
+  (`cc`, `c++`, `gcc`, `g++`, `clang`, `clang++`, `ld`, `lld`, `make`,
+  `cmake`, `ninja`) and the Lean toolchain (`lake`, `lean`) — matched by
+  exact process name.
+* **The check fails safe.** A zombie (`Z`) process does not count as an
+  active build, but a matched process whose state cannot be read (no
+  procfs, already exited) *does*: an incomplete lookup never authorizes a
+  deletion.
 * **`--dry-run` deletes nothing.** It prints `would remove <path>` for every
   candidate.
+* **Each Podman prune is guarded on its own.** Container pruning and image
+  pruning are two separate destructive steps, and each is checked
+  immediately before its own command runs; an active build prevents both.
 * **Podman pruning can be disabled** by setting
   `NEUROSTRATA_DISK_HYGIENE_PODMAN` to the empty string.
 
@@ -63,21 +79,37 @@ and buys nothing that `cargo clean` does not buy better.
 
 ## Scheduling
 
-The script installs no timer and the repository installs none either: the
-unit files are committed under `scripts/systemd/` so they can be reviewed,
-but enabling them is an operator decision.
+The script installs no timer, and this repository ships no unit file: a
+user-level timer belongs to the operator's machine, not to the project. The
+example below is a starting point to copy and edit — replace `<repo>` with
+the path of your own checkout.
 
-| File | Purpose |
-|------|---------|
-| `scripts/systemd/neurostrata-disk-hygiene.service` | The oneshot unit; ships with `--dry-run`. |
-| `scripts/systemd/neurostrata-disk-hygiene.timer` | Runs the unit every six hours. |
+```ini
+# ~/.config/systemd/user/neurostrata-disk-hygiene.service
+[Unit]
+Description=NeuroStrata disk hygiene
 
-Install and enable them with:
+[Service]
+Type=oneshot
+ExecStart=/bin/bash <repo>/scripts/disk-hygiene.sh --dry-run
+```
+
+```ini
+# ~/.config/systemd/user/neurostrata-disk-hygiene.timer
+[Unit]
+Description=Run NeuroStrata disk hygiene every six hours
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=6h
+
+[Install]
+WantedBy=timers.target
+```
+
+Enable it with:
 
 ```bash
-mkdir -p ~/.config/systemd/user
-cp scripts/systemd/neurostrata-disk-hygiene.{service,timer} ~/.config/systemd/user/
-# Adjust the ExecStart path in the service to this checkout.
 systemctl --user daemon-reload
 systemctl --user enable --now neurostrata-disk-hygiene.timer
 ```

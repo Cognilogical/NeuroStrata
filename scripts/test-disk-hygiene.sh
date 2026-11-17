@@ -11,9 +11,16 @@
 #   2. an unresolvable root exits 2 instead of silently doing nothing
 #   3. --dry-run prints the plan and deletes nothing
 #   4. idle targets and stale temp dirs are reclaimed, fresh ones are kept
-#   5. cargo's dependency artifacts are never deleted
+#   5. the main checkout's dependency artifacts survive
 #   6. an active build stops every destructive step
-#   7. the script never mentions a dependency-artifact directory
+#   7. the script has no dependency-artifact deletion step
+#   8. a native build tool (cmake) counts as an active build
+#   9. Lean tooling (lake) counts as an active build
+#  10. an unreadable process state fails safe (no deletion)
+#  11. an active build prevents every podman prune
+#  12. without an active build both podman prunes run
+#  13. a dry run prunes nothing
+#  14. a symlinked invocation resolves the real checkout
 set -euo pipefail
 
 root=$(git rev-parse --show-toplevel)
@@ -83,7 +90,24 @@ new_case() {
   mkdir -p "$case_dir/bin"
   printf '#!/usr/bin/env bash\nexit 0\n' > "$case_dir/bin/pgrep-active"
   printf '#!/usr/bin/env bash\nexit 1\n' > "$case_dir/bin/pgrep-inactive"
-  chmod +x "$case_dir/bin/pgrep-active" "$case_dir/bin/pgrep-inactive"
+  # A pgrep that matches one exact process name and reports one PID, the way
+  # a real `pgrep -x NAME` does.
+  cat > "$case_dir/bin/pgrep-matcher" <<'STUB'
+#!/usr/bin/env bash
+name="${2:-}"
+case " ${NEUROSTRATA_TEST_MATCH_NAMES:-} " in
+  *" $name "*) echo "${NEUROSTRATA_TEST_MATCH_PID:-0}"; exit 0 ;;
+esac
+exit 1
+STUB
+  # A podman that records every invocation instead of touching the machine.
+  cat > "$case_dir/bin/podman-recorder" <<'STUB'
+#!/usr/bin/env bash
+echo "$@" >> "${NEUROSTRATA_TEST_PODMAN_LOG:?}"
+exit 0
+STUB
+  chmod +x "$case_dir/bin/pgrep-active" "$case_dir/bin/pgrep-inactive" \
+    "$case_dir/bin/pgrep-matcher" "$case_dir/bin/podman-recorder"
 }
 
 # The environment that keeps the run inside the fixture. The pgrep lookup is
@@ -164,7 +188,11 @@ assert_exists "$case_dir/repo/target/debug/incremental/fresh-cache"
 assert_exists "$case_dir/tmp-base/ns-fresh"
 assert_exists "$case_dir/tmp-base/keep-me"
 
-# --- 5. cargo's dependency artifacts are never deleted ----------------------
+# --- 5. the main checkout's dependency artifacts survive ---------------------
+# The main checkout's target/debug/deps is never touched. An idle worktree's
+# target tree is deleted whole, so a worktree's own dependency cache does go
+# with it -- that is the documented scope, and the fixture only asserts the
+# main-checkout invariant here.
 assert_exists "$case_dir/repo/target/debug/deps/stale-test-binary"
 
 # --- 6. an active build stops every destructive step ------------------------
@@ -184,10 +212,96 @@ assert_absent "$case_dir/worktrees/1ebe42/wt-stale/target"
 assert_absent "$case_dir/repo/.worktrees/wt-stale/target"
 assert_absent "$case_dir/tmp-base/ns-stale"
 
-# --- 7. the script never touches cargo's dependency artifacts --------------
+# --- 7. the script has no dependency-artifact deletion step ------------------
 checks=$((checks + 1))
 if grep -q "debug/deps" "$script"; then
   fail "the script still references a dependency-artifact directory"
+fi
+
+# --- 8. a native build tool is a build too ----------------------------------
+# The project compiles a C++ core (lbug) and links OpenSSL, so cc/c++/ld/
+# cmake/ninja count as active builds, not just cargo and rustc.
+new_case native-build
+export NEUROSTRATA_TEST_MATCH_NAMES="cmake"
+export NEUROSTRATA_TEST_MATCH_PID="$$"
+run_hygiene "$case_dir" NEUROSTRATA_DISK_HYGIENE_PGREP="$case_dir/bin/pgrep-matcher"
+unset NEUROSTRATA_TEST_MATCH_NAMES NEUROSTRATA_TEST_MATCH_PID
+assert_exists "$case_dir/worktrees/1ebe42/wt-stale/target"
+assert_exists "$case_dir/repo/target/debug/incremental/stale-cache"
+assert_exists "$case_dir/tmp-base/ns-stale"
+assert_contains "$case_dir/out.log" "build active"
+
+# --- 9. Lean tooling is a build too ----------------------------------------
+new_case lean-build
+export NEUROSTRATA_TEST_MATCH_NAMES="lake"
+export NEUROSTRATA_TEST_MATCH_PID="$$"
+run_hygiene "$case_dir" NEUROSTRATA_DISK_HYGIENE_PGREP="$case_dir/bin/pgrep-matcher"
+unset NEUROSTRATA_TEST_MATCH_NAMES NEUROSTRATA_TEST_MATCH_PID
+assert_exists "$case_dir/worktrees/1ebe42/wt-stale/target"
+assert_exists "$case_dir/tmp-base/ns-stale"
+assert_contains "$case_dir/out.log" "build active"
+
+# --- 10. an unreadable process state fails safe ----------------------------
+# A matched PID whose state cannot be read (no procfs, exited process) must
+# be treated as an active build: the script must not delete anything on the
+# strength of a lookup it could not complete.
+new_case unknown-state
+export NEUROSTRATA_TEST_MATCH_NAMES="cc"
+export NEUROSTRATA_TEST_MATCH_PID="999999"
+run_hygiene "$case_dir" NEUROSTRATA_DISK_HYGIENE_PGREP="$case_dir/bin/pgrep-matcher"
+unset NEUROSTRATA_TEST_MATCH_NAMES NEUROSTRATA_TEST_MATCH_PID
+assert_exists "$case_dir/worktrees/1ebe42/wt-stale/target"
+assert_exists "$case_dir/tmp-base/ns-stale"
+assert_contains "$case_dir/out.log" "build active"
+
+# --- 11. an active build prevents every podman prune ------------------------
+new_case podman-blocked
+: > "$case_dir/podman.log"
+export NEUROSTRATA_TEST_PODMAN_LOG="$case_dir/podman.log"
+run_hygiene "$case_dir" \
+  NEUROSTRATA_DISK_HYGIENE_PGREP="$case_dir/bin/pgrep-active" \
+  NEUROSTRATA_DISK_HYGIENE_PODMAN="$case_dir/bin/podman-recorder"
+unset NEUROSTRATA_TEST_PODMAN_LOG
+assert_not_contains "$case_dir/podman.log" "prune"
+
+# --- 12. without an active build both podman prunes run ---------------------
+new_case podman-allowed
+: > "$case_dir/podman.log"
+export NEUROSTRATA_TEST_PODMAN_LOG="$case_dir/podman.log"
+run_hygiene "$case_dir" \
+  NEUROSTRATA_DISK_HYGIENE_PGREP="$case_dir/bin/pgrep-inactive" \
+  NEUROSTRATA_DISK_HYGIENE_PODMAN="$case_dir/bin/podman-recorder"
+unset NEUROSTRATA_TEST_PODMAN_LOG
+assert_contains "$case_dir/podman.log" "container prune"
+assert_contains "$case_dir/podman.log" "image prune"
+
+# --- 13. a dry run prunes nothing -------------------------------------------
+new_case podman-dry-run
+: > "$case_dir/podman.log"
+export NEUROSTRATA_TEST_PODMAN_LOG="$case_dir/podman.log"
+EXTRA_ARGS=(--dry-run)
+run_hygiene "$case_dir" \
+  NEUROSTRATA_DISK_HYGIENE_PGREP="$case_dir/bin/pgrep-inactive" \
+  NEUROSTRATA_DISK_HYGIENE_PODMAN="$case_dir/bin/podman-recorder"
+EXTRA_ARGS=()
+unset NEUROSTRATA_TEST_PODMAN_LOG
+assert_not_contains "$case_dir/podman.log" "prune"
+
+# --- 14. a symlinked invocation resolves the real checkout ------------------
+# Invoking the script through a symlink must still find the checkout the
+# script really lives in.
+new_case symlink-invocation
+ln -s "$script" "$case_dir/bin/disk-hygiene-link"
+if env \
+     NEUROSTRATA_REPO_ROOT="" \
+     NEUROSTRATA_DISK_HYGIENE_TMP_BASES="$case_dir/tmp-base" \
+     NEUROSTRATA_DISK_HYGIENE_PODMAN="" \
+     NEUROSTRATA_DISK_HYGIENE_PGREP="$case_dir/bin/pgrep-inactive" \
+     bash "$case_dir/bin/disk-hygiene-link" --dry-run \
+     > "$case_dir/out.log" 2> "$case_dir/err.log"; then
+  assert_contains "$case_dir/out.log" "repo root: $root"
+else
+  fail "the script failed through a symlink"
 fi
 
 echo "disk-hygiene self-test: $checks checks, $failures failures"

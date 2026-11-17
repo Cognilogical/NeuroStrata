@@ -13,13 +13,15 @@
 #     An unresolvable root is a hard error (exit 2), never a silent no-op.
 #   * The active-build check is re-run immediately before EVERY destructive
 #     step, so a build that starts mid-run is never raced.
-#   * Cargo's own dependency artifacts are never deleted: cargo owns them and
-#     deleting them turns the next build into a full rebuild.
+#   * The MAIN checkout's Cargo dependency artifacts are never deleted: cargo
+#     owns them and deleting them turns the next build into a full rebuild.
+#     An idle worktree's target tree is removed as a whole, so a worktree's
+#     own dependency cache goes with it -- that is the documented scope.
 #   * --dry-run prints the plan and deletes nothing.
 #
-# Scheduling is the operator's job: the unit files are committed under
-# scripts/systemd/, but nothing installs or enables them automatically. See
-# docs/features-api/ops/disk-hygiene.md for how to turn them on.
+# Scheduling is the operator's job: this script installs no timer and the
+# repository ships no unit file. See docs/features-api/ops/disk-hygiene.md for
+# a generic operator example.
 #
 # Environment overrides (all optional):
 #   NEUROSTRATA_REPO_ROOT            root to operate on (default: this checkout)
@@ -48,7 +50,23 @@ for arg in "$@"; do
   esac
 done
 
-SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+# The directory of the checkout this script really lives in. A symlinked
+# invocation resolves the link chain, so the script still finds its own
+# repository instead of the directory the link happens to sit in.
+resolve_script_dir() {
+  local source=${BASH_SOURCE[0]} dir
+  while [ -L "$source" ]; do
+    dir=$(CDPATH='' cd -P -- "$(dirname -- "$source")" && pwd)
+    source=$(readlink -- "$source")
+    case "$source" in
+      /*) ;;
+      *) source="$dir/$source" ;;
+    esac
+  done
+  CDPATH='' cd -P -- "$(dirname -- "$source")" && pwd
+}
+
+SCRIPT_DIR=$(resolve_script_dir)
 
 log() { echo "[$(date +%Y-%m-%dT%H:%M:%S)] [disk-hygiene] $*"; }
 
@@ -98,26 +116,40 @@ fi
 
 # --- helpers ----------------------------------------------------------------
 
-# Is a cargo/rustc build running right now? Re-checked before every removal.
-# Zombie processes are ignored: a reaped-but-not-yet-collected cargo is not a
-# build, and treating one as active would disable the script forever.
+# Is a build running right now? Re-checked before every removal.
+#
+# The set covers the toolchains this project actually uses: cargo and rustc,
+# the native C/C++ toolchain (lbug builds a C++ core and links a vendored
+# OpenSSL), and the Lean toolchain (the proofs/ directory is built with
+# lake). Matching is exact (-x), so a process whose name merely contains one
+# of these does not count.
+#
+# Two failure modes are handled conservatively:
+#   * a zombie (state Z) is not a build -- it is a reaped process whose entry
+#     has not been collected yet;
+#   * a matched process whose state cannot be read is treated as an ACTIVE
+#     build, so an incomplete lookup never authorizes a deletion.
+BUILD_PROCESS_NAMES=(cargo rustc cc c++ gcc g++ clang clang++ ld ld.lld lld make cmake ninja lake lean)
+
 build_active() {
-  local out pid state saw=0
-  for proc_name in cargo rustc; do
+  local out pid state saw=0 proc_name
+  for proc_name in "${BUILD_PROCESS_NAMES[@]}"; do
     out=$("$PGREP_BIN" -x "$proc_name" 2>/dev/null) || out=""
     for pid in $out; do
       saw=1
       state=$(sed 's/^.*) //' "/proc/$pid/stat" 2>/dev/null | awk '{print $1}') || state=""
-      if [ -n "$state" ] && [ "$state" != "Z" ]; then
-        return 0
-      fi
+      case "$state" in
+        Z) continue ;;   # a reaped process is not a build
+        *) return 0 ;;  # live, or unknown state: fail safe
+      esac
     done
   done
   # No pid information available (a stubbed or non-procfs lookup): fall back
   # to the lookup's own exit status.
   if [ "$saw" -eq 0 ]; then
-    "$PGREP_BIN" -x cargo >/dev/null 2>&1 && return 0
-    "$PGREP_BIN" -x rustc >/dev/null 2>&1 && return 0
+    for proc_name in "${BUILD_PROCESS_NAMES[@]}"; do
+      "$PGREP_BIN" -x "$proc_name" >/dev/null 2>&1 && return 0
+    done
   fi
   return 1
 }
@@ -166,6 +198,9 @@ for TMP_BASE in "${TMP_BASE_LIST[@]}"; do
 done
 
 # --- 2. stale Cargo targets in inactive worktrees ---------------------------
+# The whole target tree of an idle worktree goes, including the dependency
+# cache it carries: that cache is what makes the worktree idle-but-fat, and
+# cargo rebuilds it on demand.
 
 if [ -d "$OPENCODE_WORKTREES" ]; then
   for wt_target in "$OPENCODE_WORKTREES"/*/*/target "$OPENCODE_WORKTREES"/*/*/.worktrees/*/target; do
@@ -188,7 +223,9 @@ if [ -d "$REPO_ROOT/.worktrees" ]; then
 fi
 
 # --- 4. stale incremental caches in the main checkout ------------------------
-# Cargo's dependency artifacts are deliberately left alone: cargo owns them.
+# In the MAIN checkout, Cargo's dependency artifacts are deliberately left
+# alone: cargo owns them and deleting them turns the next build into a full
+# rebuild. Only the incremental cache -- which is pure cache -- is pruned.
 
 INCREMENTAL_DIR="$REPO_ROOT/target/debug/incremental"
 if [ -d "$INCREMENTAL_DIR" ]; then
@@ -200,14 +237,25 @@ if [ -d "$INCREMENTAL_DIR" ]; then
 fi
 
 # --- 5. Podman --------------------------------------------------------------
+# Container pruning and image pruning are two separate destructive steps, so
+# each one gets its own guard, taken immediately before the command runs.
 
 if [ -n "$PODMAN_BIN" ] && command -v "$PODMAN_BIN" >/dev/null 2>&1; then
   if [ "$DRY_RUN" = "1" ]; then
     log "would prune exited Podman containers and dangling image layers"
   else
-    "$PODMAN_BIN" container prune -f >/dev/null 2>&1 || true
-    "$PODMAN_BIN" image prune -f >/dev/null 2>&1 || true
-    log "pruned exited Podman containers and dangling image layers"
+    if build_active; then
+      log "build active — skipped Podman container prune"
+    else
+      "$PODMAN_BIN" container prune -f >/dev/null 2>&1 || true
+      log "pruned exited Podman containers"
+    fi
+    if build_active; then
+      log "build active — skipped Podman image prune"
+    else
+      "$PODMAN_BIN" image prune -f >/dev/null 2>&1 || true
+      log "pruned dangling Podman image layers"
+    fi
   fi
 fi
 

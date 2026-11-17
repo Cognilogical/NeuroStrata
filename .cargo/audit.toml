@@ -1,7 +1,7 @@
 # cargo-audit configuration for NeuroStrata.
 #
 # cargo-audit reads the project-local configuration from .cargo/audit.toml
-# (a copy in the repository root is silently ignored — verified with
+# (a copy in the repository root is silently ignored -- verified with
 # cargo-audit 0.22.1), so `cargo audit` at the repository root applies the
 # same exception list on CI and on a developer machine. Every entry below is
 # dated and justified: an entry without a date and a reason is not an
@@ -14,32 +14,53 @@
 # proc-macro-error2 2.0.1) that are deliberately NOT ignored so they keep
 # being visible in the report.
 #
-# Reachability of quick-xml in this dependency graph:
+# Reachability of quick-xml in the CURRENT dependency graph (verified with
+# `cargo tree -i quick-xml` on 2026-11-16):
+#
 #   neurostrata-mcp -> sparesults 0.3.5 -> quick-xml 0.37.5
-# sparesults is a direct dependency and its XML result format is used by
-# src/rdf/scenario.rs (QueryResultsFormat::Xml), so the vulnerable parser is
-# compiled into the binary and reachable from a SPARQL query that asks for
-# XML output.
+#   neurostrata-mcp -> spareval 0.2.9  -> sparesults 0.3.5 -> quick-xml
+#
+# sparesults and spareval are both direct dependencies (Cargo.toml), and
+# sparesults' XML result format is used by src/rdf/scenario.rs
+# (QueryResultsFormat::Xml), so the vulnerable parser is compiled into the
+# binary and is reachable from a SPARQL query that asks for XML output.
+#
+# History, not a current constraint: before this repository removed the
+# unused external `shacl` crate, quick-xml ALSO arrived through that crate's
+# transitive chain (shacl -> rudof_rdf -> oxigraph -> oxrdfio -> oxrdfxml).
+# That chain is gone with the crate; it is recorded here only so the lockfile
+# diff stays explicable.
 
 [advisories]
-# RUSTSEC-2026-0194 (published 2026-06-29) — quick-xml 0.37.5: quadratic run
+# RUSTSEC-2026-0194 (published 2026-06-29) -- quick-xml 0.37.5: quadratic run
 #   time when checking a start tag for duplicate attribute names.
-#   Availability only: CVSS AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H — no
-#   confidentiality or integrity impact, a crafted XML document can burn CPU.
-# RUSTSEC-2026-0195 (published 2026-06-29) — quick-xml 0.37.5: unbounded
+# RUSTSEC-2026-0195 (published 2026-06-29) -- quick-xml 0.37.5: unbounded
 #   namespace-declaration allocation in NsReader enables a memory-exhaustion
-#   denial of service. Same availability-only CVSS vector as above.
+#   denial of service.
 #
-#   Why these are not fixed yet: upstream fixed both in quick-xml >= 0.41.0,
-#   but oxrdfxml 0.2.5 requires quick-xml ^0.37, and oxrdfxml reaches this
-#   graph through oxrdfio/oxigraph. Taking the patch therefore needs an
-#   upstream oxrdfxml release, not a change on our side.
-#   Mitigation today: the XML result format is opt-in per query; the default
-#   SPARQL result format is JSON, which does not go through quick-xml.
-#   Exception reviewed on: 2026-11-16. Review again by: 2026-12-16, or as
-#   soon as an oxrdfxml release lifts the quick-xml ^0.37 requirement —
-#   whichever comes first. Both entries are deleted from this list at that
-#   point, not extended.
+#   Both are availability-only: CVSS AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N:A:H --
+#   no confidentiality or integrity impact; a crafted XML document can burn
+#   CPU or memory.
+#
+#   Why the patched version is not taken: both advisories name quick-xml
+#   >= 0.41.0 as the fix, and that version cannot be selected in this
+#   dependency graph. sparesults 0.3.5 requires quick-xml "0.37"; every
+#   published sparesults release (0.3.3, 0.3.4, 0.3.5 in the crates.io
+#   index) requires ^0.37; and spareval 0.2.9 pins sparesults "=0.3.5". The
+#   fix therefore needs an upstream sparesults release that widens its
+#   quick-xml requirement, or the removal of the direct dependency -- neither
+#   of which this repository controls.
+#
+#   Review criteria (not a calendar-only reminder): re-check when sparesults
+#   publishes a release whose quick-xml requirement admits >= 0.41, then
+#   delete these two entries. Verify with:
+#     cargo tree -i quick-xml
+#     cargo audit --json
+#   If quick-xml still resolves to 0.37.5 through sparesults, the exception
+#   stands and this comment is updated with the new evidence.
+#
+#   Exception reviewed on: 2026-11-16. Next review: on the next sparesults
+#   release, or by 2026-12-16, whichever comes first.
 ignore = [
   "RUSTSEC-2026-0194",
   "RUSTSEC-2026-0195",

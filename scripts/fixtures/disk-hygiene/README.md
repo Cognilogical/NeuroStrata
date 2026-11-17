@@ -9,7 +9,7 @@ treated as idle (`touch -d '3 days ago'`) and leaves the "fresh" ones alone.
 
 | Path | Age | Expected |
 |------|-----|----------|
-| `repo/target/debug/deps/stale-test-binary` | 3 days | **survives** - cargo owns its dependency artifacts; the script never deletes them |
+| `repo/target/debug/deps/stale-test-binary` | 3 days | **survives** - in the MAIN checkout cargo owns its dependency artifacts; the script never deletes them |
 | `repo/target/debug/incremental/stale-cache/` | 3 days | removed (stale incremental cache) |
 | `repo/target/debug/incremental/fresh-cache/` | fresh | survives |
 | `repo/.worktrees/wt-stale/target/` | 3 days | removed (idle repo-local worktree target) |
