@@ -1500,8 +1500,9 @@ pub struct LadybugStore {
     dimensions: usize,
     db: Arc<Database>,
     dirty: Dirty,
-    /// Set by `stop_checkpoints_after_pool_failure`; no checkpoint runs after.
-    checkpoints_stopped: Arc<std::sync::atomic::AtomicBool>,
+    /// Set by `stop_checkpoints_after_pool_failure`; no checkpoint runs after
+    /// it except one standalone probe (#198, #211).
+    checkpoints: CheckpointLatch,
     /// LadybugDB allows exactly one write transaction and REFUSES a second
     /// rather than queueing it, so two writers that overlap produce "Cannot
     /// start a new write transaction in the system" for whichever arrives
@@ -1601,8 +1602,29 @@ pub struct LadybugStore {
     /// use. The sidecar is the setup-time model choice's lock record:
     /// see `crate::model_choice::store_has_data`.
     store_state: Arc<std::sync::Mutex<Option<CachedStoreState>>>,
+    /// The number of `linked_files` census queries this store has run.
+    ///
+    /// The census used to cost one query per 128 hit ids, so the total work
+    /// grew with the pre-limit hit count. It is folded into the candidate
+    /// queries now -- every hit comes back with its own fan-out -- and the
+    /// metadata fallback reads its fan-out in one query, so this counter is
+    /// the metric that shows it: it does not grow with the number of hits a
+    /// file has.
+    census_reads: Arc<std::sync::atomic::AtomicU64>,
     #[cfg(test)]
     test_cleanup_dir: Option<TestCleanupDir>,
+}
+
+impl LadybugStore {
+    /// How many `linked_files` census queries this store has run.
+    ///
+    /// The folded census reads the fan-out inside the candidate queries, so
+    /// this only moves for the hits no edge query reached (the metadata
+    /// fallback), and the fallback reads them all in one query. A test that
+    /// seeds a large hit set asserts it does not grow.
+    pub fn census_reads(&self) -> u64 {
+        self.census_reads.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 #[cfg(test)]
@@ -1873,26 +1895,104 @@ fn explain_engine_error(e: anyhow::Error) -> anyhow::Error {
     )
 }
 
-/// After a checkpoint runs out of buffer pool, stop checkpointing for the rest
-/// of this process. Such a checkpoint fails part way, keeps the pages it had
+/// The buffer-pool latch (#198, surfaced by #211).
+///
+/// A checkpoint that runs out of buffer pool stops checkpointing for the rest
+/// of the process: such a checkpoint fails part way, keeps the pages it had
 /// already added to ladybug.db, and leaves the WAL as it was, so every retry
 /// fails the same way and grows the file again. The engine retries after each
 /// write commit once the WAL is past its auto-checkpoint threshold (16 MB), and
-/// the daemon every 30 s, so the file keeps growing for as long as writes come in.
-/// The writes stay in the WAL, and a restart with a bigger pool checkpoints them.
+/// the daemon every 30 s, so the file keeps growing for as long as writes come
+/// in. The writes stay in the WAL, and a restart with a bigger pool
+/// checkpoints them.
+///
+/// The latch is process-local and in memory: nothing persists it, so a new
+/// process starts with the engine's checkpointing at its defaults.
+#[derive(Clone)]
+struct CheckpointLatch {
+    /// The store this latch belongs to. The status mirror is keyed by path, so
+    /// two stores in one process cannot report each other's state.
+    store_path: Arc<PathBuf>,
+    /// Set once a checkpoint ran out of buffer pool; no checkpoint is attempted
+    /// after it except the single `probe` below.
+    stopped: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether one standalone CHECKPOINT may still be tried. Set when the
+    /// failure came from the engine's post-commit checkpoint: that one runs
+    /// inside a write, with the write's memory already held, while a standalone
+    /// CHECKPOINT afterwards has the pool to itself and may well fit. It is
+    /// taken (cleared) by the first attempt, so a second out-of-pool failure
+    /// leaves the latch set and nothing retries -- the loop #198 removed.
+    probe: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl CheckpointLatch {
+    fn new(store_path: PathBuf) -> Self {
+        Self {
+            store_path: Arc::new(store_path),
+            stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            probe: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    fn store_path(&self) -> &std::path::Path {
+        self.store_path.as_path()
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.stopped.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Latch after a buffer-pool failure. Returns whether this call engaged the
+    /// latch: a repeated failure finds it already set and changes nothing, so
+    /// the config CALLs and the warning stay once-per-process.
+    fn engage(&self, explicit: bool) -> bool {
+        if self.stopped.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return false;
+        }
+        self.probe
+            .store(!explicit, std::sync::atomic::Ordering::Release);
+        crate::storage::snapshot::record_checkpoints_stopped(self.store_path(), true);
+        true
+    }
+
+    /// Consume the one allowed standalone attempt, if there is one.
+    fn take_probe(&self) -> bool {
+        self.probe.swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    /// A checkpoint succeeded while the latch was set and the engine's
+    /// checkpointing is back on: clear the latch. The skip count stays, like
+    /// every other running total in the status.
+    fn clear(&self) {
+        self.probe
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.stopped
+            .store(false, std::sync::atomic::Ordering::Release);
+        crate::storage::snapshot::record_checkpoints_stopped(self.store_path(), false);
+    }
+
+    /// Count a checkpoint the latch skipped (#211). Distinct from a failure:
+    /// nothing was attempted, so `checkpoint_failures` must not move.
+    fn record_skip(&self) {
+        crate::storage::snapshot::record_checkpoint_skip(self.store_path());
+    }
+}
+
+/// After a checkpoint runs out of buffer pool, stop checkpointing for the rest
+/// of this process (see [`CheckpointLatch`] for why).
 ///
 /// `explicit` is our own CHECKPOINT; otherwise only the engine's post-commit
 /// checkpoint counts, not an ordinary query that ran out of pool.
 fn stop_checkpoints_after_pool_failure(
     conn: &Connection,
-    stopped: &std::sync::atomic::AtomicBool,
+    latch: &CheckpointLatch,
     err: &anyhow::Error,
     explicit: bool,
 ) {
     let text = err.to_string();
     if !text.contains("buffer pool is full")
         || !(explicit || text.contains("post-commit checkpoint failed"))
-        || stopped.swap(true, std::sync::atomic::Ordering::AcqRel)
+        || !latch.engage(explicit)
     {
         return;
     }
@@ -1905,27 +2005,71 @@ fn stop_checkpoints_after_pool_failure(
     }
     eprintln!(
         "WARNING: a checkpoint ran out of buffer pool. Each failed attempt leaves pages behind in \
-         ladybug.db, so checkpoints are off until restart; writes still reach the write-ahead log. \
-         Raise NEUROSTRATA_BUFFER_POOL_MB (or storage_hygiene.buffer_pool_mb; 0 lets the engine \
-         size it) and restart to checkpoint them."
+         ladybug.db, so checkpoints are off until one succeeds or the process restarts; writes \
+         still reach the write-ahead log, which is why storage status now reports \
+         checkpoints_stopped and counts skipped checkpoints in checkpoint_skips. Raise \
+         NEUROSTRATA_BUFFER_POOL_MB (or storage_hygiene.buffer_pool_mb; 0 lets the engine size it) \
+         and restart to checkpoint them. See docs/ops/checkpoint-latch.md."
     );
+}
+
+/// Turn the engine's checkpointing back on after one succeeded while the latch
+/// was set (#211). Nothing else re-enables it: the latch switched off
+/// `auto_checkpoint` and `force_checkpoint_on_close` on the shared database
+/// config, and leaving them off is what made a clean close leave a WAL behind.
+///
+/// If either CALL fails the latch stays, because the engine is still not
+/// checkpointing on its own; the operator's restart is the recovery either way.
+fn re_enable_checkpoints(conn: &Connection, latch: &CheckpointLatch) {
+    let auto = conn.query("CALL auto_checkpoint=true");
+    let on_close = conn.query("CALL force_checkpoint_on_close=true");
+    if let Err(e) = &auto {
+        tracing::warn!("could not turn the engine's auto-checkpoint back on: {e}");
+    }
+    if let Err(e) = &on_close {
+        tracing::warn!("could not turn the engine's checkpoint-on-close back on: {e}");
+    }
+    if auto.is_err() || on_close.is_err() {
+        return;
+    }
+    latch.clear();
+    tracing::info!(
+        "a checkpoint fit the buffer pool again; the engine's checkpointing is back on and the \
+         buffer-pool latch is cleared"
+    );
+}
+
+/// What [`guarded_checkpoint`] did (#211). A skip is not a failure: the latch
+/// prevented the attempt, so the caller must not record a failed outcome.
+enum CheckpointRun {
+    /// The latch is set and its one probe is spent: no CHECKPOINT was issued.
+    Skipped,
+    /// A CHECKPOINT was issued; this is its result.
+    Attempted(Result<()>),
 }
 
 /// Our CHECKPOINT, skipped once checkpoints are stopped and stopping them on
 /// a buffer-pool failure. Runs under the connection lock, so a write that
 /// stopped them while this waited is seen.
-fn guarded_checkpoint(conn: &Connection, stopped: &std::sync::atomic::AtomicBool) -> Result<()> {
-    if stopped.load(std::sync::atomic::Ordering::Acquire) {
-        anyhow::bail!("checkpoint skipped: an earlier one ran out of buffer pool");
+fn guarded_checkpoint(conn: &Connection, latch: &CheckpointLatch) -> CheckpointRun {
+    let was_stopped = latch.is_stopped();
+    if was_stopped && !latch.take_probe() {
+        latch.record_skip();
+        return CheckpointRun::Skipped;
     }
     let result = conn
         .query("CHECKPOINT")
         .map(|_| ())
         .map_err(anyhow::Error::from);
-    if let Err(e) = &result {
-        stop_checkpoints_after_pool_failure(conn, stopped, e, true);
+    match &result {
+        Err(e) => stop_checkpoints_after_pool_failure(conn, latch, e, true),
+        // The probe is what makes this reachable: a checkpoint issued while the
+        // latch is set succeeded, so the pool has room and the engine's own
+        // checkpointing can come back (#211).
+        Ok(()) if was_stopped => re_enable_checkpoints(conn, latch),
+        Ok(()) => {}
     }
-    result
+    CheckpointRun::Attempted(result)
 }
 
 #[cfg(test)]
@@ -2044,6 +2188,9 @@ mod buffer_pool_tests {
     #[tokio::test]
     async fn a_checkpoint_out_of_pool_is_not_retried() {
         use crate::traits::VectorStore;
+        // `checkpoint_failures` is process-global, and the latch tests assert
+        // it does not move for a skip (#211).
+        let _guard = super::checkpoint_latch_tests::counter_lock();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("ladybug.db");
         let pool = |mb: u64| {
@@ -2144,6 +2291,300 @@ mod buffer_pool_tests {
     }
 }
 
+#[cfg(test)]
+mod checkpoint_latch_tests {
+    use super::*;
+
+    /// `checkpoint_failures` is process-global, so a test that reads it must
+    /// not run beside the one test that deliberately fails checkpoints. A
+    /// poisoned lock is recovered: a panic elsewhere is not a reason to hide
+    /// this assertion.
+    pub(super) fn counter_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// What the engine says when a standalone CHECKPOINT cannot fit.
+    fn pool_error() -> anyhow::Error {
+        anyhow::anyhow!(
+            "Buffer manager exception: Unable to allocate memory! The buffer pool is full and no \
+             memory could be freed!"
+        )
+    }
+
+    /// What a write's post-commit checkpoint says when it cannot fit. That
+    /// failure leaves one standalone probe, because the standalone CHECKPOINT
+    /// does not hold the write's memory.
+    fn post_commit_pool_error() -> anyhow::Error {
+        anyhow::anyhow!("post-commit checkpoint failed: {}", pool_error())
+    }
+
+    fn wal_path(store: &std::path::Path) -> PathBuf {
+        let mut os = store.as_os_str().to_os_string();
+        os.push(".wal");
+        PathBuf::from(os)
+    }
+
+    fn wal_len(store: &std::path::Path) -> u64 {
+        std::fs::metadata(wal_path(store))
+            .map(|m| m.len())
+            .unwrap_or(0)
+    }
+
+    /// Reads an engine setting back through `current_setting`, which is how the
+    /// `CALL auto_checkpoint=...` the latch issues takes effect.
+    async fn setting(store: &LadybugStore, name: &'static str) -> String {
+        store
+            .with_conn(move |conn| {
+                let mut rows = conn.query(&format!("CALL current_setting('{name}') RETURN *"))?;
+                let row = rows.next().expect("current_setting returns one row");
+                Ok(format!("{}", row[0]).to_lowercase())
+            })
+            .await
+            .expect("read the setting")
+    }
+
+    /// #211: the latch is visible in status, and a skip is counted as a skip.
+    ///
+    /// At the baseline the field does not exist, so this does not compile; with
+    /// the latch wired into the status it reports `checkpoints_stopped` and a
+    /// skip count that `checkpoint_failures` does not move for.
+    #[tokio::test]
+    async fn a_skipped_checkpoint_counts_as_a_skip_not_a_failure() {
+        use crate::traits::VectorStore;
+        let _guard = counter_lock();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("ladybug.db");
+        let store = LadybugStore::for_testing(&path, 4).unwrap();
+        let cfg = crate::storage::StorageHygieneConfig::default();
+        let before = crate::storage::compute_storage_status(&path, &cfg);
+
+        // An out-of-pool CHECKPOINT of our own latches with no probe left.
+        let latch = store.checkpoints.clone();
+        store
+            .with_conn(move |conn| {
+                stop_checkpoints_after_pool_failure(conn, &latch, &pool_error(), true);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(store.checkpoints.is_stopped(), "the latch must be set");
+
+        let err = store
+            .checkpoint()
+            .await
+            .expect_err("a latched checkpoint must be skipped");
+        assert!(err.to_string().contains("checkpoint skipped"), "{err}");
+
+        let after = crate::storage::compute_storage_status(&path, &cfg);
+        assert!(
+            after.checkpoints_stopped,
+            "status must say checkpoints are stopped (#211)"
+        );
+        assert_eq!(
+            after.checkpoint_skips,
+            before.checkpoint_skips + 1,
+            "a skipped checkpoint is counted (#211)"
+        );
+        assert_eq!(
+            after.checkpoint_failures, before.checkpoint_failures,
+            "a skip is not a failed attempt, so it must not move checkpoint_failures (#211)"
+        );
+        assert_eq!(
+            after.last_checkpoint_duration_ms, before.last_checkpoint_duration_ms,
+            "no checkpoint ran, so no outcome is recorded"
+        );
+    }
+
+    /// #211: a checkpoint that fits while the latch is set puts the engine's
+    /// checkpointing back and clears the latch.
+    #[tokio::test]
+    async fn a_successful_checkpoint_after_the_latch_reenables_the_engine() {
+        use crate::traits::VectorStore;
+        let _guard = counter_lock();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("ladybug.db");
+        let store = LadybugStore::for_testing(&path, 4).unwrap();
+        let cfg = crate::storage::StorageHygieneConfig::default();
+
+        // A post-commit failure: the latch turns both settings off, exactly as
+        // the real one does, and leaves one standalone probe.
+        let latch = store.checkpoints.clone();
+        store
+            .with_conn(move |conn| {
+                stop_checkpoints_after_pool_failure(conn, &latch, &post_commit_pool_error(), false);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(store.checkpoints.is_stopped());
+        assert!(
+            store
+                .checkpoints
+                .probe
+                .load(std::sync::atomic::Ordering::Acquire),
+            "a post-commit failure allows one standalone attempt"
+        );
+        assert_eq!(setting(&store, "auto_checkpoint").await, "false");
+        assert_eq!(setting(&store, "force_checkpoint_on_close").await, "false");
+
+        // The standalone CHECKPOINT has the pool to itself and fits.
+        store
+            .checkpoint()
+            .await
+            .expect("the probe must run the checkpoint");
+
+        assert!(
+            !store.checkpoints.is_stopped(),
+            "a successful checkpoint clears the latch (#211)"
+        );
+        assert_eq!(
+            setting(&store, "auto_checkpoint").await,
+            "true",
+            "auto-checkpoint is back on after the success (#211)"
+        );
+        assert_eq!(
+            setting(&store, "force_checkpoint_on_close").await,
+            "true",
+            "checkpoint-on-close is back on after the success (#211)"
+        );
+        let status = crate::storage::compute_storage_status(&path, &cfg);
+        assert!(!status.checkpoints_stopped);
+        assert_eq!(
+            status.checkpoint_skips, 0,
+            "the probe was an attempt, not a skip"
+        );
+    }
+
+    /// #211/#198: the probe is not a retry loop. A second out-of-pool failure
+    /// keeps the latch, disarms the probe, and the next checkpoint is skipped
+    /// without touching the database.
+    #[tokio::test]
+    async fn a_repeated_out_of_pool_failure_keeps_the_latch() {
+        use crate::traits::VectorStore;
+        let _guard = counter_lock();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("ladybug.db");
+        let store = LadybugStore::for_testing(&path, 4).unwrap();
+        let cfg = crate::storage::StorageHygieneConfig::default();
+
+        let latch = store.checkpoints.clone();
+        store
+            .with_conn(move |conn| {
+                stop_checkpoints_after_pool_failure(conn, &latch, &post_commit_pool_error(), false);
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        // The probe runs, and runs out of pool again: the latch stays and no
+        // further attempt is armed.
+        let latch = store.checkpoints.clone();
+        store
+            .with_conn(move |conn| {
+                assert!(latch.take_probe(), "the probe was armed");
+                stop_checkpoints_after_pool_failure(conn, &latch, &pool_error(), true);
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            store.checkpoints.is_stopped(),
+            "a repeated out-of-pool failure keeps the latch (#198)"
+        );
+        assert!(
+            !store
+                .checkpoints
+                .probe
+                .load(std::sync::atomic::Ordering::Acquire),
+            "the probe is armed once, so nothing retries"
+        );
+
+        let before = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let skipped = crate::storage::compute_storage_status(&path, &cfg);
+        let err = store
+            .checkpoint()
+            .await
+            .expect_err("a latched checkpoint is skipped, not retried");
+        assert!(err.to_string().contains("checkpoint skipped"), "{err}");
+        let after = crate::storage::compute_storage_status(&path, &cfg);
+        assert_eq!(
+            after.checkpoint_skips,
+            skipped.checkpoint_skips + 1,
+            "the skip is counted"
+        );
+        assert_eq!(
+            after.checkpoint_failures, skipped.checkpoint_failures,
+            "the skip is not a failure"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+            before,
+            "a skipped checkpoint must not touch ladybug.db"
+        );
+    }
+
+    /// #211: after the re-enable, a clean close checkpoints on the way out, so
+    /// the next open has nothing to replay and does not call it unclean.
+    #[tokio::test]
+    async fn a_clean_close_after_the_re_enable_leaves_no_write_ahead_log() {
+        use crate::traits::VectorStore;
+        let _guard = counter_lock();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("ladybug.db");
+        {
+            let store = LadybugStore::for_testing(&path, 4).unwrap();
+            let latch = store.checkpoints.clone();
+            store
+                .with_conn(move |conn| {
+                    conn.query("CALL auto_checkpoint=false")?;
+                    conn.query("CREATE NODE TABLE L (id STRING, PRIMARY KEY (id))")?;
+                    conn.query("CREATE (:L {id: 'a'})")?;
+                    stop_checkpoints_after_pool_failure(
+                        conn,
+                        &latch,
+                        &post_commit_pool_error(),
+                        false,
+                    );
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            assert!(
+                wal_len(&path) > 0,
+                "the write is in the WAL before the checkpoint"
+            );
+            assert!(store.checkpoints.is_stopped());
+
+            store
+                .checkpoint()
+                .await
+                .expect("the probe must run the checkpoint");
+            assert!(
+                !store.checkpoints.is_stopped(),
+                "the close is only clean because the latch cleared"
+            );
+        }
+
+        assert_eq!(
+            wal_len(&path),
+            0,
+            "a clean close after the re-enable leaves no WAL (#211)"
+        );
+        let preserved: Vec<_> = std::fs::read_dir(root.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".wal.unclean."))
+            .collect();
+        assert!(
+            preserved.is_empty(),
+            "the next open must not treat this close as unclean: {preserved:?}"
+        );
+    }
+}
+
 /// Reads at most the first 25 bytes of a WAL and hands them to the header rule.
 fn read_wal_header_probe(path: &std::path::Path) -> crate::store::wal_header::HeaderProbe {
     use crate::store::wal_header::HeaderProbe;
@@ -2187,6 +2628,19 @@ fn unverified_replay_checksums_for(local_path: &std::path::Path) -> bool {
         HeaderSource::Single { checksums, .. } => checksums,
         HeaderSource::None | HeaderSource::Conflict(_) => true,
     }
+}
+
+/// Replay configuration for [`RecoveryArmId::ChecksumMismatchReplay`]: matches
+/// the WAL header's `enableChecksums` flag while keeping
+/// `throw_on_wal_replay_failure(true)` so any record-level corruption or
+/// semantic deserialization failure hidden behind the initial `checkWALHeader`
+/// mismatch still surfaces before a lenient retry can consume a frozen WAL.
+fn wal_header_checksums_config_for(local_path: &std::path::Path) -> SystemConfig {
+    with_buffer_pool(
+        SystemConfig::default()
+            .throw_on_wal_replay_failure(true)
+            .enable_checksums(unverified_replay_checksums_for(local_path)),
+    )
 }
 
 /// Lenient WAL replay configuration that matches the WAL header's
@@ -2337,6 +2791,89 @@ fn copy_regular_file_create_new_0600(
         .open(dst)?;
 
     std::io::copy(&mut reader, &mut writer)
+}
+
+/// Restores one preserved WAL side over `<db>.wal` / `<db>.wal.checkpoint`
+/// under the same hardened rules as preservation (`#212`).
+///
+/// Unlike [`copy_regular_file_create_new_0600`] the destination normally
+/// exists — replacing it is the point of a restore — so it is opened with
+/// `create|truncate` rather than `create_new`. Everything else matches: a
+/// symlinked or non-regular source is refused, a **symlinked destination is
+/// refused and never written through** (this is the `#212a` residual
+/// `std::fs::copy` left open), and the destination is opened `O_NOFOLLOW`
+/// with mode `0600` so a link swapped in before the open fails with `ELOOP`
+/// instead of redirecting the restore. The pre-open `symlink_metadata` check
+/// names the refusal; `O_NOFOLLOW` closes the final-component window that
+/// remains between that check and the open.
+///
+/// The mode on `create` applies only to a *new* file, so an existing target
+/// is tightened explicitly — `writer.set_permissions(0600)` on the open
+/// handle, before the sync — because a restore must not leave the WAL at
+/// whatever mode the file it replaced had. Doing it on the handle rather than
+/// by path keeps the chmod and the write on one inode.
+fn restore_regular_file_no_follow(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+) -> std::io::Result<u64> {
+    let src_meta = std::fs::symlink_metadata(src)?;
+    if src_meta.file_type().is_symlink() || !src_meta.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing to restore from non-regular or symlink source {src:?}"),
+        ));
+    }
+    if let Ok(dst_meta) = std::fs::symlink_metadata(dst) {
+        if dst_meta.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("refusing to restore through symlink destination {dst:?}"),
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    let mut reader = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(src)?
+    };
+    #[cfg(not(unix))]
+    let mut reader = std::fs::File::open(src)?;
+
+    #[cfg(unix)]
+    let mut writer = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(dst)?
+    };
+    #[cfg(not(unix))]
+    let mut writer = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(dst)?;
+
+    let copied = std::io::copy(&mut reader, &mut writer)?;
+    // `create` granted 0600 only because the file did not exist; an existing
+    // target keeps the mode it had. Tighten the mode on the open handle
+    // (fchmod) before the bytes are declared durable: no path lookup, so no
+    // window in which the path names a different inode than the one written
+    // (#212).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        writer.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    writer.sync_all()?;
+    Ok(copied)
 }
 
 fn allocate_wal_artifact_path(wal_file: &std::path::Path, kind: &str) -> std::path::PathBuf {
@@ -2912,13 +3449,16 @@ fn open_after_quarantine(
 /// `force_checkpoint_on_close=false` is known to have been applied,
 /// leaked otherwise — instead of being dropped by the caller with the
 /// flag's result discarded (`#207` C5, second call site).
-fn run_recovery_checkpoint(unverified_db: Database) -> Result<Database> {
+/// The checkpoint outcome is also persisted to the store-state sidecar
+/// (`#212`), so a fresh process reports the last real checkpoint.
+fn run_recovery_checkpoint(local_path: &std::path::Path, unverified_db: Database) -> Result<Database> {
     let ckpt_started = std::time::Instant::now();
     run_recovery_checkpoint_with(
         unverified_db,
         |conn| {
             let ckpt_res = conn.query("CHECKPOINT;");
             crate::storage::snapshot::record_checkpoint_outcome(
+                local_path,
                 ckpt_started.elapsed().as_millis() as u64,
                 ckpt_res.is_ok(),
             );
@@ -2977,6 +3517,12 @@ fn run_recovery_checkpoint_with(
 #[cfg(test)]
 static LEAKED_RECOVERY_HANDLES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+
+/// Serializes the tests that read `LEAKED_RECOVERY_HANDLES`: the counter is
+/// process-global, so a concurrent leak from another flag-discipline test used
+/// to race the drop-side assertions under full-suite parallelism.
+#[cfg(test)]
+static RECOVERY_HANDLE_FLAG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Drops a lenient handle only when `force_checkpoint_on_close=false` is known
 /// to have been applied; otherwise the handle is leaked, because `~Database()`
@@ -3074,7 +3620,7 @@ fn restore_lost_sides(
         match preserved.get(side) {
             Some(copy) => {
                 let target = side.path(local_path);
-                match std::fs::copy(copy, &target) {
+                match restore_regular_file_no_follow(copy, &target) {
                     Ok(_) => restored.push(format!(
                         "the {label} WAL was restored from {}",
                         copy.display()
@@ -3450,9 +3996,8 @@ fn open_in_mode(mode: ArmMode, request: &ArmRequest) -> Result<Database> {
             .initial_config
             .clone()
             .unwrap_or_else(verifying_config),
-        ArmMode::WalHeaderChecksums | ArmMode::LenientTail => {
-            unverified_replay_config_for(request.local_path)
-        }
+        ArmMode::WalHeaderChecksums => wal_header_checksums_config_for(request.local_path),
+        ArmMode::LenientTail => unverified_replay_config_for(request.local_path),
         ArmMode::VerifiedReopen | ArmMode::QuarantineReopen => verifying_config(),
     };
     Ok(Database::new(request.local_path, config)?)
@@ -3507,7 +4052,7 @@ fn recover_from_wal_failure(
 
     let err_msg = error.to_string();
     let checksum_mismatch = err_msg.contains("enableChecksums");
-    let integrity_failure = is_wal_integrity_failure(&err_msg);
+    let mut integrity_failure = is_wal_integrity_failure(&err_msg);
     let arm_a_foreign = foreign_side_from_error(&err_msg, local_path);
     let torn_tail = torn_tail_side(&err_msg, local_path, pre);
     let pre_total = pre.0.pre.saturating_add(pre.1.pre);
@@ -3594,7 +4139,7 @@ fn recover_from_wal_failure(
         }
     }
 
-    let lenient_provenance = if checksum_mismatch {
+    let mut lenient_provenance = if checksum_mismatch {
         OpenProvenance::ChecksumConfigMismatch
     } else {
         OpenProvenance::UnverifiedWalReplay
@@ -3611,17 +4156,59 @@ fn recover_from_wal_failure(
         eprintln!("ERROR: retrying WITHOUT strict WAL verification to recover those writes. The records replayed this way are NOT fully authenticated -- if this database may have been tampered with, stop and inspect the preserved copy instead. Set NEUROSTRATA_STRICT_WAL=1 to refuse this fallback.");
     }
 
-    let lenient = run_recovery_arm(
-        if checksum_mismatch {
-            RecoveryArmId::ChecksumMismatchReplay
-        } else {
-            RecoveryArmId::LenientReplay
-        },
-        &ArmRequest {
-            local_path,
-            initial_config: None,
-        },
-    );
+    let lenient = if checksum_mismatch {
+        match run_recovery_arm(
+            RecoveryArmId::ChecksumMismatchReplay,
+            &ArmRequest {
+                local_path,
+                initial_config: None,
+            },
+        ) {
+            Ok(handle) => Ok(handle),
+            Err(mismatch_e) => {
+                let mismatch_msg = mismatch_e.to_string();
+                let post_mismatch = wal_pair_sizes(local_path);
+                let frozen_survived_mismatch = pre.1.pre == 0 || post_mismatch.1 > 0;
+                let mismatch_integrity = is_wal_integrity_failure(&mismatch_msg);
+                let mismatch_foreign = foreign_side_from_error(&mismatch_msg, local_path);
+                let mismatch_torn = torn_tail_side(&mismatch_msg, local_path, pre);
+                if let Some(side) = mismatch_foreign {
+                    foreign = foreign.union(wal_side_set(side));
+                }
+                if !mismatch_integrity && mismatch_foreign.is_none() && mismatch_torn.is_none() {
+                    return Err(refuse_unrecognized_wal_failure(
+                        local_path,
+                        &mismatch_msg,
+                        pre,
+                        preserved,
+                    ));
+                }
+                if frozen_survived_mismatch {
+                    integrity_failure |= mismatch_integrity;
+                }
+                if mismatch_integrity || mismatch_torn.is_some() {
+                    lenient_provenance = OpenProvenance::UnverifiedWalReplay;
+                    run_recovery_arm(
+                        RecoveryArmId::LenientReplay,
+                        &ArmRequest {
+                            local_path,
+                            initial_config: None,
+                        },
+                    )
+                } else {
+                    Err(mismatch_e)
+                }
+            }
+        }
+    } else {
+        run_recovery_arm(
+            RecoveryArmId::LenientReplay,
+            &ArmRequest {
+                local_path,
+                initial_config: None,
+            },
+        )
+    };
     // Captured immediately after the open and before any CHECKPOINT/reopen/rename.
     let post = wal_pair_sizes(local_path);
     if let Err(e) = &lenient {
@@ -3713,7 +4300,7 @@ fn recover_from_wal_failure(
                     "Recovered from the write-ahead log with lenient tail truncation; it held no committed records."
                 }
             };
-            let unverified_db = run_recovery_checkpoint(unverified_db)?;
+            let unverified_db = run_recovery_checkpoint(local_path, unverified_db)?;
             drop(unverified_db);
             if pre_total > 0 {
                 let preserved_display = preserved
@@ -3776,10 +4363,21 @@ fn recover_from_wal_failure(
 
 impl Drop for LadybugStore {
     fn drop(&mut self) {
-        let stopped = self
-            .checkpoints_stopped
-            .load(std::sync::atomic::Ordering::Acquire);
-        if self.dirty.take() && !stopped {
+        let dirty = self.dirty.take();
+        if dirty && self.checkpoints.is_stopped() {
+            // Nothing retries the checkpoint: a retry is what grew
+            // ladybug.db on the way into the latch (#198). Say what the
+            // operator is left with, since this is a clean close.
+            eprintln!(
+                "WARNING: closing with checkpoints stopped after a buffer-pool failure. The writes \
+                 stay in the write-ahead log, so the next open replays them and reports an unclean \
+                 shutdown. That report is expected here: restart with a larger pool \
+                 (NEUROSTRATA_BUFFER_POOL_MB or storage_hygiene.buffer_pool_mb; 0 lets the engine \
+                 size it) and the log is checkpointed. See docs/ops/checkpoint-latch.md."
+            );
+            return;
+        }
+        if dirty {
             if let Ok(conn) = Connection::new(&self.db) {
                 if let Err(e) = conn.query("CHECKPOINT;") {
                     tracing::warn!("LadybugStore drop CHECKPOINT failed: {e}");
@@ -3889,7 +4487,7 @@ impl FirstWriteFlip {
         match self.cached_store_state() {
             CachedStoreState::Recorded(mut recorded) if !recorded.has_data => {
                 recorded.has_data = true;
-                if let Err(e) = crate::model_choice::write_store_state(&self.local_path, &recorded)
+                if let Err(e) = crate::model_choice::write_store_state_identity(&self.local_path, &recorded)
                 {
                     tracing::error!(
                         "store-state sidecar flip failed after a successful write; the store has data but its sidecar still reads pristine: {e}"
@@ -3915,12 +4513,8 @@ impl FirstWriteFlip {
                     }
                 };
                 if let Some(descriptor) = descriptor {
-                    let state = crate::model_choice::StoreState {
-                        version: crate::model_choice::STORE_STATE_VERSION,
-                        has_data: true,
-                        descriptor,
-                    };
-                    if let Err(e) = crate::model_choice::write_store_state(&self.local_path, &state)
+                    let state = crate::model_choice::StoreState::new(true, descriptor);
+                    if let Err(e) = crate::model_choice::write_store_state_identity(&self.local_path, &state)
                     {
                         tracing::error!(
                             "store-state sidecar flip failed after a successful write; the store has data but no sidecar records it: {e}"
@@ -4064,12 +4658,8 @@ impl LockedUnknownStamp {
         if !self.serving_matches_configured(serving) {
             return;
         }
-        let state = crate::model_choice::StoreState {
-            version: crate::model_choice::STORE_STATE_VERSION,
-            has_data: false,
-            descriptor: serving.clone(),
-        };
-        match crate::model_choice::write_store_state(&self.local_path, &state) {
+        let state = crate::model_choice::StoreState::new(false, serving.clone());
+        match crate::model_choice::write_store_state_identity(&self.local_path, &state) {
             Ok(()) => self.set_cached_store_state(CachedStoreState::Recorded(state)),
             Err(e) => {
                 tracing::warn!("store-state sidecar write failed: {e}")
@@ -4128,12 +4718,8 @@ impl LockedUnknownMigration {
         if rows == 0 || physical != self.dimensions {
             return Ok(false);
         }
-        let state = crate::model_choice::StoreState {
-            version: crate::model_choice::STORE_STATE_VERSION,
-            has_data: true,
-            descriptor: self.serving.clone(),
-        };
-        match crate::model_choice::write_store_state(&self.local_path, &state) {
+        let state = crate::model_choice::StoreState::new(true, self.serving.clone());
+        match crate::model_choice::write_store_state_identity(&self.local_path, &state) {
             Ok(()) => {
                 let mut cache = self.store_state.lock().unwrap_or_else(|e| e.into_inner());
                 *cache = Some(CachedStoreState::Recorded(state));
@@ -4222,6 +4808,17 @@ impl LadybugStore {
                 "A copy was kept at {:?} in case recovery is incomplete.",
                 active
             );
+            // A checkpoint that ran out of buffer pool latches checkpointing
+            // off for the rest of that process (#198, #211), so a clean close
+            // then leaves exactly this WAL behind. The shutdown was not
+            // unclean, so name the likelier cause with its recovery step.
+            eprintln!(
+                "If that process logged `checkpoints_stopped` or a checkpoint running out of \
+                 buffer pool, it stopped checkpointing on purpose and this log is what it left. \
+                 Restart with a larger pool (NEUROSTRATA_BUFFER_POOL_MB or \
+                 storage_hygiene.buffer_pool_mb; 0 lets the engine size it) so the replay is \
+                 checkpointed; see docs/ops/checkpoint-latch.md."
+            );
         }
         let pre = (
             observe_wal_side(&local_path, WalSide::Active),
@@ -4247,17 +4844,19 @@ impl LadybugStore {
             }
         };
 
-        crate::storage::snapshot::record_recovery_provenance(
+        crate::storage::snapshot::record_recovery_open(
             &local_path,
             open_provenance.recovery_kind_slug(),
+            pre.0.pre.saturating_add(pre.1.pre),
         );
 
+        let checkpoints = CheckpointLatch::new(local_path.clone());
         Ok(Self {
             local_path,
             dimensions,
             db: Arc::new(db),
             dirty: Dirty::default(),
-            checkpoints_stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            checkpoints,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             schema_ready: std::sync::atomic::AtomicBool::new(false),
             ontology: Arc::new(arc_swap::ArcSwap::from_pointee(
@@ -4282,6 +4881,7 @@ impl LadybugStore {
             db_preexisting,
             open_provenance,
             store_state: Arc::new(std::sync::Mutex::new(None)),
+            census_reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(test)]
             test_cleanup_dir: None,
         })
@@ -4474,12 +5074,8 @@ impl LadybugStore {
             {
                 if let Some(serving) = self.serving_descriptor() {
                     if serving != recorded.descriptor && self.serving_matches_configured(&serving) {
-                        let state = crate::model_choice::StoreState {
-                            version: crate::model_choice::STORE_STATE_VERSION,
-                            has_data: false,
-                            descriptor: serving.clone(),
-                        };
-                        match crate::model_choice::write_store_state(&self.local_path, &state) {
+                        let state = crate::model_choice::StoreState::new(false, serving.clone());
+                        match crate::model_choice::write_store_state_identity(&self.local_path, &state) {
                             Ok(()) => {
                                 self.set_cached_store_state(CachedStoreState::Recorded(state))
                             }
@@ -4493,12 +5089,8 @@ impl LadybugStore {
             CachedStoreState::FreshUnrecorded => {
                 if let Some(serving) = self.serving_descriptor() {
                     if self.serving_matches_configured(&serving) {
-                        let state = crate::model_choice::StoreState {
-                            version: crate::model_choice::STORE_STATE_VERSION,
-                            has_data: false,
-                            descriptor: serving.clone(),
-                        };
-                        match crate::model_choice::write_store_state(&self.local_path, &state) {
+                        let state = crate::model_choice::StoreState::new(false, serving.clone());
+                        match crate::model_choice::write_store_state_identity(&self.local_path, &state) {
                             Ok(()) => {
                                 self.set_cached_store_state(CachedStoreState::Recorded(state))
                             }
@@ -4876,7 +5468,7 @@ impl LadybugStore {
     {
         let write_lock = Arc::clone(&self.write_lock);
         let db = self.db.clone();
-        let stopped = Arc::clone(&self.checkpoints_stopped);
+        let latch = self.checkpoints.clone();
 
         let outcome = bounded(what, write_timeout(), async move {
             // One writer at a time, because the engine refuses the second
@@ -4894,7 +5486,7 @@ impl LadybugStore {
             let mut attempt = 0;
             loop {
                 let (returned, result) =
-                    Self::write_owning_turn(db.clone(), stopped.clone(), turn, f.clone()).await?;
+                    Self::write_owning_turn(db.clone(), latch.clone(), turn, f.clone()).await?;
                 turn = returned;
 
                 match result {
@@ -4938,7 +5530,7 @@ impl LadybugStore {
     /// should be allowed to start.
     async fn write_owning_turn<T, F>(
         db: Arc<Database>,
-        stopped: Arc<std::sync::atomic::AtomicBool>,
+        latch: CheckpointLatch,
         turn: tokio::sync::OwnedMutexGuard<()>,
         f: F,
     ) -> Result<(tokio::sync::OwnedMutexGuard<()>, Result<T>)>
@@ -4961,7 +5553,7 @@ impl LadybugStore {
                 let conn = Connection::new(&db)?;
                 let result = f(&conn);
                 if let Err(e) = &result {
-                    stop_checkpoints_after_pool_failure(&conn, &stopped, e, false);
+                    stop_checkpoints_after_pool_failure(&conn, &latch, e, false);
                 }
                 result
             })()
@@ -4991,7 +5583,7 @@ impl LadybugStore {
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,
     {
         let db = self.db.clone();
-        let stopped = Arc::clone(&self.checkpoints_stopped);
+        let latch = self.checkpoints.clone();
         // Held across the engine call on purpose: lbug's C++
         // DictionaryColumn::scan / BufferManager::optimisticRead segfaults
         // when a read Connection races a concurrent write Connection on the
@@ -5012,7 +5604,7 @@ impl LadybugStore {
                 let conn = Connection::new(&db)?;
                 let result = f(&conn);
                 if let Err(e) = &result {
-                    stop_checkpoints_after_pool_failure(&conn, &stopped, e, false);
+                    stop_checkpoints_after_pool_failure(&conn, &latch, e, false);
                 }
                 result
             })()
@@ -8827,6 +9419,148 @@ fn reconcile_pristine_embedding_width(
     Ok(())
 }
 
+/// Copy one snapshot member, bracketed by its source `(len, mtime)` (#95, #209).
+///
+/// A writer mutating the member between the stat calls means the copied bytes
+/// are not one instant. One observed change is retried (the second attempt may
+/// catch a settled file); a second change aborts the snapshot rather than
+/// pairing a torn member with the rest of the set.
+fn copy_file_bracketed_with<F: FnMut(&std::path::Path)>(
+    source: &std::path::Path,
+    dest: &std::path::Path,
+    label: &str,
+    mut between: F,
+) -> Result<()> {
+    let stamp = |path: &std::path::Path| -> Result<(u64, Option<std::time::SystemTime>)> {
+        let meta = std::fs::metadata(path).map_err(|e| {
+            anyhow::anyhow!(
+                "could not stat the {} {:?} during the snapshot copy: {}",
+                label,
+                path,
+                e
+            )
+        })?;
+        Ok((meta.len(), meta.modified().ok()))
+    };
+
+    let mut attempts = 0u8;
+    loop {
+        let before = stamp(source)?;
+        std::fs::copy(source, dest).map_err(|e| {
+            anyhow::anyhow!(
+                "could not copy the {} {:?} into the snapshot: {}",
+                label,
+                source,
+                e
+            )
+        })?;
+        // Production runs no hook; the seam exists so the retry/abort
+        // arithmetic is testable without racing a real writer.
+        between(source);
+        let after = stamp(source)?;
+        if before == after {
+            return Ok(());
+        }
+        attempts += 1;
+        if attempts > 1 {
+            return Err(anyhow::anyhow!(
+                "the {} {:?} changed during the snapshot copy twice; its bytes are not one instant, so the snapshot is aborted (#209)",
+                label,
+                source
+            ));
+        }
+    }
+}
+
+/// [`copy_file_bracketed_with`] with no hook: the production copy.
+fn copy_file_bracketed(
+    source: &std::path::Path,
+    dest: &std::path::Path,
+    label: &str,
+) -> Result<()> {
+    copy_file_bracketed_with(source, dest, label, |_| {})
+}
+
+/// Append a literal suffix to a path (never `with_extension`, which would
+/// rewrite a name that already carries one).
+fn append_suffix(base: &std::path::Path, suffix: &str) -> PathBuf {
+    let mut os = base.as_os_str().to_os_string();
+    os.push(suffix);
+    PathBuf::from(os)
+}
+
+/// Which WAL sides a store presents on disk right now (#209).
+///
+/// A store does **not** always have at most one side: the engine's
+/// `preflight_wal_headers` accepts a mixed pair (both sides parse and agree on
+/// the checksum flag) as a usable single store. So a snapshot records `Both`
+/// and carries both byte streams; preferring the active side here would drop
+/// committed data from the copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalRole {
+    Active,
+    Frozen,
+    Both,
+    None,
+}
+
+impl WalRole {
+    /// Which WAL sides the store presents on disk right now (#209).
+    ///
+    /// A side is either absent or a regular file. A symlink is not "the WAL
+    /// is somewhere else" -- it is a pointer, and following it would copy
+    /// whatever it points at into the snapshot under the WAL's name (#241).
+    /// A broken symlink is still a symlink, so it is refused rather than
+    /// read as "there is no WAL here" (which would write a manifest
+    /// claiming a role the store does not have). Anything that is not a
+    /// regular file is refused for the same reason.
+    fn on_disk(source: &std::path::Path) -> Result<Self> {
+        let side = |suffix: &str| -> Result<bool> {
+            let path = append_suffix(source, suffix);
+            match std::fs::symlink_metadata(&path) {
+                Ok(meta) => {
+                    let file_type = meta.file_type();
+                    if file_type.is_symlink() {
+                        return Err(anyhow::anyhow!(
+                            "the write-ahead log side {:?} is a symlink; refusing to copy it into the snapshot (#241)",
+                            path
+                        ));
+                    }
+                    if !file_type.is_file() {
+                        return Err(anyhow::anyhow!(
+                            "the write-ahead log side {:?} is not a regular file; refusing to copy it into the snapshot (#241)",
+                            path
+                        ));
+                    }
+                    Ok(true)
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(e) => Err(anyhow::anyhow!(
+                    "could not stat the write-ahead log side {:?}: {}",
+                    path,
+                    e
+                )),
+            }
+        };
+        match (side(".wal")?, side(".wal.checkpoint")?) {
+            (true, true) => Ok(WalRole::Both),
+            (true, false) => Ok(WalRole::Active),
+            (false, true) => Ok(WalRole::Frozen),
+            (false, false) => Ok(WalRole::None),
+        }
+    }
+
+    /// The `wal_kind` value this role records in the manifest.
+    fn as_manifest(self) -> &'static str {
+        match self {
+            WalRole::Active => crate::storage::snapshot::WAL_KIND_ACTIVE,
+            WalRole::Frozen => crate::storage::snapshot::WAL_KIND_FROZEN,
+            WalRole::Both => crate::storage::snapshot::WAL_KIND_BOTH,
+            WalRole::None => crate::storage::snapshot::WAL_KIND_NONE,
+        }
+    }
+}
+
 impl LadybugStore {
     /// The snapshot retention budget `export_database` prunes with. The
     /// operator override `NEUROSTRATA_SNAPSHOT_RETENTION_COUNT` wins over
@@ -8856,71 +9590,155 @@ impl LadybugStore {
     /// Used both by `export_database` (after an online `CHECKPOINT`) and by
     /// `neurostrata-mcp backup --no-open` when strict WAL verification refuses
     /// to open the store (`#196`).
+    ///
+    /// This is the uncoordinated entry point: the caller does not hold the
+    /// store, so the manifest records `coordinated: false` (#209).
     pub fn export_database_files(source: &std::path::Path, dir: &std::path::Path) -> Result<()> {
+        Self::export_database_files_with_provenance(source, dir, false)
+    }
+
+    /// [`Self::export_database_files`] that reports every copied member to
+    /// `during_copy` as it is written (#241).
+    ///
+    /// The observer runs while the copy is still in flight, so a caller can
+    /// observe the store *during* the copy window instead of only before or
+    /// after it. That is what makes "the store lock is held across the whole
+    /// window" a fact a caller can check rather than a claim it has to
+    /// believe.
+    pub fn export_database_files_observed(
+        source: &std::path::Path,
+        dir: &std::path::Path,
+        during_copy: &dyn Fn(&str),
+    ) -> Result<()> {
+        Self::export_database_files_with_provenance_observed(source, dir, false, during_copy)
+    }
+
+    /// [`Self::export_database_files`] with an explicit provenance: `true`
+    /// only when the caller holds the store for the whole copy (the online
+    /// `export_database` path).
+    fn export_database_files_with_provenance(
+        source: &std::path::Path,
+        dir: &std::path::Path,
+        coordinated: bool,
+    ) -> Result<()> {
+        Self::export_database_files_with_provenance_observed(source, dir, coordinated, &|_| {})
+    }
+
+    /// [`Self::export_database_files_with_provenance`] that reports each
+    /// copied member to `during_copy` (#241).
+    fn export_database_files_with_provenance_observed(
+        source: &std::path::Path,
+        dir: &std::path::Path,
+        coordinated: bool,
+        during_copy: &dyn Fn(&str),
+    ) -> Result<()> {
         std::fs::create_dir_all(dir)?;
         let target = dir.join("ladybug.store");
-        // Bracket the copy with the source's (len, mtime): an external
-        // writer mutating the file between the stat calls means the copy
-        // is torn, so retry once and abort the snapshot if it still
-        // changes (issue #95).
-        let mut copy_attempts = 0;
-        loop {
-            let before = std::fs::metadata(source).map_err(|e| {
-                anyhow::anyhow!(
-                    "could not stat {:?} before the snapshot copy: {}",
-                    source,
-                    e
-                )
-            })?;
-            std::fs::copy(source, &target).map_err(|e| {
-                anyhow::anyhow!("could not copy {:?} into the snapshot: {}", source, e)
-            })?;
-            let after = std::fs::metadata(source).map_err(|e| {
-                anyhow::anyhow!("could not stat {:?} after the snapshot copy: {}", source, e)
-            })?;
-            if (before.len(), before.modified().ok()) == (after.len(), after.modified().ok()) {
-                break;
-            }
-            copy_attempts += 1;
-            if copy_attempts > 1 {
-                return Err(anyhow::anyhow!(
-                    "source store changed during export_database copy"
-                ));
-            }
-        }
+        // Bracketed copy: an external writer mutating the file between the
+        // stat calls means the copy is torn, so retry once and abort the
+        // snapshot if it still changes (issue #95).
+        copy_file_bracketed(source, &target, "source store")?;
+        during_copy("ladybug.store");
+
         // A WAL left behind after the checkpoint (or before recovery in
         // `--no-open` mode) rides along, so a restore replays or preserves it.
-        let mut wal = source.to_path_buf().into_os_string();
-        wal.push(".wal");
-        let wal = std::path::PathBuf::from(wal);
-        let mut ckpt_wal = source.to_path_buf().into_os_string();
-        ckpt_wal.push(".wal.checkpoint");
-        let ckpt_wal = std::path::PathBuf::from(ckpt_wal);
-        if wal.exists() {
-            std::fs::copy(&wal, dir.join("ladybug.store.wal")).map_err(|e| {
-                anyhow::anyhow!(
-                    "could not copy the write-ahead log into the snapshot: {}",
-                    e
-                )
-            })?;
-        } else if ckpt_wal.exists() {
-            std::fs::copy(&ckpt_wal, dir.join("ladybug.store.wal")).map_err(|e| {
-                anyhow::anyhow!(
-                    "could not copy the frozen checkpoint write-ahead log into the snapshot: {}",
-                    e
-                )
-            })?;
-        } else {
-            let dest_wal = dir.join("ladybug.store.wal");
-            if dest_wal.exists() {
-                std::fs::remove_file(&dest_wal).map_err(|e| {
+        // Its role is recorded (#209): `.wal` is active, `.wal.checkpoint` is
+        // the frozen WAL of a crashed checkpoint, and a mixed pair carries
+        // BOTH byte streams (`wal_kind: both`) — the frozen side is never
+        // silently dropped. The copies get the same bracket as the database: a
+        // WAL copied at a different instant than the database is exactly the
+        // tear this snapshot must refuse.
+        let wal_role = WalRole::on_disk(source)?;
+        let dest_wal = dir.join("ladybug.store.wal");
+        let dest_checkpoint_wal = dir.join("ladybug.store.wal.checkpoint");
+        // A member this export does not produce must not survive from an
+        // earlier export into the same directory.
+        let remove_stale = |path: &std::path::Path| -> Result<()> {
+            if path.exists() {
+                std::fs::remove_file(path).map_err(|e| {
                     anyhow::anyhow!(
-                        "could not remove the stale write-ahead log from the snapshot: {}",
+                        "could not remove the stale snapshot member {}: {}",
+                        path.display(),
+                        e
+                    )
+                })?;
+            }
+            Ok(())
+        };
+        match wal_role {
+            WalRole::None => {
+                remove_stale(&dest_wal)?;
+                remove_stale(&dest_checkpoint_wal)?;
+            }
+            WalRole::Active | WalRole::Frozen => {
+                let wal_suffix = if wal_role == WalRole::Frozen {
+                    ".wal.checkpoint"
+                } else {
+                    ".wal"
+                };
+                copy_file_bracketed(
+                    &append_suffix(source, wal_suffix),
+                    &dest_wal,
+                    "write-ahead log",
+                )?;
+                during_copy("ladybug.store.wal");
+                remove_stale(&dest_checkpoint_wal)?;
+            }
+            WalRole::Both => {
+                copy_file_bracketed(
+                    &append_suffix(source, ".wal"),
+                    &dest_wal,
+                    "active write-ahead log",
+                )?;
+                during_copy("ladybug.store.wal");
+                copy_file_bracketed(
+                    &append_suffix(source, ".wal.checkpoint"),
+                    &dest_checkpoint_wal,
+                    "frozen write-ahead log",
+                )?;
+                during_copy("ladybug.store.wal.checkpoint");
+            }
+        }
+        // The pair must not have moved under the copies: if a side appeared
+        // or vanished while the snapshot ran, the recorded role describes a
+        // different instant than the copied WAL.
+        let wal_role_after = WalRole::on_disk(source)?;
+        if wal_role_after != wal_role {
+            return Err(anyhow::anyhow!(
+                "the write-ahead log role changed during the snapshot copy ({} -> {}); the snapshot is aborted (#209)",
+                wal_role.as_manifest(),
+                wal_role_after.as_manifest()
+            ));
+        }
+
+        // The checkpoint shadow and its pinned marker are the engine's record
+        // of a checkpoint that had committed but not yet been applied (#209):
+        // without them a restored crashed store cannot replay the
+        // checkpointed prefix, so they ride along under their own names.
+        for (suffix, member, label) in [
+            (".shadow", "ladybug.store.shadow", "checkpoint shadow"),
+            (
+                ".pinned.tmp",
+                "ladybug.store.pinned.tmp",
+                "pinned-checkpoint marker",
+            ),
+        ] {
+            let from = append_suffix(source, suffix);
+            let to = dir.join(member);
+            if from.exists() {
+                copy_file_bracketed(&from, &to, label)?;
+                during_copy(member);
+            } else if to.exists() {
+                std::fs::remove_file(&to).map_err(|e| {
+                    anyhow::anyhow!(
+                        "could not remove the stale {} from the snapshot: {}",
+                        member,
                         e
                     )
                 })?;
             }
         }
+
         let sidecar = crate::model_choice::store_state_path(source);
         let dest_sidecar = dir.join("ladybug.store.store-state.json");
         if sidecar.exists() {
@@ -8930,6 +9748,7 @@ impl LadybugStore {
                     e
                 )
             })?;
+            during_copy("ladybug.store.store-state.json");
         } else if dest_sidecar.exists() {
             std::fs::remove_file(&dest_sidecar).map_err(|e| {
                 anyhow::anyhow!(
@@ -8938,12 +9757,20 @@ impl LadybugStore {
                 )
             })?;
         }
+        let provenance = if coordinated {
+            crate::storage::snapshot::PROVENANCE_COORDINATED
+        } else {
+            crate::storage::snapshot::PROVENANCE_UNVERIFIED
+        };
         let manifest = serde_json::json!({
-            "format": "neurostrata-snapshot",
-            "version": 1,
+            "format": crate::storage::snapshot::SNAPSHOT_FORMAT,
+            "version": crate::storage::snapshot::SNAPSHOT_VERSION,
             "created_at": chrono::Utc::now().to_rfc3339(),
             "source": source.display().to_string(),
             "bytes": std::fs::metadata(&target).map(|m| m.len()).unwrap_or(0),
+            "coordinated": coordinated,
+            "provenance": provenance,
+            "wal_kind": wal_role.as_manifest(),
         });
         std::fs::write(
             dir.join("manifest.json"),
@@ -10685,37 +11512,40 @@ impl VectorStore for LadybugStore {
         // mid-copy; the metadata bracket on the copy catches that.
         let mut turn = Arc::clone(&self.write_lock).lock_owned().await;
         let started = std::time::Instant::now();
-        let stopped = Arc::clone(&self.checkpoints_stopped);
-        let checkpoint_result: Result<()> = {
+        let latch = self.checkpoints.clone();
+        let checkpoint_run: CheckpointRun = {
             let (returned, outcome) =
-                Self::write_owning_turn(self.db.clone(), Arc::clone(&stopped), turn, move |conn| {
-                    guarded_checkpoint(conn, &stopped)
+                Self::write_owning_turn(self.db.clone(), latch.clone(), turn, move |conn| {
+                    Ok(guarded_checkpoint(conn, &latch))
                 })
                 .await?;
             turn = returned;
-            outcome
+            outcome?
         };
-        crate::storage::snapshot::record_checkpoint_outcome(
-            started.elapsed().as_millis() as u64,
-            checkpoint_result.is_ok(),
-        );
-        checkpoint_result?;
+        match checkpoint_run {
+            // A skip is not a failed checkpoint: nothing was attempted (#211).
+            CheckpointRun::Skipped => {
+                anyhow::bail!(
+                    "checkpoint skipped: an earlier one ran out of buffer pool and a retry would \
+                     grow ladybug.db; raise NEUROSTRATA_BUFFER_POOL_MB and restart"
+                );
+            }
+            CheckpointRun::Attempted(result) => {
+                crate::storage::snapshot::record_checkpoint_outcome(
+                    &self.local_path,
+                    started.elapsed().as_millis() as u64,
+                    result.is_ok(),
+                );
+                result?;
+            }
+        }
         // Still held: no writer of this process reaches the copies below.
         let _write_guard = turn;
 
-        Self::export_database_files(&source, &dir)
+        Self::export_database_files_with_provenance(&source, &dir, true)
     }
 
     async fn checkpoint(&self) -> Result<()> {
-        if self
-            .checkpoints_stopped
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            anyhow::bail!(
-                "checkpoint skipped: an earlier one ran out of buffer pool and a retry would grow \
-                 ladybug.db; raise NEUROSTRATA_BUFFER_POOL_MB and restart"
-            );
-        }
         // Cleared first: a write that lands while the engine is flushing must
         // survive, and clearing afterwards would drop its mark.
         let had_writes = self.dirty.take();
@@ -10723,14 +11553,41 @@ impl VectorStore for LadybugStore {
         // The duration and success of every real checkpoint is recorded so
         // `compute_storage_status` reports actual hygiene, not constants.
         let started = std::time::Instant::now();
-        let stopped = Arc::clone(&self.checkpoints_stopped);
-        let outcome = self
-            .with_conn(move |conn| guarded_checkpoint(conn, &stopped))
+        let latch = self.checkpoints.clone();
+        let run = self
+            .with_conn(move |conn| Ok(guarded_checkpoint(conn, &latch)))
             .await;
-        crate::storage::snapshot::record_checkpoint_outcome(
-            started.elapsed().as_millis() as u64,
-            outcome.is_ok(),
-        );
+        let outcome = match run {
+            // The latch skipped it: no CHECKPOINT ran, so nothing is recorded
+            // as a failed one. The latch counted the skip itself (#211).
+            Ok(CheckpointRun::Skipped) => {
+                if had_writes {
+                    self.dirty.mark();
+                }
+                anyhow::bail!(
+                    "checkpoint skipped: an earlier one ran out of buffer pool and a retry would \
+                     grow ladybug.db; raise NEUROSTRATA_BUFFER_POOL_MB and restart"
+                );
+            }
+            Ok(CheckpointRun::Attempted(result)) => {
+                crate::storage::snapshot::record_checkpoint_outcome(
+                    &self.local_path,
+                    started.elapsed().as_millis() as u64,
+                    result.is_ok(),
+                );
+                result
+            }
+            // A checkpoint the engine refused to even start is a failed
+            // attempt in the same accounting as one that failed inside it.
+            Err(e) => {
+                crate::storage::snapshot::record_checkpoint_outcome(
+                    &self.local_path,
+                    started.elapsed().as_millis() as u64,
+                    false,
+                );
+                Err(e)
+            }
+        };
 
         if outcome.is_err() && had_writes {
             self.dirty.mark();
@@ -11715,6 +12572,8 @@ fn edge_hits_from_rows(
     memory_types: &[String],
     kind_of: impl Fn(&str) -> GraphMatchKind,
     edge_name: &str,
+    census: &mut LinkedFilesCensus,
+    active_by_ns: &mut std::collections::HashMap<String, ActiveGenerations>,
 ) -> Result<Vec<MemoryHit>> {
     let now = chrono::Utc::now().timestamp();
     let mut rows = conn.query(query)?;
@@ -11734,6 +12593,31 @@ fn edge_hits_from_rows(
                 Value::Null
             }
         };
+
+        // The hit's own fan-out rides along with the hit: the query joins the
+        // hit with every `GOVERNS`/`RELATES_TO` target it reaches, so the
+        // `linked_files` count costs no census query at all. The columns
+        // after the hit's own are the fan-out target's id, namespace,
+        // location, type and metadata.
+        let fan_id = format!("{}", row[5]);
+        let fan_ns = format!("{}", row[6]);
+        let fan_location = format!("{}", row[7]);
+        let fan_type = format!("{}", row[8]);
+        let fan_metadata = parse_metadata_or_warn(&format!("{}", row[9]), "metadata");
+        if let Some(key) = census_target_key(
+            &fan_id,
+            &fan_ns,
+            &fan_location,
+            &fan_type,
+            &fan_metadata,
+            active_by_ns,
+            conn,
+            now,
+        ) {
+            census.note(&id, key, fan_type == "directory");
+        }
+        // The join read this hit's fan-out in full, whether or not the hit
+        // itself survives the filters below.
 
         if !memory_types.is_empty() && !memory_types.iter().any(|t| t == &memory_type) {
             continue;
@@ -11769,12 +12653,20 @@ fn edge_hits_from_rows(
 /// `GOVERNS` onto the candidate targets, 2-hop symbol governance
 /// (`memory -GOVERNS-> symbol <-CONTAINS- file`), and `RELATES_TO` onto the
 /// candidate targets in both directions (the relation is undirected).
+///
+/// Every query also joins the hit with its own fan-out
+/// (`hit -[:GOVERNS|RELATES_TO]- target`), so the `linked_files` count comes
+/// back with the hit instead of costing a census query per batch of hit ids.
+/// The join is an inner join, and that is safe: a hit found here always has
+/// at least one `GOVERNS`/`RELATES_TO` edge -- the very edge that found it.
 fn graph_hits_from_edges(
     conn: &Connection,
     namespace: &str,
     candidates: &[(String, GraphMatchKind)],
     file_ids: &[String],
     memory_types: &[String],
+    census: &mut LinkedFilesCensus,
+    active_by_ns: &mut std::collections::HashMap<String, ActiveGenerations>,
 ) -> Result<Vec<MemoryHit>> {
     let safe_ns = escape_ladybug_string(namespace);
     let mut hits = Vec::new();
@@ -11791,7 +12683,7 @@ fn graph_hits_from_edges(
             .collect();
 
         let governs_query = format!(
-            "MATCH (m:Memory)-[:GOVERNS]->(t:Memory) WHERE t.id IN [{}] AND m.namespace = '{}' RETURN t.id, m.id, m.content, m.memory_type, m.metadata",
+            "MATCH (m:Memory)-[:GOVERNS]->(t:Memory) WHERE t.id IN [{}] AND m.namespace = '{}' MATCH (m:Memory)-[:GOVERNS|RELATES_TO]-(fan:Memory) RETURN t.id, m.id, m.content, m.memory_type, m.metadata, fan.id, fan.namespace, fan.location, fan.memory_type, fan.metadata",
             id_list, safe_ns
         );
         hits.extend(edge_hits_from_rows(
@@ -11805,12 +12697,14 @@ fn graph_hits_from_edges(
                     .unwrap_or(GraphMatchKind::MetadataFallback)
             },
             "governs",
+            census,
+            active_by_ns,
         )?);
 
         // RELATES_TO is undirected, so both orientations are queried explicitly
         // (the stored edge is still a directed row).
         let relates_out_query = format!(
-            "MATCH (m:Memory)-[:RELATES_TO]->(t:Memory) WHERE t.id IN [{}] AND m.namespace = '{}' RETURN t.id, m.id, m.content, m.memory_type, m.metadata",
+            "MATCH (m:Memory)-[:RELATES_TO]->(t:Memory) WHERE t.id IN [{}] AND m.namespace = '{}' MATCH (m:Memory)-[:GOVERNS|RELATES_TO]-(fan:Memory) RETURN t.id, m.id, m.content, m.memory_type, m.metadata, fan.id, fan.namespace, fan.location, fan.memory_type, fan.metadata",
             id_list, safe_ns
         );
         hits.extend(edge_hits_from_rows(
@@ -11819,9 +12713,11 @@ fn graph_hits_from_edges(
             memory_types,
             |_| GraphMatchKind::Related,
             "relates to",
+            census,
+            active_by_ns,
         )?);
         let relates_in_query = format!(
-            "MATCH (m:Memory)<-[:RELATES_TO]-(t:Memory) WHERE t.id IN [{}] AND m.namespace = '{}' RETURN t.id, m.id, m.content, m.memory_type, m.metadata",
+            "MATCH (m:Memory)<-[:RELATES_TO]-(t:Memory) WHERE t.id IN [{}] AND m.namespace = '{}' MATCH (m:Memory)-[:GOVERNS|RELATES_TO]-(fan:Memory) RETURN t.id, m.id, m.content, m.memory_type, m.metadata, fan.id, fan.namespace, fan.location, fan.memory_type, fan.metadata",
             id_list, safe_ns
         );
         hits.extend(edge_hits_from_rows(
@@ -11830,6 +12726,8 @@ fn graph_hits_from_edges(
             memory_types,
             |_| GraphMatchKind::Related,
             "relates to",
+            census,
+            active_by_ns,
         )?);
     }
 
@@ -11840,7 +12738,7 @@ fn graph_hits_from_edges(
             .collect::<Vec<_>>()
             .join(", ");
         let query = format!(
-            "MATCH (m:Memory)-[:GOVERNS]->(sym:Memory)<-[:CONTAINS]-(f:Memory) WHERE f.id IN [{}] AND m.namespace = '{}' RETURN sym.id, m.id, m.content, m.memory_type, m.metadata",
+            "MATCH (m:Memory)-[:GOVERNS]->(sym:Memory)<-[:CONTAINS]-(f:Memory) WHERE f.id IN [{}] AND m.namespace = '{}' MATCH (m:Memory)-[:GOVERNS|RELATES_TO]-(fan:Memory) RETURN sym.id, m.id, m.content, m.memory_type, m.metadata, fan.id, fan.namespace, fan.location, fan.memory_type, fan.metadata",
             file_list, safe_ns
         );
         hits.extend(edge_hits_from_rows(
@@ -11849,6 +12747,8 @@ fn graph_hits_from_edges(
             memory_types,
             |_| GraphMatchKind::SymbolTwoHop,
             "governs",
+            census,
+            active_by_ns,
         )?);
     }
 
@@ -11927,6 +12827,21 @@ fn discover_candidates(
     Ok((file_ids, candidates))
 }
 
+/// The `memory_type IN [...]` condition of a type-scoped query, or `None`
+/// when there is no type filter (the trait contract: an empty list means
+/// "every type").
+fn memory_type_condition(memory_types: &[String]) -> Option<String> {
+    if memory_types.is_empty() {
+        return None;
+    }
+    let list = memory_types
+        .iter()
+        .map(|t| format!("'{}'", escape_ladybug_string(t)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!("m.memory_type IN [{}]", list))
+}
+
 /// The metadata fallback: a memory whose `metadata.governs` declares the path
 /// (or an ancestor) but whose edge never materialised -- e.g. the declaration
 /// predates the stub behaviour, or the target is outside the ingested tree.
@@ -11934,6 +12849,9 @@ fn discover_candidates(
 /// The query is scoped to the memory types asked for (rules/facts/procedures
 /// by default), so the ingested AST bulk -- file/symbol/directory rows, which
 /// never carry a `governs` declaration -- is never scanned.
+///
+/// The ids of the hits it found are collected in `fallback_ids`: they are the
+/// rows whose fan-out the census still has to read.
 fn add_metadata_fallback_conn(
     conn: &Connection,
     safe_ns: &str,
@@ -11941,21 +12859,13 @@ fn add_metadata_fallback_conn(
     path: &str,
     include_ancestors: bool,
     memory_types: &[String],
+    active_gens: &std::collections::HashSet<u64>,
+    fallback_ids: &mut std::collections::HashSet<String>,
 ) -> Result<()> {
     // An empty `memory_types` means "no type filter" (the trait contract), so
     // the type condition is omitted entirely; a non-empty list is pushed into
     // the WHERE clause so only those rows are read.
-    let type_condition = if memory_types.is_empty() {
-        None
-    } else {
-        let list = memory_types
-            .iter()
-            .map(|t| format!("'{}'", escape_ladybug_string(t)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        Some(format!("m.memory_type IN [{}]", list))
-    };
-    let where_clause = match &type_condition {
+    let where_clause = match memory_type_condition(memory_types) {
         Some(tc) => format!("m.namespace = '{}' AND {}", safe_ns, tc),
         None => format!("m.namespace = '{}'", safe_ns),
     };
@@ -11967,6 +12877,11 @@ fn add_metadata_fallback_conn(
     let mut rows = conn.query(&query)?;
     while let Some(row) = rows.next() {
         let id = format!("{}", row[0]);
+        // A superseded tree declares nothing to the reader, the same way the
+        // edge path refuses a superseded node.
+        if !is_active_id(&id, active_gens) {
+            continue;
+        }
         let content = format!("{}", row[1]);
         let memory_type = format!("{}", row[2]);
         let metadata_str = format!("{}", row[3]);
@@ -11996,6 +12911,7 @@ fn add_metadata_fallback_conn(
                     .get("access_count")
                     .and_then(|v| v.as_i64())
                     .unwrap_or(0);
+                fallback_ids.insert(id.clone());
                 hits.push(MemoryHit {
                     id,
                     memory_type,
@@ -12014,67 +12930,147 @@ fn add_metadata_fallback_conn(
     Ok(())
 }
 
-/// The most memory ids one `linked_files` census query carries.
+/// The most memory ids one `linked_files` census query of the oracle carries.
 ///
-/// The hit count is bounded only by how many memories govern one file, and it
-/// is the *pre-limit* set (fan-out feeds the ranking, so it cannot be measured
-/// after truncation). Concatenating it into one `IN [...]` would therefore grow
-/// a query string without bound. The ids are batched instead: every query keeps
-/// at most this many ids, the per-namespace generation cache is shared across
-/// batches, and the batches union into the same exact per-hit count. The costs
-/// are `ceil(hits / 128)` reads instead of one, which is one read for any file
-/// with up to 128 governing memories.
+/// The census used to run one query per this many hit ids, so the total work
+/// grew with the *pre-limit* hit count (fan-out feeds the ranking, so the
+/// census cannot be measured after truncation). The census is folded into the
+/// candidate queries now: every hit comes back with its own fan-out, and the
+/// metadata fallback reads its fan-out in one query, so the counts cost no
+/// census query per batch of hits. The batching survives only in the oracle,
+/// which is the reference the fold is compared against.
 ///
 /// 128 is a transport cap, not a semantic limit: it keeps every generated
-/// query far below the engine's statement-length headroom while staying one
-/// batch for any realistic governing set. Hit counts above it only add
-/// batches; they never change a per-hit count.
+/// query far below the engine's statement-length headroom. Hit counts above
+/// it only add batches; they never change a per-hit count.
+#[cfg(test)]
 const LINKED_FILES_ID_BATCH: usize = 128;
 
-/// Sets each hit's `linked_files`: the distinct active files its `GOVERNS` and
-/// `RELATES_TO` edges reach (a symbol counts as its file, a linked memory as
-/// one, keyed by project/source and file path so equal relative paths across
-/// namespaces do not collapse). A directory link reaches every file under it,
-/// so it counts as ten, enough for the widest fan-out bucket. Inactive or
-/// superseded targets are ignored. One read per `LINKED_FILES_ID_BATCH` ids,
-/// unioned across batches, so the count is exact for any hit count.
-fn set_linked_files(conn: &Connection, hits: &mut [MemoryHit]) -> Result<()> {
-    set_linked_files_batched(conn, hits, LINKED_FILES_ID_BATCH)
+/// The key one census target contributes to a hit's `linked_files` count.
+///
+/// The key is `(owner namespace, source key, file path)`, so the same
+/// relative path under two namespaces or two sources counts twice, while one
+/// path reached through two edges counts once. A target is ignored when it is
+/// archived, retired, mesh-conflicting, a registry row, or not reachable
+/// under its namespace's active generation.
+///
+/// This is the ONE place a census target is judged. The folded census and the
+/// batched oracle both call it with the same arguments, so the two cannot
+/// drift apart and the fold stays exact.
+fn census_target_key(
+    target: &str,
+    target_ns: &str,
+    location: &str,
+    target_type: &str,
+    metadata: &Value,
+    active_by_ns: &mut std::collections::HashMap<String, ActiveGenerations>,
+    conn: &Connection,
+    now: i64,
+) -> Option<(String, String, String)> {
+    if is_archived(metadata)
+        || is_retired_at(metadata, now)
+        || is_mesh_conflicting(metadata)
+        || is_registry_row(metadata)
+    {
+        return None;
+    }
+    let owner_ns = split_scoped_id(target)
+        .map(|(ns, _, _)| ns)
+        .or_else(|| {
+            target
+                .split_once(crate::parser::ingest::NAMESPACE_SEPARATOR)
+                .map(|(ns, _)| ns.to_string())
+        })
+        .unwrap_or_else(|| target_ns.to_string());
+    let active = active_by_ns
+        .entry(owner_ns.clone())
+        .or_insert_with(|| ActiveGenerations::read(conn, &owner_ns));
+    if !active.reaches(target, &owner_ns, target_type, metadata) {
+        return None;
+    }
+    let source_key = row_source_key(metadata).unwrap_or("").to_string();
+    let raw_path = if location.is_empty() {
+        crate::parser::ingest::logical_path_of(target)
+    } else {
+        location
+    };
+    let file_path = raw_path
+        .split_once('#')
+        .map(|(f, _)| f)
+        .unwrap_or(raw_path)
+        .to_string();
+    Some((owner_ns, source_key, file_path))
 }
 
-/// `set_linked_files` with the batch width spelled out, so the boundary the
-/// census crosses between batches can be tested at a small size as well as at
-/// `LINKED_FILES_ID_BATCH`. The batching itself must not change any count.
-fn set_linked_files_batched(
+/// The distinct-file census of a hit set.
+///
+/// The counts are exact: every distinct `(owner namespace, source key, file
+/// path)` a hit reaches counts once, and a directory target counts ten (the
+/// widest fan-out bucket). Every hit's fan-out is read in full -- the edge
+/// hits with their own join, the metadata-fallback hits with the fallback's
+/// own query -- so a hit that reaches nothing counts zero rather than
+/// counting something nobody read.
+#[derive(Default)]
+struct LinkedFilesCensus {
+    files: std::collections::HashMap<String, std::collections::HashSet<(String, String, String)>>,
+    directories:
+        std::collections::HashMap<String, std::collections::HashSet<(String, String, String)>>,
+}
+
+impl LinkedFilesCensus {
+    /// Notes one target of one hit.
+    fn note(&mut self, hit_id: &str, key: (String, String, String), is_directory: bool) {
+        if is_directory {
+            self.directories
+                .entry(hit_id.to_string())
+                .or_default()
+                .insert(key);
+        } else {
+            self.files
+                .entry(hit_id.to_string())
+                .or_default()
+                .insert(key);
+        }
+    }
+
+    /// The `linked_files` count of one hit.
+    fn count(&self, hit_id: &str) -> usize {
+        self.files.get(hit_id).map_or(0, |s| s.len())
+            + 10 * self.directories.get(hit_id).map_or(0, |s| s.len())
+    }
+}
+
+/// Reads the fan-out of `ids` and notes every surviving target in the
+/// census. Returns how many queries it ran.
+///
+/// This is the batched oracle's read. The production path folds its own
+/// reads; the differential test reaches this one directly, as the oracle the
+/// folded census is compared against.
+#[cfg(test)]
+fn read_fan_out(
     conn: &Connection,
-    hits: &mut [MemoryHit],
+    ids: &[String],
     batch_size: usize,
-) -> Result<()> {
-    if hits.is_empty() {
-        return Ok(());
+    census: &mut LinkedFilesCensus,
+    active_by_ns: &mut std::collections::HashMap<String, ActiveGenerations>,
+) -> Result<usize> {
+    if ids.is_empty() {
+        return Ok(0);
     }
     let batch_size = batch_size.max(1);
     let now = chrono::Utc::now().timestamp();
-    let mut active_by_ns: std::collections::HashMap<String, ActiveGenerations> =
-        std::collections::HashMap::new();
-    let mut files: std::collections::HashMap<
-        String,
-        std::collections::HashSet<(String, String, String)>,
-    > = std::collections::HashMap::new();
-    let mut directories: std::collections::HashMap<
-        String,
-        std::collections::HashSet<(String, String, String)>,
-    > = std::collections::HashMap::new();
-    for batch in hits.chunks(batch_size) {
+    let mut queries = 0usize;
+    for batch in ids.chunks(batch_size) {
         let id_list = batch
             .iter()
-            .map(|h| format!("'{}'", escape_ladybug_string(&h.id)))
+            .map(|id| format!("'{}'", escape_ladybug_string(id)))
             .collect::<Vec<_>>()
             .join(", ");
         let query = format!(
             "MATCH (m:Memory)-[:GOVERNS|RELATES_TO]-(t:Memory) WHERE m.id IN [{}] RETURN DISTINCT m.id, t.id, t.namespace, t.location, t.memory_type, t.metadata",
             id_list
         );
+        queries += 1;
         let mut rows = conn.query(&query)?;
         while let Some(row) = rows.next() {
             let id = format!("{}", row[0]);
@@ -12083,51 +13079,127 @@ fn set_linked_files_batched(
             let location = format!("{}", row[3]);
             let target_type = format!("{}", row[4]);
             let metadata = parse_metadata_or_warn(&format!("{}", row[5]), "metadata");
-            if is_archived(&metadata)
-                || is_retired_at(&metadata, now)
-                || is_mesh_conflicting(&metadata)
-                || is_registry_row(&metadata)
-            {
+            let Some(key) = census_target_key(
+                &target,
+                &target_ns,
+                &location,
+                &target_type,
+                &metadata,
+                active_by_ns,
+                conn,
+                now,
+            ) else {
                 continue;
-            }
-            let owner_ns = split_scoped_id(&target)
-                .map(|(ns, _, _)| ns)
-                .or_else(|| {
-                    target
-                        .split_once(crate::parser::ingest::NAMESPACE_SEPARATOR)
-                        .map(|(ns, _)| ns.to_string())
-                })
-                .unwrap_or_else(|| target_ns.clone());
-            let active = active_by_ns
-                .entry(owner_ns.clone())
-                .or_insert_with(|| ActiveGenerations::read(conn, &owner_ns));
-            if !active.reaches(&target, &owner_ns, &target_type, &metadata) {
-                continue;
-            }
-            let source_key = row_source_key(&metadata).unwrap_or("").to_string();
-            let raw_path = if location.is_empty() {
-                crate::parser::ingest::logical_path_of(&target)
-            } else {
-                location.as_str()
             };
-            let file_path = raw_path
-                .split_once('#')
-                .map(|(f, _)| f)
-                .unwrap_or(raw_path)
-                .to_string();
-            let key = (owner_ns, source_key, file_path);
-            if target_type == "directory" {
-                directories.entry(id).or_default().insert(key);
-            } else {
-                files.entry(id).or_default().insert(key);
-            }
+            census.note(&id, key, target_type == "directory");
         }
     }
+    Ok(queries)
+}
+
+/// Sets each hit's `linked_files`: the distinct active files its `GOVERNS` and
+/// `RELATES_TO` edges reach (a symbol counts as its file, a linked memory as
+/// one, keyed by project/source and file path so equal relative paths across
+/// namespaces do not collapse). A directory link reaches every file under it,
+/// so it counts as ten, enough for the widest fan-out bucket. Inactive or
+/// superseded targets are ignored.
+///
+/// This is the batched oracle: the production path folds the same count into
+/// the candidate queries, and the two must agree exactly.
+///
+/// It is the oracle now, not the production path: it lives in the test build
+/// only, and the differential test compares the folded census against it.
+#[cfg(test)]
+fn set_linked_files(conn: &Connection, hits: &mut [MemoryHit]) -> Result<()> {
+    set_linked_files_batched(conn, hits, LINKED_FILES_ID_BATCH)
+}
+
+/// `set_linked_files` with the batch width spelled out, so the boundary the
+/// census crosses between batches can be tested at a small size as well as at
+/// `LINKED_FILES_ID_BATCH`. The batching itself must not change any count.
+#[cfg(test)]
+fn set_linked_files_batched(
+    conn: &Connection,
+    hits: &mut [MemoryHit],
+    batch_size: usize,
+) -> Result<()> {
+    if hits.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
+    let mut census = LinkedFilesCensus::default();
+    let mut active_by_ns: std::collections::HashMap<String, ActiveGenerations> =
+        std::collections::HashMap::new();
+    read_fan_out(conn, &ids, batch_size, &mut census, &mut active_by_ns)?;
     for hit in hits.iter_mut() {
-        hit.linked_files = files.get(&hit.id).map_or(0, |s| s.len())
-            + 10 * directories.get(&hit.id).map_or(0, |s| s.len());
+        hit.linked_files = census.count(&hit.id);
     }
     Ok(())
+}
+
+/// Reads the fan-out of the metadata-fallback hits in ONE query.
+///
+/// The fallback hits are the rows whose `metadata.governs` names the path but
+/// whose edge never materialised. Their fan-out used to be read in batches of
+/// `LINKED_FILES_ID_BATCH` hit ids, so the total work grew with the number of
+/// fallback hits. One namespace-and-type scoped query reads the fan-out of
+/// every row of that shape at once: the reads are constant, and the counts
+/// are the same ones the batched oracle produces, because the same
+/// `census_target_key` judges every target.
+///
+/// The hits themselves come from the declaration scan, not from this query: a
+/// fallback hit with no edge at all has no row here, and it must still be a
+/// hit with a count of zero.
+///
+/// Returns how many queries it ran.
+fn read_fallback_fan_out(
+    conn: &Connection,
+    safe_ns: &str,
+    memory_types: &[String],
+    fallback_ids: &std::collections::HashSet<String>,
+    census: &mut LinkedFilesCensus,
+    active_by_ns: &mut std::collections::HashMap<String, ActiveGenerations>,
+) -> Result<usize> {
+    if fallback_ids.is_empty() {
+        return Ok(0);
+    }
+    let where_clause = match memory_type_condition(memory_types) {
+        Some(tc) => format!("m.namespace = '{}' AND {}", safe_ns, tc),
+        None => format!("m.namespace = '{}'", safe_ns),
+    };
+    let query = format!(
+        "MATCH (m:Memory)-[:GOVERNS|RELATES_TO]-(fan:Memory) WHERE {} RETURN DISTINCT m.id, fan.id, fan.namespace, fan.location, fan.memory_type, fan.metadata",
+        where_clause
+    );
+    let now = chrono::Utc::now().timestamp();
+    let mut rows = conn.query(&query)?;
+    while let Some(row) = rows.next() {
+        let id = format!("{}", row[0]);
+        if !fallback_ids.contains(&id) {
+            continue;
+        }
+        let target = format!("{}", row[1]);
+        let target_ns = format!("{}", row[2]);
+        let location = format!("{}", row[3]);
+        let target_type = format!("{}", row[4]);
+        let metadata = parse_metadata_or_warn(&format!("{}", row[5]), "metadata");
+        let Some(key) = census_target_key(
+            &target,
+            &target_ns,
+            &location,
+            &target_type,
+            &metadata,
+            active_by_ns,
+            conn,
+            now,
+        ) else {
+            continue;
+        };
+        census.note(&id, key, target_type == "directory");
+    }
+    // A fallback hit with no edge has no row above, and it counts zero: the
+    // hit itself came from the declaration scan, so it is a hit either way.
+    Ok(1)
 }
 
 /// Keep the best hit per memory id: a lower match-kind priority wins, so a
@@ -12254,8 +13326,9 @@ impl GraphRead for LadybugStore {
         let path_c = path.clone();
         let sym_c = symbol.clone();
         let types = memory_types.clone();
+        let census_reads = self.census_reads.clone();
 
-        let mut hits = self
+        let (mut hits, census) = self
             .with_conn(move |conn| {
                 let safe_ns = escape_ladybug_string(&ns);
 
@@ -12283,7 +13356,25 @@ impl GraphRead for LadybugStore {
                     &active_gens,
                 )?;
 
-                let mut hits = graph_hits_from_edges(conn, &ns, &candidates, &file_ids, &types)?;
+                // The census is folded into the candidate queries: every hit
+                // comes back with its own fan-out, so the `linked_files` count
+                // costs no query of its own.
+                let mut census = LinkedFilesCensus::default();
+                let mut census_active: std::collections::HashMap<String, ActiveGenerations> =
+                    std::collections::HashMap::new();
+                // The rows the metadata fallback finds: their fan-out is read
+                // in one query after the scan.
+                let mut fallback_ids: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                let mut hits = graph_hits_from_edges(
+                    conn,
+                    &ns,
+                    &candidates,
+                    &file_ids,
+                    &types,
+                    &mut census,
+                    &mut census_active,
+                )?;
 
                 add_metadata_fallback_conn(
                     conn,
@@ -12292,9 +13383,25 @@ impl GraphRead for LadybugStore {
                     &path_c,
                     include_ancestors,
                     &types,
+                    &active_gens,
+                    &mut fallback_ids,
                 )?;
 
-                Ok(hits)
+                // The hits no edge query reached -- the metadata fallback --
+                // still need their fan-out read, and they read it all in one
+                // query: the total work does not grow with the number of
+                // fallback hits.
+                let reads = read_fallback_fan_out(
+                    conn,
+                    &safe_ns,
+                    &types,
+                    &fallback_ids,
+                    &mut census,
+                    &mut census_active,
+                )?;
+                census_reads.fetch_add(reads as u64, std::sync::atomic::Ordering::Relaxed);
+
+                Ok((hits, census))
             })
             .await?;
 
@@ -12305,12 +13412,11 @@ impl GraphRead for LadybugStore {
         }
 
         dedup_hits(&mut hits);
-        let mut hits = self
-            .with_conn(move |conn| {
-                set_linked_files(conn, &mut hits)?;
-                Ok(hits)
-            })
-            .await?;
+        // The census counts are exact and independent of the limit, so they
+        // are applied to the hits that survive the exclusion and the dedup.
+        for hit in hits.iter_mut() {
+            hit.linked_files = census.count(&hit.id);
+        }
         crate::graph_read::memories_for_file::rank_hits(&mut hits);
         hits.truncate(limit);
 
@@ -16448,6 +17554,602 @@ eurostrata\src\daemon.rs",
         for hit in &split {
             assert_eq!(hit.linked_files, 2, "batched-by-3, id {}", hit.id);
         }
+    }
+
+    /// The engine capability the folded census rests on: a statement may join
+    /// a hit with its own fan-out, so the `linked_files` count comes back with
+    /// the hit instead of costing a second query per batch of hit ids.
+    ///
+    /// Two spellings are probed, because the fold only needs one of them: the
+    /// two-clause form (the second `MATCH` reuses the variable the first one
+    /// bound) and the comma form (one `MATCH` with two pattern parts). The
+    /// test pins the two-clause form, which is the one the fold uses.
+    #[tokio::test]
+    async fn the_engine_joins_a_hit_with_its_own_fan_out() {
+        let store = retired_test_store().await;
+        for path in ["src/a.rs", "src/b.rs"] {
+            let mut file_payload = retired_test_payload("file", "auto-ingestor", json!({}));
+            file_payload.location = path.to_string();
+            store
+                .upsert(
+                    "probe",
+                    &format!("probe::{path}"),
+                    vec![0.0; 4],
+                    file_payload,
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .upsert(
+                "probe",
+                "fanout-rule",
+                vec![0.0; 4],
+                retired_test_payload(
+                    "rule",
+                    "agent",
+                    json!({
+                        "governs": ["probe::src/a.rs", "probe::src/b.rs"],
+                        "valid_from": 1_700_000_000,
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let two_clause = store
+            .with_conn(|conn| {
+                let query = "MATCH (m:Memory)-[:GOVERNS]->(t:Memory) WHERE t.id IN ['probe::src/a.rs'] AND m.namespace = 'probe' MATCH (m:Memory)-[:GOVERNS|RELATES_TO]-(fan:Memory) RETURN t.id, m.id, fan.id";
+                let mut rows = conn.query(query)?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next() {
+                    out.push(format!("{}|{}|{}", row[0], row[1], row[2]));
+                }
+                Ok(out)
+            })
+            .await
+            .expect("the two-clause fan-out join runs");
+
+        assert_eq!(
+            two_clause,
+            vec![
+                "probe::src/a.rs|fanout-rule|probe::src/a.rs".to_string(),
+                "probe::src/a.rs|fanout-rule|probe::src/b.rs".to_string(),
+            ],
+            "the hit comes back with each of its fan-out targets"
+        );
+    }
+
+    /// Seeds the nodes and rules the census tests read: two files and one
+    /// directory under `probe`, one file under another namespace, and three
+    /// rules with different fan-out shapes (a directory link, a
+    /// cross-namespace link, a `RELATES_TO` link).
+    async fn census_fixture(store: &LadybugStore) {
+        for (namespace, path, mem_type) in [
+            ("probe", "src/a.rs", "file"),
+            ("probe", "src/b.rs", "file"),
+            ("probe", "src/pkg", "directory"),
+            ("other", "src/a.rs", "file"),
+        ] {
+            let mut payload = retired_test_payload(mem_type, "auto-ingestor", json!({}));
+            payload.location = path.to_string();
+            store
+                .upsert(
+                    namespace,
+                    &format!("{}::{}", namespace, path),
+                    vec![0.0; 4],
+                    payload,
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .upsert(
+                "probe",
+                "dir_rule",
+                vec![0.0; 4],
+                retired_test_payload(
+                    "rule",
+                    "agent",
+                    json!({
+                        "governs": ["probe::src/pkg", "probe::src/a.rs"],
+                        "valid_from": 1_700_000_000,
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "cross_rule",
+                vec![0.0; 4],
+                retired_test_payload(
+                    "rule",
+                    "agent",
+                    json!({
+                        "governs": ["probe::src/a.rs", "other::src/a.rs"],
+                        "valid_from": 1_700_000_000,
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "rel_rule",
+                vec![0.0; 4],
+                retired_test_payload(
+                    "rule",
+                    "agent",
+                    json!({
+                        "relates_to": ["probe::src/a.rs"],
+                        "valid_from": 1_700_000_000,
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        // The `RELATES_TO` edge is written directly: the upsert records the
+        // declaration in the metadata, but the edge itself is what the census
+        // reads.
+        store
+            .with_conn(|conn| {
+                conn.query(
+                    "MATCH (a:Memory {id: 'rel_rule'}), (b:Memory {id: 'probe::src/a.rs'}) MERGE (a)-[r:RELATES_TO]->(b) ON CREATE SET r.source = 'probe', r.valid_from = 0, r.valid_to = 0, r.generation = 0, r.extractor = 'test', r.confidence = 1.0, r.evidence_id = 'rel_rule', r.origin = 'local'",
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("seed the relates-to edge");
+    }
+
+    /// The folded census and the batched oracle must agree exactly: the fold
+    /// is allowed to change the cost of the census, never the count.
+    #[tokio::test]
+    async fn the_folded_census_counts_exactly_like_the_batched_oracle() {
+        let store = retired_test_store().await;
+        census_fixture(&store).await;
+
+        let hits = store
+            .memories_for_file(
+                "probe",
+                None,
+                "src/a.rs",
+                None,
+                true,
+                &["rule".to_string()],
+                &[],
+                10,
+            )
+            .await
+            .expect("graph read succeeds");
+        assert_eq!(
+            hits.len(),
+            3,
+            "the three rules reach the file: {:?}",
+            hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+        );
+
+        // The oracle: the same counts, read the old way.
+        let mut oracle_hits = hits.clone();
+        let oracle_hits = store
+            .with_conn(move |conn| {
+                set_linked_files(conn, &mut oracle_hits)?;
+                Ok(oracle_hits)
+            })
+            .await
+            .expect("the oracle census succeeds");
+
+        let folded: Vec<(String, usize)> = hits
+            .iter()
+            .map(|h| (h.id.clone(), h.linked_files))
+            .collect();
+        let oracle: Vec<(String, usize)> = oracle_hits
+            .iter()
+            .map(|h| (h.id.clone(), h.linked_files))
+            .collect();
+        assert_eq!(
+            folded, oracle,
+            "the fold and the oracle count the same files"
+        );
+
+        // The counts themselves: a directory link counts ten, a file link one,
+        // and the same relative path under two namespaces is two files.
+        let by_id: std::collections::HashMap<&str, usize> = hits
+            .iter()
+            .map(|h| (h.id.as_str(), h.linked_files))
+            .collect();
+        assert_eq!(
+            by_id.get("dir_rule"),
+            Some(&11),
+            "one file and one directory"
+        );
+        assert_eq!(
+            by_id.get("cross_rule"),
+            Some(&2),
+            "two namespaces, two files"
+        );
+        assert_eq!(by_id.get("rel_rule"), Some(&1), "one related file");
+    }
+
+    /// The census is folded into the candidate queries, so the total work no
+    /// longer grows with the hit set: a file governed by more memories than
+    /// fit in one batch costs no census query at all, while the batched oracle
+    /// would have needed one query per batch.
+    #[tokio::test]
+    async fn the_folded_census_costs_no_query_for_the_hits_it_reads() {
+        let store = retired_test_store().await;
+        let hit_count = LINKED_FILES_ID_BATCH + 3;
+        for path in ["src/a.rs", "src/b.rs"] {
+            let mut file_payload = retired_test_payload("file", "auto-ingestor", json!({}));
+            file_payload.location = path.to_string();
+            store
+                .upsert(
+                    "probe",
+                    &format!("probe::{path}"),
+                    vec![0.0; 4],
+                    file_payload,
+                )
+                .await
+                .unwrap();
+        }
+        for i in 0..hit_count {
+            store
+                .upsert(
+                    "probe",
+                    &format!("boundary-{i:03}"),
+                    vec![0.0; 4],
+                    retired_test_payload(
+                        "rule",
+                        "agent",
+                        json!({
+                            "governs": ["probe::src/a.rs", "probe::src/b.rs"],
+                            "valid_from": 1_700_000_000,
+                        }),
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+
+        let hits = store
+            .memories_for_file(
+                "probe",
+                None,
+                "src/a.rs",
+                None,
+                true,
+                &["rule".to_string()],
+                &[],
+                5,
+            )
+            .await
+            .expect("graph read succeeds");
+        assert_eq!(hits.len(), 5, "the page is bounded by the limit");
+        for hit in &hits {
+            assert_eq!(hit.linked_files, 2, "id {}", hit.id);
+        }
+        assert_eq!(
+            store.census_reads(),
+            0,
+            "the folded census ran no query of its own, however many hits there were"
+        );
+    }
+
+    /// The ranking consumes the census counts, so the fold must not move a
+    /// hit: the order the folded census produces is the order the oracle's
+    /// counts produce.
+    #[tokio::test]
+    async fn the_ranking_order_is_the_same_with_the_folded_census() {
+        let store = retired_test_store().await;
+        census_fixture(&store).await;
+
+        let hits = store
+            .memories_for_file(
+                "probe",
+                None,
+                "src/a.rs",
+                None,
+                true,
+                &["rule".to_string()],
+                &[],
+                10,
+            )
+            .await
+            .expect("graph read succeeds");
+        let folded_order: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
+
+        let mut oracle_hits = hits.clone();
+        let mut oracle_hits = store
+            .with_conn(move |conn| {
+                set_linked_files(conn, &mut oracle_hits)?;
+                Ok(oracle_hits)
+            })
+            .await
+            .expect("the oracle census succeeds");
+        crate::graph_read::memories_for_file::rank_hits(&mut oracle_hits);
+        let oracle_order: Vec<String> = oracle_hits.iter().map(|h| h.id.clone()).collect();
+
+        assert_eq!(
+            folded_order, oracle_order,
+            "the fold does not move a hit in the ranking"
+        );
+        assert!(
+            !folded_order.is_empty(),
+            "the fixture produces hits to rank"
+        );
+    }
+
+    /// A fallback-only corpus: rows whose `metadata.governs` names the path
+    /// but whose edge never materialised.
+    ///
+    /// A `fact` is used on purpose: a `rule` naming a missing target
+    /// materialises a stub file node, and the hit would come from the edge
+    /// path instead of the fallback.
+    async fn fallback_corpus(store: &LadybugStore, count: usize) {
+        for i in 0..count {
+            store
+                .upsert(
+                    "probe",
+                    &format!("fallback-{i:04}"),
+                    vec![0.0; 4],
+                    retired_test_payload(
+                        "fact",
+                        "agent",
+                        json!({
+                            "governs": ["src/a.rs"],
+                            "valid_from": 1_700_000_000,
+                        }),
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    /// The fallback's census costs the same however many fallback hits there
+    /// are.
+    ///
+    /// The fallback's fan-out used to be read in batches of 128 hit ids, so a
+    /// corpus of 130 fallback hits cost two reads and a corpus of 260 cost
+    /// three: the total work grew with the hit count. The fallback reads its
+    /// fan-out in one query now, so both corpora cost the same.
+    #[tokio::test]
+    async fn the_fallback_census_costs_the_same_however_many_fallback_hits_there_are() {
+        let small = retired_test_store().await;
+        fallback_corpus(&small, 130).await;
+        let small_hits = small
+            .memories_for_file(
+                "probe",
+                None,
+                "src/a.rs",
+                None,
+                true,
+                &["fact".to_string()],
+                &[],
+                20,
+            )
+            .await
+            .expect("graph read succeeds");
+        assert_eq!(small_hits.len(), 20, "the page is bounded by the limit");
+
+        let big = retired_test_store().await;
+        fallback_corpus(&big, 260).await;
+        let big_hits = big
+            .memories_for_file(
+                "probe",
+                None,
+                "src/a.rs",
+                None,
+                true,
+                &["fact".to_string()],
+                &[],
+                20,
+            )
+            .await
+            .expect("graph read succeeds");
+        assert_eq!(big_hits.len(), 20, "the page is bounded by the limit");
+
+        assert_eq!(
+            small.census_reads(),
+            big.census_reads(),
+            "the fallback census costs the same however many fallback hits there are"
+        );
+        assert!(
+            small.census_reads() <= 1,
+            "the fallback census costs one read, not one per batch of hits: {}",
+            small.census_reads()
+        );
+    }
+
+    /// A fallback hit with no edge at all is still a hit.
+    ///
+    /// The fan-out is read with a join, and a join drops the rows that have
+    /// no match. The hit must come from the declaration alone, with a count
+    /// of zero -- not vanish.
+    #[tokio::test]
+    async fn a_fallback_hit_with_no_fan_out_is_still_a_hit() {
+        let store = retired_test_store().await;
+        store
+            .upsert(
+                "probe",
+                "lonely-fallback",
+                vec![0.0; 4],
+                retired_test_payload(
+                    "fact",
+                    "agent",
+                    json!({ "governs": ["src/a.rs"], "valid_from": 1_700_000_000 }),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let hits = store
+            .memories_for_file(
+                "probe",
+                None,
+                "src/a.rs",
+                None,
+                true,
+                &["fact".to_string()],
+                &[],
+                20,
+            )
+            .await
+            .expect("graph read succeeds");
+        assert_eq!(hits.len(), 1, "the declaration alone is a hit");
+        assert_eq!(hits[0].id, "lonely-fallback");
+        assert_eq!(hits[0].match_kind, GraphMatchKind::MetadataFallback);
+        assert_eq!(hits[0].linked_files, 0, "no edge means no linked file");
+    }
+
+    /// The fallback's counts are the oracle's counts.
+    ///
+    /// The fallback's fan-out is read in one query now, but the count it
+    /// produces must be exactly the count the batched oracle produces.
+    #[tokio::test]
+    async fn the_fallback_census_counts_exactly_like_the_batched_oracle() {
+        let store = retired_test_store().await;
+        // A file node the fallback hits can reach. It is not the queried
+        // path, so the hit stays a fallback hit.
+        let mut payload = retired_test_payload("file", "auto-ingestor", json!({}));
+        payload.location = "src/other.rs".to_string();
+        store
+            .upsert("probe", "probe::src/other.rs", vec![0.0; 4], payload)
+            .await
+            .unwrap();
+        fallback_corpus(&store, 3).await;
+        // One fallback hit reaches the file.
+        store
+            .with_conn(|conn| {
+                conn.query(
+                    "MATCH (a:Memory {id: 'fallback-0000'}), (b:Memory {id: 'probe::src/other.rs'}) MERGE (a)-[r:RELATES_TO]->(b) ON CREATE SET r.source = 'probe', r.valid_from = 0, r.valid_to = 0, r.generation = 0, r.extractor = 'test', r.confidence = 1.0, r.evidence_id = 'fallback-0000', r.origin = 'local'",
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("seed the relates-to edge");
+
+        let hits = store
+            .memories_for_file(
+                "probe",
+                None,
+                "src/a.rs",
+                None,
+                true,
+                &["fact".to_string()],
+                &[],
+                20,
+            )
+            .await
+            .expect("graph read succeeds");
+        assert_eq!(hits.len(), 3, "the three fallback hits are found");
+
+        let mut oracle_hits = hits.clone();
+        let oracle_hits = store
+            .with_conn(move |conn| {
+                set_linked_files(conn, &mut oracle_hits)?;
+                Ok(oracle_hits)
+            })
+            .await
+            .expect("the oracle census succeeds");
+
+        let folded: Vec<(String, usize)> = hits
+            .iter()
+            .map(|h| (h.id.clone(), h.linked_files))
+            .collect();
+        let oracle: Vec<(String, usize)> = oracle_hits
+            .iter()
+            .map(|h| (h.id.clone(), h.linked_files))
+            .collect();
+        assert_eq!(
+            folded, oracle,
+            "the fallback fold and the oracle count the same files"
+        );
+        let by_id: std::collections::HashMap<&str, usize> = hits
+            .iter()
+            .map(|h| (h.id.as_str(), h.linked_files))
+            .collect();
+        assert_eq!(
+            by_id.get("fallback-0000"),
+            Some(&1),
+            "the related file is counted"
+        );
+        assert_eq!(
+            by_id.get("fallback-0001"),
+            Some(&0),
+            "the hit with no edge counts nothing"
+        );
+    }
+
+    /// A generation-scoped declaration is a fallback hit only while its
+    /// generation is the active one.
+    ///
+    /// A superseded tree must not contribute a declaration to the read, the
+    /// same way the edge path already refuses a superseded node.
+    #[tokio::test]
+    async fn a_generation_scoped_declaration_is_a_fallback_hit_only_while_its_generation_is_active()
+    {
+        let store = retired_test_store().await;
+        let id = crate::parser::ingest::generation_scoped_id("probe", 7, "src/a.rs");
+        store
+            .upsert(
+                "probe",
+                &id,
+                vec![0.0; 4],
+                retired_test_payload(
+                    "fact",
+                    "agent",
+                    json!({ "governs": ["src/a.rs"], "valid_from": 1_700_000_000 }),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let hits = store
+            .memories_for_file(
+                "probe",
+                None,
+                "src/a.rs",
+                None,
+                true,
+                &["fact".to_string()],
+                &[],
+                20,
+            )
+            .await
+            .expect("graph read succeeds");
+        assert!(
+            hits.is_empty(),
+            "a superseded generation declares nothing: {:?}",
+            hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+        );
+
+        store
+            .publish_generation("probe", PROBE_SOURCE, 7)
+            .await
+            .unwrap();
+        let hits = store
+            .memories_for_file(
+                "probe",
+                None,
+                "src/a.rs",
+                None,
+                true,
+                &["fact".to_string()],
+                &[],
+                20,
+            )
+            .await
+            .expect("graph read succeeds");
+        assert_eq!(
+            hits.len(),
+            1,
+            "the active generation's declaration is a hit"
+        );
+        assert_eq!(hits[0].id, id);
     }
 
     /// Spec §3.2: an unqualified `GOVERNS` target that resolves to `Missing`
@@ -22504,6 +24206,25 @@ eurostrata\src\daemon.rs",
         serde_json::from_str(&content).expect("sidecar parses")
     }
 
+    /// The recorded identity a sidecar owns — everything except the `#212`
+    /// health fields, which a checkpoint or a recovery legitimately advances
+    /// in place. The invariant "this open never moves the recorded identity"
+    /// is about these fields, not about the health bytes beside them.
+    fn sidecar_identity(db: &std::path::Path) -> serde_json::Value {
+        let mut value = read_sidecar(db);
+        if let Some(object) = value.as_object_mut() {
+            for key in [
+                "last_recovery",
+                "last_checkpoint_at",
+                "last_checkpoint_duration_ms",
+                "checkpoint_failures",
+            ] {
+                object.remove(key);
+            }
+        }
+        value
+    }
+
     /// NEUROSTRATA_MODEL would override the file's first entry; the
     /// file-based tests pin it out of the way and restore it after.
     pub(super) fn without_model_env() -> Option<String> {
@@ -23377,13 +25098,9 @@ eurostrata\src\daemon.rs",
         blank.init("probe").await.expect("init creates the schema");
         drop(blank);
         let remote = remote_descriptor_for("RemoteModel");
-        crate::model_choice::write_store_state(
+        crate::model_choice::write_store_state_identity(
             &fx.db,
-            &crate::model_choice::StoreState {
-                version: crate::model_choice::STORE_STATE_VERSION,
-                has_data: true,
-                descriptor: remote.clone(),
-            },
+            &crate::model_choice::StoreState::new(true, remote.clone()),
         )
         .expect("record the remote identity");
 
@@ -23425,8 +25142,7 @@ eurostrata\src\daemon.rs",
         // no serving descriptor) both succeed and never move R.
         let previous = without_model_env();
         let fx = data_bearing_store_fixture("a5-unbound-opens").await;
-        let sidecar_before =
-            std::fs::read(crate::model_choice::store_state_path(&fx.db)).expect("read sidecar");
+        let sidecar_before = sidecar_identity(&fx.db);
         write_embedders_config(&fx.config_dir, "ModelB");
 
         let backup = LadybugStore::for_testing(&fx.db, 4)
@@ -23439,9 +25155,9 @@ eurostrata\src\daemon.rs",
             .expect("the backup open is never refused");
         drop(backup);
         assert_eq!(
-            std::fs::read(crate::model_choice::store_state_path(&fx.db)).expect("re-read sidecar"),
+            sidecar_identity(&fx.db),
             sidecar_before,
-            "backup never moves the recorded descriptor"
+            "backup never moves the recorded descriptor (the checkpoint health beside it may advance, #212)"
         );
 
         let report = LadybugStore::for_testing(&fx.db, 4)
@@ -23453,9 +25169,9 @@ eurostrata\src\daemon.rs",
             .expect("the report open is never refused");
         drop(report);
         assert_eq!(
-            std::fs::read(crate::model_choice::store_state_path(&fx.db)).expect("re-read sidecar"),
+            sidecar_identity(&fx.db),
             sidecar_before,
-            "a report open never moves the recorded descriptor"
+            "a report open never moves the recorded descriptor (the checkpoint health beside it may advance, #212)"
         );
         let _ = std::fs::remove_dir_all(&fx.root);
         restore_model_env(previous);
@@ -23533,13 +25249,9 @@ eurostrata\src\daemon.rs",
         // the cache is lazy, so corrupting it after construction —
         // before the first identity-consulting call — is what init
         // must classify.
-        crate::model_choice::write_store_state(
+        crate::model_choice::write_store_state_identity(
             &fx.db,
-            &crate::model_choice::StoreState {
-                version: crate::model_choice::STORE_STATE_VERSION,
-                has_data: false,
-                descriptor: serving_descriptor_for("ModelA"),
-            },
+            &crate::model_choice::StoreState::new(false, serving_descriptor_for("ModelA")),
         )
         .expect("write the pristine sidecar");
         let store = LadybugStore::for_testing(&fx.db, 4)
@@ -25000,6 +26712,318 @@ eurostrata\src\daemon.rs",
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Codex P2 (`#222`): the first-write flip caches the store-state sidecar
+    /// when it loads, but a checkpoint can update the file afterwards without
+    /// touching that cache. The first data write must not carry the cached
+    /// (stale) health back over the newer file.
+    #[tokio::test]
+    async fn first_data_write_preserves_health_recorded_after_the_cache_loaded() {
+        let previous = without_model_env();
+        let fx = store_state_fixture("a5-flip-health", "ModelA");
+        // The sidecar a previous process left behind: pristine identity plus
+        // checkpoint history.
+        crate::model_choice::write_store_state_identity(
+            &fx.db,
+            &crate::model_choice::StoreState::new(false, serving_descriptor_for("ModelA")),
+        )
+        .expect("seed the pristine sidecar");
+        crate::model_choice::record_store_state_checkpoint(
+            &fx.db,
+            "2026-11-15T00:00:00Z",
+            5,
+            false,
+        )
+        .expect("record the old checkpoint");
+
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        store.init("probe").await.expect("init");
+        // `init` loaded and cached the sidecar, health included.
+        assert!(
+            !crate::model_choice::store_has_data(&fx.db),
+            "the fixture is pristine before the first write"
+        );
+
+        // A checkpoint lands after the cache was loaded: the file moves, the
+        // in-process cache cannot know.
+        crate::model_choice::record_store_state_checkpoint(&fx.db, "2026-11-15T00:00:09Z", 9, true)
+            .expect("record the newer checkpoint");
+        assert_eq!(
+            read_sidecar(&fx.db)["last_checkpoint_at"],
+            json!("2026-11-15T00:00:09Z")
+        );
+
+        store
+            .upsert(
+                "probe",
+                "m1",
+                vec![0.1, 0.2, 0.3, 0.4],
+                store_state_payload(),
+            )
+            .await
+            .expect("the first data write lands");
+
+        let after = read_sidecar(&fx.db);
+        assert_eq!(
+            after["has_data"],
+            json!(true),
+            "the first write flipped the recorded identity"
+        );
+        assert_eq!(
+            after["last_checkpoint_at"],
+            json!("2026-11-15T00:00:09Z"),
+            "the first data write must not roll the checkpoint back to the cached copy (#212)"
+        );
+        assert_eq!(
+            after["last_checkpoint_duration_ms"],
+            json!(9),
+            "the newer checkpoint duration survives the flip"
+        );
+        assert_eq!(
+            after["checkpoint_failures"],
+            json!(1),
+            "the recorded failure count survives the flip"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    /// `#212`: a live store and a path-only query answer different questions.
+    /// After one recovery, a *verified* reopen **in the same process** must
+    /// report live state (`opened_via_recovery == false`, no kind), while the
+    /// recorded timestamp survives as history in `last_recovery_at` — on the
+    /// live status and on a path-only query alike.
+    #[tokio::test]
+    async fn verified_reopen_reports_live_state_while_path_only_status_keeps_history() {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-prov-live-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("live.lbug");
+        let previous_model = without_model_env();
+        let embed = root.join("embed");
+        std::fs::create_dir_all(&embed).expect("create the embed config dir");
+        std::fs::write(
+            embed.join("embedders.json"),
+            "[{\"model_name\":\"ModelA\",\"dimensions\":8}]",
+        )
+        .expect("write the fixture embedders.json");
+
+        let creator = LadybugStore::for_testing(&db, 8)
+            .expect("open temp database")
+            .with_embed_config_dir(&embed)
+            .with_serving_descriptor(Some(serving_descriptor_dims("ModelA", 8)));
+        creator.init("probe").await.expect("init");
+        drop(creator);
+        plant_recoverable_wal_with_corrupted_tail(&db, 2);
+
+        let _wal_env_serial = WAL_ENV_LOCK.lock().await;
+        let previous_wal = allow_unverified_wal_recovery();
+        let recovered = LadybugStore::for_testing(&db, 8).expect("recovery open");
+        assert_eq!(
+            recovered.open_provenance(),
+            OpenProvenance::UnverifiedWalReplay,
+            "the fixture must recover once"
+        );
+        drop(recovered);
+        restore_wal_env(previous_wal);
+        drop(_wal_env_serial);
+        let recorded = read_sidecar(&db)["last_recovery"]["at"]
+            .as_str()
+            .map(str::to_string)
+            .expect("the recovery left a durable timestamp in the sidecar");
+
+        // A verified reopen in this same process: the recovery is now only
+        // history, and the live map entry has been cleared by the verified
+        // open.
+        let live =
+            LadybugStore::for_testing(&db, 8).expect("the post-recovery store reopens verified");
+        assert!(
+            !live.opened_via_recovery(),
+            "the reopen after a drained WAL must be verified"
+        );
+        assert_eq!(live.open_provenance().recovery_kind_slug(), None);
+
+        // The live composition: the verified handle owns the provenance pair,
+        // while the recorded timestamp still flows through as history.
+        let live_status = crate::server::live_store_status(
+            crate::storage::compute_storage_status(
+                &db,
+                &crate::storage::StorageHygieneConfig::default(),
+            ),
+            live.opened_via_recovery(),
+            live.open_provenance().recovery_kind_slug(),
+        );
+        assert!(
+            !live_status.opened_via_recovery,
+            "a verified live store must not inherit the persisted recovery flag (#212)"
+        );
+        assert_eq!(
+            live_status.recovery_provenance, None,
+            "a verified live store must not report a persisted recovery kind (#212)"
+        );
+        assert_eq!(
+            live_status.last_recovery_at.as_deref(),
+            Some(recorded.as_str()),
+            "the live status still reports when the store last recovered (#212)"
+        );
+
+        // The path-only query answers from the sidecar: the kind is history,
+        // the handle-scoped flag is false because nothing was opened.
+        let path_only = crate::storage::compute_storage_status(
+            &db,
+            &crate::storage::StorageHygieneConfig::default(),
+        );
+        assert_eq!(
+            path_only.recovery_provenance.as_deref(),
+            Some("unverified_wal_replay"),
+            "a path-only status reports the persisted kind (#212)"
+        );
+        assert!(
+            !path_only.opened_via_recovery,
+            "opened_via_recovery stays handle-scoped for a path-only query (#212)"
+        );
+        assert_eq!(
+            path_only.last_recovery_at.as_deref(),
+            Some(recorded.as_str()),
+            "a path-only status reports the recorded recovery time (#212)"
+        );
+
+        drop(live);
+        let _ = std::fs::remove_dir_all(&root);
+        restore_model_env(previous_model);
+    }
+
+    /// `#212`: a recovery open persists its provenance to the store-state
+    /// sidecar, so a fresh, path-only `storage status` reports the recovery and
+    /// its WAL bytes instead of `opened_via_recovery=false`. The identity
+    /// fields the sidecar already held are untouched.
+    #[tokio::test]
+    async fn recovery_provenance_is_persisted_for_a_fresh_path_only_status() {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-prov-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("prov.lbug");
+        let previous_model = without_model_env();
+        let embed = root.join("embed");
+        std::fs::create_dir_all(&embed).expect("create the embed config dir");
+        std::fs::write(
+            embed.join("embedders.json"),
+            "[{\"model_name\":\"ModelA\",\"dimensions\":8}]",
+        )
+        .expect("write the fixture embedders.json");
+
+        // A sidecar recorded by a prior process — the shape a recovery open
+        // must extend rather than invent.
+        let creator = LadybugStore::for_testing(&db, 8)
+            .expect("open temp database")
+            .with_embed_config_dir(&embed)
+            .with_serving_descriptor(Some(serving_descriptor_dims("ModelA", 8)));
+        creator.init("probe").await.expect("init");
+        drop(creator);
+        assert!(
+            crate::model_choice::store_state_path(&db).exists(),
+            "the fixture records a sidecar before the recovery open"
+        );
+        let sidecar_before = read_sidecar(&db);
+
+        plant_recoverable_wal_with_corrupted_tail(&db, 3);
+        let mut wal_os = db.clone().into_os_string();
+        wal_os.push(".wal");
+        let wal_file = std::path::PathBuf::from(wal_os);
+        let pre_wal_bytes = std::fs::metadata(&wal_file).map(|m| m.len()).unwrap_or(0);
+        assert!(pre_wal_bytes > 0, "the recovery has WAL bytes to report");
+
+        let _wal_env_serial = WAL_ENV_LOCK.lock().await;
+        let previous_wal = allow_unverified_wal_recovery();
+        let store = LadybugStore::for_testing(&db, 8)
+            .expect("the unverified replay recovers the committed prefix");
+        assert_eq!(
+            store.open_provenance(),
+            OpenProvenance::UnverifiedWalReplay,
+            "the fixture must exercise the recovery arm"
+        );
+        drop(store);
+        restore_wal_env(previous_wal);
+        drop(_wal_env_serial);
+
+        let sidecar = read_sidecar(&db);
+        assert_eq!(
+            sidecar["last_recovery"]["kind"],
+            json!("unverified_wal_replay"),
+            "the recovery arm is persisted to the sidecar"
+        );
+        assert_eq!(
+            sidecar["last_recovery"]["wal_bytes"],
+            json!(pre_wal_bytes),
+            "the record carries the WAL bytes the recovery was about"
+        );
+        let at = sidecar["last_recovery"]["at"]
+            .as_str()
+            .expect("the record carries a timestamp");
+        assert!(
+            at.contains('T') && (at.ends_with('Z') || at.ends_with("+00:00")),
+            "the record carries an RFC 3339 UTC timestamp: {at}"
+        );
+        assert!(
+            sidecar["last_checkpoint_at"].is_string(),
+            "the recovery CHECKPOINT records its outcome durably"
+        );
+        assert_eq!(
+            sidecar["has_data"], sidecar_before["has_data"],
+            "the recovery provenance write leaves has_data alone"
+        );
+        assert_eq!(
+            sidecar["descriptor"], sidecar_before["descriptor"],
+            "the recovery provenance write leaves the recorded identity alone"
+        );
+
+        // The fresh-process shape: no live entry for this path, so the kind
+        // and history are answered by the sidecar alone.
+        crate::storage::snapshot::record_recovery_provenance(&db, None);
+        let status = crate::storage::compute_storage_status(
+            &db,
+            &crate::storage::StorageHygieneConfig::default(),
+        );
+        assert_eq!(
+            status.recovery_provenance.as_deref(),
+            Some("unverified_wal_replay"),
+            "a path-only status reports the persisted recovery kind (#212)"
+        );
+        assert!(
+            !status.opened_via_recovery,
+            "opened_via_recovery is handle-scoped and a path-only query opened nothing (#212)"
+        );
+        assert_eq!(
+            status.last_recovery_at.as_deref(),
+            sidecar["last_recovery"]["at"].as_str(),
+            "a path-only status reports when the recovery happened (#212)"
+        );
+        assert!(
+            status.last_checkpoint_at.is_some(),
+            "the persisted checkpoint timestamp reaches the path-only status"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        restore_model_env(previous_model);
+    }
+
     /// #69 + #90: the unverified-WAL replay checkpoints the recovered rows
     /// and then reopens the session under `verifying_config()`, so the
     /// store never keeps serving an unauthenticated configuration, and the
@@ -25701,6 +27725,8 @@ eurostrata\src\daemon.rs",
     fn release_handle_leaks_when_the_flag_call_is_not_known_to_succeed() {
         use std::sync::atomic::Ordering;
 
+        let _guard = RECOVERY_HANDLE_FLAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
         let root = std::env::temp_dir().join(format!(
             "lbug-release-leak-{}-{}",
             std::process::id(),
@@ -25736,6 +27762,8 @@ eurostrata\src\daemon.rs",
     #[test]
     fn release_handle_drops_when_the_flag_call_succeeds() {
         use std::sync::atomic::Ordering;
+
+        let _guard = RECOVERY_HANDLE_FLAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let root = std::env::temp_dir().join(format!(
             "lbug-release-ok-{}-{}",
@@ -25774,6 +27802,8 @@ eurostrata\src\daemon.rs",
     #[test]
     fn recovery_checkpoint_failure_leaks_when_the_flag_call_is_not_known_to_succeed() {
         use std::sync::atomic::Ordering;
+
+        let _guard = RECOVERY_HANDLE_FLAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let root = std::env::temp_dir().join(format!(
             "lbug-ckpt-fail-leak-{}-{}",
@@ -25821,6 +27851,8 @@ eurostrata\src\daemon.rs",
     fn recovery_checkpoint_failure_drops_when_the_flag_call_succeeds() {
         use std::sync::atomic::Ordering;
 
+        let _guard = RECOVERY_HANDLE_FLAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
         let root = std::env::temp_dir().join(format!(
             "lbug-ckpt-fail-drop-{}-{}",
             std::process::id(),
@@ -25859,6 +27891,8 @@ eurostrata\src\daemon.rs",
     #[test]
     fn recovery_checkpoint_success_returns_the_handle() {
         use std::sync::atomic::Ordering;
+
+        let _guard = RECOVERY_HANDLE_FLAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let root = std::env::temp_dir().join(format!(
             "lbug-ckpt-ok-{}-{}",
@@ -26027,7 +28061,9 @@ eurostrata\src\daemon.rs",
 
     /// #196: when strict WAL verification refuses to open a store, path-only
     /// `compute_storage_status` and `LadybugStore::export_database_files`
-    /// (`backup --no-open`) still succeed and produce a valid snapshot.
+    /// (`backup --no-open`) still succeed and produce an intact snapshot —
+    /// whose bytes must match their checksums, while its provenance stays
+    /// uncoordinated, so it is never a fully `valid` snapshot (#209).
     #[tokio::test]
     async fn storage_status_and_no_open_backup_succeed_on_strict_wal_refused_store() {
         let _env_guard = WAL_ENV_LOCK.lock().await;
@@ -26093,7 +28129,15 @@ eurostrata\src\daemon.rs",
             .expect("no-open backup succeeds on WAL-refused store (#196)");
         let report =
             crate::storage::verify_snapshot(&backup_dir).expect("verify no-open backup snapshot");
-        assert!(report.valid, "no-open backup snapshot must verify cleanly");
+        assert!(
+            report.integrity_ok,
+            "the no-open backup's bytes match their checksums"
+        );
+        assert!(
+            !report.valid,
+            "a --no-open snapshot is uncoordinated, so it is never fully valid (#209)"
+        );
+        assert_eq!(report.provenance, "unverified");
         assert!(
             backup_dir.join("ladybug.store.wal").exists(),
             "no-open backup must include the unrecovered WAL"
@@ -26209,6 +28253,341 @@ eurostrata\src\daemon.rs",
             i += 1;
         }
         String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// #209: a no-open export of a crashed checkpoint copies the frozen WAL
+    /// under the role it holds, plus the shadow the engine needs to replay
+    /// that checkpoint, and records that it was taken uncoordinated.
+    #[test]
+    fn no_open_export_preserves_the_frozen_wal_role_and_the_checkpoint_shadow() {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-no-open-export-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("crashed.lbug");
+        std::fs::write(&db, b"db-image").unwrap();
+        std::fs::write(append_suffix(&db, ".wal.checkpoint"), b"frozen-wal").unwrap();
+        std::fs::write(append_suffix(&db, ".shadow"), b"shadow-pages").unwrap();
+        std::fs::write(append_suffix(&db, ".pinned.tmp"), b"pinned-marker").unwrap();
+        let out = root.join("snap");
+
+        LadybugStore::export_database_files(&db, &out).expect("no-open export");
+
+        assert_eq!(
+            std::fs::read(out.join("ladybug.store.wal")).unwrap(),
+            b"frozen-wal",
+            "the frozen checkpoint WAL rides along"
+        );
+        assert_eq!(
+            std::fs::read(out.join("ladybug.store.shadow")).unwrap(),
+            b"shadow-pages",
+            "the checkpoint shadow rides along (#209)"
+        );
+        assert_eq!(
+            std::fs::read(out.join("ladybug.store.pinned.tmp")).unwrap(),
+            b"pinned-marker",
+            "the pinned-checkpoint marker rides along (#209)"
+        );
+
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(out.join("manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            manifest["wal_kind"], "frozen",
+            "the manifest records which WAL role was captured"
+        );
+        assert_eq!(
+            manifest["coordinated"], false,
+            "a --no-open export is not coordinated"
+        );
+        assert_eq!(manifest["provenance"], "unverified");
+
+        let report = crate::storage::verify_snapshot(&out).expect("integrity checks");
+        assert!(report.integrity_ok);
+        assert!(
+            !report.valid,
+            "a --no-open export must not verify as fully valid (#209)"
+        );
+        assert_eq!(report.wal_kind.as_deref(), Some("frozen"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #209 (V5): a mixed WAL pair preflights as a usable single store, so it
+    /// must not be silently reduced to its active side. Both byte streams are
+    /// exported, the frozen side under the checkpoint member, and the manifest
+    /// records `wal_kind: both`.
+    #[test]
+    fn a_mixed_wal_pair_exports_both_sides() {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-mixed-wal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("mixed.lbug");
+        std::fs::write(&db, b"db-image").unwrap();
+        std::fs::write(append_suffix(&db, ".wal"), b"active-bytes").unwrap();
+        std::fs::write(append_suffix(&db, ".wal.checkpoint"), b"frozen-bytes").unwrap();
+        let out = root.join("snap");
+
+        LadybugStore::export_database_files(&db, &out).expect("no-open export of a mixed pair");
+
+        assert_eq!(
+            std::fs::read(out.join("ladybug.store.wal")).unwrap(),
+            b"active-bytes",
+            "the active side keeps the wal member"
+        );
+        assert_eq!(
+            std::fs::read(out.join("ladybug.store.wal.checkpoint")).unwrap(),
+            b"frozen-bytes",
+            "the frozen side is a snapshot member, never dropped (#209)"
+        );
+
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(out.join("manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest["wal_kind"], "both");
+        assert_eq!(
+            manifest["version"],
+            crate::storage::snapshot::SNAPSHOT_VERSION,
+            "a new export writes the current snapshot format version (#209, J7)"
+        );
+
+        let checksums: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(out.join("checksums.json")).unwrap())
+                .unwrap();
+        assert!(
+            checksums["wal_checkpoint_sha256"].is_string(),
+            "the frozen side is checksummed: {checksums}"
+        );
+
+        let report = crate::storage::verify_snapshot(&out).expect("mixed pair verifies");
+        assert!(report.integrity_ok);
+        assert!(!report.valid, "a --no-open export is uncoordinated (#209)");
+        assert_eq!(report.wal_kind.as_deref(), Some("both"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #241: a WAL side that is a symlink is not a WAL side the snapshot may
+    /// copy. `Path::exists` follows links, so a linked `.wal` used to be
+    /// copied -- following the link to whatever it pointed at -- and a broken
+    /// link used to read as "no WAL at all", so the manifest claimed a role
+    /// the store did not have. Both are refused now.
+    #[test]
+    fn a_symlinked_wal_side_is_refused_rather_than_copied() {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-symlinked-wal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("linked.lbug");
+        std::fs::write(&db, b"db-image").unwrap();
+        // The link points at a file that has nothing to do with this store.
+        let outside = root.join("outside-secret");
+        std::fs::write(&outside, b"not-a-wal").unwrap();
+        std::os::unix::fs::symlink(&outside, &append_suffix(&db, ".wal")).unwrap();
+        let out = root.join("snap");
+
+        let err = LadybugStore::export_database_files(&db, &out)
+            .expect_err("a symlinked WAL side is refused (#241)");
+        let message = err.to_string();
+        assert!(
+            message.contains("symlink"),
+            "the refusal names the symlink: {message}"
+        );
+        assert!(
+            !out.join("ladybug.store.wal").exists(),
+            "no WAL is copied out of a symlink (#241)"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #241: a broken symlink is still a symlink. Reading it as "there is no
+    /// WAL here" would write a manifest claiming a role the store does not
+    /// have, so it is refused instead.
+    #[test]
+    fn a_broken_symlinked_wal_side_is_refused() {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-broken-symlinked-wal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("broken.lbug");
+        std::fs::write(&db, b"db-image").unwrap();
+        std::os::unix::fs::symlink(&root.join("nowhere"), &append_suffix(&db, ".wal")).unwrap();
+        let out = root.join("snap");
+
+        let err = LadybugStore::export_database_files(&db, &out)
+            .expect_err("a broken symlinked WAL side is refused (#241)");
+        let message = err.to_string();
+        assert!(
+            message.contains("symlink"),
+            "the refusal names the symlink: {message}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #241: only a regular file is a WAL side. A directory in its place is
+    /// refused, not copied and not reported as absent.
+    #[test]
+    fn a_wal_side_that_is_a_directory_is_refused() {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-dir-wal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("dirish.lbug");
+        std::fs::write(&db, b"db-image").unwrap();
+        std::fs::create_dir_all(append_suffix(&db, ".wal")).unwrap();
+        let out = root.join("snap");
+
+        let err = LadybugStore::export_database_files(&db, &out)
+            .expect_err("a WAL side that is a directory is refused (#241)");
+        let message = err.to_string();
+        assert!(
+            message.contains("not a regular file"),
+            "the refusal names the shape it found: {message}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #209: the WAL copy is bracketed by `(len, mtime)` exactly like the DB
+    /// copy. A writer that appends throughout must make the export abort
+    /// rather than pair a database image with a WAL from a different instant.
+    #[test]
+    fn a_wal_that_keeps_changing_aborts_the_export() {
+        use std::io::Write as _;
+
+        let root = std::env::temp_dir().join(format!(
+            "lbug-wal-bracket-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("live.lbug");
+        std::fs::write(&db, vec![7u8; 4096]).unwrap();
+        let wal = append_suffix(&db, ".wal");
+        std::fs::write(&wal, vec![1u8; 16 * 1024 * 1024]).unwrap();
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer_stop = Arc::clone(&stop);
+        let writer_writing = Arc::clone(&writing);
+        let writer_path = wal.clone();
+        let writer = std::thread::spawn(move || {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&writer_path)
+                .expect("open the WAL for the writer");
+            let buffer = [2u8; 256 * 1024];
+            let mut wrote = false;
+            while !writer_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                file.write_all(&buffer).expect("append to the WAL");
+                if !wrote {
+                    wrote = true;
+                    writer_writing.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                // Paced: the WAL keeps changing through every copy attempt
+                // without growing faster than the copy can read it.
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        });
+        while !writing.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::yield_now();
+        }
+
+        let out = root.join("snap");
+        let result = LadybugStore::export_database_files(&db, &out);
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().expect("the writer thread joins");
+
+        let err = result.expect_err(
+            "a WAL that changes during every copy attempt must abort the export (#209)",
+        );
+        assert!(
+            err.to_string().to_lowercase().contains("write-ahead log"),
+            "the abort names the WAL rather than the store: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #209: the bracket is one helper for the DB and the WAL. A single
+    /// observed change is retried; a second change aborts the snapshot.
+    #[test]
+    fn copy_file_bracketed_retries_once_and_aborts_on_a_second_change() {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-bracket-helper-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source");
+        std::fs::write(&source, b"first-generation").unwrap();
+
+        let converged = root.join("converged");
+        let mut changes = 0;
+        copy_file_bracketed_with(&source, &converged, "test member", |path| {
+            if changes == 0 {
+                changes += 1;
+                std::fs::write(path, b"second-generation").unwrap();
+            }
+        })
+        .expect("one observed change is retried");
+        assert_eq!(std::fs::read(&converged).unwrap(), b"second-generation");
+
+        let aborted = root.join("aborted");
+        let mut changes = 0;
+        let err = copy_file_bracketed_with(&source, &aborted, "test member", |path| {
+            changes += 1;
+            std::fs::write(path, format!("generation-{changes}")).unwrap();
+        })
+        .expect_err("a second observed change aborts the snapshot");
+        assert!(
+            err.to_string().contains("test member"),
+            "the abort names the member that never settled: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// #86/#207/#228 C2 — the recovery-arm census.
@@ -26553,13 +28932,9 @@ eurostrata\src\daemon.rs",
         drop(creator);
 
         // Hand-rewrite the sidecar to the stale pristine label.
-        crate::model_choice::write_store_state(
+        crate::model_choice::write_store_state_identity(
             &fx.db,
-            &crate::model_choice::StoreState {
-                version: crate::model_choice::STORE_STATE_VERSION,
-                has_data: false,
-                descriptor: serving_descriptor_dims("ModelA", 768),
-            },
+            &crate::model_choice::StoreState::new(false, serving_descriptor_dims("ModelA", 768)),
         )
         .expect("rewrite the sidecar to the stale pristine label");
         let sidecar_before =
@@ -30251,6 +32626,88 @@ mod wal_semantic_loss {
         restore_model_env(previous_model);
     }
 
+    #[tokio::test]
+    async fn a_checksum_mismatch_does_not_mask_a_semantic_early_failure_on_frozen_wal() {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-wal-checksum-mismatch-semantic-loss-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("checksum-semantic-loss.lbug");
+        let previous_model = without_model_env();
+
+        let embed = root.join("embed");
+        std::fs::create_dir_all(&embed).expect("create the embed config dir");
+        std::fs::write(
+            embed.join("embedders.json"),
+            "[{\"model_name\":\"ModelA\",\"dimensions\":8}]",
+        )
+        .expect("write the fixture embedders.json");
+        let creator = LadybugStore::for_testing(&db, 8)
+            .expect("open temp database")
+            .with_embed_config_dir(&embed);
+        creator.init("probe").await.expect("init");
+        drop(creator);
+
+        let cfg = SystemConfig::default()
+            .max_db_size(512 * 1024 * 1024)
+            .buffer_pool_size(64 * 1024 * 1024)
+            .throw_on_wal_replay_failure(true);
+        let raw = Database::new(&db, cfg).expect("raw open to seed the WAL");
+        let conn = Connection::new(&raw).expect("raw connection");
+        conn.query("CREATE (m:Memory {id: 'semantic-mismatch-0', namespace: 'probe', content: 'row', user_id: '', memory_type: 'fact', agent_name: '', location: '', location_lines: '', metadata: '{}', embedding: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]})")
+            .expect("seed a committed WAL-only row");
+        conn.query("CALL force_checkpoint_on_close=false")
+            .expect("turn off checkpoint on close");
+        drop(conn);
+        drop(raw);
+
+        let seeded = std::fs::read(wal_of(&db)).expect("read the seeded WAL");
+        let header = &seeded[..crate::store::wal_header::WAL_HEADER_CHECKSUMMED_BYTES as usize];
+        let crafted = semantic_loss_wal(header);
+        std::fs::remove_file(wal_of(&db)).expect("remove the active WAL");
+        std::fs::write(ckpt_of(&db), &crafted).expect("write the crafted frozen WAL");
+
+        // Open with enable_checksums(false) against a checksummed frozen WAL so
+        // the verified open fails in checkWALHeader with an enableChecksums
+        // mismatch before reading the corrupt COPY_TABLE_RECORD.
+        let mismatch_cfg = SystemConfig::default()
+            .max_db_size(512 * 1024 * 1024)
+            .buffer_pool_size(64 * 1024 * 1024)
+            .throw_on_wal_replay_failure(true)
+            .enable_checksums(false);
+        let _wal_env_serial = WAL_ENV_LOCK.lock().await;
+        let previous_wal = allow_unverified_wal_recovery();
+        let result = LadybugStore::with_system_config(&db, 8, mismatch_cfg);
+        restore_wal_env(previous_wal);
+        drop(_wal_env_serial);
+
+        let err = match result {
+            Ok(store) => panic!(
+                "an enableChecksums mismatch must not mask a bad frozen record and open as {:?} (#228)",
+                store.open_provenance()
+            ),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("committed_lost"),
+            "the verdict must be a committed loss even after an enableChecksums mismatch: {err}"
+        );
+        assert_eq!(
+            std::fs::read(ckpt_of(&db)).expect("read the frozen WAL"),
+            crafted,
+            "the frozen WAL must be restored with every pre-replay byte (#228)"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        restore_model_env(previous_model);
+    }
+
     /// A checksummed WAL header, as the pinned engine writes it: a 16-byte
     /// database id, the `enableChecksums` flag, and the header's own checksum
     /// (`storage/wal/wal.cpp:394-402`).
@@ -30457,6 +32914,88 @@ mod wal_preservation {
             "one artifact per side, no duplicates"
         );
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `#212`: the refusal restore must never write through a symlink planted
+    /// at `<db>.wal`. It refuses, names the side, and leaves both the link and
+    /// its target byte-intact. The pre-#212 restore (`std::fs::copy`, which
+    /// follows the link) fails this test by overwriting the target.
+    #[cfg(unix)]
+    #[test]
+    fn restore_refuses_a_symlinked_wal_and_leaves_the_target_intact() {
+        use crate::store::wal_accounting::{SideObservation, SideSet, WalAccounting};
+        let root = fixture("restore-symlink");
+        let db = root.join("sym.lbug");
+        std::fs::write(&db, b"db").unwrap();
+        let victim = root.join("operator-notes.txt");
+        std::fs::write(&victim, b"operator bytes must survive").unwrap();
+        let target = WalSide::Active.path(&db);
+        std::os::unix::fs::symlink(&victim, &target).unwrap();
+
+        let preserved = root.join("sym.lbug.wal.unclean.100");
+        std::fs::write(&preserved, b"preserved-wal-bytes").unwrap();
+        let pair = PreservedPair {
+            active: Some(preserved.clone()),
+            frozen: None,
+        };
+
+        let message = wal_refusal(
+            &db,
+            WalAccounting::CommittedLost {
+                pre_bytes: 16,
+                sides: SideSet::ACTIVE,
+            },
+            &(SideObservation::empty(), SideObservation::empty()),
+            (0, 0),
+            &pair,
+            SideSet::ACTIVE,
+            "Refusing to open: test fixture",
+        )
+        .to_string();
+        assert!(
+            message.contains("could not be restored"),
+            "the refusal reports the restore failure: {message}"
+        );
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"operator bytes must survive".to_vec(),
+            "the restore must never write through a symlink at .wal (#212)"
+        );
+        assert!(
+            std::fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the planted link is left in place for the operator"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `#212`: the refusal restore recreates its target `0600`. The mode on
+    /// `create` only applies to a *new* file, so a pre-existing looser target
+    /// (0644 here) must be tightened explicitly; `create|truncate` alone
+    /// would silently keep the old mode.
+    #[cfg(unix)]
+    #[test]
+    fn restore_recreates_the_target_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = fixture("restore-mode");
+        let src = root.join("mode.lbug.wal.unclean.100");
+        std::fs::write(&src, b"restored-wal-bytes").unwrap();
+        let dst = WalSide::Active.path(&root.join("mode.lbug"));
+        std::fs::write(&dst, b"stale-bytes").unwrap();
+        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let copied = restore_regular_file_no_follow(&src, &dst)
+            .expect("restore over an existing regular target");
+        assert_eq!(copied, 18, "every preserved byte is restored");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"restored-wal-bytes".to_vec());
+        assert_eq!(
+            std::fs::metadata(&dst).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the restored WAL is 0600 even when the target already existed (#212)"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

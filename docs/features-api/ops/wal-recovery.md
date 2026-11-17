@@ -17,10 +17,17 @@ before recovery.
    ```sh
    neurostrata-mcp storage status
    ```
-   This reports `db_bytes`, `wal_bytes` (including `<db>.wal.checkpoint`),
-   `wal_recovery_artifact_count`, `wal_recovery_artifact_bytes`, and
-   `recovery_provenance` directly from the filesystem without opening the
-   engine.
+   This reports `store_bytes`, `wal_bytes` (including `<db>.wal.checkpoint`),
+   `wal_age_secs`, `wal_recovery_artifact_count`,
+   `wal_recovery_artifact_bytes`, `recovery_provenance`,
+   `last_recovery_at`, and `opened_via_recovery` directly from the filesystem
+   without opening the engine.
+   - `wal_age_secs` is the age of the **newest** regular `<db>.wal` or
+     `<db>.wal.checkpoint` (null when neither exists). A symlink at either
+     name is not counted: it is not a WAL this store wrote. `wal_bytes` is
+     measured over the names as the engine sees them (so it follows a
+     symlink's target); the two fields can therefore describe slightly
+     different file sets.
    - Preserved pre-replay WAL copies are kept at `<db>.wal.unclean.<timestamp>`
      (and `<db>.wal.checkpoint.unclean.<timestamp>`) with `0600` permissions.
    - Unreadable WALs that had to be moved aside during opt-in recovery are kept
@@ -29,12 +36,49 @@ before recovery.
 2. **Take a no-open snapshot backup before attempting recovery:**
    ```sh
    neurostrata-mcp backup /path/to/pre-recovery-backup --no-open
-   neurostrata-mcp storage verify-snapshot /path/to/pre-recovery-backup
+   neurostrata-mcp storage verify-snapshot --dir /path/to/pre-recovery-backup
    ```
    `backup --no-open` (and `backup` automatically when strict WAL verification
-   refuses an open) copies `<db>`, `<db>.wal` / `<db>.wal.checkpoint`, and
+   refuses an open) copies `<db>`, `<db>.wal` / `<db>.wal.checkpoint`, the
+   checkpoint state (`<db>.shadow` and `<db>.pinned.tmp` when present), and
    `<db>.store-state.json` directly into a checksummed snapshot directory
    without opening or checkpointing the store.
+
+   `--no-open` **holds the store lock for the whole copy** (`#209`, `#241`): it
+   refuses while another process holds the store lock, because the store may be
+   mid-checkpoint, so the database, its WAL, and the shadow would be copied at
+   different instants — and it keeps the lock itself from the first copy to
+   the last, so a daemon that starts mid-copy cannot change what is being
+   copied. Run `backup <dir>` without `--no-open` to have the daemon take a
+   coordinated snapshot, or `shutdown` first — the recovery path in this
+   runbook runs with the daemon down, so it is not affected.
+
+   The snapshot manifest records `coordinated: false` and
+   `provenance: "unverified"` for these copies, plus `wal_kind`
+   (`active` / `frozen` / `both` / `none`). `storage verify-snapshot` prints
+   `integrity ok, uncoordinated` for them rather than `valid`: the bytes match
+   their checksums, but nothing proves they came from one instant. They remain
+   restorable, and `restore` warns when it places one.
+
+   A one-sided WAL is stored as `ladybug.store.wal` inside the snapshot. A
+   **mixed pair** (`<db>.wal` and `<db>.wal.checkpoint` both present, which the
+   engine can accept as one store) is recorded as `wal_kind: "both"` and keeps
+   both byte streams: the active side in `ladybug.store.wal`, the frozen side
+   in `ladybug.store.wal.checkpoint`, each checksummed. `restore` puts the
+   stream(s) back under their own names (`<db>.wal` for `active`,
+   `<db>.wal.checkpoint` for `frozen`, both for `both`) and drops stale
+   companions of any other role, together with the shadow and pinned marker
+   when the snapshot carries them.
+
+   **Format version.** New snapshots are written as format version 2, which
+   mandates `wal_kind` and is the only version that can carry the frozen member.
+   Binaries from before #209 pin version 1 and therefore **refuse** a v2
+   snapshot with an unsupported-version error instead of verifying it and then
+   dropping the frozen side on restore. Version 1 snapshots (all backups taken
+   before this change) remain verifiable and restorable: they have no
+   `wal_kind`, and their WAL member is restored as the active `<db>.wal`. A v1
+   manifest that claims `wal_kind: "both"` is refused by both the verifier and
+   the restore.
 
 3. **Recover committed WAL prefix records with lenient tail truncation (operator opt-in):**
    ```sh
@@ -50,7 +94,10 @@ before recovery.
    - If the lenient replay recovers **zero** committed records from a non-empty
      WAL, NeuroStrata refuses to checkpoint over the WAL and restores `<db>.wal`
      from the preserved `<db>.wal.unclean.<timestamp>` copy so no WAL bytes are
-     silently destroyed.
+     silently destroyed. The restore never writes through a symlink planted at
+     `<db>.wal`: a symlink at the target is refused (and named in the refusal),
+     and the target is reopened `O_NOFOLLOW` and left `0600` — explicitly, so a
+     pre-existing looser mode is tightened rather than inherited (`#212`).
 
 4. **Discard an unreadable WAL or restore from a known-good snapshot:**
    - If the WAL cannot be opened even with lenient replay, opt-in recovery
@@ -62,6 +109,55 @@ before recovery.
      ```
      Then update `db_path` in `~/.config/neurostrata/config.json` after
      inspecting the restored store.
+
+## Durable provenance in the store-state sidecar (`#212`)
+
+Recovery provenance used to live only in the process that recovered, so
+`storage status` in a fresh process had no provenance to report. It is now
+also written to `<db>.store-state.json` (`#212`), beside the identity fields
+the model-choice guard already reads — so a path-only status reports
+`recovery_provenance` and `last_recovery_at`, while `opened_via_recovery`
+stays handle-scoped:
+
+| field | meaning |
+|---|---|
+| `last_recovery.at` | RFC 3339 UTC timestamp of the recorded recovery open |
+| `last_recovery.kind` | recovery arm: `checksum_config_mismatch`, `unverified_wal_replay`, or `discarded_unreadable_wal` |
+| `last_recovery.wal_bytes` | bytes across the WAL pair observed before the recovery open |
+| `last_checkpoint_at` | RFC 3339 UTC timestamp of the last recorded checkpoint |
+| `last_checkpoint_duration_ms` | its duration in milliseconds |
+| `checkpoint_failures` | failed checkpoints recorded for this store (monotonic) |
+
+- The fields are `serde(default)`: a sidecar written before `#212` (or by a
+  build without the fields) parses unchanged and reads as "nothing recorded".
+- A store with **no** sidecar does not gain one from a recovery: the recipe
+  would have to invent an embedding identity this process cannot attest, and a
+  false `has_data` would unlock model choice. For those stores the in-process
+  map is still the only provenance layer.
+- The live flag and kind are **handle-derived**, but the map behind them is
+  **process-scoped**: a live status reflects any handle this process opened for
+  that path, and both the flag and the map vanish when the process exits —
+  only the sidecar (and therefore `last_recovery_at`) survives.
+- A **downgraded** build that predates `#212` does not know the health fields:
+  its identity writes (the pristine stamp, the data flip, pristine adoption)
+  rewrite the sidecar without them, so the persisted provenance and checkpoint
+  health are dropped by the first such write after a downgrade. Re-upgrading
+  starts the history over from the next recovery/checkpoint.
+- `last_recovery` is history, not the state of the current process: a later
+  verified open does not erase it. **Two fields carry it, and they mean
+  different things:**
+  - `opened_via_recovery` is **handle-scoped**: `true` only when the live
+    handle that answered this status was opened through recovery. A verified
+    reopen after a recovery reports `false` — a health check on a healthy
+    daemon must not alarm on a past recovery.
+  - `last_recovery_at` is **history**, on every surface: it answers "did this
+    store ever recover, and when?" for a live daemon and a path-only
+    `storage status` alike. `recovery_provenance` carries the live kind when
+    there is one, and the persisted kind for a path-only query (where
+    `opened_via_recovery` is necessarily `false`, because nothing was opened).
+- `last_checkpoint_at` is absent only when neither a checkpoint has been
+  recorded here nor the store directory has a readable mtime; the directory
+  mtime remains the last-resort proxy.
 
 ## Accounting verdicts (`#207`)
 

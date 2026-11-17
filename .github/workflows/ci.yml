@@ -289,3 +289,7 @@ jobs:
       - name: Gate receipt self-test
         shell: bash
         run: bash scripts/test-gate-receipt.sh
+
+      - name: Gate receipt live-path harness
+        shell: bash
+        run: bash scripts/test-gate-receipt-live.sh

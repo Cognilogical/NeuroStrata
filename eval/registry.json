@@ -355,6 +355,135 @@
         "ignored": 0,
         "_note": "scripts/remediation-eval.sh enforces only `ignored` and the exact `tests` names; any other count here would be inert, so none are listed."
       }
+    },
+    "checkpoint-latch": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp checkpoint_latch -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp storage_status_reports_the_checkpoint_latch -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp a_checkpoint_out_of_pool_is_not_retried -- --test-threads=1"
+      ],
+      "tests": [
+        "storage::snapshot::tests::storage_status_reports_the_checkpoint_latch",
+        "store::ladybug::checkpoint_latch_tests::a_skipped_checkpoint_counts_as_a_skip_not_a_failure",
+        "store::ladybug::checkpoint_latch_tests::a_successful_checkpoint_after_the_latch_reenables_the_engine",
+        "store::ladybug::checkpoint_latch_tests::a_repeated_out_of_pool_failure_keeps_the_latch",
+        "store::ladybug::checkpoint_latch_tests::a_clean_close_after_the_re_enable_leaves_no_write_ahead_log",
+        "store::ladybug::buffer_pool_tests::a_checkpoint_out_of_pool_is_not_retried"
+      ],
+      "thresholds": {
+        "ignored": 0,
+        "_note": "scripts/remediation-eval.sh enforces only `ignored` and the exact `tests` names; any other count here would be inert, so none are listed."
+      }
+    },
+    "recovery-provenance": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp recovery_provenance -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp verified_reopen_reports_live_state -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp first_data_write_preserves_health -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp identity_writes_always_merge_current_health -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store_state_provenance -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp a_broken_symlinked_sidecar -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store_state_recovery_is_not_recorded -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp wal_age_secs -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp a_wal_stamped_in_the_future -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp storage_status_reads_the_persisted -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp path_only_storage_status -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp restore_refuses_a_symlinked_wal -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp restore_recreates_the_target_0600 -- --test-threads=1"
+      ],
+      "tests": [
+        "store::ladybug::tests::recovery_provenance_is_persisted_for_a_fresh_path_only_status",
+        "store::ladybug::tests::verified_reopen_reports_live_state_while_path_only_status_keeps_history",
+        "store::ladybug::tests::first_data_write_preserves_health_recorded_after_the_cache_loaded",
+        "model_choice::tests::identity_writes_always_merge_current_health",
+        "model_choice::tests::store_state_provenance_round_trips_and_survives_a_plain_identity_write",
+        "model_choice::tests::store_state_provenance_defaults_for_an_older_sidecar",
+        "model_choice::tests::a_broken_symlinked_sidecar_reads_as_unparseable_not_absent",
+        "model_choice::tests::store_state_recovery_is_not_recorded_without_a_recorded_sidecar",
+        "storage::snapshot::tests::wal_age_secs_tracks_the_newest_wal_and_is_absent_without_one",
+        "storage::snapshot::tests::a_wal_stamped_in_the_future_reports_an_age_of_zero",
+        "storage::snapshot::tests::storage_status_reads_the_persisted_recovery_and_checkpoint_health",
+        "server::tests::path_only_storage_status_dispatches_wal_age_and_persisted_recovery",
+        "store::ladybug::wal_preservation::restore_refuses_a_symlinked_wal_and_leaves_the_target_intact",
+        "store::ladybug::wal_preservation::restore_recreates_the_target_0600"
+      ],
+      "thresholds": {
+        "ignored": 0
+      }
+    },
+    "backup-no-open": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp tests::no_open_backup -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp tests::the_no_open_copy_refuses -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp tests::the_store_lock_is_held_across -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp tests::the_fallback_ -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp tests::restore_copy_ -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp tests::restore_verify_ -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::no_open_export -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::a_mixed_wal_pair_exports -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::a_wal_side_that_is_a_directory -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::a_symlinked_wal_side -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::a_broken_symlinked_wal_side -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::a_wal_that_keeps_changing -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::copy_file_bracketed -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::storage_status_and_no_open_backup -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp storage::snapshot::tests -- --test-threads=1"
+      ],
+      "tests": [
+        "tests::no_open_backup_refuses_while_the_daemon_lock_is_held",
+        "tests::the_no_open_copy_refuses_while_the_lock_is_held_and_copies_nothing",
+        "tests::the_store_lock_is_held_across_the_uncoordinated_copy_window",
+        "tests::restore_copy_preserves_a_frozen_wal_and_the_checkpoint_shadow",
+        "tests::restore_copy_keeps_an_active_wal_active",
+        "tests::restore_copy_drops_a_stale_active_wal_when_the_snapshot_wal_is_frozen",
+        "tests::restore_copy_overwrites_orphan_target_wal_and_sidecar_from_snapshot",
+        "tests::restore_copy_drops_orphan_target_wal_and_sidecar_when_snapshot_has_none",
+        "tests::restore_copy_without_snapshot_wal_or_sidecar_and_no_orphans_succeeds",
+        "tests::restore_verify_accepts_an_uncoordinated_snapshot_whose_integrity_holds",
+        "store::ladybug::tests::no_open_export_preserves_the_frozen_wal_role_and_the_checkpoint_shadow",
+        "store::ladybug::tests::a_symlinked_wal_side_is_refused_rather_than_copied",
+        "store::ladybug::tests::a_broken_symlinked_wal_side_is_refused",
+        "store::ladybug::tests::a_wal_side_that_is_a_directory_is_refused",
+        "store::ladybug::tests::a_wal_that_keeps_changing_aborts_the_export",
+        "store::ladybug::tests::copy_file_bracketed_retries_once_and_aborts_on_a_second_change",
+        "store::ladybug::tests::storage_status_and_no_open_backup_succeed_on_strict_wal_refused_store",
+        "storage::snapshot::tests::an_uncoordinated_manifest_never_verifies_as_fully_valid",
+        "storage::snapshot::tests::a_coordinated_manifest_still_verifies_as_valid",
+        "storage::snapshot::tests::the_checkpoint_shadow_and_pinned_marker_are_snapshot_members",
+        "tests::no_open_backup_fails_closed_when_the_lock_cannot_be_taken",
+        "tests::restore_copy_places_both_wal_sides_and_drops_stale_ones",
+        "tests::restore_copy_refuses_a_both_wal_snapshot_missing_a_side",
+        "store::ladybug::tests::a_mixed_wal_pair_exports_both_sides",
+        "storage::snapshot::tests::a_both_wal_manifest_verifies_only_with_both_sides",
+        "storage::snapshot::tests::a_version_1_legacy_snapshot_still_verifies",
+        "storage::snapshot::tests::a_version_1_manifest_claiming_both_is_invalid",
+        "storage::snapshot::tests::a_version_2_manifest_without_wal_kind_is_invalid",
+        "storage::snapshot::tests::a_version_2_manifest_with_an_unknown_wal_kind_is_invalid",
+        "storage::snapshot::tests::a_version_2_manifest_without_coordinated_is_invalid",
+        "storage::snapshot::tests::a_version_2_manifest_with_a_non_boolean_coordinated_is_invalid",
+        "storage::snapshot::tests::a_version_1_manifest_with_a_non_boolean_coordinated_is_invalid",
+        "storage::snapshot::tests::a_version_2_manifest_that_is_not_coordinated_is_intact_but_not_valid",
+        "storage::snapshot::tests::a_version_2_manifest_that_is_coordinated_is_valid",
+        "storage::snapshot::tests::a_directory_in_place_of_the_store_is_refused",
+        "storage::snapshot::tests::an_unsupported_snapshot_version_is_refused",
+        "storage::snapshot::tests::select_expired_counts_version_1_and_version_2_snapshots",
+        "tests::restore_copy_reads_a_version_1_legacy_snapshot_as_active",
+        "tests::restore_copy_refuses_a_version_1_manifest_claiming_both",
+        "tests::restore_copy_refuses_a_version_2_manifest_without_wal_kind",
+        "storage::snapshot::tests::a_one_sided_manifest_with_a_frozen_member_is_refused",
+        "storage::snapshot::tests::a_both_manifest_missing_the_active_side_is_refused",
+        "tests::restore_copy_refuses_a_one_sided_snapshot_carrying_the_frozen_member",
+        "tests::restore_copy_refuses_a_both_wal_snapshot_missing_the_active_side",
+        "tests::the_fallback_refuses_while_the_store_lock_is_held_and_copies_nothing",
+        "tests::the_fallback_refuses_when_the_lock_cannot_be_taken",
+        "storage::snapshot::tests::a_none_manifest_with_a_wal_member_is_refused",
+        "tests::restore_copy_refuses_a_none_wal_snapshot_carrying_a_wal_member",
+        "tests::restore_copy_restores_a_clean_none_wal_snapshot"
+      ],
+      "thresholds": {
+        "ignored": 0,
+        "_note": "scripts/remediation-eval.sh enforces only `ignored` and the exact `tests` names; any other count here would be inert, so none are listed."
+      }
     }
   }
 }

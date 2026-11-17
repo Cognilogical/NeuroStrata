@@ -6657,8 +6657,42 @@ pub(crate) fn handle_storage_status_from_config() -> String {
         .as_ref()
         .map(|c| std::path::PathBuf::from(c.db_path.clone()))
         .unwrap_or_else(|| std::path::PathBuf::from(".NeuroStrata/db"));
-    let status = crate::storage::compute_storage_status(&db_path, &hygiene_cfg);
+    path_only_storage_status(&db_path, &hygiene_cfg)
+}
+
+/// The path-only `storage status` body (#196, #212): every field comes from
+/// the filesystem and the store-state sidecar, and no store is opened.
+///
+/// Split from [`handle_storage_status_from_config`] so the CLI's dispatch can
+/// be exercised against a fixture store without resolving (or creating) the
+/// operator's config file. This is also the surface that reports the
+/// persisted `last_recovery` history, as opposed to [`live_store_status`].
+pub(crate) fn path_only_storage_status(
+    db_path: &std::path::Path,
+    hygiene_cfg: &crate::storage::snapshot::StorageHygieneConfig,
+) -> String {
+    let status = crate::storage::compute_storage_status(db_path, hygiene_cfg);
     crate::procmem::status_with_process_memory(&status)
+}
+
+/// The live-store composition of a status (#212).
+///
+/// A live handle owns `opened_via_recovery` and its kind, and owns them
+/// *exclusively*: the sidecar's `last_recovery` is history, and it must not
+/// make a verified live store look degraded — a health check on a healthy
+/// daemon must not alarm because the store recovered last week. The
+/// path-only surface ([`path_only_storage_status`]) is the one that reports
+/// that history.
+pub(crate) fn live_store_status(
+    status: crate::storage::snapshot::StorageStatus,
+    opened_via_recovery: bool,
+    recovery_kind: Option<&str>,
+) -> crate::storage::snapshot::StorageStatus {
+    crate::storage::snapshot::StorageStatus {
+        opened_via_recovery,
+        recovery_provenance: recovery_kind.map(str::to_string),
+        ..status
+    }
 }
 
 pub(crate) async fn handle_storage_status(store: Arc<dyn VectorStore>) -> String {
@@ -6678,15 +6712,11 @@ pub(crate) async fn handle_storage_status(store: Arc<dyn VectorStore>) -> String
         .downcast_ref::<crate::store::LadybugStore>()
     {
         let status = crate::storage::compute_storage_status(ls.local_path(), &hygiene_cfg);
-        let status = crate::storage::snapshot::StorageStatus {
+        let status = live_store_status(
+            status,
             opened_via_recovery,
-            recovery_provenance: ls
-                .open_provenance()
-                .recovery_kind_slug()
-                .map(str::to_string)
-                .or(status.recovery_provenance),
-            ..status
-        };
+            ls.open_provenance().recovery_kind_slug(),
+        );
         return crate::procmem::status_with_process_memory(&status);
     }
     let db_path = cfg
@@ -6694,10 +6724,7 @@ pub(crate) async fn handle_storage_status(store: Arc<dyn VectorStore>) -> String
         .map(|c| std::path::PathBuf::from(c.db_path.clone()))
         .unwrap_or_else(|| std::path::PathBuf::from(".NeuroStrata/db"));
     let status = crate::storage::compute_storage_status(&db_path, &hygiene_cfg);
-    let status = crate::storage::snapshot::StorageStatus {
-        opened_via_recovery: opened_via_recovery || status.opened_via_recovery,
-        ..status
-    };
+    let status = live_store_status(status, opened_via_recovery, None);
     crate::procmem::status_with_process_memory(&status)
 }
 
@@ -10979,6 +11006,117 @@ mod tests {
     use super::*;
     use crate::events::{RecursionToken, ThalamicBus, ThalamicPulse};
     use crate::guard::testkit::MockStore;
+
+    /// `#212`: the CLI's path-only `storage status` dispatch emits the
+    /// filesystem-only payload — including `wal_age_secs` and the persisted
+    /// recovery history — without opening the store. Exercises the same
+    /// function the `storage status` command prints; only config resolution
+    /// (one `PathBuf`) sits outside it, which is why this fixture can assert
+    /// the payload shape without touching the operator's home config.
+    #[test]
+    fn path_only_storage_status_dispatches_wal_age_and_persisted_recovery() {
+        let root = std::env::temp_dir().join(format!(
+            "ns-storage-status-cli-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("cli.lbug");
+        std::fs::write(&db, b"db").unwrap();
+        crate::model_choice::write_store_state_identity(
+            &db,
+            &crate::model_choice::StoreState::new(
+                true,
+                crate::traits::EmbeddingDescriptor {
+                    provider: "fastembed".to_string(),
+                    model: "ModelA".to_string(),
+                    revision: "onnx".to_string(),
+                    dims: 4,
+                    normalization: "unknown".to_string(),
+                    preprocessing: "unknown".to_string(),
+                    distance_metric: "cosine".to_string(),
+                },
+            ),
+        )
+        .expect("record a sidecar");
+        crate::model_choice::record_store_state_recovery(
+            &db,
+            "discarded_unreadable_wal",
+            4096,
+            "2026-11-15T00:00:00Z",
+        )
+        .expect("record recovery history");
+        crate::storage::snapshot::record_recovery_provenance(&db, None);
+
+        let mut wal_os = db.clone().into_os_string();
+        wal_os.push(".wal");
+        let wal = std::path::PathBuf::from(wal_os);
+        std::fs::write(&wal, b"w").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&wal)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(30))
+            .unwrap();
+
+        let out = path_only_storage_status(
+            &db,
+            &crate::storage::snapshot::StorageHygieneConfig::default(),
+        );
+        let value: serde_json::Value = serde_json::from_str(&out).expect("the CLI payload is JSON");
+        assert_eq!(value["store_bytes"], serde_json::json!(2));
+        assert_eq!(value["wal_bytes"], serde_json::json!(1));
+        let age = value["wal_age_secs"]
+            .as_u64()
+            .expect("wal_age_secs is in the CLI payload (#212)");
+        assert!(
+            (29..60).contains(&age),
+            "the CLI payload reports the WAL age: {age}"
+        );
+        assert_eq!(
+            value["recovery_provenance"],
+            serde_json::json!("discarded_unreadable_wal"),
+            "the path-only CLI payload reports the persisted kind history"
+        );
+        assert_eq!(
+            value["last_recovery_at"],
+            serde_json::json!("2026-11-15T00:00:00Z"),
+            "the path-only CLI payload carries when the store last recovered"
+        );
+        assert_eq!(
+            value["opened_via_recovery"],
+            serde_json::json!(false),
+            "opened_via_recovery is handle-scoped: the CLI opened nothing (#212)"
+        );
+        assert!(
+            value["process"].is_object(),
+            "the CLI payload still carries the process block"
+        );
+
+        // A healthy (WAL-free) store: the key stays in the payload as `null`
+        // rather than disappearing, which is what the runbook promises (#212).
+        std::fs::remove_file(&wal).unwrap();
+        let out = path_only_storage_status(
+            &db,
+            &crate::storage::snapshot::StorageHygieneConfig::default(),
+        );
+        let value: serde_json::Value = serde_json::from_str(&out).expect("the CLI payload is JSON");
+        assert_eq!(value["wal_bytes"], serde_json::json!(0));
+        assert!(
+            value.get("wal_age_secs").is_some(),
+            "wal_age_secs is never omitted (#212)"
+        );
+        assert_eq!(
+            value["wal_age_secs"],
+            serde_json::Value::Null,
+            "a store with no WAL reports wal_age_secs as null (#212)"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// G3: a failed/partial hygiene repair must not advance the doctor's
     /// completion marker, so the only automatic retry path runs again.
