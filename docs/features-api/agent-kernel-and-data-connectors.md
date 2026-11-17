@@ -16,7 +16,7 @@ Central Agentic Kernel (`AgentKernel`) unifies workflow lifecycle, cognitive rec
 
 ## Principal-Scoped Kernel Ports
 
-- `MemoryPort` (`LadybugMemoryPort`): `get_visible_memory`, `register_data_pointer`, `get_data_pointer`, `list_data_pointers`.
+- `MemoryPort` (`LadybugMemoryPort`): `get_visible_memory`, `register_data_pointer`, `get_data_pointer`, `list_data_pointers`, `register_data_pool`, `list_data_pools`.
 - `ExecutivePort` (`LadybugExecutivePort`): `list_tasks`, `get_task`, `verify_task_extraction_count`, `evaluate_workflow_transition`.
 - `OntologyPort` (`LadybugOntologyPort`): `list_ontology_entities`, `get_ontology_entity`, `verify_active_action_receipt`.
 
@@ -24,7 +24,7 @@ Central Agentic Kernel (`AgentKernel`) unifies workflow lifecycle, cognitive rec
 
 - Constructor: `AgentKernel::new`, `AgentKernel::with_ports`.
 - Typed accessors: `memory()`, `executive()`, `ontology()`, `workflows()`, `connectors()`, `bus()`.
-- Operations: `register_pointer`, `resolve_pointer`, `apply_external_effect`, `execute_connector_command`, `mediate_workflow_data`.
+- Operations: `register_pool`, `register_pointer`, `resolve_pointer`, `apply_external_effect`, `execute_connector_command` (`list_connectors`, `describe_pool`, `register_pool`, `upsert_pool`, `list_pools`, `register_pointer`, `list_pointers`, `resolve_pointer`, `apply_effect`, `mediate`), `mediate_workflow_data`.
 
 ## Two-Phase DataConnector Gate
 

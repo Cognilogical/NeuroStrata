@@ -6,6 +6,13 @@
 pub trait DataConnector: Send + Sync {
     fn connector_id(&self) -> &str;
     async fn describe_pool(&self, pool_id: &str) -> Result<DataPoolSchema>;
+    async fn register_pool(&self, schema: DataPoolSchema) -> Result<DataPoolSchema>;
+    async fn seed_records(
+        &self,
+        pool_id: &str,
+        pointer_uri: &str,
+        records: Vec<Value>,
+    ) -> Result<()>;
     async fn resolve_slice(
         &self,
         pool_id: &str,
@@ -26,6 +33,8 @@ pub trait DataConnector: Send + Sync {
 ## Registry
 
 - `DataConnectorRegistry`: `new`, `new_with_defaults`, `register` (duplicate `connector_id` rejected), `get`, `list_connector_ids`.
+- `new_with_defaults` pre-seeds `"default"` (`ReadWrite`, `max_slice_rows: 1000`, `max_slice_bytes: 1048576`) and `"readonly"` (`ReadOnly`, `max_slice_rows: 1000`, `max_slice_bytes: 1048576`) pools on both built-in connectors, and loads any workspace pool schemas declared in `.NeuroStrata/connector_pools.json`.
+- Runtime pool schemas (and optional initial in-memory records) can also be registered and persisted via `AgentKernel::register_pool` (`execute_connector_command` with `"operation": "register_pool"` or `"upsert_pool"`, and listed via `"list_pools"`).
 
 ## Implementations
 
