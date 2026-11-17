@@ -122,6 +122,67 @@ Two policies are worth knowing before interpreting a refusal:
   the bytes are still in the `.corrupted.<ts>` artifact. Restore from it instead
   of treating the message as proof that nothing was lost.
 
+## A removed frozen WAL is a replay only on evidence (`#228`)
+
+The engine removes a frozen WAL (`<db>.wal.checkpoint`) when it replays it. That
+removal is **not** proof of a replay: the engine also removes a frozen WAL whose
+replay stopped at its very first record — the "semantic early failure" of a
+record the engine cannot deserialize (an unknown table, a truncated owner name,
+a record type it does not know). The open then succeeds, the committed records
+are gone, and nothing was applied.
+
+So the recovery accounting treats a **removed** frozen WAL as a replay only on
+**positive evidence**:
+
+| evidence | verdict | why |
+|---|---|---|
+| the pre-delete scan observed a complete `CHECKPOINT` record | `replayed` | the engine applies a checkpoint before it removes the file, so the checkpoint's records were applied |
+| the recovery replayed the WAL's records and the engine then removed the file | `replayed` | the applied-record count is at least one, so the engine had records to apply before it removed the file |
+| the pre-delete scan **proved** a committed record and the file is gone | `committed_lost` | a commit existed, the file no longer does, and nothing was applied: the committed records were lost |
+| the pre-delete scan saw a commit it could not prove (no checksums, an unverified frame) | `unknown` | the bytes cannot be attributed to a commit |
+| the pre-delete scan held no commit at all | `nothing_committed` | nothing was lost; the removal is lossless |
+
+A *proved* commit means a verified walk: checksums present in the file, a
+verified header, every complete frame's trailer verified, and a clean tail. A
+checksums-off WAL never proves anything, so it lands in `unknown` — the
+deliberate over-refusal described above.
+
+What this means for an operator:
+
+- A refusal naming `committed_lost` for a frozen WAL is **not** a failed
+  recovery. It means the engine deleted a WAL that held committed records
+  without applying them. The frozen WAL is restored byte-for-byte from its
+  preserved copy, and the message never claims a replay.
+- A refusal naming `unknown` for a frozen WAL means the same thing is possible
+  but unproven. Inspect the preserved copy before deciding.
+- The recovery line `Recovered by replaying the write-ahead log …` is printed
+  only **after** the verified reopen has succeeded, and only when the verdict
+  really is `replayed`. A successful open on its own is never reported as a
+  replay.
+
+The engine's own replay result (`WALReplayInfo::offsetDeserialized`) is not
+exposed by the lbug binding yet, so the accounting **emulates** the
+applied-record count from what the failed open already proved about the WAL:
+
+- A **record-level** failure (`Corrupted wal file`, `invalid WAL record type`)
+  means the WAL holds a record the engine cannot deserialize. The lenient
+  replay reads the same bytes and stops at the same record, so the engine
+  applies nothing and removes the frozen WAL. The applied-record count is
+  zero, and a removed frozen WAL with a proven commit is `committed_lost`.
+- A **header-level** failure (the checksum-config mismatch) or a **torn tail**
+  leaves the records themselves intact. The engine replays them under the WAL
+  header's own checksum setting and only then retires the file. The
+  applied-record count is at least one, so a removed frozen WAL is `replayed`.
+- A removed WAL that held no complete record applies nothing, whatever the
+  failure was.
+
+The emulation never raises the replay claim on a record failure, so a frozen
+WAL whose records are broken is never reported as a replay. Its one weakness:
+a WAL whose *later* record is broken may have had its earlier records applied
+and checkpointed before the failure, and the accounting still refuses it as
+`committed_lost`. The engine's own replay offset would settle that case, which
+is why the binding exposure is tracked on its own.
+
 ## Configuration
 
 | Variable | Effect |

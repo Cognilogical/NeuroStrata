@@ -215,7 +215,8 @@
         "cargo test --locked --bin neurostrata-mcp prune_wal_recovery_artifacts_except -- --test-threads=1",
         "cargo test --locked --bin neurostrata-mcp honours_the_verdict -- --test-threads=1",
         "cargo test --locked --bin neurostrata-mcp release_handle -- --test-threads=1",
-        "cargo test --locked --bin neurostrata-mcp recovery_checkpoint_ -- --test-threads=1"
+        "cargo test --locked --bin neurostrata-mcp recovery_checkpoint_ -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp wal_semantic_loss -- --test-threads=1"
       ],
       "tests": [
         "store::wal_accounting::tests::checksum_of_an_empty_buffer_is_the_dbs_seed",
@@ -337,7 +338,13 @@
         "store::ladybug::wal_zero_record::a_foreign_frozen_wal_with_an_unknown_active_peer_is_refused_not_quarantined",
         "store::ladybug::tests::recovery_checkpoint_failure_leaks_when_the_flag_call_is_not_known_to_succeed",
         "store::ladybug::tests::recovery_checkpoint_failure_drops_when_the_flag_call_succeeds",
-        "store::ladybug::tests::recovery_checkpoint_success_returns_the_handle"
+        "store::ladybug::tests::recovery_checkpoint_success_returns_the_handle",
+        "store::wal_accounting::tests::a_frozen_side_consumed_by_a_successful_open_is_not_a_replay",
+        "store::wal_accounting::tests::the_removed_frozen_wal_truth_table",
+        "store::wal_accounting::tests::the_emulated_applied_record_count_never_reads_a_record_failure_as_a_replay",
+        "store::wal_accounting::tests::the_operator_text_never_claims_a_successful_replay",
+        "store::ladybug::tests::wal_recovery_arms_census_and_corrupted_rename",
+        "store::ladybug::wal_semantic_loss::a_semantic_early_failure_is_a_committed_loss_and_never_a_replay"
       ],
       "thresholds": {
         "ignored": 0,

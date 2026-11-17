@@ -331,6 +331,60 @@ pub enum CommitEvidence {
     Unknown,
 }
 
+/// What the engine reported about the replay it performed (`#228`).
+///
+/// The engine's `WALReplayInfo` carries `offsetDeserialized` and
+/// `isLastRecordCheckpoint` — not an applied-record count — and the lbug
+/// binding exposes neither (`neurostrata-5lam`). Until it does, the positive
+/// evidence a *deleted* WAL can carry is an observed `CHECKPOINT` record or an
+/// emulated applied-record count; this type models the missing signal so that
+/// exposing it later is a wiring change, not a redesign.
+///
+/// [`emulate_applied_records`] derives the value the recovery funnel uses
+/// today from what the failed open already proved about the WAL. The
+/// `Unavailable` default stays the honest answer for every caller that has no
+/// such fact: absence of a signal is not evidence of a replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppliedRecords {
+    /// The engine confirmed that it applied at least one record.
+    AtLeastOne,
+    /// The engine confirmed that it applied no record.
+    None,
+    /// No engine signal is available.
+    Unavailable,
+}
+
+/// The engine's applied-record count, **emulated** from the recovery facts
+/// (`#228`).
+///
+/// The lbug binding exposes neither `WALReplayInfo::offsetDeserialized` nor
+/// `isLastRecordCheckpoint` (`neurostrata-5lam`), so the recovery funnel
+/// emulates the count from what the failed open already proved about the WAL:
+///
+/// * `record_failure` — the open failed on a **record** the engine cannot
+///   deserialize ("Corrupted wal file", "invalid WAL record type"). The
+///   lenient replay reads the same bytes and stops at the same record, so the
+///   engine applies nothing and removes the frozen WAL ("Nothing was
+///   committed, so the frozen WAL holds nothing to keep",
+///   `wal_replayer.cpp:674-679`). The applied-record count is zero.
+/// * otherwise — the failure was at the **header** (the checksum-config
+///   mismatch) or in a torn **tail**. The records themselves are intact: the
+///   engine replays them under the WAL header's own checksum setting and only
+///   then retires the file. The applied-record count is at least one.
+///
+/// `held_records` is false when the removed WAL held no complete record at
+/// all: then nothing could have been applied, whatever the failure was.
+///
+/// The emulation never raises the replay claim on a record failure, so a
+/// removed frozen WAL whose records are broken is never reported as a replay.
+pub const fn emulate_applied_records(record_failure: bool, held_records: bool) -> AppliedRecords {
+    if record_failure || !held_records {
+        AppliedRecords::None
+    } else {
+        AppliedRecords::AtLeastOne
+    }
+}
+
 /// How a WAL file's frame walk ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalTail {
@@ -425,6 +479,22 @@ impl WalScan {
                 }
             }
         }
+    }
+
+    /// Whether this walk **proved** a committed record (`#228`).
+    ///
+    /// `commit_evidence` answers "was a commit frame seen?"; this answers the
+    /// stronger question the recovery accounting needs: "did a *verified* walk
+    /// prove that a commit existed?". It requires checksums in the file, a
+    /// verified header, and every complete frame's trailer verified — so a
+    /// checksums-off WAL never proves anything, and a frame whose trailer does
+    /// not verify cannot be counted as proof either.
+    pub const fn proved_commit(self) -> bool {
+        self.commits > 0
+            && self.header_verified
+            && self.verified_frames == self.frames_parsed
+            && !matches!(self.tail, WalTail::Corrupt)
+            && matches!(self.header, HeaderRead::Readable { checksums: true, .. })
     }
 }
 
@@ -650,14 +720,16 @@ pub enum DeferralReason {
 /// How the "this side ended in a checkpoint" claim is supported.
 ///
 /// The two are not interchangeable: `Observed` is a complete `CHECKPOINT` record
-/// at the end of the WAL, while `InferredByDeletion` is the weaker fact that a
-/// successful lenient open removed a frozen WAL whose commits the scan could
-/// read. Operator text must not call the latter an observed checkpoint.
+/// at the end of the WAL, while `InferredByDeletion` is the weaker fact that
+/// the engine removed the frozen WAL after the WAL's records were replayed.
+/// Operator text must not call the latter an observed checkpoint, and it must
+/// not claim that a *successful replay* consumed the file: the engine also
+/// removes a frozen WAL whose replay never applied anything (`#228`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckpointEvidence {
     /// The scan saw a complete `CHECKPOINT_RECORD` as the last record.
     Observed,
-    /// The engine removed the frozen WAL after a successful replay; no
+    /// The engine removed the frozen WAL after its records were replayed; no
     /// `CHECKPOINT` record was seen.
     InferredByDeletion,
 }
@@ -726,10 +798,20 @@ impl WalPairObservation {
 /// entry exists for the per-side table tests and future single-side callers.
 #[allow(dead_code)]
 pub fn classify_side(observation: SideObservation) -> SideVerdict {
-    classify_side_with(observation, false)
+    classify_side_with(observation, false, AppliedRecords::Unavailable)
 }
 
-fn classify_side_with(observation: SideObservation, consumed_by_engine: bool) -> SideVerdict {
+/// Classifies one side.
+///
+/// `applied` is the engine's replay result (`#228`): it is the only signal
+/// that can make a *removed* WAL a replay, and it is
+/// [`AppliedRecords::Unavailable`] until the binding exposes the engine's
+/// replay result (`neurostrata-5lam`).
+fn classify_side_with(
+    observation: SideObservation,
+    consumed_by_engine: bool,
+    applied: AppliedRecords,
+) -> SideVerdict {
     let SideObservation {
         pre,
         bytes_scanned: _,
@@ -780,24 +862,61 @@ fn classify_side_with(observation: SideObservation, consumed_by_engine: bool) ->
     } else {
         None
     };
-    // A side a successful open consumed is *inferred* to have been replayed:
-    // the engine removed the file, the open succeeded, and the scan saw
-    // committed records (`Some`). The inference has a known hole — a
-    // byte-valid WAL whose replay fails at apply time (e.g. an unknown
-    // table) also deserialises cleanly and scans `Some`, yet the engine can
-    // still remove the file with those records unapplied; distinguishing
-    // that case needs an engine-side replay signal and is tracked in #228.
-    // Every other side is judged on its own bytes.
+    // A side the engine removed is a replay only on **positive evidence**
+    // (`#228`).
     //
-    // This is *not* an observed checkpoint: no `CHECKPOINT` record was seen, so
-    // the evidence is `InferredByDeletion` and the operator text says the frozen
-    // WAL was consumed by a successful replay.
-    if consumed_by_engine && post == 0 && matches!(evidence, CommitEvidence::Some) {
-        return SideVerdict::Replayed {
-            pre_bytes: pre,
-            residual_bytes: 0,
-            truncated_bytes: pre,
-            checkpoint: Some(CheckpointEvidence::InferredByDeletion),
+    // The old rule trusted the *successful open*: a frozen WAL the engine
+    // removed was reported as "consumed by a successful replay". That is
+    // wrong, because the engine removes a frozen WAL whose replay stopped
+    // before its first record — the semantic early failure of an unknown
+    // table (`wal_replayer.cpp:674-679`: "Nothing was committed, so the
+    // frozen WAL holds nothing to keep"). The open succeeds, the committed
+    // records are gone, and nothing was applied.
+    //
+    // Positive evidence is either an observed `CHECKPOINT` record (the engine
+    // applies that checkpoint and only then removes the file) or an
+    // engine-confirmed applied-record count. With neither, the file is gone
+    // and the open's success proves nothing: committed records the pre-delete
+    // scan proved are **lost**, and bytes that cannot be attributed are
+    // **unknown**.
+    if consumed_by_engine && post == 0 {
+        if let Some(observed) = checkpoint {
+            return SideVerdict::Replayed {
+                pre_bytes: pre,
+                residual_bytes: 0,
+                truncated_bytes: pre,
+                checkpoint: Some(observed),
+            };
+        }
+        if matches!(applied, AppliedRecords::AtLeastOne) {
+            return SideVerdict::Replayed {
+                pre_bytes: pre,
+                residual_bytes: 0,
+                truncated_bytes: pre,
+                checkpoint: Some(CheckpointEvidence::InferredByDeletion),
+            };
+        }
+        return match evidence {
+            // A *verified* pre-delete scan proved a commit existed and the
+            // file is gone: the commit was never applied.
+            CommitEvidence::Some if scan.proved_commit() => {
+                SideVerdict::CommittedLost { pre_bytes: pre }
+            }
+            // A commit frame was seen, but the walk could not prove it (no
+            // checksums, or an unverified frame): refuse as unknown.
+            CommitEvidence::Some => SideVerdict::Unknown {
+                reason: UnknownReason::UnverifiableWal,
+            },
+            // A verified walk held no commit: nothing was lost.
+            CommitEvidence::None => SideVerdict::NothingCommitted {
+                uncommitted_bytes: pre,
+            },
+            CommitEvidence::Unverifiable => SideVerdict::Unknown {
+                reason: UnknownReason::UnverifiableWal,
+            },
+            CommitEvidence::Unknown => SideVerdict::Unknown {
+                reason: UnknownReason::CommitEvidenceUnreadable,
+            },
         };
     }
     match (evidence, post) {
@@ -1007,10 +1126,23 @@ pub fn fold_side_verdicts(active: SideVerdict, frozen: SideVerdict) -> WalAccoun
 }
 
 /// Measures both sides and folds them, applying the pair's consumption fact.
+///
+/// The applied-record signal defaults to [`AppliedRecords::Unavailable`], so a
+/// removed WAL is a replay only on an observed `CHECKPOINT` record. The
+/// recovery funnel passes the emulated count from [`emulate_applied_records`]
+/// instead (`#228`).
 pub fn classify_pair(pair: WalPairObservation) -> WalAccounting {
+    classify_pair_with_applied(pair, AppliedRecords::Unavailable)
+}
+
+/// Measures both sides and folds them with the engine's replay result.
+pub fn classify_pair_with_applied(
+    pair: WalPairObservation,
+    applied: AppliedRecords,
+) -> WalAccounting {
     fold_side_verdicts(
-        classify_side_with(pair.active, pair.consumed.covers(WalSide::Active)),
-        classify_side_with(pair.frozen, pair.consumed.covers(WalSide::Frozen)),
+        classify_side_with(pair.active, pair.consumed.covers(WalSide::Active), applied),
+        classify_side_with(pair.frozen, pair.consumed.covers(WalSide::Frozen), applied),
     )
 }
 
@@ -1079,7 +1211,14 @@ impl WalAccounting {
             WalAccounting::Replayed {
                 checkpoint: Some(CheckpointEvidence::InferredByDeletion),
                 ..
-            } => Some("the frozen WAL was consumed by a successful replay"),
+            } => Some("the engine replayed the frozen WAL's records and then removed the file"),
+            WalAccounting::Replayed {
+                pre_bytes,
+                checkpoint: None,
+                ..
+            } if pre_bytes > 0 => {
+                Some("the write-ahead log was replayed and its surviving bytes are still on disk")
+            }
             _ => None,
         }
     }
@@ -1758,26 +1897,163 @@ mod tests {
         assert_eq!(verdict, SideVerdict::CommittedLost { pre_bytes: 3103 });
     }
 
+    /// `#228`: a successful open is **not** evidence that the engine applied
+    /// the frozen WAL. The engine removes a frozen WAL whose replay stopped
+    /// before its first record (`wal_replayer.cpp:674-679`: "Nothing was
+    /// committed, so the frozen WAL holds nothing to keep"), so a consumed
+    /// frozen WAL whose scan proves a commit is a **loss**, not a replay.
     #[test]
-    fn a_frozen_side_consumed_by_a_successful_open_is_a_completed_checkpoint() {
-        // `#191`: a frozen WAL with readable commits that a successful lenient
-        // open removed was replayed; the checkpoint is *inferred by deletion*,
-        // not observed in the scan.
-        let verdict = frozen_consumed_verdict(942, 0, Some(scan_checksums_off_commit()));
+    fn a_frozen_side_consumed_by_a_successful_open_is_not_a_replay() {
+        let verdict = frozen_consumed_verdict(942, 0, Some(scan_with_commit()));
         assert_eq!(
             verdict,
-            WalAccounting::Replayed {
+            WalAccounting::CommittedLost {
                 pre_bytes: 942,
-                residual_bytes: 0,
-                truncated_bytes: 942,
-                checkpoint: Some(CheckpointEvidence::InferredByDeletion)
+                sides: SideSet::FROZEN
             }
         );
+        assert!(!verdict.may_proceed(), "a lost commit must never proceed");
         assert_eq!(
             verdict.checkpoint_label(),
-            Some("the frozen WAL was consumed by a successful replay")
+            None,
+            "a loss carries no checkpoint claim"
         );
-        assert!(verdict.may_proceed());
+    }
+
+    /// `#228` §6.1 — the truth table over the four inputs of the rule:
+    /// `(consumed_by_engine, post_bytes, CommitEvidence, applied_records)`.
+    ///
+    /// A `Replayed` verdict for a *removed* frozen WAL requires positive
+    /// evidence — an observed `CHECKPOINT` record or an engine-confirmed
+    /// applied-record count. Without it the verdict is `CommittedLost` (a
+    /// proven commit) or `Unknown` (bytes that cannot be attributed), never
+    /// `Replayed`.
+    #[test]
+    fn the_removed_frozen_wal_truth_table() {
+        let rows: [(&str, u64, WalScan, AppliedRecords, &str); 7] = [
+            (
+                "a removed WAL with a proven commit and no engine signal",
+                0,
+                scan_with_commit(),
+                AppliedRecords::Unavailable,
+                "committed_lost",
+            ),
+            (
+                "a removed WAL with a proven commit and an engine-confirmed empty replay",
+                0,
+                scan_with_commit(),
+                AppliedRecords::None,
+                "committed_lost",
+            ),
+            (
+                "a removed WAL with a proven commit and an applied-record count",
+                0,
+                scan_with_commit(),
+                AppliedRecords::AtLeastOne,
+                "replayed",
+            ),
+            (
+                "a removed WAL with an observed CHECKPOINT record",
+                0,
+                scan_with_checkpoint(),
+                AppliedRecords::Unavailable,
+                "replayed",
+            ),
+            (
+                "a removed WAL whose commit cannot be verified",
+                0,
+                scan_checksums_off_commit(),
+                AppliedRecords::Unavailable,
+                "unknown",
+            ),
+            (
+                "a removed WAL that provably held no commit",
+                0,
+                scan_no_commit(),
+                AppliedRecords::Unavailable,
+                "nothing_committed",
+            ),
+            (
+                "a surviving WAL with a proven commit",
+                530,
+                scan_with_commit(),
+                AppliedRecords::Unavailable,
+                "replayed",
+            ),
+        ];
+        for (name, post, scan, applied, expected) in rows {
+            let pair = WalPairObservation::new(SideObservation::empty(), side(942, post, Some(scan)))
+                .consumed(consumed_sides(
+                    &WalPairBytes {
+                        active: 0,
+                        frozen: 942,
+                    },
+                    &WalPairBytes {
+                        active: 0,
+                        frozen: post,
+                    },
+                    true,
+                ));
+            let verdict = classify_pair_with_applied(pair, applied);
+            assert_eq!(verdict.slug(), expected, "{name}");
+        }
+    }
+
+    /// `#228`: the emulated applied-record count is what keeps a
+    /// checksum-config mismatch from reading as a loss, and it must never read
+    /// a record-level failure as a replay.
+    #[test]
+    fn the_emulated_applied_record_count_never_reads_a_record_failure_as_a_replay() {
+        assert_eq!(
+            emulate_applied_records(true, true),
+            AppliedRecords::None,
+            "a record-level failure replays nothing: the lenient replay stops at the same record"
+        );
+        assert_eq!(
+            emulate_applied_records(false, true),
+            AppliedRecords::AtLeastOne,
+            "a header-level failure or a torn tail leaves the records intact"
+        );
+        assert_eq!(
+            emulate_applied_records(false, false),
+            AppliedRecords::None,
+            "a WAL with no complete record applies nothing, whatever the failure was"
+        );
+        assert_eq!(
+            emulate_applied_records(true, false),
+            AppliedRecords::None,
+            "a broken record never raises the replay claim"
+        );
+    }
+
+    /// `#228`: the operator text must never claim that a successful replay
+    /// consumed the WAL. The only claim left for a removed WAL is the
+    /// engine's own confirmation that it applied records.
+    #[test]
+    fn the_operator_text_never_claims_a_successful_replay() {
+        let inferred = WalAccounting::Replayed {
+            pre_bytes: 942,
+            residual_bytes: 0,
+            truncated_bytes: 942,
+            checkpoint: Some(CheckpointEvidence::InferredByDeletion),
+        };
+        let label = inferred
+            .checkpoint_label()
+            .expect("an inferred deletion still carries a label");
+        assert!(
+            !label.contains("successful replay"),
+            "the label must not claim a replay: {label}"
+        );
+        assert!(
+            !label.contains("consumed by"),
+            "the label must not claim the WAL was consumed by a replay: {label}"
+        );
+
+        let lost = WalAccounting::CommittedLost {
+            pre_bytes: 942,
+            sides: SideSet::FROZEN,
+        };
+        assert_eq!(lost.checkpoint_label(), None);
     }
 
     #[test]

@@ -2846,7 +2846,13 @@ fn open_after_quarantine(
         if !moved && attempt > 0 {
             break;
         }
-        match Database::new(local_path, verifying_config()) {
+        match run_recovery_arm(
+            RecoveryArmId::QuarantineReopen,
+            &ArmRequest {
+                local_path,
+                initial_config: None,
+            },
+        ) {
             Ok(db) => {
                 // Same rule as `preserve_wal_pair`: the artifacts this arm just
                 // wrote are the operator's only copy, so they are exempt.
@@ -3009,6 +3015,27 @@ fn strict_wal_refusal(
     }
 }
 
+/// The refusal headline for a verdict (`#228`).
+///
+/// The headline names the WAL and says *which* claim failed: a proven loss of
+/// committed records is not a replay that merely could not be verified, and
+/// the operator must be able to tell the two apart. The `#189` contract (the
+/// word `zero`) and the `#207` contract (the literal `WAL`) hold for every
+/// headline.
+fn refusal_headline(verdict: &crate::store::wal_accounting::WalAccounting) -> &'static str {
+    use crate::store::wal_accounting::WalAccounting;
+
+    match verdict {
+        WalAccounting::CommittedLost { .. } => {
+            "Refusing to open: the WAL held committed records that the replay did not apply, so the engine removed the WAL with zero committed records recovered"
+        }
+        WalAccounting::Unknown { .. } => {
+            "Refusing to open: the WAL's replay could not be verified, so it is unknown whether a committed record was applied; the accounting cannot prove the replay recovered zero committed records"
+        }
+        _ => "Unverified WAL replay recovered zero committed records where the write-ahead log accounting cannot prove the replay was empty",
+    }
+}
+
 /// Refuses with the accounting verdict, restores the sides that lost every
 /// byte, and keeps the `#189` message contract (the word `zero`, the real
 /// preserved path).
@@ -3154,6 +3181,174 @@ fn lenient_failure_action(verdict: crate::store::wal_accounting::WalAccounting) 
     }
 }
 
+/// The recovery arms of the WAL funnel (`#228` C2).
+///
+/// The arm list is a **dispatch table**, not documentation. The funnel opens
+/// through it and the census test walks it, so a comment can neither add an
+/// arm nor satisfy one: an arm exists only as a row of [`RECOVERY_ARMS`], and
+/// its opener is a real function that the census executes against a real
+/// database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryArmId {
+    /// The verified open that starts the funnel.
+    VerifiedOpen,
+    /// The replay of a WAL whose checksum flag disagrees with the database
+    /// configuration, under the WAL's own checksum setting.
+    ChecksumMismatchReplay,
+    /// The unverified replay of a WAL that failed verification.
+    LenientReplay,
+    /// The verified reopen after the recovery checkpoint.
+    VerifiedReopen,
+    /// The reopen after an unreadable WAL was renamed aside.
+    QuarantineReopen,
+}
+
+/// What an arm is asked to open.
+pub struct ArmRequest<'a> {
+    /// The database the arm opens.
+    pub local_path: &'a std::path::Path,
+    /// The configuration the caller asked for on the initial open. Only the
+    /// [`RecoveryArmId::VerifiedOpen`] arm reads it; the recovery arms open
+    /// with their own configuration.
+    pub initial_config: Option<SystemConfig>,
+}
+
+/// One recovery arm: its identity, its operator-facing name, and the opener
+/// the funnel dispatches to.
+pub struct RecoveryArm {
+    /// The arm's identity.
+    pub id: RecoveryArmId,
+    /// The arm's operator-facing name. The census pins the order.
+    pub name: &'static str,
+    /// The opener the funnel calls for this arm.
+    pub opener: fn(&ArmRequest) -> Result<Database>,
+}
+
+/// The recovery arms, in funnel order (`#228` C2).
+///
+/// This table is the *only* list of arms: the funnel dispatches through it
+/// and the census test asserts against it.
+pub const RECOVERY_ARMS: [RecoveryArm; 5] = [
+    RecoveryArm {
+        id: RecoveryArmId::VerifiedOpen,
+        name: "verified-open",
+        opener: open_verified,
+    },
+    RecoveryArm {
+        id: RecoveryArmId::ChecksumMismatchReplay,
+        name: "checksum-mismatch-replay",
+        opener: open_with_wal_header_checksums,
+    },
+    RecoveryArm {
+        id: RecoveryArmId::LenientReplay,
+        name: "lenient-replay",
+        opener: open_lenient_replay,
+    },
+    RecoveryArm {
+        id: RecoveryArmId::VerifiedReopen,
+        name: "verified-reopen",
+        opener: open_verified_reopen,
+    },
+    RecoveryArm {
+        id: RecoveryArmId::QuarantineReopen,
+        name: "quarantine-reopen",
+        opener: open_quarantine_reopen,
+    },
+];
+
+thread_local! {
+    /// The arm whose opener ran last on this thread (`#228` C2).
+    ///
+    /// The census probe reads it to prove that every arm has its *own* opener:
+    /// two table rows sharing one function would report the first arm's id for
+    /// the second arm's probe, which no comment can fake.
+    static LAST_RECOVERY_ARM: std::cell::Cell<Option<RecoveryArmId>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The arm with this identity.
+pub fn recovery_arm(id: RecoveryArmId) -> &'static RecoveryArm {
+    RECOVERY_ARMS
+        .iter()
+        .find(|arm| arm.id == id)
+        .expect("every recovery arm id has a row in RECOVERY_ARMS")
+}
+
+/// Opens through an arm of [`RECOVERY_ARMS`].
+///
+/// The funnel never calls `Database::new` itself: every production open goes
+/// through this dispatch, so the census can prove that each arm is reachable
+/// and that no arm opens the database behind the table's back.
+fn run_recovery_arm(id: RecoveryArmId, request: &ArmRequest) -> Result<Database> {
+    (recovery_arm(id).opener)(request)
+}
+
+/// The open modes the arms dispatch to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArmMode {
+    /// The verified open under the caller's configuration.
+    Verified,
+    /// A replay under the WAL header's own checksum setting.
+    WalHeaderChecksums,
+    /// A replay under the WAL header's own checksum setting that tolerates a
+    /// corrupt tail.
+    LenientTail,
+    /// A verified reopen after the recovery checkpoint.
+    VerifiedReopen,
+    /// A verified reopen after a quarantine rename.
+    QuarantineReopen,
+}
+
+/// The single `Database::new` of the recovery funnel.
+///
+/// Every arm shares this one call, so the census can prove that no arm opens
+/// the database behind the dispatch table's back.
+fn open_in_mode(mode: ArmMode, request: &ArmRequest) -> Result<Database> {
+    let config = match mode {
+        ArmMode::Verified => request
+            .initial_config
+            .clone()
+            .unwrap_or_else(verifying_config),
+        ArmMode::WalHeaderChecksums | ArmMode::LenientTail => {
+            unverified_replay_config_for(request.local_path)
+        }
+        ArmMode::VerifiedReopen | ArmMode::QuarantineReopen => verifying_config(),
+    };
+    Ok(Database::new(request.local_path, config)?)
+}
+
+/// Arm 1 — the verified open that starts the funnel.
+fn open_verified(request: &ArmRequest) -> Result<Database> {
+    LAST_RECOVERY_ARM.with(|slot| slot.set(Some(RecoveryArmId::VerifiedOpen)));
+    open_in_mode(ArmMode::Verified, request)
+}
+
+/// Arm 2 — the checksum-config mismatch replay: the WAL is replayed under the
+/// WAL header's own checksum setting (`#207` BC-1).
+fn open_with_wal_header_checksums(request: &ArmRequest) -> Result<Database> {
+    LAST_RECOVERY_ARM.with(|slot| slot.set(Some(RecoveryArmId::ChecksumMismatchReplay)));
+    open_in_mode(ArmMode::WalHeaderChecksums, request)
+}
+
+/// Arm 3 — the unverified replay of a WAL that failed verification: the same
+/// framing as the WAL header, but the replay tolerates a corrupt tail.
+fn open_lenient_replay(request: &ArmRequest) -> Result<Database> {
+    LAST_RECOVERY_ARM.with(|slot| slot.set(Some(RecoveryArmId::LenientReplay)));
+    open_in_mode(ArmMode::LenientTail, request)
+}
+
+/// Arm 4 — the verified reopen after the recovery checkpoint.
+fn open_verified_reopen(request: &ArmRequest) -> Result<Database> {
+    LAST_RECOVERY_ARM.with(|slot| slot.set(Some(RecoveryArmId::VerifiedReopen)));
+    open_in_mode(ArmMode::VerifiedReopen, request)
+}
+
+/// Arm 5 — the reopen after an unreadable WAL was renamed aside.
+fn open_quarantine_reopen(request: &ArmRequest) -> Result<Database> {
+    LAST_RECOVERY_ARM.with(|slot| slot.set(Some(RecoveryArmId::QuarantineReopen)));
+    open_in_mode(ArmMode::QuarantineReopen, request)
+}
+
 /// The recovery funnel after the verified open failed (`#207`).
 fn recover_from_wal_failure(
     local_path: &std::path::Path,
@@ -3165,8 +3360,8 @@ fn recover_from_wal_failure(
     preserved: &PreservedPair,
 ) -> Result<(Database, OpenProvenance)> {
     use crate::store::wal_accounting::{
-        classify_pair, consumed_sides, disposition, Disposition, SideSet, WalAccounting,
-        WalPairBytes,
+        classify_pair, classify_pair_with_applied, consumed_sides, disposition,
+        emulate_applied_records, Disposition, SideSet, WalAccounting, WalPairBytes,
     };
 
     let err_msg = error.to_string();
@@ -3258,7 +3453,17 @@ fn recover_from_wal_failure(
         eprintln!("ERROR: retrying WITHOUT strict WAL verification to recover those writes. The records replayed this way are NOT fully authenticated -- if this database may have been tampered with, stop and inspect the preserved copy instead. Set NEUROSTRATA_STRICT_WAL=1 to refuse this fallback.");
     }
 
-    let lenient = Database::new(local_path, unverified_replay_config_for(local_path));
+    let lenient = run_recovery_arm(
+        if checksum_mismatch {
+            RecoveryArmId::ChecksumMismatchReplay
+        } else {
+            RecoveryArmId::LenientReplay
+        },
+        &ArmRequest {
+            local_path,
+            initial_config: None,
+        },
+    );
     // Captured immediately after the open and before any CHECKPOINT/reopen/rename.
     let post = wal_pair_sizes(local_path);
     if let Err(e) = &lenient {
@@ -3280,7 +3485,22 @@ fn recover_from_wal_failure(
         lenient.is_ok(),
     );
     let pair = pair_observation(pre, post, foreign).consumed(consumed);
-    let verdict = classify_pair(pair);
+    // The engine's replay result is not exposed by the binding
+    // (`neurostrata-5lam`), so the accounting emulates it from what the
+    // failed open proved about the WAL (`#228`):
+    //
+    // * a record-level failure means the lenient replay stops at the same
+    //   record and applies nothing, so the engine removes the frozen WAL
+    //   without applying a thing;
+    // * a header-level failure (the checksum-config mismatch) or a torn tail
+    //   leaves the records themselves intact, so the engine replays them
+    //   under the WAL header's own checksum setting and only then retires the
+    //   file.
+    let applied = emulate_applied_records(
+        integrity_failure,
+        pre.1.scan.map(|scan| scan.frames_parsed > 0).unwrap_or(false),
+    );
+    let verdict = classify_pair_with_applied(pair, applied);
 
     let unverified_db = match lenient {
         Ok(handle) => handle,
@@ -3326,10 +3546,14 @@ fn recover_from_wal_failure(
 
     match disposition(verdict, pair) {
         Disposition::Proceed => {
-            eprintln!("Recovered by replaying the write-ahead log with lenient tail truncation.");
-            if let Some(note) = verdict.checkpoint_label() {
-                eprintln!("WAL accounting: {note}.");
-            }
+            let recovered_line = match verdict {
+                WalAccounting::Replayed { .. } => {
+                    "Recovered by replaying the write-ahead log with lenient tail truncation."
+                }
+                _ => {
+                    "Recovered from the write-ahead log with lenient tail truncation; it held no committed records."
+                }
+            };
             let unverified_db = run_recovery_checkpoint(unverified_db)?;
             drop(unverified_db);
             if pre_total > 0 {
@@ -3341,8 +3565,21 @@ fn recover_from_wal_failure(
                     "The pre-replay write-ahead log was {pre_total} bytes. The preserved copy is kept at {preserved_display} in case any tail records were truncated."
                 );
             }
-            let db = Database::new(local_path, verifying_config())
-                .map_err(|e| anyhow::anyhow!("Recovery reopen with verification failed: {e}"))?;
+            let db = run_recovery_arm(
+                RecoveryArmId::VerifiedReopen,
+                &ArmRequest {
+                    local_path,
+                    initial_config: None,
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("Recovery reopen with verification failed: {e}"))?;
+            // The recovery claim is printed only after the verified reopen
+            // succeeded: a failed reopen must never leave an operator with a
+            // "recovered" message for a database that did not open (`#228`).
+            eprintln!("{recovered_line}");
+            if let Some(note) = verdict.checkpoint_label() {
+                eprintln!("WAL accounting: {note}.");
+            }
             Ok((db, lenient_provenance))
         }
         Disposition::Refuse { restore } => {
@@ -3354,7 +3591,7 @@ fn recover_from_wal_failure(
                 post,
                 preserved,
                 restore,
-                "Unverified WAL replay recovered zero committed records where the write-ahead log accounting cannot prove the replay was empty",
+                refusal_headline(&verdict),
             ))
         }
         Disposition::Quarantine { sides } => {
@@ -3835,7 +4072,13 @@ impl LadybugStore {
         // Open with verification first. A successful verified open is a healthy
         // replay and is never classified (`#207` B6).
         let mut open_provenance = OpenProvenance::Verified;
-        let db = match Database::new(&local_path, initial_config) {
+        let db = match run_recovery_arm(
+            RecoveryArmId::VerifiedOpen,
+            &ArmRequest {
+                local_path: &local_path,
+                initial_config: Some(initial_config.clone()),
+            },
+        ) {
             Ok(db) => db,
             Err(e) => {
                 let (db, provenance) =
@@ -25701,139 +25944,254 @@ eurostrata\src\daemon.rs",
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// #86: census guard — every production `Database::new` call site
-    /// funnels through `with_system_config` (the single recovery funnel),
-    /// and the funnel carries all three recovery arms: the strict-gated
-    /// `enableChecksums` reopen, the unverified-WAL replay with its
-    /// verified reopen, and the unreadable-WAL `.corrupted.<ts>` rename.
+    /// Strips Rust comments from source, keeping string literals intact.
+    ///
+    /// The census reads the result, so a comment can never satisfy one of its
+    /// assertions (`#228` C2). Raw strings, byte strings and char literals
+    /// are carried over verbatim; a lifetime (`'a`) is not a char literal and
+    /// survives untouched.
+    fn strip_rust_comments(src: &str) -> String {
+        let bytes = src.as_bytes();
+        let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let b = bytes[i];
+            // A raw string: `r"..."` or `r#"..."#`.
+            if b == b'r' && i + 1 < bytes.len() {
+                let mut hashes = 0usize;
+                let mut j = i + 1;
+                while j < bytes.len() && bytes[j] == b'#' {
+                    hashes += 1;
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == b'"' {
+                    let mut k = j + 1;
+                    while k < bytes.len() {
+                        if bytes[k] == b'"' {
+                            let mut seen = 0usize;
+                            while seen < hashes
+                                && k + 1 + seen < bytes.len()
+                                && bytes[k + 1 + seen] == b'#'
+                            {
+                                seen += 1;
+                            }
+                            if seen == hashes {
+                                let end = k + 1 + hashes;
+                                out.extend_from_slice(&bytes[i..end]);
+                                i = end;
+                                break;
+                            }
+                        }
+                        k += 1;
+                    }
+                    if i >= bytes.len() {
+                        break;
+                    }
+                    continue;
+                }
+            }
+            if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                let mut depth = 1usize;
+                i += 2;
+                while i < bytes.len() && depth > 0 {
+                    if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                        depth += 1;
+                        i += 2;
+                    } else if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        if bytes[i] == b'\n' {
+                            out.push(b'\n');
+                        }
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+            if b == b'"' {
+                let start = i;
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == b'"' {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                let end = i.min(bytes.len());
+                out.extend_from_slice(&bytes[start..end]);
+                continue;
+            }
+            if b == b'\'' {
+                if i + 2 < bytes.len() && bytes[i + 1] == b'\\' {
+                    let end = (i + 4).min(bytes.len());
+                    out.extend_from_slice(&bytes[i..end]);
+                    i = end;
+                    continue;
+                }
+                if i + 2 < bytes.len() && bytes[i + 2] == b'\'' {
+                    out.extend_from_slice(&bytes[i..i + 3]);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(b);
+            i += 1;
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// #86/#207/#228 C2 — the recovery-arm census.
+    ///
+    /// The census must not be satisfiable by a comment. The old one scanned
+    /// the funnel's *text* for substrings, so a comment that merely
+    /// mentioned an arm was enough — the `.corrupted.` arm, for one, was
+    /// "found" in a doc comment while the rename itself lives in another
+    /// function. This census reads the **comment-stripped** production code
+    /// and the dispatch table itself:
+    ///
+    /// * every production `Database::new` lives in the one shared opener, so
+    ///   no arm opens the database behind the table's back;
+    /// * every arm of the table is dispatched in the funnel;
+    /// * the table is the only arm list, its names and order are pinned, and
+    ///   each arm has its own opener;
+    /// * every opener really opens a database (the runtime probe).
     #[test]
     fn wal_recovery_arms_census_and_corrupted_rename() {
         let src = include_str!("ladybug.rs");
-        let lines: Vec<&str> = src.lines().collect();
-        // The recovery block starts at the `#207` preservation/accounting
-        // helpers and runs through the funnel itself; every `Database::new` in
-        // it belongs to one arm.
-        let fn_start = lines
-            .iter()
-            .position(|l| l.contains("fn preserve_wal_side("))
-            .expect("the WAL preservation helper is defined");
-        let fn_end = lines
-            .iter()
-            .position(|l| l.contains("pub fn with_embed_config_dir"))
-            .expect("with_embed_config_dir follows with_system_config");
-        let tests_start = lines
-            .iter()
-            .position(|l| l.trim_start().starts_with("mod tests {"))
+        let code = strip_rust_comments(src);
+        let tests_start = code
+            .find("mod tests {")
             .expect("the unit test module is in this file");
+        let production = &code[..tests_start];
 
-        let mut production_sites = Vec::new();
-        for (i, line) in lines.iter().enumerate() {
-            if !line.contains("Database::new") {
-                continue;
-            }
-            let within_funnel = i >= fn_start && i < fn_end;
-            let within_tests = i >= tests_start;
+        // 1. Every production open goes through the table's shared opener.
+        let opener_at = production
+            .find("fn open_in_mode(")
+            .expect("the shared opener is defined");
+        let open_sites: Vec<usize> = production
+            .match_indices("Database::new")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            open_sites.len(),
+            1,
+            "every production open must go through the arm table's shared opener, found {open_sites:?}"
+        );
+        assert!(
+            open_sites[0] > opener_at,
+            "the only production Database::new must live in the shared opener"
+        );
+
+        // 2. Every arm is dispatched in the funnel, not merely listed.
+        for arm in RECOVERY_ARMS.iter() {
+            let path = format!("RecoveryArmId::{:?}", arm.id);
             assert!(
-                within_funnel || within_tests,
-                "Database::new at line {} is outside the with_system_config recovery funnel and outside the tests module",
-                i + 1
+                production.matches(path.as_str()).count() >= 2,
+                "the arm {} must be dispatched in the funnel, not only listed in the table",
+                arm.name
             );
-            if within_funnel {
-                production_sites.push(i + 1);
-            }
         }
-        // The initial open plus the recovery arms (checksum-mismatch reopen,
-        // unverified WAL replay, verified reopen, quarantine reopen) all live in
-        // the one funnel.
-        assert!(
-            production_sites.len() >= 4,
-            "expected the initial open and the recovery arms in one funnel, found {production_sites:?}"
-        );
 
-        let funnel = lines[fn_start..fn_end].join("\n");
-        // Arm 1 — enableChecksums mismatch, gated by strict WAL verification
-        // when a non-empty WAL is present.
-        assert!(
-            funnel.contains("enableChecksums"),
-            "the enableChecksums arm is in the funnel"
+        // 3. The table is the arm list: pinned names, in order, one row per id.
+        let names: Vec<&str> = RECOVERY_ARMS.iter().map(|arm| arm.name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "verified-open",
+                "checksum-mismatch-replay",
+                "lenient-replay",
+                "verified-reopen",
+                "quarantine-reopen",
+            ],
+            "the recovery arms changed; the census pins the list"
         );
+        for (index, arm) in RECOVERY_ARMS.iter().enumerate() {
+            assert_eq!(
+                arm.id,
+                recovery_arm(arm.id).id,
+                "every arm id resolves to its own row"
+            );
+            assert!(
+                RECOVERY_ARMS[..index]
+                    .iter()
+                    .all(|other| other.id != arm.id),
+                "an arm id must appear exactly once in the table"
+            );
+        }
+
+        // 4. The runtime probe: every opener really opens a database, and each
+        //    arm has its own opener — two rows sharing one function would
+        //    report the first arm's id for the second arm's probe.
+        for arm in RECOVERY_ARMS.iter() {
+            let root = std::env::temp_dir().join(format!(
+                "lbug-arm-probe-{}-{}",
+                arm.name,
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).expect("create the probe directory");
+            let db_path = root.join("probe.lbug");
+            let request = ArmRequest {
+                local_path: &db_path,
+                initial_config: None,
+            };
+            let db = (arm.opener)(&request)
+                .unwrap_or_else(|e| panic!("the arm {} must open a database: {e}", arm.name));
+            assert!(
+                db_path.exists(),
+                "the arm {} must really create the database",
+                arm.name
+            );
+            assert_eq!(
+                LAST_RECOVERY_ARM.with(|slot| slot.get()),
+                Some(arm.id),
+                "the arm {} must have its own opener",
+                arm.name
+            );
+            drop(db);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        // 5. The funnel's behaviour, read from code and not from a comment.
+        for needle in [
+            "enableChecksums",
+            "strict_wal_verification",
+            "unverified_replay_config_for",
+            "classify_pair",
+            "disposition",
+            "verifying_config()",
+            "CHECKPOINT;",
+            "preserve_wal_pair",
+            "preserve_wal_side",
+            "force_checkpoint_on_close=false",
+            "consumed_sides(",
+            ".consumed(",
+            "lenient_failure_action(",
+            "clean_foreign_action(",
+            "release_handle(",
+            "allocate_wal_artifact_path(&target, \"corrupted\")",
+            "std::fs::rename",
+        ] {
+            assert!(
+                production.contains(needle),
+                "the funnel must contain {needle} in code, not in a comment"
+            );
+        }
         assert!(
-            funnel.contains("strict_wal_verification"),
-            "the mismatch arm gates on strict WAL verification"
-        );
-        // Arm 2 — WAL integrity failure: lenient replay under the WAL's own
-        // checksum flag, classification, CHECKPOINT, then a verified reopen.
-        assert!(
-            funnel.contains("unverified_replay_config_for"),
-            "the unverified replay arm is in the funnel"
-        );
-        assert!(
-            funnel.contains("classify_pair"),
-            "every successful lenient open is classified (#207)"
-        );
-        assert!(
-            funnel.contains("disposition"),
-            "the classification drives the arm's disposition (#207)"
-        );
-        assert!(
-            funnel.contains("verifying_config()"),
-            "the funnel reopens under verifying_config()"
-        );
-        assert!(
-            funnel.contains("CHECKPOINT;"),
-            "the funnel checkpoints the replayed WAL"
-        );
-        // Arm 3 — unreadable WAL: renamed aside to .corrupted.<ts>.
-        assert!(
-            funnel.contains(".corrupted."),
-            "the unreadable-WAL rename arm is in the funnel"
-        );
-        assert!(
-            funnel.contains("rename"),
-            "the unreadable WAL is moved aside"
-        );
-        // The WAL pair is preserved before the unverified replay, and a
-        // refusal can restore either side.
-        assert!(
-            funnel.contains("preserve_wal_pair"),
-            "the pre-replay preservation is in the funnel"
-        );
-        assert!(
-            funnel.contains("preserve_wal_side"),
-            "one hardened copy primitive serves both sides"
-        );
-        assert!(
-            funnel.contains("force_checkpoint_on_close=false"),
-            "a refusing arm never lets ~Database() checkpoint over the WAL"
-        );
-        assert!(
-            funnel.contains("consumed_sides("),
-            "the consumed-side decision is the pure `consumed_sides`, not an inline set (#207)"
-        );
-        assert!(
-            funnel.contains(".consumed("),
-            "the sealed consumption is attached to the pair observation (#207)"
-        );
-        assert!(
-            funnel.contains("let initial_foreign = quarantine_is_foreign(&foreign);"),
-            "arm D's wording branch comes from the attribution seam at the call site, \
-             not a literal (#207)"
-        );
-        assert!(
-            funnel.contains("lenient_failure_action("),
-            "a failed lenient open acts on its verdict instead of always quarantining (#207 C3)"
-        );
-        assert!(
-            funnel.contains("clean_foreign_action("),
-            "the clean-foreign arm acts on its pair snapshot instead of always quarantining (#207 C4)"
-        );
-        assert!(
-            funnel.contains("release_handle("),
-            "the drop flag is applied through `release_handle`, which leaks on failure (#207 C5)"
-        );
-        assert!(
-            !funnel.contains("SideSet::BOTH"),
-            "no arm may mark both sides consumed: the active side is never a \"consumed checkpoint\" (#207)"
+            !production.contains("SideSet::BOTH"),
+            "no arm may mark both sides consumed (#207)"
         );
     }
 
@@ -29564,6 +29922,170 @@ mod wal_zero_record {
             file_len(&ckpt),
             corrupt.len() as u64,
             "the frozen side is restored from its pre-open copy"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        restore_model_env(previous_model);
+    }
+}
+
+/// `#228` C1: the frozen-WAL semantic early failure must be *detected*.
+///
+/// A frozen WAL whose first record cannot be deserialized is deleted by the
+/// engine even though the open succeeds (`wal_replayer.cpp:674-679`: "Nothing
+/// was committed, so the frozen WAL holds nothing to keep"). The committed
+/// records are gone and nothing was applied, so the verdict must be
+/// `CommittedLost` — never `Replayed` — and the open must refuse with the
+/// bytes preserved. Sibling of `mod tests` for the same eval-filter reason
+/// as `wal_zero_record`.
+#[cfg(test)]
+mod wal_semantic_loss {
+    use super::tests::{
+        allow_unverified_wal_recovery, restore_model_env, restore_wal_env, without_model_env,
+        WAL_ENV_LOCK,
+    };
+    use super::*;
+    use crate::store::wal_accounting::{scan_wal, CommitEvidence};
+
+    fn wal_of(db: &std::path::Path) -> std::path::PathBuf {
+        let mut os = db.to_path_buf().into_os_string();
+        os.push(".wal");
+        std::path::PathBuf::from(os)
+    }
+
+    fn ckpt_of(db: &std::path::Path) -> std::path::PathBuf {
+        let mut os = db.to_path_buf().into_os_string();
+        os.push(".wal.checkpoint");
+        std::path::PathBuf::from(os)
+    }
+
+    /// One `serializeWithLength` frame with a real checksum trailer.
+    fn frame(payload: &[u8]) -> Vec<u8> {
+        let mut out = (payload.len() as u64).to_ne_bytes().to_vec();
+        out.extend_from_slice(payload);
+        let crc = crate::store::wal_accounting::wal_checksum(&out);
+        out.extend_from_slice(&crc.to_ne_bytes());
+        out
+    }
+
+    /// A frozen WAL the *scanner* reads as committed and the *engine* cannot
+    /// read past its first record.
+    ///
+    /// The first frame is a `COPY_TABLE_RECORD` (type 13) whose owner-name
+    /// length overflows the record boundary: the engine throws "Corrupted
+    /// wal file. Owner catalog name length overflows the record boundary."
+    /// (`wal_record.cpp:123`). The second frame is a `COMMIT_RECORD`, so the
+    /// scanner proves a committed record while the engine's `dryReplay`
+    /// stops at offset 0 and the frozen WAL is deleted.
+    fn semantic_loss_wal(header: &[u8]) -> Vec<u8> {
+        let mut out = header.to_vec();
+        let mut payload = vec![13u8];
+        payload.extend_from_slice(&0u64.to_ne_bytes());
+        payload.extend_from_slice(&u64::MAX.to_ne_bytes());
+        out.extend_from_slice(&frame(&payload));
+        let mut payload = vec![2u8];
+        payload.extend_from_slice(&0u64.to_ne_bytes());
+        out.extend_from_slice(&frame(&payload));
+        out
+    }
+
+    #[tokio::test]
+    async fn a_semantic_early_failure_is_a_committed_loss_and_never_a_replay() {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-wal-semantic-loss-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("semantic-loss.lbug");
+        let previous_model = without_model_env();
+
+        // A store with a checkpointed schema, so the recovery open's
+        // `has_memory_table` is true for reasons unrelated to the WAL.
+        let embed = root.join("embed");
+        std::fs::create_dir_all(&embed).expect("create the embed config dir");
+        std::fs::write(
+            embed.join("embedders.json"),
+            "[{\"model_name\":\"ModelA\",\"dimensions\":8}]",
+        )
+        .expect("write the fixture embedders.json");
+        let creator = LadybugStore::for_testing(&db, 8)
+            .expect("open temp database")
+            .with_embed_config_dir(&embed);
+        creator.init("probe").await.expect("init");
+        drop(creator);
+
+        // A real, checksummed WAL header written by the pinned engine.
+        let cfg = SystemConfig::default()
+            .max_db_size(512 * 1024 * 1024)
+            .buffer_pool_size(64 * 1024 * 1024)
+            .throw_on_wal_replay_failure(true);
+        let raw = Database::new(&db, cfg).expect("raw open to seed the WAL");
+        let conn = Connection::new(&raw).expect("raw connection");
+        conn.query("CREATE (m:Memory {id: 'semantic-0', namespace: 'probe', content: 'row', user_id: '', memory_type: 'fact', agent_name: '', location: '', location_lines: '', metadata: '{}', embedding: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]})")
+            .expect("seed a committed WAL-only row");
+        conn.query("CALL force_checkpoint_on_close=false")
+            .expect("turn off checkpoint on close");
+        drop(conn);
+        drop(raw);
+
+        let seeded = std::fs::read(wal_of(&db)).expect("read the seeded WAL");
+        let header = &seeded[..crate::store::wal_header::WAL_HEADER_CHECKSUMMED_BYTES as usize];
+        let crafted = semantic_loss_wal(header);
+
+        // The scanner's contract on the crafted bytes: a *proven* commit.
+        let scan = scan_wal(&crafted);
+        assert_eq!(scan.commit_evidence(), CommitEvidence::Some);
+        assert!(
+            scan.proved_commit(),
+            "the crafted WAL must prove a committed record"
+        );
+        assert!(
+            !scan.ended_in_checkpoint(),
+            "the crafted WAL must not end in a CHECKPOINT record: that would be \
+             positive evidence of a replay"
+        );
+
+        // The frozen side only: the active WAL is gone.
+        std::fs::remove_file(wal_of(&db)).expect("remove the active WAL");
+        std::fs::write(ckpt_of(&db), &crafted).expect("write the crafted frozen WAL");
+
+        let _wal_env_serial = WAL_ENV_LOCK.lock().await;
+        let previous_wal = allow_unverified_wal_recovery();
+        let result = LadybugStore::for_testing(&db, 8);
+        restore_wal_env(previous_wal);
+        drop(_wal_env_serial);
+
+        let err = match result {
+            Ok(store) => panic!(
+                "a semantic early failure must refuse, not open as {:?} (#228)",
+                store.open_provenance()
+            ),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("committed_lost"),
+            "the verdict must be a committed loss: {err}"
+        );
+        assert!(err.contains("WAL"), "the refusal must name the WAL: {err}");
+        assert!(
+            !err.contains("successful replay"),
+            "the refusal must never claim a replay: {err}"
+        );
+        assert!(
+            !err.contains("Recovered by replaying"),
+            "the refusal must never claim a recovery: {err}"
+        );
+
+        // The frozen WAL survives, byte for byte.
+        assert_eq!(
+            std::fs::read(ckpt_of(&db)).expect("read the frozen WAL"),
+            crafted,
+            "the frozen WAL must be restored with every pre-replay byte (#228)"
         );
 
         let _ = std::fs::remove_dir_all(&root);
