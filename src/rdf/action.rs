@@ -3295,20 +3295,61 @@ pub async fn revert_action(
                     check_target_auth(before_p, &delta.after_id)?;
                 }
 
+                let mut expected_after_payload = delta.after_payload.clone();
+                if expected_after_payload.metadata != current_row.metadata
+                    && expected_after_payload.metadata.is_object()
+                    && (current_row.metadata.get("facets").is_some()
+                        || current_row.metadata.get("facets_bitemporal").is_some())
+                {
+                    let old_entries = expected_after_payload
+                        .metadata
+                        .get("facets_bitemporal")
+                        .and_then(|v| v.as_array());
+                    let new_entries = current_row
+                        .metadata
+                        .get("facets_bitemporal")
+                        .and_then(|v| v.as_array());
+                    let old_len = old_entries.map(|a| a.len()).unwrap_or(0);
+                    let appended_ts = new_entries
+                        .and_then(|arr| arr.get(old_len))
+                        .and_then(|entry| entry.get("valid_from"))
+                        .and_then(|v| v.as_i64());
+                    let retracted_ts =
+                        old_entries.zip(new_entries).and_then(|(old_arr, new_arr)| {
+                            old_arr.iter().zip(new_arr.iter()).find_map(|(o, n)| {
+                                if o.get("valid_to").map(|v| v.is_null()).unwrap_or(true) {
+                                    n.get("valid_to").and_then(|v| v.as_i64())
+                                } else {
+                                    None
+                                }
+                            })
+                        });
+                    let facet_ts = appended_ts
+                        .or(retracted_ts)
+                        .unwrap_or(active_receipt.executed_at);
+                    crate::domain::materialize_facets_bitemporal(
+                        &expected_after_payload.memory_type,
+                        &mut expected_after_payload.metadata,
+                        facet_ts,
+                    );
+                }
+
                 let current_fp =
                     crate::rdf::scenario::fingerprint_live_row(Some(&current_row), now_ts);
-                let expected_after_fp =
-                    crate::rdf::scenario::fingerprint_live_row(Some(&delta.after_payload), now_ts);
+                let expected_after_fp = crate::rdf::scenario::fingerprint_live_row(
+                    Some(&expected_after_payload),
+                    now_ts,
+                );
 
                 if !invocation.force {
                     if !is_active_payload(&current_row, now_ts)
                         || current_fp != expected_after_fp
-                        || current_row.content != delta.after_payload.content
-                        || current_row.memory_type != delta.after_payload.memory_type
-                        || current_row.user_id != delta.after_payload.user_id
-                        || current_row.location != delta.after_payload.location
-                        || current_row.location_lines != delta.after_payload.location_lines
-                        || current_row.metadata != delta.after_payload.metadata
+                        || current_row.content != expected_after_payload.content
+                        || current_row.memory_type != expected_after_payload.memory_type
+                        || current_row.user_id != expected_after_payload.user_id
+                        || current_row.location != expected_after_payload.location
+                        || current_row.location_lines != expected_after_payload.location_lines
+                        || current_row.metadata != expected_after_payload.metadata
                     {
                         let sup = current_row
                             .metadata
@@ -7621,6 +7662,82 @@ mod tests {
             &payload_after_rev2,
             current_action_timestamp()
         ));
+
+        // Simulate a legacy pre-normalization receipt whose embedded delta.after_payload.metadata
+        // lacks "facets" and "facets_bitemporal" even though commit_action_batch materialized them
+        // on the persisted row. Non-forced revert of that receipt must still succeed.
+        let apply3 = apply_action(&store, &inv, &DummyActionEmbedder)
+            .await
+            .expect("apply3");
+        let r3_id = apply3.receipt_id().expect("r3").to_string();
+        let (r3_vec, mut r3_payload) = store
+            .get(ns, &r3_id)
+            .await
+            .unwrap()
+            .expect("r3 receipt row");
+        if let Some(meta_obj) = r3_payload.metadata["action_receipt"]["row_deltas"][0]
+            ["after_payload"]["metadata"]
+            .as_object_mut()
+        {
+            meta_obj.remove("facets");
+            meta_obj.insert(
+                "facets_bitemporal".to_string(),
+                json!([{
+                    "facet": "CustomManualPrior",
+                    "inferred": false,
+                    "valid_from": 100,
+                    "valid_to": null
+                }]),
+            );
+        }
+        let (row_vec, mut row_payload) = store
+            .get(ns, &upsert_row_id)
+            .await
+            .unwrap()
+            .expect("persisted upsert row");
+        if let Some(meta_obj) = row_payload.metadata.as_object_mut() {
+            meta_obj.remove("facets");
+            meta_obj.insert(
+                "facets_bitemporal".to_string(),
+                json!([{
+                    "facet": "CustomManualPrior",
+                    "inferred": false,
+                    "valid_from": 100,
+                    "valid_to": null
+                }]),
+            );
+        }
+        crate::domain::materialize_facets_bitemporal(
+            &row_payload.memory_type,
+            &mut row_payload.metadata,
+            1700000999,
+        );
+        store
+            .upsert(ns, &upsert_row_id, row_vec, row_payload)
+            .await
+            .expect("persist row with historical + newly materialized facets");
+        store
+            .upsert(ns, &r3_id, r3_vec, r3_payload)
+            .await
+            .expect("persist legacy pre-normalization receipt shape");
+
+        let rev3 = revert_action(
+            &store,
+            &RevertInvocation {
+                namespace: ns.to_string(),
+                receipt_id: r3_id,
+                security: ActionSecurityContext {
+                    authenticated_principal: "alice".to_string(),
+                    requested_principal: None,
+                },
+                force: false,
+            },
+            &DummyActionEmbedder,
+        )
+        .await
+        .expect("pre-normalization upsert_memory receipt must remain revertible");
+        assert!(!rev3.forced);
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
