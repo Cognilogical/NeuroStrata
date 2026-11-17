@@ -9027,15 +9027,48 @@ enum WalRole {
 }
 
 impl WalRole {
-    fn on_disk(source: &std::path::Path) -> Self {
-        match (
-            append_suffix(source, ".wal").exists(),
-            append_suffix(source, ".wal.checkpoint").exists(),
-        ) {
-            (true, true) => WalRole::Both,
-            (true, false) => WalRole::Active,
-            (false, true) => WalRole::Frozen,
-            (false, false) => WalRole::None,
+    /// Which WAL sides the store presents on disk right now (#209).
+    ///
+    /// A side is either absent or a regular file. A symlink is not "the WAL
+    /// is somewhere else" -- it is a pointer, and following it would copy
+    /// whatever it points at into the snapshot under the WAL's name (#241).
+    /// A broken symlink is still a symlink, so it is refused rather than
+    /// read as "there is no WAL here" (which would write a manifest
+    /// claiming a role the store does not have). Anything that is not a
+    /// regular file is refused for the same reason.
+    fn on_disk(source: &std::path::Path) -> Result<Self> {
+        let side = |suffix: &str| -> Result<bool> {
+            let path = append_suffix(source, suffix);
+            match std::fs::symlink_metadata(&path) {
+                Ok(meta) => {
+                    let file_type = meta.file_type();
+                    if file_type.is_symlink() {
+                        return Err(anyhow::anyhow!(
+                            "the write-ahead log side {:?} is a symlink; refusing to copy it into the snapshot (#241)",
+                            path
+                        ));
+                    }
+                    if !file_type.is_file() {
+                        return Err(anyhow::anyhow!(
+                            "the write-ahead log side {:?} is not a regular file; refusing to copy it into the snapshot (#241)",
+                            path
+                        ));
+                    }
+                    Ok(true)
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(e) => Err(anyhow::anyhow!(
+                    "could not stat the write-ahead log side {:?}: {}",
+                    path,
+                    e
+                )),
+            }
+        };
+        match (side(".wal")?, side(".wal.checkpoint")?) {
+            (true, true) => Ok(WalRole::Both),
+            (true, false) => Ok(WalRole::Active),
+            (false, true) => Ok(WalRole::Frozen),
+            (false, false) => Ok(WalRole::None),
         }
     }
 
@@ -9137,7 +9170,7 @@ impl LadybugStore {
         // silently dropped. The copies get the same bracket as the database: a
         // WAL copied at a different instant than the database is exactly the
         // tear this snapshot must refuse.
-        let wal_role = WalRole::on_disk(source);
+        let wal_role = WalRole::on_disk(source)?;
         let dest_wal = dir.join("ladybug.store.wal");
         let dest_checkpoint_wal = dir.join("ladybug.store.wal.checkpoint");
         // A member this export does not produce must not survive from an
@@ -9191,7 +9224,7 @@ impl LadybugStore {
         // The pair must not have moved under the copies: if a side appeared
         // or vanished while the snapshot ran, the recorded role describes a
         // different instant than the copied WAL.
-        let wal_role_after = WalRole::on_disk(source);
+        let wal_role_after = WalRole::on_disk(source)?;
         if wal_role_after != wal_role {
             return Err(anyhow::anyhow!(
                 "the write-ahead log role changed during the snapshot copy ({} -> {}); the snapshot is aborted (#209)",
@@ -26912,6 +26945,107 @@ eurostrata\src\daemon.rs",
         assert!(report.integrity_ok);
         assert!(!report.valid, "a --no-open export is uncoordinated (#209)");
         assert_eq!(report.wal_kind.as_deref(), Some("both"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #241: a WAL side that is a symlink is not a WAL side the snapshot may
+    /// copy. `Path::exists` follows links, so a linked `.wal` used to be
+    /// copied -- following the link to whatever it pointed at -- and a broken
+    /// link used to read as "no WAL at all", so the manifest claimed a role
+    /// the store did not have. Both are refused now.
+    #[test]
+    fn a_symlinked_wal_side_is_refused_rather_than_copied() {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-symlinked-wal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("linked.lbug");
+        std::fs::write(&db, b"db-image").unwrap();
+        // The link points at a file that has nothing to do with this store.
+        let outside = root.join("outside-secret");
+        std::fs::write(&outside, b"not-a-wal").unwrap();
+        std::os::unix::fs::symlink(&outside, &append_suffix(&db, ".wal")).unwrap();
+        let out = root.join("snap");
+
+        let err = LadybugStore::export_database_files(&db, &out)
+            .expect_err("a symlinked WAL side is refused (#241)");
+        let message = err.to_string();
+        assert!(
+            message.contains("symlink"),
+            "the refusal names the symlink: {message}"
+        );
+        assert!(
+            !out.join("ladybug.store.wal").exists(),
+            "no WAL is copied out of a symlink (#241)"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #241: a broken symlink is still a symlink. Reading it as "there is no
+    /// WAL here" would write a manifest claiming a role the store does not
+    /// have, so it is refused instead.
+    #[test]
+    fn a_broken_symlinked_wal_side_is_refused() {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-broken-symlinked-wal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("broken.lbug");
+        std::fs::write(&db, b"db-image").unwrap();
+        std::os::unix::fs::symlink(&root.join("nowhere"), &append_suffix(&db, ".wal")).unwrap();
+        let out = root.join("snap");
+
+        let err = LadybugStore::export_database_files(&db, &out)
+            .expect_err("a broken symlinked WAL side is refused (#241)");
+        let message = err.to_string();
+        assert!(
+            message.contains("symlink"),
+            "the refusal names the symlink: {message}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #241: only a regular file is a WAL side. A directory in its place is
+    /// refused, not copied and not reported as absent.
+    #[test]
+    fn a_wal_side_that_is_a_directory_is_refused() {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-dir-wal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("dirish.lbug");
+        std::fs::write(&db, b"db-image").unwrap();
+        std::fs::create_dir_all(append_suffix(&db, ".wal")).unwrap();
+        let out = root.join("snap");
+
+        let err = LadybugStore::export_database_files(&db, &out)
+            .expect_err("a WAL side that is a directory is refused (#241)");
+        let message = err.to_string();
+        assert!(
+            message.contains("not a regular file"),
+            "the refusal names the shape it found: {message}"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
