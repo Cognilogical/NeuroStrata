@@ -1329,6 +1329,70 @@ fn claim_lock(task_id: &str) -> Arc<tokio::sync::Mutex<()>> {
     lock
 }
 
+async fn resolve_task_scope(
+    args: &Value,
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+) -> (std::path::PathBuf, gate::GateScope) {
+    let explicit_root = arg_str(args, "worktree")
+        .or_else(|| arg_str(args, "project_root"))
+        .or_else(|| arg_str(args, "cwd"))
+        .map(std::path::PathBuf::from);
+    let rid = crate::registry::registry_row_id(namespace);
+    let registry_root = if let Ok(Some((_, reg_p))) = store.get(namespace, &rid).await {
+        reg_p
+            .metadata
+            .get("project_root")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(std::path::PathBuf::from)
+    } else {
+        None
+    };
+    let daemon_root = crate::daemon::resolve_project_root();
+
+    let mut candidates = Vec::new();
+    if let Some(r) = explicit_root {
+        candidates.push(r);
+    }
+    if let Some(r) = registry_root {
+        if !candidates.contains(&r) {
+            candidates.push(r);
+        }
+    }
+    if !candidates.contains(&daemon_root) {
+        candidates.push(daemon_root.clone());
+    }
+
+    let mut chosen_root = candidates
+        .first()
+        .cloned()
+        .unwrap_or_else(|| daemon_root.clone());
+    let mut scope = gate::GateScope::default();
+    for cand in &candidates {
+        let captured = gate::GateScope::capture(cand);
+        if captured.branch.is_some() || captured.worktree.is_some() {
+            chosen_root = cand.clone();
+            scope = captured;
+            break;
+        }
+    }
+    if let Some(explicit_branch) = arg_str(args, "branch") {
+        scope.branch = Some(explicit_branch.to_string());
+    }
+    if scope.worktree.is_none() {
+        if let Some(explicit_wt) = arg_str(args, "worktree") {
+            let wt_path = std::path::PathBuf::from(explicit_wt);
+            let canonical = wt_path
+                .canonicalize()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| explicit_wt.to_string());
+            scope.worktree = Some(canonical);
+        }
+    }
+    (chosen_root, scope)
+}
+
 pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> String {
     let id = match required_str(&args, "id") {
         Ok(v) => v.to_string(),
@@ -1394,7 +1458,7 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
             // but not the branch/worktree: backfill what is missing so the
             // strict gate can judge them, persist it, and leave already
             // attributed rows exactly as they are.
-            let scope = gate::GateScope::capture(&crate::daemon::resolve_project_root());
+            let (_, scope) = resolve_task_scope(&args, &store, &namespace).await;
             let obj = task_obj_mut(&mut task.payload);
             let branch_missing = obj
                 .get("branch")
@@ -1496,7 +1560,7 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
         Err(e) => return format!("ERROR: {}", e),
     };
     task = claimed;
-    let scope = gate::GateScope::capture(&crate::daemon::resolve_project_root());
+    let (scope_root, scope) = resolve_task_scope(&args, &store, &namespace).await;
     {
         let obj = task_obj_mut(&mut task.payload);
         obj.insert("assignee".to_string(), json!(assignee));
@@ -1540,7 +1604,7 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
     let event_id = arg_str(&args, "event_id").unwrap_or(&format!("claim-{}", id)).to_string();
     {
         let mut r = TASK_RECEIPTS.lock().unwrap_or_else(|e| e.into_inner());
-        let binding = crate::task::receipt::Receipt::capture(&id, &crate::daemon::resolve_project_root());
+        let binding = crate::task::receipt::Receipt::capture(&id, &scope_root);
         r.record(crate::receipts::store::Receipt {
             session_id: session.clone(),
             task_id: id.clone(),
@@ -1727,8 +1791,7 @@ pub async fn handle_task_update(
                         }
                     }
                     if new_claim {
-                        let scope =
-                            gate::GateScope::capture(&crate::daemon::resolve_project_root());
+                        let (_, scope) = resolve_task_scope(&args, &store, &namespace).await;
                         obj.insert("branch".to_string(), json!(scope.branch));
                         obj.insert("worktree".to_string(), json!(scope.worktree));
                     }
@@ -6156,6 +6219,115 @@ mod tests {
             payload.metadata["task"]["worktree"],
             json!(expected.worktree)
         );
+    }
+
+    #[tokio::test]
+    async fn claim_resolves_scope_from_registry_project_root_and_explicit_worktree() {
+        let _env_guard = crate::daemon::project_root_env_test_lock();
+        let non_git = tempfile::tempdir().unwrap();
+        let git_wt = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-b", "feature/mcp-claim"])
+            .current_dir(git_wt.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        // Point daemon project root at a non-git directory (simulating daemon startup in $HOME),
+        // while registering the namespace's project_root at the actual git worktree.
+        std::env::set_var("NEUROSTRATA_PROJECT_ROOT", non_git.path());
+        let store = store_with_namespace("MyProj").await;
+        let rid = crate::registry::registry_row_id("MyProj");
+        let reg_vec = StubEmbedder.embed("registry").await.unwrap();
+        store
+            .upsert(
+                "MyProj",
+                &rid,
+                reg_vec,
+                MemoryPayload {
+                    content: "registry".to_string(),
+                    user_id: "kenton".to_string(),
+                    memory_type: "structural".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({
+                        "project_root": git_wt.path().to_string_lossy().to_string()
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+
+        let id = create_task(&store, "MyProj", "mcp claimed work", 2).await;
+        let reply = handle_task_claim(
+            json!({
+                "namespace": "MyProj",
+                "id": id,
+                "assignee": "agent-a",
+                "session_id": "ses_mcp"
+            }),
+            store.clone(),
+        )
+        .await;
+        std::env::remove_var("NEUROSTRATA_PROJECT_ROOT");
+        assert!(reply.contains("\"status\": \"in_progress\""), "{}", reply);
+
+        let expected = gate::GateScope::capture(git_wt.path());
+        assert_eq!(expected.branch.as_deref(), Some("feature/mcp-claim"));
+        let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+        assert_eq!(payload.metadata["task"]["branch"], json!(expected.branch));
+        assert_eq!(payload.metadata["task"]["worktree"], json!(expected.worktree));
+
+        // Another worktree pushing its own branch is not blocked by this MCP-claimed task.
+        let other_scope = gate::GateScope {
+            branch: Some("feature/other-wt".to_string()),
+            worktree: Some("/repo/other-wt".to_string()),
+        };
+        let other_report = gate::run_scoped(&store, "MyProj", Some(&other_scope))
+            .await
+            .unwrap();
+        assert!(
+            !other_report.violations.iter().any(|v| v.kind == "in_progress"),
+            "other worktree must not be blocked: {:?}",
+            other_report.violations
+        );
+    }
+
+    #[test]
+    fn zero_action_exempt_shell_payload_allows_git_push_and_rejects_mutations() {
+        assert!(crate::server::is_zero_action_exempt_shell_payload(
+            "bash",
+            "git push -u origin fix/task-claim-push-scope"
+        ));
+        assert!(crate::server::is_zero_action_exempt_shell_payload(
+            "bash",
+            "CARGO_TARGET_DIR=/tmp/target git push -u origin main && git status -s"
+        ));
+        assert!(crate::server::is_zero_action_exempt_shell_payload(
+            "shell",
+            "git pull --rebase && git push && git status"
+        ));
+        assert!(crate::server::is_zero_action_exempt_shell_payload(
+            "bash",
+            "neurostrata-mcp task gate NeuroStrata --strict"
+        ));
+        assert!(!crate::server::is_zero_action_exempt_shell_payload(
+            "bash",
+            "git commit -m 'mutate history'"
+        ));
+        assert!(!crate::server::is_zero_action_exempt_shell_payload(
+            "bash",
+            "git push && rm -rf src"
+        ));
+        assert!(!crate::server::is_zero_action_exempt_shell_payload(
+            "bash",
+            "git push > /tmp/pwn"
+        ));
+        assert!(!crate::server::is_zero_action_exempt_shell_payload(
+            "edit",
+            "git push"
+        ));
     }
 
     #[tokio::test]

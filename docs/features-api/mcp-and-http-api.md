@@ -22,11 +22,12 @@
 - `neurostrata_task_create` — create a new task.
 - `neurostrata_task_list` — list tasks.
 - `neurostrata_task_get` — retrieve a single task.
-- `neurostrata_task_claim` — claim exclusivity over a task.
+- `neurostrata_task_claim` — claim exclusivity over a task and stamp caller `worktree`/`branch` scope (from explicit `worktree`/`branch`/`project_root` arguments or the namespace's registered `project_root`).
 - `neurostrata_task_update` — update status/notes on a task.
 - `neurostrata_task_complete` — finish a task (requires extracted memory → Lock 2).
 - `neurostrata_task_validate` — advisory gate report for a task.
 - `neurostrata_procedure_perform` — fire a recurring procedure.
+- `neurostrata_guard_validate` — validate PreToolUse actions against behavioral rules and Zero-Action Start (`git push`/`pull`/`fetch`/`status`/`log`/`diff`/`show`/`rev-parse` and `neurostrata-mcp task` commands are exempt from requiring an `in_progress` task so post-completion pushes pass without skipping the gate).
 
 ## Code Intelligence & SCIP Call-Graph Tools
 
