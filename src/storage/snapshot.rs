@@ -1815,7 +1815,8 @@ mod tests {
         let d = temp_dir("wal-future-age");
         let wal = d.join("ladybug.store.wal");
         fs::write(&wal, b"wal-bytes").unwrap();
-        let file = File::open(&wal).unwrap();
+        // Setting a time needs write access on Windows.
+        let file = File::options().write(true).open(&wal).unwrap();
         let future = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
         file.set_times(fs::FileTimes::new().set_modified(future)).unwrap();
         drop(file);

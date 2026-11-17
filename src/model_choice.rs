@@ -2054,6 +2054,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_broken_symlinked_sidecar_reads_as_unparseable_not_absent() {
         // #241: a dangling symlink is a sidecar that is present and cannot
