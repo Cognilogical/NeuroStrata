@@ -4,7 +4,7 @@ use crate::traits::{Embedder, MemoryPayload, VectorStore};
 use ignore::WalkBuilder;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tree_sitter::{Parser, Query, StreamingIterator};
@@ -564,6 +564,59 @@ enum IngestItem {
     },
 }
 
+/// How many refusal reasons the generation summary carries. The count of
+/// refusals is exact; only the samples are capped.
+const MAX_DEGRADED_EMBED_SAMPLES: usize = 8;
+
+/// The embeddings a provider refused during one generation.
+///
+/// A refusal is a warning, not an abort: the refused item is skipped and the
+/// generation continues. The tally is what the generation summary reports --
+/// the exact count, plus the first few reasons so an operator can see why
+/// the provider said no.
+#[derive(Debug, Default)]
+struct DegradedEmbeddings {
+    count: usize,
+    samples: Vec<String>,
+}
+
+impl DegradedEmbeddings {
+    /// Folds one batch outcome into the tally.
+    fn note(&mut self, outcome: &crate::traits::BatchEmbedOutcome) {
+        self.count += outcome.embeddings.iter().filter(|e| e.is_none()).count();
+        for reason in &outcome.warnings {
+            if self.samples.len() < MAX_DEGRADED_EMBED_SAMPLES {
+                self.samples.push(reason.clone());
+            }
+        }
+    }
+
+    /// The summary block for the generation, or `None` when nothing was
+    /// refused.
+    fn summary(&self) -> Option<String> {
+        if self.count == 0 {
+            return None;
+        }
+        let mut out = format!(
+            "WARNING: {} embedding(s) were refused by the embedder and skipped; the generation continued without them.\n",
+            self.count
+        );
+        for reason in &self.samples {
+            out.push_str(&format!("  - {}\n", reason));
+        }
+        Some(out)
+    }
+}
+
+/// What the consumer reports back to the producer.
+struct ConsumerOutcome {
+    /// Items that were not a bare directory node.
+    content_items: usize,
+    staged_symbols: Vec<StagedSymbolInfo>,
+    /// The embeddings the provider refused.
+    degraded: DegradedEmbeddings,
+}
+
 /// Secret scan over a document's text, run in the producer as the file is
 /// read — before any part of the document reaches the store. The verdict
 /// text is the reason the skip reports.
@@ -795,6 +848,303 @@ fn process_walked_entry(
     })
 }
 
+/// The most results the ingest may hold between the workers and the replay.
+///
+/// A worker may not start an index that is more than this many indices ahead
+/// of the replay, so the reorder buffer (and the channel behind it) holds a
+/// bounded number of results however large the tree is. The window is wide
+/// enough to keep every worker busy and narrow enough to bound the memory.
+const INGEST_REPLAY_WINDOW: usize = 64;
+
+/// What one streaming run cost.
+#[derive(Debug, Default, Clone, Copy)]
+struct StreamStats {
+    /// The most results that were held between a worker and the replay at one
+    /// time. It never exceeds the window: that is the bound the run promises.
+    peak_buffered: usize,
+}
+
+/// Runs `process` over `0..total` on a bounded worker pool and calls `replay`
+/// once per index, in index order.
+///
+/// The run has three moving parts:
+///
+/// * the workers hand their results back over a bounded channel, so a slow
+///   replay slows the workers down instead of growing an unbounded queue;
+/// * a worker may not start an index that is more than `window` indices ahead
+///   of the replay, so the reorder buffer holds at most `window` results;
+/// * `replay` is called in index order, so the side effects land in the same
+///   order a sequential run would put them in -- the determinism contract
+///   does not depend on the parallelism.
+///
+/// `make_process` builds one worker-local processor (the tree-sitter parser
+/// cache is per worker), and a worker that panics does not take the run with
+/// it: the panic becomes that entry's error, so the replay sees it in order
+/// like any other failure.
+fn stream_in_walk_order<T: Send, P>(
+    total: usize,
+    worker_count: usize,
+    window: usize,
+    make_process: impl Fn() -> P + Sync,
+    mut replay: impl FnMut(usize, anyhow::Result<T>) -> anyhow::Result<()>,
+) -> anyhow::Result<StreamStats>
+where
+    P: FnMut(usize) -> anyhow::Result<T> + Send,
+{
+    if total == 0 {
+        return Ok(StreamStats::default());
+    }
+    let window = window.max(1);
+    let worker_count = worker_count.max(1);
+    let next_idx = AtomicUsize::new(0);
+    // The index the replay takes next. A worker waits until its own index is
+    // within `window` of this one.
+    let position = std::sync::Mutex::new(0usize);
+    let advanced = std::sync::Condvar::new();
+    // Set when the replay gives up: the workers waiting for the replay to
+    // catch up must be woken, or the run would wait for a replay that will
+    // never come.
+    let aborted = AtomicBool::new(false);
+    // The results that are produced but not yet replayed.
+    let buffered = AtomicUsize::new(0);
+    let peak = AtomicUsize::new(0);
+    let (result_tx, result_rx) =
+        std::sync::mpsc::sync_channel::<(usize, anyhow::Result<T>)>(window);
+
+    std::thread::scope(|scope| -> anyhow::Result<()> {
+        for _ in 0..worker_count {
+            let result_tx = result_tx.clone();
+            let next_idx = &next_idx;
+            let position = &position;
+            let advanced = &advanced;
+            let aborted = &aborted;
+            let buffered = &buffered;
+            let peak = &peak;
+            let make_process = &make_process;
+            scope.spawn(move || {
+                let mut process = make_process();
+                loop {
+                    let idx = next_idx.fetch_add(1, Ordering::Relaxed);
+                    if idx >= total {
+                        break;
+                    }
+                    // Backpressure: do not run more than `window` indices
+                    // ahead of the replay.
+                    {
+                        let mut pos = position.lock().expect("replay position mutex");
+                        while idx >= *pos + window {
+                            if aborted.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            pos = advanced.wait(pos).expect("replay position mutex");
+                        }
+                        if aborted.load(Ordering::Relaxed) {
+                            break;
+                        }
+                    }
+                    // A panicking worker must not take the whole run with it:
+                    // the panic becomes this entry's error, and the replay
+                    // reports it in order like any other failure.
+                    let res =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| process(idx)))
+                            .unwrap_or_else(|_| {
+                                Err(anyhow::anyhow!(
+                                    "ingest worker panicked while processing index {}",
+                                    idx
+                                ))
+                            });
+                    let live = buffered.fetch_add(1, Ordering::Relaxed) + 1;
+                    peak.fetch_max(live, Ordering::Relaxed);
+                    if result_tx.send((idx, res)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        // The scope's own sender goes away: the channel closes when the
+        // workers are done.
+        drop(result_tx);
+
+        let mut buffer: std::collections::BTreeMap<usize, anyhow::Result<T>> =
+            std::collections::BTreeMap::new();
+        let mut next = 0usize;
+        let mut outcome: anyhow::Result<()> = Ok(());
+        while let Ok((idx, res)) = result_rx.recv() {
+            buffer.insert(idx, res);
+            while let Some(res) = buffer.remove(&next) {
+                if let Err(e) = replay(next, res) {
+                    // The replay is done: wake the workers that are waiting
+                    // for it, so the run can end instead of waiting for a
+                    // replay that will never come.
+                    outcome = Err(e);
+                    aborted.store(true, Ordering::Relaxed);
+                    advanced.notify_all();
+                    break;
+                }
+                next += 1;
+                buffered.fetch_sub(1, Ordering::Relaxed);
+                let mut pos = position.lock().expect("replay position mutex");
+                *pos = next;
+                advanced.notify_all();
+            }
+            if outcome.is_err() {
+                break;
+            }
+        }
+        if let Err(e) = outcome {
+            return Err(e);
+        }
+        if !buffer.is_empty() {
+            anyhow::bail!(
+                "ingest replay ended with {} result(s) that never arrived in order",
+                buffer.len()
+            );
+        }
+        Ok(())
+    })?;
+
+    Ok(StreamStats {
+        peak_buffered: peak.load(Ordering::Relaxed),
+    })
+}
+
+/// The state the deterministic replay writes into.
+///
+/// The replay applies the side effects of the processed entries in walk
+/// order. The state is threaded through explicitly rather than captured by a
+/// closure, so the replay is a plain function that a test can drive
+/// directly.
+struct ReplayState<'a> {
+    /// The walk, in the order the entries were found.
+    entries: &'a [WalkedEntry],
+    /// Every path this walk visited.
+    current_paths: &'a mut std::collections::HashSet<String>,
+    /// What kind of node each visited path is.
+    current_kinds: &'a mut std::collections::HashMap<String, String>,
+    /// The content hash of each visited file.
+    current_hashes: &'a mut std::collections::HashMap<String, String>,
+    /// The imports each file declared, before they are resolved.
+    raw_imports: &'a mut std::collections::HashMap<String, Vec<String>>,
+    /// The consumer the replay feeds.
+    tx: &'a mpsc::Sender<IngestItem>,
+    /// The optional observer.
+    observer: &'a Option<std::sync::Arc<dyn IngestObserver>>,
+}
+
+/// Applies one processed entry's side effects, in walk order.
+///
+/// The path and the kind are recorded before the result is unwrapped, so a
+/// failed entry still leaves the walk's shape behind; the failure itself
+/// aborts the replay, exactly as it aborted the sequential replay before.
+fn replay_processed_entry(
+    state: &mut ReplayState<'_>,
+    idx: usize,
+    result: anyhow::Result<ProcessedEntry>,
+) -> anyhow::Result<()> {
+    let entry = &state.entries[idx];
+    state.current_paths.insert(entry.node_path.clone());
+    state
+        .current_kinds
+        .insert(entry.node_path.clone(), entry.mem_type.clone());
+
+    let processed = result?;
+
+    match processed {
+        ProcessedEntry::Directory => {
+            if let Err(e) = state.tx.blocking_send(IngestItem::NodeUpsert {
+                node_id: entry.node_id.clone(),
+                node_path: entry.node_path.clone(),
+                contained_by: entry.contained_by.clone(),
+                mem_type: entry.mem_type.clone(),
+                abs_path: entry.abs_path.clone(),
+                file_sha256: None,
+            }) {
+                return Err(anyhow::anyhow!("ingest consumer dropped: {}", e));
+            }
+        }
+        ProcessedEntry::UnchangedFile { file_sha256 } => {
+            state
+                .current_hashes
+                .insert(entry.node_path.clone(), file_sha256);
+            if let Some(obs) = &state.observer {
+                obs.file_skipped(&entry.path_str, "unchanged");
+            }
+        }
+        ProcessedEntry::SecretSkipped {
+            reason,
+            had_previous,
+            file_sha256,
+        } => {
+            state
+                .current_hashes
+                .insert(entry.node_path.clone(), file_sha256);
+            if !had_previous {
+                state.current_paths.remove(&entry.node_path);
+                state.current_kinds.remove(&entry.node_path);
+            }
+            if let Err(e) = state.tx.blocking_send(IngestItem::SkippedFile {
+                path_display: entry.path_str.clone(),
+                reason,
+                had_previous,
+            }) {
+                return Err(anyhow::anyhow!("ingest consumer dropped: {}", e));
+            }
+        }
+        ProcessedEntry::ParsedFile {
+            file_sha256,
+            doc_sections,
+            symbols,
+            imports,
+            lang_name,
+        } => {
+            state
+                .current_hashes
+                .insert(entry.node_path.clone(), file_sha256.clone());
+
+            if let Err(e) = state.tx.blocking_send(IngestItem::NodeUpsert {
+                node_id: entry.node_id.clone(),
+                node_path: entry.node_path.clone(),
+                contained_by: entry.contained_by.clone(),
+                mem_type: entry.mem_type.clone(),
+                abs_path: entry.abs_path.clone(),
+                file_sha256: Some(file_sha256.clone()),
+            }) {
+                return Err(anyhow::anyhow!("ingest consumer dropped: {}", e));
+            }
+
+            if !doc_sections.is_empty() {
+                if let Err(e) = state.tx.blocking_send(IngestItem::DocSections {
+                    node_path: entry.node_path.clone(),
+                    sections: doc_sections,
+                    file_sha256: file_sha256.clone(),
+                }) {
+                    return Err(anyhow::anyhow!("ingest consumer dropped: {}", e));
+                }
+            }
+
+            if !imports.is_empty() {
+                state.raw_imports.insert(entry.node_path.clone(), imports);
+            }
+
+            if !symbols.is_empty() {
+                if let Some(ln) = lang_name {
+                    let path_display = entry.path_str.clone();
+                    if let Err(e) = state.tx.blocking_send(IngestItem::ParsedSymbols {
+                        node_path: entry.node_path.clone(),
+                        lang_name: ln,
+                        symbols,
+                        path_display,
+                        file_sha256: file_sha256.clone(),
+                    }) {
+                        return Err(anyhow::anyhow!("ingest consumer dropped: {}", e));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Blocking producer: walks the directory tree, reads files, parses ASTs,
 /// and streams owned results through `tx`. Runs on the blocking thread pool
 /// so filesystem I/O never stalls the async runtime.
@@ -954,137 +1304,51 @@ fn run_producer(
         });
     }
 
-    // Process entries in parallel across a bounded worker pool.
+    // Process the entries in parallel and replay their side effects in
+    // deterministic walk order. The stream is bounded: a worker may not run
+    // more than `INGEST_REPLAY_WINDOW` indices ahead of the replay, so the
+    // reorder buffer holds a bounded number of results however large the tree
+    // is.
     let worker_count = ingest_worker_count(entries.len());
-    let next_idx = AtomicUsize::new(0);
-    let results: std::sync::Mutex<Vec<(usize, Result<ProcessedEntry, anyhow::Error>)>> =
-        std::sync::Mutex::new(Vec::new());
-
-    std::thread::scope(|s| {
-        for _ in 0..worker_count {
-            s.spawn(|| {
-                let mut parsers_by_lang: HashMap<String, Parser> = HashMap::new();
-                loop {
-                    let idx = next_idx.fetch_add(1, Ordering::Relaxed);
-                    if idx >= entries.len() {
-                        break;
-                    }
-                    let entry = &entries[idx];
-                    let res = process_walked_entry(
-                        entry,
-                        &ext_to_lang,
-                        &schema,
-                        &compiled_queries,
-                        &prev_file_map,
-                        force_reparse,
-                        &mut parsers_by_lang,
-                    );
-                    results.lock().unwrap().push((idx, res));
-                }
-            });
-        }
-    });
-
-    let mut sorted_results = results.into_inner().unwrap();
-    sorted_results.sort_by_key(|(idx, _)| *idx);
-    let processed_results: Vec<Result<ProcessedEntry, anyhow::Error>> =
-        sorted_results.into_iter().map(|(_, r)| r).collect();
-
-    // Replay side effects in deterministic walk order.
-    for (entry, result) in entries.iter().zip(processed_results.into_iter()) {
-        current_paths.insert(entry.node_path.clone());
-        current_kinds.insert(entry.node_path.clone(), entry.mem_type.clone());
-
-        let processed = result?;
-
-        match processed {
-            ProcessedEntry::Directory => {
-                if let Err(e) = tx.blocking_send(IngestItem::NodeUpsert {
-                    node_id: entry.node_id.clone(),
-                    node_path: entry.node_path.clone(),
-                    contained_by: entry.contained_by.clone(),
-                    mem_type: entry.mem_type.clone(),
-                    abs_path: entry.abs_path.clone(),
-                    file_sha256: None,
-                }) {
-                    return Err(anyhow::anyhow!("ingest consumer dropped: {}", e));
-                }
+    let entries_ref = &entries;
+    let ext_to_lang_ref = &ext_to_lang;
+    let schema_ref = &schema;
+    let compiled_queries_ref = &compiled_queries;
+    let prev_file_map_ref = &prev_file_map;
+    let mut replay_state = ReplayState {
+        entries: &entries,
+        current_paths: &mut current_paths,
+        current_kinds: &mut current_kinds,
+        current_hashes: &mut current_hashes,
+        raw_imports: &mut raw_imports,
+        tx: &tx,
+        observer: &observer,
+    };
+    let stats = stream_in_walk_order(
+        entries.len(),
+        worker_count,
+        INGEST_REPLAY_WINDOW,
+        || {
+            let mut parsers_by_lang: HashMap<String, Parser> = HashMap::new();
+            move |idx: usize| {
+                process_walked_entry(
+                    &entries_ref[idx],
+                    ext_to_lang_ref,
+                    schema_ref,
+                    compiled_queries_ref,
+                    prev_file_map_ref,
+                    force_reparse,
+                    &mut parsers_by_lang,
+                )
             }
-            ProcessedEntry::UnchangedFile { file_sha256 } => {
-                current_hashes.insert(entry.node_path.clone(), file_sha256);
-                if let Some(obs) = &observer {
-                    obs.file_skipped(&entry.path_str, "unchanged");
-                }
-            }
-            ProcessedEntry::SecretSkipped {
-                reason,
-                had_previous,
-                file_sha256,
-            } => {
-                current_hashes.insert(entry.node_path.clone(), file_sha256);
-                if !had_previous {
-                    current_paths.remove(&entry.node_path);
-                    current_kinds.remove(&entry.node_path);
-                }
-                if let Err(e) = tx.blocking_send(IngestItem::SkippedFile {
-                    path_display: entry.path_str.clone(),
-                    reason,
-                    had_previous,
-                }) {
-                    return Err(anyhow::anyhow!("ingest consumer dropped: {}", e));
-                }
-            }
-            ProcessedEntry::ParsedFile {
-                file_sha256,
-                doc_sections,
-                symbols,
-                imports,
-                lang_name,
-            } => {
-                current_hashes.insert(entry.node_path.clone(), file_sha256.clone());
-
-                if let Err(e) = tx.blocking_send(IngestItem::NodeUpsert {
-                    node_id: entry.node_id.clone(),
-                    node_path: entry.node_path.clone(),
-                    contained_by: entry.contained_by.clone(),
-                    mem_type: entry.mem_type.clone(),
-                    abs_path: entry.abs_path.clone(),
-                    file_sha256: Some(file_sha256.clone()),
-                }) {
-                    return Err(anyhow::anyhow!("ingest consumer dropped: {}", e));
-                }
-
-                if !doc_sections.is_empty() {
-                    if let Err(e) = tx.blocking_send(IngestItem::DocSections {
-                        node_path: entry.node_path.clone(),
-                        sections: doc_sections,
-                        file_sha256: file_sha256.clone(),
-                    }) {
-                        return Err(anyhow::anyhow!("ingest consumer dropped: {}", e));
-                    }
-                }
-
-                if !imports.is_empty() {
-                    raw_imports.insert(entry.node_path.clone(), imports);
-                }
-
-                if !symbols.is_empty() {
-                    if let Some(ln) = lang_name {
-                        let path_display = entry.path_str.clone();
-                        if let Err(e) = tx.blocking_send(IngestItem::ParsedSymbols {
-                            node_path: entry.node_path.clone(),
-                            lang_name: ln,
-                            symbols,
-                            path_display,
-                            file_sha256: file_sha256.clone(),
-                        }) {
-                            return Err(anyhow::anyhow!("ingest consumer dropped: {}", e));
-                        }
-                    }
-                }
-            }
-        }
-    }
+        },
+        |idx, result| replay_processed_entry(&mut replay_state, idx, result),
+    )?;
+    drop(replay_state);
+    tracing::debug!(
+        peak_buffered = stats.peak_buffered,
+        "ingest replay stream drained"
+    );
 
     if unreadable > 0 {
         eprintln!(
@@ -1133,11 +1397,13 @@ async fn run_consumer(
     source_identity: serde_json::Value,
     ingest_version: &str,
     node_set: &[String],
-) -> anyhow::Result<(usize, Vec<StagedSymbolInfo>)> {
+) -> anyhow::Result<ConsumerOutcome> {
     // Items that are not a bare directory node: a file, section or symbol was
     // read again, so this walk changed something.
     let mut content_items = 0usize;
     let mut staged_symbols = Vec::new();
+    // The embeddings the provider refused: a warning, not an abort.
+    let mut degraded = DegradedEmbeddings::default();
     while let Some(item) = rx.recv().await {
         // A SkippedFile counts only when it replaced previous-generation rows;
         // a never-indexed skip is not content and must not defeat `unchanged`.
@@ -1227,20 +1493,27 @@ async fn run_consumer(
                             )
                         })
                         .collect();
-                    let embeddings = embedder
-                        .embed_batch(&summaries)
+                    let outcome = embedder
+                        .embed_batch_degradable(&summaries)
                         .await
                         .map_err(|e| anyhow::anyhow!("failed to embed symbol batch: {}", e))?;
-                    if embeddings.len() != summaries.len() {
+                    if outcome.embeddings.len() != summaries.len() {
                         anyhow::bail!(
                             "embedder returned {} embeddings for {} symbols",
-                            embeddings.len(),
+                            outcome.embeddings.len(),
                             summaries.len()
                         );
                     }
+                    degraded.note(&outcome);
                     for ((symbol, summary), embedding) in
-                        symbols.into_iter().zip(summaries).zip(embeddings)
+                        symbols.into_iter().zip(summaries).zip(outcome.embeddings)
                     {
+                        // A provider refusal is a warning, not an abort: the
+                        // item is skipped and the generation continues.
+                        let embedding = match embedding {
+                            Some(embedding) => embedding,
+                            None => continue,
+                        };
                         let id = generation_scoped_id(
                             namespace,
                             generation,
@@ -1377,20 +1650,28 @@ async fn run_consumer(
                         .iter()
                         .map(|c| truncate_for_embedding(c))
                         .collect();
-                    let embeddings = embedder
-                        .embed_batch(&embed_inputs)
+                    let outcome = embedder
+                        .embed_batch_degradable(&embed_inputs)
                         .await
                         .map_err(|e| anyhow::anyhow!("failed to embed doc section batch: {}", e))?;
-                    if embeddings.len() != full_contents.len() {
+                    if outcome.embeddings.len() != full_contents.len() {
                         anyhow::bail!(
                             "embedder returned {} embeddings for {} doc sections",
-                            embeddings.len(),
+                            outcome.embeddings.len(),
                             full_contents.len()
                         );
                     }
-                    for ((section, summary), embedding) in
-                        sections.into_iter().zip(full_contents).zip(embeddings)
+                    degraded.note(&outcome);
+                    for ((section, summary), embedding) in sections
+                        .into_iter()
+                        .zip(full_contents)
+                        .zip(outcome.embeddings)
                     {
+                        // A provider refusal is a warning, not an abort.
+                        let embedding = match embedding {
+                            Some(embedding) => embedding,
+                            None => continue,
+                        };
                         let id = generation_scoped_id(
                             namespace,
                             generation,
@@ -1452,7 +1733,11 @@ async fn run_consumer(
         }
     }
 
-    Ok((content_items, staged_symbols))
+    Ok(ConsumerOutcome {
+        content_items,
+        staged_symbols,
+        degraded,
+    })
 }
 
 pub async fn ingest_directory(
@@ -1685,11 +1970,13 @@ pub async fn ingest_directory(
     let mut dependency_map: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
     let mut staged_symbols: Vec<StagedSymbolInfo> = Vec::new();
+    let mut degraded_embeddings = DegradedEmbeddings::default();
     let mut content_items = usize::MAX;
     let failure: Option<anyhow::Error> = match (consumer_result, producer_result) {
-        (Ok((items, symbols)), Ok(Ok((paths, hashes, deps, kinds)))) => {
-            content_items = items;
-            staged_symbols = symbols;
+        (Ok(outcome), Ok(Ok((paths, hashes, deps, kinds)))) => {
+            content_items = outcome.content_items;
+            staged_symbols = outcome.staged_symbols;
+            degraded_embeddings = outcome.degraded;
             current_paths = paths;
             current_hashes = hashes;
             dependency_map = deps;
@@ -1722,6 +2009,13 @@ pub async fn ingest_directory(
             tracing::warn!("enrichment registry update failed: {e}");
         }
         return Err(e);
+    }
+
+    // The generation summary: the embeddings the provider refused. A refusal
+    // is a warning, not an abort -- the generation continued without those
+    // items, and the operator has to know which ones are missing.
+    if let Some(summary) = degraded_embeddings.summary() {
+        println!("{}", summary.trim_end());
     }
 
     // Nothing to publish: no file or section was read again, and the walk found
@@ -3660,6 +3954,250 @@ mod tests {
         assert!(ingest_worker_count(3) <= 3);
         assert!(ingest_worker_count(100) <= 8);
         assert!(ingest_worker_count(100) >= 1);
+    }
+
+    /// The streaming producer replays the processed entries in walk order,
+    /// however the workers happen to finish, and the replayed values are the
+    /// ones a sequential run would produce.
+    #[test]
+    fn the_ingest_stream_replays_in_index_order() {
+        let total = 64usize;
+        let window = 8usize;
+        let mut replayed: Vec<usize> = Vec::new();
+        let mut values: Vec<usize> = Vec::new();
+        let stats = stream_in_walk_order(
+            total,
+            4,
+            window,
+            || {
+                move |idx: usize| -> anyhow::Result<usize> {
+                    // The lower indices finish last, so the workers complete
+                    // out of order.
+                    std::thread::sleep(std::time::Duration::from_micros((total - idx) as u64));
+                    Ok(idx * 2)
+                }
+            },
+            |idx, result| {
+                replayed.push(idx);
+                values.push(result?);
+                Ok(())
+            },
+        )
+        .expect("the stream completes");
+        assert_eq!(
+            replayed,
+            (0..total).collect::<Vec<_>>(),
+            "the replay runs in index order"
+        );
+        assert_eq!(
+            values,
+            (0..total).map(|i| i * 2).collect::<Vec<_>>(),
+            "the replayed values are the ones a sequential run produces"
+        );
+        assert!(
+            stats.peak_buffered <= window,
+            "the stream held {} results, the window is {}",
+            stats.peak_buffered,
+            window
+        );
+    }
+
+    /// The stream bounds what it holds: no more than the window of results
+    /// are ever in flight between the workers and the replay, however large
+    /// the tree is.
+    #[test]
+    fn the_ingest_stream_bounds_what_it_holds() {
+        let total = 500usize;
+        let window = 16usize;
+        let stats = stream_in_walk_order(
+            total,
+            8,
+            window,
+            || move |idx: usize| -> anyhow::Result<usize> { Ok(idx) },
+            |_idx, _res| Ok(()),
+        )
+        .expect("the stream completes");
+        assert!(
+            stats.peak_buffered <= window,
+            "the stream held {} results, the window is {}",
+            stats.peak_buffered,
+            window
+        );
+    }
+
+    /// A worker that panics does not take the run with it: the panic becomes
+    /// that entry's error, and the rest of the run still lands in order.
+    #[test]
+    fn a_panicking_worker_becomes_that_entrys_error() {
+        let total = 32usize;
+        let mut errors: Vec<(usize, String)> = Vec::new();
+        let mut landed = 0usize;
+        stream_in_walk_order(
+            total,
+            4,
+            8,
+            || {
+                move |idx: usize| -> anyhow::Result<usize> {
+                    if idx == 7 {
+                        panic!("worker panic at index {idx}");
+                    }
+                    Ok(idx)
+                }
+            },
+            |idx, result| {
+                match result {
+                    Ok(_) => landed += 1,
+                    Err(e) => errors.push((idx, e.to_string())),
+                }
+                Ok(())
+            },
+        )
+        .expect("the run completes despite the panic");
+        assert_eq!(errors.len(), 1, "one entry failed");
+        assert_eq!(
+            errors[0].0, 7,
+            "the entry that panicked is the one that failed"
+        );
+        assert!(
+            errors[0].1.contains("panicked"),
+            "the error names the panic: {}",
+            errors[0].1
+        );
+        assert_eq!(landed, total - 1, "every other entry still landed");
+    }
+
+    /// A replay that fails ends the run instead of waiting for a replay that
+    /// will never come.
+    #[test]
+    fn a_failing_replay_ends_the_stream() {
+        let err = stream_in_walk_order(
+            64usize,
+            4,
+            8,
+            || move |idx: usize| -> anyhow::Result<usize> { Ok(idx) },
+            |idx, _res| {
+                if idx == 3 {
+                    anyhow::bail!("replay refused index 3");
+                }
+                Ok(())
+            },
+        )
+        .expect_err("the replay failure ends the stream");
+        assert!(
+            err.to_string().contains("replay refused"),
+            "the error is the replay's own: {err}"
+        );
+    }
+
+    /// The refusal tally counts every refused embedding and keeps a bounded
+    /// number of reasons, so the summary stays readable however many items
+    /// the provider refused.
+    #[test]
+    fn degraded_embeddings_count_the_refusals_and_cap_the_samples() {
+        let mut degraded = DegradedEmbeddings::default();
+        assert!(
+            degraded.summary().is_none(),
+            "nothing refused, nothing said"
+        );
+
+        let outcome = crate::traits::BatchEmbedOutcome {
+            embeddings: vec![Some(vec![0.0; 4]), None, None],
+            warnings: (0..20).map(|i| format!("refusal {i}")).collect(),
+        };
+        degraded.note(&outcome);
+        assert_eq!(degraded.count, 2, "both refusals are counted");
+        assert_eq!(
+            degraded.samples.len(),
+            MAX_DEGRADED_EMBED_SAMPLES,
+            "the reasons are sampled"
+        );
+        let summary = degraded.summary().expect("the summary names the refusals");
+        assert!(
+            summary.contains("2 embedding(s) were refused"),
+            "the summary counts the refusals: {summary}"
+        );
+        assert!(
+            summary.contains("refusal 0"),
+            "the summary carries the reasons: {summary}"
+        );
+    }
+
+    /// Refuses the first item of every batch and embeds the rest.
+    struct RefusingEmbedder;
+
+    #[async_trait::async_trait]
+    impl Embedder for RefusingEmbedder {
+        async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            Ok(vec![0.0; 4])
+        }
+
+        async fn embed_batch_degradable(
+            &self,
+            texts: &[String],
+        ) -> anyhow::Result<crate::traits::BatchEmbedOutcome> {
+            let mut embeddings: Vec<Option<Vec<f32>>> =
+                texts.iter().map(|_| Some(vec![0.0; 4])).collect();
+            if let Some(first) = embeddings.first_mut() {
+                *first = None;
+            }
+            Ok(crate::traits::BatchEmbedOutcome {
+                embeddings,
+                warnings: vec![
+                    "remote embedding refused one input (413): payload too large".to_string(),
+                ],
+            })
+        }
+
+        fn dimensions(&self) -> usize {
+            4
+        }
+    }
+
+    /// A provider that refuses one item does not cost the generation: the
+    /// refused item is skipped, the rest of the generation lands, and the
+    /// ingest reports the refusal instead of failing.
+    #[tokio::test]
+    async fn ingest_skips_a_refused_embedding_and_keeps_the_rest() {
+        let tmp = std::env::temp_dir().join(format!("ns-degraded-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        std::fs::write(tmp.join("lib.rs"), "pub fn alpha() {}\npub fn beta() {}\n")
+            .expect("write rust file");
+        let db = std::env::temp_dir().join(format!("ns-degraded-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("degraded-ns").await.expect("create the schema");
+        let schema =
+            ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        ingest_directory(
+            &tmp,
+            &schema,
+            Arc::new(RefusingEmbedder),
+            store.clone(),
+            "degraded-ns",
+            None,
+            &[],
+        )
+        .await
+        .expect("a refused embedding does not fail the ingest");
+
+        let rows = store.list("degraded-ns", None, None).await.expect("list");
+        let symbols: Vec<String> = rows
+            .iter()
+            .filter(|r| r.payload.memory_type == "code_ast")
+            .map(|r| r.payload.content.clone())
+            .collect();
+        assert_eq!(
+            symbols.len(),
+            1,
+            "the refused symbol is skipped, the other one lands: {symbols:?}"
+        );
+        assert!(
+            symbols[0].contains("beta"),
+            "the symbol that was embedded is the one that landed: {symbols:?}"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
     }
 
     #[test]

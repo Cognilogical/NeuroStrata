@@ -7,6 +7,16 @@ The `Embedder` trait is the pluggable interface for embedding generation. Implem
 - `fn embed_text(&self, text: &str) -> Vec<f32>` — embed a single string
 - `fn embed_batch(&self, texts: &[&str]) -> Vec<Vec<f32>>` — batch embedding
 
+### Degradable batch embedding
+
+`embed_batch` is all-or-nothing: one refused input fails the batch. A provider that can refuse a *single* input (an oversized or malformed item answered with `400`/`413`) instead implements the optional seam
+
+- `async fn embed_batch_degradable(&self, texts: &[String]) -> Result<BatchEmbedOutcome>` — a batch embed that may degrade item by item
+
+`BatchEmbedOutcome` carries one entry per input, in input order: `embeddings` holds `Some(vector)` for every item that landed and `None` for every item the provider refused, and `warnings` holds the reasons. The default implementation of the seam delegates to `embed_batch` and never degrades, so an existing embedder keeps working unchanged; a provider that overrides it reports the refusal instead of costing the whole generation. A caller must not store a placeholder for a refused item: a zero vector would poison every cosine distance it is later compared against.
+
+The remote provider additionally bounds each request (at most 64 inputs and at most 32 KiB of text) and halves a request the provider refuses down to the offending items, so one bad input costs one warning rather than the batch.
+
 The `VectorStore` trait is the pluggable interface for vector persistence and similarity search. Implementations must provide:
 
 - `fn insert(&mut self, id: &str, vector: &[f32]) -> Result<()>` — upsert a vector
