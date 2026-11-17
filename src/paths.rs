@@ -312,10 +312,10 @@ pub struct LookupPath {
 /// registered at a subdirectory (`repo/platform`), stored paths are relative
 /// to that subdirectory, which another checkout's paths would not match.
 ///
-/// Step 3 with a usable registered root applies the same rule: another
-/// checkout of the registered repository resolves only when the registered
-/// root is a checkout root; anything else is another project and stays
-/// `Outside`, so it never borrows this namespace's memories.
+/// Step 3 with a known root (a usable `project_root`, else a usable registered
+/// root) applies the same rule: another checkout of that repository resolves
+/// only when the known root is a checkout root; anything else is another
+/// project and stays `Outside`, so it never borrows this namespace's memories.
 ///
 /// When the file exists, the part below the root is taken from its canonical
 /// path, so it carries the on-disk spelling the store matches exactly.
@@ -377,7 +377,11 @@ fn choose_root(
         };
     }
     let (marker, marker_rel) = (marker?, marker_rel?);
-    match registry_root {
+    // The caller's root constrains the fallback like the registered one: a
+    // file in another repository must not resolve while `project_root` (which
+    // also pins the ingest generation) names this one.
+    let known_root = project_root.filter(|root| is_usable_root(root)).or(registry_root);
+    match known_root {
         None => Some((marker, marker_rel, RootSource::Marker)),
         Some(root) if is_checkout_root(root) && same_repository(&marker, root) => {
             Some((marker, marker_rel, RootSource::Marker))
@@ -663,6 +667,10 @@ mod tests {
         let file = other.join("src").join("lib.rs");
         touch(&file);
         assert_eq!(got(&file, None, Some(&root)), resolved(&s(&file), RootSource::Outside));
+        // The caller's project_root constrains it the same way, with or
+        // without a registered root.
+        assert_eq!(got(&file, Some(&root), None), resolved(&s(&file), RootSource::Outside));
+        assert_eq!(got(&file, Some(&root), Some(&root)), resolved(&s(&file), RootSource::Outside));
     }
 
     #[test]
