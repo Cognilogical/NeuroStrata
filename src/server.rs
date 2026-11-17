@@ -1998,18 +1998,31 @@ pub(crate) async fn handle_data_connector(
     store: Arc<dyn VectorStore>,
     bus: Arc<crate::events::ThalamicBus>,
 ) -> String {
+    // Validate present namespace/principal: must be a non-blank string
+    if let Some(ns) = arguments.get("namespace") {
+        match ns.as_str() {
+            None => return serde_json::json!({"ok": false, "error": "namespace must be a string"}).to_string(),
+            Some(s) if s.trim().is_empty() => return serde_json::json!({"ok": false, "error": "namespace must not be blank"}).to_string(),
+            _ => {}
+        }
+    }
+    if let Some(pr) = arguments.get("principal") {
+        match pr.as_str() {
+            None => return serde_json::json!({"ok": false, "error": "principal must be a string"}).to_string(),
+            Some(s) if s.trim().is_empty() => return serde_json::json!({"ok": false, "error": "principal must not be blank"}).to_string(),
+            _ => {}
+        }
+    }
     let namespace = arguments
         .get("namespace")
         .and_then(|v| v.as_str())
-        .filter(|s| !s.trim().is_empty())
         .unwrap_or("global");
     let Some(args) = arguments.get("args") else {
         return serde_json::json!({"ok": false, "error": "args object required"}).to_string();
     };
     let principal = arguments
         .get("principal")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.trim().is_empty());
+        .and_then(|v| v.as_str());
     let workspace_root = crate::daemon::resolve_project_root();
     let kernel = crate::kernel::AgentKernel::new(store.clone(), bus.clone(), workspace_root);
     match kernel
@@ -15744,6 +15757,138 @@ mod tests {
             gate_desc.contains("false"),
             "gate_passed documents the false default: {gate_desc}"
         );
+    }
+
+    /// Shared fixture: creates a temp store with a seeded private data_pointer
+    /// in the given namespace. Returns (store, ladybug_store, bus, ptr).
+    async fn seed_data_pointer_in_namespace(namespace: &str) -> (Arc<dyn VectorStore>, Arc<crate::store::ladybug::LadybugStore>, Arc<crate::events::ThalamicBus>, crate::connectors::DataPointerRecord) {
+        use crate::connectors::DataPointerRecord;
+        use crate::store::ladybug::LadybugStore;
+        use crate::traits::MemoryPayload;
+
+        let dir = std::env::temp_dir().join(format!("ns-dc-seed-{}-{}", namespace, uuid::Uuid::new_v4()));
+        let ladybug_store = Arc::new(LadybugStore::for_testing(&dir, 4).expect("open temp"));
+        let store: Arc<dyn VectorStore> = ladybug_store.clone();
+        store.init(namespace).await.expect("init schema");
+        let (bus, _seen) = recording_bus();
+
+        let ptr = DataPointerRecord {
+            pointer_id: "ptr_secret".to_string(),
+            connector_id: "conn1".to_string(),
+            pool_id: "pool1".to_string(),
+            pointer_uri: "uri1".to_string(),
+            entity_type: "item".to_string(),
+            expected_source_sha256: None,
+            captured_at_secs: 1000,
+            max_staleness_secs: 3600,
+        };
+        let metadata = json!({
+            "eligibility": "private",
+            "pointer": serde_json::to_value(&ptr).unwrap(),
+            "source": {"kind": "data_connector", "ref": ptr.pointer_uri.clone()},
+            "visible_to": ["alice"],
+        });
+        let payload = MemoryPayload {
+            content: format!("data pointer {}", ptr.pointer_id),
+            user_id: "alice".to_string(),
+            memory_type: "data_pointer".to_string(),
+            agent_name: None,
+            location: ptr.pointer_uri.clone(),
+            location_lines: String::new(),
+            metadata,
+        };
+        crate::traits::OntologyStore::put_scoped_memory(&*ladybug_store, namespace, &ptr.pointer_id, &payload).await.expect("seed pointer");
+
+        (store, ladybug_store, bus, ptr)
+    }
+
+    /// Data connector: blank/whitespace/non-string principal must be rejected.
+    /// Seeds pointer in "global" namespace (where old code maps invalid principal to None).
+    /// Table-driven: covers empty string, whitespace-only, null, number, object, array.
+    #[tokio::test]
+    async fn data_connector_rejects_invalid_principal() {
+        let (store, _ladybug_store, bus, _ptr) = seed_data_pointer_in_namespace("global").await;
+
+        // Malformed principal values that old code collapses to trusted None
+        let malformed_principals = [
+            json!(""),
+            json!("   "),
+            json!("\t"),
+            json!("\n"),
+            json!(null),
+            json!(123),
+            json!({}),
+            json!([]),
+        ];
+
+        for malformed in malformed_principals {
+            let arguments = json!({
+                "namespace": "global",
+                "args": {"operation": "list_pointers"},
+                "principal": malformed
+            });
+            let response_text = handle_data_connector(&arguments, store.clone(), bus.clone()).await;
+            let response: Value = serde_json::from_str(&response_text).expect("valid JSON");
+            assert_eq!(response["ok"], false, "malformed principal {:?} must be rejected, got: {}", malformed, response_text);
+            let err = response["error"].as_str().expect("error string");
+            assert!(err.contains("principal"), "error must mention principal for {:?}: {}", malformed, err);
+            assert!(!response_text.contains("ptr_secret"), "must not disclose pointer_id for {:?}: {}", malformed, response_text);
+            assert!(!response_text.contains("uri1"), "must not disclose pointer_uri for {:?}: {}", malformed, response_text);
+        }
+    }
+
+    /// Data connector: blank/whitespace/non-string namespace must be rejected.
+    /// Seeds pointer in "global" namespace (where old code maps invalid namespace to "global").
+    /// Table-driven: covers empty string, whitespace-only, null, number, object, array.
+    #[tokio::test]
+    async fn data_connector_rejects_invalid_namespace() {
+        let (store, _ladybug_store, bus, _ptr) = seed_data_pointer_in_namespace("global").await;
+
+        // Malformed namespace values that old code maps to "global"
+        let malformed_namespaces = [
+            json!(""),
+            json!("   "),
+            json!("\t"),
+            json!("\n"),
+            json!(null),
+            json!(123),
+            json!({}),
+            json!([]),
+        ];
+
+        for malformed in malformed_namespaces {
+            let arguments = json!({
+                "namespace": malformed,
+                "args": {"operation": "list_pointers"},
+                "principal": "alice"
+            });
+            let response_text = handle_data_connector(&arguments, store.clone(), bus.clone()).await;
+            let response: Value = serde_json::from_str(&response_text).expect("valid JSON");
+            assert_eq!(response["ok"], false, "malformed namespace {:?} must be rejected, got: {}", malformed, response_text);
+            let err = response["error"].as_str().expect("error string");
+            assert!(err.contains("namespace"), "error must mention namespace for {:?}: {}", malformed, err);
+            assert!(!response_text.contains("ptr_secret"), "must not disclose pointer_id for {:?}: {}", malformed, response_text);
+            assert!(!response_text.contains("uri1"), "must not disclose pointer_uri for {:?}: {}", malformed, response_text);
+        }
+    }
+
+    /// Compatibility: omitted namespace and principal must use existing defaults
+    /// (namespace -> "global", principal -> None) and return successful response.
+    #[tokio::test]
+    async fn data_connector_omitted_fields_use_defaults() {
+        let (store, _ladybug_store, bus, _ptr) = seed_data_pointer_in_namespace("global").await;
+
+        // No namespace, no principal — should use defaults and succeed
+        let arguments = json!({
+            "args": {"operation": "list_pointers"}
+        });
+        let response_text = handle_data_connector(&arguments, store.clone(), bus.clone()).await;
+        let response: Value = serde_json::from_str(&response_text).expect("valid JSON");
+        // list_pointers returns array of pointers directly (no ok wrapper)
+        let list = response.as_array().expect("list_pointers returns array");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0]["pointer_id"], "ptr_secret");
+        assert_eq!(list[0]["pointer_uri"], "uri1");
     }
 
     /// Vocabulary v4: `procedure` is an ordinary memory type on the
