@@ -444,6 +444,9 @@ pub async fn process_mcp_request(
                                 "namespace": { "type": "string", "description": "The exact project name." },
                                 "assignee": { "type": "string", "description": "Who is doing the work (the agent or operator name)." },
                                 "session_id": { "type": "string", "description": "Unique id of this session; the exclusivity check compares it against the holder's." },
+                                "worktree": { "type": "string", "description": "Optional caller worktree path for strict push-gate scoping." },
+                                "branch": { "type": "string", "description": "Optional caller git branch for strict push-gate scoping." },
+                                "project_root": { "type": "string", "description": "Optional caller project root path used to capture worktree and branch scope." },
                                 "event_id": { "type": "string", "description": "Optional idempotency event ID for the claim receipt." },
                             },
                             "required": ["id", "namespace", "assignee", "session_id"]
@@ -10541,6 +10544,101 @@ async fn build_guard_validator(
     Ok((validator, namespace.to_string()))
 }
 
+fn is_env_assignment_token(tok: &str) -> bool {
+    let Some((name, _)) = tok.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !name.chars().next().unwrap().is_ascii_digit()
+}
+
+fn is_disallowed_git_subcommand_arg(arg: &str) -> bool {
+    arg == "--output"
+        || arg.starts_with("--output=")
+        || arg.starts_with("-O")
+        || arg == "--ext-diff"
+        || arg == "--textconv"
+        || arg == "--exec"
+        || arg.starts_with("--exec=")
+        || arg == "-x"
+        || arg == "--upload-pack"
+        || arg.starts_with("--upload-pack=")
+        || arg == "--receive-pack"
+        || arg.starts_with("--receive-pack=")
+}
+
+fn is_zero_action_exempt_shell_segment(segment: &str) -> bool {
+    let mut tokens = segment
+        .split_whitespace()
+        .skip_while(|t| is_env_assignment_token(t));
+    let Some(first) = tokens.next() else {
+        return false;
+    };
+    let bin = std::path::Path::new(first)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(first);
+    match bin {
+        "git" => {
+            let mut rest: Vec<&str> = tokens.collect();
+            loop {
+                if rest.len() >= 2 && matches!(rest[0], "-C" | "--git-dir" | "--work-tree") {
+                    rest.drain(..2);
+                } else if !rest.is_empty()
+                    && (matches!(rest[0], "--no-pager" | "-P" | "--no-optional-locks")
+                        || rest[0].starts_with("--git-dir=")
+                        || rest[0].starts_with("--work-tree="))
+                {
+                    rest.remove(0);
+                } else {
+                    break;
+                }
+            }
+            if rest.first().is_some_and(|t| t.starts_with('-')) {
+                return false;
+            }
+            let Some(&subcmd) = rest.first() else {
+                return false;
+            };
+            matches!(
+                subcmd,
+                "push" | "pull" | "fetch" | "status" | "log" | "diff" | "show" | "rev-parse"
+            ) && !rest[1..]
+                .iter()
+                .any(|arg| is_disallowed_git_subcommand_arg(arg))
+        }
+        "neurostrata-mcp" => matches!(tokens.next(), Some("task")),
+        _ => false,
+    }
+}
+
+pub(crate) fn is_zero_action_exempt_shell_payload(action_type: &str, payload: &str) -> bool {
+    if !matches!(
+        action_type.to_lowercase().as_str(),
+        "bash" | "shell" | "command" | "exec"
+    ) {
+        return false;
+    }
+    let trimmed = payload.trim();
+    if trimmed.is_empty()
+        || trimmed.contains('`')
+        || trimmed.contains("$(")
+        || trimmed.contains('>')
+        || trimmed.contains('<')
+    {
+        return false;
+    }
+    let segments: Vec<&str> = trimmed
+        .split(|c| c == ';' || c == '\n' || c == '|' || c == '&')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    !segments.is_empty() && segments.into_iter().all(is_zero_action_exempt_shell_segment)
+}
+
 /// Validate an action against stored behavioral rules and (optionally) the
 /// Podman sandbox. Wraps `GuardValidator::validate`.
 async fn handle_guard_validate(
@@ -10571,7 +10669,9 @@ async fn handle_guard_validate(
 
     // Zero-Action Start (honest): in a task-enabled namespace, a mutating
     // action requires at least one claimed (in_progress) task. Read-only
-    // actions and namespaces with no task rows at all are exempt.
+    // actions, git push/sync/status commands (which are gated by the pre-push
+    // task gate and run after task completion), task-tracking CLI invocations,
+    // and namespaces with no task rows at all are exempt.
     let mutating = !matches!(
         action_type.to_lowercase().as_str(),
         "read"
@@ -10585,7 +10685,7 @@ async fn handle_guard_validate(
             | "inspect"
             | "grep"
             | "glob"
-    );
+    ) && !is_zero_action_exempt_shell_payload(action_type, payload);
     if mutating {
         // Determine whether this namespace is task-enabled. Only task rows
         // matter here, so the type filter goes into the query: listing the
