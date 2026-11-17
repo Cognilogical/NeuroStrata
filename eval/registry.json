@@ -450,6 +450,7 @@
         "storage::snapshot::tests::a_version_1_manifest_with_a_non_boolean_coordinated_is_invalid",
         "storage::snapshot::tests::a_version_2_manifest_that_is_not_coordinated_is_intact_but_not_valid",
         "storage::snapshot::tests::a_version_2_manifest_that_is_coordinated_is_valid",
+        "storage::snapshot::tests::a_directory_in_place_of_the_store_is_refused",
         "storage::snapshot::tests::an_unsupported_snapshot_version_is_refused",
         "storage::snapshot::tests::select_expired_counts_version_1_and_version_2_snapshots",
         "tests::restore_copy_reads_a_version_1_legacy_snapshot_as_active",

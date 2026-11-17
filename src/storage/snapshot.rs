@@ -617,6 +617,9 @@ pub enum SnapshotError {
     Json(serde_json::Error),
     MissingFile(String),
     InvalidManifest(String),
+    /// A snapshot member exists but is not the regular file it must be
+    /// (#241): a directory in place of the store image, or a symlink.
+    NotARegularFile(String),
     ChecksumMismatch {
         file: String,
         expected: String,
@@ -631,6 +634,7 @@ impl fmt::Display for SnapshotError {
             SnapshotError::Json(e) => write!(f, "json error: {}", e),
             SnapshotError::MissingFile(s) => write!(f, "missing file: {}", s),
             SnapshotError::InvalidManifest(s) => write!(f, "invalid manifest: {}", s),
+            SnapshotError::NotARegularFile(s) => write!(f, "not a regular file: {}", s),
             SnapshotError::ChecksumMismatch {
                 file,
                 expected,
@@ -892,10 +896,32 @@ pub fn verify_snapshot(dir: &Path) -> Result<SnapshotVerifyReport, SnapshotError
     let manifest_path = dir.join("manifest.json");
     let wal = dir.join("ladybug.store.wal");
 
-    if !ladybug.exists() && !ladybug.is_dir() {
-        return Err(SnapshotError::MissingFile(
-            "ladybug.store".into(),
-        ));
+    // The store member is the database image: one regular file (#241). A
+    // directory in its place used to be hashed like a directory (a digest
+    // over its sorted entries), so a snapshot carrying no database at all
+    // could match its own checksums and verify as intact. A symlink is
+    // refused for the same reason the WAL sides are: the member is a
+    // pointer, not the bytes.
+    match fs::symlink_metadata(&ladybug) {
+        Ok(meta) if meta.file_type().is_file() => {}
+        Ok(meta) => {
+            let found = if meta.file_type().is_symlink() {
+                "a symlink"
+            } else if meta.file_type().is_dir() {
+                "a directory"
+            } else {
+                "not a regular file"
+            };
+            return Err(SnapshotError::NotARegularFile(format!(
+                "the snapshot member ladybug.store is {found}; it must be the regular file holding the database image",
+            )));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(SnapshotError::MissingFile(
+                "ladybug.store".into(),
+            ));
+        }
+        Err(e) => return Err(SnapshotError::Io(e)),
     }
 
     let computed_ladybug = sha256_file(&ladybug)?;
@@ -1777,6 +1803,39 @@ mod tests {
             ),
             other => panic!("a version 2 manifest without wal_kind must be rejected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_directory_in_place_of_the_store_is_refused() {
+        // #241: `ladybug.store` is the database image -- one file. A
+        // directory in its place used to be hashed like a directory (a
+        // digest over its sorted entries), so a snapshot with no database
+        // in it at all could carry matching checksums and verify as
+        // intact. The member must be a regular file, and the refusal has
+        // to name it.
+        let d = temp_dir("dir-store");
+        fs::create_dir_all(d.join("ladybug.store")).unwrap();
+        fs::write(
+            d.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"coordinated\":true,\"wal_kind\":\"none\"}}",
+                SNAPSHOT_FORMAT, SNAPSHOT_VERSION
+            ),
+        )
+        .unwrap();
+        write_checksums(&d).unwrap();
+
+        let err = verify_snapshot(&d)
+            .expect_err("a directory in place of ladybug.store must be refused (#241)");
+        let message = err.to_string();
+        assert!(
+            message.contains("ladybug.store"),
+            "the refusal names the member: {message}"
+        );
+        assert!(
+            message.contains("not a regular file"),
+            "the refusal names what it found: {message}"
+        );
     }
 
     #[test]
