@@ -2113,26 +2113,36 @@ fn daemon_holds_lock(db_path: &std::path::Path) -> bool {
     }
 }
 
-/// Fallible store-lock probe for the `--no-open` gate (#209).
+/// Take the store lock for an uncoordinated copy and keep it (#241).
 ///
-/// [`daemon_holds_lock`] answers "held or not" and treats a probe failure as
-/// "not held", which is right for status reporting but wrong for a gate: a
-/// probe that cannot answer proves nothing about the store's owner, so the
-/// caller must refuse rather than copy.
-fn daemon_lock_probe(db_path: &std::path::Path) -> anyhow::Result<bool> {
+/// The `--no-open` gate used to be a point-in-time probe: it took the lock,
+/// learned whether a daemon held it, and dropped the handle before the
+/// first file copy. A daemon that started in between was never seen, so the
+/// database, its WAL, and the checkpoint shadow could be captured at
+/// different instants while every per-file check still passed.
+///
+/// The returned guard holds the lock until it is dropped, so a daemon that
+/// starts during the copy window cannot open the store and cannot change
+/// what is being copied. The lock file is created when it does not exist
+/// yet: "nobody holds the lock" is decided by taking it, not by looking for
+/// it.
+///
+/// A lock that cannot be taken is not evidence that the store is free, so
+/// the failure is closed: the caller refuses instead of copying.
+fn hold_store_lock_for_copy(db_path: &std::path::Path) -> anyhow::Result<std::fs::File> {
     let lock_path = daemon_lock_path(db_path);
-    // Read-only gating must not create the lock file either.
-    if !lock_path.exists() {
-        return Ok(false);
-    }
-    let file = open_daemon_lock(db_path)
-        .map_err(|e| anyhow::anyhow!("could not open {:?} to probe it: {}", lock_path, e))?;
+    let file = open_daemon_lock(db_path).map_err(|e| {
+        anyhow::anyhow!(
+            "Refusing the uncoordinated file copy: the store lock could not be taken (could not open {}: {}), so it cannot be shown that no daemon holds the store. Take a coordinated backup with `neurostrata-mcp backup <dir>` (without --no-open), or run `neurostrata-mcp shutdown` first.",
+            lock_path.display(),
+            e
+        )
+    })?;
     match file.try_lock() {
-        Ok(()) => Ok(false),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(true),
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(anyhow::anyhow!("{}", NO_OPEN_LOCK_HELD_MESSAGE)),
         Err(std::fs::TryLockError::Error(e)) => Err(anyhow::anyhow!(
-            "could not probe the store lock {:?}: {}",
-            lock_path,
+            "Refusing the uncoordinated file copy: the store lock could not be taken ({}), so it cannot be shown that no daemon holds the store. Take a coordinated backup with `neurostrata-mcp backup <dir>` (without --no-open), or run `neurostrata-mcp shutdown` first.",
             e
         )),
     }
@@ -4910,6 +4920,76 @@ mod tests {
     }
 
     #[test]
+    fn the_store_lock_is_held_across_the_uncoordinated_copy_window() {
+        // #241: the `--no-open` gate used to be a point-in-time probe: it took
+        // the store lock, learned whether a daemon held it, and dropped the
+        // handle before the first file copy. A daemon that started in between
+        // was never seen, so the database, its WAL, and the checkpoint shadow
+        // could be captured at different instants while every per-file check
+        // still passed. The copy has to hold the lock for its whole window: a
+        // competing lock must not be acquirable while it runs.
+        let root = std::env::temp_dir().join(format!("ns-lock-window-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("ladybug.store");
+        std::fs::write(&db, b"db-bytes").unwrap();
+        std::fs::write(root.join("ladybug.store.wal"), b"wal-bytes").unwrap();
+        std::fs::write(root.join("ladybug.store.shadow"), b"shadow-bytes").unwrap();
+        let out = root.join("snapshot");
+
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = observed.clone();
+        let lock_path = daemon_lock_path(&db);
+        export_uncoordinated_copy_observed(&db, &out, &|member| {
+            seen.lock().unwrap().push(member.to_string());
+            // A daemon starting now must not be able to take the store lock.
+            let contender = std::thread::spawn({
+                let lock_path = lock_path.clone();
+                move || {
+                    let file = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create(true)
+                        .truncate(false)
+                        .open(&lock_path)
+                        .expect("the lock file is reachable while the copy runs");
+                    file.try_lock()
+                }
+            });
+            let outcome = contender.join().expect("the contender thread finished");
+            assert!(
+                matches!(outcome, Err(std::fs::TryLockError::WouldBlock)),
+                "a competing lock must not be acquirable during the copy window (member {member})"
+            );
+        })
+        .expect("the uncoordinated copy holds the store lock");
+
+        let members = observed.lock().unwrap().clone();
+        assert!(
+            members.iter().any(|m| m == "ladybug.store"),
+            "the store was copied: {members:?}"
+        );
+        assert!(
+            members.iter().any(|m| m == "ladybug.store.wal"),
+            "the WAL was copied: {members:?}"
+        );
+        assert!(
+            members.iter().any(|m| m == "ladybug.store.shadow"),
+            "the checkpoint shadow was copied: {members:?}"
+        );
+        assert!(out.join("ladybug.store").exists(), "the snapshot carries the store");
+        assert!(
+            out.join("ladybug.store.wal").exists(),
+            "the snapshot carries the WAL"
+        );
+        assert!(
+            out.join("ladybug.store.shadow").exists(),
+            "the snapshot carries the checkpoint shadow"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn no_open_backup_refuses_while_the_daemon_lock_is_held() {
         // #209: `--no-open` used to skip both coordination gates and copy the
         // mmapped database and its WAL at different instants. While a process
@@ -4926,7 +5006,7 @@ mod tests {
             "precondition: the lock probe sees the holder"
         );
 
-        let err = refuse_uncoordinated_copy(&db)
+        let err = hold_store_lock_for_copy(&db)
             .expect_err("--no-open must be refused while the store lock is held");
         assert!(
             err.to_string().contains("--no-open"),
@@ -4939,77 +5019,74 @@ mod tests {
         drop(lock);
 
         let quiescent = root.join("quiescent.store");
-        refuse_uncoordinated_copy(&quiescent)
+        hold_store_lock_for_copy(&quiescent)
             .expect("a quiescent store still backs up without opening");
 
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn no_open_backup_fails_closed_when_the_lock_probe_errors() {
-        // #209 (V5): a probe that cannot answer is not "the lock is free". The
-        // refusal must surface the probe failure rather than let the copy run
+    fn no_open_backup_fails_closed_when_the_lock_cannot_be_taken() {
+        // #209 (V5): a lock that cannot be taken is not "the lock is free".
+        // The refusal must surface the failure rather than let the copy run
         // against a store whose owner cannot be established.
         let root = std::env::temp_dir().join(format!("ns-no-open-probe-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let db = root.join("ladybug.store");
-        // A directory where the lock file belongs: the probe cannot open it.
+        // A directory where the lock file belongs: the lock cannot be taken.
         std::fs::create_dir_all(daemon_lock_path(&db)).unwrap();
 
-        let err = refuse_uncoordinated_copy(&db)
-            .expect_err("a probe that cannot answer must refuse --no-open");
+        let err = hold_store_lock_for_copy(&db)
+            .expect_err("a lock that cannot be taken must refuse --no-open");
         let message = err.to_string();
         assert!(
-            message.contains("probe"),
-            "the refusal names the failed probe: {message}"
+            message.contains("lock"),
+            "the refusal names the lock it could not take: {message}"
         );
         assert!(
             message.contains("--no-open"),
             "the refusal names the flag: {message}"
+        );
+        assert!(
+            message.contains("without --no-open"),
+            "the refusal names the coordinated route: {message}"
         );
 
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn the_fallback_arm_is_gated_before_any_file_copy() {
+    fn the_fallback_refuses_while_the_store_lock_is_held_and_copies_nothing() {
         // #209 (J7): the automatic fallback after a refused strict open copies
-        // the same files as `--no-open`, so it must take the same lock gate.
-        let src = include_str!("main.rs");
-        let arm = src
-            .split("\n                    Err(e) if e.to_string().contains(\"Refusing to open:\") => {")
-            .nth(1)
-            .expect("the strict-refusal fallback arm is dispatched");
-        let arm = &arm[..arm
-            .find("Err(e) => return Err(e),")
-            .expect("the fallback arm ends before the plain error arm")];
-        assert!(
-            arm.contains("export_uncoordinated_fallback"),
-            "the fallback arm routes through the gated helper"
-        );
-        assert!(
-            !arm.contains("export_database_files"),
-            "the fallback arm must not call the unguarded export directly"
-        );
+        // the same files as `--no-open`, so it must take the same lock gate —
+        // and it must take it before the first file copy, not after.
+        let root = std::env::temp_dir().join(format!("ns-fallback-lock-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("ladybug.store");
+        std::fs::write(&db, b"db-bytes").unwrap();
+        let out = root.join("snapshot");
 
-        let helper = &src[src
-            .find("fn export_uncoordinated_fallback(")
-            .expect("the gated fallback helper is defined")..];
-        let gate = helper
-            .find("refuse_uncoordinated_copy(db_path)?;")
-            .expect("the fallback helper gates on the store lock");
-        let copy = helper
-            .find("LadybugStore::export_database_files(db_path, dir)")
-            .expect("the fallback helper performs the copy");
+        let lock = open_daemon_lock(&db).expect("create the daemon lock");
+        lock.lock().expect("hold the daemon lock");
+
+        let err = export_uncoordinated_fallback(&db, &out)
+            .expect_err("the fallback refuses while the store lock is held");
         assert!(
-            gate < copy,
-            "the fallback refusal runs before the first file copy"
+            err.to_string().contains("--no-open"),
+            "the refusal names the flag: {err}"
         );
+        assert!(
+            !out.exists(),
+            "no snapshot directory is created when the fallback refuses"
+        );
+        drop(lock);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn the_fallback_refuses_when_the_lock_probe_errors() {
-        // An unreadable lock path means "cannot show the store is free", so the
+    fn the_fallback_refuses_when_the_lock_cannot_be_taken() {
+        // An untakeable lock means "cannot show the store is free", so the
         // automatic fallback refuses and places no snapshot (#209, J7).
         let root = std::env::temp_dir().join(format!("ns-fallback-probe-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
@@ -5019,10 +5096,10 @@ mod tests {
         let out = root.join("snapshot");
 
         let err = export_uncoordinated_fallback(&db, &out)
-            .expect_err("the fallback refuses a probe that cannot answer");
+            .expect_err("the fallback refuses a lock it cannot take");
         assert!(
-            err.to_string().contains("probe"),
-            "the refusal names the failed probe: {err}"
+            err.to_string().contains("lock"),
+            "the refusal names the lock it could not take: {err}"
         );
         assert!(
             !out.exists(),
@@ -5032,29 +5109,31 @@ mod tests {
     }
 
     #[test]
-    fn the_backup_arm_refuses_no_open_before_any_file_copy() {
-        // The refusal has to run before the first `export_database_files`
-        // call: a check that fires after the copy is not a gate (#209).
-        let src = include_str!("main.rs");
-        // Match the dispatch arms by their indentation: the test's own
-        // pattern literals are un-indented, so they cannot shadow these.
-        let arm = src
-            .split("\n            Commands::Backup { dir, no_open } => {")
-            .nth(1)
-            .expect("the Backup arm is dispatched");
-        let arm = &arm[..arm
-            .find("\n            Commands::Restore { dir, into } => {")
-            .expect("Restore follows Backup")];
-        let gate = arm
-            .find("refuse_uncoordinated_copy")
-            .expect("the --no-open arm is gated by the store lock (#209)");
-        let first_copy = arm
-            .find("export_database_files")
-            .expect("the no-open arm exports the database files");
+    fn the_no_open_copy_refuses_while_the_lock_is_held_and_copies_nothing() {
+        // The gate has to run before the first `export_database_files` call: a
+        // check that fires after the copy is not a gate (#209).
+        let root = std::env::temp_dir().join(format!("ns-no-open-arm-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("ladybug.store");
+        std::fs::write(&db, b"db-bytes").unwrap();
+        let out = root.join("snapshot");
+
+        let lock = open_daemon_lock(&db).expect("create the daemon lock");
+        lock.lock().expect("hold the daemon lock");
+
+        let err = export_uncoordinated_copy(&db, &out)
+            .expect_err("the no-open copy refuses while the store lock is held");
         assert!(
-            gate < first_copy,
-            "the --no-open refusal must run before the first file copy"
+            err.to_string().contains("--no-open"),
+            "the refusal names the flag: {err}"
         );
+        assert!(
+            !out.exists(),
+            "no snapshot directory is created when the copy refuses"
+        );
+        drop(lock);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -5621,38 +5700,44 @@ fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
         .build()?)
 }
 
-/// Refuse an uncoordinated file copy while a process holds the store lock
-/// (#209).
+/// The uncoordinated copy, with an observer that is told which member was
+/// just copied.
 ///
-/// Both the explicit `--no-open` arm and the automatic fallback after a
-/// refused strict open copy the mmapped database, its WAL, and the checkpoint
-/// shadow straight from disk. While a daemon holds the lock it may be
-/// mid-checkpoint, so those files would be captured at different instants. A
-/// coordinated backup routes through the daemon instead.
+/// The observer runs while the copy is still in flight, so a caller can ask
+/// what the store looks like *during* the copy window rather than only
+/// before or after it.
 ///
-/// The gate is a point-in-time probe, not a lock: it fails closed when the
-/// probe itself cannot answer, because an unanswerable probe is not evidence
-/// that the store is free.
-fn refuse_uncoordinated_copy(db_path: &std::path::Path) -> anyhow::Result<()> {
-    match daemon_lock_probe(db_path) {
-        Ok(false) => Ok(()),
-        Ok(true) => Err(anyhow::anyhow!("{}", NO_OPEN_LOCK_HELD_MESSAGE)),
-        Err(e) => Err(anyhow::anyhow!(
-            "Refusing the uncoordinated file copy: the store lock probe failed ({}), so it cannot be shown that no daemon holds the store. Take a coordinated backup with `neurostrata-mcp backup <dir>` (without --no-open), or run `neurostrata-mcp shutdown` first.",
-            e
-        )),
-    }
+/// The store lock is held for the whole window (#241): the guard is dropped
+/// only after the export returns, so a daemon that starts mid-copy cannot
+/// change the database, its WAL, or the checkpoint shadow under the
+/// snapshot's feet.
+fn export_uncoordinated_copy_observed(
+    db_path: &std::path::Path,
+    dir: &std::path::Path,
+    during_copy: &dyn Fn(&str),
+) -> anyhow::Result<()> {
+    let _lock = hold_store_lock_for_copy(db_path)?;
+    LadybugStore::export_database_files_observed(db_path, dir, during_copy)
+}
+
+/// The uncoordinated copy: the store lock is taken and held for the whole
+/// window (#241).
+fn export_uncoordinated_copy(
+    db_path: &std::path::Path,
+    dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    export_uncoordinated_copy_observed(db_path, dir, &|_| {})
 }
 
 /// The automatic no-open fallback used when a strict open refuses the store
 /// (#196). It copies exactly the same files as `--no-open`, so it takes the
-/// same lock gate before the first copy (#209).
+/// same lock gate before the first copy (#209) and holds the store lock for
+/// the whole copy window (#241).
 fn export_uncoordinated_fallback(
     db_path: &std::path::Path,
     dir: &std::path::Path,
 ) -> anyhow::Result<()> {
-    refuse_uncoordinated_copy(db_path)?;
-    LadybugStore::export_database_files(db_path, dir)
+    export_uncoordinated_copy(db_path, dir)
 }
 
 /// Verify a snapshot directory before a restore copies anything from it.
@@ -6494,10 +6579,18 @@ async fn run() -> anyhow::Result<()> {
                     // read at different instants, which is exactly the
                     // verify-but-cannot-restore pair this refuses. A
                     // coordinated backup goes through the daemon above.
-                    if let Err(e) = refuse_uncoordinated_copy(&config.db_path) {
-                        eprintln!("{}", e);
-                        std::process::exit(1);
-                    }
+                    //
+                    // #241: the lock is not probed and released — it is held
+                    // for the whole copy, so a daemon that starts mid-copy
+                    // cannot change the files being copied. The guard is
+                    // dropped only after the export returns.
+                    let _lock = match hold_store_lock_for_copy(&config.db_path) {
+                        Ok(lock) => lock,
+                        Err(e) => {
+                            eprintln!("{}", e);
+                            std::process::exit(1);
+                        }
+                    };
                     LadybugStore::export_database_files(
                         &config.db_path,
                         std::path::Path::new(&dir),

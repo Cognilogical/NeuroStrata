@@ -398,7 +398,8 @@
     "backup-no-open": {
       "commands": [
         "cargo test --locked --bin neurostrata-mcp tests::no_open_backup -- --test-threads=1",
-        "cargo test --locked --bin neurostrata-mcp tests::the_backup_arm_refuses -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp tests::the_no_open_copy_refuses -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp tests::the_store_lock_is_held_across -- --test-threads=1",
         "cargo test --locked --bin neurostrata-mcp tests::the_fallback_ -- --test-threads=1",
         "cargo test --locked --bin neurostrata-mcp tests::restore_copy_ -- --test-threads=1",
         "cargo test --locked --bin neurostrata-mcp tests::restore_verify_ -- --test-threads=1",
@@ -411,7 +412,8 @@
       ],
       "tests": [
         "tests::no_open_backup_refuses_while_the_daemon_lock_is_held",
-        "tests::the_backup_arm_refuses_no_open_before_any_file_copy",
+        "tests::the_no_open_copy_refuses_while_the_lock_is_held_and_copies_nothing",
+        "tests::the_store_lock_is_held_across_the_uncoordinated_copy_window",
         "tests::restore_copy_preserves_a_frozen_wal_and_the_checkpoint_shadow",
         "tests::restore_copy_keeps_an_active_wal_active",
         "tests::restore_copy_drops_a_stale_active_wal_when_the_snapshot_wal_is_frozen",
@@ -426,7 +428,7 @@
         "storage::snapshot::tests::an_uncoordinated_manifest_never_verifies_as_fully_valid",
         "storage::snapshot::tests::a_coordinated_manifest_still_verifies_as_valid",
         "storage::snapshot::tests::the_checkpoint_shadow_and_pinned_marker_are_snapshot_members",
-        "tests::no_open_backup_fails_closed_when_the_lock_probe_errors",
+        "tests::no_open_backup_fails_closed_when_the_lock_cannot_be_taken",
         "tests::restore_copy_places_both_wal_sides_and_drops_stale_ones",
         "tests::restore_copy_refuses_a_both_wal_snapshot_missing_a_side",
         "store::ladybug::tests::a_mixed_wal_pair_exports_both_sides",
@@ -444,8 +446,8 @@
         "storage::snapshot::tests::a_both_manifest_missing_the_active_side_is_refused",
         "tests::restore_copy_refuses_a_one_sided_snapshot_carrying_the_frozen_member",
         "tests::restore_copy_refuses_a_both_wal_snapshot_missing_the_active_side",
-        "tests::the_fallback_arm_is_gated_before_any_file_copy",
-        "tests::the_fallback_refuses_when_the_lock_probe_errors",
+        "tests::the_fallback_refuses_while_the_store_lock_is_held_and_copies_nothing",
+        "tests::the_fallback_refuses_when_the_lock_cannot_be_taken",
         "storage::snapshot::tests::a_none_manifest_with_a_wal_member_is_refused",
         "tests::restore_copy_refuses_a_none_wal_snapshot_carrying_a_wal_member",
         "tests::restore_copy_restores_a_clean_none_wal_snapshot"

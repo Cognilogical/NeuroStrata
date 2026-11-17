@@ -9086,6 +9086,22 @@ impl LadybugStore {
         Self::export_database_files_with_provenance(source, dir, false)
     }
 
+    /// [`Self::export_database_files`] that reports every copied member to
+    /// `during_copy` as it is written (#241).
+    ///
+    /// The observer runs while the copy is still in flight, so a caller can
+    /// observe the store *during* the copy window instead of only before or
+    /// after it. That is what makes "the store lock is held across the whole
+    /// window" a fact a caller can check rather than a claim it has to
+    /// believe.
+    pub fn export_database_files_observed(
+        source: &std::path::Path,
+        dir: &std::path::Path,
+        during_copy: &dyn Fn(&str),
+    ) -> Result<()> {
+        Self::export_database_files_with_provenance_observed(source, dir, false, during_copy)
+    }
+
     /// [`Self::export_database_files`] with an explicit provenance: `true`
     /// only when the caller holds the store for the whole copy (the online
     /// `export_database` path).
@@ -9094,12 +9110,24 @@ impl LadybugStore {
         dir: &std::path::Path,
         coordinated: bool,
     ) -> Result<()> {
+        Self::export_database_files_with_provenance_observed(source, dir, coordinated, &|_| {})
+    }
+
+    /// [`Self::export_database_files_with_provenance`] that reports each
+    /// copied member to `during_copy` (#241).
+    fn export_database_files_with_provenance_observed(
+        source: &std::path::Path,
+        dir: &std::path::Path,
+        coordinated: bool,
+        during_copy: &dyn Fn(&str),
+    ) -> Result<()> {
         std::fs::create_dir_all(dir)?;
         let target = dir.join("ladybug.store");
         // Bracketed copy: an external writer mutating the file between the
         // stat calls means the copy is torn, so retry once and abort the
         // snapshot if it still changes (issue #95).
         copy_file_bracketed(source, &target, "source store")?;
+        during_copy("ladybug.store");
 
         // A WAL left behind after the checkpoint (or before recovery in
         // `--no-open` mode) rides along, so a restore replays or preserves it.
@@ -9142,6 +9170,7 @@ impl LadybugStore {
                     &dest_wal,
                     "write-ahead log",
                 )?;
+                during_copy("ladybug.store.wal");
                 remove_stale(&dest_checkpoint_wal)?;
             }
             WalRole::Both => {
@@ -9150,11 +9179,13 @@ impl LadybugStore {
                     &dest_wal,
                     "active write-ahead log",
                 )?;
+                during_copy("ladybug.store.wal");
                 copy_file_bracketed(
                     &append_suffix(source, ".wal.checkpoint"),
                     &dest_checkpoint_wal,
                     "frozen write-ahead log",
                 )?;
+                during_copy("ladybug.store.wal.checkpoint");
             }
         }
         // The pair must not have moved under the copies: if a side appeared
@@ -9185,6 +9216,7 @@ impl LadybugStore {
             let to = dir.join(member);
             if from.exists() {
                 copy_file_bracketed(&from, &to, label)?;
+                during_copy(member);
             } else if to.exists() {
                 std::fs::remove_file(&to).map_err(|e| {
                     anyhow::anyhow!(
@@ -9205,6 +9237,7 @@ impl LadybugStore {
                     e
                 )
             })?;
+            during_copy("ladybug.store.store-state.json");
         } else if dest_sidecar.exists() {
             std::fs::remove_file(&dest_sidecar).map_err(|e| {
                 anyhow::anyhow!(

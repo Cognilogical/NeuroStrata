@@ -44,12 +44,14 @@ before recovery.
    `<db>.store-state.json` directly into a checksummed snapshot directory
    without opening or checkpointing the store.
 
-   `--no-open` **refuses while a process holds the store lock** (`#209`): the
-   store may be mid-checkpoint, so the database, its WAL, and the shadow would
-   be copied at different instants. Run `backup <dir>` without `--no-open` to
-   have the daemon take a coordinated snapshot, or `shutdown` first — the
-   recovery path in this runbook runs with the daemon down, so it is not
-   affected.
+   `--no-open` **holds the store lock for the whole copy** (`#209`, `#241`): it
+   refuses while another process holds the store lock, because the store may be
+   mid-checkpoint, so the database, its WAL, and the shadow would be copied at
+   different instants — and it keeps the lock itself from the first copy to
+   the last, so a daemon that starts mid-copy cannot change what is being
+   copied. Run `backup <dir>` without `--no-open` to have the daemon take a
+   coordinated snapshot, or `shutdown` first — the recovery path in this
+   runbook runs with the daemon down, so it is not affected.
 
    The snapshot manifest records `coordinated: false` and
    `provenance: "unverified"` for these copies, plus `wal_kind`
