@@ -561,12 +561,14 @@ fn wal_age_secs(active: &Path, frozen: &Path) -> Option<u64> {
             meta.modified().ok()
         })
         .max()?;
-    Some(
-        std::time::SystemTime::now()
-            .duration_since(newest)
-            .unwrap_or_default()
-            .as_secs(),
-    )
+    // A WAL stamped in the future (clock skew, a copy that carried its
+    // timestamps across) has no age yet. Report zero rather than letting
+    // the subtraction wrap into a huge number (#241).
+    let age = match std::time::SystemTime::now().duration_since(newest) {
+        Ok(elapsed) => elapsed.as_secs(),
+        Err(_) => 0,
+    };
+    Some(age)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1803,6 +1805,26 @@ mod tests {
             ),
             other => panic!("a version 2 manifest without wal_kind must be rejected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_wal_stamped_in_the_future_reports_an_age_of_zero() {
+        // #241: a WAL whose mtime is in the future has no age yet. The
+        // subtraction used to wrap and report a huge age, which reads as
+        // "this WAL has not been written in years".
+        let d = temp_dir("wal-future-age");
+        let wal = d.join("ladybug.store.wal");
+        fs::write(&wal, b"wal-bytes").unwrap();
+        let file = File::open(&wal).unwrap();
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        file.set_times(fs::FileTimes::new().set_modified(future)).unwrap();
+        drop(file);
+
+        assert_eq!(
+            wal_age_secs(&wal, &d.join("ladybug.store.wal.checkpoint")),
+            Some(0),
+            "a WAL stamped in the future reports an age of zero, not a wrapped-around number"
+        );
     }
 
     #[test]
