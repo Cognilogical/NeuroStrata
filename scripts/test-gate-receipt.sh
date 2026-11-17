@@ -487,4 +487,68 @@ if [ "$listed" != "$actual" ]; then
   exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# L3 review: the workflow contract.
+#
+# The gate must run base-branch code, and a top-level receipt comment must
+# re-run it: an `issue_comment` event carries no pull_request payload, so the
+# PR and its base SHA are resolved through the API in a `resolve` step.
+# ---------------------------------------------------------------------------
+wf="$root/.github/workflows/gate-receipt.yml"
+if ! grep -q '^  issue_comment:' "$wf"; then
+  echo "FAIL: the gate workflow does not subscribe issue_comment, so a top-level receipt never re-runs the check" >&2
+  exit 1
+fi
+if ! grep -q 'id: resolve' "$wf"; then
+  echo "FAIL: the gate workflow has no resolve step for comment events" >&2
+  exit 1
+fi
+if grep -q 'pull_request.head.sha' "$wf"; then
+  echo "FAIL: the gate workflow checks out the PR head; the gate must run base-branch code" >&2
+  exit 1
+fi
+if ! grep -q 'steps.resolve.outputs.base_sha' "$wf" && ! grep -q 'pull_request.base.sha' "$wf"; then
+  echo "FAIL: the gate workflow does not check out a base SHA" >&2
+  exit 1
+fi
+if ! grep -q 'steps.resolve.outputs.pr' "$wf"; then
+  echo "FAIL: the gate workflow does not use the resolved PR number" >&2
+  exit 1
+fi
+for perm in "contents: read" "pull-requests: read"; do
+  if ! grep -q "$perm" "$wf"; then
+    echo "FAIL: the gate workflow does not keep the read-only permission '$perm'" >&2
+    exit 1
+  fi
+done
+if ! grep -q "github.event.issue.pull_request" "$wf"; then
+  echo "FAIL: the gate workflow does not guard issue_comment events to pull requests" >&2
+  exit 1
+fi
+if ! grep -q 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1' "$wf"; then
+  echo "FAIL: the gate workflow does not pin actions/checkout to the verified commit SHA" >&2
+  exit 1
+fi
+if grep -Eq 'uses: actions/checkout@v' "$wf"; then
+  echo "FAIL: the gate workflow uses a floating actions/checkout tag" >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# L3 review: a fence with an info string is still a fence.
+#
+# The tokenizer opens a fence on any run of three or more backticks, with or
+# without an info string, so ```rust hides its contents exactly like ```.
+# ---------------------------------------------------------------------------
+out=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/fence-info-string" 2>&1)
+case "$out" in
+  *"no gating marker"*) : ;;
+  *) echo "FAIL: a \`\`\`rust fence must hide both the marker and the receipt: $out" >&2; exit 1 ;;
+esac
+out=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/fence-info-string-outside" 2>&1 >/dev/null || true)
+case "$out" in
+  *"1 outstanding finding(s)"*) : ;;
+  *) echo "FAIL: a fenced receipt must not clear a marker outside the fence: $out" >&2; exit 1 ;;
+esac
+
 echo "gate-receipt self-test: PASS"

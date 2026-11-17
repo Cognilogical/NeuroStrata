@@ -160,6 +160,14 @@ expect_stdout() {
   esac
 }
 
+expect_no_stderr() {
+  # expect_no_stderr <needle> <scenario-dir>
+  case "$(cat "$2/stderr.txt")" in
+    *"$1"*) fail "stderr must not name '$1': $(cat "$2/stderr.txt")" ;;
+    *) : ;;
+  esac
+}
+
 call_count() {
   grep -c '^CALL' "$1" || true
 }
@@ -182,14 +190,17 @@ expect_call() {
 
 expect_graphql_call() {
   # expect_graphql_call <log> <line-number> <cursor|none>
+  #
+  # The GraphQL call fetches the raw envelope: the script validates the page
+  # shape itself, so no --jq filter travels with the request.
   local log=$1 line=$2 cursor=$3
   local rec args
   rec=$(sed -n "${line}p" "$log")
   rec=${rec#CALL}
   rec=${rec#$'\037'}
   IFS=$'\037' read -r -a args <<< "$rec"
-  local want=12
-  [ "$cursor" = "none" ] || want=14
+  local want=10
+  [ "$cursor" = "none" ] || want=12
   if [ "${#args[@]}" -ne "$want" ]; then
     fail "graphql call $line has ${#args[@]} args, expected $want"
   fi
@@ -197,12 +208,8 @@ expect_graphql_call() {
   [ "${args[1]}" = "graphql" ] || fail "graphql call $line arg 1: ${args[1]}"
   [ "${args[2]}" = "-f" ] || fail "graphql call $line arg 2: ${args[2]}"
   case "${args[3]}" in
-    query=*) : ;;
-    *) fail "graphql call $line arg 3 is not the query: ${args[3]}" ;;
-  esac
-  case "${args[3]}" in
-    *reviewThreads*) : ;;
-    *) fail "graphql call $line does not query reviewThreads" ;;
+    query=*reviewThreads*) : ;;
+    *) fail "graphql call $line does not query reviewThreads: ${args[3]}" ;;
   esac
   [ "${args[4]}" = "-F" ] || fail "graphql call $line arg 4: ${args[4]}"
   [ "${args[5]}" = "owner=Cognilogical" ] || fail "graphql call $line arg 5: ${args[5]}"
@@ -211,12 +218,10 @@ expect_graphql_call() {
   [ "${args[8]}" = "-F" ] || fail "graphql call $line arg 8: ${args[8]}"
   [ "${args[9]}" = "pr=123" ] || fail "graphql call $line arg 9: ${args[9]}"
   if [ "$cursor" = "none" ]; then
-    [ "${args[10]}" = "--jq" ] || fail "graphql call $line arg 10: ${args[10]}"
-  else
-    [ "${args[10]}" = "-F" ] || fail "graphql call $line arg 10: ${args[10]}"
-    [ "${args[11]}" = "endCursor=$cursor" ] || fail "graphql call $line arg 11: ${args[11]}"
-    [ "${args[12]}" = "--jq" ] || fail "graphql call $line arg 12: ${args[12]}"
+    return 0
   fi
+  [ "${args[10]}" = "-F" ] || fail "graphql call $line arg 10: ${args[10]}"
+  [ "${args[11]}" = "endCursor=$cursor" ] || fail "graphql call $line arg 11: ${args[11]}"
 }
 
 # ---------------------------------------------------------------------------
@@ -426,7 +431,8 @@ expect_rc 1 "$d"
 expect_stderr "review-thread resolution unavailable" "$d"
 expect_stderr "inline finding" "$d"
 
-# The same fallback with no inline finding still accounts the top-level pool.
+# The same fallback with no inline finding still accounts the top-level pool,
+# and says nothing about a thread it never resolved.
 d=$(new_scenario fallback-top-level)
 standard_api "$d"
 printf 'Cognilogical/NeuroStrata\n' > "$d/repo-view.json"
@@ -436,6 +442,73 @@ printf 'graphql\n' > "$d/fail"
 run_gate "$d" --pr 123
 expect_rc 0 "$d"
 expect_stdout "cleared" "$d"
+expect_no_stderr "review-thread resolution unavailable" "$d"
+
+# ---------------------------------------------------------------------------
+# 6b. A GraphQL page that is not a page.
+#
+# An HTTP 200 body can still carry GraphQL errors, a partial answer, or a
+# malformed page. Such a page must never be accepted as "no findings": the
+# script falls back, and the fail-closed fallback then gates the inline
+# finding instead of silently under-counting it.
+# ---------------------------------------------------------------------------
+invalid_page() {
+  # invalid_page <scenario-name> <page-body-file-content>
+  local name=$1
+  d=$(new_scenario "$name")
+  standard_api "$d"
+  printf 'Cognilogical/NeuroStrata\n' > "$d/repo-view.json"
+  printf '{"": "graphql-1.json"}\n' > "$d/graphql-map.json"
+  cat > "$d/graphql-1.json"
+  # An inline finding is present: the fallback must gate it.
+  cat > "$d/api/pulls-123-comments.json" <<'JSON'
+[{"body":"**P1 Badge** an inline finding with no bindable receipt","author_association":"NONE","user":{"login":"bot"}}]
+JSON
+  run_gate "$d" --pr 123
+  expect_rc 1 "$d"
+  expect_stderr "review-thread resolution unavailable" "$d"
+  expect_stderr "inline finding" "$d"
+}
+
+invalid_page graphql-http200-errors <<'JSON'
+{"errors":[{"type":"NOT_FOUND","message":"Could not resolve to a Repository"}],"data":null}
+JSON
+
+invalid_page graphql-http200-partial <<'JSON'
+{"data":{"repository":null}}
+JSON
+
+invalid_page graphql-malformed <<'JSON'
+{ this is not json
+JSON
+
+invalid_page graphql-empty-body <<'JSON'
+{}
+JSON
+
+invalid_page graphql-empty-data <<'JSON'
+{"data":{}}
+JSON
+
+invalid_page graphql-hasnext-not-boolean <<'JSON'
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":"false","endCursor":null},"nodes":[]}}}}}
+JSON
+
+invalid_page graphql-hasnext-true-without-cursor <<'JSON'
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":true,"endCursor":null},"nodes":[]}}}}}
+JSON
+
+invalid_page graphql-node-without-comments <<'JSON'
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"isResolved":false}]}}}}}
+JSON
+
+invalid_page graphql-node-without-resolution <<'JSON'
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"comments":{"totalCount":0,"nodes":[]}}]}}}}}
+JSON
+
+invalid_page graphql-comment-without-body <<'JSON'
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"isResolved":false,"comments":{"totalCount":1,"nodes":[{"authorAssociation":"NONE"}]}}]}}}}}
+JSON
 
 # The inline fetch failing inside the fallback is a fetch failure, not a
 # clearance.

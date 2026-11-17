@@ -84,11 +84,23 @@ pages) and requests up to 100 comments per thread; if a thread reports more
 comments than were returned, the script exits 1 instead of under-counting
 receipts or findings.
 
+Every page is validated before it is accepted: the response must be a JSON
+object without GraphQL `errors`, `data.repository.pullRequest.reviewThreads`
+must be an object, `pageInfo.hasNextPage` must be a boolean, a page that claims
+another page must carry a non-empty `endCursor`, `nodes` must be an array, and
+every node must carry a boolean `isResolved` and a `comments` object with a
+numeric `totalCount` and an array of comment objects with string bodies. An
+HTTP 200 body that fails any of these checks is not a page: the script refuses
+it and takes the fail-closed fallback below, because reading a malformed page
+as "no findings" would under-count findings and over-clear the gate.
+
 When GraphQL is unavailable, the script **fails closed**. Without the threads
 there is no way to bind a receipt to the finding it answers, so an inline
 finding cannot be cleared by a receipt posted elsewhere: the script announces
 `review-thread resolution unavailable` on stderr and exits 1 when any inline
-comment carries a marker. Pooling receipts across inline comments is gone —
+comment carries a marker. The announcement belongs to that failure: when no
+inline comment carries a marker there is nothing to announce. Pooling receipts
+across inline comments is gone —
 that binding was looser than thread mode and could clear an unrelated finding.
 When no inline comment carries a marker, only the top-level pool is accounted.
 An unresolved thread is never treated as clearance.
@@ -97,11 +109,17 @@ GitHub Actions has no thread-resolution trigger: `pull_request_review_thread`
 is a webhook event only, and listing it in `on:` makes the workflow invalid. A
 bare resolve/unresolve therefore does not re-run the check; it re-evaluates on
 the next review, inline comment, or PR edit. An inline `fixed@`/`filed` reply is
-a review-comment event, so the normal receipt path re-runs the check. A receipt
-posted as a top-level issue comment does not re-run it — `issue_comment` and
-`workflow_dispatch` are deliberately not subscribed, because they would execute
-a PR-supplied checkout with default-branch authority — though such a receipt
-still counts the next time the check does run.
+a review-comment event, so the normal receipt path re-runs the check.
+
+A receipt posted as a top-level issue comment re-runs it too: the workflow
+subscribes `issue_comment`. That event is a privileged default-branch context
+and carries no `pull_request` payload, so a `resolve` step looks the PR up
+through the API (`repos/<owner>/<repo>/pulls/<n>`), takes its **base** SHA, and
+the checkout uses that base SHA — never the caller's PR head. The gate therefore
+always runs base-branch code, and a privileged event cannot be used to run
+review-supplied code with default-branch authority. Comments on plain issues
+are skipped (`github.event.issue.pull_request`), the permissions stay
+read-only, and `actions/checkout` is pinned to a commit SHA.
 
 For offline checks, `--reviews-file <path>` takes a legacy body fixture and
 `--fixtures-dir <dir>` takes `reviews.json`, `issue-comments.json`, and either

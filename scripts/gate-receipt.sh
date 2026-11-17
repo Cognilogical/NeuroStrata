@@ -57,7 +57,9 @@ while [ $# -gt 0 ]; do
 done
 
 tmpdir=""
-trap '[ -n "$tmpdir" ] && rm -rf "$tmpdir"' EXIT
+# The trap must not change the exit status: `cmd && cmd` as the last
+# statement of a trap would exit non-zero when tmpdir is empty.
+trap 'if [ -n "$tmpdir" ]; then rm -rf "$tmpdir"; fi' EXIT
 
 json_entries() {
   jq -c '.[] | {body: (.body // ""), author_association: (.author_association // "NONE"), author: (.author // .user.login // "")}' "$1"
@@ -88,12 +90,6 @@ tokenizer_def='
     | .out | join("\n")
     | gsub("(?<!`)(`+)(?!`)(.*?)(?<!`)\\1(?!`)"; ""; "m");
 '
-clean_filter="${tokenizer_def}"'clean'
-
-clean_stream() {
-  jq -Rrs "$clean_filter"
-}
-
 # Normalize fixed@ receipt targets to lowercase SHAs. The grep match is
 # case-insensitive, so the prefix strip must be too: lowercase first, then
 # strip, or FIXED@<sha> survives with its prefix and never validates.
@@ -226,6 +222,56 @@ threads_query='
     }
   }'
 
+# A reviewThreads page is accepted only when its shape is complete. An HTTP
+# 200 body can carry GraphQL errors, a partial answer, or a page that is not a
+# page at all; reading such a page as "no findings" would under-count the
+# findings and over-clear the gate. A page that fails this guard is refused and
+# the fail-closed fallback takes over.
+threads_page_guard='
+  def thread_ok:
+    (type == "object")
+    and (has("isResolved"))
+    and ((.isResolved | type) == "boolean")
+    and (has("comments"))
+    and ((.comments | type) == "object")
+    and ((.comments.totalCount | type) == "number")
+    and ((.comments.nodes | type) == "array")
+    and (all(.comments.nodes[]; (type == "object") and ((.body | type) == "string")));
+  def page_info_ok:
+    (type == "object")
+    and (has("hasNextPage"))
+    and ((.hasNextPage | type) == "boolean")
+    and (((.endCursor | type) == "string") or (.endCursor == null))
+    and (if .hasNextPage then ((.endCursor | type) == "string") and ((.endCursor | length) > 0) else true end);
+  (type == "object")
+  and (((.errors // []) | type) == "array")
+  and (((.errors // []) | length) == 0)
+  and ((.data | type) == "object")
+  and ((.data.repository | type) == "object")
+  and ((.data.repository.pullRequest | type) == "object")
+  and ((.data.repository.pullRequest.reviewThreads | type) == "object")
+  and (.data.repository.pullRequest.reviewThreads.pageInfo | page_info_ok)
+  and ((.data.repository.pullRequest.reviewThreads.nodes | type) == "array")
+  and (all(.data.repository.pullRequest.reviewThreads.nodes[]; thread_ok))
+'
+
+# The projection the accounting uses, applied only to a page that passed the
+# guard above.
+threads_page_filter='
+  .data.repository.pullRequest.reviewThreads
+  | {hasNextPage: .pageInfo.hasNextPage,
+     endCursor: (.pageInfo.endCursor // ""),
+     nodes: [.nodes[] | {
+       isResolved: .isResolved,
+       commentsTotal: .comments.totalCount,
+       comments: [.comments.nodes[] | {
+         body: .body,
+         author_association: (.authorAssociation // "NONE"),
+         author: ((.author // {}) | .login // "")
+       }]
+     }]}
+'
+
 reviews_entries=""
 comment_entries=""
 top_marker_entries=""
@@ -354,19 +400,15 @@ else
     page_no=$((page_no + 1))
     gql_args=(-f query="$threads_query" -F owner="$owner" -F name="$name" -F pr="$pr")
     [ -n "$cursor" ] && gql_args+=(-F endCursor="$cursor")
-    page=$(gh api graphql "${gql_args[@]}" --jq '
-      .data.repository.pullRequest.reviewThreads
-      | {hasNextPage: (.pageInfo.hasNextPage // false),
-         endCursor: (.pageInfo.endCursor // ""),
-         nodes: [.nodes[] | {
-           isResolved: (.isResolved // false),
-           commentsTotal: (.comments.totalCount // 0),
-           comments: [.comments.nodes[] | {
-             body: (.body // ""),
-             author_association: (.authorAssociation // "NONE"),
-             author: ((.author // {}) | .login // "")
-           }]
-         }]}' 2>/dev/null) || { threads_ok=0; break; }
+    # The raw envelope is fetched, not a filtered projection: an HTTP 200 body
+    # can still carry GraphQL errors, a partial answer, or a malformed page,
+    # and a page that is not a page must never be read as "no findings".
+    raw=$(gh api graphql "${gql_args[@]}" 2>/dev/null) || { threads_ok=0; break; }
+    if ! printf '%s' "$raw" | jq -e "$threads_page_guard" >/dev/null 2>&1; then
+      threads_ok=0
+      break
+    fi
+    page=$(printf '%s' "$raw" | jq "$threads_page_filter")
     printf '%s\n' "$page" >> "$threads_pages"
     if [ "$(printf '%s' "$page" | jq -r '.hasNextPage')" != "true" ]; then
       break
@@ -447,11 +489,11 @@ elif [ "$thread_mode" = "fallback" ]; then
   # Fail closed. Without the threads there is no way to bind a receipt to the
   # finding it answers, so an inline finding is outstanding: pooling receipts
   # across comments let a receipt for one finding clear an unrelated one.
-  echo "gate-receipt: review-thread resolution unavailable; an inline finding cannot be bound to its own thread" >&2
   set_jq_args
   inline=$(printf '%s\n' "$pull_entries" | pool_stats true)
   inline_markers=$(printf '%s' "$inline" | jq -r '.markers')
   if [ "$inline_markers" -gt 0 ]; then
+    echo "gate-receipt: review-thread resolution unavailable; an inline finding cannot be bound to its own thread" >&2
     echo "gate-receipt: $inline_markers outstanding finding(s) without a receipt; $inline_markers inline finding(s) cannot be bound to a receipt without their review thread" >&2
     echo "each marker needs its own fixed@<sha>, filed #<issue>, or maintainer ruled: <reason> from the PR author or a maintainer in its own thread or body" >&2
     exit 1

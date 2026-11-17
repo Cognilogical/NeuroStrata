@@ -70,5 +70,7 @@ targets were not validated.
 | `parser-parity-threads` | the same body on the thread surface → 3 markers, 3 outstanding |
 | `parser-parity-fallback` | the same body on the fallback surface → 3 markers, 3 outstanding |
 | `parser-parity-thread-body` | the same body inside a thread → 3 markers, 3 outstanding |
+| `fence-info-string` | marker and receipt inside a ```rust fence → both excluded, no marker |
+| `fence-info-string-outside` | marker outside the fence, receipt inside it → the finding stays outstanding |
 | `truncated-threads` | envelope with `pageInfo.hasNextPage: true` → exit 1 |
 | `truncated-comments` | thread with `comments.totalCount: 101` but one node → exit 1 |
