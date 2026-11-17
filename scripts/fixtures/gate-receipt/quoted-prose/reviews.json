@@ -2,5 +2,13 @@
   {
     "body": "Quoting an earlier finding for context:\n\n> **<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub> quoted finding</sub></sub>\n\nThat was handled under the follow-up issue.",
     "author_association": "MEMBER"
+  },
+  {
+    "body": "A badge in a code span is not a marker: `**P1 Badge**`.",
+    "author_association": "MEMBER"
+  },
+  {
+    "body": "A badge in a fence is not a marker:\n```\n**P1 Badge**\n```",
+    "author_association": "MEMBER"
   }
 ]
