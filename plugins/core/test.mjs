@@ -244,7 +244,7 @@ function createMockDaemonServer({ returnTask = null, guardReject = false } = {})
         }
       });
     });
-    server.listen(0, () => {
+    server.listen(0, "127.0.0.1", () => {
       const addr = server.address();
       resolve({ server, url: `http://127.0.0.1:${addr.port}/mcp`, counters });
     });
@@ -486,7 +486,7 @@ describe("handleHookEvent / handleClaudeHookEvent alias", () => {
     const { server, url } = await createMockDaemonServer();
     try {
       resetClientForTesting();
-      const ctx = { config: { namespace: "pref-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 }, tool: { hook: async () => {} }, hooks: {} };
+      const ctx = { config: { namespace: "pref-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 2000 }, tool: { hook: async () => {} }, hooks: {} };
       await initialize(ctx);
       const out = await handleHookEvent({
         hook_event_name: "PreToolUse",
@@ -520,7 +520,7 @@ describe("handleHookEvent / handleClaudeHookEvent alias", () => {
     const { server, url } = await createMockDaemonServer({ guardReject: true });
     try {
       resetClientForTesting();
-      const ctx = { config: { namespace: "guard-ns", endpoint: url, bearerToken: "tok", strictMode: true, requestTimeoutMs: 200 }, tool: { hook: async () => {} }, hooks: {} };
+      const ctx = { config: { namespace: "guard-ns", endpoint: url, bearerToken: "tok", strictMode: true, requestTimeoutMs: 2000 }, tool: { hook: async () => {} }, hooks: {} };
       await initialize(ctx);
       const out = await handleHookEvent({
         hook_event_name: "PreToolUse",
@@ -561,7 +561,7 @@ describe("resolveActiveTaskFromDaemon", () => {
     const { server, url, counters } = await createMockDaemonServer({ returnTask: [{ id: "task-d1", session_id: "sess-d1", status: "in_progress", subagent_prompt_injection: "### Injected daemon context" }] });
     try {
       const ctx = {
-        config: { namespace: "ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 },
+        config: { namespace: "ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 2000 },
         tool: { hook: async () => {} },
         hooks: {},
       };
@@ -685,7 +685,7 @@ describe("enrichAndInjectSubagentPrompt", () => {
     const { server, url } = await createMockDaemonServer();
     try {
       resetClientForTesting();
-      const ctx = { config: { namespace: "ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 }, tool: { hook: async () => {} }, hooks: {} };
+      const ctx = { config: { namespace: "ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 2000 }, tool: { hook: async () => {} }, hooks: {} };
       await initialize(ctx);
       const target = { prompt: "Touch src/foo.ts please" };
       const changed = await enrichAndInjectSubagentPrompt(target, "ns");
@@ -704,7 +704,7 @@ describe("enrichAndInjectSubagentPrompt", () => {
     });
     try {
       resetClientForTesting();
-      const ctx = { config: { namespace: "ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 }, tool: { hook: async () => {} }, hooks: {} };
+      const ctx = { config: { namespace: "ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 2000 }, tool: { hook: async () => {} }, hooks: {} };
       await initialize(ctx);
       // Prime the cache via resolveActiveTaskFromDaemon.
       await resolveActiveTaskFromDaemon("ns");
@@ -752,7 +752,7 @@ describe("prefetchMemoriesForFile LRU + dedup", () => {
     const { server, url, counters } = await createMockDaemonServer();
     try {
       const ctx = {
-        config: { namespace: "pref-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 },
+        config: { namespace: "pref-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 2000 },
         tool: { hook: async () => {} },
         hooks: {},
       };
@@ -803,7 +803,7 @@ describe("recordLocalSessionQuery ledger object format", () => {
       // so the repository checkout's real session ledger is never overwritten.
       writeFileSync(ledgerPath, JSON.stringify([], null, 2));
       resetClientForTesting();
-      const ctx = { config: { namespace: "ledger-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 }, tool: { hook: async () => {} }, hooks: {} };
+      const ctx = { config: { namespace: "ledger-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 2000 }, tool: { hook: async () => {} }, hooks: {} };
       await initialize(ctx);
       await prefetchMemoriesForFile("ledger-ns", "src/ledger.ts", { recordLedgerDir: tmpProjectDir });
       const ledger = JSON.parse(readFileSync(ledgerPath, "utf8"));
@@ -838,7 +838,7 @@ describe("execute.before / execute.after recall delivery", () => {
       const ctx = {
         config: {
           namespace: "recall-ns", endpoint: url, bearerToken: "tok",
-          strictMode: false, requestTimeoutMs: 200,
+          strictMode: false, requestTimeoutMs: 2000,
           intentDetection: { enabled: false, injectReminder: false },
         },
         tool: {
@@ -905,7 +905,7 @@ function makeTaskCandidatesMock({ error = false } = {}) {
         } catch { res.writeHead(400); res.end(); }
       });
     });
-    server.listen(0, () => {
+    server.listen(0, "127.0.0.1", () => {
       const addr = server.address();
       resolve({ server, url: `http://127.0.0.1:${addr.port}/mcp`, captured });
     });
@@ -1051,7 +1051,7 @@ describe("postTurnCandidates", () => {
     const { server, url, captured } = await makeTaskCandidatesMock();
     try {
       resetClientForTesting();
-      const ctx = { config: { namespace: "tc-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 }, tool: { hook: async () => {} }, hooks: {} };
+      const ctx = { config: { namespace: "tc-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 2000 }, tool: { hook: async () => {} }, hooks: {} };
       await initialize(ctx);
       await postTurnCandidates([
         { kind: "task_obligation", title: "one", confidence: 0.9, auto_commit: false, provenance: { role: "user", turn_id: "t1" } },
@@ -1083,7 +1083,7 @@ describe("postTurnCandidates", () => {
     const { server, url } = await makeTaskCandidatesMock({ error: true });
     try {
       resetClientForTesting();
-      const ctx = { config: { namespace: "tc-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 }, tool: { hook: async () => {} }, hooks: {} };
+      const ctx = { config: { namespace: "tc-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 2000 }, tool: { hook: async () => {} }, hooks: {} };
       await initialize(ctx);
       await assert.doesNotReject(
         postTurnCandidates([{ kind: "task_obligation", title: "x", confidence: 0.9, auto_commit: false, provenance: {} }], "tc-ns"),
@@ -1816,7 +1816,7 @@ describe("round-6: task_update title invalidation, AST summary formatting, dev s
     const { server, url } = await createMockDaemonServer();
     try {
       const ctx = {
-        config: { namespace: "ast-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 },
+        config: { namespace: "ast-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 2000 },
         tool: { hook: async () => {} },
         hooks: {},
       };
@@ -1873,14 +1873,14 @@ describe("round-6: task_update title invalidation, AST summary formatting, dev s
             res.end(JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32601, message: "Unknown tool" } }));
           });
         });
-        s.listen(0, () => {
+        s.listen(0, "127.0.0.1", () => {
           const addr = s.address();
           resolve({ server: s, url: `http://127.0.0.1:${addr.port}/mcp` });
         });
       });
 
       resetClientForTesting();
-      const astCtx = { config: { namespace: "ast-ns", endpoint: astTestServer.url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 }, tool: { hook: async () => {} }, hooks: {} };
+      const astCtx = { config: { namespace: "ast-ns", endpoint: astTestServer.url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 2000 }, tool: { hook: async () => {} }, hooks: {} };
       await initialize(astCtx);
 
       const snippets = await prefetchMemoriesForFile("ast-ns", "src/test.rs");
@@ -2130,7 +2130,7 @@ describe("round-9: governed_prefixes records the queried path verbatim", () => {
     try {
       mkdirSync(ledgerDir, { recursive: true });
       resetClientForTesting();
-      const ctx = { config: { namespace: "r9-ledger-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 }, tool: { hook: async () => {} }, hooks: {} };
+      const ctx = { config: { namespace: "r9-ledger-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 2000 }, tool: { hook: async () => {} }, hooks: {} };
       await initialize(ctx);
       await prefetchMemoriesForFile("r9-ledger-ns", "src/auth/login.go", { recordLedgerDir: tmpProjectDir });
       const ledger = JSON.parse(readFileSync(ledgerPath, "utf8"));
@@ -2463,7 +2463,7 @@ describe("Task 1.1: execute.after V2 result mutation (via hook registration)", (
         session: { hook: () => {} },
         tool: { hook: (name, cb) => { if (name === "execute.after") afterHandler = cb; } },
         hooks: {},
-        config: { namespace: "exec-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 },
+        config: { namespace: "exec-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 2000 },
       };
       await initialize(ctx);
       assert.equal(typeof afterHandler, "function");
@@ -2503,7 +2503,7 @@ describe("Task 1.1: execute.after V2 result mutation (via hook registration)", (
         session: { hook: () => {} },
         tool: { hook: (name, cb) => { if (name === "execute.after") afterHandler = cb; } },
         hooks: {},
-        config: { namespace: "dedup-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 },
+        config: { namespace: "dedup-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 2000 },
       };
       await initialize(ctx);
 
@@ -2539,7 +2539,7 @@ describe("Task 1.1: execute.after V2 result mutation (via hook registration)", (
       const ctx = {
         tool: { hook: (name, cb) => { if (name === "execute.after") afterHandler = cb; } },
         hooks: {},
-        config: { namespace: "bash-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 },
+        config: { namespace: "bash-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 2000 },
       };
       await initialize(ctx);
 
@@ -2568,7 +2568,7 @@ describe("Task 1.1: execute.after V2 result mutation (via hook registration)", (
       const ctx = {
         tool: { hook: (name, cb) => { if (name === "execute.after") afterHandler = cb; } },
         hooks: {},
-        config: { namespace: "legacy-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 },
+        config: { namespace: "legacy-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 2000 },
       };
       await initialize(ctx);
       const evt = {

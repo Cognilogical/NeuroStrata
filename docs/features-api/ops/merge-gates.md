@@ -1,17 +1,20 @@
 # Merge gates
 
-`main` is governed by the repository ruleset `secure-rule-set`. It currently
-requires one approval, but admin/role/integration actors bypass it `always`,
-thread resolution is off, and no status checks are required. A gating review
-posted as `COMMENTED` therefore cannot block a merge.
+`main` is governed by the repository ruleset `secure-rule-set` (`16846790`),
+whose canonical declarative specification is tracked in
+`scripts/main-ruleset.json` and validated/applied by
+`scripts/enforce-main-ruleset.sh` (self-tested in `scripts/test-main-ruleset.sh`
+under the `scripts (ubuntu)` CI job).
 
 ## Required state
 
 - Required checks: `build (ubuntu-latest)`, `test (ubuntu)`, `gate-receipt`.
-- Required conversation resolution.
-- Require approval of the last push.
-- Remove `bypass_mode: always` for OrgAdmin, RepositoryRole 2/4/5, and
-  integrations. The owner may still merge, but only after the checks pass.
+- Required conversation resolution (`required_review_thread_resolution: true`).
+- Require approval of the last push (`require_last_push_approval: true`).
+- Non-fast-forward and branch-deletion blocks (`non_fast_forward`, `deletion`).
+- Remove `bypass_mode: always` for `RepositoryRole` 2/4/5 and `Integration`
+  actors; retain only the single audited `OrganizationAdmin` break-glass
+  identity (`scripts/enforce-main-ruleset.sh --apply`).
 - Agents never call `gh pr merge`; the owner performs the merge.
 
 ## Gate receipt
@@ -64,9 +67,11 @@ simulate that check).
 finding has no receipt. `.github/workflows/gate-receipt.yml` runs it on PR,
 review, and inline-review-comment events; the workflow checks out the **base**
 SHA (`github.event.pull_request.base.sha`), so the gate runs the base branch's
-script and a pull request cannot edit the gate that grades it. The ruleset does
-**not** currently require the `gate-receipt` check, so while its result is
-visible it is not an enforced gate until the settings in "Required state" land.
+script and a pull request cannot edit the gate that grades it.
+`scripts/main-ruleset.json` requires the `gate-receipt`, `build (ubuntu-latest)`,
+and `test (ubuntu)` status checks on `main`, and
+`scripts/enforce-main-ruleset.sh --live-check` / `--apply` verifies and enforces
+that ruleset against GitHub (`repos/<owner>/<repo>/rulesets/16846790`).
 
 Threads are bound to their findings. Every review thread, resolved or not, must
 carry its own `fixed@`/`filed`/maintainer `ruled:` reply: a receipt in thread A
