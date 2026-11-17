@@ -24,7 +24,7 @@ Central Agentic Kernel (`AgentKernel`) unifies workflow lifecycle, cognitive rec
 
 - Constructor: `AgentKernel::new`, `AgentKernel::with_ports`.
 - Typed accessors: `memory()`, `executive()`, `ontology()`, `workflows()`, `connectors()`, `bus()`.
-- Operations: `register_pool` (persisting pool schemas and preserving stored `pool_records` when `records` is omitted; `describe_pool_with_hydration` applies persisted namespace overrides before returning built-in defaults), `register_pointer`, `resolve_pointer`, `apply_external_effect`, `execute_connector_command` (`list_connectors`, `describe_pool`, `register_pool`, `upsert_pool`, `list_pools`, `register_pointer`, `list_pointers`, `resolve_pointer`, `apply_effect`, `mediate`), `mediate_workflow_data`.
+- Operations: `register_pool` (persisting namespace-scoped pool schemas via `scoped_connector_pool_id` and preserving stored `pool_records` when `records` is omitted; `describe_pool_with_hydration` applies persisted namespace overrides without mutating other namespaces' built-in defaults), `register_pointer`, `resolve_pointer`, `apply_external_effect`, `execute_connector_command` (`list_connectors`, `describe_pool`, `register_pool`, `upsert_pool`, `list_pools`, `register_pointer`, `list_pointers`, `resolve_pointer`, `apply_effect`, `mediate`), `mediate_workflow_data`.
 
 ## Two-Phase DataConnector Gate
 

@@ -3296,22 +3296,36 @@ pub async fn revert_action(
                 }
 
                 let mut expected_after_payload = delta.after_payload.clone();
-                if expected_after_payload.metadata.is_object()
-                    && (expected_after_payload.metadata.get("facets").is_none()
-                        || expected_after_payload
-                            .metadata
-                            .get("facets_bitemporal")
-                            .is_none())
+                if expected_after_payload.metadata != current_row.metadata
+                    && expected_after_payload.metadata.is_object()
                     && (current_row.metadata.get("facets").is_some()
                         || current_row.metadata.get("facets_bitemporal").is_some())
                 {
-                    let facet_ts = current_row
+                    let old_entries = expected_after_payload
                         .metadata
                         .get("facets_bitemporal")
-                        .and_then(|v| v.as_array())
-                        .and_then(|arr| arr.first())
+                        .and_then(|v| v.as_array());
+                    let new_entries = current_row
+                        .metadata
+                        .get("facets_bitemporal")
+                        .and_then(|v| v.as_array());
+                    let old_len = old_entries.map(|a| a.len()).unwrap_or(0);
+                    let appended_ts = new_entries
+                        .and_then(|arr| arr.get(old_len))
                         .and_then(|entry| entry.get("valid_from"))
-                        .and_then(|v| v.as_i64())
+                        .and_then(|v| v.as_i64());
+                    let retracted_ts =
+                        old_entries.zip(new_entries).and_then(|(old_arr, new_arr)| {
+                            old_arr.iter().zip(new_arr.iter()).find_map(|(o, n)| {
+                                if o.get("valid_to").map(|v| v.is_null()).unwrap_or(true) {
+                                    n.get("valid_to").and_then(|v| v.as_i64())
+                                } else {
+                                    None
+                                }
+                            })
+                        });
+                    let facet_ts = appended_ts
+                        .or(retracted_ts)
                         .unwrap_or(active_receipt.executed_at);
                     crate::domain::materialize_facets_bitemporal(
                         &expected_after_payload.memory_type,
@@ -7666,8 +7680,42 @@ mod tests {
             .as_object_mut()
         {
             meta_obj.remove("facets");
-            meta_obj.remove("facets_bitemporal");
+            meta_obj.insert(
+                "facets_bitemporal".to_string(),
+                json!([{
+                    "facet": "CustomManualPrior",
+                    "inferred": false,
+                    "valid_from": 100,
+                    "valid_to": null
+                }]),
+            );
         }
+        let (row_vec, mut row_payload) = store
+            .get(ns, &upsert_row_id)
+            .await
+            .unwrap()
+            .expect("persisted upsert row");
+        if let Some(meta_obj) = row_payload.metadata.as_object_mut() {
+            meta_obj.remove("facets");
+            meta_obj.insert(
+                "facets_bitemporal".to_string(),
+                json!([{
+                    "facet": "CustomManualPrior",
+                    "inferred": false,
+                    "valid_from": 100,
+                    "valid_to": null
+                }]),
+            );
+        }
+        crate::domain::materialize_facets_bitemporal(
+            &row_payload.memory_type,
+            &mut row_payload.metadata,
+            1700000999,
+        );
+        store
+            .upsert(ns, &upsert_row_id, row_vec, row_payload)
+            .await
+            .expect("persist row with historical + newly materialized facets");
         store
             .upsert(ns, &r3_id, r3_vec, r3_payload)
             .await

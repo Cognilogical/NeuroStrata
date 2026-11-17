@@ -209,11 +209,15 @@ impl AgentKernel {
             anyhow::bail!("max_slice_rows and max_slice_bytes must be positive");
         }
         let connector = connector_opt.expect("connector present after pre-gate check");
-        let registered = connector.register_pool(schema.clone()).await?;
+        let scoped_pool_id = Self::scoped_connector_pool_id(namespace, &schema.pool_id);
+        let mut connector_schema = schema.clone();
+        connector_schema.pool_id = scoped_pool_id.clone();
+        let mut registered = connector.register_pool(connector_schema).await?;
+        registered.pool_id = schema.pool_id.clone();
         if let Some(recs) = records {
             for (uri, values) in recs {
                 connector
-                    .seed_records(&registered.pool_id, uri, values.clone())
+                    .seed_records(&scoped_pool_id, uri, values.clone())
                     .await?;
             }
             self.hydrated_pools.lock().unwrap().insert((
@@ -227,18 +231,26 @@ impl AgentKernel {
             .await
     }
 
+    fn scoped_connector_pool_id(namespace: &str, pool_id: &str) -> String {
+        format!("__ns_pool__:{}:{}:{}", namespace.len(), namespace, pool_id)
+    }
+
     async fn describe_pool_with_hydration(
         &self,
         namespace: &str,
         connector: &Arc<dyn DataConnector>,
         pool_id: &str,
-    ) -> Result<DataPoolSchema> {
+    ) -> Result<(DataPoolSchema, String)> {
         let persisted = self
             .memory
             .list_data_pools(namespace, Some(connector.connector_id()), None)
             .await?;
+        let mut matched: Option<(DataPoolSchema, String)> = None;
         for (schema, records) in persisted {
-            let _ = connector.register_pool(schema.clone()).await;
+            let scoped_id = Self::scoped_connector_pool_id(namespace, &schema.pool_id);
+            let mut connector_schema = schema.clone();
+            connector_schema.pool_id = scoped_id.clone();
+            let _ = connector.register_pool(connector_schema).await;
             let key = (
                 namespace.to_string(),
                 schema.connector_id.clone(),
@@ -248,12 +260,19 @@ impl AgentKernel {
             if should_seed {
                 if let Some(recs) = records {
                     for (uri, values) in recs {
-                        let _ = connector.seed_records(&schema.pool_id, &uri, values).await;
+                        let _ = connector.seed_records(&scoped_id, &uri, values).await;
                     }
                 }
             }
+            if schema.pool_id == pool_id {
+                matched = Some((schema, scoped_id));
+            }
         }
-        connector.describe_pool(pool_id).await
+        if let Some((schema, scoped_id)) = matched {
+            return Ok((schema, scoped_id));
+        }
+        let schema = connector.describe_pool(pool_id).await?;
+        Ok((schema, pool_id.to_string()))
     }
 
     /// Pre-gate helper for `RegisterPointer`.
@@ -339,7 +358,7 @@ impl AgentKernel {
             anyhow::bail!("Pre-gate denied slice resolution: {:?}", pre_verdict);
         }
         let connector = connector_opt.expect("connector present after early-gate check");
-        let schema = self
+        let (schema, connector_pool_id) = self
             .describe_pool_with_hydration(namespace, &connector, &pointer.pool_id)
             .await?;
         let pre_input = KernelConnectorPreGateInput {
@@ -361,9 +380,16 @@ impl AgentKernel {
             anyhow::bail!("Pre-gate denied slice resolution: {:?}", pre_verdict);
         }
         let mut slice = connector
-            .resolve_slice(&pointer.pool_id, &pointer.pointer_uri, req.offset, req.limit, req.max_bytes)
+            .resolve_slice(
+                &connector_pool_id,
+                &pointer.pointer_uri,
+                req.offset,
+                req.limit,
+                req.max_bytes,
+            )
             .await?;
         slice.pointer_id = pointer.pointer_id.clone();
+        slice.pool_id = pointer.pool_id.clone();
         let source_digest_matches = pointer.expected_source_sha256.as_ref()
             .map(|exp| exp == &slice.source_sha256)
             .unwrap_or(true);
@@ -421,7 +447,7 @@ impl AgentKernel {
             .verify_active_action_receipt(namespace, &req.action_receipt_id, &pointer.pointer_id, &pointer.pool_id)
             .await?;
         let connector = connector_opt.expect("connector present after early-gate check");
-        let schema = self
+        let (schema, connector_pool_id) = self
             .describe_pool_with_hydration(namespace, &connector, &pointer.pool_id)
             .await?;
         let pre_input = KernelConnectorPreGateInput {
@@ -442,7 +468,9 @@ impl AgentKernel {
         if pre_verdict != KernelConnectorPreVerdict::AllowPreWriteBack {
             anyhow::bail!("Pre-gate denied write-back: {:?}", pre_verdict);
         }
-        let receipt = connector.apply_external_effect(&pointer.pool_id, &pointer.pointer_uri, req).await?;
+        let receipt = connector
+            .apply_external_effect(&connector_pool_id, &pointer.pointer_uri, req)
+            .await?;
         let source_digest_matches = req.expected_source_sha256.as_ref()
             .map(|exp| exp == &receipt.prior_source_sha256)
             .unwrap_or(true);
@@ -460,6 +488,7 @@ impl AgentKernel {
         }
         let mut receipt = receipt;
         receipt.pointer_id = pointer.pointer_id.clone();
+        receipt.pool_id = pointer.pool_id.clone();
         Ok(receipt)
     }
 
@@ -494,7 +523,7 @@ impl AgentKernel {
                     .connectors()
                     .get(connector_id)
                     .ok_or_else(|| anyhow::anyhow!("connector '{}' not found", connector_id))?;
-                let schema = self
+                let (schema, _) = self
                     .describe_pool_with_hydration(namespace, &connector, pool_id)
                     .await?;
                 Ok(serde_json::to_value(&schema)?)
@@ -1527,5 +1556,20 @@ mod tests {
             .expect("describe_pool overridden default on kernel3");
         assert_eq!(default_desc["access_mode"], "read_only");
         assert_eq!(default_desc["max_slice_rows"], 5);
+
+        let other_ns_default = kernel3
+            .execute_connector_command(
+                "ns_other",
+                &json!({
+                    "operation": "describe_pool",
+                    "connector_id": "memory_pool",
+                    "pool_id": "default"
+                }),
+                Some("ns_other"),
+            )
+            .await
+            .expect("describe_pool built-in default in untouched namespace");
+        assert_eq!(other_ns_default["access_mode"], "read_write");
+        assert_eq!(other_ns_default["max_slice_rows"], 1000);
     }
 }

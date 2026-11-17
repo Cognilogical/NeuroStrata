@@ -58,6 +58,7 @@ pub trait DataConnector: Send + Sync {
 
 - Pre-I/O: `evaluate_connector_pre_gate` — Deny unregistered connector, ReBAC denial, read-only pool on write-back, invalid receipt, slice limit exceeded, future clock skew, stale pointer.
 - Post-I/O: `evaluate_connector_post_gate` — Deny observed bounds exceeded, source digest mismatch, CAS conflict.
+- Namespace-isolated pool overrides: persisted pool registrations and built-in pool overrides are hydrated under `AgentKernel::scoped_connector_pool_id(namespace, pool_id)` so overriding a pool in one namespace never mutates another namespace's connector state.
 - Zero connector I/O on early denial: an unregistered connector or ReBAC denial aborts before `describe_pool`, `resolve_slice`, and `apply_external_effect`. All other pre-gate `Deny*` verdicts run after `describe_pool` but before `resolve_slice`/`apply_external_effect`; post-gate `Deny*` verdicts reject the connector's returned output.
 
 ## Write-Back Receipts
