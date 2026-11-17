@@ -1052,6 +1052,79 @@ fn compute_axis_alignment_bps(
     ((sum / (scores.len() as u64)) as u32).min(10000)
 }
 
+#[cfg(test)]
+#[derive(Default, Clone, Copy)]
+struct TestTaxonomyProbeState {
+    fail_probe_list: bool,
+    probe_typed_lists: usize,
+    full_reads: usize,
+}
+
+#[cfg(test)]
+fn test_taxonomy_probe_map() -> &'static std::sync::Mutex<BTreeMap<String, TestTaxonomyProbeState>> {
+    static MAP: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, TestTaxonomyProbeState>>> =
+        std::sync::OnceLock::new();
+    MAP.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn set_test_probe_fail_for_namespace(namespace: &str, fail: bool) {
+    let mut map = test_taxonomy_probe_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    map.entry(namespace.to_string()).or_default().fail_probe_list = fail;
+}
+
+#[cfg(test)]
+fn reset_test_taxonomy_read_counters(namespace: &str) {
+    let mut map = test_taxonomy_probe_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let entry = map.entry(namespace.to_string()).or_default();
+    entry.probe_typed_lists = 0;
+    entry.full_reads = 0;
+}
+
+#[cfg(test)]
+fn test_probe_typed_list_count(namespace: &str) -> usize {
+    test_taxonomy_probe_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(namespace)
+        .map_or(0, |s| s.probe_typed_lists)
+}
+
+#[cfg(test)]
+fn test_full_taxonomy_read_count(namespace: &str) -> usize {
+    test_taxonomy_probe_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(namespace)
+        .map_or(0, |s| s.full_reads)
+}
+
+async fn list_taxonomy_rows_by_type(
+    store: &LadybugStore,
+    namespace: &str,
+    memory_type: &str,
+) -> anyhow::Result<Vec<crate::traits::SearchResult>> {
+    #[cfg(test)]
+    {
+        let should_fail = {
+            let mut map = test_taxonomy_probe_map()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let entry = map.entry(namespace.to_string()).or_default();
+            entry.probe_typed_lists += 1;
+            entry.fail_probe_list
+        };
+        if should_fail {
+            anyhow::bail!("injected taxonomy probe list failure for '{namespace}' ({memory_type})");
+        }
+    }
+    store.list(namespace, None, Some(memory_type)).await
+}
+
 async fn load_active_rows_and_edges(
     store: &LadybugStore,
     namespace: &str,
@@ -1063,6 +1136,13 @@ async fn load_active_rows_and_edges(
     ),
     String,
 > {
+    #[cfg(test)]
+    {
+        let mut map = test_taxonomy_probe_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        map.entry(namespace.to_string()).or_default().full_reads += 1;
+    }
     let records = store
         .list(namespace, None, None)
         .await
@@ -3185,40 +3265,119 @@ async fn execute_advise(
     }))
 }
 
-/// Render the context-budgeted `### Project Thesis & Domain Expertise:` section (`<= 800` chars)
-/// for `neurostrata_get_snapshot`. Only includes unrestricted (`is_public_access_policy`) rows.
-/// Whether the namespace has any thesis or concept row. The taxonomy view is
-/// built only from those two types, so without them it is empty. Reading by
-/// type keeps get_snapshot and every task block from listing the whole
-/// namespace (code rows included) and all its edges just to find nothing.
-async fn namespace_has_taxonomy_rows(store: &LadybugStore, namespace: &str) -> bool {
-    for memory_type in ["thesis", "concept"] {
-        match store.list(namespace, None, Some(memory_type)).await {
-            Ok(rows) if rows.is_empty() => {}
-            // Rows found, or the narrow read failed: fall back to the full read.
-            _ => return true,
-        }
+/// Whether a taxonomy row (`"thesis"` or `"concept"`) is active, non-conflicting,
+/// unrestricted (`is_public_access_policy`), and carries a valid specification
+/// so it would actually appear in the auto-briefing taxonomy view.
+fn is_visible_autobriefing_taxonomy_row(
+    payload: &MemoryPayload,
+    memory_type: &str,
+    now_ts: i64,
+) -> bool {
+    if !is_active_non_conflicting(payload, now_ts) || !is_public_access_policy(&payload.metadata) {
+        return false;
     }
-    false
+    match memory_type {
+        "thesis" => ThesisSpec::from_payload(payload).is_some(),
+        "concept" => ConceptSpec::from_payload(payload)
+            .filter(|spec| !spec.slug.trim().is_empty())
+            .is_some(),
+        _ => false,
+    }
 }
 
-pub async fn render_snapshot_taxonomy_section(store: &LadybugStore, namespace: &str) -> String {
-    if !namespace_has_taxonomy_rows(store, namespace).await {
-        return String::new();
+enum TaxonomyProbeOutcome {
+    Empty,
+    ThesisOnly(Vec<(String, MemoryPayload)>),
+    NeedsFullRead,
+}
+
+/// Probe `"concept"` then `"thesis"` rows by type before running the full namespace + edge read:
+/// - If any active, unrestricted concept row exists (or a typed probe fails), fall back to the
+///   full read (`NeedsFullRead`) so concept hydration can inspect rules/facts/interfaces/edges.
+/// - If no visible concept exists, probe `"thesis"` and reuse the visible thesis rows directly
+///   (`ThesisOnly`) without listing the whole namespace or its edges.
+/// - If neither has any visible row, return `Empty`.
+async fn probe_autobriefing_taxonomy_rows(
+    store: &LadybugStore,
+    namespace: &str,
+    now_ts: i64,
+) -> TaxonomyProbeOutcome {
+    match list_taxonomy_rows_by_type(store, namespace, "concept").await {
+        Ok(rows) => {
+            if rows
+                .iter()
+                .any(|r| is_visible_autobriefing_taxonomy_row(&r.payload, "concept", now_ts))
+            {
+                return TaxonomyProbeOutcome::NeedsFullRead;
+            }
+        }
+        // Narrow read failed: conservatively fall back to the full read.
+        Err(_) => return TaxonomyProbeOutcome::NeedsFullRead,
     }
+
+    match list_taxonomy_rows_by_type(store, namespace, "thesis").await {
+        Ok(rows) => {
+            let visible_thesis_rows: Vec<(String, MemoryPayload)> = rows
+                .into_iter()
+                .filter(|r| is_visible_autobriefing_taxonomy_row(&r.payload, "thesis", now_ts))
+                .map(|r| (r.id, r.payload))
+                .collect();
+            if visible_thesis_rows.is_empty() {
+                TaxonomyProbeOutcome::Empty
+            } else {
+                TaxonomyProbeOutcome::ThesisOnly(visible_thesis_rows)
+            }
+        }
+        // Narrow read failed: conservatively fall back to the full read.
+        Err(_) => TaxonomyProbeOutcome::NeedsFullRead,
+    }
+}
+
+/// Whether the namespace has any active, non-conflicting, unrestricted thesis or concept row
+/// (or conservatively `true` when the narrow typed probe fails). Reading by type keeps
+/// `get_snapshot` and every task block from listing the whole namespace (code rows included)
+/// and all its edges when no visible taxonomy rows exist.
+async fn namespace_has_taxonomy_rows(store: &LadybugStore, namespace: &str) -> bool {
     let now_ts = chrono::Utc::now().timestamp();
-    let Ok((active_rows, active_edges)) = load_active_rows_and_edges(store, namespace, now_ts).await
-    else {
+    !matches!(
+        probe_autobriefing_taxonomy_rows(store, namespace, now_ts).await,
+        TaxonomyProbeOutcome::Empty
+    )
+}
+
+async fn load_autobriefing_taxonomy_view(
+    store: &LadybugStore,
+    namespace: &str,
+) -> Option<PrincipalTaxonomyView> {
+    let now_ts = chrono::Utc::now().timestamp();
+    let view = match probe_autobriefing_taxonomy_rows(store, namespace, now_ts).await {
+        TaxonomyProbeOutcome::Empty => return None,
+        TaxonomyProbeOutcome::ThesisOnly(thesis_rows) => {
+            build_principal_taxonomy_view(&thesis_rows, &[], "admin")
+        }
+        TaxonomyProbeOutcome::NeedsFullRead => {
+            let (active_rows, active_edges) =
+                load_active_rows_and_edges(store, namespace, now_ts).await.ok()?;
+            let unrestricted_rows: Vec<(String, MemoryPayload)> = active_rows
+                .into_iter()
+                .filter(|(_id, pl)| is_public_access_policy(&pl.metadata))
+                .collect();
+            build_principal_taxonomy_view(&unrestricted_rows, &active_edges, "admin")
+        }
+    };
+    if view.thesis.is_none() && view.concepts.is_empty() {
+        None
+    } else {
+        Some(view)
+    }
+}
+
+/// Render the context-budgeted `### Project Thesis & Domain Expertise:` section (`<= 800` chars)
+/// for `neurostrata_get_snapshot`. Only includes unrestricted (`is_public_access_policy`) rows.
+pub async fn render_snapshot_taxonomy_section(store: &LadybugStore, namespace: &str) -> String {
+    let Some(view) = load_autobriefing_taxonomy_view(store, namespace).await else {
         return String::new();
     };
-    let unrestricted_rows: Vec<(String, MemoryPayload)> = active_rows
-        .into_iter()
-        .filter(|(_id, pl)| is_public_access_policy(&pl.metadata))
-        .collect();
-    let view = build_principal_taxonomy_view(&unrestricted_rows, &active_edges, "admin");
-    if view.thesis.is_none() && view.concepts.is_empty() {
-        return String::new();
-    }
 
     let statuses: Vec<EpistemicStatus> = view
         .concepts
@@ -3314,22 +3473,9 @@ pub async fn build_task_taxonomy_context(
     namespace: &str,
     task_text: &str,
 ) -> (Value, Value, String) {
-    if !namespace_has_taxonomy_rows(store, namespace).await {
-        return (Value::Null, Value::Array(Vec::new()), String::new());
-    }
-    let now_ts = chrono::Utc::now().timestamp();
-    let Ok((active_rows, active_edges)) = load_active_rows_and_edges(store, namespace, now_ts).await
-    else {
+    let Some(view) = load_autobriefing_taxonomy_view(store, namespace).await else {
         return (Value::Null, Value::Array(Vec::new()), String::new());
     };
-    let unrestricted_rows: Vec<(String, MemoryPayload)> = active_rows
-        .into_iter()
-        .filter(|(_id, pl)| is_public_access_policy(&pl.metadata))
-        .collect();
-    let view = build_principal_taxonomy_view(&unrestricted_rows, &active_edges, "admin");
-    if view.thesis.is_none() && view.concepts.is_empty() {
-        return (Value::Null, Value::Array(Vec::new()), String::new());
-    }
 
     let thesis_json = view
         .thesis
@@ -4222,6 +4368,295 @@ mod tests {
         .expect("concept without a thesis");
         assert!(namespace_has_taxonomy_rows(&store, ns).await);
         assert!(render_snapshot_taxonomy_section(&store, ns).await.contains("1 unrestricted concepts"));
+    }
+
+    #[tokio::test]
+    async fn auto_briefing_probe_error_falls_back_to_full_read() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-autobrief-probe-err";
+        store.init(ns).await.expect("init");
+
+        execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "set_thesis".to_string(),
+                namespace: ns.to_string(),
+                primary_domain: Some("cognitive-memory".to_string()),
+                mission: Some("Verifiable cognitive memory engine".to_string()),
+                direction: Some("Graph-first reasoning and formal verification".to_string()),
+                core_pillars: Some(vec!["retrieval".to_string()]),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("set_thesis");
+
+        execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "upsert_concept".to_string(),
+                namespace: ns.to_string(),
+                slug: Some("rrf-fusion".to_string()),
+                pref_label: Some("RRF Fusion".to_string()),
+                definition: Some("Reciprocal rank fusion of retrieval lists.".to_string()),
+                domain: Some("retrieval".to_string()),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("upsert_concept");
+
+        reset_test_taxonomy_read_counters(ns);
+        set_test_probe_fail_for_namespace(ns, true);
+
+        assert!(
+            namespace_has_taxonomy_rows(&store, ns).await,
+            "probe error must conservatively report true so callers fall back to full read"
+        );
+        let snap = render_snapshot_taxonomy_section(&store, ns).await;
+        assert!(
+            snap.contains("cognitive-memory") && snap.contains("1 unrestricted concepts"),
+            "snapshot auto-briefing must fall back to full read on probe error: {snap}"
+        );
+        let (thesis, concepts, prompt) =
+            build_task_taxonomy_context(&store, ns, "rrf fusion").await;
+        assert!(!thesis.is_null());
+        assert_eq!(concepts.as_array().map(|a| a.len()), Some(1));
+        assert!(prompt.contains("rrf-fusion"));
+        assert_eq!(
+            test_full_taxonomy_read_count(ns),
+            2,
+            "both snapshot and task auto-briefing must execute load_active_rows_and_edges when the probe errors"
+        );
+
+        set_test_probe_fail_for_namespace(ns, false);
+
+        // Also verify an empty namespace degrades cleanly when the probe errors.
+        let empty_ns = "tax-autobrief-probe-err-empty";
+        store.init(empty_ns).await.expect("init empty");
+        reset_test_taxonomy_read_counters(empty_ns);
+        set_test_probe_fail_for_namespace(empty_ns, true);
+        assert!(namespace_has_taxonomy_rows(&store, empty_ns).await);
+        assert_eq!(render_snapshot_taxonomy_section(&store, empty_ns).await, "");
+        let (empty_thesis, empty_concepts, empty_prompt) =
+            build_task_taxonomy_context(&store, empty_ns, "anything").await;
+        assert!(empty_thesis.is_null());
+        assert_eq!(empty_concepts, json!([]));
+        assert_eq!(empty_prompt, "");
+        assert_eq!(test_full_taxonomy_read_count(empty_ns), 2);
+        set_test_probe_fail_for_namespace(empty_ns, false);
+    }
+
+    #[tokio::test]
+    async fn auto_briefing_probe_skips_non_visible_rows_and_avoids_redundant_reads() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+
+        // 1. Namespace with ONLY non-visible (restricted, retired, conflicting) thesis/concept rows
+        let ns_hidden = "tax-autobrief-nonvisible";
+        store.init(ns_hidden).await.expect("init hidden");
+        execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "set_thesis".to_string(),
+                namespace: ns_hidden.to_string(),
+                primary_domain: Some("stealth-domain".to_string()),
+                mission: Some("Confidential mission".to_string()),
+                direction: Some("Restricted direction".to_string()),
+                core_pillars: Some(vec!["stealth".to_string()]),
+                access_policy: Some(json!({
+                    "public": false,
+                    "allowed_users": ["alice"]
+                })),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("restricted thesis");
+
+        execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "upsert_concept".to_string(),
+                namespace: ns_hidden.to_string(),
+                slug: Some("restricted-concept".to_string()),
+                pref_label: Some("Restricted Concept".to_string()),
+                definition: Some("Only visible to alice.".to_string()),
+                domain: Some("stealth".to_string()),
+                access_policy: Some(json!({
+                    "public": false,
+                    "allowed_users": ["alice"]
+                })),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("restricted concept");
+
+        // Seed an expired/retired public concept and a conflicting public concept
+        store
+            .upsert(
+                ns_hidden,
+                &concept_row_id(ns_hidden, "retired-concept", 1),
+                vec![0.1; 4],
+                MemoryPayload {
+                    content: "Retired concept".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "concept".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({
+                        "concept": {
+                            "slug": "retired-concept",
+                            "pref_label": "Retired Concept",
+                            "definition": "Already expired."
+                        },
+                        "valid_from": 1,
+                        "valid_to": 2
+                    }),
+                },
+            )
+            .await
+            .expect("seed retired concept");
+
+        store
+            .upsert(
+                ns_hidden,
+                &concept_row_id(ns_hidden, "conflicting-concept", 1),
+                vec![0.1; 4],
+                MemoryPayload {
+                    content: "Conflicting concept".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "concept".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({
+                        "concept": {
+                            "slug": "conflicting-concept",
+                            "pref_label": "Conflicting Concept",
+                            "definition": "Unresolved mesh conflict."
+                        },
+                        "mesh": {
+                            "conflict": true
+                        }
+                    }),
+                },
+            )
+            .await
+            .expect("seed conflicting concept");
+
+        reset_test_taxonomy_read_counters(ns_hidden);
+        assert!(
+            !namespace_has_taxonomy_rows(&store, ns_hidden).await,
+            "namespace with only restricted/retired/conflicting taxonomy rows must report false"
+        );
+        assert_eq!(render_snapshot_taxonomy_section(&store, ns_hidden).await, "");
+        let (h_thesis, h_concepts, h_prompt) =
+            build_task_taxonomy_context(&store, ns_hidden, "stealth").await;
+        assert!(h_thesis.is_null());
+        assert_eq!(h_concepts, json!([]));
+        assert_eq!(h_prompt, "");
+        assert_eq!(
+            test_full_taxonomy_read_count(ns_hidden),
+            0,
+            "non-visible taxonomy rows must skip load_active_rows_and_edges"
+        );
+
+        // 2. Thesis-only namespace (unrestricted active thesis, no unrestricted active concepts)
+        // reuses the probed thesis rows directly without running load_active_rows_and_edges.
+        let ns_thesis_only = "tax-autobrief-thesis-only";
+        store.init(ns_thesis_only).await.expect("init thesis only");
+        execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "set_thesis".to_string(),
+                namespace: ns_thesis_only.to_string(),
+                primary_domain: Some("distributed-consensus".to_string()),
+                mission: Some("Deterministic consensus kernel".to_string()),
+                direction: Some("Leaderless quorum replication".to_string()),
+                core_pillars: Some(vec!["quorum".to_string(), "replication".to_string()]),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("public thesis");
+
+        reset_test_taxonomy_read_counters(ns_thesis_only);
+        let thesis_snap = render_snapshot_taxonomy_section(&store, ns_thesis_only).await;
+        assert!(thesis_snap.contains("distributed-consensus"));
+        assert!(thesis_snap.contains("0 unrestricted concepts"));
+        let (t_json, c_json, t_prompt) =
+            build_task_taxonomy_context(&store, ns_thesis_only, "quorum replication").await;
+        assert_eq!(t_json["primary_domain"], "distributed-consensus");
+        assert_eq!(c_json, json!([]));
+        assert!(t_prompt.contains("distributed-consensus"));
+        assert_eq!(
+            test_full_taxonomy_read_count(ns_thesis_only),
+            0,
+            "thesis-only namespace must render from probed thesis rows without calling load_active_rows_and_edges"
+        );
+
+        // 3. Concept-present namespace short-circuits on the first typed probe ("concept")
+        // without issuing a second typed "thesis" probe before the full read.
+        let ns_concept = "tax-autobrief-concept-present";
+        store.init(ns_concept).await.expect("init concept present");
+        execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "set_thesis".to_string(),
+                namespace: ns_concept.to_string(),
+                primary_domain: Some("cognitive-memory".to_string()),
+                mission: Some("Memory kernel".to_string()),
+                direction: Some("Graph-first".to_string()),
+                core_pillars: Some(vec!["retrieval".to_string()]),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("thesis");
+        execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "upsert_concept".to_string(),
+                namespace: ns_concept.to_string(),
+                slug: Some("rrf-fusion".to_string()),
+                pref_label: Some("RRF Fusion".to_string()),
+                definition: Some("Reciprocal rank fusion.".to_string()),
+                domain: Some("retrieval".to_string()),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("concept");
+
+        reset_test_taxonomy_read_counters(ns_concept);
+        let c_snap = render_snapshot_taxonomy_section(&store, ns_concept).await;
+        assert!(c_snap.contains("1 unrestricted concepts"));
+        assert_eq!(
+            test_probe_typed_list_count(ns_concept),
+            1,
+            "concept-present namespace must short-circuit after the first typed probe ('concept') without probing 'thesis'"
+        );
+        assert_eq!(test_full_taxonomy_read_count(ns_concept), 1);
     }
 
     #[tokio::test]
