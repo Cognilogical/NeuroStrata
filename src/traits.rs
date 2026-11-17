@@ -293,6 +293,26 @@ impl EmbeddingDescriptor {
     }
 }
 
+/// The outcome of a batch embed that is allowed to degrade item by item.
+///
+/// A provider that refuses one item of a batch (a `400`/`413` on an
+/// oversized or malformed input) must not cost the whole generation: the
+/// refused item is reported as `None` and the rest of the batch still lands.
+/// The reasons travel with the outcome so the caller can put a count and a
+/// few samples into its summary instead of losing the fact that something
+/// was dropped.
+#[derive(Debug, Clone, Default)]
+pub struct BatchEmbedOutcome {
+    /// One entry per input, in input order. `None` marks an item the
+    /// provider refused: no vector exists for it, and the caller must not
+    /// store a placeholder (a zero vector would poison cosine distances).
+    pub embeddings: Vec<Option<Vec<f32>>>,
+    /// Why items were refused, in the order the refusals happened. The
+    /// embedder caps how many samples it keeps; the count of refusals is
+    /// `embeddings.iter().filter(|e| e.is_none()).count()`.
+    pub warnings: Vec<String>,
+}
+
 /// The core interface for generating vector embeddings from text.
 /// By making this a trait, we can swap between Local (FastEmbed/ONNX),
 /// Remote (Ollama), or Cloud (OpenAI) implementations.
@@ -310,6 +330,21 @@ pub trait Embedder: Send + Sync {
             out.push(self.embed(text).await?);
         }
         Ok(out)
+    }
+
+    /// Batch embedding that may degrade item by item.
+    ///
+    /// The default is all-or-nothing: it delegates to `embed_batch`, so an
+    /// embedder that never refuses an individual input needs no change and
+    /// keeps its exact semantics. An embedder that can refuse a single
+    /// input (the remote one, whose provider caps the request) overrides
+    /// this to report the refusal instead of failing the whole batch.
+    async fn embed_batch_degradable(&self, texts: &[String]) -> Result<BatchEmbedOutcome> {
+        let vectors = self.embed_batch(texts).await?;
+        Ok(BatchEmbedOutcome {
+            embeddings: vectors.into_iter().map(Some).collect(),
+            warnings: Vec::new(),
+        })
     }
 
     /// Get the expected dimension of the embeddings (e.g., 768 for nomic-embed-text)

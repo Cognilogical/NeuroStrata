@@ -1602,8 +1602,29 @@ pub struct LadybugStore {
     /// use. The sidecar is the setup-time model choice's lock record:
     /// see `crate::model_choice::store_has_data`.
     store_state: Arc<std::sync::Mutex<Option<CachedStoreState>>>,
+    /// The number of `linked_files` census queries this store has run.
+    ///
+    /// The census used to cost one query per 128 hit ids, so the total work
+    /// grew with the pre-limit hit count. It is folded into the candidate
+    /// queries now -- every hit comes back with its own fan-out -- and the
+    /// metadata fallback reads its fan-out in one query, so this counter is
+    /// the metric that shows it: it does not grow with the number of hits a
+    /// file has.
+    census_reads: Arc<std::sync::atomic::AtomicU64>,
     #[cfg(test)]
     test_cleanup_dir: Option<TestCleanupDir>,
+}
+
+impl LadybugStore {
+    /// How many `linked_files` census queries this store has run.
+    ///
+    /// The folded census reads the fan-out inside the candidate queries, so
+    /// this only moves for the hits no edge query reached (the metadata
+    /// fallback), and the fallback reads them all in one query. A test that
+    /// seeds a large hit set asserts it does not grow.
+    pub fn census_reads(&self) -> u64 {
+        self.census_reads.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 #[cfg(test)]
@@ -4404,6 +4425,7 @@ impl LadybugStore {
             db_preexisting,
             open_provenance,
             store_state: Arc::new(std::sync::Mutex::new(None)),
+            census_reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(test)]
             test_cleanup_dir: None,
         })
@@ -12094,6 +12116,8 @@ fn edge_hits_from_rows(
     memory_types: &[String],
     kind_of: impl Fn(&str) -> GraphMatchKind,
     edge_name: &str,
+    census: &mut LinkedFilesCensus,
+    active_by_ns: &mut std::collections::HashMap<String, ActiveGenerations>,
 ) -> Result<Vec<MemoryHit>> {
     let now = chrono::Utc::now().timestamp();
     let mut rows = conn.query(query)?;
@@ -12113,6 +12137,31 @@ fn edge_hits_from_rows(
                 Value::Null
             }
         };
+
+        // The hit's own fan-out rides along with the hit: the query joins the
+        // hit with every `GOVERNS`/`RELATES_TO` target it reaches, so the
+        // `linked_files` count costs no census query at all. The columns
+        // after the hit's own are the fan-out target's id, namespace,
+        // location, type and metadata.
+        let fan_id = format!("{}", row[5]);
+        let fan_ns = format!("{}", row[6]);
+        let fan_location = format!("{}", row[7]);
+        let fan_type = format!("{}", row[8]);
+        let fan_metadata = parse_metadata_or_warn(&format!("{}", row[9]), "metadata");
+        if let Some(key) = census_target_key(
+            &fan_id,
+            &fan_ns,
+            &fan_location,
+            &fan_type,
+            &fan_metadata,
+            active_by_ns,
+            conn,
+            now,
+        ) {
+            census.note(&id, key, fan_type == "directory");
+        }
+        // The join read this hit's fan-out in full, whether or not the hit
+        // itself survives the filters below.
 
         if !memory_types.is_empty() && !memory_types.iter().any(|t| t == &memory_type) {
             continue;
@@ -12148,12 +12197,20 @@ fn edge_hits_from_rows(
 /// `GOVERNS` onto the candidate targets, 2-hop symbol governance
 /// (`memory -GOVERNS-> symbol <-CONTAINS- file`), and `RELATES_TO` onto the
 /// candidate targets in both directions (the relation is undirected).
+///
+/// Every query also joins the hit with its own fan-out
+/// (`hit -[:GOVERNS|RELATES_TO]- target`), so the `linked_files` count comes
+/// back with the hit instead of costing a census query per batch of hit ids.
+/// The join is an inner join, and that is safe: a hit found here always has
+/// at least one `GOVERNS`/`RELATES_TO` edge -- the very edge that found it.
 fn graph_hits_from_edges(
     conn: &Connection,
     namespace: &str,
     candidates: &[(String, GraphMatchKind)],
     file_ids: &[String],
     memory_types: &[String],
+    census: &mut LinkedFilesCensus,
+    active_by_ns: &mut std::collections::HashMap<String, ActiveGenerations>,
 ) -> Result<Vec<MemoryHit>> {
     let safe_ns = escape_ladybug_string(namespace);
     let mut hits = Vec::new();
@@ -12170,7 +12227,7 @@ fn graph_hits_from_edges(
             .collect();
 
         let governs_query = format!(
-            "MATCH (m:Memory)-[:GOVERNS]->(t:Memory) WHERE t.id IN [{}] AND m.namespace = '{}' RETURN t.id, m.id, m.content, m.memory_type, m.metadata",
+            "MATCH (m:Memory)-[:GOVERNS]->(t:Memory) WHERE t.id IN [{}] AND m.namespace = '{}' MATCH (m:Memory)-[:GOVERNS|RELATES_TO]-(fan:Memory) RETURN t.id, m.id, m.content, m.memory_type, m.metadata, fan.id, fan.namespace, fan.location, fan.memory_type, fan.metadata",
             id_list, safe_ns
         );
         hits.extend(edge_hits_from_rows(
@@ -12184,12 +12241,14 @@ fn graph_hits_from_edges(
                     .unwrap_or(GraphMatchKind::MetadataFallback)
             },
             "governs",
+            census,
+            active_by_ns,
         )?);
 
         // RELATES_TO is undirected, so both orientations are queried explicitly
         // (the stored edge is still a directed row).
         let relates_out_query = format!(
-            "MATCH (m:Memory)-[:RELATES_TO]->(t:Memory) WHERE t.id IN [{}] AND m.namespace = '{}' RETURN t.id, m.id, m.content, m.memory_type, m.metadata",
+            "MATCH (m:Memory)-[:RELATES_TO]->(t:Memory) WHERE t.id IN [{}] AND m.namespace = '{}' MATCH (m:Memory)-[:GOVERNS|RELATES_TO]-(fan:Memory) RETURN t.id, m.id, m.content, m.memory_type, m.metadata, fan.id, fan.namespace, fan.location, fan.memory_type, fan.metadata",
             id_list, safe_ns
         );
         hits.extend(edge_hits_from_rows(
@@ -12198,9 +12257,11 @@ fn graph_hits_from_edges(
             memory_types,
             |_| GraphMatchKind::Related,
             "relates to",
+            census,
+            active_by_ns,
         )?);
         let relates_in_query = format!(
-            "MATCH (m:Memory)<-[:RELATES_TO]-(t:Memory) WHERE t.id IN [{}] AND m.namespace = '{}' RETURN t.id, m.id, m.content, m.memory_type, m.metadata",
+            "MATCH (m:Memory)<-[:RELATES_TO]-(t:Memory) WHERE t.id IN [{}] AND m.namespace = '{}' MATCH (m:Memory)-[:GOVERNS|RELATES_TO]-(fan:Memory) RETURN t.id, m.id, m.content, m.memory_type, m.metadata, fan.id, fan.namespace, fan.location, fan.memory_type, fan.metadata",
             id_list, safe_ns
         );
         hits.extend(edge_hits_from_rows(
@@ -12209,6 +12270,8 @@ fn graph_hits_from_edges(
             memory_types,
             |_| GraphMatchKind::Related,
             "relates to",
+            census,
+            active_by_ns,
         )?);
     }
 
@@ -12219,7 +12282,7 @@ fn graph_hits_from_edges(
             .collect::<Vec<_>>()
             .join(", ");
         let query = format!(
-            "MATCH (m:Memory)-[:GOVERNS]->(sym:Memory)<-[:CONTAINS]-(f:Memory) WHERE f.id IN [{}] AND m.namespace = '{}' RETURN sym.id, m.id, m.content, m.memory_type, m.metadata",
+            "MATCH (m:Memory)-[:GOVERNS]->(sym:Memory)<-[:CONTAINS]-(f:Memory) WHERE f.id IN [{}] AND m.namespace = '{}' MATCH (m:Memory)-[:GOVERNS|RELATES_TO]-(fan:Memory) RETURN sym.id, m.id, m.content, m.memory_type, m.metadata, fan.id, fan.namespace, fan.location, fan.memory_type, fan.metadata",
             file_list, safe_ns
         );
         hits.extend(edge_hits_from_rows(
@@ -12228,6 +12291,8 @@ fn graph_hits_from_edges(
             memory_types,
             |_| GraphMatchKind::SymbolTwoHop,
             "governs",
+            census,
+            active_by_ns,
         )?);
     }
 
@@ -12306,6 +12371,21 @@ fn discover_candidates(
     Ok((file_ids, candidates))
 }
 
+/// The `memory_type IN [...]` condition of a type-scoped query, or `None`
+/// when there is no type filter (the trait contract: an empty list means
+/// "every type").
+fn memory_type_condition(memory_types: &[String]) -> Option<String> {
+    if memory_types.is_empty() {
+        return None;
+    }
+    let list = memory_types
+        .iter()
+        .map(|t| format!("'{}'", escape_ladybug_string(t)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!("m.memory_type IN [{}]", list))
+}
+
 /// The metadata fallback: a memory whose `metadata.governs` declares the path
 /// (or an ancestor) but whose edge never materialised -- e.g. the declaration
 /// predates the stub behaviour, or the target is outside the ingested tree.
@@ -12313,6 +12393,9 @@ fn discover_candidates(
 /// The query is scoped to the memory types asked for (rules/facts/procedures
 /// by default), so the ingested AST bulk -- file/symbol/directory rows, which
 /// never carry a `governs` declaration -- is never scanned.
+///
+/// The ids of the hits it found are collected in `fallback_ids`: they are the
+/// rows whose fan-out the census still has to read.
 fn add_metadata_fallback_conn(
     conn: &Connection,
     safe_ns: &str,
@@ -12320,21 +12403,13 @@ fn add_metadata_fallback_conn(
     path: &str,
     include_ancestors: bool,
     memory_types: &[String],
+    active_gens: &std::collections::HashSet<u64>,
+    fallback_ids: &mut std::collections::HashSet<String>,
 ) -> Result<()> {
     // An empty `memory_types` means "no type filter" (the trait contract), so
     // the type condition is omitted entirely; a non-empty list is pushed into
     // the WHERE clause so only those rows are read.
-    let type_condition = if memory_types.is_empty() {
-        None
-    } else {
-        let list = memory_types
-            .iter()
-            .map(|t| format!("'{}'", escape_ladybug_string(t)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        Some(format!("m.memory_type IN [{}]", list))
-    };
-    let where_clause = match &type_condition {
+    let where_clause = match memory_type_condition(memory_types) {
         Some(tc) => format!("m.namespace = '{}' AND {}", safe_ns, tc),
         None => format!("m.namespace = '{}'", safe_ns),
     };
@@ -12346,6 +12421,11 @@ fn add_metadata_fallback_conn(
     let mut rows = conn.query(&query)?;
     while let Some(row) = rows.next() {
         let id = format!("{}", row[0]);
+        // A superseded tree declares nothing to the reader, the same way the
+        // edge path refuses a superseded node.
+        if !is_active_id(&id, active_gens) {
+            continue;
+        }
         let content = format!("{}", row[1]);
         let memory_type = format!("{}", row[2]);
         let metadata_str = format!("{}", row[3]);
@@ -12375,6 +12455,7 @@ fn add_metadata_fallback_conn(
                     .get("access_count")
                     .and_then(|v| v.as_i64())
                     .unwrap_or(0);
+                fallback_ids.insert(id.clone());
                 hits.push(MemoryHit {
                     id,
                     memory_type,
@@ -12393,67 +12474,147 @@ fn add_metadata_fallback_conn(
     Ok(())
 }
 
-/// The most memory ids one `linked_files` census query carries.
+/// The most memory ids one `linked_files` census query of the oracle carries.
 ///
-/// The hit count is bounded only by how many memories govern one file, and it
-/// is the *pre-limit* set (fan-out feeds the ranking, so it cannot be measured
-/// after truncation). Concatenating it into one `IN [...]` would therefore grow
-/// a query string without bound. The ids are batched instead: every query keeps
-/// at most this many ids, the per-namespace generation cache is shared across
-/// batches, and the batches union into the same exact per-hit count. The costs
-/// are `ceil(hits / 128)` reads instead of one, which is one read for any file
-/// with up to 128 governing memories.
+/// The census used to run one query per this many hit ids, so the total work
+/// grew with the *pre-limit* hit count (fan-out feeds the ranking, so the
+/// census cannot be measured after truncation). The census is folded into the
+/// candidate queries now: every hit comes back with its own fan-out, and the
+/// metadata fallback reads its fan-out in one query, so the counts cost no
+/// census query per batch of hits. The batching survives only in the oracle,
+/// which is the reference the fold is compared against.
 ///
 /// 128 is a transport cap, not a semantic limit: it keeps every generated
-/// query far below the engine's statement-length headroom while staying one
-/// batch for any realistic governing set. Hit counts above it only add
-/// batches; they never change a per-hit count.
+/// query far below the engine's statement-length headroom. Hit counts above
+/// it only add batches; they never change a per-hit count.
+#[cfg(test)]
 const LINKED_FILES_ID_BATCH: usize = 128;
 
-/// Sets each hit's `linked_files`: the distinct active files its `GOVERNS` and
-/// `RELATES_TO` edges reach (a symbol counts as its file, a linked memory as
-/// one, keyed by project/source and file path so equal relative paths across
-/// namespaces do not collapse). A directory link reaches every file under it,
-/// so it counts as ten, enough for the widest fan-out bucket. Inactive or
-/// superseded targets are ignored. One read per `LINKED_FILES_ID_BATCH` ids,
-/// unioned across batches, so the count is exact for any hit count.
-fn set_linked_files(conn: &Connection, hits: &mut [MemoryHit]) -> Result<()> {
-    set_linked_files_batched(conn, hits, LINKED_FILES_ID_BATCH)
+/// The key one census target contributes to a hit's `linked_files` count.
+///
+/// The key is `(owner namespace, source key, file path)`, so the same
+/// relative path under two namespaces or two sources counts twice, while one
+/// path reached through two edges counts once. A target is ignored when it is
+/// archived, retired, mesh-conflicting, a registry row, or not reachable
+/// under its namespace's active generation.
+///
+/// This is the ONE place a census target is judged. The folded census and the
+/// batched oracle both call it with the same arguments, so the two cannot
+/// drift apart and the fold stays exact.
+fn census_target_key(
+    target: &str,
+    target_ns: &str,
+    location: &str,
+    target_type: &str,
+    metadata: &Value,
+    active_by_ns: &mut std::collections::HashMap<String, ActiveGenerations>,
+    conn: &Connection,
+    now: i64,
+) -> Option<(String, String, String)> {
+    if is_archived(metadata)
+        || is_retired_at(metadata, now)
+        || is_mesh_conflicting(metadata)
+        || is_registry_row(metadata)
+    {
+        return None;
+    }
+    let owner_ns = split_scoped_id(target)
+        .map(|(ns, _, _)| ns)
+        .or_else(|| {
+            target
+                .split_once(crate::parser::ingest::NAMESPACE_SEPARATOR)
+                .map(|(ns, _)| ns.to_string())
+        })
+        .unwrap_or_else(|| target_ns.to_string());
+    let active = active_by_ns
+        .entry(owner_ns.clone())
+        .or_insert_with(|| ActiveGenerations::read(conn, &owner_ns));
+    if !active.reaches(target, &owner_ns, target_type, metadata) {
+        return None;
+    }
+    let source_key = row_source_key(metadata).unwrap_or("").to_string();
+    let raw_path = if location.is_empty() {
+        crate::parser::ingest::logical_path_of(target)
+    } else {
+        location
+    };
+    let file_path = raw_path
+        .split_once('#')
+        .map(|(f, _)| f)
+        .unwrap_or(raw_path)
+        .to_string();
+    Some((owner_ns, source_key, file_path))
 }
 
-/// `set_linked_files` with the batch width spelled out, so the boundary the
-/// census crosses between batches can be tested at a small size as well as at
-/// `LINKED_FILES_ID_BATCH`. The batching itself must not change any count.
-fn set_linked_files_batched(
+/// The distinct-file census of a hit set.
+///
+/// The counts are exact: every distinct `(owner namespace, source key, file
+/// path)` a hit reaches counts once, and a directory target counts ten (the
+/// widest fan-out bucket). Every hit's fan-out is read in full -- the edge
+/// hits with their own join, the metadata-fallback hits with the fallback's
+/// own query -- so a hit that reaches nothing counts zero rather than
+/// counting something nobody read.
+#[derive(Default)]
+struct LinkedFilesCensus {
+    files: std::collections::HashMap<String, std::collections::HashSet<(String, String, String)>>,
+    directories:
+        std::collections::HashMap<String, std::collections::HashSet<(String, String, String)>>,
+}
+
+impl LinkedFilesCensus {
+    /// Notes one target of one hit.
+    fn note(&mut self, hit_id: &str, key: (String, String, String), is_directory: bool) {
+        if is_directory {
+            self.directories
+                .entry(hit_id.to_string())
+                .or_default()
+                .insert(key);
+        } else {
+            self.files
+                .entry(hit_id.to_string())
+                .or_default()
+                .insert(key);
+        }
+    }
+
+    /// The `linked_files` count of one hit.
+    fn count(&self, hit_id: &str) -> usize {
+        self.files.get(hit_id).map_or(0, |s| s.len())
+            + 10 * self.directories.get(hit_id).map_or(0, |s| s.len())
+    }
+}
+
+/// Reads the fan-out of `ids` and notes every surviving target in the
+/// census. Returns how many queries it ran.
+///
+/// This is the batched oracle's read. The production path folds its own
+/// reads; the differential test reaches this one directly, as the oracle the
+/// folded census is compared against.
+#[cfg(test)]
+fn read_fan_out(
     conn: &Connection,
-    hits: &mut [MemoryHit],
+    ids: &[String],
     batch_size: usize,
-) -> Result<()> {
-    if hits.is_empty() {
-        return Ok(());
+    census: &mut LinkedFilesCensus,
+    active_by_ns: &mut std::collections::HashMap<String, ActiveGenerations>,
+) -> Result<usize> {
+    if ids.is_empty() {
+        return Ok(0);
     }
     let batch_size = batch_size.max(1);
     let now = chrono::Utc::now().timestamp();
-    let mut active_by_ns: std::collections::HashMap<String, ActiveGenerations> =
-        std::collections::HashMap::new();
-    let mut files: std::collections::HashMap<
-        String,
-        std::collections::HashSet<(String, String, String)>,
-    > = std::collections::HashMap::new();
-    let mut directories: std::collections::HashMap<
-        String,
-        std::collections::HashSet<(String, String, String)>,
-    > = std::collections::HashMap::new();
-    for batch in hits.chunks(batch_size) {
+    let mut queries = 0usize;
+    for batch in ids.chunks(batch_size) {
         let id_list = batch
             .iter()
-            .map(|h| format!("'{}'", escape_ladybug_string(&h.id)))
+            .map(|id| format!("'{}'", escape_ladybug_string(id)))
             .collect::<Vec<_>>()
             .join(", ");
         let query = format!(
             "MATCH (m:Memory)-[:GOVERNS|RELATES_TO]-(t:Memory) WHERE m.id IN [{}] RETURN DISTINCT m.id, t.id, t.namespace, t.location, t.memory_type, t.metadata",
             id_list
         );
+        queries += 1;
         let mut rows = conn.query(&query)?;
         while let Some(row) = rows.next() {
             let id = format!("{}", row[0]);
@@ -12462,51 +12623,127 @@ fn set_linked_files_batched(
             let location = format!("{}", row[3]);
             let target_type = format!("{}", row[4]);
             let metadata = parse_metadata_or_warn(&format!("{}", row[5]), "metadata");
-            if is_archived(&metadata)
-                || is_retired_at(&metadata, now)
-                || is_mesh_conflicting(&metadata)
-                || is_registry_row(&metadata)
-            {
+            let Some(key) = census_target_key(
+                &target,
+                &target_ns,
+                &location,
+                &target_type,
+                &metadata,
+                active_by_ns,
+                conn,
+                now,
+            ) else {
                 continue;
-            }
-            let owner_ns = split_scoped_id(&target)
-                .map(|(ns, _, _)| ns)
-                .or_else(|| {
-                    target
-                        .split_once(crate::parser::ingest::NAMESPACE_SEPARATOR)
-                        .map(|(ns, _)| ns.to_string())
-                })
-                .unwrap_or_else(|| target_ns.clone());
-            let active = active_by_ns
-                .entry(owner_ns.clone())
-                .or_insert_with(|| ActiveGenerations::read(conn, &owner_ns));
-            if !active.reaches(&target, &owner_ns, &target_type, &metadata) {
-                continue;
-            }
-            let source_key = row_source_key(&metadata).unwrap_or("").to_string();
-            let raw_path = if location.is_empty() {
-                crate::parser::ingest::logical_path_of(&target)
-            } else {
-                location.as_str()
             };
-            let file_path = raw_path
-                .split_once('#')
-                .map(|(f, _)| f)
-                .unwrap_or(raw_path)
-                .to_string();
-            let key = (owner_ns, source_key, file_path);
-            if target_type == "directory" {
-                directories.entry(id).or_default().insert(key);
-            } else {
-                files.entry(id).or_default().insert(key);
-            }
+            census.note(&id, key, target_type == "directory");
         }
     }
+    Ok(queries)
+}
+
+/// Sets each hit's `linked_files`: the distinct active files its `GOVERNS` and
+/// `RELATES_TO` edges reach (a symbol counts as its file, a linked memory as
+/// one, keyed by project/source and file path so equal relative paths across
+/// namespaces do not collapse). A directory link reaches every file under it,
+/// so it counts as ten, enough for the widest fan-out bucket. Inactive or
+/// superseded targets are ignored.
+///
+/// This is the batched oracle: the production path folds the same count into
+/// the candidate queries, and the two must agree exactly.
+///
+/// It is the oracle now, not the production path: it lives in the test build
+/// only, and the differential test compares the folded census against it.
+#[cfg(test)]
+fn set_linked_files(conn: &Connection, hits: &mut [MemoryHit]) -> Result<()> {
+    set_linked_files_batched(conn, hits, LINKED_FILES_ID_BATCH)
+}
+
+/// `set_linked_files` with the batch width spelled out, so the boundary the
+/// census crosses between batches can be tested at a small size as well as at
+/// `LINKED_FILES_ID_BATCH`. The batching itself must not change any count.
+#[cfg(test)]
+fn set_linked_files_batched(
+    conn: &Connection,
+    hits: &mut [MemoryHit],
+    batch_size: usize,
+) -> Result<()> {
+    if hits.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
+    let mut census = LinkedFilesCensus::default();
+    let mut active_by_ns: std::collections::HashMap<String, ActiveGenerations> =
+        std::collections::HashMap::new();
+    read_fan_out(conn, &ids, batch_size, &mut census, &mut active_by_ns)?;
     for hit in hits.iter_mut() {
-        hit.linked_files = files.get(&hit.id).map_or(0, |s| s.len())
-            + 10 * directories.get(&hit.id).map_or(0, |s| s.len());
+        hit.linked_files = census.count(&hit.id);
     }
     Ok(())
+}
+
+/// Reads the fan-out of the metadata-fallback hits in ONE query.
+///
+/// The fallback hits are the rows whose `metadata.governs` names the path but
+/// whose edge never materialised. Their fan-out used to be read in batches of
+/// `LINKED_FILES_ID_BATCH` hit ids, so the total work grew with the number of
+/// fallback hits. One namespace-and-type scoped query reads the fan-out of
+/// every row of that shape at once: the reads are constant, and the counts
+/// are the same ones the batched oracle produces, because the same
+/// `census_target_key` judges every target.
+///
+/// The hits themselves come from the declaration scan, not from this query: a
+/// fallback hit with no edge at all has no row here, and it must still be a
+/// hit with a count of zero.
+///
+/// Returns how many queries it ran.
+fn read_fallback_fan_out(
+    conn: &Connection,
+    safe_ns: &str,
+    memory_types: &[String],
+    fallback_ids: &std::collections::HashSet<String>,
+    census: &mut LinkedFilesCensus,
+    active_by_ns: &mut std::collections::HashMap<String, ActiveGenerations>,
+) -> Result<usize> {
+    if fallback_ids.is_empty() {
+        return Ok(0);
+    }
+    let where_clause = match memory_type_condition(memory_types) {
+        Some(tc) => format!("m.namespace = '{}' AND {}", safe_ns, tc),
+        None => format!("m.namespace = '{}'", safe_ns),
+    };
+    let query = format!(
+        "MATCH (m:Memory)-[:GOVERNS|RELATES_TO]-(fan:Memory) WHERE {} RETURN DISTINCT m.id, fan.id, fan.namespace, fan.location, fan.memory_type, fan.metadata",
+        where_clause
+    );
+    let now = chrono::Utc::now().timestamp();
+    let mut rows = conn.query(&query)?;
+    while let Some(row) = rows.next() {
+        let id = format!("{}", row[0]);
+        if !fallback_ids.contains(&id) {
+            continue;
+        }
+        let target = format!("{}", row[1]);
+        let target_ns = format!("{}", row[2]);
+        let location = format!("{}", row[3]);
+        let target_type = format!("{}", row[4]);
+        let metadata = parse_metadata_or_warn(&format!("{}", row[5]), "metadata");
+        let Some(key) = census_target_key(
+            &target,
+            &target_ns,
+            &location,
+            &target_type,
+            &metadata,
+            active_by_ns,
+            conn,
+            now,
+        ) else {
+            continue;
+        };
+        census.note(&id, key, target_type == "directory");
+    }
+    // A fallback hit with no edge has no row above, and it counts zero: the
+    // hit itself came from the declaration scan, so it is a hit either way.
+    Ok(1)
 }
 
 /// Keep the best hit per memory id: a lower match-kind priority wins, so a
@@ -12633,8 +12870,9 @@ impl GraphRead for LadybugStore {
         let path_c = path.clone();
         let sym_c = symbol.clone();
         let types = memory_types.clone();
+        let census_reads = self.census_reads.clone();
 
-        let mut hits = self
+        let (mut hits, census) = self
             .with_conn(move |conn| {
                 let safe_ns = escape_ladybug_string(&ns);
 
@@ -12662,7 +12900,25 @@ impl GraphRead for LadybugStore {
                     &active_gens,
                 )?;
 
-                let mut hits = graph_hits_from_edges(conn, &ns, &candidates, &file_ids, &types)?;
+                // The census is folded into the candidate queries: every hit
+                // comes back with its own fan-out, so the `linked_files` count
+                // costs no query of its own.
+                let mut census = LinkedFilesCensus::default();
+                let mut census_active: std::collections::HashMap<String, ActiveGenerations> =
+                    std::collections::HashMap::new();
+                // The rows the metadata fallback finds: their fan-out is read
+                // in one query after the scan.
+                let mut fallback_ids: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                let mut hits = graph_hits_from_edges(
+                    conn,
+                    &ns,
+                    &candidates,
+                    &file_ids,
+                    &types,
+                    &mut census,
+                    &mut census_active,
+                )?;
 
                 add_metadata_fallback_conn(
                     conn,
@@ -12671,9 +12927,25 @@ impl GraphRead for LadybugStore {
                     &path_c,
                     include_ancestors,
                     &types,
+                    &active_gens,
+                    &mut fallback_ids,
                 )?;
 
-                Ok(hits)
+                // The hits no edge query reached -- the metadata fallback --
+                // still need their fan-out read, and they read it all in one
+                // query: the total work does not grow with the number of
+                // fallback hits.
+                let reads = read_fallback_fan_out(
+                    conn,
+                    &safe_ns,
+                    &types,
+                    &fallback_ids,
+                    &mut census,
+                    &mut census_active,
+                )?;
+                census_reads.fetch_add(reads as u64, std::sync::atomic::Ordering::Relaxed);
+
+                Ok((hits, census))
             })
             .await?;
 
@@ -12684,12 +12956,11 @@ impl GraphRead for LadybugStore {
         }
 
         dedup_hits(&mut hits);
-        let mut hits = self
-            .with_conn(move |conn| {
-                set_linked_files(conn, &mut hits)?;
-                Ok(hits)
-            })
-            .await?;
+        // The census counts are exact and independent of the limit, so they
+        // are applied to the hits that survive the exclusion and the dedup.
+        for hit in hits.iter_mut() {
+            hit.linked_files = census.count(&hit.id);
+        }
         crate::graph_read::memories_for_file::rank_hits(&mut hits);
         hits.truncate(limit);
 
@@ -16827,6 +17098,602 @@ eurostrata\src\daemon.rs",
         for hit in &split {
             assert_eq!(hit.linked_files, 2, "batched-by-3, id {}", hit.id);
         }
+    }
+
+    /// The engine capability the folded census rests on: a statement may join
+    /// a hit with its own fan-out, so the `linked_files` count comes back with
+    /// the hit instead of costing a second query per batch of hit ids.
+    ///
+    /// Two spellings are probed, because the fold only needs one of them: the
+    /// two-clause form (the second `MATCH` reuses the variable the first one
+    /// bound) and the comma form (one `MATCH` with two pattern parts). The
+    /// test pins the two-clause form, which is the one the fold uses.
+    #[tokio::test]
+    async fn the_engine_joins_a_hit_with_its_own_fan_out() {
+        let store = retired_test_store().await;
+        for path in ["src/a.rs", "src/b.rs"] {
+            let mut file_payload = retired_test_payload("file", "auto-ingestor", json!({}));
+            file_payload.location = path.to_string();
+            store
+                .upsert(
+                    "probe",
+                    &format!("probe::{path}"),
+                    vec![0.0; 4],
+                    file_payload,
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .upsert(
+                "probe",
+                "fanout-rule",
+                vec![0.0; 4],
+                retired_test_payload(
+                    "rule",
+                    "agent",
+                    json!({
+                        "governs": ["probe::src/a.rs", "probe::src/b.rs"],
+                        "valid_from": 1_700_000_000,
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let two_clause = store
+            .with_conn(|conn| {
+                let query = "MATCH (m:Memory)-[:GOVERNS]->(t:Memory) WHERE t.id IN ['probe::src/a.rs'] AND m.namespace = 'probe' MATCH (m:Memory)-[:GOVERNS|RELATES_TO]-(fan:Memory) RETURN t.id, m.id, fan.id";
+                let mut rows = conn.query(query)?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next() {
+                    out.push(format!("{}|{}|{}", row[0], row[1], row[2]));
+                }
+                Ok(out)
+            })
+            .await
+            .expect("the two-clause fan-out join runs");
+
+        assert_eq!(
+            two_clause,
+            vec![
+                "probe::src/a.rs|fanout-rule|probe::src/a.rs".to_string(),
+                "probe::src/a.rs|fanout-rule|probe::src/b.rs".to_string(),
+            ],
+            "the hit comes back with each of its fan-out targets"
+        );
+    }
+
+    /// Seeds the nodes and rules the census tests read: two files and one
+    /// directory under `probe`, one file under another namespace, and three
+    /// rules with different fan-out shapes (a directory link, a
+    /// cross-namespace link, a `RELATES_TO` link).
+    async fn census_fixture(store: &LadybugStore) {
+        for (namespace, path, mem_type) in [
+            ("probe", "src/a.rs", "file"),
+            ("probe", "src/b.rs", "file"),
+            ("probe", "src/pkg", "directory"),
+            ("other", "src/a.rs", "file"),
+        ] {
+            let mut payload = retired_test_payload(mem_type, "auto-ingestor", json!({}));
+            payload.location = path.to_string();
+            store
+                .upsert(
+                    namespace,
+                    &format!("{}::{}", namespace, path),
+                    vec![0.0; 4],
+                    payload,
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .upsert(
+                "probe",
+                "dir_rule",
+                vec![0.0; 4],
+                retired_test_payload(
+                    "rule",
+                    "agent",
+                    json!({
+                        "governs": ["probe::src/pkg", "probe::src/a.rs"],
+                        "valid_from": 1_700_000_000,
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "cross_rule",
+                vec![0.0; 4],
+                retired_test_payload(
+                    "rule",
+                    "agent",
+                    json!({
+                        "governs": ["probe::src/a.rs", "other::src/a.rs"],
+                        "valid_from": 1_700_000_000,
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "rel_rule",
+                vec![0.0; 4],
+                retired_test_payload(
+                    "rule",
+                    "agent",
+                    json!({
+                        "relates_to": ["probe::src/a.rs"],
+                        "valid_from": 1_700_000_000,
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        // The `RELATES_TO` edge is written directly: the upsert records the
+        // declaration in the metadata, but the edge itself is what the census
+        // reads.
+        store
+            .with_conn(|conn| {
+                conn.query(
+                    "MATCH (a:Memory {id: 'rel_rule'}), (b:Memory {id: 'probe::src/a.rs'}) MERGE (a)-[r:RELATES_TO]->(b) ON CREATE SET r.source = 'probe', r.valid_from = 0, r.valid_to = 0, r.generation = 0, r.extractor = 'test', r.confidence = 1.0, r.evidence_id = 'rel_rule', r.origin = 'local'",
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("seed the relates-to edge");
+    }
+
+    /// The folded census and the batched oracle must agree exactly: the fold
+    /// is allowed to change the cost of the census, never the count.
+    #[tokio::test]
+    async fn the_folded_census_counts_exactly_like_the_batched_oracle() {
+        let store = retired_test_store().await;
+        census_fixture(&store).await;
+
+        let hits = store
+            .memories_for_file(
+                "probe",
+                None,
+                "src/a.rs",
+                None,
+                true,
+                &["rule".to_string()],
+                &[],
+                10,
+            )
+            .await
+            .expect("graph read succeeds");
+        assert_eq!(
+            hits.len(),
+            3,
+            "the three rules reach the file: {:?}",
+            hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+        );
+
+        // The oracle: the same counts, read the old way.
+        let mut oracle_hits = hits.clone();
+        let oracle_hits = store
+            .with_conn(move |conn| {
+                set_linked_files(conn, &mut oracle_hits)?;
+                Ok(oracle_hits)
+            })
+            .await
+            .expect("the oracle census succeeds");
+
+        let folded: Vec<(String, usize)> = hits
+            .iter()
+            .map(|h| (h.id.clone(), h.linked_files))
+            .collect();
+        let oracle: Vec<(String, usize)> = oracle_hits
+            .iter()
+            .map(|h| (h.id.clone(), h.linked_files))
+            .collect();
+        assert_eq!(
+            folded, oracle,
+            "the fold and the oracle count the same files"
+        );
+
+        // The counts themselves: a directory link counts ten, a file link one,
+        // and the same relative path under two namespaces is two files.
+        let by_id: std::collections::HashMap<&str, usize> = hits
+            .iter()
+            .map(|h| (h.id.as_str(), h.linked_files))
+            .collect();
+        assert_eq!(
+            by_id.get("dir_rule"),
+            Some(&11),
+            "one file and one directory"
+        );
+        assert_eq!(
+            by_id.get("cross_rule"),
+            Some(&2),
+            "two namespaces, two files"
+        );
+        assert_eq!(by_id.get("rel_rule"), Some(&1), "one related file");
+    }
+
+    /// The census is folded into the candidate queries, so the total work no
+    /// longer grows with the hit set: a file governed by more memories than
+    /// fit in one batch costs no census query at all, while the batched oracle
+    /// would have needed one query per batch.
+    #[tokio::test]
+    async fn the_folded_census_costs_no_query_for_the_hits_it_reads() {
+        let store = retired_test_store().await;
+        let hit_count = LINKED_FILES_ID_BATCH + 3;
+        for path in ["src/a.rs", "src/b.rs"] {
+            let mut file_payload = retired_test_payload("file", "auto-ingestor", json!({}));
+            file_payload.location = path.to_string();
+            store
+                .upsert(
+                    "probe",
+                    &format!("probe::{path}"),
+                    vec![0.0; 4],
+                    file_payload,
+                )
+                .await
+                .unwrap();
+        }
+        for i in 0..hit_count {
+            store
+                .upsert(
+                    "probe",
+                    &format!("boundary-{i:03}"),
+                    vec![0.0; 4],
+                    retired_test_payload(
+                        "rule",
+                        "agent",
+                        json!({
+                            "governs": ["probe::src/a.rs", "probe::src/b.rs"],
+                            "valid_from": 1_700_000_000,
+                        }),
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+
+        let hits = store
+            .memories_for_file(
+                "probe",
+                None,
+                "src/a.rs",
+                None,
+                true,
+                &["rule".to_string()],
+                &[],
+                5,
+            )
+            .await
+            .expect("graph read succeeds");
+        assert_eq!(hits.len(), 5, "the page is bounded by the limit");
+        for hit in &hits {
+            assert_eq!(hit.linked_files, 2, "id {}", hit.id);
+        }
+        assert_eq!(
+            store.census_reads(),
+            0,
+            "the folded census ran no query of its own, however many hits there were"
+        );
+    }
+
+    /// The ranking consumes the census counts, so the fold must not move a
+    /// hit: the order the folded census produces is the order the oracle's
+    /// counts produce.
+    #[tokio::test]
+    async fn the_ranking_order_is_the_same_with_the_folded_census() {
+        let store = retired_test_store().await;
+        census_fixture(&store).await;
+
+        let hits = store
+            .memories_for_file(
+                "probe",
+                None,
+                "src/a.rs",
+                None,
+                true,
+                &["rule".to_string()],
+                &[],
+                10,
+            )
+            .await
+            .expect("graph read succeeds");
+        let folded_order: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
+
+        let mut oracle_hits = hits.clone();
+        let mut oracle_hits = store
+            .with_conn(move |conn| {
+                set_linked_files(conn, &mut oracle_hits)?;
+                Ok(oracle_hits)
+            })
+            .await
+            .expect("the oracle census succeeds");
+        crate::graph_read::memories_for_file::rank_hits(&mut oracle_hits);
+        let oracle_order: Vec<String> = oracle_hits.iter().map(|h| h.id.clone()).collect();
+
+        assert_eq!(
+            folded_order, oracle_order,
+            "the fold does not move a hit in the ranking"
+        );
+        assert!(
+            !folded_order.is_empty(),
+            "the fixture produces hits to rank"
+        );
+    }
+
+    /// A fallback-only corpus: rows whose `metadata.governs` names the path
+    /// but whose edge never materialised.
+    ///
+    /// A `fact` is used on purpose: a `rule` naming a missing target
+    /// materialises a stub file node, and the hit would come from the edge
+    /// path instead of the fallback.
+    async fn fallback_corpus(store: &LadybugStore, count: usize) {
+        for i in 0..count {
+            store
+                .upsert(
+                    "probe",
+                    &format!("fallback-{i:04}"),
+                    vec![0.0; 4],
+                    retired_test_payload(
+                        "fact",
+                        "agent",
+                        json!({
+                            "governs": ["src/a.rs"],
+                            "valid_from": 1_700_000_000,
+                        }),
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    /// The fallback's census costs the same however many fallback hits there
+    /// are.
+    ///
+    /// The fallback's fan-out used to be read in batches of 128 hit ids, so a
+    /// corpus of 130 fallback hits cost two reads and a corpus of 260 cost
+    /// three: the total work grew with the hit count. The fallback reads its
+    /// fan-out in one query now, so both corpora cost the same.
+    #[tokio::test]
+    async fn the_fallback_census_costs_the_same_however_many_fallback_hits_there_are() {
+        let small = retired_test_store().await;
+        fallback_corpus(&small, 130).await;
+        let small_hits = small
+            .memories_for_file(
+                "probe",
+                None,
+                "src/a.rs",
+                None,
+                true,
+                &["fact".to_string()],
+                &[],
+                20,
+            )
+            .await
+            .expect("graph read succeeds");
+        assert_eq!(small_hits.len(), 20, "the page is bounded by the limit");
+
+        let big = retired_test_store().await;
+        fallback_corpus(&big, 260).await;
+        let big_hits = big
+            .memories_for_file(
+                "probe",
+                None,
+                "src/a.rs",
+                None,
+                true,
+                &["fact".to_string()],
+                &[],
+                20,
+            )
+            .await
+            .expect("graph read succeeds");
+        assert_eq!(big_hits.len(), 20, "the page is bounded by the limit");
+
+        assert_eq!(
+            small.census_reads(),
+            big.census_reads(),
+            "the fallback census costs the same however many fallback hits there are"
+        );
+        assert!(
+            small.census_reads() <= 1,
+            "the fallback census costs one read, not one per batch of hits: {}",
+            small.census_reads()
+        );
+    }
+
+    /// A fallback hit with no edge at all is still a hit.
+    ///
+    /// The fan-out is read with a join, and a join drops the rows that have
+    /// no match. The hit must come from the declaration alone, with a count
+    /// of zero -- not vanish.
+    #[tokio::test]
+    async fn a_fallback_hit_with_no_fan_out_is_still_a_hit() {
+        let store = retired_test_store().await;
+        store
+            .upsert(
+                "probe",
+                "lonely-fallback",
+                vec![0.0; 4],
+                retired_test_payload(
+                    "fact",
+                    "agent",
+                    json!({ "governs": ["src/a.rs"], "valid_from": 1_700_000_000 }),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let hits = store
+            .memories_for_file(
+                "probe",
+                None,
+                "src/a.rs",
+                None,
+                true,
+                &["fact".to_string()],
+                &[],
+                20,
+            )
+            .await
+            .expect("graph read succeeds");
+        assert_eq!(hits.len(), 1, "the declaration alone is a hit");
+        assert_eq!(hits[0].id, "lonely-fallback");
+        assert_eq!(hits[0].match_kind, GraphMatchKind::MetadataFallback);
+        assert_eq!(hits[0].linked_files, 0, "no edge means no linked file");
+    }
+
+    /// The fallback's counts are the oracle's counts.
+    ///
+    /// The fallback's fan-out is read in one query now, but the count it
+    /// produces must be exactly the count the batched oracle produces.
+    #[tokio::test]
+    async fn the_fallback_census_counts_exactly_like_the_batched_oracle() {
+        let store = retired_test_store().await;
+        // A file node the fallback hits can reach. It is not the queried
+        // path, so the hit stays a fallback hit.
+        let mut payload = retired_test_payload("file", "auto-ingestor", json!({}));
+        payload.location = "src/other.rs".to_string();
+        store
+            .upsert("probe", "probe::src/other.rs", vec![0.0; 4], payload)
+            .await
+            .unwrap();
+        fallback_corpus(&store, 3).await;
+        // One fallback hit reaches the file.
+        store
+            .with_conn(|conn| {
+                conn.query(
+                    "MATCH (a:Memory {id: 'fallback-0000'}), (b:Memory {id: 'probe::src/other.rs'}) MERGE (a)-[r:RELATES_TO]->(b) ON CREATE SET r.source = 'probe', r.valid_from = 0, r.valid_to = 0, r.generation = 0, r.extractor = 'test', r.confidence = 1.0, r.evidence_id = 'fallback-0000', r.origin = 'local'",
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("seed the relates-to edge");
+
+        let hits = store
+            .memories_for_file(
+                "probe",
+                None,
+                "src/a.rs",
+                None,
+                true,
+                &["fact".to_string()],
+                &[],
+                20,
+            )
+            .await
+            .expect("graph read succeeds");
+        assert_eq!(hits.len(), 3, "the three fallback hits are found");
+
+        let mut oracle_hits = hits.clone();
+        let oracle_hits = store
+            .with_conn(move |conn| {
+                set_linked_files(conn, &mut oracle_hits)?;
+                Ok(oracle_hits)
+            })
+            .await
+            .expect("the oracle census succeeds");
+
+        let folded: Vec<(String, usize)> = hits
+            .iter()
+            .map(|h| (h.id.clone(), h.linked_files))
+            .collect();
+        let oracle: Vec<(String, usize)> = oracle_hits
+            .iter()
+            .map(|h| (h.id.clone(), h.linked_files))
+            .collect();
+        assert_eq!(
+            folded, oracle,
+            "the fallback fold and the oracle count the same files"
+        );
+        let by_id: std::collections::HashMap<&str, usize> = hits
+            .iter()
+            .map(|h| (h.id.as_str(), h.linked_files))
+            .collect();
+        assert_eq!(
+            by_id.get("fallback-0000"),
+            Some(&1),
+            "the related file is counted"
+        );
+        assert_eq!(
+            by_id.get("fallback-0001"),
+            Some(&0),
+            "the hit with no edge counts nothing"
+        );
+    }
+
+    /// A generation-scoped declaration is a fallback hit only while its
+    /// generation is the active one.
+    ///
+    /// A superseded tree must not contribute a declaration to the read, the
+    /// same way the edge path already refuses a superseded node.
+    #[tokio::test]
+    async fn a_generation_scoped_declaration_is_a_fallback_hit_only_while_its_generation_is_active()
+    {
+        let store = retired_test_store().await;
+        let id = crate::parser::ingest::generation_scoped_id("probe", 7, "src/a.rs");
+        store
+            .upsert(
+                "probe",
+                &id,
+                vec![0.0; 4],
+                retired_test_payload(
+                    "fact",
+                    "agent",
+                    json!({ "governs": ["src/a.rs"], "valid_from": 1_700_000_000 }),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let hits = store
+            .memories_for_file(
+                "probe",
+                None,
+                "src/a.rs",
+                None,
+                true,
+                &["fact".to_string()],
+                &[],
+                20,
+            )
+            .await
+            .expect("graph read succeeds");
+        assert!(
+            hits.is_empty(),
+            "a superseded generation declares nothing: {:?}",
+            hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+        );
+
+        store
+            .publish_generation("probe", PROBE_SOURCE, 7)
+            .await
+            .unwrap();
+        let hits = store
+            .memories_for_file(
+                "probe",
+                None,
+                "src/a.rs",
+                None,
+                true,
+                &["fact".to_string()],
+                &[],
+                20,
+            )
+            .await
+            .expect("graph read succeeds");
+        assert_eq!(
+            hits.len(),
+            1,
+            "the active generation's declaration is a hit"
+        );
+        assert_eq!(hits[0].id, id);
     }
 
     /// Spec §3.2: an unqualified `GOVERNS` target that resolves to `Missing`
