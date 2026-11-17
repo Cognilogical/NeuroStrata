@@ -2529,6 +2529,8 @@ async fn lookup_path_for(
 /// `memories_for_file` over every spelling in `forms`. With one form this is
 /// the single lookup; with more, the hits are merged, ranked with the same
 /// `rank_hits`, deduplicated by id (best-ranked kept) and cut to `limit`.
+/// A spelling whose lookup fails does not drop the hits the others found; the
+/// error is returned only when no spelling found anything.
 #[allow(clippy::too_many_arguments)]
 async fn memories_for_forms(
     store: &crate::store::LadybugStore,
@@ -2542,21 +2544,30 @@ async fn memories_for_forms(
     limit: usize,
 ) -> anyhow::Result<Vec<crate::graph_read::memories_for_file::MemoryHit>> {
     let mut hits = Vec::new();
+    let mut first_error = None;
     for form in forms {
-        hits.extend(
-            store
-                .memories_for_file(
-                    namespace,
-                    source,
-                    form,
-                    symbol,
-                    include_ancestors,
-                    memory_types,
-                    exclude_ids,
-                    limit,
-                )
-                .await?,
-        );
+        match store
+            .memories_for_file(
+                namespace,
+                source,
+                form,
+                symbol,
+                include_ancestors,
+                memory_types,
+                exclude_ids,
+                limit,
+            )
+            .await
+        {
+            Ok(batch) => hits.extend(batch),
+            Err(e) => {
+                tracing::warn!("memories_for_file lookup of {form:?} failed: {e}");
+                first_error.get_or_insert(e);
+            }
+        }
+    }
+    if let (true, Some(e)) = (hits.is_empty(), first_error) {
+        return Err(e);
     }
     if forms.len() > 1 {
         crate::graph_read::memories_for_file::rank_hits(&mut hits);
@@ -2623,8 +2634,8 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
     // key ingestion derives from the directory it walks. Absent a root, the
     // store falls back to the most recently published generation.
     let project_root = arguments.get("project_root").and_then(|p| p.as_str());
-    let source: Option<String> = project_root
-        .map(|root| crate::parser::ingest::source_key_for(std::path::Path::new(root)));
+    let source: Option<String> =
+        project_root.map(|root| crate::parser::ingest::source_key_for(std::path::Path::new(root)));
 
     // Stored locations are relative; hooks send the absolute path of the file
     // being touched. The root found here only relativizes the path -- it is
@@ -12973,14 +12984,35 @@ mod tests {
         std::fs::create_dir_all(worktree.join("src")).unwrap();
         std::fs::write(
             worktree.join(".git"),
-            format!("gitdir: {}\n", root.join(".git").join("worktrees").join("agent-1").to_string_lossy()),
+            format!(
+                "gitdir: {}\n",
+                root.join(".git")
+                    .join("worktrees")
+                    .join("agent-1")
+                    .to_string_lossy()
+            ),
         )
         .unwrap();
-        std::fs::write(root.join(".git").join("worktrees").join("agent-1").join("commondir"), "../..\n").unwrap();
+        std::fs::write(
+            root.join(".git")
+                .join("worktrees")
+                .join("agent-1")
+                .join("commondir"),
+            "../..\n",
+        )
+        .unwrap();
         let other = base.join("other-repo");
         std::fs::create_dir_all(other.join(".git")).unwrap();
-        let in_checkout = root.join("src").join("lib.rs").to_string_lossy().to_string();
-        let in_worktree = worktree.join("src").join("lib.rs").to_string_lossy().to_string();
+        let in_checkout = root
+            .join("src")
+            .join("lib.rs")
+            .to_string_lossy()
+            .to_string();
+        let in_worktree = worktree
+            .join("src")
+            .join("lib.rs")
+            .to_string_lossy()
+            .to_string();
 
         // One rule governs the relative file node; another declares the file
         // by an absolute path, as memories written before this fix may.
@@ -13027,29 +13059,46 @@ mod tests {
         // A root cached as a relative path is ignored: the `.git` fallback
         // still resolves the file.
         crate::registry::cache_project_root(&store, Some(&emb), "probe", "example-project").await;
-        for path in [in_checkout.clone(), in_checkout.replace('\\', "/"), in_worktree.clone(), "src/lib.rs".to_string()] {
+        for path in [
+            in_checkout.clone(),
+            in_checkout.replace('\\', "/"),
+            in_worktree.clone(),
+            "src/lib.rs".to_string(),
+        ] {
             let parsed = lookup(path.clone()).await;
             assert!(ids(&parsed).contains(&rule_id), "{path} -> {parsed}");
-            assert_eq!(parsed["path"], serde_json::json!(path), "the caller's path is echoed");
+            assert_eq!(
+                parsed["path"],
+                serde_json::json!(path),
+                "the caller's path is echoed"
+            );
         }
         let parsed = lookup(in_worktree.clone()).await;
         assert_eq!(parsed["resolved_path"], serde_json::json!("src/lib.rs"));
         assert_eq!(parsed["resolved_from"], serde_json::json!("marker"));
-        assert!(lookup("src/lib.rs".into()).await.get("resolved_path").is_none());
+        assert!(lookup("src/lib.rs".into())
+            .await
+            .get("resolved_path")
+            .is_none());
         // The rule stored with the absolute path still answers for it.
         let parsed = lookup(in_checkout.clone()).await;
         assert!(ids(&parsed).contains(&"abs-rule".to_string()), "{parsed}");
 
         // With a usable registered root, the relative path also reaches the
         // rule stored with the absolute path.
-        crate::registry::cache_project_root(&store, Some(&emb), "probe", &root.to_string_lossy()).await;
+        crate::registry::cache_project_root(&store, Some(&emb), "probe", &root.to_string_lossy())
+            .await;
         let parsed = lookup("src/lib.rs".into()).await;
         assert!(ids(&parsed).contains(&"abs-rule".to_string()), "{parsed}");
         assert!(ids(&parsed).contains(&rule_id), "{parsed}");
 
         // A file in another repository is left as it was: same relative name,
         // different project.
-        let stranger = other.join("src").join("lib.rs").to_string_lossy().to_string();
+        let stranger = other
+            .join("src")
+            .join("lib.rs")
+            .to_string_lossy()
+            .to_string();
         let parsed = lookup(stranger).await;
         assert!(ids(&parsed).is_empty(), "{parsed}");
         assert_eq!(parsed["resolved_from"], serde_json::json!("outside"));

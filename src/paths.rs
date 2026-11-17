@@ -106,7 +106,11 @@ fn parse_absolute(raw: &str) -> Option<AbsPath> {
             p => parts.push(p.to_string()),
         }
     }
-    Some(AbsPath { windows, root, parts })
+    Some(AbsPath {
+        windows,
+        root,
+        parts,
+    })
 }
 
 /// Whether `raw` is an absolute path of either platform.
@@ -217,7 +221,10 @@ fn common_git_dir(checkout: &str) -> Option<String> {
         return Some(dot_git.to_string_lossy().to_string());
     }
     let text = std::fs::read_to_string(&dot_git).ok()?;
-    let gitdir = text.lines().find_map(|l| l.trim().strip_prefix("gitdir:"))?.trim();
+    let gitdir = text
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("gitdir:"))?
+        .trim();
     let joined = |base: &Path, rel: &str| {
         if is_absolute_any(rel) {
             rel.to_string()
@@ -239,7 +246,10 @@ fn same_location(a: &str, b: &str) -> bool {
     if lexical(a, b) {
         return true;
     }
-    match (host_path(a).and_then(|p| canonical(&p)), host_path(b).and_then(|p| canonical(&p))) {
+    match (
+        host_path(a).and_then(|p| canonical(&p)),
+        host_path(b).and_then(|p| canonical(&p)),
+    ) {
         (Some(a), Some(b)) => lexical(&a.to_string_lossy(), &b.to_string_lossy()),
         _ => false,
     }
@@ -325,7 +335,11 @@ pub fn to_project_relative(
     registry_root: Option<&str>,
 ) -> LookupPath {
     if !is_absolute_any(raw) {
-        return LookupPath { path: raw.to_string(), source: RootSource::Relative, root: None };
+        return LookupPath {
+            path: raw.to_string(),
+            source: RootSource::Relative,
+            root: None,
+        };
     }
     match choose_root(raw, project_root, registry_root) {
         Some((root, rel, source)) => LookupPath {
@@ -333,7 +347,11 @@ pub fn to_project_relative(
             source,
             root: Some(root),
         },
-        None => LookupPath { path: raw.to_string(), source: RootSource::Outside, root: None },
+        None => LookupPath {
+            path: raw.to_string(),
+            source: RootSource::Outside,
+            root: None,
+        },
     }
 }
 
@@ -366,7 +384,9 @@ fn choose_root(
         (registry_root, RootSource::RegistryRoot),
     ] {
         let Some(root) = root else { continue };
-        let Some(rel) = relative_to_on_disk(raw, root) else { continue };
+        let Some(rel) = relative_to_on_disk(raw, root) else {
+            continue;
+        };
         return match (&marker, &marker_rel) {
             // A checkout nested inside the root (deeper than it).
             (Some(inner), Some(inner_rel)) if depth(inner_rel) < depth(&rel) => {
@@ -380,7 +400,9 @@ fn choose_root(
     // The caller's root constrains the fallback like the registered one: a
     // file in another repository must not resolve while `project_root` (which
     // also pins the ingest generation) names this one.
-    let known_root = project_root.filter(|root| is_usable_root(root)).or(registry_root);
+    let known_root = project_root
+        .filter(|root| is_usable_root(root))
+        .or(registry_root);
     match known_root {
         None => Some((marker, marker_rel, RootSource::Marker)),
         Some(root) if is_checkout_root(root) && same_repository(&marker, root) => {
@@ -427,9 +449,23 @@ mod tests {
 
     #[test]
     fn relative_input_is_returned_byte_for_byte() {
-        for raw in ["src/lib.rs", r"src\lib.rs", "./src/lib.rs", "lib.rs", "C:lib.rs", ""] {
+        for raw in [
+            "src/lib.rs",
+            r"src\lib.rs",
+            "./src/lib.rs",
+            "lib.rs",
+            "C:lib.rs",
+            "",
+        ] {
             let got = to_project_relative(raw, Some("/home/me/example-project"), Some(r"C:\x"));
-            assert_eq!(got, LookupPath { path: raw.to_string(), source: RootSource::Relative, root: None });
+            assert_eq!(
+                got,
+                LookupPath {
+                    path: raw.to_string(),
+                    source: RootSource::Relative,
+                    root: None
+                }
+            );
         }
     }
 
@@ -458,12 +494,22 @@ mod tests {
             "c:/dev/projects/example-project/platform/renderer/x.py",
             r"\\?\C:\dev\projects\example-project\platform\renderer\x.py",
         ] {
-            assert_eq!(relative_to(path, root).as_deref(), Some("renderer/x.py"), "{path}");
+            assert_eq!(
+                relative_to(path, root).as_deref(),
+                Some("renderer/x.py"),
+                "{path}"
+            );
         }
-        assert_eq!(relative_to(r"C:\dev\a\b.rs", r"\\?\c:\dev\").as_deref(), Some("a/b.rs"));
         assert_eq!(
-            relative_to(r"\\?\UNC\server\share\example-project\src\lib.rs", r"\\server\share\example-project")
-                .as_deref(),
+            relative_to(r"C:\dev\a\b.rs", r"\\?\c:\dev\").as_deref(),
+            Some("a/b.rs")
+        );
+        assert_eq!(
+            relative_to(
+                r"\\?\UNC\server\share\example-project\src\lib.rs",
+                r"\\server\share\example-project"
+            )
+            .as_deref(),
             Some("src/lib.rs")
         );
         // Separators and drive letters are normalized, other case is not: only
@@ -471,22 +517,41 @@ mod tests {
         assert_eq!(relative_to(r"C:\Dev\a.rs", r"C:\dev"), None);
         // Another drive, a sibling with a shared name prefix, the root itself.
         assert_eq!(relative_to(r"D:\dev\a.rs", r"C:\dev"), None);
-        assert_eq!(relative_to(r"C:\dev\projects2\a.rs", r"C:\dev\projects"), None);
+        assert_eq!(
+            relative_to(r"C:\dev\projects2\a.rs", r"C:\dev\projects"),
+            None
+        );
         assert_eq!(relative_to(r"C:\dev\projects", r"C:\dev\projects"), None);
     }
 
     #[test]
     fn posix_paths_strip_exactly() {
         let root = "/home/me/example-project";
-        assert_eq!(relative_to("/home/me/example-project/src/lib.rs", root).as_deref(), Some("src/lib.rs"));
         assert_eq!(
-            relative_to("/home/me/example-project/./src/../src/lib.rs", "/home/me/example-project/").as_deref(),
+            relative_to("/home/me/example-project/src/lib.rs", root).as_deref(),
             Some("src/lib.rs")
         );
-        assert_eq!(relative_to("/home/me/Example-Project/src/lib.rs", root), None);
-        assert_eq!(relative_to("/home/me/example-project2/src/lib.rs", root), None);
+        assert_eq!(
+            relative_to(
+                "/home/me/example-project/./src/../src/lib.rs",
+                "/home/me/example-project/"
+            )
+            .as_deref(),
+            Some("src/lib.rs")
+        );
+        assert_eq!(
+            relative_to("/home/me/Example-Project/src/lib.rs", root),
+            None
+        );
+        assert_eq!(
+            relative_to("/home/me/example-project2/src/lib.rs", root),
+            None
+        );
         // Traversal out of the root is resolved first, so it does not match.
-        assert_eq!(relative_to("/home/me/example-project/../other/lib.rs", root), None);
+        assert_eq!(
+            relative_to("/home/me/example-project/../other/lib.rs", root),
+            None
+        );
         // Mixed platforms never match.
         assert_eq!(relative_to("/c/dev/a.rs", r"C:\dev"), None);
         assert_eq!(relative_to(r"C:\home\me\a.rs", "/home/me"), None);
@@ -507,7 +572,14 @@ mod tests {
     fn an_absolute_path_under_no_known_root_is_left_unchanged() {
         let raw = "/nonexistent-ns-lookup/elsewhere/src/lib.rs";
         let got = to_project_relative(raw, Some("/nonexistent-ns-lookup/example-project"), None);
-        assert_eq!(got, LookupPath { path: raw.into(), source: RootSource::Outside, root: None });
+        assert_eq!(
+            got,
+            LookupPath {
+                path: raw.into(),
+                source: RootSource::Outside,
+                root: None
+            }
+        );
         assert_eq!(lookup_forms(raw, &got, None), vec![raw.to_string()]);
     }
 
@@ -527,7 +599,10 @@ mod tests {
         touch(&root.join("src").join("lib.rs"));
         let worktree = root.join(".claude").join("worktrees").join("agent-1");
         touch(&worktree.join("src").join("lib.rs"));
-        link_worktree(&worktree, &root.join(".git").join("worktrees").join("agent-1"));
+        link_worktree(
+            &worktree,
+            &root.join(".git").join("worktrees").join("agent-1"),
+        );
         (tmp, root, worktree)
     }
 
@@ -536,7 +611,11 @@ mod tests {
     fn link_worktree(worktree: &Path, gitdir: &Path) {
         std::fs::create_dir_all(gitdir).unwrap();
         std::fs::create_dir_all(worktree).unwrap();
-        std::fs::write(worktree.join(".git"), format!("gitdir: {}\n", s(gitdir).replace('\\', "/"))).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", s(gitdir).replace('\\', "/")),
+        )
+        .unwrap();
         std::fs::write(gitdir.join("commondir"), "../..\n").unwrap();
     }
 
@@ -557,7 +636,11 @@ mod tests {
         (path.to_string(), source)
     }
 
-    fn got(raw: &Path, project_root: Option<&Path>, registry: Option<&Path>) -> (String, RootSource) {
+    fn got(
+        raw: &Path,
+        project_root: Option<&Path>,
+        registry: Option<&Path>,
+    ) -> (String, RootSource) {
         let p = project_root.map(s);
         let r = registry.map(s);
         let l = to_project_relative(&s(raw), p.as_deref(), r.as_deref());
@@ -567,10 +650,16 @@ mod tests {
     #[test]
     fn git_fallback_finds_the_root_without_any_root_argument() {
         let (_tmp, root, _) = project_with_worktree();
-        assert_eq!(got(&root.join("src").join("lib.rs"), None, None), resolved("src/lib.rs", RootSource::Marker));
+        assert_eq!(
+            got(&root.join("src").join("lib.rs"), None, None),
+            resolved("src/lib.rs", RootSource::Marker)
+        );
         // A file about to be created resolves the same way.
         let new_file = root.join("src").join("new").join("mod.rs");
-        assert_eq!(got(&new_file, None, None), resolved("src/new/mod.rs", RootSource::Marker));
+        assert_eq!(
+            got(&new_file, None, None),
+            resolved("src/new/mod.rs", RootSource::Marker)
+        );
     }
 
     #[test]
@@ -579,9 +668,19 @@ mod tests {
         // ignored; it must not veto the `.git` fallback.
         let (_tmp, root, _) = project_with_worktree();
         let file = s(&root.join("src").join("lib.rs"));
-        for cached in ["example-project", "/nonexistent-ns-lookup/example-project", r"Q:\nonexistent\example-project"] {
+        for cached in [
+            "example-project",
+            "./src",
+            ".",
+            "/nonexistent-ns-lookup/example-project",
+            r"Q:\nonexistent\example-project",
+        ] {
             let l = to_project_relative(&file, None, Some(cached));
-            assert_eq!((l.path.as_str(), l.source), ("src/lib.rs", RootSource::Marker), "{cached}");
+            assert_eq!(
+                (l.path.as_str(), l.source),
+                ("src/lib.rs", RootSource::Marker),
+                "{cached}"
+            );
         }
     }
 
@@ -595,22 +694,37 @@ mod tests {
         let platform = repo.join("platform");
         let file = platform.join("renderer").join("x.py");
         touch(&file);
-        assert_eq!(got(&file, None, Some(&platform)), resolved("renderer/x.py", RootSource::RegistryRoot));
+        assert_eq!(
+            got(&file, None, Some(&platform)),
+            resolved("renderer/x.py", RootSource::RegistryRoot)
+        );
     }
 
     #[test]
     fn a_checkout_root_registration_resolves_its_own_linked_worktrees() {
         let (tmp, root, worktree) = project_with_worktree();
         let inside = worktree.join("src").join("lib.rs");
-        assert_eq!(got(&inside, None, Some(&root)), resolved("src/lib.rs", RootSource::Marker));
-        assert_eq!(got(&inside, Some(&root), None), resolved("src/lib.rs", RootSource::Marker));
+        assert_eq!(
+            got(&inside, None, Some(&root)),
+            resolved("src/lib.rs", RootSource::Marker)
+        );
+        assert_eq!(
+            got(&inside, Some(&root), None),
+            resolved("src/lib.rs", RootSource::Marker)
+        );
         let beside = canonical(tmp.path()).unwrap().join("example-project-wt");
         touch(&beside.join("src").join("lib.rs"));
         link_worktree(&beside, &root.join(".git").join("worktrees").join("wt"));
-        assert_eq!(got(&beside.join("src").join("lib.rs"), None, Some(&root)), resolved("src/lib.rs", RootSource::Marker));
+        assert_eq!(
+            got(&beside.join("src").join("lib.rs"), None, Some(&root)),
+            resolved("src/lib.rs", RootSource::Marker)
+        );
         // A registered worktree resolves the main checkout and its siblings.
         for checkout in [&root, &beside] {
-            assert_eq!(got(&checkout.join("src").join("lib.rs"), None, Some(&worktree)), resolved("src/lib.rs", RootSource::Marker));
+            assert_eq!(
+                got(&checkout.join("src").join("lib.rs"), None, Some(&worktree)),
+                resolved("src/lib.rs", RootSource::Marker)
+            );
         }
     }
 
@@ -624,18 +738,31 @@ mod tests {
         for dir in [&clone, &sub] {
             let file = dir.join("src").join("lib.rs");
             touch(&file);
-            for (project_root, registry) in [(None, Some(&root)), (Some(&root), None), (None, None)] {
+            for (project_root, registry) in [(None, Some(&root)), (Some(&root), None), (None, None)]
+            {
                 let expected = if project_root.is_none() && registry.is_none() {
                     // No root known: the nested repository is the only root.
                     resolved("src/lib.rs", RootSource::Marker)
                 } else {
                     resolved(&s(&file), RootSource::Outside)
                 };
-                assert_eq!(got(&file, project_root.map(|p| p.as_path()), registry.map(|p| p.as_path())), expected, "{}", s(&file));
+                assert_eq!(
+                    got(
+                        &file,
+                        project_root.map(|p| p.as_path()),
+                        registry.map(|p| p.as_path())
+                    ),
+                    expected,
+                    "{}",
+                    s(&file)
+                );
             }
             // From a registered worktree, the main checkout's submodule is
             // still another repository.
-            assert_eq!(got(&file, None, Some(&worktree)), resolved(&s(&file), RootSource::Outside));
+            assert_eq!(
+                got(&file, None, Some(&worktree)),
+                resolved(&s(&file), RootSource::Outside)
+            );
         }
     }
 
@@ -652,11 +779,22 @@ mod tests {
         link_worktree(&nested, &root.join(".git").join("worktrees").join("wt"));
         let beside = canonical(tmp.path()).unwrap().join("example-project-wt");
         link_worktree(&beside, &root.join(".git").join("worktrees").join("wt2"));
-        for file in [nested.join("platform").join("x.py"), beside.join("platform").join("x.py")] {
+        for file in [
+            nested.join("platform").join("x.py"),
+            beside.join("platform").join("x.py"),
+        ] {
             touch(&file);
-            assert_eq!(got(&file, None, Some(&platform)), resolved(&s(&file), RootSource::Outside), "{}", s(&file));
+            assert_eq!(
+                got(&file, None, Some(&platform)),
+                resolved(&s(&file), RootSource::Outside),
+                "{}",
+                s(&file)
+            );
         }
-        assert_eq!(got(&platform.join("x.py"), None, Some(&platform)), resolved("x.py", RootSource::RegistryRoot));
+        assert_eq!(
+            got(&platform.join("x.py"), None, Some(&platform)),
+            resolved("x.py", RootSource::RegistryRoot)
+        );
     }
 
     #[test]
@@ -666,11 +804,20 @@ mod tests {
         std::fs::create_dir_all(other.join(".git")).unwrap();
         let file = other.join("src").join("lib.rs");
         touch(&file);
-        assert_eq!(got(&file, None, Some(&root)), resolved(&s(&file), RootSource::Outside));
+        assert_eq!(
+            got(&file, None, Some(&root)),
+            resolved(&s(&file), RootSource::Outside)
+        );
         // The caller's project_root constrains it the same way, with or
         // without a registered root.
-        assert_eq!(got(&file, Some(&root), None), resolved(&s(&file), RootSource::Outside));
-        assert_eq!(got(&file, Some(&root), Some(&root)), resolved(&s(&file), RootSource::Outside));
+        assert_eq!(
+            got(&file, Some(&root), None),
+            resolved(&s(&file), RootSource::Outside)
+        );
+        assert_eq!(
+            got(&file, Some(&root), Some(&root)),
+            resolved(&s(&file), RootSource::Outside)
+        );
     }
 
     #[test]
@@ -680,9 +827,13 @@ mod tests {
         std::fs::create_dir_all(home.join(".NeuroStrata")).unwrap();
         let file = home.join("scratch").join("notes.py");
         touch(&file);
-        let above_has_git = std::iter::successors(Some(home.as_path()), |p| p.parent()).any(|p| p.join(".git").exists());
+        let above_has_git = std::iter::successors(Some(home.as_path()), |p| p.parent())
+            .any(|p| p.join(".git").exists());
         if !above_has_git {
-            assert_eq!(got(&file, None, None), resolved(&s(&file), RootSource::Outside));
+            assert_eq!(
+                got(&file, None, None),
+                resolved(&s(&file), RootSource::Outside)
+            );
         }
     }
 
@@ -699,9 +850,15 @@ mod tests {
         let joined = parse_absolute(&file).unwrap().to_path_string();
         assert_eq!(forms, vec!["src/lib.rs".to_string(), joined]);
         // No usable root, or a join that leaves the root: relative form only.
-        assert_eq!(lookup_forms("src/lib.rs", &rel, Some("example-project")), vec!["src/lib.rs".to_string()]);
+        assert_eq!(
+            lookup_forms("src/lib.rs", &rel, Some("example-project")),
+            vec!["src/lib.rs".to_string()]
+        );
         let up = to_project_relative("../other/lib.rs", None, None);
-        assert_eq!(lookup_forms("../other/lib.rs", &up, Some(&s(&root))), vec!["../other/lib.rs".to_string()]);
+        assert_eq!(
+            lookup_forms("../other/lib.rs", &up, Some(&s(&root))),
+            vec!["../other/lib.rs".to_string()]
+        );
     }
 
     #[cfg(unix)]
@@ -713,8 +870,14 @@ mod tests {
         touch(&file);
         let link = canonical(tmp.path()).unwrap().join("linked-project");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        assert_eq!(got(&file, Some(&link), None), resolved("src/lib.rs", RootSource::ProjectRoot));
-        assert_eq!(got(&link.join("src").join("lib.rs"), None, Some(&real)), resolved("src/lib.rs", RootSource::RegistryRoot));
+        assert_eq!(
+            got(&file, Some(&link), None),
+            resolved("src/lib.rs", RootSource::ProjectRoot)
+        );
+        assert_eq!(
+            got(&link.join("src").join("lib.rs"), None, Some(&real)),
+            resolved("src/lib.rs", RootSource::RegistryRoot)
+        );
     }
 
     #[cfg(windows)]
@@ -722,13 +885,24 @@ mod tests {
     fn a_windows_root_spelled_in_another_case_or_verbatim_matches_on_disk() {
         let (_tmp, root, _) = project_with_worktree();
         let file = s(&root.join("src").join("lib.rs"));
-        for given in [s(&root).to_uppercase(), format!(r"\\?\{}", s(&root)), s(&root).replace('\\', "/")] {
+        for given in [
+            s(&root).to_uppercase(),
+            format!(r"\\?\{}", s(&root)),
+            s(&root).replace('\\', "/"),
+        ] {
             let l = to_project_relative(&file, Some(&given), None);
-            assert_eq!((l.path.as_str(), l.source), ("src/lib.rs", RootSource::ProjectRoot), "{given}");
+            assert_eq!(
+                (l.path.as_str(), l.source),
+                ("src/lib.rs", RootSource::ProjectRoot),
+                "{given}"
+            );
         }
         // A file spelled in another case resolves to the on-disk case.
         let shouted = format!(r"{}\SRC\LIB.RS", s(&root).to_uppercase());
         let l = to_project_relative(&shouted, None, None);
-        assert_eq!((l.path.as_str(), l.source), ("src/lib.rs", RootSource::Marker));
+        assert_eq!(
+            (l.path.as_str(), l.source),
+            ("src/lib.rs", RootSource::Marker)
+        );
     }
 }
