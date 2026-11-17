@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Self-test for scripts/disk-hygiene.sh.
 #
-# Every destructive path in the script is exercised against COPIES of the
-# fixtures in scripts/fixtures/disk-hygiene/, inside a scratch directory. The
-# script is pointed at the copy through its environment overrides, so the real
-# /tmp, the real worktree root and the real repository are never touched.
+# Every destructive path in the script is exercised against a synthetic
+# scratch directory created inside mktemp -d. The script is pointed at the
+# scratch tree through its environment overrides, so the real /tmp, the real
+# worktree root and the real repository are never touched.
 #
 # The cases pin the behaviour issue #215 asks for:
 #   1. the repo root resolves from the script's own checkout
@@ -25,7 +25,6 @@ set -euo pipefail
 
 root=$(git rev-parse --show-toplevel)
 script="$root/scripts/disk-hygiene.sh"
-fixture="$root/scripts/fixtures/disk-hygiene"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
@@ -72,13 +71,37 @@ age_tree() {
   find "$1" -exec touch -d '3 days ago' {} +
 }
 
-# A fresh copy of the fixtures, with a git repository at the fixture repo root
-# so the script can resolve a root, and with the idle parts aged.
+# A fresh synthetic scratch tree with a git repository at the scratch repo
+# root so the script can resolve a root, and with the idle parts aged.
 new_case() {
   case_dir="$tmp/$1"
   rm -rf "$case_dir"
-  mkdir -p "$case_dir"
-  cp -R "$fixture/repo" "$fixture/worktrees" "$fixture/tmp-base" "$case_dir/"
+  mkdir -p \
+    "$case_dir/repo/.worktrees/wt-fresh/target/debug" \
+    "$case_dir/repo/.worktrees/wt-stale/target/debug" \
+    "$case_dir/repo/target/debug/deps" \
+    "$case_dir/repo/target/debug/incremental/fresh-cache" \
+    "$case_dir/repo/target/debug/incremental/stale-cache" \
+    "$case_dir/worktrees/1ebe42/wt-fresh/target/debug" \
+    "$case_dir/worktrees/1ebe42/wt-stale/target/debug" \
+    "$case_dir/tmp-base/keep-me" \
+    "$case_dir/tmp-base/ns-fresh" \
+    "$case_dir/tmp-base/ns-stale" \
+    "$case_dir/tmp-base/rustc-stale"
+  for marker in \
+    "$case_dir/repo/.worktrees/wt-fresh/target/debug/marker" \
+    "$case_dir/repo/.worktrees/wt-stale/target/debug/marker" \
+    "$case_dir/repo/target/debug/deps/stale-test-binary" \
+    "$case_dir/repo/target/debug/incremental/fresh-cache/marker" \
+    "$case_dir/repo/target/debug/incremental/stale-cache/marker" \
+    "$case_dir/worktrees/1ebe42/wt-fresh/target/debug/marker" \
+    "$case_dir/worktrees/1ebe42/wt-stale/target/debug/marker" \
+    "$case_dir/tmp-base/keep-me/marker" \
+    "$case_dir/tmp-base/ns-fresh/marker" \
+    "$case_dir/tmp-base/ns-stale/marker" \
+    "$case_dir/tmp-base/rustc-stale/marker"; do
+    printf 'fixture\n' > "$marker"
+  done
   git -C "$case_dir/repo" init --quiet
   age_tree "$case_dir/repo/target/debug/incremental/stale-cache"
   age_tree "$case_dir/repo/target/debug/deps"

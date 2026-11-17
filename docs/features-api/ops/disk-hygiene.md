@@ -120,9 +120,9 @@ unit once the plan looks right.
 
 ## Testing it
 
-The script's self-test runs every destructive path against copies of the
-fixtures in `scripts/fixtures/disk-hygiene/`, inside a scratch directory. It
-never touches the real `/tmp`, the real worktree root or the real repository.
+The script's self-test runs every destructive path against a synthetic scratch
+tree inside `mktemp -d`. It never touches the real `/tmp`, the real worktree
+root or the real repository.
 
 ```bash
 bash scripts/test-disk-hygiene.sh
