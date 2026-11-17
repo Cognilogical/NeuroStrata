@@ -12,14 +12,22 @@ access.
   where `comments` may be `{"totalCount": 2, "nodes": [...]}`.
   Its presence means "GraphQL answered". Every thread, resolved or not, gates
   its own markers and needs its own receipt.
-- `pull-comments.json` — fallback when `threads.json` is absent: every inline
-  finding counts, receipts pool globally, and the script says so.
+- `pull-comments.json` — fallback when `threads.json` is absent. The fallback
+  fails closed: an inline finding cannot be bound to its thread, so it stays
+  outstanding and the script says so on stderr. When no inline comment carries
+  a marker, only the top-level pool is accounted.
 - `valid-targets.json` — optional `{shas: [..], issues: [..],
   pull_requests: [..]}`. When present, `fixed@`/`filed` receipts must name
   one of these targets, simulating the `--pr` API validation. Numbers in
   `pull_requests` resolve through the issues endpoint but are pull
   requests, not issues, so they are subtracted from `issues` and never
   validate a `filed` receipt.
+- `EVIDENCE.json` — the corpus stamp: `corpus_generation` (bumped whenever a
+  fixture is added, removed, or changed), `base_sha` (the commit the
+  expectations were computed against), and the exact fixture list. The
+  self-test fails when the stamp and the directory listing disagree, so a
+  verdict computed against an older corpus cannot be replayed as current
+  evidence.
 
 Markers and receipts are read from the same tokenized text: ```/~~~ fences (any
 run, unclosed to EOF), 4-space/tab indented lines, and one-or-more-backtick
@@ -52,7 +60,17 @@ targets were not validated.
 | `pr-number-receipt` | `filed #218` naming a pull request, not an issue → fail |
 | `pr-201` | #201 thread surface: 3 P1 + 1 P2 unresolved, no receipts → fail |
 | `pr-204` | #204 shape: 2 unresolved P2 threads, no receipts → fail |
-| `pr-204-fallback` | two P2 findings via `pull-comments.json` (global pool) → fail with notice |
+| `pr-204-fallback` | two P2 findings via `pull-comments.json`, no thread → fail closed with notice |
 | `quoted-prose` | badge quoted in prose plus `filed #207` → cleared, no crash |
+| `pooled-clearance` | inline badge + receipt in another comment → fail closed, no pooled clearance |
+| `fallback-comment-only-marker` | marker only in a top-level comment, no inline finding → fail |
+| `fallback-comment-only-marker-receipted` | the same marker with a receipt → cleared |
+| `near-form-p1-underscore` | `P1_Badge` (underscore is not a separator) → not a marker |
+| `p0-never-gates` | `**P0**`, `P0 Badge`, `P0-Badge` → never gates |
+| `parser-parity-threads` | the same body on the thread surface → 3 markers, 3 outstanding |
+| `parser-parity-fallback` | the same body on the fallback surface → 3 markers, 3 outstanding |
+| `parser-parity-thread-body` | the same body inside a thread → 3 markers, 3 outstanding |
+| `fence-info-string` | marker and receipt inside a ```rust fence → both excluded, no marker |
+| `fence-info-string-outside` | marker outside the fence, receipt inside it → the finding stays outstanding |
 | `truncated-threads` | envelope with `pageInfo.hasNextPage: true` → exit 1 |
 | `truncated-comments` | thread with `comments.totalCount: 101` but one node → exit 1 |

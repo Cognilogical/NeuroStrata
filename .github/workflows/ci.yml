@@ -290,6 +290,10 @@ jobs:
         shell: bash
         run: bash scripts/test-gate-receipt.sh
 
+      - name: Gate receipt live-path harness
+        shell: bash
+        run: bash scripts/test-gate-receipt-live.sh
+
   # The release narrative names MCP tools, daemon routes, CLI subcommands and
   # in-tree files. A name that never shipped is a user-facing failure, so the
   # current release section and its release note are resolved against the
