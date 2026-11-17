@@ -25,6 +25,42 @@ cat > "$tmp/multi-both.json" <<'JSON'
 [{"author_association":"CONTRIBUTOR","body":"CHANGES-NEEDED DO-NOT-MERGE\nfixed@deadbeef fixed@cafebabe"}]
 JSON
 
+# Bold P1/P2 without the word "Badge", and code/fence stripping.
+printf '**P1** error swallowed on retry\nNo receipt.\n' > "$tmp/bold-p1.txt"
+printf '**P1** error swallowed on retry\nfiled #207\n' > "$tmp/bold-p1-filed.txt"
+printf '**P2** slow query path\nNo receipt.\n' > "$tmp/bold-p2.txt"
+printf 'Nothing to see.\n```\n**P1 Badge** hidden finding\nfixed@deadbeef\n```\n' > "$tmp/fenced-only.txt"
+printf 'Nothing to see.\n~~~\n**P1 Badge** hidden finding\nfixed@deadbeef\n~~~\n' > "$tmp/tilde-fenced.txt"
+printf 'Nothing to see.\n~~~\n**P1 Badge** hidden finding\nfixed@deadbeef\n' > "$tmp/unclosed-fence.txt"
+printf '**P1 Badge** real finding\n    fixed@deadbeef\n' > "$tmp/indented-receipt.txt"
+printf '    **P1 Badge** indented finding\nfiled #207\n' > "$tmp/indented-marker.txt"
+printf '**P1 Badge** real finding\n``fixed@deadbeef``\n' > "$tmp/double-backtick-receipt.txt"
+printf '**P1 Badge** real finding\n`fixed@deadbeef`\n' > "$tmp/inline-code-receipt.txt"
+printf '**P1 Badge** real finding\n```\nfixed@deadbeef\n```\n' > "$tmp/fenced-receipt.txt"
+
+# Problem badges are gating markers too (#201 merged with P1/P2 threads open).
+printf '**P1 Badge** unbounded retry loop in ingest\nNo receipt.\n' > "$tmp/p1-no-receipt.txt"
+printf '**P1 Badge** unbounded retry loop in ingest\nfiled #207\n' > "$tmp/p1-filed.txt"
+cat > "$tmp/p2-fixed.json" <<'JSON'
+[{"author_association":"CONTRIBUTOR","body":"**P2 Badge** racy read of the cursor\nfixed@abcdef1"}]
+JSON
+cat > "$tmp/p1-p2-both.json" <<'JSON'
+[{"author_association":"CONTRIBUTOR","body":"**P1 Badge** first finding\n**P2 Badge** second finding\nfixed@abcdef1 filed #207"}]
+JSON
+cat > "$tmp/p1-p2-one-receipt.json" <<'JSON'
+[{"author_association":"CONTRIBUTOR","body":"**P1 Badge** first finding\n**P2 Badge** second finding\nfiled #207"}]
+JSON
+cat > "$tmp/bare-p1-badge.txt" <<'EOF'
+P1 Badge: error swallowed on retry
+filed #207
+EOF
+cat > "$tmp/codex-finding-marker.json" <<'JSON'
+[{"author_association":"CONTRIBUTOR","body":"<!-- codex-code-review-finding:v1 -->\n**P1 Badge** unbounded retry loop\nNo receipt."}]
+JSON
+cat > "$tmp/codex-finding-filed.json" <<'JSON'
+[{"author_association":"CONTRIBUTOR","body":"<!-- codex-code-review-finding:v1 -->\n**P1 Badge** unbounded retry loop\nfiled #207"}]
+JSON
+
 if bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/fail.txt" >/dev/null 2>&1; then
   echo "FAIL: marker without receipt passed" >&2
   exit 1
@@ -43,4 +79,476 @@ if bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/outsider-ruling.jso
   echo "FAIL: a non-maintainer ruled: cleared a marker" >&2
   exit 1
 fi
+
+# P1/P2 problem badges are gating markers (issue #217).
+if bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/p1-no-receipt.txt" >/dev/null 2>&1; then
+  echo "FAIL: P1 Badge without receipt passed" >&2
+  exit 1
+fi
+bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/p1-filed.txt" >/dev/null
+bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/p2-fixed.json" >/dev/null
+bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/p1-p2-both.json" >/dev/null
+bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/bare-p1-badge.txt" >/dev/null
+if bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/p1-p2-one-receipt.json" >/dev/null 2>&1; then
+  echo "FAIL: two P1/P2 badges were cleared by one receipt" >&2
+  exit 1
+fi
+if bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/codex-finding-marker.json" >/dev/null 2>&1; then
+  echo "FAIL: codex finding marker with no receipt passed" >&2
+  exit 1
+fi
+bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/codex-finding-filed.json" >/dev/null
+
+if bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/bold-p1.txt" >/dev/null 2>&1; then
+  echo "FAIL: **P1** without receipt passed" >&2
+  exit 1
+fi
+bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/bold-p1-filed.txt" >/dev/null
+if bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/bold-p2.txt" >/dev/null 2>&1; then
+  echo "FAIL: **P2** without receipt passed" >&2
+  exit 1
+fi
+bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/fenced-only.txt" >/dev/null
+bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/tilde-fenced.txt" >/dev/null
+bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/unclosed-fence.txt" >/dev/null
+bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/indented-marker.txt" >/dev/null
+if bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/indented-receipt.txt" >/dev/null 2>&1; then
+  echo "FAIL: an indented code line supplied a receipt" >&2
+  exit 1
+fi
+if bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/double-backtick-receipt.txt" >/dev/null 2>&1; then
+  echo "FAIL: a double-backtick span supplied a receipt" >&2
+  exit 1
+fi
+if bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/inline-code-receipt.txt" >/dev/null 2>&1; then
+  echo "FAIL: a receipt inside inline code cleared a finding" >&2
+  exit 1
+fi
+if bash "$root/scripts/gate-receipt.sh" --reviews-file "$tmp/fenced-receipt.txt" >/dev/null 2>&1; then
+  echo "FAIL: a fenced receipt cleared a finding" >&2
+  exit 1
+fi
+
+# Fetch-layer fixtures: the shape GitHub actually returns for Codex findings.
+fix="$root/scripts/fixtures/gate-receipt"
+if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/p1-unresolved" >/dev/null 2>&1; then
+  echo "FAIL: unresolved P1 review thread without receipt passed" >&2
+  exit 1
+fi
+if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/p1-resolved" >/dev/null 2>&1; then
+  echo "FAIL: resolution alone cleared a P1 finding with no receipt" >&2
+  exit 1
+fi
+bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/p1-resolved-filed" >/dev/null
+bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/p1-filed" >/dev/null
+bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/envelope-thread-receipt" >/dev/null
+bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/quoted-prose" >/dev/null
+
+out=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/pr-201" 2>&1 >/dev/null || true)
+case "$out" in
+  *"4 outstanding finding(s)"*) : ;;
+  *) echo "FAIL: #201-shaped fixture should gate on 4 badges: $out" >&2; exit 1 ;;
+esac
+out=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/pr-204" 2>&1 >/dev/null || true)
+case "$out" in
+  *"2 outstanding finding(s)"*) : ;;
+  *) echo "FAIL: #204-shaped fixture should gate on 2 badges: $out" >&2; exit 1 ;;
+esac
+out=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/pr-204-fallback" 2>&1 >/dev/null || true)
+case "$out" in
+  *"2 outstanding finding(s)"*) : ;;
+  *) echo "FAIL: fallback should still count 2 inline badges: $out" >&2; exit 1 ;;
+esac
+case "$out" in
+  *"review-thread resolution unavailable"*) : ;;
+  *) echo "FAIL: fallback must announce that threads were not resolved: $out" >&2; exit 1 ;;
+esac
+
+# Receipts are bound to their finding, not pooled across threads (#218).
+if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/resolved-receipt-does-not-clear-an-unresolved-finding" >/dev/null 2>&1; then
+  echo "FAIL: a resolved thread's receipt cleared an unresolved finding" >&2
+  exit 1
+fi
+out=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/unresolved-receipt-is-thread-local" 2>&1 >/dev/null || true)
+case "$out" in
+  *"1 outstanding finding(s)"*) : ;;
+  *) echo "FAIL: a receipt in thread A cleared a marker in thread B: $out" >&2; exit 1 ;;
+esac
+bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/each-unresolved-thread-has-its-own-receipt" >/dev/null
+if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/top-level-marker-not-cleared-by-thread-receipt" >/dev/null 2>&1; then
+  echo "FAIL: a thread receipt cleared a top-level marker" >&2
+  exit 1
+fi
+if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/thread-marker-not-cleared-by-top-level-receipt" >/dev/null 2>&1; then
+  echo "FAIL: a top-level receipt cleared a thread marker" >&2
+  exit 1
+fi
+if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/quoted-receipt-is-not-a-receipt" >/dev/null 2>&1; then
+  echo "FAIL: a receipt quoted inside inline code cleared a finding" >&2
+  exit 1
+fi
+if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/self-receipt-in-finding-body" >/dev/null 2>&1; then
+  echo "FAIL: a receipt token inside the finding comment itself cleared a finding" >&2
+  exit 1
+fi
+
+# Receipt authorship and target validation (#218 P1.2).
+if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/none-author-receipt" >/dev/null 2>&1; then
+  echo "FAIL: an association-less (NONE) receipt cleared a finding" >&2
+  exit 1
+fi
+if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/unvalidated-sha-receipt" >/dev/null 2>&1; then
+  echo "FAIL: fixed@0000000 cleared a finding without a validated commit" >&2
+  exit 1
+fi
+if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/unknown-issue-receipt" >/dev/null 2>&1; then
+  echo "FAIL: filed #999999 cleared a finding without an existing issue" >&2
+  exit 1
+fi
+bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/validated-target-receipt" >/dev/null
+if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/double-backtick-receipt" >/dev/null 2>&1; then
+  echo "FAIL: a double-backtick span in a reply cleared a finding" >&2
+  exit 1
+fi
+if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/pr-number-receipt" >/dev/null 2>&1; then
+  echo "FAIL: filed #218 cleared a finding although #218 is a pull request, not an issue" >&2
+  exit 1
+fi
+
+# Truncated review data must fail closed instead of under-counting (#218 P2).
+out=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/truncated-threads" 2>&1 >/dev/null || true)
+case "$out" in
+  *"truncated"*) : ;;
+  *) echo "FAIL: a threads fixture with pageInfo.hasNextPage passed: $out" >&2; exit 1 ;;
+esac
+if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/truncated-threads" >/dev/null 2>&1; then
+  echo "FAIL: truncated thread pages exited 0" >&2
+  exit 1
+fi
+out=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/truncated-comments" 2>&1 >/dev/null || true)
+case "$out" in
+  *"truncated"*) : ;;
+  *) echo "FAIL: a thread with comments.totalCount > nodes passed: $out" >&2; exit 1 ;;
+esac
+if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/truncated-comments" >/dev/null 2>&1; then
+  echo "FAIL: a truncated comment list exited 0" >&2
+  exit 1
+fi
+
+# Malformed fixture shapes must fail closed, not clear the gate silently.
+expect_shape_error() {
+  local label=$1 dir=$2 needle=$3 rc=0 err
+  err=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$dir" 2>&1 >/dev/null) || rc=$?
+  if [ "$rc" -ne 2 ]; then
+    echo "FAIL: $label exited $rc, expected 2: $err" >&2
+    exit 1
+  fi
+  case "$err" in
+    *"$needle"*) : ;;
+    *) echo "FAIL: $label did not name the shape error: $err" >&2; exit 1 ;;
+  esac
+}
+
+mkdir -p "$tmp/malformed-threads" "$tmp/malformed-fallback" \
+  "$tmp/malformed-thread-element" "$tmp/malformed-reviews" "$tmp/malformed-thread-comments"
+for d in malformed-threads malformed-fallback malformed-thread-element \
+  malformed-reviews malformed-thread-comments; do
+  printf '[]\n' > "$tmp/$d/reviews.json"
+  printf '[]\n' > "$tmp/$d/issue-comments.json"
+done
+printf '{"oops":1}\n' > "$tmp/malformed-threads/threads.json"
+printf '{"oops":1}\n' > "$tmp/malformed-fallback/pull-comments.json"
+printf '[{"oops":1}]\n' > "$tmp/malformed-thread-element/threads.json"
+printf '{"oops":1}\n' > "$tmp/malformed-reviews/reviews.json"
+printf '[{"isResolved":false,"comments":{"body":"not an array"}}]\n' > "$tmp/malformed-thread-comments/threads.json"
+
+expect_shape_error "object threads.json" "$tmp/malformed-threads" "must be a JSON array of threads"
+expect_shape_error "object pull-comments.json" "$tmp/malformed-fallback" "must be a JSON array of objects with a string body"
+expect_shape_error "thread element without isResolved/comments" "$tmp/malformed-thread-element" "must be a JSON array of threads"
+expect_shape_error "object reviews.json" "$tmp/malformed-reviews" "must be a JSON array of objects with a string body"
+expect_shape_error "thread comments not an array" "$tmp/malformed-thread-comments" "must be a JSON array of threads"
+
+# Codex P2: an unclosed fence in an earlier body must not swallow later targets.
+mkdir -p "$tmp/unclosed-fence-then-receipt"
+printf '[]\n' > "$tmp/unclosed-fence-then-receipt/issue-comments.json"
+printf '{"shas":["abcdef1"],"issues":[]}\n' > "$tmp/unclosed-fence-then-receipt/valid-targets.json"
+cat > "$tmp/unclosed-fence-then-receipt/reviews.json" <<'JSON'
+[{"body":"unrelated review with an unclosed fence\n```\n","author_association":"CONTRIBUTOR"}]
+JSON
+cat > "$tmp/unclosed-fence-then-receipt/threads.json" <<'JSON'
+[{"isResolved":false,"comments":[{"body":"**![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)** finding","author_association":"NONE"},{"body":"fixed@abcdef1","author_association":"CONTRIBUTOR"}]}]
+JSON
+if ! bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$tmp/unclosed-fence-then-receipt" >/dev/null 2>&1; then
+  echo "FAIL: an earlier unclosed fence suppressed a later valid receipt target" >&2
+  exit 1
+fi
+
+# Codex P2: a receipt inside a double-backtick span that contains a shorter run.
+mkdir -p "$tmp/double-backtick-prefix"
+printf '[]\n' > "$tmp/double-backtick-prefix/reviews.json"
+printf '[]\n' > "$tmp/double-backtick-prefix/issue-comments.json"
+printf '{"shas":["abcdef1"],"issues":[]}\n' > "$tmp/double-backtick-prefix/valid-targets.json"
+cat > "$tmp/double-backtick-prefix/threads.json" <<'JSON'
+[{"isResolved":false,"comments":[{"body":"**![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)** finding","author_association":"NONE"},{"body":"`` `prefix` fixed@abcdef1 ``","author_association":"CONTRIBUTOR"}]}]
+JSON
+if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$tmp/double-backtick-prefix" >/dev/null 2>&1; then
+  echo "FAIL: a receipt inside a double-backtick span cleared a finding" >&2
+  exit 1
+fi
+
+# Codex P2: a receipt inside a multiline inline code span must not clear.
+mkdir -p "$tmp/multiline-code-span-receipt"
+printf '[]\n' > "$tmp/multiline-code-span-receipt/reviews.json"
+printf '[]\n' > "$tmp/multiline-code-span-receipt/issue-comments.json"
+printf '{"shas":["abcdef1"],"issues":[]}\n' > "$tmp/multiline-code-span-receipt/valid-targets.json"
+cat > "$tmp/multiline-code-span-receipt/threads.json" <<'JSON'
+[{"isResolved":false,"comments":[{"body":"**![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)** finding","author_association":"NONE"},{"body":"`example\nfixed@abcdef1\nend`","author_association":"OWNER"}]}]
+JSON
+if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$tmp/multiline-code-span-receipt" >/dev/null 2>&1; then
+  echo "FAIL: a receipt inside a multiline inline code span cleared a finding" >&2
+  exit 1
+fi
+
+# Private-org-member co-author (CONTRIBUTOR under GITHUB_TOKEN without read:org)
+# who pushed a commit on the PR (in pr_authors) clears; an unrelated CONTRIBUTOR
+# not in pr_authors does not.
+mkdir -p "$tmp/coauthor-receipt-ok" "$tmp/bystander-contributor-rejected"
+for d in coauthor-receipt-ok bystander-contributor-rejected; do
+  printf '[]\n' > "$tmp/$d/reviews.json"
+  printf '[]\n' > "$tmp/$d/issue-comments.json"
+  printf '{"shas":["abcdef1"],"issues":[],"pr_authors":["pr-opener","pr-coauthor"]}\n' > "$tmp/$d/valid-targets.json"
+done
+cat > "$tmp/coauthor-receipt-ok/threads.json" <<'JSON'
+[{"isResolved":false,"comments":[{"body":"**![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)** finding","author_association":"NONE"},{"body":"fixed@abcdef1","author_association":"CONTRIBUTOR","author":"pr-coauthor"}]}]
+JSON
+cat > "$tmp/bystander-contributor-rejected/threads.json" <<'JSON'
+[{"isResolved":false,"comments":[{"body":"**![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)** finding","author_association":"NONE"},{"body":"fixed@abcdef1","author_association":"CONTRIBUTOR","author":"bystander"}]}]
+JSON
+if ! bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$tmp/coauthor-receipt-ok" >/dev/null 2>&1; then
+  echo "FAIL: a PR commit co-author with CONTRIBUTOR association was rejected" >&2
+  exit 1
+fi
+if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$tmp/bystander-contributor-rejected" >/dev/null 2>&1; then
+  echo "FAIL: an unrelated CONTRIBUTOR not in pr_authors cleared a finding" >&2
+  exit 1
+fi
+
+# Codex P2: an authorized uppercase `FIXED@` token must normalize to the
+# lowercase SHA target (the grep is case-insensitive, so the prefix strip
+# must be too, or the target lookup misses and the receipt is ignored).
+fn=$(sed -n '/^fixed_sha_targets()/,/^}/p' "$root/scripts/gate-receipt.sh")
+if [ -z "$fn" ]; then
+  echo "FAIL: scripts/gate-receipt.sh does not define fixed_sha_targets" >&2
+  exit 1
+fi
+eval "$fn"
+out=$(printf 'FIXED@ABCDEF1 fixed@ABCDEF1\n' | fixed_sha_targets)
+if [ "$out" != "abcdef1" ]; then
+  echo "FAIL: an uppercase FIXED@ receipt did not normalize to the lowercase SHA: $out" >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# #226: one marker engine, one documented surface, and the pinned rulings.
+#
+# The engine keeps a single regex; the accepted and rejected forms live here
+# and in docs/features-api/ops/merge-gates.md. These assertions fail if the
+# regex and the documented surface drift apart.
+# ---------------------------------------------------------------------------
+marker_re=$(sed -n "s/^marker_re='\(.*\)'\$/\1/p" "$root/scripts/gate-receipt.sh")
+if [ -z "$marker_re" ]; then
+  echo "FAIL: scripts/gate-receipt.sh does not define a single marker_re" >&2
+  exit 1
+fi
+marker_count() {
+  printf '%s' "$1" | jq -Rrs --arg re "$marker_re" '[scan($re; "i")] | length'
+}
+doc="$root/docs/features-api/ops/merge-gates.md"
+for form in "CHANGES-NEEDED" "CHANGES NEEDED" "CHANGES_NEEDED" \
+            "DO-NOT-MERGE" "DO NOT MERGE" "DO_NOT_MERGE" \
+            "P1 Badge" "P1-Badge" "P1Badge" "P2 Badge" "P2-Badge" "P2Badge" \
+            "**P1**" "**P2**"; do
+  if [ "$(marker_count "$form")" -lt 1 ]; then
+    echo "FAIL: the accepted marker form '$form' does not match the engine regex" >&2
+    exit 1
+  fi
+  if ! grep -qF -- "$form" "$doc"; then
+    echo "FAIL: docs/features-api/ops/merge-gates.md does not document '$form'" >&2
+    exit 1
+  fi
+done
+# OWNER ruling (2026-11-16): the underscore is not a badge separator, and P0
+# never gates.
+for form in "P1_Badge" "P2_Badge" "P0 Badge" "P0-Badge" "**P0**" "P0"; do
+  if [ "$(marker_count "$form")" -ne 0 ]; then
+    echo "FAIL: the rejected near-form '$form' matched the engine regex" >&2
+    exit 1
+  fi
+done
+
+# A badge quoted in prose counts; the same badge in a code span or a fence
+# does not. The fixture carries all three shapes.
+out=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/quoted-prose" 2>/dev/null)
+case "$out" in
+  *"1 marker(s), 1 receipt(s)"*) : ;;
+  *) echo "FAIL: the prose-quoted badge was not counted exactly once: $out" >&2; exit 1 ;;
+esac
+
+# The near-forms never gate.
+for d in near-form-p1-underscore p0-never-gates; do
+  if ! out=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/$d" 2>/dev/null); then
+    echo "FAIL: $d gated" >&2
+    exit 1
+  fi
+  case "$out" in
+    *"no gating marker"*) : ;;
+    *) echo "FAIL: $d was counted as a marker: $out" >&2; exit 1 ;;
+  esac
+done
+
+# ---------------------------------------------------------------------------
+# #226: one parser, identical counts on the same bodies across the surfaces.
+# ---------------------------------------------------------------------------
+parity_thr=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/parser-parity-threads" 2>&1 >/dev/null || true)
+parity_fb=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/parser-parity-fallback" 2>&1 >/dev/null || true)
+parity_tb=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/parser-parity-thread-body" 2>&1 >/dev/null || true)
+for pair in "thread-mode:$parity_thr" "fallback-mode:$parity_fb" "thread-body:$parity_tb"; do
+  case "$pair" in
+    *"3 outstanding finding(s)"*"3 marker(s) seen"*) : ;;
+    *) echo "FAIL: the parser counted the same body differently ($pair)" >&2; exit 1 ;;
+  esac
+done
+
+# ---------------------------------------------------------------------------
+# #229: the fallback fails closed; pooled clearance is gone.
+# ---------------------------------------------------------------------------
+if bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/pooled-clearance" >/dev/null 2>&1; then
+  echo "FAIL: a receipt pooled from another comment cleared an unrelated inline finding" >&2
+  exit 1
+fi
+out=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/pooled-clearance" 2>&1 >/dev/null || true)
+case "$out" in
+  *"review-thread resolution unavailable"*) : ;;
+  *) echo "FAIL: the fallback must announce the unavailable thread resolution: $out" >&2; exit 1 ;;
+esac
+case "$out" in
+  *"inline finding"*) : ;;
+  *) echo "FAIL: the fallback must fail closed on the inline finding: $out" >&2; exit 1 ;;
+esac
+
+# A marker that lives only in a top-level comment still gates in the fallback.
+out=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/fallback-comment-only-marker" 2>&1 >/dev/null || true)
+case "$out" in
+  *"1 outstanding finding(s)"*) : ;;
+  *) echo "FAIL: a comment-only marker did not gate in fallback mode: $out" >&2; exit 1 ;;
+esac
+bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/fallback-comment-only-marker-receipted" >/dev/null
+
+# ---------------------------------------------------------------------------
+# #225: the fixture corpus is described, and its evidence is stamped.
+# ---------------------------------------------------------------------------
+readme="$root/scripts/fixtures/gate-receipt/README.md"
+if ! grep -q "same accounting branch" "$readme"; then
+  echo "FAIL: the fixtures README does not describe the accounting branch" >&2
+  exit 1
+fi
+if grep -q "same fetch branch" "$readme"; then
+  echo "FAIL: the fixtures README still describes a fetch branch" >&2
+  exit 1
+fi
+evi="$fix/EVIDENCE.json"
+if [ ! -f "$evi" ]; then
+  echo "FAIL: scripts/fixtures/gate-receipt/EVIDENCE.json is missing" >&2
+  exit 1
+fi
+gen=$(jq -r '.corpus_generation // empty' "$evi")
+case "$gen" in
+  ''|*[!0-9]*) echo "FAIL: EVIDENCE.json corpus_generation must be a positive integer" >&2; exit 1 ;;
+esac
+if [ "$gen" -lt 1 ]; then
+  echo "FAIL: EVIDENCE.json corpus_generation must be a positive integer" >&2
+  exit 1
+fi
+base_sha=$(jq -r '.base_sha // empty' "$evi")
+if ! [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "FAIL: EVIDENCE.json base_sha must be a full 40-hex commit sha" >&2
+  exit 1
+fi
+if git -C "$root" cat-file -e "$base_sha^{commit}" 2>/dev/null; then
+  if ! git -C "$root" merge-base --is-ancestor "$base_sha" HEAD; then
+    echo "FAIL: EVIDENCE.json base_sha is not an ancestor of HEAD" >&2
+    exit 1
+  fi
+fi
+listed=$(jq -r '.fixtures[]' "$evi" | sort)
+actual=$(cd "$fix" && for d in */; do printf '%s\n' "${d%/}"; done | sort)
+if [ "$listed" != "$actual" ]; then
+  echo "FAIL: EVIDENCE.json does not list the fixture corpus exactly" >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# L3 review: the workflow contract.
+#
+# The gate must run base-branch code, and a top-level receipt comment must
+# re-run it: an `issue_comment` event carries no pull_request payload, so the
+# PR and its base SHA are resolved through the API in a `resolve` step.
+# ---------------------------------------------------------------------------
+wf="$root/.github/workflows/gate-receipt.yml"
+if ! grep -q '^  issue_comment:' "$wf"; then
+  echo "FAIL: the gate workflow does not subscribe issue_comment, so a top-level receipt never re-runs the check" >&2
+  exit 1
+fi
+if ! grep -q 'id: resolve' "$wf"; then
+  echo "FAIL: the gate workflow has no resolve step for comment events" >&2
+  exit 1
+fi
+if grep -q 'pull_request.head.sha' "$wf"; then
+  echo "FAIL: the gate workflow checks out the PR head; the gate must run base-branch code" >&2
+  exit 1
+fi
+if ! grep -q 'steps.resolve.outputs.base_sha' "$wf" && ! grep -q 'pull_request.base.sha' "$wf"; then
+  echo "FAIL: the gate workflow does not check out a base SHA" >&2
+  exit 1
+fi
+if ! grep -q 'steps.resolve.outputs.pr' "$wf"; then
+  echo "FAIL: the gate workflow does not use the resolved PR number" >&2
+  exit 1
+fi
+for perm in "contents: read" "pull-requests: read"; do
+  if ! grep -q "$perm" "$wf"; then
+    echo "FAIL: the gate workflow does not keep the read-only permission '$perm'" >&2
+    exit 1
+  fi
+done
+if ! grep -q "github.event.issue.pull_request" "$wf"; then
+  echo "FAIL: the gate workflow does not guard issue_comment events to pull requests" >&2
+  exit 1
+fi
+if ! grep -q 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1' "$wf"; then
+  echo "FAIL: the gate workflow does not pin actions/checkout to the verified commit SHA" >&2
+  exit 1
+fi
+if grep -Eq 'uses: actions/checkout@v' "$wf"; then
+  echo "FAIL: the gate workflow uses a floating actions/checkout tag" >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# L3 review: a fence with an info string is still a fence.
+#
+# The tokenizer opens a fence on any run of three or more backticks, with or
+# without an info string, so ```rust hides its contents exactly like ```.
+# ---------------------------------------------------------------------------
+out=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/fence-info-string" 2>&1)
+case "$out" in
+  *"no gating marker"*) : ;;
+  *) echo "FAIL: a \`\`\`rust fence must hide both the marker and the receipt: $out" >&2; exit 1 ;;
+esac
+out=$(bash "$root/scripts/gate-receipt.sh" --fixtures-dir "$fix/fence-info-string-outside" 2>&1 >/dev/null || true)
+case "$out" in
+  *"1 outstanding finding(s)"*) : ;;
+  *) echo "FAIL: a fenced receipt must not clear a marker outside the fence: $out" >&2; exit 1 ;;
+esac
+
 echo "gate-receipt self-test: PASS"

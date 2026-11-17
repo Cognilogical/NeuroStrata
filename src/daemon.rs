@@ -1798,8 +1798,13 @@ async fn handle_set_metadata(
 async fn handle_mcp(
     State(state): State<AppState>,
     Json(request): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
     if let Ok(rpc_req) = serde_json::from_value::<crate::server::JsonRpcRequest>(request) {
+        // JSON-RPC 2.0: a notification (no `id`) is never answered. 202 with an
+        // empty body, as MCP's HTTP transport answers one; the stdio proxy
+        // writes nothing for an empty body.
+        let is_notification = rpc_req.id.is_none();
         let response = crate::server::process_mcp_request(
             rpc_req,
             state.embedder.clone(),
@@ -1809,11 +1814,15 @@ async fn handle_mcp(
             state.bus.clone(),
         )
         .await;
-        Json(response)
+        if is_notification {
+            return axum::http::StatusCode::ACCEPTED.into_response();
+        }
+        Json(response).into_response()
     } else {
         Json(
             serde_json::json!({"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid Request"}}),
         )
+        .into_response()
     }
 }
 
@@ -3045,6 +3054,79 @@ mod tests {
             .send()
             .await;
         daemon.await.unwrap().unwrap();
+    }
+
+    /// JSON-RPC over /mcp: a method the server does not implement is answered
+    /// with -32601 and the request's id (Claude Code's `server/discover` probe
+    /// used to get a bare `{}` and wait out its timeout), and a notification
+    /// gets no reply body at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unknown_methods_get_method_not_found_and_notifications_no_reply() {
+        let (base, authed, daemon, _credential_guard) = spawn_test_daemon().await;
+
+        let discover = authed
+            .post(format!("{base}/mcp"))
+            .json(&serde_json::json!({"jsonrpc": "2.0", "id": 7, "method": "server/discover"}))
+            .send()
+            .await
+            .unwrap();
+        assert!(discover.status().is_success());
+        let body: serde_json::Value = discover.json().await.unwrap();
+        assert_eq!(body["jsonrpc"], serde_json::json!("2.0"), "{body}");
+        assert_eq!(body["id"], serde_json::json!(7), "{body}");
+        assert_eq!(body["error"]["code"], serde_json::json!(-32601), "{body}");
+
+        let initialized = authed
+            .post(format!("{base}/mcp"))
+            .json(&serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(initialized.status(), axum::http::StatusCode::ACCEPTED);
+        assert_eq!(initialized.text().await.unwrap(), "", "a notification is not answered");
+
+        let ping = authed
+            .post(format!("{base}/mcp"))
+            .json(&serde_json::json!({"jsonrpc": "2.0", "id": "p", "method": "ping"}))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = ping.json().await.unwrap();
+        assert_eq!(body["id"], serde_json::json!("p"), "{body}");
+        assert_eq!(body["result"], serde_json::json!({}), "{body}");
+
+        stop_test_daemon(&base, daemon).await;
+    }
+
+    /// An explicit `"id": null` is a request id, not the notification marker
+    /// (an *omitted* `id`): it must be answered with a real response whose
+    /// top-level `id` is `null`, not swallowed as a 202 empty-body notification.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_explicit_id_null_request_is_answered_not_treated_as_a_notification() {
+        let (base, authed, daemon, _credential_guard) = spawn_test_daemon().await;
+
+        let explicit_null = authed
+            .post(format!("{base}/mcp"))
+            .json(&serde_json::json!({"jsonrpc": "2.0", "id": null, "method": "server/discover"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            explicit_null.status(),
+            axum::http::StatusCode::OK,
+            "{explicit_null:?}"
+        );
+        let body: serde_json::Value = explicit_null.json().await.unwrap();
+        assert!(body.get("id").is_some(), "{body}");
+        assert_eq!(body["id"], serde_json::Value::Null, "{body}");
+        assert_eq!(body["error"]["code"], serde_json::json!(-32601), "{body}");
+        assert_eq!(
+            body["error"]["message"],
+            serde_json::json!("Method not found: server/discover"),
+            "{body}"
+        );
+
+        stop_test_daemon(&base, daemon).await;
     }
 
     /// Task 1: no credential at all is a 401 on authenticated routes --

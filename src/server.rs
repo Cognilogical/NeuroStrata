@@ -16,9 +16,23 @@ use crate::task::intake::{
     ListCandidatesRequest, ProvenanceSpan, ResolveCandidateRequest, ReviewState, SourceKind,
 };
 
+/// Deserializes a JSON-RPC request's `id` member while keeping an explicit
+/// JSON `null` distinct from an omitted member. `Option<Value>`'s default
+/// deserializer folds both into `None`, which would classify a request
+/// carrying `"id": null` as a notification and drop its reply; JSON-RPC 2.0
+/// marks a notification by the *absence* of `id`, so an explicit null must
+/// survive as `Some(Value::Null)` and be echoed back.
+fn deserialize_id_explicit_null<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Value::deserialize(deserializer)?))
+}
+
 #[derive(Deserialize)]
 pub struct JsonRpcRequest {
     jsonrpc: String,
+    #[serde(default, deserialize_with = "deserialize_id_explicit_null")]
     pub id: Option<Value>,
     pub method: String,
     pub params: Option<Value>,
@@ -51,6 +65,8 @@ const PARSE_ERROR: i64 = -32700;
 /// The request was JSON-RPC, and answering it failed here rather than at the
 /// far end.
 const INTERNAL_ERROR: i64 = -32603;
+/// The method does not exist on this server.
+const METHOD_NOT_FOUND: i64 = -32601;
 
 /// Appends a daemon-memory advisory to tool-call error text when it matches
 /// known buffer-pool / OOM diagnostics, case-insensitively. Idempotent if the
@@ -124,6 +140,9 @@ pub async fn process_mcp_request(
         "notifications/initialized" => {
             serde_json::json!({})
         }
+        // MCP liveness check: an empty result, not an error.
+        "ping" => serde_json::to_value(JsonRpcResponse::success(id.clone(), serde_json::json!({})))
+            .unwrap_or_else(|_| serde_json::json!({})),
         "tools/list" => {
             let mut result = serde_json::json!({
                 "tools": [
@@ -425,6 +444,9 @@ pub async fn process_mcp_request(
                                 "namespace": { "type": "string", "description": "The exact project name." },
                                 "assignee": { "type": "string", "description": "Who is doing the work (the agent or operator name)." },
                                 "session_id": { "type": "string", "description": "Unique id of this session; the exclusivity check compares it against the holder's." },
+                                "worktree": { "type": "string", "description": "Optional caller worktree path for strict push-gate scoping." },
+                                "branch": { "type": "string", "description": "Optional caller git branch for strict push-gate scoping." },
+                                "project_root": { "type": "string", "description": "Optional caller project root path used to capture worktree and branch scope." },
                                 "event_id": { "type": "string", "description": "Optional idempotency event ID for the claim receipt." },
                             },
                             "required": ["id", "namespace", "assignee", "session_id"]
@@ -1958,7 +1980,16 @@ pub async fn process_mcp_request(
                 })
             })
         }
-        _ => serde_json::json!({}),
+        // A method this server does not implement (Claude Code probes with
+        // `server/discover`) gets a JSON-RPC error carrying the request's id,
+        // so the client stops waiting at once. A notification (no id) is never
+        // answered: `handle_mcp` drops the reply.
+        _ => serde_json::to_value(JsonRpcResponse::failure(
+            id.clone(),
+            METHOD_NOT_FOUND,
+            format!("Method not found: {}", request.method),
+        ))
+        .unwrap_or_else(|_| serde_json::json!({})),
     }
 }
 
@@ -6734,8 +6765,42 @@ pub(crate) fn handle_storage_status_from_config() -> String {
         .as_ref()
         .map(|c| std::path::PathBuf::from(c.db_path.clone()))
         .unwrap_or_else(|| std::path::PathBuf::from(".NeuroStrata/db"));
-    let status = crate::storage::compute_storage_status(&db_path, &hygiene_cfg);
+    path_only_storage_status(&db_path, &hygiene_cfg)
+}
+
+/// The path-only `storage status` body (#196, #212): every field comes from
+/// the filesystem and the store-state sidecar, and no store is opened.
+///
+/// Split from [`handle_storage_status_from_config`] so the CLI's dispatch can
+/// be exercised against a fixture store without resolving (or creating) the
+/// operator's config file. This is also the surface that reports the
+/// persisted `last_recovery` history, as opposed to [`live_store_status`].
+pub(crate) fn path_only_storage_status(
+    db_path: &std::path::Path,
+    hygiene_cfg: &crate::storage::snapshot::StorageHygieneConfig,
+) -> String {
+    let status = crate::storage::compute_storage_status(db_path, hygiene_cfg);
     crate::procmem::status_with_process_memory(&status)
+}
+
+/// The live-store composition of a status (#212).
+///
+/// A live handle owns `opened_via_recovery` and its kind, and owns them
+/// *exclusively*: the sidecar's `last_recovery` is history, and it must not
+/// make a verified live store look degraded — a health check on a healthy
+/// daemon must not alarm because the store recovered last week. The
+/// path-only surface ([`path_only_storage_status`]) is the one that reports
+/// that history.
+pub(crate) fn live_store_status(
+    status: crate::storage::snapshot::StorageStatus,
+    opened_via_recovery: bool,
+    recovery_kind: Option<&str>,
+) -> crate::storage::snapshot::StorageStatus {
+    crate::storage::snapshot::StorageStatus {
+        opened_via_recovery,
+        recovery_provenance: recovery_kind.map(str::to_string),
+        ..status
+    }
 }
 
 pub(crate) async fn handle_storage_status(store: Arc<dyn VectorStore>) -> String {
@@ -6755,15 +6820,11 @@ pub(crate) async fn handle_storage_status(store: Arc<dyn VectorStore>) -> String
         .downcast_ref::<crate::store::LadybugStore>()
     {
         let status = crate::storage::compute_storage_status(ls.local_path(), &hygiene_cfg);
-        let status = crate::storage::snapshot::StorageStatus {
+        let status = live_store_status(
+            status,
             opened_via_recovery,
-            recovery_provenance: ls
-                .open_provenance()
-                .recovery_kind_slug()
-                .map(str::to_string)
-                .or(status.recovery_provenance),
-            ..status
-        };
+            ls.open_provenance().recovery_kind_slug(),
+        );
         return crate::procmem::status_with_process_memory(&status);
     }
     let db_path = cfg
@@ -6771,10 +6832,7 @@ pub(crate) async fn handle_storage_status(store: Arc<dyn VectorStore>) -> String
         .map(|c| std::path::PathBuf::from(c.db_path.clone()))
         .unwrap_or_else(|| std::path::PathBuf::from(".NeuroStrata/db"));
     let status = crate::storage::compute_storage_status(&db_path, &hygiene_cfg);
-    let status = crate::storage::snapshot::StorageStatus {
-        opened_via_recovery: opened_via_recovery || status.opened_via_recovery,
-        ..status
-    };
+    let status = live_store_status(status, opened_via_recovery, None);
     crate::procmem::status_with_process_memory(&status)
 }
 
@@ -10591,6 +10649,101 @@ async fn build_guard_validator(
     Ok((validator, namespace.to_string()))
 }
 
+fn is_env_assignment_token(tok: &str) -> bool {
+    let Some((name, _)) = tok.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !name.chars().next().unwrap().is_ascii_digit()
+}
+
+fn is_disallowed_git_subcommand_arg(arg: &str) -> bool {
+    arg == "--output"
+        || arg.starts_with("--output=")
+        || arg.starts_with("-O")
+        || arg == "--ext-diff"
+        || arg == "--textconv"
+        || arg == "--exec"
+        || arg.starts_with("--exec=")
+        || arg == "-x"
+        || arg == "--upload-pack"
+        || arg.starts_with("--upload-pack=")
+        || arg == "--receive-pack"
+        || arg.starts_with("--receive-pack=")
+}
+
+fn is_zero_action_exempt_shell_segment(segment: &str) -> bool {
+    let mut tokens = segment
+        .split_whitespace()
+        .skip_while(|t| is_env_assignment_token(t));
+    let Some(first) = tokens.next() else {
+        return false;
+    };
+    let bin = std::path::Path::new(first)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(first);
+    match bin {
+        "git" => {
+            let mut rest: Vec<&str> = tokens.collect();
+            loop {
+                if rest.len() >= 2 && matches!(rest[0], "-C" | "--git-dir" | "--work-tree") {
+                    rest.drain(..2);
+                } else if !rest.is_empty()
+                    && (matches!(rest[0], "--no-pager" | "-P" | "--no-optional-locks")
+                        || rest[0].starts_with("--git-dir=")
+                        || rest[0].starts_with("--work-tree="))
+                {
+                    rest.remove(0);
+                } else {
+                    break;
+                }
+            }
+            if rest.first().is_some_and(|t| t.starts_with('-')) {
+                return false;
+            }
+            let Some(&subcmd) = rest.first() else {
+                return false;
+            };
+            matches!(
+                subcmd,
+                "push" | "pull" | "fetch" | "status" | "log" | "diff" | "show" | "rev-parse"
+            ) && !rest[1..]
+                .iter()
+                .any(|arg| is_disallowed_git_subcommand_arg(arg))
+        }
+        "neurostrata-mcp" => matches!(tokens.next(), Some("task")),
+        _ => false,
+    }
+}
+
+pub(crate) fn is_zero_action_exempt_shell_payload(action_type: &str, payload: &str) -> bool {
+    if !matches!(
+        action_type.to_lowercase().as_str(),
+        "bash" | "shell" | "command" | "exec"
+    ) {
+        return false;
+    }
+    let trimmed = payload.trim();
+    if trimmed.is_empty()
+        || trimmed.contains('`')
+        || trimmed.contains("$(")
+        || trimmed.contains('>')
+        || trimmed.contains('<')
+    {
+        return false;
+    }
+    let segments: Vec<&str> = trimmed
+        .split(|c| c == ';' || c == '\n' || c == '|' || c == '&')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    !segments.is_empty() && segments.into_iter().all(is_zero_action_exempt_shell_segment)
+}
+
 /// Validate an action against stored behavioral rules and (optionally) the
 /// Podman sandbox. Wraps `GuardValidator::validate`.
 async fn handle_guard_validate(
@@ -10621,7 +10774,9 @@ async fn handle_guard_validate(
 
     // Zero-Action Start (honest): in a task-enabled namespace, a mutating
     // action requires at least one claimed (in_progress) task. Read-only
-    // actions and namespaces with no task rows at all are exempt.
+    // actions, git push/sync/status commands (which are gated by the pre-push
+    // task gate and run after task completion), task-tracking CLI invocations,
+    // and namespaces with no task rows at all are exempt.
     let mutating = !matches!(
         action_type.to_lowercase().as_str(),
         "read"
@@ -10635,7 +10790,7 @@ async fn handle_guard_validate(
             | "inspect"
             | "grep"
             | "glob"
-    );
+    ) && !is_zero_action_exempt_shell_payload(action_type, payload);
     if mutating {
         // Determine whether this namespace is task-enabled. Only task rows
         // matter here, so the type filter goes into the query: listing the
@@ -11056,6 +11211,117 @@ mod tests {
     use super::*;
     use crate::events::{RecursionToken, ThalamicBus, ThalamicPulse};
     use crate::guard::testkit::MockStore;
+
+    /// `#212`: the CLI's path-only `storage status` dispatch emits the
+    /// filesystem-only payload — including `wal_age_secs` and the persisted
+    /// recovery history — without opening the store. Exercises the same
+    /// function the `storage status` command prints; only config resolution
+    /// (one `PathBuf`) sits outside it, which is why this fixture can assert
+    /// the payload shape without touching the operator's home config.
+    #[test]
+    fn path_only_storage_status_dispatches_wal_age_and_persisted_recovery() {
+        let root = std::env::temp_dir().join(format!(
+            "ns-storage-status-cli-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("cli.lbug");
+        std::fs::write(&db, b"db").unwrap();
+        crate::model_choice::write_store_state_identity(
+            &db,
+            &crate::model_choice::StoreState::new(
+                true,
+                crate::traits::EmbeddingDescriptor {
+                    provider: "fastembed".to_string(),
+                    model: "ModelA".to_string(),
+                    revision: "onnx".to_string(),
+                    dims: 4,
+                    normalization: "unknown".to_string(),
+                    preprocessing: "unknown".to_string(),
+                    distance_metric: "cosine".to_string(),
+                },
+            ),
+        )
+        .expect("record a sidecar");
+        crate::model_choice::record_store_state_recovery(
+            &db,
+            "discarded_unreadable_wal",
+            4096,
+            "2026-11-15T00:00:00Z",
+        )
+        .expect("record recovery history");
+        crate::storage::snapshot::record_recovery_provenance(&db, None);
+
+        let mut wal_os = db.clone().into_os_string();
+        wal_os.push(".wal");
+        let wal = std::path::PathBuf::from(wal_os);
+        std::fs::write(&wal, b"w").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&wal)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(30))
+            .unwrap();
+
+        let out = path_only_storage_status(
+            &db,
+            &crate::storage::snapshot::StorageHygieneConfig::default(),
+        );
+        let value: serde_json::Value = serde_json::from_str(&out).expect("the CLI payload is JSON");
+        assert_eq!(value["store_bytes"], serde_json::json!(2));
+        assert_eq!(value["wal_bytes"], serde_json::json!(1));
+        let age = value["wal_age_secs"]
+            .as_u64()
+            .expect("wal_age_secs is in the CLI payload (#212)");
+        assert!(
+            (29..60).contains(&age),
+            "the CLI payload reports the WAL age: {age}"
+        );
+        assert_eq!(
+            value["recovery_provenance"],
+            serde_json::json!("discarded_unreadable_wal"),
+            "the path-only CLI payload reports the persisted kind history"
+        );
+        assert_eq!(
+            value["last_recovery_at"],
+            serde_json::json!("2026-11-15T00:00:00Z"),
+            "the path-only CLI payload carries when the store last recovered"
+        );
+        assert_eq!(
+            value["opened_via_recovery"],
+            serde_json::json!(false),
+            "opened_via_recovery is handle-scoped: the CLI opened nothing (#212)"
+        );
+        assert!(
+            value["process"].is_object(),
+            "the CLI payload still carries the process block"
+        );
+
+        // A healthy (WAL-free) store: the key stays in the payload as `null`
+        // rather than disappearing, which is what the runbook promises (#212).
+        std::fs::remove_file(&wal).unwrap();
+        let out = path_only_storage_status(
+            &db,
+            &crate::storage::snapshot::StorageHygieneConfig::default(),
+        );
+        let value: serde_json::Value = serde_json::from_str(&out).expect("the CLI payload is JSON");
+        assert_eq!(value["wal_bytes"], serde_json::json!(0));
+        assert!(
+            value.get("wal_age_secs").is_some(),
+            "wal_age_secs is never omitted (#212)"
+        );
+        assert_eq!(
+            value["wal_age_secs"],
+            serde_json::Value::Null,
+            "a store with no WAL reports wal_age_secs as null (#212)"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// G3: a failed/partial hygiene repair must not advance the doctor's
     /// completion marker, so the only automatic retry path runs again.
@@ -14840,6 +15106,79 @@ mod tests {
             suffix.contains("\"a\""),
             "should use the shorter path that fits"
         );
+    }
+
+    /// A method this server does not implement is a JSON-RPC method-not-found
+    /// error carrying the request's id; `ping` is an empty result. Both used
+    /// to be a bare `{}` with no `jsonrpc` and no `id`.
+    #[tokio::test]
+    async fn unknown_methods_are_method_not_found_with_the_request_id() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+        let call = |method: &str, id: Value| JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(id),
+            method: method.to_string(),
+            params: None,
+        };
+        let (bus, _seen) = recording_bus();
+        let response = process_mcp_request(
+            call("server/discover", serde_json::json!(41)),
+            Arc::new(StubEmbedder),
+            store.clone(),
+            ingests.clone(),
+            None,
+            bus.clone(),
+        )
+        .await;
+        assert_eq!(response["jsonrpc"], serde_json::json!("2.0"), "{response}");
+        assert_eq!(response["id"], serde_json::json!(41), "{response}");
+        assert_eq!(response["error"]["code"], serde_json::json!(METHOD_NOT_FOUND), "{response}");
+        assert!(response.get("result").is_none(), "{response}");
+
+        let response = process_mcp_request(
+            call("ping", serde_json::json!("p")),
+            Arc::new(StubEmbedder),
+            store,
+            ingests,
+            None,
+            bus,
+        )
+        .await;
+        assert_eq!(response["id"], serde_json::json!("p"), "{response}");
+        assert_eq!(response["result"], serde_json::json!({}), "{response}");
+    }
+
+    /// An explicit `id: null` is a request id, not the notification marker
+    /// (which is an *omitted* `id`): dispatch answers it with an error that
+    /// echoes `"id": null` instead of suppressing the reply.
+    #[tokio::test]
+    async fn an_explicit_id_null_is_a_request_answered_with_id_null() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::Value::Null),
+            method: "server/discover".to_string(),
+            params: None,
+        };
+        let (bus, _seen) = recording_bus();
+        let response =
+            process_mcp_request(request, Arc::new(StubEmbedder), store, ingests, None, bus).await;
+        assert_eq!(response["jsonrpc"], serde_json::json!("2.0"), "{response}");
+        assert!(response.get("id").is_some(), "{response}");
+        assert_eq!(response["id"], serde_json::Value::Null, "{response}");
+        assert_eq!(
+            response["error"]["code"],
+            serde_json::json!(METHOD_NOT_FOUND),
+            "{response}"
+        );
+        assert_eq!(
+            response["error"]["message"],
+            serde_json::json!("Method not found: server/discover"),
+            "{response}"
+        );
+        assert!(response.get("result").is_none(), "{response}");
     }
 
     /// The mesh dispatch arm is the only production route from the wire to

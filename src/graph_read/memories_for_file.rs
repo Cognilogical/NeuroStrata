@@ -156,7 +156,8 @@ pub fn freshness_priority(metadata: &Value) -> u8 {
 
 /// The fan-out segment of the ranking key: a memory linked to 1-2 files says
 /// more about each of them than one linked to 3-9, or to 10 or more. Lower
-/// is better.
+/// is better. It is a *tiebreaker* inside one enforcement class, never a
+/// reason to rank a broad ENFORCED rule below a narrow advisory one (#208).
 pub fn fan_out_bucket(linked_files: usize) -> u8 {
     match linked_files {
         0..=2 => 0,
@@ -178,22 +179,24 @@ fn valid_from(metadata: &Value) -> i64 {
     metadata.get("valid_from").and_then(|v| v.as_i64()).unwrap_or(0)
 }
 
-/// Sort hits by the spec's ranking: match kind, then fan-out bucket, then
-/// memory-type priority, then freshness, then (direct matches) newest
+/// Sort hits by the spec's ranking: match kind, then memory-type priority,
+/// then fan-out bucket, then freshness, then (direct matches) newest
 /// `valid_from` first or (weaker matches) `access_count` descending, then id
-/// for determinism. Newest first for direct matches because an older memory
-/// on the same file has had more time to collect reads, and it is the newer
-/// one that describes the file as it is.
+/// for determinism. Type outranks fan-out so a broad ENFORCED rule is never
+/// pushed off the page by narrow advisory rules; fan-out only separates hits
+/// that are equal on kind and type. Newest first for direct matches because an
+/// older memory on the same file has had more time to collect reads, and it is
+/// the newer one that describes the file as it is.
 pub fn rank_hits(hits: &mut [MemoryHit]) {
     hits.sort_by(|a, b| {
         a.match_kind
             .priority()
             .cmp(&b.match_kind.priority())
-            .then_with(|| fan_out_bucket(a.linked_files).cmp(&fan_out_bucket(b.linked_files)))
             .then_with(|| {
                 memory_type_priority(&a.memory_type, &a.metadata)
                     .cmp(&memory_type_priority(&b.memory_type, &b.metadata))
             })
+            .then_with(|| fan_out_bucket(a.linked_files).cmp(&fan_out_bucket(b.linked_files)))
             .then_with(|| freshness_priority(&a.metadata).cmp(&freshness_priority(&b.metadata)))
             .then_with(|| {
                 if is_direct(a.match_kind) {

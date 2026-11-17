@@ -10,9 +10,11 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::connectors::DataPointerRecord;
+use crate::connectors::{DataPointerRecord, DataPoolSchema};
 use crate::formal_kernel::KernelActionReceiptState;
 use crate::rebac::can_read_memory;
 use crate::traits::{MemoryPayload, OntologyStore, TaskStore, TaskSummaryRow, VectorStore};
@@ -41,6 +43,29 @@ pub trait MemoryPort: Send + Sync {
 
     /// List pointers, optionally filtered by pool id and ReBAC.
     async fn list_data_pointers(&self, namespace: &str, pool_id: Option<&str>, principal: Option<&str>) -> Result<Vec<DataPointerRecord>>;
+
+    /// Persist a `DataPoolSchema` (and optional initial in-memory records) in the private registry.
+    async fn register_data_pool(
+        &self,
+        namespace: &str,
+        schema: &DataPoolSchema,
+        records: Option<&HashMap<String, Vec<Value>>>,
+        principal: Option<&str>,
+    ) -> Result<DataPoolSchema> {
+        let _ = (namespace, records, principal);
+        Ok(schema.clone())
+    }
+
+    /// List persisted `DataPoolSchema` entries in the namespace, optionally filtered by `connector_id`.
+    async fn list_data_pools(
+        &self,
+        namespace: &str,
+        connector_id: Option<&str>,
+        principal: Option<&str>,
+    ) -> Result<Vec<(DataPoolSchema, Option<HashMap<String, Vec<Value>>>)>> {
+        let _ = (namespace, connector_id, principal);
+        Ok(Vec::new())
+    }
 }
 
 /// §3.2.2 – Executive interface over tasks and workflow stage transitions.
@@ -168,8 +193,10 @@ impl MemoryPort for LadybugMemoryPort {
                 if payload.memory_type != "data_pointer" {
                     return Ok(None);
                 }
-                // Deserialize the `pointer` field from metadata.
-                let record: DataPointerRecord = serde_json::from_value(payload.metadata.get("pointer").ok_or_else(|| anyhow::anyhow!("missing pointer metadata"))?.clone())?;
+                let Some(pointer_val) = payload.metadata.get("pointer") else {
+                    return Ok(None);
+                };
+                let record: DataPointerRecord = serde_json::from_value(pointer_val.clone())?;
                 return Ok(Some(record));
             }
             return Ok(None);
@@ -179,8 +206,11 @@ impl MemoryPort for LadybugMemoryPort {
             if payload.memory_type != "data_pointer" {
                 return Ok(None);
             }
+            let Some(pointer_val) = payload.metadata.get("pointer") else {
+                return Ok(None);
+            };
             if can_read_memory(principal.unwrap(), payload.user_id.as_str(), &payload.metadata) {
-                let record: DataPointerRecord = serde_json::from_value(payload.metadata.get("pointer").ok_or_else(|| anyhow::anyhow!("missing pointer metadata"))?.clone())?;
+                let record: DataPointerRecord = serde_json::from_value(pointer_val.clone())?;
                 return Ok(Some(record));
             }
         }
@@ -199,21 +229,114 @@ impl MemoryPort for LadybugMemoryPort {
             if crate::store::ladybug::is_retired_at(&payload.metadata, now) {
                 continue;
             }
+            let Some(pointer_val) = payload.metadata.get("pointer") else {
+                continue;
+            };
             // ReBAC filtering: principal == None => trusted (include all) else require can_read_memory.
             let include = match principal {
                 None => true,
                 Some(p) => can_read_memory(p, payload.user_id.as_str(), &payload.metadata),
             };
             if !include { continue; }
-            // Optional pool_id filter.
+            let rec: DataPointerRecord = serde_json::from_value(pointer_val.clone())?;
             if let Some(pid) = pool_id {
-                let rec: DataPointerRecord = serde_json::from_value(payload.metadata.get("pointer").ok_or_else(|| anyhow::anyhow!("missing pointer metadata"))?.clone())?;
                 if rec.pool_id != pid { continue; }
             }
-            let rec: DataPointerRecord = serde_json::from_value(payload.metadata.get("pointer").ok_or_else(|| anyhow::anyhow!("missing pointer metadata"))?.clone())?;
             out.push(rec);
         }
         out.sort_by(|a, b| a.pointer_id.cmp(&b.pointer_id));
+        Ok(out)
+    }
+
+    async fn register_data_pool(
+        &self,
+        namespace: &str,
+        schema: &DataPoolSchema,
+        records: Option<&HashMap<String, Vec<Value>>>,
+        principal: Option<&str>,
+    ) -> Result<DataPoolSchema> {
+        let lb = self.ladybug_store();
+        if !crate::rebac::can_write_namespace(lb, namespace, principal) {
+            anyhow::bail!("write denied for namespace '{}'", namespace);
+        }
+        let row_id = format!(
+            "__data_pool__:{}:{}:{}",
+            namespace, schema.connector_id, schema.pool_id
+        );
+        let existing_records = if records.is_none() {
+            self.trusted_get_memory(namespace, &row_id)
+                .await?
+                .and_then(|p| p.metadata.get("pool_records").cloned())
+        } else {
+            None
+        };
+        let mut metadata = serde_json::json!({
+            "eligibility": "private",
+            "pool_schema": serde_json::to_value(schema)?,
+            "source": {
+                "kind": "data_connector_pool",
+                "ref": format!("{}:{}", schema.connector_id, schema.pool_id)
+            }
+        });
+        if let Some(recs) = records {
+            metadata["pool_records"] = serde_json::to_value(recs)?;
+        } else if let Some(prev_recs) = existing_records {
+            metadata["pool_records"] = prev_recs;
+        }
+        let user_id = principal.unwrap_or("");
+        let payload = MemoryPayload {
+            content: format!(
+                "data pool {}:{} ({})",
+                schema.connector_id, schema.pool_id, schema.description
+            ),
+            user_id: user_id.to_string(),
+            memory_type: "data_pointer".to_string(),
+            agent_name: None,
+            location: format!("{}:{}", schema.connector_id, schema.pool_id),
+            location_lines: String::new(),
+            metadata,
+        };
+        lb.put_scoped_memory(namespace, &row_id, &payload).await?;
+        Ok(schema.clone())
+    }
+
+    async fn list_data_pools(
+        &self,
+        namespace: &str,
+        connector_id: Option<&str>,
+        principal: Option<&str>,
+    ) -> Result<Vec<(DataPoolSchema, Option<HashMap<String, Vec<Value>>>)>> {
+        let mut out = Vec::new();
+        let lb = self.ladybug_store();
+        let rows = lb.list_memories_by_types(namespace, &["data_pointer"]).await?;
+        for (_id, payload) in rows {
+            let Some(schema_val) = payload.metadata.get("pool_schema") else {
+                continue;
+            };
+            let include = match principal {
+                None => true,
+                Some(p) => can_read_memory(p, payload.user_id.as_str(), &payload.metadata),
+            };
+            if !include {
+                continue;
+            }
+            let schema: DataPoolSchema = serde_json::from_value(schema_val.clone())?;
+            if let Some(cid) = connector_id {
+                if schema.connector_id != cid {
+                    continue;
+                }
+            }
+            let records = payload
+                .metadata
+                .get("pool_records")
+                .and_then(|v| serde_json::from_value(v.clone()).ok());
+            out.push((schema, records));
+        }
+        out.sort_by(|a, b| {
+            a.0.connector_id
+                .cmp(&b.0.connector_id)
+                .then_with(|| a.0.pool_id.cmp(&b.0.pool_id))
+        });
         Ok(out)
     }
 }

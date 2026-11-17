@@ -33,7 +33,7 @@ jobs:
       LBUG_VERSION: "0.22.3"
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.tag || github.ref_name }}
 
@@ -83,7 +83,7 @@ jobs:
           } > test-receipt.txt
 
       - name: Upload test receipt
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: test-receipt
           path: test-receipt.txt
@@ -139,7 +139,7 @@ jobs:
       # workflow_dispatch run builds whatever branch it was launched from and
       # then attaches those binaries to the requested tag.
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.tag || github.ref_name }}
 
@@ -204,7 +204,7 @@ jobs:
         run: Compress-Archive -Path 'dist' -DestinationPath '${{ matrix.archive }}'
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.archive }}
           path: ${{ matrix.archive }}
@@ -216,8 +216,13 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
       - name: Collect artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           merge-multiple: true
@@ -237,10 +242,16 @@ jobs:
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
+          NOTES_FILE="docs/releases/changelog/${TAG#v}.md"
+          if [ ! -s "$NOTES_FILE" ]; then
+            echo "::error::Release changelog '$NOTES_FILE' is missing or empty for tag '$TAG'"
+            exit 1
+          fi
           if ! gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Creating release $TAG"
-            gh release create "$TAG" --title "$TAG" --generate-notes
+            echo "Creating release $TAG from $NOTES_FILE"
+            gh release create "$TAG" --title "$TAG" --notes-file "$NOTES_FILE"
           else
-            echo "Release $TAG already exists; attaching assets"
+            echo "Release $TAG already exists; syncing release body from $NOTES_FILE and attaching assets"
+            gh release edit "$TAG" --title "$TAG" --notes-file "$NOTES_FILE"
           fi
           gh release upload "$TAG" dist/* --clobber

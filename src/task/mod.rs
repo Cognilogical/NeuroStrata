@@ -1329,6 +1329,70 @@ fn claim_lock(task_id: &str) -> Arc<tokio::sync::Mutex<()>> {
     lock
 }
 
+async fn resolve_task_scope(
+    args: &Value,
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+) -> (std::path::PathBuf, gate::GateScope) {
+    let explicit_root = arg_str(args, "worktree")
+        .or_else(|| arg_str(args, "project_root"))
+        .or_else(|| arg_str(args, "cwd"))
+        .map(std::path::PathBuf::from);
+    let rid = crate::registry::registry_row_id(namespace);
+    let registry_root = if let Ok(Some((_, reg_p))) = store.get(namespace, &rid).await {
+        reg_p
+            .metadata
+            .get("project_root")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(std::path::PathBuf::from)
+    } else {
+        None
+    };
+    let daemon_root = crate::daemon::resolve_project_root();
+
+    let mut candidates = Vec::new();
+    if let Some(r) = explicit_root {
+        candidates.push(r);
+    }
+    if let Some(r) = registry_root {
+        if !candidates.contains(&r) {
+            candidates.push(r);
+        }
+    }
+    if !candidates.contains(&daemon_root) {
+        candidates.push(daemon_root.clone());
+    }
+
+    let mut chosen_root = candidates
+        .first()
+        .cloned()
+        .unwrap_or_else(|| daemon_root.clone());
+    let mut scope = gate::GateScope::default();
+    for cand in &candidates {
+        let captured = gate::GateScope::capture(cand);
+        if captured.branch.is_some() || captured.worktree.is_some() {
+            chosen_root = cand.clone();
+            scope = captured;
+            break;
+        }
+    }
+    if let Some(explicit_branch) = arg_str(args, "branch") {
+        scope.branch = Some(explicit_branch.to_string());
+    }
+    if scope.worktree.is_none() {
+        if let Some(explicit_wt) = arg_str(args, "worktree") {
+            let wt_path = std::path::PathBuf::from(explicit_wt);
+            let canonical = wt_path
+                .canonicalize()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| explicit_wt.to_string());
+            scope.worktree = Some(canonical);
+        }
+    }
+    (chosen_root, scope)
+}
+
 pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> String {
     let id = match required_str(&args, "id") {
         Ok(v) => v.to_string(),
@@ -1394,7 +1458,7 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
             // but not the branch/worktree: backfill what is missing so the
             // strict gate can judge them, persist it, and leave already
             // attributed rows exactly as they are.
-            let scope = gate::GateScope::capture(&crate::daemon::resolve_project_root());
+            let (_, scope) = resolve_task_scope(&args, &store, &namespace).await;
             let obj = task_obj_mut(&mut task.payload);
             let branch_missing = obj
                 .get("branch")
@@ -1496,7 +1560,7 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
         Err(e) => return format!("ERROR: {}", e),
     };
     task = claimed;
-    let scope = gate::GateScope::capture(&crate::daemon::resolve_project_root());
+    let (scope_root, scope) = resolve_task_scope(&args, &store, &namespace).await;
     {
         let obj = task_obj_mut(&mut task.payload);
         obj.insert("assignee".to_string(), json!(assignee));
@@ -1540,7 +1604,7 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
     let event_id = arg_str(&args, "event_id").unwrap_or(&format!("claim-{}", id)).to_string();
     {
         let mut r = TASK_RECEIPTS.lock().unwrap_or_else(|e| e.into_inner());
-        let binding = crate::task::receipt::Receipt::capture(&id, &crate::daemon::resolve_project_root());
+        let binding = crate::task::receipt::Receipt::capture(&id, &scope_root);
         r.record(crate::receipts::store::Receipt {
             session_id: session.clone(),
             task_id: id.clone(),
@@ -1727,8 +1791,7 @@ pub async fn handle_task_update(
                         }
                     }
                     if new_claim {
-                        let scope =
-                            gate::GateScope::capture(&crate::daemon::resolve_project_root());
+                        let (_, scope) = resolve_task_scope(&args, &store, &namespace).await;
                         obj.insert("branch".to_string(), json!(scope.branch));
                         obj.insert("worktree".to_string(), json!(scope.worktree));
                     }
@@ -3071,6 +3134,21 @@ if [ -z "$NAMESPACE" ]; then
     NAMESPACE=$(basename "$ROOT")
 fi
 
+# Windows roots (`C:/...`) compare case-insensitively, like the file system.
+# Only ASCII letters are folded, the same way in bash, node and python, so a
+# file name spelled identically on both sides always matches.
+FOLD=0
+case "$ROOT" in
+    [A-Za-z]:*) FOLD=1 ;;
+esac
+fold_case() {
+    if [ "$FOLD" = "1" ]; then
+        printf '%s' "$1" | LC_ALL=C tr 'A-Z' 'a-z'
+    else
+        printf '%s' "$1"
+    fi
+}
+
 # ── Collect staged file paths (excluding .NeuroStrata/ internal files) ───────
 StagedFiles=()
 while IFS= read -r -d '' file; do
@@ -3089,9 +3167,12 @@ if [ "${#StagedFiles[@]}" -eq 0 ]; then
 fi
 
 # ── Path normalization for ledger matching ─────────────────────────────────
-# $file from git diff is repo-relative (e.g. `pkg/auth/handler.go`), but the
-# ledger may have recorded `"$ROOT/$file"` (absolute), `"./$file"` (dot-slash),
-# or the bare `"$file"`. Match all three spellings.
+# $file from git diff is repo-relative (e.g. `pkg/auth/handler.go`). A ledger
+# entry may carry `path` (already project-relative, written by newer daemons;
+# preferred), or only the raw `query`: `"$ROOT/$file"` as an absolute path,
+# with `/` or `\`, `\\?\` or Git Bash `/c/` prefixes and any
+# drive-letter case on Windows, `"./$file"`, or the bare `"$file"`. All of them
+# are reduced to the repo-relative form below.
 normalize_rel_path() {
     local p="$1"
     p="${p#"$ROOT"/}"
@@ -3108,26 +3189,39 @@ dump_ledger_paths() {
     if [ ! -f "$LEDGER" ]; then
         return 0
     fi
-    export LEDGER ROOT
+    export LEDGER ROOT FOLD
     if command -v node >/dev/null 2>&1; then
         node -e '
           const fs = require("fs");
           const ledger = process.env.LEDGER;
-          const root = process.env.ROOT || "";
+          const win = process.env.FOLD === "1";
+          const fold = (s) => (win ? s.replace(/[A-Z]/g, (c) => c.toLowerCase()) : s);
+          // C:\x | C:/x | \\?\C:\x | /c/x (Windows only) -> C:/x ; no trailing /
+          const normAbs = (p) => {
+            p = p.replace(/\\/g, "/").replace(/^\/\/[?.]\//, "");
+            const m = win ? /^\/([A-Za-z])(\/.*)?$/.exec(p) : null;
+            if (m) p = m[1] + ":" + (m[2] || "/");
+            return p.length > 1 ? p.replace(/\/+$/, "") : p;
+          };
+          const roots = [process.env.ROOT].filter(Boolean).map(normAbs);
           let parsed;
           try { parsed = JSON.parse(fs.readFileSync(ledger, "utf8")); } catch { process.exit(0); }
           const queries = Array.isArray(parsed) ? parsed : (parsed && Array.isArray(parsed.queries) ? parsed.queries : []);
           const out = new Set();
-          const norm = (p) => {
-            if (typeof p !== "string" || !p) return;
-            if (root && (p === root || p.startsWith(root + "/"))) p = p.slice(root.length).replace(/^\//, "");
+          const norm = (raw) => {
+            if (typeof raw !== "string" || !raw) return;
+            let p = normAbs(raw);
+            for (const r of roots) {
+              if (fold(p) === fold(r)) return;
+              if (fold(p).startsWith(fold(r) + "/")) { p = p.slice(r.length + 1); break; }
+            }
+            if (/^[A-Za-z]:\//.test(p) || p.startsWith("/")) return; // another project
             while (p.startsWith("./")) p = p.slice(2);
-            if (p.endsWith("/")) p = p.slice(0, -1);
-            if (p) out.add(p);
+            if (p) out.add(fold(p));
           };
           for (const q of queries) {
             if (!q || typeof q !== "object") continue;
-            norm(q.query);
+            if (typeof q.path === "string" && q.path) norm(q.path); else norm(q.query);
             for (const k of ["domains", "governed_prefixes"]) {
               if (Array.isArray(q[k])) q[k].forEach(norm);
             }
@@ -3136,11 +3230,24 @@ dump_ledger_paths() {
         ' 2>/dev/null || true
     elif command -v python3 >/dev/null 2>&1; then
         python3 -c '
-import json, os, sys
+import json, os, re, sys
+# Bash compares these lines byte for byte (grep -x): write UTF-8 and plain
+# newlines even where a Windows Python defaults to the ANSI code page and CRLF.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", newline="\n")
 ledger = os.environ["LEDGER"]
-root = os.environ.get("ROOT") or ""
+win = os.environ.get("FOLD") == "1"
+def fold(s):
+    return re.sub(r"[A-Z]", lambda m: m.group(0).lower(), s) if win else s
+def norm_abs(p):
+    p = re.sub(r"^//[?.]/", "", p.replace("\\", "/"))
+    m = re.match(r"^/([A-Za-z])(/.*)?$", p) if win else None
+    if m:
+        p = m.group(1) + ":" + (m.group(2) or "/")
+    return p.rstrip("/") if len(p) > 1 else p
+roots = [norm_abs(r) for r in (os.environ.get("ROOT"),) if r]
 try:
-    with open(ledger) as f:
+    with open(ledger, encoding="utf-8") as f:
         parsed = json.load(f)
 except Exception:
     sys.exit(0)
@@ -3148,20 +3255,29 @@ queries = parsed if isinstance(parsed, list) else (parsed.get("queries") if isin
 if not isinstance(queries, list):
     queries = []
 out = set()
-def norm(p):
-    if not isinstance(p, str) or not p:
+def norm(raw):
+    if not isinstance(raw, str) or not raw:
         return
-    if root and (p == root or p.startswith(root + "/")):
-        p = p[len(root):].lstrip("/")
+    p = norm_abs(raw)
+    for r in roots:
+        if fold(p) == fold(r):
+            return
+        if fold(p).startswith(fold(r) + "/"):
+            p = p[len(r) + 1:]
+            break
+    if re.match(r"^[A-Za-z]:/", p) or p.startswith("/"):
+        return
     while p.startswith("./"):
         p = p[2:]
-    p = p.rstrip("/")
     if p:
-        out.add(p)
+        out.add(fold(p))
 for q in queries:
     if not isinstance(q, dict):
         continue
-    norm(q.get("query"))
+    if isinstance(q.get("path"), str) and q.get("path"):
+        norm(q.get("path"))
+    else:
+        norm(q.get("query"))
     for k in ("domains", "governed_prefixes"):
         v = q.get(k)
         if isinstance(v, list):
@@ -3178,7 +3294,7 @@ LEDGER_PATHS=$(dump_ledger_paths)
 ledger_has_file() {
     local rel="$1"
     if [ -n "$LEDGER_PATHS" ]; then
-        printf '%s\n' "$LEDGER_PATHS" | grep -qxF "$rel"
+        printf '%s\n' "$LEDGER_PATHS" | grep -qxF "$(fold_case "$rel")"
         return $?
     fi
     [ -f "$LEDGER" ] || return 1
@@ -3190,7 +3306,7 @@ ledger_has_file() {
 ledger_has_dir() {
     local rel_dir="${1%/}"
     if [ -n "$LEDGER_PATHS" ]; then
-        printf '%s\n' "$LEDGER_PATHS" | grep -qxF "$rel_dir"
+        printf '%s\n' "$LEDGER_PATHS" | grep -qxF "$(fold_case "$rel_dir")"
         return $?
     fi
     [ -f "$LEDGER" ] || return 1
@@ -3238,7 +3354,7 @@ for raw_file in "${StagedFiles[@]}"; do
     file=$(normalize_rel_path "$raw_file")
     [ -z "$file" ] && continue
     if [ -n "$LEDGER_PATHS" ]; then
-        if printf '%s\n' "$LEDGER_PATHS" | grep -qxF "$file"; then
+        if printf '%s\n' "$LEDGER_PATHS" | grep -qxF "$(fold_case "$file")"; then
             continue
         fi
     fi
@@ -4855,6 +4971,119 @@ mod tests {
         Arc::new(StubEmbedder)
     }
 
+    /// Git's own bash: on Windows `bash` on PATH may be WSL's launcher, which
+    /// cannot run a hook against a Windows checkout.
+    fn hook_bash() -> Option<std::path::PathBuf> {
+        if cfg!(windows) {
+            let out = std::process::Command::new("git").arg("--exec-path").output().ok()?;
+            let exec = std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+            // <git>/mingw64/libexec/git-core -> <git>
+            let git_root = exec.parent()?.parent()?.parent()?.to_path_buf();
+            ["usr/bin/bash.exe", "bin/bash.exe"]
+                .iter()
+                .map(|rel| git_root.join(rel))
+                .find(|p| p.is_file())
+        } else {
+            Some(std::path::PathBuf::from("bash"))
+        }
+    }
+
+    fn git_stdout_in(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Runs the scaffolded pre-commit hook in `dir`; returns its stderr.
+    fn run_pre_commit(bash: &std::path::Path, hook: &std::path::Path, dir: &std::path::Path) -> String {
+        let out = std::process::Command::new(bash)
+            .arg(hook)
+            .current_dir(dir)
+            .output()
+            .expect("the hook runs");
+        String::from_utf8_lossy(&out.stderr).to_string()
+    }
+
+    /// The pre-commit hook used to strip only `"$ROOT/"` with forward slashes,
+    /// so on Windows every lookup the hooks recorded (`C:\...\x.rs`) read as
+    /// "no recorded lookup". Every spelling of a recorded file now matches.
+    #[test]
+    fn the_pre_commit_hook_matches_every_spelling_of_a_recorded_path() {
+        let Some(bash) = hook_bash() else {
+            eprintln!("skipped: no bash to run the hook with");
+            return;
+        };
+        let has = |tool: &str| {
+            std::process::Command::new(&bash)
+                .args(["-c", &format!("command -v {tool}")])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        if !has("node") && !has("python3") {
+            eprintln!("skipped: the hook needs node or python3 to read the ledger");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        let repo = base.join("example-project");
+        let hooks_off = base.join("no-hooks");
+        std::fs::create_dir_all(repo.join("src").join("a")).unwrap();
+        std::fs::create_dir_all(repo.join(".NeuroStrata")).unwrap();
+        std::fs::create_dir_all(&hooks_off).unwrap();
+        git_stdout_in(&repo, &["init", "-q"]);
+        git_stdout_in(&repo, &["config", "user.email", "t@example.invalid"]);
+        git_stdout_in(&repo, &["config", "user.name", "t"]);
+        git_stdout_in(&repo, &["config", "core.hooksPath", &hooks_off.to_string_lossy()]);
+        for f in ["a1", "a2", "a3", "a4", "a5", "a6", "Ä7"] {
+            std::fs::write(repo.join("src").join("a").join(format!("{f}.rs")), "x").unwrap();
+        }
+        std::fs::write(repo.join("none.rs"), "x").unwrap();
+        git_stdout_in(&repo, &["config", "core.quotePath", "false"]);
+
+        let root = git_stdout_in(&repo, &["rev-parse", "--show-toplevel"]);
+        let back = root.replace('/', "\\");
+        let mut queries = vec![
+            json!({"tool": "neurostrata_memories_for_file", "query": format!(r"{back}\src\a\a1.rs")}),
+            json!({"tool": "t", "query": format!("{root}/src/a/a2.rs")}),
+        ];
+        if cfg!(windows) {
+            let msys = format!("/{}{}", root[..1].to_lowercase(), &root[2..]);
+            queries.push(json!({"tool": "t", "query": format!("{msys}/src/a/a3.rs")}));
+            queries.push(json!({"tool": "t", "query": format!(r"\\?\{back}\src\a\a4.rs")}));
+            queries.push(json!({"tool": "t", "query": format!("{}/SRC/A/A5.RS", root.to_uppercase())}));
+        } else {
+            queries.push(json!({"tool": "t", "query": "./src/a/a3.rs"}));
+            queries.push(json!({"tool": "t", "query": "src/a/a4.rs/"}));
+            queries.push(json!({"tool": "t", "query": "src/a/a5.rs"}));
+        }
+        // `path` wins over a query naming another checkout's absolute path.
+        queries.push(json!({"tool": "t", "query": "/elsewhere/src/a/a6.rs", "path": "src/a/a6.rs"}));
+        queries.push(json!({"tool": "t", "query": "/elsewhere/none.rs"}));
+        // A non-ASCII name spelled the same on both sides matches: every
+        // side folds only ASCII letters.
+        queries.push(json!({"tool": "t", "query": format!("{root}/src/a/Ä7.rs")}));
+        let ledger = repo.join(".NeuroStrata").join("session_queries.json");
+        std::fs::write(
+            &ledger,
+            serde_json::to_string_pretty(&json!({"namespace": "example-project", "queries": queries})).unwrap(),
+        )
+        .unwrap();
+        let hook = base.join("pre-commit");
+        std::fs::write(&hook, SCAFFOLDED_PRE_COMMIT_HOOK).unwrap();
+
+        git_stdout_in(&repo, &["add", "src", "none.rs"]);
+        let stderr = run_pre_commit(&bash, &hook, &repo);
+        assert!(stderr.contains("file 'none.rs' has no recorded"), "{stderr}");
+        for f in ["a1", "a2", "a3", "a4", "a5", "a6", "Ä7"] {
+            assert!(!stderr.contains(&format!("src/a/{f}.rs' has no recorded")), "{f}: {stderr}");
+        }
+    }
+
     /// A store whose `namespace` already holds one rule, so the namespace
     /// exists for task_create's existence check.
     async fn store_with_namespace(namespace: &str) -> Arc<dyn VectorStore> {
@@ -5990,6 +6219,131 @@ mod tests {
             payload.metadata["task"]["worktree"],
             json!(expected.worktree)
         );
+    }
+
+    #[tokio::test]
+    async fn claim_resolves_scope_from_registry_project_root_and_explicit_worktree() {
+        let _env_guard = crate::daemon::project_root_env_test_lock();
+        let non_git = tempfile::tempdir().unwrap();
+        let git_wt = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-b", "feature/mcp-claim"])
+            .current_dir(git_wt.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        // Point daemon project root at a non-git directory (simulating daemon startup in $HOME),
+        // while registering the namespace's project_root at the actual git worktree.
+        std::env::set_var("NEUROSTRATA_PROJECT_ROOT", non_git.path());
+        let store = store_with_namespace("MyProj").await;
+        let rid = crate::registry::registry_row_id("MyProj");
+        let reg_vec = StubEmbedder.embed("registry").await.unwrap();
+        store
+            .upsert(
+                "MyProj",
+                &rid,
+                reg_vec,
+                MemoryPayload {
+                    content: "registry".to_string(),
+                    user_id: "kenton".to_string(),
+                    memory_type: "structural".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({
+                        "project_root": git_wt.path().to_string_lossy().to_string()
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+
+        let id = create_task(&store, "MyProj", "mcp claimed work", 2).await;
+        let reply = handle_task_claim(
+            json!({
+                "namespace": "MyProj",
+                "id": id,
+                "assignee": "agent-a",
+                "session_id": "ses_mcp"
+            }),
+            store.clone(),
+        )
+        .await;
+        std::env::remove_var("NEUROSTRATA_PROJECT_ROOT");
+        assert!(reply.contains("\"status\": \"in_progress\""), "{}", reply);
+
+        let expected = gate::GateScope::capture(git_wt.path());
+        assert_eq!(expected.branch.as_deref(), Some("feature/mcp-claim"));
+        let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+        assert_eq!(payload.metadata["task"]["branch"], json!(expected.branch));
+        assert_eq!(payload.metadata["task"]["worktree"], json!(expected.worktree));
+
+        // Another worktree pushing its own branch is not blocked by this MCP-claimed task.
+        let other_scope = gate::GateScope {
+            branch: Some("feature/other-wt".to_string()),
+            worktree: Some("/repo/other-wt".to_string()),
+        };
+        let other_report = gate::run_scoped(&store, "MyProj", Some(&other_scope))
+            .await
+            .unwrap();
+        assert!(
+            !other_report.violations.iter().any(|v| v.kind == "in_progress"),
+            "other worktree must not be blocked: {:?}",
+            other_report.violations
+        );
+    }
+
+    #[test]
+    fn zero_action_exempt_shell_payload_allows_git_push_and_rejects_mutations() {
+        assert!(crate::server::is_zero_action_exempt_shell_payload(
+            "bash",
+            "git push -u origin fix/task-claim-push-scope"
+        ));
+        assert!(crate::server::is_zero_action_exempt_shell_payload(
+            "bash",
+            "CARGO_TARGET_DIR=/tmp/target git push -u origin main && git status -s"
+        ));
+        assert!(crate::server::is_zero_action_exempt_shell_payload(
+            "shell",
+            "git pull --rebase && git push && git status"
+        ));
+        assert!(crate::server::is_zero_action_exempt_shell_payload(
+            "bash",
+            "neurostrata-mcp task gate NeuroStrata --strict"
+        ));
+        assert!(!crate::server::is_zero_action_exempt_shell_payload(
+            "bash",
+            "git commit -m 'mutate history'"
+        ));
+        assert!(!crate::server::is_zero_action_exempt_shell_payload(
+            "bash",
+            "git push && rm -rf src"
+        ));
+        assert!(!crate::server::is_zero_action_exempt_shell_payload(
+            "bash",
+            "git push > /tmp/pwn"
+        ));
+        assert!(!crate::server::is_zero_action_exempt_shell_payload(
+            "bash",
+            "git diff --output=src/file.rs"
+        ));
+        assert!(!crate::server::is_zero_action_exempt_shell_payload(
+            "bash",
+            "git show --output src/file.rs"
+        ));
+        assert!(!crate::server::is_zero_action_exempt_shell_payload(
+            "bash",
+            "git log --output=src/file.rs"
+        ));
+        assert!(!crate::server::is_zero_action_exempt_shell_payload(
+            "bash",
+            "git -c core.sshCommand=evil push"
+        ));
+        assert!(!crate::server::is_zero_action_exempt_shell_payload(
+            "edit",
+            "git push"
+        ));
     }
 
     #[tokio::test]

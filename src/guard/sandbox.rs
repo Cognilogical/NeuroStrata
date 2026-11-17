@@ -22,14 +22,46 @@ pub fn probe_podman_available() -> bool {
 }
 
 pub struct SandboxEvaluator {
-    engine: String, // "podman" or "docker"
-    available: bool,
+    /// ("podman" or "none", available), detected on the first `evaluate`.
+    ///
+    /// Detection spawns `podman --version` (~200 ms on Windows). It used to
+    /// run in the constructor, and `neurostrata_guard_validate` builds a new
+    /// validator per call, so every call paid for it although the hook calls
+    /// with `use_sandbox: false` and never reaches `evaluate`.
+    engine: tokio::sync::OnceCell<(String, bool)>,
+    /// How many times `detect_engine` ran for this evaluator.
+    engine_probes: std::sync::atomic::AtomicUsize,
+}
+
+impl Default for SandboxEvaluator {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SandboxEvaluator {
-    pub async fn new() -> Self {
-        let (engine, available) = Self::detect_engine().await;
-        Self { engine, available }
+    pub fn new() -> Self {
+        Self {
+            engine: tokio::sync::OnceCell::new(),
+            engine_probes: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// How many times this evaluator ran engine detection (0 until the first
+    /// `evaluate`, then 1).
+    pub fn engine_probe_count(&self) -> usize {
+        self.engine_probes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    async fn detected_engine(&self) -> (String, bool) {
+        self.engine
+            .get_or_init(|| async {
+                self.engine_probes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Self::detect_engine().await
+            })
+            .await
+            .clone()
     }
 
     async fn detect_engine() -> (String, bool) {
@@ -50,12 +82,12 @@ impl SandboxEvaluator {
         payload: &str,
         cwd: &str,
     ) -> anyhow::Result<ValidateVerdict> {
-        // Re-probe dynamically: `available` was computed once in the
-        // constructor, so Podman may have appeared (or gone) since. Probing
-        // again here keeps this check from contradicting the daemon's own
-        // live probe at the request boundary (TOCTOU).
-        let mut engine = self.engine.clone();
-        let mut available = self.available;
+        // Re-probe dynamically: `available` is computed once per evaluator
+        // (the daemon's /validate route keeps one for its whole life), so
+        // Podman may have appeared since. Probing again here keeps this check
+        // from contradicting the daemon's own live probe at the request
+        // boundary (TOCTOU).
+        let (mut engine, mut available) = self.detected_engine().await;
         if !available && probe_podman_available() {
             // detect_engine only ever selects podman, so a successful probe
             // is exactly the engine the constructor would have recorded.

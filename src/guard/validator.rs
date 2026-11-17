@@ -19,7 +19,8 @@ pub struct GuardValidator {
 impl GuardValidator {
     pub async fn new(store: Arc<dyn VectorStore>, embedder: Arc<dyn Embedder>, namespace: &str) -> Self {
         let semantic = SemanticEvaluator::new(store, embedder, namespace);
-        let sandbox = SandboxEvaluator::new().await;
+        // No engine probe here: the sandbox detects Podman on its first use.
+        let sandbox = SandboxEvaluator::new();
 
         Self {
             semantic,
@@ -204,6 +205,13 @@ impl GuardValidator {
             is_mutating,
             mutations_since_note,
         )
+    }
+
+    /// How many times the sandbox detected its engine (spawned
+    /// `podman --version`) for this validator.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn sandbox_engine_probes(&self) -> usize {
+        self.sandbox.engine_probe_count()
     }
 
     /// Check if a rule's trigger pattern matches the action
@@ -1089,6 +1097,52 @@ mod tests {
             Some(1),
             "hit_count must increment on the global rule row"
         );
+    }
+
+    /// `neurostrata_guard_validate` builds a validator per call and the hook
+    /// calls it with `use_sandbox: false`. Neither the constructor nor a
+    /// validate without the sandbox may spawn `podman --version` (~200 ms per
+    /// call on Windows); the verdicts stay what they were.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_validate_without_the_sandbox_never_probes_the_engine() {
+        let (_store, validator) =
+            validator_with(vec![rule("rule.fires", "rm -rf", "never rm -rf", "active")]).await;
+        assert_eq!(validator.sandbox_engine_probes(), 0, "the constructor does not probe");
+
+        let (pass, _) = validator.validate("bash", "echo hello", "/tmp", false).await;
+        assert!(matches!(pass, ValidateVerdict::SandboxPassHighFidelity { .. }));
+        let (reject, fired) = validator.validate("bash", "rm -rf /tmp/x", "/tmp", false).await;
+        assert!(matches!(reject, ValidateVerdict::DeterministicReject { .. }));
+        assert_eq!(fired, vec!["rule.fires".to_string()]);
+
+        assert_eq!(
+            validator.sandbox_engine_probes(),
+            0,
+            "a validate that does not use the sandbox does not probe the engine"
+        );
+    }
+
+    /// With the sandbox on, the engine is detected on first use and kept for
+    /// the validator's life, as the constructor's probe was.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_sandbox_detects_its_engine_once_per_validator() {
+        let (_store, validator) = validator_with(vec![]).await;
+        let cwd = std::env::temp_dir().to_string_lossy().to_string();
+
+        // A non-shell action never starts a container, with or without Podman:
+        // the answer is ApprovedFailOpen or the no-engine reject.
+        for _ in 0..2 {
+            let (verdict, _) = validator.validate("write", "notes", &cwd, true).await;
+            assert!(
+                matches!(
+                    verdict,
+                    ValidateVerdict::ApprovedFailOpen { .. }
+                        | ValidateVerdict::DeterministicReject { .. }
+                ),
+                "unexpected verdict {verdict:?}"
+            );
+        }
+        assert_eq!(validator.sandbox_engine_probes(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]

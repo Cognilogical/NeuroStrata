@@ -923,9 +923,25 @@ async fn resolve_namespace_target_row(
     raw_id: &str,
     is_twin_lookup: bool,
 ) -> Result<Option<(String, MemoryPayload)>, ActionError> {
+    let empty_staged = BTreeMap::new();
+    resolve_namespace_target_row_with_staged(store, namespace, raw_id, is_twin_lookup, &empty_staged)
+        .await
+}
+
+async fn resolve_namespace_target_row_with_staged(
+    store: &crate::store::ladybug::LadybugStore,
+    namespace: &str,
+    raw_id: &str,
+    is_twin_lookup: bool,
+    staged_rows: &BTreeMap<String, MemoryPayload>,
+) -> Result<Option<(String, MemoryPayload)>, ActionError> {
     use crate::traits::VectorStore;
     let now_ts = current_action_timestamp();
-    if let Some((_vec, payload)) = store
+    if let Some(staged_payload) = staged_rows.get(raw_id) {
+        if is_active_payload(staged_payload, now_ts) {
+            return Ok(Some((raw_id.to_string(), staged_payload.clone())));
+        }
+    } else if let Some((_vec, payload)) = store
         .get(namespace, raw_id)
         .await
         .map_err(|e| ActionError::Storage(e.to_string()))?
@@ -941,30 +957,28 @@ async fn resolve_namespace_target_row(
             .await
             .map_err(|e| ActionError::Storage(e.to_string()))?;
         let mut best: Option<(u64, String, MemoryPayload)> = None;
-        for r in rows {
-            if !is_active_payload(&r.payload, now_ts) {
-                continue;
+        let mut consider = |id: String, payload: MemoryPayload| {
+            if !is_active_payload(&payload, now_ts) {
+                return;
             }
-            let tid = r
-                .payload
+            let tid = payload
                 .metadata
                 .get("twin")
                 .and_then(|t| t.get("id"))
                 .or_else(|| {
-                    r.payload
+                    payload
                         .metadata
                         .get("digital_twin")
                         .and_then(|t| t.get("twin_id").or_else(|| t.get("id")))
                 })
                 .and_then(|v| v.as_str());
             if tid == Some(raw_id) {
-                let ver = r
-                    .payload
+                let ver = payload
                     .metadata
                     .get("twin")
                     .and_then(|t| t.get("version"))
                     .or_else(|| {
-                        r.payload
+                        payload
                             .metadata
                             .get("digital_twin")
                             .and_then(|t| t.get("version"))
@@ -974,12 +988,24 @@ async fn resolve_namespace_target_row(
                 let replace = match &best {
                     None => true,
                     Some((best_ver, best_id, _)) => {
-                        ver > *best_ver || (ver == *best_ver && r.id > *best_id)
+                        ver > *best_ver || (ver == *best_ver && id > *best_id)
                     }
                 };
                 if replace {
-                    best = Some((ver, r.id, r.payload));
+                    best = Some((ver, id, payload));
                 }
+            }
+        };
+
+        for r in rows {
+            if staged_rows.contains_key(&r.id) {
+                continue;
+            }
+            consider(r.id, r.payload);
+        }
+        for (staged_id, staged_payload) in staged_rows {
+            if staged_payload.memory_type == "digital_twin" {
+                consider(staged_id.clone(), staged_payload.clone());
             }
         }
         if let Some((_ver, id, payload)) = best {
@@ -2152,6 +2178,13 @@ pub async fn stage_action(
                         .entry("valid_from")
                         .or_insert_with(|| serde_json::json!(now_ts));
                 }
+                if let Some(topology) = metadata.get_mut("topology") {
+                    crate::rdf::canonicalize_topology(
+                        topology,
+                        &store.get_ontology(&eval.namespace),
+                    );
+                }
+                crate::domain::materialize_facets_bitemporal(&memory_type, &mut metadata, now_ts);
 
                 let upsert_id = deterministic_upsert_id(
                     &eval.namespace,
@@ -2871,6 +2904,13 @@ pub async fn revert_action(
     }
 
     // 4. Stage inverse row mutations in reverse effect order.
+    struct StagedTwinRevertChain {
+        expected_prev_after_id: Option<String>,
+        superseded_by_after_id: String,
+        staged_head_row_id: String,
+    }
+    let mut staged_twin_reverts: BTreeMap<String, StagedTwinRevertChain> = BTreeMap::new();
+
     for (rev_idx, delta) in active_receipt.row_deltas.iter().rev().enumerate() {
         let step_hash = deterministic_effect_hash(
             &invocation.namespace,
@@ -2912,14 +2952,23 @@ pub async fn revert_action(
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
 
-                let after_row_opt = store
-                    .get(&invocation.namespace, &delta.after_id)
-                    .await
-                    .map_err(|e| ActionError::Storage(e.to_string()))?
-                    .map(|(_v, p)| p);
-                let active_twin_opt =
-                    resolve_namespace_target_row(store, &invocation.namespace, &twin_id, true)
-                        .await?;
+                let after_row_opt = if let Some(staged) = staged_rows.get(&delta.after_id) {
+                    Some(staged.clone())
+                } else {
+                    store
+                        .get(&invocation.namespace, &delta.after_id)
+                        .await
+                        .map_err(|e| ActionError::Storage(e.to_string()))?
+                        .map(|(_v, p)| p)
+                };
+                let active_twin_opt = resolve_namespace_target_row_with_staged(
+                    store,
+                    &invocation.namespace,
+                    &twin_id,
+                    true,
+                    &staged_rows,
+                )
+                .await?;
 
                 let Some((head_row_id, head_payload)) = active_twin_opt else {
                     return Err(ActionError::ConflictWithNewerVersion {
@@ -2947,17 +2996,49 @@ pub async fn revert_action(
                     .unwrap_or(expected_after_ver);
 
                 if !invocation.force {
-                    let after_active = after_row_opt
-                        .as_ref()
-                        .map_or(false, |p| is_active_payload(p, now_ts));
-                    if !after_active
-                        || head_row_id != delta.after_id
-                        || head_version != expected_after_ver
-                    {
-                        return Err(ActionError::ConflictWithNewerVersion {
-                            receipt_id: active_receipt.receipt_id.clone(),
-                            superseded_by: head_row_id,
+                    if let Some(chain) = staged_twin_reverts.get(&twin_id) {
+                        let persisted_after_matches = after_row_opt.as_ref().map_or(false, |p| {
+                            let ver = p
+                                .metadata
+                                .get("twin")
+                                .and_then(|t| t.get("version"))
+                                .or_else(|| {
+                                    p.metadata
+                                        .get("digital_twin")
+                                        .and_then(|t| t.get("version"))
+                                })
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            let sup_by = p
+                                .metadata
+                                .get("superseded_by")
+                                .and_then(|v| v.as_str());
+                            ver == expected_after_ver
+                                && sup_by == Some(chain.superseded_by_after_id.as_str())
                         });
+                        if head_row_id != chain.staged_head_row_id
+                            || chain.expected_prev_after_id.as_deref()
+                                != Some(delta.after_id.as_str())
+                            || !persisted_after_matches
+                        {
+                            return Err(ActionError::ConflictWithNewerVersion {
+                                receipt_id: active_receipt.receipt_id.clone(),
+                                superseded_by: head_row_id,
+                            });
+                        }
+                    } else {
+                        let after_active = after_row_opt
+                            .as_ref()
+                            .map_or(false, |p| is_active_payload(p, now_ts));
+                        if !after_active
+                            || head_row_id != delta.after_id
+                            || head_version != expected_after_ver
+                        {
+                            return Err(ActionError::ConflictWithNewerVersion {
+                                receipt_id: active_receipt.receipt_id.clone(),
+                                superseded_by: head_row_id,
+                            });
+                        }
                     }
                 }
 
@@ -3051,6 +3132,14 @@ pub async fn revert_action(
                     &mut staged_order,
                     restored_row_id.clone(),
                     restored_payload.clone(),
+                );
+                staged_twin_reverts.insert(
+                    twin_id.clone(),
+                    StagedTwinRevertChain {
+                        expected_prev_after_id: delta.before_id.clone(),
+                        superseded_by_after_id: delta.after_id.clone(),
+                        staged_head_row_id: restored_row_id.clone(),
+                    },
                 );
 
                 revert_superseded_pairs.push(SupersededPair {
@@ -3185,15 +3274,20 @@ pub async fn revert_action(
                 });
             }
             "upsert_memory" => {
-                let Some((_v, current_row)) = store
-                    .get(&invocation.namespace, &delta.after_id)
-                    .await
-                    .map_err(|e| ActionError::Storage(e.to_string()))?
-                else {
-                    return Err(ActionError::ConflictWithNewerVersion {
-                        receipt_id: active_receipt.receipt_id.clone(),
-                        superseded_by: "missing".to_string(),
-                    });
+                let current_row = if let Some(staged) = staged_rows.get(&delta.after_id) {
+                    staged.clone()
+                } else {
+                    let Some((_v, persisted)) = store
+                        .get(&invocation.namespace, &delta.after_id)
+                        .await
+                        .map_err(|e| ActionError::Storage(e.to_string()))?
+                    else {
+                        return Err(ActionError::ConflictWithNewerVersion {
+                            receipt_id: active_receipt.receipt_id.clone(),
+                            superseded_by: "missing".to_string(),
+                        });
+                    };
+                    persisted
                 };
 
                 check_target_auth(&current_row, &delta.after_id)?;
@@ -3201,9 +3295,61 @@ pub async fn revert_action(
                     check_target_auth(before_p, &delta.after_id)?;
                 }
 
+                let mut expected_after_payload = delta.after_payload.clone();
+                if expected_after_payload.metadata != current_row.metadata
+                    && expected_after_payload.metadata.is_object()
+                    && (current_row.metadata.get("facets").is_some()
+                        || current_row.metadata.get("facets_bitemporal").is_some())
+                {
+                    let old_entries = expected_after_payload
+                        .metadata
+                        .get("facets_bitemporal")
+                        .and_then(|v| v.as_array());
+                    let new_entries = current_row
+                        .metadata
+                        .get("facets_bitemporal")
+                        .and_then(|v| v.as_array());
+                    let old_len = old_entries.map(|a| a.len()).unwrap_or(0);
+                    let appended_ts = new_entries
+                        .and_then(|arr| arr.get(old_len))
+                        .and_then(|entry| entry.get("valid_from"))
+                        .and_then(|v| v.as_i64());
+                    let retracted_ts =
+                        old_entries.zip(new_entries).and_then(|(old_arr, new_arr)| {
+                            old_arr.iter().zip(new_arr.iter()).find_map(|(o, n)| {
+                                if o.get("valid_to").map(|v| v.is_null()).unwrap_or(true) {
+                                    n.get("valid_to").and_then(|v| v.as_i64())
+                                } else {
+                                    None
+                                }
+                            })
+                        });
+                    let facet_ts = appended_ts
+                        .or(retracted_ts)
+                        .unwrap_or(active_receipt.executed_at);
+                    crate::domain::materialize_facets_bitemporal(
+                        &expected_after_payload.memory_type,
+                        &mut expected_after_payload.metadata,
+                        facet_ts,
+                    );
+                }
+
+                let current_fp =
+                    crate::rdf::scenario::fingerprint_live_row(Some(&current_row), now_ts);
+                let expected_after_fp = crate::rdf::scenario::fingerprint_live_row(
+                    Some(&expected_after_payload),
+                    now_ts,
+                );
+
                 if !invocation.force {
                     if !is_active_payload(&current_row, now_ts)
-                        || current_row.content != delta.after_payload.content
+                        || current_fp != expected_after_fp
+                        || current_row.content != expected_after_payload.content
+                        || current_row.memory_type != expected_after_payload.memory_type
+                        || current_row.user_id != expected_after_payload.user_id
+                        || current_row.location != expected_after_payload.location
+                        || current_row.location_lines != expected_after_payload.location_lines
+                        || current_row.metadata != expected_after_payload.metadata
                     {
                         let sup = current_row
                             .metadata
@@ -3218,12 +3364,17 @@ pub async fn revert_action(
                     }
                 }
 
-                record_expected_active_row(
-                    &mut expected_heads,
-                    &mut seen_expected_rows,
-                    &delta.after_id,
-                    &current_row,
-                );
+                if seen_expected_rows.insert(delta.after_id.clone()) {
+                    let expected_fingerprint = if invocation.force {
+                        current_fp
+                    } else {
+                        expected_after_fp
+                    };
+                    expected_heads.push(ExpectedHead::RowFingerprint {
+                        row_id: delta.after_id.clone(),
+                        expected_fingerprint,
+                    });
+                }
 
                 if delta.created || delta.before_payload.is_none() {
                     let mut retired = current_row.clone();
@@ -7220,6 +7371,373 @@ mod tests {
             1,
             "store must contain exactly one active action_type row"
         );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn revert_multi_effect_set_twin_state_on_same_twin_chains_through_staged_state() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ns-action-multi-twin-revert-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = crate::store::ladybug::LadybugStore::for_testing(&tmp, 4).expect("store");
+        let ns = "ns-multi-twin-rev";
+        store.init(ns).await.unwrap();
+
+        store
+            .upsert(
+                ns,
+                "twin-1",
+                vec![0.1; 4],
+                MemoryPayload {
+                    content: "Twin loop-a v1".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "digital_twin".to_string(),
+                    agent_name: None,
+                    location: "".to_string(),
+                    location_lines: "".to_string(),
+                    metadata: json!({
+                        "valid_from": 1700000000,
+                        "twin": {
+                            "id": "loop-a",
+                            "version": 1,
+                            "schema_id": "cooling-loop",
+                            "variables": { "temperature": 65.0, "pressure": 100.0 }
+                        }
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+
+        store
+            .upsert(
+                ns,
+                "act-two-step-twin",
+                vec![0.1; 4],
+                MemoryPayload {
+                    content: "Action: two-step-twin".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "action_type".to_string(),
+                    agent_name: None,
+                    location: "".to_string(),
+                    location_lines: "".to_string(),
+                    metadata: json!({
+                        "action_type": {
+                            "slug": "two-step-twin",
+                            "title": "Two Step Twin",
+                            "description": "Applies two SetTwinState effects to the same twin in one action",
+                            "required_role": "editor",
+                            "parameters": {
+                                "twin_id": { "param_type": "twin_id", "required": true, "target_memory_type": "digital_twin", "target_schema_id": "cooling-loop" },
+                                "temp": { "param_type": "f64", "required": true },
+                                "press": { "param_type": "f64", "required": true }
+                            },
+                            "submission_criteria": [],
+                            "effects": [
+                                {
+                                    "op": "set_twin_state",
+                                    "twin_param": "twin_id",
+                                    "merge": true,
+                                    "variables_from_params": { "temperature": "temp" }
+                                },
+                                {
+                                    "op": "set_twin_state",
+                                    "twin_param": "twin_id",
+                                    "merge": true,
+                                    "variables_from_params": { "pressure": "press" }
+                                }
+                            ]
+                        }
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+
+        let apply_out = apply_action(
+            &store,
+            &ActionInvocation {
+                namespace: ns.to_string(),
+                slug: "two-step-twin".to_string(),
+                security: ActionSecurityContext {
+                    authenticated_principal: "alice".to_string(),
+                    requested_principal: None,
+                },
+                params: BTreeMap::from([
+                    ("twin_id".to_string(), json!("loop-a")),
+                    ("temp".to_string(), json!(50.0)),
+                    ("press".to_string(), json!(120.0)),
+                ]),
+            },
+            &DummyActionEmbedder,
+        )
+        .await
+        .expect("apply two-step-twin");
+        let receipt_id = apply_out.receipt_id().expect("applied receipt").to_string();
+
+        let active_after_apply = resolve_namespace_target_row(&store, ns, "loop-a", true)
+            .await
+            .unwrap()
+            .expect("active twin after apply");
+        assert_eq!(active_after_apply.1.metadata["twin"]["version"], json!(3));
+        assert_eq!(
+            active_after_apply.1.metadata["twin"]["variables"]["temperature"],
+            json!(50.0)
+        );
+        assert_eq!(
+            active_after_apply.1.metadata["twin"]["variables"]["pressure"],
+            json!(120.0)
+        );
+
+        let rev_out = revert_action(
+            &store,
+            &RevertInvocation {
+                namespace: ns.to_string(),
+                receipt_id,
+                security: ActionSecurityContext {
+                    authenticated_principal: "alice".to_string(),
+                    requested_principal: None,
+                },
+                force: false,
+            },
+            &DummyActionEmbedder,
+        )
+        .await
+        .expect("non-forced revert of multi-effect SetTwinState action must succeed (#248)");
+
+        assert!(!rev_out.forced);
+        assert_eq!(rev_out.revert_receipt.row_deltas.len(), 2);
+
+        let active_after_revert = resolve_namespace_target_row(&store, ns, "loop-a", true)
+            .await
+            .unwrap()
+            .expect("active twin after revert");
+        assert_eq!(active_after_revert.1.metadata["twin"]["version"], json!(5));
+        assert_eq!(
+            active_after_revert.1.metadata["twin"]["variables"]["temperature"],
+            json!(65.0)
+        );
+        assert_eq!(
+            active_after_revert.1.metadata["twin"]["variables"]["pressure"],
+            json!(100.0)
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn revert_first_of_two_identical_upserts_is_refused_without_retiring_newer_payload() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ns-action-upsert-rev-guard-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = crate::store::ladybug::LadybugStore::for_testing(&tmp, 4).expect("store");
+        let ns = "ns-upsert-rev-guard";
+        store.init(ns).await.unwrap();
+
+        store
+            .upsert(
+                ns,
+                "act-upsert-same",
+                vec![0.1; 4],
+                MemoryPayload {
+                    content: "Action: upsert-same".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "action_type".to_string(),
+                    agent_name: None,
+                    location: "".to_string(),
+                    location_lines: "".to_string(),
+                    metadata: json!({
+                        "action_type": {
+                            "slug": "upsert-same",
+                            "title": "Upsert Same",
+                            "description": "Upserts deterministic row",
+                            "required_role": "editor",
+                            "parameters": {
+                                "tag": { "param_type": "string", "required": true }
+                            },
+                            "submission_criteria": [],
+                            "effects": [
+                                {
+                                    "op": "upsert_memory",
+                                    "memory_type": "fact",
+                                    "content_template": "Deterministic fact tag={{tag}}",
+                                    "metadata_template": { "domain": "ops" }
+                                }
+                            ]
+                        }
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+
+        let inv = ActionInvocation {
+            namespace: ns.to_string(),
+            slug: "upsert-same".to_string(),
+            security: ActionSecurityContext {
+                authenticated_principal: "alice".to_string(),
+                requested_principal: None,
+            },
+            params: BTreeMap::from([("tag".to_string(), json!("steady"))]),
+        };
+
+        let apply1 = apply_action(&store, &inv, &DummyActionEmbedder)
+            .await
+            .expect("apply1");
+        let r1_id = apply1.receipt_id().expect("r1").to_string();
+        let upsert_row_id = apply1.receipt().unwrap().row_deltas[0].after_id.clone();
+
+        let apply2 = apply_action(&store, &inv, &DummyActionEmbedder)
+            .await
+            .expect("apply2");
+        let r2_id = apply2.receipt_id().expect("r2").to_string();
+        let (_, payload_after_apply2) = store
+            .get(ns, &upsert_row_id)
+            .await
+            .unwrap()
+            .expect("row exists");
+
+        // Attempting to revert receipt 1 (without force) after receipt 2 rewrote the same deterministic row
+        // must fail with ConflictWithNewerVersion and leave the newer payload active (#247).
+        let stale_rev = revert_action(
+            &store,
+            &RevertInvocation {
+                namespace: ns.to_string(),
+                receipt_id: r1_id,
+                security: ActionSecurityContext {
+                    authenticated_principal: "alice".to_string(),
+                    requested_principal: None,
+                },
+                force: false,
+            },
+            &DummyActionEmbedder,
+        )
+        .await;
+        assert!(
+            matches!(stale_rev, Err(ActionError::ConflictWithNewerVersion { .. })),
+            "reverting superseded first upsert must fail with ConflictWithNewerVersion: {stale_rev:?}"
+        );
+
+        let (_, payload_after_failed_revert) = store
+            .get(ns, &upsert_row_id)
+            .await
+            .unwrap()
+            .expect("row still exists");
+        assert!(
+            is_active_payload(&payload_after_failed_revert, current_action_timestamp()),
+            "newer upsert payload must remain active"
+        );
+        assert_eq!(
+            payload_after_failed_revert.metadata,
+            payload_after_apply2.metadata,
+            "newer upsert metadata (including valid_from) must be untouched"
+        );
+
+        // Reverting receipt 2 (whose post-image matches the current row) succeeds and restores receipt 1's payload.
+        let rev2 = revert_action(
+            &store,
+            &RevertInvocation {
+                namespace: ns.to_string(),
+                receipt_id: r2_id,
+                security: ActionSecurityContext {
+                    authenticated_principal: "alice".to_string(),
+                    requested_principal: None,
+                },
+                force: false,
+            },
+            &DummyActionEmbedder,
+        )
+        .await
+        .expect("reverting latest upsert receipt succeeds");
+        assert!(!rev2.forced);
+        let (_, payload_after_rev2) = store
+            .get(ns, &upsert_row_id)
+            .await
+            .unwrap()
+            .expect("restored row");
+        assert!(is_active_payload(
+            &payload_after_rev2,
+            current_action_timestamp()
+        ));
+
+        // Simulate a legacy pre-normalization receipt whose embedded delta.after_payload.metadata
+        // lacks "facets" and "facets_bitemporal" even though commit_action_batch materialized them
+        // on the persisted row. Non-forced revert of that receipt must still succeed.
+        let apply3 = apply_action(&store, &inv, &DummyActionEmbedder)
+            .await
+            .expect("apply3");
+        let r3_id = apply3.receipt_id().expect("r3").to_string();
+        let (r3_vec, mut r3_payload) = store
+            .get(ns, &r3_id)
+            .await
+            .unwrap()
+            .expect("r3 receipt row");
+        if let Some(meta_obj) = r3_payload.metadata["action_receipt"]["row_deltas"][0]
+            ["after_payload"]["metadata"]
+            .as_object_mut()
+        {
+            meta_obj.remove("facets");
+            meta_obj.insert(
+                "facets_bitemporal".to_string(),
+                json!([{
+                    "facet": "CustomManualPrior",
+                    "inferred": false,
+                    "valid_from": 100,
+                    "valid_to": null
+                }]),
+            );
+        }
+        let (row_vec, mut row_payload) = store
+            .get(ns, &upsert_row_id)
+            .await
+            .unwrap()
+            .expect("persisted upsert row");
+        if let Some(meta_obj) = row_payload.metadata.as_object_mut() {
+            meta_obj.remove("facets");
+            meta_obj.insert(
+                "facets_bitemporal".to_string(),
+                json!([{
+                    "facet": "CustomManualPrior",
+                    "inferred": false,
+                    "valid_from": 100,
+                    "valid_to": null
+                }]),
+            );
+        }
+        crate::domain::materialize_facets_bitemporal(
+            &row_payload.memory_type,
+            &mut row_payload.metadata,
+            1700000999,
+        );
+        store
+            .upsert(ns, &upsert_row_id, row_vec, row_payload)
+            .await
+            .expect("persist row with historical + newly materialized facets");
+        store
+            .upsert(ns, &r3_id, r3_vec, r3_payload)
+            .await
+            .expect("persist legacy pre-normalization receipt shape");
+
+        let rev3 = revert_action(
+            &store,
+            &RevertInvocation {
+                namespace: ns.to_string(),
+                receipt_id: r3_id,
+                security: ActionSecurityContext {
+                    authenticated_principal: "alice".to_string(),
+                    requested_principal: None,
+                },
+                force: false,
+            },
+            &DummyActionEmbedder,
+        )
+        .await
+        .expect("pre-normalization upsert_memory receipt must remain revertible");
+        assert!(!rev3.forced);
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

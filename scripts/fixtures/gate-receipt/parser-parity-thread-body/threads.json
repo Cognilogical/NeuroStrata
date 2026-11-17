@@ -1,0 +1,11 @@
+[
+  {
+    "isResolved": false,
+    "comments": [
+      {
+        "body": "Two markers on one line: **P1 Badge** and **P2 Badge**\nCHANGES-NEEDED on a line of its own\n`P1 Badge` inside a code span does not count\n```\n**P1 Badge** inside a fence does not count\n```",
+        "author_association": "MEMBER"
+      }
+    ]
+  }
+]
