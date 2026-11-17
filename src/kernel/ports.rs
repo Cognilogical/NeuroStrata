@@ -257,6 +257,13 @@ impl MemoryPort for LadybugMemoryPort {
             "__data_pool__:{}:{}:{}",
             namespace, schema.connector_id, schema.pool_id
         );
+        let existing_records = if records.is_none() {
+            self.trusted_get_memory(namespace, &row_id)
+                .await?
+                .and_then(|p| p.metadata.get("pool_records").cloned())
+        } else {
+            None
+        };
         let mut metadata = serde_json::json!({
             "eligibility": "private",
             "pool_schema": serde_json::to_value(schema)?,
@@ -267,6 +274,8 @@ impl MemoryPort for LadybugMemoryPort {
         });
         if let Some(recs) = records {
             metadata["pool_records"] = serde_json::to_value(recs)?;
+        } else if let Some(prev_recs) = existing_records {
+            metadata["pool_records"] = prev_recs;
         }
         let user_id = principal.unwrap_or("");
         let payload = MemoryPayload {
