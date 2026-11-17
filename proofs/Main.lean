@@ -17,6 +17,58 @@ open NeuroStrata.WorkflowStage
 
 def boolToStr (b : Bool) : String := if b then "true" else "false"
 
+/-- The commit evidence a WAL side the engine removed carries (`#228`). -/
+inductive WalCommitEvidence where
+  | commitSeen
+  | noCommit
+  | unverifiable
+  | unreadable
+  deriving DecidableEq, Repr
+
+/-- The accounting verdict for a WAL side the engine removed (`#228`). -/
+inductive WalVerdict where
+  | replayedObserved
+  | replayedInferred
+  | committedLost
+  | unknownUnverifiable
+  | unknownUnreadable
+  | nothingCommitted
+  deriving DecidableEq, Repr
+
+def WalCommitEvidence.asTag : WalCommitEvidence → String
+  | .commitSeen => "commit_seen"
+  | .noCommit => "no_commit"
+  | .unverifiable => "unverifiable"
+  | .unreadable => "unreadable"
+
+def WalVerdict.asTag : WalVerdict → String
+  | .replayedObserved => "replayed_observed"
+  | .replayedInferred => "replayed_inferred"
+  | .committedLost => "committed_lost"
+  | .unknownUnverifiable => "unknown_unverifiable"
+  | .unknownUnreadable => "unknown_unreadable"
+  | .nothingCommitted => "nothing_committed"
+
+/-- The removed-WAL verdict (`#228`).
+A WAL side the engine removed is a replay only on positive evidence: an
+observed `CHECKPOINT` record, or an applied-record count of at least one.
+Otherwise the commit evidence decides: a proved commit that is gone is a
+committed loss, an unproved commit or an unverifiable WAL is unknown, and a
+sound walk that held no commit lost nothing. -/
+@[simp]
+def evaluateWalVerdict (evidence : WalCommitEvidence) (commitProved : Bool)
+    (checkpointObserved : Bool) (appliedAtLeastOne : Bool) : WalVerdict :=
+  if checkpointObserved then
+    .replayedObserved
+  else if appliedAtLeastOne then
+    .replayedInferred
+  else
+    (match evidence with
+     | .commitSeen => if commitProved then .committedLost else .unknownUnverifiable
+     | .noCommit => .nothingCommitted
+     | .unverifiable => .unknownUnverifiable
+     | .unreadable => .unknownUnreadable)
+
 def main : IO Unit := do
   let statuses : List Status := [.openState, .inProgress, .blocked, .done]
   let lifecycles : List LifecycleState := [.active, .archived, .superseded, .tombstoned]
@@ -226,3 +278,10 @@ def main : IO Unit := do
   for st in wfStages do
     for (evLabel, ev) in wfEvents do
       IO.println s!"WORKFLOW_STAGE|{st.asStr}|{evLabel}|{workflowTransitionTag st ev}"
+  let walEvidences : List WalCommitEvidence := [.commitSeen, .noCommit, .unverifiable, .unreadable]
+  for e in walEvidences do
+    for proved in [false, true] do
+      for ckpt in [false, true] do
+        for applied in [false, true] do
+          let tag := evaluateWalVerdict e proved ckpt applied |>.asTag
+          IO.println s!"WAL_VERDICT|{e.asTag}|{boolToStr proved}|{boolToStr ckpt}|{boolToStr applied}|{tag}"

@@ -33,7 +33,7 @@ On top of these strata sits **SynapticGraph**, the retrieval substrate: a usage-
 
 - Local-first, single-binary deployment with no mandatory cloud service
 - Bitemporal correctness — every memory mutation is versioned and revertible
-- Formal verification of every gate, lock, and state machine (Lean 4 kernel parity)
+- Formal verification of every gate, lock, state machine, and WAL recovery verdict (Lean 4 kernel parity)
 - Graph-first exploration that keeps agent context windows small
 - Deterministic, auditable retrieval
 
