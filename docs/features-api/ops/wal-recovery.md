@@ -218,6 +218,114 @@ Two policies are worth knowing before interpreting a refusal:
   the bytes are still in the `.corrupted.<ts>` artifact. Restore from it instead
   of treating the message as proof that nothing was lost.
 
+## A removed frozen WAL is a replay only on evidence (`#228`)
+
+The engine removes a frozen WAL (`<db>.wal.checkpoint`) when it replays it. That
+removal is **not** proof of a replay: the engine also removes a frozen WAL whose
+replay stopped at its very first record — the "semantic early failure" of a
+record the engine cannot apply (a truncated owner name, a record type it does
+not know, a catalog entry the database does not have). The open then succeeds,
+the committed records are gone, and nothing was applied.
+
+So the recovery accounting treats a **removed** frozen WAL as a replay only on
+**positive evidence**:
+
+| evidence | verdict | why |
+|---|---|---|
+| the pre-delete scan observed a complete `CHECKPOINT` record | `replayed` | the engine applies a checkpoint before it removes the file, so the checkpoint's records were applied |
+| the recovery replayed the WAL's records and the engine then removed the file | `replayed` | the applied-record count is at least one, so the engine had records to apply before it removed the file |
+| the pre-delete scan **proved** a committed record and the file is gone | `committed_lost` | a commit existed, the file no longer does, and nothing was applied: the committed records were lost |
+| the pre-delete scan saw a commit it could not prove (no checksums, an unverified frame) | `unknown` | the bytes cannot be attributed to a commit |
+| the pre-delete scan held no commit at all | `nothing_committed` | nothing was lost; the removal is lossless |
+
+A *proved* commit means a verified walk: checksums present in the file, a
+verified header, every complete frame's trailer verified, and a clean tail. A
+checksums-off WAL never proves anything, so it lands in `unknown` — the
+deliberate over-refusal described above.
+
+What this means for an operator:
+
+- A refusal naming `committed_lost` for a frozen WAL is **not** a failed
+  recovery. It means the engine deleted a WAL that held committed records
+  without applying them. The frozen WAL is restored byte-for-byte from its
+  preserved copy, and the message never claims a replay.
+- A refusal naming `unknown` for a frozen WAL means the same thing is possible
+  but unproven. Inspect the preserved copy before deciding.
+- The recovery line `Recovered by replaying the write-ahead log …` is printed
+  only **after** the verified reopen has succeeded, and only when the verdict
+  really is `replayed`. A successful open on its own is never reported as a
+  replay.
+
+The engine's own replay result (`WALReplayInfo::offsetDeserialized`) is not
+exposed by the lbug binding yet, so the accounting **emulates** the
+applied-record count from what the recovery already proved about the WAL.
+
+The emulated count is never read as an engine confirmation. It is derived from
+**committed work** — a commit frame that a sound walk found, or a valid
+observed `CHECKPOINT` record — and from nothing else. A WAL that held frames
+but no committed work (a lone `BEGIN`, an incomplete frame) emulates a count of
+zero, because the engine applies nothing from it and retires the file with
+`offsetDeserialized == 0`.
+
+- A **record-level** failure (`Corrupted wal file`, `invalid WAL record type`)
+  means the WAL holds a record the engine cannot deserialize. The lenient
+  replay reads the same bytes and stops at the same record, so the engine
+  applies nothing and removes the frozen WAL. The emulated count is zero, and
+  a removed frozen WAL with a proved commit is `committed_lost`.
+- A **header-level** failure (the checksum-config mismatch) or a **torn tail**
+  leaves the records themselves intact. The engine replays them under the WAL
+  header's own checksum setting and only then retires the file. The emulated
+  count is at least one **iff** the WAL held committed work, so a removed
+  frozen WAL is `replayed`.
+- A removed WAL that held no committed work applies nothing, whatever the
+  failure was.
+
+One case needs its own word. A **checksums-off** WAL carries no trailer to
+authenticate its frames, so a commit frame in it can be *seen* but never
+*proved*. The engine's replay reads such a WAL under the WAL header's own
+setting — no verification — and applies the commit it finds, so the frame
+counts as committed work and the checksum-config mismatch drains the WAL and
+reopens the store. A walk that found a corrupt frame, a corrupt header, or a
+frame it could not validate proves nothing, whatever frames it walked: those
+cases still refuse.
+
+The emulation never raises the replay claim on a record failure, so a frozen
+WAL whose records are broken is never reported as a replay. Its one weakness:
+a WAL whose *later* record is broken may have had its earlier records applied
+and checkpointed before the failure, and the accounting still refuses it as
+`committed_lost`. The engine's own replay offset would settle that case, which
+is why the binding exposure is tracked on its own.
+
+## An unrecognized engine failure is refused, not replayed (`#228`)
+
+The lenient replay is only safe for the failure classes the recovery funnel
+recognizes:
+
+- the **checksum-config mismatch** (`enableChecksums`), where the records
+  themselves are intact and only the checksum setting was wrong;
+- a **WAL integrity failure** (`Corrupted wal file`, `invalid WAL record type`),
+  where the lenient replay stops at the same broken record and applies
+  nothing;
+- a **foreign WAL**, which the engine attributes to another database;
+- a **torn tail**, which the lenient replay truncates.
+
+Any other failure — a *semantic* engine failure such as the pinned engine's
+`"<name> does not exist in catalog."`, or a database error the funnel does not
+recognize — is **not** replayed: replaying the same bytes unverified fails the
+same way. With a WAL on disk the funnel instead
+
+1. accounts for the pair as it stands after the failed open,
+2. restores every side that lost every byte from its preserved copy, and
+3. refuses with the verdict (`committed_lost`, `unknown`, `deferred`,
+   `foreign_wal`) and the engine's own error text.
+
+Such a refusal never claims a replay: the no-loss case says only that the
+accounting found no committed loss, and the message names no replay. A
+refusal that names `committed_lost` after an unrecognized failure means the
+failed open removed a WAL that held committed records without applying them;
+the preserved copy holds every byte, and the restored side is byte-identical
+to the pre-replay file.
+
 ## Configuration
 
 | Variable | Effect |

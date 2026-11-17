@@ -1791,6 +1791,106 @@ pub const fn compute_frontier_leverage_bps(
         raw as u32
     }
 }
+/// The commit evidence a WAL side the engine removed carries (`#228`).
+///
+/// Mirrors [`crate::store::wal_accounting::CommitEvidence`], but the kernel
+/// owns its own copy so it stays dependency-free for Aeneas/Charon extraction
+/// and so the Lean parity rows have a closed input space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelWalCommitEvidence {
+    /// A commit frame was seen in the walk.
+    CommitSeen,
+    /// A sound walk saw no commit frame.
+    NoCommit,
+    /// The WAL carries no checksums, so the walk can prove nothing.
+    Unverifiable,
+    /// The bytes could not be attributed at all.
+    Unreadable,
+}
+
+/// The accounting verdict for a WAL side the engine removed (`#228`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelWalVerdict {
+    /// The WAL ended in an observed `CHECKPOINT` record: the engine applied it
+    /// and only then retired the file.
+    ReplayedObserved,
+    /// The engine applied at least one record before it retired the file.
+    ReplayedInferred,
+    /// A verified walk proved a commit and the WAL is gone: the commit was
+    /// never applied.
+    CommittedLost,
+    /// The bytes cannot prove that nothing was committed.
+    UnknownUnverifiable,
+    /// The bytes could not be attributed.
+    UnknownUnreadable,
+    /// A sound walk held no commit: nothing was lost.
+    NothingCommitted,
+}
+
+/// Decides the accounting verdict for a WAL side the engine removed (`#228`).
+///
+/// The decision order is the recovery funnel's:
+///
+/// 1. an **observed** `CHECKPOINT` record — the engine applied that checkpoint
+///    and only then retired the file, so the WAL was replayed;
+/// 2. an applied-record count of at least one — the engine applied the records
+///    before it retired the file, so the WAL was replayed;
+/// 3. otherwise the commit evidence decides: a *proved* commit that is gone is
+///    a committed loss, an unproved commit or an unverifiable WAL is unknown,
+///    and a sound walk that held no commit lost nothing.
+///
+/// A removed WAL is never a replay without one of the two positive signals,
+/// and the two positive signals always outrank the commit evidence: a WAL the
+/// engine applied is a replay whatever its commit evidence says.
+pub const fn evaluate_removed_wal_verdict(
+    evidence: KernelWalCommitEvidence,
+    commit_proved: bool,
+    checkpoint_observed: bool,
+    applied_at_least_one: bool,
+) -> KernelWalVerdict {
+    if checkpoint_observed {
+        return KernelWalVerdict::ReplayedObserved;
+    }
+    if applied_at_least_one {
+        return KernelWalVerdict::ReplayedInferred;
+    }
+    match evidence {
+        KernelWalCommitEvidence::CommitSeen => {
+            if commit_proved {
+                KernelWalVerdict::CommittedLost
+            } else {
+                KernelWalVerdict::UnknownUnverifiable
+            }
+        }
+        KernelWalCommitEvidence::NoCommit => KernelWalVerdict::NothingCommitted,
+        KernelWalCommitEvidence::Unverifiable => KernelWalVerdict::UnknownUnverifiable,
+        KernelWalCommitEvidence::Unreadable => KernelWalVerdict::UnknownUnreadable,
+    }
+}
+
+/// Tag string for the removed-WAL verdict, matching the Lean parity rows.
+pub const fn removed_wal_verdict_tag(verdict: KernelWalVerdict) -> &'static str {
+    match verdict {
+        KernelWalVerdict::ReplayedObserved => "replayed_observed",
+        KernelWalVerdict::ReplayedInferred => "replayed_inferred",
+        KernelWalVerdict::CommittedLost => "committed_lost",
+        KernelWalVerdict::UnknownUnverifiable => "unknown_unverifiable",
+        KernelWalVerdict::UnknownUnreadable => "unknown_unreadable",
+        KernelWalVerdict::NothingCommitted => "nothing_committed",
+    }
+}
+
+/// Tag string for the removed-WAL commit evidence, matching the Lean parity
+/// rows.
+pub const fn wal_commit_evidence_tag(evidence: KernelWalCommitEvidence) -> &'static str {
+    match evidence {
+        KernelWalCommitEvidence::CommitSeen => "commit_seen",
+        KernelWalCommitEvidence::NoCommit => "no_commit",
+        KernelWalCommitEvidence::Unverifiable => "unverifiable",
+        KernelWalCommitEvidence::Unreadable => "unreadable",
+    }
+}
+
 // Unit tests for formal_kernel.rs – covering classify_epistemic_status, validate_taxonomy_dag, validate_skos_disjointness, compute_epistemic_coverage_bps, realization_status_gap_bps, compute_frontier_leverage_bps
 #[cfg(test)]
 mod tests {
