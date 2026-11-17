@@ -1120,6 +1120,40 @@ pub async fn execute_taxonomy(
     Ok(res)
 }
 
+/// Encode a namespace into an injective, IRI-safe taxonomy ID token so
+/// distinct namespaces never collide in LadybugStore's global row ID space
+/// (including when one namespace is `a-b` with slug `c` and another is `a`
+/// with slug `b-c`).
+pub fn taxonomy_namespace_token(namespace: &str) -> String {
+    let mut out = String::with_capacity(namespace.len());
+    let bytes = namespace.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        let is_double_dash = b == b'-' && (i > 0 && bytes[i - 1] == b'-');
+        match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' => out.push(b as char),
+            b'-' if !is_double_dash => out.push('-'),
+            _ => {
+                use std::fmt::Write;
+                let _ = write!(&mut out, "~{:02x}", b);
+            }
+        }
+    }
+    out
+}
+
+/// Deterministic, namespace-qualified row ID for a thesis version.
+pub fn thesis_row_id(namespace: &str, version: u64) -> String {
+    format!("thesis-{}--v{version}", taxonomy_namespace_token(namespace))
+}
+
+/// Deterministic, namespace-qualified row ID for a SKOS concept version.
+pub fn concept_row_id(namespace: &str, slug: &str, version: u64) -> String {
+    format!(
+        "concept-{}--{slug}-v{version}",
+        taxonomy_namespace_token(namespace)
+    )
+}
+
 async fn execute_set_thesis(
     store: &LadybugStore,
     embedder: &dyn Embedder,
@@ -1221,7 +1255,7 @@ async fn execute_set_thesis(
     } else {
         (1u64, None)
     };
-    let new_id = format!("thesis-v{next_ver}");
+    let new_id = thesis_row_id(namespace, next_ver);
     expected_heads.push(ExpectedHead::AbsentOrInactive {
         row_id: new_id.clone(),
     });
@@ -1655,7 +1689,7 @@ async fn execute_upsert_concept(
     } else {
         (1u64, None)
     };
-    let new_id = format!("concept-{slug}-v{next_ver}");
+    let new_id = concept_row_id(namespace, &slug, next_ver);
 
     let mut expected_heads: Vec<ExpectedHead> = vec![ExpectedHead::AbsentOrInactive {
         row_id: new_id.clone(),
@@ -3420,10 +3454,10 @@ mod tests {
         )
         .await
         .expect("set_thesis v1");
-        assert_eq!(r1["thesis_id"], "thesis-v1");
+        assert_eq!(r1["thesis_id"], thesis_row_id(ns, 1));
         assert!(r1["superseded_id"].is_null());
 
-        // 2. Second set_thesis supersedes thesis-v1 with thesis-v2
+        // 2. Second set_thesis supersedes thesis v1 with thesis v2
         let r2 = execute_taxonomy(
             &store,
             &embedder,
@@ -3442,14 +3476,18 @@ mod tests {
         )
         .await
         .expect("set_thesis v2");
-        assert_eq!(r2["thesis_id"], "thesis-v2");
-        assert_eq!(r2["superseded_id"], "thesis-v1");
+        assert_eq!(r2["thesis_id"], thesis_row_id(ns, 2));
+        assert_eq!(r2["superseded_id"], thesis_row_id(ns, 1));
 
-        // Verify thesis-v1 has superseded_by = "thesis-v2"
-        let (_v1_vec, v1_pl) = store.get(ns, "thesis-v1").await.unwrap().unwrap();
-        assert_eq!(v1_pl.metadata["superseded_by"], "thesis-v2");
+        // Verify thesis v1 has superseded_by = thesis v2
+        let (_v1_vec, v1_pl) = store
+            .get(ns, &thesis_row_id(ns, 1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(v1_pl.metadata["superseded_by"], thesis_row_id(ns, 2));
 
-        // 3. Upsert concept twice with same slug -> concept-bitemporal-graph-v1 superseded by v2
+        // 3. Upsert concept twice with same slug -> v1 superseded by v2
         let c1 = execute_taxonomy(
             &store,
             &embedder,
@@ -3466,7 +3504,10 @@ mod tests {
         )
         .await
         .expect("upsert_concept v1");
-        assert_eq!(c1["concept_id"], "concept-bitemporal-graph-v1");
+        assert_eq!(
+            c1["concept_id"],
+            concept_row_id(ns, "bitemporal-graph", 1)
+        );
         assert!(c1["superseded_id"].is_null());
 
         let c2 = execute_taxonomy(
@@ -3485,8 +3526,65 @@ mod tests {
         )
         .await
         .expect("upsert_concept v2");
-        assert_eq!(c2["concept_id"], "concept-bitemporal-graph-v2");
-        assert_eq!(c2["superseded_id"], "concept-bitemporal-graph-v1");
+        assert_eq!(
+            c2["concept_id"],
+            concept_row_id(ns, "bitemporal-graph", 2)
+        );
+        assert_eq!(
+            c2["superseded_id"],
+            concept_row_id(ns, "bitemporal-graph", 1)
+        );
+
+        // 4. Cross-namespace set_thesis and upsert_concept (#246): a second
+        // namespace in the same store must mint distinct row IDs and never
+        // collide in commit_action_batch.
+        let ns2 = "tax-cas-ns-other";
+        store.init(ns2).await.expect("init ns2");
+        let r_ns2 = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "set_thesis".to_string(),
+                namespace: ns2.to_string(),
+                primary_domain: Some("cognitive-memory".to_string()),
+                mission: Some("Second namespace mission".to_string()),
+                direction: Some("Second namespace direction".to_string()),
+                core_pillars: Some(vec!["graph-memory".to_string()]),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("set_thesis in second namespace must not collide");
+        assert_eq!(r_ns2["thesis_id"], thesis_row_id(ns2, 1));
+        assert_ne!(r_ns2["thesis_id"], r1["thesis_id"]);
+
+        let c_ns2 = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "upsert_concept".to_string(),
+                namespace: ns2.to_string(),
+                slug: Some("bitemporal-graph".to_string()),
+                pref_label: Some("Bitemporal Property Graph".to_string()),
+                definition: Some("Second namespace definition".to_string()),
+                domain: Some("graph-memory".to_string()),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("upsert_concept in second namespace with same slug must not collide");
+        assert_eq!(
+            c_ns2["concept_id"],
+            concept_row_id(ns2, "bitemporal-graph", 1)
+        );
+        assert_ne!(c_ns2["concept_id"], c1["concept_id"]);
+        // Adversarial delimiter boundary: ("a-b", "c") vs ("a", "b-c") must remain distinct.
+        assert_ne!(
+            concept_row_id("a-b", "c", 1),
+            concept_row_id("a", "b-c", 1)
+        );
     }
 
     #[tokio::test]
@@ -4611,7 +4709,7 @@ mod tests {
             src_store.as_ref(),
             ns,
             &crate::events::ThalamicPulse::Created {
-                id: "concept-shared-concept-v1".to_string(),
+                id: concept_row_id(ns, "shared-concept", 1),
                 namespace: ns.to_string(),
                 kind: "concept".to_string(),
             },
@@ -4670,7 +4768,7 @@ mod tests {
             Some("shared-concept")
         );
 
-        // 3. Supersede thesis-v1 -> thesis-v2 via handle_taxonomy_with_bus (single Superseded pulse)
+        // 3. Supersede thesis v1 -> thesis v2 via handle_taxonomy_with_bus (single Superseded pulse)
         let thesis_v2_out = crate::handlers::taxonomy::handle_taxonomy_with_bus(
             &json!({
                 "operation": "set_thesis",
@@ -4687,7 +4785,7 @@ mod tests {
         )
         .await;
         assert!(
-            thesis_v2_out.contains("\"superseded_id\": \"thesis-v1\""),
+            thesis_v2_out.contains(&format!("\"superseded_id\": \"{}\"", thesis_row_id(ns, 1))),
             "thesis_v2_out: {thesis_v2_out}"
         );
         for _ in 0..20 {
