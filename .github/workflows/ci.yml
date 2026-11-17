@@ -301,6 +301,10 @@ jobs:
         shell: bash
         run: bash scripts/test-gate-receipt.sh
 
+      - name: Gate receipt live-path harness
+        shell: bash
+        run: bash scripts/test-gate-receipt-live.sh
+
       # The disk-hygiene script is shell behaviour too: it deletes things, so
       # its self-test runs against copies of the fixtures, never against the
       # runner's real filesystem.

@@ -7,9 +7,11 @@ name: gate-receipt
 # `fixed@`/`filed`/`ruled:` reply is an inline comment, so the receipt path
 # re-runs the check without an unrelated push.
 #
-# No privileged-context triggers (`issue_comment`, `workflow_dispatch`) are
-# subscribed here: they would execute a PR-supplied checkout in a context with
-# default-branch authority. Use a review/inline reply (or a push) to re-run.
+# A top-level receipt (an issue comment) is subscribed too, so it re-runs the
+# check as well. `issue_comment` is a privileged default-branch context and
+# carries no `pull_request` payload, so the PR and its base SHA are resolved
+# through the API in the `resolve` step, and only the base SHA is ever
+# checked out: the gate runs base-branch code, never a caller's PR head.
 on:
   pull_request_review:
     types: [submitted, edited, dismissed]
@@ -17,6 +19,8 @@ on:
     types: [created, edited, deleted]
   pull_request:
     types: [opened, synchronize, reopened, edited]
+  issue_comment:
+    types: [created, edited, deleted]
 
 permissions:
   contents: read
@@ -25,18 +29,42 @@ permissions:
 jobs:
   gate-receipt:
     name: gate-receipt
+    # A comment on a plain issue has no gate to run; only pull requests do.
     if: github.event_name != 'issue_comment' || github.event.issue.pull_request
     runs-on: ubuntu-latest
     steps:
-      # Bootstrap: this workflow lands in the PR that adds the script, so PR and
-      # review events run the head. After this lands, switch that checkout to
-      # the base ref so a PR cannot edit the gate that checks it.
-      - name: Checkout the PR head
-        uses: actions/checkout@v7.0.1
+      # Resolve the PR number and its BASE sha through the API. For a comment
+      # event there is no `pull_request` payload, so the PR number comes from
+      # the issue number and both the PR and its base are looked up here. The
+      # resolved SHA is the base, never the head: a pull request cannot edit
+      # the gate that grades it.
+      - name: Resolve the PR and its base SHA
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+        run: |
+          case "$PR_NUMBER" in
+            ''|*[!0-9]*)
+              echo "::error::PR number is missing or not numeric: '$PR_NUMBER'"
+              exit 2
+              ;;
+          esac
+          base_sha=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER" --jq .base.sha)
+          if [ "${#base_sha}" -ne 40 ] || ! printf '%s' "$base_sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::cannot resolve the base SHA of PR #$PR_NUMBER: '$base_sha'"
+            exit 2
+          fi
+          echo "pr=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout the base branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ steps.resolve.outputs.base_sha }}
 
       - name: Require a receipt for every gating marker
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash scripts/gate-receipt.sh --pr "${{ github.event.pull_request.number }}"
+          PR_NUMBER: ${{ steps.resolve.outputs.pr }}
+        run: bash scripts/gate-receipt.sh --pr "$PR_NUMBER"

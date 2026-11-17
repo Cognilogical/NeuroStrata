@@ -56,6 +56,8 @@ LadybugDB maintains a write-ahead log (`*.wal`) alongside the main database file
    ```
 3. **Guided Recovery:** Follow the step-by-step runbook in [`docs/features-api/ops/wal-recovery.md`](wal-recovery.md) to quarantine the damaged WAL or replay verified frames using `NEUROSTRATA_ALLOW_UNVERIFIED_WAL=1`.
 
+> A WAL left behind by a *clean* close is usually the checkpoint latch, not a crash: a checkpoint that ran out of buffer pool stops checkpointing for the rest of the process (`checkpoints_stopped` in `storage_status`). See [`checkpoint-latch.md`](checkpoint-latch.md) for the restart with a larger pool that drains it.
+
 ---
 
 ## 4. Checkpointed Backups & Safe Restore
