@@ -648,7 +648,7 @@ pub async fn process_mcp_request(
                         "inputSchema": {
                             "type": "object",
                             "properties": {
-                                "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata')." },
+                                "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata'; runtime defaults to 'global' if omitted on direct handler calls)." },
                                 "principal": { "type": "string", "description": "Optional requested principal." },
                                 "args": {
                                     "type": "object",
@@ -1998,11 +1998,12 @@ pub(crate) async fn handle_data_connector(
     store: Arc<dyn VectorStore>,
     bus: Arc<crate::events::ThalamicBus>,
 ) -> String {
-    // Validate present namespace/principal: must be a non-blank string
+    // Validate present namespace/principal: must be a non-blank string without surrounding whitespace
     if let Some(ns) = arguments.get("namespace") {
         match ns.as_str() {
             None => return serde_json::json!({"ok": false, "error": "namespace must be a string"}).to_string(),
             Some(s) if s.trim().is_empty() => return serde_json::json!({"ok": false, "error": "namespace must not be blank"}).to_string(),
+            Some(s) if s.trim() != s => return serde_json::json!({"ok": false, "error": "namespace must not have leading or trailing whitespace"}).to_string(),
             _ => {}
         }
     }
@@ -2010,6 +2011,7 @@ pub(crate) async fn handle_data_connector(
         match pr.as_str() {
             None => return serde_json::json!({"ok": false, "error": "principal must be a string"}).to_string(),
             Some(s) if s.trim().is_empty() => return serde_json::json!({"ok": false, "error": "principal must not be blank"}).to_string(),
+            Some(s) if s.trim() != s => return serde_json::json!({"ok": false, "error": "principal must not have leading or trailing whitespace"}).to_string(),
             _ => {}
         }
     }
@@ -15809,12 +15811,15 @@ mod tests {
     async fn data_connector_rejects_invalid_principal() {
         let (store, _ladybug_store, bus, _ptr) = seed_data_pointer_in_namespace("global").await;
 
-        // Malformed principal values that old code collapses to trusted None
+        // Malformed principal values (blank, surrounding whitespace, non-string)
         let malformed_principals = [
             json!(""),
             json!("   "),
             json!("\t"),
             json!("\n"),
+            json!(" alice"),
+            json!("alice "),
+            json!(" alice "),
             json!(null),
             json!(123),
             json!({}),
@@ -15844,12 +15849,15 @@ mod tests {
     async fn data_connector_rejects_invalid_namespace() {
         let (store, _ladybug_store, bus, _ptr) = seed_data_pointer_in_namespace("global").await;
 
-        // Malformed namespace values that old code maps to "global"
+        // Malformed namespace values (blank, surrounding whitespace, non-string)
         let malformed_namespaces = [
             json!(""),
             json!("   "),
             json!("\t"),
             json!("\n"),
+            json!(" global"),
+            json!("global "),
+            json!(" global "),
             json!(null),
             json!(123),
             json!({}),

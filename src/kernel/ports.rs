@@ -140,6 +140,39 @@ impl LadybugMemoryPort {
     }
 }
 
+/// Returns `true` when a `data_pointer` / pool row is retired or inactive:
+/// - `valid_to` is expired (`store::ladybug::is_retired_at(metadata, now)`),
+/// - `archived == true`,
+/// - `retired == true`, or
+/// - `superseded_by` is a non-blank string.
+fn is_retired_data_metadata(metadata: &Value, now: i64) -> bool {
+    if crate::store::ladybug::is_retired_at(metadata, now) {
+        return true;
+    }
+    if metadata
+        .get("archived")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    if metadata
+        .get("retired")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    if metadata
+        .get("superseded_by")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.trim().is_empty())
+    {
+        return true;
+    }
+    false
+}
+
 #[async_trait]
 impl MemoryPort for LadybugMemoryPort {
     async fn get_visible_memory(&self, namespace: &str, id: &str, principal: Option<&str>) -> Result<Option<MemoryPayload>> {
@@ -158,11 +191,11 @@ impl MemoryPort for LadybugMemoryPort {
         }
         // Reject duplicate active pointer IDs in the namespace.
         if let Some(existing) = self.trusted_get_memory(namespace, &record.pointer_id).await? {
-            if !crate::store::ladybug::is_retired_at(&existing.metadata, chrono::Utc::now().timestamp()) {
+            if !is_retired_data_metadata(&existing.metadata, chrono::Utc::now().timestamp()) {
                 anyhow::bail!("pointer_id '{}' already exists", record.pointer_id);
             }
         }
-        let mut metadata = serde_json::json!({
+        let metadata = serde_json::json!({
             "eligibility": "private",
             "pointer": serde_json::to_value(record)?,
             "source": {
@@ -187,34 +220,28 @@ impl MemoryPort for LadybugMemoryPort {
     }
 
     async fn get_data_pointer(&self, namespace: &str, pointer_id: &str, principal: Option<&str>) -> Result<Option<DataPointerRecord>> {
-        // Trusted internal path: `principal == None` returns the raw record without ReBAC.
-        if principal.is_none() {
-            if let Some(payload) = self.trusted_get_memory(namespace, pointer_id).await? {
-                if payload.memory_type != "data_pointer" {
-                    return Ok(None);
-                }
-                let Some(pointer_val) = payload.metadata.get("pointer") else {
-                    return Ok(None);
-                };
-                let record: DataPointerRecord = serde_json::from_value(pointer_val.clone())?;
-                return Ok(Some(record));
-            }
+        let Some(payload) = self.trusted_get_memory(namespace, pointer_id).await? else {
+            return Ok(None);
+        };
+        if payload.memory_type != "data_pointer"
+            || is_retired_data_metadata(&payload.metadata, chrono::Utc::now().timestamp())
+        {
             return Ok(None);
         }
-        // ReBAC‑checked path.
-        if let Some(payload) = self.trusted_get_memory(namespace, pointer_id).await? {
-            if payload.memory_type != "data_pointer" {
-                return Ok(None);
-            }
-            let Some(pointer_val) = payload.metadata.get("pointer") else {
-                return Ok(None);
-            };
-            if can_read_memory(principal.unwrap(), payload.user_id.as_str(), &payload.metadata) {
-                let record: DataPointerRecord = serde_json::from_value(pointer_val.clone())?;
-                return Ok(Some(record));
-            }
+        let Some(pointer_val) = payload.metadata.get("pointer") else {
+            return Ok(None);
+        };
+        // Trusted internal path: `principal == None` returns the raw record without ReBAC;
+        // otherwise enforce `can_read_memory`.
+        let visible = match principal {
+            None => true,
+            Some(p) => can_read_memory(p, payload.user_id.as_str(), &payload.metadata),
+        };
+        if !visible {
+            return Ok(None);
         }
-        Ok(None)
+        let record: DataPointerRecord = serde_json::from_value(pointer_val.clone())?;
+        Ok(Some(record))
     }
 
     async fn list_data_pointers(&self, namespace: &str, pool_id: Option<&str>, principal: Option<&str>) -> Result<Vec<DataPointerRecord>> {
@@ -226,7 +253,7 @@ impl MemoryPort for LadybugMemoryPort {
         // List all memory_type == "data_pointer" in the namespace.
         let rows = lb.list_memories_by_types(namespace, &["data_pointer"]).await?;
         for (_id, payload) in rows {
-            if crate::store::ladybug::is_retired_at(&payload.metadata, now) {
+            if is_retired_data_metadata(&payload.metadata, now) {
                 continue;
             }
             let Some(pointer_val) = payload.metadata.get("pointer") else {
@@ -264,8 +291,10 @@ impl MemoryPort for LadybugMemoryPort {
             namespace, schema.connector_id, schema.pool_id
         );
         let existing_records = if records.is_none() {
+            let now = chrono::Utc::now().timestamp();
             self.trusted_get_memory(namespace, &row_id)
                 .await?
+                .filter(|p| !is_retired_data_metadata(&p.metadata, now))
                 .and_then(|p| p.metadata.get("pool_records").cloned())
         } else {
             None
@@ -308,8 +337,12 @@ impl MemoryPort for LadybugMemoryPort {
     ) -> Result<Vec<(DataPoolSchema, Option<HashMap<String, Vec<Value>>>)>> {
         let mut out = Vec::new();
         let lb = self.ladybug_store();
+        let now = chrono::Utc::now().timestamp();
         let rows = lb.list_memories_by_types(namespace, &["data_pointer"]).await?;
         for (_id, payload) in rows {
+            if is_retired_data_metadata(&payload.metadata, now) {
+                continue;
+            }
             let Some(schema_val) = payload.metadata.get("pool_schema") else {
                 continue;
             };

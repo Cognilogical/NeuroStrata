@@ -18,13 +18,13 @@ pub fn allowed_with_roles(
     relation: &str,
     acl: &[(String, String)],
 ) -> bool {
-    if user.is_empty() {
-        return false; // no anonymous access
+    if user.trim().is_empty() {
+        return false; // no anonymous or whitespace-only access
     }
     if user == "admin" {
         return true; // admin bypass
     }
-    if !resource_owner.is_empty() && check(resource_owner, user, "") {
+    if !resource_owner.trim().is_empty() && check(resource_owner, user, "") {
         return true; // owner always allowed, via §5.2 exact-equality check
     }
     if acl.is_empty() {
@@ -43,7 +43,7 @@ pub fn allowed_with_roles(
 
 /// §5.2 — check (exact equality only, no substring spoofing).
 pub fn check(predicate: &str, user: &str, resource: &str) -> bool {
-    if user.is_empty() {
+    if user.trim().is_empty() {
         return false;
     }
     predicate == user || predicate == resource || user == "admin"
@@ -313,6 +313,8 @@ mod tests {
     fn allowed_empty_user_denied() {
         assert!(!allowed("", "alice", "viewer", &[]));
         assert!(!allowed("", "", "viewer", &[]));
+        assert!(!allowed("   ", "alice", "viewer", &[]));
+        assert!(!allowed("   ", "   ", "viewer", &[]));
     }
 
     #[test]
@@ -347,6 +349,8 @@ mod tests {
     #[test]
     fn check_empty_user_denied() {
         assert!(!check("alice", "", "resource"));
+        assert!(!check("alice", "   ", "resource"));
+        assert!(!check("   ", "   ", "resource"));
     }
 
     // §5.3 resolve_principal — non-admin cannot spoof; admin can.

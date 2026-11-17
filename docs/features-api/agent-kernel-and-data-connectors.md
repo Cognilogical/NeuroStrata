@@ -54,8 +54,8 @@ The `neurostrata_data_connector` MCP tool discloses an operation-discriminated `
 
 - `now_secs` (optional u64) is accepted by `resolve_pointer`, `apply_effect`, and `mediate`; omission defaults to the current epoch.
 - `mediate` accepts optional `gate_passed` (boolean); omission defaults to `false` at runtime.
-- `list_pointers` omits retired pointers from its output.
-- `handle_data_connector` defaults omitted `namespace` to `"global"` and omitted `principal` to `None`, while rejecting present non-string or blank/whitespace `namespace` and `principal` values before `AgentKernel` construction; pool operations (`register_pool`, `upsert_pool`, `list_pools`) are also accepted at runtime via `execute_connector_command`.
+- `list_pointers`, `resolve_pointer`, `apply_effect`, `register_pointer`, and pool operations exclude retired/inactive rows (`valid_to` expired, `archived == true`, `retired == true`, or non-empty `superseded_by`).
+- `handle_data_connector` defaults omitted `namespace` to `"global"` and omitted `principal` to `None`, while rejecting present non-string, blank/whitespace, or whitespace-padded `namespace` and `principal` values before `AgentKernel` construction; pool operations (`register_pool`, `upsert_pool`, `list_pools`) are also accepted at runtime via `execute_connector_command`.
 
 ## Verification
 
