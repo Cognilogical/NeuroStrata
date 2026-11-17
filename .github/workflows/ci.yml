@@ -312,6 +312,10 @@ jobs:
         shell: bash
         run: bash scripts/test-disk-hygiene.sh
 
+      - name: Main ruleset specification self-test
+        shell: bash
+        run: bash scripts/test-main-ruleset.sh
+
   # The dependency graph carries known advisories, so the audit is a gate
   # rather than a report: cargo-audit fails the job on any vulnerability that
   # is not in the dated exception list in .cargo/audit.toml. The tool version
