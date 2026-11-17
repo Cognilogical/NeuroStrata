@@ -293,3 +293,22 @@ jobs:
       - name: Gate receipt live-path harness
         shell: bash
         run: bash scripts/test-gate-receipt-live.sh
+
+  # The release narrative names MCP tools, daemon routes, CLI subcommands and
+  # in-tree files. A name that never shipped is a user-facing failure, so the
+  # current release section and its release note are resolved against the
+  # source registries on every PR. See scripts/check-release-references.sh.
+  release-references:
+    name: release references
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Self-test the release-reference check
+        shell: bash
+        run: bash scripts/check-release-references.test.sh
+
+      - name: Validate release-narrative references
+        shell: bash
+        run: bash scripts/check-release-references.sh
