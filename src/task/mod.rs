@@ -714,19 +714,22 @@ pub async fn build_task_graph_context(
     for r in &golden_rules {
         seen_ids.insert(r.id.clone());
         let snippet: String = r.payload.content.chars().take(240).collect();
+        let presented = crate::rdf::provenance::decorate_content(&snippet, &r.payload.metadata);
         prompt_lines.push(format!(
             "  - [GOLDEN {}] `{}`: {}",
             r.payload.memory_type,
             r.id,
-            snippet.replace('\n', " ")
+            presented.replace('\n', " ")
         ));
-        golden_json.push(json!({
+        let mut entry = json!({
             "id": r.id,
             "memory_type": r.payload.memory_type,
             "location": r.payload.location,
-            "snippet": snippet,
+            "snippet": presented,
             "metadata": r.payload.metadata,
-        }));
+        });
+        crate::rdf::provenance::attach_presentation(&mut entry, &r.payload.metadata, "snippet");
+        golden_json.push(entry);
     }
 
     let raw_hits = store
@@ -744,6 +747,7 @@ pub async fn build_task_graph_context(
             continue;
         }
         let snippet: String = r.payload.content.chars().take(140).collect();
+        let presented = crate::rdf::provenance::decorate_content(&snippet, &r.payload.metadata);
         let calls = r.payload.metadata.get("calls").cloned().unwrap_or(Value::Null);
         let imports = r.payload.metadata.get("imports").cloned().unwrap_or(Value::Null);
         let governs = r.payload.metadata.get("governs").cloned().unwrap_or(Value::Null);
@@ -753,20 +757,22 @@ pub async fn build_task_graph_context(
             r.payload.memory_type,
             r.id,
             if r.payload.location.is_empty() { "memory" } else { &r.payload.location },
-            snippet.replace('\n', " ")
+            presented.replace('\n', " ")
         ));
-        hits_json.push(json!({
+        let mut entry = json!({
             "id": r.id,
             "memory_type": r.payload.memory_type,
             "location": r.payload.location,
-            "snippet": snippet,
+            "snippet": presented,
             "metadata": r.payload.metadata,
             "calls": calls,
             "imports": imports,
             "governs": governs,
             "depends_on": depends_on,
             "evidence": r.evidence,
-        }));
+        });
+        crate::rdf::provenance::attach_presentation(&mut entry, &r.payload.metadata, "snippet");
+        hits_json.push(entry);
         if hits_json.len() >= 5 {
             break;
         }
@@ -2650,6 +2656,21 @@ pub async fn handle_task_complete(
         })
         .collect();
 
+    // Capability E: post-commit learning hook. Best-effort by design — a
+    // mining/reflection failure is reported and logged, never allowed to roll
+    // back the already-committed task or make completion look successful when
+    // reflection did not happen. The hook never completes a task, so no
+    // recursion back into this handler is possible.
+    let learning_report = crate::learning::hooks::on_task_completed(
+        &store,
+        &emb,
+        &namespace,
+        &id,
+        dedup.as_ref(),
+        &crate::daemon::resolve_project_root(),
+    )
+    .await;
+
     let mut reply = json!({
         "task": task_summary(&id, &completed.payload),
         "extracted_memory_ids": extracted,
@@ -2657,6 +2678,8 @@ pub async fn handle_task_complete(
         "task_intent_signals": signals,
         "transition": { "from": task.status().as_str(), "to": "done" },
     });
+    reply["learning_hook"] = serde_json::to_value(&learning_report)
+        .unwrap_or_else(|_| json!({ "errors": ["serialize learning hook report"] }));
     if !registry_warnings.is_empty() {
         reply["registry_warning"] = json!(registry_warnings.join("; "));
     }
@@ -9088,6 +9111,110 @@ impl crate::traits::AsAny for ListHidingStore {
         assert!(
             golden.iter().any(|g| g["id"] == "pinned-local-1"),
             "golden_rules must include local pinned rule: {golden:?}"
+        );
+    }
+
+    // ── Capability C: task views + task_validate production surfaces ──────
+    #[tokio::test]
+    async fn task_validate_exposes_advisory_stale_memories_from_non_task_rows() {
+        let store = store_with_namespace("MyProj").await;
+        let fact_id = uuid::Uuid::new_v4().to_string();
+        store
+            .upsert(
+                "MyProj",
+                &fact_id,
+                StubEmbedder.embed("decayed external API fact").await.unwrap(),
+                MemoryPayload {
+                    content: "external API fact that decayed".to_string(),
+                    user_id: "kenton".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({"stale_after": "2000-01-01T00:00:00Z"}),
+                },
+            )
+            .await
+            .expect("seed stale fact");
+
+        let reply = handle_task_validate(json!({ "namespace": "MyProj" }), store).await;
+        let parsed: Value = serde_json::from_str(&reply).expect("json reply");
+        let alias = parsed
+            .get("stale_memories")
+            .expect("task_validate must expose stale_memories alias");
+        let items = alias.as_array().expect("stale_memories is a list");
+        assert!(
+            items.iter().any(|v| v["id"] == json!(fact_id)),
+            "non-task stale row must be listed: {reply}"
+        );
+        assert!(
+            items.iter().any(|v| v.to_string().contains("advisory")),
+            "stale_memories must be labelled advisory (nonblocking): {reply}"
+        );
+        assert!(parsed.get("stale").is_some(), "legacy `stale` key retained");
+    }
+
+    #[tokio::test]
+    async fn task_view_governing_memories_emit_deprecation_presentation() {
+        let store = store_with_namespace("MyProj").await;
+        let rule_id = uuid::Uuid::new_v4().to_string();
+        store
+            .upsert(
+                "MyProj",
+                &rule_id,
+                StubEmbedder.embed("legacy podman rule").await.unwrap(),
+                MemoryPayload {
+                    content: "legacy podman rule that was superseded".to_string(),
+                    user_id: "kenton".to_string(),
+                    memory_type: "rule".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({
+                        "deprecation": {
+                            "status": "deprecated",
+                            "superseded_by": "mem-replacement-42",
+                            "reason": "replaced by the podman v2 rule",
+                            "effective_at": 1700000000
+                        },
+                        "not_definition": "does not apply to rootless podman sockets",
+                    }),
+                },
+            )
+            .await
+            .expect("seed deprecated rule");
+
+        let task_id = create_task(&store, "MyProj", "Review podman guidance", 1).await;
+        handle_task_claim(
+            json!({
+                "namespace": "MyProj",
+                "id": task_id,
+                "assignee": "agent-a",
+                "session_id": "ses-capc-view"
+            }),
+            store.clone(),
+        )
+        .await;
+        let list: Value = serde_json::from_str(
+            &handle_task_list(
+                json!({ "namespace": "MyProj", "status": "in_progress" }),
+                store.clone(),
+            )
+            .await,
+        )
+        .unwrap();
+        let prompt = list["tasks"][0]["subagent_prompt_injection"]
+            .as_str()
+            .expect("prompt present");
+        assert!(
+            prompt.contains(
+                "[DEPRECATED — SUPERSEDED BY mem-replacement-42: replaced by the podman v2 rule]"
+            ),
+            "governing memory in task view must emit exact banner: {prompt}"
+        );
+        assert!(
+            prompt.contains("NOT DEFINITION: does not apply to rootless podman sockets"),
+            "governing memory in task view must emit boundary: {prompt}"
         );
     }
 }

@@ -111,9 +111,30 @@ impl GateReport {
 
     /// The neurostrata_task_validate body.
     pub fn validate_json(&self) -> Value {
+        // Capability C: explicit advisory alias. `stale` is kept verbatim for
+        // compatibility; `stale_memories` isolates the stale-SLA rows and
+        // labels them advisory/nonblocking so callers cannot mistake them for
+        // gate violations.
+        let stale_memories: Vec<Value> = self
+            .stale
+            .iter()
+            .filter(|v| v.kind == "stale_memories")
+            .map(|v| {
+                let mut item = v.to_json();
+                if let Some(obj) = item.as_object_mut() {
+                    obj.insert("advisory".to_string(), json!(true));
+                    obj.insert(
+                        "label".to_string(),
+                        json!("advisory: stale_after SLA elapsed; re-verify or supersede"),
+                    );
+                }
+                item
+            })
+            .collect();
         json!({
             "violations": self.violations.iter().map(Violation::to_json).collect::<Vec<_>>(),
             "stale": self.stale.iter().map(Violation::to_json).collect::<Vec<_>>(),
+            "stale_memories": stale_memories,
             "unextracted_done": self.unextracted_done.iter().map(Violation::to_json).collect::<Vec<_>>(),
             "counts": self.counts.to_json(),
         })
@@ -122,6 +143,52 @@ impl GateReport {
 
 pub fn is_task(result: &SearchResult) -> bool {
     result.payload.memory_type == "task"
+}
+
+/// Capability C: advisory stale-SLA scan across ALL active rows (not just
+/// tasks). Shared by the gate, `task_validate`, and `get_snapshot` so the three
+/// surfaces can never disagree about which memories need re-verification.
+/// `stale_after` is read from `metadata.task.stale_after` first, then the
+/// top-level `metadata.stale_after`; malformed values are skipped, never
+/// coerced to epoch 0. Never blocking — these are advisory rows.
+pub fn stale_memory_violations(memories: &[SearchResult], now: i64) -> Vec<Violation> {
+    let mut out = Vec::new();
+    for row in memories {
+        if is_retired(&row.payload.metadata, now) {
+            continue;
+        }
+        let task_meta = row.payload.metadata.get("task");
+        let stale_after_val = task_meta
+            .and_then(|t| t.get("stale_after"))
+            .filter(|v| !v.is_null())
+            .or_else(|| {
+                row.payload
+                    .metadata
+                    .get("stale_after")
+                    .filter(|v| !v.is_null())
+            });
+        let Some(val) = stale_after_val else {
+            continue;
+        };
+        if matches!(
+            crate::rdf::provenance::stale_after_parse(val, now),
+            Some(true)
+        ) {
+            let rendered = val
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| val.to_string());
+            out.push(Violation {
+                id: row.id.clone(),
+                kind: "stale_memories",
+                detail: format!(
+                    "advisory (nonblocking): {} '{}' has stale_after {} which is past now; re-verify or supersede it.",
+                    row.payload.memory_type, row.payload.content, rendered
+                ),
+            });
+        }
+    }
+    out
 }
 
 /// Whether a row is retired history: its `metadata.valid_to` has passed.
@@ -298,7 +365,9 @@ pub(crate) fn age_secs(meta: Option<&Value>, keys: &[&str], now: i64) -> Option<
             continue;
         }
         match chrono::DateTime::parse_from_rfc3339(s) {
-            Ok(stamp) => return Some(now - stamp.timestamp()),
+            // Corrupt clocks can be arbitrarily far from `now`; saturate
+            // instead of overflowing the i64 age on a debug build.
+            Ok(stamp) => return Some(now.saturating_sub(stamp.timestamp())),
             // Silence is how a corrupt timestamp hides forever: a stamped
             // clock that cannot be parsed is logged, then the next key is
             // tried (a task with one bad and one good stamp still ages).
@@ -457,6 +526,10 @@ pub fn evaluate_scoped(
             }
         }
     }
+
+    // Capability C: advisory stale_memories from ALL active rows where
+    // stale_after has passed. Never blocking; lives in report.stale only.
+    report.stale.extend(stale_memory_violations(memories, now));
 
     // A6 rule honesty: "a rule that no machine checks is a note, not a rule."
     // A rule claiming ENFORCED must name a real wire from the closed registry.
@@ -1954,5 +2027,269 @@ mod tests {
         assert!(!extraction_exists(&memories, "ns-zzzz", NOW));
         // A task never extracts from itself.
         assert!(!extraction_exists(&memories[..1], "ns-aaaa", NOW));
+    }
+
+    /// Capability C: advisory stale_memories from active rows where stale_after < now.
+    #[test]
+    fn stale_memories_advisory_triggers_on_past_stale_after() {
+        let memories = vec![
+            task(
+                "stale-task",
+                json!({
+                    "status": "open",
+                    "stale_after": iso(DAY * 2),
+                }),
+            ),
+            task(
+                "fresh-task",
+                json!({
+                    "status": "open",
+                    "stale_after": iso(-DAY),
+                }),
+            ),
+            // Malformed stale_after is ignored (no advisory).
+            task(
+                "malformed-stale",
+                json!({
+                    "status": "open",
+                    "stale_after": "not-a-date",
+                }),
+            ),
+            // Retired task: stale_after advisory does not apply (not active).
+            row(
+                "retired-stale",
+                "task",
+                "retired work",
+                json!({
+                    "task": { "status": "open", "stale_after": iso(DAY * 2) },
+                    "valid_to": NOW - 1,
+                }),
+            ),
+        ];
+        let report = evaluate(&memories, NOW);
+        let stale: Vec<&str> = report
+            .stale
+            .iter()
+            .filter(|v| v.kind == "stale_memories")
+            .map(|v| v.id.as_str())
+            .collect();
+        // Only the active stale task triggers advisory.
+        assert_eq!(stale, vec!["stale-task"]);
+        // Advisory is non-blocking: report.ok() must be true.
+        assert!(report.ok(), "stale_memories advisory must not block");
+    }
+
+    /// Capability C: stale_memories advisory applies to all active statuses.
+    #[test]
+    fn stale_memories_advisory_applies_to_all_active_statuses() {
+        let memories = vec![
+            task(
+                "open-stale",
+                json!({ "status": "open", "stale_after": iso(DAY) }),
+            ),
+            task(
+                "in_progress-stale",
+                json!({ "status": "in_progress", "assignee": "agent-x", "stale_after": iso(DAY) }),
+            ),
+            task(
+                "blocked-stale",
+                json!({ "status": "blocked", "stale_after": iso(DAY) }),
+            ),
+            // done is active in this engine's evaluation (counts as live).
+            task(
+                "done-stale",
+                json!({ "status": "done", "created_at": iso(DAY * 2), "stale_after": iso(DAY) }),
+            ),
+        ];
+        let report = evaluate(&memories, NOW);
+        let mut stale: Vec<&str> = report
+            .stale
+            .iter()
+            .filter(|v| v.kind == "stale_memories")
+            .map(|v| v.id.as_str())
+            .collect();
+        stale.sort();
+        assert_eq!(stale, vec!["blocked-stale", "done-stale", "in_progress-stale", "open-stale"]);
+    }
+
+    /// Capability C: epoch seconds stale_after is parsed correctly.
+    #[test]
+    fn stale_memories_advisory_parses_epoch_seconds() {
+        let epoch_past = (NOW - DAY).to_string();
+        let epoch_future = (NOW + DAY).to_string();
+        let memories = vec![
+            task("epoch-past", json!({ "status": "open", "stale_after": epoch_past })),
+            task("epoch-future", json!({ "status": "open", "stale_after": epoch_future })),
+        ];
+        let report = evaluate(&memories, NOW);
+        let stale: Vec<&str> = report
+            .stale
+            .iter()
+            .filter(|v| v.kind == "stale_memories")
+            .map(|v| v.id.as_str())
+            .collect();
+        assert_eq!(stale, vec!["epoch-past"]);
+    }
+
+    /// Review finding: stale_after may live on the task object or at the top
+    /// level of metadata; the task field wins when both are present.
+    #[test]
+    fn stale_memories_reads_task_field_then_top_level_metadata() {
+        let memories = vec![
+            task(
+                "in-task",
+                json!({ "status": "open", "stale_after": iso(DAY * 2) }),
+            ),
+            row(
+                "top-level",
+                "task",
+                "top",
+                json!({
+                    "task": {"status": "open"},
+                    "stale_after": iso(DAY * 2)
+                }),
+            ),
+            row(
+                "task-wins",
+                "task",
+                "both",
+                json!({
+                    "task": {"status": "open", "stale_after": iso(-DAY)},
+                    "stale_after": iso(DAY * 2)
+                }),
+            ),
+        ];
+        let report = evaluate(&memories, NOW);
+        let mut stale: Vec<&str> = report
+            .stale
+            .iter()
+            .filter(|v| v.kind == "stale_memories")
+            .map(|v| v.id.as_str())
+            .collect();
+        stale.sort();
+        assert_eq!(stale, vec!["in-task", "top-level"]);
+    }
+
+    /// Review finding: a numeric epoch detail names the supplied value, not
+    /// the literal word "malformed".
+    #[test]
+    fn stale_memories_numeric_epoch_detail_uses_the_actual_value() {
+        let value = NOW - DAY;
+        let memories = vec![task(
+            "numeric",
+            json!({ "status": "open", "stale_after": value }),
+        )];
+        let report = evaluate(&memories, NOW);
+        let violation = report
+            .stale
+            .iter()
+            .find(|v| v.id == "numeric")
+            .expect("numeric epoch must produce an advisory");
+        assert!(violation.detail.contains(&value.to_string()), "{violation:?}");
+        assert!(!violation.detail.contains("malformed"), "{violation:?}");
+    }
+
+    /// Review finding: malformed values are skipped, never coerced to epoch 0.
+    #[test]
+    fn stale_memories_malformed_is_skipped_not_coerced_to_epoch_zero() {
+        let memories = vec![
+            task(
+                "bad-string",
+                json!({ "status": "open", "stale_after": "garbage" }),
+            ),
+            task(
+                "bad-array",
+                json!({ "status": "open", "stale_after": [1, 2] }),
+            ),
+            task(
+                "negative",
+                json!({ "status": "open", "stale_after": -1 }),
+            ),
+            task("epoch-zero", json!({ "status": "open", "stale_after": 0 })),
+        ];
+        let report = evaluate(&memories, NOW);
+        let stale: Vec<&str> = report
+            .stale
+            .iter()
+            .filter(|v| v.kind == "stale_memories")
+            .map(|v| v.id.as_str())
+            .collect();
+        assert_eq!(stale, vec!["epoch-zero"]);
+    }
+
+    /// Review finding: age arithmetic must saturate under extreme clock skew.
+    #[test]
+    fn age_secs_saturates_on_extreme_clock_skew() {
+        let meta = json!({"t": "0000-01-01T00:00:00Z"});
+        assert_eq!(age_secs(Some(&meta), &["t"], i64::MAX), Some(i64::MAX));
+    }
+
+    // ── Capability C: advisory stale scan covers ALL active rows ─────────
+    #[test]
+    fn stale_memories_advisory_scans_facts_rules_and_tasks_not_just_tasks() {
+        let now = 1_700_000_000i64;
+        let stale_fact = row(
+            "stale-fact",
+            "fact",
+            "decayed external API fact",
+            json!({"stale_after": "2000-01-01T00:00:00Z"}),
+        );
+        let stale_rule = row(
+            "stale-rule",
+            "rule",
+            "decayed rule",
+            json!({
+                "source": "owner 2023-01-01",
+                "stale_after": 946_684_800
+            }),
+        );
+        let stale_task = row(
+            "stale-task",
+            "task",
+            "decayed task",
+            json!({"task": {"stale_after": "2000-01-01T00:00:00Z"}}),
+        );
+        let report = evaluate(&[stale_fact, stale_rule, stale_task], now);
+        let kinds: Vec<(&str, &str)> = report
+            .stale
+            .iter()
+            .map(|v| (v.id.as_str(), v.kind))
+            .collect();
+        for id in ["stale-fact", "stale-rule", "stale-task"] {
+            assert!(
+                kinds.contains(&(id, "stale_memories")),
+                "every active row with stale_after must be scanned; got {kinds:?}"
+            );
+        }
+        assert!(
+            report.violations.is_empty(),
+            "staleness is advisory, never blocking: {:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn task_validate_json_exposes_advisory_stale_memories_alias() {
+        let now = 1_700_000_000i64;
+        let stale_fact = row(
+            "stale-fact-2",
+            "fact",
+            "decayed fact",
+            json!({"stale_after": "2000-01-01T00:00:00Z"}),
+        );
+        let report = evaluate(&[stale_fact], now);
+        let json = report.validate_json();
+        let alias = json.get("stale_memories").expect("stale_memories alias present");
+        let items = alias.as_array().expect("stale_memories is a list");
+        assert_eq!(items.len(), 1);
+        let rendered = items[0].to_string();
+        assert!(
+            rendered.contains("advisory"),
+            "stale_memories must be explicitly labelled advisory: {rendered}"
+        );
+        assert!(
+            json.get("stale").is_some(),
+            "legacy `stale` key kept for compatibility"
+        );
     }
 }

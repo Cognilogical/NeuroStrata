@@ -17,3 +17,4 @@ import NeuroStrata.Insights
 import NeuroStrata.Taxonomy
 import NeuroStrata.WorkflowStage
 import NeuroStrata.DataConnector
+import NeuroStrata.DerivationCertificate

@@ -108,12 +108,36 @@ pub struct ConceptSpec {
     pub evidence_refs: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concept_iri: Option<String>,
+    /// Explicit negative scope boundary (spec §4.2.3). Backward-compatible:
+    /// absent on every pre-C concept row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_definition: Option<Value>,
+    /// Governed deprecation annotation `{status, superseded_by, reason,
+    /// effective_at}`. Backward-compatible: absent on older rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deprecation: Option<Value>,
+    /// Deterministic banner derived from `deprecation` at read time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deprecation_banner: Option<String>,
 }
 
 impl ConceptSpec {
     pub fn from_payload(payload: &MemoryPayload) -> Option<Self> {
         let obj = payload.metadata.get("concept")?;
         let mut spec: Self = serde_json::from_value(obj.clone()).ok()?;
+        if spec.not_definition.is_none() {
+            spec.not_definition = obj
+                .get("not_definition")
+                .filter(|v| !v.is_null())
+                .cloned();
+        }
+        if spec.deprecation.is_none() {
+            spec.deprecation = obj.get("deprecation").filter(|v| v.is_object()).cloned();
+        }
+        spec.deprecation_banner = spec
+            .deprecation
+            .as_ref()
+            .and_then(crate::rdf::provenance::deprecation_banner);
         if spec.aliases.is_empty() {
             spec.aliases = extract_string_vec_from_meta(obj, "alt_labels");
         }
@@ -161,6 +185,12 @@ pub struct HydratedConcept {
     pub locations: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concept_iri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_definition: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deprecation: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deprecation_banner: Option<String>,
     pub epistemic_status: String,
     pub epistemic_weight_bps: u32,
     pub descendant_count: usize,
@@ -317,6 +347,11 @@ pub struct TaxonomyRequest {
     pub evidence_refs: Option<Vec<String>>,
     #[serde(default)]
     pub concept_iri: Option<String>,
+    /// Capability C: structured negative boundary and deprecation annotation.
+    #[serde(default)]
+    pub not_definition: Option<Value>,
+    #[serde(default)]
+    pub deprecation: Option<Value>,
     #[serde(default)]
     pub governs: Option<Vec<String>>,
     #[serde(default)]
@@ -1002,6 +1037,9 @@ pub fn build_principal_taxonomy_view(
                 governs,
                 locations,
                 concept_iri: spec.concept_iri.clone(),
+                not_definition: spec.not_definition.clone(),
+                deprecation: spec.deprecation.clone(),
+                deprecation_banner: spec.deprecation_banner.clone(),
                 epistemic_status: ep_status.as_str().to_string(),
                 epistemic_weight_bps: ep_status.weight_bps(),
                 descendant_count,
@@ -1729,6 +1767,12 @@ async fn execute_upsert_concept(
         evaluation_scores: evaluation_scores.clone(),
         evidence_refs: evidence_refs.clone(),
         concept_iri: concept_iri.clone(),
+        not_definition: req.not_definition.clone().filter(|v| !v.is_null()),
+        deprecation: req.deprecation.clone().filter(|v| v.is_object()),
+        deprecation_banner: req
+            .deprecation
+            .as_ref()
+            .and_then(crate::rdf::provenance::deprecation_banner),
     };
 
     // Collect existing active concept rows in namespace and check global DAG + SKOS S27 disjointness
@@ -1857,6 +1901,12 @@ async fn execute_upsert_concept(
         "valid_from": now_ts,
         "updated_at": now_ts,
     });
+    if let Some(nd) = &candidate_spec.not_definition {
+        meta["concept"]["not_definition"] = nd.clone();
+    }
+    if let Some(dep) = &candidate_spec.deprecation {
+        meta["concept"]["deprecation"] = dep.clone();
+    }
     if let Some(d) = &domain_slug {
         meta["domain"] = json!(d);
     }
@@ -2683,6 +2733,29 @@ async fn execute_compare(
     }))
 }
 
+/// Capability C: compact, deterministic list of concepts that carry a
+/// negative boundary or a deprecation annotation. Shared by `gaps`, `advise`,
+/// and the snapshot taxonomy strip so those surfaces cannot drift.
+fn concept_deprecation_and_boundaries(view: &PrincipalTaxonomyView) -> Vec<Value> {
+    view.concepts
+        .values()
+        .filter(|c| c.deprecation_banner.is_some() || c.not_definition.is_some())
+        .map(|c| {
+            let mut item = json!({
+                "slug": c.slug,
+                "pref_label": c.pref_label,
+            });
+            if let Some(banner) = &c.deprecation_banner {
+                item["deprecation_banner"] = json!(banner);
+            }
+            if let Some(boundary) = &c.not_definition {
+                item["not_definition"] = boundary.clone();
+            }
+            item
+        })
+        .collect()
+}
+
 pub fn compute_gaps_from_view(view: &PrincipalTaxonomyView) -> Value {
     let mut n_seed: usize = 0;
     let mut n_defined: usize = 0;
@@ -2882,6 +2955,10 @@ pub fn compute_gaps_from_view(view: &PrincipalTaxonomyView) -> Value {
         "dangling_concept_refs": dangling_concept_refs,
         "shallow_concepts": shallow_concepts,
         "anti_patterns": anti_patterns,
+        // Capability C: explicit advisory surface for negative boundaries and
+        // deprecations. Restricted concepts never reach `view`, so privacy is
+        // unchanged. Advisory only — never a blocking gate violation.
+        "deprecation_and_boundaries": concept_deprecation_and_boundaries(view),
     })
 }
 
@@ -3262,6 +3339,9 @@ async fn execute_advise(
         "recommendations": recommendations,
         "insufficient_evidence_concepts": insufficient_evidence_concepts,
         "external_research_agenda": external_research_agenda,
+        // Capability C: the advisor must see which canonical concepts are
+        // bounded or deprecated before recommending them as evidence anchors.
+        "deprecation_and_boundaries": concept_deprecation_and_boundaries(&view),
     }))
 }
 
@@ -3454,6 +3534,27 @@ pub async fn render_snapshot_taxonomy_section(store: &LadybugStore, namespace: &
         lines.push("  - Top Epistemic Gaps: none (all concepts synthesized/verified)".to_string());
     } else {
         lines.push(format!("  - Top Epistemic Gaps: {}", gap_items.join(", ")));
+    }
+
+    // Capability C: surface bounded/deprecated concepts in the snapshot strip.
+    // The autobriefing view already excludes restricted rows, so this adds no
+    // new privacy exposure. Kept compact to respect the 800-char budget.
+    let annotations = concept_deprecation_and_boundaries(&view);
+    if !annotations.is_empty() {
+        let summary: Vec<String> = annotations
+            .iter()
+            .take(3)
+            .filter_map(|a| {
+                let slug = a.get("slug")?.as_str()?;
+                match a.get("deprecation_banner").and_then(Value::as_str) {
+                    Some(banner) => Some(format!("{slug}({banner})")),
+                    None => Some(format!("{slug}(NOT DEFINITION)")),
+                }
+            })
+            .collect();
+        if !summary.is_empty() {
+            lines.push(format!("  - Deprecated / Bounded Concepts: {}", summary.join("; ")));
+        }
     }
 
     let out = lines.join("\n");
@@ -5293,5 +5394,142 @@ mod tests {
             }),
         };
         assert!(!crate::rdf::shacl::validate_memory(&bad_concept).is_empty());
+    }
+
+    // ── Capability C: taxonomy surfaces carry boundary + deprecation ─────
+    #[tokio::test]
+    async fn concept_boundary_and_deprecation_reach_briefing_compare_gaps_advise_and_snapshot() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-capc-ns";
+        store.init(ns).await.expect("init");
+
+        for (slug, label, def) in [
+            ("legacy-concept", "Legacy Concept", "an older concept"),
+            ("new-concept", "New Concept", "the replacement concept"),
+        ] {
+            execute_taxonomy(
+                &store,
+                &embedder,
+                TaxonomyRequest {
+                    operation: "upsert_concept".to_string(),
+                    namespace: ns.to_string(),
+                    slug: Some(slug.to_string()),
+                    pref_label: Some(label.to_string()),
+                    definition: Some(def.to_string()),
+                    ..Default::default()
+                },
+                &sec("alice"),
+            )
+            .await
+            .expect("seed concept");
+        }
+
+        let concept_id = concept_row_id(ns, "legacy-concept", 1);
+        let (_, mut pl) = store
+            .get(ns, &concept_id)
+            .await
+            .expect("read concept row")
+            .expect("concept row exists");
+        {
+            let concept = pl
+                .metadata
+                .get_mut("concept")
+                .and_then(Value::as_object_mut)
+                .expect("concept metadata object");
+            concept.insert(
+                "not_definition".to_string(),
+                json!("not a replacement for live concepts"),
+            );
+            concept.insert(
+                "deprecation".to_string(),
+                json!({
+                    "status": "deprecated",
+                    "superseded_by": "concept-new",
+                    "reason": "renamed to the new concept",
+                    "effective_at": 1700000000
+                }),
+            );
+        }
+        store
+            .upsert(ns, &concept_id, embedder.embed("legacy concept").await.unwrap(), pl)
+            .await
+            .expect("write annotated concept");
+
+        let banner = "[DEPRECATED — SUPERSEDED BY concept-new: renamed to the new concept]";
+
+        let briefing = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "briefing".to_string(),
+                namespace: ns.to_string(),
+                query: Some("legacy".to_string()),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("briefing");
+        let matched = briefing["matched_concepts"][0].clone();
+        assert_eq!(matched["not_definition"], json!("not a replacement for live concepts"));
+        assert_eq!(matched["deprecation_banner"], json!(banner));
+
+        let compare = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "compare".to_string(),
+                namespace: ns.to_string(),
+                slugs: Some(vec!["legacy-concept".to_string(), "new-concept".to_string()]),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("compare");
+        let compared = compare["concepts"][0].clone();
+        assert_eq!(compared["not_definition"], json!("not a replacement for live concepts"));
+        assert_eq!(compared["deprecation_banner"], json!(banner));
+
+        let gaps = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "gaps".to_string(),
+                namespace: ns.to_string(),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("gaps");
+        let gap_str = gaps.to_string();
+        assert!(gap_str.contains("not a replacement for live concepts"), "gaps must expose boundary: {gap_str}");
+        assert!(gap_str.contains(banner), "gaps must expose banner: {gap_str}");
+
+        let advise = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "advise".to_string(),
+                namespace: ns.to_string(),
+                top_k: Some(2),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("advise");
+        let advise_str = advise.to_string();
+        assert!(advise_str.contains("not a replacement for live concepts"), "advise must expose boundary: {advise_str}");
+        assert!(advise_str.contains(banner), "advise must expose banner: {advise_str}");
+
+        let snap = render_snapshot_taxonomy_section(&store, ns).await;
+        assert!(
+            snap.contains("DEPRECATED") || snap.contains("not_definition"),
+            "snapshot taxonomy must expose the annotation: {snap}"
+        );
     }
 }

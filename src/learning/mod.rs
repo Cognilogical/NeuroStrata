@@ -10,4 +10,7 @@ pub mod evaluator;
 pub mod calibration;
 pub mod status;
 pub mod control;
+pub mod trajectory;
+pub mod reflection;
+pub mod hooks;
 

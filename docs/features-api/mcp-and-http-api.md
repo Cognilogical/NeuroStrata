@@ -10,6 +10,7 @@
 - `neurostrata_related` — find related entities (`CONTAINS`, `GOVERNS`).
 - `neurostrata_diff_tour` — diff tour between versions.
 - `neurostrata_ingest_directory` — ingest a directory into the property graph.
+- `neurostrata_ingest_bounded` — ontology-scoped bounded RDF classification + ingest (Capability F). Inputs: `namespace`, `domain`, `candidates` (all required), optional `principal`, `user_id`, `reason`. Each candidate carries `subject`, `class`, `predicate` and an `object` that is either `{"iri": "<absolute-iri>"}` or `{"literal": {"value": "...", "datatype"?: "<iri>", "language"?: "<tag>"}}`. The requested `domain` is normalized before the governed class/predicate closure is selected under a fixed finite query budget; `governs_class` is exact-match only, so invented IRIs that collapse onto a slug are rejected. Finite caps apply to candidate count (256), IRI length (2048 bytes) and literal length (65536 bytes). The emitted Turtle and the `MemoryPayload` are SHACL-validated before any write; any violation, unknown/empty domain, budget exhaustion, ungoverned class/predicate, malformed term or cap breach fails closed with `{"ok": false, "error": ...}` and zero writes. A successful call commits exactly one idempotent batch memory (`bounded-ingest-<sha256>`) and returns `{"ok": true, "id", "namespace", "domain", "triple_count", "turtle"}`. A ReBAC namespace write gate (`can_write_namespace` on the resolved principal) protects the write; there is no permissive opt-out and no CLI/daemon surface for this tool.
 - `neurostrata_append_log` — append conversational transcript log entries.
 - `neurostrata_bootstrap` — initialize a new project namespace.
 - `neurostrata_task_setup` — configure task scaffolding.
@@ -39,12 +40,17 @@
 ## Enterprise Ontology, Digital Twins, Scenarios & Kinetic Actions
 
 - `neurostrata_twin` — manage digital twin state.
-- `neurostrata_scenario` — define counterfactual scenarios.
+- `neurostrata_scenario` — define counterfactual scenarios. Operations: `create`, `stage_memory`, `stage_twin`, `apply_action`, `evaluate_sparql`, `diff`, `plan_ontology_diff`, `commit`, `drop`, `list`.
+  - `plan_ontology_diff` is a zero-mutation dry run (`POST /scenario` shares this same handler). It clones the active namespace RDF — or the named `scenario_id` overlay — into an ephemeral in-memory dataset, applies `add_turtle` (Turtle/N-Quads) and `retract_triples` (canonical N-Triple/N-Quad patterns), validates the post-image against `candidate_shacl_turtle` (or the governing shapes) via `ontobug::validate::shacl_turtle`, and returns a `plan` report: certified Capability A `added_entailments` (`DerivationStep`s) and `removed_entailments`, `validation_conforms`, `new_shacl_violations`, `consistency_violations`, ReBAC-filtered `impacted_memories`/`impacted_files`/`impacted_action_slugs` (from changed governance facts and SPARQL ASK outcomes), and `schema_ddl_diff` from `ontobug::diff_ontologies` + `generate_cypher_ddl`. Nothing is committed to a store, scenario, task, edge or the ontology cache.
 - `neurostrata_action` — apply kinetic actions (state-machine mutations) via `POST /action`.
 
 ## Central Agentic Kernel & DataConnector Tools
 
 - `neurostrata_data_connector` — execute an `AgentKernel` connector command: `list_connectors`, `describe_pool`, `register_pointer`, `list_pointers`, `resolve_pointer`, `apply_effect`, `mediate` (runtime dispatch also accepts `register_pool`, `upsert_pool`, and `list_pools`). The MCP `tools/list` disclosure for its `args` object is operation-discriminated (`oneOf` on `operation`): each variant lists its own required fields and the nested `DataPointerRecord`, `DataSliceRequest`, and `ExternalEffectRequest` layouts. Omitted `namespace` defaults to `"global"` and omitted `principal` defaults to `None`, while present non-string, blank/whitespace, or whitespace-padded `namespace` and `principal` values are rejected at the handler boundary with `{"ok": false, "error": ...}` before constructing `AgentKernel`. Optional `now_secs` (u64) on `resolve_pointer`, `apply_effect`, and `mediate` defaults to the current epoch when omitted; the schema is discovery-only and runtime validation is unchanged.
+
+## Vault-LD Markdown Sync
+
+- `neurostrata_vault_sync` — bidirectional W3C YAML-LD 1.0 / Vault-LD Markdown sync with Open JSON Canvas 1.0 topology export. `action='export'`: one Markdown note per readable memory (ReBAC `can_read_memory` filter on `principal`), plus `topology.canvas` of the note graph grouped by epistemic tier. `action='import'`: walks the vault for `*.md`, secret-scans (`SecretScanner::scan_str`) and SHACL-validates (`ontobug::validate::shacl_turtle`, `Mode::Native`) every note BEFORE any store write — violations skip the note, never partially store it. Unresolved `[[WikiLinks]]` materialize as `stub: true` notes. Inputs: `action` (`export`|`import`, default `export`), `namespace` (default `NeuroStrata`), `vault_path` (required), `output_dir` (export only; defaults to `vault_path`), `principal` (ReBAC principal, optional). Over HTTP the daemon validates `vault_path`/`output_dir` against its startup root and `allowed_external_dirs` before any filesystem access; over CLI/MCP the process cwd is the J6 boundary.
 
 ## Subject-Matter Domain Expertise & SKOS Taxonomy
 
@@ -63,6 +69,7 @@
 | POST | `/scenario` | Create a counterfactual scenario |
 | POST | `/action` | Apply a kinetic action (state machine mutation) |
 | POST | `/data-connector` | Execute a DataConnector command (list/describe/register-pointer/resolve/apply-effect/mediate) |
+| POST | `/vault-sync` | Bidirectional Vault-LD Markdown sync (export/import); `vault_path`/`output_dir` validated against the daemon startup root + `allowed_external_dirs` before any filesystem access |
 | GET | `/taxonomy` | Query SKOS concept graph |
 | POST | `/graphql` | Execute GraphQL queries over the ontology |
 

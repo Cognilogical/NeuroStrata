@@ -238,6 +238,48 @@ pub async fn process_mcp_request(
                         }
                     },
                     {
+                        "name": "neurostrata_ingest_bounded",
+                        "description": "Ontology-scoped bounded RDF classification + ingest (Capability F). Classify explicit subject/class/predicate/object candidates against ONLY the governed vocabulary of one domain under a finite query budget, SHACL-validate the emitted graph and the memory payload before ANY write, then commit exactly one batch memory. Fails closed on unsupported classes/predicates, oversized input, or any SHACL violation. Each candidate object is either {\"iri\": \"<absolute-iri>\"} or {\"literal\": {\"value\": \"...\", \"datatype\"?: \"<iri>\", \"language\"?: \"<tag>\"}}. Optional principal drives the ReBAC namespace write gate; reason feeds task-intent signals.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "Target project namespace." },
+                                "domain": { "type": "string", "description": "Governed domain slug; normalized before vocabulary selection." },
+                                "candidates": {
+                                    "type": "array",
+                                    "description": "Explicit classification candidates; non-empty and finite-capped.",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "subject": { "type": "string", "description": "Absolute subject IRI." },
+                                            "class": { "type": "string", "description": "Governed class term from the active ontology profile." },
+                                            "predicate": { "type": "string", "description": "Governed predicate IRI from the active ontology profile." },
+                                            "object": { "type": "object", "description": "Either {\"iri\": \"...\"} or {\"literal\": {\"value\": \"...\"}}." }
+                                        },
+                                        "required": ["subject", "class", "predicate", "object"]
+                                    }
+                                },
+                                "principal": { "type": "string", "description": "ReBAC principal for the namespace write gate (default admin)." },
+                                "user_id": { "type": "string", "description": "Owner id persisted on the batch memory." },
+                                "reason": { "type": "string", "description": "Optional reason; task-intent signals are derived from it." }
+                            },
+                            "required": ["namespace", "domain", "candidates"]
+                        },
+                        "outputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "ok": { "type": "boolean" },
+                                "id": { "type": "string" },
+                                "namespace": { "type": "string" },
+                                "domain": { "type": "string" },
+                                "triple_count": { "type": "integer" },
+                                "turtle": { "type": "string" },
+                                "error": { "type": "string" }
+                            },
+                            "required": ["ok"]
+                        }
+                    },
+                    {
                         "name": "neurostrata_list_namespaces",
                         "description": "List all existing project namespaces in the database. Use this to prevent hallucinating namespace names.",
                         "inputSchema": {
@@ -819,6 +861,21 @@ pub async fn process_mcp_request(
                         }
                     },
                     {
+                        "name": "neurostrata_vault_sync",
+                        "description": "Bidirectional W3C YAML-LD 1.0 / Vault-LD Markdown vault sync with Open JSON Canvas 1.0 topology export. action='export' writes one Markdown note per readable memory plus a Canvas file; action='import' walks the vault, converts Vault-LD notes to memories, and stores them only after secret-scan and SHACL pass. Unresolved WikiLinks become stub notes (stub:true). Read access follows ReBAC can_read_memory for the caller's principal: admin always passes, owners always pass, rows without an ACL are readable, restricted rows need a matching ACL entry.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "action": { "type": "string", "enum": ["export", "import"], "description": "Sync direction. Defaults to 'export'." },
+                                "namespace": { "type": "string", "description": "The exact project name." },
+                                "vault_path": { "type": "string", "description": "Directory of the Markdown vault. Must resolve under the caller's J6 boundary (daemon startup root or allowlist on HTTP; process cwd on CLI/MCP)." },
+                                "output_dir": { "type": "string", "description": "Directory for generated artifacts (export only). Defaults to vault_path." },
+                                "principal": { "type": "string", "description": "ReBAC principal for read filtering (export)." }
+                            },
+                            "required": ["vault_path"]
+                        }
+                    },
+                    {
                         "name": "neurostrata_export_canonical_rdf",
                         "description": "Export canonical RDF for a memory or an entire namespace. Inputs: namespace (optional), memory_id (optional), profile: 'local'|'mesh', format: 'n-quads'|'trig'. Returns { quads, canonical_hash }. Canonical hash claims apply only to n-quads. Local storage remains LadybugDB; this is a read-only projection.",
                         "inputSchema": {
@@ -1169,7 +1226,7 @@ pub async fn process_mcp_request(
                                 "namespace": { "type": "string", "description": "Project namespace." },
                                 "action": {
                                     "type": "string",
-                                    "enum": ["create", "stage_memory", "stage_twin", "apply_action", "evaluate_sparql", "diff", "commit", "drop", "list"],
+                                    "enum": ["create", "stage_memory", "stage_twin", "apply_action", "evaluate_sparql", "diff", "plan_ontology_diff", "commit", "drop", "list"],
                                     "description": "Scenario operation to perform."
                                 },
                                 "scenario_id": { "type": "string", "description": "Scenario ID (optional on create, required on stage_memory/stage_twin/apply_action/evaluate_sparql/diff/commit/drop)." },
@@ -1204,6 +1261,9 @@ pub async fn process_mcp_request(
                                 "query": { "type": "string", "description": "SPARQL SELECT/ASK/CONSTRUCT query when action is 'evaluate_sparql'." },
                                 "format": { "type": "string", "enum": ["json", "xml", "csv", "tsv"], "default": "json", "description": "SPARQL result format when action is 'evaluate_sparql'." },
                                 "compare_to_scenario_id": { "type": "string", "description": "Optional second scenario ID for side-by-side diff (defaults to comparing against live)." },
+                                "add_turtle": { "type": "string", "description": "Turtle/N-Quads additions staged in the ephemeral sandbox when action is 'plan_ontology_diff'." },
+                                "retract_triples": { "type": "array", "items": { "type": "string" }, "description": "Canonical N-Triple/N-Quad patterns retracted in the sandbox when action is 'plan_ontology_diff'." },
+                                "candidate_shacl_turtle": { "type": "string", "description": "Replacement SHACL shapes Turtle validated against the post-image when action is 'plan_ontology_diff'." },
                                 "enforce_shacl_on_commit": { "type": "boolean", "default": true, "description": "Reject commit if staged rows have SHACL violations (default true)." },
                                 "principal": { "type": "string", "description": "Optional requested principal (honored only for admin callers)." }
                             },
@@ -1550,6 +1610,14 @@ pub async fn process_mcp_request(
                                 }
                             }
                         }
+                        "neurostrata_ingest_bounded" => {
+                            result_text = handle_ingest_bounded(
+                                &arguments,
+                                emb.clone(),
+                                store.clone(),
+                            )
+                            .await;
+                        }
                         "neurostrata_search_memory" => {
                             result_text =
                                 handle_search_memory(arguments, emb.clone(), store.clone()).await;
@@ -1731,6 +1799,16 @@ pub async fn process_mcp_request(
                         }
                         "neurostrata_validate_shapes" => {
                             result_text = handle_validate_shapes(arguments, store.clone()).await;
+                        }
+                        "neurostrata_vault_sync" => {
+                            result_text = crate::vault_ld::vault_sync::handle_vault_sync(
+                                &arguments,
+                                store.clone(),
+                                emb.clone(),
+                                None,
+                                None,
+                            )
+                            .await;
                         }
                         "neurostrata_export_canonical_rdf" => {
                             result_text =
@@ -2713,9 +2791,20 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
         .await
     {
         Ok(hits) => {
+            // Capability C: attach the shared deprecation/boundary presentation
+            // to every governed-memory row before it leaves this surface.
+            // MemoryHit is a typed struct; decorate its serialized form so the
+            // structured fields appear in the JSON answer without changing the
+            // ranking struct.
+            let mut memory_values: Vec<serde_json::Value> = Vec::with_capacity(hits.len());
+            for hit in &hits {
+                let mut value = serde_json::to_value(hit).unwrap_or(serde_json::Value::Null);
+                crate::rdf::provenance::attach_presentation(&mut value, &hit.metadata, "content");
+                memory_values.push(value);
+            }
             let hit_ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
             let mut response = serde_json::json!({
-                "memories": hits,
+                "memories": memory_values,
                 "unsupported": false,
                 "path": path,
             });
@@ -2735,7 +2824,7 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
                             .unwrap_or(false);
                         let excluded: std::collections::HashSet<&str> =
                             exclude_ids.iter().map(String::as_str).collect();
-                        let filtered: Vec<serde_json::Value> = related_memories
+                        let mut filtered: Vec<serde_json::Value> = related_memories
                             .into_iter()
                             .filter(|m| {
                                 m.get("id")
@@ -2744,6 +2833,20 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
                                     .unwrap_or(true)
                             })
                             .collect();
+                        // Capability C: AST neighbors are recall material too.
+                        // Decorate each surviving entry from its own bounded
+                        // metadata so a deprecated/bounded neighbor cannot be
+                        // read as authoritative guidance. Clone the metadata
+                        // first to avoid aliasing the mutable entry.
+                        for entry in &mut filtered {
+                            let metadata = entry
+                                .get("metadata")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null);
+                            crate::rdf::provenance::attach_presentation(
+                                entry, &metadata, "content",
+                            );
+                        }
                         response["related_memories"] = serde_json::Value::Array(filtered);
                         response["related_memories_truncated"] =
                             serde_json::Value::Bool(related_truncated);
@@ -2784,6 +2887,7 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
         None => return "Missing 'id' parameter.".to_string(),
     };
     let namespace = resolve_namespace(&store, namespace).await;
+    let store_for_meta = store.clone();
 
     let relations: Vec<String> = match arguments.get("relations") {
         Some(Value::Array(arr)) => arr
@@ -2971,6 +3075,23 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
             }
 
             let mut body = serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);
+            // Capability C: traversal nodes carry a snippet but no metadata.
+            // Hydrate just the presentation fields so related/recall exposes the
+            // same banner and negative boundary as search and file lookup.
+            if let Some(nodes) = body.get_mut("nodes").and_then(serde_json::Value::as_array_mut) {
+                for node in nodes {
+                    let Some(id) = node.get("id").and_then(serde_json::Value::as_str) else {
+                        continue;
+                    };
+                    if let Ok(Some((_, payload))) = store_for_meta.get(&namespace, id).await {
+                        crate::rdf::provenance::attach_presentation(
+                            node,
+                            &payload.metadata,
+                            "snippet",
+                        );
+                    }
+                }
+            }
             if let Some(obj) = body.as_object_mut() {
                 obj.insert("unsupported".to_string(), serde_json::json!(false));
                 obj.insert("seed".to_string(), serde_json::json!(seed));
@@ -4629,6 +4750,20 @@ async fn handle_get_snapshot(
         None => true,
         Some(v) => v.is_null() || (v.as_i64().unwrap_or(0) > now),
     });
+    // Capability C: advisory freshness SLA scan over ALL active visible rows,
+    // computed before the top-5 truncation. Never blocks anything.
+    let stale_memory_rows = crate::task::gate::stale_memory_violations(&all_memories, now);
+    let stale_section = if stale_memory_rows.is_empty() {
+        String::new()
+    } else {
+        let mut section = String::from(
+            "### Advisory stale_memories (nonblocking — re-verify or supersede these rows):",
+        );
+        for row in &stale_memory_rows {
+            section.push_str(&format!("\n  - {} [{}]: {}", row.id, row.kind, row.detail));
+        }
+        section
+    };
     // Computed off the pre-truncation list too: global and pinned Golden Rules
     // must surface regardless of whether they made the top-5 by access_count.
     let golden_rules =
@@ -5105,7 +5240,22 @@ async fn handle_get_snapshot(
     let body = if all_memories.is_empty() {
         format!("No active memories found for namespace: {}", namespace)
     } else {
-        serde_json::to_string_pretty(&all_memories)
+        // Capability C: snapshot rows carry the same structured presentation
+        // and prepended banner as search/file/related rows.
+        let mut rows: Vec<serde_json::Value> = all_memories
+            .iter()
+            .filter_map(|r| serde_json::to_value(r).ok())
+            .collect();
+        for (row, source) in rows.iter_mut().zip(all_memories.iter()) {
+            if let Some(payload) = row.get_mut("payload") {
+                crate::rdf::provenance::attach_presentation(
+                    payload,
+                    &source.payload.metadata,
+                    "content",
+                );
+            }
+        }
+        serde_json::to_string_pretty(&rows)
             .map_err(|e| format!("Internal serialization error: {}", e))?
     };
     // Communities (N) section (§5.6): render when communities exist.
@@ -5272,6 +5422,9 @@ async fn handle_get_snapshot(
     }
     if !taxonomy_section.is_empty() {
         parts.push(taxonomy_section);
+    }
+    if !stale_section.is_empty() {
+        parts.push(stale_section);
     }
     if let Some(dr) = &doctor_report {
         parts.push(dr.clone());
@@ -5479,6 +5632,152 @@ async fn handle_validate_shapes(arguments: Value, store: Arc<dyn VectorStore>) -
         }
         Ok(None) => serde_json::json!({"ok":false,"error":"memory not found"}).to_string(),
         Err(e) => serde_json::json!({"ok":false,"error":e.to_string()}).to_string(),
+    }
+}
+
+/// Capability F MCP surface: strict, fail-closed bounded classification ingest.
+/// No permissive opt-out — every request passes the ReBAC namespace write gate,
+/// finite budget, governed-vocabulary checks and whole-batch SHACL validation
+/// before the single store write.
+async fn handle_ingest_bounded(
+    arguments: &Value,
+    emb: Arc<dyn Embedder>,
+    store: Arc<dyn VectorStore>,
+) -> String {
+    use crate::rdf::ingest::{
+        ingest_bounded_classification, BoundedClassificationRequest, CandidateLiteral,
+        CandidateObject, ClassificationCandidate,
+    };
+    use crate::traits::VectorStore as _;
+
+    let namespace_raw = arguments
+        .get("namespace")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if namespace_raw.trim().is_empty() {
+        return json!({"ok": false, "error": "namespace required"}).to_string();
+    }
+    let domain_raw = arguments
+        .get("domain")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if domain_raw.trim().is_empty() {
+        return json!({"ok": false, "error": "domain required"}).to_string();
+    }
+    let candidates_val = match arguments.get("candidates") {
+        Some(Value::Array(a)) => a,
+        _ => return json!({"ok": false, "error": "candidates must be an array"}).to_string(),
+    };
+
+    let namespace = resolve_namespace(&store, namespace_raw).await;
+    let Some(lb) = crate::traits::VectorStore::as_any(store.as_ref())
+        .downcast_ref::<crate::store::LadybugStore>()
+    else {
+        return json!({"ok": false, "error": "bounded ingest requires the graph store"}).to_string();
+    };
+
+    // ReBAC namespace write gate. The MCP path has no separate authenticated
+    // channel; "admin" is the harness principal and an explicit client
+    // principal is resolved through the same path as the taxonomy surface.
+    let effective = crate::rebac::resolve_principal(
+        "admin",
+        arguments.get("principal").and_then(|v| v.as_str()),
+    );
+    if !crate::rebac::can_write_namespace(lb, &namespace, Some(&effective)) {
+        return json!({
+            "ok": false,
+            "error": format!("write denied for principal {effective:?} on namespace {namespace:?}")
+        })
+        .to_string();
+    }
+
+    let mut candidates = Vec::with_capacity(candidates_val.len());
+    for candidate in candidates_val {
+        let subject = candidate.get("subject").and_then(|v| v.as_str());
+        let class = candidate.get("class").and_then(|v| v.as_str());
+        let predicate = candidate.get("predicate").and_then(|v| v.as_str());
+        let (Some(subject), Some(class), Some(predicate)) = (subject, class, predicate) else {
+            return json!({
+                "ok": false,
+                "error": "each candidate needs subject, class, predicate and object"
+            })
+            .to_string();
+        };
+        let object_val = candidate.get("object");
+        let object = if let Some(iri) = object_val
+            .and_then(|o| o.get("iri"))
+            .and_then(|v| v.as_str())
+        {
+            CandidateObject::Iri(iri.to_string())
+        } else {
+            let literal = object_val.and_then(|o| o.get("literal"));
+            let Some(value) = literal
+                .and_then(|l| l.get("value"))
+                .and_then(|v| v.as_str())
+            else {
+                return json!({
+                    "ok": false,
+                    "error": "object must be {\"iri\": \"...\"} or {\"literal\": {\"value\": \"...\"}}"
+                })
+                .to_string();
+            };
+            CandidateObject::Literal(CandidateLiteral {
+                value: value.to_string(),
+                datatype: literal
+                    .and_then(|l| l.get("datatype"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                language: literal
+                    .and_then(|l| l.get("language"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+            })
+        };
+        candidates.push(ClassificationCandidate {
+            subject: subject.to_string(),
+            class: class.to_string(),
+            predicate: predicate.to_string(),
+            object,
+        });
+    }
+
+    let user_id = arguments
+        .get("user_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or(effective.as_str())
+        .to_string();
+    let request = BoundedClassificationRequest {
+        domain: domain_raw.to_string(),
+        user_id,
+        candidates,
+        reason: arguments
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+    };
+
+    // Refresh so classification sees the current SHACL shapes/ontology.
+    lb.refresh_ontology(&namespace).await;
+    let index = lb.get_ontology(&namespace);
+    let budget = crate::rdf::ontology::QueryBudget {
+        max_ms: 5_000,
+        max_nodes: 10_000,
+    };
+
+    match ingest_bounded_classification(lb, &namespace, &index, &budget, &request, emb.as_ref())
+        .await
+    {
+        Ok(outcome) => json!({
+            "ok": true,
+            "id": outcome.id,
+            "namespace": namespace,
+            "domain": crate::domain::normalize_domain_slug(domain_raw)
+                .unwrap_or_else(|| domain_raw.to_string()),
+            "triple_count": outcome.triple_count,
+            "turtle": outcome.turtle,
+        })
+        .to_string(),
+        Err(err) => json!({"ok": false, "error": err.to_string()}).to_string(),
     }
 }
 
@@ -7551,6 +7850,59 @@ pub(crate) async fn handle_scenario_with_auth(
                 Err(e) => serde_json::json!({
                     "ok": false,
                     "action": "diff",
+                    "error": e,
+                })
+                .to_string(),
+            }
+        }
+        "plan_ontology_diff" => {
+            let scenario_id = arguments
+                .get("scenario_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string);
+            let add_turtle = arguments
+                .get("add_turtle")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let retract_triples: Vec<String> = arguments
+                .get("retract_triples")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let candidate_shacl_turtle = arguments
+                .get("candidate_shacl_turtle")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let request = crate::rdf::ontology::OntologyPlanRequest {
+                namespace: namespace.clone(),
+                scenario_id,
+                add_turtle,
+                retract_triples,
+                candidate_shacl_turtle,
+            };
+            match crate::rdf::scenario::plan_ontology_diff(
+                lb_store,
+                &namespace,
+                &request,
+                security.requested_principal.as_deref(),
+            )
+            .await
+            {
+                Ok(report) => serde_json::json!({
+                    "ok": true,
+                    "action": "plan_ontology_diff",
+                    "namespace": namespace,
+                    "plan": report,
+                })
+                .to_string(),
+                Err(e) => serde_json::json!({
+                    "ok": false,
+                    "action": "plan_ontology_diff",
                     "error": e,
                 })
                 .to_string(),
@@ -10449,7 +10801,13 @@ pub(crate) fn format_memory(id: &str, payload: &MemoryPayload) -> String {
     if let Some(note) = governance_conflict_note(&payload.content, &payload.metadata) {
         out.push_str(&note);
     }
-    out
+    // Capability C: deprecated/bounded rows announce themselves before any
+    // other line so stale guidance cannot be read as authoritative first.
+    format!(
+        "{}{}",
+        crate::rdf::provenance::presentation_prefix(&payload.metadata),
+        out
+    )
 }
 
 /// Maximum UTF-8 bytes of evidence suffix per result.
@@ -12935,6 +13293,180 @@ mod tests {
         (store, id)
     }
 
+    // ── Capability C remediation: production presentation surfaces ────────
+    async fn store_with_deprecated_rule(namespace: &str) -> (Arc<dyn VectorStore>, String) {
+        let dir = std::env::temp_dir().join(format!("ns-capc-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database"),
+        );
+        store.init(namespace).await.expect("init schema");
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut p = payload("legacy podman rule that was superseded");
+        p.metadata = serde_json::json!({
+            "deprecation": {
+                "status": "deprecated",
+                "superseded_by": "mem-replacement-42",
+                "reason": "replaced by the podman v2 rule",
+                "effective_at": 1700000000
+            },
+            "not_definition": "does not apply to rootless podman sockets",
+        });
+        let vector = StubEmbedder.embed("legacy podman rule").await.unwrap();
+        store
+            .upsert(namespace, &id, vector, p)
+            .await
+            .expect("seed deprecated rule");
+        (store, id)
+    }
+
+    #[test]
+    fn format_memory_prepends_exact_banner_and_not_definition() {
+        let mut p = payload("legacy guidance");
+        p.metadata = serde_json::json!({
+            "deprecation": {
+                "status": "deprecated",
+                "superseded_by": "mem-7",
+                "reason": "superseded by new rule",
+                "effective_at": 1
+            },
+            "not_definition": "not valid for external APIs",
+        });
+        let rendered = format_memory("mem-1", &p);
+        assert!(
+            rendered.starts_with(
+                "[DEPRECATED — SUPERSEDED BY mem-7: superseded by new rule]\nNOT DEFINITION: not valid for external APIs\n"
+            ),
+            "banner + boundary must be prepended deterministically: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_memory_surface_emits_deprecation_presentation() {
+        let (store, _id) = store_with_deprecated_rule("probe").await;
+        let text = handle_search_memory(
+            serde_json::json!({ "namespace": "probe", "query": "podman", "exact": true }),
+            Arc::new(StubEmbedder),
+            store,
+        )
+        .await;
+        assert!(
+            text.contains("[DEPRECATED — SUPERSEDED BY mem-replacement-42: replaced by the podman v2 rule]"),
+            "search must emit the exact banner: {text}"
+        );
+        assert!(
+            text.contains("NOT DEFINITION: does not apply to rootless podman sockets"),
+            "search must emit the boundary: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memories_for_file_surface_emits_structured_deprecation_presentation() {
+        let (store, rule_id) = store_with_deprecated_rule("probe").await;
+        let lb = crate::traits::VectorStore::as_any(store.as_ref())
+            .downcast_ref::<crate::store::LadybugStore>()
+            .expect("ladybug store");
+        lb.with_conn(move |conn| {
+            conn.query(
+                "CREATE (m:Memory {id: 'src/lib.rs', namespace: 'probe', content: 'c', user_id: 'u', memory_type: 'file', agent_name: 'a', location: 'src/lib.rs', location_lines: '', metadata: '{}', embedding: [0.0,0.0,0.0,0.0]})"
+            )?;
+            conn.query(&format!(
+                "MERGE (a:Memory {{id: '{rule_id}'}}), (b:Memory {{id: 'src/lib.rs'}}) MERGE (a)-[r:GOVERNS {{source: 'test', valid_from: 0, valid_to: 0, generation: 0, extractor: 'test', evidence_id: 'e', origin: 'local'}}]->(b)"
+            ))?;
+            Ok(())
+        })
+        .await
+        .expect("seed file + edge");
+        let text = handle_memories_for_file(
+            serde_json::json!({ "namespace": "probe", "path": "src/lib.rs", "include_ast_edges": false }),
+            store,
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&text).expect("valid JSON");
+        let hit = parsed["memories"][0].clone();
+        assert_eq!(
+            hit["deprecation_banner"],
+            json!("[DEPRECATED — SUPERSEDED BY mem-replacement-42: replaced by the podman v2 rule]"),
+            "memories_for_file must carry the structured banner: {text}"
+        );
+        assert_eq!(
+            hit["not_definition"],
+            json!("does not apply to rootless podman sockets"),
+            "memories_for_file must carry the structured boundary: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn related_surface_emits_deprecation_presentation() {
+        let (store, rule_id) = store_with_deprecated_rule("probe").await;
+        let lb = crate::traits::VectorStore::as_any(store.as_ref())
+            .downcast_ref::<crate::store::LadybugStore>()
+            .expect("ladybug store");
+        let seed_rule_id = rule_id.clone();
+        lb.with_conn(move |conn| {
+            conn.query(
+                "CREATE (m:Memory {id: 'mem-neighbor', namespace: 'probe', content: 'neighbor', user_id: 'u', memory_type: 'fact', agent_name: 'a', location: '', location_lines: '', metadata: '{}', embedding: [0.0,0.0,0.0,0.0]})"
+            )?;
+            conn.query(&format!(
+                "MERGE (a:Memory {{id: '{seed_rule_id}'}}), (b:Memory {{id: 'mem-neighbor'}}) MERGE (a)-[r:RELATES_TO {{source: 'test', valid_from: 0, valid_to: 0, generation: 0, extractor: 'test', evidence_id: 'e', origin: 'local'}}]->(b)"
+            ))?;
+            Ok(())
+        })
+        .await
+        .expect("seed related neighbor");
+        let text = handle_related(
+            serde_json::json!({ "namespace": "probe", "id": rule_id, "max_hops": 1 }),
+            store,
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&text).expect("valid JSON");
+        let seed = parsed["nodes"]
+            .as_array()
+            .expect("nodes array")
+            .iter()
+            .find(|n| n["id"] == json!(rule_id))
+            .expect("seed node present");
+        assert_eq!(
+            seed["deprecation_banner"],
+            json!("[DEPRECATED — SUPERSEDED BY mem-replacement-42: replaced by the podman v2 rule]"),
+            "related must carry the structured banner: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_surfaces_advisory_stale_memories_for_all_active_rows() {
+        let (store, _) = store_with_one_rule("probe").await;
+        // Add a stale non-task fact via the store trait.
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut p = payload("a fact about an external API that decayed");
+        p.memory_type = "fact".to_string();
+        p.metadata = serde_json::json!({
+            "stale_after": "2000-01-01T00:00:00Z",
+        });
+        store
+            .upsert(
+                "probe",
+                &id,
+                StubEmbedder.embed("decayed external API fact").await.unwrap(),
+                p,
+            )
+            .await
+            .expect("seed stale fact");
+        let result = handle_get_snapshot(serde_json::json!({ "namespace": "probe" }), store).await;
+        let text = result.expect("snapshot succeeds");
+        assert!(
+            text.contains("stale_memories"),
+            "snapshot must name the advisory section: {text}"
+        );
+        assert!(
+            text.contains("advisory"),
+            "snapshot must label staleness advisory (nonblocking): {text}"
+        );
+        assert!(
+            text.contains(&id) || text.contains("external API"),
+            "snapshot must surface the stale non-task row: {text}"
+        );
+    }
+
     /// A backend without graph-read must answer `unsupported: true`, never an
     /// empty list -- which a caller would misread as "no rules govern this".
     #[tokio::test]
@@ -13027,6 +13559,110 @@ mod tests {
         assert!(
             parsed.get("ast_summary").is_none(),
             "ast_summary omitted: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memories_for_file_decorates_ast_related_deprecated_and_bounded_neighbors() {
+        let (store, rule_id) = store_with_one_rule("probe").await;
+        let lb = crate::traits::VectorStore::as_any(store.as_ref())
+            .downcast_ref::<crate::store::ladybug::LadybugStore>()
+            .expect("ladybug store");
+        let neighbor_meta = serde_json::to_string(&serde_json::json!({
+            "deprecation": {
+                "status": "deprecated",
+                "superseded_by": "mem-99",
+                "reason": "retired AST neighbor",
+                "effective_at": 1700000000
+            },
+            "not_definition": "not valid for async AST edges",
+        }))
+        .expect("serialize neighbor metadata");
+        let seed_rule_id = rule_id.clone();
+        lb.with_conn(move |conn| {
+            // The file node id must equal the path for discover_candidates.
+            conn.query(
+                "CREATE (m:Memory {id: 'src/lib.rs', namespace: 'probe', content: 'c', user_id: 'u', memory_type: 'file', agent_name: 'a', location: 'src/lib.rs', location_lines: '', metadata: '{\"imports\": [\"pkg/other.rs\"]}', embedding: [0.0,0.0,0.0,0.0]})"
+            )?;
+            conn.query(&format!(
+                "MERGE (a:Memory {{id: '{seed_rule_id}'}}), (b:Memory {{id: 'src/lib.rs'}}) MERGE (a)-[r:GOVERNS {{source: 'test', valid_from: 0, valid_to: 0, generation: 0, extractor: 'test', evidence_id: 'e', origin: 'local'}}]->(b)"
+            ))?;
+            conn.query(&format!(
+                "CREATE (m:Memory {{id: 'mem-dep-neighbor', namespace: 'probe', content: 'old AST neighbor guidance', user_id: 'u', memory_type: 'fact', agent_name: 'a', location: 'src/other.rs', location_lines: '', metadata: '{neighbor_meta}', embedding: [0.0,0.0,0.0,0.0]}})"
+            ))?;
+            conn.query(&format!(
+                "MERGE (a:Memory {{id: '{seed_rule_id}'}}), (b:Memory {{id: 'mem-dep-neighbor'}}) MERGE (a)-[r:RELATES_TO {{source: 'test', valid_from: 0, valid_to: 0, generation: 0, extractor: 'test', evidence_id: 'e', origin: 'local'}}]->(b)"
+            ))?;
+            Ok(())
+        })
+        .await
+        .expect("seed file + deprecated AST neighbor");
+
+        let banner = "[DEPRECATED — SUPERSEDED BY mem-99: retired AST neighbor]";
+        let neighbor_from = |text: &str| -> serde_json::Value {
+            let parsed: Value = serde_json::from_str(text).expect("valid JSON");
+            parsed["related_memories"]
+                .as_array()
+                .expect("related_memories array")
+                .iter()
+                .find(|m| m["id"] == serde_json::json!("mem-dep-neighbor"))
+                .cloned()
+                .expect("deprecated AST neighbor present")
+        };
+
+        let text = handle_memories_for_file(
+            serde_json::json!({
+                "namespace": "probe", "path": "src/lib.rs", "include_ast_edges": true,
+            }),
+            store.clone(),
+        )
+        .await;
+        let neighbor = neighbor_from(&text);
+        assert_eq!(
+            neighbor["deprecation_banner"], serde_json::json!(banner),
+            "AST related_memories must carry the exact banner: {text}"
+        );
+        assert_eq!(
+            neighbor["not_definition"],
+            serde_json::json!("not valid for async AST edges"),
+            "AST related_memories must carry the structured boundary: {text}"
+        );
+        let rendered = neighbor["content"].as_str().expect("content string");
+        assert!(
+            rendered.starts_with(banner),
+            "banner must be prepended deterministically to neighbor content: {rendered}"
+        );
+        assert!(
+            rendered.contains("NOT DEFINITION: not valid for async AST edges"),
+            "negative boundary must be prepended to neighbor content: {rendered}"
+        );
+        let parsed: Value = serde_json::from_str(&text).expect("valid JSON");
+        assert!(
+            parsed["related_memories_truncated"].is_boolean(),
+            "truncation flag preserved: {text}"
+        );
+
+        // Exclusion and flags still work on the decorated array.
+        let excluded = handle_memories_for_file(
+            serde_json::json!({
+                "namespace": "probe", "path": "src/lib.rs", "include_ast_edges": true,
+                "exclude_ids": ["mem-dep-neighbor"],
+            }),
+            store,
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&excluded).expect("valid JSON");
+        assert!(
+            parsed["related_memories"]
+                .as_array()
+                .expect("related_memories array")
+                .iter()
+                .all(|m| m["id"] != serde_json::json!("mem-dep-neighbor")),
+            "exclude_ids must still remove the neighbor: {excluded}"
+        );
+        assert!(
+            parsed["related_memories_truncated"].is_boolean(),
+            "truncation flag preserved with exclude_ids: {excluded}"
         );
     }
 
@@ -15239,7 +15875,7 @@ mod tests {
     /// Clients pin this list; a silent rename orphans their wiring.
     /// Keep in sync with the entries in `process_mcp_request` -> `"tools/list"`.
     #[tokio::test]
-    async fn tools_list_carries_all_thirty_seven_tools_in_a_stable_order() {
+    async fn tools_list_carries_all_thirty_eight_tools_in_a_stable_order() {
         let (store, _) = store_with_one_rule("probe").await;
         let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
         let request = JsonRpcRequest {
@@ -15266,6 +15902,7 @@ mod tests {
                 "neurostrata_get_snapshot",
                 "neurostrata_ingest_directory",
                 "neurostrata_ingest_scip",
+                "neurostrata_ingest_bounded",
                 "neurostrata_list_namespaces",
                 "neurostrata_search_memory",
                 "neurostrata_rebuild_lexical_index",
@@ -15293,6 +15930,7 @@ mod tests {
                 "neurostrata_feedback",
                 "neurostrata_distill",
                 "neurostrata_validate_shapes",
+                "neurostrata_vault_sync",
                 "neurostrata_export_canonical_rdf",
                 "neurostrata_validate_canonical_rdf",
                 "neurostrata_sparql_query",
@@ -15446,6 +16084,83 @@ mod tests {
         assert!(
             !loc_desc.contains("Memories MUST reference"),
             "locations description must never claim memories MUST reference documents: {loc_desc:?}"
+        );
+    }
+
+    /// Capability F review fix: the bounded classifier must be a real MCP
+    /// surface, not a module-only API. RED until schema + dispatch are wired.
+    #[tokio::test]
+    async fn mcp_surface_wires_strict_ingest_bounded_tool() {
+        let ns = format!("ns-mcp-ib-{}", uuid::Uuid::new_v4());
+        let (store, _) = store_with_one_rule(&ns).await;
+        let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+        let (bus, _) = recording_bus();
+
+        let list_req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: "tools/list".to_string(),
+            params: Some(serde_json::json!({})),
+        };
+        let list_resp = process_mcp_request(
+            list_req,
+            Arc::new(StubEmbedder),
+            store.clone(),
+            ingests.clone(),
+            None,
+            bus.clone(),
+        )
+        .await;
+        let tool = list_resp["result"]["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .find(|t| t["name"] == "neurostrata_ingest_bounded")
+            .expect("neurostrata_ingest_bounded must be exposed over MCP");
+        let required = tool["inputSchema"]["required"]
+            .as_array()
+            .expect("inputSchema.required");
+        for field in ["namespace", "domain", "candidates"] {
+            assert!(
+                required.iter().any(|v| v == field),
+                "required schema field missing: {field}"
+            );
+        }
+
+        let call_req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(2)),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "name": "neurostrata_ingest_bounded",
+                "arguments": {
+                    "namespace": ns,
+                    "domain": "memory",
+                    "candidates": []
+                }
+            })),
+        };
+        let call_resp = process_mcp_request(
+            call_req,
+            Arc::new(StubEmbedder),
+            store,
+            ingests,
+            None,
+            bus,
+        )
+        .await;
+        let text = call_resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool result text");
+        assert!(
+            !text.contains("Unknown tool"),
+            "dispatch must reach the real handler, got: {text}"
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(text).expect("handler returns structured JSON");
+        assert_eq!(
+            value["ok"], false,
+            "an empty candidate batch must fail closed through the MCP surface"
         );
     }
 
@@ -19144,5 +19859,30 @@ mod context_plan_tests {
             "active_session.json golden_rules must include global NO PYTHON rule: {golden_arr:?}"
         );
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn scenario_plan_ontology_diff_dispatches_zero_mutation_report() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store: Arc<dyn crate::traits::VectorStore> = Arc::new(
+            crate::store::LadybugStore::for_testing(&tmp.path().join("db"), 4)
+                .expect("open temp database"),
+        );
+        store.init("probe-plan").await.expect("init namespace");
+        let args = serde_json::json!({
+            "namespace": "probe-plan",
+            "action": "plan_ontology_diff",
+        });
+        let out = handle_scenario(&args, Arc::new(LocalStubEmbedder), store.clone()).await;
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert_eq!(parsed["ok"], true, "dispatch failed: {out}");
+        assert_eq!(parsed["action"], "plan_ontology_diff");
+        assert_eq!(parsed["namespace"], "probe-plan");
+        let plan = &parsed["plan"];
+        assert_eq!(plan["namespace"], "probe-plan");
+        assert!(plan["added_entailments"].as_array().unwrap().is_empty());
+        assert!(plan["removed_entailments"].as_array().unwrap().is_empty());
+        assert!(plan["schema_ddl_diff"].as_array().unwrap().is_empty());
+        assert_eq!(plan["validation_conforms"], true);
     }
 }

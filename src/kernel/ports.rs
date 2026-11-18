@@ -97,6 +97,15 @@ pub trait OntologyPort: Send + Sync {
 
     /// Inspect an action receipt’s kinetic state (bound, reverted, etc.).
     async fn verify_active_action_receipt(&self, namespace: &str, receipt_id: &str, pointer_id: &str, pool_id: &str) -> Result<KernelActionReceiptState>;
+
+    /// Zero-mutation ontology change-impact plan (spec §3.2). Read-only: never
+    /// commits to the store, scenarios, tasks, edges or the ontology cache.
+    async fn plan_ontology_diff(
+        &self,
+        namespace: &str,
+        request: &crate::rdf::ontology::OntologyPlanRequest,
+        principal: Option<&str>,
+    ) -> Result<crate::rdf::ontology::OntologyPlanReport>;
 }
 
 /// Persistent `MemoryPort` backed by `LadybugStore`.
@@ -526,5 +535,21 @@ impl OntologyPort for LadybugOntologyPort {
             }
         }
         Ok(KernelActionReceiptState::TargetMismatch)
+    }
+
+    async fn plan_ontology_diff(
+        &self,
+        namespace: &str,
+        request: &crate::rdf::ontology::OntologyPlanRequest,
+        principal: Option<&str>,
+    ) -> Result<crate::rdf::ontology::OntologyPlanReport> {
+        crate::rdf::scenario::plan_ontology_diff(
+            self.ladybug_store(),
+            namespace,
+            request,
+            principal,
+        )
+        .await
+        .map_err(anyhow::Error::msg)
     }
 }

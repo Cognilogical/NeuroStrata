@@ -47,6 +47,7 @@ mod registry;
 mod retention;
 mod search;
 mod secrets;
+mod semantic_eval;
 mod server;
 mod setup;
 mod source_context;
@@ -59,6 +60,7 @@ mod telemetry;
 mod time_series;
 mod tools;
 mod traits;
+mod vault_ld;
 mod workflow;
 
 use crate::traits::SearchResult;
@@ -210,6 +212,26 @@ enum Commands {
         /// Optional namespace to record latency samples into TimeSeriesStore
         #[arg(long)]
         record_metrics: Option<String>,
+    },
+
+    /// Run offline semantic competency and four-arm retrieval evaluation gate
+    #[command(name = "semantic-eval")]
+    SemanticEval {
+        /// Strict competency fixture path
+        #[arg(long)]
+        competency: std::path::PathBuf,
+        /// Strict retrieval fixture path
+        #[arg(long)]
+        retrieval: std::path::PathBuf,
+        /// Number of measured iterations (warmup excluded); must be >= 3
+        #[arg(long, default_value_t = 3)]
+        iterations: usize,
+        /// Optional path for the strict JSON evidence receipt
+        #[arg(long)]
+        output: Option<std::path::PathBuf>,
+        /// Exit nonzero on any validation, execution, or gate failure
+        #[arg(long)]
+        check: bool,
     },
 
     /// Report what the thalamic bus has done since the daemon started
@@ -604,6 +626,21 @@ enum Commands {
     DataConnector {
         #[command(subcommand)]
         action: DataConnectorCommands,
+    },
+
+    /// Vault-LD sync: export/import vault notes + Canvas topology
+    #[command(name = "vault-sync")]
+    VaultSync {
+        /// Sync direction: export (memories -> vault) or import (vault -> memories)
+        action: String,
+        /// The exact project name
+        namespace: String,
+        /// Directory of the Markdown vault
+        vault_path: String,
+        /// Directory for generated artifacts (export only)
+        output_dir: String,
+        /// Optional ReBAC principal
+        principal: Option<String>,
     },
 }
 
@@ -1212,6 +1249,26 @@ enum ScenarioCommands {
         /// Scenario ID
         scenario_id: String,
     },
+    /// Zero-mutation ontology blast-radius & semantic closure diff (dry run)
+    PlanOntologyDiff {
+        /// Target namespace
+        namespace: String,
+        /// Optional overlay scenario ID (defaults to active namespace)
+        #[arg(long)]
+        scenario_id: Option<String>,
+        /// Turtle/N-Quads additions staged in the ephemeral sandbox
+        #[arg(long)]
+        add_turtle: Option<String>,
+        /// Canonical N-Triple/N-Quad patterns retracted in the sandbox
+        #[arg(long)]
+        retract_triples: Vec<String>,
+        /// Replacement SHACL shapes Turtle validated against the post-image
+        #[arg(long)]
+        candidate_shacl_turtle: Option<String>,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
     /// List active scenario overlays in a namespace
     List {
         /// Target namespace
@@ -1377,6 +1434,33 @@ fn scenario_command_to_json(scenario: &ScenarioCommands) -> anyhow::Result<serde
             "action": "drop",
             "scenario_id": scenario_id,
         })),
+        ScenarioCommands::PlanOntologyDiff {
+            namespace,
+            scenario_id,
+            add_turtle,
+            retract_triples,
+            candidate_shacl_turtle,
+            principal,
+        } => {
+            let mut body = serde_json::json!({
+                "namespace": namespace,
+                "action": "plan_ontology_diff",
+                "retract_triples": retract_triples,
+            });
+            if let Some(id) = scenario_id {
+                body["scenario_id"] = serde_json::json!(id);
+            }
+            if let Some(t) = add_turtle {
+                body["add_turtle"] = serde_json::json!(t);
+            }
+            if let Some(sh) = candidate_shacl_turtle {
+                body["candidate_shacl_turtle"] = serde_json::json!(sh);
+            }
+            if let Some(p) = principal {
+                body["principal"] = serde_json::json!(p);
+            }
+            Ok(body)
+        }
         ScenarioCommands::List { namespace } => Ok(serde_json::json!({
             "namespace": namespace,
             "action": "list",
@@ -6476,6 +6560,31 @@ async fn run() -> anyhow::Result<()> {
                     }
                 }
             }
+            Commands::SemanticEval {
+                competency,
+                retrieval,
+                iterations,
+                output,
+                check,
+            } => {
+                let outcome = crate::semantic_eval::run_semantic_eval(
+                    &competency,
+                    &retrieval,
+                    iterations,
+                )
+                .await;
+                let json = serde_json::to_string_pretty(&outcome.receipt)?;
+                if let Some(path) = &output {
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(path, &json)?;
+                }
+                println!("{json}");
+                if check && !outcome.passed {
+                    std::process::exit(1);
+                }
+            }
             Commands::BusMetrics => {
                 // Answered from the daemon, never from a bus built here: the
                 // pulses are emitted by the daemon that owns the store, so a
@@ -8396,6 +8505,32 @@ async fn run() -> anyhow::Result<()> {
                             eprintln!("Warning: failed to clear export freshness: {e}");
                         }
                     }
+                    Commands::VaultSync {
+                        action,
+                        namespace,
+                        vault_path,
+                        output_dir,
+                        principal,
+                    } => {
+                        use crate::vault_ld::vault_sync::handle_vault_sync;
+                        let args = serde_json::json!({
+                            "action": action,
+                            "namespace": namespace,
+                            "vault_path": vault_path,
+                            "output_dir": output_dir,
+                            "principal": principal,
+                        });
+                        let embedder = build_embedder()?;
+                        let response = handle_vault_sync(
+                            &args,
+                            vector_store.clone(),
+                            embedder,
+                            None,
+                            None,
+                        )
+                        .await;
+                        println!("{}", response);
+                    }
                     Commands::NormalizeMetadata { namespace } => {
                         let embedder = build_embedder()?;
                         prepare_fallback_write_store(&vector_store, &embedder, &namespace)
@@ -8677,6 +8812,7 @@ async fn run() -> anyhow::Result<()> {
                     | Commands::DataConnector { .. }
                     | Commands::Hooks { .. }
                     | Commands::Bench { .. }
+                    | Commands::SemanticEval { .. }
                     // THE OUTER match already handles Learn (src/main.rs ~2822);
                     // this inner catch-all can never see it.
                     | Commands::Learn { .. } => unreachable!(),
