@@ -12,7 +12,11 @@
 //! - **Absolute paths of either platform are recognized on any host**
 //!   ([`is_absolute_any`]): a daemon on Linux can be handed a Windows path by
 //!   its client. `\` and `/` are both separators; the Win32 verbatim (`\\?\`)
-//!   and device (`\\.\`) prefixes are dropped.
+//!   and device (`\\.\`) prefixes are dropped. A UNC path spelled with
+//!   backslashes (`\\server\share`) is Windows on any host. Any other pair of
+//!   leading separators (`//`, `/\`, `\/`) is UNC only on a Windows host; on
+//!   Linux and macOS it is the POSIX root `/`, as those systems read it. So a
+//!   Windows client must spell a UNC path with backslashes for a daemon there.
 //! - **Comparison** ([`relative_to`]) normalizes separators, not case. The
 //!   only case folded is the drive letter, which Windows tools spell either
 //!   way (`c:\x` from some shells, `C:\x` from others) for the same volume.
@@ -54,10 +58,23 @@ impl AbsPath {
 /// Parse `raw` as an absolute path of either platform, or `None` when it is
 /// relative. `.` and `..` components are resolved lexically.
 fn parse_absolute(raw: &str) -> Option<AbsPath> {
+    // POSIX leaves a leading `//` to the system; Linux and macOS read it as
+    // `/`. Off Windows only two backslashes (`\\server`) are UNC: that is how
+    // a Windows client spells it. Any other pair of leading separators (`//`,
+    // `/\`, `\/`) is the POSIX root there.
+    let lead = raw.as_bytes();
+    let posix_double_slash = !cfg!(windows)
+        && lead.len() >= 2
+        && matches!(lead[0], b'/' | b'\\')
+        && matches!(lead[1], b'/' | b'\\')
+        && !(lead[0] == b'\\' && lead[1] == b'\\');
     let forward = raw.replace('\\', "/");
     let mut rest: &str = &forward;
     let mut unc = false;
     for verbatim in ["//?/", "//./"] {
+        if posix_double_slash {
+            break;
+        }
         if let Some(after) = rest.strip_prefix(verbatim) {
             if let Some(share) = after
                 .strip_prefix("UNC/")
@@ -84,7 +101,7 @@ fn parse_absolute(raw: &str) -> Option<AbsPath> {
             format!("{}:", (bytes[0] as char).to_ascii_uppercase()),
             rest.get(2..).unwrap_or(""),
         )
-    } else if unc || rest.starts_with("//") {
+    } else if unc || (rest.starts_with("//") && !posix_double_slash) {
         let mut segments = rest.trim_start_matches('/').splitn(3, '/');
         let server = segments.next().filter(|s| !s.is_empty())?;
         let share = segments.next().filter(|s| !s.is_empty())?;
@@ -532,6 +549,47 @@ mod tests {
         for raw in ["src/lib.rs", r"src\lib.rs", "C:lib.rs", "./a", "../a"] {
             assert!(!is_absolute_any(raw), "{raw}");
         }
+    }
+
+    #[test]
+    fn a_backslash_unc_path_is_windows_on_every_host() {
+        let unc = parse_absolute(r"\\server\share\example-project\src\lib.rs").unwrap();
+        assert!(unc.windows);
+        assert_eq!(unc.root, "//server/share");
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn a_forward_double_slash_is_the_posix_root_off_windows() {
+        // Linux and macOS read `//repo/src/lib.rs` as `/repo/src/lib.rs`.
+        let parsed = parse_absolute("//repo/src/lib.rs").unwrap();
+        assert!(!parsed.windows);
+        assert_eq!(parsed.to_path_string(), "/repo/src/lib.rs");
+        assert_eq!(
+            relative_to("//repo/src/lib.rs", "/repo").as_deref(),
+            Some("src/lib.rs")
+        );
+        assert_eq!(
+            relative_to("/repo/src/lib.rs", "//repo").as_deref(),
+            Some("src/lib.rs")
+        );
+        // Mixed separators follow the same rule; two backslashes stay UNC.
+        for mixed in [r"/\repo/src/lib.rs", r"\/repo/src/lib.rs"] {
+            assert!(!parse_absolute(mixed).unwrap().windows, "{mixed}");
+        }
+        assert!(parse_absolute(r"\\server\share\x").unwrap().windows);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_forward_double_slash_is_unc_on_windows() {
+        let parsed = parse_absolute("//server/share/src/lib.rs").unwrap();
+        assert!(parsed.windows);
+        assert_eq!(parsed.root, "//server/share");
+        assert_eq!(
+            relative_to("//server/share/src/lib.rs", r"\\server\share").as_deref(),
+            Some("src/lib.rs")
+        );
     }
 
     #[test]
