@@ -724,6 +724,7 @@ fn persist_active_session_file_with_home(
         for key in ["task_id", "status", "session_id", "subagent_prompt_injection"] {
             active.remove(key);
         }
+        active.insert("updated_at".to_string(), json!(machine::timestamp()));
     }
 
     if std::fs::create_dir_all(&ns_dir).is_ok() {
@@ -845,6 +846,43 @@ fn seed_expand_next_hops(namespace: &str, seeds: &[String], edges: &[Value]) -> 
         }
     }
     actions
+}
+
+/// When task `task_id` stops being in progress (completed, released, blocked),
+/// remove its fields from the session file at the namespace's registered
+/// project root, the file `task_claim` wrote, so the next session start does
+/// not announce a finished task. Only a file that still names this task is
+/// touched: another task claimed since keeps its fields. Best effort.
+pub(crate) async fn clear_finished_task_from_session_file(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    task_id: &str,
+) {
+    let rid = crate::registry::registry_row_id(namespace);
+    let Ok(Some((_, registry))) = store.get(namespace, &rid).await else {
+        return;
+    };
+    let Some(root) = registry.metadata.get("project_root").and_then(|v| v.as_str()) else {
+        return;
+    };
+    let session_path = std::path::Path::new(root).join(".NeuroStrata").join("active_session.json");
+    let Some(mut active) = std::fs::read_to_string(&session_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.as_object().cloned())
+    else {
+        return;
+    };
+    if active.get("task_id").and_then(|v| v.as_str()) != Some(task_id) {
+        return;
+    }
+    for key in ["task_id", "status", "session_id", "subagent_prompt_injection"] {
+        active.remove(key);
+    }
+    active.insert("updated_at".to_string(), json!(machine::timestamp()));
+    if let Ok(serialized) = serde_json::to_string_pretty(&Value::Object(active)) {
+        let _ = std::fs::write(&session_path, serialized);
+    }
 }
 
 /// Auto-retrieve relevant governing rules, memories, code symbols, and 1-hop
@@ -2744,6 +2782,9 @@ pub async fn handle_task_update(
     if let Err(e) = save_task(&store, &namespace, &id, vector, task.payload.clone()).await {
         return e;
     }
+    if task.status() != Status::InProgress {
+        clear_finished_task_from_session_file(&store, &namespace, &id).await;
+    }
     let event_id = arg_str(&args, "event_id")
         .unwrap_or(&format!("update-{}", id))
         .to_string();
@@ -3431,6 +3472,7 @@ pub async fn handle_task_complete(
         }
     }
     save_task(&store, &namespace, &id, vector, completed.payload.clone()).await?;
+    clear_finished_task_from_session_file(&store, &namespace, &id).await;
     let event_id = arg_str(&args, "event_id")
         .unwrap_or(&format!("complete-{}", id))
         .to_string();

@@ -23929,6 +23929,10 @@ mod tests {
                 assert!(released.contains("\"open\""), "release failed: {}", released);
             }
         }
+        // Ending the task already clears it, before any snapshot runs: a
+        // session that ends right after would otherwise leave it for the next.
+        let ended = read_session();
+        assert!(ended.get("task_id").is_none(), "cleared when the task ended: {ended}");
 
         handle_get_snapshot(snapshot_args, store.clone())
             .await
