@@ -196,7 +196,7 @@ fn without_governed_slash(payload: &crate::traits::MemoryPayload) -> crate::trai
     if let Some(governs) = bare.metadata.get_mut("governs").and_then(|g| g.as_array_mut()) {
         for g in governs.iter_mut() {
             if let Some(s) = g.as_str() {
-                *g = serde_json::json!(s.trim_end_matches('/'));
+                *g = serde_json::json!(s.strip_suffix('/').unwrap_or(s));
             }
         }
     }
@@ -291,6 +291,7 @@ mod tests {
         let root_s = root.to_string_lossy().to_string();
         let absolute = root.join("src").join("lib.rs").to_string_lossy().to_string();
         let elsewhere = base.join("elsewhere.rs").to_string_lossy().to_string();
+        let src_dir = root.join("src").to_string_lossy().to_string();
 
         let rows = [
             (
@@ -304,6 +305,11 @@ mod tests {
             ("current", payload("src/lib.rs", json!({"governs": ["src/lib.rs"]}), "agent")),
             ("root-rule", payload("", json!({"governs": [root_s.clone()]}), "agent")),
             ("shared", payload(&absolute, json!({"mesh": {"update_id": "u1"}}), "agent")),
+            // A mesh folder entry that differs by more than its slash.
+            (
+                "shared-folder",
+                payload("", json!({"mesh": {"update_id": "u3"}, "governs": [src_dir.clone()]}), "agent"),
+            ),
             (
                 "ingested",
                 payload(&absolute, json!({"index_generation": 3}), "auto-ingestor"),
@@ -339,7 +345,7 @@ mod tests {
         assert!(!state.paths_migrated, "a dry run records nothing");
         assert_eq!(dry.changed.len(), 1, "{dry:?}");
         assert_eq!(dry.changed[0].id, "legacy");
-        assert_eq!(dry.skipped_mesh, 1);
+        assert_eq!(dry.skipped_mesh, 2);
         // The ingested row, plus the file nodes the store derives from locations.
         assert!(dry.skipped_ingested >= 1, "{dry:?}");
         assert_eq!(dry.unplaced.len(), 2, "{:?}", dry.unplaced);
@@ -358,7 +364,13 @@ mod tests {
         assert_eq!(applied.changed.len(), 1);
         // The mesh row still carries an absolute path under the root, so one
         // spelling would not find it: the namespace is not marked yet.
-        assert_eq!(applied.mesh_unmigrated, vec!["shared".to_string()]);
+        let mut mesh_unmigrated = applied.mesh_unmigrated.clone();
+        mesh_unmigrated.sort();
+        assert_eq!(
+            mesh_unmigrated,
+            vec!["shared".to_string(), "shared-folder".to_string()],
+            "an absolute folder entry still needs another spelling"
+        );
         // The ingested row was written with an absolute location; only a
         // re-ingest stores it relative.
         assert_eq!(applied.ingested_absolute, 1);
@@ -382,6 +394,15 @@ mod tests {
                 vec![0.1; 384],
                 // Its folder entry has no slash; that alone needs no spelling.
                 payload("src/lib.rs", json!({"mesh": {"update_id": "u2"}, "governs": ["src"]}), "agent"),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                ns,
+                "shared-folder",
+                vec![0.1; 384],
+                payload("", json!({"mesh": {"update_id": "u4"}, "governs": ["src"]}), "agent"),
             )
             .await
             .unwrap();
