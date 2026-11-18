@@ -6421,6 +6421,7 @@ async fn handle_get_snapshot(
             std::path::Path::new(root_str),
             namespace,
             &golden_rules,
+            None,
             active_task.as_deref(),
         )
         .await;
@@ -23815,6 +23816,7 @@ mod tests {
     enum TaskEnd {
         Complete,
         Release,
+        Block,
     }
 
     /// `.NeuroStrata/active_session.json` is what the session-start hook
@@ -23932,6 +23934,21 @@ mod tests {
                 .await;
                 assert!(released.contains("\"open\""), "release failed: {}", released);
             }
+            TaskEnd::Block => {
+                let blocked = crate::task::handle_task_update(
+                    serde_json::json!({
+                        "namespace": "probe",
+                        "id": id,
+                        "status": "blocked",
+                        "session_id": "ses_a",
+                        "note": "waiting on review"
+                    }),
+                    Arc::new(StubEmbedder),
+                    store.clone(),
+                )
+                .await;
+                assert!(blocked.contains("\"blocked\""), "block failed: {}", blocked);
+            }
         }
         // Ending the task already clears it, before any snapshot runs: a
         // session that ends right after would otherwise leave it for the next.
@@ -23967,6 +23984,11 @@ mod tests {
     #[tokio::test]
     async fn the_session_file_drops_a_released_task() {
         session_file_after_task_ends(TaskEnd::Release).await;
+    }
+
+    #[tokio::test]
+    async fn the_session_file_drops_a_blocked_task() {
+        session_file_after_task_ends(TaskEnd::Block).await;
     }
 
     /// The cleanup after a release can run late, after another session has
@@ -24025,7 +24047,7 @@ mod tests {
         assert_eq!(after["session_id"], serde_json::json!("ses_b"), "{after}");
 
         // A snapshot that saw no task in progress before the claim landed.
-        crate::task::refresh_active_session_file(&store, &proj_root, "probe", &[], None).await;
+        crate::task::refresh_active_session_file(&store, &proj_root, "probe", &[], None, None).await;
         let after = read_session();
         assert_eq!(after["task_id"], serde_json::json!(id), "the snapshot keeps it too: {after}");
         assert_eq!(after["status"], serde_json::json!("in_progress"), "{after}");

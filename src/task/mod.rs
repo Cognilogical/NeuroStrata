@@ -862,33 +862,63 @@ fn session_file_task_id(project_root: &std::path::Path) -> Option<String> {
     value.get("task_id").and_then(|v| v.as_str()).map(String::from)
 }
 
-/// The row of task `id` when it is in progress right now, read fresh.
-async fn in_progress_task(store: &Arc<dyn VectorStore>, namespace: &str, id: &str) -> Option<Task> {
-    load_task(store, namespace, id)
-        .await
-        .ok()
-        .map(|(task, _)| task)
-        .filter(|task| task.status() == Status::InProgress)
+/// The row of task `id` read fresh: `Ok(Some)` when it is in progress and a
+/// snapshot would show it (not archived, expired or mesh-conflicting),
+/// `Ok(None)` when it is not, `Err` when the store could not be read. A read
+/// error is never taken as "finished".
+async fn in_progress_task(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    id: &str,
+) -> Result<Option<Task>, ()> {
+    let payload = match store.get(namespace, id).await {
+        Ok(Some((_, payload))) => payload,
+        Ok(None) => return Ok(None),
+        Err(_) => return Err(()),
+    };
+    let now = chrono::Utc::now().timestamp();
+    let expired = payload
+        .metadata
+        .get("valid_to")
+        .is_some_and(|v| !v.is_null() && v.as_i64().unwrap_or(0) <= now);
+    let task = Task { id: id.to_string(), payload };
+    let shown = task.payload.memory_type == "task"
+        && task.status() == Status::InProgress
+        && !expired
+        && !crate::handlers::archive_memory::is_archived(&task.payload)
+        && !crate::synaptic_mesh::conflict::is_conflicting(&task.payload);
+    Ok(shown.then_some(task))
 }
 
-/// [`persist_active_session_file`] under [`SESSION_FILE_LOCK`], naming a task
+/// [`persist_active_session_file`] under [`SESSION_FILE_LOCK`]. `claimed` is
+/// the row a claim has just saved, written as is. Otherwise a task is named
 /// only when its row is in progress at write time: `candidate` (the task the
-/// caller found or just claimed), else the task the file already names (a
-/// claim that landed after the caller listed the tasks), else none.
+/// snapshot found), else the task the file already names (a claim that landed
+/// after the snapshot listed the tasks), else none. If a row cannot be read,
+/// the file is left as it is.
 pub(crate) async fn refresh_active_session_file(
     store: &Arc<dyn VectorStore>,
     project_root: &std::path::Path,
     namespace: &str,
     golden_rules: &[SearchResult],
+    claimed: Option<(&str, &MemoryPayload)>,
     candidate: Option<&str>,
 ) {
     let _session_guard = SESSION_FILE_LOCK.lock().await;
+    if let Some(claimed) = claimed {
+        persist_active_session_file(project_root, namespace, golden_rules, Some(claimed));
+        return;
+    }
     let mut active: Option<Task> = None;
     let named = session_file_task_id(project_root);
     for id in candidate.map(String::from).into_iter().chain(named) {
-        if let Some(task) = in_progress_task(store, namespace, &id).await {
-            active = Some(task);
-            break;
+        match in_progress_task(store, namespace, &id).await {
+            Ok(Some(task)) => {
+                active = Some(task);
+                break;
+            }
+            Ok(None) => {}
+            Err(()) => return,
         }
     }
     persist_active_session_file(
@@ -930,7 +960,7 @@ pub(crate) async fn clear_finished_task_from_session_file(
     if active.get("task_id").and_then(|v| v.as_str()) != Some(task_id) {
         return;
     }
-    if in_progress_task(store, namespace, task_id).await.is_some() {
+    if !matches!(in_progress_task(store, namespace, task_id).await, Ok(None)) {
         return;
     }
     for key in ["task_id", "status", "session_id", "subagent_prompt_injection"] {
@@ -2555,7 +2585,15 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
     let hint_root = explicit_root.clone().or_else(|| session_root.clone());
     if let Some(root) = session_root {
         let golden = collect_golden_rules(&store, &namespace, None).await;
-        refresh_active_session_file(&store, &root, &namespace, &golden, Some(&id)).await;
+        refresh_active_session_file(
+            &store,
+            &root,
+            &namespace,
+            &golden,
+            Some((&id, &task.payload)),
+            None,
+        )
+        .await;
     }
     let event_id = arg_str(&args, "event_id")
         .unwrap_or(&format!("claim-{}", id))
@@ -2839,7 +2877,7 @@ pub async fn handle_task_update(
     if let Err(e) = save_task(&store, &namespace, &id, vector, task.payload.clone()).await {
         return e;
     }
-    if task.status() != Status::InProgress {
+    if from == Status::InProgress && task.status() != Status::InProgress {
         clear_finished_task_from_session_file(&store, &namespace, &id).await;
     }
     let event_id = arg_str(&args, "event_id")
