@@ -321,16 +321,20 @@ pub struct LookupPath {
 /// 3. the nearest ancestor holding `.git`.
 ///
 /// Within 1 and 2, a `.git` between the root and the file keeps apart what is
-/// not this project: a nested clone or submodule is never resolved, and a
-/// linked worktree inside the root resolves against the worktree only when
-/// the root is the top of a checkout of the same repository. Under a project
-/// registered at a subdirectory (`repo/platform`), stored paths are relative
-/// to that subdirectory, which another checkout's paths would not match.
+/// not this project: a nested clone or submodule is never resolved against
+/// that candidate, but only vetoes it — the lookup falls through to the next
+/// known root. A linked worktree inside the root resolves against the worktree
+/// only when the root is the top of a checkout of the same repository. Under a
+/// project registered at a subdirectory (`repo/platform`), stored paths are
+/// relative to that subdirectory, which another checkout's paths would not
+/// match.
 ///
-/// Step 3 with a known root (a usable `project_root`, else a usable registered
-/// root) applies the same rule: another checkout of that repository resolves
-/// only when the known root is a checkout root; anything else is another
-/// project and stays `Outside`, so it never borrows this namespace's memories.
+/// Step 3 with a known root (a supplied `project_root`, else a usable
+/// registered root) applies the same rule: another checkout of that repository
+/// resolves only when the known root is a checkout root; anything else is
+/// another project and stays `Outside`, so it never borrows this namespace's
+/// memories. A supplied `project_root` vetoes here even when it is unusable on
+/// this host (a moved root), while an unusable registered root is ignored.
 ///
 /// When the file exists, the part below the root is taken from its canonical
 /// path, so it carries the on-disk spelling the store matches exactly.
@@ -409,6 +413,10 @@ fn with_disk_spelling(path: &str, root: &str, rel: String) -> String {
 
 /// The root that relativizes absolute `raw`, the part below it, and where the
 /// root came from; `None` when no root this namespace knows contains it.
+/// Candidates are tried in order and a nested foreign checkout vetoes only the
+/// candidate it is nested in, so the lookup falls through to a later known
+/// root before the `.git` fallback. That fallback is still vetoed by a supplied
+/// `project_root` even when unusable here; the registry root is usable-filtered.
 fn choose_root(
     raw: &str,
     project_root: Option<&str>,
@@ -425,22 +433,24 @@ fn choose_root(
         let Some(rel) = relative_to_on_disk(raw, root) else {
             continue;
         };
-        return match (&marker, &marker_rel) {
-            // A checkout nested inside the root (deeper than it).
+        let resolved = match (&marker, &marker_rel) {
+            // A checkout nested inside the root (deeper than it). A foreign
+            // one vetoes only this candidate; a later known root may answer.
             (Some(inner), Some(inner_rel)) if depth(inner_rel) < depth(&rel) => {
                 (is_checkout_root(root) && same_repository(inner, root))
                     .then(|| (inner.clone(), inner_rel.clone(), RootSource::Marker))
             }
             _ => Some((root.to_string(), rel, source)),
         };
+        if resolved.is_some() {
+            return resolved;
+        }
     }
     let (marker, marker_rel) = (marker?, marker_rel?);
-    // The caller's root constrains the fallback like the registered one: a
-    // file in another repository must not resolve while `project_root` (which
-    // also pins the ingest generation) names this one.
-    let known_root = project_root
-        .filter(|root| is_usable_root(root))
-        .or(registry_root);
+    // A supplied root constrains the fallback even when unusable here: a moved
+    // root still vetoes another repository. The registry root was filtered
+    // above, so an unusable cached root remains ignored.
+    let known_root = project_root.or(registry_root);
     match known_root {
         None => Some((marker, marker_rel, RootSource::Marker)),
         Some(root) if is_checkout_root(root) && same_repository(&marker, root) => {
@@ -856,6 +866,61 @@ mod tests {
         assert_eq!(
             got(&file, Some(&root), Some(&root)),
             resolved(&s(&file), RootSource::Outside)
+        );
+    }
+
+    #[test]
+    fn an_unusable_caller_root_still_vetoes_a_file_in_another_repository() {
+        // The caller's root need not exist here to constrain the `.git`
+        // fallback: a moved root must not let a different repository borrow
+        // this namespace's memories.
+        let (_tmp, root, _) = project_with_worktree();
+        let other = root.with_file_name("other-repo");
+        std::fs::create_dir_all(other.join(".git")).unwrap();
+        let file = other.join("src").join("lib.rs");
+        touch(&file);
+        let missing = root.with_file_name("moved-away");
+        assert!(!missing.exists());
+        assert_eq!(
+            got(&file, Some(&missing), None),
+            resolved(&s(&file), RootSource::Outside)
+        );
+    }
+
+    #[test]
+    fn a_nested_foreign_checkout_falls_through_to_the_registered_root() {
+        // `project_root` is an outer checkout; an independent repository
+        // nested in it vetoes that root, but the lookup continues to the
+        // registered nested root instead of ending as `Outside`.
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = canonical(tmp.path()).unwrap().join("outer");
+        std::fs::create_dir_all(outer.join(".git")).unwrap();
+        let nested = outer.join("nested");
+        std::fs::create_dir_all(nested.join(".git")).unwrap();
+        let file = nested.join("src").join("lib.rs");
+        touch(&file);
+        assert_eq!(
+            got(&file, Some(&outer), Some(&nested)),
+            resolved("src/lib.rs", RootSource::RegistryRoot)
+        );
+    }
+
+    #[test]
+    fn a_noncheckout_caller_root_falls_through_to_a_deeper_registered_checkout() {
+        // The supplied root exists but is not itself a checkout; a nested
+        // independent checkout vetoes it, and the deeper registered root
+        // answers the file.
+        let tmp = tempfile::tempdir().unwrap();
+        let broad = canonical(tmp.path()).unwrap().join("workdir");
+        std::fs::create_dir_all(&broad).unwrap();
+        let project = broad.join("project");
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        let file = project.join("src").join("lib.rs");
+        touch(&file);
+        assert!(!broad.join(".git").exists());
+        assert_eq!(
+            got(&file, Some(&broad), Some(&project)),
+            resolved("src/lib.rs", RootSource::RegistryRoot)
         );
     }
 

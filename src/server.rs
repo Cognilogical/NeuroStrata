@@ -2526,11 +2526,49 @@ async fn lookup_path_for(
     (lookup, forms)
 }
 
+/// Merge one lookup result per spelling into a single answer. A spelling that
+/// succeeded with zero rows is still an answer, so the first error surfaces
+/// only when no spelling succeeded. With more than one spelling the hits are
+/// ranked with `rank_hits`, deduplicated by id (best-ranked kept) and cut to
+/// `limit` (also capped at `MAX_LIMIT`).
+fn merge_spelling_results(
+    results: Vec<anyhow::Result<Vec<crate::graph_read::memories_for_file::MemoryHit>>>,
+    limit: usize,
+) -> anyhow::Result<Vec<crate::graph_read::memories_for_file::MemoryHit>> {
+    let multiple = results.len() > 1;
+    let mut hits = Vec::new();
+    let mut any_success = false;
+    let mut first_error = None;
+    for result in results {
+        match result {
+            Ok(batch) => {
+                any_success = true;
+                hits.extend(batch);
+            }
+            Err(e) => {
+                first_error.get_or_insert(e);
+            }
+        }
+    }
+    if !any_success {
+        if let Some(e) = first_error {
+            return Err(e);
+        }
+    }
+    if multiple {
+        crate::graph_read::memories_for_file::rank_hits(&mut hits);
+        let mut seen = std::collections::HashSet::new();
+        hits.retain(|h| seen.insert(h.id.clone()));
+        // Each spelling's query is capped at MAX_LIMIT; the merge must be too.
+        hits.truncate(limit.min(crate::graph_read::memories_for_file::MAX_LIMIT));
+    }
+    Ok(hits)
+}
+
 /// `memories_for_file` over every spelling in `forms`. With one form this is
-/// the single lookup; with more, the hits are merged, ranked with the same
-/// `rank_hits`, deduplicated by id (best-ranked kept) and cut to `limit`.
-/// A spelling whose lookup fails does not drop the hits the others found; the
-/// error is returned only when no spelling found anything.
+/// the single lookup; with more, [`merge_spelling_results`] merges, ranks,
+/// deduplicates and cuts the hits. A failed spelling is logged and kept aside;
+/// its error is returned only when no spelling succeeded.
 #[allow(clippy::too_many_arguments)]
 async fn memories_for_forms(
     store: &crate::store::LadybugStore,
@@ -2543,10 +2581,9 @@ async fn memories_for_forms(
     exclude_ids: &[String],
     limit: usize,
 ) -> anyhow::Result<Vec<crate::graph_read::memories_for_file::MemoryHit>> {
-    let mut hits = Vec::new();
-    let mut first_error = None;
+    let mut results = Vec::with_capacity(forms.len());
     for form in forms {
-        match store
+        let result = store
             .memories_for_file(
                 namespace,
                 source,
@@ -2557,26 +2594,13 @@ async fn memories_for_forms(
                 exclude_ids,
                 limit,
             )
-            .await
-        {
-            Ok(batch) => hits.extend(batch),
-            Err(e) => {
-                tracing::warn!("memories_for_file lookup of {form:?} failed: {e}");
-                first_error.get_or_insert(e);
-            }
+            .await;
+        if let Err(e) = &result {
+            tracing::warn!("memories_for_file lookup of {form:?} failed: {e}");
         }
+        results.push(result);
     }
-    if let (true, Some(e)) = (hits.is_empty(), first_error) {
-        return Err(e);
-    }
-    if forms.len() > 1 {
-        crate::graph_read::memories_for_file::rank_hits(&mut hits);
-        let mut seen = std::collections::HashSet::new();
-        hits.retain(|h| seen.insert(h.id.clone()));
-        // Each spelling's query is capped at MAX_LIMIT; the merge must be too.
-        hits.truncate(limit.min(crate::graph_read::memories_for_file::MAX_LIMIT));
-    }
-    Ok(hits)
+    merge_spelling_results(results, limit)
 }
 
 /// Whether an `ast_summary` found nothing for the file: no symbols, edges or
@@ -13021,6 +13045,31 @@ mod tests {
             related_ids(&text).iter().all(|id| id != "mem-related"),
             "related_memories must omit excluded neighbor mem-related: {text}"
         );
+    }
+
+    #[test]
+    fn an_empty_spelling_success_is_not_discarded_by_another_spellings_error() {
+        use crate::graph_read::memories_for_file::MemoryHit;
+
+        // One spelling answered successfully with zero rows; another failed.
+        // The empty answer is valid and must win over the error.
+        let got = merge_spelling_results(
+            vec![
+                Ok(Vec::<MemoryHit>::new()),
+                Err(anyhow::anyhow!("store failure")),
+            ],
+            10,
+        );
+        assert!(
+            got.is_ok(),
+            "a successful empty answer must survive another spelling's error"
+        );
+        assert!(got.unwrap().is_empty());
+
+        // No spelling succeeded: surface the first error.
+        let got =
+            merge_spelling_results(vec![Err::<Vec<MemoryHit>, _>(anyhow::anyhow!("first"))], 10);
+        assert!(got.is_err(), "when every spelling fails, surface the error");
     }
 
     /// Hooks send the absolute path of the file being touched (Claude Code's
