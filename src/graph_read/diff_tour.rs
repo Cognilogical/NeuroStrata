@@ -10,7 +10,7 @@ use unidiff::PatchSet;
 use crate::formal_kernel::{classify_tour_stop, TourStopCategory};
 use crate::graph_read::locate::{LocateFailedAttempt, LocateRuleSummary, RULE_SUMMARY_MAX_CHARS};
 use crate::rebac::{can_read_memory, resolve_principal};
-use crate::traits::{GraphRead, SearchResult, VectorStore};
+use crate::traits::{SearchResult, VectorStore};
 
 pub const DEFAULT_MAX_BLAST_RADIUS_CALLERS: usize = 15;
 pub const MAX_DIFF_HUNKS: usize = 500;
@@ -646,7 +646,10 @@ fn extract_failed_attempt(row: &SearchResult) -> Option<LocateFailedAttempt> {
 #[derive(Debug, Clone)]
 struct StagedTourNode {
     row_id: Option<String>,
+    /// Supplied spelling preserved for user-visible outputs.
     path: String,
+    /// Resolved canonical stored spelling used for stop classification.
+    canonical_path: String,
     lines: String,
     start_line: u32,
     symbol: Option<String>,
@@ -734,6 +737,11 @@ pub async fn execute_diff_tour(
     trusted_principal: Option<&str>,
 ) -> anyhow::Result<DiffTourResponse> {
     let namespace = crate::server::resolve_namespace(store, &request.namespace).await;
+    // One registry read per request; fail closed on a store error rather than
+    // silently widening scope by pretending no root is registered.
+    let registry_root = crate::registry::cached_project_root(store, &namespace)
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let max_blast = request
         .max_blast_radius_callers
         .unwrap_or(DEFAULT_MAX_BLAST_RADIUS_CALLERS)
@@ -855,28 +863,71 @@ pub async fn execute_diff_tour(
         }
     }
 
-    // Map diff spans onto ingested symbols (or uningested file hunks).
+    // Map diff spans onto ingested symbols (or uningested file hunks). The
+    // supplied path stays user-visible; resolved forms are used only for the
+    // internal store/governance lookups and the session ledger's canonical path.
     let mut touched_files: BTreeSet<String> = BTreeSet::new();
     let mut uningested_files: BTreeSet<String> = BTreeSet::new();
     let mut staged_nodes_map: BTreeMap<String, StagedTourNode> = BTreeMap::new();
+    let mut touched_file_forms: BTreeMap<String, crate::paths::ResolvedPathForms> = BTreeMap::new();
+    let mut canonical_ledger_paths: BTreeSet<String> = BTreeSet::new();
 
     for span in &spans {
         if span.path.is_empty() {
             continue;
         }
-        touched_files.insert(span.path.clone());
-        let Some(file_rows) = structural_by_path.get(&span.path) else {
-            uningested_files.insert(span.path.clone());
+        let display_path = span.path.clone();
+        let resolved = crate::paths::resolve_in_scope_forms(
+            &display_path,
+            request.project_root.as_deref(),
+            registry_root.as_deref(),
+            crate::paths::PathResolutionScope::File,
+        )
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        touched_file_forms.insert(display_path.clone(), resolved.clone());
+        touched_files.insert(display_path.clone());
+
+        // Collect structural rows across every equivalent spelling, deduping
+        // by id in deterministic form order.
+        let mut file_rows: Vec<SearchResult> = Vec::new();
+        let mut seen_row_ids: BTreeSet<String> = BTreeSet::new();
+        let mut canonical_stored_path: Option<String> = None;
+        for form in &resolved.forms {
+            let normalized = crate::parser::ingest::normalize_node_path(form);
+            if canonical_stored_path.is_none() && structural_by_path.contains_key(&normalized) {
+                canonical_stored_path = Some(normalized.clone());
+            }
+            for key in [form.as_str(), normalized.as_str()] {
+                if let Some(rows) = structural_by_path.get(key) {
+                    for row in rows {
+                        if seen_row_ids.insert(row.id.clone()) {
+                            file_rows.push(row.clone());
+                        }
+                    }
+                }
+            }
+        }
+        let canonical_stored_path = canonical_stored_path.unwrap_or_else(|| {
+            resolved
+                .canonical_form
+                .clone()
+                .unwrap_or_else(|| crate::parser::ingest::normalize_node_path(&display_path))
+        });
+        canonical_ledger_paths.insert(canonical_stored_path.clone());
+
+        if file_rows.is_empty() {
+            uningested_files.insert(display_path.clone());
             let lines_str = format_span_lines(span);
             let start_line = span
                 .new_lines
                 .map(|(s, _)| s)
                 .or_else(|| span.old_lines.map(|(s, _)| s))
                 .unwrap_or(1);
-            let key = format!("file:{}#{}", span.path, lines_str);
+            let key = format!("file:{}#{}", display_path, lines_str);
             staged_nodes_map.entry(key).or_insert(StagedTourNode {
                 row_id: None,
-                path: span.path.clone(),
+                path: display_path.clone(),
+                canonical_path: canonical_stored_path.clone(),
                 lines: lines_str,
                 start_line,
                 symbol: None,
@@ -886,10 +937,10 @@ pub async fn execute_diff_tour(
                 change_kind: span.change_kind.clone(),
             });
             continue;
-        };
+        }
 
         let mut matched_symbol_row = false;
-        for row in file_rows {
+        for row in &file_rows {
             let sym = extract_symbol_name(row);
             if sym.is_none() && row.payload.memory_type == "file" {
                 continue;
@@ -909,7 +960,8 @@ pub async fn execute_diff_tour(
                 let key = format!("row:{}", row.id);
                 staged_nodes_map.entry(key).or_insert(StagedTourNode {
                     row_id: Some(row.id.clone()),
-                    path: span.path.clone(),
+                    path: display_path.clone(),
+                    canonical_path: canonical_stored_path.clone(),
                     lines: lines_str,
                     start_line,
                     symbol: sym,
@@ -928,10 +980,11 @@ pub async fn execute_diff_tour(
                 .map(|(s, _)| s)
                 .or_else(|| span.old_lines.map(|(s, _)| s))
                 .unwrap_or(1);
-            let key = format!("file:{}#{}", span.path, lines_str);
+            let key = format!("file:{}#{}", display_path, lines_str);
             staged_nodes_map.entry(key).or_insert(StagedTourNode {
                 row_id: None,
-                path: span.path.clone(),
+                path: display_path.clone(),
+                canonical_path: canonical_stored_path.clone(),
                 lines: lines_str,
                 start_line,
                 symbol: None,
@@ -1008,12 +1061,21 @@ pub async fn execute_diff_tour(
     if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref())
         .downcast_ref::<crate::store::LadybugStore>()
     {
-        for path in &touched_files {
-            if let Ok(hits) = ls
-                .memories_for_file(&namespace, None, path, None, true, &[], &[], 25)
+        for (display_path, resolved) in &touched_file_forms {
+            if let Ok(multi) = ls
+                .memories_for_file_forms(
+                    &namespace,
+                    None,
+                    &resolved.forms,
+                    None,
+                    true,
+                    &[],
+                    &[],
+                    25,
+                )
                 .await
             {
-                for hit in hits {
+                for hit in multi.hits {
                     if let Some(row) = rows_by_id.get(&hit.id) {
                         if extract_failed_attempt(row).is_some() {
                             continue;
@@ -1033,12 +1095,12 @@ pub async fn execute_diff_tour(
                                 governs_paths: gov_paths.into_iter().collect(),
                             }
                         });
-                        if !entry.governs_paths.contains(path) {
-                            entry.governs_paths.push(path.clone());
+                        if !entry.governs_paths.contains(display_path) {
+                            entry.governs_paths.push(display_path.clone());
                             entry.governs_paths.sort();
                         }
                         rules_by_path
-                            .entry(path.clone())
+                            .entry(display_path.clone())
                             .or_default()
                             .insert(row.id.clone());
                     }
@@ -1049,54 +1111,54 @@ pub async fn execute_diff_tour(
 
     for row in &visible_rows {
         let targets = extract_governed_targets(row);
-        if let Some(mut attempt) = extract_failed_attempt(row) {
-            let matches_touched = targets.iter().any(|(tp, _, _)| {
-                touched_files
-                    .iter()
-                    .any(|tf| path_matches_governance_target(tf, tp))
-            });
-            if matches_touched {
-                for tf in &touched_files {
-                    if targets
+        // A touched file matches when any of its resolved spellings matches a
+        // governed target; user-visible fields still use the display path.
+        let matching_touched: Vec<(&String, &crate::paths::ResolvedPathForms)> = touched_file_forms
+            .iter()
+            .filter(|(_, resolved)| {
+                targets.iter().any(|(tp, _, _)| {
+                    resolved
+                        .forms
                         .iter()
-                        .any(|(tp, _, _)| path_matches_governance_target(tf, tp))
-                        && !attempt.paths.contains(tf)
-                    {
-                        attempt.paths.push(tf.clone());
-                    }
+                        .any(|form| path_matches_governance_target(form, tp))
+                })
+            })
+            .collect();
+        if matching_touched.is_empty() {
+            continue;
+        }
+        if let Some(mut attempt) = extract_failed_attempt(row) {
+            for (display_path, _) in &matching_touched {
+                if !attempt.paths.contains(*display_path) {
+                    attempt.paths.push((*display_path).clone());
                 }
-                attempt.paths.sort();
-                failed_attempts_map.insert(attempt.id.clone(), attempt);
             }
+            attempt.paths.sort();
+            failed_attempts_map.insert(attempt.id.clone(), attempt);
             continue;
         }
         if !is_normative_type(&row.payload.memory_type) {
             continue;
         }
-        for tf in &touched_files {
-            if targets
-                .iter()
-                .any(|(tp, _, _)| path_matches_governance_target(tf, tp))
-            {
-                let entry = rule_table.entry(row.id.clone()).or_insert_with(|| {
-                    let gov_paths: BTreeSet<String> =
-                        targets.iter().map(|(p, _, _)| p.clone()).collect();
-                    LocateRuleSummary {
-                        id: row.id.clone(),
-                        memory_type: row.payload.memory_type.clone(),
-                        summary: truncate_chars(&row.payload.content, RULE_SUMMARY_MAX_CHARS),
-                        governs_paths: gov_paths.into_iter().collect(),
-                    }
-                });
-                if !entry.governs_paths.contains(tf) {
-                    entry.governs_paths.push(tf.clone());
-                    entry.governs_paths.sort();
+        for (display_path, _) in &matching_touched {
+            let entry = rule_table.entry(row.id.clone()).or_insert_with(|| {
+                let gov_paths: BTreeSet<String> =
+                    targets.iter().map(|(p, _, _)| p.clone()).collect();
+                LocateRuleSummary {
+                    id: row.id.clone(),
+                    memory_type: row.payload.memory_type.clone(),
+                    summary: truncate_chars(&row.payload.content, RULE_SUMMARY_MAX_CHARS),
+                    governs_paths: gov_paths.into_iter().collect(),
                 }
-                rules_by_path
-                    .entry(tf.clone())
-                    .or_default()
-                    .insert(row.id.clone());
+            });
+            if !entry.governs_paths.contains(*display_path) {
+                entry.governs_paths.push((*display_path).clone());
+                entry.governs_paths.sort();
             }
+            rules_by_path
+                .entry((*display_path).clone())
+                .or_default()
+                .insert(row.id.clone());
         }
     }
 
@@ -1105,15 +1167,25 @@ pub async fn execute_diff_tour(
     let mut node_categories: Vec<TourStopCategory> = Vec::with_capacity(staged_nodes.len());
 
     for (idx, node) in staged_nodes.iter().enumerate() {
+        // Classify on the canonical stored path so an absolute display path is
+        // treated identically to its relative spelling; still allow the display
+        // path to classify when it carries meaning the canonical form lacks.
         let is_test_or_doc = is_test_or_doc_item(
+            &node.canonical_path,
+            node.memory_type.as_deref(),
+            node.symbol.as_deref(),
+            node.content.as_deref(),
+        ) || is_test_or_doc_item(
             &node.path,
             node.memory_type.as_deref(),
             node.symbol.as_deref(),
             node.content.as_deref(),
         );
         let is_foundation =
-            is_foundation_kind_or_path_item(&node.path, node.symbol_kind.as_deref());
-        let is_entrypoint = is_entrypoint_path_item(&node.path);
+            is_foundation_kind_or_path_item(&node.canonical_path, node.symbol_kind.as_deref())
+                || is_foundation_kind_or_path_item(&node.path, node.symbol_kind.as_deref());
+        let is_entrypoint =
+            is_entrypoint_path_item(&node.canonical_path) || is_entrypoint_path_item(&node.path);
         let in_deg = callers_in_diff_idx
             .get(&idx)
             .map(|s| s.len() as u32)
@@ -1301,9 +1373,11 @@ pub async fn execute_diff_tour(
         });
     }
 
-    // Record touched paths in Graph-First ledger.
-    for path in &touched_files {
-        crate::task::record_graph_query(store, &namespace, "neurostrata_diff_tour", path).await;
+    // Record resolved canonical stored paths in the Graph-First ledger, not the
+    // raw display spellings, so later correlation sees one stable identity.
+    for canonical_path in &canonical_ledger_paths {
+        crate::task::record_graph_query(store, &namespace, "neurostrata_diff_tour", canonical_path)
+            .await;
     }
 
     Ok(DiffTourResponse {
@@ -1583,5 +1657,109 @@ mod tests {
         assert!(!resp
             .untested_modified_symbols
             .contains(&"src/server.rs::handle_request".to_string()));
+    }
+
+    #[tokio::test]
+    async fn diff_tour_resolves_absolute_spans_preserves_display_paths_and_records_canonical_ledger_path(
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store: Arc<dyn VectorStore> =
+            Arc::new(LadybugStore::for_testing(tmp.path().join("db"), 4).expect("store init"));
+        let ns = "ns";
+        store.init(ns).await.unwrap();
+
+        let root = tmp.path().join("ns-v1190-diff-root");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let abs_file = root.join("src/lib.rs");
+        std::fs::write(&abs_file, "pub fn alpha() {}\n").unwrap();
+
+        store
+            .upsert(
+                ns,
+                "sym:alpha",
+                vec![0.1; 4],
+                MemoryPayload {
+                    content: "functions alpha in src/lib.rs".to_string(),
+                    location: "src/lib.rs".to_string(),
+                    location_lines: "1-20".to_string(),
+                    memory_type: "code_ast".to_string(),
+                    metadata: json!({
+                        "domain": "code_ast",
+                        "symbol": "alpha",
+                        "symbol_kind": "functions",
+                        "locations": [{ "path": "src/lib.rs", "lines": "1-20" }],
+                    }),
+                    user_id: "test".to_string(),
+                    agent_name: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        store
+            .upsert(
+                ns,
+                "rule:alpha",
+                vec![0.1; 4],
+                MemoryPayload {
+                    content: "alpha must remain verified".to_string(),
+                    location: "src/lib.rs".to_string(),
+                    location_lines: String::new(),
+                    memory_type: "rule".to_string(),
+                    metadata: json!({ "governs": ["src/lib.rs"] }),
+                    user_id: "test".to_string(),
+                    agent_name: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        crate::task::clear_recorded_graph_queries_for_tests();
+
+        let abs_path = abs_file.to_string_lossy().to_string();
+        let request = DiffTourRequest {
+            namespace: ns.to_string(),
+            project_root: Some(root.to_string_lossy().to_string()),
+            diff_text: None,
+            changed_spans: Some(vec![ChangedFileSpan {
+                path: abs_path.clone(),
+                old_lines: Some((1, 5)),
+                new_lines: Some((1, 8)),
+                change_kind: "modified".to_string(),
+            }]),
+            max_blast_radius_callers: Some(5),
+            principal: Some("admin".to_string()),
+        };
+
+        let response = execute_diff_tour(&store, &request, Some("admin"))
+            .await
+            .expect("diff tour succeeds");
+
+        assert!(response.uningested_files.is_empty());
+        assert_eq!(response.total_symbols_touched, 1);
+        assert!(response
+            .governing_rules
+            .iter()
+            .any(|r| r.id == "rule:alpha"));
+
+        let expected_display = crate::parser::ingest::normalize_node_path(&abs_path);
+        let touched: Vec<&TourItem> = response
+            .stops
+            .iter()
+            .flat_map(|s| s.items.iter())
+            .filter(|item| item.path == expected_display)
+            .collect();
+        assert_eq!(touched.len(), 1);
+        assert!(touched[0]
+            .governing_rule_ids
+            .contains(&"rule:alpha".to_string()));
+
+        let ledger = crate::task::recorded_graph_queries_for_tests();
+        assert!(ledger.iter().any(|(ns, tool, path)| {
+            ns == "ns" && tool == "neurostrata_diff_tour" && path == "src/lib.rs"
+        }));
+        assert!(!ledger
+            .iter()
+            .any(|(_, tool, path)| { tool == "neurostrata_diff_tour" && path == &abs_path }));
     }
 }

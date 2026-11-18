@@ -1029,6 +1029,25 @@ pub(crate) fn jaccard_similarity(a: &HashSet<String>, b: &HashSet<String>) -> f6
     }
 }
 
+#[cfg(test)]
+static RECORDED_GRAPH_QUERIES: std::sync::OnceLock<
+    std::sync::Mutex<Vec<(String, String, String)>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub fn clear_recorded_graph_queries_for_tests() {
+    let mutex = RECORDED_GRAPH_QUERIES.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    if let Ok(mut guard) = mutex.lock() {
+        guard.clear();
+    }
+}
+
+#[cfg(test)]
+pub fn recorded_graph_queries_for_tests() -> Vec<(String, String, String)> {
+    let mutex = RECORDED_GRAPH_QUERIES.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    mutex.lock().map(|g| g.clone()).unwrap_or_default()
+}
+
 /// Record a graph or memory lookup against any active `in_progress` task in
 /// `namespace` and append to `.NeuroStrata/session_queries.json` if a project
 /// root is known.
@@ -1039,6 +1058,13 @@ pub async fn record_graph_query(
     query_hint: &str,
 ) {
     let ns = crate::server::resolve_namespace(store, namespace).await;
+    #[cfg(test)]
+    {
+        let mutex = RECORDED_GRAPH_QUERIES.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+        if let Ok(mut guard) = mutex.lock() {
+            guard.push((ns.clone(), tool_name.to_string(), query_hint.to_string()));
+        }
+    }
     // This runs on every graph-first lookup. It used to list the WHOLE
     // namespace each time (+50 to +300 MB per call in the daemon log); name only the rows it needs: the task rows, the
     // registry row by its fixed id, and directory rows only when the registry

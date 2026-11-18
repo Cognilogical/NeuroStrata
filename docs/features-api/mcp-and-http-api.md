@@ -3,12 +3,14 @@
 ## Core Memory & Graph Retrieval Tools
 
 - `neurostrata_add_memory` — store an architectural rule, project pattern, or task insight.
-- `neurostrata_search_memory` — query memory contents via vector + graph RAG.
+- `neurostrata_search_memory` — query memory contents via vector + graph RAG (accepts optional `project_root` alongside `path_prefix` for multi-form relative/absolute prefix resolution).
 - `neurostrata_get_snapshot` — fetch current task state snapshot (<=800 chars).
 - `neurostrata_supersede_memory` — replace active version with new one atomically.
 - `neurostrata_memories_for_file` — inspect governing memories for a given path/file.
-- `neurostrata_related` — find related entities (`CONTAINS`, `GOVERNS`).
-- `neurostrata_diff_tour` — diff tour between versions.
+- `neurostrata_related` — find related entities (`CONTAINS`, `GOVERNS`; accepts optional `project_root`, resolves multi-form file seeds to one canonical in-namespace file node before single traversal, and returns additive `resolved_seed` metadata).
+- `neurostrata_diff_tour` — diff tour between versions (separates caller-facing display paths from internal multi-form lookup paths and records canonical project-relative paths in the Graph-First session ledger).
+- `neurostrata_locate` — locate structural code symbols and governing rules (resolves `path_prefix` against optional `project_root` and the namespace's cached `registry_root` across relative and absolute stored spellings, failing closed on unresolvable absolute prefixes).
+- `neurostrata_insights` — evaluate and track architectural insights (accepts optional `project_root`; resolves `path_prefix` dynamically at `snapshot`/`series` time for `lexical` and `ast_calls` insights across relative and absolute stored spellings, failing closed on unresolvable absolute prefixes).
 - `neurostrata_ingest_directory` — ingest a directory into the property graph.
 - `neurostrata_ingest_bounded` — ontology-scoped bounded RDF classification + ingest (Capability F). Inputs: `namespace`, `domain`, `candidates` (all required), optional `principal`, `user_id`, `reason`. Each candidate carries `subject`, `class`, `predicate` and an `object` that is either `{"iri": "<absolute-iri>"}` or `{"literal": {"value": "...", "datatype"?: "<iri>", "language"?: "<tag>"}}`. The requested `domain` is normalized before the governed class/predicate closure is selected under a fixed finite query budget; `governs_class` is exact-match only, so invented IRIs that collapse onto a slug are rejected. Finite caps apply to candidate count (256), IRI length (2048 bytes) and literal length (65536 bytes). The emitted Turtle and the `MemoryPayload` are SHACL-validated before any write; any violation, unknown/empty domain, budget exhaustion, ungoverned class/predicate, malformed term or cap breach fails closed with `{"ok": false, "error": ...}` and zero writes. A successful call commits exactly one idempotent batch memory (`bounded-ingest-<sha256>`) and returns `{"ok": true, "id", "namespace", "domain", "triple_count", "turtle"}`. A ReBAC namespace write gate (`can_write_namespace` on the resolved principal) protects the write; there is no permissive opt-out and no CLI/daemon surface for this tool.
 - `neurostrata_append_log` — append conversational transcript log entries.

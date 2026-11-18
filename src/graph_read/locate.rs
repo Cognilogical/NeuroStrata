@@ -606,11 +606,22 @@ pub async fn execute_locate(
         .clamp(1, MAX_LOCATIONS_CAP);
     let max_bytes = request.max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
     let symbols_only = request.symbols_only.unwrap_or(false);
-    let path_prefix = request
+    let prefix_forms: Vec<String> = if let Some(raw_prefix) = request
         .path_prefix
         .as_deref()
-        .map(crate::parser::ingest::normalize_node_path)
-        .filter(|s| !s.is_empty());
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let registry_root = crate::registry::cached_project_root(store, &namespace).await?;
+        crate::paths::prefix_lookup_forms(
+            raw_prefix,
+            request.project_root.as_deref(),
+            registry_root.as_deref(),
+        )
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?
+    } else {
+        Vec::new()
+    };
 
     let principal = resolve_principal(
         trusted_principal.unwrap_or("admin"),
@@ -1028,12 +1039,7 @@ pub async fn execute_locate(
     let mut candidates: Vec<CandidateSpan> = span_map
         .into_values()
         .filter(|span| !symbols_only || span.symbol.is_some())
-        .filter(|span| {
-            path_prefix
-                .as_ref()
-                .map(|prefix| span.path.starts_with(prefix))
-                .unwrap_or(true)
-        })
+        .filter(|span| crate::search::path_prefix_forms_match(&span.path, &prefix_forms))
         .collect();
 
     candidates.sort_by(|a, b| {

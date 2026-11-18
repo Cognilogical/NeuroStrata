@@ -746,8 +746,8 @@ mod tests {
                 .next()
                 .expect("parse inferred nquad")
                 .expect("valid inferred nquad");
-            assert_eq!(q.graph_name, inf_graph, "inferred quad leaked graph: {nq}");
-            assert!(dataset.contains(&q), "inferred quad missing from dataset: {nq}");
+            assert_eq!(q.graph_name, inf_graph, "inferred quad leaked graph");
+            assert!(dataset.contains(&q), "inferred quad missing from dataset");
         }
 
         // RDF-star provenance is persisted in the receipt, not discarded.
