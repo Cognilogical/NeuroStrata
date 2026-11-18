@@ -387,7 +387,8 @@ pub async fn process_mcp_request(
                             "type": "object",
                             "properties": {
                                 "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata')." },
-                                "id": { "type": "string", "description": "The seed node: a memory id, a task id, or a qualified file path." },
+                                "id": { "type": "string", "description": "The seed node: a memory id, a task id, or a file path. An absolute file path is made project-relative the way neurostrata_memories_for_file does it." },
+                                "project_root": { "type": "string", "description": "Optional absolute path to the project root, used to make an absolute file seed relative." },
                                 "relations": { "type": "array", "items": { "type": "string" }, "description": "Relations to follow: GOVERNS, CONTAINS, RELATES_TO, EXTRACTED_FROM. Default all four." },
                                 "direction": { "type": "string", "enum": ["outgoing", "incoming", "both"], "description": "Traversal direction. Default both." },
                                 "max_hops": { "type": "integer", "description": "Traversal depth. Default 1, max 2." },
@@ -2721,7 +2722,7 @@ pub async fn start_mcp_proxy(origin: DaemonOrigin) -> io::Result<()> {
 /// paths. Stored memories are read as they are, never rewritten. Fails only
 /// when the registered root cannot be read and nothing else constrains an
 /// absolute path (see [`registry_root_for_lookup`]).
-async fn lookup_path_for(
+pub(crate) async fn lookup_path_for(
     store: &Arc<dyn VectorStore>,
     namespace: &str,
     path: &str,
@@ -2734,11 +2735,48 @@ async fn lookup_path_for(
         project_root,
     )?;
     let lookup = crate::paths::to_project_relative(path, project_root, registry_root.as_deref());
-    let known_root = project_root
-        .filter(|root| crate::paths::is_usable_root(root))
-        .or(registry_root.as_deref());
-    let forms = crate::paths::lookup_forms(path, &lookup, known_root);
+    let known_root = crate::paths::known_root(project_root, registry_root.as_deref());
+    let forms = crate::paths::lookup_forms(&lookup, known_root);
     Ok((lookup, forms))
+}
+
+/// Every spelling a `path_prefix` filter should match, resolved like a file
+/// lookup ([`lookup_path_for`]): the project-relative, on-disk spelling first,
+/// then the spellings a memory written before the namespace's paths were
+/// migrated may carry. A prefix under no known root, or one the lookup cannot
+/// place, is kept as given. A trailing `/` (a directory boundary) is kept on
+/// every spelling. Empty when the prefix is empty: no filter.
+pub(crate) async fn resolve_path_prefix(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    prefix: &str,
+    project_root: Option<&str>,
+) -> Vec<String> {
+    let directory = prefix.ends_with(['/', '\\']);
+    let normalized = crate::parser::ingest::normalize_node_path(prefix);
+    if normalized.is_empty() {
+        return Vec::new();
+    }
+    let mut forms: Vec<String> =
+        match lookup_path_for(store, namespace, &normalized, project_root).await {
+            Ok((lookup, forms)) if lookup.source != crate::paths::RootSource::Outside => forms
+                .iter()
+                .map(|f| crate::parser::ingest::normalize_node_path(f))
+                .collect(),
+            Ok(_) => vec![normalized],
+            Err(e) => {
+                tracing::warn!("path_prefix {normalized:?} kept as given: {e:#}");
+                vec![normalized]
+            }
+        };
+    if directory {
+        for form in &mut forms {
+            form.push('/');
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    forms.retain(|f| seen.insert(f.clone()));
+    forms
 }
 
 /// The registered root to resolve `path` with, given the result of reading it.
@@ -3118,6 +3156,28 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
         None => return "Missing 'id' parameter.".to_string(),
     };
     let namespace = resolve_namespace(&store, namespace).await;
+    // A file seed may be absolute (the path a hook or an agent has open).
+    // Stored locations are project-relative, so it is resolved the way
+    // neurostrata_memories_for_file resolves its path; an id, a relative
+    // path, or an absolute path under no known root is used as given. Until
+    // the namespace's paths are migrated, a memory may still carry the
+    // absolute spelling, so each spelling is tried in turn (resolved first).
+    let seed_forms: Vec<String> = if crate::paths::is_absolute_any(seed) {
+        let project_root = arguments.get("project_root").and_then(|p| p.as_str());
+        match lookup_path_for(&store, &namespace, seed, project_root).await {
+            Ok((lookup, forms)) if lookup.source != crate::paths::RootSource::Outside => forms,
+            Ok(_) => vec![seed.to_string()],
+            // The seed as given matches only that exact location, so it
+            // cannot widen the walk; use it rather than fail the call.
+            Err(e) => {
+                tracing::warn!("related seed {seed:?} used as given: {e:#}");
+                vec![seed.to_string()]
+            }
+        }
+    } else {
+        vec![seed.to_string()]
+    };
+    let seed = seed_forms[0].as_str();
     let store_for_meta = store.clone();
 
     let relations: Vec<String> = match arguments.get("relations") {
@@ -3200,20 +3260,33 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
         .to_string();
     };
 
-    match store
-        .related(
-            &namespace,
-            seed,
-            &relations,
-            direction,
-            max_hops,
-            &memory_types,
-            limit,
-            cursor.as_ref(),
-            &cross_namespace,
-        )
-        .await
-    {
+    // The first spelling that names a node is the seed; with none, the
+    // answer for the resolved spelling stands.
+    let mut walked = None;
+    for candidate in &seed_forms {
+        let result = store
+            .related(
+                &namespace,
+                candidate,
+                &relations,
+                direction,
+                max_hops,
+                &memory_types,
+                limit,
+                cursor.as_ref(),
+                &cross_namespace,
+            )
+            .await;
+        let found = matches!(&result, Ok(r) if !r.nodes.is_empty());
+        if found || walked.is_none() {
+            walked = Some((candidate.as_str(), result));
+        }
+        if found {
+            break;
+        }
+    }
+    let (seed, walked) = walked.expect("seed_forms is never empty");
+    match walked {
         Ok(mut result) => {
             // Temporal bounds apply to the validity windows of the edges on
             // each node's evidence path. The seed is the explicit query target
@@ -10166,7 +10239,7 @@ async fn handle_search_memory(
     // Upgraded SearchFilters (src/search.rs). Optional: defaults preserve
     // existing search behavior (include_code_ast defaults to true so searches
     // that match code_ast rows keep working unless explicitly disabled).
-    let search_filters = crate::search::SearchFilters {
+    let mut search_filters = crate::search::SearchFilters {
         memory_types: arguments
             .get("memory_types")
             .and_then(|v| v.as_array())
@@ -10184,6 +10257,7 @@ async fn handle_search_memory(
             .get("path_prefix")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
+        path_prefix_alternates: Vec::new(),
         exclude_stale: arguments
             .get("exclude_stale")
             .and_then(|v| v.as_bool())
@@ -10193,6 +10267,13 @@ async fn handle_search_memory(
             .and_then(|v| v.as_bool())
             .unwrap_or(true),
     };
+    if let Some(prefix) = search_filters.path_prefix.take() {
+        let mut forms = resolve_path_prefix(&store, namespace, &prefix, None).await;
+        if !forms.is_empty() {
+            search_filters.path_prefix = Some(forms.remove(0));
+            search_filters.path_prefix_alternates = forms;
+        }
+    }
     let has_upgraded_filters = !search_filters.memory_types.is_empty()
         || search_filters.fact_shape.is_some()
         || search_filters.path_prefix.is_some()
@@ -14049,6 +14130,76 @@ mod tests {
         let got =
             merge_spelling_results(vec![Err::<Vec<MemoryHit>, _>(anyhow::anyhow!("first"))], 10);
         assert!(got.is_err(), "when every spelling fails, surface the error");
+    }
+
+    /// `neurostrata_related` and the `path_prefix` filters resolve a file path
+    /// the way `neurostrata_memories_for_file` does: an absolute path meets the
+    /// project-relative location it names.
+    #[tokio::test]
+    async fn related_and_path_prefix_resolve_an_absolute_path() {
+        let (store, rule_id) = store_with_one_rule("probe").await;
+        let lb = crate::traits::VectorStore::as_any(store.as_ref())
+            .downcast_ref::<crate::store::ladybug::LadybugStore>()
+            .expect("ladybug store");
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let base = dunce::canonicalize(tmp.path()).expect("canonical temp dir");
+        let root = base.join("example-project");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src").join("lib.rs"), "x").unwrap();
+        let root_s = root.to_string_lossy().to_string();
+        let absolute = root.join("src").join("lib.rs").to_string_lossy().to_string();
+
+        let edge_rule_id = rule_id.clone();
+        lb.with_conn(move |conn| {
+            conn.query(
+                "CREATE (m:Memory {id: 'src/lib.rs', namespace: 'probe', content: 'c', user_id: 'u', memory_type: 'file', agent_name: 'a', location: 'src/lib.rs', location_lines: '', metadata: '{}', embedding: [0.0,0.0,0.0,0.0]})"
+            )?;
+            conn.query(&format!(
+                "MERGE (a:Memory {{id: '{edge_rule_id}'}}), (b:Memory {{id: 'src/lib.rs'}}) MERGE (a)-[r:GOVERNS {{source: 'test', valid_from: 0, valid_to: 0, generation: 0, extractor: 'test', evidence_id: 'e', origin: 'local'}}]->(b)"
+            ))?;
+            Ok(())
+        })
+        .await
+        .expect("seed file + edge");
+
+        let text = handle_related(
+            serde_json::json!({
+                "namespace": "probe",
+                "id": absolute,
+                "project_root": root_s,
+                "max_hops": 1,
+            }),
+            store.clone(),
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&text).expect("valid JSON");
+        let nodes = parsed["nodes"].as_array().expect("nodes array");
+        assert!(
+            nodes.iter().any(|n| n["id"] == json!(rule_id)),
+            "the absolute seed reaches the rule governing src/lib.rs: {text}"
+        );
+
+        // The resolved spelling comes first; the absolute one a memory written
+        // before migration may carry follows.
+        let src = root.join("src").to_string_lossy().to_string();
+        let forms = resolve_path_prefix(&store, "probe", &src, Some(&root_s)).await;
+        assert_eq!(forms[0], "src", "{forms:?}");
+        assert!(
+            forms.contains(&crate::parser::ingest::normalize_node_path(&src)),
+            "{forms:?}"
+        );
+        // A trailing `/` keeps the directory boundary: `src/` must not match `src2/`.
+        let forms = resolve_path_prefix(&store, "probe", "src/", Some(&root_s)).await;
+        assert_eq!(forms[0], "src/", "{forms:?}");
+        assert!(forms.iter().all(|f| f.ends_with('/')), "{forms:?}");
+        // Under no known root: kept as given, separators normalized.
+        let elsewhere = base.join("elsewhere").join("x").to_string_lossy().to_string();
+        assert_eq!(
+            resolve_path_prefix(&store, "probe", &elsewhere, Some(&root_s)).await,
+            vec![crate::parser::ingest::normalize_node_path(&elsewhere)]
+        );
+        assert!(resolve_path_prefix(&store, "probe", "", Some(&root_s)).await.is_empty());
     }
 
     /// Hooks send the absolute path of the file being touched (Claude Code's

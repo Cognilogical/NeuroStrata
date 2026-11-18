@@ -606,11 +606,19 @@ pub async fn execute_locate(
         .clamp(1, MAX_LOCATIONS_CAP);
     let max_bytes = request.max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
     let symbols_only = request.symbols_only.unwrap_or(false);
-    let path_prefix = request
-        .path_prefix
-        .as_deref()
-        .map(crate::parser::ingest::normalize_node_path)
-        .filter(|s| !s.is_empty());
+    // Every spelling of the prefix; empty means no filter.
+    let path_prefix: Vec<String> = match request.path_prefix.as_deref() {
+        Some(prefix) => {
+            crate::server::resolve_path_prefix(
+                store,
+                &namespace,
+                prefix,
+                request.project_root.as_deref(),
+            )
+            .await
+        }
+        None => Vec::new(),
+    };
 
     let principal = resolve_principal(
         trusted_principal.unwrap_or("admin"),
@@ -1029,10 +1037,8 @@ pub async fn execute_locate(
         .into_values()
         .filter(|span| !symbols_only || span.symbol.is_some())
         .filter(|span| {
-            path_prefix
-                .as_ref()
-                .map(|prefix| span.path.starts_with(prefix))
-                .unwrap_or(true)
+            path_prefix.is_empty()
+                || path_prefix.iter().any(|prefix| span.path.starts_with(prefix.as_str()))
         })
         .collect();
 

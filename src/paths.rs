@@ -174,21 +174,29 @@ pub fn relative_to_on_disk(path: &str, root: &str) -> Option<String> {
         return Some(rel);
     }
     let root_canonical = canonical(&host_path(root)?)?;
-    let host = host_path(path)?;
-    let mut existing = host.as_path();
-    let mut missing: Vec<String> = Vec::new();
+    let full = disk_form(&host_path(path)?)?;
+    relative_to(&full.to_string_lossy(), &root_canonical.to_string_lossy())
+}
+
+/// The on-disk form of `path`: its canonical path when it exists; else, for a
+/// file not written yet, the canonical path of its nearest existing ancestor
+/// with the missing components appended as given. So `SRC/new.rs` under an
+/// existing `src` reads as `src/new.rs` on a volume that ignores case.
+fn disk_form(path: &Path) -> Option<PathBuf> {
+    let mut existing = path;
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
     let base = loop {
         if let Some(c) = canonical(existing) {
             break c;
         }
-        missing.push(existing.file_name()?.to_string_lossy().to_string());
+        missing.push(existing.file_name()?.to_os_string());
         existing = existing.parent()?;
     };
     let mut full = base;
     for part in missing.iter().rev() {
         full.push(part);
     }
-    relative_to(&full.to_string_lossy(), &root_canonical.to_string_lossy())
+    Some(full)
 }
 
 /// Whether `root` can serve as a root on this host: absolute here and an
@@ -330,11 +338,16 @@ pub struct LookupPath {
 }
 
 /// Turn the path a caller sent into the project-relative path the graph
-/// stores. A relative path is returned byte for byte, without touching the
-/// disk. An absolute one is made relative to, in order:
+/// stores. A relative path is returned as given, unless the file system
+/// spells it differently under the known root ([`known_root`]): then that
+/// spelling comes first and the caller's is an alternate. For a file not
+/// written yet, its nearest existing directory decides the spelling. An absolute one is
+/// made relative to, in order:
 /// 1. `project_root`, when it contains the path;
 /// 2. `registry_root`, when it is usable on this host ([`is_usable_root`]) and
 ///    contains the path. An unusable one is ignored, never a veto;
+///    A usable `registry_root` inside `project_root` is tried before it, since
+///    it is the root this namespace's stored paths are relative to;
 /// 3. the nearest ancestor holding `.git`.
 ///
 /// Within 1 and 2, a `.git` between the root and the file keeps apart what is
@@ -353,19 +366,31 @@ pub struct LookupPath {
 /// memories. A supplied `project_root` vetoes here even when it is unusable on
 /// this host (a moved root), while an unusable registered root is ignored.
 ///
-/// When the file exists, the part below the root is taken from its canonical
-/// path, so it carries the on-disk spelling the store matches exactly.
+/// The part below the root is taken from the file's canonical path (for a
+/// file not written yet, its nearest existing directory's), so it carries the
+/// on-disk spelling the store matches exactly.
 pub fn to_project_relative(
     raw: &str,
     project_root: Option<&str>,
     registry_root: Option<&str>,
 ) -> LookupPath {
     if !is_absolute_any(raw) {
-        return LookupPath {
-            path: raw.to_string(),
-            source: RootSource::Relative,
-            root: None,
-            alternates: Vec::new(),
+        return match known_root(project_root, registry_root).and_then(|root| relative_on_disk_spelling(raw, root)) {
+            // The file exists under the known root and the file system spells
+            // it differently (case, `..`, a symlinked file): query that
+            // spelling first, and the caller's as an alternate.
+            Some(disk) if disk != raw => LookupPath {
+                path: disk,
+                source: RootSource::Relative,
+                root: None,
+                alternates: vec![raw.to_string()],
+            },
+            _ => LookupPath {
+                path: raw.to_string(),
+                source: RootSource::Relative,
+                root: None,
+                alternates: Vec::new(),
+            },
         };
     }
     let input = follow_parent_components(raw);
@@ -374,6 +399,11 @@ pub fn to_project_relative(
             let path = with_disk_spelling(&input, &root, rel.clone());
             let mut alternates = vec![rel, input.clone()];
             alternates.extend(parse_absolute(&input).map(|p| p.to_path_string()));
+            // A `..` resolved on disk changes the absolute spelling; a memory
+            // may still carry the caller's literal one.
+            if input != raw {
+                alternates.push(raw.to_string());
+            }
             LookupPath {
                 path,
                 source,
@@ -414,6 +444,38 @@ fn follow_parent_components(raw: &str) -> String {
     resolved.map_or_else(|| raw.to_string(), |p| p.to_string_lossy().to_string())
 }
 
+/// The root a relative path is read against: the registered root when it is
+/// usable and lies inside the caller's `project_root` (stored paths are
+/// relative to it), else a usable `project_root`, else a usable registered
+/// root. The same order [`to_project_relative`] tries for an absolute path.
+pub fn known_root<'a>(project_root: Option<&'a str>, registry_root: Option<&'a str>) -> Option<&'a str> {
+    let project_root = project_root.filter(|root| is_usable_root(root));
+    let registry_root = registry_root.filter(|root| is_usable_root(root));
+    match (project_root, registry_root) {
+        (Some(caller), Some(registered)) if registered_root_is_nested(caller, registered) => {
+            Some(registered)
+        }
+        (caller, registered) => caller.or(registered),
+    }
+}
+
+/// Whether `registered` lies strictly inside `caller`.
+fn registered_root_is_nested(caller: &str, registered: &str) -> bool {
+    relative_to_on_disk(registered, caller).is_some()
+}
+
+/// Relative `raw` as the file system spells it below `root`: on-disk case,
+/// `..` resolved through symlinked directories, a symlinked file read as its
+/// target. For a file not written yet, its nearest existing directory decides.
+/// `None` when it resolves outside `root`.
+fn relative_on_disk_spelling(raw: &str, root: &str) -> Option<String> {
+    let joined = format!("{}/{}", root.trim_end_matches(['/', '\\']), raw);
+    let input = follow_parent_components(&joined);
+    let file = disk_form(&host_path(&input)?)?;
+    let root = canonical(&host_path(root)?)?;
+    relative_to(&file.to_string_lossy(), &root.to_string_lossy())
+}
+
 /// `rel` (the part of `path` below `root`) re-read from the filesystem when
 /// the file exists: the canonical path carries the on-disk case and resolves
 /// symlinked roots. Falls back to `rel` when the file does not exist yet, or
@@ -422,7 +484,7 @@ fn with_disk_spelling(path: &str, root: &str, rel: String) -> String {
     let (Some(file), Some(root_host)) = (host_path(path), host_path(root)) else {
         return rel;
     };
-    let (Some(file), Some(root_c)) = (canonical(&file), canonical(&root_host)) else {
+    let (Some(file), Some(root_c)) = (disk_form(&file), canonical(&root_host)) else {
         return rel;
     };
     relative_to(&file.to_string_lossy(), &root_c.to_string_lossy()).unwrap_or(rel)
@@ -442,10 +504,19 @@ fn choose_root(
     let registry_root = registry_root.filter(|root| is_usable_root(root));
     let marker = find_git_root(raw);
     let marker_rel = marker.as_deref().and_then(|m| relative_to(raw, m));
-    for (root, source) in [
+    let mut candidates = [
         (project_root, RootSource::ProjectRoot),
         (registry_root, RootSource::RegistryRoot),
-    ] {
+    ];
+    // A registered root inside the caller's (a project registered at a
+    // subdirectory, a broad working directory passed as `project_root`) is
+    // where the stored paths of this namespace are relative to: try it first.
+    if let (Some(caller), Some(registered)) = (project_root, registry_root) {
+        if registered_root_is_nested(caller, registered) {
+            candidates.swap(0, 1);
+        }
+    }
+    for (root, source) in candidates {
         let Some(root) = root else { continue };
         let Some(rel) = relative_to_on_disk(raw, root) else {
             continue;
@@ -477,7 +548,7 @@ fn choose_root(
     }
 }
 
-/// Every spelling to query the store with for `raw`, the resolved form first.
+/// Every spelling to query the store with for `lookup`, the resolved form first.
 /// Stored locations are normally relative, but older memories may carry an
 /// absolute path; they are read as they are, never rewritten:
 /// - a resolved absolute path is also queried as the caller spelled it below
@@ -485,16 +556,30 @@ fn choose_root(
 /// - a relative path is also queried joined onto `known_root` (when it is
 ///   usable here and the join stays inside it);
 /// - an `Outside` path is queried only as given.
-pub fn lookup_forms(raw: &str, lookup: &LookupPath, known_root: Option<&str>) -> Vec<String> {
+pub fn lookup_forms(lookup: &LookupPath, known_root: Option<&str>) -> Vec<String> {
     let mut forms = vec![lookup.path.clone()];
     match lookup.source {
         RootSource::Outside => {}
         RootSource::Relative => {
-            let joined = known_root.filter(|r| is_usable_root(r)).and_then(|root| {
-                let joined = parse_absolute(&format!("{root}/{raw}"))?.to_path_string();
-                relative_to(&joined, root).map(|_| joined)
-            });
-            forms.extend(joined);
+            forms.extend(lookup.alternates.iter().cloned());
+            // Each relative spelling (the resolved one and the caller's) is
+            // also queried joined onto the root, for memories stored with an
+            // absolute path. `..` is resolved on disk first, as for an absolute
+            // path: past a symlinked directory, collapsing it by spelling
+            // names another file.
+            if let Some(root) = known_root.filter(|r| is_usable_root(r)) {
+                let relatives: Vec<String> = std::iter::once(lookup.path.clone())
+                    .chain(lookup.alternates.iter().cloned())
+                    .collect();
+                for rel in relatives {
+                    let joined = follow_parent_components(&format!("{root}/{rel}"));
+                    if let Some(joined) = parse_absolute(&joined).map(|p| p.to_path_string()) {
+                        if relative_to_on_disk(&joined, root).is_some() {
+                            forms.push(joined);
+                        }
+                    }
+                }
+            }
         }
         RootSource::ProjectRoot | RootSource::RegistryRoot | RootSource::Marker => {
             forms.extend(lookup.alternates.iter().cloned());
@@ -687,7 +772,7 @@ mod tests {
                 alternates: Vec::new(),
             }
         );
-        assert_eq!(lookup_forms(raw, &got, None), vec![raw.to_string()]);
+        assert_eq!(lookup_forms(&got, None), vec![raw.to_string()]);
     }
 
     // ---- filesystem layouts (temp dirs) ----
@@ -1004,21 +1089,21 @@ mod tests {
         let (_tmp, root, _) = project_with_worktree();
         let file = s(&root.join("src").join("lib.rs"));
         let l = to_project_relative(&file, None, None);
-        let forms = lookup_forms(&file, &l, None);
+        let forms = lookup_forms(&l, None);
         assert_eq!(forms[0], "src/lib.rs");
         assert!(forms.contains(&file), "{forms:?}");
         let rel = to_project_relative("src/lib.rs", None, None);
-        let forms = lookup_forms("src/lib.rs", &rel, Some(&s(&root)));
+        let forms = lookup_forms(&rel, Some(&s(&root)));
         let joined = parse_absolute(&file).unwrap().to_path_string();
         assert_eq!(forms, vec!["src/lib.rs".to_string(), joined]);
         // No usable root, or a join that leaves the root: relative form only.
         assert_eq!(
-            lookup_forms("src/lib.rs", &rel, Some("example-project")),
+            lookup_forms(&rel, Some("example-project")),
             vec!["src/lib.rs".to_string()]
         );
         let up = to_project_relative("../other/lib.rs", None, None);
         assert_eq!(
-            lookup_forms("../other/lib.rs", &up, Some(&s(&root))),
+            lookup_forms(&up, Some(&s(&root))),
             vec!["../other/lib.rs".to_string()]
         );
     }
@@ -1042,6 +1127,143 @@ mod tests {
         assert!(file.exists());
     }
 
+    #[test]
+    fn a_relative_path_takes_the_disk_spelling_under_a_known_root() {
+        let (_tmp, root, _) = project_with_worktree();
+        let r = s(&root);
+        // `..` is resolved; the caller's spelling stays as an alternate.
+        let l = to_project_relative("src/../src/lib.rs", Some(&r), None);
+        assert_eq!(l.path, "src/lib.rs");
+        assert_eq!(l.source, RootSource::Relative);
+        assert_eq!(l.alternates, vec!["src/../src/lib.rs".to_string()]);
+        // The registered root serves when the caller sent none.
+        let l = to_project_relative("src/../src/lib.rs", None, Some(&r));
+        assert_eq!(l.path, "src/lib.rs");
+        // Already the disk spelling: unchanged, no alternate.
+        let l = to_project_relative("src/lib.rs", Some(&r), None);
+        assert_eq!((l.path.as_str(), l.alternates.len()), ("src/lib.rs", 0));
+        // A file not written yet takes its existing directory's spelling.
+        let l = to_project_relative("src/./new.rs", Some(&r), None);
+        assert_eq!(l.path, "src/new.rs");
+        assert_eq!(l.alternates, vec!["src/./new.rs".to_string()]);
+        // Under no existing directory, it is returned byte for byte.
+        let l = to_project_relative("gone/x.rs", Some(&r), None);
+        assert_eq!((l.path.as_str(), l.alternates.len()), ("gone/x.rs", 0));
+    }
+
+    #[test]
+    fn a_relative_path_takes_the_on_disk_case_where_the_volume_ignores_case() {
+        let (_tmp, root, _) = project_with_worktree();
+        touch(&root.join("src").join("Mixed.rs"));
+        if !root.join("src").join("mixed.rs").exists() {
+            return; // case-sensitive volume: `mixed.rs` is another file.
+        }
+        let l = to_project_relative("SRC/mixed.rs", Some(&s(&root)), None);
+        assert_eq!(l.path, "src/Mixed.rs");
+        assert_eq!(l.alternates, vec!["SRC/mixed.rs".to_string()]);
+        // A file not written yet takes the case of its existing directory, so
+        // rules on `src` still apply before the write.
+        let l = to_project_relative("SRC/new.rs", Some(&s(&root)), None);
+        assert_eq!(l.path, "src/new.rs");
+        let absolute = s(&root.join("SRC").join("new.rs"));
+        let l = to_project_relative(&absolute, Some(&s(&root)), None);
+        assert_eq!(l.path, "src/new.rs");
+    }
+
+    #[test]
+    fn an_absolute_path_with_parent_components_keeps_its_literal_spelling() {
+        // A memory may carry `/repo/src/../src/lib.rs` as written.
+        let (_tmp, root, _) = project_with_worktree();
+        let raw = s(&root.join("src").join("..").join("src").join("lib.rs"));
+        let l = to_project_relative(&raw, Some(&s(&root)), None);
+        assert_eq!(l.path, "src/lib.rs");
+        assert!(lookup_forms(&l, None).contains(&raw), "{:?}", l.alternates);
+    }
+
+    #[test]
+    fn a_relative_path_is_read_against_a_registered_root_nested_in_the_callers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let broad = canonical(tmp.path()).unwrap().join("work");
+        let project = broad.join("project");
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        touch(&project.join("src").join("lib.rs"));
+        let (b, p) = (s(&broad), s(&project));
+        assert_eq!(known_root(Some(&b), Some(&p)), Some(p.as_str()));
+        assert_eq!(known_root(Some(&p), Some(&b)), Some(p.as_str()));
+        let missing = s(&broad.join("gone"));
+        assert_eq!(known_root(Some(&missing), Some(&p)), Some(p.as_str()));
+        // `src/lib.rs` exists under the project, not under `work`.
+        let l = to_project_relative("src/../src/lib.rs", Some(&b), Some(&p));
+        assert_eq!(l.path, "src/lib.rs");
+    }
+
+    #[test]
+    fn a_registered_linked_worktree_still_answers_for_the_main_checkout() {
+        // The namespace's root was cached from a linked worktree; a file in the
+        // main checkout of the same repository still resolves, by its `.git`.
+        let (_tmp, root, worktree) = project_with_worktree();
+        assert_eq!(
+            got(&root.join("src").join("lib.rs"), None, Some(&worktree)),
+            resolved("src/lib.rs", RootSource::Marker)
+        );
+    }
+
+    #[test]
+    fn a_registered_root_inside_the_callers_root_is_tried_first() {
+        // The caller passes a broad directory; the namespace is registered at
+        // the project below it, which its stored paths are relative to.
+        let tmp = tempfile::tempdir().unwrap();
+        let broad = canonical(tmp.path()).unwrap().join("work");
+        let project = broad.join("project");
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        let file = project.join("src").join("lib.rs");
+        touch(&file);
+        assert_eq!(
+            got(&file, Some(&broad), Some(&project)),
+            resolved("src/lib.rs", RootSource::RegistryRoot)
+        );
+        // Not nested: the caller's root still comes first.
+        assert_eq!(
+            got(&file, Some(&project), Some(&broad)),
+            resolved("src/lib.rs", RootSource::ProjectRoot)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_path_joined_onto_the_root_follows_a_symlinked_directory() {
+        // `link` points at `a/b`: `link/../file.rs` is `a/file.rs`, and the
+        // absolute alias must name that file, not `<root>/file.rs`.
+        let (_tmp, root, _) = project_with_worktree();
+        std::fs::create_dir_all(root.join("a").join("b")).unwrap();
+        touch(&root.join("a").join("file.rs"));
+        touch(&root.join("file.rs"));
+        std::os::unix::fs::symlink(root.join("a").join("b"), root.join("link")).unwrap();
+        let r = s(&root);
+        let l = to_project_relative("link/../file.rs", Some(&r), None);
+        assert_eq!(l.path, "a/file.rs");
+        let forms = lookup_forms(&l, Some(&r));
+        assert!(forms.contains(&s(&root.join("a").join("file.rs"))), "{forms:?}");
+        assert!(!forms.contains(&s(&root.join("file.rs"))), "{forms:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_symlinked_file_is_also_queried_absolute_as_the_caller_spelled_it() {
+        // A memory written before migration may carry `<root>/src/config.rs`.
+        let (_tmp, root, _) = project_with_worktree();
+        touch(&root.join("shared").join("config.rs"));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let link = root.join("src").join("config.rs");
+        std::os::unix::fs::symlink(root.join("shared").join("config.rs"), &link).unwrap();
+        let r = s(&root);
+        let l = to_project_relative("src/config.rs", Some(&r), None);
+        assert_eq!(l.path, "shared/config.rs");
+        let forms = lookup_forms(&l, Some(&r));
+        assert!(forms.contains(&"src/config.rs".to_string()), "{forms:?}");
+        assert!(forms.contains(&s(&link)), "{forms:?}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_symlinked_file_is_also_looked_up_as_the_caller_spelled_it() {
@@ -1055,7 +1277,7 @@ mod tests {
         std::os::unix::fs::symlink(root.join("shared").join("config.rs"), &link).unwrap();
         let l = to_project_relative(&s(&link), Some(&s(&root)), None);
         assert_eq!(l.path, "shared/config.rs");
-        let forms = lookup_forms(&s(&link), &l, Some(&s(&root)));
+        let forms = lookup_forms(&l, Some(&s(&root)));
         assert!(forms.contains(&"src/config.rs".to_string()), "{forms:?}");
     }
 
@@ -1072,7 +1294,7 @@ mod tests {
         let raw = s(&root.join("link").join("..").join("file.rs"));
         let l = to_project_relative(&raw, Some(&s(&root)), None);
         assert_eq!(l.path, "a/file.rs");
-        let forms = lookup_forms(&raw, &l, Some(&s(&root)));
+        let forms = lookup_forms(&l, Some(&s(&root)));
         assert!(
             !forms
                 .iter()

@@ -747,11 +747,20 @@ async fn evaluate_custom_insight(
     valid_rows: &[&SearchResult],
     as_of: Option<i64>,
 ) -> (f64, Vec<String>) {
-    let prefix_norm = def
-        .path_prefix
-        .as_deref()
-        .map(crate::parser::ingest::normalize_node_path)
-        .filter(|s| !s.is_empty());
+    // Every spelling of the prefix; the governed-path check below is already
+    // boundary-aware, so a trailing `/` is dropped.
+    let prefix_norm: Option<BTreeSet<String>> = match def.path_prefix.as_deref() {
+        Some(prefix) => {
+            let forms: BTreeSet<String> =
+                crate::server::resolve_path_prefix(store, namespace, prefix, None)
+                    .await
+                    .iter()
+                    .map(|f| crate::parser::ingest::normalize_node_path(f))
+                    .collect();
+            (!forms.is_empty()).then_some(forms)
+        }
+        None => None,
+    };
 
     match def.query_kind {
         InsightQueryKind::Lexical => {
@@ -772,7 +781,7 @@ async fn evaluate_custom_insight(
                             if let Some(r) = valid_by_id.get(hit.id.as_str()) {
                                 if let Some(pref) = &prefix_norm {
                                     let p = extract_node_path(r).unwrap_or_default();
-                                    if !path_is_governed_by_any(&p, &BTreeSet::from([pref.clone()]))
+                                    if !path_is_governed_by_any(&p, pref)
                                     {
                                         continue;
                                     }
@@ -798,7 +807,7 @@ async fn evaluate_custom_insight(
                     }
                     if let Some(pref) = &prefix_norm {
                         let p = extract_node_path(r).unwrap_or_default();
-                        if !path_is_governed_by_any(&p, &BTreeSet::from([pref.clone()])) {
+                        if !path_is_governed_by_any(&p, pref) {
                             continue;
                         }
                     }
@@ -828,7 +837,7 @@ async fn evaluate_custom_insight(
                 }
                 let path = extract_node_path(r).unwrap_or_default();
                 if let Some(pref) = &prefix_norm {
-                    if !path_is_governed_by_any(&path, &BTreeSet::from([pref.clone()])) {
+                    if !path_is_governed_by_any(&path, pref) {
                         continue;
                     }
                 }

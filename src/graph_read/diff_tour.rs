@@ -773,6 +773,45 @@ pub async fn execute_diff_tour(
         }
     }
 
+    // Spans are matched against stored, project-relative locations, so each
+    // span path is resolved the way neurostrata_memories_for_file resolves its
+    // path: an absolute one (a diff made with absolute paths, an editor's
+    // span) is made relative, and a relative one takes the on-disk spelling
+    // when the file exists. One under no known root is kept as given.
+    // Every spelling of each resolved path is kept for the governance read:
+    // until the namespace's paths are migrated, a rule may still declare the
+    // file by its absolute path. A span that cannot be placed (the registered
+    // root unreadable and no `project_root`) is kept as given, as before.
+    let mut resolved: HashMap<String, String> = HashMap::new();
+    let mut spellings: HashMap<String, Vec<String>> = HashMap::new();
+    for span in &mut spans {
+        if span.path.is_empty() {
+            continue;
+        }
+        if let Some(rel) = resolved.get(&span.path) {
+            span.path = rel.clone();
+            continue;
+        }
+        match crate::server::lookup_path_for(
+            store,
+            &namespace,
+            &span.path,
+            request.project_root.as_deref(),
+        )
+        .await
+        {
+            Ok((lookup, forms)) if lookup.source != crate::paths::RootSource::Outside => {
+                resolved.insert(span.path.clone(), lookup.path.clone());
+                spellings.insert(lookup.path.clone(), forms);
+                span.path = lookup.path;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!("diff_tour span {:?} kept as given: {e:#}", span.path);
+            }
+        }
+    }
+
     let all_rows = store.list(&namespace, None, None).await.unwrap_or_default();
     let visible_rows: Vec<SearchResult> = all_rows
         .into_iter()
@@ -865,7 +904,25 @@ pub async fn execute_diff_tour(
             continue;
         }
         touched_files.insert(span.path.clone());
-        let Some(file_rows) = structural_by_path.get(&span.path) else {
+        // A structural row may still carry another spelling of the path (an
+        // absolute location), so every spelling of the span is tried.
+        // Rows under each spelling are merged (one file may have both).
+        let mut span_rows: Vec<SearchResult> = Vec::new();
+        let mut seen_rows: BTreeSet<String> = BTreeSet::new();
+        let mut seen_forms: BTreeSet<String> = BTreeSet::new();
+        for form in std::iter::once(&span.path).chain(spellings.get(&span.path).into_iter().flatten()) {
+            let key = crate::parser::ingest::normalize_node_path(form);
+            if !seen_forms.insert(key.clone()) {
+                continue;
+            }
+            for row in structural_by_path.get(&key).into_iter().flatten() {
+                if seen_rows.insert(row.id.clone()) {
+                    span_rows.push(row.clone());
+                }
+            }
+        }
+        let span_rows = (!span_rows.is_empty()).then_some(span_rows);
+        let Some(file_rows) = span_rows.as_ref() else {
             uningested_files.insert(span.path.clone());
             let lines_str = format_span_lines(span);
             let start_line = span
@@ -1009,9 +1066,19 @@ pub async fn execute_diff_tour(
         .downcast_ref::<crate::store::LadybugStore>()
     {
         for path in &touched_files {
-            if let Ok(hits) = ls
-                .memories_for_file(&namespace, None, path, None, true, &[], &[], 25)
-                .await
+            let forms = spellings
+                .get(path)
+                .cloned()
+                .unwrap_or_else(|| vec![path.clone()]);
+            let mut hits = Vec::new();
+            for form in &forms {
+                if let Ok(found) = ls
+                    .memories_for_file(&namespace, None, form, None, true, &[], &[], 25)
+                    .await
+                {
+                    hits.extend(found);
+                }
+            }
             {
                 for hit in hits {
                     if let Some(row) = rows_by_id.get(&hit.id) {
@@ -1325,6 +1392,117 @@ mod tests {
     use crate::store::LadybugStore;
     use crate::traits::MemoryPayload;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn an_absolute_span_path_meets_the_stored_relative_location() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store: Arc<dyn VectorStore> =
+            Arc::new(LadybugStore::new(dir.path().join("db"), 384).expect("store init"));
+        let ns = "DiffTourAbsNs";
+        store.init(ns).await.unwrap();
+        store
+            .upsert(
+                ns,
+                "sym-lib",
+                vec![0.1; 384],
+                MemoryPayload {
+                    content: "functions run in src/lib.rs
+lines 1-5
+
+pub fn run() {}".to_string(),
+                    location: "src/lib.rs".to_string(),
+                    location_lines: "1-5".to_string(),
+                    memory_type: "code_ast".to_string(),
+                    metadata: json!({"domain": "code_ast", "symbol": "run", "symbol_kind": "functions"}),
+                    user_id: "test".to_string(),
+                    agent_name: None,
+                },
+            )
+            .await
+            .unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap().join("example-project");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src").join("lib.rs"), "pub fn run() {}").unwrap();
+        let absolute = root.join("src").join("lib.rs").to_string_lossy().to_string();
+        let request = DiffTourRequest {
+            namespace: ns.to_string(),
+            project_root: Some(root.to_string_lossy().to_string()),
+            diff_text: None,
+            changed_spans: Some(vec![ChangedFileSpan {
+                path: absolute.clone(),
+                old_lines: Some((1, 5)),
+                new_lines: Some((1, 5)),
+                change_kind: "modified".to_string(),
+            }]),
+            max_blast_radius_callers: None,
+            principal: None,
+        };
+        let tour = execute_diff_tour(&store, &request, None).await.unwrap();
+        assert!(
+            tour.uningested_files.is_empty(),
+            "the absolute span names the ingested src/lib.rs: {:?}",
+            tour.uningested_files
+        );
+    }
+
+    #[tokio::test]
+    async fn a_structural_row_with_an_absolute_location_still_matches_its_span() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store: Arc<dyn VectorStore> =
+            Arc::new(LadybugStore::new(dir.path().join("db"), 384).expect("store init"));
+        let ns = "DiffTourAbsLocNs";
+        store.init(ns).await.unwrap();
+        // A row ingested before paths were stored relative.
+        let root0 = dunce::canonicalize(dir.path()).unwrap().join("example-project");
+        let absolute_location = crate::parser::ingest::normalize_node_path(
+            &root0.join("src").join("lib.rs").to_string_lossy(),
+        );
+        store
+            .upsert(
+                ns,
+                "sym-lib",
+                vec![0.1; 384],
+                MemoryPayload {
+                    content: "functions run in src/lib.rs
+lines 1-5
+
+pub fn run() {}".to_string(),
+                    location: absolute_location.clone(),
+                    location_lines: "1-5".to_string(),
+                    memory_type: "code_ast".to_string(),
+                    metadata: json!({"domain": "code_ast", "symbol": "run", "symbol_kind": "functions"}),
+                    user_id: "test".to_string(),
+                    agent_name: None,
+                },
+            )
+            .await
+            .unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap().join("example-project");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src").join("lib.rs"), "pub fn run() {}").unwrap();
+        let absolute = root.join("src").join("lib.rs").to_string_lossy().to_string();
+        let request = DiffTourRequest {
+            namespace: ns.to_string(),
+            project_root: Some(root.to_string_lossy().to_string()),
+            diff_text: None,
+            changed_spans: Some(vec![ChangedFileSpan {
+                path: absolute.clone(),
+                old_lines: Some((1, 5)),
+                new_lines: Some((1, 5)),
+                change_kind: "modified".to_string(),
+            }]),
+            max_blast_radius_callers: None,
+            principal: None,
+        };
+        let tour = execute_diff_tour(&store, &request, None).await.unwrap();
+        assert!(
+            tour.uningested_files.is_empty(),
+            "the absolute span names the ingested src/lib.rs: {:?}",
+            tour.uningested_files
+        );
+    }
 
     #[tokio::test]
     async fn diff_tour_orders_four_stops_reports_unchanged_callers_and_governs_rules() {

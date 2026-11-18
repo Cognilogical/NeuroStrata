@@ -11,6 +11,9 @@ pub struct SearchFilters {
     pub memory_types: Vec<String>,
     pub fact_shape: Option<String>, // decision/topology/attempt/any
     pub path_prefix: Option<String>,
+    /// Other spellings of `path_prefix` a location may match: a memory
+    /// written before its namespace's paths were migrated may carry one.
+    pub path_prefix_alternates: Vec<String>,
     pub exclude_stale: bool,
     pub include_code_ast: bool,
 }
@@ -100,7 +103,12 @@ pub fn passes_filters(memory_type: &str, metadata: &Value, location: &str, filte
             }
         }
     }
-    if !path_prefix_matches(location, filters.path_prefix.as_deref()) {
+    if !path_prefix_matches(location, filters.path_prefix.as_deref())
+        && !filters
+            .path_prefix_alternates
+            .iter()
+            .any(|p| path_prefix_matches(location, Some(p)))
+    {
         return false;
     }
     if filters.exclude_stale && is_stale_for_filter(metadata) {
