@@ -5023,11 +5023,18 @@ mod tests {
 
     /// Runs the scaffolded pre-commit hook in `dir`; returns its stderr.
     fn run_pre_commit(bash: &std::path::Path, hook: &std::path::Path, dir: &std::path::Path) -> String {
-        let out = std::process::Command::new(bash)
-            .arg(hook)
-            .current_dir(dir)
-            .output()
-            .expect("the hook runs");
+        let mut cmd = std::process::Command::new(bash);
+        cmd.arg(hook).current_dir(dir);
+        // Git for Windows puts its usr/bin (grep, sed, tr, ...) on PATH when it
+        // runs a hook; a bare bash.exe launch does not, so add it the same way.
+        if cfg!(windows) {
+            if let Some(bin) = bash.parent() {
+                let mut paths = vec![bin.to_path_buf()];
+                paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+                cmd.env("PATH", std::env::join_paths(paths).expect("join PATH"));
+            }
+        }
+        let out = cmd.output().expect("the hook runs");
         String::from_utf8_lossy(&out.stderr).to_string()
     }
 
