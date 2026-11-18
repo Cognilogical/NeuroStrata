@@ -8561,13 +8561,17 @@ async fn run() -> anyhow::Result<()> {
                     } => {
                         // A dry run only reads; only --apply prepares the
                         // store for writing.
-                        if apply {
+                        let embedder = if apply {
                             let embedder = build_embedder()?;
                             prepare_fallback_write_store(&vector_store, &embedder, &namespace)
                                 .await?;
-                        }
+                            Some(embedder)
+                        } else {
+                            None
+                        };
                         let report = crate::paths_migration::migrate_paths(
                             &vector_store,
+                            embedder.as_ref(),
                             &namespace,
                             project_root.as_deref(),
                             apply,
@@ -8591,7 +8595,25 @@ async fn run() -> anyhow::Result<()> {
                             report.skipped_mesh,
                             report.unplaced.len(),
                         );
-                        if !report.applied && !report.changed.is_empty() {
+                        for (id, path) in &report.root_ancestors {
+                            println!("governs the project root or a directory above it, correct by hand: {id}: {path}");
+                        }
+                        for id in &report.mesh_unmigrated {
+                            println!("mesh row left as its author wrote it, still needs another spelling: {id}");
+                        }
+                        if report.marked {
+                            println!("File lookups in '{namespace}' now query only the project-relative spelling.");
+                        } else if report.applied {
+                            println!(
+                                "Not marked as migrated: {} mesh rows, {} ingested rows and {} root-or-above paths still need another spelling, so file lookups keep querying every spelling.",
+                                report.mesh_unmigrated.len(),
+                                report.ingested_absolute,
+                                report.root_ancestors.len()
+                            );
+                            if report.ingested_absolute > 0 {
+                                println!("Re-ingest the project to store its ingested rows relative, then run this again.");
+                            }
+                        } else if !report.changed.is_empty() {
                             println!("Run again with --apply to write these changes.");
                         }
                     }

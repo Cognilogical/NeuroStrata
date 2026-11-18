@@ -2721,7 +2721,9 @@ pub async fn start_mcp_proxy(origin: DaemonOrigin) -> io::Result<()> {
 /// An absolute path is made relative to the caller's `project_root`, the
 /// namespace's registered root, or the nearest `.git` ancestor; a relative one
 /// is also tried joined onto a known root, for memories stored with absolute
-/// paths. Stored memories are read as they are, never rewritten. Fails only
+/// paths. Stored memories are read as they are, never rewritten. Once the
+/// namespace is migrated (`migrate-paths --apply`), only the resolved spelling
+/// is queried. Fails only
 /// when the registered root cannot be read and nothing else constrains an
 /// absolute path (see [`registry_root_for_lookup`]).
 pub(crate) async fn lookup_path_for(
@@ -2730,13 +2732,26 @@ pub(crate) async fn lookup_path_for(
     path: &str,
     project_root: Option<&str>,
 ) -> anyhow::Result<(crate::paths::LookupPath, Vec<String>)> {
-    let registry_root = registry_root_for_lookup(
-        crate::registry::cached_project_root(store, namespace).await,
-        namespace,
-        path,
-        project_root,
-    )?;
+    let state = crate::registry::cached_registry_paths(store, namespace).await;
+    // After `migrate-paths --apply`, every agent-written path is stored in the
+    // resolved spelling, so that one spelling is the whole lookup. Unknown
+    // (a failed read) counts as not migrated: query every spelling.
+    let migrated = state.as_ref().is_ok_and(|s| s.paths_migrated);
+    let registry_root =
+        registry_root_for_lookup(state.map(|s| s.project_root), namespace, path, project_root)?;
     let lookup = crate::paths::to_project_relative(path, project_root, registry_root.as_deref());
+    if migrated {
+        // Every stored path is relative now, so absolute spellings are dropped.
+        // Relative alternates stay: a symlinked file is also looked up as the
+        // caller spelled it, so rules on that path's own directories apply.
+        let mut forms = vec![lookup.path.clone()];
+        for alternate in &lookup.alternates {
+            if !crate::paths::is_absolute_any(alternate) && !forms.contains(alternate) {
+                forms.push(alternate.clone());
+            }
+        }
+        return Ok((lookup, forms));
+    }
     let known_root = crate::paths::known_root(project_root, registry_root.as_deref());
     let forms = crate::paths::lookup_forms(&lookup, known_root);
     Ok((lookup, forms))
@@ -14306,6 +14321,51 @@ mod tests {
         let got =
             merge_spelling_results(vec![Err::<Vec<MemoryHit>, _>(anyhow::anyhow!("first"))], 10);
         assert!(got.is_err(), "when every spelling fails, surface the error");
+    }
+
+    /// Before `migrate-paths --apply` a lookup queries every spelling a legacy
+    /// row may carry; after it, only the resolved one.
+    #[tokio::test]
+    async fn a_migrated_namespace_is_looked_up_with_one_spelling() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let root = dunce::canonicalize(tmp.path()).unwrap().join("example-project");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src").join("lib.rs"), "x").unwrap();
+        let root_s = root.to_string_lossy().to_string();
+        let absolute = root.join("src").join("lib.rs").to_string_lossy().to_string();
+
+        let (_, forms) = lookup_path_for(&store, "probe", &absolute, Some(&root_s)).await.unwrap();
+        assert!(forms.len() > 1, "not migrated: every spelling, {forms:?}");
+
+        let mut registry = crate::registry::registry_metadata(&[]);
+        registry["project_root"] = json!(root_s);
+        registry["paths_migrated"] = json!(true);
+        let row = crate::traits::MemoryPayload {
+            content: crate::registry::registry_content("probe"),
+            user_id: "system".to_string(),
+            memory_type: "fact".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: registry,
+        };
+        let dim = store.get("probe", &store.list("probe", None, None).await.unwrap()[0].id)
+            .await
+            .unwrap()
+            .unwrap()
+            .0
+            .len();
+        store
+            .upsert("probe", &crate::registry::registry_row_id("probe"), vec![0.0; dim], row)
+            .await
+            .unwrap();
+
+        let (lookup, forms) =
+            lookup_path_for(&store, "probe", &absolute, Some(&root_s)).await.unwrap();
+        assert_eq!(lookup.path, "src/lib.rs");
+        assert_eq!(forms, vec!["src/lib.rs".to_string()]);
     }
 
     /// Writes store file paths in the form lookups use: project-relative, in

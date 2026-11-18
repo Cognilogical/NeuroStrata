@@ -88,7 +88,7 @@ neurostrata-mcp delete <namespace> <id>
 ```
 
 ### `migrate-paths`
-Rewrites the file paths stored on memories (`location`, `refs[].file`, `governs`) into the project-relative form new writes use, once. Without `--apply` it lists what it would change and writes nothing. Ingested nodes, rows received through the SynapticMesh, and paths under no known root are left as they are. Needs a project root usable on this machine: `--project-root`, else the namespace's registered root. Run with the daemon stopped.
+Rewrites the file paths stored on memories (`location`, `refs[].file`, `governs`) into the project-relative form new writes use, once. Without `--apply` it lists what it would change and writes nothing. Ingested nodes, rows received through the SynapticMesh, and paths under no known root are left as they are. Needs a project root usable on this machine: `--project-root`, else the namespace's registered root; a `--project-root` other than a usable registered root is refused. With `--apply`, the registry row records `paths_migrated` once no row still needs another spelling: a SynapticMesh row is left as its author wrote it, and an ingested row that still carries an absolute location needs a re-ingest first; from then on file lookups query only the project-relative spelling. Run with the daemon stopped.
 ```bash
 neurostrata-mcp migrate-paths <namespace> [--project-root <dir>] [--apply]
 ```

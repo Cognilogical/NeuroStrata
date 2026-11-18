@@ -750,6 +750,42 @@ pub async fn cache_project_root(
     }
 }
 
+/// What the namespace's registry row says about stored file paths.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RegistryPaths {
+    /// The `project_root` cached by [`cache_project_root`].
+    pub project_root: Option<String>,
+    /// Set by `migrate-paths --apply` once no agent-written memory carries a
+    /// path outside the project-relative form; file lookups then query only
+    /// that spelling.
+    pub paths_migrated: bool,
+}
+
+/// The registry row's path state. A missing row or field reads as the
+/// default; a failed store read is an error, so a caller can tell "no root"
+/// from "unknown".
+pub async fn cached_registry_paths(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+) -> anyhow::Result<RegistryPaths> {
+    Ok(match store.get(namespace, &registry_row_id(namespace)).await? {
+        Some((_, payload)) if is_registry_row(&payload.metadata) => RegistryPaths {
+            project_root: payload
+                .metadata
+                .get("project_root")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            paths_migrated: payload
+                .metadata
+                .get("paths_migrated")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        },
+        _ => RegistryPaths::default(),
+    })
+}
+
 /// The `project_root` cached on the namespace's registry row by
 /// [`cache_project_root`]. A missing row or field is `Ok(None)`; a failed
 /// store read is an error, so a caller can tell "no root" from "unknown".
@@ -757,15 +793,30 @@ pub async fn cached_project_root(
     store: &Arc<dyn VectorStore>,
     namespace: &str,
 ) -> anyhow::Result<Option<String>> {
-    Ok(match store.get(namespace, &registry_row_id(namespace)).await? {
-        Some((_, payload)) if is_registry_row(&payload.metadata) => payload
-            .metadata
-            .get("project_root")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(str::to_string),
-        _ => None,
-    })
+    Ok(cached_registry_paths(store, namespace).await?.project_root)
+}
+
+/// Record that the namespace's stored memory paths are all project-relative,
+/// so file lookups need only that spelling. Written by `migrate-paths
+/// --apply`; an error when the registry row cannot be read or written, since
+/// lookups must not drop spellings on a guess.
+pub async fn mark_paths_migrated(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+) -> anyhow::Result<()> {
+    let registry_id = registry_row_id(namespace);
+    let Some((vector, mut payload)) = store.get(namespace, &registry_id).await? else {
+        anyhow::bail!("namespace '{namespace}' has no registry row to record the migration on");
+    };
+    if !is_registry_row(&payload.metadata) {
+        anyhow::bail!("row {registry_id} of '{namespace}' is not its registry row");
+    }
+    let Some(obj) = payload.metadata.as_object_mut() else {
+        anyhow::bail!("the registry row of '{namespace}' has no metadata object");
+    };
+    obj.insert("paths_migrated".to_string(), serde_json::Value::Bool(true));
+    store.upsert(namespace, &registry_id, vector, payload).await?;
+    Ok(())
 }
 
 #[cfg(test)]
