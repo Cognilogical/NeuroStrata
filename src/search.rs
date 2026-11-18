@@ -41,9 +41,18 @@ pub fn type_allowed(memory_type: &str, filters: &SearchFilters) -> bool {
 /// Whether a fact shape matches the requested shape.
 pub fn fact_shape_matches(metadata: &Value, shape: &str) -> bool {
     match shape {
-        "decision" => metadata.get("decision").map(|v| !v.is_null()).unwrap_or(false),
-        "topology" => metadata.get("topology").map(|v| !v.is_null()).unwrap_or(false),
-        "attempt" => metadata.get("attempt").map(|v| !v.is_null()).unwrap_or(false),
+        "decision" => metadata
+            .get("decision")
+            .map(|v| !v.is_null())
+            .unwrap_or(false),
+        "topology" => metadata
+            .get("topology")
+            .map(|v| !v.is_null())
+            .unwrap_or(false),
+        "attempt" => metadata
+            .get("attempt")
+            .map(|v| !v.is_null())
+            .unwrap_or(false),
         "any" | "" => true,
         _ => false,
     }
@@ -88,22 +97,40 @@ pub fn normalize_prefix_comparison_value(value: &str) -> String {
     while let Some(rest) = out.strip_prefix("./") {
         out = rest.to_string();
     }
-    out.trim_matches('/').to_string()
+    let trimmed = out.trim_matches('/');
+    if trimmed == "." {
+        return String::new();
+    }
+    let mut normalized = trimmed.to_string();
+    if normalized.len() >= 2
+        && normalized.as_bytes()[0].is_ascii_alphabetic()
+        && normalized.as_bytes()[1] == b':'
+    {
+        normalized.as_mut_str()[..1].make_ascii_uppercase();
+    }
+    normalized
 }
 
-/// Match one prefix against a location: raw literal prefix first (preserves
-/// legacy behavior), then normalized, separator/boundary-aware comparison.
+/// Match one prefix against a location using normalized, separator- and
+/// segment-boundary-aware comparison. Relative prefix forms match only relative
+/// locations; absolute prefix forms match only absolute locations.
 pub fn single_prefix_matches(location: &str, prefix: &str) -> bool {
     if prefix.trim().is_empty() {
         return true;
     }
-    if location.starts_with(prefix) {
-        return true;
+    if location.trim().is_empty() {
+        return false;
+    }
+    if crate::paths::is_absolute_any(location) != crate::paths::is_absolute_any(prefix) {
+        return false;
     }
     let loc = normalize_prefix_comparison_value(location);
+    if loc.is_empty() {
+        return false;
+    }
     let pref = normalize_prefix_comparison_value(prefix);
     if pref.is_empty() {
-        return true;
+        return loc != ".." && !loc.starts_with("../");
     }
     loc == pref
         || loc
@@ -186,7 +213,12 @@ pub fn is_stale_for_filter(metadata: &Value) -> bool {
     source == "changed" && semantic != "verified"
 }
 
-pub fn passes_filters(memory_type: &str, metadata: &Value, location: &str, filters: &SearchFilters) -> bool {
+pub fn passes_filters(
+    memory_type: &str,
+    metadata: &Value,
+    location: &str,
+    filters: &SearchFilters,
+) -> bool {
     if !type_allowed(memory_type, filters) {
         return false;
     }
@@ -303,6 +335,19 @@ mod tests {
     }
 
     #[test]
+    fn root_prefix_forms_match_in_root_relative_and_absolute_locations_only() {
+        let forms = vec![".".to_string(), "/repo".to_string()];
+        assert!(path_prefix_forms_match("src/lib.rs", &forms));
+        assert!(path_prefix_forms_match("Cargo.toml", &forms));
+        assert!(path_prefix_forms_match("./src/lib.rs", &forms));
+        assert!(path_prefix_forms_match("/repo/src/lib.rs", &forms));
+        assert!(!path_prefix_forms_match("/repo-other/src/lib.rs", &forms));
+        assert!(!path_prefix_forms_match("/other/src/lib.rs", &forms));
+        assert!(!path_prefix_forms_match("../other/src/lib.rs", &forms));
+        assert!(!path_prefix_forms_match("", &forms));
+    }
+
+    #[test]
     fn is_stale_for_filter_variants() {
         let stale = json!({"source_currency":"changed","verification":{"status":"unverified"}});
         assert!(is_stale_for_filter(&stale));
@@ -326,7 +371,8 @@ mod tests {
         // wrong path
         assert!(!passes_filters("fact", &meta, "lib/x.rs", &f));
         // stale excluded
-        let stale_meta = json!({"source_currency":"changed","verification":{"status":"unverified"}});
+        let stale_meta =
+            json!({"source_currency":"changed","verification":{"status":"unverified"}});
         assert!(!passes_filters("fact", &stale_meta, "src/x.rs", &f));
         // fact_shape filter
         let mut f2 = f.clone();

@@ -3,7 +3,7 @@
 ## Core Memory & Graph Retrieval Tools
 
 - `neurostrata_add_memory` — store an architectural rule, project pattern, or task insight.
-- `neurostrata_search_memory` — query memory contents via vector + graph RAG (accepts optional `project_root` alongside `path_prefix` for multi-form relative/absolute prefix resolution).
+- `neurostrata_search_memory` — query memory contents via vector + graph RAG (accepts optional `project_root` alongside `path_prefix` for multi-form relative/absolute prefix resolution, including root-equal prefixes that match in-root relative and absolute paths).
 - `neurostrata_get_snapshot` — fetch current task state snapshot (<=800 chars).
 - `neurostrata_supersede_memory` — replace active version with new one atomically.
 - `neurostrata_memories_for_file` — inspect governing memories for a given path/file.
