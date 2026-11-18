@@ -138,7 +138,12 @@ pub async fn migrate_paths(
                 &mut resolved,
             )
             .await;
-            if !path_changes(&row.payload, &resolved).is_empty() {
+            // A governed folder's trailing slash only types the node a write
+            // creates; lookups match `governs` with or without it, so a
+            // slash-only difference needs no other spelling.
+            if !path_changes(&without_governed_slash(&row.payload), &without_governed_slash(&resolved))
+                .is_empty()
+            {
                 report.mesh_unmigrated.push(row.id.clone());
             }
             continue;
@@ -183,6 +188,19 @@ pub async fn migrate_paths(
         report.marked = true;
     }
     Ok(report)
+}
+
+/// `payload` with each `governs` entry's trailing slash removed.
+fn without_governed_slash(payload: &crate::traits::MemoryPayload) -> crate::traits::MemoryPayload {
+    let mut bare = payload.clone();
+    if let Some(governs) = bare.metadata.get_mut("governs").and_then(|g| g.as_array_mut()) {
+        for g in governs.iter_mut() {
+            if let Some(s) = g.as_str() {
+                *g = serde_json::json!(s.trim_end_matches('/'));
+            }
+        }
+    }
+    bare
 }
 
 /// Whether absolute `path` is `root` itself or a directory above it.
@@ -362,13 +380,14 @@ mod tests {
                 ns,
                 "shared",
                 vec![0.1; 384],
-                payload("src/lib.rs", json!({"mesh": {"update_id": "u2"}}), "agent"),
+                // Its folder entry has no slash; that alone needs no spelling.
+                payload("src/lib.rs", json!({"mesh": {"update_id": "u2"}, "governs": ["src"]}), "agent"),
             )
             .await
             .unwrap();
         // The root rule is corrected by hand.
         store
-            .upsert(ns, "root-rule", vec![0.1; 384], payload("", json!({"governs": ["src"]}), "agent"))
+            .upsert(ns, "root-rule", vec![0.1; 384], payload("", json!({"governs": ["src/"]}), "agent"))
             .await
             .unwrap();
         // And the project is re-ingested.
