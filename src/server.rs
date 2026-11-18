@@ -2757,7 +2757,8 @@ pub(crate) async fn store_paths_in_payload(
     payload: &mut crate::traits::MemoryPayload,
 ) -> Vec<String> {
     let mut unplaced: Vec<String> = Vec::new();
-    let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut seen: std::collections::HashMap<String, (String, Option<String>)> =
+        std::collections::HashMap::new();
     let registered = crate::registry::cached_project_root(store, namespace)
         .await
         .ok()
@@ -2777,7 +2778,8 @@ pub(crate) async fn store_paths_in_payload(
         }
         payload.location =
             stored_spelling(store, namespace, project_root, &payload.location, known_root, &mut seen, &mut unplaced)
-                .await;
+                .await
+                .0;
     }
     if let Some(refs) = payload
         .metadata
@@ -2792,7 +2794,7 @@ pub(crate) async fn store_paths_in_payload(
                 continue;
             }
             let stored =
-                stored_spelling(store, namespace, project_root, &file, known_root, &mut seen, &mut unplaced).await;
+                stored_spelling(store, namespace, project_root, &file, known_root, &mut seen, &mut unplaced).await.0;
             r["file"] = serde_json::json!(stored);
         }
     }
@@ -2807,8 +2809,12 @@ pub(crate) async fn store_paths_in_payload(
             let Some(target) = g.as_str().filter(|s| !s.is_empty()).map(str::to_string) else {
                 continue;
             };
-            let stored =
+            let (stored, root) =
                 stored_spelling(store, namespace, project_root, &target, known_root, &mut seen, &mut unplaced).await;
+            // Only `governs` keeps a folder's slash: the store types the node
+            // it creates for a governed path not yet ingested by that slash,
+            // while readers of `location` and `refs` match the bare path.
+            let stored = governed_directory_slash(stored, &target, root.as_deref());
             *g = serde_json::json!(stored);
         }
         // Two spellings of one file collapse to one entry.
@@ -2820,19 +2826,18 @@ pub(crate) async fn store_paths_in_payload(
     unplaced
 }
 
-/// `raw` in the stored form, memoized in `seen`; an absolute path that could
-/// not be placed under a root is added to `unplaced`. A directory ends in `/`:
-/// the store types a placeholder node for a governed path by that slash, so
-/// the slash follows the disk ([`stored_directory_slash`]).
+/// `raw` in the stored form, memoized in `seen`, with the root it lies under
+/// when one is known; an absolute path that could not be placed under a root
+/// is added to `unplaced` and kept as written, with no root.
 async fn stored_spelling(
     store: &Arc<dyn VectorStore>,
     namespace: &str,
     project_root: Option<&str>,
     raw: &str,
     known_root: Option<&str>,
-    seen: &mut std::collections::HashMap<String, String>,
+    seen: &mut std::collections::HashMap<String, (String, Option<String>)>,
     unplaced: &mut Vec<String>,
-) -> String {
+) -> (String, Option<String>) {
     if let Some(stored) = seen.get(raw) {
         return stored.clone();
     }
@@ -2845,39 +2850,41 @@ async fn stored_spelling(
         None
     } else {
         match lookup_path_for(store, namespace, &normalized, project_root).await {
-            Ok((lookup, _)) if lookup.source != crate::paths::RootSource::Outside => {
-                Some(crate::parser::ingest::normalize_node_path(&lookup.path))
-            }
+            // The root that placed an absolute path is the one its relative
+            // form lies under; a relative path lies under the known root.
+            Ok((lookup, _)) if lookup.source != crate::paths::RootSource::Outside => Some((
+                crate::parser::ingest::normalize_node_path(&lookup.path),
+                lookup.root.or_else(|| known_root.map(str::to_string)),
+            )),
             _ => None,
         }
     };
     let stored = match placed {
-        Some(stored) => stored_directory_slash(stored, raw, known_root),
+        Some(found) => found,
         None if absolute => {
             unplaced.push(raw.to_string());
-            raw.to_string()
+            (raw.to_string(), None)
         }
-        None => stored_directory_slash(normalized, raw, known_root),
+        None => (normalized, known_root.map(str::to_string)),
     };
     seen.insert(raw.to_string(), stored.clone());
     stored
 }
 
-/// `stored` with a trailing `/` when it names a directory, without one when it
-/// names a file. The disk decides: a path that exists under `known_root` (or,
-/// when absolute, by itself) takes the slash its kind calls for, whatever the
-/// caller wrote. A path that does not exist (yet) keeps the caller's slash.
-fn stored_directory_slash(stored: String, raw: &str, known_root: Option<&str>) -> String {
+/// A governed project-relative path, ending in `/` when it names a directory
+/// under `root` and bare when it names a file, whatever the caller wrote. A
+/// path not on disk (yet), one that climbs out of `root`, or one with no root
+/// to look under, keeps the caller's slash.
+fn governed_directory_slash(stored: String, raw: &str, root: Option<&str>) -> String {
     let trimmed = stored.trim_end_matches('/');
-    if trimmed.is_empty() {
+    if trimmed.is_empty() || crate::paths::is_absolute_any(trimmed) {
         return stored;
     }
-    let on_disk = if crate::paths::is_absolute_any(trimmed) {
-        Some(std::path::PathBuf::from(trimmed))
-    } else {
-        known_root.map(|root| std::path::Path::new(root).join(trimmed))
-    };
-    let is_directory = match on_disk.and_then(|p| std::fs::metadata(p).ok()) {
+    let inside_root = !trimmed.split('/').any(|segment| segment == "..");
+    let on_disk = root
+        .filter(|_| inside_root)
+        .and_then(|root| std::fs::metadata(std::path::Path::new(root).join(trimmed)).ok());
+    let is_directory = match on_disk {
         Some(meta) => meta.is_dir(),
         None => raw.replace('\\', "/").ends_with('/'),
     };
@@ -14396,12 +14403,13 @@ mod tests {
         assert_eq!(unplaced, vec![absolute]);
     }
 
-    /// A stored path ends in `/` exactly when it names a directory, by the
+    /// A governed path ends in `/` exactly when it names a directory, by the
     /// disk: a folder written without a slash gains one, a file written with
     /// one loses it, and a path not on disk keeps what the caller wrote. So a
     /// rule governing an un-ingested folder still gets a `directory` node.
+    /// `location` and `refs` stay bare: their readers match the bare path.
     #[tokio::test]
-    async fn a_stored_directory_path_ends_in_a_slash_by_the_disk() {
+    async fn a_governed_directory_path_ends_in_a_slash_by_the_disk() {
         let (store, _) = store_with_one_rule("probe").await;
         let tmp = tempfile::tempdir().expect("temp dir");
         let base = dunce::canonicalize(tmp.path()).expect("canonical temp dir");
@@ -14417,22 +14425,51 @@ mod tests {
             user_id: "u".to_string(),
             memory_type: "rule".to_string(),
             agent_name: None,
-            location: "pkg".to_string(),
+            location: "pkg/".to_string(),
             location_lines: String::new(),
             metadata: serde_json::json!({
-                "refs": [{"file": "pkg/lib.rs/"}, {"file": absolute_dir}],
-                "governs": ["pkg", "pkg/", "planned/", "planned-file"],
+                "refs": [{"file": "pkg/"}, {"file": absolute_dir}],
+                "governs": [
+                    "pkg", "pkg/", "pkg\\sub\\", "pkg/lib.rs/", absolute_dir,
+                    "planned/", "planned-file", "../outside/",
+                ],
             }),
         };
         store_paths_in_payload(&store, "probe", Some(&root_s), &mut payload).await;
-        assert_eq!(payload.location, "pkg/");
-        assert_eq!(payload.metadata["refs"][0]["file"], json!("pkg/lib.rs"));
-        assert_eq!(payload.metadata["refs"][1]["file"], json!("pkg/sub/"));
+        assert_eq!(payload.location, "pkg", "a location stays bare");
+        assert_eq!(payload.metadata["refs"][0]["file"], json!("pkg"));
+        assert_eq!(payload.metadata["refs"][1]["file"], json!("pkg/sub"));
         assert_eq!(
             payload.metadata["governs"],
-            json!(["pkg/", "planned/", "planned-file"]),
-            "both spellings of the folder collapse to one; paths not on disk keep the caller's slash"
+            json!(["pkg/", "pkg/sub/", "pkg/lib.rs", "planned/", "planned-file", "../outside/"]),
+            "the disk decides the slash and spellings collapse; paths not on disk, \
+             or outside the root, keep the caller's slash"
         );
+
+        // With no root this namespace knows, a relative path keeps the
+        // caller's slash: there is no disk to ask.
+        let mut payload = crate::traits::MemoryPayload {
+            content: "folder rule".to_string(),
+            user_id: "u".to_string(),
+            memory_type: "rule".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: serde_json::json!({ "governs": ["pkg", "planned/"] }),
+        };
+        store_paths_in_payload(&store, "other-ns", None, &mut payload).await;
+        assert_eq!(payload.metadata["governs"], json!(["pkg", "planned/"]));
+
+        let mut payload = crate::traits::MemoryPayload {
+            content: "folder rule".to_string(),
+            user_id: "u".to_string(),
+            memory_type: "rule".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: serde_json::json!({ "governs": ["pkg", "planned/", "planned-file"] }),
+        };
+        store_paths_in_payload(&store, "probe", Some(&root_s), &mut payload).await;
 
         store
             .upsert("probe", "folder-rule", vec![0.0; 4], payload)
