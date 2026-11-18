@@ -28432,6 +28432,7 @@ eurostrata\src\daemon.rs",
     /// copied -- following the link to whatever it pointed at -- and a broken
     /// link used to read as "no WAL at all", so the manifest claimed a role
     /// the store did not have. Both are refused now.
+    #[cfg(unix)]
     #[test]
     fn a_symlinked_wal_side_is_refused_rather_than_copied() {
         let root = std::env::temp_dir().join(format!(
@@ -28470,6 +28471,7 @@ eurostrata\src\daemon.rs",
     /// #241: a broken symlink is still a symlink. Reading it as "there is no
     /// WAL here" would write a manifest claiming a role the store does not
     /// have, so it is refused instead.
+    #[cfg(unix)]
     #[test]
     fn a_broken_symlinked_wal_side_is_refused() {
         let root = std::env::temp_dir().join(format!(
