@@ -426,7 +426,8 @@ pub async fn process_mcp_request(
                                 "locations": { "type": "array", "items": { "type": "object" }, "description": "Replacement anchors: [{path, lines?, symbol?, source_context?}]. source_context is opaque provenance from a configured provider; Core does not assume Git. Replaces refs wholesale and re-derives governs from the paths, exactly like add_memory." },
                                 "reason": { "type": "string", "description": "WHY this memory is being corrected, in one clause. Recorded as superseded_reason on the retired memory, so the history says what was wrong, not merely that something changed. Omit it and the reply says the history will not carry a why." },
                                 "source": { "type": ["string", "object"], "description": "Provenance of the CORRECTED text, with the same semantics add_memory's metadata.source accepts: a dated string, or {kind: owner-quote|doc|transcript|commit|derived, ref, captured_at}. Written to metadata.source on the replacement. Passed = replaces the old provenance; absent = the old one carries over and the reply names it." },
-                                "allow_global": { "type": "boolean", "description": "Required to supersede anything in the machine-wide 'global' namespace, whose rules apply to every project on this machine." }
+                                "allow_global": { "type": "boolean", "description": "Required to supersede anything in the machine-wide 'global' namespace, whose rules apply to every project on this machine." },
+                                "project_root": { "type": "string", "description": "Optional absolute path to the project root. File paths in locations and governs are stored relative to it (else to the registered root)." }
                             },
                             "required": ["id", "namespace", "content"]
                         }
@@ -556,6 +557,7 @@ pub async fn process_mcp_request(
                                 "follow_up_tasks": { "type": "array", "items": { "type": "object", "properties": { "title": { "type": "string" }, "description": { "type": "string" }, "task_type": { "type": "string", "enum": ["task", "bug", "feature", "epic"] }, "priority": { "type": "integer", "enum": [0,1,2,3,4] }, "labels": { "type": "array", "items": { "type": "string" } } }, "required": ["title"] }, "description": "Optional list of follow-up tasks to create after this task is done. Each becomes an open task with spawned_from=parent and a related_to edge." },
                                 "link_memory_id": { "type": "string", "description": "Bind an already-written memory to this task via EXTRACTED_FROM. Its vector is reused as-is; linking never re-embeds." },
                                 "session_id": { "type": "string", "description": "Caller session ID to verify claim ownership." },
+                                "project_root": { "type": "string", "description": "Optional absolute path to the project root. File paths in memory.locations are stored relative to it (else to the registered root)." },
                                 "user_id": { "type": "string", "description": "Optional user identifier for audit receipts." },
                                 "agent_name": { "type": "string", "description": "Optional agent identifier for audit receipts." },
                                 "event_id": { "type": "string", "description": "Optional idempotency event ID for the completion receipt." },
@@ -2740,6 +2742,124 @@ pub(crate) async fn lookup_path_for(
     Ok((lookup, forms))
 }
 
+/// Put every file path a memory carries into the form stored paths use, the
+/// way a lookup resolves them ([`lookup_path_for`]): its `location`, each
+/// `refs[].file`, and each `governs` entry. An absolute path becomes
+/// project-relative; a relative one naming an existing file takes its on-disk
+/// spelling; an id names no file and is left as it is. An absolute path is
+/// placed only under a root this namespace knows (a usable `project_root` or
+/// registered root), never by the nearest `.git` alone; one that cannot be
+/// placed is kept exactly as written and returned, so the reply can say so.
+pub(crate) async fn store_paths_in_payload(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    project_root: Option<&str>,
+    payload: &mut crate::traits::MemoryPayload,
+) -> Vec<String> {
+    let mut unplaced: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let registered = crate::registry::cached_project_root(store, namespace)
+        .await
+        .ok()
+        .flatten();
+    let has_known_root = crate::paths::known_root(project_root, registered.as_deref()).is_some();
+
+    if !payload.location.is_empty() {
+        // The graph export opens a memory's file from `metadata.absolute_path`
+        // when its location is relative and carries no source context, so an
+        // absolute location keeps its original spelling there.
+        let original = payload.location.clone();
+        if crate::paths::is_absolute_any(&original) && payload.metadata.get("absolute_path").is_none() {
+            if let Some(obj) = payload.metadata.as_object_mut() {
+                obj.insert("absolute_path".to_string(), serde_json::json!(original));
+            }
+        }
+        payload.location =
+            stored_spelling(store, namespace, project_root, &payload.location, has_known_root, &mut seen, &mut unplaced)
+                .await;
+    }
+    if let Some(refs) = payload
+        .metadata
+        .get_mut("refs")
+        .and_then(|r| r.as_array_mut())
+    {
+        for r in refs.iter_mut() {
+            let Some(file) = r.get("file").and_then(|f| f.as_str()).map(str::to_string) else {
+                continue;
+            };
+            if file.is_empty() {
+                continue;
+            }
+            let stored =
+                stored_spelling(store, namespace, project_root, &file, has_known_root, &mut seen, &mut unplaced).await;
+            r["file"] = serde_json::json!(stored);
+        }
+    }
+    if let Some(governs) = payload
+        .metadata
+        .get_mut("governs")
+        .and_then(|g| g.as_array_mut())
+    {
+        for g in governs.iter_mut() {
+            // Ids (a memory id, a qualified node id) name no file on disk,
+            // so resolution leaves them as they are.
+            let Some(target) = g.as_str().filter(|s| !s.is_empty()).map(str::to_string) else {
+                continue;
+            };
+            let stored =
+                stored_spelling(store, namespace, project_root, &target, has_known_root, &mut seen, &mut unplaced).await;
+            *g = serde_json::json!(stored);
+        }
+        // Two spellings of one file collapse to one entry.
+        let mut kept = std::collections::HashSet::new();
+        governs.retain(|g| kept.insert(g.to_string()));
+    }
+    unplaced.sort();
+    unplaced.dedup();
+    unplaced
+}
+
+/// `raw` in the stored form, memoized in `seen`; an absolute path that could
+/// not be placed under a root is added to `unplaced`.
+async fn stored_spelling(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    project_root: Option<&str>,
+    raw: &str,
+    has_known_root: bool,
+    seen: &mut std::collections::HashMap<String, String>,
+    unplaced: &mut Vec<String>,
+) -> String {
+    if let Some(stored) = seen.get(raw) {
+        return stored.clone();
+    }
+    let normalized = crate::parser::ingest::normalize_node_path(raw);
+    let absolute = crate::paths::is_absolute_any(&normalized);
+    // A stored path is permanent, so an absolute one is placed only under a
+    // root this namespace knows; the nearest `.git` alone could be any
+    // checkout. Otherwise it is kept exactly as written.
+    let placed = if absolute && !has_known_root {
+        None
+    } else {
+        match lookup_path_for(store, namespace, &normalized, project_root).await {
+            Ok((lookup, _)) if lookup.source != crate::paths::RootSource::Outside => {
+                Some(crate::parser::ingest::normalize_node_path(&lookup.path))
+            }
+            _ => None,
+        }
+    };
+    let stored = match placed {
+        Some(stored) => stored,
+        None if absolute => {
+            unplaced.push(raw.to_string());
+            raw.to_string()
+        }
+        None => normalized,
+    };
+    seen.insert(raw.to_string(), stored.clone());
+    stored
+}
+
 /// Every spelling a `path_prefix` filter should match, resolved like a file
 /// lookup ([`lookup_path_for`]): the project-relative, on-disk spelling first,
 /// then the spellings a memory written before the namespace's paths were
@@ -4335,7 +4455,7 @@ async fn handle_add_memory(
             }
         }
 
-        let payload = MemoryPayload {
+        let mut payload = MemoryPayload {
             content: content.to_string(),
             user_id: user_id.to_string(),
             memory_type: memory_type.to_string(),
@@ -4344,6 +4464,15 @@ async fn handle_add_memory(
             location_lines,
             metadata,
         };
+        // File paths are stored project-relative, in the file system's
+        // spelling, so a lookup needs only that one spelling (#275).
+        let unplaced_paths = store_paths_in_payload(
+            &store,
+            namespace,
+            arguments.get("project_root").and_then(|r| r.as_str()),
+            &mut payload,
+        )
+        .await;
 
         if arguments
             .get("shacl_enforce")
@@ -4436,6 +4565,12 @@ async fn handle_add_memory(
                 );
                 let mut msg = format!("Successfully added memory for namespace: {}", namespace);
                 msg.push_str(&format!("\nMemory ID: {}", upsert.id));
+                if !unplaced_paths.is_empty() {
+                    msg.push_str(&format!(
+                        "\nStored as given (under no project root this namespace knows): {}",
+                        unplaced_paths.join(", ")
+                    ));
+                }
                 if adopted_governs {
                     msg.push_str(" (governs set from the Governs line in your content)");
                 }
@@ -9463,6 +9598,41 @@ async fn handle_supersede_memory(
         }
     }
 
+    // File paths the caller sent (locations, governs, a Governs line) are
+    // stored project-relative, in the file system's spelling, like
+    // add_memory's (#275). Paths inherited from the old row are left as they
+    // are: a correction to the text is not a change of anchors, and
+    // `migrate-paths` rewrites old rows.
+    let caller_sent_paths = arguments.get("locations").is_some()
+        || arguments.get("governs").is_some()
+        || replaced.iter().any(|r| r.starts_with("governs"));
+    let unplaced_paths = if caller_sent_paths {
+        // Only `governs` was sent: the inherited `location` and `refs` keep
+        // their stored spelling.
+        let inherited_anchors = arguments.get("locations").is_none().then(|| {
+            (
+                new_payload.location.clone(),
+                new_payload.metadata.get("refs").cloned(),
+            )
+        });
+        let unplaced = store_paths_in_payload(
+            &store,
+            namespace,
+            arguments.get("project_root").and_then(|r| r.as_str()),
+            &mut new_payload,
+        )
+        .await;
+        if let Some((location, refs)) = inherited_anchors {
+            new_payload.location = location;
+            if let (Some(refs), Some(obj)) = (refs, new_payload.metadata.as_object_mut()) {
+                obj.insert("refs".to_string(), refs);
+            }
+        }
+        unplaced
+    } else {
+        Vec::new()
+    };
+
     let vector = match emb.embed(&content).await {
         Ok(v) => v,
         // The whole point of superseding rather than editing: the new text gets
@@ -9590,6 +9760,12 @@ async fn handle_supersede_memory(
     }
     if !replaced.is_empty() {
         report.push_str(&format!(" Replaced metadata: {}.", replaced.join(", ")));
+    }
+    if !unplaced_paths.is_empty() {
+        report.push_str(&format!(
+            " Stored as given (under no project root this namespace knows): {}.",
+            unplaced_paths.join(", ")
+        ));
     }
     for edge in &replacement_report.deferred_edges {
         report.push_str(&format!(
@@ -14132,6 +14308,66 @@ mod tests {
         assert!(got.is_err(), "when every spelling fails, surface the error");
     }
 
+    /// Writes store file paths in the form lookups use: project-relative, in
+    /// the file system's spelling. Ids and paths under no known root are kept.
+    #[tokio::test]
+    async fn a_memorys_file_paths_are_stored_project_relative() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let base = dunce::canonicalize(tmp.path()).expect("canonical temp dir");
+        let root = base.join("example-project");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src").join("lib.rs"), "x").unwrap();
+        let root_s = root.to_string_lossy().to_string();
+        let absolute = root.join("src").join("lib.rs").to_string_lossy().to_string();
+        let elsewhere = base.join("elsewhere").join("x.rs").to_string_lossy().to_string();
+
+        let mut payload = crate::traits::MemoryPayload {
+            content: "rule".to_string(),
+            user_id: "u".to_string(),
+            memory_type: "rule".to_string(),
+            agent_name: None,
+            location: absolute.clone(),
+            location_lines: String::new(),
+            metadata: serde_json::json!({
+                "refs": [{"file": absolute}, {"file": "src/../src/lib.rs"}],
+                "governs": [absolute, "src/lib.rs", "mem-1234", elsewhere],
+            }),
+        };
+        let unplaced = store_paths_in_payload(&store, "probe", Some(&root_s), &mut payload).await;
+
+        assert_eq!(payload.location, "src/lib.rs");
+        assert_eq!(
+            payload.metadata["absolute_path"],
+            json!(absolute),
+            "the graph export still finds the file"
+        );
+        assert_eq!(payload.metadata["refs"][0]["file"], json!("src/lib.rs"));
+        assert_eq!(payload.metadata["refs"][1]["file"], json!("src/lib.rs"));
+        assert_eq!(
+            payload.metadata["governs"],
+            json!(["src/lib.rs", "mem-1234", elsewhere]),
+            "two spellings of one file collapse; an id and an outside path stay as written"
+        );
+        assert_eq!(unplaced, vec![elsewhere.clone()]);
+
+        // With no root this namespace knows, an absolute path is not placed by
+        // the nearest `.git` alone: it is stored exactly as written.
+        let mut payload = crate::traits::MemoryPayload {
+            content: "rule".to_string(),
+            user_id: "u".to_string(),
+            memory_type: "rule".to_string(),
+            agent_name: None,
+            location: absolute.clone(),
+            location_lines: String::new(),
+            metadata: serde_json::json!({}),
+        };
+        let unplaced = store_paths_in_payload(&store, "probe", None, &mut payload).await;
+        assert_eq!(payload.location, absolute);
+        assert_eq!(unplaced, vec![absolute]);
+    }
+
     /// `neurostrata_related` and the `path_prefix` filters resolve a file path
     /// the way `neurostrata_memories_for_file` does: an absolute path meets the
     /// project-relative location it names.
@@ -15459,6 +15695,49 @@ mod tests {
             new_row.metadata["related_to"],
             serde_json::json!(["someone"])
         );
+    }
+
+    /// A supersede resolves only the path fields it is sent: a `governs`-only
+    /// correction leaves the inherited `location` and `refs` as stored.
+    #[tokio::test]
+    async fn supersede_resolves_only_the_paths_it_is_sent() {
+        let dir = std::env::temp_dir().join(format!("ns-supersede-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database"),
+        );
+        store.init("probe").await.expect("create the schema");
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(tmp.path()).unwrap().join("example-project");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src").join("lib.rs"), "x").unwrap();
+        let root_s = root.to_string_lossy().to_string();
+        let absolute = root.join("src").join("lib.rs").to_string_lossy().to_string();
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut old = payload("anchored rule");
+        old.location = absolute.clone();
+        old.metadata = serde_json::json!({ "refs": [{ "file": absolute }], "governs": ["dead/old.go"] });
+        let v = StubEmbedder.embed("anchored rule").await.unwrap();
+        store.upsert("probe", &id, v, old).await.unwrap();
+        let reply = handle_supersede_memory(
+            serde_json::json!({
+                "id": id,
+                "namespace": "probe",
+                "content": "anchored rule v2",
+                "governs": [absolute],
+                "project_root": root_s,
+            }),
+            emb.clone(),
+            store.clone(),
+            quiet_bus(),
+        )
+        .await;
+        let (_, row) = store.get("probe", &new_id_from(&reply)).await.unwrap().unwrap();
+        assert_eq!(row.metadata["governs"], serde_json::json!(["src/lib.rs"]), "{reply}");
+        assert_eq!(row.location, absolute, "the inherited location is not rewritten");
+        assert_eq!(row.metadata["refs"][0]["file"], serde_json::json!(absolute));
     }
 
     /// Guinea-pig round 3 (Option 1 completion + Option 2): locations replace

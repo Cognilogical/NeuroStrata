@@ -2449,7 +2449,7 @@ pub async fn handle_task_complete(
                     Err(rejection) => return Err(rejection),
                 }
             }
-            let payload = MemoryPayload {
+            let mut payload = MemoryPayload {
                 content,
                 user_id,
                 memory_type,
@@ -2458,6 +2458,20 @@ pub async fn handle_task_complete(
                 location_lines,
                 metadata: meta,
             };
+            // File paths are stored project-relative, like add_memory's (#275).
+            let unplaced = crate::server::store_paths_in_payload(
+                &store,
+                &namespace,
+                args.get("project_root").and_then(|r| r.as_str()),
+                &mut payload,
+            )
+            .await;
+            if !unplaced.is_empty() {
+                registry_warnings.push(format!(
+                    "stored as given (under no project root this namespace knows): {}",
+                    unplaced.join(", ")
+                ));
+            }
             let report = crate::server::embed_dedup_and_upsert(
                 &store,
                 &emb,
