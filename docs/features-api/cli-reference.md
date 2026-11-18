@@ -10,7 +10,7 @@ NeuroStrata provides a standalone compiled CLI binary (`neurostrata-mcp`) alongs
 ## 1. Core Daemon & Setup Commands
 
 ### `daemon`
-Starts the NeuroStrata MCP server (HTTP loopback on `127.0.0.1:34343` and/or stdio transport). Only one daemon instance may hold the store lock at a time.
+Starts the NeuroStrata MCP server (HTTP loopback on `127.0.0.1:34343` and/or stdio transport). Only one daemon instance may hold the store lock at a time. File-governance MCP calls accept absolute paths, resolving equivalent relative and absolute spellings against the caller and registered project roots; see [MCP & HTTP API](mcp-and-http-api.md).
 ```bash
 neurostrata-mcp daemon
 ```
