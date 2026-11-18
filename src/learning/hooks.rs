@@ -903,7 +903,7 @@ mod tests {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     fn tmp_dir(tag: &str) -> PathBuf {
-        let p = PathBuf::from("/tmp/opencode").join(format!(
+        let p = std::env::temp_dir().join(format!(
             "cap-e-hooks-{}-{}-{}",
             tag,
             std::process::id(),

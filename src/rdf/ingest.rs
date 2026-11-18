@@ -891,7 +891,7 @@ mod tests {
     }
 
     fn temp_store_dir() -> std::path::PathBuf {
-        std::path::PathBuf::from("/tmp/opencode").join(format!("ns-ingest-{}", uuid::Uuid::new_v4()))
+        std::env::temp_dir().join(format!("ns-ingest-{}", uuid::Uuid::new_v4()))
     }
 
     #[test]
