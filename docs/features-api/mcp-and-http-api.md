@@ -50,6 +50,8 @@ Active-task resolution is session/worktree scoped: when the daemon returns sever
 
 `neurostrata_guard_validate` unwraps a JSON shell payload via its `command`/`cmd` field when deciding whether a shell command is a read-only/verification exemption. The proxy caller's `cwd` (or `workdir`) is propagated into the guard request, with `worktree` defaulting to that `cwd`, so scope checks use the caller's real working tree rather than the daemon process directory. The `is_mutating` flag on the wire is client-supplied and untrusted; the daemon recomputes shell mutability from the raw payload and never trusts it.
 
+When no task is in progress, `neurostrata_get_snapshot` removes `task_id`, `status`, `session_id` and `subagent_prompt_injection` from `.NeuroStrata/active_session.json`, so session start stops announcing a task once it is completed or released. Other keys (namespace, golden rules) stay.
+
 ## Code Intelligence & SCIP Call-Graph Tools
 
 - `neurostrata_Export_scip` — export SCIP code graph data.
