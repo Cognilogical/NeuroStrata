@@ -87,6 +87,12 @@ Permanently deletes a single memory node by ID. Deliberately restricted to the C
 neurostrata-mcp delete <namespace> <id>
 ```
 
+### `migrate-paths`
+Rewrites the file paths stored on memories (`location`, `refs[].file`, `governs`) into the project-relative form new writes use, once. Without `--apply` it lists what it would change and writes nothing. Ingested nodes, rows received through the SynapticMesh, and paths under no known root are left as they are. Needs a project root usable on this machine: `--project-root`, else the namespace's registered root. Run with the daemon stopped.
+```bash
+neurostrata-mcp migrate-paths <namespace> [--project-root <dir>] [--apply]
+```
+
 ---
 
 ## 3. Codebase Ingestion & Graph Export

@@ -38,6 +38,7 @@ mod multimodal;
 mod ontology_grounding;
 mod parser;
 mod paths;
+mod paths_migration;
 mod procmem;
 mod rag_chat;
 mod rdf;
@@ -382,6 +383,27 @@ enum Commands {
     NormalizeMetadata {
         /// The exact project name
         namespace: String,
+    },
+
+    /// Rewrite the file paths stored on memories into project-relative form
+    ///
+    /// New writes store a memory's `location`, `refs[].file` and `governs`
+    /// project-relative, in the file system's spelling. This puts memories
+    /// written before that through the same resolver once. Without --apply it
+    /// only lists what it would change. Ingested nodes, rows received through
+    /// the SynapticMesh, and paths under no known root are left as they are.
+    /// Uses the existing vector, so no re-embedding. Run with the daemon
+    /// stopped.
+    #[command(name = "migrate-paths")]
+    MigratePaths {
+        /// The exact project name
+        namespace: String,
+        /// The project's directory; defaults to the namespace's registered root
+        #[arg(long)]
+        project_root: Option<String>,
+        /// Write the changes (without it, only list them)
+        #[arg(long)]
+        apply: bool,
     },
 
     /// Task subsystem: the gate behind the pre-push hook (section 5)
@@ -8531,6 +8553,47 @@ async fn run() -> anyhow::Result<()> {
                         )
                         .await;
                         println!("{}", response);
+                    }
+                    Commands::MigratePaths {
+                        namespace,
+                        project_root,
+                        apply,
+                    } => {
+                        // A dry run only reads; only --apply prepares the
+                        // store for writing.
+                        if apply {
+                            let embedder = build_embedder()?;
+                            prepare_fallback_write_store(&vector_store, &embedder, &namespace)
+                                .await?;
+                        }
+                        let report = crate::paths_migration::migrate_paths(
+                            &vector_store,
+                            &namespace,
+                            project_root.as_deref(),
+                            apply,
+                        )
+                        .await?;
+                        for row in &report.changed {
+                            println!("{}", row.id);
+                            for (field, old, new) in &row.changes {
+                                println!("  {field}: {old} -> {new}");
+                            }
+                        }
+                        for (id, path) in &report.unplaced {
+                            println!("left exactly as written (under no known root): {id}: {path}");
+                        }
+                        println!(
+                            "{} {} of {} memories ({} ingested, {} from the mesh, left as they are; {} paths under no known root).",
+                            if report.applied { "Rewrote" } else { "Would rewrite" },
+                            report.changed.len(),
+                            report.scanned,
+                            report.skipped_ingested,
+                            report.skipped_mesh,
+                            report.unplaced.len(),
+                        );
+                        if !report.applied && !report.changed.is_empty() {
+                            println!("Run again with --apply to write these changes.");
+                        }
                     }
                     Commands::NormalizeMetadata { namespace } => {
                         let embedder = build_embedder()?;
