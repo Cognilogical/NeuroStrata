@@ -234,6 +234,25 @@ pub fn generate_canvas(notes: &[VaultNote], _namespace: &str) -> CanvasDocument 
     CanvasDocument { nodes, edges }
 }
 
+/// Map an untrusted memory id to one flat Markdown filename.
+///
+/// Imported ids are attacker-controlled: the pre-existing `/` and `:` rewrite
+/// leaves the Windows separator `\` intact, so `..\..\outside\victim` escapes
+/// the J6-validated vault root when `join`ed on Windows (and UNC / rooted ids
+/// replace the base outright). Neutralising every separator form keeps the
+/// established flattened-naming behaviour on all platforms.
+fn export_filename_for_id(id: &str) -> String {
+    let mut stem = String::with_capacity(id.len() + 3);
+    for ch in id.chars() {
+        stem.push(match ch {
+            '/' | '\\' | ':' => '_',
+            _ => ch,
+        });
+    }
+    stem.push_str(".md");
+    stem
+}
+
 /// Export vault contents to the configured path
 pub async fn export_vault(
     config: VaultSyncConfig,
@@ -286,8 +305,17 @@ pub async fn export_vault(
 
     for note in &notes {
         let markdown = note.to_markdown();
-        let filename = format!("{}.md", note.id.replace('/', "_").replace(":", "_"));
-        let filepath = canonical_vault.join(filename);
+        let filename = export_filename_for_id(&note.id);
+        let filepath = canonical_vault.join(&filename);
+        // Fail closed: the J6-validated vault root is the only legal parent.
+        // A separator that somehow survived sanitisation must not be written.
+        if filepath.parent() != Some(canonical_vault.as_path()) {
+            errors.push(format!(
+                "Refusing to export note {} outside vault root",
+                note.id
+            ));
+            continue;
+        }
 
         if let Err(e) = std::fs::write(&filepath, markdown) {
             errors.push(format!("Failed to write {}: {}", filepath.display(), e));
@@ -1499,5 +1527,100 @@ mod tests {
         assert!(msg.contains("ORPHAN HISTORY"));
         assert!(msg.contains("history-1"));
         assert!(msg.contains("disk read-only"));
+    }
+
+    /// Codex 4610878281 P1: separator-bearing ids flatten to one safe name.
+    /// Covers both slash styles, nested traversal, rooted/prefix-like ids and
+    /// legitimate nested ids (which stay flattened, as before).
+    #[test]
+    fn export_filename_is_flat_for_every_separator_and_prefix_form() {
+        let cases = [
+            ("../../outside/victim", ".._.._outside_victim.md"),
+            (r"..\..\outside\victim", ".._.._outside_victim.md"),
+            ("a/b/../../outside/victim", "a_b_.._.._outside_victim.md"),
+            (r"a\b\..\..\outside\victim", "a_b_.._.._outside_victim.md"),
+            ("/etc/passwd", "_etc_passwd.md"),
+            (r"\root\victim", "_root_victim.md"),
+            (r"\\server\share\victim", "__server_share_victim.md"),
+            (r"C:\Windows\Temp\victim", "C__Windows_Temp_victim.md"),
+            (r"\\?\C:\victim", "__?_C__victim.md"),
+            ("folder/note", "folder_note.md"),
+            (r"folder\note", "folder_note.md"),
+            ("plain-id", "plain-id.md"),
+        ];
+        for (id, expected) in cases {
+            let name = export_filename_for_id(id);
+            assert_eq!(name, expected, "id {id:?}");
+            assert!(
+                !name.contains('/') && !name.contains('\\') && !name.contains(':'),
+                "no separator survived for {id:?} -> {name:?}"
+            );
+            assert!(
+                Path::new(&name).components().count() == 1,
+                "must be a single path component: {name:?}"
+            );
+        }
+    }
+
+    /// Codex 4610878281 P1: an imported id carrying Windows separators must
+    /// never survive into an export filename. On Windows `canonical_vault.join`
+    /// would follow `..\` out of the J6-validated root; on POSIX the backslash
+    /// is a literal character and lands in the filename. Either way a path
+    /// separator reaching the filesystem is the bug.
+    #[tokio::test]
+    async fn export_flattens_windows_separator_id() {
+        let root = std::env::temp_dir().join(format!("ns-exp-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_exp";
+        store.init(ns).await.expect("init");
+        store
+            .upsert(
+                ns,
+                r"..\..\outside\victim",
+                vec![0.0; 4],
+                crate::traits::MemoryPayload {
+                    content: "hostile".to_string(),
+                    user_id: "default".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("seed hostile id");
+        let config = VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.clone()),
+            allowed_external_dirs: None,
+        };
+        let result = export_vault(config, store).await.expect("export");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.notes_exported, 1);
+        let names: Vec<String> = std::fs::read_dir(&vault)
+            .expect("read vault")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            names.iter().all(|n| !n.contains('/') && !n.contains('\\')),
+            "no written filename may carry a separator: {:?}",
+            names
+        );
+        assert!(
+            names.iter().any(|n| n == ".._.._outside_victim.md"),
+            "hostile id must flatten to one safe name: {:?}",
+            names
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -437,20 +437,20 @@ pub fn extract_shacl_shapes(ttl: &str) -> Result<Vec<ExtractedShaclShape>> {
 
         // Collect property constraints from sh:property blank-node constraints
         let mut property_constraints: Vec<ExtractedShaclProperty> = Vec::new();
-        let mut seen_prop_bnodes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut seen_prop_nodes: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
 
         for (p, o) in subj_triples {
             if *p != sh_property {
                 continue;
             }
+            // sh:property may reference either a blank node or a named property
+            // shape (IRI); both are keyed in by_subj, so resolve either the same way.
             let o_str: String = o.clone();
-            if !o_str.starts_with("_:") {
+            if seen_prop_nodes.contains(&o_str) {
                 continue;
             }
-            if seen_prop_bnodes.contains(&o_str) {
-                continue;
-            }
-            seen_prop_bnodes.insert(o_str.clone());
+            seen_prop_nodes.insert(o_str.clone());
             let mut constraint = ExtractedShaclProperty {
                 path: String::new(),
                 min_count: None,
@@ -513,4 +513,60 @@ pub fn extract_shacl_shapes(ttl: &str) -> Result<Vec<ExtractedShaclShape>> {
     }
 
     Ok(shapes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const EX: &str = "http://example.org/";
+    const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
+    const SH: &str = "http://www.w3.org/ns/shacl#";
+
+    /// A named-node IRI used as `sh:property` must contribute its constraints.
+    /// Regression: named property shapes were skipped, dropping minCount/datatype.
+    #[test]
+    fn named_node_property_shape_constraints_are_extracted() {
+        let ttl = format!(
+            "@prefix sh: <{SH}> .\n\
+             @prefix ex: <{EX}> .\n\
+             @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n\
+             ex:PersonShape a sh:NodeShape ;\n\
+                 sh:targetClass ex:Person ;\n\
+                 sh:property ex:nameProperty .\n\
+             ex:nameProperty a sh:PropertyShape ;\n\
+                 sh:path ex:name ;\n\
+                 sh:minCount 1 ;\n\
+                 sh:datatype xsd:string ."
+        );
+
+        let shapes = extract_shacl_shapes(&ttl).expect("parse shapes");
+        assert_eq!(shapes.len(), 1, "one NodeShape");
+        let shape = &shapes[0];
+        assert_eq!(shape.shape_iri, format!("{EX}PersonShape"));
+        assert_eq!(shape.property_constraints.len(), 1, "named property kept");
+        let prop = &shape.property_constraints[0];
+        assert_eq!(prop.path, format!("{EX}name"));
+        assert_eq!(prop.min_count, Some(1));
+        assert_eq!(prop.datatype.as_deref(), Some(XSD_STRING));
+    }
+
+    /// Blank-node property shapes must keep working alongside named nodes.
+    #[test]
+    fn blank_node_property_shape_constraints_still_extracted() {
+        let ttl = format!(
+            "@prefix sh: <{SH}> .\n\
+             @prefix ex: <{EX}> .\n\
+             @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n\
+             ex:PersonShape a sh:NodeShape ;\n\
+                 sh:targetClass ex:Person ;\n\
+                 sh:property [ sh:path ex:age ; sh:minCount 2 ; sh:datatype xsd:integer ] ."
+        );
+
+        let shapes = extract_shacl_shapes(&ttl).expect("parse shapes");
+        assert_eq!(shapes.len(), 1, "one NodeShape");
+        let prop = &shapes[0].property_constraints[0];
+        assert_eq!(prop.path, format!("{EX}age"));
+        assert_eq!(prop.min_count, Some(2));
+    }
 }

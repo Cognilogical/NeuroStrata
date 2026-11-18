@@ -1984,8 +1984,22 @@ pub async fn plan_ontology_diff(
         })
         .collect();
 
-    let visible_memory_ids: Vec<String> =
+    let visible_id_set: std::collections::BTreeSet<String> =
         visible_rows.iter().map(|(id, _)| id.clone()).collect();
+    let visible_memory_ids: Vec<String> = visible_id_set.iter().cloned().collect();
+
+    // An edge quad names both endpoints, so an edge with a ReBAC-hidden endpoint
+    // would project a hidden memory IRI into the ontology pre-image. The closure
+    // would then derive entailments through that edge and disclose the hidden row.
+    // Filter the merged edge list against the same visible set used for nodes;
+    // this covers both live edges and scenario-staged edges.
+    let edges: Vec<(String, String, String, Option<crate::rdf::EdgeProvenance>)> = edges
+        .into_iter()
+        .filter(|(source, _relation, target, _prov)| {
+            visible_id_set.contains(source) && visible_id_set.contains(target)
+        })
+        .collect();
+
     let visible_file_paths: Vec<String> = visible_rows
         .iter()
         .filter(|(_, p)| !p.location.trim().is_empty())
@@ -2493,5 +2507,120 @@ mod tests {
             .scenarios()
             .list(ns, chrono::Utc::now().timestamp())
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn plan_ontology_diff_excludes_private_edges_from_entailments() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let ns = "rebac-plan-test";
+        store.init(ns).await.expect("init");
+
+        let visible_row = |owner: &str, governs: Option<&str>| MemoryPayload {
+            content: format!("visible rule {owner}"),
+            user_id: owner.to_string(),
+            memory_type: "rule".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: {
+                let mut m = serde_json::json!({ "visible_to": [owner] });
+                if let Some(target) = governs {
+                    m["governs"] = serde_json::json!([target]);
+                }
+                m
+            },
+        };
+
+        // Seed in dependency order so GOVERNS edges materialize on write.
+        store
+            .upsert(ns, "vis-c", vec![0.1; 4], visible_row("alice", None))
+            .await
+            .expect("seed vis-c");
+        store
+            .upsert(
+                ns,
+                "vis-b",
+                vec![0.1; 4],
+                visible_row("alice", Some("vis-c")),
+            )
+            .await
+            .expect("seed vis-b");
+        store
+            .upsert(
+                ns,
+                "vis-a",
+                vec![0.1; 4],
+                visible_row("alice", Some("vis-b")),
+            )
+            .await
+            .expect("seed vis-a");
+        // Private row (owner bob) governs a visible row; alice cannot read it.
+        let private = MemoryPayload {
+            content: "private rule".to_string(),
+            user_id: "bob".to_string(),
+            memory_type: "rule".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: serde_json::json!({
+                "visible_to": ["bob"],
+                "governs": ["vis-a"],
+            }),
+        };
+        store
+            .upsert(ns, "priv", vec![0.1; 4], private)
+            .await
+            .expect("seed priv");
+
+        let edges = store.list_edges(ns).await.expect("list edges");
+        assert!(edges
+            .iter()
+            .any(|(s, r, t, _)| s == "priv" && r == "GOVERNS" && t == "vis-a"));
+        assert!(edges
+            .iter()
+            .any(|(s, r, t, _)| s == "vis-a" && r == "GOVERNS" && t == "vis-b"));
+
+        let request = crate::rdf::ontology::OntologyPlanRequest {
+            namespace: ns.to_string(),
+            scenario_id: None,
+            add_turtle: Some(
+                concat!(
+                    "<urn:neurostrata:ns#governs> ",
+                    "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ",
+                    "<http://www.w3.org/2002/07/owl#TransitiveProperty> ."
+                )
+                .to_string(),
+            ),
+            retract_triples: Vec::new(),
+            candidate_shacl_turtle: None,
+        };
+
+        let report = plan_ontology_diff(&store, ns, &request, Some("alice"))
+            .await
+            .expect("plan succeeds");
+
+        let conclusions: Vec<&str> = report
+            .added_entailments
+            .iter()
+            .map(|s| s.conclusion.as_str())
+            .collect();
+
+        // No entailment may mention the ReBAC-hidden memory IRI, including
+        // derivations that hop through its governance edge.
+        assert!(
+            !conclusions
+                .iter()
+                .any(|c| c.contains("urn:neurostrata:memory:priv")),
+            "private row leaked via edge-derived entailment: {conclusions:?}"
+        );
+        // The authorized two-hop entailment must still be reported.
+        assert!(
+            conclusions.iter().any(|c| {
+                c.contains("urn:neurostrata:memory:vis-a")
+                    && c.contains("urn:neurostrata:memory:vis-c")
+            }),
+            "authorized transitive entailment missing: {conclusions:?}"
+        );
     }
 }

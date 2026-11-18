@@ -1860,10 +1860,12 @@ fn topo_order_steps(
 /// Unlike the in-line construction check, this entry point never trusts
 /// caller-supplied booleans: it recomputes the canonical digest over the
 /// persisted profile + steps + violations, derives proof coverage from the
-/// actual inferred triple set, rebuilds kernel witnesses with genuine premise
-/// availability, and passes only computed booleans to the formal kernel.
-/// Tampered steps, a tampered digest, a missing proof, or a broken chain are
-/// all rejected (I2).
+/// actual inferred triple set, independently re-derives every step's rule
+/// instance (and the disjointness-violation set) over `base ∪ inferred`,
+/// rebuilds kernel witnesses with genuine premise availability, and passes only
+/// computed booleans to the formal kernel. A forged conclusion whose digest was
+/// recomputed, a mismatched rule, tampered steps, a tampered digest, a missing
+/// proof, or a broken chain are all rejected (I2).
 pub fn verify_persisted_certificate(
     certificate: &DerivationCertificate,
     inferred_triples: &[oxrdf::Triple],
@@ -1892,6 +1894,64 @@ pub fn verify_persisted_certificate(
             let nt = nt_triple(t);
             certificate.steps.iter().any(|st| st.conclusion == nt)
         });
+
+    // Independent semantic re-derivation. The kernel verifier only sees rule
+    // tags, premise counts and availability booleans; those are all attacker
+    // forgeable when the digest is unkeyed. Here, with the real triples in hand,
+    // every certified step is reconstructed from its rule instance over
+    // base ∪ inferred using the SAME deterministic audit that produced it. A
+    // fabricated conclusion, a mismatched rule tag, or a premise set that does
+    // not actually fire the rule cannot be reconstructed and fails closed.
+    let mut audit_triples = base_triples.to_vec();
+    audit_triples.extend_from_slice(inferred_triples);
+    let graph = AuditGraph::new_with_base(audit_triples, base_triples.to_vec());
+    for st in &certificate.steps {
+        let conclusion = match inferred_triples
+            .iter()
+            .find(|t| nt_triple(t) == st.conclusion)
+        {
+            Some(t) => t,
+            None => {
+                return Err(ReasoningMaterializeError::KernelVerificationFailed {
+                    reason: format!(
+                        "step conclusion {} is not an inferred triple",
+                        st.conclusion
+                    ),
+                })
+            }
+        };
+        let reconstructed = audit_step(&graph, conclusion);
+        let matches = reconstructed.as_ref().is_some_and(|r| {
+            r.rule == st.rule
+                && r.premises.iter().cloned().collect::<BTreeSet<_>>()
+                    == st.premises.iter().cloned().collect::<BTreeSet<_>>()
+        });
+        if !matches {
+            return Err(ReasoningMaterializeError::KernelVerificationFailed {
+                reason: format!(
+                    "step for {} is not derivable by {} from its premises",
+                    st.conclusion,
+                    st.rule.as_str()
+                ),
+            });
+        }
+    }
+    // Disjointness violations carry the same proof obligation: re-derive the
+    // authoritative violation set and require an exact match.
+    let expected_violations: HashSet<_> = audit_disjointness_violations(&graph)
+        .into_iter()
+        .map(|v| (v.rule, v.premises, v.conclusion))
+        .collect();
+    let certified_violations: HashSet<_> = certificate
+        .disjointness_violations
+        .iter()
+        .map(|v| (v.rule.clone(), v.premises.clone(), v.conclusion.clone()))
+        .collect();
+    if certified_violations != expected_violations {
+        return Err(ReasoningMaterializeError::KernelVerificationFailed {
+            reason: "disjointness violations do not match an independent re-derivation".to_string(),
+        });
+    }
 
     let profile_tag = match certificate.profile {
         ReasoningProfile::Rdfs => 0,
@@ -1934,6 +1994,13 @@ pub fn verify_persisted_certificate(
     Ok(())
 }
 
+/// Base triples are fed to the reasoner in bounded batches so the
+/// `max_inferred_triples` cap is enforced before an oversized closure is ever
+/// materialized. After each batch the incremental output is inspected by
+/// reference (no `to_vec`) for a monotonic lower bound on the final inferred
+/// count; exceeding the cap aborts immediately.
+const REASON_BATCH: usize = 16;
+
 impl ReasoningAdapter {
     /// Materialize the DataFrog OWL 2 RL closure over `base_triples` and return
     /// every inferred triple together with a proof-carrying certificate.
@@ -1950,25 +2017,54 @@ impl ReasoningAdapter {
         max_inferred_triples: usize,
         profile: ReasoningProfile,
     ) -> Result<MaterializationCertificate, ReasoningMaterializeError> {
+        let base_nt: HashSet<String> = base_triples.iter().map(nt_triple).collect();
+
+        // Bound CPU/allocation: load in small batches and check the cap after
+        // each incremental materialization. closure(S) ⊆ closure(base) for any
+        // subset S, so a non-base count above the cap here is a monotonic lower
+        // bound on the final inferred count and rejection is sound.
         let mut reasoner = reasonable::reasoner::Reasoner::new();
-        reasoner.load_triples(base_triples.to_vec());
+        for batch in base_triples.chunks(REASON_BATCH) {
+            reasoner.load_triples(batch.to_vec());
+            reasoner.reason();
+            let inferred_so_far = reasoner
+                .view_output()
+                .iter()
+                .filter(|t| !base_nt.contains(&nt_triple(t)))
+                .count();
+            if inferred_so_far > max_inferred_triples {
+                return Err(ReasoningMaterializeError::InferredLimitExceeded {
+                    max: max_inferred_triples,
+                    actual: inferred_so_far,
+                });
+            }
+        }
+
+        // Canonical full materialization regardless of incremental internals.
+        // Reachable only with inferred_so_far ≤ cap, so this pass is bounded.
+        // Enforce the cap once more on the borrowed view BEFORE copying the
+        // closure or allocating any proof/nquad vectors (I2, I6).
         reasoner.reason_full();
-        let full = reasoner.view_output().to_vec();
+        let inferred_len = reasoner
+            .view_output()
+            .iter()
+            .filter(|t| !base_nt.contains(&nt_triple(t)))
+            .count();
+        if inferred_len > max_inferred_triples {
+            return Err(ReasoningMaterializeError::InferredLimitExceeded {
+                max: max_inferred_triples,
+                actual: inferred_len,
+            });
+        }
 
         // Deterministic inferred set: sorted by canonical N-Triple rendering.
-        let base_nt: HashSet<String> = base_triples.iter().map(nt_triple).collect();
+        let full = reasoner.view_output().to_vec();
         let mut inferred: Vec<oxrdf::Triple> = full
             .into_iter()
             .filter(|t| !base_nt.contains(&nt_triple(t)))
             .collect();
         inferred.sort_by(|a, b| nt_triple(a).cmp(&nt_triple(b)));
         inferred.dedup();
-        if inferred.len() > max_inferred_triples {
-            return Err(ReasoningMaterializeError::InferredLimitExceeded {
-                max: max_inferred_triples,
-                actual: inferred.len(),
-            });
-        }
 
         let mut audit_graph_triples = base_triples.to_vec();
         audit_graph_triples.extend(inferred.iter().cloned());
@@ -2507,6 +2603,105 @@ mod tests {
             &out.certificate.disjointness_violations,
         ));
         assert!(verify_persisted_certificate(&out.certificate, &out.inferred_triples, &base).is_err());
+    }
+
+    #[test]
+    fn verify_persisted_certificate_rejects_fabricated_conclusion_with_valid_digest() {
+        // P1: an attacker swaps one step's conclusion for an arbitrary triple
+        // and recomputes the UNKEYED SHA-256 over the canonical material. Rule
+        // tag / premise count / availability / coverage / digest all still pass
+        // on the current verifier, so only an independent re-derivation catches
+        // it.
+        let (profile, base, mut out) = persisted_fixture();
+        let idx = out
+            .certificate
+            .steps
+            .iter()
+            .position(|s| s.rule == Owl2RlRuleId::CaxSco)
+            .expect("fixture must contain a cax-sco step");
+        let fake = ex_tb("http://ex.org/x", RDF_TYPE, "http://ex.org/FAKE");
+        let fake_nt = nt_triple(&fake);
+        let old_nt = out.certificate.steps[idx].conclusion.clone();
+        out.certificate.steps[idx].conclusion = fake_nt;
+        let iidx = out
+            .inferred_triples
+            .iter()
+            .position(|t| nt_triple(t) == old_nt)
+            .expect("inferred triple for cax-sco step must exist");
+        out.inferred_triples[iidx] = fake;
+        out.certificate.certificate_sha256 = certificate_digest(&canonical_certificate_material(
+            profile,
+            &out.certificate.steps,
+            &out.certificate.disjointness_violations,
+        ));
+        assert!(
+            verify_persisted_certificate(&out.certificate, &out.inferred_triples, &base).is_err(),
+            "fabricated conclusion with a recomputed unkeyed digest must be rejected"
+        );
+    }
+
+    #[test]
+    fn verify_persisted_certificate_rejects_wrong_rule_with_valid_digest() {
+        // P1: genuine premise set + genuine conclusion, but the rule tag is a
+        // different (valid) OWL-RL rule whose premise pattern does not match.
+        let (profile, base, mut out) = persisted_fixture();
+        let idx = out
+            .certificate
+            .steps
+            .iter()
+            .position(|s| s.rule == Owl2RlRuleId::CaxSco)
+            .expect("fixture must contain a cax-sco step");
+        out.certificate.steps[idx].rule = Owl2RlRuleId::PrpDom;
+        out.certificate.certificate_sha256 = certificate_digest(&canonical_certificate_material(
+            profile,
+            &out.certificate.steps,
+            &out.certificate.disjointness_violations,
+        ));
+        assert!(
+            verify_persisted_certificate(&out.certificate, &out.inferred_triples, &base).is_err(),
+            "a step whose rule does not entail its conclusion must be rejected"
+        );
+    }
+
+    #[test]
+    fn inferred_limit_aborts_before_full_closure() {
+        // P2: with a large cap the transitive-property fixture yields a large
+        // inferred closure. A tiny cap must abort materialization early instead
+        // of first building/copying that entire closure; the reported `actual`
+        // must therefore be far below the full closure size.
+        let p = "http://ex.org/tp";
+        let mut base = vec![ex_tb(p, RDF_TYPE, EX_TRP)];
+        for i in 0..40 {
+            base.push(ex_tb(
+                &format!("http://ex.org/n{i}"),
+                p,
+                &format!("http://ex.org/n{}", i + 1),
+            ));
+        }
+        let full = ReasoningAdapter::new()
+            .materialize_owl2_rl_with_proofs(&base, "test/ns", 50_000, ReasoningProfile::OwlRl)
+            .expect("full closure must certify");
+        let full_count = full.certificate.inferred_triple_count;
+        assert!(
+            full_count > 500,
+            "fixture must produce a large closure, got {full_count}"
+        );
+
+        match ReasoningAdapter::new().materialize_owl2_rl_with_proofs(
+            &base,
+            "test/ns",
+            8,
+            ReasoningProfile::OwlRl,
+        ) {
+            Err(ReasoningMaterializeError::InferredLimitExceeded { max, actual }) => {
+                assert_eq!(max, 8);
+                assert!(
+                    actual < full_count,
+                    "tiny cap must abort before building the full closure ({actual} vs {full_count})"
+                );
+            }
+            other => panic!("expected InferredLimitExceeded, got {other:?}"),
+        }
     }
 
     // ---- I4: exact reasonable 0.5.0-a1 supported-behavior matrix ----

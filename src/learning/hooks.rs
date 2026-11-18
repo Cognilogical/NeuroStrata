@@ -473,6 +473,7 @@ async fn surface_action_candidate(
     namespace: &str,
     definition: &ActionTypeDefinition,
     source_task_ids: &[String],
+    dimensions: usize,
 ) -> std::result::Result<bool, String> {
     let violations = definition.validate_definition();
     if !violations.is_empty() {
@@ -534,7 +535,10 @@ async fn surface_action_candidate(
         expected_heads: vec![ExpectedHead::AbsentOrInactive { row_id: id.clone() }],
         writes: vec![StagedMemoryWrite {
             id,
-            vector: vec![0.0f32; 4], // inert: never searched by meaning
+            // Inert (never searched by meaning), but the row still lands in a
+            // fixed FLOAT[N] column built at the embedder's configured width;
+            // a zero vector of any other length is rejected by the engine.
+            vector: vec![0.0f32; dimensions],
             payload,
         }],
         edge_deltas: Vec::new(),
@@ -604,6 +608,7 @@ pub async fn on_task_completed_with_judge(
                 namespace,
                 &action_candidate.definition,
                 &candidate.task_ids,
+                emb.dimensions(),
             )
             .await
             {
@@ -1440,7 +1445,7 @@ mod tests {
             )],
         )
         .await;
-        let result = surface_action_candidate(&store, "ns-e", &def, &task_ids).await;
+        let result = surface_action_candidate(&store, "ns-e", &def, &task_ids, 4).await;
         assert!(result.is_err(), "foreign-owned inactive row must not be overwritten");
     }
 
@@ -1452,8 +1457,8 @@ mod tests {
         store.init("ns-e").await.unwrap();
         let def = valid_action_definition("learned-active");
         let task_ids = vec!["t1".to_string()];
-        assert!(surface_action_candidate(&store, "ns-e", &def, &task_ids).await.unwrap());
-        assert!(!surface_action_candidate(&store, "ns-e", &def, &task_ids).await.unwrap());
+        assert!(surface_action_candidate(&store, "ns-e", &def, &task_ids, 4).await.unwrap());
+        assert!(!surface_action_candidate(&store, "ns-e", &def, &task_ids, 4).await.unwrap());
     }
 
     // F2 — an invalid definition is rejected before any write.
@@ -1465,9 +1470,36 @@ mod tests {
         let def = valid_action_definition("NOT A CANONICAL SLUG");
         let task_ids = vec!["t1".to_string()];
         let id = action_candidate_id_of(&def, &task_ids);
-        let result = surface_action_candidate(&store, "ns-e", &def, &task_ids).await;
+        let result = surface_action_candidate(&store, "ns-e", &def, &task_ids, 4).await;
         assert!(result.is_err(), "invalid definition must be rejected");
         assert!(store.get("ns-e", &id).await.unwrap().is_none(), "nothing may be written");
+    }
+
+    // P2 (Codex thread 4610878291) — an inert action candidate must carry a
+    // zero vector of the STORE's configured width, not a hardcoded 4. A
+    // production store is FLOAT[768]; a 4-wide vector is rejected by the engine.
+    #[tokio::test]
+    async fn action_candidate_uses_store_embedding_width() {
+        const STORE_WIDTH: usize = 8; // deliberately != 4
+        let dir = tmp_dir("p2-action-candidate-width");
+        let store = LadybugStore::for_testing(&dir, STORE_WIDTH).expect("store");
+        store.init("ns-e").await.unwrap();
+        let def = valid_action_definition("learned-width");
+        let task_ids = vec!["t1".to_string()];
+        let id = action_candidate_id_of(&def, &task_ids);
+
+        let result = surface_action_candidate(&store, "ns-e", &def, &task_ids, STORE_WIDTH).await;
+        assert!(
+            result.is_ok(),
+            "candidate write into FLOAT[{STORE_WIDTH}] must succeed: {:?}",
+            result.err()
+        );
+        let (vector, _) = store.get("ns-e", &id).await.unwrap().unwrap();
+        assert_eq!(
+            vector.len(),
+            STORE_WIDTH,
+            "candidate vector width must match the store column"
+        );
     }
 
     // F3 — only receipts linked to the completing task may reinforce targets.
