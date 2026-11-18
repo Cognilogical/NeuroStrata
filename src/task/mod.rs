@@ -848,11 +848,64 @@ fn seed_expand_next_hops(namespace: &str, seeds: &[String], edges: &[Value]) -> 
     actions
 }
 
+/// Serializes every read-modify-write of `.NeuroStrata/active_session.json`
+/// (claim, snapshot, and the cleanup after a task ends), so a cleanup cannot
+/// clear the fields a concurrent claim has just written. One daemon process
+/// runs all of them (see [`claim_lock`]), so a process lock covers it.
+static SESSION_FILE_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// The task id the session file at `project_root` currently names, if any.
+fn session_file_task_id(project_root: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(project_root.join(".NeuroStrata").join("active_session.json")).ok()?;
+    let value = serde_json::from_str::<Value>(&text).ok()?;
+    value.get("task_id").and_then(|v| v.as_str()).map(String::from)
+}
+
+/// The row of task `id` when it is in progress right now, read fresh.
+async fn in_progress_task(store: &Arc<dyn VectorStore>, namespace: &str, id: &str) -> Option<Task> {
+    load_task(store, namespace, id)
+        .await
+        .ok()
+        .map(|(task, _)| task)
+        .filter(|task| task.status() == Status::InProgress)
+}
+
+/// [`persist_active_session_file`] under [`SESSION_FILE_LOCK`], naming a task
+/// only when its row is in progress at write time: `candidate` (the task the
+/// caller found or just claimed), else the task the file already names (a
+/// claim that landed after the caller listed the tasks), else none.
+pub(crate) async fn refresh_active_session_file(
+    store: &Arc<dyn VectorStore>,
+    project_root: &std::path::Path,
+    namespace: &str,
+    golden_rules: &[SearchResult],
+    candidate: Option<&str>,
+) {
+    let _session_guard = SESSION_FILE_LOCK.lock().await;
+    let mut active: Option<Task> = None;
+    let named = session_file_task_id(project_root);
+    for id in candidate.map(String::from).into_iter().chain(named) {
+        if let Some(task) = in_progress_task(store, namespace, &id).await {
+            active = Some(task);
+            break;
+        }
+    }
+    persist_active_session_file(
+        project_root,
+        namespace,
+        golden_rules,
+        active.as_ref().map(|task| (task.id.as_str(), &task.payload)),
+    );
+}
+
 /// When task `task_id` stops being in progress (completed, released, blocked),
 /// remove its fields from the session file at the namespace's registered
 /// project root, the file `task_claim` wrote, so the next session start does
 /// not announce a finished task. Only a file that still names this task is
-/// touched: another task claimed since keeps its fields. Best effort.
+/// touched: another task claimed since keeps its fields, and so does this
+/// task when another session has claimed it again meanwhile (its row is
+/// read again under the session file lock). Best effort.
 pub(crate) async fn clear_finished_task_from_session_file(
     store: &Arc<dyn VectorStore>,
     namespace: &str,
@@ -865,6 +918,7 @@ pub(crate) async fn clear_finished_task_from_session_file(
     let Some(root) = registry.metadata.get("project_root").and_then(|v| v.as_str()) else {
         return;
     };
+    let _session_guard = SESSION_FILE_LOCK.lock().await;
     let session_path = std::path::Path::new(root).join(".NeuroStrata").join("active_session.json");
     let Some(mut active) = std::fs::read_to_string(&session_path)
         .ok()
@@ -874,6 +928,9 @@ pub(crate) async fn clear_finished_task_from_session_file(
         return;
     };
     if active.get("task_id").and_then(|v| v.as_str()) != Some(task_id) {
+        return;
+    }
+    if in_progress_task(store, namespace, task_id).await.is_some() {
         return;
     }
     for key in ["task_id", "status", "session_id", "subagent_prompt_injection"] {
@@ -2498,7 +2555,7 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
     let hint_root = explicit_root.clone().or_else(|| session_root.clone());
     if let Some(root) = session_root {
         let golden = collect_golden_rules(&store, &namespace, None).await;
-        persist_active_session_file(&root, &namespace, &golden, Some((&id, &task.payload)));
+        refresh_active_session_file(&store, &root, &namespace, &golden, Some(&id)).await;
     }
     let event_id = arg_str(&args, "event_id")
         .unwrap_or(&format!("claim-{}", id))

@@ -6413,13 +6413,17 @@ async fn handle_get_snapshot(
         let active_task = all_memories
             .iter()
             .find(|m| is_active(m) && matches_root(m))
-            .map(|m| (m.id.as_str(), &m.payload));
-        crate::task::persist_active_session_file(
+            .map(|m| m.id.clone());
+        // Serialized with claims and with the cleanup after a task ends; a
+        // task is named only if its row is still in progress at write time.
+        crate::task::refresh_active_session_file(
+            &store,
             std::path::Path::new(root_str),
             namespace,
             &golden_rules,
-            active_task,
-        );
+            active_task.as_deref(),
+        )
+        .await;
     }
     // F10: detect conflicts AFTER active-row filtering (valid_to, archived,
     // mesh-conflicting, registry) so expired rows never participate.
@@ -23963,6 +23967,69 @@ mod tests {
     #[tokio::test]
     async fn the_session_file_drops_a_released_task() {
         session_file_after_task_ends(TaskEnd::Release).await;
+    }
+
+    /// The cleanup after a release can run late, after another session has
+    /// claimed the same task again. It must leave that new claim in the
+    /// session file, and so must a snapshot that listed the tasks before the
+    /// claim landed.
+    #[tokio::test]
+    async fn a_late_cleanup_keeps_a_new_claim_of_the_same_task() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let proj_root = std::env::temp_dir().join(format!("ns-session-reclaim-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&proj_root).unwrap();
+        let session_file = proj_root.join(".NeuroStrata").join("active_session.json");
+        let read_session = || -> Value {
+            serde_json::from_str(&std::fs::read_to_string(&session_file).expect("session file"))
+                .expect("session file is json")
+        };
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        crate::registry::cache_project_root(&store, Some(&emb), "probe", &proj_root.to_string_lossy())
+            .await;
+        let created = crate::task::handle_task_create(
+            serde_json::json!({ "namespace": "probe", "title": "the work" }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+        )
+        .await;
+        let created: Value = serde_json::from_str(&created).expect("create replies with json");
+        let id = created["id"].as_str().expect("id").to_string();
+        let claim = |session: &'static str| {
+            let store = store.clone();
+            let id = id.clone();
+            async move {
+                crate::task::handle_task_claim(
+                    serde_json::json!({
+                        "namespace": "probe", "id": id, "assignee": session, "session_id": session
+                    }),
+                    store,
+                )
+                .await
+            }
+        };
+        assert!(claim("ses_a").await.contains("in_progress"));
+        let released = crate::task::handle_task_update(
+            serde_json::json!({ "namespace": "probe", "id": id, "status": "open", "session_id": "ses_a" }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+        )
+        .await;
+        assert!(released.contains("\"open\""), "release failed: {}", released);
+        assert!(claim("ses_b").await.contains("in_progress"));
+        assert_eq!(read_session()["session_id"], serde_json::json!("ses_b"));
+
+        // The release's cleanup, arriving after the new claim.
+        crate::task::clear_finished_task_from_session_file(&store, "probe", &id).await;
+        let after = read_session();
+        assert_eq!(after["task_id"], serde_json::json!(id), "the new claim stays: {after}");
+        assert_eq!(after["session_id"], serde_json::json!("ses_b"), "{after}");
+
+        // A snapshot that saw no task in progress before the claim landed.
+        crate::task::refresh_active_session_file(&store, &proj_root, "probe", &[], None).await;
+        let after = read_session();
+        assert_eq!(after["task_id"], serde_json::json!(id), "the snapshot keeps it too: {after}");
+        assert_eq!(after["status"], serde_json::json!("in_progress"), "{after}");
+        let _ = std::fs::remove_dir_all(&proj_root);
     }
 
     /// The printed path carries the graph's own direction. The store's
