@@ -258,7 +258,7 @@ Always quote commit hashes, memory IDs, and task IDs directly from tool output.
    - Preserves bitemporal audit history: edits to an existing note's body or frontmatter invoke `supersede_memory` (or create a new bitemporal version under `LadybugStore::write_lock`) rather than destructively mutating historical versions in place.
    - Honours SynapticMesh sovereignty and access control: private rows (`eligibility: "private"`), mesh-owned foreign records, and ReBAC-disallowed targets cannot be silently clobbered.
 
-### 5.4 Remaining integration contract for parent/coder (Capability D)
+### 5.4 Implemented integration contract (Capability D, neurostrata-dlag)
 - **Core:** implement/complete `src/vault_ld/mod.rs` (and submodules as needed) as the shared sync engine: YAML-LD frontmatter parse/render, `[[WikiLinks]]` mapping, diff detection, export, import-to-RDF, canvas generation, `stub:true` minting, and bitemporal supersession.
 - **Wiring (all required):** `src/server.rs` registers `neurostrata_vault_sync` in tool listing/schema and dispatches to shared handler; `src/daemon.rs` adds HTTP route/handler delegating to same shared handler; `src/main.rs` adds `vault-sync` CLI command/subcommand delegating to same shared handler. Use existing `check_caller_path`, guard secret scan, `ontobug::validate::shacl_turtle` / ontology validation, `rebac::can_read_memory` (and write checks), and store write-lock/supersession APIs.
 - **Concrete targets:** `src/vault_ld/mod.rs`, `src/server.rs`, `src/daemon.rs`, `src/main.rs`, `docs/features-api/ops/obsidian.md` (and API/CLI docs if surfaced by implementation conventions).
@@ -277,7 +277,7 @@ Agents repeatedly execute multi-step workflows (recorded across task history not
    - Inspects completed tasks (`status == "done"`), their `EXTRACTED_FROM` memories, `action_receipt` chains, and `.NeuroStrata/sessions/*.md` episodic sequences.
    - Identifies recurring ordered n-grams of `(trigger_context, tool_or_action_sequence, verification_gate)` that appear across $\ge 3$ completed tasks with a $100\%$ non-reverted completion rate.
    - **Pure miner core (deterministic, side-effect free):** computes and returns candidate payloads/structs (procedure candidates and optional candidate `ActionTypeDefinition` payloads) without store writes; unit-testable in isolation.
-   - Synthesizes candidate `memory_type = "procedure"` payloads with valid SHACL metadata (`trigger`, `remaining_fires: 10`, `performance_count: 0`, `generated_by: "trajectory-miner"`, `verified_by: "task-receipts:<id1>,<id2>,<id3>"`, `epistemic_tier: "empirical_verified"`), deduplicating against existing procedures via the local Laya ONNX judge (`src/judgment/laya_onnx.rs`) with fail-closed behavior when safety cannot be established.
+   - Synthesizes candidate `memory_type = "procedure"` payloads with valid SHACL metadata (`trigger`, `remaining_fires: 10`, `performance_count: 0`, `generated_by: "trajectory-miner"`, `verified_by: "task-receipts:<id1>,<id2>,<id3>"`, `epistemic_tier: "empirical_verified"`), deduplicating against existing procedures via the local Laya ONNX judge (`src/judgment/laya_onnx.rs`) with fail-closed behavior when safety cannot be established (neurostrata-mpau).
    - **Candidate `ActionTypeDefinition`s:** emitted as candidates only. Any registration/persistence must pass the existing action define gate in `src/rdf/action.rs` (`ActionTypeDefinition::from_payload` / `validate_definition` / `define_action` path including slug/schema/budget checks and namespace uniqueness semantics). **Never auto-applied**; no `neurostrata_action(apply)` side effects at mining/proposal time.
 
 2. **Outcome-Verified Belief Reflection (`src/learning/reflection.rs`):**
@@ -306,7 +306,7 @@ Long-lived agentic repositories need domain-scoped classification: agents should
 - Wrap ingestion in ontobug/rudof SHACL fail-closed validation (via `ontobug::validate::shacl_turtle` / `ontobug::validate::shex` where applicable and `OntologyIndex::validate_rdf_graph` / strict post-image validation) **before** writes.
 - Emit `task_intent_signals`/`task_intent` metadata on resulting memories for tracking.
 
-### 6.5.3 Remaining integration contract for parent/coder (Capability F)
+### 6.5.3 Implemented integration contract (Capability F, neurostrata-v6dw)
 - **Core:** implement production logic in `src/rdf/ingest.rs` (vocabulary/domain resolution, bounded classification, candidate graph construction, batch validation, atomic commit).
 - **Production handler exposure:** expose the capability through a real production handler/surface (MCP tool/operation schema + dispatch in `src/server.rs`, and daemon/CLI parity if included in this release scope) rather than an unreachable module-only API.
 - **Concrete targets:** `src/rdf/ingest.rs`, `src/rdf/ontology.rs` (vocabulary/subgraph helpers as needed), `src/server.rs` (+ `src/daemon.rs`/`src/main.rs` if parity wired), and focused tests.
