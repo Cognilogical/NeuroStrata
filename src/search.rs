@@ -111,6 +111,16 @@ pub fn normalize_prefix_comparison_value(value: &str) -> String {
     normalized
 }
 
+fn is_absolute_any_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    path.starts_with('/')
+        || path.starts_with('\\')
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && (bytes[2] == b'/' || bytes[2] == b'\\'))
+}
+
 /// Match one prefix against a location using normalized, separator- and
 /// segment-boundary-aware comparison. Relative prefix forms match only relative
 /// locations; absolute prefix forms match only absolute locations.
@@ -121,7 +131,7 @@ pub fn single_prefix_matches(location: &str, prefix: &str) -> bool {
     if location.trim().is_empty() {
         return false;
     }
-    if crate::paths::is_absolute_any(location) != crate::paths::is_absolute_any(prefix) {
+    if is_absolute_any_path(location) != is_absolute_any_path(prefix) {
         return false;
     }
     let loc = normalize_prefix_comparison_value(location);
