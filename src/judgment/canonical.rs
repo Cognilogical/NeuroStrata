@@ -7,14 +7,15 @@ use anyhow::Result;
 /// key is a deterministic serialization of a fixed field set; it never
 /// consults vector distance or model scores.
 pub fn canonical_duplicate_key(namespace: &str, payload: &MemoryPayload) -> Result<String> {
-    // Sorted governs list.
+    // Sorted governs list. A folder's trailing slash only types the node a
+    // write creates, so `pkg` and `pkg/` govern the same thing.
     let mut governs: Vec<String> = payload
         .metadata
         .get("governs")
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .filter_map(|x| x.as_str().map(|s| s.strip_suffix('/').unwrap_or(s).to_string()))
                 .collect()
         })
         .unwrap_or_default();
@@ -147,5 +148,18 @@ mod tests {
         let mut b = a.clone();
         b.metadata = serde_json::json!({"attempt": {"approach":"r2","outcome":"failed","failure_mode":"t","context":"c"}});
         assert_ne!(canonical_duplicate_key("ns", &a).unwrap(), canonical_duplicate_key("ns", &b).unwrap());
+    }
+
+    #[test]
+    fn a_governed_folders_slash_does_not_change_the_key() {
+        let mut a = payload("hello", "rule");
+        a.metadata = serde_json::json!({"governs": ["pkg/"]});
+        let mut b = payload("hello", "rule");
+        b.metadata = serde_json::json!({"governs": ["pkg"]});
+        let mut c = payload("hello", "rule");
+        c.metadata = serde_json::json!({"governs": ["lib/"]});
+        let key = |p: &MemoryPayload| canonical_duplicate_key("ns", p).unwrap();
+        assert_eq!(key(&a), key(&b));
+        assert_ne!(key(&a), key(&c));
     }
 }
