@@ -2300,7 +2300,14 @@ async fn handle_context_plan(
             for fp in &requested_files {
                 // Same resolution as neurostrata_memories_for_file, so an
                 // absolute file path reaches the relative locations it names.
-                let (_, forms) = lookup_path_for(&store, effective_ns, fp, None).await;
+                let forms = match lookup_path_for(&store, effective_ns, fp, None).await {
+                    Ok((_, forms)) => forms,
+                    Err(e) => {
+                        had_backend_error = true;
+                        tracing::warn!("context_plan path lookup error: {e:#}");
+                        continue;
+                    }
+                };
                 match memories_for_forms(
                     ls,
                     effective_ns,
@@ -2711,20 +2718,56 @@ pub async fn start_mcp_proxy(origin: DaemonOrigin) -> io::Result<()> {
 /// An absolute path is made relative to the caller's `project_root`, the
 /// namespace's registered root, or the nearest `.git` ancestor; a relative one
 /// is also tried joined onto a known root, for memories stored with absolute
-/// paths. Stored memories are read as they are, never rewritten.
+/// paths. Stored memories are read as they are, never rewritten. Fails only
+/// when the registered root cannot be read and nothing else constrains an
+/// absolute path (see [`registry_root_for_lookup`]).
 async fn lookup_path_for(
     store: &Arc<dyn VectorStore>,
     namespace: &str,
     path: &str,
     project_root: Option<&str>,
-) -> (crate::paths::LookupPath, Vec<String>) {
-    let registry_root = crate::registry::cached_project_root(store, namespace).await;
+) -> anyhow::Result<(crate::paths::LookupPath, Vec<String>)> {
+    let registry_root = registry_root_for_lookup(
+        crate::registry::cached_project_root(store, namespace).await,
+        namespace,
+        path,
+        project_root,
+    )?;
     let lookup = crate::paths::to_project_relative(path, project_root, registry_root.as_deref());
     let known_root = project_root
         .filter(|root| crate::paths::is_usable_root(root))
         .or(registry_root.as_deref());
     let forms = crate::paths::lookup_forms(path, &lookup, known_root);
-    (lookup, forms)
+    Ok((lookup, forms))
+}
+
+/// The registered root to resolve `path` with, given the result of reading it.
+/// A failed read is not a miss: with no root at all, an absolute path falls
+/// back to the nearest `.git`, which may be another repository. So when the
+/// read fails and the caller supplied no `project_root` to constrain that
+/// fallback, an absolute path is an error. A relative path, or one the
+/// caller's root constrains, goes on without the registered root; that can
+/// only find less, and the failure is logged.
+fn registry_root_for_lookup(
+    read: anyhow::Result<Option<String>>,
+    namespace: &str,
+    path: &str,
+    project_root: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    match read {
+        Ok(root) => Ok(root),
+        Err(e) if project_root.is_none() && crate::paths::is_absolute_any(path) => {
+            Err(e.context(format!(
+                "could not read the registered project root of namespace '{namespace}', so the absolute path cannot be placed in this project; retry, or pass project_root"
+            )))
+        }
+        Err(e) => {
+            tracing::warn!(
+                "registered project root of '{namespace}' could not be read; resolving {path:?} without it: {e:#}"
+            );
+            Ok(None)
+        }
+    }
 }
 
 /// Merge one lookup result per spelling into a single answer. A spelling that
@@ -2922,7 +2965,21 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
     // being touched. The root found here only relativizes the path -- it is
     // never used as `source`, so a worktree that was never ingested cannot pin
     // an empty generation.
-    let (lookup, forms) = lookup_path_for(&store, &namespace, path, project_root).await;
+    let (lookup, forms) = match lookup_path_for(&store, &namespace, path, project_root).await {
+        Ok(found) => found,
+        Err(e) => {
+            let graph_read = crate::traits::VectorStore::as_any(store.as_ref())
+                .downcast_ref::<crate::store::LadybugStore>()
+                .is_some();
+            return serde_json::json!({
+                "memories": [],
+                "unsupported": !graph_read,
+                "path": path,
+                "error": format!("{e:#}"),
+            })
+            .to_string();
+        }
+    };
     let original_path = path;
     let path = lookup.path.as_str();
 
@@ -13900,6 +13957,72 @@ mod tests {
         assert!(
             related_ids(&text).iter().all(|id| id != "mem-related"),
             "related_memories must omit excluded neighbor mem-related: {text}"
+        );
+    }
+
+    /// The handler answers an absolute path with the read error instead of
+    /// widening the lookup; a relative path goes on without the root.
+    #[tokio::test]
+    async fn memories_for_file_reports_a_failed_registry_read() {
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        mock.set_get_fails(true);
+        let store: Arc<dyn VectorStore> = mock;
+        let text = handle_memories_for_file(
+            serde_json::json!({"namespace": "probe", "path": "/repo/src/lib.rs"}),
+            store.clone(),
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&text).expect("valid JSON");
+        let error = parsed["error"].as_str().unwrap_or_default();
+        assert!(error.contains("registered project root"), "{text}");
+        assert_eq!(parsed["memories"], json!([]), "{text}");
+        assert_eq!(parsed["unsupported"], json!(true), "this store has no graph read: {text}");
+
+        // A relative path is not placed by a root: no error. (This store has
+        // no graph-read support, so it answers `unsupported`.)
+        let text = handle_memories_for_file(
+            serde_json::json!({"namespace": "probe", "path": "src/lib.rs"}),
+            store,
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&text).expect("valid JSON");
+        assert!(parsed.get("error").is_none(), "{text}");
+        assert_eq!(parsed["unsupported"], json!(true), "{text}");
+    }
+
+    #[test]
+    fn a_failed_registry_read_is_not_a_missing_root() {
+        let failed = || Err(anyhow::anyhow!("store unavailable"));
+
+        // Nothing constrains the `.git` fallback: an absolute path must not
+        // be placed as if no root were registered.
+        let got = registry_root_for_lookup(failed(), "ns", "/repo/src/lib.rs", None);
+        let err = got.expect_err("an unreadable root must not widen the lookup");
+        let text = format!("{err:#}");
+        assert!(text.contains("registered project root"), "{text}");
+        assert!(text.contains("store unavailable"), "keeps the cause: {text}");
+
+        // A relative path never takes that fallback; it goes on without the
+        // registered root.
+        assert_eq!(
+            registry_root_for_lookup(failed(), "ns", "src/lib.rs", None).unwrap(),
+            None
+        );
+
+        // The caller's root constrains the fallback, so the lookup goes on.
+        assert_eq!(
+            registry_root_for_lookup(failed(), "ns", "/repo/src/lib.rs", Some("/repo")).unwrap(),
+            None
+        );
+
+        // A read that worked is passed through, root or no root.
+        assert_eq!(
+            registry_root_for_lookup(Ok(Some("/repo".into())), "ns", "/repo/a.rs", None).unwrap(),
+            Some("/repo".to_string())
+        );
+        assert_eq!(
+            registry_root_for_lookup(Ok(None), "ns", "/repo/a.rs", None).unwrap(),
+            None
         );
     }
 

@@ -751,17 +751,21 @@ pub async fn cache_project_root(
 }
 
 /// The `project_root` cached on the namespace's registry row by
-/// [`cache_project_root`], if any. A read miss is `None`, never an error.
-pub async fn cached_project_root(store: &Arc<dyn VectorStore>, namespace: &str) -> Option<String> {
-    match store.get(namespace, &registry_row_id(namespace)).await {
-        Ok(Some((_, payload))) if is_registry_row(&payload.metadata) => payload
+/// [`cache_project_root`]. A missing row or field is `Ok(None)`; a failed
+/// store read is an error, so a caller can tell "no root" from "unknown".
+pub async fn cached_project_root(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+) -> anyhow::Result<Option<String>> {
+    Ok(match store.get(namespace, &registry_row_id(namespace)).await? {
+        Some((_, payload)) if is_registry_row(&payload.metadata) => payload
             .metadata
             .get("project_root")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .map(str::to_string),
         _ => None,
-    }
+    })
 }
 
 #[cfg(test)]
