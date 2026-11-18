@@ -2880,10 +2880,16 @@ fn governed_directory_slash(stored: String, raw: &str, root: Option<&str>) -> St
     if trimmed.is_empty() || crate::paths::is_absolute_any(trimmed) {
         return stored;
     }
-    let inside_root = !trimmed.split('/').any(|segment| segment == "..");
-    let on_disk = root
-        .filter(|_| inside_root)
-        .and_then(|root| std::fs::metadata(std::path::Path::new(root).join(trimmed)).ok());
+    // Ask the disk only about a path that stays under the root once `..` and
+    // symlinks are followed.
+    let on_disk = root.and_then(|root| {
+        let root = dunce::canonicalize(root).ok()?;
+        let target = dunce::canonicalize(root.join(trimmed)).ok()?;
+        if !target.starts_with(&root) {
+            return None;
+        }
+        std::fs::metadata(target).ok()
+    });
     let is_directory = match on_disk {
         Some(meta) => meta.is_dir(),
         None => raw.replace('\\', "/").ends_with('/'),
@@ -14401,6 +14407,32 @@ mod tests {
         let unplaced = store_paths_in_payload(&store, "probe", None, &mut payload).await;
         assert_eq!(payload.location, absolute);
         assert_eq!(unplaced, vec![absolute]);
+    }
+
+    /// A symlink inside the root that leads out of it does not decide the
+    /// slash: the caller's spelling stands.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlink_out_of_the_root_keeps_the_callers_slash() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let base = dunce::canonicalize(tmp.path()).expect("canonical temp dir");
+        let root = base.join("example-project");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(base.join("outside")).unwrap();
+        std::os::unix::fs::symlink(base.join("outside"), root.join("escape")).unwrap();
+        let root_s = root.to_string_lossy().to_string();
+        let mut payload = crate::traits::MemoryPayload {
+            content: "folder rule".to_string(),
+            user_id: "u".to_string(),
+            memory_type: "rule".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: serde_json::json!({ "governs": ["escape"] }),
+        };
+        store_paths_in_payload(&store, "probe", Some(&root_s), &mut payload).await;
+        assert_eq!(payload.metadata["governs"], json!(["escape"]));
     }
 
     /// A governed path ends in `/` exactly when it names a directory, by the
