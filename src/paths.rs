@@ -305,6 +305,11 @@ pub struct LookupPath {
     pub path: String,
     pub source: RootSource,
     pub root: Option<String>,
+    /// For a resolved absolute path, the other spellings it may be stored
+    /// under, after `path`: the part below the root as the caller spelled it
+    /// (when the on-disk spelling differs, as through a symlinked file), then
+    /// the absolute path itself. Empty for `Relative` and `Outside`.
+    pub alternates: Vec<String>,
 }
 
 /// Turn the path a caller sent into the project-relative path the graph
@@ -339,20 +344,53 @@ pub fn to_project_relative(
             path: raw.to_string(),
             source: RootSource::Relative,
             root: None,
+            alternates: Vec::new(),
         };
     }
-    match choose_root(raw, project_root, registry_root) {
-        Some((root, rel, source)) => LookupPath {
-            path: with_disk_spelling(raw, &root, rel),
-            source,
-            root: Some(root),
-        },
+    let input = follow_parent_components(raw);
+    match choose_root(&input, project_root, registry_root) {
+        Some((root, rel, source)) => {
+            let path = with_disk_spelling(&input, &root, rel.clone());
+            let mut alternates = vec![rel, input.clone()];
+            alternates.extend(parse_absolute(&input).map(|p| p.to_path_string()));
+            LookupPath {
+                path,
+                source,
+                root: Some(root),
+                alternates,
+            }
+        }
         None => LookupPath {
             path: raw.to_string(),
             source: RootSource::Outside,
             root: None,
+            alternates: Vec::new(),
         },
     }
+}
+
+/// `raw` with its `..` components resolved by the filesystem when the path
+/// exists. The OS follows a directory symlink before `..`, so
+/// `/repo/link/../f.rs` with `link` pointing at `/repo/a/b` names
+/// `/repo/a/f.rs`; collapsing `..` by spelling would name `/repo/f.rs`, another
+/// file. Only the directory part is resolved, so the file keeps its own name
+/// (a symlinked file is not replaced by its target here) and one not created
+/// yet still resolves. Without a `..` component, or when the directory does
+/// not exist here, `raw` is returned and `..` is collapsed by spelling as
+/// before.
+fn follow_parent_components(raw: &str) -> String {
+    if !raw.split(['/', '\\']).any(|c| c == "..") {
+        return raw.to_string();
+    }
+    let Some(host) = host_path(raw).map(|_| PathBuf::from(raw)) else {
+        return raw.to_string();
+    };
+    let resolved = match host.file_name() {
+        Some(name) => host.parent().and_then(canonical).map(|dir| dir.join(name)),
+        // The path ends in `..`: it names a directory, resolve all of it.
+        None => canonical(&host),
+    };
+    resolved.map_or_else(|| raw.to_string(), |p| p.to_string_lossy().to_string())
 }
 
 /// `rel` (the part of `path` below `root`) re-read from the filesystem when
@@ -415,8 +453,8 @@ fn choose_root(
 /// Every spelling to query the store with for `raw`, the resolved form first.
 /// Stored locations are normally relative, but older memories may carry an
 /// absolute path; they are read as they are, never rewritten:
-/// - a resolved absolute path is also queried in the caller's own absolute
-///   spelling;
+/// - a resolved absolute path is also queried as the caller spelled it below
+///   the root, and in its absolute spelling ([`LookupPath::alternates`]);
 /// - a relative path is also queried joined onto `known_root` (when it is
 ///   usable here and the join stays inside it);
 /// - an `Outside` path is queried only as given.
@@ -432,8 +470,7 @@ pub fn lookup_forms(raw: &str, lookup: &LookupPath, known_root: Option<&str>) ->
             forms.extend(joined);
         }
         RootSource::ProjectRoot | RootSource::RegistryRoot | RootSource::Marker => {
-            forms.push(raw.to_string());
-            forms.extend(parse_absolute(raw).map(|p| p.to_path_string()));
+            forms.extend(lookup.alternates.iter().cloned());
         }
     }
     let mut seen = std::collections::HashSet::new();
@@ -463,7 +500,8 @@ mod tests {
                 LookupPath {
                     path: raw.to_string(),
                     source: RootSource::Relative,
-                    root: None
+                    root: None,
+                    alternates: Vec::new(),
                 }
             );
         }
@@ -577,7 +615,8 @@ mod tests {
             LookupPath {
                 path: raw.into(),
                 source: RootSource::Outside,
-                root: None
+                root: None,
+                alternates: Vec::new(),
             }
         );
         assert_eq!(lookup_forms(raw, &got, None), vec![raw.to_string()]);
@@ -858,6 +897,64 @@ mod tests {
         assert_eq!(
             lookup_forms("../other/lib.rs", &up, Some(&s(&root))),
             vec!["../other/lib.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn parent_components_resolve_to_the_file_they_name() {
+        let (_tmp, root, _) = project_with_worktree();
+        let file = root.join("src").join("lib.rs");
+        let via_parent = s(&root.join("src").join("..").join("src").join("lib.rs"));
+        assert_eq!(
+            got(Path::new(&via_parent), Some(&root), None),
+            resolved("src/lib.rs", RootSource::ProjectRoot)
+        );
+        // A file not created yet resolves through its directory.
+        let new_file = s(&root.join("src").join("..").join("docs").join("new.md"));
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        assert_eq!(
+            got(Path::new(&new_file), Some(&root), None),
+            resolved("docs/new.md", RootSource::ProjectRoot)
+        );
+        assert!(file.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_file_is_also_looked_up_as_the_caller_spelled_it() {
+        // `src/config.rs` links to `shared/config.rs`: the disk spelling comes
+        // first, and the caller's own spelling (with its `src` ancestor) is
+        // still queried, so rules on `src/config.rs` are not lost.
+        let (_tmp, root, _) = project_with_worktree();
+        touch(&root.join("shared").join("config.rs"));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let link = root.join("src").join("config.rs");
+        std::os::unix::fs::symlink(root.join("shared").join("config.rs"), &link).unwrap();
+        let l = to_project_relative(&s(&link), Some(&s(&root)), None);
+        assert_eq!(l.path, "shared/config.rs");
+        let forms = lookup_forms(&s(&link), &l, Some(&s(&root)));
+        assert!(forms.contains(&"src/config.rs".to_string()), "{forms:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parent_components_follow_a_symlinked_directory_first() {
+        // `link` points at `a/b`, so `link/../file.rs` is `a/file.rs`, not the
+        // `file.rs` that collapsing `..` by spelling would give.
+        let (_tmp, root, _) = project_with_worktree();
+        std::fs::create_dir_all(root.join("a").join("b")).unwrap();
+        touch(&root.join("a").join("file.rs"));
+        touch(&root.join("file.rs"));
+        std::os::unix::fs::symlink(root.join("a").join("b"), root.join("link")).unwrap();
+        let raw = s(&root.join("link").join("..").join("file.rs"));
+        let l = to_project_relative(&raw, Some(&s(&root)), None);
+        assert_eq!(l.path, "a/file.rs");
+        let forms = lookup_forms(&raw, &l, Some(&s(&root)));
+        assert!(
+            !forms
+                .iter()
+                .any(|f| f == "file.rs" || f.ends_with("/example-project/file.rs")),
+            "the collapsed spelling names another file: {forms:?}"
         );
     }
 

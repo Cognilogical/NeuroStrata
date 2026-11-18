@@ -2573,9 +2573,65 @@ async fn memories_for_forms(
         crate::graph_read::memories_for_file::rank_hits(&mut hits);
         let mut seen = std::collections::HashSet::new();
         hits.retain(|h| seen.insert(h.id.clone()));
-        hits.truncate(limit);
+        // Each spelling's query is capped at MAX_LIMIT; the merge must be too.
+        hits.truncate(limit.min(crate::graph_read::memories_for_file::MAX_LIMIT));
     }
     Ok(hits)
+}
+
+/// Whether an `ast_summary` found nothing for the file: no symbols, edges or
+/// importers, and no blast radius.
+fn ast_summary_is_empty(summary: &serde_json::Value) -> bool {
+    let empty = |key: &str| {
+        summary
+            .get(key)
+            .and_then(|v| v.as_array())
+            .is_none_or(|a| a.is_empty())
+    };
+    ["symbols", "callers", "callees", "imports", "importers"]
+        .iter()
+        .all(|k| empty(k))
+        && summary
+            .get("blast_radius_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            == 0
+}
+
+/// `ast_neighborhood_for_file` over the same spellings as
+/// [`memories_for_forms`]: the first spelling whose AST summary is not empty
+/// wins, so a database that stores absolute file locations still answers an
+/// absolute request. When every spelling is empty, the first answer stands; an
+/// error is returned only when no spelling answered at all.
+async fn ast_neighborhood_for_forms(
+    store: &crate::store::LadybugStore,
+    namespace: &str,
+    source: Option<&str>,
+    forms: &[String],
+    governing_ids: &[String],
+) -> anyhow::Result<(Vec<serde_json::Value>, serde_json::Value)> {
+    let mut first = None;
+    let mut first_error = None;
+    for form in forms {
+        match store
+            .ast_neighborhood_for_file(namespace, source, form, governing_ids)
+            .await
+        {
+            Ok(found) if !ast_summary_is_empty(&found.1) => return Ok(found),
+            Ok(found) => {
+                first.get_or_insert(found);
+            }
+            Err(e) => {
+                tracing::warn!("ast_neighborhood_for_file lookup of {form:?} failed: {e}");
+                first_error.get_or_insert(e);
+            }
+        }
+    }
+    match (first, first_error) {
+        (Some(found), _) => Ok(found),
+        (None, Some(e)) => Err(e),
+        (None, None) => Err(anyhow::anyhow!("no lookup spelling for the file")),
+    }
 }
 
 /// The `neurostrata_memories_for_file` handler. Returns a JSON object carrying
@@ -2690,9 +2746,14 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
             if include_ast_edges {
-                match store
-                    .ast_neighborhood_for_file(&namespace, source.as_deref(), path, &hit_ids)
-                    .await
+                match ast_neighborhood_for_forms(
+                    store,
+                    &namespace,
+                    source.as_deref(),
+                    &forms,
+                    &hit_ids,
+                )
+                .await
                 {
                     Ok((related_memories, ast_summary)) => {
                         let related_truncated = ast_summary
@@ -13104,6 +13165,57 @@ mod tests {
         assert_eq!(parsed["resolved_from"], serde_json::json!("outside"));
         // ...while the worktree of the registered checkout still resolves.
         assert!(ids(&lookup(in_worktree).await).contains(&rule_id));
+
+        // A database that stores the file's symbols under the absolute path
+        // still returns them for an absolute request.
+        let abs_location = in_checkout.replace('\\', "/");
+        lb.with_conn(move |conn| {
+            conn.query(&format!(
+                "CREATE (m:Memory {{id: 'abs-symbol', namespace: 'probe', content: 'fn run', user_id: 'u', memory_type: 'code_ast', agent_name: 'a', location: '{abs_location}#functions:run@h', location_lines: '', metadata: '{{}}', embedding: [0.0,0.0,0.0,0.0]}})"
+            ))?;
+            Ok(())
+        })
+        .await
+        .expect("seed a symbol stored under the absolute path");
+        let parsed = lookup(in_checkout.replace('\\', "/")).await;
+        let symbols = parsed["ast_summary"]["symbols"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            symbols.iter().any(|s| s.to_string().contains("abs-symbol")),
+            "{parsed}"
+        );
+
+        // Merging the two spellings stays within MAX_LIMIT, as one query does.
+        let abs_governs = in_checkout.replace('\\', "/");
+        lb.with_conn(move |conn| {
+            for i in 0..15 {
+                conn.query(&format!(
+                    "CREATE (m:Memory {{id: 'rel-{i}', namespace: 'probe', content: 'rel {i}', user_id: 'u', memory_type: 'rule', agent_name: 'a', location: '', location_lines: '', metadata: '{{}}', embedding: [0.0,0.0,0.0,0.0]}})"
+                ))?;
+                conn.query(&format!(
+                    "MERGE (a:Memory {{id: 'rel-{i}'}}), (b:Memory {{id: 'src/lib.rs'}}) MERGE (a)-[r:GOVERNS {{source: 'test', valid_from: 0, valid_to: 0, generation: 0, extractor: 'test', evidence_id: 'e', origin: 'local'}}]->(b)"
+                ))?;
+                conn.query(&format!(
+                    "CREATE (m:Memory {{id: 'abs-{i}', namespace: 'probe', content: 'abs {i}', user_id: 'u', memory_type: 'rule', agent_name: 'a', location: '', location_lines: '', metadata: '{{\"governs\":[\"{abs_governs}\"]}}', embedding: [0.0,0.0,0.0,0.0]}})"
+                ))?;
+            }
+            Ok(())
+        })
+        .await
+        .expect("seed rules under both spellings");
+        let text = handle_memories_for_file(
+            serde_json::json!({ "namespace": "probe", "path": in_checkout, "limit": 100 }),
+            store.clone(),
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(
+            ids(&parsed).len(),
+            crate::graph_read::memories_for_file::MAX_LIMIT,
+            "{parsed}"
+        );
     }
 
     #[tokio::test]
