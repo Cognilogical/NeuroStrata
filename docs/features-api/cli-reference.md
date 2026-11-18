@@ -210,6 +210,23 @@ neurostrata-mcp restore <backup_dir> --into <new_db_path>
 
 `backup --no-open` copies the database, its write-ahead log, the checkpoint shadow, and the store-state sidecar directly to disk without opening or checkpointing the store. It **takes the store lock and holds it for the whole copy** (`#209`, `#241`): it refuses while another process holds the lock, and it fails closed when the lock cannot be taken at all, because an untakeable lock is not evidence that the store is free. Holding the lock across the window means a daemon that starts mid-copy cannot change the files being captured. Use a plain `backup <dir>` (daemon-coordinated) or `shutdown` first when the daemon is running.
 
+### `semantic-eval`
+Offline v1.19.0 release gate: runs versioned SPARQL competency contracts and a 60-query four-arm retrieval ablation against real temporary LadybugDB stores, then writes one strict JSON receipt.
+```bash
+neurostrata-mcp semantic-eval \
+  --competency eval/semantic/competency.json \
+  --retrieval eval/semantic/retrieval.json \
+  --iterations 3 \
+  --output /tmp/opencode/semantic-eval.json \
+  --check
+```
+* `--iterations >= 3` is required by the corrected timing contract (warmup excluded; per-query latency = median across measured iterations; arm p95 over per-query medians).
+* `--check` writes the receipt and exits nonzero on any gate failure or validation/execution error (fail-closed; an error never yields an empty-result PASS). Without `--check` the receipt is written and the verdict reported but the process exits zero.
+* **Strict receipt (minimum):** `schema_version`, package version, fixture ids and SHA-256 digests, `evidence_class: "synthetic_deterministic"`, `production_roi_claimed: false`, competency per-query results, all four arms' aggregate/per-query metrics and rankings, ontology-targeted Recall@5, p95 overhead, derived-storage percentage, determinism SHA-256, `gate_violations`, `not_evaluated`, and overall `verdict: "PASS" | "FAIL"`.
+* **Evidence boundary:** the corpus is `synthetic_deterministic`, not owner-labeled or production. `production_roi_claimed` is `false`, and `not_evaluated` names `owner_labeled_production_roi`, `blind_agent_answer_accuracy`, `owner_labeled_corpus`, `rollback_validation`, `curation_cost`, and `real_namespace_accuracy`. No production ROI, owner-labeled-corpus, blind-agent, rollback, curation-cost, or real-namespace claim is implied.
+* **Current status (honest FAIL):** the registered mixed alias+hierarchy subset yields `insufficient_ontology_subset_lift 0.042857 < 0.10`; competency queries pass 8/8; overall `verdict = "FAIL"` and both final `--check` runs exit nonzero. This is the gate failing closed, not a CLI defect. Strict receipts are complete: remediation 65/65 with zero ignored/failed, six `not_evaluated` exclusions, and identical determinism SHA-256 `5f378d7b6d2666dbaef44a06fa80de1b75f5dec2c99951559593f52db4f45583`. The 1.19.0 release record references the `--output` receipt and remediation-runner JSON; no semantic-gate PASS or production claim is made.
+* **Remediation runner:** `eval/registry.json` suite `semantic-evaluation` pins the 36 named `semantic_eval_metrics_test` cases plus 17 competency and 12 ablation inline tests with `ignored: 0`. Run `EVAL_ALLOW_DIRTY=1 scripts/remediation-eval.sh semantic-evaluation --json /tmp/opencode/semantic-evaluation-remediation.json` on intentionally dirty trees only; it never ignores test failures.
+
 ---
 
 ## Workflow, Documentation Gate & Ontology Commands
@@ -261,7 +278,7 @@ neurostrata-mcp taxonomy validate-dag
 ```
 
 ### `scenario`, `object-view`, `diff-tour` & `insights`
-Creates and evaluates counterfactual ontology scenarios (`create`, `stage-memory`, `stage-twin`, `apply-action`, `eval`, `diff`, `commit`), polymorphic object views (`object-view`), structural diff tours (`diff-tour`), and repository architectural insights (`insights`). Additional administration commands include `set-metadata`, `normalize-metadata`, `storage`, `chat`, `metrics`, `graphql`, and `kge`.
+Creates and evaluates counterfactual ontology scenarios (`create`, `stage-memory`, `stage-twin`, `apply-action`, `eval`, `diff`, `plan-ontology-diff`, `commit`), polymorphic object views (`object-view`), structural diff tours (`diff-tour`), and repository architectural insights (`insights`). Additional administration commands include `set-metadata`, `normalize-metadata`, `storage`, `chat`, `metrics`, `graphql`, and `kge`.
 
 `storage status` (no-open surface since #212) reports `wal_bytes` and `wal_age_secs` (regular files only) alongside artifact accounting, and answers "did this store ever recover?" from the store-state sidecar's `last_recovery { at, kind, wal_bytes }` history rather than from any live handle's flag; identity (`has_data`, descriptor) and health (checkpoint outcome) writes are split, and checkpoint outcomes persist to the sidecar so a fresh process reports the last real checkpoint.
 ```bash
@@ -271,6 +288,10 @@ neurostrata-mcp scenario stage-twin <scenario_id> <twin.json>
 neurostrata-mcp scenario apply-action <scenario_id> <action_type> <parameters.json>
 neurostrata-mcp scenario eval <scenario_id> <query.rq>
 neurostrata-mcp scenario diff <scenario_id> [--against <twin_id>]
+neurostrata-mcp scenario plan-ontology-diff <namespace> \
+  [--scenario-id <id>] [--add-turtle <ttl>] \
+  [--retract-triples <ntriples>]... \
+  [--candidate-shacl-turtle <ttl>] [--principal <p>]
 neurostrata-mcp object-view <namespace> <id>
 neurostrata-mcp diff-tour <namespace> [--range <rev_range>]
 neurostrata-mcp insights <namespace>
@@ -311,3 +332,16 @@ neurostrata-mcp data-connector resolve --namespace <namespace> --pointer-id <poi
 neurostrata-mcp data-connector apply-effect --namespace <namespace> --pointer-id <pointer_id> --operation <operation> --payload @effect.json --action-receipt-id <action_receipt_id> --idempotency-key <idempotency_key> --expected-source-sha256 <expected_source_sha256> --now-secs <now_secs>
 neurostrata-mcp data-connector mediate --namespace <namespace> --from-stage <from_stage> --to-stage <to_stage> --gate-passed <bool> --pointer-id <pointer_id> --offset <offset> --limit <limit> --max-bytes <max_bytes> --now-secs <now_secs>
 ```
+
+---
+
+## 9. Vault-LD Markdown Sync
+
+### `vault-sync`
+Bidirectional W3C YAML-LD 1.0 / Vault-LD sync between a namespace and a Markdown vault, with Open JSON Canvas 1.0 topology export. Positional arguments, in order: `action` (`export`|`import`), `namespace`, `vault_path`, `output_dir`, optional `principal`.
+```bash
+neurostrata-mcp vault-sync export NeuroStrata /path/to/vault /path/to/out [principal]
+neurostrata-mcp vault-sync import NeuroStrata /path/to/vault /path/to/out [principal]
+```
+
+Export writes one YAML-LD Markdown note per memory readable by `principal` (ReBAC `can_read_memory`; default `default`), plus `topology.canvas` (Open JSON Canvas 1.0) under `output_dir`. Import secret-scans and SHACL-validates (`Mode::Native`) every `*.md` BEFORE any store write — violating notes are skipped and reported in `errors`, never partially stored; each stored note passes a ReBAC `can_write_memory` check. Unresolved `[[WikiLinks]]` materialize as `stub: true` notes. `vault_path`/`output_dir` resolve under the process cwd (CLI/MCP J6 boundary); the HTTP daemon instead validates against its startup root and `allowed_external_dirs`. The same behavior is available over HTTP as `POST /vault-sync`. See [`ops/obsidian.md`](ops/obsidian.md).

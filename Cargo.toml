@@ -1,10 +1,10 @@
 [workspace]
-members = ["crates/neurostrata-wasm"]
+members = ["crates/neurostrata-wasm", "crates/ontobug"]
 exclude = ["src-tauri"]
 
 [package]
 name = "neurostrata-mcp"
-version = "1.18.1"
+version = "1.19.0"
 edition = "2021"
 
 [[bin]]
@@ -76,6 +76,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 async-trait = "0.1"
 anyhow = "1.0"
+serde_yaml = "0.9"
+ontobug = { path = "crates/ontobug" }
 fs2 = "0.4"
 fastembed = { version = "7", default-features = false, features = [
     "ort-download-binaries-rustls-tls",
@@ -111,6 +113,7 @@ hex = "0.4"
 tar = "0.4"
 flate2 = "1.1"
 oxrdf = { version = "0.3", features = ["rdf-12"] }
+reasonable = { version = "0.5.0-a1", features = ["rdf-12"] }
 oxttl = { version = "0.2", features = ["rdf-12"] }
 zstd = "0.14"
 spargebra = { version = "0.4", features = ["sparql-12"] }
@@ -175,6 +178,10 @@ path = "tests/recall_exact_identifier.rs"
 [[test]]
 name = "procedure_ack_contract"
 path = "tests/procedure_ack_contract.rs"
+
+[[test]]
+name = "semantic_eval_metrics_test"
+path = "tests/semantic_eval_metrics_test.rs"
 
 
 

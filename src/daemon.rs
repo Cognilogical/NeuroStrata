@@ -1125,6 +1125,7 @@ pub(crate) async fn start_daemon_on(
         .route("/insights", post(handle_http_insights))
         .route("/taxonomy", post(handle_http_taxonomy))
         .route("/data-connector", post(handle_http_data_connector))
+        .route("/vault-sync", post(handle_http_vault_sync))
         .route("/shutdown", post(handle_shutdown))
         .with_state(state.clone())
         .layer(axum::middleware::from_fn_with_state(state, auth_middleware));
@@ -2184,6 +2185,43 @@ async fn handle_http_data_connector(
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         body,
     )
+}
+
+/// `/vault-sync` — Vault-LD bidirectional Markdown sync. The caller's
+/// `vault_path` (and `output_dir`, when named) are validated through
+/// [`check_caller_path`] against the daemon's startup root and the
+/// configured allowlist BEFORE any filesystem access (Task 2 re-file / J6).
+async fn handle_http_vault_sync(
+    State(state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<
+    (
+        [(axum::http::header::HeaderName, &'static str); 1],
+        String,
+    ),
+    (axum::http::StatusCode, String),
+> {
+    let vault_path = req
+        .get("vault_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or(".")
+        .to_string();
+    let _ = caller_path_refusal(&state, &vault_path)?;
+    if let Some(output_dir) = req.get("output_dir").and_then(|v| v.as_str()) {
+        let _ = caller_path_refusal(&state, output_dir)?;
+    }
+    let body = crate::vault_ld::vault_sync::handle_vault_sync(
+        &req,
+        state.vector_store.clone(),
+        state.embedder.clone(),
+        Some(state.startup_root.clone()),
+        Some(state.allowed_external_dirs.clone()),
+    )
+    .await;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    ))
 }
 
 async fn handle_http_scenario(

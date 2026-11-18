@@ -48,6 +48,15 @@ Central Agentic Kernel (`AgentKernel`) unifies workflow lifecycle, cognitive rec
 - HTTP endpoint: `POST /data-connector`
 - CLI: `neurostrata-mcp data-connector <list|describe|register-pointer|resolve|apply-effect|mediate>`
 
+## Schema Discovery
+
+The `neurostrata_data_connector` MCP tool discloses an operation-discriminated `args` schema (`oneOf` keyed on `operation`): each of `list_connectors`, `list_pointers`, `describe_pool`, `register_pointer`, `resolve_pointer`, `apply_effect`, and `mediate` declares its own required fields, including the nested `DataPointerRecord`, `DataSliceRequest`, and `ExternalEffectRequest` layouts. The schema is discovery-only: the runtime still accepts anything it accepts today, so clients are never constrained by the disclosure.
+
+- `now_secs` (optional u64) is accepted by `resolve_pointer`, `apply_effect`, and `mediate`; omission defaults to the current epoch.
+- `mediate` accepts optional `gate_passed` (boolean); omission defaults to `false` at runtime.
+- `list_pointers`, `resolve_pointer`, `apply_effect`, `register_pointer`, and pool operations exclude retired/inactive rows (`valid_to` expired, `archived == true`, `retired == true`, or non-empty `superseded_by`).
+- `handle_data_connector` defaults omitted `namespace` to `"global"` and omitted `principal` to `None`, while rejecting present non-string, blank/whitespace, or whitespace-padded `namespace` and `principal` values before `AgentKernel` construction; pool operations (`register_pool`, `upsert_pool`, `list_pools`) are also accepted at runtime via `execute_connector_command`.
+
 ## Verification
 
 - `cargo test --bin neurostrata-mcp kernel::`

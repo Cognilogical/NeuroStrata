@@ -18,13 +18,13 @@ pub fn allowed_with_roles(
     relation: &str,
     acl: &[(String, String)],
 ) -> bool {
-    if user.is_empty() {
-        return false; // no anonymous access
+    if user.trim().is_empty() {
+        return false; // no anonymous or whitespace-only access
     }
     if user == "admin" {
         return true; // admin bypass
     }
-    if !resource_owner.is_empty() && check(resource_owner, user, "") {
+    if !resource_owner.trim().is_empty() && check(resource_owner, user, "") {
         return true; // owner always allowed, via §5.2 exact-equality check
     }
     if acl.is_empty() {
@@ -43,7 +43,7 @@ pub fn allowed_with_roles(
 
 /// §5.2 — check (exact equality only, no substring spoofing).
 pub fn check(predicate: &str, user: &str, resource: &str) -> bool {
-    if user.is_empty() {
+    if user.trim().is_empty() {
         return false;
     }
     predicate == user || predicate == resource || user == "admin"
@@ -220,9 +220,11 @@ pub fn can_write_memory(principal: &str, user_id: &str, metadata: &Value) -> boo
 /// §5.4 / §5.6 — namespace write permission via ReBAC.
 ///
 /// The namespace-level write gate:
-/// - `admin` always passes.
+/// - empty or whitespace-only namespace or principal is always denied
+///   (fail-closed; blank credentials are not meaningful authorization inputs),
+/// - `admin` always passes,
 /// - a principal whose name exactly matches the namespace name is allowed
-///   (namespace owner namesake convention).
+///   (namespace owner namesake convention),
 /// - any other principal is denied (fail-closed).
 pub fn can_write_namespace(
     _store: &crate::store::LadybugStore,
@@ -230,6 +232,12 @@ pub fn can_write_namespace(
     principal: Option<&str>,
 ) -> bool {
     let principal = principal.unwrap_or("");
+    // Fail closed on blank credentials: an empty or whitespace-only namespace
+    // or principal names nothing, so nothing can be authorized (R14 parity
+    // with the store-level namespace guard).
+    if namespace.trim().is_empty() || principal.trim().is_empty() {
+        return false;
+    }
     // admin bypass
     if principal == "admin" {
         return true;
@@ -305,6 +313,8 @@ mod tests {
     fn allowed_empty_user_denied() {
         assert!(!allowed("", "alice", "viewer", &[]));
         assert!(!allowed("", "", "viewer", &[]));
+        assert!(!allowed("   ", "alice", "viewer", &[]));
+        assert!(!allowed("   ", "   ", "viewer", &[]));
     }
 
     #[test]
@@ -339,6 +349,8 @@ mod tests {
     #[test]
     fn check_empty_user_denied() {
         assert!(!check("alice", "", "resource"));
+        assert!(!check("alice", "   ", "resource"));
+        assert!(!check("   ", "   ", "resource"));
     }
 
     // §5.3 resolve_principal — non-admin cannot spoof; admin can.
@@ -448,6 +460,52 @@ mod tests {
         let mixed = serde_json::json!({"user_id":"alice","visible_to":[42,"bob"]});
         assert!(can_read_memory("bob", "alice", &mixed));
         assert!(!can_read_memory("carol", "alice", &mixed));
+    }
+
+    // §5.4 / §5.6 namespace write gate must fail closed on blank credentials:
+    // an empty or whitespace-only namespace or principal names nothing, so no
+    // authorization can be meaningful. Adversarial cases: blank==blank used to
+    // authorize via the namesake rule, and the admin bypass honored a blank
+    // namespace.
+    fn namespace_gate_store() -> (tempfile::TempDir, crate::store::LadybugStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("db");
+        let store = crate::store::LadybugStore::new(path, 4).expect("store init");
+        (dir, store)
+    }
+
+    #[test]
+    fn can_write_namespace_rejects_blank_namespace() {
+        let (_dir, store) = namespace_gate_store();
+        assert!(!can_write_namespace(&store, "", None), "empty namespace, no principal");
+        assert!(!can_write_namespace(&store, "", Some("")), "empty namespace, empty principal");
+        assert!(!can_write_namespace(&store, "", Some("admin")), "empty namespace, admin");
+        assert!(!can_write_namespace(&store, "", Some("alice")), "empty namespace, owner namesake");
+        assert!(!can_write_namespace(&store, "   ", None), "spaces namespace");
+        assert!(!can_write_namespace(&store, "  ", Some("  ")), "spaces namespace, spaces principal");
+        assert!(!can_write_namespace(&store, "\t\n", Some("\t\n")), "control-whitespace match");
+        assert!(!can_write_namespace(&store, "  ", Some("admin")), "spaces namespace, admin");
+    }
+
+    #[test]
+    fn can_write_namespace_rejects_blank_principal() {
+        let (_dir, store) = namespace_gate_store();
+        assert!(!can_write_namespace(&store, "ns", Some("")), "empty principal");
+        assert!(!can_write_namespace(&store, "ns", Some("   ")), "spaces principal");
+        assert!(!can_write_namespace(&store, "ns", Some("\t")), "tab principal");
+        assert!(!can_write_namespace(&store, "  ", Some("")), "blank namespace, empty principal");
+        assert!(!can_write_namespace(&store, "", Some("   ")), "empty namespace, spaces principal");
+    }
+
+    #[test]
+    fn can_write_namespace_preserves_non_blank_behavior() {
+        let (_dir, store) = namespace_gate_store();
+        assert!(can_write_namespace(&store, "ns", Some("admin")), "admin bypass preserved");
+        assert!(can_write_namespace(&store, "ns", Some("ns")), "namesake convention preserved");
+        assert!(!can_write_namespace(&store, "ns", Some("bob")), "stranger denied");
+        assert!(!can_write_namespace(&store, "ns", None), "absent principal denied");
+        assert!(can_write_namespace(&store, " ns ", Some(" ns ")), "non-blank whitespace namesake kept");
+        assert!(!can_write_namespace(&store, "ns", Some(" ns ")), "exact match only, no trim-spoof");
     }
 
     #[test]

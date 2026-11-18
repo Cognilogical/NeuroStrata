@@ -1300,6 +1300,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_pointers_excludes_retired_rows_and_keeps_active_visible() {
+        let now = now_epoch();
+        let ns = "ns1";
+        let spy = Arc::new(SpyConnector::new("spy", DataPoolAccessMode::ReadWrite, 10, 1024));
+        let (kernel, store, _dir) = build_kernel(spy.clone());
+        store.init(ns).await.expect("init");
+
+        // One active visible pointer and four retired/inactive pointers across
+        // all lifecycle markers (valid_to, archived, retired, superseded_by),
+        // all owned by the caller and readable under ReBAC: only retirement —
+        // not ReBAC — may hide or block the retired rows.
+        let active = pointer_record("ptr_active", "spy", now, 3600);
+        seed_pointer(&store, ns, &active, "alice", None).await;
+        let retired_cases = [
+            ("ptr_retired_valid_to", json!({"valid_to": now.saturating_sub(1)})),
+            ("ptr_retired_archived", json!({"archived": true})),
+            ("ptr_retired_flag", json!({"retired": true})),
+            ("ptr_retired_superseded", json!({"superseded_by": "ptr_active"})),
+        ];
+        for (pid, marker) in &retired_cases {
+            let rec = pointer_record(pid, "spy", now, 3600);
+            let mut metadata = json!({
+                "eligibility": "private",
+                "pointer": serde_json::to_value(&rec).unwrap(),
+                "source": {"kind": "data_connector", "ref": rec.pointer_uri},
+            });
+            for (k, v) in marker.as_object().unwrap() {
+                metadata[k] = v.clone();
+            }
+            let payload = MemoryPayload {
+                content: format!("data pointer {}", rec.pointer_id),
+                user_id: "alice".to_string(),
+                memory_type: "data_pointer".to_string(),
+                agent_name: None,
+                location: rec.pointer_uri.clone(),
+                location_lines: String::new(),
+                metadata,
+            };
+            store
+                .put_scoped_memory(ns, &rec.pointer_id, &payload)
+                .await
+                .expect("seed retired pointer");
+        }
+
+        let value = kernel
+            .execute_connector_command(ns, &json!({ "operation": "list_pointers" }), Some("alice"))
+            .await
+            .expect("list_pointers");
+        let ids: Vec<&str> = value
+            .as_array()
+            .expect("pointers array")
+            .iter()
+            .map(|v| v["pointer_id"].as_str().expect("pointer_id"))
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["ptr_active"],
+            "retired data pointers are history, not live connector locators"
+        );
+
+        // Resolving any retired/archived/superseded pointer must fail closed
+        // before connector I/O (both authenticated and trusted paths).
+        for (pid, _) in &retired_cases {
+            let req = DataSliceRequest {
+                pointer_id: (*pid).to_string(),
+                offset: 0,
+                limit: 1,
+                max_bytes: 256,
+            };
+            let err = kernel
+                .resolve_pointer(ns, &req, now, Some("alice"))
+                .await
+                .expect_err("retired pointer must not resolve");
+            assert!(
+                err.to_string().contains("not found"),
+                "expected not found for {pid}, got: {err}"
+            );
+        }
+        assert_eq!(
+            spy.resolve_calls.load(Ordering::SeqCst),
+            0,
+            "retired pointer lookup must perform zero connector slice I/O"
+        );
+    }
+
+    #[tokio::test]
     async fn kernel_construction_and_execution_accept_trait_object_store() {
         let dir = tempfile::tempdir().expect("tempdir");
         // The serving layers (MCP / daemon / CLI) hold the store as the trait

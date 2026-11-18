@@ -13979,6 +13979,11 @@ impl LadybugStore {
                 "symbol_name",
                 "ast_kind",
                 "eligibility",
+                // Capability C: these drive the deterministic deprecation
+                // banner and negative boundary on recall surfaces. Dropping
+                // them on truncation would silently lose that presentation.
+                "deprecation",
+                "not_definition",
             ] {
                 if let Some(val) = obj.get(key) {
                     compact.insert(key.to_string(), val.clone());
@@ -23874,6 +23879,48 @@ eurostrata\src\daemon.rs",
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn bound_neighbor_metadata_preserves_capc_fields_and_bounds_bulky_metadata() {
+        let meta = serde_json::json!({
+            "deprecation": {
+                "status": "deprecated",
+                "superseded_by": "mem-77",
+                "reason": "replaced by the new neighbor",
+                "effective_at": 1700000000
+            },
+            "not_definition": "not for rootless sockets",
+            "governs": ["NeuroStrata::src/lib.rs"],
+            "bulky_payload": "x".repeat(LadybugStore::MAX_NEIGHBOR_METADATA_BYTES * 4),
+        });
+        let (bounded, truncated) = LadybugStore::bound_neighbor_metadata(meta);
+        assert!(truncated, "oversized metadata must be flagged truncated");
+        assert_eq!(
+            bounded["deprecation"]["superseded_by"],
+            serde_json::json!("mem-77"),
+            "deprecation must survive truncation: {bounded}"
+        );
+        assert_eq!(
+            bounded["deprecation"]["reason"],
+            serde_json::json!("replaced by the new neighbor"),
+            "deprecation reason must survive truncation: {bounded}"
+        );
+        assert_eq!(
+            bounded["not_definition"],
+            serde_json::json!("not for rootless sockets"),
+            "not_definition must survive truncation: {bounded}"
+        );
+        assert!(
+            bounded.get("bulky_payload").is_none(),
+            "unrelated bulky metadata must be dropped: {bounded}"
+        );
+        assert_eq!(bounded["truncated"], serde_json::json!(true));
+        let byte_len = serde_json::to_string(&bounded).expect("serialize bounded").len();
+        assert!(
+            byte_len <= LadybugStore::MAX_NEIGHBOR_METADATA_BYTES,
+            "bounded metadata must stay within budget: {byte_len}"
+        );
+    }
+
     /// `ast_neighborhood_for_file` bundles 1-hop `DEPENDS_ON`/`RELATES_TO`
     /// neighbors (both directions) plus `SUPERSEDES` targets into
     /// `related_memories`, and a compact AST neighborhood
@@ -33325,6 +33372,29 @@ mod wal_preservation {
 }
 
 impl LadybugStore {
+    /// Returns the ontobug catalog registered for this store's database.
+    ///
+    /// Acquires `write_lock` while initializing the schema tables (`SchemaEntry`, `OntologyClass`,
+    /// `OntologyProperty`, `ShaclShape`, `ShaclProperty`, `Namespace`, `RdfNode`, `Statement`),
+    /// and returns `ontobug::Catalog::from_database(self.db.clone(), &self.local_path)`.
+    pub async fn ontobug_catalog(&self) -> anyhow::Result<ontobug::Catalog> {
+        let _guard = self.write_lock.lock().await;
+        ontobug::Catalog::from_database(self.db.clone(), &self.local_path)
+            .map_err(|e| anyhow::anyhow!(e))
+    }
+
+    /// Executes `f` against an `ontobug::Catalog` while holding `self.write_lock`
+    /// across both schema initialization and the caller's catalog operation.
+    pub async fn with_ontobug_catalog<F, R>(&self, f: F) -> anyhow::Result<R>
+    where
+        F: FnOnce(&mut ontobug::Catalog) -> ontobug::Result<R>,
+    {
+        let _guard = self.write_lock.lock().await;
+        let mut catalog = ontobug::Catalog::from_database(self.db.clone(), &self.local_path)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        f(&mut catalog).map_err(|e| anyhow::anyhow!(e))
+    }
+
     pub async fn list_edges(
         &self,
         namespace: &str,

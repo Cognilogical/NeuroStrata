@@ -2630,10 +2630,23 @@ pub async fn apply_action(
         .commit_action_batch(&invocation.namespace, stage.write_set)
         .await?;
 
-    Ok(ActionApplyOutcome::Applied {
+    let outcome = ActionApplyOutcome::Applied {
         receipt_id: stage.receipt_id,
         receipt: stage.receipt,
-    })
+    };
+    // Capability E: post-COMMIT learning hook. Runs only after the action batch
+    // is durable; a revert of this receipt is the only thing that flips the
+    // reinforcement to negative. Failures are logged inside the hook and never
+    // roll back the committed action. No recursion: the hook only reads rows
+    // and stages its own memory writes.
+    crate::learning::hooks::on_action_applied(
+        store,
+        &invocation.namespace,
+        &outcome,
+        &crate::daemon::resolve_project_root(),
+    )
+    .await;
+    Ok(outcome)
 }
 
 async fn follow_superseded_chain(
@@ -3693,13 +3706,19 @@ pub async fn revert_action(
         )
         .await?;
 
-    Ok(ActionRevertOutcome {
+    let outcome = ActionRevertOutcome {
         reverted_receipt_id: active_receipt.receipt_id,
         active_receipt_version_id: superseded_apply_row_id,
         revert_receipt_id,
         revert_receipt,
         forced: invocation.force,
-    })
+    };
+    // Capability E: post-COMMIT revert learning hook. Runs only after the
+    // revert batch is durable (never on validation failure or dry run). Negative
+    // reflection targets only the governing/motivating rules actually linked to
+    // the reverted receipt and uses the revert receipt id for idempotency.
+    crate::learning::hooks::on_action_reverted(store, &invocation.namespace, &outcome).await;
+    Ok(outcome)
 }
 
 pub async fn action_log(
