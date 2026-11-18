@@ -878,7 +878,9 @@ mod tests {
     fn canonicalize_rejects_dotdot_in_nonexistent_remainder() {
         let root = std::env::temp_dir().join(format!("ns-j6-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join("vault")).expect("create root");
-        let escaped = root.join("vault/missing/../escape");
+        // The spelling climbs out of the root: Windows resolves `missing\..`
+        // lexically, so there the containment check refuses it instead.
+        let escaped = root.join("vault/missing/../../../escape");
         assert!(
             canonicalize_vault_path(&escaped, &root, &[]).is_err(),
             "`..` in a non-existent remainder must be refused, not joined"
@@ -887,6 +889,7 @@ mod tests {
     }
 
     /// Finding 6: a symlink that escapes the authority root must be refused.
+    #[cfg(unix)]
     #[test]
     fn canonicalize_rejects_symlink_escape() {
         let root = std::env::temp_dir().join(format!("ns-j6-{}", uuid::Uuid::new_v4()));

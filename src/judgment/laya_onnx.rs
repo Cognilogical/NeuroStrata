@@ -867,6 +867,9 @@ impl ContradictionQueue {
         f.sync_data()?;
         // A newly created queue file (and its lock file) is only durable once
         // the containing directory entry has been flushed to stable storage.
+        // Windows cannot open a directory with File::open (Access is denied),
+        // and NTFS journals the directory entry itself, so this is Unix-only.
+        #[cfg(unix)]
         if let Some(parent) = self.path.parent() {
             let dir = std::fs::File::open(parent)?;
             dir.sync_all()?;
