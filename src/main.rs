@@ -37,6 +37,7 @@ mod model_downloader;
 mod multimodal;
 mod ontology_grounding;
 mod parser;
+mod paths;
 mod procmem;
 mod rag_chat;
 mod rdf;
