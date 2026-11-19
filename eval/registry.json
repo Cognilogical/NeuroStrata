@@ -561,6 +561,33 @@
         "ignored": 0,
         "_note": "scripts/remediation-eval.sh enforces `ignored` and the exact `tests` names; numerical acceptance (nDCG/recall/precision/subset lift/p95/derived storage/determinism) is owned by the strict semantic-eval CLI receipt, so no inert count keys are listed here."
       }
+    },
+    "paths-main-hygiene": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp server::tests::shareable_rule_source_is_portable_ac1_matrix -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::test_f6_evidence_id_hash_multibyte_byte_cap -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::test_f6_evidence_id_hash_long_ascii_unchanged -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::memories_for_file_forms_runs_one_physical_scan_set -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::memories_for_file_forms_matches_per_form_hits_and_filters -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::memories_for_file_forms_matches_per_form_candidate_caps -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::memories_for_file_forms_matches_per_form_failures_and_empty_input -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::memories_for_file_forms_matches_per_form_retirement_boundary -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp paths::tests::prefix_equal_to_configured_or_checkout_root_resolves_to_root_forms -- --test-threads=1"
+      ],
+      "tests": [
+        "server::tests::shareable_rule_source_is_portable_ac1_matrix",
+        "store::ladybug::tests::test_f6_evidence_id_hash_multibyte_byte_cap",
+        "store::ladybug::tests::test_f6_evidence_id_hash_long_ascii_unchanged",
+        "store::ladybug::tests::memories_for_file_forms_runs_one_physical_scan_set",
+        "store::ladybug::tests::memories_for_file_forms_matches_per_form_hits_and_filters",
+        "store::ladybug::tests::memories_for_file_forms_matches_per_form_candidate_caps",
+        "store::ladybug::tests::memories_for_file_forms_matches_per_form_failures_and_empty_input",
+        "store::ladybug::tests::memories_for_file_forms_matches_per_form_retirement_boundary",
+        "paths::tests::prefix_equal_to_configured_or_checkout_root_resolves_to_root_forms"
+      ],
+      "thresholds": {
+        "ignored": 0
+      }
     }
   }
 }
