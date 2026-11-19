@@ -3013,15 +3013,26 @@ describe("nb9q FIX1: zero-action shell segments in the mutating guard", () => {
     }
     for (const cmd of [
       "rm -rf /tmp/x", "git reset --hard HEAD", "git commit -m x", "cargo build",
-      "git push --force", "git push -f", "git push -fv origin main",
-      "git push --force-with-lease", "git push --force-with-lease=origin", "git status &",
+      "git push --force", "git push -f", "git push -fv origin main", "git push -vf",
+      "git push -uf", "git push origin +main", "git push --mirror", "git push --delete origin main",
+      "git push --prune", "git push --force-with-lease", "git push --force-with-lease=origin", "git status &",
     ]) {
       assert.equal(f("bash", cmd), false, `mutating: ${cmd}`);
     }
     assert.equal(f("bash", "git status && git diff"), true, "chained read-only stays exempt");
     const mod = await import("./dist/index.js");
-    for (const tool of ["exec_command", "run_shell_command", "run_command", "execute_command", "terminal", "gh_exec"]) {
+    for (const tool of ["exec_command", "run_shell_command", "run_command", "execute_command", "terminal", "gh_exec", "execute", "mcp_execute"]) {
       assert.equal(mod.isReadOnlyInspectionTool(tool), true, `read-only inspection: ${tool}`);
+    }
+  });
+
+  it("publishes exactly one default export from every adapter bundle", () => {
+    for (const harness of ["opencode", "claude", "codex", "hermes", "openclaw", "github-cli"]) {
+      for (const ext of ["js", "d.ts"]) {
+        const src = readFileSync(new URL(`../${harness}/dist/index.${ext}`, import.meta.url), "utf8");
+        const count = (src.match(/export default /g) || []).length;
+        assert.equal(count, 1, `${harness} dist/index.${ext} must declare exactly one default export`);
+      }
     }
   });
 
@@ -3159,7 +3170,7 @@ describe("nb9q FIX3: no task-intent intake from read-only tool output", () => {
         tool: { hook: async (name, cb) => { if (name === "execute.after") afterHandler = cb; } },
         hooks: {},
       });
-      for (const tool of ["grep", "Grep", "read", "read_file", "bash", "shell", "exec_command", "run_shell_command"]) {
+      for (const tool of ["grep", "Grep", "read", "read_file", "bash", "shell", "exec_command", "run_shell_command", "execute", "mcp_execute"]) {
         await afterHandler({
           name: tool, sessionID: "ses", args: {}, status: "completed",
           result: { content: "TODO: deferred cleanup", output: "TODO: deferred cleanup" },

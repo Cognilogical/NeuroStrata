@@ -693,7 +693,9 @@ const READ_ONLY_INSPECTION_TOOLS = new Set([
     "run_command", "execute_command", "terminal", "gh_exec", "grep", "glob", "view", "cat",
 ]);
 export function isReadOnlyInspectionTool(name) {
-    return READ_ONLY_INSPECTION_TOOLS.has(String(name).toLowerCase());
+    const lower = String(name).toLowerCase();
+    // Code Mode's execute pair is also tool output, never user/assistant speech.
+    return READ_ONLY_INSPECTION_TOOLS.has(lower) || CODE_EXEC_TOOLS.has(lower);
 }
 export function isSubagentTool(name) {
     return SUBAGENT_TOOLS.has(name);
@@ -735,7 +737,15 @@ function isZeroActionExemptShellSegment(segment) {
         }
         const sub = rest[0];
         const subArgs = rest.slice(1);
-        if (sub === "push" && subArgs.some((a) => a === "-f" || a === "--force" || a.startsWith("--force-with-lease") || (a.startsWith("-f") && !a.startsWith("--")))) {
+        // Fail closed on every way to force a push: bundled short flags (-vf,
+        // -uf), forced refspecs (+main), and destructive remote operations.
+        if (sub === "push" && subArgs.some((a) => a.startsWith("+") ||
+            a === "--force" ||
+            a.startsWith("--force-") ||
+            a === "--mirror" ||
+            a === "--delete" ||
+            a === "--prune" ||
+            (a.startsWith("-") && !a.startsWith("--") && a.slice(1).includes("f")))) {
             return false;
         }
         if (["push", "pull", "fetch", "status", "log", "diff", "show", "rev-parse"].includes(sub)) {
