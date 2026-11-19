@@ -2965,6 +2965,26 @@ fn lookup_path_with_registry_root(
     Ok((resolved.lookup, resolved.forms))
 }
 
+/// The `source` a rule without one gets from its `location`: the path
+/// relative to the project root. `source` is published to mesh peers and
+/// exported, so an absolute path, which names the author's machine, is never
+/// stored there. `None` when the location is empty or no known root contains
+/// it.
+async fn implicit_source_from_location(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    location: &str,
+    project_root: Option<&str>,
+) -> Option<String> {
+    if location.is_empty() || location == "N/A" {
+        return None;
+    }
+    let (lookup, _) = lookup_path_for(store, namespace, location, project_root)
+        .await
+        .ok()?;
+    (lookup.source != crate::paths::RootSource::Outside).then_some(lookup.path)
+}
+
 /// The registered root to resolve `path` with, given the result of reading it.
 /// A failed read is not a miss: with no root at all, an absolute path falls
 /// back to the nearest `.git`, which may be another repository. So when the
@@ -4727,7 +4747,8 @@ async fn handle_add_memory(
     // For rules, ensure `metadata.source` always exists to avoid missing
     // SHACL warnings on directory ingest and direct tool writes. If the
     // caller omitted source (or left it blank), backfill from the location
-    // argument when it is usable, otherwise fall back to "agent".
+    // argument (project-relative) when it is usable, otherwise fall back to
+    // "agent".
     if memory_type == "rule" {
         if metadata
             .as_object()
@@ -4737,11 +4758,9 @@ async fn handle_add_memory(
                 Some(_) => false,
             })
         {
-            let resolved_source = if !location.is_empty() && location != "N/A" {
-                Some(location.clone())
-            } else {
-                None
-            };
+            let project_root = arguments.get("project_root").and_then(|r| r.as_str());
+            let resolved_source =
+                implicit_source_from_location(&store, namespace, &location, project_root).await;
             if let Some(o) = metadata.as_object_mut() {
                 o.insert(
                     "source".to_string(),
@@ -16574,6 +16593,118 @@ mod tests {
             "digest must NOT be the 'pending' digest; reply: {}",
             projected
         );
+    }
+
+    /// A rule written without a `source` gets one from its location. `source`
+    /// is published to mesh peers (record metadata and canonical N-Quads), so
+    /// an absolute location must land there project-relative, and one under
+    /// no known root must not land there at all.
+    #[tokio::test]
+    async fn an_implicit_rule_source_never_carries_an_absolute_path() {
+        const SENTINEL: &str = "src-leak-sentinel";
+        let (store, _) = store_with_one_rule("probe").await;
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        let base = std::env::temp_dir().join(format!("ns-src-leak-{}", uuid::Uuid::new_v4()));
+        let project = base.join(SENTINEL).join("proj");
+        std::fs::create_dir_all(project.join(".NeuroStrata")).unwrap();
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::write(project.join("src").join("lib.rs"), "").unwrap();
+        let outside = base.join(SENTINEL).join("elsewhere").join("notes.md");
+
+        let add = |content: &str, location: &std::path::Path, root: Option<&std::path::Path>| {
+            let mut args = serde_json::json!({
+                "content": content,
+                "namespace": "probe",
+                "memory_type": "rule",
+                "locations": [{ "path": location.to_string_lossy() }],
+                "metadata": { "eligibility": "shareable" },
+            });
+            if let Some(root) = root {
+                args["project_root"] = serde_json::json!(root.to_string_lossy());
+            }
+            handle_add_memory(args, emb.clone(), store.clone(), None, quiet_bus())
+        };
+        let stored = |reply: String| {
+            let store = store.clone();
+            async move {
+                assert!(reply.starts_with("Successfully added memory"), "{reply}");
+                let bare_id = reply
+                    .lines()
+                    .find_map(|l| l.strip_prefix("Memory ID: "))
+                    .map(|id| id.trim().to_string())
+                    .expect("reply carries the memory id");
+                let rows = store.list("probe", None, None).await.expect("probe rows");
+                let row = rows
+                    .into_iter()
+                    .find(|m| m.id == bare_id || m.id.ends_with(&bare_id))
+                    .expect("the rule is stored");
+                (bare_id, row)
+            }
+        };
+
+        // Under the caller's project root: the project-relative path.
+        let (id, row) = stored(
+            add(
+                "never commit generated lockfiles",
+                &project.join("src").join("lib.rs"),
+                Some(&project),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(row.payload.metadata["source"], serde_json::json!("src/lib.rs"));
+
+        // Under no known root: the generic fallback, not the path.
+        let (_, outside_row) =
+            stored(add("keep release notes short", &outside, None).await).await;
+        assert_eq!(outside_row.payload.metadata["source"], serde_json::json!("agent"));
+
+        // What a mesh peer receives: the published record, its canonical
+        // N-Quads included, names no local directory.
+        let mesh_base = std::env::temp_dir().join(format!("ns-src-leak-mesh-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&mesh_base).unwrap();
+        let mesh = crate::synaptic_mesh::storage::MeshStorage::init(
+            &mesh_base,
+            "node-author",
+            "team",
+            &["probe".to_string()],
+            None,
+        )
+        .unwrap();
+        let outbox = crate::synaptic_mesh::outbox::Outbox::open(
+            &crate::synaptic_mesh::outbox::outbox_dir_for(mesh.root()),
+        )
+        .unwrap();
+        outbox
+            .append(&crate::synaptic_mesh::outbox::OutboxEntry {
+                stable_op_id: uuid::Uuid::now_v7(),
+                op: crate::synaptic_mesh::outbox::OP_CREATED.to_string(),
+                id: id.clone(),
+                namespace: "probe".to_string(),
+                memory_type: row.payload.memory_type.clone(),
+                content: row.payload.content.clone(),
+                metadata: row.payload.metadata.clone(),
+                superseded_by: None,
+                ts: 1_700_000_000,
+                epoch: 1,
+            })
+            .unwrap();
+        let report =
+            crate::synaptic_mesh::worker::drain_once(&outbox, &mesh, "node-author").unwrap();
+        assert_eq!(report.applied, 1, "the shareable rule is published: {report:?}");
+        let text = std::fs::read_to_string(
+            mesh.root().join("probe").join("memories").join(format!("{id}.json")),
+        )
+        .expect("the record file exists");
+        let record: crate::synaptic_mesh::record::MeshRecord =
+            serde_json::from_str(&text).unwrap();
+        assert_eq!(record.metadata["source"], serde_json::json!("src/lib.rs"));
+        let quads = &record.rdf.as_ref().expect("the record carries N-Quads").quads;
+        assert!(quads.contains("\"src/lib.rs\""), "{quads}");
+        assert!(!text.contains(SENTINEL), "a local path reached the mesh: {text}");
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&mesh_base);
     }
 
     /// The write path normalizes a string domain to its slug, so a stored

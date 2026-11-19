@@ -6094,7 +6094,9 @@ fn plan_hygiene_row(
         let src = meta.get("source").and_then(|v| v.as_str()).unwrap_or("");
         let usable = crate::traits::has_source(&meta) && src != "N/A";
         if !usable {
-            let val = if !loc.is_empty() && loc != "N/A" {
+            // `source` is published to mesh peers and exported, so an
+            // absolute location (the author's machine) is not copied there.
+            let val = if !loc.is_empty() && loc != "N/A" && !crate::paths::is_absolute_any(loc) {
                 loc.clone()
             } else {
                 "legacy-rule".to_string()
@@ -23853,6 +23855,42 @@ eurostrata\src\daemon.rs",
             Some(&json!({ "kind": "release-run", "ref": "v1.16.0" })),
             "the repair must not overwrite an object source with a string"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `source` is published to mesh peers, so the repair fills a missing one
+    /// from the row's location only when that location is relative. An
+    /// absolute one names the author's machine.
+    #[tokio::test]
+    async fn repair_hygiene_never_copies_an_absolute_location_into_source() {
+        let dir = std::env::temp_dir().join(format!("ns-repair-abs-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("init");
+        let v = vec![0.1, 0.2, 0.3, 0.4];
+
+        for (id, location) in [
+            ("rule-windows", r"C:\Users\src-leak-sentinel\proj\src\lib.rs"),
+            ("rule-posix", "/home/src-leak-sentinel/proj/src/lib.rs"),
+            ("rule-relative", "src/lib.rs"),
+        ] {
+            let rule = MemoryPayload {
+                location: location.to_string(),
+                ..retired_test_payload("rule", "agent", json!({}))
+            };
+            store.upsert("probe", id, v.clone(), rule).await.unwrap();
+        }
+
+        store.repair_namespace_hygiene("probe").await.unwrap();
+
+        let rows = store.list_memories("probe", None, None).await.unwrap();
+        let source = |id: &str| {
+            rows.iter()
+                .find(|r| r.id == id)
+                .and_then(|r| r.payload.metadata.get("source").cloned())
+        };
+        assert_eq!(source("rule-windows"), Some(json!("legacy-rule")));
+        assert_eq!(source("rule-posix"), Some(json!("legacy-rule")));
+        assert_eq!(source("rule-relative"), Some(json!("src/lib.rs")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
