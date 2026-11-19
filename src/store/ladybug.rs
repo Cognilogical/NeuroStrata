@@ -13301,31 +13301,216 @@ impl OntologyStore for LadybugStore {
     }
 }
 
-#[async_trait::async_trait]
-impl GraphRead for LadybugStore {
-    async fn memories_for_file(
+/// The result of a per-logical-file, multi-form memory retrieval.
+///
+/// `candidate_truncated` reports that at least one spelling's raw candidate
+/// pool exceeded the per-form safety budget before the global merge, so the
+/// answer may not include every candidate the spelling matched.
+#[derive(Debug, Clone, Default)]
+pub struct MultiFormMemoryRetrieval {
+    pub hits: Vec<crate::graph_read::memories_for_file::MemoryHit>,
+    pub candidate_truncated: bool,
+}
+
+#[cfg(test)]
+static BRIDGE_ENRICHMENT_COUNTER_FOR_TESTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub fn reset_bridge_enrichment_counter_for_tests() {
+    BRIDGE_ENRICHMENT_COUNTER_FOR_TESTS.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub fn bridge_enrichment_counter_for_tests() -> usize {
+    BRIDGE_ENRICHMENT_COUNTER_FOR_TESTS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Safety budget on raw candidates collected from a single spelling before the
+/// global merge ranks and caps them. Prevents one high-fan-out spelling from
+/// monopolizing the candidate pool when many forms are queried.
+const MAX_RAW_CANDIDATES_PER_FORM: usize = 1024;
+
+impl LadybugStore {
+    /// Populate conceptual bridges on an already-ranked, capped hit set.
+    ///
+    /// Kept separate from candidate collection so a multi-form query enriches
+    /// the merged, per-logical-file result exactly once rather than once per
+    /// spelling.
+    async fn enrich_conceptual_bridges(
+        &self,
+        namespace: &str,
+        hits: &mut [crate::graph_read::memories_for_file::MemoryHit],
+    ) {
+        #[cfg(test)]
+        if !hits.is_empty() {
+            BRIDGE_ENRICHMENT_COUNTER_FOR_TESTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            crate::server::context_plan_benchmark_instrumentation::record_bridge_enrichment_pass();
+        }
+
+        // Populate conceptual_bridges: for each seed hit, find up to 2
+        // 2-hop cross-domain bridges via 1-hop via nodes whose domain
+        // is disjoint from the seed's domain. Target must be normative.
+        for hit in hits.iter_mut() {
+            let mut bridges: Vec<crate::graph_read::memories_for_file::ConceptualBridge> =
+                Vec::with_capacity(2);
+            let mut seen_targets: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            let relations_vec: Vec<String> = [
+                "GOVERNS",
+                "CONTAINS",
+                "RELATES_TO",
+                "EXTRACTED_FROM",
+                "DEPENDS_ON",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+            if let Ok(related) = self
+                .related(
+                    namespace,
+                    &hit.id,
+                    &relations_vec,
+                    crate::graph_read::related::Direction::Both,
+                    1,
+                    &[],
+                    50,
+                    None,
+                    &crate::graph_read::traversal::CrossNamespacePolicy::default(),
+                )
+                .await
+            {
+                let via_ids: Vec<&str> = related
+                    .nodes
+                    .iter()
+                    .filter(|n| n.id != hit.id)
+                    .map(|n| n.id.as_str())
+                    .collect();
+                for via_id in &via_ids {
+                    if bridges.len() >= 2 {
+                        break;
+                    }
+                    let relations_vec: Vec<String> = [
+                        "GOVERNS",
+                        "CONTAINS",
+                        "RELATES_TO",
+                        "EXTRACTED_FROM",
+                        "DEPENDS_ON",
+                    ]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                    if let Ok(related2) = self
+                        .related(
+                            namespace,
+                            via_id,
+                            &relations_vec,
+                            crate::graph_read::related::Direction::Both,
+                            1,
+                            &[],
+                            50,
+                            None,
+                            &crate::graph_read::traversal::CrossNamespacePolicy::default(),
+                        )
+                        .await
+                    {
+                        for target_node in &related2.nodes {
+                            if bridges.len() >= 2 {
+                                break;
+                            }
+                            if target_node.id == hit.id || target_node.id == *via_id {
+                                continue;
+                            }
+                            if seen_targets.contains(&target_node.id) {
+                                continue;
+                            }
+                            if let Ok(Some((_, target_payload))) =
+                                self.get(namespace, &target_node.id).await
+                            {
+                                let is_normative = matches!(
+                                    target_payload.memory_type.as_str(),
+                                    "rule" | "fact" | "decision" | "procedure"
+                                );
+                                if !is_normative {
+                                    continue;
+                                }
+                                // Cross-domain token sets for the jaccard < 0.35 filter.
+                                let target_domain =
+                                    crate::domain::domain_keys(&target_payload.metadata);
+                                let mut target_tokens: std::collections::HashSet<String> =
+                                    std::collections::HashSet::new();
+                                for d in &target_domain {
+                                    target_tokens.insert(d.clone());
+                                }
+                                target_tokens.extend(crate::task::feature_tokens(
+                                    &target_payload.metadata,
+                                    &target_payload.location,
+                                ));
+                                let mut seed_tokens: std::collections::HashSet<String> =
+                                    std::collections::HashSet::new();
+                                seed_tokens.extend(crate::task::feature_tokens(&hit.metadata, ""));
+                                if !target_tokens.is_empty() {
+                                    let sim = crate::task::jaccard_similarity(
+                                        &seed_tokens,
+                                        &target_tokens,
+                                    );
+                                    if sim >= 0.35 {
+                                        continue;
+                                    }
+                                }
+                                seen_targets.insert(target_node.id.clone());
+                                let target_type = target_payload.memory_type.clone();
+                                let target_summary = if target_payload.content.chars().count() > 160
+                                {
+                                    target_payload.content.chars().take(160).collect::<String>()
+                                } else {
+                                    target_payload.content.clone()
+                                };
+                                bridges.push(
+                                    crate::graph_read::memories_for_file::ConceptualBridge {
+                                        source_id: hit.id.clone(),
+                                        via_id: via_id.to_string(),
+                                        target_id: target_node.id.clone(),
+                                        target_domain: target_domain
+                                            .first()
+                                            .cloned()
+                                            .unwrap_or_default(),
+                                        target_type,
+                                        target_summary,
+                                        path: format!(
+                                            "{} -> {} -> {}",
+                                            hit.id, via_id, target_node.id
+                                        ),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            hit.conceptual_bridges = bridges;
+        }
+    }
+
+    /// Collect raw candidate hits for one normalized spelling, without applying
+    /// the caller's `limit` and without conceptual-bridge enrichment. Both are
+    /// deferred to the global merge in `memories_for_file_forms`.
+    #[allow(clippy::too_many_arguments)]
+    async fn raw_memories_for_single_form(
         &self,
         namespace: &str,
         source: Option<&str>,
-        path: &str,
+        normalized_path: &str,
         symbol: Option<&str>,
         include_ancestors: bool,
         memory_types: &[String],
         exclude_ids: &[String],
-        limit: usize,
-    ) -> Result<Vec<MemoryHit>> {
-        let namespace = namespace.to_string();
-        let path = crate::parser::ingest::normalize_node_path(path);
-        let symbol = symbol.map(|s| s.to_string());
-        let memory_types = memory_types.to_vec();
-        let exclude_ids = exclude_ids.to_vec();
-        let limit = limit.min(crate::graph_read::memories_for_file::MAX_LIMIT);
+    ) -> Result<(Vec<crate::graph_read::memories_for_file::MemoryHit>, bool)> {
+        let ns = namespace.to_string();
+        let path_c = normalized_path.to_string();
+        let sym_c = symbol.map(|s| s.to_string());
+        let types = memory_types.to_vec();
         let source = source.map(|s| s.to_string());
-
-        let ns = namespace.clone();
-        let path_c = path.clone();
-        let sym_c = symbol.clone();
-        let types = memory_types.clone();
         let census_reads = self.census_reads.clone();
 
         let (mut hits, census) = self
@@ -13405,165 +13590,131 @@ impl GraphRead for LadybugStore {
             })
             .await?;
 
-        // Exclusion happens before the limit is applied, so an excluded hit
-        // never crowds out a live one.
+        // Exclusion happens before the global merge, so an excluded hit never
+        // crowds out a live one.
         if !exclude_ids.is_empty() {
             hits.retain(|h| !exclude_ids.iter().any(|e| e == &h.id));
         }
 
         dedup_hits(&mut hits);
-        // The census counts are exact and independent of the limit, so they
-        // are applied to the hits that survive the exclusion and the dedup.
+        // The census counts are exact and independent of any limit, so they are
+        // applied to the hits that survive the exclusion and the dedup.
         for hit in hits.iter_mut() {
             hit.linked_files = census.count(&hit.id);
         }
         crate::graph_read::memories_for_file::rank_hits(&mut hits);
-        hits.truncate(limit);
 
-        // Populate conceptual_bridges: for each seed hit, find up to 2
-        // 2-hop cross-domain bridges via 1-hop via nodes whose domain
-        // is disjoint from the seed's domain. Target must be normative.
-        for hit in hits.iter_mut() {
-            let mut bridges: Vec<crate::graph_read::memories_for_file::ConceptualBridge> =
-                Vec::with_capacity(2);
-            let mut seen_targets: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-            let relations_vec: Vec<String> = [
-                "GOVERNS",
-                "CONTAINS",
-                "RELATES_TO",
-                "EXTRACTED_FROM",
-                "DEPENDS_ON",
-            ]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-            if let Ok(related) = self
-                .related(
-                    &namespace,
-                    &hit.id,
-                    &relations_vec,
-                    crate::graph_read::related::Direction::Both,
-                    1,
-                    &[],
-                    50,
-                    None,
-                    &crate::graph_read::traversal::CrossNamespacePolicy::default(),
+        let form_truncated = if hits.len() > MAX_RAW_CANDIDATES_PER_FORM {
+            hits.truncate(MAX_RAW_CANDIDATES_PER_FORM);
+            true
+        } else {
+            false
+        };
+        Ok((hits, form_truncated))
+    }
+
+    /// Retrieve memories for every distinct logical form of one file as a
+    /// single logical query: collect raw candidates per form, merge/rank/dedup
+    /// globally, cap to the caller's limit, then enrich bridges exactly once.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn memories_for_file_forms(
+        &self,
+        namespace: &str,
+        source: Option<&str>,
+        forms: &[String],
+        symbol: Option<&str>,
+        include_ancestors: bool,
+        memory_types: &[String],
+        exclude_ids: &[String],
+        limit: usize,
+    ) -> Result<MultiFormMemoryRetrieval> {
+        let mut hits: Vec<crate::graph_read::memories_for_file::MemoryHit> = Vec::new();
+        let mut candidate_truncated = false;
+        let mut any_success = false;
+        let mut first_error: Option<anyhow::Error> = None;
+        let mut queried: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for form in forms {
+            let normalized = crate::parser::ingest::normalize_node_path(form);
+            if !queried.insert(normalized.clone()) {
+                continue;
+            }
+            #[cfg(test)]
+            crate::server::context_plan_benchmark_instrumentation::record_store_memory_multiform_op(
+            );
+            match self
+                .raw_memories_for_single_form(
+                    namespace,
+                    source,
+                    &normalized,
+                    symbol,
+                    include_ancestors,
+                    memory_types,
+                    exclude_ids,
                 )
                 .await
             {
-                let via_ids: Vec<&str> = related
-                    .nodes
-                    .iter()
-                    .filter(|n| n.id != hit.id)
-                    .map(|n| n.id.as_str())
-                    .collect();
-                for via_id in &via_ids {
-                    if bridges.len() >= 2 {
-                        break;
-                    }
-                    let relations_vec: Vec<String> = [
-                        "GOVERNS",
-                        "CONTAINS",
-                        "RELATES_TO",
-                        "EXTRACTED_FROM",
-                        "DEPENDS_ON",
-                    ]
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect();
-                    if let Ok(related2) = self
-                        .related(
-                            &namespace,
-                            via_id,
-                            &relations_vec,
-                            crate::graph_read::related::Direction::Both,
-                            1,
-                            &[],
-                            50,
-                            None,
-                            &crate::graph_read::traversal::CrossNamespacePolicy::default(),
-                        )
-                        .await
-                    {
-                        for target_node in &related2.nodes {
-                            if bridges.len() >= 2 {
-                                break;
-                            }
-                            if target_node.id == hit.id || target_node.id == *via_id {
-                                continue;
-                            }
-                            if seen_targets.contains(&target_node.id) {
-                                continue;
-                            }
-                            if let Ok(Some((_, target_payload))) =
-                                self.get(&namespace, &target_node.id).await
-                            {
-                                let is_normative = matches!(
-                                    target_payload.memory_type.as_str(),
-                                    "rule" | "fact" | "decision" | "procedure"
-                                );
-                                if !is_normative {
-                                    continue;
-                                }
-                                // Cross-domain token sets for the jaccard < 0.35 filter.
-                                let target_domain =
-                                    crate::domain::domain_keys(&target_payload.metadata);
-                                let mut target_tokens: std::collections::HashSet<String> =
-                                    std::collections::HashSet::new();
-                                for d in &target_domain {
-                                    target_tokens.insert(d.clone());
-                                }
-                                target_tokens.extend(crate::task::feature_tokens(
-                                    &target_payload.metadata,
-                                    &target_payload.location,
-                                ));
-                                let mut seed_tokens: std::collections::HashSet<String> =
-                                    std::collections::HashSet::new();
-                                seed_tokens.extend(crate::task::feature_tokens(&hit.metadata, ""));
-                                if !target_tokens.is_empty() {
-                                    let sim = crate::task::jaccard_similarity(
-                                        &seed_tokens,
-                                        &target_tokens,
-                                    );
-                                    if sim >= 0.35 {
-                                        continue;
-                                    }
-                                }
-                                seen_targets.insert(target_node.id.clone());
-                                let target_type = target_payload.memory_type.clone();
-                                let target_summary = if target_payload.content.chars().count() > 160
-                                {
-                                    target_payload.content.chars().take(160).collect::<String>()
-                                } else {
-                                    target_payload.content.clone()
-                                };
-                                bridges.push(
-                                    crate::graph_read::memories_for_file::ConceptualBridge {
-                                        source_id: hit.id.clone(),
-                                        via_id: via_id.to_string(),
-                                        target_id: target_node.id.clone(),
-                                        target_domain: target_domain
-                                            .first()
-                                            .cloned()
-                                            .unwrap_or_default(),
-                                        target_type,
-                                        target_summary,
-                                        path: format!(
-                                            "{} -> {} -> {}",
-                                            hit.id, via_id, target_node.id
-                                        ),
-                                    },
-                                );
-                            }
-                        }
-                    }
+                Ok((batch, truncated)) => {
+                    any_success = true;
+                    candidate_truncated |= truncated;
+                    hits.extend(batch);
+                }
+                Err(e) => {
+                    tracing::warn!("memories_for_file lookup of {form:?} failed: {e}");
+                    first_error.get_or_insert(e);
                 }
             }
-            hit.conceptual_bridges = bridges;
         }
 
-        Ok(hits)
+        if !any_success {
+            if let Some(e) = first_error {
+                return Err(e);
+            }
+        }
+
+        // Global merge: rank the whole candidate pool, dedup by id keeping the
+        // best-ranked occurrence, then cap to the caller's limit.
+        crate::graph_read::memories_for_file::rank_hits(&mut hits);
+        let mut seen = std::collections::HashSet::new();
+        hits.retain(|h| seen.insert(h.id.clone()));
+        let effective_limit = limit.min(crate::graph_read::memories_for_file::MAX_LIMIT);
+        hits.truncate(effective_limit);
+
+        // One enrichment pass over the final per-logical-file hit set.
+        self.enrich_conceptual_bridges(namespace, &mut hits).await;
+
+        Ok(MultiFormMemoryRetrieval {
+            hits,
+            candidate_truncated,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl GraphRead for LadybugStore {
+    async fn memories_for_file(
+        &self,
+        namespace: &str,
+        source: Option<&str>,
+        path: &str,
+        symbol: Option<&str>,
+        include_ancestors: bool,
+        memory_types: &[String],
+        exclude_ids: &[String],
+        limit: usize,
+    ) -> Result<Vec<MemoryHit>> {
+        self.memories_for_file_forms(
+            namespace,
+            source,
+            &[path.to_string()],
+            symbol,
+            include_ancestors,
+            memory_types,
+            exclude_ids,
+            limit,
+        )
+        .await
+        .map(|r| r.hits)
     }
 
     async fn related(
@@ -13614,14 +13765,14 @@ impl GraphRead for LadybugStore {
         let seed_c = seed.clone();
         let rels = relations.clone();
 
-        let (nodes, edges, generation) = self
+        let (nodes, edges, generation, resolved_seed_id) = self
             .with_conn(move |conn| {
                 fetch_related_subgraph(conn, &ns, &seed_c, &rels, max_hops, &policy, &expanded_set)
             })
             .await?;
 
         Ok(crate::graph_read::related::graph_read_related(
-            &seed,
+            &resolved_seed_id,
             &nodes,
             &edges,
             &relations,
@@ -13632,6 +13783,151 @@ impl GraphRead for LadybugStore {
             generation,
             cursor,
         ))
+    }
+}
+
+impl LadybugStore {
+    /// Resolve a caller-supplied file-path seed (expanded into every spelling
+    /// it may be stored under) to exactly one active node id in `namespace`.
+    /// Deterministic: form order first, then priority rank, then id lexical.
+    pub async fn resolve_canonical_file_seed_id(
+        &self,
+        namespace: &str,
+        forms: &[String],
+    ) -> Result<Option<String>> {
+        let namespace = namespace.to_string();
+        let forms = forms.to_vec();
+        self.with_conn(move |conn| {
+            let safe_ns = escape_ladybug_string(&namespace);
+            let active_gens = active_generations_of(conn, &namespace);
+            let now = chrono::Utc::now().timestamp();
+
+            let parse_meta = |raw: &str| -> Value {
+                match serde_json::from_str(raw) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if !raw.trim().is_empty() {
+                            tracing::warn!("corrupt metadata JSON in store row: {e}");
+                        }
+                        Value::Null
+                    }
+                }
+            };
+
+            let visible = |id: &str, metadata: &Value| -> bool {
+                is_active_id(id, &active_gens)
+                    && !is_archived(metadata)
+                    && !is_retired_at(metadata, now)
+                    && !is_mesh_conflicting(metadata)
+                    && !crate::registry::is_registry_row(metadata)
+            };
+
+            let location_matches = |metadata: &Value, norm: &str| -> bool {
+                if norm.is_empty() {
+                    return false;
+                }
+                let matches_path = |p: &str| {
+                    crate::parser::ingest::normalize_node_path(p) == norm
+                };
+                metadata
+                    .get("relative_path")
+                    .and_then(|v| v.as_str())
+                    .map(matches_path)
+                    .unwrap_or(false)
+                    || metadata
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .map(matches_path)
+                        .unwrap_or(false)
+                    || metadata
+                        .get("locations")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter().any(|loc| {
+                                loc.get("path")
+                                    .and_then(|v| v.as_str())
+                                    .map(matches_path)
+                                    .unwrap_or(false)
+                            })
+                        })
+                        .unwrap_or(false)
+            };
+
+            for form in &forms {
+                let norm = crate::parser::ingest::normalize_node_path(form);
+                let mut rows: Vec<(String, String, Value)> = Vec::new();
+
+                // (a) exact id / file:-prefixed id / location matches.
+                let direct_q = format!(
+                    "MATCH (m:Memory) WHERE m.namespace = '{ns}' AND (m.id = '{form}' OR m.id = '{norm}' OR m.id = 'file:{form}' OR m.id = 'file:{norm}' OR m.location = '{form}' OR m.location = '{norm}') RETURN m.id, m.memory_type, m.location, m.metadata",
+                    ns = safe_ns,
+                    form = escape_ladybug_string(form),
+                    norm = escape_ladybug_string(&norm),
+                );
+                let result = conn.query(&direct_q)?;
+                for row in result {
+                    let id = format!("{}", row[0]);
+                    let memory_type = format!("{}", row[1]);
+                    let metadata = parse_meta(&format!("{}", row[3]));
+                    rows.push((id, memory_type, metadata));
+                }
+
+                // (b) memories storing the path only in metadata (empty
+                // `location` column): narrow the CONTAINS prefilter to rows
+                // whose parsed metadata actually carries the normalized path.
+                if !norm.is_empty() {
+                    let meta_q = format!(
+                        "MATCH (m:Memory) WHERE m.namespace = '{ns}' AND m.metadata CONTAINS '{norm}' RETURN m.id, m.memory_type, m.location, m.metadata",
+                        ns = safe_ns,
+                        norm = escape_ladybug_string(&norm),
+                    );
+                    let result = conn.query(&meta_q)?;
+                    for row in result {
+                        let id = format!("{}", row[0]);
+                        let memory_type = format!("{}", row[1]);
+                        let metadata = parse_meta(&format!("{}", row[3]));
+                        if location_matches(&metadata, &norm) {
+                            rows.push((id, memory_type, metadata));
+                        }
+                    }
+                }
+
+                let mut seen = std::collections::HashSet::new();
+                let candidates: Vec<(String, u8)> = rows
+                    .into_iter()
+                    .filter(|(id, _, metadata)| visible(id, metadata))
+                    .filter_map(|(id, memory_type, _)| {
+                        if !seen.insert(id.clone()) {
+                            return None;
+                        }
+                        let rank = if id.as_str() == form.as_str() || id.as_str() == norm.as_str() {
+                            0
+                        } else if memory_type == "file" {
+                            1
+                        } else if memory_type == "structural"
+                            || id.as_str() == format!("file:{}", form).as_str()
+                            || id.as_str() == format!("file:{}", norm).as_str()
+                        {
+                            2
+                        } else if memory_type == "code_ast" || memory_type == "symbol" {
+                            3
+                        } else {
+                            4
+                        };
+                        Some((id, rank))
+                    })
+                    .collect();
+
+                if let Some((best, _)) = candidates
+                    .into_iter()
+                    .min_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)))
+                {
+                    return Ok(Some(best));
+                }
+            }
+            Ok(None)
+        })
+        .await
     }
 }
 
@@ -13656,6 +13952,7 @@ fn fetch_related_subgraph(
     Vec<crate::graph_read::related::NodeSpec>,
     Vec<crate::graph_read::related::EdgeSpec>,
     u64,
+    String,
 )> {
     use crate::graph_read::related::{EdgeSpec, NodeSpec};
 
@@ -13787,8 +14084,11 @@ fn fetch_related_subgraph(
     }
 
     let Some(seed_id) = seed_id else {
-        return Ok((Vec::new(), Vec::new(), generation));
+        return Ok((Vec::new(), Vec::new(), generation, seed.to_string()));
     };
+    // The seed may have matched by `location`; pass the resolved node id on so
+    // the pure traversal's `node_map.get(seed)` still finds its own root node.
+    let resolved_seed_id = seed_id.clone();
 
     // BFS out to `max_hops`, fetching both orientations (the pure traversal
     // reapplies the direction allowlist). Only same-namespace neighbours are
@@ -13936,7 +14236,7 @@ fn fetch_related_subgraph(
     }
 
     let nodes: Vec<NodeSpec> = nodes.into_values().collect();
-    Ok((nodes, edges, generation))
+    Ok((nodes, edges, generation, resolved_seed_id))
 }
 
 impl LadybugStore {
@@ -15783,6 +16083,132 @@ eurostrata\src\daemon.rs",
         store.test_cleanup_dir = Some(TestCleanupDir(dir));
         store.init("probe").await.expect("create the schema");
         store
+    }
+
+    /// Per-logical-file retrieval must rank the GLOBAL candidate pool, not each
+    /// spelling in isolation: a high-value hit from a later form outranks the
+    /// low-value hits an earlier form would have used to fill a per-form limit.
+    #[tokio::test]
+    async fn memories_for_file_forms_preserves_global_best_hit_across_form_cutoff_boundary() {
+        let form_a = "src/lib.rs";
+        let form_b = "/tmp/ns-v1190-project/src/lib.rs";
+        let dir = std::env::temp_dir().join(format!("ns-v1190-forms-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp test dir");
+        let store = LadybugStore::for_testing(dir.join("db"), 4).expect("open temp database");
+        store.init("ns").await.expect("init namespace");
+
+        for id in ["hit-a1", "hit-a2", "hit-a3"] {
+            let mtype = if id == "hit-a3" {
+                "structural"
+            } else {
+                "symbol"
+            };
+            store
+                .upsert(
+                    "ns",
+                    id,
+                    vec![0.0; 4],
+                    retired_test_payload(
+                        mtype,
+                        "agent",
+                        json!({"governs": [form_a], "locations": [{"path": form_a}]}),
+                    ),
+                )
+                .await
+                .expect("seed form_a hit");
+        }
+        store
+            .upsert(
+                "ns",
+                "best-rule-b1",
+                vec![0.0; 4],
+                retired_test_payload(
+                    "rule",
+                    "agent",
+                    json!({"governs": [form_b], "locations": [{"path": form_b}]}),
+                ),
+            )
+            .await
+            .expect("seed form_b rule");
+
+        let out = store
+            .memories_for_file_forms(
+                "ns",
+                None,
+                &[form_a.to_string(), form_b.to_string()],
+                None,
+                false,
+                &[],
+                &[],
+                2,
+            )
+            .await
+            .expect("multi-form retrieval");
+
+        assert!(
+            out.hits.iter().any(|h| h.id == "best-rule-b1"),
+            "global best rule must survive the per-form cutoff: {:?}",
+            out.hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>()
+        );
+        assert!(out.hits.len() <= 2, "global limit is 2");
+        let mut seen = std::collections::HashSet::new();
+        assert!(
+            out.hits.iter().all(|h| seen.insert(h.id.clone())),
+            "hits are globally deduped"
+        );
+    }
+
+    /// Bridge enrichment runs once on the merged per-logical-file hit set, not
+    /// once per spelling -- the counter must read exactly 1 for two forms.
+    #[tokio::test]
+    async fn memories_for_file_forms_enriches_bridges_once_per_logical_file() {
+        reset_bridge_enrichment_counter_for_tests();
+        let form_a = "src/lib.rs";
+        let form_b = "/tmp/ns-v1190-project/src/lib.rs";
+        let forms = vec![form_a.to_string(), form_b.to_string()];
+        let dir = std::env::temp_dir().join(format!("ns-v1190-bridges-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp test dir");
+        let store = LadybugStore::for_testing(dir.join("db"), 4).expect("open temp database");
+        store.init("ns").await.expect("init namespace");
+
+        store
+            .upsert(
+                "ns",
+                "seed-1",
+                vec![0.0; 4],
+                retired_test_payload(
+                    "fact",
+                    "agent",
+                    json!({"governs": [form_a], "locations": [{"path": form_a}]}),
+                ),
+            )
+            .await
+            .expect("seed seed-1");
+        store
+            .upsert(
+                "ns",
+                "seed-2",
+                vec![0.0; 4],
+                retired_test_payload(
+                    "rule",
+                    "agent",
+                    json!({"governs": [form_b], "locations": [{"path": form_b}]}),
+                ),
+            )
+            .await
+            .expect("seed seed-2");
+
+        let out = store
+            .memories_for_file_forms("ns", None, &forms, None, false, &[], &[], 10)
+            .await
+            .expect("ok");
+
+        assert!(!out.hits.is_empty(), "at least one seed hit is returned");
+        assert_eq!(
+            bridge_enrichment_counter_for_tests(),
+            1,
+            "bridge enrichment runs once per logical file, not once per form"
+        );
     }
 
     /// Composite Recommendation #11: the first embedding descriptor recorded

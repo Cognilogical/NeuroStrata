@@ -372,8 +372,37 @@ pub fn to_project_relative(
     match choose_root(&input, project_root, registry_root) {
         Some((root, rel, source)) => {
             let path = with_disk_spelling(&input, &root, rel.clone());
-            let mut alternates = vec![rel, input.clone()];
+            let mut alternates = vec![rel.clone(), input.clone()];
             alternates.extend(parse_absolute(&input).map(|p| p.to_path_string()));
+            // A broader `project_root` wins for `path`/`source`, but a deeper
+            // usable registry root may hold the file under a shorter relative
+            // spelling. Keep that spelling as an alternate — only when the
+            // root resolves the file and is not vetoed by a nested foreign
+            // checkout — without changing the primary resolution.
+            if source == RootSource::ProjectRoot {
+                if let Some(reg_root) = registry_root.filter(|r| is_usable_root(r)) {
+                    let marker = find_git_root(&input);
+                    let marker_rel = marker.as_deref().and_then(|m| relative_to(&input, m));
+                    if let Some((reg_resolved_root, reg_rel, _)) = resolve_candidate_root(
+                        &input,
+                        reg_root,
+                        RootSource::RegistryRoot,
+                        &marker,
+                        &marker_rel,
+                    ) {
+                        if depth(&reg_rel) < depth(&rel) {
+                            alternates.push(with_disk_spelling(
+                                &input,
+                                &reg_resolved_root,
+                                reg_rel.clone(),
+                            ));
+                            alternates.push(reg_rel);
+                        }
+                    }
+                }
+            }
+            let mut seen = std::collections::HashSet::new();
+            alternates.retain(|a| seen.insert(crate::parser::ingest::normalize_node_path(a)));
             LookupPath {
                 path,
                 source,
@@ -428,6 +457,32 @@ fn with_disk_spelling(path: &str, root: &str, rel: String) -> String {
     relative_to(&file.to_string_lossy(), &root_c.to_string_lossy()).unwrap_or(rel)
 }
 
+/// Evaluate a single candidate root for absolute `raw`: the part below it and
+/// where the root came from, or `None` when this candidate cannot answer.
+/// A nested foreign checkout vetoes only this candidate — the exact rule
+/// shared by [`choose_root`] and the deeper-alternate retention in
+/// [`to_project_relative`]. The candidate itself is never usability-filtered
+/// here (a supplied `project_root` vetoes even when moved/unusable); callers
+/// filter registry roots before passing them in.
+fn resolve_candidate_root(
+    raw: &str,
+    root: &str,
+    source: RootSource,
+    marker: &Option<String>,
+    marker_rel: &Option<String>,
+) -> Option<(String, String, RootSource)> {
+    let rel = relative_to_on_disk(raw, root)?;
+    match (marker, marker_rel) {
+        // A checkout nested inside the root (deeper than it). A foreign one
+        // vetoes only this candidate; a later known root may answer.
+        (Some(inner), Some(inner_rel)) if depth(inner_rel) < depth(&rel) => {
+            (is_checkout_root(root) && same_repository(inner, root))
+                .then(|| (inner.clone(), inner_rel.clone(), RootSource::Marker))
+        }
+        _ => Some((root.to_string(), rel, source)),
+    }
+}
+
 /// The root that relativizes absolute `raw`, the part below it, and where the
 /// root came from; `None` when no root this namespace knows contains it.
 /// Candidates are tried in order and a nested foreign checkout vetoes only the
@@ -447,20 +502,8 @@ fn choose_root(
         (registry_root, RootSource::RegistryRoot),
     ] {
         let Some(root) = root else { continue };
-        let Some(rel) = relative_to_on_disk(raw, root) else {
-            continue;
-        };
-        let resolved = match (&marker, &marker_rel) {
-            // A checkout nested inside the root (deeper than it). A foreign
-            // one vetoes only this candidate; a later known root may answer.
-            (Some(inner), Some(inner_rel)) if depth(inner_rel) < depth(&rel) => {
-                (is_checkout_root(root) && same_repository(inner, root))
-                    .then(|| (inner.clone(), inner_rel.clone(), RootSource::Marker))
-            }
-            _ => Some((root.to_string(), rel, source)),
-        };
-        if resolved.is_some() {
-            return resolved;
+        if let Some(resolved) = resolve_candidate_root(raw, root, source, &marker, &marker_rel) {
+            return Some(resolved);
         }
     }
     let (marker, marker_rel) = (marker?, marker_rel?);
@@ -503,6 +546,260 @@ pub fn lookup_forms(raw: &str, lookup: &LookupPath, known_root: Option<&str>) ->
     let mut seen = std::collections::HashSet::new();
     forms.retain(|f| seen.insert(crate::parser::ingest::normalize_node_path(f)));
     forms
+}
+
+/// Whether a path names a single file or a directory prefix. Prefixes accept
+/// an empty raw input (they resolve to no forms); files do not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathResolutionScope {
+    File,
+    Prefix,
+}
+
+/// The scoped lookup forms for a raw path: every spelling a store query must
+/// try, plus the normalized first form used as its canonical identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedPathForms {
+    pub lookup: LookupPath,
+    pub forms: Vec<String>,
+    pub canonical_form: Option<String>,
+}
+
+/// An absolute path (or prefix) that is under no root this namespace knows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvablePathError {
+    pub input: String,
+    pub reason: String,
+}
+
+impl std::fmt::Display for UnresolvablePathError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "unresolvable path {} (outside every expected root): {}",
+            self.input, self.reason
+        )
+    }
+}
+
+impl std::error::Error for UnresolvablePathError {}
+
+/// The explicit error for an absolute path outside every expected root. The
+/// message names the expected root(s) so a caller can see what would make the
+/// path resolvable.
+pub fn unresolvable_absolute_path_error(
+    input: &str,
+    project_root: Option<&str>,
+    registry_root: Option<&str>,
+) -> UnresolvablePathError {
+    let mut roots: Vec<&str> = Vec::new();
+    if let Some(root) = project_root {
+        roots.push(root);
+    }
+    if let Some(root) = registry_root {
+        roots.push(root);
+    }
+    let reason = if roots.is_empty() {
+        "no project root is registered".to_string()
+    } else {
+        format!("expected root(s): {}", roots.join(", "))
+    };
+    UnresolvablePathError {
+        input: input.to_string(),
+        reason,
+    }
+}
+
+/// When a directory prefix equals a known root (`project_root`, usable
+/// `registry_root`, or an unvetoed `.git` checkout root), resolve it to `"."`
+/// under that root so prefix queries over the root directory match both
+/// relative and absolute stored paths inside that root.
+fn resolve_prefix_root_lookup(
+    raw: &str,
+    project_root: Option<&str>,
+    registry_root: Option<&str>,
+) -> Option<LookupPath> {
+    if !is_absolute_any(raw) {
+        return None;
+    }
+    let input = follow_parent_components(raw);
+    let registry_root = registry_root.filter(|root| is_usable_root(root));
+    let matched = [
+        (project_root, RootSource::ProjectRoot),
+        (registry_root, RootSource::RegistryRoot),
+    ]
+    .into_iter()
+    .find_map(|(root, source)| {
+        let root = root?;
+        same_location(&input, root).then(|| (root.to_string(), source))
+    })
+    .or_else(|| {
+        if !is_checkout_root(&input) {
+            return None;
+        }
+        let marker = parse_absolute(&input)
+            .map(|p| p.to_path_string())
+            .unwrap_or_else(|| input.clone());
+        let known_root = project_root.or(registry_root);
+        match known_root {
+            None => Some((marker, RootSource::Marker)),
+            Some(root) if is_checkout_root(root) && same_repository(&marker, root) => {
+                Some((marker, RootSource::Marker))
+            }
+            Some(_) => None,
+        }
+    });
+    let (root, source) = matched?;
+    let mut alternates = Vec::new();
+    alternates.extend(parse_absolute(&root).map(|p| p.to_path_string()));
+    alternates.push(root.clone());
+    alternates.extend(parse_absolute(&input).map(|p| p.to_path_string()));
+    alternates.push(input);
+    let mut seen = std::collections::HashSet::new();
+    alternates.retain(|a| seen.insert(crate::parser::ingest::normalize_node_path(a)));
+    Some(LookupPath {
+        path: ".".to_string(),
+        source,
+        root: Some(root),
+        alternates,
+    })
+}
+
+/// Every store-query spelling for `raw` at the given scope. Beyond
+/// [`lookup_forms`], a prefix also carries its normalized relative form and
+/// the absolute forms joined onto the known roots. Only joins that stay
+/// inside their root (or equal the root for a root-level prefix) are added,
+/// so the scope never widens to a sibling or parent directory.
+pub fn lookup_forms_for_scope(
+    raw: &str,
+    lookup: &LookupPath,
+    known_root: Option<&str>,
+    scope: PathResolutionScope,
+) -> Vec<String> {
+    if scope == PathResolutionScope::Prefix && raw.trim().is_empty() {
+        return Vec::new();
+    }
+    let mut forms = lookup_forms(raw, lookup, known_root);
+    if scope == PathResolutionScope::Prefix {
+        let normalized = crate::parser::ingest::normalize_node_path(&lookup.path);
+        if !normalized.is_empty() {
+            forms.push(normalized);
+        }
+        let mut roots: Vec<&str> = Vec::new();
+        if let Some(root) = lookup.root.as_deref() {
+            roots.push(root);
+        }
+        if let Some(root) = known_root {
+            roots.push(root);
+        }
+        let has_parent_traversal = lookup.path.split(['/', '\\']).any(|c| c == "..");
+        for root in roots {
+            if !is_usable_root(root) {
+                continue;
+            }
+            let joined = format!(
+                "{}/{}",
+                root.trim_end_matches('/'),
+                lookup.path.trim_start_matches('/')
+            );
+            let Some(joined) = parse_absolute(&joined).map(|p| p.to_path_string()) else {
+                continue;
+            };
+            if (!has_parent_traversal && same_location(&joined, root))
+                || relative_to(&joined, root).is_some()
+            {
+                forms.push(joined);
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        forms.retain(|f| seen.insert(crate::parser::ingest::normalize_node_path(f)));
+    }
+    forms
+}
+
+/// Resolve `raw` into every spelling it may be stored under at the given
+/// scope. An absolute path or prefix under no known root is an explicit
+/// [`UnresolvablePathError`] — it is never silently widened to a different
+/// repository. A relative path additionally gets a joined form under a
+/// distinct usable registry root so either stored spelling is found.
+pub fn resolve_in_scope_forms(
+    raw: &str,
+    project_root: Option<&str>,
+    registry_root: Option<&str>,
+    scope: PathResolutionScope,
+) -> Result<ResolvedPathForms, UnresolvablePathError> {
+    if scope == PathResolutionScope::Prefix && raw.trim().is_empty() {
+        return Ok(ResolvedPathForms {
+            lookup: to_project_relative(raw, project_root, registry_root),
+            forms: Vec::new(),
+            canonical_form: None,
+        });
+    }
+    let mut lookup = to_project_relative(raw, project_root, registry_root);
+    if lookup.source == RootSource::Outside && scope == PathResolutionScope::Prefix {
+        if let Some(root_lookup) = resolve_prefix_root_lookup(raw, project_root, registry_root) {
+            lookup = root_lookup;
+        }
+    }
+    if lookup.source == RootSource::Outside {
+        return Err(unresolvable_absolute_path_error(
+            raw,
+            project_root,
+            registry_root,
+        ));
+    }
+    let known_root = project_root.or(registry_root.filter(|r| is_usable_root(r)));
+    let mut forms = lookup_forms_for_scope(raw, &lookup, known_root, scope);
+    if lookup.source == RootSource::Relative {
+        if let (Some(project), Some(reg)) =
+            (project_root, registry_root.filter(|r| is_usable_root(r)))
+        {
+            if reg != project {
+                let has_parent_traversal = raw.split(['/', '\\']).any(|c| c == "..");
+                let joined = format!(
+                    "{}/{}",
+                    reg.trim_end_matches('/'),
+                    raw.trim_start_matches('/')
+                );
+                if let Some(joined) = parse_absolute(&joined).map(|p| p.to_path_string()) {
+                    if (scope == PathResolutionScope::Prefix
+                        && !has_parent_traversal
+                        && same_location(&joined, reg))
+                        || relative_to(&joined, reg).is_some()
+                    {
+                        forms.push(joined);
+                    }
+                }
+                let mut seen = std::collections::HashSet::new();
+                forms.retain(|f| seen.insert(crate::parser::ingest::normalize_node_path(f)));
+            }
+        }
+    }
+    let canonical_form = forms
+        .first()
+        .map(|f| crate::parser::ingest::normalize_node_path(f))
+        .filter(|s| !s.is_empty());
+    Ok(ResolvedPathForms {
+        lookup,
+        forms,
+        canonical_form,
+    })
+}
+
+/// Every spelling to query for a directory prefix, or an explicit error when
+/// the prefix is absolute but outside every known root.
+pub fn prefix_lookup_forms(
+    raw: &str,
+    project_root: Option<&str>,
+    registry_root: Option<&str>,
+) -> Result<Vec<String>, UnresolvablePathError> {
+    resolve_in_scope_forms(
+        raw,
+        project_root,
+        registry_root,
+        PathResolutionScope::Prefix,
+    )
+    .map(|resolved| resolved.forms)
 }
 
 #[cfg(test)]
@@ -1123,6 +1420,163 @@ mod tests {
         assert_eq!(
             (l.path.as_str(), l.source),
             ("src/lib.rs", RootSource::Marker)
+        );
+    }
+
+    // ---- Task 2: host-native `//` and scoped path/prefix resolution ----
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_double_slash_path_is_posix_absolute_not_unc() {
+        assert!(is_absolute_any("//server/share/repo/src/lib.rs"));
+        let root = "/";
+        let lookup = to_project_relative("//server/share/repo/src/lib.rs", Some(root), Some(root));
+        assert_eq!(lookup.source, RootSource::ProjectRoot);
+        assert_eq!(lookup.path, "server/share/repo/src/lib.rs");
+        assert!(lookup.root.as_deref() == Some("/"));
+        let forms = lookup_forms("//server/share/repo/src/lib.rs", &lookup, Some(root));
+        assert!(forms.iter().any(|f| f == "server/share/repo/src/lib.rs"));
+        assert!(forms.iter().all(|f| !f.starts_with("\\\\")));
+    }
+
+    #[test]
+    fn unresolvable_absolute_path_in_scope_returns_explicit_error() {
+        let root = std::env::temp_dir().join("ns-v1190-path-root");
+        std::fs::create_dir_all(&root).expect("create temp root");
+        let root_s = root.to_string_lossy().to_string();
+        let err = resolve_in_scope_forms(
+            "/definitely/outside/ns-v1190.rs",
+            Some(&root_s),
+            Some(&root_s),
+            PathResolutionScope::File,
+        )
+        .expect_err("outside absolute path must be unresolvable");
+        let msg = err.to_string();
+        assert!(msg.contains("unresolvable") || msg.contains("outside"));
+        assert!(msg.contains(&root_s));
+    }
+
+    #[test]
+    fn prefix_forms_match_absolute_and_relative_stored_spellings() {
+        let root = std::env::temp_dir().join("ns-v1190-prefix-root");
+        std::fs::create_dir_all(root.join("src/graph")).expect("create prefix root");
+        let root_s = root.to_string_lossy().to_string();
+        let resolved = resolve_in_scope_forms(
+            &format!("{}/src/graph", root_s),
+            Some(&root_s),
+            Some(&root_s),
+            PathResolutionScope::Prefix,
+        )
+        .expect("in-scope prefix");
+        assert_eq!(resolved.lookup.source, RootSource::ProjectRoot);
+        assert!(resolved
+            .forms
+            .iter()
+            .any(|f| f == "src/graph" || f == "src/graph/"));
+        assert!(resolved.forms.iter().any(
+            |f| f == &format!("{}/src/graph", root_s) || f == &format!("{}/src/graph/", root_s)
+        ));
+    }
+
+    #[test]
+    fn prefix_resolution_does_not_widen_outside_scope() {
+        let root = std::env::temp_dir().join("ns-v1190-prefix-scope");
+        std::fs::create_dir_all(&root).expect("create temp root");
+        let root_s = root.to_string_lossy().to_string();
+        let err = resolve_in_scope_forms(
+            "/other/repo/src",
+            Some(&root_s),
+            Some(&root_s),
+            PathResolutionScope::Prefix,
+        )
+        .expect_err("outside prefix must be unresolvable");
+        assert!(err.to_string().contains("unresolvable") || err.to_string().contains("outside"));
+    }
+
+    #[test]
+    fn to_project_relative_retains_deeper_valid_registry_relative_alternate_when_broader_project_root_wins(
+    ) {
+        let tmp = std::env::temp_dir().join("ns-v1190-alternates");
+        let project = tmp.join("repo");
+        let registry = project.join("platform");
+        std::fs::create_dir_all(registry.join("src")).expect("create dirs");
+        std::fs::create_dir_all(project.join(".git")).expect("create git marker");
+        let file = registry.join("src/lib.rs");
+        std::fs::write(&file, "pub fn demo() {}\n").expect("write file");
+        let file_s = file.to_string_lossy().to_string();
+        let project_s = project.to_string_lossy().to_string();
+        let registry_s = registry.to_string_lossy().to_string();
+        let lookup = to_project_relative(&file_s, Some(&project_s), Some(&registry_s));
+        assert_eq!(lookup.source, RootSource::ProjectRoot);
+        assert_eq!(lookup.path, "platform/src/lib.rs");
+        assert!(lookup.alternates.iter().any(|a| a == "src/lib.rs"));
+        let norm = lookup
+            .alternates
+            .iter()
+            .map(|a| crate::parser::ingest::normalize_node_path(a))
+            .collect::<Vec<_>>();
+        let mut dedup = norm.clone();
+        dedup.sort();
+        dedup.dedup();
+        assert_eq!(
+            norm.len(),
+            dedup.len(),
+            "alternates must be normalized/deduped stable-first-seen"
+        );
+    }
+
+    #[test]
+    fn prefix_equal_to_configured_or_checkout_root_resolves_to_root_forms() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = canonical(tmp.path()).expect("canonical tmp").join("repo");
+        std::fs::create_dir_all(root.join(".git")).expect("create repo .git");
+        let foreign = canonical(tmp.path())
+            .expect("canonical tmp")
+            .join("foreign");
+        std::fs::create_dir_all(foreign.join(".git")).expect("create foreign .git");
+
+        let root_s = root.to_string_lossy().to_string();
+        let root_slash = format!("{root_s}/");
+        let foreign_s = foreign.to_string_lossy().to_string();
+
+        for raw in [root_s.as_str(), root_slash.as_str()] {
+            let by_project =
+                resolve_in_scope_forms(raw, Some(&root_s), None, PathResolutionScope::Prefix)
+                    .expect("prefix equal to project_root must resolve");
+            assert_eq!(by_project.lookup.source, RootSource::ProjectRoot);
+            assert_eq!(by_project.lookup.path, ".");
+            assert!(by_project.forms.iter().any(|f| f == "."));
+            assert!(by_project.forms.iter().any(|f| f == &root_s));
+
+            let by_registry =
+                resolve_in_scope_forms(raw, None, Some(&root_s), PathResolutionScope::Prefix)
+                    .expect("prefix equal to usable registry_root must resolve");
+            assert_eq!(by_registry.lookup.source, RootSource::RegistryRoot);
+            assert_eq!(by_registry.lookup.path, ".");
+            assert!(by_registry.forms.iter().any(|f| f == "."));
+            assert!(by_registry.forms.iter().any(|f| f == &root_s));
+
+            let by_marker = resolve_in_scope_forms(raw, None, None, PathResolutionScope::Prefix)
+                .expect("prefix equal to checkout root must resolve via .git marker");
+            assert_eq!(by_marker.lookup.source, RootSource::Marker);
+            assert_eq!(by_marker.lookup.path, ".");
+            assert!(by_marker.forms.iter().any(|f| f == "."));
+            assert!(by_marker.forms.iter().any(|f| f == &root_s));
+        }
+
+        // Foreign checkout root stays vetoed when a project_root or registry_root is configured.
+        assert!(resolve_in_scope_forms(
+            &foreign_s,
+            Some(&root_s),
+            None,
+            PathResolutionScope::Prefix,
+        )
+        .is_err());
+
+        // File scope still rejects the root directory itself.
+        assert!(
+            resolve_in_scope_forms(&root_s, Some(&root_s), None, PathResolutionScope::File,)
+                .is_err()
         );
     }
 }

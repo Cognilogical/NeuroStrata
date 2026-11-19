@@ -308,6 +308,7 @@ pub async fn process_mcp_request(
                                 "memory_types": { "type": "array", "items": { "type": "string" }, "description": "Optional list of memory_type values to filter by." },
                                 "fact_shape": { "type": "string", "enum": ["atomic", "composite", "any"], "description": "Filter fact memories by shape ('atomic', 'composite', or 'any')." },
                                 "path_prefix": { "type": "string", "description": "Optional file/location path prefix filter." },
+                                 "project_root": { "type": "string", "description": "Optional project root directory for resolving path_prefix filters." },
                                 "exclude_stale": { "type": "boolean", "default": false, "description": "Exclude memories marked stale." },
                                 "include_code_ast": { "type": "boolean", "default": true, "description": "Include structural code AST memories even when memory_type is not explicitly set to structural." },
                                 "include_archived": { "type": "boolean", "description": "When true, include archived memories in search results." },
@@ -388,6 +389,7 @@ pub async fn process_mcp_request(
                             "properties": {
                                 "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata')." },
                                 "id": { "type": "string", "description": "The seed node: a memory id, a task id, or a qualified file path." },
+                                "project_root": { "type": "string", "description": "Optional checkout root used to resolve file-path seeds before graph traversal." },
                                 "relations": { "type": "array", "items": { "type": "string" }, "description": "Relations to follow: GOVERNS, CONTAINS, RELATES_TO, EXTRACTED_FROM. Default all four." },
                                 "direction": { "type": "string", "enum": ["outgoing", "incoming", "both"], "description": "Traversal direction. Default both." },
                                 "max_hops": { "type": "integer", "description": "Traversal depth. Default 1, max 2." },
@@ -1348,6 +1350,7 @@ pub async fn process_mcp_request(
                                 "query_kind": { "type": "string", "enum": ["sparql", "lexical", "ast_calls"], "description": "Custom insight query kind ('sparql', 'lexical', or 'ast_calls')." },
                                 "query": { "type": "string", "description": "Custom insight query string (SPARQL SELECT, lexical query, or called symbol name)." },
                                 "path_prefix": { "type": "string", "description": "Optional file/directory path prefix filter for lexical or ast_calls insights." },
+                                 "project_root": { "type": "string", "description": "Optional project root directory for resolving path_prefix filters." },
                                 "from_ts": { "type": "integer", "description": "Optional start unix timestamp (seconds) for series query or bitemporal backfill." },
                                 "to_ts": { "type": "integer", "description": "Optional end unix timestamp (seconds) for series query or bitemporal backfill." },
                                 "backfill_points": { "type": "integer", "description": "Optional number of bitemporal as_of backfill steps across [from_ts, to_ts] (2..=64)." },
@@ -1611,12 +1614,8 @@ pub async fn process_mcp_request(
                             }
                         }
                         "neurostrata_ingest_bounded" => {
-                            result_text = handle_ingest_bounded(
-                                &arguments,
-                                emb.clone(),
-                                store.clone(),
-                            )
-                            .await;
+                            result_text =
+                                handle_ingest_bounded(&arguments, emb.clone(), store.clone()).await;
                         }
                         "neurostrata_search_memory" => {
                             result_text =
@@ -1946,12 +1945,8 @@ pub async fn process_mcp_request(
                             .await;
                         }
                         "neurostrata_data_connector" => {
-                            result_text = handle_data_connector(
-                                &arguments,
-                                store.clone(),
-                                bus.clone(),
-                            )
-                            .await;
+                            result_text =
+                                handle_data_connector(&arguments, store.clone(), bus.clone()).await;
                         }
                         // SynapticMesh: the handler is a pure string-in/
                         // string-out dispatch (filesystem + git only; no
@@ -2100,9 +2095,7 @@ pub(crate) async fn handle_data_connector(
     let Some(args) = arguments.get("args") else {
         return serde_json::json!({"ok": false, "error": "args object required"}).to_string();
     };
-    let principal = arguments
-        .get("principal")
-        .and_then(|v| v.as_str());
+    let principal = arguments.get("principal").and_then(|v| v.as_str());
     let workspace_root = crate::daemon::resolve_project_root();
     let kernel = crate::kernel::AgentKernel::new(store.clone(), bus.clone(), workspace_root);
     match kernel
@@ -2111,6 +2104,101 @@ pub(crate) async fn handle_data_connector(
     {
         Ok(value) => serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()),
         Err(e) => serde_json::json!({"ok": false, "error": e.to_string()}).to_string(),
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod context_plan_benchmark_instrumentation {
+    use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Mutex;
+
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    static REGISTRY_ROOT_READS: AtomicU64 = AtomicU64::new(0);
+    static STORE_MEMORY_MULTIFORM_OPS: AtomicU64 = AtomicU64::new(0);
+    static AST_FORM_QUERIES: AtomicU64 = AtomicU64::new(0);
+    static BRIDGE_ENRICHMENT_PASSES: AtomicU64 = AtomicU64::new(0);
+    static LOGICAL_FILES_ENRICHED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+    pub(crate) struct DisableOnDrop;
+
+    impl Drop for DisableOnDrop {
+        fn drop(&mut self) {
+            ENABLED.store(false, Ordering::Relaxed);
+            reset_counts();
+        }
+    }
+
+    fn reset_counts() {
+        REGISTRY_ROOT_READS.store(0, Ordering::Relaxed);
+        STORE_MEMORY_MULTIFORM_OPS.store(0, Ordering::Relaxed);
+        AST_FORM_QUERIES.store(0, Ordering::Relaxed);
+        BRIDGE_ENRICHMENT_PASSES.store(0, Ordering::Relaxed);
+        LOGICAL_FILES_ENRICHED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    pub(crate) fn enable() -> DisableOnDrop {
+        reset_counts();
+        ENABLED.store(true, Ordering::Relaxed);
+        DisableOnDrop
+    }
+
+    pub(crate) fn begin_request() {
+        reset_counts();
+    }
+
+    pub(crate) fn record_registry_root_read() {
+        if ENABLED.load(Ordering::Relaxed) {
+            REGISTRY_ROOT_READS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_store_memory_multiform_op() {
+        if ENABLED.load(Ordering::Relaxed) {
+            STORE_MEMORY_MULTIFORM_OPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_ast_form_query() {
+        if ENABLED.load(Ordering::Relaxed) {
+            AST_FORM_QUERIES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_bridge_enrichment_pass() {
+        if ENABLED.load(Ordering::Relaxed) {
+            BRIDGE_ENRICHMENT_PASSES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_logical_file_enriched(path: &str) {
+        if ENABLED.load(Ordering::Relaxed) {
+            LOGICAL_FILES_ENRICHED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(crate::parser::ingest::normalize_node_path(path));
+        }
+    }
+
+    pub(crate) fn logical_files_enriched() -> BTreeSet<String> {
+        LOGICAL_FILES_ENRICHED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn snapshot() -> serde_json::Value {
+        let logical_files_enriched = logical_files_enriched().len();
+        serde_json::json!({
+            "registry_root_reads_per_request": REGISTRY_ROOT_READS.load(Ordering::Relaxed),
+            "store_memory_multiform_ops_per_request": STORE_MEMORY_MULTIFORM_OPS.load(Ordering::Relaxed),
+            "ast_form_queries_per_request": AST_FORM_QUERIES.load(Ordering::Relaxed),
+            "bridge_enrichment_passes_per_request": BRIDGE_ENRICHMENT_PASSES.load(Ordering::Relaxed),
+            "logical_files_enriched_per_request": logical_files_enriched,
+        })
     }
 }
 
@@ -2135,18 +2223,35 @@ async fn handle_context_plan(
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let file_path = arguments.get("file_path").and_then(|v| v.as_str());
+    // Dedupe requested work at construction time by the same normalized path
+    // key the lookup/form layer uses, keeping first-seen order and the caller's
+    // original spelling for the synthetic source item below.
     let requested_files: Vec<String> = {
         let mut v: Vec<String> = Vec::new();
+        let mut seen_norm: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut push_dedup = |raw: &str| {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return;
+            }
+            let key = crate::parser::ingest::normalize_node_path(trimmed);
+            let dedup_key = if key.is_empty() {
+                trimmed.to_string()
+            } else {
+                key
+            };
+            if seen_norm.insert(dedup_key) {
+                v.push(raw.to_string());
+            }
+        };
         if let Some(fp) = file_path {
-            v.push(fp.to_string());
+            push_dedup(fp);
         }
         for key in ["files", "file_paths"] {
             if let Some(Value::Array(arr)) = arguments.get(key) {
                 for it in arr {
                     if let Some(s) = it.as_str() {
-                        if !s.is_empty() && !v.iter().any(|e| e == s) {
-                            v.push(s.to_string());
-                        }
+                        push_dedup(s);
                     }
                 }
             }
@@ -2293,54 +2398,101 @@ async fn handle_context_plan(
     // hits governing each requested file path and surface them as plan items.
     // `unsupported` backends still yield a plan -- just without this half.
     {
-        use crate::traits::GraphRead;
         let ladybug = crate::traits::VectorStore::as_any(store.as_ref())
             .downcast_ref::<crate::store::LadybugStore>();
         if let Some(ls) = ladybug {
-            for fp in &requested_files {
-                // Same resolution as neurostrata_memories_for_file, so an
-                // absolute file path reaches the relative locations it names.
-                let forms = match lookup_path_for(&store, effective_ns, fp, None).await {
-                    Ok((_, forms)) => forms,
-                    Err(e) => {
-                        had_backend_error = true;
-                        tracing::warn!("context_plan path lookup error: {e:#}");
-                        continue;
-                    }
-                };
-                match memories_for_forms(
-                    ls,
-                    effective_ns,
-                    None,
-                    &forms,
-                    None,
-                    true,
-                    &crate::graph_read::memories_for_file::DEFAULT_MEMORY_TYPES
+            if !requested_files.is_empty() {
+                // One registry read per request, shared by every logical file.
+                // lookup_path_for would re-read it on each requested file.
+                let registry_root_read = crate::registry::cached_project_root(&store, effective_ns)
+                    .await
+                    .map_err(|e| e.to_string());
+                let default_memory_types =
+                    crate::graph_read::memories_for_file::DEFAULT_MEMORY_TYPES
                         .iter()
                         .map(|s| s.to_string())
-                        .collect::<Vec<String>>(),
-                    &[],
-                    max_items.max(1),
-                )
-                .await
-                {
-                    Ok(hits) => {
-                        for hit in hits {
-                            if items.iter().any(|it| it.id == hit.id) {
+                        .collect::<Vec<String>>();
+                let mut seen_logical_files: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                for fp in &requested_files {
+                    // Same resolution as neurostrata_memories_for_file, but
+                    // against the hoisted registry root. An absolute spelling
+                    // therefore reaches the same relative locations as its
+                    // relative twin and is recognized as the same logical file.
+                    let registry_root = match registry_root_for_lookup(
+                        registry_root_read
+                            .as_ref()
+                            .cloned()
+                            .map_err(|e| anyhow::anyhow!("{e}")),
+                        effective_ns,
+                        fp,
+                        None,
+                    ) {
+                        Ok(root) => root,
+                        Err(e) => {
+                            had_backend_error = true;
+                            tracing::warn!("context_plan path lookup error: {e:#}");
+                            continue;
+                        }
+                    };
+                    let (lookup, forms) =
+                        match lookup_path_with_registry_root(fp, None, registry_root.as_deref()) {
+                            Ok(found) => found,
+                            Err(e) => {
+                                had_backend_error = true;
+                                tracing::warn!("context_plan path lookup error: {e:#}");
                                 continue;
                             }
-                            items.push(ContextItem {
-                                id: hit.id,
-                                memory_type: hit.memory_type,
-                                content: hit.content,
-                                freshness: None,
-                            });
+                        };
+                    let logical_key = {
+                        let norm = crate::parser::ingest::normalize_node_path(&lookup.path);
+                        if norm.is_empty() {
+                            lookup.path.clone()
+                        } else {
+                            norm
                         }
-                    }
-                    Err(e) => {
-                        had_backend_error = true;
-                        tracing::warn!("context_plan backend error: {e}");
+                    };
+                    if !seen_logical_files.insert(logical_key) {
                         continue;
+                    }
+                    match memories_for_forms(
+                        ls,
+                        effective_ns,
+                        None,
+                        &forms,
+                        None,
+                        true,
+                        &default_memory_types,
+                        &[],
+                        max_items.max(1),
+                    )
+                    .await
+                    {
+                        Ok(retrieval) => {
+                            let hits = retrieval.hits;
+                            #[cfg(test)]
+                            if !hits.is_empty() {
+                                context_plan_benchmark_instrumentation::record_logical_file_enriched(
+                                    &lookup.path,
+                                );
+                            }
+                            for hit in hits {
+                                if items.iter().any(|it| it.id == hit.id) {
+                                    continue;
+                                }
+                                items.push(ContextItem {
+                                    id: hit.id,
+                                    memory_type: hit.memory_type,
+                                    content: hit.content,
+                                    freshness: None,
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            had_backend_error = true;
+                            tracing::warn!("context_plan backend error: {e}");
+                            continue;
+                        }
                     }
                 }
             }
@@ -2733,12 +2885,25 @@ async fn lookup_path_for(
         path,
         project_root,
     )?;
-    let lookup = crate::paths::to_project_relative(path, project_root, registry_root.as_deref());
-    let known_root = project_root
-        .filter(|root| crate::paths::is_usable_root(root))
-        .or(registry_root.as_deref());
-    let forms = crate::paths::lookup_forms(path, &lookup, known_root);
-    Ok((lookup, forms))
+    Ok(lookup_path_with_registry_root(
+        path,
+        project_root,
+        registry_root.as_deref(),
+    )?)
+}
+
+fn lookup_path_with_registry_root(
+    path: &str,
+    project_root: Option<&str>,
+    registry_root: Option<&str>,
+) -> Result<(crate::paths::LookupPath, Vec<String>), crate::paths::UnresolvablePathError> {
+    let resolved = crate::paths::resolve_in_scope_forms(
+        path,
+        project_root,
+        registry_root,
+        crate::paths::PathResolutionScope::File,
+    )?;
+    Ok((resolved.lookup, resolved.forms))
 }
 
 /// The registered root to resolve `path` with, given the result of reading it.
@@ -2775,6 +2940,9 @@ fn registry_root_for_lookup(
 /// only when no spelling succeeded. With more than one spelling the hits are
 /// ranked with `rank_hits`, deduplicated by id (best-ranked kept) and cut to
 /// `limit` (also capped at `MAX_LIMIT`).
+///
+/// Retained for its unit tests; multi-form merging now lives in the store.
+#[cfg_attr(not(test), allow(dead_code))]
 fn merge_spelling_results(
     results: Vec<anyhow::Result<Vec<crate::graph_read::memories_for_file::MemoryHit>>>,
     limit: usize,
@@ -2809,10 +2977,9 @@ fn merge_spelling_results(
     Ok(hits)
 }
 
-/// `memories_for_file` over every spelling in `forms`. With one form this is
-/// the single lookup; with more, [`merge_spelling_results`] merges, ranks,
-/// deduplicates and cuts the hits. A failed spelling is logged and kept aside;
-/// its error is returned only when no spelling succeeded.
+/// `memories_for_file` over every spelling in `forms`, as one logical query:
+/// the store collects raw candidates per spelling, merges/ranks/dedups them
+/// globally, caps to `limit`, and enriches bridges exactly once.
 #[allow(clippy::too_many_arguments)]
 async fn memories_for_forms(
     store: &crate::store::LadybugStore,
@@ -2824,82 +2991,286 @@ async fn memories_for_forms(
     memory_types: &[String],
     exclude_ids: &[String],
     limit: usize,
-) -> anyhow::Result<Vec<crate::graph_read::memories_for_file::MemoryHit>> {
-    let mut results = Vec::with_capacity(forms.len());
-    for form in forms {
-        let result = store
-            .memories_for_file(
-                namespace,
-                source,
-                form,
-                symbol,
-                include_ancestors,
-                memory_types,
-                exclude_ids,
-                limit,
-            )
-            .await;
-        if let Err(e) = &result {
-            tracing::warn!("memories_for_file lookup of {form:?} failed: {e}");
+) -> anyhow::Result<crate::store::ladybug::MultiFormMemoryRetrieval> {
+    store
+        .memories_for_file_forms(
+            namespace,
+            source,
+            forms,
+            symbol,
+            include_ancestors,
+            memory_types,
+            exclude_ids,
+            limit,
+        )
+        .await
+}
+
+/// Union of AST neighborhood results across all equivalent path spellings.
+#[derive(Debug, Clone)]
+struct AstNeighborhoodUnion {
+    related_memories: Vec<serde_json::Value>,
+    ast_summary: serde_json::Value,
+}
+
+/// Deterministically merge the per-form AST neighborhood results. Every
+/// spelling contributes; truncation is preserved rather than being mistaken
+/// for "this spelling found nothing".
+fn merge_ast_neighborhood_results(
+    results: Vec<anyhow::Result<(Vec<serde_json::Value>, serde_json::Value)>>,
+) -> anyhow::Result<AstNeighborhoodUnion> {
+    const AST_COLLECTIONS: [&str; 5] = ["symbols", "callers", "callees", "imports", "importers"];
+
+    fn item_key(item: &serde_json::Value, collection: &str) -> String {
+        if collection == "imports" {
+            if let Some(path) = item
+                .get("path")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                return format!("path:{path}");
+            }
+            if let Some(path) = item.get("path") {
+                return format!("path-json:{path}");
+            }
+            return format!("json:{item}");
         }
-        results.push(result);
+        if let Some(id) = item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            return format!("id:{id}");
+        }
+        let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let relation = item
+            .get("relation")
+            .and_then(|v| v.as_str())
+            .or_else(|| item.get("kind").and_then(|v| v.as_str()))
+            .unwrap_or("");
+        let path = item.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        let start = item.get("start_line").and_then(|v| v.as_u64()).unwrap_or(0);
+        let end = item.get("end_line").and_then(|v| v.as_u64()).unwrap_or(0);
+        if name.is_empty() && relation.is_empty() && path.is_empty() && start == 0 && end == 0 {
+            return format!("json:{item}");
+        }
+        format!("tuple:{name}|{relation}|{path}|{start}|{end}")
     }
-    merge_spelling_results(results, limit)
-}
 
-/// Whether an `ast_summary` found nothing for the file: no symbols, edges or
-/// importers, and no blast radius.
-fn ast_summary_is_empty(summary: &serde_json::Value) -> bool {
-    let empty = |key: &str| {
-        summary
-            .get(key)
-            .and_then(|v| v.as_array())
-            .is_none_or(|a| a.is_empty())
-    };
-    ["symbols", "callers", "callees", "imports", "importers"]
+    let max_related = crate::store::LadybugStore::MAX_RELATED_MEMORIES;
+    let related_byte_budget = crate::store::LadybugStore::MAX_NEIGHBORHOOD_RESPONSE_BYTES / 2;
+    let max_items = crate::store::LadybugStore::MAX_AST_COLLECTION_ITEMS;
+
+    let mut any_success = false;
+    let mut first_error: Option<String> = None;
+    let mut merged_related: Vec<serde_json::Value> = Vec::new();
+    let mut seen_related: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut related_bytes: usize = 0;
+    let mut related_memories_truncated = false;
+    let mut related_stop = false;
+    let mut truncated = false;
+    let mut truncated_set: std::collections::HashSet<&'static str> =
+        std::collections::HashSet::new();
+    let mut count_includes_symbols = false;
+
+    // Pass 1: union related memories and fold per-form metadata/flags.
+    for result in &results {
+        match result.as_ref() {
+            Ok((related, summary)) => {
+                any_success = true;
+                if !related_stop {
+                    for item in related {
+                        let key = format!(
+                            "{}\u{1f}{}\u{1f}{}\u{1f}{}",
+                            item.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+                            item.get("relation").and_then(|v| v.as_str()).unwrap_or(""),
+                            item.get("direction").and_then(|v| v.as_str()).unwrap_or(""),
+                            item.get("supersedes")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                        );
+                        if seen_related.contains(&key) {
+                            continue;
+                        }
+                        let entry_bytes =
+                            serde_json::to_string(item).map(|s| s.len()).unwrap_or(128);
+                        if merged_related.len() >= max_related
+                            || (!merged_related.is_empty()
+                                && related_bytes + entry_bytes > related_byte_budget)
+                        {
+                            related_memories_truncated = true;
+                            related_stop = true;
+                            break;
+                        }
+                        seen_related.insert(key);
+                        related_bytes += entry_bytes;
+                        merged_related.push(item.clone());
+                    }
+                }
+                if summary
+                    .get("related_memories_truncated")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    related_memories_truncated = true;
+                }
+                if summary
+                    .get("truncated")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    truncated = true;
+                }
+                if let Some(names) = summary
+                    .get("truncated_collections")
+                    .and_then(|v| v.as_array())
+                {
+                    for name in names {
+                        if let Some(name) = name.as_str() {
+                            truncated = true;
+                            if let Some(canonical) =
+                                AST_COLLECTIONS.iter().find(|candidate| **candidate == name)
+                            {
+                                truncated_set.insert(*canonical);
+                            }
+                        }
+                    }
+                }
+                let form_symbols = summary
+                    .get("symbols")
+                    .and_then(|v| v.as_array())
+                    .map_or(0, |a| a.len());
+                let form_neighbors: usize = ["callers", "callees", "imports", "importers"]
+                    .iter()
+                    .map(|key| {
+                        summary
+                            .get(*key)
+                            .and_then(|v| v.as_array())
+                            .map_or(0, |a| a.len())
+                    })
+                    .sum();
+                let form_blast_radius = summary
+                    .get("blast_radius_count")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
+                if form_symbols > 0 && form_blast_radius == form_symbols + form_neighbors {
+                    count_includes_symbols = true;
+                }
+            }
+            Err(e) => {
+                if first_error.is_none() {
+                    first_error = Some(e.to_string());
+                }
+            }
+        }
+    }
+
+    if !any_success {
+        return Err(match first_error {
+            Some(message) => anyhow::anyhow!(message),
+            None => anyhow::anyhow!("no AST forms provided"),
+        });
+    }
+
+    // Pass 2: union the canonical AST collections under the remaining budget.
+    let ast_byte_budget =
+        crate::store::LadybugStore::MAX_NEIGHBORHOOD_RESPONSE_BYTES.saturating_sub(related_bytes);
+    let mut buckets: Vec<Vec<serde_json::Value>> =
+        AST_COLLECTIONS.iter().map(|_| Vec::new()).collect();
+    let mut seen_items: Vec<std::collections::HashSet<String>> = AST_COLLECTIONS
         .iter()
-        .all(|k| empty(k))
-        && summary
-            .get("blast_radius_count")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0)
-            == 0
+        .map(|_| std::collections::HashSet::new())
+        .collect();
+    let mut collection_full: Vec<bool> = vec![false; AST_COLLECTIONS.len()];
+    let mut ast_bytes: usize = 0;
+
+    for result in &results {
+        let Ok((_, summary)) = result.as_ref() else {
+            continue;
+        };
+        for (index, name) in AST_COLLECTIONS.iter().enumerate() {
+            if collection_full[index] {
+                continue;
+            }
+            let Some(items) = summary.get(*name).and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for entry in items {
+                let key = item_key(entry, name);
+                if seen_items[index].contains(&key) {
+                    continue;
+                }
+                let entry_bytes = serde_json::to_string(entry).map(|s| s.len()).unwrap_or(64);
+                if buckets[index].len() >= max_items
+                    || (!buckets[index].is_empty() && ast_bytes + entry_bytes > ast_byte_budget)
+                {
+                    truncated = true;
+                    truncated_set.insert(*name);
+                    collection_full[index] = true;
+                    break;
+                }
+                seen_items[index].insert(key);
+                ast_bytes += entry_bytes;
+                buckets[index].push(entry.clone());
+            }
+        }
+    }
+
+    let truncated_collections: Vec<&str> = AST_COLLECTIONS
+        .iter()
+        .copied()
+        .filter(|name| truncated_set.contains(name))
+        .collect();
+    let union_neighbors = buckets[1].len() + buckets[2].len() + buckets[3].len() + buckets[4].len();
+    let blast_radius_count = if count_includes_symbols {
+        buckets[0].len() + union_neighbors
+    } else {
+        union_neighbors
+    };
+    let symbols = std::mem::take(&mut buckets[0]);
+    let callers = std::mem::take(&mut buckets[1]);
+    let callees = std::mem::take(&mut buckets[2]);
+    let imports = std::mem::take(&mut buckets[3]);
+    let importers = std::mem::take(&mut buckets[4]);
+    let ast_summary = serde_json::json!({
+        "symbols": symbols,
+        "callers": callers,
+        "callees": callees,
+        "imports": imports,
+        "importers": importers,
+        "blast_radius_count": blast_radius_count,
+        "truncated": truncated,
+        "truncated_collections": truncated_collections,
+        "related_memories_truncated": related_memories_truncated,
+    });
+
+    Ok(AstNeighborhoodUnion {
+        related_memories: merged_related,
+        ast_summary,
+    })
 }
 
-/// `ast_neighborhood_for_file` over the same spellings as
-/// [`memories_for_forms`]: the first spelling whose AST summary is not empty
-/// wins, so a database that stores absolute file locations still answers an
-/// absolute request. When every spelling is empty, the first answer stands; an
-/// error is returned only when no spelling answered at all.
+/// Query every equivalent path spelling and union their AST neighborhoods.
 async fn ast_neighborhood_for_forms(
     store: &crate::store::LadybugStore,
     namespace: &str,
     source: Option<&str>,
     forms: &[String],
     governing_ids: &[String],
-) -> anyhow::Result<(Vec<serde_json::Value>, serde_json::Value)> {
-    let mut first = None;
-    let mut first_error = None;
+) -> anyhow::Result<AstNeighborhoodUnion> {
+    let mut results = Vec::with_capacity(forms.len());
     for form in forms {
-        match store
+        #[cfg(test)]
+        context_plan_benchmark_instrumentation::record_ast_form_query();
+        let res = store
             .ast_neighborhood_for_file(namespace, source, form, governing_ids)
-            .await
-        {
-            Ok(found) if !ast_summary_is_empty(&found.1) => return Ok(found),
-            Ok(found) => {
-                first.get_or_insert(found);
-            }
-            Err(e) => {
-                tracing::warn!("ast_neighborhood_for_file lookup of {form:?} failed: {e}");
-                first_error.get_or_insert(e);
-            }
+            .await;
+        if let Err(e) = &res {
+            tracing::warn!("ast_neighborhood_for_file lookup of {form:?} failed: {e}");
         }
+        results.push(res);
     }
-    match (first, first_error) {
-        (Some(found), _) => Ok(found),
-        (None, Some(e)) => Err(e),
-        (None, None) => Err(anyhow::anyhow!("no lookup spelling for the file")),
-    }
+    merge_ast_neighborhood_results(results)
 }
 
 /// The `neurostrata_memories_for_file` handler. Returns a JSON object carrying
@@ -2971,17 +3342,23 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
             let graph_read = crate::traits::VectorStore::as_any(store.as_ref())
                 .downcast_ref::<crate::store::LadybugStore>()
                 .is_some();
-            return serde_json::json!({
+            let mut response = serde_json::json!({
                 "memories": [],
                 "unsupported": !graph_read,
                 "path": path,
                 "error": format!("{e:#}"),
-            })
-            .to_string();
+            });
+            if e.downcast_ref::<crate::paths::UnresolvablePathError>()
+                .is_some()
+            {
+                response["resolved_path"] = serde_json::Value::String(path.to_string());
+                response["resolved_from"] =
+                    serde_json::json!(crate::paths::RootSource::Outside.as_str());
+            }
+            return response.to_string();
         }
     };
     let original_path = path;
-    let path = lookup.path.as_str();
 
     // The graph-read capability is optional per backend: only LadybugStore
     // implements it (spec §4.6). Anything else answers `unsupported` -- never
@@ -3010,7 +3387,8 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
     )
     .await
     {
-        Ok(hits) => {
+        Ok(retrieval) => {
+            let hits = retrieval.hits;
             // Capability C: attach the shared deprecation/boundary presentation
             // to every governed-memory row before it leaves this surface.
             // MemoryHit is a typed struct; decorate its serialized form so the
@@ -3028,6 +3406,9 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
                 "unsupported": false,
                 "path": original_path,
             });
+            if retrieval.candidate_truncated {
+                response["candidate_truncated"] = serde_json::json!(true);
+            }
             // An absolute path says what it was looked up as, so a miss on a
             // file outside every known root is visible rather than silent.
             if lookup.source != crate::paths::RootSource::Relative {
@@ -3048,7 +3429,10 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
                 )
                 .await
                 {
-                    Ok((related_memories, ast_summary)) => {
+                    Ok(AstNeighborhoodUnion {
+                        related_memories,
+                        ast_summary,
+                    }) => {
                         let related_truncated = ast_summary
                             .get("related_memories_truncated")
                             .and_then(|v| v.as_bool())
@@ -3103,6 +3487,33 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
     }
 }
 
+#[cfg(test)]
+static RELATED_TRAVERSAL_COUNTER: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn reset_related_traversal_counter_for_tests() {
+    RELATED_TRAVERSAL_COUNTER.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn related_traversal_counter_for_tests() -> usize {
+    RELATED_TRAVERSAL_COUNTER.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Whether a `related` seed names a file path (and so needs canonical
+/// resolution before traversal) rather than a memory/task id. Qualified ids
+/// and symbol ids (`a::b`) are never file paths.
+fn is_file_path_seed(seed: &str) -> bool {
+    if crate::paths::is_absolute_any(seed) {
+        return true;
+    }
+    if seed.contains("::") || seed.starts_with("file:") {
+        return false;
+    }
+    seed.contains('/') || seed.contains('\\')
+}
+
 /// The `neurostrata_related` handler. Returns the bounded traversal result plus
 /// `unsupported` (false for LadybugStore) and `seed` echoing the queried node,
 /// so a backend without graph-read is never mistaken for "nothing is related".
@@ -3117,8 +3528,10 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
         Some(n) => n,
         None => return "Missing 'id' parameter.".to_string(),
     };
+    let original_seed = seed;
     let namespace = resolve_namespace(&store, namespace).await;
     let store_for_meta = store.clone();
+    let project_root = arguments.get("project_root").and_then(|v| v.as_str());
 
     let relations: Vec<String> = match arguments.get("relations") {
         Some(Value::Array(arr)) => arr
@@ -3195,15 +3608,100 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
             "total": 0,
             "truncated": false,
             "unsupported": true,
-            "seed": seed,
+            "seed": original_seed,
         })
         .to_string();
     };
 
+    // A file-path seed is resolved to one canonical node id before traversal,
+    // so an absolute spelling and its relative spelling reach the same subgraph.
+    // Every failure below is fail closed: the traversal is never entered.
+    let mut traversal_seed = original_seed.to_string();
+    let mut resolved_seed_opt: Option<String> = None;
+    if is_file_path_seed(original_seed) {
+        let registry_root =
+            match crate::registry::cached_project_root(&store_for_meta, &namespace).await {
+                Ok(root) => root,
+                Err(e) => {
+                    return serde_json::json!({
+                        "nodes": [],
+                        "edges": [],
+                        "evidence": [],
+                        "total": 0,
+                        "truncated": false,
+                        "unsupported": false,
+                        "seed": original_seed,
+                        "error": e.to_string(),
+                    })
+                    .to_string();
+                }
+            };
+        let forms = match lookup_path_with_registry_root(
+            original_seed,
+            project_root,
+            registry_root.as_deref(),
+        ) {
+            Ok((_, forms)) => forms,
+            Err(e) => {
+                return serde_json::json!({
+                    "nodes": [],
+                    "edges": [],
+                    "evidence": [],
+                    "total": 0,
+                    "truncated": false,
+                    "unsupported": false,
+                    "seed": original_seed,
+                    "error": e.to_string(),
+                })
+                .to_string();
+            }
+        };
+        match store
+            .resolve_canonical_file_seed_id(&namespace, &forms)
+            .await
+        {
+            Ok(Some(canonical_id)) => {
+                traversal_seed = canonical_id.clone();
+                resolved_seed_opt = Some(canonical_id);
+            }
+            Ok(None) => {
+                return serde_json::json!({
+                    "nodes": [],
+                    "edges": [],
+                    "evidence": [],
+                    "total": 0,
+                    "truncated": false,
+                    "unsupported": false,
+                    "seed": original_seed,
+                    "error": format!(
+                        "unresolvable file seed '{original_seed}': no matching node in namespace '{namespace}'"
+                    ),
+                })
+                .to_string();
+            }
+            Err(e) => {
+                return serde_json::json!({
+                    "nodes": [],
+                    "edges": [],
+                    "evidence": [],
+                    "total": 0,
+                    "truncated": false,
+                    "unsupported": false,
+                    "seed": original_seed,
+                    "error": e.to_string(),
+                })
+                .to_string();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    RELATED_TRAVERSAL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
     match store
         .related(
             &namespace,
-            seed,
+            &traversal_seed,
             &relations,
             direction,
             max_hops,
@@ -3238,7 +3736,7 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
                     }
                 }
                 result.nodes.retain(|node| {
-                    if node.id == seed {
+                    if node.id == traversal_seed {
                         return true;
                     }
                     paths
@@ -3264,7 +3762,7 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
                     // the stored endpoints, so an incoming edge (`other -->
                     // seed`) has `target == seed`; keying by the last edge's
                     // target would mis-attribute the reached node.
-                    let mut cur = seed.to_string();
+                    let mut cur = traversal_seed.clone();
                     let chain: Vec<String> = evidence
                         .path
                         .iter()
@@ -3282,7 +3780,7 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
                     relations.insert(cur, chain);
                 }
                 // The seed itself is a direct match with no relation chain.
-                relations.entry(seed.to_string()).or_default();
+                relations.entry(traversal_seed.clone()).or_default();
                 let items: Vec<crate::graph_read::prioritized::RelatedItem> = result
                     .nodes
                     .iter()
@@ -3309,7 +3807,10 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
             // Capability C: traversal nodes carry a snippet but no metadata.
             // Hydrate just the presentation fields so related/recall exposes the
             // same banner and negative boundary as search and file lookup.
-            if let Some(nodes) = body.get_mut("nodes").and_then(serde_json::Value::as_array_mut) {
+            if let Some(nodes) = body
+                .get_mut("nodes")
+                .and_then(serde_json::Value::as_array_mut)
+            {
                 for node in nodes {
                     let Some(id) = node.get("id").and_then(serde_json::Value::as_str) else {
                         continue;
@@ -3325,7 +3826,10 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
             }
             if let Some(obj) = body.as_object_mut() {
                 obj.insert("unsupported".to_string(), serde_json::json!(false));
-                obj.insert("seed".to_string(), serde_json::json!(seed));
+                obj.insert("seed".to_string(), serde_json::json!(original_seed));
+                if let Some(ref resolved) = resolved_seed_opt {
+                    obj.insert("resolved_seed".to_string(), serde_json::json!(resolved));
+                }
                 if apply_temporal {
                     obj.insert(
                         "temporal_filter".to_string(),
@@ -3387,7 +3891,7 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
                         })
                         .collect();
                     let closure = crate::graph_read::related::closure_governs(
-                        seed,
+                        &traversal_seed,
                         &edges,
                         &crate::graph_read::related::QueryBudget::default(),
                     );
@@ -3410,7 +3914,7 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
             "total": 0,
             "truncated": false,
             "unsupported": false,
-            "seed": seed,
+            "seed": original_seed,
             "error": e.to_string(),
         })
         .to_string(),
@@ -5904,7 +6408,8 @@ async fn handle_ingest_bounded(
     let Some(lb) = crate::traits::VectorStore::as_any(store.as_ref())
         .downcast_ref::<crate::store::LadybugStore>()
     else {
-        return json!({"ok": false, "error": "bounded ingest requires the graph store"}).to_string();
+        return json!({"ok": false, "error": "bounded ingest requires the graph store"})
+            .to_string();
     };
 
     // ReBAC namespace write gate. The MCP path has no separate authenticated
@@ -8508,6 +9013,10 @@ pub(crate) async fn handle_insights_with_auth(
             .get("path_prefix")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
+        project_root: arguments
+            .get("project_root")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
         from_ts: arguments.get("from_ts").and_then(|v| v.as_i64()),
         to_ts: arguments.get("to_ts").and_then(|v| v.as_i64()),
         backfill_points: arguments
@@ -10166,7 +10675,8 @@ async fn handle_search_memory(
     // Upgraded SearchFilters (src/search.rs). Optional: defaults preserve
     // existing search behavior (include_code_ast defaults to true so searches
     // that match code_ast rows keep working unless explicitly disabled).
-    let search_filters = crate::search::SearchFilters {
+    let project_root = arguments.get("project_root").and_then(|v| v.as_str());
+    let mut search_filters = crate::search::SearchFilters {
         memory_types: arguments
             .get("memory_types")
             .and_then(|v| v.as_array())
@@ -10184,6 +10694,7 @@ async fn handle_search_memory(
             .get("path_prefix")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
+        path_prefix_forms: Vec::new(),
         exclude_stale: arguments
             .get("exclude_stale")
             .and_then(|v| v.as_bool())
@@ -10193,9 +10704,34 @@ async fn handle_search_memory(
             .and_then(|v| v.as_bool())
             .unwrap_or(true),
     };
+    if let Some(raw_prefix) = arguments
+        .get("path_prefix")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let registry_root = match crate::registry::cached_project_root(&store, namespace).await {
+            Ok(root) => root,
+            Err(e) => {
+                return format!(
+                    "ERROR [PATH_PREFIX]: failed to read namespace registry root for '{namespace}': {e}"
+                )
+            }
+        };
+        let prefix_forms = match crate::paths::prefix_lookup_forms(
+            raw_prefix,
+            project_root,
+            registry_root.as_deref(),
+        ) {
+            Ok(forms) => forms,
+            Err(e) => return format!("ERROR [PATH_PREFIX]: {e}"),
+        };
+        search_filters.path_prefix_forms = prefix_forms;
+    }
     let has_upgraded_filters = !search_filters.memory_types.is_empty()
         || search_filters.fact_shape.is_some()
         || search_filters.path_prefix.is_some()
+        || !search_filters.path_prefix_forms.is_empty()
         || search_filters.exclude_stale
         || !search_filters.include_code_ast;
     // domains filter (OR) - thread into search_with_domain? Store filters by domains already via `domain` param.
@@ -11258,9 +11794,7 @@ fn is_env_assignment_token(tok: &str) -> bool {
         return false;
     };
     !name.is_empty()
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         && !name.chars().next().unwrap().is_ascii_digit()
 }
 
@@ -11345,7 +11879,10 @@ pub(crate) fn is_zero_action_exempt_shell_payload(action_type: &str, payload: &s
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect();
-    !segments.is_empty() && segments.into_iter().all(is_zero_action_exempt_shell_segment)
+    !segments.is_empty()
+        && segments
+            .into_iter()
+            .all(is_zero_action_exempt_shell_segment)
 }
 
 /// Validate an action against stored behavioral rules and (optionally) the
@@ -11815,6 +12352,186 @@ mod tests {
     use super::*;
     use crate::events::{RecursionToken, ThalamicBus, ThalamicPulse};
     use crate::guard::testkit::MockStore;
+
+    #[test]
+    fn ast_neighborhood_union_preserves_truncation_and_recomputes_blast_radius() {
+        let form_a = Ok((
+            vec![serde_json::json!({"id":"r1","memory_type":"symbol","content":"a"})],
+            serde_json::json!({
+                "symbols":[{"id":"s1","name":"a"}],
+                "callers":[{"id":"c1","name":"caller1"}],
+                "callees":[],
+                "imports":[],
+                "importers":[],
+                "blast_radius_count":1,
+                "truncated":true,
+                "truncated_collections":["callers"]
+            }),
+        ));
+        let form_b = Ok((
+            vec![],
+            serde_json::json!({
+                "symbols":[{"id":"s2","name":"b"}],
+                "callers":[{"id":"c2","name":"caller2"}],
+                "callees":[],
+                "imports":[],
+                "importers":[],
+                "blast_radius_count":1,
+                "truncated":false,
+                "truncated_collections":[]
+            }),
+        ));
+        let merged = merge_ast_neighborhood_results(vec![form_a, form_b]).expect("union");
+        let summary = merged.ast_summary;
+        assert_eq!(summary["symbols"].as_array().map(|a| a.len()), Some(2));
+        assert_eq!(summary["callers"].as_array().map(|a| a.len()), Some(2));
+        assert_eq!(summary["truncated"], serde_json::json!(true));
+        assert_eq!(
+            summary["truncated_collections"],
+            serde_json::json!(["callers"])
+        );
+        assert_eq!(summary["blast_radius_count"], serde_json::json!(2));
+    }
+
+    #[test]
+    fn ast_neighborhood_union_treats_empty_with_truncation_as_evidence() {
+        let form_a = Ok((
+            vec![],
+            serde_json::json!({
+                "symbols":[], "callers":[], "callees":[], "imports":[], "importers":[],
+                "blast_radius_count":0, "truncated":true, "truncated_collections":["symbols"]
+            }),
+        ));
+        let form_b = Ok((
+            vec![],
+            serde_json::json!({
+                "symbols":[], "callers":[], "callees":[], "imports":[], "importers":[],
+                "blast_radius_count":0, "truncated":false, "truncated_collections":[]
+            }),
+        ));
+        let merged = merge_ast_neighborhood_results(vec![form_a, form_b]).expect("union");
+        assert_eq!(merged.ast_summary["truncated"], serde_json::json!(true));
+        assert_eq!(
+            merged.ast_summary["truncated_collections"],
+            serde_json::json!(["symbols"])
+        );
+    }
+
+    #[tokio::test]
+    async fn memories_for_file_fails_closed_on_cached_root_store_error() {
+        use crate::traits::{AsAny, UpsertReport, VectorStore};
+        use std::sync::Arc;
+
+        struct ErrRegistryStore {
+            inner: Arc<MockStore>,
+        }
+        impl AsAny for ErrRegistryStore {
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+        #[async_trait::async_trait]
+        impl VectorStore for ErrRegistryStore {
+            async fn init(&self, ns: &str) -> anyhow::Result<()> {
+                self.inner.init(ns).await
+            }
+            async fn upsert(
+                &self,
+                ns: &str,
+                id: &str,
+                v: Vec<f32>,
+                p: crate::traits::MemoryPayload,
+            ) -> anyhow::Result<UpsertReport> {
+                self.inner.upsert(ns, id, v, p).await
+            }
+            async fn search(
+                &self,
+                ns: &str,
+                v: Vec<f32>,
+                l: usize,
+                it: bool,
+                ia: bool,
+            ) -> anyhow::Result<Vec<crate::traits::SearchResult>> {
+                self.inner.search(ns, v, l, it, ia).await
+            }
+            async fn delete(&self, ns: &str, id: &str) -> anyhow::Result<()> {
+                self.inner.delete(ns, id).await
+            }
+            async fn clear_ingested(&self, ns: &str) -> anyhow::Result<()> {
+                self.inner.clear_ingested(ns).await
+            }
+            async fn relink_edges(&self, ns: &str, sk: &str) -> anyhow::Result<usize> {
+                self.inner.relink_edges(ns, sk).await
+            }
+            async fn list(
+                &self,
+                ns: &str,
+                u: Option<&str>,
+                mt: Option<&str>,
+            ) -> anyhow::Result<Vec<crate::traits::SearchResult>> {
+                self.inner.list(ns, u, mt).await
+            }
+            async fn get(
+                &self,
+                ns: &str,
+                id: &str,
+            ) -> anyhow::Result<Option<(Vec<f32>, crate::traits::MemoryPayload)>> {
+                if id == crate::registry::registry_row_id(ns) {
+                    Err(anyhow::anyhow!("registry-read-boom"))
+                } else {
+                    self.inner.get(ns, id).await
+                }
+            }
+            async fn relocate(
+                &self,
+                id: &str,
+                from: &str,
+                to: &str,
+            ) -> anyhow::Result<crate::traits::RelocateOutcome> {
+                self.inner.relocate(id, from, to).await
+            }
+            async fn list_namespaces(&self) -> anyhow::Result<Vec<String>> {
+                self.inner.list_namespaces().await
+            }
+            async fn export_graph(
+                &self,
+                ir: bool,
+                ia: bool,
+                pc: &std::collections::HashMap<String, std::path::PathBuf>,
+                ao: Option<&crate::source_context::ScopedAnchorOverride>,
+            ) -> anyhow::Result<serde_json::Value> {
+                self.inner.export_graph(ir, ia, pc, ao).await
+            }
+            async fn increment_access_count(&self, ns: &str, id: &str) -> anyhow::Result<()> {
+                self.inner.increment_access_count(ns, id).await
+            }
+            async fn export_database(&self, dir: &str) -> anyhow::Result<()> {
+                self.inner.export_database(dir).await
+            }
+            async fn checkpoint(&self) -> anyhow::Result<()> {
+                self.inner.checkpoint().await
+            }
+        }
+
+        let store: Arc<dyn VectorStore> = Arc::new(ErrRegistryStore {
+            inner: Arc::new(MockStore::new()),
+        });
+        let out = handle_memories_for_file(
+            serde_json::json!({"namespace":"ns","path":"/tmp/project/src/lib.rs"}),
+            store,
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&out).expect("json");
+        assert!(
+            v.get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("")
+                .contains("registry-read-boom")
+                || out.contains("registry-read-boom"),
+            "handler must surface the registry-root read error: {out}"
+        );
+        assert_eq!(v.get("unsupported").and_then(|b| b.as_bool()), Some(true));
+    }
 
     /// `#212`: the CLI's path-only `storage status` dispatch emits the
     /// filesystem-only payload — including `wal_age_secs` and the persisted
@@ -13198,6 +13915,374 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn prefix_filters_match_relative_and_absolute_stored_spellings_across_search_locate_and_insights(
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::LadybugStore::for_testing(tmp.path().join("db"), 384).expect("store"),
+        );
+        store.init("ns").await.expect("init ns");
+
+        let root = tmp.path().join("ns-v1190-prefix-root");
+        std::fs::create_dir_all(root.join("src")).expect("create src dir");
+        let abs_prefix = root.join("src").to_string_lossy().to_string();
+        let abs_b = root.join("src/b.rs").to_string_lossy().to_string();
+
+        store
+            .upsert(
+                "ns",
+                "sym:rel",
+                vec![0.1; 384],
+                MemoryPayload {
+                    content: "pub fn prefix_probe_token() { call_target_fn(); }".to_string(),
+                    location: "src/a.rs".to_string(),
+                    location_lines: "1-5".to_string(),
+                    memory_type: "code_ast".to_string(),
+                    metadata: serde_json::json!({
+                        "domain": "code_ast",
+                        "symbol": "prefix_probe_token",
+                        "symbol_kind": "functions",
+                        "calls": ["call_target_fn"],
+                        "locations": [{"path": "src/a.rs", "lines": "1-5"}]
+                    }),
+                    user_id: "test".to_string(),
+                    agent_name: None,
+                },
+            )
+            .await
+            .expect("upsert rel");
+        store
+            .upsert(
+                "ns",
+                "sym:abs",
+                vec![0.1; 384],
+                MemoryPayload {
+                    content: "pub fn prefix_probe_token_abs() { call_target_fn(); }".to_string(),
+                    location: abs_b.clone(),
+                    location_lines: "1-5".to_string(),
+                    memory_type: "code_ast".to_string(),
+                    metadata: serde_json::json!({
+                        "domain": "code_ast",
+                        "symbol": "prefix_probe_token_abs",
+                        "symbol_kind": "functions",
+                        "calls": ["call_target_fn"],
+                        "locations": [{"path": abs_b, "lines": "1-5"}]
+                    }),
+                    user_id: "test".to_string(),
+                    agent_name: None,
+                },
+            )
+            .await
+            .expect("upsert abs");
+
+        let search_out = handle_search_memory(
+            serde_json::json!({
+                "namespace": "ns",
+                "query": "prefix_probe_token",
+                "mode": "lexical-inhouse",
+                "path_prefix": abs_prefix,
+                "project_root": root.to_string_lossy(),
+                "include_code_ast": true
+            }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+        )
+        .await;
+        assert!(
+            search_out.contains("sym:rel") && search_out.contains("sym:abs"),
+            "search must match both stored spellings; got: {search_out}"
+        );
+
+        let locate_out = handle_locate(
+            &serde_json::json!({
+                "namespace": "ns",
+                "query": "prefix_probe_token",
+                "path_prefix": abs_prefix,
+                "project_root": root.to_string_lossy()
+            }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+        )
+        .await;
+        let locate_v: serde_json::Value = serde_json::from_str(&locate_out).expect("locate json");
+        assert_eq!(
+            locate_v["ok"],
+            serde_json::json!(true),
+            "locate: {locate_out}"
+        );
+        assert!(
+            locate_v["locations"]
+                .as_array()
+                .map(|a| a.len() >= 2)
+                .unwrap_or(false),
+            "locate must return both stored spellings; got: {locate_out}"
+        );
+
+        let define_out = handle_insights(
+            &serde_json::json!({
+                "namespace": "ns",
+                "action": "define",
+                "name": "calls_target",
+                "title": "Calls Target",
+                "query_kind": "ast_calls",
+                "query": "call_target_fn",
+                "path_prefix": "src",
+                "project_root": root.to_string_lossy()
+            }),
+            store.clone(),
+        )
+        .await;
+        let define_v: serde_json::Value = serde_json::from_str(&define_out).expect("define json");
+        assert_eq!(
+            define_v["ok"],
+            serde_json::json!(true),
+            "define: {define_out}"
+        );
+
+        let snap_out = handle_insights(
+            &serde_json::json!({
+                "namespace": "ns",
+                "action": "snapshot",
+                "name": "calls_target",
+                "project_root": root.to_string_lossy()
+            }),
+            store.clone(),
+        )
+        .await;
+        let snap_v: serde_json::Value = serde_json::from_str(&snap_out).expect("snapshot json");
+        assert_eq!(
+            snap_v["ok"],
+            serde_json::json!(true),
+            "snapshot: {snap_out}"
+        );
+        assert!(
+            snap_v["series"][0]["current_value"]
+                .as_f64()
+                .map(|v| v >= 2.0)
+                .unwrap_or(false),
+            "relative persisted prefix must match both stored spellings; got: {snap_out}"
+        );
+
+        let define_abs_out = handle_insights(
+            &serde_json::json!({
+                "namespace": "ns",
+                "action": "define",
+                "name": "calls_target_abs",
+                "title": "Calls Target Absolute",
+                "query_kind": "ast_calls",
+                "query": "call_target_fn",
+                "path_prefix": abs_prefix,
+                "project_root": root.to_string_lossy()
+            }),
+            store.clone(),
+        )
+        .await;
+        let define_abs_v: serde_json::Value =
+            serde_json::from_str(&define_abs_out).expect("define abs json");
+        assert_eq!(
+            define_abs_v["ok"],
+            serde_json::json!(true),
+            "define abs: {define_abs_out}"
+        );
+
+        let snap_abs_out = handle_insights(
+            &serde_json::json!({
+                "namespace": "ns",
+                "action": "snapshot",
+                "name": "calls_target_abs",
+                "project_root": root.to_string_lossy()
+            }),
+            store.clone(),
+        )
+        .await;
+        let snap_abs_v: serde_json::Value =
+            serde_json::from_str(&snap_abs_out).expect("snapshot abs json");
+        assert_eq!(
+            snap_abs_v["ok"],
+            serde_json::json!(true),
+            "snapshot abs: {snap_abs_out}"
+        );
+        assert!(
+            snap_abs_v["series"][0]["current_value"]
+                .as_f64()
+                .map(|v| v >= 2.0)
+                .unwrap_or(false),
+            "absolute persisted prefix must match both stored spellings; got: {snap_abs_out}"
+        );
+
+        // A prefix equal to `project_root` (or the cached registry root) must also
+        // resolve and match both relative and absolute stored entries under that root.
+        let root_prefix = root.to_string_lossy().to_string();
+        let search_root_out = handle_search_memory(
+            serde_json::json!({
+                "namespace": "ns",
+                "query": "prefix_probe_token",
+                "mode": "lexical-inhouse",
+                "path_prefix": root_prefix,
+                "project_root": root.to_string_lossy(),
+                "include_code_ast": true
+            }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+        )
+        .await;
+        assert!(
+            search_root_out.contains("sym:rel") && search_root_out.contains("sym:abs"),
+            "root-equal prefix in search must match both stored spellings; got: {search_root_out}"
+        );
+
+        let locate_root_out = handle_locate(
+            &serde_json::json!({
+                "namespace": "ns",
+                "query": "prefix_probe_token",
+                "path_prefix": root.to_string_lossy(),
+                "project_root": root.to_string_lossy()
+            }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+        )
+        .await;
+        let locate_root_v: serde_json::Value =
+            serde_json::from_str(&locate_root_out).expect("locate root json");
+        assert_eq!(
+            locate_root_v["ok"],
+            serde_json::json!(true),
+            "locate root: {locate_root_out}"
+        );
+        assert!(
+            locate_root_v["locations"]
+                .as_array()
+                .map(|a| a.len() >= 2)
+                .unwrap_or(false),
+            "root-equal prefix in locate must return both stored spellings; got: {locate_root_out}"
+        );
+
+        let define_root_out = handle_insights(
+            &serde_json::json!({
+                "namespace": "ns",
+                "action": "define",
+                "name": "calls_target_root",
+                "title": "Calls Target Root",
+                "query_kind": "ast_calls",
+                "query": "call_target_fn",
+                "path_prefix": root.to_string_lossy(),
+                "project_root": root.to_string_lossy()
+            }),
+            store.clone(),
+        )
+        .await;
+        let define_root_v: serde_json::Value =
+            serde_json::from_str(&define_root_out).expect("define root json");
+        assert_eq!(
+            define_root_v["ok"],
+            serde_json::json!(true),
+            "define root: {define_root_out}"
+        );
+
+        let snap_root_out = handle_insights(
+            &serde_json::json!({
+                "namespace": "ns",
+                "action": "snapshot",
+                "name": "calls_target_root",
+                "project_root": root.to_string_lossy()
+            }),
+            store.clone(),
+        )
+        .await;
+        let snap_root_v: serde_json::Value =
+            serde_json::from_str(&snap_root_out).expect("snapshot root json");
+        assert_eq!(
+            snap_root_v["ok"],
+            serde_json::json!(true),
+            "snapshot root: {snap_root_out}"
+        );
+        assert!(
+            snap_root_v["series"][0]["current_value"]
+                .as_f64()
+                .map(|v| v >= 2.0)
+                .unwrap_or(false),
+            "root-equal prefix in insights must match both stored spellings; got: {snap_root_out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prefix_filters_reject_unresolvable_absolute_prefix_across_search_locate_and_insights()
+    {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::LadybugStore::for_testing(tmp.path().join("db"), 384).expect("store"),
+        );
+        store.init("ns").await.expect("init ns");
+
+        let root = tmp.path().join("ns-v1190-prefix-unres");
+        let bad_prefix = "/outside/ns-v1190/prefix";
+
+        let search_out = handle_search_memory(
+            serde_json::json!({
+                "namespace": "ns",
+                "query": "anything",
+                "mode": "lexical-inhouse",
+                "path_prefix": bad_prefix,
+                "project_root": root.to_string_lossy()
+            }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+        )
+        .await;
+        assert!(
+            search_out.contains("ERROR") || search_out.contains("unresolvable"),
+            "search must fail closed on an unresolvable absolute prefix; got: {search_out}"
+        );
+
+        let locate_out = handle_locate(
+            &serde_json::json!({
+                "namespace": "ns",
+                "query": "anything",
+                "path_prefix": bad_prefix,
+                "project_root": root.to_string_lossy()
+            }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+        )
+        .await;
+        let locate_v: serde_json::Value = serde_json::from_str(&locate_out).expect("locate json");
+        assert_eq!(
+            locate_v["ok"],
+            serde_json::json!(false),
+            "locate must fail closed: {locate_out}"
+        );
+        assert!(
+            locate_v["error"].as_str().is_some(),
+            "locate must report an error: {locate_out}"
+        );
+
+        let ins_out = handle_insights(
+            &serde_json::json!({
+                "namespace": "ns",
+                "action": "define",
+                "name": "bad_prefix",
+                "title": "Bad Prefix",
+                "query_kind": "lexical",
+                "query": "anything",
+                "path_prefix": bad_prefix,
+                "project_root": root.to_string_lossy()
+            }),
+            store.clone(),
+        )
+        .await;
+        let ins_v: serde_json::Value = serde_json::from_str(&ins_out).expect("insights json");
+        assert_eq!(
+            ins_v["ok"],
+            serde_json::json!(false),
+            "insights define must fail closed: {ins_out}"
+        );
+        assert!(
+            ins_v["error"].as_str().is_some(),
+            "insights define must report an error: {ins_out}"
+        );
+    }
+
     /// `handle_search_memory` with `StubEmbedder` (no `NoisyEmbedder`
     /// workaround) succeeds: the search path is no longer a landmine that
     /// every test had to step around.
@@ -13581,7 +14666,9 @@ mod tests {
         )
         .await;
         assert!(
-            text.contains("[DEPRECATED — SUPERSEDED BY mem-replacement-42: replaced by the podman v2 rule]"),
+            text.contains(
+                "[DEPRECATED — SUPERSEDED BY mem-replacement-42: replaced by the podman v2 rule]"
+            ),
             "search must emit the exact banner: {text}"
         );
         assert!(
@@ -13616,7 +14703,9 @@ mod tests {
         let hit = parsed["memories"][0].clone();
         assert_eq!(
             hit["deprecation_banner"],
-            json!("[DEPRECATED — SUPERSEDED BY mem-replacement-42: replaced by the podman v2 rule]"),
+            json!(
+                "[DEPRECATED — SUPERSEDED BY mem-replacement-42: replaced by the podman v2 rule]"
+            ),
             "memories_for_file must carry the structured banner: {text}"
         );
         assert_eq!(
@@ -13658,9 +14747,109 @@ mod tests {
             .expect("seed node present");
         assert_eq!(
             seed["deprecation_banner"],
-            json!("[DEPRECATED — SUPERSEDED BY mem-replacement-42: replaced by the podman v2 rule]"),
+            json!(
+                "[DEPRECATED — SUPERSEDED BY mem-replacement-42: replaced by the podman v2 rule]"
+            ),
             "related must carry the structured banner: {text}"
         );
+    }
+
+    #[tokio::test]
+    async fn related_resolves_file_seed_across_absolute_and_relative_spellings() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&tmp.path().join("db"), 4)
+                .expect("open temp database"),
+        );
+        store.init("ns").await.expect("init namespace");
+
+        let mut p = payload("pub fn demo() {}");
+        p.user_id = "u".to_string();
+        p.memory_type = "structural".to_string();
+        p.agent_name = Some("a".to_string());
+        p.metadata = serde_json::json!({"locations":[{"path":"src/lib.rs"}]});
+        store
+            .upsert("ns", "file:src/lib.rs", vec![0.0; 4], p)
+            .await
+            .expect("seed file node");
+
+        reset_related_traversal_counter_for_tests();
+
+        let root = tmp.path().join("ns-v1190-related-root");
+        std::fs::create_dir_all(root.join("src")).expect("root src");
+        let abs_seed = root.join("src/lib.rs").to_string_lossy().to_string();
+
+        let rel_v: Value = serde_json::from_str(
+            &handle_related(
+                serde_json::json!({
+                    "namespace": "ns",
+                    "id": "src/lib.rs",
+                    "max_hops": 1,
+                    "limit": 20,
+                }),
+                store.clone(),
+            )
+            .await,
+        )
+        .expect("valid JSON");
+
+        let abs_v: Value = serde_json::from_str(
+            &handle_related(
+                serde_json::json!({
+                    "namespace": "ns",
+                    "id": abs_seed,
+                    "project_root": root.to_string_lossy(),
+                    "max_hops": 1,
+                    "limit": 20,
+                }),
+                store,
+            )
+            .await,
+        )
+        .expect("valid JSON");
+
+        assert!(rel_v.get("error").is_none(), "{rel_v}");
+        assert!(abs_v.get("error").is_none(), "{abs_v}");
+        assert_eq!(abs_v["seed"], serde_json::json!(abs_seed));
+        assert_eq!(abs_v["resolved_seed"], serde_json::json!("file:src/lib.rs"));
+        assert_eq!(rel_v["resolved_seed"], serde_json::json!("file:src/lib.rs"));
+        assert!(
+            !rel_v["nodes"].as_array().unwrap().is_empty(),
+            "relative seed must reach the file node: {rel_v}"
+        );
+        assert_eq!(rel_v["nodes"], abs_v["nodes"]);
+        assert_eq!(related_traversal_counter_for_tests(), 2);
+    }
+
+    #[tokio::test]
+    async fn related_unresolvable_absolute_file_seed_returns_explicit_error() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&tmp.path().join("db"), 4)
+                .expect("open temp database"),
+        );
+        store.init("ns").await.expect("init namespace");
+
+        reset_related_traversal_counter_for_tests();
+
+        let root = tmp.path().join("ns-v1190-related-unres");
+        let v: Value = serde_json::from_str(
+            &handle_related(
+                serde_json::json!({
+                    "namespace": "ns",
+                    "id": "/outside/ns-v1190/nope.rs",
+                    "project_root": root.to_string_lossy(),
+                    "max_hops": 1,
+                    "limit": 20,
+                }),
+                store,
+            )
+            .await,
+        )
+        .expect("valid JSON");
+
+        assert!(v.get("error").and_then(|e| e.as_str()).is_some(), "{v}");
+        assert_eq!(related_traversal_counter_for_tests(), 0);
     }
 
     #[tokio::test]
@@ -13677,7 +14866,10 @@ mod tests {
             .upsert(
                 "probe",
                 &id,
-                StubEmbedder.embed("decayed external API fact").await.unwrap(),
+                StubEmbedder
+                    .embed("decayed external API fact")
+                    .await
+                    .unwrap(),
                 p,
             )
             .await
@@ -13850,7 +15042,8 @@ mod tests {
         .await;
         let neighbor = neighbor_from(&text);
         assert_eq!(
-            neighbor["deprecation_banner"], serde_json::json!(banner),
+            neighbor["deprecation_banner"],
+            serde_json::json!(banner),
             "AST related_memories must carry the exact banner: {text}"
         );
         assert_eq!(
@@ -13976,7 +15169,11 @@ mod tests {
         let error = parsed["error"].as_str().unwrap_or_default();
         assert!(error.contains("registered project root"), "{text}");
         assert_eq!(parsed["memories"], json!([]), "{text}");
-        assert_eq!(parsed["unsupported"], json!(true), "this store has no graph read: {text}");
+        assert_eq!(
+            parsed["unsupported"],
+            json!(true),
+            "this store has no graph read: {text}"
+        );
 
         // A relative path is not placed by a root: no error. (This store has
         // no graph-read support, so it answers `unsupported`.)
@@ -14000,7 +15197,10 @@ mod tests {
         let err = got.expect_err("an unreadable root must not widen the lookup");
         let text = format!("{err:#}");
         assert!(text.contains("registered project root"), "{text}");
-        assert!(text.contains("store unavailable"), "keeps the cause: {text}");
+        assert!(
+            text.contains("store unavailable"),
+            "keeps the cause: {text}"
+        );
 
         // A relative path never takes that fallback; it goes on without the
         // registered root.
@@ -14243,6 +15443,264 @@ mod tests {
             ids(&parsed).len(),
             crate::graph_read::memories_for_file::MAX_LIMIT,
             "{parsed}"
+        );
+    }
+
+    /// #266 end-to-end: an absolute path resolved under a broader `project_root`
+    /// and the relative form resolved under the deeper registered root must
+    /// reach the same governing memories, while the primary resolution stays
+    /// `project_root`.
+    #[tokio::test]
+    async fn memories_for_file_absolute_and_relative_spellings_resolve_identically() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&tmp.path().join("db"), 4)
+                .expect("open temp database"),
+        );
+        store.init("ns").await.expect("init namespace");
+
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(workspace.join(".git")).expect("workspace .git");
+        let member = workspace.join("member");
+        std::fs::create_dir_all(member.join("src")).expect("member src");
+        let file = member.join("src").join("lib.rs");
+        std::fs::write(&file, "// lib").expect("write file");
+
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        crate::registry::cache_project_root(&store, Some(&emb), "ns", &member.to_string_lossy())
+            .await;
+
+        let abs_norm = file.to_string_lossy().replace('\\', "/");
+        for (id, governs) in [
+            ("rule-reg-rel", "src/lib.rs"),
+            ("rule-proj-rel", "member/src/lib.rs"),
+            ("rule-abs", abs_norm.as_str()),
+        ] {
+            let mut p = payload("rule");
+            p.metadata = serde_json::json!({"governs": [governs]});
+            store
+                .upsert("ns", id, vec![0.0; 4], p)
+                .await
+                .expect("seed governing rule");
+        }
+
+        let abs_v: Value = serde_json::from_str(
+            &handle_memories_for_file(
+                serde_json::json!({
+                    "namespace": "ns",
+                    "path": file.to_string_lossy(),
+                    "project_root": workspace.to_string_lossy(),
+                }),
+                store.clone(),
+            )
+            .await,
+        )
+        .expect("valid JSON");
+        assert!(abs_v.get("error").is_none(), "{abs_v}");
+        assert_eq!(
+            abs_v["resolved_path"],
+            serde_json::json!("member/src/lib.rs")
+        );
+        assert_eq!(abs_v["resolved_from"], serde_json::json!("project_root"));
+        let hit_ids = |v: &Value| -> Vec<String> {
+            v["memories"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(str::to_string))
+                .collect()
+        };
+        let abs_ids = hit_ids(&abs_v);
+        for id in ["rule-reg-rel", "rule-proj-rel", "rule-abs"] {
+            assert!(
+                abs_ids.iter().any(|got| got == id),
+                "{id} missing from {abs_ids:?}"
+            );
+        }
+
+        let rel_v: Value = serde_json::from_str(
+            &handle_memories_for_file(
+                serde_json::json!({"namespace": "ns", "path": "src/lib.rs"}),
+                store.clone(),
+            )
+            .await,
+        )
+        .expect("valid JSON");
+        assert!(rel_v.get("error").is_none(), "{rel_v}");
+        let rel_ids = hit_ids(&rel_v);
+        for id in ["rule-reg-rel", "rule-abs"] {
+            assert!(
+                rel_ids.iter().any(|got| got == id),
+                "{id} missing from {rel_ids:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn memories_for_file_and_context_plan_reject_unresolvable_outside_path_even_if_stored() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&tmp.path().join("db"), 4)
+                .expect("open temp database"),
+        );
+        store.init("ns").await.expect("init namespace");
+
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(root.join(".git")).expect("repo .git");
+        let outside = tmp.path().join("outside-repo").join("src").join("lib.rs");
+        std::fs::create_dir_all(outside.parent().unwrap()).expect("outside dir");
+        std::fs::write(&outside, "// outside").expect("write outside file");
+        let outside_s = outside.to_string_lossy().replace('\\', "/");
+
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        crate::registry::cache_project_root(&store, Some(&emb), "ns", &root.to_string_lossy())
+            .await;
+
+        let mut p = payload("rule");
+        p.content = "outside rule".to_string();
+        p.location = outside_s.clone();
+        p.metadata = serde_json::json!({"governs": [outside_s]});
+        store
+            .upsert("ns", "rule-outside", vec![0.1; 4], p)
+            .await
+            .expect("seed outside governing rule");
+
+        let mff_out = handle_memories_for_file(
+            serde_json::json!({
+                "namespace": "ns",
+                "path": outside_s,
+                "project_root": root.to_string_lossy(),
+            }),
+            store.clone(),
+        )
+        .await;
+        let mff_v: Value = serde_json::from_str(&mff_out).expect("valid JSON");
+        assert!(
+            mff_v["memories"]
+                .as_array()
+                .map(|a| a.is_empty())
+                .unwrap_or(false),
+            "unresolvable outside path must not return stored outside rule: {mff_v}"
+        );
+        assert_eq!(mff_v["resolved_from"], serde_json::json!("outside"));
+        let err_msg = mff_v
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or_default();
+        assert!(
+            err_msg.contains("unresolvable") || err_msg.contains("outside"),
+            "memories_for_file must surface unresolvable path error: {mff_v}"
+        );
+
+        let cp_out = handle_context_plan(
+            &serde_json::json!({
+                "namespace": "ns",
+                "files": [outside_s],
+                "max_items": 20,
+            }),
+            emb,
+            store,
+        )
+        .await;
+        let cp_v: Value = serde_json::from_str(&cp_out).expect("context_plan json");
+        let enriched_ids: Vec<&str> = cp_v["items"]
+            .as_array()
+            .expect("items array")
+            .iter()
+            .filter(|it| it.get("freshness").is_none())
+            .filter_map(|it| it["id"].as_str())
+            .collect();
+        assert!(
+            !enriched_ids.contains(&"rule-outside"),
+            "context_plan file enrichment must not match stored outside location on unresolvable file: {cp_v}"
+        );
+        assert_eq!(
+            cp_v["degradation"],
+            serde_json::json!("partial"),
+            "context_plan must degrade to partial on unresolvable file: {cp_v}"
+        );
+    }
+
+    /// #271/#272 end-to-end: `handle_memories_for_file` must union the AST
+    /// neighborhoods found under both equivalent spellings, not stop at the
+    /// first one that returns symbols.
+    #[tokio::test]
+    async fn memories_for_file_unions_ast_neighborhood_across_equivalent_spellings() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&tmp.path().join("db"), 4)
+                .expect("open temp database"),
+        );
+        store.init("ns").await.expect("init namespace");
+        let lb = crate::traits::VectorStore::as_any(store.as_ref())
+            .downcast_ref::<crate::store::ladybug::LadybugStore>()
+            .expect("ladybug store");
+
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(root.join(".git")).expect("repo .git");
+        std::fs::create_dir_all(root.join("src")).expect("repo src");
+        let abs_file = root.join("src").join("lib.rs");
+        std::fs::write(&abs_file, "// lib").expect("write file");
+        let abs_norm = abs_file.to_string_lossy().replace('\\', "/");
+
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        crate::registry::cache_project_root(&store, Some(&emb), "ns", &root.to_string_lossy())
+            .await;
+
+        lb.with_conn(move |conn| {
+            conn.query(&format!(
+                "CREATE (m:Memory {{id: 'sym-rel', namespace: 'ns', content: 'fn rel_fn', user_id: 'u', memory_type: 'code_ast', agent_name: 'a', location: 'src/lib.rs#functions:rel_fn@h1', location_lines: '', metadata: '{{}}', embedding: [0.0,0.0,0.0,0.0]}})"
+            ))?;
+            conn.query(&format!(
+                "CREATE (m:Memory {{id: 'sym-abs', namespace: 'ns', content: 'fn abs_fn', user_id: 'u', memory_type: 'code_ast', agent_name: 'a', location: '{abs_norm}#functions:abs_fn@h2', location_lines: '', metadata: '{{}}', embedding: [0.0,0.0,0.0,0.0]}})"
+            ))?;
+            Ok(())
+        })
+        .await
+        .expect("seed AST symbols under both spellings");
+
+        let symbol_ids = |v: &Value| -> Vec<String> {
+            v["ast_summary"]["symbols"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|s| s.get("id").and_then(|i| i.as_str()).map(str::to_string))
+                .collect()
+        };
+
+        let abs_v: Value = serde_json::from_str(
+            &handle_memories_for_file(
+                serde_json::json!({
+                    "namespace": "ns",
+                    "path": abs_file.to_string_lossy(),
+                    "project_root": root.to_string_lossy(),
+                }),
+                store.clone(),
+            )
+            .await,
+        )
+        .expect("valid JSON");
+        let abs_ids = symbol_ids(&abs_v);
+        assert!(abs_ids.iter().any(|id| id == "sym-rel"), "{abs_v}");
+        assert!(abs_ids.iter().any(|id| id == "sym-abs"), "{abs_v}");
+
+        let rel_v: Value = serde_json::from_str(
+            &handle_memories_for_file(
+                serde_json::json!({"namespace": "ns", "path": "src/lib.rs"}),
+                store.clone(),
+            )
+            .await,
+        )
+        .expect("valid JSON");
+        let rel_ids = symbol_ids(&rel_v);
+        assert!(rel_ids.iter().any(|id| id == "sym-rel"), "{rel_v}");
+        assert!(rel_ids.iter().any(|id| id == "sym-abs"), "{rel_v}");
+        assert_eq!(rel_ids, abs_ids, "both spellings must yield the same union");
+        assert_eq!(
+            rel_v["ast_summary"]["symbols"], abs_v["ast_summary"]["symbols"],
+            "full symbol arrays must match across spellings"
         );
     }
 
@@ -16301,7 +17759,11 @@ mod tests {
         .await;
         assert_eq!(response["jsonrpc"], serde_json::json!("2.0"), "{response}");
         assert_eq!(response["id"], serde_json::json!(41), "{response}");
-        assert_eq!(response["error"]["code"], serde_json::json!(METHOD_NOT_FOUND), "{response}");
+        assert_eq!(
+            response["error"]["code"],
+            serde_json::json!(METHOD_NOT_FOUND),
+            "{response}"
+        );
         assert!(response.get("result").is_none(), "{response}");
 
         let response = process_mcp_request(
@@ -16657,15 +18119,8 @@ mod tests {
                 }
             })),
         };
-        let call_resp = process_mcp_request(
-            call_req,
-            Arc::new(StubEmbedder),
-            store,
-            ingests,
-            None,
-            bus,
-        )
-        .await;
+        let call_resp =
+            process_mcp_request(call_req, Arc::new(StubEmbedder), store, ingests, None, bus).await;
         let text = call_resp["result"]["content"][0]["text"]
             .as_str()
             .expect("tool result text");
@@ -16751,20 +18206,24 @@ mod tests {
         ];
         // Nullable parity helper: Option<String> accepts null; as_u64()/as_bool()
         // on null map to the runtime default — discovery must not forbid null.
-        let assert_nullable =
-            |value: &serde_json::Value, want: &[&str], what: &str| {
-                let types: Vec<&str> = value["type"]
-                    .as_array()
-                    .unwrap_or_else(|| panic!("{what}: type must be a nullable array, got {}", value["type"]))
-                    .iter()
-                    .map(|t| t.as_str().expect("type is a string"))
-                    .collect();
-                let mut got = types;
-                got.sort();
-                let mut want_sorted = want.to_vec();
-                want_sorted.sort();
-                assert_eq!(got, want_sorted, "{what}: nullable type set");
-            };
+        let assert_nullable = |value: &serde_json::Value, want: &[&str], what: &str| {
+            let types: Vec<&str> = value["type"]
+                .as_array()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{what}: type must be a nullable array, got {}",
+                        value["type"]
+                    )
+                })
+                .iter()
+                .map(|t| t.as_str().expect("type is a string"))
+                .collect();
+            let mut got = types;
+            got.sort();
+            let mut want_sorted = want.to_vec();
+            want_sorted.sort();
+            assert_eq!(got, want_sorted, "{what}: nullable type set");
+        };
         let sorted = |value: &serde_json::Value, what: &str| -> Vec<String> {
             let mut keys: Vec<String> = value
                 .as_object()
@@ -16797,11 +18256,13 @@ mod tests {
                 .collect();
             assert_eq!(&req, required, "{op} required fields");
             let mut got_props = sorted(&variant["properties"], "variant properties");
-            let mut want_props: Vec<String> =
-                declared.iter().map(|s| s.to_string()).collect();
+            let mut want_props: Vec<String> = declared.iter().map(|s| s.to_string()).collect();
             got_props.sort();
             want_props.sort();
-            assert_eq!(got_props, want_props, "{op} declares exactly these properties");
+            assert_eq!(
+                got_props, want_props,
+                "{op} declares exactly these properties"
+            );
             if variant["properties"]["now_secs"].is_object() {
                 assert_nullable(
                     &variant["properties"]["now_secs"],
@@ -16854,7 +18315,10 @@ mod tests {
             .chain(std::iter::once("expected_source_sha256".to_string()))
             .collect();
         want_record_props.sort();
-        assert_eq!(record_props, want_record_props, "DataPointerRecord declares exactly these fields");
+        assert_eq!(
+            record_props, want_record_props,
+            "DataPointerRecord declares exactly these fields"
+        );
         assert_nullable(
             &record["properties"]["expected_source_sha256"],
             &["string", "null"],
@@ -16862,8 +18326,7 @@ mod tests {
         );
         for f in ["captured_at_secs", "max_staleness_secs"] {
             assert_eq!(
-                record["properties"][f]["type"],
-                "integer",
+                record["properties"][f]["type"], "integer",
                 "{f} is a u64, serialized as an integer"
             );
             assert_eq!(
@@ -16907,8 +18370,7 @@ mod tests {
             );
             for f in ["offset", "limit", "max_bytes"] {
                 assert_eq!(
-                    slice_schema["properties"][f]["type"],
-                    "integer",
+                    slice_schema["properties"][f]["type"], "integer",
                     "{op} {f} is a u32, serialized as an integer"
                 );
                 assert_eq!(
@@ -16952,7 +18414,10 @@ mod tests {
             .chain(std::iter::once("expected_source_sha256".to_string()))
             .collect();
         want_eff_props.sort();
-        assert_eq!(eff_props, want_eff_props, "ExternalEffectRequest declares exactly these fields");
+        assert_eq!(
+            eff_props, want_eff_props,
+            "ExternalEffectRequest declares exactly these fields"
+        );
         assert_nullable(
             &eff["properties"]["expected_source_sha256"],
             &["string", "null"],
@@ -16995,12 +18460,20 @@ mod tests {
 
     /// Shared fixture: creates a temp store with a seeded private data_pointer
     /// in the given namespace. Returns (store, ladybug_store, bus, ptr).
-    async fn seed_data_pointer_in_namespace(namespace: &str) -> (Arc<dyn VectorStore>, Arc<crate::store::ladybug::LadybugStore>, Arc<crate::events::ThalamicBus>, crate::connectors::DataPointerRecord) {
+    async fn seed_data_pointer_in_namespace(
+        namespace: &str,
+    ) -> (
+        Arc<dyn VectorStore>,
+        Arc<crate::store::ladybug::LadybugStore>,
+        Arc<crate::events::ThalamicBus>,
+        crate::connectors::DataPointerRecord,
+    ) {
         use crate::connectors::DataPointerRecord;
         use crate::store::ladybug::LadybugStore;
         use crate::traits::MemoryPayload;
 
-        let dir = std::env::temp_dir().join(format!("ns-dc-seed-{}-{}", namespace, uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("ns-dc-seed-{}-{}", namespace, uuid::Uuid::new_v4()));
         let ladybug_store = Arc::new(LadybugStore::for_testing(&dir, 4).expect("open temp"));
         let store: Arc<dyn VectorStore> = ladybug_store.clone();
         store.init(namespace).await.expect("init schema");
@@ -17031,7 +18504,14 @@ mod tests {
             location_lines: String::new(),
             metadata,
         };
-        crate::traits::OntologyStore::put_scoped_memory(&*ladybug_store, namespace, &ptr.pointer_id, &payload).await.expect("seed pointer");
+        crate::traits::OntologyStore::put_scoped_memory(
+            &*ladybug_store,
+            namespace,
+            &ptr.pointer_id,
+            &payload,
+        )
+        .await
+        .expect("seed pointer");
 
         (store, ladybug_store, bus, ptr)
     }
@@ -17066,11 +18546,30 @@ mod tests {
             });
             let response_text = handle_data_connector(&arguments, store.clone(), bus.clone()).await;
             let response: Value = serde_json::from_str(&response_text).expect("valid JSON");
-            assert_eq!(response["ok"], false, "malformed principal {:?} must be rejected, got: {}", malformed, response_text);
+            assert_eq!(
+                response["ok"], false,
+                "malformed principal {:?} must be rejected, got: {}",
+                malformed, response_text
+            );
             let err = response["error"].as_str().expect("error string");
-            assert!(err.contains("principal"), "error must mention principal for {:?}: {}", malformed, err);
-            assert!(!response_text.contains("ptr_secret"), "must not disclose pointer_id for {:?}: {}", malformed, response_text);
-            assert!(!response_text.contains("uri1"), "must not disclose pointer_uri for {:?}: {}", malformed, response_text);
+            assert!(
+                err.contains("principal"),
+                "error must mention principal for {:?}: {}",
+                malformed,
+                err
+            );
+            assert!(
+                !response_text.contains("ptr_secret"),
+                "must not disclose pointer_id for {:?}: {}",
+                malformed,
+                response_text
+            );
+            assert!(
+                !response_text.contains("uri1"),
+                "must not disclose pointer_uri for {:?}: {}",
+                malformed,
+                response_text
+            );
         }
     }
 
@@ -17104,11 +18603,30 @@ mod tests {
             });
             let response_text = handle_data_connector(&arguments, store.clone(), bus.clone()).await;
             let response: Value = serde_json::from_str(&response_text).expect("valid JSON");
-            assert_eq!(response["ok"], false, "malformed namespace {:?} must be rejected, got: {}", malformed, response_text);
+            assert_eq!(
+                response["ok"], false,
+                "malformed namespace {:?} must be rejected, got: {}",
+                malformed, response_text
+            );
             let err = response["error"].as_str().expect("error string");
-            assert!(err.contains("namespace"), "error must mention namespace for {:?}: {}", malformed, err);
-            assert!(!response_text.contains("ptr_secret"), "must not disclose pointer_id for {:?}: {}", malformed, response_text);
-            assert!(!response_text.contains("uri1"), "must not disclose pointer_uri for {:?}: {}", malformed, response_text);
+            assert!(
+                err.contains("namespace"),
+                "error must mention namespace for {:?}: {}",
+                malformed,
+                err
+            );
+            assert!(
+                !response_text.contains("ptr_secret"),
+                "must not disclose pointer_id for {:?}: {}",
+                malformed,
+                response_text
+            );
+            assert!(
+                !response_text.contains("uri1"),
+                "must not disclose pointer_uri for {:?}: {}",
+                malformed,
+                response_text
+            );
         }
     }
 
@@ -20139,6 +21657,430 @@ mod context_plan_tests {
         fn dimensions(&self) -> usize {
             4
         }
+    }
+
+    #[tokio::test]
+    async fn context_plan_hoists_registry_root_dedupes_equivalent_files_and_enriches_once_per_logical_file(
+    ) {
+        use crate::traits::{MemoryPayload, VectorStore};
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::LadybugStore::for_testing(&tmp.path().join("db"), 4).expect("open"),
+        );
+        store.init("ns").await.expect("init ns");
+
+        let root = tmp.path().join("ns-v1190-cp-root");
+        std::fs::create_dir_all(root.join("src")).expect("create src dir");
+        let f1 = root.join("src/one.rs");
+        let f2 = root.join("src/two.rs");
+        std::fs::write(&f1, "pub fn one() {}\n").expect("write one.rs");
+        std::fs::write(&f2, "pub fn two() {}\n").expect("write two.rs");
+
+        let embedder: Arc<dyn Embedder> = Arc::new(LocalStubEmbedder);
+        crate::registry::cache_project_root(&store, Some(&embedder), "ns", &root.to_string_lossy())
+            .await;
+
+        let abs1 = f1.to_string_lossy().to_string();
+        let abs2 = f2.to_string_lossy().to_string();
+        let seed = [
+            ("rule:one:rel", "src/one.rs".to_string(), "src/one.rs"),
+            ("rule:one:abs", abs1.clone(), abs1.as_str()),
+            ("rule:two:rel", "src/two.rs".to_string(), "src/two.rs"),
+        ];
+        for (id, location, governed) in seed {
+            store
+                .upsert(
+                    "ns",
+                    id,
+                    vec![0.1f32; 4],
+                    MemoryPayload {
+                        content: format!("governing {id}"),
+                        user_id: "test".to_string(),
+                        memory_type: "rule".to_string(),
+                        agent_name: None,
+                        location,
+                        location_lines: String::new(),
+                        metadata: serde_json::json!({"governs": [governed]}),
+                    },
+                )
+                .await
+                .expect("upsert governing rule");
+        }
+
+        let _instrumentation = super::context_plan_benchmark_instrumentation::enable();
+        super::context_plan_benchmark_instrumentation::begin_request();
+        let result = handle_context_plan(
+            &serde_json::json!({
+                "namespace": "ns",
+                "query": "rule",
+                "files": ["src/one.rs", abs1, "src/two.rs", abs2],
+                "max_items": 20,
+            }),
+            embedder.clone(),
+            store.clone(),
+        )
+        .await;
+        let snap = super::context_plan_benchmark_instrumentation::snapshot();
+        let plan: serde_json::Value = serde_json::from_str(&result).expect("plan json");
+
+        // Registry root is read once per request, not once per requested file.
+        assert_eq!(snap["registry_root_reads_per_request"], 1, "snap={snap}");
+        // Absolute and relative spellings collapse to two logical files.
+        assert_eq!(snap["logical_files_enriched_per_request"], 2, "snap={snap}");
+        // One enrichment pass per logical file's final merged hit set.
+        assert_eq!(
+            snap["bridge_enrichment_passes_per_request"], 2,
+            "snap={snap}"
+        );
+        // Two logical files × two distinct forms each (down from 8 before dedupe); no duplicate equivalent-file work.
+        assert_eq!(
+            snap["store_memory_multiform_ops_per_request"], 4,
+            "snap={snap}"
+        );
+
+        let ids: Vec<&str> = plan["items"]
+            .as_array()
+            .expect("items array")
+            .iter()
+            .filter_map(|it| it["id"].as_str())
+            .collect();
+        assert!(ids.contains(&"rule:one:rel"), "ids={ids:?}");
+        assert!(ids.contains(&"rule:one:abs"), "ids={ids:?}");
+        assert!(ids.contains(&"rule:two:rel"), "ids={ids:?}");
+    }
+
+    #[ignore]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn context_plan_multi_form_benchmark_fixture_10k_memories_100_files() {
+        use crate::traits::{MemoryPayload, VectorStore};
+        use std::time::Instant;
+
+        const NAMESPACE: &str = "context-plan-benchmark";
+        const FILE_COUNT: usize = 100;
+        const MEMORIES_PER_FILE: usize = 100;
+        const MEMORY_COUNT: usize = FILE_COUNT * MEMORIES_PER_FILE;
+        const WARMUP_ITERATIONS: usize = 5;
+        const MEASURED_ITERATIONS: usize = 20;
+
+        fn remove_fixture_path(path: &std::path::Path) -> std::io::Result<()> {
+            if path.is_dir() {
+                std::fs::remove_dir_all(path)
+            } else if path.exists() {
+                std::fs::remove_file(path)
+            } else {
+                Ok(())
+            }
+        }
+
+        struct BenchmarkCleanup(Vec<std::path::PathBuf>);
+        impl Drop for BenchmarkCleanup {
+            fn drop(&mut self) {
+                for path in &self.0 {
+                    let _ = remove_fixture_path(path);
+                }
+            }
+        }
+
+        let fixture_root =
+            std::path::PathBuf::from("/tmp/opencode/neurostrata-context-plan-benchmark-v1-fixture");
+        let store_dir = std::path::PathBuf::from(
+            "/tmp/opencode/neurostrata-context-plan-benchmark-v1-store-dir",
+        );
+        let store_path = store_dir.join("db");
+        let legacy_store_paths: Vec<_> = std::fs::read_dir("/tmp/opencode")
+            .expect("read benchmark temp root")
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .map_or(false, |name| {
+                        name == "neurostrata-context-plan-benchmark-v1-store"
+                            || name.starts_with("neurostrata-context-plan-benchmark-v1-store.wal")
+                    })
+            })
+            .collect();
+        for path in [&fixture_root, &store_dir]
+            .into_iter()
+            .chain(legacy_store_paths.iter())
+        {
+            remove_fixture_path(path).expect("remove stale benchmark fixture");
+        }
+        std::fs::create_dir_all(&fixture_root).expect("create fixture root");
+        std::fs::create_dir_all(&store_dir).expect("create benchmark store directory");
+        let _cleanup = BenchmarkCleanup(vec![fixture_root.clone(), store_dir.clone()]);
+
+        let max_db_size: u64 = std::env::var("NEUROSTRATA_TEST_MAX_DB_SIZE")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(512 * 1024 * 1024);
+        let buffer_pool_size: u64 = std::env::var("NEUROSTRATA_TEST_BUFFER_POOL_SIZE")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(512 * 1024 * 1024);
+        let config = lbug::SystemConfig::default()
+            .max_db_size(max_db_size)
+            .buffer_pool_size(buffer_pool_size)
+            .throw_on_wal_replay_failure(true);
+        let store = Arc::new(
+            crate::store::LadybugStore::with_system_config(&store_path, 4, config)
+                .expect("open benchmark store"),
+        );
+        let vector_store: Arc<dyn VectorStore> = store.clone();
+        vector_store.init(NAMESPACE).await.expect("init namespace");
+        let embedder: Arc<dyn crate::traits::Embedder> = Arc::new(LocalStubEmbedder);
+        crate::registry::cache_project_root(
+            &vector_store,
+            Some(&embedder),
+            NAMESPACE,
+            &fixture_root.to_string_lossy(),
+        )
+        .await;
+
+        let mut logical_files = Vec::with_capacity(FILE_COUNT);
+        let mut requested_files = Vec::with_capacity(FILE_COUNT * 2);
+        let mut seeded_memories = 0usize;
+        let mut relative_stored_memories = 0usize;
+        let mut absolute_stored_memories = 0usize;
+        for file_index in 0..FILE_COUNT {
+            let relative = format!(
+                "src/module-{:02}/file-{:03}.rs",
+                file_index / 10,
+                file_index
+            );
+            let absolute = fixture_root.join(&relative).to_string_lossy().to_string();
+            let disk_path = fixture_root.join(&relative);
+            std::fs::create_dir_all(disk_path.parent().expect("file parent"))
+                .expect("create module directory");
+            std::fs::write(
+                &disk_path,
+                format!("pub fn symbol_{file_index:03}() -> usize {{ {file_index} }}\n"),
+            )
+            .expect("write deterministic source file");
+            logical_files.push(relative.clone());
+            requested_files.push(relative.clone());
+            requested_files.push(absolute.clone());
+
+            for row_index in 0..MEMORIES_PER_FILE {
+                let global_index = file_index * MEMORIES_PER_FILE + row_index;
+                let stored_form = if row_index < MEMORIES_PER_FILE / 2 {
+                    relative_stored_memories += 1;
+                    relative.clone()
+                } else {
+                    absolute_stored_memories += 1;
+                    absolute.clone()
+                };
+                let memory_type = ["rule", "fact", "procedure"][global_index % 3];
+                let payload = MemoryPayload {
+                    content: format!(
+                        "Deterministic benchmark memory {global_index:05} for {relative}"
+                    ),
+                    user_id: "benchmark".to_string(),
+                    memory_type: memory_type.to_string(),
+                    agent_name: Some("context-plan-benchmark".to_string()),
+                    location: stored_form.clone(),
+                    location_lines: (row_index + 1).to_string(),
+                    metadata: serde_json::json!({
+                        "access_count": row_index % 11,
+                        "benchmark_file": relative,
+                        "benchmark_row": row_index,
+                        "governs": [stored_form],
+                        "stored_spelling": if row_index < MEMORIES_PER_FILE / 2 {
+                            "relative"
+                        } else {
+                            "absolute"
+                        },
+                    }),
+                };
+                vector_store
+                    .upsert(
+                        NAMESPACE,
+                        &format!("context-plan-bench-{global_index:05}"),
+                        vec![
+                            (global_index % 251) as f32 / 251.0,
+                            (file_index % 101) as f32 / 101.0,
+                            (row_index % 17) as f32 / 17.0,
+                            1.0,
+                        ],
+                        payload,
+                    )
+                    .await
+                    .expect("seed deterministic memory");
+                seeded_memories += 1;
+            }
+        }
+
+        assert_eq!(seeded_memories, MEMORY_COUNT);
+        assert_eq!(MEMORY_COUNT, 10_000);
+        assert_eq!(logical_files.len(), 100);
+        assert_eq!(requested_files.len(), 200);
+        assert_eq!(relative_stored_memories, 5_000);
+        assert_eq!(absolute_stored_memories, 5_000);
+        let stored_rows = vector_store
+            .list(NAMESPACE, None, None)
+            .await
+            .expect("list seeded benchmark memories");
+        let benchmark_rows: Vec<_> = stored_rows
+            .iter()
+            .filter(|row| row.id.starts_with("context-plan-bench-"))
+            .collect();
+        assert_eq!(benchmark_rows.len(), MEMORY_COUNT);
+        assert_eq!(crate::store::ladybug::engine_in_flight(), 0);
+        for (file_index, relative) in logical_files.iter().enumerate() {
+            let expected = format!("pub fn symbol_{file_index:03}() -> usize {{ {file_index} }}\n");
+            assert_eq!(
+                std::fs::read_to_string(fixture_root.join(relative)).expect("read fixture file"),
+                expected
+            );
+        }
+
+        let arguments = serde_json::json!({
+            "namespace": NAMESPACE,
+            "query": "deterministic context plan benchmark",
+            "files": requested_files,
+            "max_items": 1,
+            "max_bytes": 65_536,
+            "format": "json",
+        });
+        println!(
+            "{}",
+            serde_json::json!({
+                "record": "context",
+                "benchmark": "context_plan_multi_form",
+                "machine": {
+                    "os": std::env::consts::OS,
+                    "arch": std::env::consts::ARCH,
+                    "available_parallelism": std::thread::available_parallelism()
+                        .map(usize::from)
+                        .unwrap_or(1),
+                },
+                "context": {
+                    "namespace": NAMESPACE,
+                    "memory_count": seeded_memories,
+                    "logical_file_count": logical_files.len(),
+                    "relative_stored_memories": relative_stored_memories,
+                    "absolute_stored_memories": absolute_stored_memories,
+                    "warmup_iterations": WARMUP_ITERATIONS,
+                    "measured_iterations": MEASURED_ITERATIONS,
+                    "ast_metric_note": "context_plan has no AST neighborhood call in this build; the instrumented per-form AST counter therefore reports zero",
+                },
+                "request_shape": {
+                    "requested_file_entries": 200,
+                    "equivalent_request_forms_per_logical_file": 2,
+                    "request_form_order": ["relative", "absolute"],
+                    "max_items": 1,
+                    "max_bytes": 65_536,
+                    "include_ancestors": true,
+                    "source": null,
+                },
+                "metric_definitions": {
+                    "store_memory_multiform_ops_per_request": "individual LadybugStore::memories_for_file calls across ordered equivalent forms",
+                    "bridge_enrichment_passes_per_request": "non-empty final per-call hit sets entering the conceptual-bridge enrichment loop",
+                    "logical_files_enriched_per_request": "distinct normalized resolved lookup paths with at least one final merged hit",
+                }
+            })
+        );
+
+        let _instrumentation = super::context_plan_benchmark_instrumentation::enable();
+        let mut measured_ms = Vec::with_capacity(MEASURED_ITERATIONS);
+        let mut expected_counts: Option<serde_json::Value> = None;
+        for iteration in 0..(WARMUP_ITERATIONS + MEASURED_ITERATIONS) {
+            super::context_plan_benchmark_instrumentation::begin_request();
+            let started = Instant::now();
+            let result =
+                handle_context_plan(&arguments, embedder.clone(), vector_store.clone()).await;
+            let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+            let counts = super::context_plan_benchmark_instrumentation::snapshot();
+            let plan: serde_json::Value = serde_json::from_str(&result).expect("plan JSON");
+            assert!(plan["items"].is_array(), "context plan must contain items");
+            let enriched = super::context_plan_benchmark_instrumentation::logical_files_enriched();
+            let missing: Vec<&String> = logical_files
+                .iter()
+                .filter(|path| !enriched.contains(*path))
+                .collect();
+            if !missing.is_empty() {
+                use crate::traits::GraphRead;
+                for path in &missing {
+                    let (_lookup, forms) = lookup_path_for(&vector_store, NAMESPACE, path, None)
+                        .await
+                        .expect("benchmark diagnostic lookup_path_for");
+                    for form in forms {
+                        let hits = store
+                            .memories_for_file(
+                                NAMESPACE,
+                                None,
+                                &form,
+                                None,
+                                true,
+                                &["rule".into(), "fact".into(), "procedure".into()],
+                                &[],
+                                1,
+                            )
+                            .await;
+                        let hit_count = hits.as_ref().map(|hits| hits.len()).unwrap_or(0);
+                        let error = hits.err();
+                        eprintln!(
+                            "benchmark missing path={path:?} form={form:?} hits={hit_count} error={error:?} engine={}",
+                            crate::store::ladybug::engine_stats()
+                        );
+                    }
+                }
+            }
+            assert_eq!(
+                counts["logical_files_enriched_per_request"], 100,
+                "counts={counts}; missing={missing:?}"
+            );
+            assert!(counts["registry_root_reads_per_request"]
+                .as_u64()
+                .is_some_and(|count| count > 0));
+            assert!(counts["store_memory_multiform_ops_per_request"]
+                .as_u64()
+                .is_some_and(|count| count > 0));
+            assert!(counts["bridge_enrichment_passes_per_request"]
+                .as_u64()
+                .is_some_and(|count| count > 0));
+            if let Some(expected) = &expected_counts {
+                assert_eq!(&counts, expected, "invocation counts must be deterministic");
+            } else {
+                expected_counts = Some(counts.clone());
+            }
+            let warmup = iteration < WARMUP_ITERATIONS;
+            let record_iteration = if warmup {
+                iteration + 1
+            } else {
+                iteration - WARMUP_ITERATIONS + 1
+            };
+            let mut output = counts;
+            output["record"] = serde_json::json!(if warmup { "warmup" } else { "measured" });
+            output["iteration"] = serde_json::json!(record_iteration);
+            output["wall_clock_ms"] = serde_json::json!(elapsed_ms);
+            println!("{output}");
+            if !warmup {
+                measured_ms.push(elapsed_ms);
+            }
+        }
+
+        assert_eq!(measured_ms.len(), MEASURED_ITERATIONS);
+        measured_ms.sort_by(f64::total_cmp);
+        let median_ms =
+            (measured_ms[MEASURED_ITERATIONS / 2 - 1] + measured_ms[MEASURED_ITERATIONS / 2]) / 2.0;
+        let p95_index = ((0.95 * measured_ms.len() as f64).ceil() as usize)
+            .saturating_sub(1)
+            .min(measured_ms.len() - 1);
+        println!(
+            "{}",
+            serde_json::json!({
+                "record": "summary",
+                "warmup_iterations": WARMUP_ITERATIONS,
+                "measured_iterations": MEASURED_ITERATIONS,
+                "median_ms": median_ms,
+                "p95_ms": measured_ms[p95_index],
+                "p95_method": "nearest-rank ceil(0.95*N), clamped one-based index",
+                "sorted_measured_wall_clock_ms": measured_ms,
+                "invocation_counts_per_request": expected_counts.expect("one measured request"),
+            })
+        );
     }
 
     #[tokio::test]

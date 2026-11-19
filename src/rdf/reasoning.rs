@@ -2682,10 +2682,7 @@ mod tests {
             .materialize_owl2_rl_with_proofs(&base, "test/ns", 50_000, ReasoningProfile::OwlRl)
             .expect("full closure must certify");
         let full_count = full.certificate.inferred_triple_count;
-        assert!(
-            full_count > 500,
-            "fixture must produce a large closure, got {full_count}"
-        );
+        assert!(full_count > 500, "fixture must produce a large closure");
 
         match ReasoningAdapter::new().materialize_owl2_rl_with_proofs(
             &base,
@@ -2697,10 +2694,10 @@ mod tests {
                 assert_eq!(max, 8);
                 assert!(
                     actual < full_count,
-                    "tiny cap must abort before building the full closure ({actual} vs {full_count})"
+                    "tiny cap must abort before building the full closure"
                 );
             }
-            other => panic!("expected InferredLimitExceeded, got {other:?}"),
+            Err(_) | Ok(_) => panic!("expected InferredLimitExceeded"),
         }
     }
 
