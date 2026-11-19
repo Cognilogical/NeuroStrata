@@ -49,6 +49,8 @@ binaries/
 downloads/
 web-ui/public/graph.json
 # Generated plugin build artifacts (rebuilt by npm run build)
+plugins/core/node_modules/
+plugins/core/package-lock.json
 plugins/opencode/node_modules/
 plugins/claude/node_modules/
 plugins/hermes/node_modules/

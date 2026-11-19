@@ -146,7 +146,7 @@ function makeMockRpcResponse(id, resultObj, errorObj = null) {
 }
 
 function createMockDaemonServer({ returnTask = null, guardReject = false } = {}) {
-  const counters = { memoriesForFile: 0, taskList: 0, guardValidate: 0, memoriesForFilePaths: [], guardArgs: [], taskListArgs: [] };
+  const counters = { memoriesForFile: 0, taskList: 0, guardValidate: 0, taskCandidates: 0, memoriesForFilePaths: [], guardArgs: [], taskListArgs: [] };
   return new Promise((resolve) => {
     const server = http.createServer((req, res) => {
       if (req.method !== "POST") {
@@ -220,6 +220,11 @@ function createMockDaemonServer({ returnTask = null, guardReject = false } = {})
                 },
               ],
             });
+            return;
+          }
+          if (name === "neurostrata_task_candidates") {
+            counters.taskCandidates++;
+            respond({ content: [{ type: "text", text: JSON.stringify({ recorded: true }) }] });
             return;
           }
           if (name === "neurostrata_guard_validate") {
@@ -2977,6 +2982,211 @@ describe("guard_validate cwd/worktree propagation + shell mutation exemption", (
       assert.equal(guard.worktree, "/caller/custom-wt");
       assert.equal(guard.action_type, "Bash");
       assert.equal(getTrackingState().mutationsSinceNote, before, "verification command does not count");
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// nb9q: plugin guard / subagent / tool-output-intent performance fixes
+// ──────────────────────────────────────────────────────────────────────
+
+describe("nb9q FIX1: zero-action shell segments in the mutating guard", () => {
+  async function exempt() {
+    const mod = await import("./dist/index.js");
+    return mod.isZeroActionExemptShellPayload;
+  }
+
+  it("classifies read-only, verification and publish commands as exempt", async () => {
+    const f = await exempt();
+    for (const cmd of [
+      "git status", "git diff HEAD~1", "git log --oneline -5", "git show HEAD",
+      "git rev-parse --show-toplevel", "cargo test", "cargo check", "cargo clippy",
+      "cargo metadata --format-version 1", "gh pr view 42", "gh pr list", "gh pr diff 42",
+      "gh pr checks", "node --test plugins/core/test.mjs", "rustc --version",
+      "neurostrata-mcp task list", "git push", "git push origin main",
+      "git pull --rebase", "git fetch origin",
+    ]) {
+      assert.equal(f("bash", cmd), true, `exempt: ${cmd}`);
+    }
+    for (const cmd of [
+      "rm -rf /tmp/x", "git reset --hard HEAD", "git commit -m x", "cargo build",
+      "git push --force", "git push -f", "git push -fv origin main", "git push -vf",
+      "git push -uf", "git push origin +main", "git push --mirror", "git push --delete origin main",
+      "git push --prune", "git push --force-with-lease", "git push --force-with-lease=origin", "git status &",
+    ]) {
+      assert.equal(f("bash", cmd), false, `mutating: ${cmd}`);
+    }
+    assert.equal(f("bash", "git status && git diff"), true, "chained read-only stays exempt");
+    const mod = await import("./dist/index.js");
+    for (const tool of ["exec_command", "run_shell_command", "run_command", "execute_command", "terminal", "gh_exec", "execute", "mcp_execute"]) {
+      assert.equal(mod.isReadOnlyInspectionTool(tool), true, `read-only inspection: ${tool}`);
+    }
+  });
+
+  it("publishes exactly one default export from every adapter bundle", () => {
+    for (const harness of ["opencode", "claude", "codex", "hermes", "openclaw", "github-cli"]) {
+      for (const ext of ["js", "d.ts"]) {
+        const src = readFileSync(new URL(`../${harness}/dist/index.${ext}`, import.meta.url), "utf8");
+        const count = (src.match(/export default /g) || []).length;
+        assert.equal(count, 1, `${harness} dist/index.${ext} must declare exactly one default export`);
+      }
+    }
+  });
+
+  it("passes is_mutating=false to the guard for exempt shells, true for mutating ones", async () => {
+    const { server, url, counters } = await createMockDaemonServer();
+    let beforeHandler;
+    try {
+      resetClientForTesting();
+      await initialize({
+        config: { namespace: "nb9q-guard", endpoint: url, bearerToken: "tok", strictMode: true, requestTimeoutMs: 2000 },
+        tool: { hook: async (name, cb) => { if (name === "execute.before") beforeHandler = cb; } },
+        hooks: {},
+      });
+      for (const cmd of ["git status --short", "cargo test --test lean_parity_test", "git push origin main", "git pull --rebase"]) {
+        await beforeHandler({ tool: "bash", input: { command: cmd } });
+        assert.equal(counters.guardArgs.at(-1).is_mutating, false, `guard is_mutating=false: ${cmd}`);
+      }
+      for (const cmd of ["rm -rf /tmp/x", "git reset --hard HEAD"]) {
+        await beforeHandler({ tool: "bash", input: { command: cmd } });
+        assert.equal(counters.guardArgs.at(-1).is_mutating, true, `guard is_mutating=true: ${cmd}`);
+      }
+      await beforeHandler({ tool: "write", input: { path: "x", content: "y" } });
+      assert.equal(counters.guardArgs.at(-1).is_mutating, true, "write tool stays mutating");
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+
+  it("post-task-complete git push is not blocked by the no-claimed-task guard", async () => {
+    // Guard rejects any action that still claims to be mutating. After task
+    // completion there is no active task, so a genuine mutating push would be
+    // rejected (the Lock 2 / Push Catch-22). Exempt publish commands must pass
+    // is_mutating=false and therefore be allowed.
+    const { server, url, counters } = await createMockDaemonServer({
+      returnTask: [],
+      guardReject: () => (counters.guardArgs.at(-1)?.is_mutating === true),
+    });
+    let beforeHandler;
+    try {
+      resetClientForTesting();
+      await initialize({
+        config: { namespace: "nb9q-push", endpoint: url, bearerToken: "tok", strictMode: true, requestTimeoutMs: 2000 },
+        tool: { hook: async (name, cb) => { if (name === "execute.before") beforeHandler = cb; } },
+        hooks: {},
+      });
+      await beforeHandler({ tool: "neurostrata_task_complete", input: { id: "task-z" } });
+      const out = await handleHookEvent({
+        hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "git push" },
+      });
+      assert.equal(out.hookSpecificOutput.permissionDecision, "allow", "git push allowed after task_complete");
+      assert.equal(counters.guardArgs.at(-1).is_mutating, false);
+      assert.equal(getTrackingState().activeTaskId, null, "no active task remains");
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+});
+
+describe("nb9q FIX2: subagent-aware, harness-aware graph-first injection", () => {
+  it("exports the agent/harness detectors", async () => {
+    const mod = await import("./dist/index.js");
+    assert.equal(typeof mod.isReadOnlySubagentAgent, "function");
+    assert.equal(typeof mod.resolveSubagentAgentId, "function");
+    assert.equal(typeof mod.detectCodeMode, "function");
+    assert.equal(mod.isReadOnlySubagentAgent("checker"), true);
+    assert.equal(mod.isReadOnlySubagentAgent("checker-free"), true);
+    assert.equal(mod.isReadOnlySubagentAgent("reviewer"), true);
+    assert.equal(mod.isReadOnlySubagentAgent("explore"), true);
+    assert.equal(mod.isReadOnlySubagentAgent("general"), false);
+    assert.equal(mod.isReadOnlySubagentAgent("build"), false);
+    assert.equal(mod.resolveSubagentAgentId({ agent: "checker", prompt: "x" }), "checker");
+    assert.equal(mod.resolveSubagentAgentId({ subagent_type: "explore", prompt: "x" }), "explore");
+    assert.equal(mod.resolveSubagentAgentId({ subagent: "reviewer", prompt: "x" }), "reviewer");
+  });
+
+  it("createHarnessPlugin harness name drives Code Mode detection", async () => {
+    const mod = await import("./dist/index.js");
+    mod.createHarnessPlugin("p", "OpenCode");
+    assert.equal(mod.detectCodeMode(), true, "OpenCode is a Code-Mode harness");
+    mod.createHarnessPlugin("p", "Claude Code");
+    assert.equal(mod.detectCodeMode(), false, "Claude is not Code Mode");
+  });
+
+  it("read-only agents get a skip note, not a bare MCP tool-call directive", () => {
+    const h = buildSubagentContextHeader("ns", "t", undefined, { agentId: "checker" });
+    assert.ok(h.includes("Read-Only Subagent"));
+    assert.equal(h.includes("neurostrata_memories_for_file"), false, "no bare MCP directive");
+    assert.equal(h.includes("neurostrata_task_update"), false);
+    const review = buildSubagentContextHeader("ns", "t", undefined, { agentId: "reviewer" });
+    assert.ok(review.includes("Read-Only Subagent"));
+  });
+
+  it("Code Mode harnesses reference execute + tools.neurostrata.*", () => {
+    const h = buildSubagentContextHeader("ns", "t", undefined, { codeMode: true });
+    assert.ok(h.includes("Graph-First Lookup Rule"));
+    assert.ok(h.includes("tools.neurostrata.memories_for_file"));
+    assert.ok(h.includes("execute"));
+  });
+
+  it("default injection keeps the original bare MCP directive", () => {
+    const h = buildSubagentContextHeader("ns", "t");
+    assert.ok(h.includes("Graph-First Lookup Rule"));
+    assert.ok(h.includes("neurostrata_memories_for_file"));
+  });
+
+  it("enrichAndInjectSubagentPrompt detects the agent id from tool args", async () => {
+    const { server, url } = await createMockDaemonServer();
+    const target = { prompt: "review the diff", subagent_type: "checker" };
+    try {
+      resetClientForTesting();
+      await initialize({
+        config: { namespace: "nb9q-sub", endpoint: url, bearerToken: "tok", strictMode: true, requestTimeoutMs: 2000 },
+        tool: { hook: async () => {} }, hooks: {},
+      });
+      assert.equal(await enrichAndInjectSubagentPrompt(target, "nb9q-sub", "t"), true);
+      assert.ok(target.prompt.includes("Read-Only Subagent"));
+      assert.equal(target.prompt.includes("neurostrata_memories_for_file"), false);
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+});
+
+describe("nb9q FIX3: no task-intent intake from read-only tool output", () => {
+  it("execute.after on grep/read output with TODO: posts no candidates; real turns still do", async () => {
+    const { server, url, counters } = await createMockDaemonServer();
+    let afterHandler;
+    try {
+      resetClientForTesting();
+      await initialize({
+        config: { namespace: "nb9q-intent", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 2000 },
+        tool: { hook: async (name, cb) => { if (name === "execute.after") afterHandler = cb; } },
+        hooks: {},
+      });
+      for (const tool of ["grep", "Grep", "read", "read_file", "bash", "shell", "exec_command", "run_shell_command", "execute", "mcp_execute"]) {
+        await afterHandler({
+          name: tool, sessionID: "ses", args: {}, status: "completed",
+          result: { content: "TODO: deferred cleanup", output: "TODO: deferred cleanup" },
+        });
+      }
+      assert.equal(counters.taskCandidates, 0, "read-only tool output posts no intake candidates");
+
+      // A non-inspection tool result still feeds the intake ledger.
+      await afterHandler({
+        name: "write", sessionID: "ses", args: {}, status: "completed",
+        result: { content: "TODO: real obligation", output: "TODO: real obligation" },
+      });
+      assert.ok(counters.taskCandidates > 0, "non-inspection output still posts candidates");
+
+      // The pure extractor still recognizes a genuine user/assistant turn.
+      assert.ok(extractTurnCandidates({ role: "user", content: "TODO: real user turn" }).length > 0);
     } finally {
       server.close();
       resetModuleState();

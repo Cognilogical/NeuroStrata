@@ -1259,10 +1259,17 @@ fn formal_kernel_compiles_standalone_for_aeneas_extraction() {
         script.display()
     );
 
-    let status = Command::new("bash")
-        .arg(&script)
-        .current_dir(&root)
-        .env("NEUROSTRATA_SKIP_KANI", "1")
+    // Normal `cargo test` must stay fast: the extract script also runs the
+    // 40+ Kani symbolic proof harnesses when `kani` is installed (450-520s).
+    // Skip Kani by default and only run it when the dedicated proof job opts
+    // in via NEUROSTRATA_REQUIRE_KANI=1. The script itself rejects a
+    // conflicting SKIP=1 + REQUIRE=1 pair, so never set SKIP when REQUIRE=1.
+    let mut cmd = Command::new("bash");
+    cmd.arg(&script).current_dir(&root);
+    if std::env::var("NEUROSTRATA_REQUIRE_KANI").ok().as_deref() != Some("1") {
+        cmd.env("NEUROSTRATA_SKIP_KANI", "1");
+    }
+    let status = cmd
         .status()
         .expect("failed to spawn proofs/scripts/extract-aeneas.sh");
     assert!(status.success(), "extract-aeneas.sh exited non-zero");

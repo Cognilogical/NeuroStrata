@@ -998,3 +998,12 @@ async function onTurnEnd(turn: ConversationTurn): Promise<void> {
 // resolver, the wire helpers, the verdict parser and the adapter status are
 // the contract the adapter tests exercise.
 // ──────────────────────────────────────────────────────────────────────
+
+// The published d.ts declares a default export; keep the JS bundle in sync
+// so consumers doing `import plugin from "@neurostrata/openclaw-plugin"`
+// do not hit a link-time SyntaxError.
+export default {
+  id: "neurostrata-openclaw",
+  setup: initialize,
+  initialize,
+};

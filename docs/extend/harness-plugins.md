@@ -19,6 +19,12 @@ The plugin is harness-agnostic: the same `createHarnessPlugin` function works fo
 
 `isZeroActionExemptShellPayload` (exported from `plugins/core`) keeps the Breath mutation counter from advancing on provably read-only / verification shell commands only. It accepts `bash`/`shell`/`command`/`exec` tools, unwraps JSON `{command, cmd}` payloads, and uses a fail-closed allowlist: read-only git subcommands (`status`, `log`, `diff`, `show`, `rev-parse`, `fetch`, `stash list|show`, read-only `branch` flags), `neurostrata-mcp task|doc-gate|synaptic-mesh status`, the `cargo` check/test family, read-only `gh` subcommands and `gh api` without write flags, `node --test` / `*test.mjs`, gate-receipt scripts, and `rustc --version`. Substitutions, redirection, and chains containing any non-exempt segment fail closed. The `neurostrata_guard_validate` call itself is never skipped for an exempt command.
 
+`neurostrata-nb9q`: both hook call sites (`executeBeforeHandler` and `handleHookEvent`) pass `is_mutating: !shellExempt` to `neurostrata_guard_validate`, so read-only commands — including `git push`/`git pull` after `neurostrata_task_complete` — never trip the no-claimed-task gate (the Lock 2 / push Catch-22). Force-push flags (`-f`, `--force`, `--force-with-lease`) and backgrounded shells (`CMD &`) stay mutating; `&&` chains of read-only commands stay exempt.
+
+`neurostrata-1e14`: the plugin and the daemon shell classifiers apply the same force-push rejection — any `-f` inside a short bundle (`-vf`/`-uf`), `--force`, `--force-with-lease[=<ref>]`, forced refspecs (`+main`), `--mirror`, `--delete` and `--prune` stay mutating. The daemon intentionally recomputes mutability from the raw payload instead of trusting the plugin's `is_mutating`, so both classifiers must agree or a remote-history rewrite skips the active-task gate. Code Mode's `execute`/`mcp_execute` tool output is also excluded from task-intent intake.
+
+`neurostrata-nb9q`: subagent graph-first injection is agent- and harness-aware: read-only subagents (`reviewer`, `checker`, `checker-free`, `explore`) receive a skip note instead of directives to call MCP tools they do not have, and Code Mode harnesses reference `execute` with `tools.neurostrata.*`. Intent extraction from `read`/`grep`/`glob`/shell tool output is suppressed, because `TODO:`/`defer` in stdout or source comments is not a task obligation; user and assistant turns still nudge.
+
 ## Implementing a New Harness Adapter
 
 To add a new harness adapter:
