@@ -2979,12 +2979,33 @@ async fn implicit_source_from_location(
     if location.is_empty() || location == "N/A" {
         return None;
     }
-    let (lookup, _) = lookup_path_for(store, namespace, location, project_root)
-        .await
-        .ok()?;
-    (lookup.source != crate::paths::RootSource::Outside
-        && !crate::paths::is_absolute_any(&lookup.path))
-    .then_some(lookup.path)
+    let registry_root = registry_root_for_lookup(
+        crate::registry::cached_project_root(store, namespace).await,
+        namespace,
+        location,
+        project_root,
+    )
+    .ok()?;
+    let resolved = crate::paths::resolve_in_scope_forms(
+        location,
+        project_root,
+        registry_root.as_deref(),
+        crate::paths::PathResolutionScope::File,
+    )
+    .ok()?;
+    let placed = if resolved.lookup.root.is_some() {
+        resolved.lookup
+    } else {
+        // Relative input alone is not placed. Only the resolver's
+        // root-contained absolute form can establish an implicit source.
+        let joined = resolved
+            .forms
+            .iter()
+            .find(|path| crate::paths::is_absolute_any(path))?;
+        crate::paths::to_project_relative(joined, project_root, registry_root.as_deref())
+    };
+    (placed.root.is_some() && !crate::paths::is_absolute_any(&placed.path))
+        .then_some(placed.path)
 }
 
 /// The registered root to resolve `path` with, given the result of reading it.
@@ -4748,9 +4769,9 @@ async fn handle_add_memory(
 
     // For rules, ensure `metadata.source` always exists to avoid missing
     // SHACL warnings on directory ingest and direct tool writes. If the
-    // caller omitted source (or left it blank), backfill from the location
-    // argument (project-relative) when it is usable, otherwise fall back to
-    // "agent".
+    // caller omitted source (or left it blank), backfill from the location's
+    // project-relative spelling when a project root actually places it; raw
+    // local paths must not reach mesh peers, otherwise fall back to "agent".
     if memory_type == "rule" {
         if metadata
             .as_object()
@@ -16429,6 +16450,244 @@ mod tests {
             reply
         );
         assert!(reply.contains("metadata"), "{}", reply);
+    }
+
+    #[tokio::test]
+    async fn shareable_rule_source_is_portable_ac1_matrix() {
+        use crate::events::subscribers::mesh_outbox::MeshOutbox;
+        use crate::events::{MemorySubscriber, SubscriberContext};
+        use crate::synaptic_mesh::outbox::{outbox_dir_for, Outbox};
+        use crate::synaptic_mesh::record::MeshRecord;
+        use crate::synaptic_mesh::storage::MeshStorage;
+
+        let tmp = tempfile::Builder::new()
+            .prefix("ns-source-sentinel-")
+            .tempdir()
+            .unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        let root = base.join("project");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "").unwrap();
+        let absolute = root.join("src/lib.rs").to_string_lossy().into_owned();
+        let outside = base.join("outside.rs").to_string_lossy().into_owned();
+        let windows = r"C:\sentinel\project\src\lib.rs".to_string();
+        let (store, _) = store_with_one_rule("probe").await;
+        let mesh = MeshStorage::init(
+            &base.join("mesh"),
+            "node-source-test",
+            "source-test",
+            &["probe".to_string()],
+            None,
+        )
+        .unwrap();
+        let outbox_dir = outbox_dir_for(mesh.root());
+        let outbox = Outbox::open(&outbox_dir).unwrap();
+        let subscriber = MeshOutbox::new(
+            outbox_dir,
+            Arc::new(tokio::sync::Notify::new()),
+            mesh.manifest().epoch,
+        )
+        .unwrap();
+        let cases = [
+            (
+                "posix_placed_missing",
+                Some(absolute.clone()),
+                None,
+                true,
+                "src/lib.rs",
+            ),
+            (
+                "posix_placed_blank",
+                Some(absolute.clone()),
+                Some(" \t"),
+                true,
+                "src/lib.rs",
+            ),
+            (
+                "posix_outside_missing",
+                Some(outside.clone()),
+                None,
+                true,
+                "agent",
+            ),
+            (
+                "posix_outside_blank",
+                Some(outside.clone()),
+                Some(""),
+                true,
+                "agent",
+            ),
+            (
+                "posix_without_root",
+                Some(absolute.clone()),
+                None,
+                false,
+                "agent",
+            ),
+            (
+                "windows_missing",
+                Some(windows.clone()),
+                None,
+                true,
+                "agent",
+            ),
+            ("windows_blank", Some(windows), Some(" \t"), true, "agent"),
+            ("absent_missing", None, None, true, "agent"),
+            ("absent_blank", None, Some(""), true, "agent"),
+            (
+                "relative_placed",
+                Some("src/lib.rs".to_string()),
+                None,
+                true,
+                "src/lib.rs",
+            ),
+            (
+                "relative_normalized",
+                Some("./src/../src/lib.rs".to_string()),
+                Some(""),
+                true,
+                "src/lib.rs",
+            ),
+            (
+                "relative_without_root",
+                Some("src/lib.rs".to_string()),
+                None,
+                false,
+                "agent",
+            ),
+            (
+                "relative_escaping",
+                Some("../outside.rs".to_string()),
+                None,
+                true,
+                "agent",
+            ),
+            ("unavailable", Some("N/A".to_string()), None, true, "agent"),
+            (
+                "explicit_placed",
+                Some(absolute),
+                Some("caller supplied source"),
+                true,
+                "caller supplied source",
+            ),
+            (
+                "explicit_outside",
+                Some(outside),
+                Some("caller supplied source"),
+                true,
+                "caller supplied source",
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (case, location, source, with_root, expected_source) in cases {
+            let mut arguments = json!({
+                "namespace": "probe",
+                "memory_type": "rule",
+                "content": format!("portable source rule: {case}"),
+                "create_new_namespace": true,
+                "location": "ignored-top-level.rs",
+                "metadata": { "eligibility": "shareable" },
+            });
+            if let Some(path) = &location {
+                arguments["locations"] = json!([{ "path": path }]);
+            }
+            if let Some(source) = source {
+                arguments["metadata"]["source"] = json!(source);
+            }
+            if with_root {
+                arguments["project_root"] = json!(root);
+            }
+            let reply = handle_add_memory(
+                arguments,
+                Arc::new(StubEmbedder),
+                store.clone(),
+                None,
+                quiet_bus(),
+            )
+            .await;
+            assert!(
+                reply.starts_with("Successfully added memory"),
+                "{case}: {reply}"
+            );
+            let id = reply
+                .lines()
+                .find_map(|line| line.strip_prefix("Memory ID: "))
+                .expect("successful add returns its record ID");
+            let uuid = uuid::Uuid::parse_str(id).expect("persisted record ID is a UUID");
+            let (_, stored) = store
+                .get("probe", id)
+                .await
+                .unwrap()
+                .expect("persisted rule");
+            assert_eq!(
+                stored.location,
+                location.unwrap_or_default(),
+                "{case}: locations[0].path"
+            );
+
+            // Drive the production subscriber synchronously to avoid dispatcher timing.
+            subscriber
+                .handle(
+                    &ThalamicPulse::Created {
+                        id: id.to_string(),
+                        namespace: "probe".to_string(),
+                        kind: "rule".to_string(),
+                    },
+                    &RecursionToken::new(),
+                    &SubscriberContext {
+                        store: store.as_ref(),
+                        namespace: "probe",
+                        ts: 1_700_000_000,
+                    },
+                )
+                .await
+                .unwrap();
+            let report =
+                crate::synaptic_mesh::worker::drain_once(&outbox, &mesh, "node-source-test")
+                    .unwrap();
+            assert_eq!(report.applied, 1, "{case}: rule must pass the publish gate");
+            let emitted = std::fs::read_to_string(
+                mesh.root()
+                    .join("probe/memories")
+                    .join(format!("{id}.json")),
+            )
+            .unwrap();
+            let record: MeshRecord = serde_json::from_str(&emitted).unwrap();
+            assert_eq!(record.id, uuid, "{case}: emitted record ID");
+            assert_eq!(record.metadata["eligibility"], json!("shareable"), "{case}");
+            let quads = &record.rdf.as_ref().expect("emitted canonical RDF").quads;
+            let source_triple = format!(
+                "<urn:neurostrata:memory:{id}> <urn:neurostrata:ns#source> \"{expected_source}\"^^<http://www.w3.org/2001/XMLSchema#string> <urn:neurostrata:graph:probe:domain:gen:0> ."
+            );
+            // Collect every matrix failure so the baseline identifies each leaked source.
+            if record.metadata["source"] != json!(expected_source) {
+                failures.push(format!(
+                    "{case}: emitted metadata.source = {}, expected {expected_source:?}",
+                    record.metadata["source"]
+                ));
+            }
+            if !quads.lines().any(|line| line == source_triple) {
+                failures.push(format!(
+                    "{case}: missing exact RDF source triple: {source_triple}"
+                ));
+            }
+            for (label, text) in [
+                ("mesh record", emitted.as_str()),
+                ("N-Quads", quads.as_str()),
+            ] {
+                let matches = text.matches("sentinel").count();
+                if matches != 0 {
+                    failures.push(format!(
+                        "{case}: {label} contains {matches} sentinel matches, expected 0"
+                    ));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "AC1 matrix failures:\n{}",
+            failures.join("\n")
+        );
     }
 
     #[tokio::test]
