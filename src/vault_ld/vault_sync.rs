@@ -137,18 +137,34 @@ fn is_iri_unsafe_char(c: char) -> bool {
         || c == '\u{7f}'
 }
 
-/// Strict prefixed name: `[A-Za-z_][A-Za-z0-9_-]*:[A-Za-z_][A-Za-z0-9_-]*`.
+/// Strict Turtle `PNAME_LN`:
+/// - `PN_PREFIX`: `[A-Za-z_][A-Za-z0-9_.-]*`, never ending in `.`
+/// - `PN_LOCAL`: `[A-Za-z0-9_:][A-Za-z0-9_.:-]*`, never ending in `.`
 fn is_strict_prefixed_name(s: &str) -> bool {
-    fn valid_part(part: &str) -> bool {
-        let mut chars = part.chars();
+    fn valid_prefix(prefix: &str) -> bool {
+        if prefix.ends_with('.') {
+            return false;
+        }
+        let mut chars = prefix.chars();
         match chars.next() {
             Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
             _ => return false,
         }
-        chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    }
+    fn valid_local(local: &str) -> bool {
+        if local.ends_with('.') {
+            return false;
+        }
+        let mut chars = local.chars();
+        match chars.next() {
+            Some(c) if c.is_ascii_alphanumeric() || c == '_' || c == ':' => {}
+            _ => return false,
+        }
+        chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
     }
     match s.split_once(':') {
-        Some((prefix, local)) => valid_part(prefix) && valid_part(local),
+        Some((prefix, local)) => valid_prefix(prefix) && valid_local(local),
         None => false,
     }
 }
@@ -2337,6 +2353,105 @@ mod tests {
             "hostile id must flatten to one safe name: {:?}",
             names
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Codex PR #295 P2: valid custom Turtle local-name characters (dots,
+    /// leading digits, colons) in `rdf_type` must be accepted so exported
+    /// memories with custom `memory_type` values such as `custom.kind`
+    /// round-trip through `export_vault` -> `import_vault`, while trailing
+    /// dots (which terminate a Turtle statement) remain rejected.
+    #[tokio::test]
+    async fn custom_dotted_memory_type_roundtrips_through_export_and_import() {
+        for valid_type in ["yaml:custom.kind", "yaml:123_custom", "yaml:ns:sub.kind"] {
+            let mut n = note("dotted-note", &[]);
+            n.rdf_type = valid_type.to_string();
+            let turtle = note_to_turtle(&n).unwrap_or_else(|e| {
+                panic!("expected valid Turtle type {valid_type:?} to render, got {e}")
+            });
+            validate_shacl(&turtle).unwrap_or_else(|e| {
+                panic!("expected valid Turtle type {valid_type:?} to pass SHACL, got {e}")
+            });
+        }
+
+        for invalid_type in ["yaml:custom.", "yaml.:custom", "yaml:"] {
+            let mut n = note("trailing-dot-note", &[]);
+            n.rdf_type = invalid_type.to_string();
+            assert!(
+                note_to_turtle(&n).is_err(),
+                "invalid prefixed name {invalid_type:?} must fail closed"
+            );
+        }
+
+        let root = std::env::temp_dir().join(format!("ns-custom-type-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_custom_type";
+        store.init(ns).await.expect("init");
+        store
+            .upsert(
+                ns,
+                "custom-1",
+                vec![0.0; 4],
+                crate::traits::MemoryPayload {
+                    content: "custom kind note".to_string(),
+                    user_id: "default".to_string(),
+                    memory_type: "custom.kind".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("seed custom.kind memory");
+
+        let export_cfg = VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.clone()),
+            allowed_external_dirs: None,
+        };
+        let exported = export_vault(export_cfg, store.clone())
+            .await
+            .expect("export");
+        assert_eq!(exported.notes_exported, 1, "{:?}", exported.errors);
+
+        let import_ns = "vault_custom_type_imported";
+        let fresh_store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&root.join("db2"), 4)
+                .expect("fresh temp store"),
+        );
+        fresh_store.init(import_ns).await.expect("init import ns");
+        let import_cfg = VaultSyncConfig {
+            namespace: import_ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.clone()),
+            allowed_external_dirs: None,
+        };
+        let imported = import_vault(
+            import_cfg,
+            fresh_store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("import");
+        assert!(imported.errors.is_empty(), "{:?}", imported.errors);
+        assert_eq!(imported.notes_imported, 1);
+        let (_, payload) = fresh_store
+            .get(import_ns, "custom-1")
+            .await
+            .expect("get")
+            .expect("imported row exists");
+        assert_eq!(payload.memory_type, "custom.kind");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

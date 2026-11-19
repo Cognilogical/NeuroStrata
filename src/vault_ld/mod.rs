@@ -283,7 +283,7 @@ pub const VAULT_LD_SHAPES_V1: &str = "@prefix rdf: <http://www.w3.org/1999/02/22
     sh:property [
         sh:path yaml:epistemicTier ;
         sh:nodeKind sh:Literal ;
-        sh:pattern \"^[A-Za-z_][A-Za-z0-9_-]*$\" ;
+        sh:pattern \"^[A-Za-z_][A-Za-z0-9_.-]*$\" ;
         sh:message \"epistemicTier must be a simple tier token (rule|fact|procedure|structural|task|symbol or a custom slug)\" ;
     ] ;
     sh:property [
