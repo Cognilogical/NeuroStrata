@@ -189,9 +189,8 @@ jobs:
           set -euo pipefail
           KANI_VER="0.68.0"
           mkdir -p "$HOME/.kani" "$HOME/.cargo/bin"
-          curl -sSL "https://github.com/model-checking/kani/releases/download/kani-${KANI_VER}/kani-${KANI_VER}-x86_64-unknown-linux-gnu.tar.gz" | tar -xz -C "$HOME/.kani"
           rm -rf "$HOME/.kani/kani-${KANI_VER}"
-          mv "$HOME/.kani/kani-${KANI_VER}-x86_64-unknown-linux-gnu" "$HOME/.kani/kani-${KANI_VER}"
+          curl -sSL "https://github.com/model-checking/kani/releases/download/kani-${KANI_VER}/kani-${KANI_VER}-x86_64-unknown-linux-gnu.tar.gz" | tar -xz -C "$HOME/.kani"
           KANI_TC="$(tr -d '[:space:]' < "$HOME/.kani/kani-${KANI_VER}/rust-toolchain-version")"
           rustup toolchain install "$KANI_TC" --profile minimal --component rust-src
           TC_LIB="$HOME/.rustup/toolchains/${KANI_TC}-x86_64-unknown-linux-gnu/lib"
