@@ -23,6 +23,9 @@ proofs/.lake/
 *.log
 *.pid
 
+# Local formatting dependency installs
+/node_modules/
+
 # IDE / editor settings - never tracked
 .idea/
 *.iml

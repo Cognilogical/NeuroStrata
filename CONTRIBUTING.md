@@ -47,4 +47,52 @@ Follow strict **Red → Green → Refactor** (`test-driven-development` and `ver
 - Run `bash scripts/task-coverage-gate.sh` before pushing.
 - File tracked tasks with `neurostrata_task_create` for deferred work.
 
+## 6. Staged Format/Lint (Pre-Commit Hook)
+
+Formatting and lint enforcement is staged and non-destructive: the pre-commit hook runs `scripts/check-staged-quality.sh` against staged files only, and never rewrites, restages, or downloads dependencies on its own. If checks fail, the commit aborts before any ledger/graph write occurs.
+
+### Setup
+
+- Install root Node dependencies: `npm ci`
+- Install web-UI Node dependencies: `npm --prefix web-ui ci`
+- Install Rust components: `rustup component add rustfmt clippy`
+- Install ShellCheck for `scripts/*.sh` validation (platform package manager or from https://www.shellcheck.net)
+- Install the hook into `.git/hooks/pre-commit`: `bash scripts/install-hooks.sh`
+
+### What the gate enforces
+
+- Rust staged files: `rustfmt --edition 2021 --config skip_children=true --check`; Clippy with staged-file diagnostics filtered by `scripts/clippy-staged-diagnostics.mjs`.
+- Shell staged files: `bash -n` and `shellcheck`.
+- JS/TS staged files: Prettier via local `node_modules/.bin/prettier` (and web-ui ESLint via `web-ui/node_modules/.bin/eslint`).
+- Full runner: `scripts/check-staged-quality.sh`; all checks use local, repo-locked tools. The hook is fail-closed: if a required tool is absent, the gate reports what is missing and exits nonzero.
+
+### Repair workflow
+
+There is no automated auto-fix or auto-restage in the hook path. Run the checks locally, fix the staged files, and `git add` the results yourself:
+
+- `bash -n scripts/*.sh` and `shellcheck scripts/*.sh`
+- `node scripts/clippy-staged-diagnostics.mjs --root "$PWD" --staged src/task/mod.rs`
+- `npx prettier` is out of scope — use `./node_modules/.bin/prettier --check <paths>` and `./node_modules/.bin/eslint <paths>` instead
+- `rustfmt --edition 2021 --config skip_children=true --check src/task/mod.rs`
+
+### Incremental staged-file policy
+
+The gate runs incrementally: only files that are staged in the commit are checked. Unchanged files, generated bundles, and `.NeuroStrata/` internal files are excluded to keep CI and local commits fast and deterministic.
+
+### No auto rewrite / no auto restage
+
+Formatting is strictly manual. Neither the checked-in hook nor any `npm` script rewrites staged files or modifies the index. If `shellcheck`, `rustfmt`, or `prettier` finds issues, fix them in the working tree, then `git add` again before committing.
+
+### Fail-closed, no downloads
+
+Required tools must be installed before the hook runs. The runner never downloads packages (`npm install`, `npx <pkg>`, `rustup` fetches) on its own. Missing tools produce a clear diagnostic and a nonzero exit. Because the hook delegates to the project's `scripts/check-staged-quality.sh` when present, consumer projects can keep their own gates without modifying this repository.
+
+### Verification
+
+- Hook sources byte-identity: `TMPDIR=/var/tmp/ns-tmp cargo test --bin neurostrata-mcp pre_commit_hook_sources_stay_byte_identical -- --nocapture`
+- Propagation fixtures: `bash scripts/test-staged-quality.sh`
+- Installed hook read-back: `cmp scripts/hooks/pre-commit .git/hooks/pre-commit`
+- Full suite: `TMPDIR=/var/tmp/ns-tmp cargo test --locked -- --test-threads=1`
+- Gate: `TMPDIR=/var/tmp/ns-tmp bash scripts/task-coverage-gate.sh`
+
 [Contributing Guide (\`CONTRIBUTING.md\`)](CONTRIBUTING.md) · [AGENTS.md](AGENTS.md)
