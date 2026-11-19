@@ -146,7 +146,7 @@ function makeMockRpcResponse(id, resultObj, errorObj = null) {
 }
 
 function createMockDaemonServer({ returnTask = null, guardReject = false } = {}) {
-  const counters = { memoriesForFile: 0, taskList: 0, guardValidate: 0, memoriesForFilePaths: [] };
+  const counters = { memoriesForFile: 0, taskList: 0, guardValidate: 0, memoriesForFilePaths: [], guardArgs: [], taskListArgs: [] };
   return new Promise((resolve) => {
     const server = http.createServer((req, res) => {
       if (req.method !== "POST") {
@@ -209,6 +209,7 @@ function createMockDaemonServer({ returnTask = null, guardReject = false } = {})
           }
           if (name === "neurostrata_task_list") {
             counters.taskList++;
+            counters.taskListArgs.push(params.arguments ?? {});
             respond({
               content: [
                 {
@@ -223,6 +224,7 @@ function createMockDaemonServer({ returnTask = null, guardReject = false } = {})
           }
           if (name === "neurostrata_guard_validate") {
             counters.guardValidate++;
+            counters.guardArgs.push(params.arguments ?? {});
             // `guardReject` may be a boolean or a getter, so a test can flip the
             // verdict between two calls against the same mock daemon.
             const reject = typeof guardReject === "function" ? guardReject() : guardReject;
@@ -2643,5 +2645,341 @@ describe("daemon memory advisory (#140)", () => {
     assert.equal(extractDaemonMemoryAdvisory(text, 10_000_001), null);
     resetAdvisoryStateForTesting();
     assert.notEqual(extractDaemonMemoryAdvisory(text, 10_000_002), null);
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// Session/worktree Breath isolation + read-only shell exemption (RED-first)
+// ──────────────────────────────────────────────────────────────────────
+
+describe("regression: variable-valued Code Mode task IDs / notes", () => {
+  it("treats a claim with a variable id and literal session as claimed without a literal id", () => {
+    const out = inspectCodeModeExecution(
+      'const created = await tools.neurostrata.neurostrata_task_create({ namespace: "ns" });\nawait tools.neurostrata.neurostrata_task_claim({ id: created.id, session_id: "ses_123" });',
+    );
+    assert.equal(out.id, undefined);
+    assert.equal(out.sessionId, "ses_123");
+    assert.equal(out.taskClaimed, true);
+    assert.equal(out.taskCompleted, false);
+  });
+
+  it("treats a claim with both id and session_id as variable expressions as claimed", () => {
+    const out = inspectCodeModeExecution(
+      "await tools.neurostrata.neurostrata_task_claim({ id: created.id, session_id: ctx.sessionID });",
+    );
+    assert.equal(out.id, undefined);
+    assert.equal(out.sessionId, undefined);
+    assert.equal(out.taskClaimed, true);
+  });
+
+  it("does not treat explicit undefined/null id as a claim key", () => {
+    const undef = inspectCodeModeExecution(
+      'neurostrata_task_claim({ id: undefined, session_id: "ses-1" });',
+    );
+    assert.ok(!undef.taskClaimed, "explicit undefined id is not a claim");
+    const nil = inspectCodeModeExecution(
+      'neurostrata_task_claim({ id: null, session_id: "ses-1" });',
+    );
+    assert.ok(!nil.taskClaimed, "explicit null id is not a claim");
+  });
+
+  it("detects template-literal and variable notes on task_update", () => {
+    const tpl = inspectCodeModeExecution(
+      'await tools.neurostrata.neurostrata_task_update({ id: task.id, note: `Breath: ${step}` });',
+    );
+    assert.equal(tpl.taskUpdated, true);
+    assert.equal(tpl.note, "");
+    const variable = inspectCodeModeExecution(
+      "await tools.neurostrata.neurostrata_task_update({ id: task.id, note: summary });",
+    );
+    assert.equal(variable.note, "");
+    const none = inspectCodeModeExecution(
+      "await tools.neurostrata.neurostrata_task_update({ id: task.id, priority: 2 });",
+    );
+    assert.equal(none.note, undefined);
+  });
+
+  it("clears stale activeTaskId on a variable-id claim in execute.before and PreToolUse", async () => {
+    const { server, url } = await createMockDaemonServer();
+    try {
+      let beforeHandler;
+      resetClientForTesting();
+      await initialize({
+        config: { namespace: "clear-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 2000 },
+        tool: {
+          hook: async (name, cb) => {
+            if (name === "execute.before") beforeHandler = cb;
+          },
+        },
+        hooks: {},
+      });
+      await beforeHandler({
+        tool: "execute",
+        input: { code: 'neurostrata_task_claim({ id: "stale-task", session_id: "ses-fresh" })' },
+      });
+      assert.equal(getTrackingState().activeTaskId, "stale-task");
+      assert.equal(getTrackingState().activeSessionId, "ses-fresh");
+
+      await beforeHandler({
+        tool: "execute",
+        input: { code: "neurostrata_task_claim({ id: created.id, session_id: ses.id })" },
+      });
+      assert.equal(getTrackingState().activeTaskId, null, "stale task id cleared so daemon re-resolves");
+      assert.equal(getTrackingState().activeSessionId, "ses-fresh", "known session preserved");
+
+      await beforeHandler({
+        tool: "execute",
+        input: { code: 'neurostrata_task_claim({ id: "stale-2", session_id: "ses-fresh" })' },
+      });
+      await handleHookEvent({
+        hook_event_name: "PreToolUse",
+        tool_name: "execute",
+        tool_input: { code: "neurostrata_task_claim({ id: created.id, session_id: ses.id })" },
+      });
+      assert.equal(getTrackingState().activeTaskId, null, "PreToolUse clears stale task id too");
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+});
+
+describe("resolveActiveTaskFromDaemon session/worktree scoping", () => {
+  const root = process.cwd();
+
+  async function withDaemon(tasks, fn) {
+    const { server, url, counters } = await createMockDaemonServer({ returnTask: tasks });
+    try {
+      resetClientForTesting();
+      await initialize({
+        config: { namespace: "scope-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 2000 },
+        tool: { hook: async () => {} },
+        hooks: {},
+      });
+      return await fn(counters);
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  }
+
+  async function seedSession(sessionId) {
+    await handleHookEvent({
+      hook_event_name: "PreToolUse",
+      tool_name: "neurostrata_task_claim",
+      tool_input: { id: `seed-${sessionId}`, session_id: sessionId },
+    });
+  }
+
+  it("prefers session+worktree exact match over other in_progress tasks", async () => {
+    const tasks = [
+      { id: "foreign-same-worktree", session_id: "ses-other", worktree: root, status: "in_progress", subagent_prompt_injection: "FOREIGN" },
+      { id: "same-session-other-worktree", session_id: "ses-mine", worktree: "/tmp/other-wt", status: "in_progress", subagent_prompt_injection: "SAME_SESSION" },
+      { id: "exact", session_id: "ses-mine", worktree: root, status: "in_progress", subagent_prompt_injection: "EXACT" },
+    ];
+    await withDaemon(tasks, async () => {
+      await seedSession("ses-mine");
+      const res = await resolveActiveTaskFromDaemon("scope-ns");
+      assert.equal(res.taskId, "exact", "session+worktree exact match wins");
+      assert.equal(res.promptInjection, "EXACT");
+      assert.equal(getTrackingState().activeSessionId, "ses-mine");
+      for (const t of tasks) {
+        assert.ok(cachedTaskInjection.has(t.id), `injection cached for every task: ${t.id}`);
+      }
+    });
+  });
+
+  it("prefers a session match over a worktree-only match", async () => {
+    const tasks = [
+      { id: "foreign-same-worktree", session_id: "ses-other", worktree: root, status: "in_progress" },
+      { id: "same-session", session_id: "ses-mine", worktree: "/tmp/other-wt", status: "in_progress" },
+    ];
+    await withDaemon(tasks, async () => {
+      await seedSession("ses-mine");
+      const res = await resolveActiveTaskFromDaemon("scope-ns");
+      assert.equal(res.taskId, "same-session", "session specificity outranks worktree specificity");
+    });
+  });
+
+  it("never lets a fallback task from a different session hijack a known session", async () => {
+    const tasks = [
+      { id: "foreign-1", session_id: "ses-other", status: "in_progress" },
+      { id: "foreign-2", session_id: "ses-another", status: "in_progress" },
+    ];
+    await withDaemon(tasks, async () => {
+      await seedSession("ses-mine");
+      await resolveActiveTaskFromDaemon("scope-ns");
+      assert.equal(getTrackingState().activeSessionId, "ses-mine", "known session preserved on fallback");
+    });
+  });
+
+  it("honors an explicit preferredTaskId across sessions and adopts its session", async () => {
+    const tasks = [
+      { id: "mine", session_id: "ses-mine", worktree: root, status: "in_progress" },
+      { id: "preferred", session_id: "ses-preferred", worktree: "/tmp/other-wt", status: "in_progress", subagent_prompt_injection: "PREFERRED" },
+    ];
+    await withDaemon(tasks, async () => {
+      await seedSession("ses-mine");
+      const res = await resolveActiveTaskFromDaemon("scope-ns", "preferred");
+      assert.equal(res.taskId, "preferred");
+      assert.equal(res.sessionId, "ses-preferred");
+      assert.equal(getTrackingState().activeSessionId, "ses-preferred", "explicit preference may adopt a session");
+    });
+  });
+});
+
+describe("isZeroActionExemptShellPayload (read-only / verification commands)", () => {
+  async function exempt() {
+    const mod = await import("./dist/index.js");
+    assert.equal(typeof mod.isZeroActionExemptShellPayload, "function", "helper exported from dist");
+    return mod.isZeroActionExemptShellPayload;
+  }
+
+  it("accepts only shell action types and rejects non-shell tools", async () => {
+    const f = await exempt();
+    for (const t of ["bash", "Bash", "shell", "command", "exec"]) {
+      assert.equal(f(t, "git status"), true, `${t} allowed`);
+    }
+    for (const t of ["write", "read", "execute", ""]) {
+      assert.equal(f(t, "git status"), false, `${t} rejected`);
+    }
+  });
+
+  it("allows read-only git subcommands and rejects write-capable ones", async () => {
+    const f = await exempt();
+    for (const cmd of [
+      "git status", "git status --short", "git log --oneline -5", "git diff HEAD~1",
+      "git show HEAD", "git rev-parse --show-toplevel", "git fetch --dry-run",
+      "git -C /tmp/repo status", "git --no-pager log -1", "git --git-dir=/x/.git log -1",
+      "git -P status", "git --no-optional-locks status", "git stash list", "git stash show stash@{0}",
+      "git branch --show-current", "git branch -a", "git branch --list",
+    ]) {
+      assert.equal(f("bash", cmd), true, `allow: ${cmd}`);
+    }
+    for (const cmd of [
+      "git stash pop", "git branch -D topic", "git diff --output=/tmp/x", "git diff -O file",
+      "git diff --ext-diff", "git log --exec echo", "git commit -m x",
+    ]) {
+      assert.equal(f("bash", cmd), false, `reject: ${cmd}`);
+    }
+  });
+
+  it("allows neurostrata-mcp read-only task/doc-gate/mesh-status commands", async () => {
+    const f = await exempt();
+    for (const cmd of [
+      "neurostrata-mcp task list",
+      "neurostrata-mcp task gate NeuroStrata --strict",
+      "neurostrata-mcp doc-gate check",
+      "neurostrata-mcp synaptic-mesh status",
+    ]) {
+      assert.equal(f("shell", cmd), true, `allow: ${cmd}`);
+    }
+    assert.equal(f("shell", "neurostrata-mcp synaptic-mesh sync"), false);
+    assert.equal(f("shell", "neurostrata-mcp ingest /tmp/x"), false);
+  });
+
+  it("allows verification command families (cargo, gh, node, receipt scripts, rustc)", async () => {
+    const f = await exempt();
+    for (const cmd of [
+      "cargo test --workspace", "cargo +nightly clippy", "cargo check", "cargo --version",
+      "gh pr view 42", "gh pr checks", "gh issue list", "gh run watch 7",
+      "gh api repos/owner/repo", "node --test plugins/core/test.mjs", "node ./tools/run-test.mjs",
+      "bash scripts/gate-receipt.sh", "./check-include-str-targets.sh", "rustc --version", "rustc -V",
+    ]) {
+      assert.equal(f("exec", cmd), true, `allow: ${cmd}`);
+    }
+    for (const cmd of [
+      "cargo build", "cargo fmt", "gh pr create", "gh api -X POST repos/x", "gh api --method DELETE repos/x",
+      "gh api -f key=value repos/x", "node build.js", "bash scripts/cleanup.sh", "rustc src/main.rs",
+    ]) {
+      assert.equal(f("exec", cmd), false, `reject: ${cmd}`);
+    }
+  });
+
+  it("unwraps JSON command payloads and rejects substitutions, redirection, and mixed chains", async () => {
+    const f = await exempt();
+    assert.equal(f("bash", JSON.stringify({ command: "git status" })), true);
+    assert.equal(f("bash", JSON.stringify({ cmd: "cargo test" })), true);
+    assert.equal(f("bash", JSON.stringify({ command: "echo 1" })), false);
+    assert.equal(f("bash", JSON.stringify({})), false);
+    assert.equal(f("bash", "git status && rm -rf /tmp/x"), false, "all segments must be exempt");
+    assert.equal(f("bash", "git status; git log -1"), true, "all-exempt chain allowed");
+    assert.equal(f("bash", "git status | grep foo"), false, "grep is not exempt");
+    assert.equal(f("bash", "echo $(whoami)"), false);
+    assert.equal(f("bash", "echo `date`"), false);
+    assert.equal(f("bash", "git status > out.txt"), false);
+    assert.equal(f("bash", "cat < in.txt"), false);
+    assert.equal(f("bash", "   "), false);
+  });
+});
+
+describe("guard_validate cwd/worktree propagation + shell mutation exemption", () => {
+  it("propagates caller cwd/worktree and does not count read-only shell commands as mutations", async () => {
+    const { server, url, counters } = await createMockDaemonServer();
+    try {
+      let beforeHandler;
+      resetClientForTesting();
+      await initialize({
+        config: { namespace: "guard-cwd-ns", endpoint: url, bearerToken: "tok", strictMode: true, requestTimeoutMs: 2000 },
+        tool: {
+          hook: async (name, cb) => {
+            if (name === "execute.before") beforeHandler = cb;
+          },
+        },
+        hooks: {},
+      });
+
+      const before = getTrackingState().mutationsSinceNote;
+      await beforeHandler({
+        tool: "bash",
+        input: { command: "git status", cwd: "/caller/repo", worktree: "/caller/custom-wt" },
+      });
+      const guard = counters.guardArgs.at(-1);
+      assert.equal(guard.cwd, "/caller/repo", "caller cwd forwarded");
+      assert.equal(guard.worktree, "/caller/custom-wt", "caller worktree forwarded");
+      assert.equal(guard.action_type, "bash");
+      assert.equal(counters.guardValidate, 1, "guard still called for exempt shell command");
+      assert.equal(getTrackingState().mutationsSinceNote, before, "read-only command does not count");
+
+      await beforeHandler({ tool: "bash", input: { command: "echo 1" } });
+      assert.equal(getTrackingState().mutationsSinceNote, before + 1, "non-exempt command still counts");
+      const guard2 = counters.guardArgs.at(-1);
+      assert.equal(guard2.cwd, process.cwd(), "cwd defaults to project root");
+      assert.equal(guard2.worktree, process.cwd(), "worktree defaults to cwd");
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+
+  it("handleHookEvent forwards cwd/worktree and exempts read-only shell commands", async () => {
+    const { server, url, counters } = await createMockDaemonServer();
+    try {
+      resetClientForTesting();
+      await initialize({
+        config: { namespace: "guard-hook-ns", endpoint: url, bearerToken: "tok", strictMode: true, requestTimeoutMs: 2000 },
+        tool: { hook: async () => {} },
+        hooks: {},
+      });
+      const before = getTrackingState().mutationsSinceNote;
+      const out = await handleHookEvent({
+        hook_event_name: "PreToolUse",
+        tool_name: "Bash",
+        tool_input: {
+          command: "node --test plugins/core/test.mjs",
+          cwd: "/caller/repo",
+          worktree: "/caller/custom-wt",
+        },
+      });
+      assert.equal(out.hookSpecificOutput.permissionDecision, "allow");
+      const guard = counters.guardArgs.at(-1);
+      assert.equal(guard.cwd, "/caller/repo");
+      assert.equal(guard.worktree, "/caller/custom-wt");
+      assert.equal(guard.action_type, "Bash");
+      assert.equal(getTrackingState().mutationsSinceNote, before, "verification command does not count");
+    } finally {
+      server.close();
+      resetModuleState();
+    }
   });
 });

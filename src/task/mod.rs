@@ -254,6 +254,8 @@ pub fn task_summary(id: &str, payload: &MemoryPayload) -> Value {
         "task_type": field("task_type"),
         "assignee": field("assignee"),
         "session_id": field("session_id"),
+        "branch": field("branch"),
+        "worktree": field("worktree"),
         "labels": field("labels"),
         "blocked_by": field("blocked_by"),
         "description": field("description"),
@@ -1048,6 +1050,28 @@ pub fn recorded_graph_queries_for_tests() -> Vec<(String, String, String)> {
     mutex.lock().map(|g| g.clone()).unwrap_or_default()
 }
 
+/// Resolve a caller directory (which may be a subdirectory of a Git worktree)
+/// to its enclosing worktree/project root so `.NeuroStrata/active_session.json`
+/// and `.NeuroStrata/session_queries.json` are always read and written at the
+/// worktree root rather than a nested subdirectory.
+pub fn resolve_session_root_dir(dir: &std::path::Path) -> std::path::PathBuf {
+    if let Some(wt) = gate::GateScope::capture(dir).worktree {
+        return std::path::PathBuf::from(wt);
+    }
+    let mut cur = if dir.is_dir() {
+        Some(dir)
+    } else {
+        dir.parent()
+    };
+    while let Some(d) = cur {
+        if d.join(".git").exists() || d.join(".NeuroStrata").exists() {
+            return d.to_path_buf();
+        }
+        cur = d.parent().filter(|p| !p.as_os_str().is_empty());
+    }
+    dir.to_path_buf()
+}
+
 /// Record a graph or memory lookup against any active `in_progress` task in
 /// `namespace` and append to `.NeuroStrata/session_queries.json` if a project
 /// root is known.
@@ -1056,6 +1080,19 @@ pub async fn record_graph_query(
     namespace: &str,
     tool_name: &str,
     query_hint: &str,
+) {
+    record_graph_query_with_root(store, namespace, tool_name, query_hint, None).await;
+}
+
+/// Like [`record_graph_query`], but prefers an explicit caller root
+/// (`project_root` / `worktree` / `cwd`) or an absolute `query_hint`'s enclosing
+/// git worktree over the shared namespace registry row's `project_root`.
+pub async fn record_graph_query_with_root(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    tool_name: &str,
+    query_hint: &str,
+    caller_root: Option<&str>,
 ) {
     let ns = crate::server::resolve_namespace(store, namespace).await;
     #[cfg(test)]
@@ -1074,11 +1111,37 @@ pub async fn record_graph_query(
     };
     let now = chrono::Utc::now().timestamp();
     let entry_str = format!("{}:{}", tool_name, query_hint.chars().take(80).collect::<String>());
-    let mut project_root: Option<String> = None;
-    if let Ok(Some((_, registry))) = store.get(&ns, &crate::registry::registry_row_id(&ns)).await {
-        if crate::registry::is_registry_row(&registry.metadata) {
-            if let Some(p) = registry.metadata.get("project_root").and_then(|v| v.as_str()) {
-                project_root = Some(p.to_string());
+    let mut project_root: Option<String> = caller_root
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            resolve_session_root_dir(std::path::Path::new(s))
+                .to_string_lossy()
+                .into_owned()
+        });
+    if project_root.is_none() {
+        let hint_path = std::path::Path::new(query_hint);
+        if hint_path.is_absolute() {
+            let mut cur = if hint_path.is_dir() {
+                Some(hint_path)
+            } else {
+                hint_path.parent()
+            };
+            while let Some(dir) = cur {
+                if dir.join(".git").exists() || dir.join(".NeuroStrata").exists() {
+                    project_root = Some(dir.to_string_lossy().to_string());
+                    break;
+                }
+                cur = dir.parent().filter(|p| !p.as_os_str().is_empty());
+            }
+        }
+    }
+    if project_root.is_none() {
+        if let Ok(Some((_, registry))) = store.get(&ns, &crate::registry::registry_row_id(&ns)).await {
+            if crate::registry::is_registry_row(&registry.metadata) {
+                if let Some(p) = registry.metadata.get("project_root").and_then(|v| v.as_str()) {
+                    project_root = Some(p.to_string());
+                }
             }
         }
     }
@@ -1384,16 +1447,17 @@ async fn resolve_task_scope(
     let daemon_root = crate::daemon::resolve_project_root();
 
     let mut candidates = Vec::new();
-    if let Some(r) = explicit_root {
-        candidates.push(r);
-    }
-    if let Some(r) = registry_root {
-        if !candidates.contains(&r) {
-            candidates.push(r);
+    if let Some(ref r) = explicit_root {
+        candidates.push(r.clone());
+    } else {
+        if let Some(r) = registry_root {
+            if !candidates.contains(&r) {
+                candidates.push(r);
+            }
         }
-    }
-    if !candidates.contains(&daemon_root) {
-        candidates.push(daemon_root.clone());
+        if !candidates.contains(&daemon_root) {
+            candidates.push(daemon_root.clone());
+        }
     }
 
     let mut chosen_root = candidates
@@ -1413,12 +1477,12 @@ async fn resolve_task_scope(
         scope.branch = Some(explicit_branch.to_string());
     }
     if scope.worktree.is_none() {
-        if let Some(explicit_wt) = arg_str(args, "worktree") {
-            let wt_path = std::path::PathBuf::from(explicit_wt);
-            let canonical = wt_path
+        if let Some(ref explicit_wt) = explicit_root {
+            let root_dir = resolve_session_root_dir(explicit_wt);
+            let canonical = root_dir
                 .canonicalize()
                 .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| explicit_wt.to_string());
+                .unwrap_or_else(|_| root_dir.to_string_lossy().into_owned());
             scope.worktree = Some(canonical);
         }
     }
@@ -1621,17 +1685,36 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
     if let Err(e) = save_task(&store, &namespace, &id, vector.clone(), task.payload.clone()).await {
         return e;
     }
-    let rid = crate::registry::registry_row_id(&namespace);
-    if let Ok(Some((_, reg_p))) = store.get(&namespace, &rid).await {
-        if let Some(pr) = reg_p.metadata.get("project_root").and_then(|v| v.as_str()) {
-            let golden = collect_golden_rules(&store, &namespace, None).await;
-            persist_active_session_file(
-                std::path::Path::new(pr),
-                &namespace,
-                &golden,
-                Some((&id, &task.payload)),
-            );
+    // Write active_session.json into the caller's own worktree, not the global
+    // registry root: explicit worktree/project_root/cwd wins; otherwise use the
+    // registry project_root. Never fall back to daemon_root here -- a worktree
+    // caller without a registry root must not write into the daemon checkout.
+    let explicit_root = arg_str(&args, "worktree")
+        .or_else(|| arg_str(&args, "project_root"))
+        .or_else(|| arg_str(&args, "cwd"))
+        .map(std::path::PathBuf::from);
+    let session_root = if let Some(ref exp) = explicit_root {
+        scope
+            .worktree
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .or_else(|| Some(resolve_session_root_dir(exp)))
+    } else {
+        let rid = crate::registry::registry_row_id(&namespace);
+        if let Ok(Some((_, reg_p))) = store.get(&namespace, &rid).await {
+            reg_p
+                .metadata
+                .get("project_root")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(std::path::PathBuf::from)
+        } else {
+            None
         }
+    };
+    if let Some(root) = session_root {
+        let golden = collect_golden_rules(&store, &namespace, None).await;
+        persist_active_session_file(&root, &namespace, &golden, Some((&id, &task.payload)));
     }
     let event_id = arg_str(&args, "event_id").unwrap_or(&format!("claim-{}", id)).to_string();
     {
@@ -6347,6 +6430,168 @@ mod tests {
             !other_report.violations.iter().any(|v| v.kind == "in_progress"),
             "other worktree must not be blocked: {:?}",
             other_report.violations
+        );
+    }
+
+    #[test]
+    fn task_summary_exposes_branch_and_worktree() {
+        let payload = MemoryPayload {
+            content: "scoped work".to_string(),
+            user_id: "kenton".to_string(),
+            memory_type: "task".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: json!({
+                "task": {
+                    "status": "in_progress",
+                    "branch": "feature/scope",
+                    "worktree": "/wt/scope",
+                }
+            }),
+        };
+        let summary = task_summary("neurostrata-test", &payload);
+        assert_eq!(summary["branch"], json!("feature/scope"));
+        assert_eq!(summary["worktree"], json!("/wt/scope"));
+    }
+
+    #[tokio::test]
+    async fn task_list_includes_branch_and_worktree() {
+        let store = store_with_namespace("MyProj").await;
+        let id = "task-scope-fields";
+        let vector = StubEmbedder.embed("scope fields").await.unwrap();
+        store
+            .upsert(
+                "MyProj",
+                id,
+                vector,
+                MemoryPayload {
+                    content: "scope fields".to_string(),
+                    user_id: "kenton".to_string(),
+                    memory_type: "task".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({
+                        "task": {
+                            "status": "in_progress",
+                            "branch": "feature/scope",
+                            "worktree": "/wt/scope",
+                        }
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+
+        let list: Value = serde_json::from_str(
+            &handle_task_list(json!({ "namespace": "MyProj" }), store.clone()).await,
+        )
+        .unwrap();
+        assert_eq!(list["tasks"][0]["branch"], json!("feature/scope"));
+        assert_eq!(list["tasks"][0]["worktree"], json!("/wt/scope"));
+    }
+
+    #[tokio::test]
+    async fn claim_writes_active_session_to_explicit_cwd_not_registry_root() {
+        let _env_guard = crate::daemon::project_root_env_test_lock();
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let store = store_with_namespace("MyProj").await;
+        let rid = crate::registry::registry_row_id("MyProj");
+        let reg_vec = StubEmbedder.embed("registry").await.unwrap();
+        store
+            .upsert(
+                "MyProj",
+                &rid,
+                reg_vec,
+                MemoryPayload {
+                    content: "registry".to_string(),
+                    user_id: "kenton".to_string(),
+                    memory_type: "structural".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({
+                        "project_root": dir_a.path().to_string_lossy().to_string()
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+
+        let id = create_task(&store, "MyProj", "scope me", 1).await;
+        handle_task_claim(
+            json!({
+                "namespace": "MyProj",
+                "id": id,
+                "assignee": "agent",
+                "session_id": "ses_wt",
+                "cwd": dir_b.path().to_string_lossy().to_string(),
+            }),
+            store.clone(),
+        )
+        .await;
+
+        let b_session = dir_b.path().join(".NeuroStrata").join("active_session.json");
+        let a_session = dir_a.path().join(".NeuroStrata").join("active_session.json");
+        assert!(
+            b_session.exists(),
+            "active_session.json must be written in the explicit cwd dir_b"
+        );
+        assert!(
+            !a_session.exists(),
+            "must not write into the registry project_root dir_a"
+        );
+        let body: Value =
+            serde_json::from_str(&std::fs::read_to_string(&b_session).unwrap()).unwrap();
+        assert_eq!(body["task_id"], json!(id));
+
+        let expected_wt = dir_b
+            .path()
+            .canonicalize()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| dir_b.path().to_string_lossy().into_owned());
+        let (_, claimed_payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+        assert_eq!(
+            claimed_payload.metadata["task"]["worktree"],
+            json!(expected_wt),
+            "non-git explicit cwd must bind task worktree to dir_b rather than falling through to registry_root or daemon_root"
+        );
+        assert_eq!(
+            claimed_payload.metadata["task"]["branch"],
+            Value::Null,
+            "non-git explicit cwd without branch arg must not inherit daemon_root branch"
+        );
+
+        // When the proxy runs from a subdirectory of a Git worktree, `cwd` is
+        // that subdirectory, while `active_session.json` must still be written
+        // at the worktree root so plugin readers at the project root find it.
+        let wt_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(wt_dir.path().join(".git")).unwrap();
+        let nested_cwd = wt_dir.path().join("crates").join("sub");
+        std::fs::create_dir_all(&nested_cwd).unwrap();
+        let id2 = create_task(&store, "MyProj", "scope nested cwd", 1).await;
+        handle_task_claim(
+            json!({
+                "namespace": "MyProj",
+                "id": id2,
+                "assignee": "agent",
+                "session_id": "ses_nested",
+                "cwd": nested_cwd.to_string_lossy().to_string(),
+            }),
+            store.clone(),
+        )
+        .await;
+        let root_session = wt_dir.path().join(".NeuroStrata").join("active_session.json");
+        let nested_session = nested_cwd.join(".NeuroStrata").join("active_session.json");
+        assert!(
+            root_session.exists(),
+            "active_session.json must be written at the enclosing worktree root"
+        );
+        assert!(
+            !nested_session.exists(),
+            "active_session.json must not be stranded in a nested subdirectory"
         );
     }
 

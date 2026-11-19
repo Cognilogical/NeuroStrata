@@ -225,6 +225,12 @@ export declare function isFileTouchTool(name: string): boolean;
 export declare function isMutatingTool(name: string): boolean;
 export declare function isSubagentTool(name: string): boolean;
 export declare function isCodeExecTool(name: string): boolean;
+/**
+ * True only for shell tools whose payload is provably read-only/verification.
+ * JSON payloads are unwrapped via `command`/`cmd`; substitutions, redirection
+ * and chains containing any mutating segment fail closed.
+ */
+export declare function isZeroActionExemptShellPayload(actionType: string, payloadOrCommand: string): boolean;
 export interface CodeModeInspection {
     id?: string;
     sessionId?: string;

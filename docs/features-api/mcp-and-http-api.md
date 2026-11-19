@@ -34,6 +34,10 @@
 - `neurostrata_procedure_perform` — fire a recurring procedure.
 - `neurostrata_guard_validate` — validate PreToolUse actions against behavioral rules and Zero-Action Start (`git push`/`pull`/`fetch`/`status`/`log`/`diff`/`show`/`rev-parse` without file-output or exec-override flags like `--output`/`-c`, plus `neurostrata-mcp task` commands, are exempt from requiring an `in_progress` task so post-completion pushes pass without skipping the gate).
 
+Active-task resolution is session/worktree scoped: when the daemon returns several `in_progress` tasks, resolution prefers an explicit `preferredTaskId`, then a task whose `session_id` and `worktree` both match the caller's session and project root, then a session-only match, then a worktree-only match, and only then any in-progress task. A fallback task owned by a different session does not overwrite an already known `activeSessionId`.
+
+`neurostrata_guard_validate` unwraps a JSON shell payload via its `command`/`cmd` field when deciding whether a shell command is a read-only/verification exemption. The proxy caller's `cwd` (or `workdir`) is propagated into the guard request, with `worktree` defaulting to that `cwd`, so scope checks use the caller's real working tree rather than the daemon process directory.
+
 ## Code Intelligence & SCIP Call-Graph Tools
 
 - `neurostrata_Export_scip` — export SCIP code graph data.
