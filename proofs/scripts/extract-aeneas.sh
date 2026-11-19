@@ -8,6 +8,11 @@
 #   bash proofs/scripts/extract-aeneas.sh [--podman]
 set -euo pipefail
 
+if [ "${NEUROSTRATA_REQUIRE_KANI:-0}" = "1" ] && [ "${NEUROSTRATA_SKIP_KANI:-0}" = "1" ]; then
+    echo "[extract-aeneas] ERROR: NEUROSTRATA_REQUIRE_KANI=1 conflicts with NEUROSTRATA_SKIP_KANI=1" >&2
+    exit 1
+fi
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 KERNEL_SRC="${REPO_ROOT}/src/formal_kernel.rs"
 OUT_DIR="${TMPDIR:-/tmp}/neurostrata-aeneas"
@@ -24,11 +29,6 @@ if command -v kani >/dev/null 2>&1; then
     KANI_BIN="$(command -v kani)"
 elif [ -x "${HOME:-}/.cargo/bin/kani" ]; then
     KANI_BIN="${HOME}/.cargo/bin/kani"
-fi
-
-if [ "${NEUROSTRATA_REQUIRE_KANI:-0}" = "1" ] && [ "${NEUROSTRATA_SKIP_KANI:-0}" = "1" ]; then
-    echo "[extract-aeneas] ERROR: NEUROSTRATA_REQUIRE_KANI=1 conflicts with NEUROSTRATA_SKIP_KANI=1" >&2
-    exit 1
 fi
 
 if [ "${NEUROSTRATA_SKIP_KANI:-0}" = "1" ]; then
