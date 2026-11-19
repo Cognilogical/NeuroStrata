@@ -1625,6 +1625,13 @@ struct FormScanCounts {
     metadata: std::sync::atomic::AtomicUsize,
     exact_failures: std::sync::Mutex<HashSet<String>>,
     fail_shared_metadata: std::sync::atomic::AtomicBool,
+    clock: std::sync::Mutex<Option<FormScanClock>>,
+}
+
+#[cfg(test)]
+struct FormScanClock {
+    now: i64,
+    advance_after_edges_for: &'static str,
 }
 
 #[cfg(test)]
@@ -1635,6 +1642,22 @@ impl FormScanCounts {
             anyhow::bail!("injected exact-file query failure for {path:?}");
         }
         Ok(())
+    }
+
+    fn finish_edges(&self, path: &str) {
+        if let Some(clock) = self.clock.lock().unwrap().as_mut() {
+            if path == clock.advance_after_edges_for {
+                clock.now += 1;
+            }
+        }
+    }
+
+    fn metadata_now(&self) -> i64 {
+        self.clock
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or_else(|| chrono::Utc::now().timestamp(), |clock| clock.now)
     }
 
     fn take(&self) -> (usize, usize, usize) {
@@ -12941,27 +12964,29 @@ fn memory_type_condition(memory_types: &[String]) -> Option<String> {
     Some(format!("m.memory_type IN [{}]", list))
 }
 
-/// The metadata fallback: a memory whose `metadata.governs` declares the path
-/// (or an ancestor) but whose edge never materialised -- e.g. the declaration
-/// predates the stub behaviour, or the target is outside the ingested tree.
+struct MetadataFallbackRow {
+    id: String,
+    content: String,
+    memory_type: String,
+    metadata: Value,
+    declared_paths: Vec<String>,
+    access_count: i64,
+}
+
+/// Read the metadata declarations once. Their retirement is evaluated in each
+/// form's fallback stage, after that form's edge reads.
 ///
 /// The query is scoped to the memory types asked for (rules/facts/procedures
 /// by default), so the ingested AST bulk -- file/symbol/directory rows, which
 /// never carry a `governs` declaration -- is never scanned.
-///
-/// The ids of the hits it found are collected in `fallback_ids`: they are the
-/// rows whose fan-out the census still has to read.
-#[allow(clippy::too_many_arguments)]
-fn add_metadata_fallback_conn(
+fn read_metadata_fallback_rows(
     conn: &Connection,
     safe_ns: &str,
-    paths: &[String],
-    include_ancestors: bool,
     memory_types: &[String],
     active_gens: &std::collections::HashSet<u64>,
-    form_hits: &mut [Result<FileFormHits>],
+    #[cfg(test)] shared: bool,
     #[cfg(test)] scans: &FormScanCounts,
-) -> Result<()> {
+) -> Result<Vec<MetadataFallbackRow>> {
     // An empty `memory_types` means "no type filter" (the trait contract), so
     // the type condition is omitted entirely; a non-empty list is pushed into
     // the WHERE clause so only those rows are read.
@@ -12973,9 +12998,8 @@ fn add_metadata_fallback_conn(
         "MATCH (m:Memory) WHERE {} RETURN m.id, m.content, m.memory_type, m.metadata",
         where_clause
     );
-    let now = chrono::Utc::now().timestamp();
     #[cfg(test)]
-    if paths.len() > 1
+    if shared
         && scans
             .fail_shared_metadata
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -12987,6 +13011,7 @@ fn add_metadata_fallback_conn(
     scans
         .metadata
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut declarations = Vec::new();
     while let Some(row) = rows.next() {
         let id = format!("{}", row[0]);
         // A superseded tree declares nothing to the reader, the same way the
@@ -12994,8 +13019,6 @@ fn add_metadata_fallback_conn(
         if !is_active_id(&id, active_gens) {
             continue;
         }
-        let content = format!("{}", row[1]);
-        let memory_type = format!("{}", row[2]);
         let metadata_str = format!("{}", row[3]);
         let metadata: Value = match serde_json::from_str(&metadata_str) {
             Ok(v) => v,
@@ -13006,14 +13029,13 @@ fn add_metadata_fallback_conn(
                 Value::Null
             }
         };
-        if is_archived(&metadata) || is_retired_at(&metadata, now) || is_mesh_conflicting(&metadata)
-        {
+        if is_archived(&metadata) || is_mesh_conflicting(&metadata) {
             continue;
         }
         let Some(Value::Array(governs)) = metadata.get("governs") else {
             continue;
         };
-        let declared_paths: Vec<_> = governs
+        let declared_paths = governs
             .iter()
             .filter_map(Value::as_str)
             .map(crate::parser::ingest::normalize_node_path)
@@ -13022,29 +13044,47 @@ fn add_metadata_fallback_conn(
             .get("access_count")
             .and_then(Value::as_i64)
             .unwrap_or(0);
-        for (path, result) in paths.iter().zip(&mut *form_hits) {
-            let Ok(form) = result else { continue };
-            // Preserve the first matching declaration for each form separately.
-            let Some(declared) = declared_paths.iter().find(|declared| {
-                *declared == path || (include_ancestors && is_ancestor_of(declared, path))
-            }) else {
-                continue;
-            };
-            form.fallback_ids.insert(id.clone());
-            form.hits.push(MemoryHit {
-                id: id.clone(),
-                memory_type: memory_type.clone(),
-                content: content.clone(),
-                match_kind: GraphMatchKind::MetadataFallback,
-                access_count,
-                explanation: format!("declares governs {declared}"),
-                metadata: metadata.clone(),
-                conceptual_bridges: Vec::new(),
-                linked_files: 0,
-            });
-        }
+        declarations.push(MetadataFallbackRow {
+            id,
+            content: format!("{}", row[1]),
+            memory_type: format!("{}", row[2]),
+            metadata,
+            declared_paths,
+            access_count,
+        });
     }
-    Ok(())
+    Ok(declarations)
+}
+
+fn add_metadata_fallback_hits(
+    declarations: &[MetadataFallbackRow],
+    path: &str,
+    include_ancestors: bool,
+    now: i64,
+    form: &mut FileFormHits,
+) {
+    for row in declarations {
+        if is_retired_at(&row.metadata, now) {
+            continue;
+        }
+        let Some(declared) = row.declared_paths.iter().find(|declared| {
+            *declared == path || (include_ancestors && is_ancestor_of(declared, path))
+        }) else {
+            continue;
+        };
+        form.fallback_ids.insert(row.id.clone());
+        form.hits.push(MemoryHit {
+            id: row.id.clone(),
+            memory_type: row.memory_type.clone(),
+            content: row.content.clone(),
+            match_kind: GraphMatchKind::MetadataFallback,
+            access_count: row.access_count,
+            explanation: format!("declares governs {declared}"),
+            metadata: row.metadata.clone(),
+            conceptual_bridges: Vec::new(),
+            linked_files: 0,
+        });
+    }
 }
 
 /// The most memory ids one `linked_files` census query of the oracle carries.
@@ -13719,59 +13759,69 @@ impl LadybugStore {
                     &scans,
                 )?;
 
-                // Keep the edge query inputs and hit order per form, including
-                // which explanation wins when the same hit has tied edges.
-                let mut form_hits: Vec<_> = targets
-                    .into_iter()
-                    .map(|targets| {
-                        let mut form = FileFormHits::default();
-                        form.hits = graph_hits_from_edges(
-                            conn,
-                            &ns,
-                            &targets.matches,
-                            &targets.files,
-                            &types,
-                            &mut form.census,
-                            &mut form.census_active,
-                        )
-                        .map_err(explain_form_error)?;
-                        Ok(form)
-                    })
-                    .collect();
-
-                if form_hits.iter().any(Result::is_ok) {
-                    add_metadata_fallback_conn(
+                // Complete each form's time-sensitive reads in their original
+                // order. Cache the declarations at the first fallback stage.
+                #[cfg(test)]
+                let shared = paths.len() > 1;
+                let mut declarations = None;
+                let mut form_hits = Vec::with_capacity(paths.len());
+                for (path, targets) in paths.iter().zip(targets) {
+                    let mut form = FileFormHits::default();
+                    form.hits = match graph_hits_from_edges(
                         conn,
-                        &safe_ns,
-                        &paths,
-                        include_ancestors,
+                        &ns,
+                        &targets.matches,
+                        &targets.files,
                         &types,
-                        &active_gens,
-                        &mut form_hits,
-                        #[cfg(test)]
-                        &scans,
-                    )?;
-                }
-
-                // Edge hits carry their own fan-out. Each form reads the
-                // fan-out of its metadata fallback hits in one query.
-                Ok(form_hits
-                    .into_iter()
-                    .map(|result| {
-                        let mut form = result?;
-                        let reads = read_fallback_fan_out(
+                        &mut form.census,
+                        &mut form.census_active,
+                    ) {
+                        Ok(hits) => hits,
+                        Err(error) => {
+                            form_hits.push(Err(explain_form_error(error)));
+                            continue;
+                        }
+                    };
+                    #[cfg(not(test))]
+                    let now = chrono::Utc::now().timestamp();
+                    #[cfg(test)]
+                    let now = {
+                        scans.finish_edges(path);
+                        scans.metadata_now()
+                    };
+                    let rows = match &mut declarations {
+                        Some(rows) => rows,
+                        slot @ None => slot.insert(read_metadata_fallback_rows(
                             conn,
                             &safe_ns,
                             &types,
-                            &form.fallback_ids,
-                            &mut form.census,
-                            &mut form.census_active,
-                        )
-                        .map_err(explain_form_error)?;
+                            &active_gens,
+                            #[cfg(test)]
+                            shared,
+                            #[cfg(test)]
+                            &scans,
+                        )?),
+                    };
+                    add_metadata_fallback_hits(rows, path, include_ancestors, now, &mut form);
+
+                    // Edge hits carry their own fan-out. Read the metadata
+                    // hits' fan-out before starting the next form's edges.
+                    let result = read_fallback_fan_out(
+                        conn,
+                        &safe_ns,
+                        &types,
+                        &form.fallback_ids,
+                        &mut form.census,
+                        &mut form.census_active,
+                    )
+                    .map(|reads| {
                         census_reads.fetch_add(reads as u64, std::sync::atomic::Ordering::Relaxed);
-                        Ok(form)
+                        form
                     })
-                    .collect::<Vec<_>>())
+                    .map_err(explain_form_error);
+                    form_hits.push(result);
+                }
+                Ok(form_hits)
             })
             .await?;
 
@@ -16639,6 +16689,61 @@ eurostrata\src\daemon.rs",
                 observable_form_retrieval(Ok(baseline))
             );
         }
+    }
+
+    #[tokio::test]
+    async fn memories_for_file_forms_matches_per_form_retirement_boundary() {
+        let store = retired_test_store().await;
+        seed_form_scan_fixture(&store).await;
+        let start = 1_800_000_000;
+        let valid_to = start + 1;
+        store
+            .with_conn(move |conn| {
+                for (id, path) in [
+                    ("retiring-first", SCAN_FORM_A),
+                    ("retiring-second", SCAN_FORM_B),
+                ] {
+                    create_form_scan_row(
+                        conn,
+                        id,
+                        "fact",
+                        "",
+                        json!({"governs": [path], "valid_to": valid_to}),
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        // Both reads start at the same second. The second form's edge stage
+        // ends at the retirement boundary, before its metadata evaluation.
+        let reset_clock = || {
+            *store.form_scans.clock.lock().unwrap() = Some(FormScanClock {
+                now: start,
+                advance_after_edges_for: SCAN_FORM_B,
+            });
+        };
+        let forms = [SCAN_FORM_A.to_string(), SCAN_FORM_B.to_string()];
+        let types = ["fact".to_string()];
+        reset_clock();
+        let baseline =
+            per_form_retrieval_baseline(&store, None, &forms, None, false, &types, &[], 20)
+                .await
+                .unwrap();
+        assert!(baseline.hits.iter().any(|hit| hit.id == "retiring-first"));
+        assert!(!baseline.hits.iter().any(|hit| hit.id == "retiring-second"));
+        assert_eq!(store.form_scans.take(), (2, 0, 2));
+
+        reset_clock();
+        let actual = store
+            .memories_for_file_forms("probe", None, &forms, None, false, &types, &[], 20)
+            .await;
+        assert_eq!(store.form_scans.take(), (1, 0, 1));
+        assert_eq!(
+            observable_form_retrieval(actual),
+            observable_form_retrieval(Ok(baseline))
+        );
     }
 
     async fn seed_form_cap_rows(
