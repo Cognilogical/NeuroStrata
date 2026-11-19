@@ -90,4 +90,69 @@ theorem bounded_fire_conserves_budget :
       · rfl
       · omega
 
+@[simp]
+def i64MaxInt : Int := 9223372036854775807
+
+@[simp]
+def i64MinInt : Int := -9223372036854775808
+
+@[simp]
+def clampI64 (x : Int) : Int :=
+  if x > i64MaxInt then i64MaxInt
+  else if x < i64MinInt then i64MinInt
+  else x
+
+@[simp]
+def satAddI64 (a b : Int) : Int :=
+  clampI64 (a + b)
+
+@[simp]
+def satMulI64 (a b : Int) : Int :=
+  clampI64 (a * b)
+
+@[simp]
+def procedureDaySeconds : Int := 86400
+
+@[simp]
+def procedureSessionEstimateSeconds : Int := 3600
+
+@[simp]
+def computeProcedureNextDue
+    (now : Int)
+    (lastPerformedAt : Option Int)
+    (dayCadence : Option Int)
+    (sessionCadence : Option Int)
+    (sessionsSinceLastFire : Option Int) : Int :=
+  match dayCadence, lastPerformedAt with
+  | some days, some last =>
+    if days > 0 then
+      satAddI64 last (satMulI64 days procedureDaySeconds)
+    else
+      match sessionCadence with
+      | some nSessions =>
+        if nSessions > 1 then
+          let rawElapsed := match sessionsSinceLastFire with
+            | some s => s
+            | none => nSessions - 1
+          let elapsed := if rawElapsed < 0 then 0 else rawElapsed
+          satAddI64 last (satMulI64 elapsed procedureSessionEstimateSeconds)
+        else now
+      | none => now
+  | _, _ =>
+    match sessionCadence, lastPerformedAt with
+    | some nSessions, some last =>
+      if nSessions > 1 then
+        let rawElapsed := match sessionsSinceLastFire with
+          | some s => s
+          | none => nSessions - 1
+        let elapsed := if rawElapsed < 0 then 0 else rawElapsed
+        satAddI64 last (satMulI64 elapsed procedureSessionEstimateSeconds)
+      else now
+    | _, _ => now
+
+theorem non_positive_day_cadence_without_sessions_falls_back_to_now
+    (now last days : Int) (h : ¬(days > 0)) :
+    computeProcedureNextDue now (some last) (some days) none none = now := by
+  simp [computeProcedureNextDue, h]
+
 end NeuroStrata.Procedure

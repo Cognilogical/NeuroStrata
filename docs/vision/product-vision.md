@@ -12,7 +12,7 @@ The engine unifies:
 
 - A property-graph memory with bitemporal versioning and supersession
 - A W3C RDF semantic layer (SPARQL 1.1, SHACL validation, RDF-star provenance)
-- SKOS domain taxonomies with disjointness and subsumption reasoning
+- SKOS domain taxonomies with linear DAG validation and transitive disjointness reasoning
 - Polymorphic digital twins fed by telemetry
 - Counterfactual copy-on-write ontology scenarios
 - Fail-closed kinetic actions with bitemporal revert logs
@@ -33,7 +33,7 @@ On top of these strata sits **SynapticGraph**, the retrieval substrate: a usage-
 
 - Local-first, single-binary deployment with no mandatory cloud service
 - Bitemporal correctness — every memory mutation is versioned and revertible
-- Formal verification of every gate, lock, state machine, and WAL recovery verdict (Lean 4 kernel parity)
+- Formal verification of every gate, lock, state machine, and WAL recovery verdict (Lean 4 kernel parity and Kani Rust Verifier symbolic model checking of arithmetic, boundary, and state-machine invariants)
 - v1.19.0 certified OWL 2 RL materialization: a 26-rule formal kernel independently verifies a complete derivation certificate for every inferred triple, with Lean parity evidence. Certification covers only this implemented kernel — not arbitrary reasoning.
 - Graph-first exploration that keeps agent context windows small
 - Deterministic, auditable retrieval

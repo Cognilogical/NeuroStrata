@@ -18,6 +18,32 @@ echo "[extract-aeneas] compiling ${KERNEL_SRC} -> ${RLIB_OUT}"
 rustc -D warnings --edition=2021 --crate-type=lib "${KERNEL_SRC}" -o "${RLIB_OUT}"
 echo "[extract-aeneas] kernel compiled OK -> ${RLIB_OUT}"
 
+# Symbolic model checking via Kani Rust Verifier (#[cfg(kani)] proof harnesses in src/formal_kernel.rs).
+KANI_BIN=""
+if command -v kani >/dev/null 2>&1; then
+    KANI_BIN="$(command -v kani)"
+elif [ -x "${HOME:-}/.cargo/bin/kani" ]; then
+    KANI_BIN="${HOME}/.cargo/bin/kani"
+fi
+
+if [ "${NEUROSTRATA_REQUIRE_KANI:-0}" = "1" ] && [ "${NEUROSTRATA_SKIP_KANI:-0}" = "1" ]; then
+    echo "[extract-aeneas] ERROR: NEUROSTRATA_REQUIRE_KANI=1 conflicts with NEUROSTRATA_SKIP_KANI=1" >&2
+    exit 1
+fi
+
+if [ "${NEUROSTRATA_SKIP_KANI:-0}" = "1" ]; then
+    echo "[extract-aeneas] NEUROSTRATA_SKIP_KANI=1; skipping Kani verification"
+elif [ -n "${KANI_BIN}" ]; then
+    echo "[extract-aeneas] running Kani symbolic model checker (${KANI_BIN}) on ${KERNEL_SRC}"
+    "${KANI_BIN}" "${KERNEL_SRC}"
+    echo "[extract-aeneas] Kani verification OK"
+elif [ "${NEUROSTRATA_REQUIRE_KANI:-0}" = "1" ]; then
+    echo "[extract-aeneas] ERROR: NEUROSTRATA_REQUIRE_KANI=1 but kani was not found on PATH or ~/.cargo/bin/kani" >&2
+    exit 1
+else
+    echo "[extract-aeneas] kani not on PATH; skipping Kani symbolic verification"
+fi
+
 # Optional Lean-4 translation: charon (Rust -> Aeneas IR) then aeneas (IR -> Lean).
 # Only runs when charon and aeneas are on PATH, or --podman is passed
 # (in which case a container image would need to be provided by the operator).

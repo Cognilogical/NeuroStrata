@@ -26,7 +26,7 @@ case "$ROOT" in
 esac
 fold_case() {
     if [ "$FOLD" = "1" ]; then
-        printf '%s' "$1" | LC_ALL=C tr 'A-Z' 'a-z'
+        printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]'
     else
         printf '%s' "$1"
     fi
@@ -47,6 +47,14 @@ if [ "${#StagedFiles[@]}" -eq 0 ]; then
             *) StagedFiles+=("$file") ;;
         esac
     done < <(git diff --name-only -z 2>/dev/null)
+fi
+
+# ── Project quality gate (optional; only when the project ships a runner) ────
+# When scripts/check-staged-quality.sh exists it runs the project's staged
+# formatting/lint checks. Any nonzero exit aborts the hook before the ledger
+# is written, so a failed quality gate never records a lookup.
+if [ -f "$ROOT/scripts/check-staged-quality.sh" ]; then
+    bash "$ROOT/scripts/check-staged-quality.sh" || exit $?
 fi
 
 # ── Path normalization for ledger matching ─────────────────────────────────
@@ -315,7 +323,7 @@ with open(ledger, "w") as f:
         printf '%s\n' "${MissingFiles[@]}" > "$FILELIST"
         export FILELIST
         TMP=$(mktemp)
-        awk '
+        if awk '
           function json_escape(s,    i, n, c, out) {
             out = ""
             n = length(s)
@@ -417,7 +425,11 @@ with open(ledger, "w") as f:
             print "  ]"
             print "}"
           }
-        ' "$LEDGER" > "$TMP" 2>/dev/null && mv "$TMP" "$LEDGER" || rm -f "$TMP"
+        ' "$LEDGER" > "$TMP" 2>/dev/null && mv "$TMP" "$LEDGER"; then
+            :
+        else
+            rm -f "$TMP"
+        fi
         rm -f "$FILELIST"
     fi
 fi

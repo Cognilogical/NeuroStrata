@@ -17,15 +17,16 @@ pub mod wiring;
 
 use crate::formal_kernel::{evaluate_claim_decision, KernelClaimDecision};
 use crate::judgment::DeduplicationChecker;
-use crate::traits::{Embedder, GraphRead, MemoryPayload, SearchResult, VectorStore};
 use crate::store::LadybugStore;
+use crate::traits::{Embedder, GraphRead, MemoryPayload, SearchResult, VectorStore};
 use intake::undisposed_high_confidence_obligations;
 use machine::{annotate, apply, Ctx, Status, Task};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
-static TASK_RECEIPTS: std::sync::LazyLock<std::sync::Mutex<crate::receipts::store::ReceiptStore>> = std::sync::LazyLock::new(|| std::sync::Mutex::new(crate::receipts::store::ReceiptStore::new()));
+static TASK_RECEIPTS: std::sync::LazyLock<std::sync::Mutex<crate::receipts::store::ReceiptStore>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(crate::receipts::store::ReceiptStore::new()));
 
 // ── small helpers shared by every handler ──────────────────────────────────
 
@@ -469,14 +470,8 @@ async fn store_new_task(
 }
 
 /// Memory types treated as normative (governing constraints) for reserved slots.
-const NORMATIVE_MEMORY_TYPES: &[&str] = &[
-    "rule",
-    "fact",
-    "decision",
-    "procedure",
-    "thesis",
-    "concept",
-];
+const NORMATIVE_MEMORY_TYPES: &[&str] =
+    &["rule", "fact", "decision", "procedure", "thesis", "concept"];
 /// Memory types treated as structural evidence anchors.
 const STRUCTURAL_MEMORY_TYPES: &[&str] = &["code_ast", "doc_section"];
 /// Max normative memories reserved in `auto_retrieved_context`.
@@ -486,7 +481,13 @@ const MAX_STRUCTURAL_ANCHORS: usize = 3;
 /// Max cross-domain conceptual bridges emitted per task context.
 const MAX_CONCEPTUAL_BRIDGES: usize = 2;
 /// Relations traversed when synthesising 2-hop conceptual bridges.
-const BRIDGE_RELATIONS: &[&str] = &["GOVERNS", "CONTAINS", "RELATES_TO", "EXTRACTED_FROM", "DEPENDS_ON"];
+const BRIDGE_RELATIONS: &[&str] = &[
+    "GOVERNS",
+    "CONTAINS",
+    "RELATES_TO",
+    "EXTRACTED_FROM",
+    "DEPENDS_ON",
+];
 
 fn is_normative_memory(memory_type: &str) -> bool {
     NORMATIVE_MEMORY_TYPES.contains(&memory_type)
@@ -788,13 +789,17 @@ pub async fn build_task_graph_context(
     // Partition the retrieved items into reserved normative memories and structural anchors.
     let normative_memories: Vec<Value> = hits_json
         .iter()
-        .filter(|h| is_normative_memory(h.get("memory_type").and_then(|v| v.as_str()).unwrap_or("")))
+        .filter(|h| {
+            is_normative_memory(h.get("memory_type").and_then(|v| v.as_str()).unwrap_or(""))
+        })
         .take(MAX_NORMATIVE_MEMORIES)
         .cloned()
         .collect();
     let structural_anchors: Vec<Value> = hits_json
         .iter()
-        .filter(|h| is_structural_memory(h.get("memory_type").and_then(|v| v.as_str()).unwrap_or("")))
+        .filter(|h| {
+            is_structural_memory(h.get("memory_type").and_then(|v| v.as_str()).unwrap_or(""))
+        })
         .take(MAX_STRUCTURAL_ANCHORS)
         .cloned()
         .collect();
@@ -924,13 +929,14 @@ async fn synthesize_conceptual_bridges(
                 // The via is whichever endpoint sits at hop 1; the target is the
                 // other endpoint (the edge may be stored in either orientation
                 // under Direction::Both, so do not assume edge.source is the via).
-                let (via_id, target_id) = if hop1_ids.contains(a) && b != seed_id && !hop1_ids.contains(b) {
-                    (a, b)
-                } else if hop1_ids.contains(b) && a != seed_id && !hop1_ids.contains(a) {
-                    (b, a)
-                } else {
-                    continue;
-                };
+                let (via_id, target_id) =
+                    if hop1_ids.contains(a) && b != seed_id && !hop1_ids.contains(b) {
+                        (a, b)
+                    } else if hop1_ids.contains(b) && a != seed_id && !hop1_ids.contains(a) {
+                        (b, a)
+                    } else {
+                        continue;
+                    };
                 if seen_targets.contains(target_id) {
                     continue;
                 }
@@ -943,13 +949,12 @@ async fn synthesize_conceptual_bridges(
                 }
                 // Fetch the target row so its full metadata (domain, tags,
                 // governs, location) is available for token extraction.
-                let target_metadata = if let Ok(Some((_, payload))) =
-                    ladybug.get(namespace, target_id).await
-                {
-                    payload.metadata
-                } else {
-                    Value::Null
-                };
+                let target_metadata =
+                    if let Ok(Some((_, payload))) = ladybug.get(namespace, target_id).await {
+                        payload.metadata
+                    } else {
+                        Value::Null
+                    };
                 let target_location = target_metadata
                     .get("location")
                     .and_then(|v| v.as_str())
@@ -971,8 +976,7 @@ async fn synthesize_conceptual_bridges(
                     }
                 }
                 seen_targets.insert(target_id.to_string());
-                let why_connected =
-                    format!("{} -> {} -> {}", seed_id, via_id, target_id);
+                let why_connected = format!("{} -> {} -> {}", seed_id, via_id, target_id);
                 bridges.push(json!({
                     "id": target_node.id,
                     "memory_type": target_node.memory_type,
@@ -1148,7 +1152,12 @@ pub async fn record_graph_query_with_root(
     if project_root.is_none() {
         if let Ok(dirs) = store.list(&ns, None, Some("directory")).await {
             for d in &dirs {
-                if let Some(p) = d.payload.metadata.get("absolute_path").and_then(|v| v.as_str()) {
+                if let Some(p) = d
+                    .payload
+                    .metadata
+                    .get("absolute_path")
+                    .and_then(|v| v.as_str())
+                {
                     if std::path::Path::new(p).join(".git").exists() {
                         project_root = Some(p.to_string());
                         break;
@@ -1161,13 +1170,21 @@ pub async fn record_graph_query_with_root(
         if gate::is_task(r) && gate::task_status(r) == Status::InProgress {
             if let Ok(Some((vec, mut payload))) = store.get(&ns, &r.id).await {
                 let obj = task_obj_mut(&mut payload);
-                let count = obj.get("graph_queries_count").and_then(|v| v.as_i64()).unwrap_or(0) + 1;
+                let count = obj
+                    .get("graph_queries_count")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0)
+                    + 1;
                 obj.insert("graph_queries_count".to_string(), json!(count));
                 obj.insert("graph_queried".to_string(), json!(true));
                 let mut recent: Vec<String> = obj
                     .get("recent_queries")
                     .and_then(|v| v.as_array())
-                    .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 recent.push(entry_str.clone());
                 if recent.len() > 10 {
@@ -1200,7 +1217,9 @@ pub async fn record_graph_query_with_root(
     }
     let governed_prefix = if query_hint.ends_with('/')
         || (project_root.is_some()
-            && std::path::Path::new(project_root.as_ref().unwrap()).join(query_hint).is_dir())
+            && std::path::Path::new(project_root.as_ref().unwrap())
+                .join(query_hint)
+                .is_dir())
     {
         // Explicit directory coverage: preserve trailing slash without
         // widening to the top-level directory.
@@ -1366,9 +1385,8 @@ pub async fn handle_task_create(
     {
         Ok((id, mut payload)) => {
             let vector = emb.embed(&payload.content).await.unwrap_or_default();
-            let (hits_json, subagent_prompt) = build_task_graph_context(
-                &store, &namespace, &id, &vector, &payload,
-            ).await;
+            let (hits_json, subagent_prompt) =
+                build_task_graph_context(&store, &namespace, &id, &vector, &payload).await;
             // Re-read the freshest row under the task claim lock so a
             // concurrent create/update cannot be overwritten mid-context-build.
             let claim_mutex = claim_lock(&id);
@@ -1376,13 +1394,19 @@ pub async fn handle_task_create(
             if let Ok((mut latest_task, latest_vec)) = load_task(&store, &namespace, &id).await {
                 {
                     let obj = task_obj_mut(&mut latest_task.payload);
-                    obj.insert("subagent_prompt_injection".to_string(), json!(subagent_prompt));
+                    obj.insert(
+                        "subagent_prompt_injection".to_string(),
+                        json!(subagent_prompt),
+                    );
                 }
                 let _ = save_task(&store, &namespace, &id, latest_vec, latest_task.payload).await;
             }
             {
                 let obj = task_obj_mut(&mut payload);
-                obj.insert("subagent_prompt_injection".to_string(), json!(subagent_prompt));
+                obj.insert(
+                    "subagent_prompt_injection".to_string(),
+                    json!(subagent_prompt),
+                );
             }
             encode(&json!({
                 "id": id,
@@ -1540,7 +1564,11 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
     let mut age: Option<i64> = None;
     if from == Status::InProgress && !same_session {
         let now = chrono::Utc::now().timestamp();
-        age = gate::age_secs(task.payload.metadata.get("task"), &["updated_at", "created_at"], now);
+        age = gate::age_secs(
+            task.payload.metadata.get("task"),
+            &["updated_at", "created_at"],
+            now,
+        );
         if age.is_none() {
             tracing::warn!(
                 "task {} in_progress claim has missing/invalid updated_at timestamp; treating claim as stale",
@@ -1675,14 +1703,24 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
     // BEFORE the single save, while _claim_guard is still held, so a
     // concurrent claim cannot observe a row without the injection.
 
-    let (hits_json, subagent_prompt) = build_task_graph_context(
-        &store, &namespace, &id, &vector, &task.payload,
-    ).await;
+    let (hits_json, subagent_prompt) =
+        build_task_graph_context(&store, &namespace, &id, &vector, &task.payload).await;
     {
         let obj = task_obj_mut(&mut task.payload);
-        obj.insert("subagent_prompt_injection".to_string(), json!(subagent_prompt));
+        obj.insert(
+            "subagent_prompt_injection".to_string(),
+            json!(subagent_prompt),
+        );
     }
-    if let Err(e) = save_task(&store, &namespace, &id, vector.clone(), task.payload.clone()).await {
+    if let Err(e) = save_task(
+        &store,
+        &namespace,
+        &id,
+        vector.clone(),
+        task.payload.clone(),
+    )
+    .await
+    {
         return e;
     }
     // Write active_session.json into the caller's own worktree, not the global
@@ -1716,7 +1754,9 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
         let golden = collect_golden_rules(&store, &namespace, None).await;
         persist_active_session_file(&root, &namespace, &golden, Some((&id, &task.payload)));
     }
-    let event_id = arg_str(&args, "event_id").unwrap_or(&format!("claim-{}", id)).to_string();
+    let event_id = arg_str(&args, "event_id")
+        .unwrap_or(&format!("claim-{}", id))
+        .to_string();
     {
         let mut r = TASK_RECEIPTS.lock().unwrap_or_else(|e| e.into_inner());
         let binding = crate::task::receipt::Receipt::capture(&id, &scope_root);
@@ -1989,13 +2029,21 @@ pub async fn handle_task_update(
     if let Err(e) = save_task(&store, &namespace, &id, vector, task.payload.clone()).await {
         return e;
     }
-    let event_id = arg_str(&args, "event_id").unwrap_or(&format!("update-{}", id)).to_string();
-    let session_for_receipt = arg_str(&args, "session_id").map(String::from).unwrap_or_else(|| {
-        task.task_field("session_id").and_then(|v| v.as_str()).unwrap_or("").to_string()
-    });
+    let event_id = arg_str(&args, "event_id")
+        .unwrap_or(&format!("update-{}", id))
+        .to_string();
+    let session_for_receipt = arg_str(&args, "session_id")
+        .map(String::from)
+        .unwrap_or_else(|| {
+            task.task_field("session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        });
     {
         let mut r = TASK_RECEIPTS.lock().unwrap_or_else(|e| e.into_inner());
-        let binding = crate::task::receipt::Receipt::capture(&id, &crate::daemon::resolve_project_root());
+        let binding =
+            crate::task::receipt::Receipt::capture(&id, &crate::daemon::resolve_project_root());
         r.record(crate::receipts::store::Receipt {
             session_id: session_for_receipt,
             task_id: id.clone(),
@@ -2007,10 +2055,18 @@ pub async fn handle_task_update(
             dirty_tree_hash: binding.dirty_tree_hash,
         });
     }
-    let graph_queries_count = task.payload.metadata.get("task").and_then(|t| t.get("graph_queries_count")).and_then(|v| v.as_i64()).unwrap_or(0);
+    let graph_queries_count = task
+        .payload
+        .metadata
+        .get("task")
+        .and_then(|t| t.get("graph_queries_count"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
     let graph_lookup_nudge = if graph_queries_count == 0 {
         Some("Graph-First Lookup: run neurostrata_memories_for_file / neurostrata_related / neurostrata_search_memory before editing files.")
-    } else { None };
+    } else {
+        None
+    };
     encode(&json!({
         "id": id,
         "namespace": namespace,
@@ -2231,14 +2287,16 @@ pub async fn handle_task_complete(
 
     // M3: optional inline follow_up_tasks. Validate everything before any
     // mutation so a bad entry cannot leave the parent half-completed.
-    let mut follow_up_specs: Vec<(String, Option<String>, String, i64, Vec<String>)> = Vec::new();
-    
+    type FollowUpSpec = (String, Option<String>, String, i64, Vec<String>);
+    let mut follow_up_specs: Vec<FollowUpSpec> = Vec::new();
+
     // Task intent enforcement: reject if intent markers present without follow_up_tasks or task ID citation
     let mut full_text = String::new();
     if !reason.is_empty() {
         full_text.push_str(&reason);
     }
-    if let Some(mem_content) = memory.as_ref()
+    if let Some(mem_content) = memory
+        .as_ref()
         .and_then(|m| m.get("content"))
         .and_then(|c| c.as_str())
     {
@@ -2306,10 +2364,7 @@ pub async fn handle_task_complete(
                 let priority = match item.get("priority") {
                     None => 2i64,
                     Some(Value::Number(n))
-                        if n
-                            .as_i64()
-                            .map(|p| (0..=4).contains(&p))
-                            .unwrap_or(false) =>
+                        if n.as_i64().map(|p| (0..=4).contains(&p)).unwrap_or(false) =>
                     {
                         n.as_i64().unwrap_or(2)
                     }
@@ -2336,7 +2391,7 @@ pub async fn handle_task_complete(
     let intake_store = store.as_intake_store();
     if let Some(intake) = intake_store {
         let obligations =
-            undisposed_high_confidence_obligations(&*intake, &namespace, None, Some(id.as_str()))
+            undisposed_high_confidence_obligations(intake, &namespace, None, Some(id.as_str()))
                 .await
                 .unwrap_or_default();
         if !obligations.is_empty() {
@@ -2495,9 +2550,7 @@ pub async fn handle_task_complete(
             if !meta
                 .get("extracted_from")
                 .and_then(|v| v.as_array())
-                .map_or(false, |arr| {
-                    arr.iter().any(|t| t.as_str() == Some(id.as_str()))
-                })
+                .is_some_and(|arr| arr.iter().any(|t| t.as_str() == Some(id.as_str())))
             {
                 match meta.get_mut("extracted_from") {
                     None => meta["extracted_from"] = json!([id.as_str()]),
@@ -2546,8 +2599,7 @@ pub async fn handle_task_complete(
                     .get("register_domain")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                match crate::registry::check_domain(&store, &namespace, &raw, register_domain)
-                    .await
+                match crate::registry::check_domain(&store, &namespace, &raw, register_domain).await
                 {
                     Ok(check) => {
                         pending_registry = check.cache;
@@ -2666,15 +2718,23 @@ pub async fn handle_task_complete(
         }
     }
     save_task(&store, &namespace, &id, vector, completed.payload.clone()).await?;
-    let event_id = arg_str(&args, "event_id").unwrap_or(&format!("complete-{}", id)).to_string();
-    let session_for_receipt = arg_str(&args, "session_id").map(String::from).unwrap_or_else(|| {
-        task.task_field("session_id").and_then(|v| v.as_str()).unwrap_or("").to_string()
-    });
+    let event_id = arg_str(&args, "event_id")
+        .unwrap_or(&format!("complete-{}", id))
+        .to_string();
+    let session_for_receipt = arg_str(&args, "session_id")
+        .map(String::from)
+        .unwrap_or_else(|| {
+            task.task_field("session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        });
     {
         let mut r = TASK_RECEIPTS.lock().unwrap_or_else(|e| e.into_inner());
         // Bind the completion receipt to the worktree state captured right now
         // (AC5): retention verification later re-checks this binding.
-        let binding = crate::task::receipt::Receipt::capture(&id, &crate::daemon::resolve_project_root());
+        let binding =
+            crate::task::receipt::Receipt::capture(&id, &crate::daemon::resolve_project_root());
         r.record(crate::receipts::store::Receipt {
             session_id: session_for_receipt.clone(),
             task_id: binding.task_id.clone(),
@@ -2793,8 +2853,7 @@ pub async fn handle_task_complete(
         reply["registry_warning"] = json!(registry_warnings.join("; "));
     }
 
-    serde_json::to_string_pretty(&reply)
-        .map_err(|e| format!("Internal serialization error: {}", e))
+    serde_json::to_string_pretty(&reply).map_err(|e| format!("Internal serialization error: {}", e))
 }
 
 // ── tool: neurostrata_task_validate ────────────────────────────────────────
@@ -2820,10 +2879,13 @@ pub async fn handle_task_validate(args: Value, store: Arc<dyn VectorStore>) -> S
                         let count = edges.len();
                         let samples: Vec<_> = edges.into_iter().take(5).collect();
                         if let Some(obj) = json.as_object_mut() {
-                            obj.insert("dangling_edges".to_string(), serde_json::json!({
-                                "total": count,
-                                "samples": samples,
-                            }));
+                            obj.insert(
+                                "dangling_edges".to_string(),
+                                serde_json::json!({
+                                    "total": count,
+                                    "samples": samples,
+                                }),
+                            );
                         }
                     }
                     Err(e) => {
@@ -2836,7 +2898,10 @@ pub async fn handle_task_validate(args: Value, store: Arc<dyn VectorStore>) -> S
                 }
                 let ow = ls.ontology_warnings(&namespace).await;
                 if let Some(obj) = json.as_object_mut() {
-                    obj.insert("ontology_warnings".to_string(), serde_json::Value::Array(ow));
+                    obj.insert(
+                        "ontology_warnings".to_string(),
+                        serde_json::Value::Array(ow),
+                    );
                 }
                 // Enrichment state surface (F12/F14/F24), warn-first.
                 let rid = crate::registry::registry_row_id(&namespace);
@@ -3050,7 +3115,8 @@ pub async fn handle_bootstrap(
     }
     let project_description = arg_str(&args, "project_description").map(|s| s.to_string());
     let root = std::path::Path::new(project_root);
-    let harness_plugins = harness_plugins::auto_install_detected_plugins(root, &namespace, arg_str(&args, "harness"));
+    let harness_plugins =
+        harness_plugins::auto_install_detected_plugins(root, &namespace, arg_str(&args, "harness"));
     let (wiring_block, verified, wire_instruction) = wiring_panel(root, &namespace);
     let hook_installed = verified["hook_installed"].as_bool().unwrap_or(false);
 
@@ -3275,7 +3341,7 @@ case "$ROOT" in
 esac
 fold_case() {
     if [ "$FOLD" = "1" ]; then
-        printf '%s' "$1" | LC_ALL=C tr 'A-Z' 'a-z'
+        printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]'
     else
         printf '%s' "$1"
     fi
@@ -3296,6 +3362,14 @@ if [ "${#StagedFiles[@]}" -eq 0 ]; then
             *) StagedFiles+=("$file") ;;
         esac
     done < <(git diff --name-only -z 2>/dev/null)
+fi
+
+# ── Project quality gate (optional; only when the project ships a runner) ────
+# When scripts/check-staged-quality.sh exists it runs the project's staged
+# formatting/lint checks. Any nonzero exit aborts the hook before the ledger
+# is written, so a failed quality gate never records a lookup.
+if [ -f "$ROOT/scripts/check-staged-quality.sh" ]; then
+    bash "$ROOT/scripts/check-staged-quality.sh" || exit $?
 fi
 
 # ── Path normalization for ledger matching ─────────────────────────────────
@@ -3564,7 +3638,7 @@ with open(ledger, "w") as f:
         printf '%s\n' "${MissingFiles[@]}" > "$FILELIST"
         export FILELIST
         TMP=$(mktemp)
-        awk '
+        if awk '
           function json_escape(s,    i, n, c, out) {
             out = ""
             n = length(s)
@@ -3666,7 +3740,11 @@ with open(ledger, "w") as f:
             print "  ]"
             print "}"
           }
-        ' "$LEDGER" > "$TMP" 2>/dev/null && mv "$TMP" "$LEDGER" || rm -f "$TMP"
+        ' "$LEDGER" > "$TMP" 2>/dev/null && mv "$TMP" "$LEDGER"; then
+            :
+        else
+            rm -f "$TMP"
+        fi
         rm -f "$FILELIST"
     fi
 fi
@@ -3768,21 +3846,20 @@ pub(crate) fn hook_hygiene(root: &std::path::Path) -> String {
             set_executable(&pre_commit_target);
         }
     } else if let Ok(pc_content) = std::fs::read_to_string(&pre_commit_target) {
-        if pc_content.contains("NeuroStrata pre-commit hook") && pc_content != SCAFFOLDED_PRE_COMMIT_HOOK {
-            if std::fs::copy(&pre_commit_target, hooks_dir.join("pre-commit.bak")).is_ok()
-                && std::fs::write(&pre_commit_target, SCAFFOLDED_PRE_COMMIT_HOOK).is_ok()
-            {
-                set_executable(&pre_commit_target);
-            }
+        if pc_content.contains("NeuroStrata pre-commit hook")
+            && pc_content != SCAFFOLDED_PRE_COMMIT_HOOK
+            && std::fs::copy(&pre_commit_target, hooks_dir.join("pre-commit.bak")).is_ok()
+            && std::fs::write(&pre_commit_target, SCAFFOLDED_PRE_COMMIT_HOOK).is_ok()
+        {
+            set_executable(&pre_commit_target);
         }
     }
     let repo_scripts_hooks = root.join("scripts/hooks");
     if repo_scripts_hooks.is_dir() {
         let repo_pc = repo_scripts_hooks.join("pre-commit");
-        let needs_repo_pc = std::fs::read_to_string(&repo_pc)
-            .map(|c| c != SCAFFOLDED_PRE_COMMIT_HOOK)
-            .unwrap_or(true);
-        if needs_repo_pc && std::fs::write(&repo_pc, SCAFFOLDED_PRE_COMMIT_HOOK).is_ok() {
+        // The repo-side hook is tracked. Only seed it when absent: an older
+        // binary must never clobber a newer checked-in hook or local edits.
+        if !repo_pc.exists() && std::fs::write(&repo_pc, SCAFFOLDED_PRE_COMMIT_HOOK).is_ok() {
             set_executable(&repo_pc);
         }
     }
@@ -4231,7 +4308,7 @@ fn detect_project(root: &std::path::Path) -> ProjectScan {
         }
         scan.language_counts.push((lang.to_string(), *n));
     }
-    scan.language_counts.sort_by(|a, b| b.1.cmp(&a.1));
+    scan.language_counts.sort_by_key(|a| std::cmp::Reverse(a.1));
     // Manifest-detected languages with no counted files sort last, keeping the
     // order meaningful for everything suggested_rules derives from it.
     scan.languages.sort_by_key(|l| {
@@ -4443,7 +4520,8 @@ pub async fn handle_task_setup(
     if !root.is_dir() {
         return format!("ERROR: project_root '{}' is not a directory.", project_root);
     }
-    let harness_plugins = harness_plugins::auto_install_detected_plugins(root, &namespace, arg_str(&args, "harness"));
+    let harness_plugins =
+        harness_plugins::auto_install_detected_plugins(root, &namespace, arg_str(&args, "harness"));
 
     let scan = detect_project(root);
     let (wiring_block, verified, wire_instruction) = wiring_panel(root, &namespace);
@@ -4501,7 +4579,10 @@ pub async fn handle_task_setup(
         let count = std::fs::read_to_string(root.join(beads_rel))
             .map(|text| text.lines().filter(|l| !l.trim().is_empty()).count())
             .unwrap_or_else(|e| {
-                tracing::warn!("failed to read beads file {}: {e}", root.join(beads_rel).display());
+                tracing::warn!(
+                    "failed to read beads file {}: {e}",
+                    root.join(beads_rel).display()
+                );
                 0
             });
         let title = format!("Migrate {} beads issues into NeuroStrata tasks", count);
@@ -4549,23 +4630,23 @@ pub async fn handle_task_setup(
         match emb.embed(&content).await {
             Ok(vec) => match store.search(&namespace, vec, 3, false, false).await {
                 Ok(hits) => {
-                for hit in hits {
-                    let preview: String = hit.payload.content.chars().take(160).collect();
-                    similar.push(json!({
-                        "id": hit.id,
-                        "memory_type": hit.payload.memory_type,
-                        "content": preview,
-                    }));
-                    if hit.payload.memory_type == "rule" {
-                        conflicts.push(json!({
+                    for hit in hits {
+                        let preview: String = hit.payload.content.chars().take(160).collect();
+                        similar.push(json!({
+                            "id": hit.id,
+                            "memory_type": hit.payload.memory_type,
+                            "content": preview,
+                        }));
+                        if hit.payload.memory_type == "rule" {
+                            conflicts.push(json!({
                             "kind": "suggested_rule_overlap",
                             "suggestion": content,
                             "existing_id": hit.id,
                             "existing": preview,
                             "resolution": "review both; supersede the stale one instead of accepting a contradiction",
                         }));
+                        }
                     }
-                }
                 }
                 Err(e) => {
                     tracing::warn!("rule similarity search failed for '{namespace}': {e}");
@@ -4651,10 +4732,16 @@ pub async fn handle_task_setup(
     if let Ok(Some((reg_vec, mut reg_payload))) = store.get(&namespace, &rid).await {
         if let Some(ds) = reg_payload.metadata.get("doctor_state") {
             if let Some(arr) = ds.get("configured_wires").and_then(|v| v.as_array()) {
-                prev_wires = arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect();
+                prev_wires = arr
+                    .iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect();
             }
             if let Some(arr) = ds.get("configured_fires_on").and_then(|v| v.as_array()) {
-                prev_fires = arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect();
+                prev_fires = arr
+                    .iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect();
             }
         }
         if let Some(obj) = reg_payload.metadata.as_object_mut() {
@@ -5223,6 +5310,28 @@ mod tests {
         }
     }
 
+    /// The pre-commit hook is authored twice: the checked-in file the installer
+    /// copies into `.git/hooks`, and the copy embedded in the binary for fresh
+    /// projects. If the two drift, an installed project runs a different gate
+    /// than the one reviewed in the repository — so they must stay byte-identical,
+    /// and both must delegate to the project's staged-quality runner when one
+    /// exists.
+    #[test]
+    fn pre_commit_hook_sources_stay_byte_identical() {
+        let checked_in = include_str!("../../scripts/hooks/pre-commit");
+        if SCAFFOLDED_PRE_COMMIT_HOOK != checked_in {
+            panic!(
+                "embedded pre-commit hook ({} bytes) differs from scripts/hooks/pre-commit ({} bytes)",
+                SCAFFOLDED_PRE_COMMIT_HOOK.len(),
+                checked_in.len()
+            );
+        }
+        assert!(
+            checked_in.contains("scripts/check-staged-quality.sh"),
+            "the pre-commit hook must delegate to the project's staged-quality runner"
+        );
+    }
+
     /// A store whose `namespace` already holds one rule, so the namespace
     /// exists for task_create's existence check.
     async fn store_with_namespace(namespace: &str) -> Arc<dyn VectorStore> {
@@ -5425,7 +5534,10 @@ mod tests {
         );
         assert_eq!(wiring_block["coverage"]["uncovered"], json!([]));
         // the task-coverage gate is wired by design; it is a real guard, not faked
-        assert_eq!(verified["hook_project_guards"], json!(["./scripts/task-coverage-gate.sh"]));
+        assert_eq!(
+            verified["hook_project_guards"],
+            json!(["./scripts/task-coverage-gate.sh"])
+        );
         // and no per-guard claim of client-side coverage survives
         assert!(
             wiring_block["automatic"]
@@ -5455,7 +5567,11 @@ mod tests {
         assert_eq!(verified["hook_installed"], json!(true));
         assert_eq!(
             verified["hook_project_guards"],
-            json!(["./scripts/task-coverage-gate.sh", "./scripts/rules-gate.sh", "./scripts/typecheck.sh"])
+            json!([
+                "./scripts/task-coverage-gate.sh",
+                "./scripts/rules-gate.sh",
+                "./scripts/typecheck.sh"
+            ])
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -5755,14 +5871,12 @@ mod tests {
             root.join("scripts").join("task-coverage-gate.sh"),
             "#!/bin/bash\n# stub gate for test\ntask-coverage-gate: no untracked work items found\nexit 0\n",
         ).unwrap();
-        let mut perms = std::fs::metadata(
-            root.join("scripts").join("task-coverage-gate.sh")
-        ).unwrap().permissions();
+        let mut perms = std::fs::metadata(root.join("scripts").join("task-coverage-gate.sh"))
+            .unwrap()
+            .permissions();
         perms.set_mode(0o755);
-        std::fs::set_permissions(
-            root.join("scripts").join("task-coverage-gate.sh"),
-            perms,
-        ).unwrap();
+        std::fs::set_permissions(root.join("scripts").join("task-coverage-gate.sh"), perms)
+            .unwrap();
 
         let run_gate = |code: i32| {
             std::process::Command::new("bash")
@@ -6338,26 +6452,29 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn claim_stamps_the_current_branch_and_worktree() {
+    #[test]
+    fn claim_stamps_the_current_branch_and_worktree() {
         let _env_guard = crate::daemon::project_root_env_test_lock();
-        let store = store_with_namespace("MyProj").await;
-        let id = create_task(&store, "MyProj", "the work", 2).await;
-        let expected = gate::GateScope::capture(&crate::daemon::resolve_project_root());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let store = store_with_namespace("MyProj").await;
+            let id = create_task(&store, "MyProj", "the work", 2).await;
+            let expected = gate::GateScope::capture(&crate::daemon::resolve_project_root());
 
-        let reply = handle_task_claim(
-            json!({ "namespace": "MyProj", "id": id, "assignee": "agent-a", "session_id": "ses_a" }),
-            store.clone(),
-        )
-        .await;
-        assert!(reply.contains("\"status\": \"in_progress\""), "{}", reply);
+            let reply = handle_task_claim(
+                json!({ "namespace": "MyProj", "id": id, "assignee": "agent-a", "session_id": "ses_a" }),
+                store.clone(),
+            )
+            .await;
+            assert!(reply.contains("\"status\": \"in_progress\""), "{}", reply);
 
-        let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
-        assert_eq!(payload.metadata["task"]["branch"], json!(expected.branch));
-        assert_eq!(
-            payload.metadata["task"]["worktree"],
-            json!(expected.worktree)
-        );
+            let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+            assert_eq!(payload.metadata["task"]["branch"], json!(expected.branch));
+            assert_eq!(
+                payload.metadata["task"]["worktree"],
+                json!(expected.worktree)
+            );
+        });
     }
 
     #[tokio::test]
@@ -6719,45 +6836,48 @@ mod tests {
         assert_eq!(task_meta["session_id"], json!("ses_other"));
     }
 
-    #[tokio::test]
-    async fn task_update_claim_stamps_scope_for_the_strict_gate() {
+    #[test]
+    fn task_update_claim_stamps_scope_for_the_strict_gate() {
         let _env_guard = crate::daemon::project_root_env_test_lock();
-        let store = store_with_namespace("MyProj").await;
-        let id = create_task(&store, "MyProj", "the work", 2).await;
-        let expected = gate::GateScope::capture(&crate::daemon::resolve_project_root());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let store = store_with_namespace("MyProj").await;
+            let id = create_task(&store, "MyProj", "the work", 2).await;
+            let expected = gate::GateScope::capture(&crate::daemon::resolve_project_root());
 
-        let reply = handle_task_update(
-            json!({
-                "namespace": "MyProj",
-                "id": id,
-                "status": "in_progress",
-                "assignee": "agent-a",
-                "session_id": "ses_a"
-            }),
-            emb(),
-            store.clone(),
-        )
-        .await;
-        assert!(reply.contains("\"status\": \"in_progress\""), "{}", reply);
+            let reply = handle_task_update(
+                json!({
+                    "namespace": "MyProj",
+                    "id": id,
+                    "status": "in_progress",
+                    "assignee": "agent-a",
+                    "session_id": "ses_a"
+                }),
+                emb(),
+                store.clone(),
+            )
+            .await;
+            assert!(reply.contains("\"status\": \"in_progress\""), "{}", reply);
 
-        let same_scope = gate::run_scoped(&store, "MyProj", Some(&expected))
-            .await
-            .unwrap();
-        assert!(same_scope
-            .violations
-            .iter()
-            .any(|v| v.kind == "in_progress"));
-        let independent = gate::GateScope {
-            branch: Some("feature/independent".to_string()),
-            worktree: Some("/repo/independent".to_string()),
-        };
-        let other_scope = gate::run_scoped(&store, "MyProj", Some(&independent))
-            .await
-            .unwrap();
-        assert!(!other_scope
-            .violations
-            .iter()
-            .any(|v| v.kind == "in_progress"));
+            let same_scope = gate::run_scoped(&store, "MyProj", Some(&expected))
+                .await
+                .unwrap();
+            assert!(same_scope
+                .violations
+                .iter()
+                .any(|v| v.kind == "in_progress"));
+            let independent = gate::GateScope {
+                branch: Some("feature/independent".to_string()),
+                worktree: Some("/repo/independent".to_string()),
+            };
+            let other_scope = gate::run_scoped(&store, "MyProj", Some(&independent))
+                .await
+                .unwrap();
+            assert!(!other_scope
+                .violations
+                .iter()
+                .any(|v| v.kind == "in_progress"));
+        });
     }
 
     #[tokio::test]
@@ -6832,7 +6952,10 @@ mod tests {
             holder
         );
         assert_eq!(
-            payload.metadata["task"]["history"].as_array().unwrap().len(),
+            payload.metadata["task"]["history"]
+                .as_array()
+                .unwrap()
+                .len(),
             1,
             "only the winning claim is persisted"
         );
@@ -6901,67 +7024,70 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn same_session_reclaim_backfills_missing_legacy_attribution_and_preserves_existing() {
+    #[test]
+    fn same_session_reclaim_backfills_missing_legacy_attribution_and_preserves_existing() {
         let _env_guard = crate::daemon::project_root_env_test_lock();
-        let store = store_with_namespace("MyProj").await;
-        let id = create_task(&store, "MyProj", "the work", 2).await;
-        let args = json!({ "namespace": "MyProj", "id": id, "assignee": "agent-a", "session_id": "ses_a" });
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let store = store_with_namespace("MyProj").await;
+            let id = create_task(&store, "MyProj", "the work", 2).await;
+            let args = json!({ "namespace": "MyProj", "id": id, "assignee": "agent-a", "session_id": "ses_a" });
 
-        handle_task_claim(args.clone(), store.clone()).await;
+            handle_task_claim(args.clone(), store.clone()).await;
 
-        // Simulate a legacy row: attribution dropped, claim intact.
-        let expected = gate::GateScope::capture(&crate::daemon::resolve_project_root());
-        let (vector, mut payload) = store.get("MyProj", &id).await.unwrap().unwrap();
-        payload.metadata["task"]
-            .as_object_mut()
-            .unwrap()
-            .remove("branch");
-        payload.metadata["task"]
-            .as_object_mut()
-            .unwrap()
-            .remove("worktree");
-        store.upsert("MyProj", &id, vector, payload).await.unwrap();
+            // Simulate a legacy row: attribution dropped, claim intact.
+            let expected = gate::GateScope::capture(&crate::daemon::resolve_project_root());
+            let (vector, mut payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+            payload.metadata["task"]
+                .as_object_mut()
+                .unwrap()
+                .remove("branch");
+            payload.metadata["task"]
+                .as_object_mut()
+                .unwrap()
+                .remove("worktree");
+            store.upsert("MyProj", &id, vector, payload).await.unwrap();
 
-        let backfill = handle_task_claim(args.clone(), store.clone()).await;
-        assert!(
-            backfill.contains("already claimed by this session"),
-            "{}",
-            backfill
-        );
+            let backfill = handle_task_claim(args.clone(), store.clone()).await;
+            assert!(
+                backfill.contains("already claimed by this session"),
+                "{}",
+                backfill
+            );
 
-        let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
-        assert_eq!(
-            payload.metadata["task"]["branch"],
-            json!(expected.branch),
-            "legacy branch attribution must be backfilled"
-        );
-        assert_eq!(
-            payload.metadata["task"]["worktree"],
-            json!(expected.worktree),
-            "legacy worktree attribution must be backfilled"
-        );
+            let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+            assert_eq!(
+                payload.metadata["task"]["branch"],
+                json!(expected.branch),
+                "legacy branch attribution must be backfilled"
+            );
+            assert_eq!(
+                payload.metadata["task"]["worktree"],
+                json!(expected.worktree),
+                "legacy worktree attribution must be backfilled"
+            );
 
-        // Idempotency: an already-attributed row keeps its exact attribution.
-        let (vector, mut payload) = store.get("MyProj", &id).await.unwrap().unwrap();
-        payload.metadata["task"]["branch"] = json!("legacy/branch");
-        payload.metadata["task"]["worktree"] = json!("/legacy/worktree");
-        store.upsert("MyProj", &id, vector, payload).await.unwrap();
+            // Idempotency: an already-attributed row keeps its exact attribution.
+            let (vector, mut payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+            payload.metadata["task"]["branch"] = json!("legacy/branch");
+            payload.metadata["task"]["worktree"] = json!("/legacy/worktree");
+            store.upsert("MyProj", &id, vector, payload).await.unwrap();
 
-        let again = handle_task_claim(args, store.clone()).await;
-        assert!(
-            again.contains("already claimed by this session"),
-            "{}",
-            again
-        );
+            let again = handle_task_claim(args, store.clone()).await;
+            assert!(
+                again.contains("already claimed by this session"),
+                "{}",
+                again
+            );
 
-        let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
-        assert_eq!(payload.metadata["task"]["branch"], json!("legacy/branch"));
-        assert_eq!(
-            payload.metadata["task"]["worktree"],
-            json!("/legacy/worktree"),
-            "existing attribution must not be overwritten"
-        );
+            let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+            assert_eq!(payload.metadata["task"]["branch"], json!("legacy/branch"));
+            assert_eq!(
+                payload.metadata["task"]["worktree"],
+                json!("/legacy/worktree"),
+                "existing attribution must not be overwritten"
+            );
+        });
     }
 
     #[tokio::test]
@@ -7097,7 +7223,7 @@ mod tests {
                 confidence: Some(0.9),
                 source_span: None,
                 provenance: Some(
-                    serde_json::from_value::<crate::task::intake::ProvenanceSpan>(prov).unwrap()
+                    serde_json::from_value::<crate::task::intake::ProvenanceSpan>(prov).unwrap(),
                 ),
                 extractor_fingerprint: None,
             })
@@ -7118,7 +7244,10 @@ mod tests {
             err.starts_with("BLOCKED (Lock 2 — Task Obligation)"),
             "wrong message: {err}"
         );
-        assert!(err.contains("Fix login bug"), "names obligation title: {err}");
+        assert!(
+            err.contains("Fix login bug"),
+            "names obligation title: {err}"
+        );
         assert!(
             err.contains("neurostrata_task_candidates action: \"resolve\""),
             "names resolve action: {err}"
@@ -7157,7 +7286,7 @@ mod tests {
                 confidence: Some(0.9),
                 source_span: None,
                 provenance: Some(
-                    serde_json::from_value::<crate::task::intake::ProvenanceSpan>(prov).unwrap()
+                    serde_json::from_value::<crate::task::intake::ProvenanceSpan>(prov).unwrap(),
                 ),
                 extractor_fingerprint: None,
             })
@@ -7873,11 +8002,11 @@ mod tests {
         }
     }
 
-impl crate::traits::AsAny for ListHidingStore {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+    impl crate::traits::AsAny for ListHidingStore {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
     }
-}
 
     /// The ordering invariant the emit site carries: a `Superseded` published
     /// on the inline path claims the task gave way to a lesson. If the Lock 2
@@ -8018,7 +8147,10 @@ impl crate::traits::AsAny for ListHidingStore {
         .await
         .expect_err("a secret must not be stored as an extraction");
         assert!(err.contains("ERROR [SECURITY]"), "{}", err);
-        assert_eq!(store.list("MyProj", None, None).await.unwrap().len(), before);
+        assert_eq!(
+            store.list("MyProj", None, None).await.unwrap().len(),
+            before
+        );
         assert_eq!(status_of(&store, "MyProj", &id).await, Status::InProgress);
     }
 
@@ -9250,9 +9382,11 @@ impl crate::traits::AsAny for ListHidingStore {
             metadata: json!({}),
         };
         let (ctx, prompt) =
-            build_task_graph_context(&store, "probe", "task-1", &vec![0.0f32; 4], &payload).await;
+            build_task_graph_context(&store, "probe", "task-1", &[0.0f32; 4], &payload).await;
 
-        let obj = ctx.as_object().expect("auto_retrieved_context is an object");
+        let obj = ctx
+            .as_object()
+            .expect("auto_retrieved_context is an object");
         for key in [
             "query",
             "items",
@@ -9272,7 +9406,8 @@ impl crate::traits::AsAny for ListHidingStore {
             .and_then(|v| v.as_array())
             .expect("normative_memories is an array");
         assert!(
-            nm.iter().any(|v| v.get("id").and_then(|v| v.as_str()) == Some("mem-rule-m1")),
+            nm.iter()
+                .any(|v| v.get("id").and_then(|v| v.as_str()) == Some("mem-rule-m1")),
             "M1 rule must be in normative_memories: {nm:?}"
         );
         assert!(
@@ -9285,17 +9420,27 @@ impl crate::traits::AsAny for ListHidingStore {
             .and_then(|v| v.as_array())
             .expect("structural_anchors is an array");
         assert!(
-            sa.iter().any(|v| v.get("id").and_then(|v| v.as_str()) == Some("mem-file-b")),
+            sa.iter()
+                .any(|v| v.get("id").and_then(|v| v.as_str()) == Some("mem-file-b")),
             "file B must be in structural_anchors: {sa:?}"
         );
-        assert!(sa.len() <= MAX_STRUCTURAL_ANCHORS, "structural_anchors within cap: {sa:?}");
+        assert!(
+            sa.len() <= MAX_STRUCTURAL_ANCHORS,
+            "structural_anchors within cap: {sa:?}"
+        );
 
         let cb = obj
             .get("conceptual_bridges")
             .and_then(|v| v.as_array())
             .expect("conceptual_bridges is an array");
-        assert!(!cb.is_empty(), "conceptual_bridges should be non-empty: {cb:?}");
-        assert!(cb.len() <= MAX_CONCEPTUAL_BRIDGES, "conceptual_bridges within cap: {cb:?}");
+        assert!(
+            !cb.is_empty(),
+            "conceptual_bridges should be non-empty: {cb:?}"
+        );
+        assert!(
+            cb.len() <= MAX_CONCEPTUAL_BRIDGES,
+            "conceptual_bridges within cap: {cb:?}"
+        );
         let bridge = cb.first().expect("at least one bridge");
         assert_eq!(
             bridge.get("id").and_then(|v| v.as_str()),
@@ -9303,7 +9448,10 @@ impl crate::traits::AsAny for ListHidingStore {
             "bridge target must be M1: {bridge:?}"
         );
         assert!(
-            bridge.get("why_connected").and_then(|v| v.as_str()).is_some(),
+            bridge
+                .get("why_connected")
+                .and_then(|v| v.as_str())
+                .is_some(),
             "bridge carries why_connected: {bridge:?}"
         );
 
@@ -9311,7 +9459,10 @@ impl crate::traits::AsAny for ListHidingStore {
             prompt.contains("### Cross-Domain Bridges"),
             "prompt has Cross-Domain Bridges section: {prompt}"
         );
-        assert!(prompt.contains("mem-rule-m1"), "prompt references M1: {prompt}");
+        assert!(
+            prompt.contains("mem-rule-m1"),
+            "prompt references M1: {prompt}"
+        );
     }
 
     #[tokio::test]
@@ -9327,7 +9478,8 @@ impl crate::traits::AsAny for ListHidingStore {
                 "bf710e0e-a4b5-41cc-a8d7-e25fb14b12f8",
                 vec![0.9f32; 4],
                 MemoryPayload {
-                    content: "RULE: The user has a strong preference AGAINST using Python.".to_string(),
+                    content: "RULE: The user has a strong preference AGAINST using Python."
+                        .to_string(),
                     user_id: "owner".to_string(),
                     memory_type: "fact".to_string(),
                     agent_name: None,
@@ -9368,7 +9520,7 @@ impl crate::traits::AsAny for ListHidingStore {
             metadata: json!({}),
         };
         let (ctx, prompt) =
-            build_task_graph_context(&store, "probe", "task-1", &vec![0.1f32; 4], &payload).await;
+            build_task_graph_context(&store, "probe", "task-1", &[0.1f32; 4], &payload).await;
 
         assert!(
             prompt.contains("bf710e0e-a4b5-41cc-a8d7-e25fb14b12f8")
@@ -9383,7 +9535,9 @@ impl crate::traits::AsAny for ListHidingStore {
             .as_array()
             .expect("auto_retrieved_context.golden_rules array");
         assert!(
-            golden.iter().any(|g| g["id"] == "bf710e0e-a4b5-41cc-a8d7-e25fb14b12f8"),
+            golden
+                .iter()
+                .any(|g| g["id"] == "bf710e0e-a4b5-41cc-a8d7-e25fb14b12f8"),
             "golden_rules must include global rule: {golden:?}"
         );
         assert!(

@@ -288,6 +288,33 @@ def main : IO Unit := do
   for st in wfStages do
     for (evLabel, ev) in wfEvents do
       IO.println s!"WORKFLOW_STAGE|{st.asStr}|{evLabel}|{workflowTransitionTag st ev}"
+  let resolvePostCases : List (String × Nat × Nat × Nat × Nat × Nat × Nat × Bool) :=
+    [ ("within_both", 2, 2, 10, 32, 64, 1024, true)
+    , ("over_req_under_schema", 5, 2, 10, 32, 64, 1024, true)
+    , ("over_u32_wrap", 4294967296, 2, 10, 32, 64, 1024, true)
+    , ("bad_digest", 2, 2, 10, 32, 64, 1024, false)
+    ]
+  for (label, obsR, reqR, maxR, obsB, reqB, maxB, sdm) in resolvePostCases do
+    let v := DataConnector.evaluateResolvePostGateBounded obsR reqR maxR obsB reqB maxB sdm
+    IO.println s!"CONNECTOR_RESOLVE_POST_BOUNDED|{label}|{v.asTag}"
+  for ptrOk in [false, true] do
+    for casOk in [false, true] do
+      let v := DataConnector.evaluateWritebackPostGateBounded 10 1024 ptrOk casOk
+      IO.println s!"CONNECTOR_WRITEBACK_POST_BOUNDED|{boolToStr ptrOk}|{boolToStr casOk}|{v.asTag}"
+  let nextDueCases : List (String × Int × Option Int × Option Int × Option Int × Option Int) :=
+    [ ("never_performed", 1000000, none, some 3, none, none)
+    , ("days_positive", 1000000, some 900000, some 2, none, none)
+    , ("days_zero", 1000000, some 900000, some 0, none, none)
+    , ("days_negative", 1000000, some 900000, some (-5), none, none)
+    , ("days_overflow", 1000000, some 1000000, some 9223372036854775807, none, none)
+    , ("sessions_default", 1000000, some 900000, none, some 4, none)
+    , ("sessions_explicit", 1000000, some 900000, none, some 4, some 2)
+    , ("sessions_negative_elapsed", 1000000, some 900000, none, some 4, some (-3))
+    , ("sessions_overflow", 1000000, some 1000000, none, some 9223372036854775807, none)
+    ]
+  for (label, now, last, dayCad, sessCad, sessElapsed) in nextDueCases do
+    let due := computeProcedureNextDue now last dayCad sessCad sessElapsed
+    IO.println s!"PROCEDURE_NEXT_DUE|{label}|{due}"
   let walEvidences : List WalCommitEvidence := [.commitSeen, .noCommit, .unverifiable, .unreadable]
   for e in walEvidences do
     for proved in [false, true] do

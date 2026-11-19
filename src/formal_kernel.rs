@@ -8,6 +8,7 @@
 #![allow(dead_code)]
 
 /// Task status in the task state machine.
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelTaskStatus {
     Open,
@@ -28,6 +29,7 @@ impl KernelTaskStatus {
 }
 
 /// Guard required for a task transition edge.
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelGuard {
     None,
@@ -36,6 +38,7 @@ pub enum KernelGuard {
 }
 
 /// Outcome of a successful task step.
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KernelTaskStepOutcome {
     pub next_status: KernelTaskStatus,
@@ -43,6 +46,7 @@ pub struct KernelTaskStepOutcome {
 }
 
 /// Error from a task step.
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelTaskStepError {
     Illegal,
@@ -124,6 +128,7 @@ pub const fn is_retired_at(valid_to: Option<i64>, now: i64) -> bool {
 }
 
 /// Lifecycle state in the SynapticMesh state machine.
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelLifecycleState {
     Active,
@@ -169,6 +174,7 @@ pub const fn lifecycle_is_terminal(state: KernelLifecycleState) -> bool {
 }
 
 /// Decision from the epoch gate.
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelEpochDecision {
     Apply,
@@ -197,6 +203,7 @@ pub const fn epoch_gate_tag(candidate_epoch: u32, manifest_epoch: u32) -> &'stat
 }
 
 /// Merge decision from the SynapticMesh concurrent merge policy.
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelMergeDecision {
     Apply,
@@ -335,6 +342,7 @@ pub const fn classify_merge_decision_tag(d: KernelMergeDecision) -> &'static str
 }
 
 /// Task claim decision: idempotency, live-holder refusal, stale takeover, or FSM delegation.
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KernelClaimDecision {
     IdempotentSameSession,
@@ -376,6 +384,7 @@ pub const fn claim_decision_tag(d: KernelClaimDecision) -> &'static str {
 
 /// Sovereignty decision: allow / forbidden memory type / not shareable / forbidden runtime
 /// counter / unauthorized recipient / private row.
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KernelSovereigntyDecision {
     Allow,
@@ -419,6 +428,7 @@ pub const fn sovereignty_decision_tag(d: KernelSovereigntyDecision) -> &'static 
 }
 
 /// Import precheck decision over an existing-row idempotency sweep.
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KernelImportPrecheck {
     FreshInsert,
@@ -456,6 +466,7 @@ pub const fn import_precheck_tag(d: KernelImportPrecheck) -> &'static str {
 }
 
 /// Procedure trust level for a procedurally-firing kernel.
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KernelProcedureTrust {
     Untrusted,
@@ -508,6 +519,7 @@ pub const fn procedure_is_lapsed(valid_to: Option<i64>, now: i64) -> bool {
 }
 
 /// Outcome of a procedure fire attempt against its rehearsal budget.
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KernelProcedureFireOutcome {
     RefuseUntrusted,
@@ -565,6 +577,46 @@ pub const fn procedure_fire_tag(o: KernelProcedureFireOutcome) -> &'static str {
     }
 }
 
+/// Seconds in a day (86,400) for `every-n-days:N` procedure cadence (`neurostrata-zbe7`).
+pub const PROCEDURE_DAY_SECONDS: i64 = 86_400;
+/// Estimated wall-clock length of one session (3,600s) for `every-n-sessions:N` cadence (`neurostrata-zbe7`).
+pub const PROCEDURE_SESSION_ESTIMATE_SECONDS: i64 = 3_600;
+
+/// Pure, overflow-free `next_due` cadence calculator for procedural memory (`neurostrata-zbe7`).
+///
+/// - When `day_cadence` is `Some(days)` with `days > 0` and `last_performed_at` is `Some(last)`,
+///   returns `last.saturating_add(days.saturating_mul(PROCEDURE_DAY_SECONDS))`.
+/// - Otherwise, when `session_cadence` is `Some(n_sessions)` with `n_sessions > 1` and
+///   `last_performed_at` is `Some(last)`, uses `sessions_since_last_fire.unwrap_or(n_sessions - 1).max(0)`
+///   and returns `last.saturating_add(sessions_elapsed.saturating_mul(PROCEDURE_SESSION_ESTIMATE_SECONDS))`.
+/// - In all other cases (including `days <= 0`, `n_sessions <= 1`, or never performed), returns `now`.
+pub const fn compute_procedure_next_due(
+    now: i64,
+    last_performed_at: Option<i64>,
+    day_cadence: Option<i64>,
+    session_cadence: Option<i64>,
+    sessions_since_last_fire: Option<i64>,
+) -> i64 {
+    if let (Some(days), Some(last)) = (day_cadence, last_performed_at) {
+        if days > 0 {
+            return last.saturating_add(days.saturating_mul(PROCEDURE_DAY_SECONDS));
+        }
+    }
+    if let (Some(n_sessions), Some(last)) = (session_cadence, last_performed_at) {
+        if n_sessions > 1 {
+            let raw_elapsed = match sessions_since_last_fire {
+                Some(s) => s,
+                None => n_sessions - 1,
+            };
+            let sessions_elapsed = if raw_elapsed < 0 { 0 } else { raw_elapsed };
+            return last.saturating_add(
+                sessions_elapsed.saturating_mul(PROCEDURE_SESSION_ESTIMATE_SECONDS),
+            );
+        }
+    }
+    now
+}
+
 /// Task status join semilattice rank helper (monotone max-rank join).
 pub const fn task_status_rank(status: KernelTaskStatus) -> u8 {
     match status {
@@ -585,6 +637,7 @@ pub const fn join_task_status(a: KernelTaskStatus, b: KernelTaskStatus) -> Kerne
 }
 
 /// Sequence continuity decision across twin-CRDT merges.
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KernelSeqDecision {
     DuplicateIgnore,
@@ -618,6 +671,7 @@ pub const fn seq_decision_tag(d: KernelSeqDecision) -> &'static str {
 }
 
 /// Retention verdict: over-latency / store-empty / receipt-missing / worktree-moved / retained.
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KernelRetentionVerdict {
     Retained,
@@ -661,6 +715,7 @@ pub const fn retention_verdict_tag(v: KernelRetentionVerdict) -> &'static str {
 }
 
 /// Claim scope gate verdict for strict pre-push evaluation of an `in_progress` task.
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KernelClaimScopeVerdict {
     BlockUnscoped,
@@ -715,6 +770,7 @@ pub const fn claim_scope_verdict_tag(v: KernelClaimScopeVerdict) -> &'static str
 }
 
 /// Decision from the 5-stage kinetic Action submission gate.
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActionGateDecision {
     Allow,
@@ -762,6 +818,7 @@ pub const fn action_gate_tag(d: ActionGateDecision) -> &'static str {
 }
 
 /// State of the active receipt version being targeted for revert.
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActionReceiptState {
     Active,
@@ -778,6 +835,7 @@ impl ActionReceiptState {
 }
 
 /// Decision from the kinetic Action revert gate.
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActionRevertDecision {
     RevertCommit,
@@ -827,6 +885,7 @@ pub const fn action_revert_tag(d: ActionRevertDecision) -> &'static str {
 }
 
 /// Requested target task status in an `ActionEffectTemplate::TransitionTask`.
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActionTaskTargetStatus {
     Open,
@@ -847,6 +906,7 @@ impl ActionTaskTargetStatus {
 }
 
 /// Error from evaluating an `ActionEffectTemplate::TransitionTask` transition.
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KernelConnectorOp {
     RegisterPointer,
@@ -854,6 +914,7 @@ pub enum KernelConnectorOp {
     ApplyWriteBack,
 }
 
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelActionReceiptState {
     NotRequired,
@@ -863,6 +924,7 @@ pub enum KernelActionReceiptState {
     TargetMismatch,
 }
 
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KernelConnectorPreGateInput {
     pub connector_registered: bool,
@@ -879,6 +941,7 @@ pub struct KernelConnectorPreGateInput {
     pub max_staleness_secs: u64,
 }
 
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelConnectorPreVerdict {
     AllowPreRegister,
@@ -893,7 +956,9 @@ pub enum KernelConnectorPreVerdict {
     DenyPointerStale,
 }
 
-pub const fn evaluate_connector_pre_gate(input: KernelConnectorPreGateInput) -> KernelConnectorPreVerdict {
+pub const fn evaluate_connector_pre_gate(
+    input: KernelConnectorPreGateInput,
+) -> KernelConnectorPreVerdict {
     if !input.connector_registered {
         KernelConnectorPreVerdict::DenyUnregisteredConnector
     } else if !input.rebac_allowed {
@@ -902,9 +967,16 @@ pub const fn evaluate_connector_pre_gate(input: KernelConnectorPreGateInput) -> 
         KernelConnectorPreVerdict::AllowPreRegister
     } else if matches!(input.op, KernelConnectorOp::ApplyWriteBack) && !input.pool_writable {
         KernelConnectorPreVerdict::DenyReadOnlyPool
-    } else if matches!(input.op, KernelConnectorOp::ApplyWriteBack) && !matches!(input.receipt_state, KernelActionReceiptState::ActiveBound) {
+    } else if matches!(input.op, KernelConnectorOp::ApplyWriteBack)
+        && !matches!(input.receipt_state, KernelActionReceiptState::ActiveBound)
+    {
         KernelConnectorPreVerdict::DenyInvalidActionReceipt
-    } else if matches!(input.op, KernelConnectorOp::ResolveSlice) && (input.requested_rows == 0 || input.requested_rows > input.max_slice_rows || input.requested_bytes == 0 || input.requested_bytes > input.max_slice_bytes) {
+    } else if matches!(input.op, KernelConnectorOp::ResolveSlice)
+        && (input.requested_rows == 0
+            || input.requested_rows > input.max_slice_rows
+            || input.requested_bytes == 0
+            || input.requested_bytes > input.max_slice_bytes)
+    {
         KernelConnectorPreVerdict::DenySliceLimitExceeded
     } else if input.clock_skew_future {
         KernelConnectorPreVerdict::DenyClockSkewFuture
@@ -919,6 +991,7 @@ pub const fn evaluate_connector_pre_gate(input: KernelConnectorPreGateInput) -> 
     }
 }
 
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KernelConnectorPostGateInput {
     pub op: KernelConnectorOp,
@@ -930,6 +1003,7 @@ pub struct KernelConnectorPostGateInput {
     pub cas_expected_matches: bool,
 }
 
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelConnectorPostVerdict {
     AllowPostOutput,
@@ -938,8 +1012,13 @@ pub enum KernelConnectorPostVerdict {
     DenyCasConflict,
 }
 
-pub const fn evaluate_connector_post_gate(input: KernelConnectorPostGateInput) -> KernelConnectorPostVerdict {
-    if matches!(input.op, KernelConnectorOp::ResolveSlice) && (input.observed_rows > input.max_slice_rows || input.observed_bytes > input.max_slice_bytes) {
+pub const fn evaluate_connector_post_gate(
+    input: KernelConnectorPostGateInput,
+) -> KernelConnectorPostVerdict {
+    if matches!(input.op, KernelConnectorOp::ResolveSlice)
+        && (input.observed_rows > input.max_slice_rows
+            || input.observed_bytes > input.max_slice_bytes)
+    {
         KernelConnectorPostVerdict::DenyObservedBoundsExceeded
     } else if !input.source_digest_matches {
         KernelConnectorPostVerdict::DenySourceDigestMismatch
@@ -950,6 +1029,55 @@ pub const fn evaluate_connector_post_gate(input: KernelConnectorPostGateInput) -
     }
 }
 
+/// Builds a `KernelConnectorPostGateInput` for `ResolveSlice`, saturating `observed_rows_len`
+/// from `usize` to `u32::MAX` (preventing 64-bit `as u32` truncation wrap) and capping
+/// `max_slice_rows` / `max_slice_bytes` at `min(requested, schema_max)` (`neurostrata-zbe7`).
+pub const fn build_resolve_post_gate_input(
+    observed_rows_len: usize,
+    requested_rows: u32,
+    schema_max_rows: u32,
+    observed_bytes: u32,
+    requested_bytes: u32,
+    schema_max_bytes: u32,
+    source_digest_matches: bool,
+) -> KernelConnectorPostGateInput {
+    let observed_rows = if observed_rows_len > (u32::MAX as usize) {
+        u32::MAX
+    } else {
+        observed_rows_len as u32
+    };
+    KernelConnectorPostGateInput {
+        op: KernelConnectorOp::ResolveSlice,
+        observed_rows,
+        max_slice_rows: min_u32(requested_rows, schema_max_rows),
+        observed_bytes,
+        max_slice_bytes: min_u32(requested_bytes, schema_max_bytes),
+        source_digest_matches,
+        cas_expected_matches: true,
+    }
+}
+
+/// Builds a `KernelConnectorPostGateInput` for `ApplyWriteBack`, keeping pointer pinned-digest
+/// verification (`pointer_source_digest_matches`) distinct from request CAS verification
+/// (`request_cas_expected_matches`) (`neurostrata-zbe7`).
+pub const fn build_writeback_post_gate_input(
+    schema_max_rows: u32,
+    schema_max_bytes: u32,
+    pointer_source_digest_matches: bool,
+    request_cas_expected_matches: bool,
+) -> KernelConnectorPostGateInput {
+    KernelConnectorPostGateInput {
+        op: KernelConnectorOp::ApplyWriteBack,
+        observed_rows: 0,
+        max_slice_rows: schema_max_rows,
+        observed_bytes: 0,
+        max_slice_bytes: schema_max_bytes,
+        source_digest_matches: pointer_source_digest_matches,
+        cas_expected_matches: request_cas_expected_matches,
+    }
+}
+
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActionTaskEffectError {
     DoneRequiresComplete,
@@ -998,6 +1126,7 @@ pub const fn action_task_effect_tag(
 }
 
 /// Kind of kinetic action memory row for SynapticMesh shareability evaluation.
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActionMemoryKind {
     ActionType,
@@ -1025,6 +1154,7 @@ pub const fn is_action_memory_shareable(kind: ActionMemoryKind, explicit_shareab
 
 /// Allocation of result slots across reserved primary-normative, reserved graph-expansion,
 /// and general remaining pools (`neurostrata-5xjo`).
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HybridSlotAllocation {
     pub normative_taken: u32,
@@ -1086,11 +1216,12 @@ pub const fn allocate_hybrid_slots(
 }
 
 /// Error from intersecting an interface's variable bounds with a child twin schema's bounds (`neurostrata-brs1`).
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TwinBoundError {
-    InvertedInterfaceBounds,
-    InvertedTwinBounds,
-    DisjointBounds,
+    InvertedInterface,
+    InvertedTwin,
+    Disjoint,
 }
 
 /// Intersects an interface bound `[iface_min, iface_max]` with a child schema bound `[twin_min, twin_max]`,
@@ -1102,10 +1233,10 @@ pub const fn intersect_var_bounds(
     twin_max: i64,
 ) -> Result<(i64, i64), TwinBoundError> {
     if iface_min > iface_max {
-        return Err(TwinBoundError::InvertedInterfaceBounds);
+        return Err(TwinBoundError::InvertedInterface);
     }
     if twin_min > twin_max {
-        return Err(TwinBoundError::InvertedTwinBounds);
+        return Err(TwinBoundError::InvertedTwin);
     }
     let eff_min = if iface_min >= twin_min {
         iface_min
@@ -1118,13 +1249,14 @@ pub const fn intersect_var_bounds(
         twin_max
     };
     if eff_min > eff_max {
-        Err(TwinBoundError::DisjointBounds)
+        Err(TwinBoundError::Disjoint)
     } else {
         Ok((eff_min, eff_max))
     }
 }
 
 /// Deterministic link-reducer operator kind (`neurostrata-brs1`).
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReducerOpKind {
     Count,
@@ -1151,6 +1283,7 @@ impl ReducerOpKind {
 }
 
 /// Total outcome of evaluating a declarative link reducer over 1-hop twin neighbors (`neurostrata-brs1`).
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReducerEvalOutcome {
     pub numeric_val: i64,
@@ -1232,6 +1365,7 @@ pub const fn evaluate_reducer_total(
 }
 
 /// Resolution tier for Tier-1 cross-file call graph linking (`neurostrata-rbde`).
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CrossFileResolution {
     SameFile,
@@ -1282,6 +1416,7 @@ pub const fn resolve_cross_file_call(
 }
 
 /// Copy-on-Write row visibility inside a counterfactual `ScenarioOverlay` (`neurostrata-ai0v`).
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScenarioRowVisibility {
     VisibleStaged,
@@ -1322,6 +1457,7 @@ pub const fn resolve_scenario_row(
 }
 
 /// Decision outcome for optimistic CAS scenario commit (`neurostrata-ai0v`).
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScenarioCommitDecision {
     CommitAllowed,
@@ -1365,6 +1501,7 @@ pub const fn evaluate_scenario_commit(
 }
 
 /// Four-stage guided diff tour stop category (`neurostrata-737r`).
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TourStopCategory {
     Foundations,
@@ -1422,6 +1559,7 @@ pub const fn classify_tour_stop(
 }
 
 /// Decision for registering a custom `InsightDefinition` (`neurostrata-kx2n`).
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InsightDefineDecision {
     DefineAllowed,
@@ -1737,9 +1875,21 @@ pub const fn verify_certificate_chain_slices(
     }
     let mut i = 0usize;
     while i < step_count {
-        let rv = if i < rule_validity.len() { rule_validity[i] } else { false };
-        let pc = if i < premise_count_ok.len() { premise_count_ok[i] } else { false };
-        let cc = if i < chain_continuity.len() { chain_continuity[i] } else { false };
+        let rv = if i < rule_validity.len() {
+            rule_validity[i]
+        } else {
+            false
+        };
+        let pc = if i < premise_count_ok.len() {
+            premise_count_ok[i]
+        } else {
+            false
+        };
+        let cc = if i < chain_continuity.len() {
+            chain_continuity[i]
+        } else {
+            false
+        };
         if !rv {
             return KernelCertVerdict::UnknownRule;
         }
@@ -1865,6 +2015,7 @@ pub const fn verify_derivation_certificate(
 }
 
 /// Workflow lifecycle stage in the pluggable workflow state machine.
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelWorkflowStage {
     Unpreflighted,
@@ -1878,17 +2029,31 @@ pub enum KernelWorkflowStage {
 }
 
 /// Workflow lifecycle event in the pluggable workflow state machine.
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelWorkflowEvent {
     LoadContext,
-    ClaimTask { has_valid_scope: bool },
-    Mutate { mutations_since_note_after: usize, breath_limit: usize },
+    ClaimTask {
+        has_valid_scope: bool,
+    },
+    Mutate {
+        mutations_since_note_after: usize,
+        breath_limit: usize,
+    },
     RecordBreathNote,
-    TriggerPreCheckpoint { has_receipt: bool },
+    TriggerPreCheckpoint {
+        has_receipt: bool,
+    },
     CheckpointPassed,
-    TriggerPrePublish { task_gate_ok: bool, doc_gate_ok: bool },
+    TriggerPrePublish {
+        task_gate_ok: bool,
+        doc_gate_ok: bool,
+    },
     PublishPassed,
-    CompleteTask { has_extracted_memory: bool, dirty_targets: usize },
+    CompleteTask {
+        has_extracted_memory: bool,
+        dirty_targets: usize,
+    },
 }
 
 /// Evaluates a workflow stage transition in the pure kernel.
@@ -1897,25 +2062,57 @@ pub const fn evaluate_workflow_stage_transition(
     stage: KernelWorkflowStage,
     event: KernelWorkflowEvent,
 ) -> Result<KernelWorkflowStage, &'static str> {
-    use KernelWorkflowStage::*;
     use KernelWorkflowEvent::*;
+    use KernelWorkflowStage::*;
 
     match (stage, event) {
         (Unpreflighted, LoadContext) => Ok(ContextLoaded),
         (ContextLoaded, LoadContext) => Ok(ContextLoaded),
-        (ContextLoaded, ClaimTask { has_valid_scope: true }) => Ok(Claimed),
-        (Claimed, ClaimTask { has_valid_scope: true }) => Ok(Claimed),
-        (Mutating, ClaimTask { has_valid_scope: true }) => Ok(Claimed),
-        (_, ClaimTask { has_valid_scope: false }) => Err("ClaimRequiresValidWorkspaceScope"),
+        (
+            ContextLoaded,
+            ClaimTask {
+                has_valid_scope: true,
+            },
+        ) => Ok(Claimed),
+        (
+            Claimed,
+            ClaimTask {
+                has_valid_scope: true,
+            },
+        ) => Ok(Claimed),
+        (
+            Mutating,
+            ClaimTask {
+                has_valid_scope: true,
+            },
+        ) => Ok(Claimed),
+        (
+            _,
+            ClaimTask {
+                has_valid_scope: false,
+            },
+        ) => Err("ClaimRequiresValidWorkspaceScope"),
         (Unpreflighted, ClaimTask { .. }) => Err("PreflightRequiredBeforeClaim"),
-        (Claimed, Mutate { mutations_since_note_after, breath_limit }) => {
+        (
+            Claimed,
+            Mutate {
+                mutations_since_note_after,
+                breath_limit,
+            },
+        ) => {
             if mutations_since_note_after >= breath_limit {
                 Ok(BreathRequired)
             } else {
                 Ok(Mutating)
             }
         }
-        (Mutating, Mutate { mutations_since_note_after, breath_limit }) => {
+        (
+            Mutating,
+            Mutate {
+                mutations_since_note_after,
+                breath_limit,
+            },
+        ) => {
             if mutations_since_note_after >= breath_limit {
                 Ok(BreathRequired)
             } else {
@@ -1929,23 +2126,85 @@ pub const fn evaluate_workflow_stage_transition(
         (Mutating, TriggerPreCheckpoint { has_receipt: true }) => Ok(PreCheckpoint),
         (_, TriggerPreCheckpoint { has_receipt: false }) => Err("CheckpointRequiresValidReceipt"),
         (PreCheckpoint, CheckpointPassed) => Ok(Mutating),
-        (Claimed, TriggerPrePublish { task_gate_ok: true, doc_gate_ok: true }) => Ok(PrePublish),
-        (Mutating, TriggerPrePublish { task_gate_ok: true, doc_gate_ok: true }) => Ok(PrePublish),
-        (PreCheckpoint, TriggerPrePublish { task_gate_ok: true, doc_gate_ok: true }) => Ok(PrePublish),
-        (_, TriggerPrePublish { task_gate_ok: false, .. }) => Err("PublishBlockedByTaskGate"),
-        (_, TriggerPrePublish { doc_gate_ok: false, .. }) => Err("PublishBlockedByDocumentationGate"),
+        (
+            Claimed,
+            TriggerPrePublish {
+                task_gate_ok: true,
+                doc_gate_ok: true,
+            },
+        ) => Ok(PrePublish),
+        (
+            Mutating,
+            TriggerPrePublish {
+                task_gate_ok: true,
+                doc_gate_ok: true,
+            },
+        ) => Ok(PrePublish),
+        (
+            PreCheckpoint,
+            TriggerPrePublish {
+                task_gate_ok: true,
+                doc_gate_ok: true,
+            },
+        ) => Ok(PrePublish),
+        (
+            _,
+            TriggerPrePublish {
+                task_gate_ok: false,
+                ..
+            },
+        ) => Err("PublishBlockedByTaskGate"),
+        (
+            _,
+            TriggerPrePublish {
+                doc_gate_ok: false, ..
+            },
+        ) => Err("PublishBlockedByDocumentationGate"),
         (PrePublish, PublishPassed) => Ok(Mutating),
-        (Claimed, CompleteTask { has_extracted_memory: true, dirty_targets: 0 }) => Ok(Completed),
-        (Mutating, CompleteTask { has_extracted_memory: true, dirty_targets: 0 }) => Ok(Completed),
-        (PreCheckpoint, CompleteTask { has_extracted_memory: true, dirty_targets: 0 }) => Ok(Completed),
-        (PrePublish, CompleteTask { has_extracted_memory: true, dirty_targets: 0 }) => Ok(Completed),
-        (_, CompleteTask { has_extracted_memory: false, .. }) => Err("CompletionRequiresExtractedMemory"),
-        (_, CompleteTask { dirty_targets, .. }) if dirty_targets > 0 => Err("CompletionBlockedByDirtyTargets"),
+        (
+            Claimed,
+            CompleteTask {
+                has_extracted_memory: true,
+                dirty_targets: 0,
+            },
+        ) => Ok(Completed),
+        (
+            Mutating,
+            CompleteTask {
+                has_extracted_memory: true,
+                dirty_targets: 0,
+            },
+        ) => Ok(Completed),
+        (
+            PreCheckpoint,
+            CompleteTask {
+                has_extracted_memory: true,
+                dirty_targets: 0,
+            },
+        ) => Ok(Completed),
+        (
+            PrePublish,
+            CompleteTask {
+                has_extracted_memory: true,
+                dirty_targets: 0,
+            },
+        ) => Ok(Completed),
+        (
+            _,
+            CompleteTask {
+                has_extracted_memory: false,
+                ..
+            },
+        ) => Err("CompletionRequiresExtractedMemory"),
+        (_, CompleteTask { dirty_targets, .. }) if dirty_targets > 0 => {
+            Err("CompletionBlockedByDirtyTargets")
+        }
         _ => Err("IllegalWorkflowStageTransition"),
     }
 }
 
 /// Epistemic maturity status of a taxonomy concept.
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EpistemicStatus {
     Seed,
@@ -1994,139 +2253,264 @@ pub const fn classify_epistemic_status(
     }
 }
 
-/// Validates that `broader_edges` form a DAG (no self-loops, no cycles).
-pub fn validate_taxonomy_dag(broader_edges: &[(u32, u32)]) -> bool {
-    // Check self-loops
-    for &(u, v) in broader_edges {
-        if u == v {
-            return false;
-        }
-    }
-    // Detect cycles using DFS with color marking
-    use std::collections::HashMap;
-    let mut adj: HashMap<u32, Vec<u32>> = HashMap::new();
-    for &(u, v) in broader_edges {
-        adj.entry(u).or_default().push(v);
-    }
-    let mut color: HashMap<u32, u8> = HashMap::new(); // 0=unvisited, 1=visiting, 2=done
-    fn dfs(u: u32, adj: &HashMap<u32, Vec<u32>>, color: &mut HashMap<u32, u8>) -> bool {
-        color.insert(u, 1);
-        if let Some(neighbors) = adj.get(&u) {
-            for &v in neighbors {
-                match color.get(&v) {
-                    Some(1) => return false, // back edge = cycle
-                    Some(2) => {}
-                    _ => {
-                        if !dfs(v, adj, color) {
-                            return false;
-                        }
-                    }
+#[cfg(not(kani))]
+struct TaxonomyGraph {
+    indices: std::collections::BTreeMap<u32, usize>,
+    adjacency: Vec<Vec<usize>>,
+}
+
+#[cfg(not(kani))]
+impl TaxonomyGraph {
+    fn new(edges: &[(u32, u32)]) -> Self {
+        let mut indices = std::collections::BTreeMap::new();
+        for &(u, v) in edges {
+            for node in [u, v] {
+                if !indices.contains_key(&node) {
+                    let next = indices.len();
+                    indices.insert(node, next);
                 }
             }
         }
-        color.insert(u, 2);
-        true
+        let mut adjacency = vec![Vec::new(); indices.len()];
+        for &(u, v) in edges {
+            adjacency[indices[&u]].push(indices[&v]);
+        }
+        Self { indices, adjacency }
     }
-    for &u in adj.keys() {
-        if !color.contains_key(&u) {
-            if !dfs(u, &adj, &mut color) {
-                return false;
+
+    fn is_valid_dag(&self, edges: &[(u32, u32)]) -> bool {
+        if edges.iter().any(|&(u, v)| u == v) {
+            return false;
+        }
+        let mut indegree = vec![0usize; self.indices.len()];
+        for &(u, v) in edges {
+            indegree[self.indices[&v]] += 1;
+            let _ = u;
+        }
+        let mut queue: Vec<usize> = indegree
+            .iter()
+            .enumerate()
+            .filter_map(|(node, &degree)| if degree == 0 { Some(node) } else { None })
+            .collect();
+        let mut processed = 0usize;
+        while processed < queue.len() {
+            let node = queue[processed];
+            processed += 1;
+            for &next in &self.adjacency[node] {
+                indegree[next] -= 1;
+                if indegree[next] == 0 {
+                    queue.push(next);
+                }
             }
         }
+        processed == self.indices.len()
     }
-    true
+
+    fn reachable_from(&self, start: u32) -> Vec<bool> {
+        let mut visited = vec![false; self.indices.len()];
+        let Some(&start) = self.indices.get(&start) else {
+            return visited;
+        };
+        let mut queue = vec![start];
+        visited[start] = true;
+        let mut head = 0usize;
+        while head < queue.len() {
+            let node = queue[head];
+            head += 1;
+            for &next in &self.adjacency[node] {
+                if !visited[next] {
+                    visited[next] = true;
+                    queue.push(next);
+                }
+            }
+        }
+        visited
+    }
+
+    fn is_reachable(
+        &self,
+        cache: &mut std::collections::BTreeMap<u32, Vec<bool>>,
+        start: u32,
+        target: u32,
+    ) -> bool {
+        let Some(&target) = self.indices.get(&target) else {
+            return false;
+        };
+        cache
+            .entry(start)
+            .or_insert_with(|| self.reachable_from(start))[target]
+    }
 }
 
-/// Validates SKOS disjointness: related/contrast edges must not overlap with
-/// transitive broader hierarchy in either direction.
+/// Validates that `broader_edges` form a DAG in O(V + E).
+#[cfg(not(kani))]
+pub fn validate_taxonomy_dag(broader_edges: &[(u32, u32)]) -> bool {
+    TaxonomyGraph::new(broader_edges).is_valid_dag(broader_edges)
+}
+
+/// Validates SKOS disjointness against the transitive broader hierarchy.
+#[cfg(not(kani))]
 pub fn validate_skos_disjointness(
     broader_edges: &[(u32, u32)],
     related_edges: &[(u32, u32)],
     contrast_edges: &[(u32, u32)],
 ) -> bool {
-    // Cycle guard: reject if broader_edges contain cycles (self-loop or cycles)
+    let graph = TaxonomyGraph::new(broader_edges);
+    if !graph.is_valid_dag(broader_edges) {
+        return false;
+    }
+    let mut reachability = std::collections::BTreeMap::new();
+    for &(u, v) in related_edges.iter().chain(contrast_edges) {
+        if u == v
+            || graph.is_reachable(&mut reachability, u, v)
+            || graph.is_reachable(&mut reachability, v, u)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Deterministic bounded reachability used by Kani proofs.
+#[cfg(kani)]
+fn is_reachable_in_edges(edges: &[(u32, u32)], start: u32, target: u32) -> bool {
+    #[cfg(kani)]
+    const CAP: usize = 8;
+    #[cfg(not(kani))]
+    const CAP: usize = 128;
+
+    let n = edges.len();
+    if n == 0 {
+        return false;
+    }
+    if n <= CAP {
+        let mut used = [false; CAP];
+        let mut queue = [0u32; CAP + 1];
+        queue[0] = start;
+        let mut head = 0usize;
+        let mut tail = 1usize;
+        let mut step = 0usize;
+        while step <= n {
+            if head < tail {
+                let curr = queue[head];
+                head += 1;
+                let mut i = 0usize;
+                while i < n {
+                    if !used[i] && edges[i].0 == curr {
+                        if edges[i].1 == target {
+                            return true;
+                        }
+                        used[i] = true;
+                        if tail <= CAP {
+                            queue[tail] = edges[i].1;
+                            tail += 1;
+                        }
+                    }
+                    i += 1;
+                }
+            }
+            step += 1;
+        }
+        return false;
+    }
+    #[cfg(not(kani))]
+    {
+        let mut used = vec![false; n];
+        let mut queue = Vec::with_capacity(n + 1);
+        queue.push(start);
+        let mut head = 0usize;
+        while head < queue.len() {
+            let curr = queue[head];
+            head += 1;
+            let mut i = 0usize;
+            while i < n {
+                if !used[i] && edges[i].0 == curr {
+                    if edges[i].1 == target {
+                        return true;
+                    }
+                    used[i] = true;
+                    queue.push(edges[i].1);
+                }
+                i += 1;
+            }
+        }
+    }
+    false
+}
+
+/// Validates the bounded DAG semantics exercised by Kani.
+#[cfg(kani)]
+pub fn validate_taxonomy_dag(broader_edges: &[(u32, u32)]) -> bool {
+    let mut i = 0;
+    while i < broader_edges.len() {
+        let (u, v) = broader_edges[i];
+        if u == v || is_reachable_in_edges(broader_edges, v, u) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Validates bounded SKOS disjointness semantics for Kani.
+#[cfg(kani)]
+pub fn validate_skos_disjointness(
+    broader_edges: &[(u32, u32)],
+    related_edges: &[(u32, u32)],
+    contrast_edges: &[(u32, u32)],
+) -> bool {
     if !validate_taxonomy_dag(broader_edges) {
         return false;
     }
-    use std::collections::{HashMap, HashSet};
-
-    // Build adjacency for broader hierarchy
-    let mut adj: HashMap<u32, Vec<u32>> = HashMap::new();
-    let mut rev_adj: HashMap<u32, Vec<u32>> = HashMap::new();
-    for &(u, v) in broader_edges {
-        adj.entry(u).or_default().push(v);
-        rev_adj.entry(v).or_default().push(u);
-    }
-
-    // Compute transitive reachability: for each node, all nodes reachable via broader+
-    let mut reachable: HashMap<u32, HashSet<u32>> = HashMap::new();
-
-    fn compute_reachable(
-        u: u32,
-        adj: &HashMap<u32, Vec<u32>>,
-        memo: &mut HashMap<u32, HashSet<u32>>,
-    ) -> HashSet<u32> {
-        if let Some(cached) = memo.get(&u) {
-            return cached.clone();
-        }
-        let mut set = HashSet::new();
-        if let Some(neighbors) = adj.get(&u) {
-            for &v in neighbors {
-                set.insert(v);
-                let child_reachable = compute_reachable(v, adj, memo);
-                set.extend(child_reachable);
-            }
-        }
-        memo.insert(u, set.clone());
-        set
-    }
-
-    // Compute for all nodes in adj
-    for &u in adj.keys() {
-        compute_reachable(u, &adj, &mut reachable);
-    }
-
-    // A related/contrast pair is a violation when the two concepts are comparable
-    // in the broader hierarchy in either direction, or identical.
-    let pair_disjoint = |u: u32, v: u32| -> bool {
-        if u == v {
+    let mut i = 0;
+    while i < related_edges.len() {
+        let (u, v) = related_edges[i];
+        if u == v
+            || is_reachable_in_edges(broader_edges, u, v)
+            || is_reachable_in_edges(broader_edges, v, u)
+        {
             return false;
         }
-        if let Some(reach_u) = reachable.get(&u) {
-            if reach_u.contains(&v) {
-                return false;
-            }
-        }
-        if let Some(reach_v) = reachable.get(&v) {
-            if reach_v.contains(&u) {
-                return false;
-            }
-        }
-        true
-    };
-
-    for &(u, v) in related_edges {
-        if !pair_disjoint(u, v) {
+        i += 1;
+    }
+    let mut j = 0;
+    while j < contrast_edges.len() {
+        let (u, v) = contrast_edges[j];
+        if u == v
+            || is_reachable_in_edges(broader_edges, u, v)
+            || is_reachable_in_edges(broader_edges, v, u)
+        {
             return false;
         }
+        j += 1;
     }
-    for &(u, v) in contrast_edges {
-        if !pair_disjoint(u, v) {
-            return false;
-        }
-    }
-
     true
 }
 
 /// Computes epistemic coverage in basis points.
-pub fn compute_epistemic_coverage_bps(statuses: &[EpistemicStatus], unmapped_domain_count: u32) -> u32 {
+pub const fn compute_epistemic_coverage_bps(
+    statuses: &[EpistemicStatus],
+    unmapped_domain_count: u32,
+) -> u32 {
     if statuses.is_empty() && unmapped_domain_count == 0 {
         return 0;
     }
-    let sum_weights: u64 = statuses.iter().map(|s| s.weight_bps() as u64).sum();
-    let denom: u64 = statuses.len() as u64 + unmapped_domain_count as u64;
-    ((sum_weights / denom) as u32).min(10000)
+    let mut sum_weights: u64 = 0;
+    let mut i = 0;
+    while i < statuses.len() {
+        sum_weights = sum_weights.saturating_add(statuses[i].weight_bps() as u64);
+        i += 1;
+    }
+    let denom: u64 = (statuses.len() as u64).saturating_add(unmapped_domain_count as u64);
+    if denom == 0 {
+        return 0;
+    }
+    let avg = sum_weights / denom;
+    if avg > 10000 {
+        10000
+    } else {
+        avg as u32
+    }
 }
 
 /// Returns realization status gap in basis points.
@@ -2149,9 +2533,7 @@ pub const fn compute_frontier_leverage_bps(
     has_frontier_or_limitation: bool,
     has_references_or_comparables: bool,
 ) -> u32 {
-    if realization_gap_bps == 0
-        || (realization_gap_bps <= 2500 && !has_frontier_or_limitation)
-    {
+    if realization_gap_bps == 0 || (realization_gap_bps <= 2500 && !has_frontier_or_limitation) {
         return 0;
     }
     let align = if axis_alignment_bps > 10000 {
@@ -2170,8 +2552,16 @@ pub const fn compute_frontier_leverage_bps(
         canonical_connectivity_count as u64
     };
     let conn_bps = conn_capped * 1000;
-    let frontier_bps = if has_frontier_or_limitation { 10000u64 } else { 0u64 };
-    let cite_bps = if has_references_or_comparables { 10000u64 } else { 0u64 };
+    let frontier_bps = if has_frontier_or_limitation {
+        10000u64
+    } else {
+        0u64
+    };
+    let cite_bps = if has_references_or_comparables {
+        10000u64
+    } else {
+        0u64
+    };
     let raw = (35 * align + 25 * gap + 20 * conn_bps + 10 * frontier_bps + 10 * cite_bps) / 100;
     if raw > 10000 {
         10000
@@ -2285,11 +2675,26 @@ mod tests {
     use super::*;
     #[test]
     fn test_classify_epistemic_status() {
-        assert_eq!(classify_epistemic_status(false, false, false, false), EpistemicStatus::Seed);
-        assert_eq!(classify_epistemic_status(true, false, false, false), EpistemicStatus::Seed);
-        assert_eq!(classify_epistemic_status(true, true, false, false), EpistemicStatus::Defined);
-        assert_eq!(classify_epistemic_status(true, true, true, false), EpistemicStatus::Synthesized);
-        assert_eq!(classify_epistemic_status(true, true, true, true), EpistemicStatus::Verified);
+        assert_eq!(
+            classify_epistemic_status(false, false, false, false),
+            EpistemicStatus::Seed
+        );
+        assert_eq!(
+            classify_epistemic_status(true, false, false, false),
+            EpistemicStatus::Seed
+        );
+        assert_eq!(
+            classify_epistemic_status(true, true, false, false),
+            EpistemicStatus::Defined
+        );
+        assert_eq!(
+            classify_epistemic_status(true, true, true, false),
+            EpistemicStatus::Synthesized
+        );
+        assert_eq!(
+            classify_epistemic_status(true, true, true, true),
+            EpistemicStatus::Verified
+        );
         // Monotonic progression as pillars are added
         assert!(EpistemicStatus::Seed < classify_epistemic_status(true, true, false, false));
         assert!(EpistemicStatus::Defined < classify_epistemic_status(true, true, true, false));
@@ -2307,13 +2712,85 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_taxonomy_dag_duplicate_and_disconnected_edges() {
+        assert!(validate_taxonomy_dag(&[(1, 2), (1, 2), (10, 11)]));
+        assert!(!validate_taxonomy_dag(&[
+            (1, 2),
+            (1, 2),
+            (10, 11),
+            (11, 12),
+            (12, 10),
+        ]));
+        assert!(validate_taxonomy_dag(&[]));
+    }
+
+    #[test]
+    fn test_validate_taxonomy_dag_long_chain_is_linear() {
+        let edges: Vec<(u32, u32)> = (0..2_000).map(|n| (n, n + 1)).collect();
+        let start = std::time::Instant::now();
+        assert!(validate_taxonomy_dag(&edges));
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(500),
+            "2,000-edge DAG validation regressed to quadratic reachability: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn test_validate_taxonomy_dag_large_and_sparse() {
+        let chain: Vec<(u32, u32)> = (0..5_000).map(|n| (n, n + 1)).collect();
+        assert!(validate_taxonomy_dag(&chain));
+        let mut cycle = chain;
+        cycle.push((5_000, 0));
+        assert!(!validate_taxonomy_dag(&cycle));
+        assert!(validate_taxonomy_dag(&[(1_000_000, 1_000_001)]));
+        assert!(!validate_taxonomy_dag(&[
+            (1_000_000, 1_000_001),
+            (1_000_001, 1_000_000),
+        ]));
+        assert!(!validate_taxonomy_dag(&[(u32::MAX, u32::MAX)]));
+    }
+
+    #[test]
+    fn test_validate_skos_disjointness_reuses_reachability() {
+        let mut broader = Vec::new();
+        for base in [0, 10_000] {
+            broader.extend((0..2_000).map(|n| (base + n, base + n + 1)));
+        }
+        let related: Vec<(u32, u32)> = (0..20_000)
+            .map(|n| {
+                if n % 2 == 0 {
+                    (0, 10_000 + (n % 2_000))
+                } else {
+                    (10_000, n % 2_000)
+                }
+            })
+            .collect();
+        let start = std::time::Instant::now();
+        assert!(validate_skos_disjointness(&broader, &related, &[]));
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(500),
+            "disjointness restarted reachability for every pair: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
     fn test_validate_skos_disjointness() {
         // direct overlap broader == related -> violation -> false
         assert!(!validate_skos_disjointness(&[(0, 1)], &[(0, 1)], &[]));
         // transitive violation: broader 0->1->2, related (0,2) comparable -> false
-        assert!(!validate_skos_disjointness(&[(0, 1), (1, 2)], &[(0, 2)], &[]));
+        assert!(!validate_skos_disjointness(
+            &[(0, 1), (1, 2)],
+            &[(0, 2)],
+            &[]
+        ));
         // reverse transitive violation: related (2,0), 2 reachable from 0 -> false
-        assert!(!validate_skos_disjointness(&[(0, 1), (1, 2)], &[(2, 0)], &[]));
+        assert!(!validate_skos_disjointness(
+            &[(0, 1), (1, 2)],
+            &[(2, 0)],
+            &[]
+        ));
         // unrelated distinct pair -> true
         assert!(validate_skos_disjointness(&[(0, 1)], &[(2, 3)], &[]));
         // empty related/contrast with broader -> true
@@ -2321,12 +2798,31 @@ mod tests {
         // contrast overlapping -> false
         assert!(!validate_skos_disjointness(&[(0, 1)], &[], &[(0, 1)]));
         // contrast trans violation -> false
-        assert!(!validate_skos_disjointness(&[(0, 1), (1, 2)], &[], &[(0, 2)]));
+        assert!(!validate_skos_disjointness(
+            &[(0, 1), (1, 2)],
+            &[],
+            &[(0, 2)]
+        ));
+        // Reverse transitive contrast and unknown endpoint IDs.
+        assert!(!validate_skos_disjointness(
+            &[(0, 1), (1, 2)],
+            &[],
+            &[(2, 0)]
+        ));
+        assert!(validate_skos_disjointness(
+            &[(0, 1), (1, 2)],
+            &[(90, 91)],
+            &[(92, 93)]
+        ));
     }
 
     #[test]
     fn test_validate_skos_disjointness_cycle_guard() {
-        assert!(!validate_skos_disjointness(&[(0, 1), (1, 2), (2, 0)], &[], &[]));
+        assert!(!validate_skos_disjointness(
+            &[(0, 1), (1, 2), (2, 0)],
+            &[],
+            &[]
+        ));
         assert!(!validate_skos_disjointness(&[(0, 1), (1, 0)], &[], &[]));
         assert!(!validate_skos_disjointness(&[(0, 0)], &[], &[]));
     }
@@ -2335,11 +2831,29 @@ mod tests {
     fn test_compute_epistemic_coverage_bps() {
         assert_eq!(compute_epistemic_coverage_bps(&[], 0), 0);
         assert_eq!(compute_epistemic_coverage_bps(&[], 5), 0);
-        assert_eq!(compute_epistemic_coverage_bps(&[EpistemicStatus::Seed], 0), 2500);
-        assert_eq!(compute_epistemic_coverage_bps(&[EpistemicStatus::Verified, EpistemicStatus::Verified], 0), 10000);
-        assert_eq!(compute_epistemic_coverage_bps(&[EpistemicStatus::Seed, EpistemicStatus::Verified], 0), 6250);
-        assert_eq!(compute_epistemic_coverage_bps(&[EpistemicStatus::Seed; 3], 0), 2500);
-        assert_eq!(compute_epistemic_coverage_bps(&[EpistemicStatus::Seed, EpistemicStatus::Seed], 1), 1666);
+        assert_eq!(
+            compute_epistemic_coverage_bps(&[EpistemicStatus::Seed], 0),
+            2500
+        );
+        assert_eq!(
+            compute_epistemic_coverage_bps(
+                &[EpistemicStatus::Verified, EpistemicStatus::Verified],
+                0
+            ),
+            10000
+        );
+        assert_eq!(
+            compute_epistemic_coverage_bps(&[EpistemicStatus::Seed, EpistemicStatus::Verified], 0),
+            6250
+        );
+        assert_eq!(
+            compute_epistemic_coverage_bps(&[EpistemicStatus::Seed; 3], 0),
+            2500
+        );
+        assert_eq!(
+            compute_epistemic_coverage_bps(&[EpistemicStatus::Seed, EpistemicStatus::Seed], 1),
+            1666
+        );
     }
 
     #[test]
@@ -2362,10 +2876,22 @@ mod tests {
     #[test]
     fn test_compute_frontier_leverage_bps() {
         assert_eq!(compute_frontier_leverage_bps(5000, 0, 3, true, true), 0);
-        assert_eq!(compute_frontier_leverage_bps(5000, 2500, 3, false, false), 0);
-        assert_eq!(compute_frontier_leverage_bps(5000, 2500, 3, true, true), 4975);
-        assert_eq!(compute_frontier_leverage_bps(20000, 20000, 3, true, true), 8600);
-        assert_eq!(compute_frontier_leverage_bps(20000, 20000, 3, false, false), 6600);
+        assert_eq!(
+            compute_frontier_leverage_bps(5000, 2500, 3, false, false),
+            0
+        );
+        assert_eq!(
+            compute_frontier_leverage_bps(5000, 2500, 3, true, true),
+            4975
+        );
+        assert_eq!(
+            compute_frontier_leverage_bps(20000, 20000, 3, true, true),
+            8600
+        );
+        assert_eq!(
+            compute_frontier_leverage_bps(20000, 20000, 3, false, false),
+            6600
+        );
     }
 
     #[test]
@@ -2381,15 +2907,32 @@ mod tests {
             Ok(ContextLoaded)
         );
         assert_eq!(
-            evaluate_workflow_stage_transition(ContextLoaded, ClaimTask { has_valid_scope: true }),
+            evaluate_workflow_stage_transition(
+                ContextLoaded,
+                ClaimTask {
+                    has_valid_scope: true
+                }
+            ),
             Ok(Claimed)
         );
         assert_eq!(
-            evaluate_workflow_stage_transition(Claimed, Mutate { mutations_since_note_after: 2, breath_limit: 5 }),
+            evaluate_workflow_stage_transition(
+                Claimed,
+                Mutate {
+                    mutations_since_note_after: 2,
+                    breath_limit: 5
+                }
+            ),
             Ok(Mutating)
         );
         assert_eq!(
-            evaluate_workflow_stage_transition(Mutating, Mutate { mutations_since_note_after: 5, breath_limit: 5 }),
+            evaluate_workflow_stage_transition(
+                Mutating,
+                Mutate {
+                    mutations_since_note_after: 5,
+                    breath_limit: 5
+                }
+            ),
             Ok(BreathRequired)
         );
         assert_eq!(
@@ -2397,11 +2940,20 @@ mod tests {
             Ok(Mutating)
         );
         assert_eq!(
-            evaluate_workflow_stage_transition(Mutating, TriggerPreCheckpoint { has_receipt: true }),
+            evaluate_workflow_stage_transition(
+                Mutating,
+                TriggerPreCheckpoint { has_receipt: true }
+            ),
             Ok(PreCheckpoint)
         );
         assert_eq!(
-            evaluate_workflow_stage_transition(PreCheckpoint, TriggerPrePublish { task_gate_ok: true, doc_gate_ok: true }),
+            evaluate_workflow_stage_transition(
+                PreCheckpoint,
+                TriggerPrePublish {
+                    task_gate_ok: true,
+                    doc_gate_ok: true
+                }
+            ),
             Ok(PrePublish)
         );
         assert_eq!(
@@ -2409,7 +2961,13 @@ mod tests {
             Ok(Mutating)
         );
         assert_eq!(
-            evaluate_workflow_stage_transition(Mutating, CompleteTask { has_extracted_memory: true, dirty_targets: 0 }),
+            evaluate_workflow_stage_transition(
+                Mutating,
+                CompleteTask {
+                    has_extracted_memory: true,
+                    dirty_targets: 0
+                }
+            ),
             Ok(Completed)
         );
     }
@@ -2419,39 +2977,88 @@ mod tests {
         use KernelWorkflowEvent::*;
         use KernelWorkflowStage::*;
         assert_eq!(
-            evaluate_workflow_stage_transition(BreathRequired, Mutate { mutations_since_note_after: 0, breath_limit: 5 }),
+            evaluate_workflow_stage_transition(
+                BreathRequired,
+                Mutate {
+                    mutations_since_note_after: 0,
+                    breath_limit: 5
+                }
+            ),
             Err("BreathNoteRequiredBeforeFurtherMutation")
         );
         assert_eq!(
-            evaluate_workflow_stage_transition(Claimed, TriggerPrePublish { task_gate_ok: false, doc_gate_ok: true }),
+            evaluate_workflow_stage_transition(
+                Claimed,
+                TriggerPrePublish {
+                    task_gate_ok: false,
+                    doc_gate_ok: true
+                }
+            ),
             Err("PublishBlockedByTaskGate")
         );
         assert_eq!(
-            evaluate_workflow_stage_transition(Claimed, TriggerPrePublish { task_gate_ok: true, doc_gate_ok: false }),
+            evaluate_workflow_stage_transition(
+                Claimed,
+                TriggerPrePublish {
+                    task_gate_ok: true,
+                    doc_gate_ok: false
+                }
+            ),
             Err("PublishBlockedByDocumentationGate")
         );
         assert_eq!(
-            evaluate_workflow_stage_transition(Claimed, CompleteTask { has_extracted_memory: false, dirty_targets: 0 }),
+            evaluate_workflow_stage_transition(
+                Claimed,
+                CompleteTask {
+                    has_extracted_memory: false,
+                    dirty_targets: 0
+                }
+            ),
             Err("CompletionRequiresExtractedMemory")
         );
         assert_eq!(
-            evaluate_workflow_stage_transition(Claimed, CompleteTask { has_extracted_memory: true, dirty_targets: 3 }),
+            evaluate_workflow_stage_transition(
+                Claimed,
+                CompleteTask {
+                    has_extracted_memory: true,
+                    dirty_targets: 3
+                }
+            ),
             Err("CompletionBlockedByDirtyTargets")
         );
         assert_eq!(
-            evaluate_workflow_stage_transition(Unpreflighted, ClaimTask { has_valid_scope: true }),
+            evaluate_workflow_stage_transition(
+                Unpreflighted,
+                ClaimTask {
+                    has_valid_scope: true
+                }
+            ),
             Err("PreflightRequiredBeforeClaim")
         );
         assert_eq!(
-            evaluate_workflow_stage_transition(ContextLoaded, Mutate { mutations_since_note_after: 0, breath_limit: 5 }),
+            evaluate_workflow_stage_transition(
+                ContextLoaded,
+                Mutate {
+                    mutations_since_note_after: 0,
+                    breath_limit: 5
+                }
+            ),
             Err("ClaimedTaskRequiredBeforeMutation")
         );
         assert_eq!(
-            evaluate_workflow_stage_transition(Claimed, TriggerPreCheckpoint { has_receipt: false }),
+            evaluate_workflow_stage_transition(
+                Claimed,
+                TriggerPreCheckpoint { has_receipt: false }
+            ),
             Err("CheckpointRequiresValidReceipt")
         );
         assert_eq!(
-            evaluate_workflow_stage_transition(ContextLoaded, ClaimTask { has_valid_scope: false }),
+            evaluate_workflow_stage_transition(
+                ContextLoaded,
+                ClaimTask {
+                    has_valid_scope: false
+                }
+            ),
             Err("ClaimRequiresValidWorkspaceScope")
         );
         assert_eq!(
@@ -2463,190 +3070,904 @@ mod tests {
     #[test]
     fn data_connector_gate_parity() {
         // Test Pre-Gate Verdicts
-        assert_eq!(evaluate_connector_pre_gate(KernelConnectorPreGateInput {
-            connector_registered: true,
-            rebac_allowed: true,
-            op: KernelConnectorOp::RegisterPointer,
-            pool_writable: false,
-            receipt_state: KernelActionReceiptState::NotRequired,
-            requested_rows: 0,
-            max_slice_rows: 100,
-            requested_bytes: 0,
-            max_slice_bytes: 1000,
-            clock_skew_future: false,
-            age_secs: 0,
-            max_staleness_secs: 0,
-        }), KernelConnectorPreVerdict::AllowPreRegister);
+        assert_eq!(
+            evaluate_connector_pre_gate(KernelConnectorPreGateInput {
+                connector_registered: true,
+                rebac_allowed: true,
+                op: KernelConnectorOp::RegisterPointer,
+                pool_writable: false,
+                receipt_state: KernelActionReceiptState::NotRequired,
+                requested_rows: 0,
+                max_slice_rows: 100,
+                requested_bytes: 0,
+                max_slice_bytes: 1000,
+                clock_skew_future: false,
+                age_secs: 0,
+                max_staleness_secs: 0,
+            }),
+            KernelConnectorPreVerdict::AllowPreRegister
+        );
 
-        assert_eq!(evaluate_connector_pre_gate(KernelConnectorPreGateInput {
-            connector_registered: false,
-            rebac_allowed: true,
-            op: KernelConnectorOp::ResolveSlice,
-            pool_writable: true,
-            receipt_state: KernelActionReceiptState::NotRequired,
-            requested_rows: 0,
-            max_slice_rows: 100,
-            requested_bytes:  0,
-            max_slice_bytes: 1000,
-            clock_skew_future: false,
-            age_secs: 0,
-            max_staleness_secs: 0,
-        }), KernelConnectorPreVerdict::DenyUnregisteredConnector);
+        assert_eq!(
+            evaluate_connector_pre_gate(KernelConnectorPreGateInput {
+                connector_registered: false,
+                rebac_allowed: true,
+                op: KernelConnectorOp::ResolveSlice,
+                pool_writable: true,
+                receipt_state: KernelActionReceiptState::NotRequired,
+                requested_rows: 0,
+                max_slice_rows: 100,
+                requested_bytes: 0,
+                max_slice_bytes: 1000,
+                clock_skew_future: false,
+                age_secs: 0,
+                max_staleness_secs: 0,
+            }),
+            KernelConnectorPreVerdict::DenyUnregisteredConnector
+        );
 
-        assert_eq!(evaluate_connector_pre_gate(KernelConnectorPreGateInput {
-            connector_registered: true,
-            rebac_allowed: false,
-            op: KernelConnectorOp::ResolveSlice,
-            pool_writable: true,
-            receipt_state: KernelActionReceiptState::NotRequired,
-            requested_rows: 0,
-            max_slice_rows: 100,
-            requested_bytes: 0,
-            max_slice_bytes: 1000,
-            clock_skew_future: false,
-            age_secs: 0,
-            max_staleness_secs: 0,
-        }), KernelConnectorPreVerdict::DenyRebacAccess);
+        assert_eq!(
+            evaluate_connector_pre_gate(KernelConnectorPreGateInput {
+                connector_registered: true,
+                rebac_allowed: false,
+                op: KernelConnectorOp::ResolveSlice,
+                pool_writable: true,
+                receipt_state: KernelActionReceiptState::NotRequired,
+                requested_rows: 0,
+                max_slice_rows: 100,
+                requested_bytes: 0,
+                max_slice_bytes: 1000,
+                clock_skew_future: false,
+                age_secs: 0,
+                max_staleness_secs: 0,
+            }),
+            KernelConnectorPreVerdict::DenyRebacAccess
+        );
 
-        assert_eq!(evaluate_connector_pre_gate(KernelConnectorPreGateInput {
-            connector_registered: true,
-            rebac_allowed: true,
-            op: KernelConnectorOp::ApplyWriteBack,
-            pool_writable: false,
-            receipt_state: KernelActionReceiptState::NotRequired,
-            requested_rows: 0,
-            max_slice_rows: 100,
-            requested_bytes: 0,
-            max_slice_bytes: 1000,
-            clock_skew_future: false,
-            age_secs: 0,
-            max_staleness_secs: 0,
-        }), KernelConnectorPreVerdict::DenyReadOnlyPool);
+        assert_eq!(
+            evaluate_connector_pre_gate(KernelConnectorPreGateInput {
+                connector_registered: true,
+                rebac_allowed: true,
+                op: KernelConnectorOp::ApplyWriteBack,
+                pool_writable: false,
+                receipt_state: KernelActionReceiptState::NotRequired,
+                requested_rows: 0,
+                max_slice_rows: 100,
+                requested_bytes: 0,
+                max_slice_bytes: 1000,
+                clock_skew_future: false,
+                age_secs: 0,
+                max_staleness_secs: 0,
+            }),
+            KernelConnectorPreVerdict::DenyReadOnlyPool
+        );
 
-        assert_eq!(evaluate_connector_pre_gate(KernelConnectorPreGateInput {
-            connector_registered: true,
-            rebac_allowed: true,
-            op: KernelConnectorOp::ApplyWriteBack,
-            pool_writable: true,
-            receipt_state: KernelActionReceiptState::ActiveBound,
-            requested_rows: 0,
-            max_slice_rows: 100,
-            requested_bytes: 0,
-            max_slice_bytes: 1000,
-            clock_skew_future: false,
-            age_secs: 0,
-            max_staleness_secs: 0,
-        }), KernelConnectorPreVerdict::AllowPreWriteBack);
+        assert_eq!(
+            evaluate_connector_pre_gate(KernelConnectorPreGateInput {
+                connector_registered: true,
+                rebac_allowed: true,
+                op: KernelConnectorOp::ApplyWriteBack,
+                pool_writable: true,
+                receipt_state: KernelActionReceiptState::ActiveBound,
+                requested_rows: 0,
+                max_slice_rows: 100,
+                requested_bytes: 0,
+                max_slice_bytes: 1000,
+                clock_skew_future: false,
+                age_secs: 0,
+                max_staleness_secs: 0,
+            }),
+            KernelConnectorPreVerdict::AllowPreWriteBack
+        );
 
-        assert_eq!(evaluate_connector_pre_gate(KernelConnectorPreGateInput {
-            connector_registered: true,
-            rebac_allowed: true,
-            op: KernelConnectorOp::ResolveSlice,
-            pool_writable: true,
-            receipt_state: KernelActionReceiptState::NotRequired,
-            requested_rows: 101,
-            max_slice_rows: 100,
-            requested_bytes: 0,
-            max_slice_bytes: 1000,
-            clock_skew_future: false,
-            age_secs: 0,
-            max_staleness_secs: 0,
-        }), KernelConnectorPreVerdict::DenySliceLimitExceeded);
+        assert_eq!(
+            evaluate_connector_pre_gate(KernelConnectorPreGateInput {
+                connector_registered: true,
+                rebac_allowed: true,
+                op: KernelConnectorOp::ResolveSlice,
+                pool_writable: true,
+                receipt_state: KernelActionReceiptState::NotRequired,
+                requested_rows: 101,
+                max_slice_rows: 100,
+                requested_bytes: 0,
+                max_slice_bytes: 1000,
+                clock_skew_future: false,
+                age_secs: 0,
+                max_staleness_secs: 0,
+            }),
+            KernelConnectorPreVerdict::DenySliceLimitExceeded
+        );
 
-        assert_eq!(evaluate_connector_pre_gate(KernelConnectorPreGateInput {
-            connector_registered: true,
-            rebac_allowed: true,
-            op: KernelConnectorOp::ResolveSlice,
-            pool_writable: true,
-            receipt_state: KernelActionReceiptState::NotRequired,
-            requested_rows: 1,
-            max_slice_rows: 100,
-            requested_bytes: 1,
-            max_slice_bytes: 1000,
-            clock_skew_future: true,
-            age_secs: 0,
-            max_staleness_secs: 0,
-        }), KernelConnectorPreVerdict::DenyClockSkewFuture);
+        assert_eq!(
+            evaluate_connector_pre_gate(KernelConnectorPreGateInput {
+                connector_registered: true,
+                rebac_allowed: true,
+                op: KernelConnectorOp::ResolveSlice,
+                pool_writable: true,
+                receipt_state: KernelActionReceiptState::NotRequired,
+                requested_rows: 1,
+                max_slice_rows: 100,
+                requested_bytes: 1,
+                max_slice_bytes: 1000,
+                clock_skew_future: true,
+                age_secs: 0,
+                max_staleness_secs: 0,
+            }),
+            KernelConnectorPreVerdict::DenyClockSkewFuture
+        );
 
-        assert_eq!(evaluate_connector_pre_gate(KernelConnectorPreGateInput {
-            connector_registered: true,
-            rebac_allowed: true,
-            op: KernelConnectorOp::ResolveSlice,
-            pool_writable: true,
-            receipt_state: KernelActionReceiptState::NotRequired,
-            requested_rows: 1,
-            max_slice_rows: 100,
-            requested_bytes: 1,
-            max_slice_bytes: 1000,
-            clock_skew_future: false,
-            age_secs: 1000,
-            max_staleness_secs: 0,
-        }), KernelConnectorPreVerdict::AllowPreResolve);
+        assert_eq!(
+            evaluate_connector_pre_gate(KernelConnectorPreGateInput {
+                connector_registered: true,
+                rebac_allowed: true,
+                op: KernelConnectorOp::ResolveSlice,
+                pool_writable: true,
+                receipt_state: KernelActionReceiptState::NotRequired,
+                requested_rows: 1,
+                max_slice_rows: 100,
+                requested_bytes: 1,
+                max_slice_bytes: 1000,
+                clock_skew_future: false,
+                age_secs: 1000,
+                max_staleness_secs: 0,
+            }),
+            KernelConnectorPreVerdict::AllowPreResolve
+        );
 
-        assert_eq!(evaluate_connector_pre_gate(KernelConnectorPreGateInput {
-            connector_registered: true,
-            rebac_allowed: true,
-            op: KernelConnectorOp::ResolveSlice,
-            pool_writable: true,
-            receipt_state: KernelActionReceiptState::NotRequired,
-            requested_rows: 1,
-            max_slice_rows: 100,
-            requested_bytes: 1,
-            max_slice_bytes: 1000,
-            clock_skew_future: false,
-            age_secs: 1000,
-            max_staleness_secs: 1,
-        }), KernelConnectorPreVerdict::DenyPointerStale);
-     
+        assert_eq!(
+            evaluate_connector_pre_gate(KernelConnectorPreGateInput {
+                connector_registered: true,
+                rebac_allowed: true,
+                op: KernelConnectorOp::ResolveSlice,
+                pool_writable: true,
+                receipt_state: KernelActionReceiptState::NotRequired,
+                requested_rows: 1,
+                max_slice_rows: 100,
+                requested_bytes: 1,
+                max_slice_bytes: 1000,
+                clock_skew_future: false,
+                age_secs: 1000,
+                max_staleness_secs: 1,
+            }),
+            KernelConnectorPreVerdict::DenyPointerStale
+        );
+
         // Test Post-Gate Verdicts
-        assert_eq!(evaluate_connector_post_gate(KernelConnectorPostGateInput {
-            op: KernelConnectorOp::ResolveSlice,
-            observed_rows: 0,
-            max_slice_rows: 100,
-            observed_bytes: 0,
-            max_slice_bytes: 1000,
-            source_digest_matches: true,
-            cas_expected_matches: true,
-        }), KernelConnectorPostVerdict::AllowPostOutput);
-         
-         assert_eq!(evaluate_connector_post_gate(KernelConnectorPostGateInput {
-             op: KernelConnectorOp::ResolveSlice,
-             observed_rows: 101,
-             max_slice_rows: 100,
-             observed_bytes: 0,
-             max_slice_bytes: 1000,
-             source_digest_matches: true,
-             cas_expected_matches: true,
-         }), KernelConnectorPostVerdict::DenyObservedBoundsExceeded);
-         
-         assert_eq!(evaluate_connector_post_gate(KernelConnectorPostGateInput {
-             op: KernelConnectorOp::ResolveSlice,
-             observed_rows: 0,
-             max_slice_rows: 100,
-             observed_bytes: 0,
-             max_slice_bytes: 1000,
-             source_digest_matches: false,
-             cas_expected_matches: true,
-         }), KernelConnectorPostVerdict::DenySourceDigestMismatch);
-         
-         assert_eq!(evaluate_connector_post_gate(KernelConnectorPostGateInput {
-             op: KernelConnectorOp::ApplyWriteBack,
-             observed_rows: 0,
-             max_slice_rows: 100,
-             observed_bytes: 0,
-             max_slice_bytes: 1000,
-             source_digest_matches: true,
-             cas_expected_matches: false,
-         }), KernelConnectorPostVerdict::DenyCasConflict);
-         
-         assert_eq!(evaluate_connector_post_gate(KernelConnectorPostGateInput {
-             op: KernelConnectorOp::ApplyWriteBack,
-             observed_rows: 0,
-             max_slice_rows: 100,
-             observed_bytes: 0,
-             max_slice_bytes: 1000,
-             source_digest_matches: true,
-             cas_expected_matches: true,
-         }), KernelConnectorPostVerdict::AllowPostOutput);
-     }
+        assert_eq!(
+            evaluate_connector_post_gate(KernelConnectorPostGateInput {
+                op: KernelConnectorOp::ResolveSlice,
+                observed_rows: 0,
+                max_slice_rows: 100,
+                observed_bytes: 0,
+                max_slice_bytes: 1000,
+                source_digest_matches: true,
+                cas_expected_matches: true,
+            }),
+            KernelConnectorPostVerdict::AllowPostOutput
+        );
+
+        assert_eq!(
+            evaluate_connector_post_gate(KernelConnectorPostGateInput {
+                op: KernelConnectorOp::ResolveSlice,
+                observed_rows: 101,
+                max_slice_rows: 100,
+                observed_bytes: 0,
+                max_slice_bytes: 1000,
+                source_digest_matches: true,
+                cas_expected_matches: true,
+            }),
+            KernelConnectorPostVerdict::DenyObservedBoundsExceeded
+        );
+
+        assert_eq!(
+            evaluate_connector_post_gate(KernelConnectorPostGateInput {
+                op: KernelConnectorOp::ResolveSlice,
+                observed_rows: 0,
+                max_slice_rows: 100,
+                observed_bytes: 0,
+                max_slice_bytes: 1000,
+                source_digest_matches: false,
+                cas_expected_matches: true,
+            }),
+            KernelConnectorPostVerdict::DenySourceDigestMismatch
+        );
+
+        assert_eq!(
+            evaluate_connector_post_gate(KernelConnectorPostGateInput {
+                op: KernelConnectorOp::ApplyWriteBack,
+                observed_rows: 0,
+                max_slice_rows: 100,
+                observed_bytes: 0,
+                max_slice_bytes: 1000,
+                source_digest_matches: true,
+                cas_expected_matches: false,
+            }),
+            KernelConnectorPostVerdict::DenyCasConflict
+        );
+
+        assert_eq!(
+            evaluate_connector_post_gate(KernelConnectorPostGateInput {
+                op: KernelConnectorOp::ApplyWriteBack,
+                observed_rows: 0,
+                max_slice_rows: 100,
+                observed_bytes: 0,
+                max_slice_bytes: 1000,
+                source_digest_matches: true,
+                cas_expected_matches: true,
+            }),
+            KernelConnectorPostVerdict::AllowPostOutput
+        );
+    }
+
+    #[test]
+    fn test_build_resolve_post_gate_input_caps_at_min_of_requested_and_schema() {
+        // Observed rows above u32::MAX saturate instead of truncating via `as u32`.
+        let saturated =
+            build_resolve_post_gate_input((u32::MAX as usize) + 1, 10, 10, 64, 256, 1024, true);
+        assert_eq!(saturated.observed_rows, u32::MAX);
+        assert_eq!(saturated.max_slice_rows, 10);
+        assert_eq!(saturated.observed_bytes, 64);
+        assert_eq!(saturated.max_slice_bytes, 256);
+
+        // The effective row cap is min(requested, schema), so an over-broad
+        // request cannot widen the schema cap.
+        let capped = build_resolve_post_gate_input(5, 2, 10, 32, 256, 1024, true);
+        assert_eq!(capped.observed_rows, 5);
+        assert_eq!(capped.max_slice_rows, 2);
+        assert_eq!(capped.max_slice_bytes, 256);
+        assert_eq!(
+            evaluate_connector_post_gate(capped),
+            KernelConnectorPostVerdict::DenyObservedBoundsExceeded
+        );
+    }
+
+    #[test]
+    fn test_build_writeback_post_gate_input_separates_pointer_digest_and_cas() {
+        let digest_mismatch = build_writeback_post_gate_input(10, 1024, false, true);
+        assert!(!digest_mismatch.source_digest_matches);
+        assert!(digest_mismatch.cas_expected_matches);
+        assert_eq!(
+            evaluate_connector_post_gate(digest_mismatch),
+            KernelConnectorPostVerdict::DenySourceDigestMismatch
+        );
+
+        let cas_mismatch = build_writeback_post_gate_input(10, 1024, true, false);
+        assert!(cas_mismatch.source_digest_matches);
+        assert!(!cas_mismatch.cas_expected_matches);
+        assert_eq!(
+            evaluate_connector_post_gate(cas_mismatch),
+            KernelConnectorPostVerdict::DenyCasConflict
+        );
+
+        let ok = build_writeback_post_gate_input(10, 1024, true, true);
+        assert_eq!(
+            evaluate_connector_post_gate(ok),
+            KernelConnectorPostVerdict::AllowPostOutput
+        );
+    }
+
+    #[test]
+    fn test_compute_procedure_next_due_saturates_and_rejects_non_positive_cadence() {
+        assert_eq!(
+            compute_procedure_next_due(1_000, Some(0), Some(i64::MAX), None, None),
+            i64::MAX
+        );
+        assert_eq!(
+            compute_procedure_next_due(1_000, Some(0), Some(0), None, None),
+            1_000
+        );
+        assert_eq!(
+            compute_procedure_next_due(1_000, Some(0), Some(-5), None, None),
+            1_000
+        );
+        assert_eq!(
+            compute_procedure_next_due(1_000, Some(0), None, Some(i64::MAX), None),
+            i64::MAX
+        );
+        // Negative session elapsed clamps to zero rather than shifting backwards.
+        assert_eq!(
+            compute_procedure_next_due(1_000, Some(1000), None, Some(2), Some(-3)),
+            1_000
+        );
+        assert_eq!(
+            compute_procedure_next_due(1_000, Some(1000), None, Some(2), Some(3)),
+            1_000 + 3 * PROCEDURE_SESSION_ESTIMATE_SECONDS
+        );
+    }
+    #[test]
+    fn test_build_resolve_post_gate_input() {
+        let input = build_resolve_post_gate_input(5, 10, 100, 100, 500, 1000, true);
+        assert_eq!(input.op, KernelConnectorOp::ResolveSlice);
+        assert_eq!(input.observed_rows, 5);
+        assert_eq!(input.max_slice_rows, 10);
+        assert_eq!(input.observed_bytes, 100);
+        assert_eq!(input.max_slice_bytes, 500);
+        assert!(input.source_digest_matches);
+        assert!(input.cas_expected_matches);
+
+        let input =
+            build_resolve_post_gate_input((u32::MAX as usize) + 100, 10, 100, 100, 500, 1000, true);
+        assert_eq!(input.observed_rows, u32::MAX);
+
+        let input = build_resolve_post_gate_input(5, 50, 30, 100, 500, 1000, true);
+        assert_eq!(input.max_slice_rows, 30);
+
+        let input = build_resolve_post_gate_input(5, 10, 100, 100, 2000, 1000, true);
+        assert_eq!(input.max_slice_bytes, 1000);
+    }
+
+    #[test]
+    fn test_build_writeback_post_gate_input() {
+        let input = build_writeback_post_gate_input(100, 1000, true, true);
+        assert_eq!(input.op, KernelConnectorOp::ApplyWriteBack);
+        assert_eq!(input.observed_rows, 0);
+        assert_eq!(input.max_slice_rows, 100);
+        assert_eq!(input.observed_bytes, 0);
+        assert_eq!(input.max_slice_bytes, 1000);
+        assert!(input.source_digest_matches);
+        assert!(input.cas_expected_matches);
+
+        let input = build_writeback_post_gate_input(100, 1000, false, true);
+        assert!(!input.source_digest_matches);
+        assert!(input.cas_expected_matches);
+
+        let input = build_writeback_post_gate_input(100, 1000, true, false);
+        assert!(input.source_digest_matches);
+        assert!(!input.cas_expected_matches);
+
+        let input = build_writeback_post_gate_input(100, 1000, false, false);
+        assert!(!input.source_digest_matches);
+        assert!(!input.cas_expected_matches);
+    }
+
+    #[test]
+    fn test_compute_procedure_next_due() {
+        const NOW: i64 = 1_000_000;
+        const LAST: i64 = 900_000;
+
+        assert_eq!(
+            compute_procedure_next_due(NOW, Some(LAST), Some(7), None, None),
+            LAST.saturating_add(7 * PROCEDURE_DAY_SECONDS)
+        );
+
+        assert_eq!(
+            compute_procedure_next_due(NOW, Some(LAST), Some(0), None, None),
+            NOW
+        );
+
+        assert_eq!(
+            compute_procedure_next_due(NOW, Some(LAST), Some(-5), None, None),
+            NOW
+        );
+
+        assert_eq!(
+            compute_procedure_next_due(NOW, Some(LAST), Some(i64::MAX), None, None),
+            i64::MAX
+        );
+
+        assert_eq!(
+            compute_procedure_next_due(NOW, Some(LAST), None, Some(5), None),
+            LAST.saturating_add(4 * PROCEDURE_SESSION_ESTIMATE_SECONDS)
+        );
+
+        assert_eq!(
+            compute_procedure_next_due(NOW, Some(LAST), None, Some(5), Some(10)),
+            LAST.saturating_add(10 * PROCEDURE_SESSION_ESTIMATE_SECONDS)
+        );
+
+        assert_eq!(
+            compute_procedure_next_due(NOW, Some(LAST), None, Some(1), None),
+            NOW
+        );
+
+        assert_eq!(
+            compute_procedure_next_due(NOW, Some(LAST), None, Some(0), None),
+            NOW
+        );
+
+        assert_eq!(
+            compute_procedure_next_due(NOW, Some(LAST), None, Some(-3), None),
+            NOW
+        );
+
+        assert_eq!(
+            compute_procedure_next_due(NOW, Some(LAST), None, Some(i64::MAX), None),
+            i64::MAX
+        );
+
+        assert_eq!(
+            compute_procedure_next_due(NOW, None, Some(7), None, None),
+            NOW
+        );
+        assert_eq!(
+            compute_procedure_next_due(NOW, Some(LAST), None, None, None),
+            NOW
+        );
+        assert_eq!(compute_procedure_next_due(NOW, None, None, None, None), NOW);
+
+        assert_eq!(
+            compute_procedure_next_due(NOW, Some(LAST), None, Some(5), Some(-10)),
+            LAST
+        );
+    }
+}
+
+/// Kani proof harnesses for the formal kernel decision functions.
+///
+/// These harnesses are only compiled under `cfg(kani)` and verify key
+/// safety/overflow/no-panic properties of the pure kernel functions.
+/// Run via `kani src/formal_kernel.rs`.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    #[kani::proof]
+    fn proof_task_step_no_panic() {
+        let from = kani::any::<KernelTaskStatus>();
+        let to = kani::any::<KernelTaskStatus>();
+        let has_reason = kani::any::<bool>();
+        let extraction_edge_exists = kani::any::<bool>();
+        let _ = task_step(from, to, has_reason, extraction_edge_exists);
+    }
+
+    #[kani::proof]
+    fn proof_task_edge_guard_legal_edges() {
+        use KernelTaskStatus::*;
+        let from = kani::any::<KernelTaskStatus>();
+        let to = kani::any::<KernelTaskStatus>();
+
+        // Exact legality table: all sixteen pairs are classified.
+        let expected = match (from, to) {
+            (Open, InProgress) | (InProgress, Open) => Some(KernelGuard::None),
+            (Open, Blocked) | (InProgress, Blocked) | (Blocked, Open) | (Done, Open) => {
+                Some(KernelGuard::RequireReason)
+            }
+            (Open, Done) | (InProgress, Done) => Some(KernelGuard::ExtractionRequired),
+            _ => None,
+        };
+        assert_eq!(task_edge_guard(from, to), expected);
+
+        // task_step enforces each guard, so a dropped guard changes the result.
+        let has_reason = kani::any::<bool>();
+        let extraction_edge_exists = kani::any::<bool>();
+        let step = task_step(from, to, has_reason, extraction_edge_exists);
+        match expected {
+            None => assert!(step.is_err()),
+            Some(KernelGuard::None) => assert!(step.is_ok()),
+            Some(KernelGuard::RequireReason) => assert_eq!(step.is_ok(), has_reason),
+            Some(KernelGuard::ExtractionRequired) => {
+                assert_eq!(step.is_ok(), extraction_edge_exists)
+            }
+        }
+    }
+
+    #[kani::proof]
+    fn proof_epoch_gate_total() {
+        let candidate = kani::any::<u32>();
+        let manifest = kani::any::<u32>();
+        let decision = epoch_gate_decision(candidate, manifest);
+        let expected = if candidate == manifest {
+            KernelEpochDecision::Apply
+        } else if candidate < manifest {
+            KernelEpochDecision::QuarantineOld
+        } else {
+            KernelEpochDecision::RefuseFuture
+        };
+        assert_eq!(decision, expected);
+    }
+
+    #[kani::proof]
+    fn proof_classify_merge_decision_total() {
+        let local = kani::any::<KernelLifecycleState>();
+        let cand = kani::any::<KernelLifecycleState>();
+        let same = kani::any::<bool>();
+        let changed = kani::any::<bool>();
+        let concurrent = kani::any::<bool>();
+        let _ = classify_merge_decision(local, cand, same, changed, concurrent);
+    }
+
+    #[kani::proof]
+    fn proof_evaluate_claim_decision_total() {
+        let status = kani::any::<KernelTaskStatus>();
+        let same_session = kani::any::<bool>();
+        let age = kani::any::<Option<i64>>();
+        let stale_after = kani::any::<i64>();
+        let _ = evaluate_claim_decision(status, same_session, age, stale_after);
+    }
+
+    #[kani::proof]
+    fn proof_evaluate_sovereignty_gate_total() {
+        let permitted = kani::any::<bool>();
+        let shareable = kani::any::<bool>();
+        let runtime_counter = kani::any::<bool>();
+        let acl_empty = kani::any::<bool>();
+        let in_acl = kani::any::<bool>();
+        let _ = evaluate_sovereignty_gate(permitted, shareable, runtime_counter, acl_empty, in_acl);
+    }
+
+    #[kani::proof]
+    fn proof_evaluate_import_precheck_total() {
+        let row_exists = kani::any::<bool>();
+        let mesh_provenance = kani::any::<bool>();
+        let same_update_id = kani::any::<bool>();
+        let _ = evaluate_import_precheck(row_exists, mesh_provenance, same_update_id);
+    }
+
+    #[kani::proof]
+    fn proof_evaluate_procedure_fire_no_panic() {
+        let trust = kani::any::<KernelProcedureTrust>();
+        let has_provenance = kani::any::<bool>();
+        let valid_to = kani::any::<Option<i64>>();
+        let now = kani::any::<i64>();
+        let remaining = kani::any::<Option<u64>>();
+        let perf_count = kani::any::<u64>();
+        let outcome =
+            evaluate_procedure_fire(trust, has_provenance, valid_to, now, remaining, perf_count);
+        // Budget conservation: a fired rehearsal decrements exactly one slot.
+        match outcome {
+            KernelProcedureFireOutcome::Fired {
+                remaining_fires: Some(r),
+                performance_count: p,
+            } => {
+                let budget = remaining.expect("bounded fire requires a budget");
+                assert!(budget > 0);
+                assert_eq!(r, budget - 1);
+                assert_eq!(p, perf_count.saturating_add(1));
+            }
+            KernelProcedureFireOutcome::Fired {
+                remaining_fires: None,
+                performance_count: p,
+            } => {
+                assert!(remaining.is_none());
+                assert_eq!(p, perf_count.saturating_add(1));
+            }
+            KernelProcedureFireOutcome::RefuseSpent => assert_eq!(remaining, Some(0)),
+            KernelProcedureFireOutcome::RefuseUntrusted => {
+                assert!(procedure_is_untrusted(trust, has_provenance))
+            }
+            KernelProcedureFireOutcome::RefuseLapsed => {
+                assert!(!procedure_is_untrusted(trust, has_provenance));
+                assert!(procedure_is_lapsed(valid_to, now));
+            }
+        }
+    }
+
+    #[kani::proof]
+    fn proof_compute_procedure_next_due_no_overflow() {
+        let now = kani::any::<i64>();
+        let last = kani::any::<Option<i64>>();
+        let days = kani::any::<Option<i64>>();
+        let sessions = kani::any::<Option<i64>>();
+        let since = kani::any::<Option<i64>>();
+        let due = compute_procedure_next_due(now, last, days, sessions, since);
+        // Exact cadence spec: day cadence wins, then session cadence, else now.
+        match (last, days, sessions) {
+            (Some(l), Some(d), _) if d > 0 => {
+                assert_eq!(
+                    due,
+                    l.saturating_add(d.saturating_mul(PROCEDURE_DAY_SECONDS))
+                );
+                assert!(due >= l);
+            }
+            (Some(l), _, Some(n)) if n > 1 => {
+                let elapsed = match since {
+                    Some(s) if s > 0 => s,
+                    Some(_) => 0,
+                    None => n - 1,
+                };
+                assert_eq!(
+                    due,
+                    l.saturating_add(elapsed.saturating_mul(PROCEDURE_SESSION_ESTIMATE_SECONDS))
+                );
+                assert!(due >= l);
+            }
+            _ => assert_eq!(due, now),
+        }
+    }
+
+    #[kani::proof]
+    fn proof_evaluate_action_gate_total() {
+        let auth = kani::any::<bool>();
+        let params = kani::any::<bool>();
+        let ask = kani::any::<bool>();
+        let twin = kani::any::<bool>();
+        let shacl = kani::any::<bool>();
+        let _ = evaluate_action_gate(auth, params, ask, twin, shacl);
+    }
+
+    #[kani::proof]
+    fn proof_evaluate_action_revert_total() {
+        let state = kani::any::<ActionReceiptState>();
+        let cas = kani::any::<bool>();
+        let force = kani::any::<bool>();
+        let owner = kani::any::<bool>();
+        let editor = kani::any::<bool>();
+        let _ = evaluate_action_revert(state, cas, force, owner, editor);
+    }
+
+    #[kani::proof]
+    fn proof_evaluate_connector_pre_gate_total() {
+        let input = kani::any::<KernelConnectorPreGateInput>();
+        let _ = evaluate_connector_pre_gate(input);
+    }
+
+    #[kani::proof]
+    fn proof_evaluate_connector_post_gate_total() {
+        let input = kani::any::<KernelConnectorPostGateInput>();
+        let verdict = evaluate_connector_post_gate(input);
+        let bounds_exceeded = matches!(input.op, KernelConnectorOp::ResolveSlice)
+            && (input.observed_rows > input.max_slice_rows
+                || input.observed_bytes > input.max_slice_bytes);
+        // Precedence is observable: bounds, then source digest, then CAS.
+        if bounds_exceeded {
+            assert_eq!(
+                verdict,
+                KernelConnectorPostVerdict::DenyObservedBoundsExceeded
+            );
+        } else if !input.source_digest_matches {
+            assert_eq!(
+                verdict,
+                KernelConnectorPostVerdict::DenySourceDigestMismatch
+            );
+        } else if matches!(input.op, KernelConnectorOp::ApplyWriteBack)
+            && !input.cas_expected_matches
+        {
+            assert_eq!(verdict, KernelConnectorPostVerdict::DenyCasConflict);
+        } else {
+            assert_eq!(verdict, KernelConnectorPostVerdict::AllowPostOutput);
+        }
+    }
+
+    #[kani::proof]
+    fn proof_build_resolve_post_gate_input_bounds() {
+        let observed_len = kani::any::<usize>();
+        let req_rows = kani::any::<u32>();
+        let schema_rows = kani::any::<u32>();
+        let obs_bytes = kani::any::<u32>();
+        let req_bytes = kani::any::<u32>();
+        let schema_bytes = kani::any::<u32>();
+        let src_match = kani::any::<bool>();
+        let input = build_resolve_post_gate_input(
+            observed_len,
+            req_rows,
+            schema_rows,
+            obs_bytes,
+            req_bytes,
+            schema_bytes,
+            src_match,
+        );
+        // The saturated observable count and the effective caps are exact.
+        let expected_observed = if observed_len > (u32::MAX as usize) {
+            u32::MAX
+        } else {
+            observed_len as u32
+        };
+        assert_eq!(input.observed_rows, expected_observed);
+        assert_eq!(input.max_slice_rows, min_u32(req_rows, schema_rows));
+        assert_eq!(input.max_slice_bytes, min_u32(req_bytes, schema_bytes));
+        assert_eq!(input.op, KernelConnectorOp::ResolveSlice);
+        assert!(input.cas_expected_matches);
+
+        // The post-gate consumes those fields and rejects an over-limit result.
+        let verdict = evaluate_connector_post_gate(input);
+        if input.observed_rows > input.max_slice_rows
+            || input.observed_bytes > input.max_slice_bytes
+        {
+            assert_eq!(
+                verdict,
+                KernelConnectorPostVerdict::DenyObservedBoundsExceeded
+            );
+        } else if !src_match {
+            assert_eq!(
+                verdict,
+                KernelConnectorPostVerdict::DenySourceDigestMismatch
+            );
+        } else {
+            assert_eq!(verdict, KernelConnectorPostVerdict::AllowPostOutput);
+        }
+    }
+
+    #[kani::proof]
+    fn proof_build_writeback_post_gate_input_distinct() {
+        let schema_rows = kani::any::<u32>();
+        let schema_bytes = kani::any::<u32>();
+        let ptr_match = kani::any::<bool>();
+        let cas_match = kani::any::<bool>();
+        let input =
+            build_writeback_post_gate_input(schema_rows, schema_bytes, ptr_match, cas_match);
+        // Pointer digest match and CAS match are independent flags.
+        assert!(input.source_digest_matches == ptr_match);
+        assert!(input.cas_expected_matches == cas_match);
+
+        // Pre-write digest failure wins over a CAS conflict.
+        let verdict = evaluate_connector_post_gate(input);
+        if !ptr_match {
+            assert_eq!(
+                verdict,
+                KernelConnectorPostVerdict::DenySourceDigestMismatch
+            );
+        } else if !cas_match {
+            assert_eq!(verdict, KernelConnectorPostVerdict::DenyCasConflict);
+        } else {
+            assert_eq!(verdict, KernelConnectorPostVerdict::AllowPostOutput);
+        }
+    }
+
+    #[kani::proof]
+    fn proof_evaluate_reducer_total_no_div_zero() {
+        let op = kani::any::<ReducerOpKind>();
+        let count = kani::any::<u32>();
+        let sum = kani::any::<i64>();
+        let min_v = kani::any::<i64>();
+        let max_v = kani::any::<i64>();
+        let oob = kani::any::<bool>();
+        let outcome = evaluate_reducer_total(op, count, sum, min_v, max_v, oob);
+        // Avg with count == 0 is defined as 0, never panics.
+        if count == 0 && matches!(op, ReducerOpKind::Avg) {
+            assert!(outcome.is_defined && outcome.numeric_val == 0);
+        }
+    }
+
+    #[kani::proof]
+    fn proof_evaluate_seq_continuity_total() {
+        let seen = kani::any::<bool>();
+        let expected = kani::any::<u64>();
+        let frame = kani::any::<u64>();
+        let _ = evaluate_seq_continuity(seen, expected, frame);
+    }
+
+    #[kani::proof]
+    fn proof_evaluate_retention_gate_total() {
+        let within = kani::any::<bool>();
+        let non_empty = kani::any::<bool>();
+        let receipt = kani::any::<bool>();
+        let bound = kani::any::<bool>();
+        let matches = kani::any::<bool>();
+        let _ = evaluate_retention_gate(within, non_empty, receipt, bound, matches);
+    }
+
+    #[kani::proof]
+    fn proof_evaluate_claim_scope_gate_total() {
+        let scoped = kani::any::<bool>();
+        let identifiable = kani::any::<bool>();
+        let attributed = kani::any::<bool>();
+        let branch = kani::any::<bool>();
+        let worktree = kani::any::<bool>();
+        let _ = evaluate_claim_scope_gate(scoped, identifiable, attributed, branch, worktree);
+    }
+
+    #[kani::proof]
+    fn proof_allocate_hybrid_slots_conservation() {
+        let limit = kani::any::<u32>();
+        let avail_norm = kani::any::<u32>();
+        let avail_exp = kani::any::<u32>();
+        let avail_other = kani::any::<u32>();
+        let alloc = allocate_hybrid_slots(limit, avail_norm, avail_exp, avail_other);
+        assert!(alloc.normative_taken <= avail_norm);
+        assert!(alloc.expansion_taken <= avail_exp);
+        let total_taken = (alloc.normative_taken as u64)
+            + (alloc.expansion_taken as u64)
+            + (alloc.remaining_taken as u64);
+        assert!(total_taken <= limit as u64);
+    }
+
+    #[kani::proof]
+    fn proof_intersect_var_bounds_covariant() {
+        let imin = kani::any::<i64>();
+        let imax = kani::any::<i64>();
+        let tmin = kani::any::<i64>();
+        let tmax = kani::any::<i64>();
+        if let Ok((emin, emax)) = intersect_var_bounds(imin, imax, tmin, tmax) {
+            assert!(emin <= emax);
+            assert!(emin >= imin && emax <= imax);
+            assert!(emin >= tmin && emax <= tmax);
+        }
+    }
+
+    #[kani::proof]
+    fn proof_resolve_cross_file_call_total() {
+        let is_self = kani::any::<bool>();
+        let same_file = kani::any::<bool>();
+        let imported = kani::any::<bool>();
+        let ws_count = kani::any::<u32>();
+        let ident_len = kani::any::<u32>();
+        let is_std = kani::any::<bool>();
+        let _ = resolve_cross_file_call(is_self, same_file, imported, ws_count, ident_len, is_std);
+    }
+
+    #[kani::proof]
+    fn proof_resolve_scenario_row_total() {
+        let live = kani::any::<bool>();
+        let retired = kani::any::<bool>();
+        let upsert = kani::any::<bool>();
+        let _ = resolve_scenario_row(live, retired, upsert);
+    }
+
+    #[kani::proof]
+    fn proof_validate_taxonomy_dag_bounded() {
+        let e0 = (kani::any::<u8>() & 3) as u32;
+        let e1 = (kani::any::<u8>() & 3) as u32;
+        let e2 = (kani::any::<u8>() & 3) as u32;
+        let e3 = (kani::any::<u8>() & 3) as u32;
+        let edges = [(e0, e1), (e2, e3)];
+        let valid = validate_taxonomy_dag(&edges);
+        if e0 == e1 || e2 == e3 {
+            assert!(!valid);
+        }
+
+        // A two-edge cycle is rejected even when every edge is non-reflexive.
+        let a = kani::any::<u32>();
+        let b = kani::any::<u32>();
+        kani::assume(a != b);
+        assert!(!validate_taxonomy_dag(&[(a, b), (b, a)]));
+
+        // Fixed 2- and 3-cycles, and a valid chain.
+        assert!(!validate_taxonomy_dag(&[(0, 1), (1, 0)]));
+        assert!(!validate_taxonomy_dag(&[(0, 1), (1, 2), (2, 0)]));
+        assert!(validate_taxonomy_dag(&[(0, 1), (1, 2), (2, 3)]));
+    }
+
+    #[kani::proof]
+    fn proof_validate_skos_disjointness_bounded() {
+        let a = (kani::any::<u8>() & 3) as u32;
+        let b = (kani::any::<u8>() & 3) as u32;
+        let broader = [(a, b)];
+        let related = [(a, b)];
+        let contrast: [(u32, u32); 0] = [];
+        assert!(!validate_skos_disjointness(&broader, &related, &contrast));
+
+        // A related edge that equals the transitive broader closure is invalid,
+        // while an unrelated pair stays valid.
+        assert!(!validate_skos_disjointness(
+            &[(0, 1), (1, 2)],
+            &[(0, 2)],
+            &[]
+        ));
+        assert!(validate_skos_disjointness(&[(0, 1)], &[(2, 3)], &[]));
+    }
+
+    #[kani::proof]
+    fn proof_compute_epistemic_coverage_bps_bounds() {
+        let s0 = kani::any::<EpistemicStatus>();
+        let s1 = kani::any::<EpistemicStatus>();
+        let s2 = kani::any::<EpistemicStatus>();
+        let unmapped = kani::any::<u32>();
+        let statuses = [s0, s1, s2];
+        let bps = compute_epistemic_coverage_bps(&statuses, unmapped);
+        assert!(bps <= 10_000);
+        assert_eq!(compute_epistemic_coverage_bps(&[], 0), 0);
+    }
+
+    #[kani::proof]
+    fn proof_compute_frontier_leverage_bps_bounds() {
+        let axis_w = kani::any::<u32>();
+        let gap = kani::any::<u32>();
+        let deg = kani::any::<u32>();
+        let frontier = kani::any::<bool>();
+        let lit = kani::any::<bool>();
+        let bps = compute_frontier_leverage_bps(axis_w, gap, deg, frontier, lit);
+        assert!(bps <= 10_000);
+        if gap == 0 {
+            assert_eq!(bps, 0);
+        }
+    }
+
+    #[kani::proof]
+    fn proof_workflow_stage_transition_total() {
+        let stage = kani::any::<KernelWorkflowStage>();
+        let event = kani::any::<KernelWorkflowEvent>();
+        if let Ok(next) = evaluate_workflow_stage_transition(stage, event) {
+            if matches!(next, KernelWorkflowStage::Completed)
+                && !matches!(stage, KernelWorkflowStage::Completed)
+            {
+                assert!(matches!(
+                    event,
+                    KernelWorkflowEvent::CompleteTask {
+                        has_extracted_memory: true,
+                        dirty_targets: 0
+                    }
+                ));
+            }
+        }
+    }
 }

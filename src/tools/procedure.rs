@@ -22,7 +22,10 @@
 //! v1 keeps due-logic thin: every non-lapsed procedure is due, and only the
 //! day-cadence trigger gets a real `next_due`.
 
-use crate::formal_kernel::{procedure_is_lapsed, procedure_is_untrusted, KernelProcedureTrust};
+use crate::formal_kernel::{
+    evaluate_procedure_fire, procedure_is_lapsed, procedure_is_untrusted,
+    KernelProcedureFireOutcome, KernelProcedureTrust,
+};
 use crate::traits::{SearchResult, VectorStore};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -31,11 +34,6 @@ use std::sync::Arc;
 /// buffer.rs is consumed as-is here, so the number is repeated rather than
 /// exported; if one moves, the other has to move with it.
 const ROLLOVER_BYTES: u64 = 500 * 1024;
-/// Seconds in a day, for the `every-n-days:N` cadence.
-const DAY_SECONDS: i64 = 86_400;
-/// Estimated wall-clock length of one session, for the
-/// `every-n-sessions:N` cadence (a session carries no timestamp of its own).
-const SESSION_ESTIMATE_SECONDS: i64 = 3600;
 
 /// Composite Rec #20: process-wide per-procedure firing locks, keyed by
 /// `{namespace}::{id}`. Two concurrent perform calls on the same row would
@@ -43,7 +41,9 @@ const SESSION_ESTIMATE_SECONDS: i64 = 3600;
 /// the same `remaining_fires` — double-spending the budget against a single
 /// counter. The async mutex is held from the row's authoritative re-read
 /// through `store.upsert`, so concurrent firings serialize.
-static PROCEDURE_FIRE_LOCKS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>> = std::sync::OnceLock::new();
+static PROCEDURE_FIRE_LOCKS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+> = std::sync::OnceLock::new();
 
 fn fire_lock(key: &str) -> Arc<tokio::sync::Mutex<()>> {
     let map = PROCEDURE_FIRE_LOCKS
@@ -65,9 +65,13 @@ fn fire_lock(key: &str) -> Arc<tokio::sync::Mutex<()>> {
 /// absent or explicitly null never lapses, and a value that is not an integer
 /// reads as 0 (long expired) rather than as "expires in the far future".
 pub(crate) fn is_lapsed(metadata: &Value, now: i64) -> bool {
-    let vt = metadata
-        .get("valid_to")
-        .and_then(|v| if v.is_null() { None } else { Some(v.as_i64().unwrap_or(0)) });
+    let vt = metadata.get("valid_to").and_then(|v| {
+        if v.is_null() {
+            None
+        } else {
+            Some(v.as_i64().unwrap_or(0))
+        }
+    });
     procedure_is_lapsed(vt, now)
 }
 
@@ -119,10 +123,7 @@ fn last_episodic_pointer(metadata: &Value) -> Option<String> {
 /// `synaptic_mesh::import`), and no local write path writes one, so the
 /// object's presence is the provenance signal the gate discriminates on.
 fn has_import_provenance(metadata: &Value) -> bool {
-    metadata
-        .get("mesh")
-        .map(|m| m.is_object())
-        .unwrap_or(false)
+    metadata.get("mesh").map(|m| m.is_object()).unwrap_or(false)
 }
 
 /// Whether the fire gate blocks this row. The trust stamp is
@@ -169,41 +170,31 @@ pub(crate) fn stamp_local_trust(metadata: &mut Value) {
 
 /// When this procedure is next owed.
 ///
-/// v1 only gives the day-cadence trigger a real answer: everything else fires
-/// on the snapshot it rides on, so it is owed at `now`. A `every-n-days:N` or
-/// `every-n-sessions:N` procedure that has never been performed is owed at
-/// `now` too — otherwise a brand-new procedure would sit silent until its
-/// first rehearsal.
-///
-/// `every-n-sessions:N` (Fired on snapshots just like `every-n-days:N`, but
-/// measured in sessions rather than days): a session has no wall-clock
-/// length, so one session is estimated as [`SESSION_ESTIMATE_SECONDS`] of
-/// elapsed time between rehearsals. When the row carries a
-/// `sessions_since_last_fire` counter it is authoritative instead of the
-/// estimate.
+/// Delegates to the pure formal-kernel cadence calculator
+/// (`crate::formal_kernel::compute_procedure_next_due`), which saturates at
+/// `i64::MAX` and rejects non-positive cadences instead of overflowing.
 fn next_due(metadata: &Value, now: i64) -> i64 {
-    let trigger_str = metadata
+    let last_performed = last_performed_at(metadata);
+    let trigger = metadata
         .get("trigger")
-        .and_then(|t| t.as_str());
-    let day_cadence = trigger_str
-        .and_then(|t| t.strip_prefix("every-n-days:"))
-        .and_then(|n| n.parse::<i64>().ok());
-    if let (Some(days), Some(last)) = (day_cadence, last_performed_at(metadata)) {
-        return last + days * DAY_SECONDS;
-    }
-    let session_cadence = trigger_str
-        .and_then(|t| t.strip_prefix("every-n-sessions:"))
-        .and_then(|n| n.parse::<i64>().ok());
-    if let (Some(n_sessions), Some(last)) = (session_cadence, last_performed_at(metadata)) {
-        if n_sessions > 1 {
-            let sessions_elapsed = metadata
-                .get("sessions_since_last_fire")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(n_sessions - 1);
-            return last + sessions_elapsed * SESSION_ESTIMATE_SECONDS;
-        }
-    }
-    now
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let day_cadence = trigger
+        .strip_prefix("every-n-days:")
+        .and_then(|n| n.trim().parse::<i64>().ok());
+    let session_cadence = trigger
+        .strip_prefix("every-n-sessions:")
+        .and_then(|n| n.trim().parse::<i64>().ok());
+    let sessions_since_last_fire = metadata
+        .get("sessions_since_last_fire")
+        .and_then(|v| v.as_i64());
+    crate::formal_kernel::compute_procedure_next_due(
+        now,
+        last_performed,
+        day_cadence,
+        session_cadence,
+        sessions_since_last_fire,
+    )
 }
 
 // ── strap: procedures_due ───────────────────────────────────────────────────
@@ -273,7 +264,11 @@ pub(crate) fn procedures_due_strap_filtered(
     let filtered: Vec<Value> = all
         .into_iter()
         .filter(|row| {
-            let trigger = row.get("trigger").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+            let trigger = row
+                .get("trigger")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_lowercase();
             let mem = memories
                 .iter()
                 .find(|m| m.id == row.get("id").and_then(|v| v.as_str()).unwrap_or(""));
@@ -282,17 +277,23 @@ pub(crate) fn procedures_due_strap_filtered(
                 .unwrap_or(false);
             // Domain-aware matching (F19): also match when the needle is a
             // domain slug that the procedure's metadata.domain expands to.
-            let domain_ok = mem.map(|m| {
-                let domains: Vec<String> = match m.payload.metadata.get("domain") {
-                    Some(serde_json::Value::String(s)) => vec![s.clone()],
-                    Some(serde_json::Value::Array(arr)) => arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect(),
-                    _ => vec![],
-                };
-                domains.iter().any(|d| {
-                    let slug = crate::domain::normalize_domain_slug(d).unwrap_or_else(|| d.to_lowercase());
-                    slug == needle || d.to_lowercase() == needle
+            let domain_ok = mem
+                .map(|m| {
+                    let domains: Vec<String> = match m.payload.metadata.get("domain") {
+                        Some(serde_json::Value::String(s)) => vec![s.clone()],
+                        Some(serde_json::Value::Array(arr)) => arr
+                            .iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect(),
+                        _ => vec![],
+                    };
+                    domains.iter().any(|d| {
+                        let slug = crate::domain::normalize_domain_slug(d)
+                            .unwrap_or_else(|| d.to_lowercase());
+                        slug == needle || d.to_lowercase() == needle
+                    })
                 })
-            }).unwrap_or(false);
+                .unwrap_or(false);
             trigger.contains(&needle) || content_ok || domain_ok
         })
         .collect();
@@ -525,8 +526,43 @@ pub async fn handle_procedure_perform(arguments: Value, store: Arc<dyn VectorSto
         return reply(false, false, true, budget, count, pointer_before, "spent");
     }
 
-    let after_budget = budget.map(|b| b.saturating_sub(1));
-    let after_count = count + 1;
+    let remaining: Option<u64> = budget.map(|n| n as u64);
+    let prior_count_u64: u64 = if count < 0 { 0 } else { count as u64 };
+    let outcome = evaluate_procedure_fire(
+        KernelProcedureTrust::Local,
+        false,
+        None,
+        now,
+        remaining,
+        prior_count_u64,
+    );
+    let (after_remaining, after_count) = match outcome {
+        KernelProcedureFireOutcome::Fired {
+            remaining_fires,
+            performance_count,
+        } => (
+            remaining_fires.map(|n| n.min(i64::MAX as u64) as i64),
+            performance_count.min(i64::MAX as u64) as i64,
+        ),
+        KernelProcedureFireOutcome::RefuseUntrusted => {
+            return reply(
+                false,
+                false,
+                false,
+                budget,
+                count,
+                pointer_before,
+                "untrusted",
+            );
+        }
+        KernelProcedureFireOutcome::RefuseLapsed => {
+            return reply(false, true, false, budget, count, pointer_before, "lapsed");
+        }
+        KernelProcedureFireOutcome::RefuseSpent => {
+            return reply(false, false, true, budget, count, pointer_before, "spent");
+        }
+    };
+    let after_budget = after_remaining;
     let note = arguments
         .get("note")
         .and_then(|n| n.as_str())
@@ -1339,6 +1375,99 @@ mod tests {
             now,
             "an unparseable cadence falls back to v1's always-due"
         );
+    }
+
+    #[test]
+    fn next_due_never_panics_on_overflow_or_non_positive_cadence() {
+        let now = 1_000_000;
+        // Huge day cadence must saturate at i64::MAX rather than panicking on i64 overflow.
+        assert_eq!(
+            next_due(
+                &json!({ "trigger": "every-n-days:9223372036854775807", "last_performed_at": now }),
+                now
+            ),
+            i64::MAX
+        );
+        // Zero or negative day cadence is invalid and must fall back to `now` (never shift backwards).
+        assert_eq!(
+            next_due(
+                &json!({ "trigger": "every-n-days:0", "last_performed_at": now - 86_400 }),
+                now
+            ),
+            now
+        );
+        assert_eq!(
+            next_due(
+                &json!({ "trigger": "every-n-days:-5", "last_performed_at": now }),
+                now
+            ),
+            now
+        );
+        // Huge session cadence / sessions_since_last_fire must saturate rather than panic.
+        assert_eq!(
+            next_due(
+                &json!({
+                    "trigger": "every-n-sessions:9223372036854775807",
+                    "last_performed_at": now
+                }),
+                now
+            ),
+            i64::MAX
+        );
+    }
+
+    #[tokio::test]
+    async fn procedure_perform_saturates_at_i64_max_and_clamps_negative_count() {
+        let store = empty_store("probe").await;
+        seed(
+            &store,
+            "probe",
+            "proc-max-count",
+            "procedure",
+            json!({
+                "trigger": "session-start",
+                "remaining_fires": 2,
+                "performance_count": i64::MAX
+            }),
+        )
+        .await;
+        seed(
+            &store,
+            "probe",
+            "proc-neg-count",
+            "procedure",
+            json!({
+                "trigger": "session-start",
+                "remaining_fires": 2,
+                "performance_count": -10
+            }),
+        )
+        .await;
+        let root = scratch("overflow-count");
+
+        let reply_max: Value = serde_json::from_str(
+            &handle_procedure_perform(
+                json!({ "id": "proc-max-count", "project_root": root.display().to_string() }),
+                store.clone(),
+            )
+            .await,
+        )
+        .expect("json");
+        assert_eq!(reply_max["performed"], json!(true));
+        assert_eq!(reply_max["performance_count"], json!(i64::MAX));
+        assert_eq!(reply_max["remaining_fires"], json!(1));
+
+        let reply_neg: Value = serde_json::from_str(
+            &handle_procedure_perform(
+                json!({ "id": "proc-neg-count", "project_root": root.display().to_string() }),
+                store.clone(),
+            )
+            .await,
+        )
+        .expect("json");
+        assert_eq!(reply_neg["performed"], json!(true));
+        assert_eq!(reply_neg["performance_count"], json!(1));
+        assert_eq!(reply_neg["remaining_fires"], json!(1));
     }
 
     // ── the procedures_due strap ───────────────────────────────────────────

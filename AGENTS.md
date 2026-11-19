@@ -3,6 +3,7 @@
 This document compiles all the operational mandates, workflows, and behavioral constraints the agent is currently programmed to follow. Please review this to identify any missing triggers or rules.
 
 ## 1. Task Tracking (MANDATORY WORKFLOW)
+
 - **Zero-Action Start:** The agent MUST NOT start writing code, modifying files, or executing a task until a task exists and is claimed by this session. `neurostrata_get_snapshot` says it first: "Zero-Action Start: claim or create a task before editing."
 - **Workflow:**
   1. Check for existing work: `neurostrata_task_list` with `ready: true` (open tasks whose blockers are all done) or filters for `status`/`assignee`.
@@ -13,12 +14,14 @@ This document compiles all the operational mandates, workflows, and behavioral c
 - **No Alternatives:** Never use TodoWrite, TaskCreate, `bd` commands, or markdown TODO lists for tracking. Always use the task tools.
 
 ## 2. Session Completion & Hand-off
+
 Work is NOT complete until `neurostrata_task_complete` succeeded, the task gate passes, and `git push` succeeds.
+
 - **Completion Steps:**
   1. **Extract Knowledge:** Run `neurostrata_add_memory` with `metadata.extracted_from: ["<task id>"]` to save facts, fixes, or constraints — or hand the extraction to the completion itself via `memory.content` (what did you learn? what rule does this task prove?) or `link_memory_id`.
   2. **Finish the task:** `neurostrata_task_complete`. With zero extracted memories it fails with a `BLOCKED (Lock 2)` JSON-RPC error naming both ways to comply; that error is the funnel working.
   3. **File Follow-ups:** Create tasks for remaining work (`neurostrata_task_create`, `blocked_by` where it waits).
-  4. **Quality Gates:** Run tests, linters, builds. Mid-session, `neurostrata_task_validate` (or `neurostrata-mcp task validate <ns>`) is the advisory gate report — it never blocks.
+  4. **Quality Gates:** Run tests, linters, builds. The pre-commit hook (`scripts/hooks/pre-commit`, installed via `bash scripts/install-hooks.sh`) delegates to `scripts/check-staged-quality.sh` for staged formatting/lint; verify sources stay byte-identical (`TMPDIR=/var/tmp/ns-tmp cargo test --bin neurostrata-mcp pre_commit_hook_sources_stay_byte_identical -- --nocapture`) and fixtures pass (`bash scripts/test-staged-quality.sh`). Mid-session, `neurostrata_task_validate` (or `neurostrata-mcp task validate <ns>`) is the advisory gate report — it never blocks.
   5. **Push to Remote (CRITICAL):**
      - `git pull --rebase`
      - `git push` — the pre-push hook runs `neurostrata-mcp task gate <namespace> --strict`; violations (an `in_progress` task on the current branch/worktree or an unattributed legacy claim, `done` without an extracted memory, P0 open >24h) block the push.
@@ -28,6 +31,7 @@ Work is NOT complete until `neurostrata_task_complete` succeeded, the task gate 
 - **Never Strand Work:** Never stop before pushing. Never say "ready to push when you are" (the agent must do it).
 
 ## 3. NeuroStrata Memory & The 3 Resilient Soft Locks
+
 Memory architecture is the single most important aspect of this system. It is NON-OPTIONAL. **NeuroStrata is a general-purpose, project-oriented memory, knowledge-base, and ontology system (`b76e9591-bc17-4aa5-941d-1b13ce1e6308`):** while it has first-class support for coding and document projects, a project does NOT have to be coding- or document-oriented. When a user tells the agent domain facts, entities, operational knowledge, preferences, or rules in conversation, store and link them directly in the project knowledge base via `neurostrata_add_memory` (where `locations` are optional and used only when anchoring to specific files or code symbols), digital twins, ontology scenarios, and kinetic actions, and use `neurostrata_append_log` for conversational transcripts.
 
 - **CRITICAL RESTRICTION**: NEVER use `bd remember` to store memories. That tool is deprecated for agent use. You MUST use the dedicated `neurostrata_add_memory` tool.
@@ -35,7 +39,9 @@ Memory architecture is the single most important aspect of this system. It is NO
 - **Lock 2 (Checklist Abstraction):** Completing a Goal (`working` → `done`) must be accompanied by an architectural summary via `neurostrata_add_memory`. The Central Executive enforces this: `neurostrata_task_complete` fails until a memory has been extracted from the work.
 
 ## 3a. Task vs Procedure (do not confuse)
+
 NeuroStrata has two distinct work-related concepts:
+
 - A `task` is a unit of work that FINISHES — it must reach `done` via `neurostrata_task_complete` (Lock 2). Each cycle of a recurring pattern = one new task.
 - A `procedure` is a knowing-how routine with a finite rehearsal budget — it is FIRED (not finished) by `neurostrata_procedure_perform`, which stamps `last_performed_at`, increments `performance_count`, decrements `remaining_fires`, and writes one Episodic Buffer entry. A lapsed/spent procedure answers accordingly and does not mutate the row.
 
@@ -49,12 +55,15 @@ NeuroStrata has two distinct work-related concepts:
 - **Retrieval Protocol (MANDATORY):** Every time you start a new session, or if a user asks about previous system design, YOU MUST proactively use `neurostrata_search_memory` or grep `.NeuroStrata/sessions/*` (if local fallback is needed) to retrieve the context before answering or coding.
 
 ## 3c. Task recognition (heuristic)
+
 A statement of future/deferred work is a TASK, not a note:
+
 - Explicit tags: `TODO:`, `FIXME:`, `follow-up:`, `next step:`, `action item:`, `remaining work:`.
 - Modal deferral: `we should also`, `later we need to`, `still need to`, `must also fix`, `need to follow up`, `filed follow-up`, `defer`/`deferred`.
-When you see one in user/agent speech, logs, or memory content, capture it with `neurostrata_task_create` (namespace, title) instead of letting it evaporate. The lexical detector surfaces these as `task_intent_signals` in `neurostrata_append_log` and as a `TASK NUDGE` line in `neurostrata_add_memory`.
+  When you see one in user/agent speech, logs, or memory content, capture it with `neurostrata_task_create` (namespace, title) instead of letting it evaporate. The lexical detector surfaces these as `task_intent_signals` in `neurostrata_append_log` and as a `TASK NUDGE` line in `neurostrata_add_memory`.
 
 ## 3d. Automatic Graph-First Exploration & Subagent Context Propagation (MANDATORY)
+
 - **Auto-Retrieved Task Context:** `neurostrata_task_create` and `neurostrata_task_claim` automatically run a hybrid vector + 1-hop graph search on the task's title/description and return `auto_retrieved_context` and a ready-to-paste `subagent_prompt_injection` block.
 - **Graph-First Lookup Reflex:** Before using blind `grep`/`glob` or editing a file, query `neurostrata_memories_for_file`, `neurostrata_related`, `neurostrata_search_memory` (`include_related: true`), or `neurostrata_sparql_query` to inspect `GOVERNS`, `DEPENDS_ON`, and AST `calls`/`imports` edges.Every lookup increments `task.graph_queries_count` and records into `.NeuroStrata/session_queries.json`.
 - **Subagent Prompt Propagation:** Subagents start with a blank context window and no memory of `neurostrata_get_snapshot`. On session init, write the Graph-First rule into your active plan, and whenever you spawn ANY subagent (`subagent` / `Task`), paste the `subagent_prompt_injection` block from `neurostrata_task_claim` into the subagent's prompt and instruct it to query NeuroStrata before blind file searches.
@@ -63,7 +72,7 @@ When you see one in user/agent speech, logs, or memory content, capture it with 
 
 When this project is joined to a SynapticMesh (`neurostrata-mcp synaptic-mesh status` tells you), some memory mutations are additionally mirrored to the team mesh. The rules an agent must not bend:
 
-- **What is shared vs not:** `rule`/`fact`/`procedure` *definitions* cross the mesh only when they carry `eligibility: shareable` — and procedure definitions travel WITHOUT their runtime counters (`remaining_fires`, `performance_count`, `last_performed_at`, `last_episodic_pointer` are strictly local; a shared record carrying any of them is refused on receipt). Tasks, `structural` rows, embeddings, and private rows never travel.
+- **What is shared vs not:** `rule`/`fact`/`procedure` _definitions_ cross the mesh only when they carry `eligibility: shareable` — and procedure definitions travel WITHOUT their runtime counters (`remaining_fires`, `performance_count`, `last_performed_at`, `last_episodic_pointer` are strictly local; a shared record carrying any of them is refused on receipt). Tasks, `structural` rows, embeddings, and private rows never travel. (neurostrata-oc64)
 - **Private rows are sovereign:** never edit, overwrite, or "refresh" a row that carries mesh provenance you did not write, and never import over a private row that owns an id. Conflicts between mesh variants are preserved, never silently resolved — if `mesh status` reports unresolved conflicts, stop synthesizing over that id and say so.
 - **Honesty rules for the mesh surfaces:**
   - **Explicit-zero status lines:** when there is nothing pending/unresolved, `mesh status` and sync replies say `0`/`no pending`, never noise or silence — a blank field is a lie an operator cannot debug.
@@ -71,11 +80,13 @@ When this project is joined to a SynapticMesh (`neurostrata-mcp synaptic-mesh st
   - **Never force-push the mesh:** the mesh repo is `--ff-only` pull discipline and regular pushes only. Divergent history is an operator decision; an agent who force-pushes has deleted a teammate's accepted record. Recovery is print-only (`mesh recover`), never `reset --hard`.
 
 ## 4. Bootstrapping & Ingestion
+
 - **Docs:** If `.NeuroStrata/docs/` is missing, call `neurostrata_bootstrap` (new project) or `neurostrata_task_setup` (existing project) and follow the returned instructions — they carry the AGENTS.md template and the first mandatory Goal.
 - **Zero-Touch Harness Plugin Auto-Install:** On init (`neurostrata_bootstrap`, `neurostrata_task_setup`, and `neurostrata_get_snapshot`), NeuroStrata automatically detects the active CLI/terminal agent harness (`opencode`, `openclaw`, `claude`, `hermes`, `codex`, `github-cli`) from environment and project markers and installs/wires the zero-dependency plugin bundle under `.NeuroStrata/plugins/<harness>/` with zero user involvement.
 - **AST Ingestion:** On fresh install, entering a new codebase, or after structural changes, proactively ingest the AST using `neurostrata_ingest_directory` (or `neurostrata-mcp ingest ...`), followed by `neurostrata-mcp export-graph` to refresh the UI.
 
 ## 5. Global Database & Daemon Security Constraints (Safety)
+
 - **Shared Architecture:** The database (LadybugDB) is a SHARED, global memory architecture.
 - **No Destructive Operations:** NEVER attempt to delete the DB directory, drop tables, or run destructive operations.
 - **No Bulk Deletes:** Only delete specific memory IDs, one at a time, via the CLI (`neurostrata-mcp delete`) when explicitly correcting a hallucination — deletion is deliberately absent from the MCP surface.
@@ -83,24 +94,28 @@ When this project is joined to a SynapticMesh (`neurostrata-mcp synaptic-mesh st
 - **Dual Git Hooks (`pre-push` + `pre-commit`):** `neurostrata-mcp hooks install` (and `hook_hygiene` on `neurostrata_get_snapshot`) automatically installs/refreshes both `.git/hooks/pre-push` (strict task gate) and `.git/hooks/pre-commit` (graph-query ledger) plus all detected CLI/terminal harness plugins (`neurostrata-lf3p`).
 
 ## 6. Global Infrastructure & Tooling Constraints
+
 - **Containers:** ALWAYS use `podman` and `podman-compose`. NEVER use `docker`.
 - **Data Formats:** ALWAYS prefer strict JSON and JSON Schema over YAML, TOML, or their derivatives.
 - **Non-Interactive Shells:** ALWAYS use non-interactive flags (e.g., `cp -f`, `rm -rf`, `apt-get -y`) to avoid hanging the agent on confirmation prompts.
 
 ## 7. Cost Management & Async Delegation
+
 - **Role:** The primary agent acts as Knowledge Manager, Architect, and Orchestrator.
 - **Offloading Work:** Aggressively offload "work" (coding, refactoring) to `NeuroStrata-Task-Agent` OR capture it asynchronously as a Goal (`neurostrata_task_create`) to avoid blocking the chat.
 - **Synchronous vs Asynchronous:** Only use the `Task` tool synchronously if the user explicitly asks for the work to be completed right now. Otherwise, create a task to capture requirements.
 - **Exceptions:** The primary agent may only make direct file edits for trivial, one-off changes (fixing typos, renaming a variable).
 
 ## 8. Core Engineering Mandates
+
 - **Conventions:** Rigorously adhere to existing project conventions (formatting, naming, frameworks).
 - **Competitor Naming Prohibition (`9e64a5a8-aba4-4034-abfe-8b478bd9950e`):** NEVER name NeuroStrata files, features, plans, specs, tasks, symbols, or documentation after competitor companies, products, or projects. When adopting or adapting capabilities from external product comparisons, always use NeuroStrata-native domain terminology and never include competitor brand or product names in the repository.
 - **Libraries/Frameworks:** NEVER assume a library is available. Verify in configuration files first.
-- **Comments:** Add comments sparingly, focusing on *why* rather than *what*. Never talk to the user through code comments.
+- **Comments:** Add comments sparingly, focusing on _why_ rather than _what_. Never talk to the user through code comments.
 - **Paths:** Always use absolute paths when using file system tools.
 
 ## 9. Kinetic Action Types & Bitemporal Revert Log (`neurostrata_action`)
+
 - **Operations & Parity:** `neurostrata_action` (MCP), `POST /action` (Daemon), and `neurostrata-mcp action <define|validate|apply|revert|log>` (CLI) share a single deterministic application service.
   - `define`: Strictly validates an `ActionTypeDefinition` (`slug`, `required_role`, `parameters`, `submission_criteria`, `effects`), rejects duplicate active slugs in the namespace, stores a `memory_type = "action_type"` row, and refreshes the namespace's `OntologyIndex`. Raw memory ingest (`neurostrata_add_memory`) remains warn-first and never compiles malformed definitions.
   - `validate` / `apply`: Evaluates the 5-stage fail-closed gate (trusted principal ReBAC via `rebac::resolve_principal`, typed parameters with finite bounds, offline read-only `SparqlAsk` bound via `spareval::PreparedQuery::substitute_variable` with `SERVICE` forbidden, `TwinVarPrecondition` bounds, and strict post-image SHACL across all staged rows and the receipt). `validate` never writes; `apply` commits all effects (`SupersedeMemory`, `UpsertMemory`, `SetTwinState`, `LinkEdge`, `TransitionTask`) plus a bitemporal `action_receipt` in one atomic LadybugDB write turn with active-head CAS revalidation. `TransitionTask` only targets `open`, `in_progress`, or `blocked` and never bypasses Lock 2 (`neurostrata_task_complete`).
@@ -108,11 +123,13 @@ When this project is joined to a SynapticMesh (`neurostrata-mcp synaptic-mesh st
   - `log` & Privacy: `action_receipt` rows are structural and unconditionally private (`eligibility: "private"`, excluded from `SHAREABLE_MEMORY_TYPES`, SynapticMesh import/export/outbox, and default normative recall). `log` returns active receipt versions newest-first (default `limit: 100`, max `1000`) with parameter values, content before/after payloads, and template strings redacted.
 
 ## 10. Subject-Matter Domain Expertise, SKOS Taxonomy & SME Frontier Advisor (`neurostrata_taxonomy`)
+
 - **Operations & Parity:** `neurostrata_taxonomy` (MCP), `POST /taxonomy` (Daemon), and `neurostrata-mcp taxonomy <set-thesis|upsert-concept|tree|briefing|compare|gaps|advise>` (CLI) share a single deterministic application service (`src/rdf/taxonomy.rs`).
-- **Expert-to-Expert Advisory Protocol:** When asked strategic, architectural, or domain-improvement questions (e.g., *"What are the top 5 ways we could improve this project?"*), call `neurostrata_taxonomy(operation: "advise", top_k: 5)`, execute any `public_safe` external research agenda queries (`websearch`, `context7`), persist newly discovered literature and SPDX license-verified `comparable_implementations` via `upsert_concept`, and ground all recommendations in canonical project entities (`implemented_interfaces`, `linked_action_types`, governing rules/facts, `locations`) and domain literature.
+- **Expert-to-Expert Advisory Protocol:** When asked strategic, architectural, or domain-improvement questions (e.g., _"What are the top 5 ways we could improve this project?"_), call `neurostrata_taxonomy(operation: "advise", top_k: 5)`, execute any `public_safe` external research agenda queries (`websearch`, `context7`), persist newly discovered literature and SPDX license-verified `comparable_implementations` via `upsert_concept`, and ground all recommendations in canonical project entities (`implemented_interfaces`, `linked_action_types`, governing rules/facts, `locations`) and domain literature.
 - **Privacy & ReBAC:** `thesis` and `concept` rows default to `eligibility: "private"` and are filtered by `rebac::can_read_memory` across all operations. Auto-briefing in `neurostrata_get_snapshot` (`<= 800` chars) and `subagent_prompt_injection` (`<= 1200` chars) includes only unrestricted (`is_public_access_policy`) rows.
 
 ## 0. The Prime Directive: Never Defer Anything (Ruling 2026-10-25)
+
 - **This is the highest-priority rule.** No task, feature, or implementation may be
   left in a "deferred", "todo", "stub", "phase-2", or "later" state. If it cannot be
   completed in the current session, it must be filed as a concrete tracked task with
@@ -134,7 +151,9 @@ When this project is joined to a SynapticMesh (`neurostrata-mcp synaptic-mesh st
   with extracted memory before this session claims completion.
 
 <!-- lean-ctx-compression -->
+
 OUTPUT STYLE: expert-terse
+
 - Telegraph format: subject-verb-object, drop articles/prepositions
 - Symbolic vocabulary: → cause, ∵ because, ∴ therefore, ⊕ add, ⊖ remove, Δ change, ≈ similar, ≠ different, ∈ in/member, ∅ empty/none, ✓ ok, ✗ fail
 - Code blocks: untouched (never compress code syntax)

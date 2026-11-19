@@ -185,4 +185,60 @@ theorem post_observed_bounds_denied
       .denyObservedBoundsExceeded := by
   simp [evaluateConnectorPostGate, hrows]
 
+@[simp]
+def u32MaxNat : Nat := 4294967295
+
+@[simp]
+def saturateUsizeToU32 (n : Nat) : Nat :=
+  if n > u32MaxNat then u32MaxNat else n
+
+@[simp]
+def evaluateResolvePostGateBounded
+    (observedRowsLen requestedRows schemaMaxRows observedBytes requestedBytes schemaMaxBytes : Nat)
+    (sourceDigestMatches : Bool) : ConnectorPostVerdict :=
+  evaluateConnectorPostGate
+    .resolveSlice
+    (saturateUsizeToU32 observedRowsLen)
+    (Nat.min requestedRows schemaMaxRows)
+    observedBytes
+    (Nat.min requestedBytes schemaMaxBytes)
+    sourceDigestMatches
+    true
+
+@[simp]
+def evaluateWritebackPostGateBounded
+    (schemaMaxRows schemaMaxBytes : Nat)
+    (pointerSourceDigestMatches requestCasExpectedMatches : Bool) : ConnectorPostVerdict :=
+  evaluateConnectorPostGate
+    .applyWriteBack
+    0
+    schemaMaxRows
+    0
+    schemaMaxBytes
+    pointerSourceDigestMatches
+    requestCasExpectedMatches
+
+theorem resolve_post_gate_rejects_above_requested_rows
+    (obs req rmax ob reqb bmax : Nat) (sdm : Bool)
+    (hreq : req < u32MaxNat)
+    (hover : obs > req) :
+    evaluateResolvePostGateBounded obs req rmax ob reqb bmax sdm =
+      .denyObservedBoundsExceeded := by
+  apply post_observed_bounds_denied
+  simp only [saturateUsizeToU32, u32MaxNat] at *
+  have hle : Nat.min req rmax ≤ req := Nat.min_le_left req rmax
+  by_cases hcap : obs > 4294967295 <;> simp [hcap] <;> omega
+
+theorem writeback_post_gate_pointer_digest_before_cas
+    (rmax bmax : Nat) (cas : Bool) :
+    evaluateWritebackPostGateBounded rmax bmax false cas =
+      .denySourceDigestMismatch := by
+  rfl
+
+theorem writeback_post_gate_cas_conflict
+    (rmax bmax : Nat) :
+    evaluateWritebackPostGateBounded rmax bmax true false =
+      .denyCasConflict := by
+  rfl
+
 end NeuroStrata.DataConnector
