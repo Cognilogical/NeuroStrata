@@ -689,7 +689,8 @@ export function isMutatingTool(name) {
 // markers such as TODO:/defer found there are code or log noise, not a task
 // obligation. Never post intake candidates from read-only inspection tools.
 const READ_ONLY_INSPECTION_TOOLS = new Set([
-    "read", "read_file", "shell", "bash", "local_shell", "grep", "glob", "view", "cat",
+    "read", "read_file", "shell", "bash", "local_shell", "exec_command", "run_shell_command",
+    "run_command", "execute_command", "terminal", "gh_exec", "grep", "glob", "view", "cat",
 ]);
 export function isReadOnlyInspectionTool(name) {
     return READ_ONLY_INSPECTION_TOOLS.has(String(name).toLowerCase());
@@ -734,6 +735,9 @@ function isZeroActionExemptShellSegment(segment) {
         }
         const sub = rest[0];
         const subArgs = rest.slice(1);
+        if (sub === "push" && subArgs.some((a) => a === "-f" || a === "--force" || a.startsWith("--force-with-lease"))) {
+            return false;
+        }
         if (["push", "pull", "fetch", "status", "log", "diff", "show", "rev-parse"].includes(sub)) {
             return !hasFlag(["--output", "-O", "--ext-diff", "--textconv", "--exec", "-x", "--upload-pack", "--receive-pack"]);
         }
@@ -800,6 +804,9 @@ export function isZeroActionExemptShellPayload(actionType, payloadOrCommand) {
     }
     const cmd = command.trim();
     if (!cmd || cmd.includes("`") || cmd.includes("$(") || cmd.includes(">") || cmd.includes("<"))
+        return false;
+    // A lone '&' backgrounds the command; splitting on it would hide the operator.
+    if (cmd.replace(/&&/g, "").includes("&"))
         return false;
     const segments = cmd.split(/[;\n|&]+/).map((segment) => segment.trim()).filter(Boolean);
     return segments.length > 0 && segments.every(isZeroActionExemptShellSegment);
