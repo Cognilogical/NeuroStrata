@@ -10,23 +10,23 @@
 
 ## 1. Problem Statement & Empirical Field Audit (597 OpenCode V2 Sessions)
 
-An empirical audit of **597 OpenCode V2 (`v2.2.6`) sessions** (`167,887` `session_message` rows across `NeuroStrata` and secondary workspace sessions from `2026-11-03` through `2026-11-07`) and decompilation of `/home/kenton/.opencode/bin/opencode` established two root causes for why post-`v1.15.1` / `v1.16.1` autonomous recall, memory capture, and task intake did not fire as intended:
+An empirical audit of **597 OpenCode V2 (`v2.2.6`) sessions** (`167,887` `session_message` rows across `NeuroStrata` and secondary workspace sessions from `2026-11-03` through `2026-11-07`) and decompilation of `~/.opencode/bin/opencode` established two root causes for why post-`v1.15.1` / `v1.16.1` autonomous recall, memory capture, and task intake did not fire as intended:
 
 ### 1.1 OpenCode V2 Plugin: Propagation Gap + 3 Code Defects in `v1.16.1`
 
 Both failure modes occurred simultaneously on this machine:
 
 1. **Lazy-Install Propagation Gap (`src/task/harness_plugins.rs:222`, `src/task/mod.rs:2817`, `src/server.rs:3431`):**
-   - `/home/kenton/.cargo/bin/neurostrata-mcp` was built `2026-11-05 19:39` (with PR #52 / `v1.16.0`), but the running `neurostrata-mcp daemon` process (`PID 9936`) did not restart until `2026-11-06 15:01 EST` (`1793995260000` ms).
+   - `~/.cargo/bin/neurostrata-mcp` was built `2026-11-05 19:39` (with PR #52 / `v1.16.0`), but the running `neurostrata-mcp daemon` process (`PID 9936`) did not restart until `2026-11-06 15:01 EST` (`1793995260000` ms).
    - `auto_install_detected_plugins` is only invoked inside `hook_hygiene` when an agent calls `neurostrata_get_snapshot` (or `bootstrap` / `task_setup`). Because zero sessions ran in secondary workspaces after the daemon restart, those workspaces retained their `Nov 3` `.opencode/` directories (missing `.opencode/plugins/neurostrata.js`), and `NeuroStrata` only received `.opencode/plugins/neurostrata.js` at `2026-11-07T03:03:47Z` during this audit session.
 2. **Defect A — `executeAfterHandler` Payload Contract Mismatch (`plugins/core/index.ts:1310-1331`):**
-   - Verified against `/home/kenton/.opencode/bin/opencode` (`v2.2.6`, byte offset `176924277` and `opencode.tool.input.repair` at offset `177909005`): OpenCode V2 invokes `ctx.tool.hook("execute.after", cb)` with a single event object:
+   - Verified against `~/.opencode/bin/opencode` (`v2.2.6`, byte offset `176924277` and `opencode.tool.input.repair` at offset `177909005`): OpenCode V2 invokes `ctx.tool.hook("execute.after", cb)` with a single event object:
      `event = { tool, sessionID, agent, messageID, id, input, status: "completed", result: { content, output?, metadata? } }`
      and reads back `event.result.content` and `event.result.output`.
    - `executeAfterHandler` checks `target.output` (undefined on `event`, because the nested field is `event.result`) and then tests `typeof out.output === "string"` / `typeof out.content === "string"` on top-level `event`. It mutates `event.additionalContext` (ignored by OpenCode V2) and leaves `event.result.content` untouched — resulting in **0 real `[NeuroStrata Governing Memories` injections** on `read`/`edit`/`write` across all 597 sessions.
 3. **Defect B — Invalid `.opencode/opencode.json` `"plugins"` Wiring (`src/task/harness_plugins.rs:496-546`):**
    - `wire_harness_config("opencode")` writes `"plugins": ["./.NeuroStrata/plugins/opencode/dist/index.js"]` into `.opencode/opencode.json`.
-   - OpenCode V2 (`offset 177438800`) resolves relative paths in `.opencode/opencode.json` against `.opencode/`, emitting `ENOENT: stat '/home/kenton/Documents/NeuroStrata/.opencode/.NeuroStrata/plugins/opencode/dist/index.js'` in `opencode.log`, and rejects file paths (`configured plugin path must be a directory`). Meanwhile, OpenCode V2 already auto-discovers `.opencode/plugins/neurostrata.js` without any `"plugins"` entry in `.opencode/opencode.json`.
+   - OpenCode V2 (`offset 177438800`) resolves relative paths in `.opencode/opencode.json` against `.opencode/`, emitting `ENOENT: stat '<repo-root>/.opencode/.NeuroStrata/plugins/opencode/dist/index.js'` in `opencode.log`, and rejects file paths (`configured plugin path must be a directory`). Meanwhile, OpenCode V2 already auto-discovers `.opencode/plugins/neurostrata.js` without any `"plugins"` entry in `.opencode/opencode.json`.
 4. **Defect C — Project Identity & CWD Resolution (`plugins/core/index.ts:1501`):**
    - `initialize(ctx)` calls `resolveConfig(ctx?.config ?? ctx?.pluginConfig ?? {})` with default `cwd = process.cwd()` instead of reading `ctx?.location?.project?.canonical ?? ctx?.location?.directory` and `ctx?.options`, risking cross-repository namespace contamination in a multi-project OpenCode V2 server.
 

@@ -137,30 +137,38 @@ impl VaultNote {
         out
     }
 
-    /// Parse Markdown with YAML-LD frontmatter
+    /// Parse Markdown with YAML-LD frontmatter.
+    ///
+    /// Frontmatter is exactly one block: only a `---` on the first line
+    /// (after an optional UTF-8 BOM) opens it, the next `---` closes it,
+    /// and delimiter scanning stops permanently at that point. Every later
+    /// `---` is ordinary body content (a Markdown horizontal rule) and must
+    /// never be reinterpreted as a frontmatter boundary.
     pub fn from_markdown(markdown: &str) -> Result<Self, String> {
+        let markdown = markdown.strip_prefix('\u{feff}').unwrap_or(markdown);
         let lines: Vec<&str> = markdown.lines().collect();
-        let mut in_frontmatter = false;
+
+        if lines.first().map(|line| line.trim()) != Some("---") {
+            return Err("unterminated or missing YAML frontmatter block".to_string());
+        }
+
         let mut frontmatter_lines = Vec::new();
         let mut body_lines = Vec::new();
-
-        for line in lines {
-            if line.trim() == "---" {
-                if !in_frontmatter {
-                    in_frontmatter = true;
-                    frontmatter_lines.clear();
+        let mut closed = false;
+        for line in lines.into_iter().skip(1) {
+            if !closed {
+                if line.trim() == "---" {
+                    closed = true;
                 } else {
-                    in_frontmatter = false;
+                    frontmatter_lines.push(line);
                 }
-            } else if in_frontmatter {
-                frontmatter_lines.push(line);
             } else {
                 body_lines.push(line);
             }
         }
 
-        if frontmatter_lines.is_empty() {
-            return Err("Missing YAML frontmatter".to_string());
+        if !closed || frontmatter_lines.is_empty() {
+            return Err("unterminated or missing YAML frontmatter block".to_string());
         }
 
         // YAML-LD uses `@`-prefixed keys (@context/@id/@type), which libyaml
@@ -171,10 +179,7 @@ impl VaultNote {
             .map(|line| {
                 let trimmed = line.trim_start();
                 let indent = &line[..line.len() - trimmed.len()];
-                if trimmed.starts_with('@')
-                    && !trimmed.starts_with('"')
-                    && trimmed.contains(':')
-                {
+                if trimmed.starts_with('@') && !trimmed.starts_with('"') && trimmed.contains(':') {
                     if let Some(pos) = trimmed.find(':') {
                         return format!("{}\"{}\"{}", indent, &trimmed[..pos], &trimmed[pos..]);
                     }
@@ -278,7 +283,8 @@ pub const VAULT_LD_SHAPES_V1: &str = "@prefix rdf: <http://www.w3.org/1999/02/22
     sh:property [
         sh:path yaml:epistemicTier ;
         sh:nodeKind sh:Literal ;
-        sh:message \"epistemicTier must be a valid tier (rule|fact|procedure|structural|task|symbol)\" ;
+        sh:pattern \"^[A-Za-z_][A-Za-z0-9_-]*$\" ;
+        sh:message \"epistemicTier must be a simple tier token (rule|fact|procedure|structural|task|symbol or a custom slug)\" ;
     ] ;
     sh:property [
         sh:path yaml:canonicalSha256 ;
@@ -330,10 +336,10 @@ pub struct CanvasDocument {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::vault_sync::{
         canonicalize_vault_path, generate_canvas, note_to_turtle, scan_secrets, validate_shacl,
     };
+    use super::*;
     use std::path::Path;
 
     #[test]
@@ -414,7 +420,7 @@ Hello World
             content: "Rule content".to_string(),
         };
 
-        let turtle = note_to_turtle(&note);
+        let turtle = note_to_turtle(&note).expect("valid VaultNote renders to Turtle");
         assert!(turtle.contains("turtle-test"));
         assert!(turtle.contains("yaml:rule"));
         assert!(turtle.contains("yaml:epistemicTier"));
@@ -490,10 +496,16 @@ Hello World
             content: "content".to_string(),
         };
         note.canonical_sha256 = note.fingerprint();
-        assert!(validate_shacl(&note_to_turtle(&note)).is_ok());
+        assert!(
+            validate_shacl(&note_to_turtle(&note).expect("valid VaultNote renders to Turtle"))
+                .is_ok()
+        );
 
         note.canonical_sha256 = "not-a-hash".to_string();
-        assert!(validate_shacl(&note_to_turtle(&note)).is_err());
+        assert!(
+            validate_shacl(&note_to_turtle(&note).expect("valid VaultNote renders to Turtle"))
+                .is_err()
+        );
     }
 
     /// Finding 9: a standalone WikiLink written by the user is body content.
@@ -541,5 +553,56 @@ Hello World
         assert_eq!(parsed.content, original.content);
         assert!(parsed.related.contains(&"user-link".to_string()));
         assert!(parsed.related.contains(&"structural-target".to_string()));
+    }
+
+    /// Issue #292: only the first `---` opens frontmatter and the next one
+    /// closes it. Every later `---` is body content (a Markdown rule).
+    #[test]
+    fn from_markdown_preserves_body_horizontal_rules() {
+        let original = VaultNote {
+            id: "rules-note".to_string(),
+            rdf_type: "yaml:fact".to_string(),
+            context: YAML_LD_CONTEXT.to_string(),
+            epistemic_tier: "fact".to_string(),
+            canonical_sha256: "a".repeat(64),
+            related: Vec::new(),
+            content: "Intro\n\n---\n\nMiddle\n\n---\n\nOutro".to_string(),
+        };
+        let parsed = VaultNote::from_markdown(&original.to_markdown())
+            .expect("two body rules must not confuse the frontmatter scanner");
+        assert_eq!(parsed.id, original.id);
+        assert_eq!(parsed.rdf_type, original.rdf_type);
+        assert_eq!(parsed.epistemic_tier, original.epistemic_tier);
+        assert_eq!(parsed.content, original.content);
+        assert_eq!(parsed.content.matches("---").count(), 2);
+    }
+
+    /// Issue #292: a UTF-8 BOM before the opening delimiter is tolerated, and
+    /// a single horizontal rule in the body survives parsing.
+    #[test]
+    fn from_markdown_accepts_bom_and_single_body_horizontal_rule() {
+        let markdown = format!(
+            "\u{feff}---\n@context: \"{}\"\n@id: \"bom-note\"\n@type: \"yaml:fact\"\n\
+             epistemic_tier: fact\ncanonical_sha256: \"{}\"\nrelated: []\n---\n\n\
+             Before\n---\nAfter",
+            YAML_LD_CONTEXT,
+            "a".repeat(64)
+        );
+        let parsed = VaultNote::from_markdown(&markdown).expect("BOM + rule must parse");
+        assert_eq!(parsed.id, "bom-note");
+        assert_eq!(parsed.content, "Before\n---\nAfter");
+    }
+
+    /// Issue #292: an unclosed opening delimiter, or no opening delimiter at
+    /// all, is a typed parse error — never silently treated as frontmatter.
+    #[test]
+    fn from_markdown_rejects_unterminated_or_missing_frontmatter() {
+        let unterminated = "---\n@id: \"x\"\nbody without a closing delimiter\n";
+        let err = VaultNote::from_markdown(unterminated).expect_err("unclosed block must fail");
+        assert!(err.to_lowercase().contains("unterminated"), "{}", err);
+
+        let missing = "not frontmatter\njust a body\n";
+        let err = VaultNote::from_markdown(missing).expect_err("missing block must fail");
+        assert!(err.to_lowercase().contains("unterminated"), "{}", err);
     }
 }

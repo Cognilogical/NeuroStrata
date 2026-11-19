@@ -140,7 +140,7 @@ Expected: FAIL.
 - Compute metrics via `metrics` (including exact nDCG `(2^gain - 1)/log2(rank + 2)` zero-based rank) and deterministic deltas/gate decisions: `relative_gain(0,x)=0`, p95 gate = arm4-arm3 overhead `<=25ms` AND `<=10%` over per-query medians from `>=3` measured iterations (warmup excluded).
 - Emit derived storage evidence as compact canonical JSON of arm4 domain entries sorted by slug with aliases sorted (numerator bytes) and raw `retrieval.json` bytes (denominator), plus both values and ratio.
 - Create `eval/semantic/retrieval.json` as `synthetic_deterministic` corpus with required DTO fields and reconciled arm3/arm4 domain/alias semantics.
-- Export/wire in `src/semantic_eval/mod.rs` and modify `src/main.rs` to expose the exact CLI: `neurostrata-mcp semantic-eval --competency eval/semantic/competency.json --retrieval eval/semantic/retrieval.json --iterations 3 --output /tmp/opencode/semantic-eval.json --check` (iterations/measured-iteration semantics as specified). CLI must write strict JSON and exit nonzero on any gate failure or execution/validation error when `--check` (fail-closed).
+- Export/wire in `src/semantic_eval/mod.rs` and modify `src/main.rs` to expose the exact CLI: `neurostrata-mcp semantic-eval --competency eval/semantic/competency.json --retrieval eval/semantic/retrieval.json --iterations 3 --output eval/semantic/retrieval-receipt.json --check` (iterations/measured-iteration semantics as specified). CLI must write strict JSON and exit nonzero on any gate failure or execution/validation error when `--check` (fail-closed).
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -178,7 +178,7 @@ Expected: FAIL.
 
 - [ ] **Step 3: Write minimal implementation and doc/registry updates**
 
-- Implement strict report serialization and CLI wiring in the existing module/main entry points (per Task 3 CLI): `neurostrata-mcp semantic-eval --competency eval/semantic/competency.json --retrieval eval/semantic/retrieval.json --iterations 3 --output /tmp/opencode/semantic-eval.json --check` writes strict JSON and exits nonzero on `--check` failures/errors (fail-closed).
+- Implement strict report serialization and CLI wiring in the existing module/main entry points (per Task 3 CLI): `neurostrata-mcp semantic-eval --competency eval/semantic/competency.json --retrieval eval/semantic/retrieval.json --iterations 3 --output eval/semantic/retrieval-receipt.json --check` writes strict JSON and exits nonzero on `--check` failures/errors (fail-closed).
 - Update `eval/registry.json` to register/remediate the semantic evaluation gate using the approved test/command surface.
 - Update docs: `docs/superpowers/specs/2026-11-17-v1-19-0-semantic-graph-and-agentic-reasoning-design.md`, `docs/superpowers/plans/2026-11-17-v1-19-0-semantic-graph-and-agentic-reasoning-plan.md`, `docs/features-api/cli-reference.md`, and `docs/releases/changelog/1.19.0.md` / `CHANGELOG.md` only if needed to describe fixtures (`eval/semantic/competency.json`, `eval/semantic/retrieval.json`), CLI, gate criteria/corrections (arm isolation, `SearchMode::Default`, derived storage serialization, `relative_gain(0,x)=0`, p95 overhead gate), and the honest `synthetic_deterministic` non-production evidence boundary.
 - Do **not** add a library crate root, a remediation test-registry source file, a monolithic semantic-eval integration test file, or any version-control commit steps.
@@ -188,9 +188,9 @@ Expected: FAIL.
 Run:
 - `cargo test --locked --test semantic_eval_metrics_test -- --test-threads=1`
 - `cargo test --locked --bin neurostrata-mcp semantic_eval:: -- --test-threads=1`
-- `EVAL_ALLOW_DIRTY=1 scripts/remediation-eval.sh semantic-evaluation --json /tmp/opencode/semantic-evaluation-remediation.json`
-- `cargo run --locked --bin neurostrata-mcp -- semantic-eval --competency eval/semantic/competency.json --retrieval eval/semantic/retrieval.json --iterations 3 --output /tmp/opencode/semantic-eval.json --check`
-- `jq -e '.verdict == "PASS" and .production_roi_claimed == false and .evidence_class == "synthetic_deterministic"' /tmp/opencode/semantic-eval.json`
+- `EVAL_ALLOW_DIRTY=1 scripts/remediation-eval.sh semantic-evaluation --json <tmp>/semantic-evaluation-remediation.json`
+- `cargo run --locked --bin neurostrata-mcp -- semantic-eval --competency eval/semantic/competency.json --retrieval eval/semantic/retrieval.json --iterations 3 --output eval/semantic/retrieval-receipt.json --check`
+- `jq -e '.verdict == "PASS" and .production_roi_claimed == false and .evidence_class == "synthetic_deterministic"' eval/semantic/retrieval-receipt.json`
 
 Expected: actual receipts pass before any completion claim. `EVAL_ALLOW_DIRTY=1` only permits the intentionally dirty consolidated release tree; it never ignores test failures.
 
@@ -206,10 +206,10 @@ Expected: PASS; docs/registry updated only as listed, CLI and fail-closed synthe
 - [ ] **Four-arm ablation (reconciled):** 60 deterministic queries over four real temporary stores, all arms `SearchMode::Default` with original query text. Arm1/arm2: no fixture domain-registry row (shipped vocabulary retained). Arm3: production alias-only `OntologyIndex`/domain registry with same aliases as arm4 and all `parent=null` (no hierarchy, no hand query rewrite). Arm4: production alias+hierarchy `OntologyIndex`/domain registry via production path. No hardcoded rankings.
 - [ ] **Latency/p95 gate:** `>= 3` measured iterations, warmup excluded; per-query latency = median across measured iterations; arm p95 computed over per-query medians. Gate requires arm4-minus-arm3 overhead `<= 25ms` AND `<= 10%` (not arm4 absolute p95 only). Emit iteration counts, warmup exclusion, medians/p95, delta-ms, and delta-%.
 - [ ] **Derived storage:** numerator = compact canonical JSON of arm4 domain entries sorted by slug with aliases sorted; denominator = raw `retrieval.json` bytes. Emit both byte values and ratio.
-- [ ] **CLI/report (exact) and fail-closed evidence:** `neurostrata-mcp semantic-eval --competency eval/semantic/competency.json --retrieval eval/semantic/retrieval.json --iterations 3 --output /tmp/opencode/semantic-eval.json --check` writes strict JSON and exits nonzero on any gate failure or validation/execution error when `--check`. Evidence is `synthetic_deterministic` only and states non-owner-labeled/non-production boundary (independent review is release-process evidence, not a fixture DTO).
+- [ ] **CLI/report (exact) and fail-closed evidence:** `neurostrata-mcp semantic-eval --competency eval/semantic/competency.json --retrieval eval/semantic/retrieval.json --iterations 3 --output eval/semantic/retrieval-receipt.json --check` writes strict JSON and exits nonzero on any gate failure or validation/execution error when `--check`. Evidence is `synthetic_deterministic` only and states non-owner-labeled/non-production boundary (independent review is release-process evidence, not a fixture DTO).
 - [ ] **Task 4 files/scope (exact):** modify `eval/registry.json`, `docs/superpowers/specs/2026-11-17-v1-19-0-semantic-graph-and-agentic-reasoning-design.md`, `docs/superpowers/plans/2026-11-17-v1-19-0-semantic-graph-and-agentic-reasoning-plan.md`, `docs/features-api/cli-reference.md`, `docs/releases/changelog/1.19.0.md`, `CHANGELOG.md` only if needed. No library crate root, no remediation test-registry source file, no monolithic semantic-eval integration test file, and no version-control commit steps.
 
 ## Remediation-runner notes
-- Primary command: `neurostrata-mcp semantic-eval --competency eval/semantic/competency.json --retrieval eval/semantic/retrieval.json --iterations 3 --output /tmp/opencode/semantic-eval.json --check`
+- Primary command: `neurostrata-mcp semantic-eval --competency eval/semantic/competency.json --retrieval eval/semantic/retrieval.json --iterations 3 --output eval/semantic/retrieval-receipt.json --check`
 - Focused tests: `cargo test --locked --test semantic_eval_metrics_test -- --test-threads=1` and `cargo test --locked --bin neurostrata-mcp semantic_eval:: -- --test-threads=1`; register every expected test name in `eval/registry.json` with `ignored: 0`.
 - Evidence remains fail-closed, deterministic, and explicitly `synthetic_deterministic` (not owner-labeled/production). All plan checkboxes remain unchecked.

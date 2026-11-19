@@ -15,7 +15,7 @@
 //! ```
 
 use crate::error::{Error, Result};
-use crate::registry::{SchemaGraph, SchemaRole, RDF_TYPE};
+use crate::registry::{RDF_TYPE, SchemaGraph, SchemaRole};
 use lbug::{Connection, Database, LogicalType, SystemConfig, Value};
 use oxrdf::{GraphName, GraphNameRef, NamedNode};
 use std::collections::BTreeSet;
@@ -283,7 +283,6 @@ impl LadybugSchemaStore {
             path: path.as_ref().to_path_buf(),
         }
     }
-
 
     fn connection(&self) -> Result<Connection<'_>> {
         Connection::new(&self.db).map_err(|e| Error::Ladybug(e.to_string()))
@@ -1160,7 +1159,11 @@ impl LadybugSchemaStore {
             let (Some(sid), Some(targets)) = (row.first(), row.get(1)) else {
                 continue;
             };
-            let iris: Vec<String> = serde_json::from_str(targets).unwrap_or_default();
+            let iris: Vec<String> = serde_json::from_str(targets).map_err(|e| {
+                Error::Other(format!(
+                    "corrupt stored targetClasses on shape '{sid}': {e}"
+                ))
+            })?;
             for iri in iris {
                 conn.execute(
                     &mut mk_targets,
@@ -1431,7 +1434,12 @@ impl LadybugSchemaStore {
             if row.len() < 4 {
                 continue;
             }
-            let graphs: Vec<String> = serde_json::from_str(&row[2]).unwrap_or_default();
+            let graphs: Vec<String> = serde_json::from_str(&row[2]).map_err(|e| {
+                Error::Other(format!(
+                    "corrupt stored sourceGraphs on namespace '{}': {e}",
+                    row[0]
+                ))
+            })?;
             out.push(NamespaceInfo {
                 iri: row[0].clone(),
                 prefix: row[1].clone(),
@@ -1517,7 +1525,13 @@ impl LadybugSchemaStore {
         }
         Ok(n)
     }
-    fn write_copy_csv(header: &[&str], rows: &[Vec<String>]) -> Result<PathBuf> {
+    /// Stage CSV rows in a freshly created, exclusive temporary directory. Returning the
+    /// `TempDir` keeps it alive for the caller and removes it on drop; `O_EXCL` creation
+    /// means a pre-planted symlink or stale directory can never be followed.
+    fn write_copy_csv(
+        header: &[&str],
+        rows: &[Vec<String>],
+    ) -> Result<(tempfile::TempDir, PathBuf)> {
         fn esc(s: &str) -> String {
             let mut o = String::with_capacity(s.len() + 2);
             o.push('"');
@@ -1530,10 +1544,10 @@ impl LadybugSchemaStore {
             o.push('"');
             o
         }
-        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("ontobug-copy-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).map_err(|e| Error::Ladybug(e.to_string()))?;
+        let dir = tempfile::Builder::new()
+            .prefix("ontobug-copy-")
+            .tempdir()
+            .map_err(|e| Error::Ladybug(e.to_string()))?;
         let mut text = String::new();
         text.push_str(&header.iter().map(|h| esc(h)).collect::<Vec<_>>().join(","));
         text.push('\n');
@@ -1541,9 +1555,18 @@ impl LadybugSchemaStore {
             text.push_str(&r.iter().map(|c| esc(c)).collect::<Vec<_>>().join(","));
             text.push('\n');
         }
-        let path = dir.join("copy.csv");
+        let path = dir.path().join("copy.csv");
         std::fs::write(&path, text).map_err(|e| Error::Ladybug(e.to_string()))?;
-        Ok(path)
+        Ok((dir, path))
+    }
+
+    /// The `COPY` statement for a staged CSV path. The path is escaped as a Ladybug
+    /// string literal so a `'` in a temporary directory cannot terminate it.
+    fn copy_csv_statement(table: &str, path: &Path) -> String {
+        format!(
+            "COPY {table} FROM '{}' (HEADER true, PARALLEL=FALSE)",
+            crate::diff::esc(&path.to_string_lossy())
+        )
     }
 
     /// One native `COPY` of CSV rows into a table (skipped when empty). Quoted
@@ -1557,13 +1580,9 @@ impl LadybugSchemaStore {
         if rows.is_empty() {
             return Ok(());
         }
-        let path = Self::write_copy_csv(header, rows)?;
-        let r = conn.query(&format!(
-            "COPY {table} FROM '{}' (HEADER true, PARALLEL=FALSE)",
-            path.display()
-        ));
-        let _ = std::fs::remove_dir_all(path.parent().expect("file has a parent"));
-        r.map_err(|e| Error::Ladybug(e.to_string()))?;
+        let (_dir, path) = Self::write_copy_csv(header, rows)?;
+        conn.query(&Self::copy_csv_statement(table, &path))
+            .map_err(|e| Error::Ladybug(e.to_string()))?;
         Ok(())
     }
 
@@ -2016,11 +2035,12 @@ mod tests {
         let back = store.load_entries().unwrap();
         assert_eq!(back.len(), 3);
         assert!(back.contains(&entries[0]));
-        assert!(back
-            .iter()
-            .any(|e| e.graph.to_string() == "<https://ex.org/shapes>"
-                && e.role == SchemaRole::Shacl
-                && e.applies_to.is_empty()));
+        assert!(
+            back.iter()
+                .any(|e| e.graph.to_string() == "<https://ex.org/shapes>"
+                    && e.role == SchemaRole::Shacl
+                    && e.applies_to.is_empty())
+        );
         // The default graph round-trips through its label.
         let mut d = SchemaGraph::new(GraphName::DefaultGraph, SchemaRole::Ontology);
         d.applies_to = vec![GraphName::DefaultGraph];
@@ -2038,5 +2058,136 @@ mod tests {
         assert!(!back.iter().any(|e| e.graph == entries[0].graph));
         store.clear().unwrap();
         assert!(store.load_entries().unwrap().is_empty());
+    }
+
+    #[test]
+    fn relink_shapes_surfaces_corrupt_target_classes_json() {
+        let store = LadybugSchemaStore::open_in_memory().unwrap();
+        store
+            .cypher("CREATE (:ShaclShape {id: 's1', targetClasses: 'not-json'})")
+            .unwrap();
+        let err = store.relink_shapes().unwrap_err();
+        assert!(
+            matches!(err, Error::Other(_) | Error::Json(_)),
+            "expected a typed JSON/storage error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn list_namespaces_surfaces_corrupt_source_graphs_json() {
+        let store = LadybugSchemaStore::open_in_memory().unwrap();
+        store
+            .cypher("CREATE (:Namespace {iri: 'http://ex.org/', prefix: 'ex', sourceGraphs: 'not-json', termCount: 1, triples: 1})")
+            .unwrap();
+        let err = store.list_namespaces().unwrap_err();
+        assert!(
+            matches!(err, Error::Other(_) | Error::Json(_)),
+            "expected a typed JSON/storage error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn copy_csv_escapes_single_quote_in_staging_path() {
+        // A `'` in the staging directory must be backslash-escaped in the COPY literal;
+        // with a raw quote the Cypher string terminates early and the COPY fails.
+        static TMP_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = TMP_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let store = LadybugSchemaStore::open_in_memory().unwrap();
+        let root = std::env::temp_dir().join(format!("ontobug-quote-'-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let old = std::env::var_os("TMPDIR");
+        std::env::set_var("TMPDIR", &root);
+        let result = {
+            let g = "<https://ex.org/g>".to_owned();
+            let t = oxrdf::Triple {
+                subject: oxrdf::NamedNode::new("https://ex.org/s").unwrap().into(),
+                predicate: oxrdf::NamedNode::new("https://ex.org/p").unwrap(),
+                object: oxrdf::Literal::new_simple_literal("v").into(),
+            };
+            store.ingest_quads(&[(g, t)])
+        };
+        if let Some(v) = old {
+            std::env::set_var("TMPDIR", v);
+        } else {
+            std::env::remove_var("TMPDIR");
+        }
+        result.unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_copy_csv_creates_exclusive_directory_and_cleans_up() {
+        let (a_dir, a_path) =
+            LadybugSchemaStore::write_copy_csv(&["h"], &[vec!["v".into()]]).unwrap();
+        let (b_dir, b_path) =
+            LadybugSchemaStore::write_copy_csv(&["h"], &[vec!["v".into()]]).unwrap();
+        assert_ne!(
+            a_dir.path(),
+            b_dir.path(),
+            "each call must get a fresh directory"
+        );
+        assert_ne!(a_path, b_path);
+        for d in [&a_dir, &b_dir] {
+            let m = std::fs::symlink_metadata(d.path()).unwrap();
+            assert!(m.is_dir(), "staging path must be a real directory");
+            assert!(
+                !m.file_type().is_symlink(),
+                "staging path must not be a symlink"
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&a_path).unwrap(), "\"h\"\n\"v\"\n");
+        drop(a_dir);
+        assert!(
+            !a_path.exists(),
+            "TempDir drop must remove the staging directory"
+        );
+    }
+
+    #[test]
+    fn write_copy_csv_never_follows_a_planted_symlink() {
+        static TMP_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = TMP_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("ontobug-plant-root-{}", std::process::id()));
+        let target =
+            std::env::temp_dir().join(format!("ontobug-plant-target-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&target);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        let planted = root.join(format!("ontobug-copy-{}-0", std::process::id()));
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &planted).unwrap();
+
+        let old = std::env::var_os("TMPDIR");
+        std::env::set_var("TMPDIR", &root);
+        let (dir, path) = LadybugSchemaStore::write_copy_csv(&["h"], &[vec!["v".into()]]).unwrap();
+        if let Some(v) = old {
+            std::env::set_var("TMPDIR", v);
+        } else {
+            std::env::remove_var("TMPDIR");
+        }
+
+        assert_ne!(dir.path(), planted.as_path());
+        assert!(path.starts_with(dir.path()));
+        assert!(
+            !target.join("copy.csv").exists(),
+            "must not write through a pre-planted symlink"
+        );
+        drop(dir);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn copy_csv_statement_escapes_apostrophe_in_staging_path() {
+        let stmt = LadybugSchemaStore::copy_csv_statement(
+            "RdfNode",
+            Path::new("/tmp/O'Reilly/ontobug-copy-1/copy.csv"),
+        );
+        assert_eq!(
+            stmt,
+            "COPY RdfNode FROM '/tmp/O\\'Reilly/ontobug-copy-1/copy.csv' (HEADER true, PARALLEL=FALSE)"
+        );
     }
 }
