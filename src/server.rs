@@ -11999,7 +11999,15 @@ fn is_zero_action_exempt_shell_segment(segment: &str) -> bool {
                 return false;
             }
             match subcmd {
-                "push" | "pull" | "fetch" | "status" | "log" | "diff" | "show" | "rev-parse" => true,
+                // Force-push rewrites remote history: never exempt it from the
+                // active-task gate. Mirror the plugin's flag detection here.
+                "push" => !rest[1..].iter().copied().any(|arg| {
+                    arg == "-f"
+                        || arg == "--force"
+                        || arg.starts_with("--force-with-lease")
+                        || (arg.starts_with('-') && !arg.starts_with("--") && arg[1..].starts_with('f'))
+                }),
+                "pull" | "fetch" | "status" | "log" | "diff" | "show" | "rev-parse" => true,
                 "stash" => matches!(rest.get(1).copied(), Some("list" | "show")),
                 "branch" => {
                     rest.len() >= 2

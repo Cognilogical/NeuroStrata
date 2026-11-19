@@ -21,6 +21,8 @@ The plugin is harness-agnostic: the same `createHarnessPlugin` function works fo
 
 `neurostrata-nb9q`: both hook call sites (`executeBeforeHandler` and `handleHookEvent`) pass `is_mutating: !shellExempt` to `neurostrata_guard_validate`, so read-only commands — including `git push`/`git pull` after `neurostrata_task_complete` — never trip the no-claimed-task gate (the Lock 2 / push Catch-22). Force-push flags (`-f`, `--force`, `--force-with-lease`) and backgrounded shells (`CMD &`) stay mutating; `&&` chains of read-only commands stay exempt.
 
+`neurostrata-1e14`: the plugin and the daemon shell classifiers apply the same force-push rejection, including bundled short flags (`-fv`) and `--force-with-lease=<ref>`; a classifier that exempted force-push but let the daemon recompute mutability from the raw payload would let remote-history rewrites skip the active-task gate.
+
 `neurostrata-nb9q`: subagent graph-first injection is agent- and harness-aware: read-only subagents (`reviewer`, `checker`, `checker-free`, `explore`) receive a skip note instead of directives to call MCP tools they do not have, and Code Mode harnesses reference `execute` with `tools.neurostrata.*`. Intent extraction from `read`/`grep`/`glob`/shell tool output is suppressed, because `TODO:`/`defer` in stdout or source comments is not a task obligation; user and assistant turns still nudge.
 
 ## Implementing a New Harness Adapter

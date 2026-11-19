@@ -902,7 +902,7 @@ function isZeroActionExemptShellSegment(segment: string): boolean {
     }
     const sub = rest[0];
     const subArgs = rest.slice(1);
-    if (sub === "push" && subArgs.some((a) => a === "-f" || a === "--force" || a.startsWith("--force-with-lease"))) {
+    if (sub === "push" && subArgs.some((a) => a === "-f" || a === "--force" || a.startsWith("--force-with-lease") || (a.startsWith("-f") && !a.startsWith("--")))) {
       return false;
     }
     if (["push", "pull", "fetch", "status", "log", "diff", "show", "rev-parse"].includes(sub)) {

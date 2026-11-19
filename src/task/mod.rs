@@ -6730,6 +6730,17 @@ mod tests {
             "bash",
             "neurostrata-mcp task gate NeuroStrata --strict"
         ));
+        for force_push in [
+            "git push --force",
+            "git push -f",
+            "git push -fv origin main",
+            "git push --force-with-lease=origin",
+        ] {
+            assert!(
+                !crate::server::is_zero_action_exempt_shell_payload("bash", force_push),
+                "force-push must still require an active task: {force_push}"
+            );
+        }
         assert!(!crate::server::is_zero_action_exempt_shell_payload(
             "bash",
             "git commit -m 'mutate history'"

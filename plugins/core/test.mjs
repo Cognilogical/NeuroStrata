@@ -3013,7 +3013,8 @@ describe("nb9q FIX1: zero-action shell segments in the mutating guard", () => {
     }
     for (const cmd of [
       "rm -rf /tmp/x", "git reset --hard HEAD", "git commit -m x", "cargo build",
-      "git push --force", "git push -f", "git push --force-with-lease", "git status &",
+      "git push --force", "git push -f", "git push -fv origin main",
+      "git push --force-with-lease", "git push --force-with-lease=origin", "git status &",
     ]) {
       assert.equal(f("bash", cmd), false, `mutating: ${cmd}`);
     }
