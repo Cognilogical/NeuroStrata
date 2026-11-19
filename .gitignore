@@ -57,3 +57,8 @@ plugins/github-cli/node_modules/
 plugins/openclaw/node_modules/
 plugins/opencode/@opencode/
 kge/
+
+# Kani harness artifacts (written next to the source by `kani <file>`)
+*.symtab.out
+*.pretty_name_map.json
+*.type_map.json
