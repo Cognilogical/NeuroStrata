@@ -85,6 +85,22 @@ pub struct ExternalEffectReceipt {
 pub trait DataConnector: Send + Sync {
     fn connector_id(&self) -> &str;
     async fn describe_pool(&self, pool_id: &str) -> Result<DataPoolSchema>;
+    async fn register_pool(&self, schema: DataPoolSchema) -> Result<DataPoolSchema> {
+        let _ = schema;
+        Err(anyhow!(
+            "connector '{}' does not support pool registration",
+            self.connector_id()
+        ))
+    }
+    async fn seed_records(
+        &self,
+        pool_id: &str,
+        pointer_uri: &str,
+        records: Vec<Value>,
+    ) -> Result<()> {
+        let _ = (pool_id, pointer_uri, records);
+        Ok(())
+    }
     async fn resolve_slice(
         &self,
         pool_id: &str,
@@ -112,10 +128,64 @@ impl DataConnectorRegistry {
         }
     }
 
+    fn default_pool_schemas(connector_id: &str) -> [DataPoolSchema; 2] {
+        [
+            DataPoolSchema {
+                connector_id: connector_id.to_string(),
+                pool_id: "default".to_string(),
+                access_mode: DataPoolAccessMode::ReadWrite,
+                entity_types: vec!["json_record".to_string()],
+                max_slice_rows: 1000,
+                max_slice_bytes: 1_048_576,
+                description: "Default read-write data pool".to_string(),
+            },
+            DataPoolSchema {
+                connector_id: connector_id.to_string(),
+                pool_id: "readonly".to_string(),
+                access_mode: DataPoolAccessMode::ReadOnly,
+                entity_types: vec!["json_record".to_string()],
+                max_slice_rows: 1000,
+                max_slice_bytes: 1_048_576,
+                description: "Default read-only data pool".to_string(),
+            },
+        ]
+    }
+
+    fn load_configured_pool_schemas(workspace_root: &Path) -> Vec<DataPoolSchema> {
+        let config_path = workspace_root.join(".NeuroStrata").join("connector_pools.json");
+        let Ok(raw) = std::fs::read_to_string(&config_path) else {
+            return Vec::new();
+        };
+        if let Ok(schemas) = serde_json::from_str::<Vec<DataPoolSchema>>(&raw) {
+            return schemas;
+        }
+        if let Ok(wrapper) = serde_json::from_str::<Value>(&raw) {
+            if let Some(arr) = wrapper.get("pools") {
+                if let Ok(schemas) = serde_json::from_value::<Vec<DataPoolSchema>>(arr.clone()) {
+                    return schemas;
+                }
+            }
+        }
+        Vec::new()
+    }
+
     pub fn new_with_defaults(workspace_root: PathBuf) -> Self {
         let reg = DataConnectorRegistry::new();
         let inmem = Arc::new(InMemoryPoolConnector::new());
-        let json = Arc::new(JsonFilePoolConnector::new(workspace_root));
+        let json = Arc::new(JsonFilePoolConnector::new(workspace_root.clone()));
+        for schema in Self::default_pool_schemas(inmem.connector_id()) {
+            inmem.upsert_pool(schema);
+        }
+        for schema in Self::default_pool_schemas(json.connector_id()) {
+            json.register_pool(schema);
+        }
+        for schema in Self::load_configured_pool_schemas(&workspace_root) {
+            if schema.connector_id == inmem.connector_id() {
+                inmem.upsert_pool(schema);
+            } else if schema.connector_id == json.connector_id() {
+                json.register_pool(schema);
+            }
+        }
         reg.register(inmem).expect("register in-memory connector");
         reg.register(json).expect("register json-file connector");
         reg
@@ -226,6 +296,37 @@ impl DataConnector for InMemoryPoolConnector {
             Some(entry) => Ok(entry.schema.clone()),
             None => Err(anyhow!("pool '{}' not found", pool_id)),
         }
+    }
+
+    async fn register_pool(&self, mut schema: DataPoolSchema) -> Result<DataPoolSchema> {
+        if schema.pool_id.trim().is_empty() {
+            return Err(anyhow!("pool_id must not be empty"));
+        }
+        if schema.connector_id.trim().is_empty() {
+            schema.connector_id = self.connector_id().to_string();
+        } else if schema.connector_id != self.connector_id() {
+            return Err(anyhow!(
+                "schema connector_id '{}' does not match '{}'",
+                schema.connector_id,
+                self.connector_id()
+            ));
+        }
+        self.upsert_pool(schema.clone());
+        Ok(schema)
+    }
+
+    async fn seed_records(
+        &self,
+        pool_id: &str,
+        pointer_uri: &str,
+        records: Vec<Value>,
+    ) -> Result<()> {
+        let mut pools = self.pools.write().unwrap();
+        let pool = pools
+            .get_mut(pool_id)
+            .ok_or_else(|| anyhow!("pool '{}' not found", pool_id))?;
+        pool.records.insert(pointer_uri.to_string(), records);
+        Ok(())
     }
 
     async fn resolve_slice(
@@ -464,6 +565,23 @@ impl DataConnector for JsonFilePoolConnector {
         }
     }
 
+    async fn register_pool(&self, mut schema: DataPoolSchema) -> Result<DataPoolSchema> {
+        if schema.pool_id.trim().is_empty() {
+            return Err(anyhow!("pool_id must not be empty"));
+        }
+        if schema.connector_id.trim().is_empty() {
+            schema.connector_id = self.connector_id().to_string();
+        } else if schema.connector_id != self.connector_id() {
+            return Err(anyhow!(
+                "schema connector_id '{}' does not match '{}'",
+                schema.connector_id,
+                self.connector_id()
+            ));
+        }
+        JsonFilePoolConnector::register_pool(self, schema.clone());
+        Ok(schema)
+    }
+
     async fn resolve_slice(
         &self,
         pool_id: &str,
@@ -472,6 +590,9 @@ impl DataConnector for JsonFilePoolConnector {
         limit: u32,
         max_bytes: u32,
     ) -> Result<DataSlicePayload> {
+        if !self.pools.read().unwrap().contains_key(pool_id) {
+            return Err(anyhow!("pool '{}' not found", pool_id));
+        }
         let path = self.resolve_path(pointer_uri)?;
         let all_records = JsonFilePoolConnector::read_json_file(&path)?;
         let source_sha = JsonFilePoolConnector::compute_sha(&all_records);
@@ -794,5 +915,54 @@ mod tests {
         let err = rt.block_on(c.apply_external_effect("jp", "../outside.json", &req)).unwrap_err();
         assert!(err.to_string().contains("must not contain '..'"));
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn test_new_with_defaults_preseeds_default_and_configured_pools() {
+        let dir = tempfile::tempdir().unwrap();
+        let ns_dir = dir.path().join(".NeuroStrata");
+        std::fs::create_dir_all(&ns_dir).unwrap();
+        std::fs::write(
+            ns_dir.join("connector_pools.json"),
+            serde_json::to_string_pretty(&json!({
+                "pools": [
+                    {
+                        "connector_id": "json_file",
+                        "pool_id": "custom_json",
+                        "access_mode": "read_write",
+                        "entity_types": ["record"],
+                        "max_slice_rows": 50,
+                        "max_slice_bytes": 4096,
+                        "description": "Custom JSON file pool"
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("items.json"),
+            serde_json::to_string_pretty(&json!([{"k": 1}, {"k": 2}])).unwrap(),
+        )
+        .unwrap();
+
+        let reg = DataConnectorRegistry::new_with_defaults(dir.path().to_path_buf());
+        let rt = rt();
+        let json_conn = reg.get("json_file").unwrap();
+        let default_schema = rt.block_on(json_conn.describe_pool("default")).unwrap();
+        assert_eq!(default_schema.access_mode, DataPoolAccessMode::ReadWrite);
+        let ro_schema = rt.block_on(json_conn.describe_pool("readonly")).unwrap();
+        assert_eq!(ro_schema.access_mode, DataPoolAccessMode::ReadOnly);
+        let custom_schema = rt.block_on(json_conn.describe_pool("custom_json")).unwrap();
+        assert_eq!(custom_schema.max_slice_rows, 50);
+
+        let slice = rt
+            .block_on(json_conn.resolve_slice("default", "items.json", 0, 10, 1024))
+            .unwrap();
+        assert_eq!(slice.records.len(), 2);
+
+        let mem_conn = reg.get("memory_pool").unwrap();
+        let mem_default = rt.block_on(mem_conn.describe_pool("default")).unwrap();
+        assert_eq!(mem_default.access_mode, DataPoolAccessMode::ReadWrite);
     }
 }

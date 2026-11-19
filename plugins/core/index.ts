@@ -851,6 +851,114 @@ export function isCodeExecTool(name: string): boolean {
   return CODE_EXEC_TOOLS.has(name);
 }
 
+/**
+ * Fail-closed recognition of a single read-only / verification shell segment.
+ * Only an explicit allowlist passes; anything else is treated as mutating.
+ */
+function isZeroActionExemptShellSegment(segment: string): boolean {
+  let tokens = segment.trim().split(/\s+/).filter(Boolean);
+  while (tokens.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0])) {
+    tokens = tokens.slice(1);
+  }
+  if (tokens.length === 0) return false;
+  const bin = tokens[0].replace(/\\/g, "/").split("/").pop() ?? "";
+  const args = tokens.slice(1);
+  const hasFlag = (flags: string[]): boolean =>
+    args.some((arg) =>
+      flags.some((flag) =>
+        arg === flag || (flag.startsWith("--") ? arg.startsWith(`${flag}=`) : arg.startsWith(flag)),
+      ),
+    );
+
+  if (bin === "git") {
+    let rest = args;
+    while (rest.length > 0) {
+      const head = rest[0];
+      if (head === "-C" || head === "--git-dir" || head === "--work-tree") {
+        rest = rest.slice(2);
+      } else if (
+        head === "--no-pager" ||
+        head === "-P" ||
+        head === "--no-optional-locks" ||
+        head.startsWith("--git-dir=") ||
+        head.startsWith("--work-tree=")
+      ) {
+        rest = rest.slice(1);
+      } else {
+        break;
+      }
+    }
+    const sub = rest[0];
+    const subArgs = rest.slice(1);
+    if (["push", "pull", "fetch", "status", "log", "diff", "show", "rev-parse"].includes(sub)) {
+      return !hasFlag(["--output", "-O", "--ext-diff", "--textconv", "--exec", "-x", "--upload-pack", "--receive-pack"]);
+    }
+    if (sub === "stash") return subArgs[0] === "list" || subArgs[0] === "show";
+    if (sub === "branch") {
+      return subArgs.every((arg) => ["--show-current", "-a", "-r", "--list", "-v", "-vv"].includes(arg));
+    }
+    return false;
+  }
+
+  if (bin === "neurostrata-mcp") {
+    if (args[0] === "task" || args[0] === "doc-gate") return true;
+    return args[0] === "synaptic-mesh" && args[1] === "status";
+  }
+
+  if (bin === "cargo") {
+    const rest = args[0]?.startsWith("+") ? args.slice(1) : args;
+    return ["test", "check", "clippy", "bench", "metadata", "tree", "version", "--version"].includes(rest[0]);
+  }
+
+  if (bin === "gh") {
+    if (args[0] === "pr") return ["view", "list", "checks", "status", "diff"].includes(args[1]);
+    if (args[0] === "issue") return ["view", "list", "status"].includes(args[1]);
+    if (args[0] === "run") return ["view", "list", "watch"].includes(args[1]);
+    if (args[0] === "api") {
+      return !hasFlag(["-X", "--method", "-f", "-F", "--field", "--raw-field", "--input"]);
+    }
+    return false;
+  }
+
+  if (bin === "node") {
+    return args.some((arg) => arg === "--test" || arg.endsWith("test.mjs"));
+  }
+
+  if (bin === "gate-receipt.sh" || bin === "check-include-str-targets.sh") return true;
+  if (bin === "bash") {
+    const next = args[0] ?? "";
+    return next.endsWith("gate-receipt.sh") || next.endsWith("check-include-str-targets.sh");
+  }
+
+  if (bin === "rustc") return args[0] === "--version" || args[0] === "-V";
+
+  return false;
+}
+
+/**
+ * True only for shell tools whose payload is provably read-only/verification.
+ * JSON payloads are unwrapped via `command`/`cmd`; substitutions, redirection
+ * and chains containing any mutating segment fail closed.
+ */
+export function isZeroActionExemptShellPayload(actionType: string, payloadOrCommand: string): boolean {
+  if (!["bash", "shell", "command", "exec"].includes(String(actionType).toLowerCase())) return false;
+  let command = payloadOrCommand;
+  const trimmed = payloadOrCommand.trim();
+  if (trimmed.startsWith("{")) {
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = asRecord(JSON.parse(trimmed));
+    } catch {
+      return false;
+    }
+    command = asString(parsed.command) ?? asString(parsed.cmd) ?? "";
+  }
+  const cmd = command.trim();
+  if (!cmd || cmd.includes("`") || cmd.includes("$(") || cmd.includes(">") || cmd.includes("<")) return false;
+  const segments = cmd.split(/[;\n|&]+/).map((segment) => segment.trim()).filter(Boolean);
+  return segments.length > 0 && segments.every(isZeroActionExemptShellSegment);
+}
+
 export interface CodeModeInspection {
   id?: string;
   sessionId?: string;
@@ -910,11 +1018,18 @@ export function inspectCodeModeExecution(code: string): CodeModeInspection {
     const sessionMatch = argSlice.match(/(?:^|[^\w$])["']?session_id["']?\s*:\s*["']([^"']+)["']/);
     const noteMatch = argSlice.match(/(?:^|[^\w$])["']?note["']?\s*:\s*["']([^"']*)["']/);
     const pathMatch = argSlice.match(/(?:^|[^\w$])["']?(?:path|path_prefix|query)["']?\s*:\s*["']([^"']+)["']/);
+    // A claim/update can pass variables or template literals instead of string
+    // literals. Those values are not extractable, but the key itself still
+    // proves the call's intent — detect it without mistaking explicit
+    // undefined/null for a real value.
+    const hasIdKey = /(?:^|[^\w$])["']?id["']?\s*:\s*(?!undefined\b|null\b)\S/.test(argSlice);
+    const hasSessionKey = /(?:^|[^\w$])["']?session_id["']?\s*:\s*(?!undefined\b|null\b)\S/.test(argSlice);
+    const hasNoteKey = /(?:^|[^\w$])["']?note["']?\s*:\s*(?!undefined\b|null\b)\S/.test(argSlice);
 
     if (tool === "neurostrata_task_claim") {
-      if (idMatch && sessionMatch) {
-        result.id = idMatch[1];
-        result.sessionId = sessionMatch[1];
+      if (idMatch) result.id = idMatch[1];
+      if (sessionMatch) result.sessionId = sessionMatch[1];
+      if ((idMatch || hasIdKey) && (sessionMatch || hasSessionKey)) {
         result.taskClaimed = true;
         result.taskCompleted = false;
       }
@@ -923,6 +1038,7 @@ export function inspectCodeModeExecution(code: string): CodeModeInspection {
       if (idMatch) result.id = idMatch[1];
       if (sessionMatch) result.sessionId = sessionMatch[1];
       if (noteMatch) result.note = noteMatch[1];
+      else if (hasNoteKey) result.note = "";
     } else if (tool === "neurostrata_task_complete") {
       result.taskCompleted = true;
     } else if (tool === "neurostrata_memories_for_file" || tool === "neurostrata_locate") {
@@ -1397,7 +1513,10 @@ export async function resolveActiveTaskFromDaemon(
       body = {};
     }
     const tasks = Array.isArray(body.tasks) ? body.tasks : Array.isArray(body.items) ? body.items : [];
+    const projectRoot = effectiveProjectRoot(config);
     let target: Record<string, unknown> | null = null;
+    let targetRank = -1;
+    let firstInProgress: Record<string, unknown> | null = null;
     for (const item of tasks) {
       if (typeof item !== "object" || item === null) continue;
       const rec = item as Record<string, unknown>;
@@ -1405,28 +1524,40 @@ export async function resolveActiveTaskFromDaemon(
       if (recId) {
         cachedTaskInjection.set(recId, asString(rec.subagent_prompt_injection) ?? null);
       }
-      if (preferredTaskId && recId === preferredTaskId) {
+      if (asString(rec.status) !== "in_progress") continue;
+      if (!firstInProgress) firstInProgress = rec;
+      const claim = asRecord(rec.claim);
+      const recSession = asString(rec.session_id) ?? asString(claim.session_id) ?? null;
+      const recWorktree = asString(rec.worktree) ?? asString(claim.worktree) ?? null;
+      // Strict specificity: an explicit preference wins, then the current
+      // session+worktree, then session, then worktree, then any in_progress.
+      // A task owned by another session must never hijack this session.
+      let rank = 1;
+      if (preferredTaskId && recId === preferredTaskId) rank = 5;
+      else if (activeSessionId && recSession === activeSessionId && recWorktree && recWorktree === projectRoot) rank = 4;
+      else if (activeSessionId && recSession === activeSessionId) rank = 3;
+      else if (recWorktree && recWorktree === projectRoot) rank = 2;
+      if (rank > targetRank) {
         target = rec;
-        break;
-      }
-      if (!target && asString(rec.status) === "in_progress") {
-        target = rec;
+        targetRank = rank;
       }
     }
+    if (!target) target = firstInProgress;
     if (!target && tasks.length > 0 && typeof tasks[0] === "object" && tasks[0] !== null) {
       target = tasks[0] as Record<string, unknown>;
     }
     if (target) {
       const taskId = asString(target.id);
+      const claim = asRecord(target.claim);
       const sessionId =
-        asString(target.session_id) ??
-        asString((target as Record<string, unknown> & { claim?: { session_id?: unknown } }).claim?.session_id) ??
-        null;
+        asString(target.session_id) ?? asString(claim.session_id) ?? null;
       const promptInjection = asString(target.subagent_prompt_injection) ?? null;
       if (taskId) {
         if (!preferredTaskId || taskId === preferredTaskId) {
           activeTaskId = taskId;
-          activeSessionId = sessionId;
+          if (!activeSessionId || sessionId === activeSessionId || preferredTaskId) {
+            activeSessionId = sessionId;
+          }
         }
         cachedTaskInjection.set(taskId, promptInjection);
       }
@@ -2103,6 +2234,11 @@ const executeBeforeHandler = async (input: any): Promise<any> => {
       activeTaskId = inspection.id;
     }
     if (inspection.sessionId) activeSessionId = inspection.sessionId;
+    if (inspection.taskClaimed && !inspection.id) {
+      // Variable id: the real task id is only known to the daemon. Drop the
+      // stale id so the next check re-resolves it via activeSessionId.
+      activeTaskId = null;
+    }
     if (inspection.taskClaimed || inspection.taskCompleted || inspection.note !== undefined) {
       mutationsSinceNote = 0;
     }
@@ -2195,14 +2331,15 @@ const executeBeforeHandler = async (input: any): Promise<any> => {
 
   // Mutating tool guard (fail closed).
   if (isMutatingTool(toolName)) {
+    const payload = JSON.stringify(args);
     if (config.strictMode) {
       const call: any = {
         name: toolName,
-        args: firstRecord(input?.input, input?.args, input),
+        args,
         session_id: asString(input?.session_id) ?? asString(input?.sessionID) ?? activeSessionId ?? undefined,
       };
-      const payload = JSON.stringify(call.args);
-      const cwd = process.cwd();
+      const projectRoot = effectiveProjectRoot(config);
+      const cwd = asString(args.cwd) ?? asString(args.workdir) ?? projectRoot;
       const session_id = call.session_id;
       const active_task_id = asString(args.active_task_id) ?? activeTaskId;
       const worktree = asString(args.worktree) ?? cwd;
@@ -2237,7 +2374,7 @@ const executeBeforeHandler = async (input: any): Promise<any> => {
         throw new Error(`Guard validation unavailable (NeuroStrata core degraded): ${message}`);
       }
     }
-    mutationsSinceNote++;
+    if (!isZeroActionExemptShellPayload(toolName, payload)) mutationsSinceNote++;
   }
 
   if (filePath) confirmPrefetchDelivery(config.namespace, filePath);
@@ -2373,6 +2510,10 @@ export async function handleHookEvent(event: Record<string, unknown>): Promise<R
         activeTaskId = inspection.id;
       }
       if (inspection.sessionId) activeSessionId = inspection.sessionId;
+      if (inspection.taskClaimed && !inspection.id) {
+        // Variable id: let the next check re-resolve from activeSessionId.
+        activeTaskId = null;
+      }
       if (inspection.taskClaimed || inspection.taskCompleted || inspection.note !== undefined) {
         mutationsSinceNote = 0;
       }
@@ -2451,10 +2592,11 @@ export async function handleHookEvent(event: Record<string, unknown>): Promise<R
           // fail-soft
         }
       }
+      const callArgs = firstRecord(toolInput);
+      const payload = JSON.stringify(callArgs);
       if (config.strictMode) {
-        const callArgs = firstRecord(toolInput);
-        const payload = JSON.stringify(callArgs);
-        const cwd = process.cwd();
+        const projectRoot = effectiveProjectRoot(config);
+        const cwd = asString(callArgs.cwd) ?? asString(callArgs.workdir) ?? projectRoot;
         const session_id = asString(callArgs.session_id) ?? asString(event.session_id) ?? activeSessionId ?? undefined;
         const active_task_id = asString(callArgs.active_task_id) ?? activeTaskId;
         const worktree = asString(callArgs.worktree) ?? cwd;
@@ -2488,7 +2630,7 @@ export async function handleHookEvent(event: Record<string, unknown>): Promise<R
           return denyWithRecall(`Guard unavailable: ${message}`);
         }
       }
-      mutationsSinceNote++;
+      if (!isZeroActionExemptShellPayload(toolNameRaw, payload)) mutationsSinceNote++;
     }
     if (recalledFilePath) confirmPrefetchDelivery(config.namespace, recalledFilePath);
     return {

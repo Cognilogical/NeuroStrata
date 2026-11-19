@@ -89,6 +89,50 @@ fn collect_files_recursive(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
     }
 }
 
+/// Markdown files under `docs/` (including `support_dirs`) subject to the
+/// machine-path content rule.
+///
+/// Inside a git worktree (`root.join(".git").exists()`), only git-tracked
+/// markdown files under `docs/` are scanned so an untracked local scratch file
+/// never blocks the gate. Outside a git worktree (temp-dir unit tests), every
+/// markdown file under `docs/` is scanned.
+fn collect_doc_markdown_files(root: &Path) -> Vec<std::path::PathBuf> {
+    let tracked: Option<std::collections::BTreeSet<String>> = if root.join(".git").exists() {
+        std::process::Command::new("git")
+            .args(["ls-files", "--", "docs"])
+            .current_dir(root)
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| {
+                String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .map(|line| line.trim().replace('\\', "/"))
+                    .filter(|line| !line.is_empty())
+                    .collect()
+            })
+    } else {
+        None
+    };
+
+    let mut files = Vec::new();
+    collect_files_recursive(&root.join("docs"), &mut files);
+    files
+        .into_iter()
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("md"))
+        .filter(|p| {
+            let Some(tracked) = &tracked else {
+                return true;
+            };
+            let Ok(rel) = p.strip_prefix(root) else {
+                return false;
+            };
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            tracked.contains(&rel)
+        })
+        .collect()
+}
+
 /// Extracts public surface identifiers (CLI `#[command(name = "...")]` subcommands,
 /// MCP `"name": "neurostrata_..."` tool identifiers, and `pub trait <Name>` declarations)
 /// from added diff lines or source text.
@@ -299,6 +343,38 @@ pub fn evaluate_doc_gate(
         }
     }
 
+    // 5b. No maintainer machine paths in any tracked doc under docs/ (including
+    // support_dirs such as docs/superpowers/ and docs/releases/).
+    const MACHINE_PATH_NEEDLES: [&str; 2] = ["/home/kenton", "/tmp/opencode"];
+    for path in collect_doc_markdown_files(root) {
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let found: Vec<&str> = MACHINE_PATH_NEEDLES
+            .iter()
+            .copied()
+            .filter(|needle| content.contains(needle))
+            .collect();
+        if found.is_empty() {
+            continue;
+        }
+        hygiene_failed = true;
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .to_string();
+        violations.push(DocViolation {
+            rule_id: "machine-path".to_string(),
+            kind: "maintainer_machine_path".to_string(),
+            path: rel.clone(),
+            detail: format!(
+                "maintainer machine path(s) {:?} found in tracked doc '{}'",
+                found, rel
+            ),
+        });
+    }
+
     if hygiene_failed {
         return DocGateReport {
             passed: false,
@@ -500,6 +576,37 @@ mod tests {
             "surface_rules": {}
         }}"#,
             surface_rules_json
+        );
+        std::fs::write(docs_dir.join("manifest.json"), manifest).unwrap();
+    }
+
+    fn write_manifest_support_dirs(docs_dir: &std::path::Path, support_dirs_json: &str) {
+        let manifest = format!(
+            r#"{{
+            "schema_version": 1,
+            "allowed_root_files": ["README.md", "manifest.json"],
+            "tiers": {{
+                "vision": {{
+                    "dir": "docs/vision",
+                    "description": "Vision tier",
+                    "required_files": []
+                }},
+                "features_api": {{
+                    "dir": "docs/features-api",
+                    "description": "Features API tier",
+                    "required_files": []
+                }},
+                "extend": {{
+                    "dir": "docs/extend",
+                    "description": "Extend tier",
+                    "required_files": []
+                }}
+            }},
+            "support_dirs": {},
+            "prohibited_filename_substrings": [],
+            "surface_rules": []
+        }}"#,
+            support_dirs_json
         );
         std::fs::write(docs_dir.join("manifest.json"), manifest).unwrap();
     }
@@ -952,6 +1059,76 @@ mod tests {
             }),
             "untracked file was not scanned: {:?}",
             report
+        );
+    }
+
+    #[test]
+    fn rejects_maintainer_machine_path_in_support_dir_doc() {
+        // No .git in a temp dir: every markdown file under docs/ (including
+        // support_dirs) must be scanned for maintainer machine paths.
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        let docs_dir = root.join("docs");
+        std::fs::create_dir_all(docs_dir.join("vision")).unwrap();
+        std::fs::create_dir_all(docs_dir.join("features-api")).unwrap();
+        std::fs::create_dir_all(docs_dir.join("extend")).unwrap();
+        std::fs::create_dir_all(docs_dir.join("superpowers").join("plans")).unwrap();
+        write_manifest_support_dirs(&docs_dir, r#"["docs/superpowers"]"#);
+        std::fs::write(
+            docs_dir.join("superpowers").join("plans").join("leak.md"),
+            "See /tmp/opencode/semantic-eval.json for the strict receipt.",
+        )
+        .unwrap();
+
+        let report = evaluate_doc_gate(root, None);
+        assert!(!report.passed);
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| { v.kind == "maintainer_machine_path" && v.path.contains("leak.md") }),
+            "expected maintainer_machine_path violation, got {:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn machine_path_rule_ignores_untracked_but_flags_tracked_doc() {
+        // Inside a git worktree only tracked docs are scanned, so an
+        // untracked scratch file under docs/superpowers/ never blocks the gate.
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        let docs_dir = root.join("docs");
+        std::fs::create_dir_all(docs_dir.join("vision")).unwrap();
+        std::fs::create_dir_all(docs_dir.join("features-api")).unwrap();
+        std::fs::create_dir_all(docs_dir.join("extend")).unwrap();
+        std::fs::create_dir_all(docs_dir.join("superpowers").join("plans")).unwrap();
+        write_manifest_support_dirs(&docs_dir, r#"["docs/superpowers"]"#);
+        init_git_repo(root);
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-q", "-m", "baseline"]);
+
+        let scratch = docs_dir
+            .join("superpowers")
+            .join("plans")
+            .join("scratch.md");
+        std::fs::write(&scratch, "run from /home/kenton/worktree/<id>").unwrap();
+        let report = evaluate_doc_gate(root, None);
+        assert!(
+            report.passed,
+            "untracked scratch doc must be ignored: {:?}",
+            report.violations
+        );
+
+        run_git(root, &["add", "docs/superpowers/plans/scratch.md"]);
+        let report = evaluate_doc_gate(root, None);
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.kind == "maintainer_machine_path"),
+            "tracked doc with machine path must be flagged: {:?}",
+            report.violations
         );
     }
 

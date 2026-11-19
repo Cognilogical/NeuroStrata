@@ -1,0 +1,16 @@
+# The Rust toolchain this repository builds with.
+#
+# Pinning the channel keeps CI and local builds on the same compiler, so a
+# warning or an error never depends on whichever stable happened to be
+# installed. The pinned version is the one this tree was verified against:
+# rustc 1.100.0 (0ef1bc386 2026-11-09).
+#
+# profile = "minimal" keeps the toolchain small: this repository does not
+# build rustdoc in CI, and the wasm crate builds with the host target.
+[toolchain]
+channel = "1.100.0"
+profile = "minimal"
+# rustfmt and clippy are part of the everyday developer loop, so they are
+# pinned with the toolchain instead of being left to whatever the default
+# toolchain happens to have.
+components = ["rustfmt", "clippy"]

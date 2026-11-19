@@ -1614,6 +1614,394 @@ pub const fn is_memory_valid_at(
     valid_from <= as_of_ts && (!has_valid_to || valid_to > as_of_ts)
 }
 
+// ─── OWL 2 RL Derivation Certificate Verification (Capability A, neurostrata-s0l0) ───
+
+/// OWL 2 RL / RDFS rule identifiers for derivation certificates.
+/// Mirrors every rule the Rust adapter can emit (the 14 profile rules plus
+/// adapter extensions for reasonable's emitted closure).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelOwl2RlRuleId {
+    PrpDom,
+    PrpRng,
+    PrpTrp,
+    PrpSymp,
+    PrpInv,
+    PrpSpo1,
+    PrpSpo2,
+    PrpEqp,
+    CaxSco,
+    CaxEqc,
+    ClsHv,
+    ClsSvf,
+    ClsAvf,
+    CaxDwViolation,
+    OwlUniverse,
+    ScmEqc,
+    RdfsScoTrans,
+    EqSym,
+    EqTrans,
+    EqRepS,
+    EqRepP,
+    EqRepO,
+    ClsInt1,
+    ClsInt2,
+    ClsUni,
+    RdfsContainer,
+}
+
+impl KernelOwl2RlRuleId {
+    /// All rules, in canonical tag order. Tag index == position in this array.
+    pub const ALL: [KernelOwl2RlRuleId; 26] = [
+        KernelOwl2RlRuleId::PrpDom,
+        KernelOwl2RlRuleId::PrpRng,
+        KernelOwl2RlRuleId::PrpTrp,
+        KernelOwl2RlRuleId::PrpSymp,
+        KernelOwl2RlRuleId::PrpInv,
+        KernelOwl2RlRuleId::PrpSpo1,
+        KernelOwl2RlRuleId::PrpSpo2,
+        KernelOwl2RlRuleId::PrpEqp,
+        KernelOwl2RlRuleId::CaxSco,
+        KernelOwl2RlRuleId::CaxEqc,
+        KernelOwl2RlRuleId::ClsHv,
+        KernelOwl2RlRuleId::ClsSvf,
+        KernelOwl2RlRuleId::ClsAvf,
+        KernelOwl2RlRuleId::CaxDwViolation,
+        KernelOwl2RlRuleId::OwlUniverse,
+        KernelOwl2RlRuleId::ScmEqc,
+        KernelOwl2RlRuleId::RdfsScoTrans,
+        KernelOwl2RlRuleId::EqSym,
+        KernelOwl2RlRuleId::EqTrans,
+        KernelOwl2RlRuleId::EqRepS,
+        KernelOwl2RlRuleId::EqRepP,
+        KernelOwl2RlRuleId::EqRepO,
+        KernelOwl2RlRuleId::ClsInt1,
+        KernelOwl2RlRuleId::ClsInt2,
+        KernelOwl2RlRuleId::ClsUni,
+        KernelOwl2RlRuleId::RdfsContainer,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            KernelOwl2RlRuleId::PrpDom => "prp-dom",
+            KernelOwl2RlRuleId::PrpRng => "prp-rng",
+            KernelOwl2RlRuleId::PrpTrp => "prp-trp",
+            KernelOwl2RlRuleId::PrpSymp => "prp-symp",
+            KernelOwl2RlRuleId::PrpInv => "prp-inv",
+            KernelOwl2RlRuleId::PrpSpo1 => "prp-spo1",
+            KernelOwl2RlRuleId::PrpSpo2 => "prp-spo2",
+            KernelOwl2RlRuleId::PrpEqp => "prp-eqp",
+            KernelOwl2RlRuleId::CaxSco => "cax-sco",
+            KernelOwl2RlRuleId::CaxEqc => "cax-eqc",
+            KernelOwl2RlRuleId::ClsHv => "cls-hv",
+            KernelOwl2RlRuleId::ClsSvf => "cls-svf",
+            KernelOwl2RlRuleId::ClsAvf => "cls-avf",
+            KernelOwl2RlRuleId::CaxDwViolation => "cax-dw",
+            KernelOwl2RlRuleId::OwlUniverse => "owl-universe",
+            KernelOwl2RlRuleId::ScmEqc => "scm-eqc",
+            KernelOwl2RlRuleId::RdfsScoTrans => "rdfs11-subClassOf",
+            KernelOwl2RlRuleId::EqSym => "eq-sym",
+            KernelOwl2RlRuleId::EqTrans => "eq-trans",
+            KernelOwl2RlRuleId::EqRepS => "eq-rep-s",
+            KernelOwl2RlRuleId::EqRepP => "eq-rep-p",
+            KernelOwl2RlRuleId::EqRepO => "eq-rep-o",
+            KernelOwl2RlRuleId::ClsInt1 => "cls-int1",
+            KernelOwl2RlRuleId::ClsInt2 => "cls-int2",
+            KernelOwl2RlRuleId::ClsUni => "cls-uni",
+            KernelOwl2RlRuleId::RdfsContainer => "rdfs-container-membership",
+        }
+    }
+
+    pub const fn is_valid(self) -> bool {
+        true
+    }
+
+    /// Minimum number of premises needed to fire this rule. Steps with more
+    /// premises are valid (variable-arity rules such as prp-spo2 and cls-int*).
+    pub const fn min_premise_count(self) -> u8 {
+        match self {
+            KernelOwl2RlRuleId::OwlUniverse => 0,
+            KernelOwl2RlRuleId::ScmEqc | KernelOwl2RlRuleId::EqSym => 1,
+            KernelOwl2RlRuleId::RdfsContainer => 1,
+            KernelOwl2RlRuleId::PrpTrp
+            | KernelOwl2RlRuleId::PrpSpo2
+            | KernelOwl2RlRuleId::ClsHv
+            | KernelOwl2RlRuleId::ClsSvf
+            | KernelOwl2RlRuleId::CaxDwViolation => 3,
+            KernelOwl2RlRuleId::ClsAvf => 4,
+            KernelOwl2RlRuleId::ClsInt1
+            | KernelOwl2RlRuleId::ClsInt2
+            | KernelOwl2RlRuleId::ClsUni => 4,
+            _ => 2,
+        }
+    }
+
+    /// Canonical (minimum) premise count used by parity rows.
+    pub const fn expected_premise_count(self) -> u8 {
+        self.min_premise_count()
+    }
+}
+
+/// Stable numeric tag for a rule (index into `KernelOwl2RlRuleId::ALL`).
+pub const fn kernel_rule_tag(rule: KernelOwl2RlRuleId) -> u8 {
+    let mut i = 0u8;
+    while i < KernelOwl2RlRuleId::ALL.len() as u8 {
+        if KernelOwl2RlRuleId::ALL[i as usize] as u8 == rule as u8 {
+            return i;
+        }
+        i += 1;
+    }
+    255
+}
+
+/// Resolve a numeric rule tag; unknown tags fail closed.
+pub const fn kernel_rule_from_tag(tag: u8) -> Option<KernelOwl2RlRuleId> {
+    if tag < KernelOwl2RlRuleId::ALL.len() as u8 {
+        Some(KernelOwl2RlRuleId::ALL[tag as usize])
+    } else {
+        None
+    }
+}
+
+/// Tag string for an OWL 2 RL rule ID.
+pub const fn owl2rl_rule_tag(rule: KernelOwl2RlRuleId) -> &'static str {
+    rule.as_str()
+}
+
+/// Verification verdict for a single derivation step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelStepVerdict {
+    Valid,
+    InvalidRule,
+    PremiseCountMismatch,
+    InvalidPremises,
+    InvalidConclusion,
+}
+
+impl KernelStepVerdict {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            KernelStepVerdict::Valid => "valid",
+            KernelStepVerdict::InvalidRule => "invalid_rule",
+            KernelStepVerdict::PremiseCountMismatch => "premise_count_mismatch",
+            KernelStepVerdict::InvalidPremises => "invalid_premises",
+            KernelStepVerdict::InvalidConclusion => "invalid_conclusion",
+        }
+    }
+}
+
+/// Verify a single derivation step: rule validity and premise count.
+/// Premise count is checked against the rule's MINIMUM (>=), because rules
+/// such as prp-spo2 and cls-int1 carry a variable number of premises.
+pub const fn verify_derivation_step_structure(
+    rule: KernelOwl2RlRuleId,
+    premise_count: u8,
+) -> KernelStepVerdict {
+    if !rule.is_valid() {
+        return KernelStepVerdict::InvalidRule;
+    }
+    if premise_count < rule.min_premise_count() {
+        return KernelStepVerdict::PremiseCountMismatch;
+    }
+    KernelStepVerdict::Valid
+}
+
+pub const fn step_verdict_tag(v: KernelStepVerdict) -> &'static str {
+    v.as_str()
+}
+
+/// Certificate-chain verification verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelCertVerdict {
+    Valid,
+    UnknownRule,
+    BrokenChain,
+    MissingProof,
+    HashMismatch,
+}
+
+impl KernelCertVerdict {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            KernelCertVerdict::Valid => "valid",
+            KernelCertVerdict::UnknownRule => "unknown_rule",
+            KernelCertVerdict::BrokenChain => "broken_chain",
+            KernelCertVerdict::MissingProof => "missing_proof",
+            KernelCertVerdict::HashMismatch => "hash_mismatch",
+        }
+    }
+}
+
+/// Verify the chain structure of a derivation certificate over fixed [bool;64]
+/// arrays (kept for the 14-rule parity contract). Missing entries are false.
+pub const fn verify_certificate_chain(
+    step_count: u8,
+    rule_validity: &[bool; 64],
+    premise_count_ok: &[bool; 64],
+    chain_continuity: &[bool; 64],
+    all_inferred_have_proof: bool,
+) -> KernelCertVerdict {
+    if !all_inferred_have_proof {
+        return KernelCertVerdict::MissingProof;
+    }
+    // The legacy window is a hard cap: a larger certificate must fail closed
+    // instead of being silently truncated (I1; matches Lean).
+    if step_count > MAX_CERT_STEPS {
+        return KernelCertVerdict::BrokenChain;
+    }
+    let mut i = 0usize;
+    while i < step_count as usize && i < 64 {
+        if !rule_validity[i] {
+            return KernelCertVerdict::UnknownRule;
+        }
+        if !premise_count_ok[i] || !chain_continuity[i] {
+            return KernelCertVerdict::BrokenChain;
+        }
+        i += 1;
+    }
+    KernelCertVerdict::Valid
+}
+
+/// Slice-based chain verification with fail-closed defaults: a missing entry
+/// is false, so a short list cannot silently pass as a complete chain.
+pub const fn verify_certificate_chain_slices(
+    step_count: usize,
+    rule_validity: &[bool],
+    premise_count_ok: &[bool],
+    chain_continuity: &[bool],
+    all_inferred_have_proof: bool,
+) -> KernelCertVerdict {
+    if !all_inferred_have_proof {
+        return KernelCertVerdict::MissingProof;
+    }
+    let mut i = 0usize;
+    while i < step_count {
+        let rv = if i < rule_validity.len() { rule_validity[i] } else { false };
+        let pc = if i < premise_count_ok.len() { premise_count_ok[i] } else { false };
+        let cc = if i < chain_continuity.len() { chain_continuity[i] } else { false };
+        if !rv {
+            return KernelCertVerdict::UnknownRule;
+        }
+        if !pc || !cc {
+            return KernelCertVerdict::BrokenChain;
+        }
+        i += 1;
+    }
+    KernelCertVerdict::Valid
+}
+
+pub const fn cert_verdict_tag(v: KernelCertVerdict) -> &'static str {
+    v.as_str()
+}
+
+/// Maximum number of derivation steps admitted by the legacy 64-step window.
+/// The full certificate verifier has no such cap.
+pub const MAX_CERT_STEPS: u8 = 64;
+
+/// Certificate hash verification result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelHashVerdict {
+    Valid,
+    Mismatch,
+}
+
+impl KernelHashVerdict {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            KernelHashVerdict::Valid => "valid",
+            KernelHashVerdict::Mismatch => "mismatch",
+        }
+    }
+}
+
+pub const fn verify_certificate_hash(expected_hash: u64, actual_hash: u64) -> KernelHashVerdict {
+    if expected_hash == actual_hash {
+        KernelHashVerdict::Valid
+    } else {
+        KernelHashVerdict::Mismatch
+    }
+}
+
+pub const fn hash_verdict_tag(v: KernelHashVerdict) -> &'static str {
+    v.as_str()
+}
+
+/// Verdict for a complete derivation certificate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelCertificateVerdict {
+    Valid,
+    InvalidProfile,
+    DigestMismatch,
+    MissingProof,
+    UnknownRule,
+    PremiseCountMismatch,
+    BrokenChain,
+}
+
+impl KernelCertificateVerdict {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            KernelCertificateVerdict::Valid => "valid",
+            KernelCertificateVerdict::InvalidProfile => "invalid_profile",
+            KernelCertificateVerdict::DigestMismatch => "digest_mismatch",
+            KernelCertificateVerdict::MissingProof => "missing_proof",
+            KernelCertificateVerdict::UnknownRule => "unknown_rule",
+            KernelCertificateVerdict::PremiseCountMismatch => "premise_count_mismatch",
+            KernelCertificateVerdict::BrokenChain => "broken_chain",
+        }
+    }
+}
+
+/// A single step witness handed to the full certificate verifier. The adapter
+/// derives `premises_available` from base-plus-earlier-conclusions; the kernel
+/// validates the rule tag, the premise floor, and the carried chain flag for
+/// EVERY step (no 64-step bypass).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KernelCertificateStep {
+    pub rule_tag: u8,
+    pub premise_count: u8,
+    pub premises_available: bool,
+}
+
+/// Independently verify a complete derivation certificate.
+///
+/// `profile_tag`: 0 = rdfs, 1 = owl-rl; any other value is rejected.
+/// `digest_matches`: true iff the certificate's recorded digest equals a
+/// freshly computed canonical-material digest (computed by the adapter).
+/// `steps`: every derivation step; the full slice is inspected.
+pub const fn verify_derivation_certificate(
+    profile_tag: u8,
+    digest_matches: bool,
+    steps: &[KernelCertificateStep],
+    all_inferred_have_proof: bool,
+) -> KernelCertificateVerdict {
+    if profile_tag > 1 {
+        return KernelCertificateVerdict::InvalidProfile;
+    }
+    if !digest_matches {
+        return KernelCertificateVerdict::DigestMismatch;
+    }
+    if !all_inferred_have_proof {
+        return KernelCertificateVerdict::MissingProof;
+    }
+    let mut i = 0usize;
+    while i < steps.len() {
+        let st = steps[i];
+        match kernel_rule_from_tag(st.rule_tag) {
+            None => return KernelCertificateVerdict::UnknownRule,
+            Some(rule) => {
+                if st.premise_count < rule.min_premise_count() {
+                    return KernelCertificateVerdict::PremiseCountMismatch;
+                }
+            }
+        }
+        if !st.premises_available {
+            return KernelCertificateVerdict::BrokenChain;
+        }
+        i += 1;
+    }
+    KernelCertificateVerdict::Valid
+}
+
 /// Workflow lifecycle stage in the pluggable workflow state machine.
 #[cfg_attr(kani, derive(kani::Arbitrary))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2051,6 +2439,106 @@ pub const fn compute_frontier_leverage_bps(
         raw as u32
     }
 }
+/// The commit evidence a WAL side the engine removed carries (`#228`).
+///
+/// Mirrors [`crate::store::wal_accounting::CommitEvidence`], but the kernel
+/// owns its own copy so it stays dependency-free for Aeneas/Charon extraction
+/// and so the Lean parity rows have a closed input space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelWalCommitEvidence {
+    /// A commit frame was seen in the walk.
+    CommitSeen,
+    /// A sound walk saw no commit frame.
+    NoCommit,
+    /// The WAL carries no checksums, so the walk can prove nothing.
+    Unverifiable,
+    /// The bytes could not be attributed at all.
+    Unreadable,
+}
+
+/// The accounting verdict for a WAL side the engine removed (`#228`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelWalVerdict {
+    /// The WAL ended in an observed `CHECKPOINT` record: the engine applied it
+    /// and only then retired the file.
+    ReplayedObserved,
+    /// The engine applied at least one record before it retired the file.
+    ReplayedInferred,
+    /// A verified walk proved a commit and the WAL is gone: the commit was
+    /// never applied.
+    CommittedLost,
+    /// The bytes cannot prove that nothing was committed.
+    UnknownUnverifiable,
+    /// The bytes could not be attributed.
+    UnknownUnreadable,
+    /// A sound walk held no commit: nothing was lost.
+    NothingCommitted,
+}
+
+/// Decides the accounting verdict for a WAL side the engine removed (`#228`).
+///
+/// The decision order is the recovery funnel's:
+///
+/// 1. an **observed** `CHECKPOINT` record — the engine applied that checkpoint
+///    and only then retired the file, so the WAL was replayed;
+/// 2. an applied-record count of at least one — the engine applied the records
+///    before it retired the file, so the WAL was replayed;
+/// 3. otherwise the commit evidence decides: a *proved* commit that is gone is
+///    a committed loss, an unproved commit or an unverifiable WAL is unknown,
+///    and a sound walk that held no commit lost nothing.
+///
+/// A removed WAL is never a replay without one of the two positive signals,
+/// and the two positive signals always outrank the commit evidence: a WAL the
+/// engine applied is a replay whatever its commit evidence says.
+pub const fn evaluate_removed_wal_verdict(
+    evidence: KernelWalCommitEvidence,
+    commit_proved: bool,
+    checkpoint_observed: bool,
+    applied_at_least_one: bool,
+) -> KernelWalVerdict {
+    if checkpoint_observed {
+        return KernelWalVerdict::ReplayedObserved;
+    }
+    if applied_at_least_one {
+        return KernelWalVerdict::ReplayedInferred;
+    }
+    match evidence {
+        KernelWalCommitEvidence::CommitSeen => {
+            if commit_proved {
+                KernelWalVerdict::CommittedLost
+            } else {
+                KernelWalVerdict::UnknownUnverifiable
+            }
+        }
+        KernelWalCommitEvidence::NoCommit => KernelWalVerdict::NothingCommitted,
+        KernelWalCommitEvidence::Unverifiable => KernelWalVerdict::UnknownUnverifiable,
+        KernelWalCommitEvidence::Unreadable => KernelWalVerdict::UnknownUnreadable,
+    }
+}
+
+/// Tag string for the removed-WAL verdict, matching the Lean parity rows.
+pub const fn removed_wal_verdict_tag(verdict: KernelWalVerdict) -> &'static str {
+    match verdict {
+        KernelWalVerdict::ReplayedObserved => "replayed_observed",
+        KernelWalVerdict::ReplayedInferred => "replayed_inferred",
+        KernelWalVerdict::CommittedLost => "committed_lost",
+        KernelWalVerdict::UnknownUnverifiable => "unknown_unverifiable",
+        KernelWalVerdict::UnknownUnreadable => "unknown_unreadable",
+        KernelWalVerdict::NothingCommitted => "nothing_committed",
+    }
+}
+
+/// Tag string for the removed-WAL commit evidence, matching the Lean parity
+/// rows.
+pub const fn wal_commit_evidence_tag(evidence: KernelWalCommitEvidence) -> &'static str {
+    match evidence {
+        KernelWalCommitEvidence::CommitSeen => "commit_seen",
+        KernelWalCommitEvidence::NoCommit => "no_commit",
+        KernelWalCommitEvidence::Unverifiable => "unverifiable",
+        KernelWalCommitEvidence::Unreadable => "unreadable",
+    }
+}
+
 // Unit tests for formal_kernel.rs – covering classify_epistemic_status, validate_taxonomy_dag, validate_skos_disjointness, compute_epistemic_coverage_bps, realization_status_gap_bps, compute_frontier_leverage_bps
 #[cfg(test)]
 mod tests {

@@ -16,9 +16,23 @@ use crate::task::intake::{
     ListCandidatesRequest, ProvenanceSpan, ResolveCandidateRequest, ReviewState, SourceKind,
 };
 
+/// Deserializes a JSON-RPC request's `id` member while keeping an explicit
+/// JSON `null` distinct from an omitted member. `Option<Value>`'s default
+/// deserializer folds both into `None`, which would classify a request
+/// carrying `"id": null` as a notification and drop its reply; JSON-RPC 2.0
+/// marks a notification by the *absence* of `id`, so an explicit null must
+/// survive as `Some(Value::Null)` and be echoed back.
+fn deserialize_id_explicit_null<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Value::deserialize(deserializer)?))
+}
+
 #[derive(Deserialize)]
 pub struct JsonRpcRequest {
     jsonrpc: String,
+    #[serde(default, deserialize_with = "deserialize_id_explicit_null")]
     pub id: Option<Value>,
     pub method: String,
     pub params: Option<Value>,
@@ -51,6 +65,8 @@ const PARSE_ERROR: i64 = -32700;
 /// The request was JSON-RPC, and answering it failed here rather than at the
 /// far end.
 const INTERNAL_ERROR: i64 = -32603;
+/// The method does not exist on this server.
+const METHOD_NOT_FOUND: i64 = -32601;
 
 /// Appends a daemon-memory advisory to tool-call error text when it matches
 /// known buffer-pool / OOM diagnostics, case-insensitively. Idempotent if the
@@ -124,6 +140,9 @@ pub async fn process_mcp_request(
         "notifications/initialized" => {
             serde_json::json!({})
         }
+        // MCP liveness check: an empty result, not an error.
+        "ping" => serde_json::to_value(JsonRpcResponse::success(id.clone(), serde_json::json!({})))
+            .unwrap_or_else(|_| serde_json::json!({})),
         "tools/list" => {
             let mut result = serde_json::json!({
                 "tools": [
@@ -219,6 +238,48 @@ pub async fn process_mcp_request(
                         }
                     },
                     {
+                        "name": "neurostrata_ingest_bounded",
+                        "description": "Ontology-scoped bounded RDF classification + ingest (Capability F). Classify explicit subject/class/predicate/object candidates against ONLY the governed vocabulary of one domain under a finite query budget, SHACL-validate the emitted graph and the memory payload before ANY write, then commit exactly one batch memory. Fails closed on unsupported classes/predicates, oversized input, or any SHACL violation. Each candidate object is either {\"iri\": \"<absolute-iri>\"} or {\"literal\": {\"value\": \"...\", \"datatype\"?: \"<iri>\", \"language\"?: \"<tag>\"}}. Optional principal drives the ReBAC namespace write gate; reason feeds task-intent signals.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "Target project namespace." },
+                                "domain": { "type": "string", "description": "Governed domain slug; normalized before vocabulary selection." },
+                                "candidates": {
+                                    "type": "array",
+                                    "description": "Explicit classification candidates; non-empty and finite-capped.",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "subject": { "type": "string", "description": "Absolute subject IRI." },
+                                            "class": { "type": "string", "description": "Governed class term from the active ontology profile." },
+                                            "predicate": { "type": "string", "description": "Governed predicate IRI from the active ontology profile." },
+                                            "object": { "type": "object", "description": "Either {\"iri\": \"...\"} or {\"literal\": {\"value\": \"...\"}}." }
+                                        },
+                                        "required": ["subject", "class", "predicate", "object"]
+                                    }
+                                },
+                                "principal": { "type": "string", "description": "ReBAC principal for the namespace write gate (default admin)." },
+                                "user_id": { "type": "string", "description": "Owner id persisted on the batch memory." },
+                                "reason": { "type": "string", "description": "Optional reason; task-intent signals are derived from it." }
+                            },
+                            "required": ["namespace", "domain", "candidates"]
+                        },
+                        "outputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "ok": { "type": "boolean" },
+                                "id": { "type": "string" },
+                                "namespace": { "type": "string" },
+                                "domain": { "type": "string" },
+                                "triple_count": { "type": "integer" },
+                                "turtle": { "type": "string" },
+                                "error": { "type": "string" }
+                            },
+                            "required": ["ok"]
+                        }
+                    },
+                    {
                         "name": "neurostrata_list_namespaces",
                         "description": "List all existing project namespaces in the database. Use this to prevent hallucinating namespace names.",
                         "inputSchema": {
@@ -247,6 +308,7 @@ pub async fn process_mcp_request(
                                 "memory_types": { "type": "array", "items": { "type": "string" }, "description": "Optional list of memory_type values to filter by." },
                                 "fact_shape": { "type": "string", "enum": ["atomic", "composite", "any"], "description": "Filter fact memories by shape ('atomic', 'composite', or 'any')." },
                                 "path_prefix": { "type": "string", "description": "Optional file/location path prefix filter." },
+                                 "project_root": { "type": "string", "description": "Optional project root directory for resolving path_prefix filters." },
                                 "exclude_stale": { "type": "boolean", "default": false, "description": "Exclude memories marked stale." },
                                 "include_code_ast": { "type": "boolean", "default": true, "description": "Include structural code AST memories even when memory_type is not explicitly set to structural." },
                                 "include_archived": { "type": "boolean", "description": "When true, include archived memories in search results." },
@@ -327,6 +389,7 @@ pub async fn process_mcp_request(
                             "properties": {
                                 "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata')." },
                                 "id": { "type": "string", "description": "The seed node: a memory id, a task id, or a qualified file path." },
+                                "project_root": { "type": "string", "description": "Optional checkout root used to resolve file-path seeds before graph traversal." },
                                 "relations": { "type": "array", "items": { "type": "string" }, "description": "Relations to follow: GOVERNS, CONTAINS, RELATES_TO, EXTRACTED_FROM. Default all four." },
                                 "direction": { "type": "string", "enum": ["outgoing", "incoming", "both"], "description": "Traversal direction. Default both." },
                                 "max_hops": { "type": "integer", "description": "Traversal depth. Default 1, max 2." },
@@ -425,6 +488,9 @@ pub async fn process_mcp_request(
                                 "namespace": { "type": "string", "description": "The exact project name." },
                                 "assignee": { "type": "string", "description": "Who is doing the work (the agent or operator name)." },
                                 "session_id": { "type": "string", "description": "Unique id of this session; the exclusivity check compares it against the holder's." },
+                                "worktree": { "type": "string", "description": "Optional caller worktree path for strict push-gate scoping." },
+                                "branch": { "type": "string", "description": "Optional caller git branch for strict push-gate scoping." },
+                                "project_root": { "type": "string", "description": "Optional caller project root path used to capture worktree and branch scope." },
                                 "event_id": { "type": "string", "description": "Optional idempotency event ID for the claim receipt." },
                             },
                             "required": ["id", "namespace", "assignee", "session_id"]
@@ -626,15 +692,120 @@ pub async fn process_mcp_request(
                         "inputSchema": {
                             "type": "object",
                             "properties": {
-                                "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata')." },
+                                "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata'; runtime defaults to 'global' if omitted on direct handler calls)." },
                                 "principal": { "type": "string", "description": "Optional requested principal." },
                                 "args": {
                                     "type": "object",
-                                    "description": "Connector operation arguments with 'operation' field.",
-                                    "properties": {
-                                        "operation": { "type": "string", "description": "Connector operation (list_connectors, describe_pool, register_pointer, list_pointers, resolve_pointer, apply_effect, mediate)." }
-                                    },
-                                    "required": ["operation"]
+                                    "description": "Connector operation arguments discriminated by 'operation'; each variant declares its own required fields. Omitting 'now_secs' defaults it to the current epoch. Runtime also accepts extra fields not listed here.",
+                                    "oneOf": [
+                                        {
+                                            "type": "object",
+                                            "properties": {
+                                                "operation": { "const": "list_connectors", "description": "List every registered connector id." }
+                                            },
+                                            "required": ["operation"]
+                                        },
+                                        {
+                                            "type": "object",
+                                            "properties": {
+                                                "operation": { "const": "list_pointers", "description": "List visible data pointers (retired pointers are omitted)." }
+                                            },
+                                            "required": ["operation"]
+                                        },
+                                        {
+                                            "type": "object",
+                                            "properties": {
+                                                "operation": { "const": "describe_pool", "description": "Describe one pool's schema on a connector." },
+                                                "pool_id": { "type": "string", "description": "Pool to describe." },
+                                                "connector_id": { "type": "string", "description": "Registered connector id (from list_connectors)." }
+                                            },
+                                            "required": ["operation", "pool_id", "connector_id"]
+                                        },
+                                        {
+                                            "type": "object",
+                                            "properties": {
+                                                "operation": { "const": "register_pointer", "description": "Register a data pointer under ReBAC + pre-gate enforcement." },
+                                                "record": {
+                                                    "type": "object",
+                                                    "description": "The DataPointerRecord to register.",
+                                                    "properties": {
+                                                        "pointer_id": { "type": "string", "description": "Stable pointer id." },
+                                                        "connector_id": { "type": "string", "description": "Owning connector id." },
+                                                        "pool_id": { "type": "string", "description": "Pool the pointer lives in." },
+                                                        "pointer_uri": { "type": "string", "description": "Connector-facing uri of the entity." },
+                                                        "entity_type": { "type": "string", "description": "Pool entity type." },
+                                                        "expected_source_sha256": { "type": ["string", "null"], "description": "Optional expected source digest for write-back CAS." },
+                                                        "captured_at_secs": { "type": "integer", "minimum": 0, "description": "u64 epoch seconds when the pointer was captured." },
+                                                        "max_staleness_secs": { "type": "integer", "minimum": 0, "description": "u64 seconds before the pointer is considered stale." }
+                                                    },
+                                                    "required": ["pointer_id", "connector_id", "pool_id", "pointer_uri", "entity_type", "captured_at_secs", "max_staleness_secs"]
+                                                }
+                                            },
+                                            "required": ["operation", "record"]
+                                        },
+                                        {
+                                            "type": "object",
+                                            "properties": {
+                                                "operation": { "const": "resolve_pointer", "description": "Resolve a bounded data slice from a pointer." },
+                                                "req": {
+                                                    "type": "object",
+                                                    "description": "The DataSliceRequest to resolve.",
+                                                    "properties": {
+                                                        "pointer_id": { "type": "string", "description": "Pointer to resolve." },
+                                                        "offset": { "type": "integer", "minimum": 0, "maximum": 4294967295u64, "description": "u32 zero-based row offset." },
+                                                        "limit": { "type": "integer", "minimum": 0, "maximum": 4294967295u64, "description": "u32 maximum rows to return." },
+                                                        "max_bytes": { "type": "integer", "minimum": 0, "maximum": 4294967295u64, "description": "u32 maximum serialized payload bytes." }
+                                                    },
+                                                    "required": ["pointer_id", "offset", "limit", "max_bytes"]
+                                                },
+                                                "now_secs": { "type": ["integer", "null"], "minimum": 0, "description": "Optional u64 epoch seconds for staleness checks; omitted => current epoch." }
+                                            },
+                                            "required": ["operation", "req"]
+                                        },
+                                        {
+                                            "type": "object",
+                                            "properties": {
+                                                "operation": { "const": "apply_effect", "description": "Apply an external effect through the connector (write-back)." },
+                                                "req": {
+                                                    "type": "object",
+                                                    "description": "The ExternalEffectRequest to apply.",
+                                                    "properties": {
+                                                        "pointer_id": { "type": "string", "description": "Pointer whose entity the effect targets." },
+                                                        "operation": { "type": "string", "description": "Connector-side operation name (e.g. 'append')." },
+                                                        "payload": { "description": "JSON value of any shape; the connector interprets it." },
+                                                        "action_receipt_id": { "type": "string", "description": "Action receipt id recording this effect." },
+                                                        "expected_source_sha256": { "type": ["string", "null"], "description": "Optional expected prior source digest for CAS." },
+                                                        "idempotency_key": { "type": "string", "description": "Client-supplied idempotency key." }
+                                                    },
+                                                    "required": ["pointer_id", "operation", "payload", "action_receipt_id", "idempotency_key"]
+                                                },
+                                                "now_secs": { "type": ["integer", "null"], "minimum": 0, "description": "Optional u64 epoch seconds for staleness checks; omitted => current epoch." }
+                                            },
+                                            "required": ["operation", "req"]
+                                        },
+                                        {
+                                            "type": "object",
+                                            "properties": {
+                                                "operation": { "const": "mediate", "description": "Run the workflow transition gate, then resolve a bounded slice." },
+                                                "from_stage": { "type": "string", "description": "Origin workflow stage; runtime matches case-insensitively: unpreflighted, contextloaded, claimed, mutating, breathrequired, precheckpoint, prepublish, completed." },
+                                                "to_stage": { "type": "string", "description": "Target workflow stage; same case-insensitive stage names as from_stage." },
+                                                "slice_req": {
+                                                    "type": "object",
+                                                    "description": "The DataSliceRequest resolved after the gate.",
+                                                    "properties": {
+                                                        "pointer_id": { "type": "string", "description": "Pointer to resolve." },
+                                                        "offset": { "type": "integer", "minimum": 0, "maximum": 4294967295u64, "description": "u32 zero-based row offset." },
+                                                        "limit": { "type": "integer", "minimum": 0, "maximum": 4294967295u64, "description": "u32 maximum rows to return." },
+                                                        "max_bytes": { "type": "integer", "minimum": 0, "maximum": 4294967295u64, "description": "u32 maximum serialized payload bytes." }
+                                                    },
+                                                    "required": ["pointer_id", "offset", "limit", "max_bytes"]
+                                                },
+                                                "gate_passed": { "type": ["boolean", "null"], "description": "Optional gate precondition; runtime defaults to false when omitted or null." },
+                                                "now_secs": { "type": ["integer", "null"], "minimum": 0, "description": "Optional u64 epoch seconds for staleness checks; omitted => current epoch." }
+                                            },
+                                            "required": ["operation", "from_stage", "to_stage", "slice_req"]
+                                        }
+                                    ]
                                 }
                             },
                             "required": ["namespace", "args"]
@@ -689,6 +860,21 @@ pub async fn process_mcp_request(
                                 "namespace": { "type": "string", "description": "The exact project name." }
                             },
                             "required": ["id", "namespace"]
+                        }
+                    },
+                    {
+                        "name": "neurostrata_vault_sync",
+                        "description": "Bidirectional W3C YAML-LD 1.0 / Vault-LD Markdown vault sync with Open JSON Canvas 1.0 topology export. action='export' writes one Markdown note per readable memory plus a Canvas file; action='import' walks the vault, converts Vault-LD notes to memories, and stores them only after secret-scan and SHACL pass. Unresolved WikiLinks become stub notes (stub:true). Read access follows ReBAC can_read_memory for the caller's principal: admin always passes, owners always pass, rows without an ACL are readable, restricted rows need a matching ACL entry.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "action": { "type": "string", "enum": ["export", "import"], "description": "Sync direction. Defaults to 'export'." },
+                                "namespace": { "type": "string", "description": "The exact project name." },
+                                "vault_path": { "type": "string", "description": "Directory of the Markdown vault. Must resolve under the caller's J6 boundary (daemon startup root or allowlist on HTTP; process cwd on CLI/MCP)." },
+                                "output_dir": { "type": "string", "description": "Directory for generated artifacts (export only). Defaults to vault_path." },
+                                "principal": { "type": "string", "description": "ReBAC principal for read filtering (export)." }
+                            },
+                            "required": ["vault_path"]
                         }
                     },
                     {
@@ -1042,7 +1228,7 @@ pub async fn process_mcp_request(
                                 "namespace": { "type": "string", "description": "Project namespace." },
                                 "action": {
                                     "type": "string",
-                                    "enum": ["create", "stage_memory", "stage_twin", "apply_action", "evaluate_sparql", "diff", "commit", "drop", "list"],
+                                    "enum": ["create", "stage_memory", "stage_twin", "apply_action", "evaluate_sparql", "diff", "plan_ontology_diff", "commit", "drop", "list"],
                                     "description": "Scenario operation to perform."
                                 },
                                 "scenario_id": { "type": "string", "description": "Scenario ID (optional on create, required on stage_memory/stage_twin/apply_action/evaluate_sparql/diff/commit/drop)." },
@@ -1077,6 +1263,9 @@ pub async fn process_mcp_request(
                                 "query": { "type": "string", "description": "SPARQL SELECT/ASK/CONSTRUCT query when action is 'evaluate_sparql'." },
                                 "format": { "type": "string", "enum": ["json", "xml", "csv", "tsv"], "default": "json", "description": "SPARQL result format when action is 'evaluate_sparql'." },
                                 "compare_to_scenario_id": { "type": "string", "description": "Optional second scenario ID for side-by-side diff (defaults to comparing against live)." },
+                                "add_turtle": { "type": "string", "description": "Turtle/N-Quads additions staged in the ephemeral sandbox when action is 'plan_ontology_diff'." },
+                                "retract_triples": { "type": "array", "items": { "type": "string" }, "description": "Canonical N-Triple/N-Quad patterns retracted in the sandbox when action is 'plan_ontology_diff'." },
+                                "candidate_shacl_turtle": { "type": "string", "description": "Replacement SHACL shapes Turtle validated against the post-image when action is 'plan_ontology_diff'." },
                                 "enforce_shacl_on_commit": { "type": "boolean", "default": true, "description": "Reject commit if staged rows have SHACL violations (default true)." },
                                 "principal": { "type": "string", "description": "Optional requested principal (honored only for admin callers)." }
                             },
@@ -1161,6 +1350,7 @@ pub async fn process_mcp_request(
                                 "query_kind": { "type": "string", "enum": ["sparql", "lexical", "ast_calls"], "description": "Custom insight query kind ('sparql', 'lexical', or 'ast_calls')." },
                                 "query": { "type": "string", "description": "Custom insight query string (SPARQL SELECT, lexical query, or called symbol name)." },
                                 "path_prefix": { "type": "string", "description": "Optional file/directory path prefix filter for lexical or ast_calls insights." },
+                                 "project_root": { "type": "string", "description": "Optional project root directory for resolving path_prefix filters." },
                                 "from_ts": { "type": "integer", "description": "Optional start unix timestamp (seconds) for series query or bitemporal backfill." },
                                 "to_ts": { "type": "integer", "description": "Optional end unix timestamp (seconds) for series query or bitemporal backfill." },
                                 "backfill_points": { "type": "integer", "description": "Optional number of bitemporal as_of backfill steps across [from_ts, to_ts] (2..=64)." },
@@ -1423,6 +1613,10 @@ pub async fn process_mcp_request(
                                 }
                             }
                         }
+                        "neurostrata_ingest_bounded" => {
+                            result_text =
+                                handle_ingest_bounded(&arguments, emb.clone(), store.clone()).await;
+                        }
                         "neurostrata_search_memory" => {
                             result_text =
                                 handle_search_memory(arguments, emb.clone(), store.clone()).await;
@@ -1605,6 +1799,16 @@ pub async fn process_mcp_request(
                         "neurostrata_validate_shapes" => {
                             result_text = handle_validate_shapes(arguments, store.clone()).await;
                         }
+                        "neurostrata_vault_sync" => {
+                            result_text = crate::vault_ld::vault_sync::handle_vault_sync(
+                                &arguments,
+                                store.clone(),
+                                emb.clone(),
+                                None,
+                                None,
+                            )
+                            .await;
+                        }
                         "neurostrata_export_canonical_rdf" => {
                             result_text =
                                 handle_export_canonical_rdf(&arguments, store.clone()).await;
@@ -1741,12 +1945,8 @@ pub async fn process_mcp_request(
                             .await;
                         }
                         "neurostrata_data_connector" => {
-                            result_text = handle_data_connector(
-                                &arguments,
-                                store.clone(),
-                                bus.clone(),
-                            )
-                            .await;
+                            result_text =
+                                handle_data_connector(&arguments, store.clone(), bus.clone()).await;
                         }
                         // SynapticMesh: the handler is a pure string-in/
                         // string-out dispatch (filesystem + git only; no
@@ -1803,7 +2003,23 @@ pub async fn process_mcp_request(
                                 })
                                 .and_then(|v| v.as_str())
                                 .unwrap_or(name);
-                            crate::task::record_graph_query(&store, ns, name, hint).await;
+                            let caller_root = args_ref
+                                .and_then(|a| {
+                                    a.get("project_root")
+                                        .or_else(|| a.get("worktree"))
+                                        .or_else(|| a.get("cwd"))
+                                })
+                                .and_then(|v| v.as_str())
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty());
+                            crate::task::record_graph_query_with_root(
+                                &store,
+                                ns,
+                                name,
+                                hint,
+                                caller_root,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -1853,7 +2069,16 @@ pub async fn process_mcp_request(
                 })
             })
         }
-        _ => serde_json::json!({}),
+        // A method this server does not implement (Claude Code probes with
+        // `server/discover`) gets a JSON-RPC error carrying the request's id,
+        // so the client stops waiting at once. A notification (no id) is never
+        // answered: `handle_mcp` drops the reply.
+        _ => serde_json::to_value(JsonRpcResponse::failure(
+            id.clone(),
+            METHOD_NOT_FOUND,
+            format!("Method not found: {}", request.method),
+        ))
+        .unwrap_or_else(|_| serde_json::json!({})),
     }
 }
 
@@ -1862,18 +2087,31 @@ pub(crate) async fn handle_data_connector(
     store: Arc<dyn VectorStore>,
     bus: Arc<crate::events::ThalamicBus>,
 ) -> String {
+    // Validate present namespace/principal: must be a non-blank string without surrounding whitespace
+    if let Some(ns) = arguments.get("namespace") {
+        match ns.as_str() {
+            None => return serde_json::json!({"ok": false, "error": "namespace must be a string"}).to_string(),
+            Some(s) if s.trim().is_empty() => return serde_json::json!({"ok": false, "error": "namespace must not be blank"}).to_string(),
+            Some(s) if s.trim() != s => return serde_json::json!({"ok": false, "error": "namespace must not have leading or trailing whitespace"}).to_string(),
+            _ => {}
+        }
+    }
+    if let Some(pr) = arguments.get("principal") {
+        match pr.as_str() {
+            None => return serde_json::json!({"ok": false, "error": "principal must be a string"}).to_string(),
+            Some(s) if s.trim().is_empty() => return serde_json::json!({"ok": false, "error": "principal must not be blank"}).to_string(),
+            Some(s) if s.trim() != s => return serde_json::json!({"ok": false, "error": "principal must not have leading or trailing whitespace"}).to_string(),
+            _ => {}
+        }
+    }
     let namespace = arguments
         .get("namespace")
         .and_then(|v| v.as_str())
-        .filter(|s| !s.trim().is_empty())
         .unwrap_or("global");
     let Some(args) = arguments.get("args") else {
         return serde_json::json!({"ok": false, "error": "args object required"}).to_string();
     };
-    let principal = arguments
-        .get("principal")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.trim().is_empty());
+    let principal = arguments.get("principal").and_then(|v| v.as_str());
     let workspace_root = crate::daemon::resolve_project_root();
     let kernel = crate::kernel::AgentKernel::new(store.clone(), bus.clone(), workspace_root);
     match kernel
@@ -1882,6 +2120,101 @@ pub(crate) async fn handle_data_connector(
     {
         Ok(value) => serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()),
         Err(e) => serde_json::json!({"ok": false, "error": e.to_string()}).to_string(),
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod context_plan_benchmark_instrumentation {
+    use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Mutex;
+
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    static REGISTRY_ROOT_READS: AtomicU64 = AtomicU64::new(0);
+    static STORE_MEMORY_MULTIFORM_OPS: AtomicU64 = AtomicU64::new(0);
+    static AST_FORM_QUERIES: AtomicU64 = AtomicU64::new(0);
+    static BRIDGE_ENRICHMENT_PASSES: AtomicU64 = AtomicU64::new(0);
+    static LOGICAL_FILES_ENRICHED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+    pub(crate) struct DisableOnDrop;
+
+    impl Drop for DisableOnDrop {
+        fn drop(&mut self) {
+            ENABLED.store(false, Ordering::Relaxed);
+            reset_counts();
+        }
+    }
+
+    fn reset_counts() {
+        REGISTRY_ROOT_READS.store(0, Ordering::Relaxed);
+        STORE_MEMORY_MULTIFORM_OPS.store(0, Ordering::Relaxed);
+        AST_FORM_QUERIES.store(0, Ordering::Relaxed);
+        BRIDGE_ENRICHMENT_PASSES.store(0, Ordering::Relaxed);
+        LOGICAL_FILES_ENRICHED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    pub(crate) fn enable() -> DisableOnDrop {
+        reset_counts();
+        ENABLED.store(true, Ordering::Relaxed);
+        DisableOnDrop
+    }
+
+    pub(crate) fn begin_request() {
+        reset_counts();
+    }
+
+    pub(crate) fn record_registry_root_read() {
+        if ENABLED.load(Ordering::Relaxed) {
+            REGISTRY_ROOT_READS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_store_memory_multiform_op() {
+        if ENABLED.load(Ordering::Relaxed) {
+            STORE_MEMORY_MULTIFORM_OPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_ast_form_query() {
+        if ENABLED.load(Ordering::Relaxed) {
+            AST_FORM_QUERIES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_bridge_enrichment_pass() {
+        if ENABLED.load(Ordering::Relaxed) {
+            BRIDGE_ENRICHMENT_PASSES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_logical_file_enriched(path: &str) {
+        if ENABLED.load(Ordering::Relaxed) {
+            LOGICAL_FILES_ENRICHED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(crate::parser::ingest::normalize_node_path(path));
+        }
+    }
+
+    pub(crate) fn logical_files_enriched() -> BTreeSet<String> {
+        LOGICAL_FILES_ENRICHED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn snapshot() -> serde_json::Value {
+        let logical_files_enriched = logical_files_enriched().len();
+        serde_json::json!({
+            "registry_root_reads_per_request": REGISTRY_ROOT_READS.load(Ordering::Relaxed),
+            "store_memory_multiform_ops_per_request": STORE_MEMORY_MULTIFORM_OPS.load(Ordering::Relaxed),
+            "ast_form_queries_per_request": AST_FORM_QUERIES.load(Ordering::Relaxed),
+            "bridge_enrichment_passes_per_request": BRIDGE_ENRICHMENT_PASSES.load(Ordering::Relaxed),
+            "logical_files_enriched_per_request": logical_files_enriched,
+        })
     }
 }
 
@@ -1906,18 +2239,35 @@ async fn handle_context_plan(
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let file_path = arguments.get("file_path").and_then(|v| v.as_str());
+    // Dedupe requested work at construction time by the same normalized path
+    // key the lookup/form layer uses, keeping first-seen order and the caller's
+    // original spelling for the synthetic source item below.
     let requested_files: Vec<String> = {
         let mut v: Vec<String> = Vec::new();
+        let mut seen_norm: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut push_dedup = |raw: &str| {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return;
+            }
+            let key = crate::parser::ingest::normalize_node_path(trimmed);
+            let dedup_key = if key.is_empty() {
+                trimmed.to_string()
+            } else {
+                key
+            };
+            if seen_norm.insert(dedup_key) {
+                v.push(raw.to_string());
+            }
+        };
         if let Some(fp) = file_path {
-            v.push(fp.to_string());
+            push_dedup(fp);
         }
         for key in ["files", "file_paths"] {
             if let Some(Value::Array(arr)) = arguments.get(key) {
                 for it in arr {
                     if let Some(s) = it.as_str() {
-                        if !s.is_empty() && !v.iter().any(|e| e == s) {
-                            v.push(s.to_string());
-                        }
+                        push_dedup(s);
                     }
                 }
             }
@@ -2064,44 +2414,101 @@ async fn handle_context_plan(
     // hits governing each requested file path and surface them as plan items.
     // `unsupported` backends still yield a plan -- just without this half.
     {
-        use crate::traits::GraphRead;
         let ladybug = crate::traits::VectorStore::as_any(store.as_ref())
             .downcast_ref::<crate::store::LadybugStore>();
         if let Some(ls) = ladybug {
-            for fp in &requested_files {
-                match ls
-                    .memories_for_file(
+            if !requested_files.is_empty() {
+                // One registry read per request, shared by every logical file.
+                // lookup_path_for would re-read it on each requested file.
+                let registry_root_read = crate::registry::cached_project_root(&store, effective_ns)
+                    .await
+                    .map_err(|e| e.to_string());
+                let default_memory_types =
+                    crate::graph_read::memories_for_file::DEFAULT_MEMORY_TYPES
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<String>>();
+                let mut seen_logical_files: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                for fp in &requested_files {
+                    // Same resolution as neurostrata_memories_for_file, but
+                    // against the hoisted registry root. An absolute spelling
+                    // therefore reaches the same relative locations as its
+                    // relative twin and is recognized as the same logical file.
+                    let registry_root = match registry_root_for_lookup(
+                        registry_root_read
+                            .as_ref()
+                            .cloned()
+                            .map_err(|e| anyhow::anyhow!("{e}")),
                         effective_ns,
-                        None,
                         fp,
                         None,
+                    ) {
+                        Ok(root) => root,
+                        Err(e) => {
+                            had_backend_error = true;
+                            tracing::warn!("context_plan path lookup error: {e:#}");
+                            continue;
+                        }
+                    };
+                    let (lookup, forms) =
+                        match lookup_path_with_registry_root(fp, None, registry_root.as_deref()) {
+                            Ok(found) => found,
+                            Err(e) => {
+                                had_backend_error = true;
+                                tracing::warn!("context_plan path lookup error: {e:#}");
+                                continue;
+                            }
+                        };
+                    let logical_key = {
+                        let norm = crate::parser::ingest::normalize_node_path(&lookup.path);
+                        if norm.is_empty() {
+                            lookup.path.clone()
+                        } else {
+                            norm
+                        }
+                    };
+                    if !seen_logical_files.insert(logical_key) {
+                        continue;
+                    }
+                    match memories_for_forms(
+                        ls,
+                        effective_ns,
+                        None,
+                        &forms,
+                        None,
                         true,
-                        &crate::graph_read::memories_for_file::DEFAULT_MEMORY_TYPES
-                            .iter()
-                            .map(|s| s.to_string())
-                            .collect::<Vec<String>>(),
+                        &default_memory_types,
                         &[],
                         max_items.max(1),
                     )
                     .await
-                {
-                    Ok(hits) => {
-                        for hit in hits {
-                            if items.iter().any(|it| it.id == hit.id) {
-                                continue;
+                    {
+                        Ok(retrieval) => {
+                            let hits = retrieval.hits;
+                            #[cfg(test)]
+                            if !hits.is_empty() {
+                                context_plan_benchmark_instrumentation::record_logical_file_enriched(
+                                    &lookup.path,
+                                );
                             }
-                            items.push(ContextItem {
-                                id: hit.id,
-                                memory_type: hit.memory_type,
-                                content: hit.content,
-                                freshness: None,
-                            });
+                            for hit in hits {
+                                if items.iter().any(|it| it.id == hit.id) {
+                                    continue;
+                                }
+                                items.push(ContextItem {
+                                    id: hit.id,
+                                    memory_type: hit.memory_type,
+                                    content: hit.content,
+                                    freshness: None,
+                                });
+                            }
                         }
-                    }
-                    Err(e) => {
-                        had_backend_error = true;
-                        tracing::warn!("context_plan backend error: {e}");
-                        continue;
+                        Err(e) => {
+                            had_backend_error = true;
+                            tracing::warn!("context_plan backend error: {e}");
+                            continue;
+                        }
                     }
                 }
             }
@@ -2317,6 +2724,48 @@ fn proxy_client() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
+/// The MCP proxy runs in the harness process, so `std::env::current_dir()` is
+/// the caller's worktree. Stamp it onto `tools/call` arguments that carry no
+/// explicit root, so downstream task handlers attribute the call to the right
+/// worktree instead of the daemon's global checkout.
+fn inject_proxy_caller_cwd(request: &Value, caller_cwd: Option<&std::path::Path>) -> Value {
+    let is_tools_call = request
+        .get("method")
+        .and_then(|v| v.as_str())
+        == Some("tools/call");
+    let (Some(cwd_path), true) = (caller_cwd, is_tools_call) else {
+        return request.clone();
+    };
+    let Some(args) = request
+        .get("params")
+        .and_then(|p| p.get("arguments"))
+        .and_then(|v| v.as_object())
+    else {
+        return request.clone();
+    };
+    let has_explicit_root = ["cwd", "worktree", "project_root"].iter().any(|key| {
+        args.get(*key)
+            .and_then(|v| v.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
+    });
+    if has_explicit_root {
+        return request.clone();
+    }
+    let mut out = request.clone();
+    if let Some(obj) = out
+        .get_mut("params")
+        .and_then(|p| p.get_mut("arguments"))
+        .and_then(|v| v.as_object_mut())
+    {
+        obj.insert(
+            "cwd".to_string(),
+            serde_json::json!(cwd_path.to_string_lossy()),
+        );
+    }
+    out
+}
+
 /// One forwarding attempt: POST the JSON-RPC request to the daemon's
 /// /mcp endpoint with the proxy client. The startup-wait loop in
 /// `start_mcp_proxy` retries this on connect errors while the daemon is
@@ -2336,7 +2785,8 @@ async fn forward_mcp_request(
     request: &Value,
 ) -> reqwest::Result<reqwest::Response> {
     let token = crate::daemon::read_token_file("daemon.token");
-    let mut attempt = client.post(url).json(request);
+    let payload = inject_proxy_caller_cwd(request, std::env::current_dir().ok().as_deref());
+    let mut attempt = client.post(url).json(&payload);
     if let Some(token) = token {
         if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token)) {
             attempt = attempt.header(reqwest::header::AUTHORIZATION, val);
@@ -2474,6 +2924,414 @@ pub async fn start_mcp_proxy(origin: DaemonOrigin) -> io::Result<()> {
     Ok(())
 }
 
+/// How a file lookup reads `path`, and every spelling to query the store with
+/// (see `crate::paths::to_project_relative` and `crate::paths::lookup_forms`).
+/// An absolute path is made relative to the caller's `project_root`, the
+/// namespace's registered root, or the nearest `.git` ancestor; a relative one
+/// is also tried joined onto a known root, for memories stored with absolute
+/// paths. Stored memories are read as they are, never rewritten. Fails only
+/// when the registered root cannot be read and nothing else constrains an
+/// absolute path (see [`registry_root_for_lookup`]).
+async fn lookup_path_for(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    path: &str,
+    project_root: Option<&str>,
+) -> anyhow::Result<(crate::paths::LookupPath, Vec<String>)> {
+    let registry_root = registry_root_for_lookup(
+        crate::registry::cached_project_root(store, namespace).await,
+        namespace,
+        path,
+        project_root,
+    )?;
+    Ok(lookup_path_with_registry_root(
+        path,
+        project_root,
+        registry_root.as_deref(),
+    )?)
+}
+
+fn lookup_path_with_registry_root(
+    path: &str,
+    project_root: Option<&str>,
+    registry_root: Option<&str>,
+) -> Result<(crate::paths::LookupPath, Vec<String>), crate::paths::UnresolvablePathError> {
+    let resolved = crate::paths::resolve_in_scope_forms(
+        path,
+        project_root,
+        registry_root,
+        crate::paths::PathResolutionScope::File,
+    )?;
+    Ok((resolved.lookup, resolved.forms))
+}
+
+/// The registered root to resolve `path` with, given the result of reading it.
+/// A failed read is not a miss: with no root at all, an absolute path falls
+/// back to the nearest `.git`, which may be another repository. So when the
+/// read fails and the caller supplied no `project_root` to constrain that
+/// fallback, an absolute path is an error. A relative path, or one the
+/// caller's root constrains, goes on without the registered root; that can
+/// only find less, and the failure is logged.
+fn registry_root_for_lookup(
+    read: anyhow::Result<Option<String>>,
+    namespace: &str,
+    path: &str,
+    project_root: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    match read {
+        Ok(root) => Ok(root),
+        Err(e) if project_root.is_none() && crate::paths::is_absolute_any(path) => {
+            Err(e.context(format!(
+                "could not read the registered project root of namespace '{namespace}', so the absolute path cannot be placed in this project; retry, or pass project_root"
+            )))
+        }
+        Err(e) => {
+            tracing::warn!(
+                "registered project root of '{namespace}' could not be read; resolving {path:?} without it: {e:#}"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Merge one lookup result per spelling into a single answer. A spelling that
+/// succeeded with zero rows is still an answer, so the first error surfaces
+/// only when no spelling succeeded. With more than one spelling the hits are
+/// ranked with `rank_hits`, deduplicated by id (best-ranked kept) and cut to
+/// `limit` (also capped at `MAX_LIMIT`).
+///
+/// Retained for its unit tests; multi-form merging now lives in the store.
+#[cfg_attr(not(test), allow(dead_code))]
+fn merge_spelling_results(
+    results: Vec<anyhow::Result<Vec<crate::graph_read::memories_for_file::MemoryHit>>>,
+    limit: usize,
+) -> anyhow::Result<Vec<crate::graph_read::memories_for_file::MemoryHit>> {
+    let multiple = results.len() > 1;
+    let mut hits = Vec::new();
+    let mut any_success = false;
+    let mut first_error = None;
+    for result in results {
+        match result {
+            Ok(batch) => {
+                any_success = true;
+                hits.extend(batch);
+            }
+            Err(e) => {
+                first_error.get_or_insert(e);
+            }
+        }
+    }
+    if !any_success {
+        if let Some(e) = first_error {
+            return Err(e);
+        }
+    }
+    if multiple {
+        crate::graph_read::memories_for_file::rank_hits(&mut hits);
+        let mut seen = std::collections::HashSet::new();
+        hits.retain(|h| seen.insert(h.id.clone()));
+        // Each spelling's query is capped at MAX_LIMIT; the merge must be too.
+        hits.truncate(limit.min(crate::graph_read::memories_for_file::MAX_LIMIT));
+    }
+    Ok(hits)
+}
+
+/// `memories_for_file` over every spelling in `forms`, as one logical query:
+/// the store collects raw candidates per spelling, merges/ranks/dedups them
+/// globally, caps to `limit`, and enriches bridges exactly once.
+#[allow(clippy::too_many_arguments)]
+async fn memories_for_forms(
+    store: &crate::store::LadybugStore,
+    namespace: &str,
+    source: Option<&str>,
+    forms: &[String],
+    symbol: Option<&str>,
+    include_ancestors: bool,
+    memory_types: &[String],
+    exclude_ids: &[String],
+    limit: usize,
+) -> anyhow::Result<crate::store::ladybug::MultiFormMemoryRetrieval> {
+    store
+        .memories_for_file_forms(
+            namespace,
+            source,
+            forms,
+            symbol,
+            include_ancestors,
+            memory_types,
+            exclude_ids,
+            limit,
+        )
+        .await
+}
+
+/// Union of AST neighborhood results across all equivalent path spellings.
+#[derive(Debug, Clone)]
+struct AstNeighborhoodUnion {
+    related_memories: Vec<serde_json::Value>,
+    ast_summary: serde_json::Value,
+}
+
+/// Deterministically merge the per-form AST neighborhood results. Every
+/// spelling contributes; truncation is preserved rather than being mistaken
+/// for "this spelling found nothing".
+fn merge_ast_neighborhood_results(
+    results: Vec<anyhow::Result<(Vec<serde_json::Value>, serde_json::Value)>>,
+) -> anyhow::Result<AstNeighborhoodUnion> {
+    const AST_COLLECTIONS: [&str; 5] = ["symbols", "callers", "callees", "imports", "importers"];
+
+    fn item_key(item: &serde_json::Value, collection: &str) -> String {
+        if collection == "imports" {
+            if let Some(path) = item
+                .get("path")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                return format!("path:{path}");
+            }
+            if let Some(path) = item.get("path") {
+                return format!("path-json:{path}");
+            }
+            return format!("json:{item}");
+        }
+        if let Some(id) = item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            return format!("id:{id}");
+        }
+        let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let relation = item
+            .get("relation")
+            .and_then(|v| v.as_str())
+            .or_else(|| item.get("kind").and_then(|v| v.as_str()))
+            .unwrap_or("");
+        let path = item.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        let start = item.get("start_line").and_then(|v| v.as_u64()).unwrap_or(0);
+        let end = item.get("end_line").and_then(|v| v.as_u64()).unwrap_or(0);
+        if name.is_empty() && relation.is_empty() && path.is_empty() && start == 0 && end == 0 {
+            return format!("json:{item}");
+        }
+        format!("tuple:{name}|{relation}|{path}|{start}|{end}")
+    }
+
+    let max_related = crate::store::LadybugStore::MAX_RELATED_MEMORIES;
+    let related_byte_budget = crate::store::LadybugStore::MAX_NEIGHBORHOOD_RESPONSE_BYTES / 2;
+    let max_items = crate::store::LadybugStore::MAX_AST_COLLECTION_ITEMS;
+
+    let mut any_success = false;
+    let mut first_error: Option<String> = None;
+    let mut merged_related: Vec<serde_json::Value> = Vec::new();
+    let mut seen_related: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut related_bytes: usize = 0;
+    let mut related_memories_truncated = false;
+    let mut related_stop = false;
+    let mut truncated = false;
+    let mut truncated_set: std::collections::HashSet<&'static str> =
+        std::collections::HashSet::new();
+    let mut count_includes_symbols = false;
+
+    // Pass 1: union related memories and fold per-form metadata/flags.
+    for result in &results {
+        match result.as_ref() {
+            Ok((related, summary)) => {
+                any_success = true;
+                if !related_stop {
+                    for item in related {
+                        let key = format!(
+                            "{}\u{1f}{}\u{1f}{}\u{1f}{}",
+                            item.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+                            item.get("relation").and_then(|v| v.as_str()).unwrap_or(""),
+                            item.get("direction").and_then(|v| v.as_str()).unwrap_or(""),
+                            item.get("supersedes")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                        );
+                        if seen_related.contains(&key) {
+                            continue;
+                        }
+                        let entry_bytes =
+                            serde_json::to_string(item).map(|s| s.len()).unwrap_or(128);
+                        if merged_related.len() >= max_related
+                            || (!merged_related.is_empty()
+                                && related_bytes + entry_bytes > related_byte_budget)
+                        {
+                            related_memories_truncated = true;
+                            related_stop = true;
+                            break;
+                        }
+                        seen_related.insert(key);
+                        related_bytes += entry_bytes;
+                        merged_related.push(item.clone());
+                    }
+                }
+                if summary
+                    .get("related_memories_truncated")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    related_memories_truncated = true;
+                }
+                if summary
+                    .get("truncated")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    truncated = true;
+                }
+                if let Some(names) = summary
+                    .get("truncated_collections")
+                    .and_then(|v| v.as_array())
+                {
+                    for name in names {
+                        if let Some(name) = name.as_str() {
+                            truncated = true;
+                            if let Some(canonical) =
+                                AST_COLLECTIONS.iter().find(|candidate| **candidate == name)
+                            {
+                                truncated_set.insert(*canonical);
+                            }
+                        }
+                    }
+                }
+                let form_symbols = summary
+                    .get("symbols")
+                    .and_then(|v| v.as_array())
+                    .map_or(0, |a| a.len());
+                let form_neighbors: usize = ["callers", "callees", "imports", "importers"]
+                    .iter()
+                    .map(|key| {
+                        summary
+                            .get(*key)
+                            .and_then(|v| v.as_array())
+                            .map_or(0, |a| a.len())
+                    })
+                    .sum();
+                let form_blast_radius = summary
+                    .get("blast_radius_count")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
+                if form_symbols > 0 && form_blast_radius == form_symbols + form_neighbors {
+                    count_includes_symbols = true;
+                }
+            }
+            Err(e) => {
+                if first_error.is_none() {
+                    first_error = Some(e.to_string());
+                }
+            }
+        }
+    }
+
+    if !any_success {
+        return Err(match first_error {
+            Some(message) => anyhow::anyhow!(message),
+            None => anyhow::anyhow!("no AST forms provided"),
+        });
+    }
+
+    // Pass 2: union the canonical AST collections under the remaining budget.
+    let ast_byte_budget =
+        crate::store::LadybugStore::MAX_NEIGHBORHOOD_RESPONSE_BYTES.saturating_sub(related_bytes);
+    let mut buckets: Vec<Vec<serde_json::Value>> =
+        AST_COLLECTIONS.iter().map(|_| Vec::new()).collect();
+    let mut seen_items: Vec<std::collections::HashSet<String>> = AST_COLLECTIONS
+        .iter()
+        .map(|_| std::collections::HashSet::new())
+        .collect();
+    let mut collection_full: Vec<bool> = vec![false; AST_COLLECTIONS.len()];
+    let mut ast_bytes: usize = 0;
+
+    for result in &results {
+        let Ok((_, summary)) = result.as_ref() else {
+            continue;
+        };
+        for (index, name) in AST_COLLECTIONS.iter().enumerate() {
+            if collection_full[index] {
+                continue;
+            }
+            let Some(items) = summary.get(*name).and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for entry in items {
+                let key = item_key(entry, name);
+                if seen_items[index].contains(&key) {
+                    continue;
+                }
+                let entry_bytes = serde_json::to_string(entry).map(|s| s.len()).unwrap_or(64);
+                if buckets[index].len() >= max_items
+                    || (!buckets[index].is_empty() && ast_bytes + entry_bytes > ast_byte_budget)
+                {
+                    truncated = true;
+                    truncated_set.insert(*name);
+                    collection_full[index] = true;
+                    break;
+                }
+                seen_items[index].insert(key);
+                ast_bytes += entry_bytes;
+                buckets[index].push(entry.clone());
+            }
+        }
+    }
+
+    let truncated_collections: Vec<&str> = AST_COLLECTIONS
+        .iter()
+        .copied()
+        .filter(|name| truncated_set.contains(name))
+        .collect();
+    let union_neighbors = buckets[1].len() + buckets[2].len() + buckets[3].len() + buckets[4].len();
+    let blast_radius_count = if count_includes_symbols {
+        buckets[0].len() + union_neighbors
+    } else {
+        union_neighbors
+    };
+    let symbols = std::mem::take(&mut buckets[0]);
+    let callers = std::mem::take(&mut buckets[1]);
+    let callees = std::mem::take(&mut buckets[2]);
+    let imports = std::mem::take(&mut buckets[3]);
+    let importers = std::mem::take(&mut buckets[4]);
+    let ast_summary = serde_json::json!({
+        "symbols": symbols,
+        "callers": callers,
+        "callees": callees,
+        "imports": imports,
+        "importers": importers,
+        "blast_radius_count": blast_radius_count,
+        "truncated": truncated,
+        "truncated_collections": truncated_collections,
+        "related_memories_truncated": related_memories_truncated,
+    });
+
+    Ok(AstNeighborhoodUnion {
+        related_memories: merged_related,
+        ast_summary,
+    })
+}
+
+/// Query every equivalent path spelling and union their AST neighborhoods.
+async fn ast_neighborhood_for_forms(
+    store: &crate::store::LadybugStore,
+    namespace: &str,
+    source: Option<&str>,
+    forms: &[String],
+    governing_ids: &[String],
+) -> anyhow::Result<AstNeighborhoodUnion> {
+    let mut results = Vec::with_capacity(forms.len());
+    for form in forms {
+        #[cfg(test)]
+        context_plan_benchmark_instrumentation::record_ast_form_query();
+        let res = store
+            .ast_neighborhood_for_file(namespace, source, form, governing_ids)
+            .await;
+        if let Err(e) = &res {
+            tracing::warn!("ast_neighborhood_for_file lookup of {form:?} failed: {e}");
+        }
+        results.push(res);
+    }
+    merge_ast_neighborhood_results(results)
+}
+
 /// The `neurostrata_memories_for_file` handler. Returns a JSON object carrying
 /// `memories` (possibly empty) and `unsupported` -- an explicit flag, because a
 /// backend without graph-read must never be mistaken for "no rules apply".
@@ -2493,9 +3351,21 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
     // Direct invocations of handle_memories_for_file also record the
     // touched file path in `.NeuroStrata/session_queries.json` and bump
     // `graph_queries_count` on the active in_progress task.
-    let _ =
-        crate::task::record_graph_query(&store, &namespace, "neurostrata_memories_for_file", path)
-            .await;
+    let caller_root = arguments
+        .get("project_root")
+        .or_else(|| arguments.get("worktree"))
+        .or_else(|| arguments.get("cwd"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let _ = crate::task::record_graph_query_with_root(
+        &store,
+        &namespace,
+        "neurostrata_memories_for_file",
+        path,
+        caller_root,
+    )
+    .await;
 
     let symbol = arguments.get("symbol").and_then(|s| s.as_str());
     let include_ancestors = arguments
@@ -2529,10 +3399,37 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
     // therefore the active generation) the query resolves against -- the same
     // key ingestion derives from the directory it walks. Absent a root, the
     // store falls back to the most recently published generation.
-    let source: Option<String> = arguments
-        .get("project_root")
-        .and_then(|p| p.as_str())
-        .map(|root| crate::parser::ingest::source_key_for(std::path::Path::new(root)));
+    let project_root = arguments.get("project_root").and_then(|p| p.as_str());
+    let source: Option<String> =
+        project_root.map(|root| crate::parser::ingest::source_key_for(std::path::Path::new(root)));
+
+    // Stored locations are relative; hooks send the absolute path of the file
+    // being touched. The root found here only relativizes the path -- it is
+    // never used as `source`, so a worktree that was never ingested cannot pin
+    // an empty generation.
+    let (lookup, forms) = match lookup_path_for(&store, &namespace, path, project_root).await {
+        Ok(found) => found,
+        Err(e) => {
+            let graph_read = crate::traits::VectorStore::as_any(store.as_ref())
+                .downcast_ref::<crate::store::LadybugStore>()
+                .is_some();
+            let mut response = serde_json::json!({
+                "memories": [],
+                "unsupported": !graph_read,
+                "path": path,
+                "error": format!("{e:#}"),
+            });
+            if e.downcast_ref::<crate::paths::UnresolvablePathError>()
+                .is_some()
+            {
+                response["resolved_path"] = serde_json::Value::String(path.to_string());
+                response["resolved_from"] =
+                    serde_json::json!(crate::paths::RootSource::Outside.as_str());
+            }
+            return response.to_string();
+        }
+    };
+    let original_path = path;
 
     // The graph-read capability is optional per backend: only LadybugStore
     // implements it (spec §4.6). Anything else answers `unsupported` -- never
@@ -2543,48 +3440,77 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
         return serde_json::json!({
             "memories": [],
             "unsupported": true,
-            "path": path,
+            "path": original_path,
         })
         .to_string();
     };
 
-    match store
-        .memories_for_file(
-            &namespace,
-            source.as_deref(),
-            path,
-            symbol,
-            include_ancestors,
-            &memory_types,
-            &exclude_ids,
-            limit,
-        )
-        .await
+    match memories_for_forms(
+        store,
+        &namespace,
+        source.as_deref(),
+        &forms,
+        symbol,
+        include_ancestors,
+        &memory_types,
+        &exclude_ids,
+        limit,
+    )
+    .await
     {
-        Ok(hits) => {
+        Ok(retrieval) => {
+            let hits = retrieval.hits;
+            // Capability C: attach the shared deprecation/boundary presentation
+            // to every governed-memory row before it leaves this surface.
+            // MemoryHit is a typed struct; decorate its serialized form so the
+            // structured fields appear in the JSON answer without changing the
+            // ranking struct.
+            let mut memory_values: Vec<serde_json::Value> = Vec::with_capacity(hits.len());
+            for hit in &hits {
+                let mut value = serde_json::to_value(hit).unwrap_or(serde_json::Value::Null);
+                crate::rdf::provenance::attach_presentation(&mut value, &hit.metadata, "content");
+                memory_values.push(value);
+            }
             let hit_ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
             let mut response = serde_json::json!({
-                "memories": hits,
+                "memories": memory_values,
                 "unsupported": false,
-                "path": path,
+                "path": original_path,
             });
+            if retrieval.candidate_truncated {
+                response["candidate_truncated"] = serde_json::json!(true);
+            }
+            // An absolute path says what it was looked up as, so a miss on a
+            // file outside every known root is visible rather than silent.
+            if lookup.source != crate::paths::RootSource::Relative {
+                response["resolved_path"] = serde_json::Value::String(lookup.path.clone());
+                response["resolved_from"] = serde_json::json!(lookup.source.as_str());
+            }
             let include_ast_edges = arguments
                 .get("include_ast_edges")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
             if include_ast_edges {
-                match store
-                    .ast_neighborhood_for_file(&namespace, source.as_deref(), path, &hit_ids)
-                    .await
+                match ast_neighborhood_for_forms(
+                    store,
+                    &namespace,
+                    source.as_deref(),
+                    &forms,
+                    &hit_ids,
+                )
+                .await
                 {
-                    Ok((related_memories, ast_summary)) => {
+                    Ok(AstNeighborhoodUnion {
+                        related_memories,
+                        ast_summary,
+                    }) => {
                         let related_truncated = ast_summary
                             .get("related_memories_truncated")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
                         let excluded: std::collections::HashSet<&str> =
                             exclude_ids.iter().map(String::as_str).collect();
-                        let filtered: Vec<serde_json::Value> = related_memories
+                        let mut filtered: Vec<serde_json::Value> = related_memories
                             .into_iter()
                             .filter(|m| {
                                 m.get("id")
@@ -2593,6 +3519,20 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
                                     .unwrap_or(true)
                             })
                             .collect();
+                        // Capability C: AST neighbors are recall material too.
+                        // Decorate each surviving entry from its own bounded
+                        // metadata so a deprecated/bounded neighbor cannot be
+                        // read as authoritative guidance. Clone the metadata
+                        // first to avoid aliasing the mutable entry.
+                        for entry in &mut filtered {
+                            let metadata = entry
+                                .get("metadata")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null);
+                            crate::rdf::provenance::attach_presentation(
+                                entry, &metadata, "content",
+                            );
+                        }
                         response["related_memories"] = serde_json::Value::Array(filtered);
                         response["related_memories_truncated"] =
                             serde_json::Value::Bool(related_truncated);
@@ -2611,11 +3551,38 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
         Err(e) => serde_json::json!({
             "memories": [],
             "unsupported": false,
-            "path": path,
+            "path": original_path,
             "error": e.to_string(),
         })
         .to_string(),
     }
+}
+
+#[cfg(test)]
+static RELATED_TRAVERSAL_COUNTER: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn reset_related_traversal_counter_for_tests() {
+    RELATED_TRAVERSAL_COUNTER.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn related_traversal_counter_for_tests() -> usize {
+    RELATED_TRAVERSAL_COUNTER.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Whether a `related` seed names a file path (and so needs canonical
+/// resolution before traversal) rather than a memory/task id. Qualified ids
+/// and symbol ids (`a::b`) are never file paths.
+fn is_file_path_seed(seed: &str) -> bool {
+    if crate::paths::is_absolute_any(seed) {
+        return true;
+    }
+    if seed.contains("::") || seed.starts_with("file:") {
+        return false;
+    }
+    seed.contains('/') || seed.contains('\\')
 }
 
 /// The `neurostrata_related` handler. Returns the bounded traversal result plus
@@ -2632,7 +3599,10 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
         Some(n) => n,
         None => return "Missing 'id' parameter.".to_string(),
     };
+    let original_seed = seed;
     let namespace = resolve_namespace(&store, namespace).await;
+    let store_for_meta = store.clone();
+    let project_root = arguments.get("project_root").and_then(|v| v.as_str());
 
     let relations: Vec<String> = match arguments.get("relations") {
         Some(Value::Array(arr)) => arr
@@ -2709,15 +3679,100 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
             "total": 0,
             "truncated": false,
             "unsupported": true,
-            "seed": seed,
+            "seed": original_seed,
         })
         .to_string();
     };
 
+    // A file-path seed is resolved to one canonical node id before traversal,
+    // so an absolute spelling and its relative spelling reach the same subgraph.
+    // Every failure below is fail closed: the traversal is never entered.
+    let mut traversal_seed = original_seed.to_string();
+    let mut resolved_seed_opt: Option<String> = None;
+    if is_file_path_seed(original_seed) {
+        let registry_root =
+            match crate::registry::cached_project_root(&store_for_meta, &namespace).await {
+                Ok(root) => root,
+                Err(e) => {
+                    return serde_json::json!({
+                        "nodes": [],
+                        "edges": [],
+                        "evidence": [],
+                        "total": 0,
+                        "truncated": false,
+                        "unsupported": false,
+                        "seed": original_seed,
+                        "error": e.to_string(),
+                    })
+                    .to_string();
+                }
+            };
+        let forms = match lookup_path_with_registry_root(
+            original_seed,
+            project_root,
+            registry_root.as_deref(),
+        ) {
+            Ok((_, forms)) => forms,
+            Err(e) => {
+                return serde_json::json!({
+                    "nodes": [],
+                    "edges": [],
+                    "evidence": [],
+                    "total": 0,
+                    "truncated": false,
+                    "unsupported": false,
+                    "seed": original_seed,
+                    "error": e.to_string(),
+                })
+                .to_string();
+            }
+        };
+        match store
+            .resolve_canonical_file_seed_id(&namespace, &forms)
+            .await
+        {
+            Ok(Some(canonical_id)) => {
+                traversal_seed = canonical_id.clone();
+                resolved_seed_opt = Some(canonical_id);
+            }
+            Ok(None) => {
+                return serde_json::json!({
+                    "nodes": [],
+                    "edges": [],
+                    "evidence": [],
+                    "total": 0,
+                    "truncated": false,
+                    "unsupported": false,
+                    "seed": original_seed,
+                    "error": format!(
+                        "unresolvable file seed '{original_seed}': no matching node in namespace '{namespace}'"
+                    ),
+                })
+                .to_string();
+            }
+            Err(e) => {
+                return serde_json::json!({
+                    "nodes": [],
+                    "edges": [],
+                    "evidence": [],
+                    "total": 0,
+                    "truncated": false,
+                    "unsupported": false,
+                    "seed": original_seed,
+                    "error": e.to_string(),
+                })
+                .to_string();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    RELATED_TRAVERSAL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
     match store
         .related(
             &namespace,
-            seed,
+            &traversal_seed,
             &relations,
             direction,
             max_hops,
@@ -2752,7 +3807,7 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
                     }
                 }
                 result.nodes.retain(|node| {
-                    if node.id == seed {
+                    if node.id == traversal_seed {
                         return true;
                     }
                     paths
@@ -2778,7 +3833,7 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
                     // the stored endpoints, so an incoming edge (`other -->
                     // seed`) has `target == seed`; keying by the last edge's
                     // target would mis-attribute the reached node.
-                    let mut cur = seed.to_string();
+                    let mut cur = traversal_seed.clone();
                     let chain: Vec<String> = evidence
                         .path
                         .iter()
@@ -2796,7 +3851,7 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
                     relations.insert(cur, chain);
                 }
                 // The seed itself is a direct match with no relation chain.
-                relations.entry(seed.to_string()).or_default();
+                relations.entry(traversal_seed.clone()).or_default();
                 let items: Vec<crate::graph_read::prioritized::RelatedItem> = result
                     .nodes
                     .iter()
@@ -2820,9 +3875,32 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
             }
 
             let mut body = serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);
+            // Capability C: traversal nodes carry a snippet but no metadata.
+            // Hydrate just the presentation fields so related/recall exposes the
+            // same banner and negative boundary as search and file lookup.
+            if let Some(nodes) = body
+                .get_mut("nodes")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for node in nodes {
+                    let Some(id) = node.get("id").and_then(serde_json::Value::as_str) else {
+                        continue;
+                    };
+                    if let Ok(Some((_, payload))) = store_for_meta.get(&namespace, id).await {
+                        crate::rdf::provenance::attach_presentation(
+                            node,
+                            &payload.metadata,
+                            "snippet",
+                        );
+                    }
+                }
+            }
             if let Some(obj) = body.as_object_mut() {
                 obj.insert("unsupported".to_string(), serde_json::json!(false));
-                obj.insert("seed".to_string(), serde_json::json!(seed));
+                obj.insert("seed".to_string(), serde_json::json!(original_seed));
+                if let Some(ref resolved) = resolved_seed_opt {
+                    obj.insert("resolved_seed".to_string(), serde_json::json!(resolved));
+                }
                 if apply_temporal {
                     obj.insert(
                         "temporal_filter".to_string(),
@@ -2884,7 +3962,7 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
                         })
                         .collect();
                     let closure = crate::graph_read::related::closure_governs(
-                        seed,
+                        &traversal_seed,
                         &edges,
                         &crate::graph_read::related::QueryBudget::default(),
                     );
@@ -2907,7 +3985,7 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
             "total": 0,
             "truncated": false,
             "unsupported": false,
-            "seed": seed,
+            "seed": original_seed,
             "error": e.to_string(),
         })
         .to_string(),
@@ -4384,7 +5462,37 @@ async fn handle_get_snapshot(
     } else {
         None
     };
-    let project_root = project_root_arg.clone().or(cached_root);
+    // The root used for hygiene/session-file writes prefers the caller's own
+    // worktree/cwd over the cached registry root. project_root_arg itself is
+    // kept separate above so an injected cwd never overwrites the registry's
+    // durable project_root via cache_project_root.
+    let project_root = project_root_arg
+        .clone()
+        .or_else(|| {
+            arguments
+                .get("worktree")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    crate::task::resolve_session_root_dir(std::path::Path::new(s))
+                        .to_string_lossy()
+                        .into_owned()
+                })
+        })
+        .or_else(|| {
+            arguments
+                .get("cwd")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    crate::task::resolve_session_root_dir(std::path::Path::new(s))
+                        .to_string_lossy()
+                        .into_owned()
+                })
+        })
+        .or(cached_root);
 
     // Cache an explicitly-provided project_root into the registry row (best-effort).
     if let Some(pr) = &project_root_arg {
@@ -4478,23 +5586,49 @@ async fn handle_get_snapshot(
         None => true,
         Some(v) => v.is_null() || (v.as_i64().unwrap_or(0) > now),
     });
+    // Capability C: advisory freshness SLA scan over ALL active visible rows,
+    // computed before the top-5 truncation. Never blocks anything.
+    let stale_memory_rows = crate::task::gate::stale_memory_violations(&all_memories, now);
+    let stale_section = if stale_memory_rows.is_empty() {
+        String::new()
+    } else {
+        let mut section = String::from(
+            "### Advisory stale_memories (nonblocking — re-verify or supersede these rows):",
+        );
+        for row in &stale_memory_rows {
+            section.push_str(&format!("\n  - {} [{}]: {}", row.id, row.kind, row.detail));
+        }
+        section
+    };
     // Computed off the pre-truncation list too: global and pinned Golden Rules
     // must surface regardless of whether they made the top-5 by access_count.
     let golden_rules =
         crate::task::collect_golden_rules(&store, namespace, Some(&all_memories)).await;
     let golden_section = crate::task::format_golden_rules_section(&golden_rules);
     if let Some(root_str) = &inferred_root {
+        let is_active = |m: &SearchResult| {
+            m.payload.memory_type == "task"
+                && m.payload
+                    .metadata
+                    .get("task")
+                    .and_then(|t| t.get("status"))
+                    .and_then(|v| v.as_str())
+                    == Some("in_progress")
+        };
+        let matches_root = |m: &SearchResult| {
+            m.payload
+                .metadata
+                .get("task")
+                .and_then(|t| t.get("worktree"))
+                .and_then(|v| v.as_str())
+                == Some(root_str.as_str())
+        };
+        // A task attributed to this worktree wins over an arbitrary in_progress
+        // task from a different worktree/session.
         let active_task = all_memories
             .iter()
-            .find(|m| {
-                m.payload.memory_type == "task"
-                    && m.payload
-                        .metadata
-                        .get("task")
-                        .and_then(|t| t.get("status"))
-                        .and_then(|v| v.as_str())
-                        == Some("in_progress")
-            })
+            .find(|m| is_active(m) && matches_root(m))
+            .or_else(|| all_memories.iter().find(|m| is_active(m)))
             .map(|m| (m.id.as_str(), &m.payload));
         crate::task::persist_active_session_file(
             std::path::Path::new(root_str),
@@ -4954,7 +6088,22 @@ async fn handle_get_snapshot(
     let body = if all_memories.is_empty() {
         format!("No active memories found for namespace: {}", namespace)
     } else {
-        serde_json::to_string_pretty(&all_memories)
+        // Capability C: snapshot rows carry the same structured presentation
+        // and prepended banner as search/file/related rows.
+        let mut rows: Vec<serde_json::Value> = all_memories
+            .iter()
+            .filter_map(|r| serde_json::to_value(r).ok())
+            .collect();
+        for (row, source) in rows.iter_mut().zip(all_memories.iter()) {
+            if let Some(payload) = row.get_mut("payload") {
+                crate::rdf::provenance::attach_presentation(
+                    payload,
+                    &source.payload.metadata,
+                    "content",
+                );
+            }
+        }
+        serde_json::to_string_pretty(&rows)
             .map_err(|e| format!("Internal serialization error: {}", e))?
     };
     // Communities (N) section (§5.6): render when communities exist.
@@ -5121,6 +6270,9 @@ async fn handle_get_snapshot(
     }
     if !taxonomy_section.is_empty() {
         parts.push(taxonomy_section);
+    }
+    if !stale_section.is_empty() {
+        parts.push(stale_section);
     }
     if let Some(dr) = &doctor_report {
         parts.push(dr.clone());
@@ -5328,6 +6480,153 @@ async fn handle_validate_shapes(arguments: Value, store: Arc<dyn VectorStore>) -
         }
         Ok(None) => serde_json::json!({"ok":false,"error":"memory not found"}).to_string(),
         Err(e) => serde_json::json!({"ok":false,"error":e.to_string()}).to_string(),
+    }
+}
+
+/// Capability F MCP surface: strict, fail-closed bounded classification ingest.
+/// No permissive opt-out — every request passes the ReBAC namespace write gate,
+/// finite budget, governed-vocabulary checks and whole-batch SHACL validation
+/// before the single store write.
+async fn handle_ingest_bounded(
+    arguments: &Value,
+    emb: Arc<dyn Embedder>,
+    store: Arc<dyn VectorStore>,
+) -> String {
+    use crate::rdf::ingest::{
+        ingest_bounded_classification, BoundedClassificationRequest, CandidateLiteral,
+        CandidateObject, ClassificationCandidate,
+    };
+    use crate::traits::VectorStore as _;
+
+    let namespace_raw = arguments
+        .get("namespace")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if namespace_raw.trim().is_empty() {
+        return json!({"ok": false, "error": "namespace required"}).to_string();
+    }
+    let domain_raw = arguments
+        .get("domain")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if domain_raw.trim().is_empty() {
+        return json!({"ok": false, "error": "domain required"}).to_string();
+    }
+    let candidates_val = match arguments.get("candidates") {
+        Some(Value::Array(a)) => a,
+        _ => return json!({"ok": false, "error": "candidates must be an array"}).to_string(),
+    };
+
+    let namespace = resolve_namespace(&store, namespace_raw).await;
+    let Some(lb) = crate::traits::VectorStore::as_any(store.as_ref())
+        .downcast_ref::<crate::store::LadybugStore>()
+    else {
+        return json!({"ok": false, "error": "bounded ingest requires the graph store"})
+            .to_string();
+    };
+
+    // ReBAC namespace write gate. The MCP path has no separate authenticated
+    // channel; "admin" is the harness principal and an explicit client
+    // principal is resolved through the same path as the taxonomy surface.
+    let effective = crate::rebac::resolve_principal(
+        "admin",
+        arguments.get("principal").and_then(|v| v.as_str()),
+    );
+    if !crate::rebac::can_write_namespace(lb, &namespace, Some(&effective)) {
+        return json!({
+            "ok": false,
+            "error": format!("write denied for principal {effective:?} on namespace {namespace:?}")
+        })
+        .to_string();
+    }
+
+    let mut candidates = Vec::with_capacity(candidates_val.len());
+    for candidate in candidates_val {
+        let subject = candidate.get("subject").and_then(|v| v.as_str());
+        let class = candidate.get("class").and_then(|v| v.as_str());
+        let predicate = candidate.get("predicate").and_then(|v| v.as_str());
+        let (Some(subject), Some(class), Some(predicate)) = (subject, class, predicate) else {
+            return json!({
+                "ok": false,
+                "error": "each candidate needs subject, class, predicate and object"
+            })
+            .to_string();
+        };
+        let object_val = candidate.get("object");
+        let object = if let Some(iri) = object_val
+            .and_then(|o| o.get("iri"))
+            .and_then(|v| v.as_str())
+        {
+            CandidateObject::Iri(iri.to_string())
+        } else {
+            let literal = object_val.and_then(|o| o.get("literal"));
+            let Some(value) = literal
+                .and_then(|l| l.get("value"))
+                .and_then(|v| v.as_str())
+            else {
+                return json!({
+                    "ok": false,
+                    "error": "object must be {\"iri\": \"...\"} or {\"literal\": {\"value\": \"...\"}}"
+                })
+                .to_string();
+            };
+            CandidateObject::Literal(CandidateLiteral {
+                value: value.to_string(),
+                datatype: literal
+                    .and_then(|l| l.get("datatype"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                language: literal
+                    .and_then(|l| l.get("language"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+            })
+        };
+        candidates.push(ClassificationCandidate {
+            subject: subject.to_string(),
+            class: class.to_string(),
+            predicate: predicate.to_string(),
+            object,
+        });
+    }
+
+    let user_id = arguments
+        .get("user_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or(effective.as_str())
+        .to_string();
+    let request = BoundedClassificationRequest {
+        domain: domain_raw.to_string(),
+        user_id,
+        candidates,
+        reason: arguments
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+    };
+
+    // Refresh so classification sees the current SHACL shapes/ontology.
+    lb.refresh_ontology(&namespace).await;
+    let index = lb.get_ontology(&namespace);
+    let budget = crate::rdf::ontology::QueryBudget {
+        max_ms: 5_000,
+        max_nodes: 10_000,
+    };
+
+    match ingest_bounded_classification(lb, &namespace, &index, &budget, &request, emb.as_ref())
+        .await
+    {
+        Ok(outcome) => json!({
+            "ok": true,
+            "id": outcome.id,
+            "namespace": namespace,
+            "domain": crate::domain::normalize_domain_slug(domain_raw)
+                .unwrap_or_else(|| domain_raw.to_string()),
+            "triple_count": outcome.triple_count,
+            "turtle": outcome.turtle,
+        })
+        .to_string(),
+        Err(err) => json!({"ok": false, "error": err.to_string()}).to_string(),
     }
 }
 
@@ -6629,8 +7928,42 @@ pub(crate) fn handle_storage_status_from_config() -> String {
         .as_ref()
         .map(|c| std::path::PathBuf::from(c.db_path.clone()))
         .unwrap_or_else(|| std::path::PathBuf::from(".NeuroStrata/db"));
-    let status = crate::storage::compute_storage_status(&db_path, &hygiene_cfg);
+    path_only_storage_status(&db_path, &hygiene_cfg)
+}
+
+/// The path-only `storage status` body (#196, #212): every field comes from
+/// the filesystem and the store-state sidecar, and no store is opened.
+///
+/// Split from [`handle_storage_status_from_config`] so the CLI's dispatch can
+/// be exercised against a fixture store without resolving (or creating) the
+/// operator's config file. This is also the surface that reports the
+/// persisted `last_recovery` history, as opposed to [`live_store_status`].
+pub(crate) fn path_only_storage_status(
+    db_path: &std::path::Path,
+    hygiene_cfg: &crate::storage::snapshot::StorageHygieneConfig,
+) -> String {
+    let status = crate::storage::compute_storage_status(db_path, hygiene_cfg);
     crate::procmem::status_with_process_memory(&status)
+}
+
+/// The live-store composition of a status (#212).
+///
+/// A live handle owns `opened_via_recovery` and its kind, and owns them
+/// *exclusively*: the sidecar's `last_recovery` is history, and it must not
+/// make a verified live store look degraded — a health check on a healthy
+/// daemon must not alarm because the store recovered last week. The
+/// path-only surface ([`path_only_storage_status`]) is the one that reports
+/// that history.
+pub(crate) fn live_store_status(
+    status: crate::storage::snapshot::StorageStatus,
+    opened_via_recovery: bool,
+    recovery_kind: Option<&str>,
+) -> crate::storage::snapshot::StorageStatus {
+    crate::storage::snapshot::StorageStatus {
+        opened_via_recovery,
+        recovery_provenance: recovery_kind.map(str::to_string),
+        ..status
+    }
 }
 
 pub(crate) async fn handle_storage_status(store: Arc<dyn VectorStore>) -> String {
@@ -6650,15 +7983,11 @@ pub(crate) async fn handle_storage_status(store: Arc<dyn VectorStore>) -> String
         .downcast_ref::<crate::store::LadybugStore>()
     {
         let status = crate::storage::compute_storage_status(ls.local_path(), &hygiene_cfg);
-        let status = crate::storage::snapshot::StorageStatus {
+        let status = live_store_status(
+            status,
             opened_via_recovery,
-            recovery_provenance: ls
-                .open_provenance()
-                .recovery_kind_slug()
-                .map(str::to_string)
-                .or(status.recovery_provenance),
-            ..status
-        };
+            ls.open_provenance().recovery_kind_slug(),
+        );
         return crate::procmem::status_with_process_memory(&status);
     }
     let db_path = cfg
@@ -6666,10 +7995,7 @@ pub(crate) async fn handle_storage_status(store: Arc<dyn VectorStore>) -> String
         .map(|c| std::path::PathBuf::from(c.db_path.clone()))
         .unwrap_or_else(|| std::path::PathBuf::from(".NeuroStrata/db"));
     let status = crate::storage::compute_storage_status(&db_path, &hygiene_cfg);
-    let status = crate::storage::snapshot::StorageStatus {
-        opened_via_recovery: opened_via_recovery || status.opened_via_recovery,
-        ..status
-    };
+    let status = live_store_status(status, opened_via_recovery, None);
     crate::procmem::status_with_process_memory(&status)
 }
 
@@ -7378,6 +8704,59 @@ pub(crate) async fn handle_scenario_with_auth(
                 .to_string(),
             }
         }
+        "plan_ontology_diff" => {
+            let scenario_id = arguments
+                .get("scenario_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string);
+            let add_turtle = arguments
+                .get("add_turtle")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let retract_triples: Vec<String> = arguments
+                .get("retract_triples")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let candidate_shacl_turtle = arguments
+                .get("candidate_shacl_turtle")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let request = crate::rdf::ontology::OntologyPlanRequest {
+                namespace: namespace.clone(),
+                scenario_id,
+                add_turtle,
+                retract_triples,
+                candidate_shacl_turtle,
+            };
+            match crate::rdf::scenario::plan_ontology_diff(
+                lb_store,
+                &namespace,
+                &request,
+                security.requested_principal.as_deref(),
+            )
+            .await
+            {
+                Ok(report) => serde_json::json!({
+                    "ok": true,
+                    "action": "plan_ontology_diff",
+                    "namespace": namespace,
+                    "plan": report,
+                })
+                .to_string(),
+                Err(e) => serde_json::json!({
+                    "ok": false,
+                    "action": "plan_ontology_diff",
+                    "error": e,
+                })
+                .to_string(),
+            }
+        }
         "commit" => {
             let Some(scenario_id) = arguments
                 .get("scenario_id")
@@ -7745,6 +9124,10 @@ pub(crate) async fn handle_insights_with_auth(
             .map(|s| s.to_string()),
         path_prefix: arguments
             .get("path_prefix")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        project_root: arguments
+            .get("project_root")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
         from_ts: arguments.get("from_ts").and_then(|v| v.as_i64()),
@@ -9405,7 +10788,8 @@ async fn handle_search_memory(
     // Upgraded SearchFilters (src/search.rs). Optional: defaults preserve
     // existing search behavior (include_code_ast defaults to true so searches
     // that match code_ast rows keep working unless explicitly disabled).
-    let search_filters = crate::search::SearchFilters {
+    let project_root = arguments.get("project_root").and_then(|v| v.as_str());
+    let mut search_filters = crate::search::SearchFilters {
         memory_types: arguments
             .get("memory_types")
             .and_then(|v| v.as_array())
@@ -9423,6 +10807,7 @@ async fn handle_search_memory(
             .get("path_prefix")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
+        path_prefix_forms: Vec::new(),
         exclude_stale: arguments
             .get("exclude_stale")
             .and_then(|v| v.as_bool())
@@ -9432,9 +10817,34 @@ async fn handle_search_memory(
             .and_then(|v| v.as_bool())
             .unwrap_or(true),
     };
+    if let Some(raw_prefix) = arguments
+        .get("path_prefix")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let registry_root = match crate::registry::cached_project_root(&store, namespace).await {
+            Ok(root) => root,
+            Err(e) => {
+                return format!(
+                    "ERROR [PATH_PREFIX]: failed to read namespace registry root for '{namespace}': {e}"
+                )
+            }
+        };
+        let prefix_forms = match crate::paths::prefix_lookup_forms(
+            raw_prefix,
+            project_root,
+            registry_root.as_deref(),
+        ) {
+            Ok(forms) => forms,
+            Err(e) => return format!("ERROR [PATH_PREFIX]: {e}"),
+        };
+        search_filters.path_prefix_forms = prefix_forms;
+    }
     let has_upgraded_filters = !search_filters.memory_types.is_empty()
         || search_filters.fact_shape.is_some()
         || search_filters.path_prefix.is_some()
+        || !search_filters.path_prefix_forms.is_empty()
         || search_filters.exclude_stale
         || !search_filters.include_code_ast;
     // domains filter (OR) - thread into search_with_domain? Store filters by domains already via `domain` param.
@@ -10271,7 +11681,13 @@ pub(crate) fn format_memory(id: &str, payload: &MemoryPayload) -> String {
     if let Some(note) = governance_conflict_note(&payload.content, &payload.metadata) {
         out.push_str(&note);
     }
-    out
+    // Capability C: deprecated/bounded rows announce themselves before any
+    // other line so stale guidance cannot be read as authoritative first.
+    format!(
+        "{}{}",
+        crate::rdf::provenance::presentation_prefix(&payload.metadata),
+        out
+    )
 }
 
 /// Maximum UTF-8 bytes of evidence suffix per result.
@@ -10486,6 +11902,186 @@ async fn build_guard_validator(
     Ok((validator, namespace.to_string()))
 }
 
+fn is_env_assignment_token(tok: &str) -> bool {
+    let Some((name, _)) = tok.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !name.chars().next().unwrap().is_ascii_digit()
+}
+
+fn is_disallowed_git_subcommand_arg(arg: &str) -> bool {
+    arg == "--output"
+        || arg.starts_with("--output=")
+        || arg.starts_with("-O")
+        || arg == "--ext-diff"
+        || arg == "--textconv"
+        || arg == "--exec"
+        || arg.starts_with("--exec=")
+        || arg == "-x"
+        || arg == "--upload-pack"
+        || arg.starts_with("--upload-pack=")
+        || arg == "--receive-pack"
+        || arg.starts_with("--receive-pack=")
+}
+
+fn is_zero_action_exempt_shell_segment(segment: &str) -> bool {
+    let mut tokens = segment
+        .split_whitespace()
+        .skip_while(|t| is_env_assignment_token(t));
+    let Some(first) = tokens.next() else {
+        return false;
+    };
+    let bin = std::path::Path::new(first)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(first);
+    match bin {
+        "git" => {
+            let mut rest: Vec<&str> = tokens.collect();
+            loop {
+                if rest.len() >= 2 && matches!(rest[0], "-C" | "--git-dir" | "--work-tree") {
+                    rest.drain(..2);
+                } else if !rest.is_empty()
+                    && (matches!(rest[0], "--no-pager" | "-P" | "--no-optional-locks")
+                        || rest[0].starts_with("--git-dir=")
+                        || rest[0].starts_with("--work-tree="))
+                {
+                    rest.remove(0);
+                } else {
+                    break;
+                }
+            }
+            if rest.first().is_some_and(|t| t.starts_with('-')) {
+                return false;
+            }
+            let Some(&subcmd) = rest.first() else {
+                return false;
+            };
+            if rest[1..]
+                .iter()
+                .any(|arg| is_disallowed_git_subcommand_arg(arg))
+            {
+                return false;
+            }
+            match subcmd {
+                "push" | "pull" | "fetch" | "status" | "log" | "diff" | "show" | "rev-parse" => true,
+                "stash" => matches!(rest.get(1).copied(), Some("list" | "show")),
+                "branch" => {
+                    rest.len() >= 2
+                        && rest[1..].iter().all(|t| {
+                            matches!(
+                                *t,
+                                "--show-current" | "-a" | "-r" | "--list" | "-v" | "-vv"
+                            )
+                        })
+                }
+                _ => false,
+            }
+        }
+        "neurostrata-mcp" => {
+            let rest: Vec<&str> = tokens.collect();
+            match rest.first().copied() {
+                Some("task" | "doc-gate") => true,
+                Some("synaptic-mesh") => matches!(rest.get(1).copied(), Some("status")),
+                _ => false,
+            }
+        }
+        "cargo" => {
+            let mut rest: Vec<&str> = tokens.collect();
+            if rest.first().is_some_and(|t| t.starts_with('+')) {
+                rest.remove(0);
+            }
+            matches!(
+                rest.first().copied(),
+                Some("test" | "check" | "clippy" | "bench" | "metadata" | "tree" | "version" | "--version")
+            )
+        }
+        "gh" => {
+            let rest: Vec<&str> = tokens.collect();
+            match rest.first().copied() {
+                Some("pr") => matches!(
+                    rest.get(1).copied(),
+                    Some("view" | "list" | "checks" | "status" | "diff")
+                ),
+                Some("issue") => matches!(rest.get(1).copied(), Some("view" | "list" | "status")),
+                Some("run") => matches!(rest.get(1).copied(), Some("view" | "list" | "watch")),
+                Some("api") => !rest[1..].iter().any(|arg| {
+                    matches!(
+                        *arg,
+                        "-X" | "--method" | "-f" | "-F" | "--field" | "--raw-field" | "--input"
+                    ) || arg.starts_with("--method=")
+                        || arg.starts_with("--field=")
+                        || arg.starts_with("--raw-field=")
+                        || arg.starts_with("--input=")
+                }),
+                _ => false,
+            }
+        }
+        "node" => {
+            let rest: Vec<&str> = tokens.collect();
+            rest.iter()
+                .any(|t| *t == "--test" || t.ends_with("test.mjs"))
+        }
+        "gate-receipt.sh" | "check-include-str-targets.sh" => true,
+        "bash" => tokens.next().is_some_and(|t| {
+            t.ends_with("gate-receipt.sh") || t.ends_with("check-include-str-targets.sh")
+        }),
+        "rustc" => matches!(tokens.next(), Some("--version" | "-V")),
+        _ => false,
+    }
+}
+
+pub(crate) fn is_zero_action_exempt_shell_payload(action_type: &str, payload: &str) -> bool {
+    if !matches!(
+        action_type.to_lowercase().as_str(),
+        "bash" | "shell" | "command" | "exec"
+    ) {
+        return false;
+    }
+    // Harness plugins send payload = JSON.stringify(call.args), e.g.
+    // {"command":"git status --short"}. Unwrap the command before segmenting;
+    // a JSON object with no string command is never exempt.
+    let parsed: Option<serde_json::Value> = if payload.trim_start().starts_with('{') {
+        match serde_json::from_str(payload) {
+            Ok(value @ serde_json::Value::Object(_)) => Some(value),
+            _ => return false,
+        }
+    } else {
+        None
+    };
+    let command = match &parsed {
+        Some(serde_json::Value::Object(obj)) => match obj
+            .get("command")
+            .or_else(|| obj.get("cmd"))
+            .and_then(|v| v.as_str())
+        {
+            Some(s) => s,
+            None => return false,
+        },
+        _ => payload,
+    };
+    let trimmed = command.trim();
+    if trimmed.is_empty()
+        || trimmed.contains('`')
+        || trimmed.contains("$(")
+        || trimmed.contains('>')
+        || trimmed.contains('<')
+    {
+        return false;
+    }
+    let segments: Vec<&str> = trimmed
+        .split(|c| c == ';' || c == '\n' || c == '|' || c == '&')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    !segments.is_empty()
+        && segments
+            .into_iter()
+            .all(is_zero_action_exempt_shell_segment)
+}
+
 /// Validate an action against stored behavioral rules and (optionally) the
 /// Podman sandbox. Wraps `GuardValidator::validate`.
 async fn handle_guard_validate(
@@ -10516,7 +12112,9 @@ async fn handle_guard_validate(
 
     // Zero-Action Start (honest): in a task-enabled namespace, a mutating
     // action requires at least one claimed (in_progress) task. Read-only
-    // actions and namespaces with no task rows at all are exempt.
+    // actions, git push/sync/status commands (which are gated by the pre-push
+    // task gate and run after task completion), task-tracking CLI invocations,
+    // and namespaces with no task rows at all are exempt.
     let mutating = !matches!(
         action_type.to_lowercase().as_str(),
         "read"
@@ -10530,7 +12128,7 @@ async fn handle_guard_validate(
             | "inspect"
             | "grep"
             | "glob"
-    );
+    ) && !is_zero_action_exempt_shell_payload(action_type, payload);
     if mutating {
         // Determine whether this namespace is task-enabled. Only task rows
         // matter here, so the type filter goes into the query: listing the
@@ -10592,30 +12190,64 @@ async fn handle_guard_validate(
                     serde_json::to_string_pretty(&body).unwrap_or_default()
                 );
             }
-            // AC2: a claimed task exists, so the mutating action must pass
-            // the session/worktree preflight before rule validation runs.
-            // Caller-named active task wins when it is InProgress; else any
-            // InProgress row in the namespace.
-            // Resolve the active InProgress task: caller-named active_task_id
-            // wins when it is an InProgress row; else any InProgress row.
+            // AC2: a claimed task exists, so the mutating action must pass the
+            // session/worktree preflight before rule validation runs. Resolve
+            // the active InProgress task in strict specificity order, so one
+            // session's task cannot hijack another worktree's Breath gate:
+            // named id > session+worktree > session > worktree > first row.
+            let caller_session = arguments
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && *s != "unknown");
+            let caller_worktree = arguments
+                .get("worktree")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .or_else(|| (!cwd.trim().is_empty()).then_some(cwd.trim()));
+            let in_progress = |m: &SearchResult| {
+                crate::task::gate::is_task(m)
+                    && crate::task::gate::task_status(m)
+                        == crate::task::machine::Status::InProgress
+            };
+            let task_matches = |m: &SearchResult, key: &str, expected: &str| {
+                m.payload
+                    .metadata
+                    .get("task")
+                    .and_then(|t| t.get(key))
+                    .and_then(|v| v.as_str())
+                    == Some(expected)
+            };
             let active_task_row: Option<&SearchResult> = arguments
                 .get("active_task_id")
                 .and_then(|v| v.as_str())
-                .and_then(|tid| {
-                    memories.iter().find(|m| {
-                        m.id == tid
-                            && crate::task::gate::is_task(m)
-                            && crate::task::gate::task_status(m)
-                                == crate::task::machine::Status::InProgress
+                .and_then(|tid| memories.iter().find(|m| m.id == tid && in_progress(m)))
+                .or_else(|| {
+                    match (caller_session, caller_worktree) {
+                        (Some(s), Some(w)) => memories.iter().find(|m| {
+                            in_progress(m)
+                                && task_matches(m, "session_id", s)
+                                && task_matches(m, "worktree", w)
+                        }),
+                        _ => None,
+                    }
+                })
+                .or_else(|| {
+                    caller_session.and_then(|s| {
+                        memories
+                            .iter()
+                            .find(|m| in_progress(m) && task_matches(m, "session_id", s))
                     })
                 })
                 .or_else(|| {
-                    memories.iter().find(|m| {
-                        crate::task::gate::is_task(m)
-                            && crate::task::gate::task_status(m)
-                                == crate::task::machine::Status::InProgress
+                    caller_worktree.and_then(|w| {
+                        memories
+                            .iter()
+                            .find(|m| in_progress(m) && task_matches(m, "worktree", w))
                     })
-                });
+                })
+                .or_else(|| memories.iter().find(|m| in_progress(m)));
             let active_task_id = active_task_row.map(|m| m.id.as_str());
             let session_id = arguments
                 .get("session_id")
@@ -10951,6 +12583,430 @@ mod tests {
     use super::*;
     use crate::events::{RecursionToken, ThalamicBus, ThalamicPulse};
     use crate::guard::testkit::MockStore;
+
+    #[test]
+    fn inject_proxy_caller_cwd_stamps_cwd_and_preserves_explicit_roots() {
+        let req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {
+                "name": "neurostrata_task_claim",
+                "arguments": { "id": "t" }
+            }
+        });
+        let cwd = std::path::Path::new("/caller/wt");
+        let injected = inject_proxy_caller_cwd(&req, Some(cwd));
+        assert_eq!(
+            injected["params"]["arguments"]["cwd"],
+            serde_json::json!(cwd.to_string_lossy())
+        );
+        // The request is cloned, never mutated in place.
+        assert!(req["params"]["arguments"].get("cwd").is_none());
+
+        for key in ["cwd", "worktree", "project_root"] {
+            let mut args = serde_json::Map::new();
+            args.insert("id".to_string(), serde_json::json!("t"));
+            args.insert(key.to_string(), serde_json::json!("/explicit/root"));
+            let explicit = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": { "name": "neurostrata_task_claim", "arguments": args }
+            });
+            let out = inject_proxy_caller_cwd(&explicit, Some(cwd));
+            assert_eq!(
+                out["params"]["arguments"][key],
+                serde_json::json!("/explicit/root"),
+                "explicit {key} must be preserved"
+            );
+            assert!(
+                out["params"]["arguments"].get("cwd").is_none() || key == "cwd",
+                "no cwd should be injected when {key} is already present"
+            );
+        }
+
+        // Non tools/call methods carry no tool arguments to stamp.
+        let notify = serde_json::json!({
+            "jsonrpc": "2.0", "method": "notifications/initialized", "params": {}
+        });
+        assert_eq!(inject_proxy_caller_cwd(&notify, Some(cwd)), notify);
+        assert_eq!(inject_proxy_caller_cwd(&req, None), req);
+    }
+
+    #[test]
+    fn json_wrapped_shell_payloads_expand_readonly_exemptions() {
+        for payload in [
+            r#"{"command":"git status --short"}"#,
+            r#"{"command":"cargo test --bin neurostrata-mcp"}"#,
+            r#"{"command":"gh pr view 300 --json state; git stash list"}"#,
+            r#"{"command":"./scripts/gate-receipt.sh --pr 300"}"#,
+        ] {
+            assert!(
+                is_zero_action_exempt_shell_payload("bash", payload),
+                "expected exempt: {payload}"
+            );
+        }
+        for payload in [
+            r#"{"command":"echo 1"}"#,
+            r#"{"command":"rm -rf /tmp/x"}"#,
+            r#"{"command":"git checkout -b foo"}"#,
+            r#"{"command":"git stash drop"}"#,
+            r#"{"command":"gh api repos/x/y -X POST -f body=hi"}"#,
+        ] {
+            assert!(
+                !is_zero_action_exempt_shell_payload("bash", payload),
+                "expected not exempt: {payload}"
+            );
+        }
+        // A JSON object with no string command is never exempt.
+        assert!(!is_zero_action_exempt_shell_payload("bash", r#"{"cmd":42}"#));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn guard_validate_resolves_active_task_by_session_and_worktree() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let vector = StubEmbedder.embed("task").await.unwrap();
+
+        let task = |id: &str, sid: &str, wt: &str| {
+            let mut p = payload(id);
+            p.memory_type = "task".to_string();
+            p.metadata = serde_json::json!({
+                "task": {
+                    "status": "in_progress",
+                    "session_id": sid,
+                    "worktree": wt,
+                }
+            });
+            (id.to_string(), p)
+        };
+        let (id_a, p_a) = task("task-A", "ses_A", "/wt/a");
+        let (id_b, p_b) = task("task-B", "ses_B", "/wt/b");
+        for (id, p) in [(&id_a, p_a), (&id_b, p_b)] {
+            store.upsert("probe", id, vector.clone(), p).await.unwrap();
+        }
+
+        // The BreathRequired rejection names the resolved task id, so it is a
+        // direct observation of which in_progress row the handler selected.
+        for extra in [
+            serde_json::json!({ "session_id": "ses_B" }),
+            serde_json::json!({ "worktree": "/wt/b" }),
+        ] {
+            let mut args = serde_json::json!({
+                "namespace": "probe",
+                "action_type": "write",
+                "payload": "/tmp/scratch.txt",
+                "cwd": "/wt/b",
+                "mutations_since_note": 5
+            });
+            if let (Some(obj), Some(extra_obj)) = (args.as_object_mut(), extra.as_object()) {
+                for (k, v) in extra_obj {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            let reply = handle_guard_validate(
+                args,
+                store.clone(),
+                Arc::new(StubEmbedder),
+                recording_bus().0,
+            )
+            .await;
+            assert!(
+                reply.contains(&id_b) && !reply.contains(&id_a),
+                "expected Task B resolved, got: {}",
+                reply
+            );
+        }
+    }
+
+    #[test]
+    fn ast_neighborhood_union_preserves_truncation_and_recomputes_blast_radius() {
+        let form_a = Ok((
+            vec![serde_json::json!({"id":"r1","memory_type":"symbol","content":"a"})],
+            serde_json::json!({
+                "symbols":[{"id":"s1","name":"a"}],
+                "callers":[{"id":"c1","name":"caller1"}],
+                "callees":[],
+                "imports":[],
+                "importers":[],
+                "blast_radius_count":1,
+                "truncated":true,
+                "truncated_collections":["callers"]
+            }),
+        ));
+        let form_b = Ok((
+            vec![],
+            serde_json::json!({
+                "symbols":[{"id":"s2","name":"b"}],
+                "callers":[{"id":"c2","name":"caller2"}],
+                "callees":[],
+                "imports":[],
+                "importers":[],
+                "blast_radius_count":1,
+                "truncated":false,
+                "truncated_collections":[]
+            }),
+        ));
+        let merged = merge_ast_neighborhood_results(vec![form_a, form_b]).expect("union");
+        let summary = merged.ast_summary;
+        assert_eq!(summary["symbols"].as_array().map(|a| a.len()), Some(2));
+        assert_eq!(summary["callers"].as_array().map(|a| a.len()), Some(2));
+        assert_eq!(summary["truncated"], serde_json::json!(true));
+        assert_eq!(
+            summary["truncated_collections"],
+            serde_json::json!(["callers"])
+        );
+        assert_eq!(summary["blast_radius_count"], serde_json::json!(2));
+    }
+
+    #[test]
+    fn ast_neighborhood_union_treats_empty_with_truncation_as_evidence() {
+        let form_a = Ok((
+            vec![],
+            serde_json::json!({
+                "symbols":[], "callers":[], "callees":[], "imports":[], "importers":[],
+                "blast_radius_count":0, "truncated":true, "truncated_collections":["symbols"]
+            }),
+        ));
+        let form_b = Ok((
+            vec![],
+            serde_json::json!({
+                "symbols":[], "callers":[], "callees":[], "imports":[], "importers":[],
+                "blast_radius_count":0, "truncated":false, "truncated_collections":[]
+            }),
+        ));
+        let merged = merge_ast_neighborhood_results(vec![form_a, form_b]).expect("union");
+        assert_eq!(merged.ast_summary["truncated"], serde_json::json!(true));
+        assert_eq!(
+            merged.ast_summary["truncated_collections"],
+            serde_json::json!(["symbols"])
+        );
+    }
+
+    #[tokio::test]
+    async fn memories_for_file_fails_closed_on_cached_root_store_error() {
+        use crate::traits::{AsAny, UpsertReport, VectorStore};
+        use std::sync::Arc;
+
+        struct ErrRegistryStore {
+            inner: Arc<MockStore>,
+        }
+        impl AsAny for ErrRegistryStore {
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+        #[async_trait::async_trait]
+        impl VectorStore for ErrRegistryStore {
+            async fn init(&self, ns: &str) -> anyhow::Result<()> {
+                self.inner.init(ns).await
+            }
+            async fn upsert(
+                &self,
+                ns: &str,
+                id: &str,
+                v: Vec<f32>,
+                p: crate::traits::MemoryPayload,
+            ) -> anyhow::Result<UpsertReport> {
+                self.inner.upsert(ns, id, v, p).await
+            }
+            async fn search(
+                &self,
+                ns: &str,
+                v: Vec<f32>,
+                l: usize,
+                it: bool,
+                ia: bool,
+            ) -> anyhow::Result<Vec<crate::traits::SearchResult>> {
+                self.inner.search(ns, v, l, it, ia).await
+            }
+            async fn delete(&self, ns: &str, id: &str) -> anyhow::Result<()> {
+                self.inner.delete(ns, id).await
+            }
+            async fn clear_ingested(&self, ns: &str) -> anyhow::Result<()> {
+                self.inner.clear_ingested(ns).await
+            }
+            async fn relink_edges(&self, ns: &str, sk: &str) -> anyhow::Result<usize> {
+                self.inner.relink_edges(ns, sk).await
+            }
+            async fn list(
+                &self,
+                ns: &str,
+                u: Option<&str>,
+                mt: Option<&str>,
+            ) -> anyhow::Result<Vec<crate::traits::SearchResult>> {
+                self.inner.list(ns, u, mt).await
+            }
+            async fn get(
+                &self,
+                ns: &str,
+                id: &str,
+            ) -> anyhow::Result<Option<(Vec<f32>, crate::traits::MemoryPayload)>> {
+                if id == crate::registry::registry_row_id(ns) {
+                    Err(anyhow::anyhow!("registry-read-boom"))
+                } else {
+                    self.inner.get(ns, id).await
+                }
+            }
+            async fn relocate(
+                &self,
+                id: &str,
+                from: &str,
+                to: &str,
+            ) -> anyhow::Result<crate::traits::RelocateOutcome> {
+                self.inner.relocate(id, from, to).await
+            }
+            async fn list_namespaces(&self) -> anyhow::Result<Vec<String>> {
+                self.inner.list_namespaces().await
+            }
+            async fn export_graph(
+                &self,
+                ir: bool,
+                ia: bool,
+                pc: &std::collections::HashMap<String, std::path::PathBuf>,
+                ao: Option<&crate::source_context::ScopedAnchorOverride>,
+            ) -> anyhow::Result<serde_json::Value> {
+                self.inner.export_graph(ir, ia, pc, ao).await
+            }
+            async fn increment_access_count(&self, ns: &str, id: &str) -> anyhow::Result<()> {
+                self.inner.increment_access_count(ns, id).await
+            }
+            async fn export_database(&self, dir: &str) -> anyhow::Result<()> {
+                self.inner.export_database(dir).await
+            }
+            async fn checkpoint(&self) -> anyhow::Result<()> {
+                self.inner.checkpoint().await
+            }
+        }
+
+        let store: Arc<dyn VectorStore> = Arc::new(ErrRegistryStore {
+            inner: Arc::new(MockStore::new()),
+        });
+        let out = handle_memories_for_file(
+            serde_json::json!({"namespace":"ns","path":"/tmp/project/src/lib.rs"}),
+            store,
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&out).expect("json");
+        assert!(
+            v.get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("")
+                .contains("registry-read-boom")
+                || out.contains("registry-read-boom"),
+            "handler must surface the registry-root read error: {out}"
+        );
+        assert_eq!(v.get("unsupported").and_then(|b| b.as_bool()), Some(true));
+    }
+
+    /// `#212`: the CLI's path-only `storage status` dispatch emits the
+    /// filesystem-only payload — including `wal_age_secs` and the persisted
+    /// recovery history — without opening the store. Exercises the same
+    /// function the `storage status` command prints; only config resolution
+    /// (one `PathBuf`) sits outside it, which is why this fixture can assert
+    /// the payload shape without touching the operator's home config.
+    #[test]
+    fn path_only_storage_status_dispatches_wal_age_and_persisted_recovery() {
+        let root = std::env::temp_dir().join(format!(
+            "ns-storage-status-cli-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("cli.lbug");
+        std::fs::write(&db, b"db").unwrap();
+        crate::model_choice::write_store_state_identity(
+            &db,
+            &crate::model_choice::StoreState::new(
+                true,
+                crate::traits::EmbeddingDescriptor {
+                    provider: "fastembed".to_string(),
+                    model: "ModelA".to_string(),
+                    revision: "onnx".to_string(),
+                    dims: 4,
+                    normalization: "unknown".to_string(),
+                    preprocessing: "unknown".to_string(),
+                    distance_metric: "cosine".to_string(),
+                },
+            ),
+        )
+        .expect("record a sidecar");
+        crate::model_choice::record_store_state_recovery(
+            &db,
+            "discarded_unreadable_wal",
+            4096,
+            "2026-11-15T00:00:00Z",
+        )
+        .expect("record recovery history");
+        crate::storage::snapshot::record_recovery_provenance(&db, None);
+
+        let mut wal_os = db.clone().into_os_string();
+        wal_os.push(".wal");
+        let wal = std::path::PathBuf::from(wal_os);
+        std::fs::write(&wal, b"w").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&wal)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(30))
+            .unwrap();
+
+        let out = path_only_storage_status(
+            &db,
+            &crate::storage::snapshot::StorageHygieneConfig::default(),
+        );
+        let value: serde_json::Value = serde_json::from_str(&out).expect("the CLI payload is JSON");
+        assert_eq!(value["store_bytes"], serde_json::json!(2));
+        assert_eq!(value["wal_bytes"], serde_json::json!(1));
+        let age = value["wal_age_secs"]
+            .as_u64()
+            .expect("wal_age_secs is in the CLI payload (#212)");
+        assert!(
+            (29..60).contains(&age),
+            "the CLI payload reports the WAL age: {age}"
+        );
+        assert_eq!(
+            value["recovery_provenance"],
+            serde_json::json!("discarded_unreadable_wal"),
+            "the path-only CLI payload reports the persisted kind history"
+        );
+        assert_eq!(
+            value["last_recovery_at"],
+            serde_json::json!("2026-11-15T00:00:00Z"),
+            "the path-only CLI payload carries when the store last recovered"
+        );
+        assert_eq!(
+            value["opened_via_recovery"],
+            serde_json::json!(false),
+            "opened_via_recovery is handle-scoped: the CLI opened nothing (#212)"
+        );
+        assert!(
+            value["process"].is_object(),
+            "the CLI payload still carries the process block"
+        );
+
+        // A healthy (WAL-free) store: the key stays in the payload as `null`
+        // rather than disappearing, which is what the runbook promises (#212).
+        std::fs::remove_file(&wal).unwrap();
+        let out = path_only_storage_status(
+            &db,
+            &crate::storage::snapshot::StorageHygieneConfig::default(),
+        );
+        let value: serde_json::Value = serde_json::from_str(&out).expect("the CLI payload is JSON");
+        assert_eq!(value["wal_bytes"], serde_json::json!(0));
+        assert!(
+            value.get("wal_age_secs").is_some(),
+            "wal_age_secs is never omitted (#212)"
+        );
+        assert_eq!(
+            value["wal_age_secs"],
+            serde_json::Value::Null,
+            "a store with no WAL reports wal_age_secs as null (#212)"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// G3: a failed/partial hygiene repair must not advance the doctor's
     /// completion marker, so the only automatic retry path runs again.
@@ -12223,6 +14279,374 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn prefix_filters_match_relative_and_absolute_stored_spellings_across_search_locate_and_insights(
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::LadybugStore::for_testing(tmp.path().join("db"), 384).expect("store"),
+        );
+        store.init("ns").await.expect("init ns");
+
+        let root = tmp.path().join("ns-v1190-prefix-root");
+        std::fs::create_dir_all(root.join("src")).expect("create src dir");
+        let abs_prefix = root.join("src").to_string_lossy().to_string();
+        let abs_b = root.join("src/b.rs").to_string_lossy().to_string();
+
+        store
+            .upsert(
+                "ns",
+                "sym:rel",
+                vec![0.1; 384],
+                MemoryPayload {
+                    content: "pub fn prefix_probe_token() { call_target_fn(); }".to_string(),
+                    location: "src/a.rs".to_string(),
+                    location_lines: "1-5".to_string(),
+                    memory_type: "code_ast".to_string(),
+                    metadata: serde_json::json!({
+                        "domain": "code_ast",
+                        "symbol": "prefix_probe_token",
+                        "symbol_kind": "functions",
+                        "calls": ["call_target_fn"],
+                        "locations": [{"path": "src/a.rs", "lines": "1-5"}]
+                    }),
+                    user_id: "test".to_string(),
+                    agent_name: None,
+                },
+            )
+            .await
+            .expect("upsert rel");
+        store
+            .upsert(
+                "ns",
+                "sym:abs",
+                vec![0.1; 384],
+                MemoryPayload {
+                    content: "pub fn prefix_probe_token_abs() { call_target_fn(); }".to_string(),
+                    location: abs_b.clone(),
+                    location_lines: "1-5".to_string(),
+                    memory_type: "code_ast".to_string(),
+                    metadata: serde_json::json!({
+                        "domain": "code_ast",
+                        "symbol": "prefix_probe_token_abs",
+                        "symbol_kind": "functions",
+                        "calls": ["call_target_fn"],
+                        "locations": [{"path": abs_b, "lines": "1-5"}]
+                    }),
+                    user_id: "test".to_string(),
+                    agent_name: None,
+                },
+            )
+            .await
+            .expect("upsert abs");
+
+        let search_out = handle_search_memory(
+            serde_json::json!({
+                "namespace": "ns",
+                "query": "prefix_probe_token",
+                "mode": "lexical-inhouse",
+                "path_prefix": abs_prefix,
+                "project_root": root.to_string_lossy(),
+                "include_code_ast": true
+            }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+        )
+        .await;
+        assert!(
+            search_out.contains("sym:rel") && search_out.contains("sym:abs"),
+            "search must match both stored spellings; got: {search_out}"
+        );
+
+        let locate_out = handle_locate(
+            &serde_json::json!({
+                "namespace": "ns",
+                "query": "prefix_probe_token",
+                "path_prefix": abs_prefix,
+                "project_root": root.to_string_lossy()
+            }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+        )
+        .await;
+        let locate_v: serde_json::Value = serde_json::from_str(&locate_out).expect("locate json");
+        assert_eq!(
+            locate_v["ok"],
+            serde_json::json!(true),
+            "locate: {locate_out}"
+        );
+        assert!(
+            locate_v["locations"]
+                .as_array()
+                .map(|a| a.len() >= 2)
+                .unwrap_or(false),
+            "locate must return both stored spellings; got: {locate_out}"
+        );
+
+        let define_out = handle_insights(
+            &serde_json::json!({
+                "namespace": "ns",
+                "action": "define",
+                "name": "calls_target",
+                "title": "Calls Target",
+                "query_kind": "ast_calls",
+                "query": "call_target_fn",
+                "path_prefix": "src",
+                "project_root": root.to_string_lossy()
+            }),
+            store.clone(),
+        )
+        .await;
+        let define_v: serde_json::Value = serde_json::from_str(&define_out).expect("define json");
+        assert_eq!(
+            define_v["ok"],
+            serde_json::json!(true),
+            "define: {define_out}"
+        );
+
+        let snap_out = handle_insights(
+            &serde_json::json!({
+                "namespace": "ns",
+                "action": "snapshot",
+                "name": "calls_target",
+                "project_root": root.to_string_lossy()
+            }),
+            store.clone(),
+        )
+        .await;
+        let snap_v: serde_json::Value = serde_json::from_str(&snap_out).expect("snapshot json");
+        assert_eq!(
+            snap_v["ok"],
+            serde_json::json!(true),
+            "snapshot: {snap_out}"
+        );
+        assert!(
+            snap_v["series"][0]["current_value"]
+                .as_f64()
+                .map(|v| v >= 2.0)
+                .unwrap_or(false),
+            "relative persisted prefix must match both stored spellings; got: {snap_out}"
+        );
+
+        let define_abs_out = handle_insights(
+            &serde_json::json!({
+                "namespace": "ns",
+                "action": "define",
+                "name": "calls_target_abs",
+                "title": "Calls Target Absolute",
+                "query_kind": "ast_calls",
+                "query": "call_target_fn",
+                "path_prefix": abs_prefix,
+                "project_root": root.to_string_lossy()
+            }),
+            store.clone(),
+        )
+        .await;
+        let define_abs_v: serde_json::Value =
+            serde_json::from_str(&define_abs_out).expect("define abs json");
+        assert_eq!(
+            define_abs_v["ok"],
+            serde_json::json!(true),
+            "define abs: {define_abs_out}"
+        );
+
+        let snap_abs_out = handle_insights(
+            &serde_json::json!({
+                "namespace": "ns",
+                "action": "snapshot",
+                "name": "calls_target_abs",
+                "project_root": root.to_string_lossy()
+            }),
+            store.clone(),
+        )
+        .await;
+        let snap_abs_v: serde_json::Value =
+            serde_json::from_str(&snap_abs_out).expect("snapshot abs json");
+        assert_eq!(
+            snap_abs_v["ok"],
+            serde_json::json!(true),
+            "snapshot abs: {snap_abs_out}"
+        );
+        assert!(
+            snap_abs_v["series"][0]["current_value"]
+                .as_f64()
+                .map(|v| v >= 2.0)
+                .unwrap_or(false),
+            "absolute persisted prefix must match both stored spellings; got: {snap_abs_out}"
+        );
+
+        // A prefix equal to `project_root` (or the cached registry root) must also
+        // resolve and match both relative and absolute stored entries under that root.
+        let root_prefix = root.to_string_lossy().to_string();
+        let search_root_out = handle_search_memory(
+            serde_json::json!({
+                "namespace": "ns",
+                "query": "prefix_probe_token",
+                "mode": "lexical-inhouse",
+                "path_prefix": root_prefix,
+                "project_root": root.to_string_lossy(),
+                "include_code_ast": true
+            }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+        )
+        .await;
+        assert!(
+            search_root_out.contains("sym:rel") && search_root_out.contains("sym:abs"),
+            "root-equal prefix in search must match both stored spellings; got: {search_root_out}"
+        );
+
+        let locate_root_out = handle_locate(
+            &serde_json::json!({
+                "namespace": "ns",
+                "query": "prefix_probe_token",
+                "path_prefix": root.to_string_lossy(),
+                "project_root": root.to_string_lossy()
+            }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+        )
+        .await;
+        let locate_root_v: serde_json::Value =
+            serde_json::from_str(&locate_root_out).expect("locate root json");
+        assert_eq!(
+            locate_root_v["ok"],
+            serde_json::json!(true),
+            "locate root: {locate_root_out}"
+        );
+        assert!(
+            locate_root_v["locations"]
+                .as_array()
+                .map(|a| a.len() >= 2)
+                .unwrap_or(false),
+            "root-equal prefix in locate must return both stored spellings; got: {locate_root_out}"
+        );
+
+        let define_root_out = handle_insights(
+            &serde_json::json!({
+                "namespace": "ns",
+                "action": "define",
+                "name": "calls_target_root",
+                "title": "Calls Target Root",
+                "query_kind": "ast_calls",
+                "query": "call_target_fn",
+                "path_prefix": root.to_string_lossy(),
+                "project_root": root.to_string_lossy()
+            }),
+            store.clone(),
+        )
+        .await;
+        let define_root_v: serde_json::Value =
+            serde_json::from_str(&define_root_out).expect("define root json");
+        assert_eq!(
+            define_root_v["ok"],
+            serde_json::json!(true),
+            "define root: {define_root_out}"
+        );
+
+        let snap_root_out = handle_insights(
+            &serde_json::json!({
+                "namespace": "ns",
+                "action": "snapshot",
+                "name": "calls_target_root",
+                "project_root": root.to_string_lossy()
+            }),
+            store.clone(),
+        )
+        .await;
+        let snap_root_v: serde_json::Value =
+            serde_json::from_str(&snap_root_out).expect("snapshot root json");
+        assert_eq!(
+            snap_root_v["ok"],
+            serde_json::json!(true),
+            "snapshot root: {snap_root_out}"
+        );
+        assert!(
+            snap_root_v["series"][0]["current_value"]
+                .as_f64()
+                .map(|v| v >= 2.0)
+                .unwrap_or(false),
+            "root-equal prefix in insights must match both stored spellings; got: {snap_root_out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prefix_filters_reject_unresolvable_absolute_prefix_across_search_locate_and_insights()
+    {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::LadybugStore::for_testing(tmp.path().join("db"), 384).expect("store"),
+        );
+        store.init("ns").await.expect("init ns");
+
+        let root = tmp.path().join("ns-v1190-prefix-unres");
+        let bad_prefix = "/outside/ns-v1190/prefix";
+
+        let search_out = handle_search_memory(
+            serde_json::json!({
+                "namespace": "ns",
+                "query": "anything",
+                "mode": "lexical-inhouse",
+                "path_prefix": bad_prefix,
+                "project_root": root.to_string_lossy()
+            }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+        )
+        .await;
+        assert!(
+            search_out.contains("ERROR") || search_out.contains("unresolvable"),
+            "search must fail closed on an unresolvable absolute prefix; got: {search_out}"
+        );
+
+        let locate_out = handle_locate(
+            &serde_json::json!({
+                "namespace": "ns",
+                "query": "anything",
+                "path_prefix": bad_prefix,
+                "project_root": root.to_string_lossy()
+            }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+        )
+        .await;
+        let locate_v: serde_json::Value = serde_json::from_str(&locate_out).expect("locate json");
+        assert_eq!(
+            locate_v["ok"],
+            serde_json::json!(false),
+            "locate must fail closed: {locate_out}"
+        );
+        assert!(
+            locate_v["error"].as_str().is_some(),
+            "locate must report an error: {locate_out}"
+        );
+
+        let ins_out = handle_insights(
+            &serde_json::json!({
+                "namespace": "ns",
+                "action": "define",
+                "name": "bad_prefix",
+                "title": "Bad Prefix",
+                "query_kind": "lexical",
+                "query": "anything",
+                "path_prefix": bad_prefix,
+                "project_root": root.to_string_lossy()
+            }),
+            store.clone(),
+        )
+        .await;
+        let ins_v: serde_json::Value = serde_json::from_str(&ins_out).expect("insights json");
+        assert_eq!(
+            ins_v["ok"],
+            serde_json::json!(false),
+            "insights define must fail closed: {ins_out}"
+        );
+        assert!(
+            ins_v["error"].as_str().is_some(),
+            "insights define must report an error: {ins_out}"
+        );
+    }
+
     /// `handle_search_memory` with `StubEmbedder` (no `NoisyEmbedder`
     /// workaround) succeeds: the search path is no longer a landmine that
     /// every test had to step around.
@@ -12549,6 +14973,287 @@ mod tests {
         (store, id)
     }
 
+    // ── Capability C remediation: production presentation surfaces ────────
+    async fn store_with_deprecated_rule(namespace: &str) -> (Arc<dyn VectorStore>, String) {
+        let dir = std::env::temp_dir().join(format!("ns-capc-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database"),
+        );
+        store.init(namespace).await.expect("init schema");
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut p = payload("legacy podman rule that was superseded");
+        p.metadata = serde_json::json!({
+            "deprecation": {
+                "status": "deprecated",
+                "superseded_by": "mem-replacement-42",
+                "reason": "replaced by the podman v2 rule",
+                "effective_at": 1700000000
+            },
+            "not_definition": "does not apply to rootless podman sockets",
+        });
+        let vector = StubEmbedder.embed("legacy podman rule").await.unwrap();
+        store
+            .upsert(namespace, &id, vector, p)
+            .await
+            .expect("seed deprecated rule");
+        (store, id)
+    }
+
+    #[test]
+    fn format_memory_prepends_exact_banner_and_not_definition() {
+        let mut p = payload("legacy guidance");
+        p.metadata = serde_json::json!({
+            "deprecation": {
+                "status": "deprecated",
+                "superseded_by": "mem-7",
+                "reason": "superseded by new rule",
+                "effective_at": 1
+            },
+            "not_definition": "not valid for external APIs",
+        });
+        let rendered = format_memory("mem-1", &p);
+        assert!(
+            rendered.starts_with(
+                "[DEPRECATED — SUPERSEDED BY mem-7: superseded by new rule]\nNOT DEFINITION: not valid for external APIs\n"
+            ),
+            "banner + boundary must be prepended deterministically: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_memory_surface_emits_deprecation_presentation() {
+        let (store, _id) = store_with_deprecated_rule("probe").await;
+        let text = handle_search_memory(
+            serde_json::json!({ "namespace": "probe", "query": "podman", "exact": true }),
+            Arc::new(StubEmbedder),
+            store,
+        )
+        .await;
+        assert!(
+            text.contains(
+                "[DEPRECATED — SUPERSEDED BY mem-replacement-42: replaced by the podman v2 rule]"
+            ),
+            "search must emit the exact banner: {text}"
+        );
+        assert!(
+            text.contains("NOT DEFINITION: does not apply to rootless podman sockets"),
+            "search must emit the boundary: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memories_for_file_surface_emits_structured_deprecation_presentation() {
+        let (store, rule_id) = store_with_deprecated_rule("probe").await;
+        let lb = crate::traits::VectorStore::as_any(store.as_ref())
+            .downcast_ref::<crate::store::LadybugStore>()
+            .expect("ladybug store");
+        lb.with_conn(move |conn| {
+            conn.query(
+                "CREATE (m:Memory {id: 'src/lib.rs', namespace: 'probe', content: 'c', user_id: 'u', memory_type: 'file', agent_name: 'a', location: 'src/lib.rs', location_lines: '', metadata: '{}', embedding: [0.0,0.0,0.0,0.0]})"
+            )?;
+            conn.query(&format!(
+                "MERGE (a:Memory {{id: '{rule_id}'}}), (b:Memory {{id: 'src/lib.rs'}}) MERGE (a)-[r:GOVERNS {{source: 'test', valid_from: 0, valid_to: 0, generation: 0, extractor: 'test', evidence_id: 'e', origin: 'local'}}]->(b)"
+            ))?;
+            Ok(())
+        })
+        .await
+        .expect("seed file + edge");
+        let text = handle_memories_for_file(
+            serde_json::json!({ "namespace": "probe", "path": "src/lib.rs", "include_ast_edges": false }),
+            store,
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&text).expect("valid JSON");
+        let hit = parsed["memories"][0].clone();
+        assert_eq!(
+            hit["deprecation_banner"],
+            json!(
+                "[DEPRECATED — SUPERSEDED BY mem-replacement-42: replaced by the podman v2 rule]"
+            ),
+            "memories_for_file must carry the structured banner: {text}"
+        );
+        assert_eq!(
+            hit["not_definition"],
+            json!("does not apply to rootless podman sockets"),
+            "memories_for_file must carry the structured boundary: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn related_surface_emits_deprecation_presentation() {
+        let (store, rule_id) = store_with_deprecated_rule("probe").await;
+        let lb = crate::traits::VectorStore::as_any(store.as_ref())
+            .downcast_ref::<crate::store::LadybugStore>()
+            .expect("ladybug store");
+        let seed_rule_id = rule_id.clone();
+        lb.with_conn(move |conn| {
+            conn.query(
+                "CREATE (m:Memory {id: 'mem-neighbor', namespace: 'probe', content: 'neighbor', user_id: 'u', memory_type: 'fact', agent_name: 'a', location: '', location_lines: '', metadata: '{}', embedding: [0.0,0.0,0.0,0.0]})"
+            )?;
+            conn.query(&format!(
+                "MERGE (a:Memory {{id: '{seed_rule_id}'}}), (b:Memory {{id: 'mem-neighbor'}}) MERGE (a)-[r:RELATES_TO {{source: 'test', valid_from: 0, valid_to: 0, generation: 0, extractor: 'test', evidence_id: 'e', origin: 'local'}}]->(b)"
+            ))?;
+            Ok(())
+        })
+        .await
+        .expect("seed related neighbor");
+        let text = handle_related(
+            serde_json::json!({ "namespace": "probe", "id": rule_id, "max_hops": 1 }),
+            store,
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&text).expect("valid JSON");
+        let seed = parsed["nodes"]
+            .as_array()
+            .expect("nodes array")
+            .iter()
+            .find(|n| n["id"] == json!(rule_id))
+            .expect("seed node present");
+        assert_eq!(
+            seed["deprecation_banner"],
+            json!(
+                "[DEPRECATED — SUPERSEDED BY mem-replacement-42: replaced by the podman v2 rule]"
+            ),
+            "related must carry the structured banner: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn related_resolves_file_seed_across_absolute_and_relative_spellings() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&tmp.path().join("db"), 4)
+                .expect("open temp database"),
+        );
+        store.init("ns").await.expect("init namespace");
+
+        let mut p = payload("pub fn demo() {}");
+        p.user_id = "u".to_string();
+        p.memory_type = "structural".to_string();
+        p.agent_name = Some("a".to_string());
+        p.metadata = serde_json::json!({"locations":[{"path":"src/lib.rs"}]});
+        store
+            .upsert("ns", "file:src/lib.rs", vec![0.0; 4], p)
+            .await
+            .expect("seed file node");
+
+        reset_related_traversal_counter_for_tests();
+
+        let root = tmp.path().join("ns-v1190-related-root");
+        std::fs::create_dir_all(root.join("src")).expect("root src");
+        let abs_seed = root.join("src/lib.rs").to_string_lossy().to_string();
+
+        let rel_v: Value = serde_json::from_str(
+            &handle_related(
+                serde_json::json!({
+                    "namespace": "ns",
+                    "id": "src/lib.rs",
+                    "max_hops": 1,
+                    "limit": 20,
+                }),
+                store.clone(),
+            )
+            .await,
+        )
+        .expect("valid JSON");
+
+        let abs_v: Value = serde_json::from_str(
+            &handle_related(
+                serde_json::json!({
+                    "namespace": "ns",
+                    "id": abs_seed,
+                    "project_root": root.to_string_lossy(),
+                    "max_hops": 1,
+                    "limit": 20,
+                }),
+                store,
+            )
+            .await,
+        )
+        .expect("valid JSON");
+
+        assert!(rel_v.get("error").is_none(), "{rel_v}");
+        assert!(abs_v.get("error").is_none(), "{abs_v}");
+        assert_eq!(abs_v["seed"], serde_json::json!(abs_seed));
+        assert_eq!(abs_v["resolved_seed"], serde_json::json!("file:src/lib.rs"));
+        assert_eq!(rel_v["resolved_seed"], serde_json::json!("file:src/lib.rs"));
+        assert!(
+            !rel_v["nodes"].as_array().unwrap().is_empty(),
+            "relative seed must reach the file node: {rel_v}"
+        );
+        assert_eq!(rel_v["nodes"], abs_v["nodes"]);
+        assert_eq!(related_traversal_counter_for_tests(), 2);
+    }
+
+    #[tokio::test]
+    async fn related_unresolvable_absolute_file_seed_returns_explicit_error() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&tmp.path().join("db"), 4)
+                .expect("open temp database"),
+        );
+        store.init("ns").await.expect("init namespace");
+
+        reset_related_traversal_counter_for_tests();
+
+        let root = tmp.path().join("ns-v1190-related-unres");
+        let v: Value = serde_json::from_str(
+            &handle_related(
+                serde_json::json!({
+                    "namespace": "ns",
+                    "id": "/outside/ns-v1190/nope.rs",
+                    "project_root": root.to_string_lossy(),
+                    "max_hops": 1,
+                    "limit": 20,
+                }),
+                store,
+            )
+            .await,
+        )
+        .expect("valid JSON");
+
+        assert!(v.get("error").and_then(|e| e.as_str()).is_some(), "{v}");
+        assert_eq!(related_traversal_counter_for_tests(), 0);
+    }
+
+    #[tokio::test]
+    async fn snapshot_surfaces_advisory_stale_memories_for_all_active_rows() {
+        let (store, _) = store_with_one_rule("probe").await;
+        // Add a stale non-task fact via the store trait.
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut p = payload("a fact about an external API that decayed");
+        p.memory_type = "fact".to_string();
+        p.metadata = serde_json::json!({
+            "stale_after": "2000-01-01T00:00:00Z",
+        });
+        store
+            .upsert(
+                "probe",
+                &id,
+                StubEmbedder
+                    .embed("decayed external API fact")
+                    .await
+                    .unwrap(),
+                p,
+            )
+            .await
+            .expect("seed stale fact");
+        let result = handle_get_snapshot(serde_json::json!({ "namespace": "probe" }), store).await;
+        let text = result.expect("snapshot succeeds");
+        assert!(
+            text.contains("stale_memories"),
+            "snapshot must name the advisory section: {text}"
+        );
+        assert!(
+            text.contains("advisory"),
+            "snapshot must label staleness advisory (nonblocking): {text}"
+        );
+        assert!(
+            text.contains(&id) || text.contains("external API"),
+            "snapshot must surface the stale non-task row: {text}"
+        );
+    }
+
     /// A backend without graph-read must answer `unsupported: true`, never an
     /// empty list -- which a caller would misread as "no rules govern this".
     #[tokio::test]
@@ -12645,6 +15350,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memories_for_file_decorates_ast_related_deprecated_and_bounded_neighbors() {
+        let (store, rule_id) = store_with_one_rule("probe").await;
+        let lb = crate::traits::VectorStore::as_any(store.as_ref())
+            .downcast_ref::<crate::store::ladybug::LadybugStore>()
+            .expect("ladybug store");
+        let neighbor_meta = serde_json::to_string(&serde_json::json!({
+            "deprecation": {
+                "status": "deprecated",
+                "superseded_by": "mem-99",
+                "reason": "retired AST neighbor",
+                "effective_at": 1700000000
+            },
+            "not_definition": "not valid for async AST edges",
+        }))
+        .expect("serialize neighbor metadata");
+        let seed_rule_id = rule_id.clone();
+        lb.with_conn(move |conn| {
+            // The file node id must equal the path for discover_candidates.
+            conn.query(
+                "CREATE (m:Memory {id: 'src/lib.rs', namespace: 'probe', content: 'c', user_id: 'u', memory_type: 'file', agent_name: 'a', location: 'src/lib.rs', location_lines: '', metadata: '{\"imports\": [\"pkg/other.rs\"]}', embedding: [0.0,0.0,0.0,0.0]})"
+            )?;
+            conn.query(&format!(
+                "MERGE (a:Memory {{id: '{seed_rule_id}'}}), (b:Memory {{id: 'src/lib.rs'}}) MERGE (a)-[r:GOVERNS {{source: 'test', valid_from: 0, valid_to: 0, generation: 0, extractor: 'test', evidence_id: 'e', origin: 'local'}}]->(b)"
+            ))?;
+            conn.query(&format!(
+                "CREATE (m:Memory {{id: 'mem-dep-neighbor', namespace: 'probe', content: 'old AST neighbor guidance', user_id: 'u', memory_type: 'fact', agent_name: 'a', location: 'src/other.rs', location_lines: '', metadata: '{neighbor_meta}', embedding: [0.0,0.0,0.0,0.0]}})"
+            ))?;
+            conn.query(&format!(
+                "MERGE (a:Memory {{id: '{seed_rule_id}'}}), (b:Memory {{id: 'mem-dep-neighbor'}}) MERGE (a)-[r:RELATES_TO {{source: 'test', valid_from: 0, valid_to: 0, generation: 0, extractor: 'test', evidence_id: 'e', origin: 'local'}}]->(b)"
+            ))?;
+            Ok(())
+        })
+        .await
+        .expect("seed file + deprecated AST neighbor");
+
+        let banner = "[DEPRECATED — SUPERSEDED BY mem-99: retired AST neighbor]";
+        let neighbor_from = |text: &str| -> serde_json::Value {
+            let parsed: Value = serde_json::from_str(text).expect("valid JSON");
+            parsed["related_memories"]
+                .as_array()
+                .expect("related_memories array")
+                .iter()
+                .find(|m| m["id"] == serde_json::json!("mem-dep-neighbor"))
+                .cloned()
+                .expect("deprecated AST neighbor present")
+        };
+
+        let text = handle_memories_for_file(
+            serde_json::json!({
+                "namespace": "probe", "path": "src/lib.rs", "include_ast_edges": true,
+            }),
+            store.clone(),
+        )
+        .await;
+        let neighbor = neighbor_from(&text);
+        assert_eq!(
+            neighbor["deprecation_banner"],
+            serde_json::json!(banner),
+            "AST related_memories must carry the exact banner: {text}"
+        );
+        assert_eq!(
+            neighbor["not_definition"],
+            serde_json::json!("not valid for async AST edges"),
+            "AST related_memories must carry the structured boundary: {text}"
+        );
+        let rendered = neighbor["content"].as_str().expect("content string");
+        assert!(
+            rendered.starts_with(banner),
+            "banner must be prepended deterministically to neighbor content: {rendered}"
+        );
+        assert!(
+            rendered.contains("NOT DEFINITION: not valid for async AST edges"),
+            "negative boundary must be prepended to neighbor content: {rendered}"
+        );
+        let parsed: Value = serde_json::from_str(&text).expect("valid JSON");
+        assert!(
+            parsed["related_memories_truncated"].is_boolean(),
+            "truncation flag preserved: {text}"
+        );
+
+        // Exclusion and flags still work on the decorated array.
+        let excluded = handle_memories_for_file(
+            serde_json::json!({
+                "namespace": "probe", "path": "src/lib.rs", "include_ast_edges": true,
+                "exclude_ids": ["mem-dep-neighbor"],
+            }),
+            store,
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&excluded).expect("valid JSON");
+        assert!(
+            parsed["related_memories"]
+                .as_array()
+                .expect("related_memories array")
+                .iter()
+                .all(|m| m["id"] != serde_json::json!("mem-dep-neighbor")),
+            "exclude_ids must still remove the neighbor: {excluded}"
+        );
+        assert!(
+            parsed["related_memories_truncated"].is_boolean(),
+            "truncation flag preserved with exclude_ids: {excluded}"
+        );
+    }
+
+    #[tokio::test]
     async fn memories_for_file_filters_exclude_ids_from_related_memories() {
         let (store, rule_id) = store_with_one_rule("probe").await;
 
@@ -12704,6 +15514,557 @@ mod tests {
         assert!(
             related_ids(&text).iter().all(|id| id != "mem-related"),
             "related_memories must omit excluded neighbor mem-related: {text}"
+        );
+    }
+
+    /// The handler answers an absolute path with the read error instead of
+    /// widening the lookup; a relative path goes on without the root.
+    #[tokio::test]
+    async fn memories_for_file_reports_a_failed_registry_read() {
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        mock.set_get_fails(true);
+        let store: Arc<dyn VectorStore> = mock;
+        let text = handle_memories_for_file(
+            serde_json::json!({"namespace": "probe", "path": "/repo/src/lib.rs"}),
+            store.clone(),
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&text).expect("valid JSON");
+        let error = parsed["error"].as_str().unwrap_or_default();
+        assert!(error.contains("registered project root"), "{text}");
+        assert_eq!(parsed["memories"], json!([]), "{text}");
+        assert_eq!(
+            parsed["unsupported"],
+            json!(true),
+            "this store has no graph read: {text}"
+        );
+
+        // A relative path is not placed by a root: no error. (This store has
+        // no graph-read support, so it answers `unsupported`.)
+        let text = handle_memories_for_file(
+            serde_json::json!({"namespace": "probe", "path": "src/lib.rs"}),
+            store,
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&text).expect("valid JSON");
+        assert!(parsed.get("error").is_none(), "{text}");
+        assert_eq!(parsed["unsupported"], json!(true), "{text}");
+    }
+
+    #[test]
+    fn a_failed_registry_read_is_not_a_missing_root() {
+        let failed = || Err(anyhow::anyhow!("store unavailable"));
+
+        // Nothing constrains the `.git` fallback: an absolute path must not
+        // be placed as if no root were registered.
+        let got = registry_root_for_lookup(failed(), "ns", "/repo/src/lib.rs", None);
+        let err = got.expect_err("an unreadable root must not widen the lookup");
+        let text = format!("{err:#}");
+        assert!(text.contains("registered project root"), "{text}");
+        assert!(
+            text.contains("store unavailable"),
+            "keeps the cause: {text}"
+        );
+
+        // A relative path never takes that fallback; it goes on without the
+        // registered root.
+        assert_eq!(
+            registry_root_for_lookup(failed(), "ns", "src/lib.rs", None).unwrap(),
+            None
+        );
+
+        // The caller's root constrains the fallback, so the lookup goes on.
+        assert_eq!(
+            registry_root_for_lookup(failed(), "ns", "/repo/src/lib.rs", Some("/repo")).unwrap(),
+            None
+        );
+
+        // A read that worked is passed through, root or no root.
+        assert_eq!(
+            registry_root_for_lookup(Ok(Some("/repo".into())), "ns", "/repo/a.rs", None).unwrap(),
+            Some("/repo".to_string())
+        );
+        assert_eq!(
+            registry_root_for_lookup(Ok(None), "ns", "/repo/a.rs", None).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn an_empty_spelling_success_is_not_discarded_by_another_spellings_error() {
+        use crate::graph_read::memories_for_file::MemoryHit;
+
+        // One spelling answered successfully with zero rows; another failed.
+        // The empty answer is valid and must win over the error.
+        let got = merge_spelling_results(
+            vec![
+                Ok(Vec::<MemoryHit>::new()),
+                Err(anyhow::anyhow!("store failure")),
+            ],
+            10,
+        );
+        assert!(
+            got.is_ok(),
+            "a successful empty answer must survive another spelling's error"
+        );
+        assert!(got.unwrap().is_empty());
+
+        // No spelling succeeded: surface the first error.
+        let got =
+            merge_spelling_results(vec![Err::<Vec<MemoryHit>, _>(anyhow::anyhow!("first"))], 10);
+        assert!(got.is_err(), "when every spelling fails, surface the error");
+    }
+
+    /// Hooks send the absolute path of the file being touched (Claude Code's
+    /// `tool_input.file_path`); stored locations are relative, and older
+    /// memories may carry an absolute `governs` path. Covers the main
+    /// checkout, a linked worktree under `.claude/worktrees/`, a relative
+    /// path, both stored spellings, a relative cached root (ignored), and a
+    /// file in another repository (must not borrow this namespace's memories).
+    #[tokio::test]
+    async fn memories_for_file_resolves_an_absolute_path_to_the_governing_memory() {
+        let (store, rule_id) = store_with_one_rule("probe").await;
+        let lb = crate::traits::VectorStore::as_any(store.as_ref())
+            .downcast_ref::<crate::store::ladybug::LadybugStore>()
+            .expect("ladybug store");
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let base = dunce::canonicalize(tmp.path()).expect("canonical temp dir");
+        let root = base.join("example-project");
+        std::fs::create_dir_all(root.join(".git").join("worktrees").join("agent-1")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let worktree = root.join(".claude").join("worktrees").join("agent-1");
+        std::fs::create_dir_all(worktree.join("src")).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                root.join(".git")
+                    .join("worktrees")
+                    .join("agent-1")
+                    .to_string_lossy()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".git")
+                .join("worktrees")
+                .join("agent-1")
+                .join("commondir"),
+            "../..\n",
+        )
+        .unwrap();
+        let other = base.join("other-repo");
+        std::fs::create_dir_all(other.join(".git")).unwrap();
+        let in_checkout = root
+            .join("src")
+            .join("lib.rs")
+            .to_string_lossy()
+            .to_string();
+        let in_worktree = worktree
+            .join("src")
+            .join("lib.rs")
+            .to_string_lossy()
+            .to_string();
+
+        // One rule governs the relative file node; another declares the file
+        // by an absolute path, as memories written before this fix may.
+        let edge_rule_id = rule_id.clone();
+        let abs_governs = in_checkout.replace('\\', "/");
+        lb.with_conn(move |conn| {
+            let rule_id = edge_rule_id;
+            conn.query(
+                "CREATE (m:Memory {id: 'src/lib.rs', namespace: 'probe', content: 'c', user_id: 'u', memory_type: 'file', agent_name: 'a', location: 'src/lib.rs', location_lines: '', metadata: '{}', embedding: [0.0,0.0,0.0,0.0]})"
+            )?;
+            conn.query(&format!(
+                "MERGE (a:Memory {{id: '{rule_id}'}}), (b:Memory {{id: 'src/lib.rs'}}) MERGE (a)-[r:GOVERNS {{source: 'test', valid_from: 0, valid_to: 0, generation: 0, extractor: 'test', evidence_id: 'e', origin: 'local'}}]->(b)"
+            ))?;
+            conn.query(&format!(
+                "CREATE (m:Memory {{id: 'abs-rule', namespace: 'probe', content: 'abs', user_id: 'u', memory_type: 'rule', agent_name: 'a', location: '', location_lines: '', metadata: '{{\"governs\":[\"{abs_governs}\"]}}', embedding: [0.0,0.0,0.0,0.0]}})"
+            ))?;
+            Ok(())
+        })
+        .await
+        .expect("seed file, edge and absolute-path rule");
+
+        let lookup = |path: String| {
+            let store = store.clone();
+            async move {
+                let text = handle_memories_for_file(
+                    serde_json::json!({ "namespace": "probe", "path": path }),
+                    store,
+                )
+                .await;
+                serde_json::from_str::<Value>(&text).expect("valid JSON")
+            }
+        };
+        let ids = |parsed: &Value| -> Vec<String> {
+            parsed["memories"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(str::to_string))
+                .collect()
+        };
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+
+        // A root cached as a relative path is ignored: the `.git` fallback
+        // still resolves the file.
+        crate::registry::cache_project_root(&store, Some(&emb), "probe", "example-project").await;
+        for path in [
+            in_checkout.clone(),
+            in_checkout.replace('\\', "/"),
+            in_worktree.clone(),
+            "src/lib.rs".to_string(),
+        ] {
+            let parsed = lookup(path.clone()).await;
+            assert!(ids(&parsed).contains(&rule_id), "{path} -> {parsed}");
+            assert_eq!(
+                parsed["path"],
+                serde_json::json!(path),
+                "the caller's path is echoed"
+            );
+        }
+        let parsed = lookup(in_worktree.clone()).await;
+        assert_eq!(parsed["resolved_path"], serde_json::json!("src/lib.rs"));
+        assert_eq!(parsed["resolved_from"], serde_json::json!("marker"));
+        assert!(lookup("src/lib.rs".into())
+            .await
+            .get("resolved_path")
+            .is_none());
+        // The rule stored with the absolute path still answers for it.
+        let parsed = lookup(in_checkout.clone()).await;
+        assert!(ids(&parsed).contains(&"abs-rule".to_string()), "{parsed}");
+
+        // With a usable registered root, the relative path also reaches the
+        // rule stored with the absolute path.
+        crate::registry::cache_project_root(&store, Some(&emb), "probe", &root.to_string_lossy())
+            .await;
+        let parsed = lookup("src/lib.rs".into()).await;
+        assert!(ids(&parsed).contains(&"abs-rule".to_string()), "{parsed}");
+        assert!(ids(&parsed).contains(&rule_id), "{parsed}");
+
+        // A file in another repository is left as it was: same relative name,
+        // different project.
+        let stranger = other
+            .join("src")
+            .join("lib.rs")
+            .to_string_lossy()
+            .to_string();
+        let parsed = lookup(stranger).await;
+        assert!(ids(&parsed).is_empty(), "{parsed}");
+        assert_eq!(parsed["resolved_from"], serde_json::json!("outside"));
+        // ...while the worktree of the registered checkout still resolves.
+        assert!(ids(&lookup(in_worktree).await).contains(&rule_id));
+
+        // A database that stores the file's symbols under the absolute path
+        // still returns them for an absolute request.
+        let abs_location = in_checkout.replace('\\', "/");
+        lb.with_conn(move |conn| {
+            conn.query(&format!(
+                "CREATE (m:Memory {{id: 'abs-symbol', namespace: 'probe', content: 'fn run', user_id: 'u', memory_type: 'code_ast', agent_name: 'a', location: '{abs_location}#functions:run@h', location_lines: '', metadata: '{{}}', embedding: [0.0,0.0,0.0,0.0]}})"
+            ))?;
+            Ok(())
+        })
+        .await
+        .expect("seed a symbol stored under the absolute path");
+        let parsed = lookup(in_checkout.replace('\\', "/")).await;
+        let symbols = parsed["ast_summary"]["symbols"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            symbols.iter().any(|s| s.to_string().contains("abs-symbol")),
+            "{parsed}"
+        );
+
+        // Merging the two spellings stays within MAX_LIMIT, as one query does.
+        let abs_governs = in_checkout.replace('\\', "/");
+        lb.with_conn(move |conn| {
+            for i in 0..15 {
+                conn.query(&format!(
+                    "CREATE (m:Memory {{id: 'rel-{i}', namespace: 'probe', content: 'rel {i}', user_id: 'u', memory_type: 'rule', agent_name: 'a', location: '', location_lines: '', metadata: '{{}}', embedding: [0.0,0.0,0.0,0.0]}})"
+                ))?;
+                conn.query(&format!(
+                    "MERGE (a:Memory {{id: 'rel-{i}'}}), (b:Memory {{id: 'src/lib.rs'}}) MERGE (a)-[r:GOVERNS {{source: 'test', valid_from: 0, valid_to: 0, generation: 0, extractor: 'test', evidence_id: 'e', origin: 'local'}}]->(b)"
+                ))?;
+                conn.query(&format!(
+                    "CREATE (m:Memory {{id: 'abs-{i}', namespace: 'probe', content: 'abs {i}', user_id: 'u', memory_type: 'rule', agent_name: 'a', location: '', location_lines: '', metadata: '{{\"governs\":[\"{abs_governs}\"]}}', embedding: [0.0,0.0,0.0,0.0]}})"
+                ))?;
+            }
+            Ok(())
+        })
+        .await
+        .expect("seed rules under both spellings");
+        let text = handle_memories_for_file(
+            serde_json::json!({ "namespace": "probe", "path": in_checkout, "limit": 100 }),
+            store.clone(),
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(
+            ids(&parsed).len(),
+            crate::graph_read::memories_for_file::MAX_LIMIT,
+            "{parsed}"
+        );
+    }
+
+    /// #266 end-to-end: an absolute path resolved under a broader `project_root`
+    /// and the relative form resolved under the deeper registered root must
+    /// reach the same governing memories, while the primary resolution stays
+    /// `project_root`.
+    #[tokio::test]
+    async fn memories_for_file_absolute_and_relative_spellings_resolve_identically() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&tmp.path().join("db"), 4)
+                .expect("open temp database"),
+        );
+        store.init("ns").await.expect("init namespace");
+
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(workspace.join(".git")).expect("workspace .git");
+        let member = workspace.join("member");
+        std::fs::create_dir_all(member.join("src")).expect("member src");
+        let file = member.join("src").join("lib.rs");
+        std::fs::write(&file, "// lib").expect("write file");
+
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        crate::registry::cache_project_root(&store, Some(&emb), "ns", &member.to_string_lossy())
+            .await;
+
+        let abs_norm = file.to_string_lossy().replace('\\', "/");
+        for (id, governs) in [
+            ("rule-reg-rel", "src/lib.rs"),
+            ("rule-proj-rel", "member/src/lib.rs"),
+            ("rule-abs", abs_norm.as_str()),
+        ] {
+            let mut p = payload("rule");
+            p.metadata = serde_json::json!({"governs": [governs]});
+            store
+                .upsert("ns", id, vec![0.0; 4], p)
+                .await
+                .expect("seed governing rule");
+        }
+
+        let abs_v: Value = serde_json::from_str(
+            &handle_memories_for_file(
+                serde_json::json!({
+                    "namespace": "ns",
+                    "path": file.to_string_lossy(),
+                    "project_root": workspace.to_string_lossy(),
+                }),
+                store.clone(),
+            )
+            .await,
+        )
+        .expect("valid JSON");
+        assert!(abs_v.get("error").is_none(), "{abs_v}");
+        assert_eq!(
+            abs_v["resolved_path"],
+            serde_json::json!("member/src/lib.rs")
+        );
+        assert_eq!(abs_v["resolved_from"], serde_json::json!("project_root"));
+        let hit_ids = |v: &Value| -> Vec<String> {
+            v["memories"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(str::to_string))
+                .collect()
+        };
+        let abs_ids = hit_ids(&abs_v);
+        for id in ["rule-reg-rel", "rule-proj-rel", "rule-abs"] {
+            assert!(
+                abs_ids.iter().any(|got| got == id),
+                "{id} missing from {abs_ids:?}"
+            );
+        }
+
+        let rel_v: Value = serde_json::from_str(
+            &handle_memories_for_file(
+                serde_json::json!({"namespace": "ns", "path": "src/lib.rs"}),
+                store.clone(),
+            )
+            .await,
+        )
+        .expect("valid JSON");
+        assert!(rel_v.get("error").is_none(), "{rel_v}");
+        let rel_ids = hit_ids(&rel_v);
+        for id in ["rule-reg-rel", "rule-abs"] {
+            assert!(
+                rel_ids.iter().any(|got| got == id),
+                "{id} missing from {rel_ids:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn memories_for_file_and_context_plan_reject_unresolvable_outside_path_even_if_stored() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&tmp.path().join("db"), 4)
+                .expect("open temp database"),
+        );
+        store.init("ns").await.expect("init namespace");
+
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(root.join(".git")).expect("repo .git");
+        let outside = tmp.path().join("outside-repo").join("src").join("lib.rs");
+        std::fs::create_dir_all(outside.parent().unwrap()).expect("outside dir");
+        std::fs::write(&outside, "// outside").expect("write outside file");
+        let outside_s = outside.to_string_lossy().replace('\\', "/");
+
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        crate::registry::cache_project_root(&store, Some(&emb), "ns", &root.to_string_lossy())
+            .await;
+
+        let mut p = payload("rule");
+        p.content = "outside rule".to_string();
+        p.location = outside_s.clone();
+        p.metadata = serde_json::json!({"governs": [outside_s]});
+        store
+            .upsert("ns", "rule-outside", vec![0.1; 4], p)
+            .await
+            .expect("seed outside governing rule");
+
+        let mff_out = handle_memories_for_file(
+            serde_json::json!({
+                "namespace": "ns",
+                "path": outside_s,
+                "project_root": root.to_string_lossy(),
+            }),
+            store.clone(),
+        )
+        .await;
+        let mff_v: Value = serde_json::from_str(&mff_out).expect("valid JSON");
+        assert!(
+            mff_v["memories"]
+                .as_array()
+                .map(|a| a.is_empty())
+                .unwrap_or(false),
+            "unresolvable outside path must not return stored outside rule: {mff_v}"
+        );
+        assert_eq!(mff_v["resolved_from"], serde_json::json!("outside"));
+        let err_msg = mff_v
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or_default();
+        assert!(
+            err_msg.contains("unresolvable") || err_msg.contains("outside"),
+            "memories_for_file must surface unresolvable path error: {mff_v}"
+        );
+
+        let cp_out = handle_context_plan(
+            &serde_json::json!({
+                "namespace": "ns",
+                "files": [outside_s],
+                "max_items": 20,
+            }),
+            emb,
+            store,
+        )
+        .await;
+        let cp_v: Value = serde_json::from_str(&cp_out).expect("context_plan json");
+        let enriched_ids: Vec<&str> = cp_v["items"]
+            .as_array()
+            .expect("items array")
+            .iter()
+            .filter(|it| it.get("freshness").is_none())
+            .filter_map(|it| it["id"].as_str())
+            .collect();
+        assert!(
+            !enriched_ids.contains(&"rule-outside"),
+            "context_plan file enrichment must not match stored outside location on unresolvable file: {cp_v}"
+        );
+        assert_eq!(
+            cp_v["degradation"],
+            serde_json::json!("partial"),
+            "context_plan must degrade to partial on unresolvable file: {cp_v}"
+        );
+    }
+
+    /// #271/#272 end-to-end: `handle_memories_for_file` must union the AST
+    /// neighborhoods found under both equivalent spellings, not stop at the
+    /// first one that returns symbols.
+    #[tokio::test]
+    async fn memories_for_file_unions_ast_neighborhood_across_equivalent_spellings() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&tmp.path().join("db"), 4)
+                .expect("open temp database"),
+        );
+        store.init("ns").await.expect("init namespace");
+        let lb = crate::traits::VectorStore::as_any(store.as_ref())
+            .downcast_ref::<crate::store::ladybug::LadybugStore>()
+            .expect("ladybug store");
+
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(root.join(".git")).expect("repo .git");
+        std::fs::create_dir_all(root.join("src")).expect("repo src");
+        let abs_file = root.join("src").join("lib.rs");
+        std::fs::write(&abs_file, "// lib").expect("write file");
+        let abs_norm = abs_file.to_string_lossy().replace('\\', "/");
+
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        crate::registry::cache_project_root(&store, Some(&emb), "ns", &root.to_string_lossy())
+            .await;
+
+        lb.with_conn(move |conn| {
+            conn.query(&format!(
+                "CREATE (m:Memory {{id: 'sym-rel', namespace: 'ns', content: 'fn rel_fn', user_id: 'u', memory_type: 'code_ast', agent_name: 'a', location: 'src/lib.rs#functions:rel_fn@h1', location_lines: '', metadata: '{{}}', embedding: [0.0,0.0,0.0,0.0]}})"
+            ))?;
+            conn.query(&format!(
+                "CREATE (m:Memory {{id: 'sym-abs', namespace: 'ns', content: 'fn abs_fn', user_id: 'u', memory_type: 'code_ast', agent_name: 'a', location: '{abs_norm}#functions:abs_fn@h2', location_lines: '', metadata: '{{}}', embedding: [0.0,0.0,0.0,0.0]}})"
+            ))?;
+            Ok(())
+        })
+        .await
+        .expect("seed AST symbols under both spellings");
+
+        let symbol_ids = |v: &Value| -> Vec<String> {
+            v["ast_summary"]["symbols"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|s| s.get("id").and_then(|i| i.as_str()).map(str::to_string))
+                .collect()
+        };
+
+        let abs_v: Value = serde_json::from_str(
+            &handle_memories_for_file(
+                serde_json::json!({
+                    "namespace": "ns",
+                    "path": abs_file.to_string_lossy(),
+                    "project_root": root.to_string_lossy(),
+                }),
+                store.clone(),
+            )
+            .await,
+        )
+        .expect("valid JSON");
+        let abs_ids = symbol_ids(&abs_v);
+        assert!(abs_ids.iter().any(|id| id == "sym-rel"), "{abs_v}");
+        assert!(abs_ids.iter().any(|id| id == "sym-abs"), "{abs_v}");
+
+        let rel_v: Value = serde_json::from_str(
+            &handle_memories_for_file(
+                serde_json::json!({"namespace": "ns", "path": "src/lib.rs"}),
+                store.clone(),
+            )
+            .await,
+        )
+        .expect("valid JSON");
+        let rel_ids = symbol_ids(&rel_v);
+        assert!(rel_ids.iter().any(|id| id == "sym-rel"), "{rel_v}");
+        assert!(rel_ids.iter().any(|id| id == "sym-abs"), "{rel_v}");
+        assert_eq!(rel_ids, abs_ids, "both spellings must yield the same union");
+        assert_eq!(
+            rel_v["ast_summary"]["symbols"], abs_v["ast_summary"]["symbols"],
+            "full symbol arrays must match across spellings"
         );
     }
 
@@ -14737,6 +18098,83 @@ mod tests {
         );
     }
 
+    /// A method this server does not implement is a JSON-RPC method-not-found
+    /// error carrying the request's id; `ping` is an empty result. Both used
+    /// to be a bare `{}` with no `jsonrpc` and no `id`.
+    #[tokio::test]
+    async fn unknown_methods_are_method_not_found_with_the_request_id() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+        let call = |method: &str, id: Value| JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(id),
+            method: method.to_string(),
+            params: None,
+        };
+        let (bus, _seen) = recording_bus();
+        let response = process_mcp_request(
+            call("server/discover", serde_json::json!(41)),
+            Arc::new(StubEmbedder),
+            store.clone(),
+            ingests.clone(),
+            None,
+            bus.clone(),
+        )
+        .await;
+        assert_eq!(response["jsonrpc"], serde_json::json!("2.0"), "{response}");
+        assert_eq!(response["id"], serde_json::json!(41), "{response}");
+        assert_eq!(
+            response["error"]["code"],
+            serde_json::json!(METHOD_NOT_FOUND),
+            "{response}"
+        );
+        assert!(response.get("result").is_none(), "{response}");
+
+        let response = process_mcp_request(
+            call("ping", serde_json::json!("p")),
+            Arc::new(StubEmbedder),
+            store,
+            ingests,
+            None,
+            bus,
+        )
+        .await;
+        assert_eq!(response["id"], serde_json::json!("p"), "{response}");
+        assert_eq!(response["result"], serde_json::json!({}), "{response}");
+    }
+
+    /// An explicit `id: null` is a request id, not the notification marker
+    /// (which is an *omitted* `id`): dispatch answers it with an error that
+    /// echoes `"id": null` instead of suppressing the reply.
+    #[tokio::test]
+    async fn an_explicit_id_null_is_a_request_answered_with_id_null() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::Value::Null),
+            method: "server/discover".to_string(),
+            params: None,
+        };
+        let (bus, _seen) = recording_bus();
+        let response =
+            process_mcp_request(request, Arc::new(StubEmbedder), store, ingests, None, bus).await;
+        assert_eq!(response["jsonrpc"], serde_json::json!("2.0"), "{response}");
+        assert!(response.get("id").is_some(), "{response}");
+        assert_eq!(response["id"], serde_json::Value::Null, "{response}");
+        assert_eq!(
+            response["error"]["code"],
+            serde_json::json!(METHOD_NOT_FOUND),
+            "{response}"
+        );
+        assert_eq!(
+            response["error"]["message"],
+            serde_json::json!("Method not found: server/discover"),
+            "{response}"
+        );
+        assert!(response.get("result").is_none(), "{response}");
+    }
+
     /// The mesh dispatch arm is the only production route from the wire to
     /// the mesh module. Mutation-probe evidence (checker-free, integration
     /// round): with the prefix sabotaged, the ENTIRE suite stayed green —
@@ -14780,7 +18218,7 @@ mod tests {
     /// Clients pin this list; a silent rename orphans their wiring.
     /// Keep in sync with the entries in `process_mcp_request` -> `"tools/list"`.
     #[tokio::test]
-    async fn tools_list_carries_all_thirty_seven_tools_in_a_stable_order() {
+    async fn tools_list_carries_all_thirty_eight_tools_in_a_stable_order() {
         let (store, _) = store_with_one_rule("probe").await;
         let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
         let request = JsonRpcRequest {
@@ -14807,6 +18245,7 @@ mod tests {
                 "neurostrata_get_snapshot",
                 "neurostrata_ingest_directory",
                 "neurostrata_ingest_scip",
+                "neurostrata_ingest_bounded",
                 "neurostrata_list_namespaces",
                 "neurostrata_search_memory",
                 "neurostrata_rebuild_lexical_index",
@@ -14834,6 +18273,7 @@ mod tests {
                 "neurostrata_feedback",
                 "neurostrata_distill",
                 "neurostrata_validate_shapes",
+                "neurostrata_vault_sync",
                 "neurostrata_export_canonical_rdf",
                 "neurostrata_validate_canonical_rdf",
                 "neurostrata_sparql_query",
@@ -14988,6 +18428,589 @@ mod tests {
             !loc_desc.contains("Memories MUST reference"),
             "locations description must never claim memories MUST reference documents: {loc_desc:?}"
         );
+    }
+
+    /// Capability F review fix: the bounded classifier must be a real MCP
+    /// surface, not a module-only API. RED until schema + dispatch are wired.
+    #[tokio::test]
+    async fn mcp_surface_wires_strict_ingest_bounded_tool() {
+        let ns = format!("ns-mcp-ib-{}", uuid::Uuid::new_v4());
+        let (store, _) = store_with_one_rule(&ns).await;
+        let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+        let (bus, _) = recording_bus();
+
+        let list_req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: "tools/list".to_string(),
+            params: Some(serde_json::json!({})),
+        };
+        let list_resp = process_mcp_request(
+            list_req,
+            Arc::new(StubEmbedder),
+            store.clone(),
+            ingests.clone(),
+            None,
+            bus.clone(),
+        )
+        .await;
+        let tool = list_resp["result"]["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .find(|t| t["name"] == "neurostrata_ingest_bounded")
+            .expect("neurostrata_ingest_bounded must be exposed over MCP");
+        let required = tool["inputSchema"]["required"]
+            .as_array()
+            .expect("inputSchema.required");
+        for field in ["namespace", "domain", "candidates"] {
+            assert!(
+                required.iter().any(|v| v == field),
+                "required schema field missing: {field}"
+            );
+        }
+
+        let call_req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(2)),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "name": "neurostrata_ingest_bounded",
+                "arguments": {
+                    "namespace": ns,
+                    "domain": "memory",
+                    "candidates": []
+                }
+            })),
+        };
+        let call_resp =
+            process_mcp_request(call_req, Arc::new(StubEmbedder), store, ingests, None, bus).await;
+        let text = call_resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool result text");
+        assert!(
+            !text.contains("Unknown tool"),
+            "dispatch must reach the real handler, got: {text}"
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(text).expect("handler returns structured JSON");
+        assert_eq!(
+            value["ok"], false,
+            "an empty candidate batch must fail closed through the MCP surface"
+        );
+    }
+
+    /// The connector tool's `args` object is the only contract a client
+    /// reads before calling it. An underspecified schema turns every
+    /// operation-specific required field into a runtime error instead of
+    /// a dispatch-time rejection. `args` therefore discriminates on
+    /// `operation`, and each variant declares the fields
+    /// AgentKernel::execute_connector_command actually reads, with the
+    /// nested serde records spelled out. A missing variant, a dropped
+    /// required field, or a wrong integer width fails here.
+    #[tokio::test]
+    async fn data_connector_schema_is_operation_specific() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: "tools/list".to_string(),
+            params: Some(serde_json::json!({})),
+        };
+        let (bus, _seen) = recording_bus();
+        let response =
+            process_mcp_request(request, Arc::new(StubEmbedder), store, ingests, None, bus).await;
+        let tools = response["result"]["tools"]
+            .as_array()
+            .expect("tools/list returns an array");
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == "neurostrata_data_connector")
+            .expect("connector tool is exposed");
+        // Hand-derived from AgentKernel::execute_connector_command and the
+        // serde records in src/connectors/mod.rs — not from the emitted schema.
+        // Each row: (op, required, declared top-level properties in the variant).
+        // Exact property sets pin discovery: a spurious now_secs on the wrong op fails here.
+        let expected: &[(&str, &[&str], &[&str])] = &[
+            ("list_connectors", &["operation"], &["operation"]),
+            ("list_pointers", &["operation"], &["operation"]),
+            (
+                "describe_pool",
+                &["operation", "pool_id", "connector_id"],
+                &["operation", "pool_id", "connector_id"],
+            ),
+            (
+                "register_pointer",
+                &["operation", "record"],
+                &["operation", "record"],
+            ),
+            (
+                "resolve_pointer",
+                &["operation", "req"],
+                &["operation", "req", "now_secs"],
+            ),
+            (
+                "apply_effect",
+                &["operation", "req"],
+                &["operation", "req", "now_secs"],
+            ),
+            (
+                "mediate",
+                &["operation", "from_stage", "to_stage", "slice_req"],
+                &[
+                    "operation",
+                    "from_stage",
+                    "to_stage",
+                    "slice_req",
+                    "gate_passed",
+                    "now_secs",
+                ],
+            ),
+        ];
+        // Nullable parity helper: Option<String> accepts null; as_u64()/as_bool()
+        // on null map to the runtime default — discovery must not forbid null.
+        let assert_nullable = |value: &serde_json::Value, want: &[&str], what: &str| {
+            let types: Vec<&str> = value["type"]
+                .as_array()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{what}: type must be a nullable array, got {}",
+                        value["type"]
+                    )
+                })
+                .iter()
+                .map(|t| t.as_str().expect("type is a string"))
+                .collect();
+            let mut got = types;
+            got.sort();
+            let mut want_sorted = want.to_vec();
+            want_sorted.sort();
+            assert_eq!(got, want_sorted, "{what}: nullable type set");
+        };
+        let sorted = |value: &serde_json::Value, what: &str| -> Vec<String> {
+            let mut keys: Vec<String> = value
+                .as_object()
+                .unwrap_or_else(|| panic!("{what}: expected an object"))
+                .keys()
+                .cloned()
+                .collect();
+            keys.sort();
+            keys
+        };
+        let args = &tool["inputSchema"]["properties"]["args"];
+        let one_of = args["oneOf"]
+            .as_array()
+            .expect("args discriminates on operation via oneOf");
+        assert_eq!(
+            one_of.len(),
+            expected.len(),
+            "exactly the seven wire operations are declared"
+        );
+        for (op, required, declared) in expected {
+            let variant = one_of
+                .iter()
+                .find(|v| v["properties"]["operation"]["const"] == *op)
+                .unwrap_or_else(|| panic!("oneOf carries a variant for {op}"));
+            let req: Vec<&str> = variant["required"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{op} declares required fields"))
+                .iter()
+                .map(|v| v.as_str().expect("a required field name"))
+                .collect();
+            assert_eq!(&req, required, "{op} required fields");
+            let mut got_props = sorted(&variant["properties"], "variant properties");
+            let mut want_props: Vec<String> = declared.iter().map(|s| s.to_string()).collect();
+            got_props.sort();
+            want_props.sort();
+            assert_eq!(
+                got_props, want_props,
+                "{op} declares exactly these properties"
+            );
+            if variant["properties"]["now_secs"].is_object() {
+                assert_nullable(
+                    &variant["properties"]["now_secs"],
+                    &["integer", "null"],
+                    &format!("{op} now_secs"),
+                );
+                assert_eq!(
+                    variant["properties"]["now_secs"]["minimum"],
+                    serde_json::json!(0),
+                    "{op} now_secs is a u64 epoch with minimum 0"
+                );
+                let desc = variant["properties"]["now_secs"]["description"]
+                    .as_str()
+                    .expect("now_secs documents its default");
+                assert!(
+                    desc.contains("current epoch"),
+                    "{op} now_secs documents the current-epoch default: {desc}"
+                );
+            }
+        }
+        // DataPointerRecord: the exact required set the serde derive
+        // enforces; expected_source_sha256 stays optional and nullable.
+        let register = one_of
+            .iter()
+            .find(|v| v["properties"]["operation"]["const"] == "register_pointer")
+            .expect("register_pointer variant");
+        let record = &register["properties"]["record"];
+        let mut record_required: Vec<&str> = record["required"]
+            .as_array()
+            .expect("record declares required fields")
+            .iter()
+            .map(|v| v.as_str().expect("a required field name"))
+            .collect();
+        record_required.sort();
+        let mut want_record = vec![
+            "captured_at_secs",
+            "connector_id",
+            "entity_type",
+            "max_staleness_secs",
+            "pointer_id",
+            "pointer_uri",
+            "pool_id",
+        ];
+        want_record.sort();
+        assert_eq!(record_required, want_record, "DataPointerRecord required");
+        let record_props = sorted(&record["properties"], "DataPointerRecord properties");
+        let mut want_record_props: Vec<String> = want_record
+            .iter()
+            .map(|s| s.to_string())
+            .chain(std::iter::once("expected_source_sha256".to_string()))
+            .collect();
+        want_record_props.sort();
+        assert_eq!(
+            record_props, want_record_props,
+            "DataPointerRecord declares exactly these fields"
+        );
+        assert_nullable(
+            &record["properties"]["expected_source_sha256"],
+            &["string", "null"],
+            "DataPointerRecord expected_source_sha256",
+        );
+        for f in ["captured_at_secs", "max_staleness_secs"] {
+            assert_eq!(
+                record["properties"][f]["type"], "integer",
+                "{f} is a u64, serialized as an integer"
+            );
+            assert_eq!(
+                record["properties"][f]["minimum"],
+                serde_json::json!(0),
+                "{f} is a u64 with minimum 0"
+            );
+        }
+        // DataSliceRequest, shared by resolve_pointer.req and mediate.slice_req.
+        let slice_variations = [
+            (
+                "resolve_pointer",
+                &one_of
+                    .iter()
+                    .find(|v| v["properties"]["operation"]["const"] == "resolve_pointer")
+                    .expect("resolve_pointer variant")["properties"]["req"],
+            ),
+            (
+                "mediate",
+                &one_of
+                    .iter()
+                    .find(|v| v["properties"]["operation"]["const"] == "mediate")
+                    .expect("mediate variant")["properties"]["slice_req"],
+            ),
+        ];
+        for (op, slice_schema) in slice_variations {
+            let mut slice_required: Vec<&str> = slice_schema["required"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{op} slice request declares required fields"))
+                .iter()
+                .map(|v| v.as_str().expect("a required field name"))
+                .collect();
+            slice_required.sort();
+            let mut want_slice = vec!["limit", "max_bytes", "offset", "pointer_id"];
+            want_slice.sort();
+            assert_eq!(slice_required, want_slice, "{op} DataSliceRequest required");
+            assert_eq!(
+                sorted(&slice_schema["properties"], "DataSliceRequest properties"),
+                want_slice.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                "{op} DataSliceRequest declares exactly these fields"
+            );
+            for f in ["offset", "limit", "max_bytes"] {
+                assert_eq!(
+                    slice_schema["properties"][f]["type"], "integer",
+                    "{op} {f} is a u32, serialized as an integer"
+                );
+                assert_eq!(
+                    slice_schema["properties"][f]["minimum"],
+                    serde_json::json!(0),
+                    "{op} {f} minimum 0"
+                );
+                assert_eq!(
+                    slice_schema["properties"][f]["maximum"],
+                    serde_json::json!(4294967295u64),
+                    "{op} {f} maximum 4294967295 (u32)"
+                );
+            }
+        }
+        // ExternalEffectRequest.
+        let apply = one_of
+            .iter()
+            .find(|v| v["properties"]["operation"]["const"] == "apply_effect")
+            .expect("apply_effect variant");
+        let eff = &apply["properties"]["req"];
+        let mut eff_required: Vec<&str> = eff["required"]
+            .as_array()
+            .expect("effect request declares required fields")
+            .iter()
+            .map(|v| v.as_str().expect("a required field name"))
+            .collect();
+        eff_required.sort();
+        let mut want_eff = vec![
+            "action_receipt_id",
+            "idempotency_key",
+            "operation",
+            "payload",
+            "pointer_id",
+        ];
+        want_eff.sort();
+        assert_eq!(eff_required, want_eff, "ExternalEffectRequest required");
+        let eff_props = sorted(&eff["properties"], "ExternalEffectRequest properties");
+        let mut want_eff_props: Vec<String> = want_eff
+            .iter()
+            .map(|s| s.to_string())
+            .chain(std::iter::once("expected_source_sha256".to_string()))
+            .collect();
+        want_eff_props.sort();
+        assert_eq!(
+            eff_props, want_eff_props,
+            "ExternalEffectRequest declares exactly these fields"
+        );
+        assert_nullable(
+            &eff["properties"]["expected_source_sha256"],
+            &["string", "null"],
+            "ExternalEffectRequest expected_source_sha256",
+        );
+        assert!(
+            eff["properties"]["payload"].get("type").is_none(),
+            "payload is any JSON value; the schema must not constrain it"
+        );
+        // mediate: stage strings stay unconstrained at the schema layer because
+        // the runtime matches case-insensitively; gate_passed is nullable
+        // (as_bool() on null maps to the false default) and documents it.
+        let mediate = one_of
+            .iter()
+            .find(|v| v["properties"]["operation"]["const"] == "mediate")
+            .expect("mediate variant");
+        assert_eq!(mediate["properties"]["from_stage"]["type"], "string");
+        assert_eq!(mediate["properties"]["to_stage"]["type"], "string");
+        assert!(
+            mediate["properties"]["from_stage"].get("enum").is_none(),
+            "from_stage must not carry an enum (runtime matches case-insensitively)"
+        );
+        assert!(
+            mediate["properties"]["to_stage"].get("enum").is_none(),
+            "to_stage must not carry an enum (runtime matches case-insensitively)"
+        );
+        assert_nullable(
+            &mediate["properties"]["gate_passed"],
+            &["boolean", "null"],
+            "mediate gate_passed",
+        );
+        let gate_desc = mediate["properties"]["gate_passed"]["description"]
+            .as_str()
+            .expect("gate_passed documents its default");
+        assert!(
+            gate_desc.contains("false"),
+            "gate_passed documents the false default: {gate_desc}"
+        );
+    }
+
+    /// Shared fixture: creates a temp store with a seeded private data_pointer
+    /// in the given namespace. Returns (store, ladybug_store, bus, ptr).
+    async fn seed_data_pointer_in_namespace(
+        namespace: &str,
+    ) -> (
+        Arc<dyn VectorStore>,
+        Arc<crate::store::ladybug::LadybugStore>,
+        Arc<crate::events::ThalamicBus>,
+        crate::connectors::DataPointerRecord,
+    ) {
+        use crate::connectors::DataPointerRecord;
+        use crate::store::ladybug::LadybugStore;
+        use crate::traits::MemoryPayload;
+
+        let dir =
+            std::env::temp_dir().join(format!("ns-dc-seed-{}-{}", namespace, uuid::Uuid::new_v4()));
+        let ladybug_store = Arc::new(LadybugStore::for_testing(&dir, 4).expect("open temp"));
+        let store: Arc<dyn VectorStore> = ladybug_store.clone();
+        store.init(namespace).await.expect("init schema");
+        let (bus, _seen) = recording_bus();
+
+        let ptr = DataPointerRecord {
+            pointer_id: "ptr_secret".to_string(),
+            connector_id: "conn1".to_string(),
+            pool_id: "pool1".to_string(),
+            pointer_uri: "uri1".to_string(),
+            entity_type: "item".to_string(),
+            expected_source_sha256: None,
+            captured_at_secs: 1000,
+            max_staleness_secs: 3600,
+        };
+        let metadata = json!({
+            "eligibility": "private",
+            "pointer": serde_json::to_value(&ptr).unwrap(),
+            "source": {"kind": "data_connector", "ref": ptr.pointer_uri.clone()},
+            "visible_to": ["alice"],
+        });
+        let payload = MemoryPayload {
+            content: format!("data pointer {}", ptr.pointer_id),
+            user_id: "alice".to_string(),
+            memory_type: "data_pointer".to_string(),
+            agent_name: None,
+            location: ptr.pointer_uri.clone(),
+            location_lines: String::new(),
+            metadata,
+        };
+        crate::traits::OntologyStore::put_scoped_memory(
+            &*ladybug_store,
+            namespace,
+            &ptr.pointer_id,
+            &payload,
+        )
+        .await
+        .expect("seed pointer");
+
+        (store, ladybug_store, bus, ptr)
+    }
+
+    /// Data connector: blank/whitespace/non-string principal must be rejected.
+    /// Seeds pointer in "global" namespace (where old code maps invalid principal to None).
+    /// Table-driven: covers empty string, whitespace-only, null, number, object, array.
+    #[tokio::test]
+    async fn data_connector_rejects_invalid_principal() {
+        let (store, _ladybug_store, bus, _ptr) = seed_data_pointer_in_namespace("global").await;
+
+        // Malformed principal values (blank, surrounding whitespace, non-string)
+        let malformed_principals = [
+            json!(""),
+            json!("   "),
+            json!("\t"),
+            json!("\n"),
+            json!(" alice"),
+            json!("alice "),
+            json!(" alice "),
+            json!(null),
+            json!(123),
+            json!({}),
+            json!([]),
+        ];
+
+        for malformed in malformed_principals {
+            let arguments = json!({
+                "namespace": "global",
+                "args": {"operation": "list_pointers"},
+                "principal": malformed
+            });
+            let response_text = handle_data_connector(&arguments, store.clone(), bus.clone()).await;
+            let response: Value = serde_json::from_str(&response_text).expect("valid JSON");
+            assert_eq!(
+                response["ok"], false,
+                "malformed principal {:?} must be rejected, got: {}",
+                malformed, response_text
+            );
+            let err = response["error"].as_str().expect("error string");
+            assert!(
+                err.contains("principal"),
+                "error must mention principal for {:?}: {}",
+                malformed,
+                err
+            );
+            assert!(
+                !response_text.contains("ptr_secret"),
+                "must not disclose pointer_id for {:?}: {}",
+                malformed,
+                response_text
+            );
+            assert!(
+                !response_text.contains("uri1"),
+                "must not disclose pointer_uri for {:?}: {}",
+                malformed,
+                response_text
+            );
+        }
+    }
+
+    /// Data connector: blank/whitespace/non-string namespace must be rejected.
+    /// Seeds pointer in "global" namespace (where old code maps invalid namespace to "global").
+    /// Table-driven: covers empty string, whitespace-only, null, number, object, array.
+    #[tokio::test]
+    async fn data_connector_rejects_invalid_namespace() {
+        let (store, _ladybug_store, bus, _ptr) = seed_data_pointer_in_namespace("global").await;
+
+        // Malformed namespace values (blank, surrounding whitespace, non-string)
+        let malformed_namespaces = [
+            json!(""),
+            json!("   "),
+            json!("\t"),
+            json!("\n"),
+            json!(" global"),
+            json!("global "),
+            json!(" global "),
+            json!(null),
+            json!(123),
+            json!({}),
+            json!([]),
+        ];
+
+        for malformed in malformed_namespaces {
+            let arguments = json!({
+                "namespace": malformed,
+                "args": {"operation": "list_pointers"},
+                "principal": "alice"
+            });
+            let response_text = handle_data_connector(&arguments, store.clone(), bus.clone()).await;
+            let response: Value = serde_json::from_str(&response_text).expect("valid JSON");
+            assert_eq!(
+                response["ok"], false,
+                "malformed namespace {:?} must be rejected, got: {}",
+                malformed, response_text
+            );
+            let err = response["error"].as_str().expect("error string");
+            assert!(
+                err.contains("namespace"),
+                "error must mention namespace for {:?}: {}",
+                malformed,
+                err
+            );
+            assert!(
+                !response_text.contains("ptr_secret"),
+                "must not disclose pointer_id for {:?}: {}",
+                malformed,
+                response_text
+            );
+            assert!(
+                !response_text.contains("uri1"),
+                "must not disclose pointer_uri for {:?}: {}",
+                malformed,
+                response_text
+            );
+        }
+    }
+
+    /// Compatibility: omitted namespace and principal must use existing defaults
+    /// (namespace -> "global", principal -> None) and return successful response.
+    #[tokio::test]
+    async fn data_connector_omitted_fields_use_defaults() {
+        let (store, _ladybug_store, bus, _ptr) = seed_data_pointer_in_namespace("global").await;
+
+        // No namespace, no principal — should use defaults and succeed
+        let arguments = json!({
+            "args": {"operation": "list_pointers"}
+        });
+        let response_text = handle_data_connector(&arguments, store.clone(), bus.clone()).await;
+        let response: Value = serde_json::from_str(&response_text).expect("valid JSON");
+        // list_pointers returns array of pointers directly (no ok wrapper)
+        let list = response.as_array().expect("list_pointers returns array");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0]["pointer_id"], "ptr_secret");
+        assert_eq!(list[0]["pointer_uri"], "uri1");
     }
 
     /// Vocabulary v4: `procedure` is an ordinary memory type on the
@@ -18001,6 +22024,430 @@ mod context_plan_tests {
     }
 
     #[tokio::test]
+    async fn context_plan_hoists_registry_root_dedupes_equivalent_files_and_enriches_once_per_logical_file(
+    ) {
+        use crate::traits::{MemoryPayload, VectorStore};
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::LadybugStore::for_testing(&tmp.path().join("db"), 4).expect("open"),
+        );
+        store.init("ns").await.expect("init ns");
+
+        let root = tmp.path().join("ns-v1190-cp-root");
+        std::fs::create_dir_all(root.join("src")).expect("create src dir");
+        let f1 = root.join("src/one.rs");
+        let f2 = root.join("src/two.rs");
+        std::fs::write(&f1, "pub fn one() {}\n").expect("write one.rs");
+        std::fs::write(&f2, "pub fn two() {}\n").expect("write two.rs");
+
+        let embedder: Arc<dyn Embedder> = Arc::new(LocalStubEmbedder);
+        crate::registry::cache_project_root(&store, Some(&embedder), "ns", &root.to_string_lossy())
+            .await;
+
+        let abs1 = f1.to_string_lossy().to_string();
+        let abs2 = f2.to_string_lossy().to_string();
+        let seed = [
+            ("rule:one:rel", "src/one.rs".to_string(), "src/one.rs"),
+            ("rule:one:abs", abs1.clone(), abs1.as_str()),
+            ("rule:two:rel", "src/two.rs".to_string(), "src/two.rs"),
+        ];
+        for (id, location, governed) in seed {
+            store
+                .upsert(
+                    "ns",
+                    id,
+                    vec![0.1f32; 4],
+                    MemoryPayload {
+                        content: format!("governing {id}"),
+                        user_id: "test".to_string(),
+                        memory_type: "rule".to_string(),
+                        agent_name: None,
+                        location,
+                        location_lines: String::new(),
+                        metadata: serde_json::json!({"governs": [governed]}),
+                    },
+                )
+                .await
+                .expect("upsert governing rule");
+        }
+
+        let _instrumentation = super::context_plan_benchmark_instrumentation::enable();
+        super::context_plan_benchmark_instrumentation::begin_request();
+        let result = handle_context_plan(
+            &serde_json::json!({
+                "namespace": "ns",
+                "query": "rule",
+                "files": ["src/one.rs", abs1, "src/two.rs", abs2],
+                "max_items": 20,
+            }),
+            embedder.clone(),
+            store.clone(),
+        )
+        .await;
+        let snap = super::context_plan_benchmark_instrumentation::snapshot();
+        let plan: serde_json::Value = serde_json::from_str(&result).expect("plan json");
+
+        // Registry root is read once per request, not once per requested file.
+        assert_eq!(snap["registry_root_reads_per_request"], 1, "snap={snap}");
+        // Absolute and relative spellings collapse to two logical files.
+        assert_eq!(snap["logical_files_enriched_per_request"], 2, "snap={snap}");
+        // One enrichment pass per logical file's final merged hit set.
+        assert_eq!(
+            snap["bridge_enrichment_passes_per_request"], 2,
+            "snap={snap}"
+        );
+        // Two logical files × two distinct forms each (down from 8 before dedupe); no duplicate equivalent-file work.
+        assert_eq!(
+            snap["store_memory_multiform_ops_per_request"], 4,
+            "snap={snap}"
+        );
+
+        let ids: Vec<&str> = plan["items"]
+            .as_array()
+            .expect("items array")
+            .iter()
+            .filter_map(|it| it["id"].as_str())
+            .collect();
+        assert!(ids.contains(&"rule:one:rel"), "ids={ids:?}");
+        assert!(ids.contains(&"rule:one:abs"), "ids={ids:?}");
+        assert!(ids.contains(&"rule:two:rel"), "ids={ids:?}");
+    }
+
+    #[ignore]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn context_plan_multi_form_benchmark_fixture_10k_memories_100_files() {
+        use crate::traits::{MemoryPayload, VectorStore};
+        use std::time::Instant;
+
+        const NAMESPACE: &str = "context-plan-benchmark";
+        const FILE_COUNT: usize = 100;
+        const MEMORIES_PER_FILE: usize = 100;
+        const MEMORY_COUNT: usize = FILE_COUNT * MEMORIES_PER_FILE;
+        const WARMUP_ITERATIONS: usize = 5;
+        const MEASURED_ITERATIONS: usize = 20;
+
+        fn remove_fixture_path(path: &std::path::Path) -> std::io::Result<()> {
+            if path.is_dir() {
+                std::fs::remove_dir_all(path)
+            } else if path.exists() {
+                std::fs::remove_file(path)
+            } else {
+                Ok(())
+            }
+        }
+
+        struct BenchmarkCleanup(Vec<std::path::PathBuf>);
+        impl Drop for BenchmarkCleanup {
+            fn drop(&mut self) {
+                for path in &self.0 {
+                    let _ = remove_fixture_path(path);
+                }
+            }
+        }
+
+        let fixture_root =
+            std::path::PathBuf::from("/tmp/opencode/neurostrata-context-plan-benchmark-v1-fixture");
+        let store_dir = std::path::PathBuf::from(
+            "/tmp/opencode/neurostrata-context-plan-benchmark-v1-store-dir",
+        );
+        let store_path = store_dir.join("db");
+        let legacy_store_paths: Vec<_> = std::fs::read_dir("/tmp/opencode")
+            .expect("read benchmark temp root")
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .map_or(false, |name| {
+                        name == "neurostrata-context-plan-benchmark-v1-store"
+                            || name.starts_with("neurostrata-context-plan-benchmark-v1-store.wal")
+                    })
+            })
+            .collect();
+        for path in [&fixture_root, &store_dir]
+            .into_iter()
+            .chain(legacy_store_paths.iter())
+        {
+            remove_fixture_path(path).expect("remove stale benchmark fixture");
+        }
+        std::fs::create_dir_all(&fixture_root).expect("create fixture root");
+        std::fs::create_dir_all(&store_dir).expect("create benchmark store directory");
+        let _cleanup = BenchmarkCleanup(vec![fixture_root.clone(), store_dir.clone()]);
+
+        let max_db_size: u64 = std::env::var("NEUROSTRATA_TEST_MAX_DB_SIZE")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(512 * 1024 * 1024);
+        let buffer_pool_size: u64 = std::env::var("NEUROSTRATA_TEST_BUFFER_POOL_SIZE")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(512 * 1024 * 1024);
+        let config = lbug::SystemConfig::default()
+            .max_db_size(max_db_size)
+            .buffer_pool_size(buffer_pool_size)
+            .throw_on_wal_replay_failure(true);
+        let store = Arc::new(
+            crate::store::LadybugStore::with_system_config(&store_path, 4, config)
+                .expect("open benchmark store"),
+        );
+        let vector_store: Arc<dyn VectorStore> = store.clone();
+        vector_store.init(NAMESPACE).await.expect("init namespace");
+        let embedder: Arc<dyn crate::traits::Embedder> = Arc::new(LocalStubEmbedder);
+        crate::registry::cache_project_root(
+            &vector_store,
+            Some(&embedder),
+            NAMESPACE,
+            &fixture_root.to_string_lossy(),
+        )
+        .await;
+
+        let mut logical_files = Vec::with_capacity(FILE_COUNT);
+        let mut requested_files = Vec::with_capacity(FILE_COUNT * 2);
+        let mut seeded_memories = 0usize;
+        let mut relative_stored_memories = 0usize;
+        let mut absolute_stored_memories = 0usize;
+        for file_index in 0..FILE_COUNT {
+            let relative = format!(
+                "src/module-{:02}/file-{:03}.rs",
+                file_index / 10,
+                file_index
+            );
+            let absolute = fixture_root.join(&relative).to_string_lossy().to_string();
+            let disk_path = fixture_root.join(&relative);
+            std::fs::create_dir_all(disk_path.parent().expect("file parent"))
+                .expect("create module directory");
+            std::fs::write(
+                &disk_path,
+                format!("pub fn symbol_{file_index:03}() -> usize {{ {file_index} }}\n"),
+            )
+            .expect("write deterministic source file");
+            logical_files.push(relative.clone());
+            requested_files.push(relative.clone());
+            requested_files.push(absolute.clone());
+
+            for row_index in 0..MEMORIES_PER_FILE {
+                let global_index = file_index * MEMORIES_PER_FILE + row_index;
+                let stored_form = if row_index < MEMORIES_PER_FILE / 2 {
+                    relative_stored_memories += 1;
+                    relative.clone()
+                } else {
+                    absolute_stored_memories += 1;
+                    absolute.clone()
+                };
+                let memory_type = ["rule", "fact", "procedure"][global_index % 3];
+                let payload = MemoryPayload {
+                    content: format!(
+                        "Deterministic benchmark memory {global_index:05} for {relative}"
+                    ),
+                    user_id: "benchmark".to_string(),
+                    memory_type: memory_type.to_string(),
+                    agent_name: Some("context-plan-benchmark".to_string()),
+                    location: stored_form.clone(),
+                    location_lines: (row_index + 1).to_string(),
+                    metadata: serde_json::json!({
+                        "access_count": row_index % 11,
+                        "benchmark_file": relative,
+                        "benchmark_row": row_index,
+                        "governs": [stored_form],
+                        "stored_spelling": if row_index < MEMORIES_PER_FILE / 2 {
+                            "relative"
+                        } else {
+                            "absolute"
+                        },
+                    }),
+                };
+                vector_store
+                    .upsert(
+                        NAMESPACE,
+                        &format!("context-plan-bench-{global_index:05}"),
+                        vec![
+                            (global_index % 251) as f32 / 251.0,
+                            (file_index % 101) as f32 / 101.0,
+                            (row_index % 17) as f32 / 17.0,
+                            1.0,
+                        ],
+                        payload,
+                    )
+                    .await
+                    .expect("seed deterministic memory");
+                seeded_memories += 1;
+            }
+        }
+
+        assert_eq!(seeded_memories, MEMORY_COUNT);
+        assert_eq!(MEMORY_COUNT, 10_000);
+        assert_eq!(logical_files.len(), 100);
+        assert_eq!(requested_files.len(), 200);
+        assert_eq!(relative_stored_memories, 5_000);
+        assert_eq!(absolute_stored_memories, 5_000);
+        let stored_rows = vector_store
+            .list(NAMESPACE, None, None)
+            .await
+            .expect("list seeded benchmark memories");
+        let benchmark_rows: Vec<_> = stored_rows
+            .iter()
+            .filter(|row| row.id.starts_with("context-plan-bench-"))
+            .collect();
+        assert_eq!(benchmark_rows.len(), MEMORY_COUNT);
+        assert_eq!(crate::store::ladybug::engine_in_flight(), 0);
+        for (file_index, relative) in logical_files.iter().enumerate() {
+            let expected = format!("pub fn symbol_{file_index:03}() -> usize {{ {file_index} }}\n");
+            assert_eq!(
+                std::fs::read_to_string(fixture_root.join(relative)).expect("read fixture file"),
+                expected
+            );
+        }
+
+        let arguments = serde_json::json!({
+            "namespace": NAMESPACE,
+            "query": "deterministic context plan benchmark",
+            "files": requested_files,
+            "max_items": 1,
+            "max_bytes": 65_536,
+            "format": "json",
+        });
+        println!(
+            "{}",
+            serde_json::json!({
+                "record": "context",
+                "benchmark": "context_plan_multi_form",
+                "machine": {
+                    "os": std::env::consts::OS,
+                    "arch": std::env::consts::ARCH,
+                    "available_parallelism": std::thread::available_parallelism()
+                        .map(usize::from)
+                        .unwrap_or(1),
+                },
+                "context": {
+                    "namespace": NAMESPACE,
+                    "memory_count": seeded_memories,
+                    "logical_file_count": logical_files.len(),
+                    "relative_stored_memories": relative_stored_memories,
+                    "absolute_stored_memories": absolute_stored_memories,
+                    "warmup_iterations": WARMUP_ITERATIONS,
+                    "measured_iterations": MEASURED_ITERATIONS,
+                    "ast_metric_note": "context_plan has no AST neighborhood call in this build; the instrumented per-form AST counter therefore reports zero",
+                },
+                "request_shape": {
+                    "requested_file_entries": 200,
+                    "equivalent_request_forms_per_logical_file": 2,
+                    "request_form_order": ["relative", "absolute"],
+                    "max_items": 1,
+                    "max_bytes": 65_536,
+                    "include_ancestors": true,
+                    "source": null,
+                },
+                "metric_definitions": {
+                    "store_memory_multiform_ops_per_request": "individual LadybugStore::memories_for_file calls across ordered equivalent forms",
+                    "bridge_enrichment_passes_per_request": "non-empty final per-call hit sets entering the conceptual-bridge enrichment loop",
+                    "logical_files_enriched_per_request": "distinct normalized resolved lookup paths with at least one final merged hit",
+                }
+            })
+        );
+
+        let _instrumentation = super::context_plan_benchmark_instrumentation::enable();
+        let mut measured_ms = Vec::with_capacity(MEASURED_ITERATIONS);
+        let mut expected_counts: Option<serde_json::Value> = None;
+        for iteration in 0..(WARMUP_ITERATIONS + MEASURED_ITERATIONS) {
+            super::context_plan_benchmark_instrumentation::begin_request();
+            let started = Instant::now();
+            let result =
+                handle_context_plan(&arguments, embedder.clone(), vector_store.clone()).await;
+            let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+            let counts = super::context_plan_benchmark_instrumentation::snapshot();
+            let plan: serde_json::Value = serde_json::from_str(&result).expect("plan JSON");
+            assert!(plan["items"].is_array(), "context plan must contain items");
+            let enriched = super::context_plan_benchmark_instrumentation::logical_files_enriched();
+            let missing: Vec<&String> = logical_files
+                .iter()
+                .filter(|path| !enriched.contains(*path))
+                .collect();
+            if !missing.is_empty() {
+                use crate::traits::GraphRead;
+                for path in &missing {
+                    let (_lookup, forms) = lookup_path_for(&vector_store, NAMESPACE, path, None)
+                        .await
+                        .expect("benchmark diagnostic lookup_path_for");
+                    for form in forms {
+                        let hits = store
+                            .memories_for_file(
+                                NAMESPACE,
+                                None,
+                                &form,
+                                None,
+                                true,
+                                &["rule".into(), "fact".into(), "procedure".into()],
+                                &[],
+                                1,
+                            )
+                            .await;
+                        let hit_count = hits.as_ref().map(|hits| hits.len()).unwrap_or(0);
+                        let error = hits.err();
+                        eprintln!(
+                            "benchmark missing path={path:?} form={form:?} hits={hit_count} error={error:?} engine={}",
+                            crate::store::ladybug::engine_stats()
+                        );
+                    }
+                }
+            }
+            assert_eq!(
+                counts["logical_files_enriched_per_request"], 100,
+                "counts={counts}; missing={missing:?}"
+            );
+            assert!(counts["registry_root_reads_per_request"]
+                .as_u64()
+                .is_some_and(|count| count > 0));
+            assert!(counts["store_memory_multiform_ops_per_request"]
+                .as_u64()
+                .is_some_and(|count| count > 0));
+            assert!(counts["bridge_enrichment_passes_per_request"]
+                .as_u64()
+                .is_some_and(|count| count > 0));
+            if let Some(expected) = &expected_counts {
+                assert_eq!(&counts, expected, "invocation counts must be deterministic");
+            } else {
+                expected_counts = Some(counts.clone());
+            }
+            let warmup = iteration < WARMUP_ITERATIONS;
+            let record_iteration = if warmup {
+                iteration + 1
+            } else {
+                iteration - WARMUP_ITERATIONS + 1
+            };
+            let mut output = counts;
+            output["record"] = serde_json::json!(if warmup { "warmup" } else { "measured" });
+            output["iteration"] = serde_json::json!(record_iteration);
+            output["wall_clock_ms"] = serde_json::json!(elapsed_ms);
+            println!("{output}");
+            if !warmup {
+                measured_ms.push(elapsed_ms);
+            }
+        }
+
+        assert_eq!(measured_ms.len(), MEASURED_ITERATIONS);
+        measured_ms.sort_by(f64::total_cmp);
+        let median_ms =
+            (measured_ms[MEASURED_ITERATIONS / 2 - 1] + measured_ms[MEASURED_ITERATIONS / 2]) / 2.0;
+        let p95_index = ((0.95 * measured_ms.len() as f64).ceil() as usize)
+            .saturating_sub(1)
+            .min(measured_ms.len() - 1);
+        println!(
+            "{}",
+            serde_json::json!({
+                "record": "summary",
+                "warmup_iterations": WARMUP_ITERATIONS,
+                "measured_iterations": MEASURED_ITERATIONS,
+                "median_ms": median_ms,
+                "p95_ms": measured_ms[p95_index],
+                "p95_method": "nearest-rank ceil(0.95*N), clamped one-based index",
+                "sorted_measured_wall_clock_ms": measured_ms,
+                "invocation_counts_per_request": expected_counts.expect("one measured request"),
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn test_handle_context_plan_returns_budgeted_plan() {
         use crate::context::model::{ContextPlan, Degradation, CONTEXT_PLAN_SCHEMA_VERSION};
         let args_json =
@@ -18235,5 +22682,30 @@ mod context_plan_tests {
             "active_session.json golden_rules must include global NO PYTHON rule: {golden_arr:?}"
         );
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn scenario_plan_ontology_diff_dispatches_zero_mutation_report() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store: Arc<dyn crate::traits::VectorStore> = Arc::new(
+            crate::store::LadybugStore::for_testing(&tmp.path().join("db"), 4)
+                .expect("open temp database"),
+        );
+        store.init("probe-plan").await.expect("init namespace");
+        let args = serde_json::json!({
+            "namespace": "probe-plan",
+            "action": "plan_ontology_diff",
+        });
+        let out = handle_scenario(&args, Arc::new(LocalStubEmbedder), store.clone()).await;
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert_eq!(parsed["ok"], true, "dispatch failed: {out}");
+        assert_eq!(parsed["action"], "plan_ontology_diff");
+        assert_eq!(parsed["namespace"], "probe-plan");
+        let plan = &parsed["plan"];
+        assert_eq!(plan["namespace"], "probe-plan");
+        assert!(plan["added_entailments"].as_array().unwrap().is_empty());
+        assert!(plan["removed_entailments"].as_array().unwrap().is_empty());
+        assert!(plan["schema_ddl_diff"].as_array().unwrap().is_empty());
+        assert_eq!(plan["validation_conforms"], true);
     }
 }

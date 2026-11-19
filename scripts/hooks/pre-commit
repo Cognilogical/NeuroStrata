@@ -26,7 +26,7 @@ case "$ROOT" in
 esac
 fold_case() {
     if [ "$FOLD" = "1" ]; then
-        printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]'
+        printf '%s' "$1" | LC_ALL=C tr 'A-Z' 'a-z'
     else
         printf '%s' "$1"
     fi

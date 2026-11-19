@@ -45,21 +45,21 @@ ns:DomainPropertyShape a sh:PropertyShape ;
     sh:path ns:domain ;
     sh:or (
         [ sh:datatype xsd:string ]
-        [ sh:nodeKind sh:List ; sh:qualifiedValueShape [ sh:datatype xsd:string ] ]
+        [ sh:nodeKind sh:BlankNodeOrIRI ; sh:qualifiedValueShape [ sh:datatype xsd:string ] ]
     ) ;
     sh:message "domain must be a string or array of strings" .
 
 # Mentions metadata property shape
 ns:MentionsPropertyShape a sh:PropertyShape ;
     sh:path ns:mentions ;
-    sh:nodeKind sh:List ;
+    sh:nodeKind sh:BlankNodeOrIRI ;
     sh:qualifiedValueShape [ sh:datatype xsd:string ] ;
     sh:message "mentions must be an array of strings" .
 
 # Facets metadata property shape
 ns:FacetsPropertyShape a sh:PropertyShape ;
     sh:path ns:facets ;
-    sh:nodeKind sh:List ;
+    sh:nodeKind sh:BlankNodeOrIRI ;
     sh:qualifiedValueShape [ sh:datatype xsd:string ] ;
     sh:message "facets must be an array of strings" .
 

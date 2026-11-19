@@ -2,7 +2,7 @@
 
 NeuroStrata provides two complementary visual interfaces for exploring, auditing, and curating your AI agent's cognitive graph:
 1. **The Embedded Web UI & Tauri Desktop App (`web-ui/` / `src-tauri/`):** An interactive 3D/2D Force Graph, Central Executive Task Board, SynapticMesh Inspector, and SPARQL/Digital-Twin console connected directly to the Rust daemon (`http://127.0.0.1:34343`).
-2. **NeuroVault Obsidian Integration — Planned, not implemented:** Bidirectional Markdown note synchronization and JSON Canvas spatial topology export are tracked by task `neurostrata-dlag`; no `src/obsidian.rs` module exists in this release.
+2. **NeuroVault Obsidian Integration — Shipped in v1.19.0:** Bidirectional YAML-LD Markdown note synchronization and Open JSON Canvas spatial topology export are available via the `neurostrata_vault_sync` MCP tool, the `neurostrata-mcp vault-sync` CLI subcommand, and `POST /vault-sync` on the daemon. See [`docs/features-api/ops/obsidian.md`](ops/obsidian.md).
 
 ---
 
@@ -40,4 +40,4 @@ The Task Board view surfaces the live state of the Central Executive (`src/task/
 
 ## 4. Obsidian Vault Synchronization (`NeuroVault`)
 
-This feature is **not available in this release**. There is no `neurostrata_sync_obsidian` MCP tool, no `obsidian-sync` CLI subcommand, and no `src/obsidian.rs` module. The bidirectional Markdown sync and JSON Canvas export are planned and tracked by task `neurostrata-dlag`. See [`docs/ops/obsidian.md`](ops/obsidian.md) for the planned design and current status.
+Available as of v1.19.0. The bidirectional Vault-LD Markdown sync is exposed three ways: the `neurostrata_vault_sync` MCP tool, the `neurostrata-mcp vault-sync` CLI subcommand, and `POST /vault-sync` on the daemon. Export writes one YAML-LD 1.0 Markdown note per readable memory plus `topology.canvas` (Open JSON Canvas 1.0, nodes grouped by epistemic tier, WikiLink edges); import secret-scans and SHACL-validates every note BEFORE any store write. See [`ops/obsidian.md`](ops/obsidian.md) for the full reference.

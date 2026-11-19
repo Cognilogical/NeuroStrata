@@ -81,6 +81,8 @@ pub struct InsightsRequest {
     #[serde(default)]
     pub path_prefix: Option<String>,
     #[serde(default)]
+    pub project_root: Option<String>,
+    #[serde(default)]
     pub from_ts: Option<i64>,
     #[serde(default)]
     pub to_ts: Option<i64>,
@@ -128,6 +130,29 @@ fn normalize_insight_slug(raw: &str) -> Result<String, String> {
         ));
     }
     Ok(slug)
+}
+
+/// Resolve an insight's persisted prefix through the shared prefix-forms
+/// helper at evaluation time. SPARQL insights and empty prefixes need no
+/// resolution; lexical/ast_calls prefixes fail closed on unresolvable absolute
+/// values.
+fn resolve_insight_prefix_forms(
+    def: &InsightDefinition,
+    project_root: Option<&str>,
+    registry_root: Option<&str>,
+) -> Result<Vec<String>, String> {
+    if matches!(def.query_kind, InsightQueryKind::Sparql) {
+        return Ok(Vec::new());
+    }
+    let Some(raw) = def
+        .path_prefix
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(Vec::new());
+    };
+    crate::paths::prefix_lookup_forms(raw, project_root, registry_root).map_err(|e| e.to_string())
 }
 
 pub async fn load_custom_insights(
@@ -504,6 +529,7 @@ async fn evaluate_insight_value(
     insight_name: &str,
     custom_def: Option<&InsightDefinition>,
     visible_rows: &[SearchResult],
+    prefix_forms: &[String],
     as_of: Option<i64>,
 ) -> (f64, Vec<String>) {
     let valid_rows: Vec<&SearchResult> = visible_rows
@@ -735,7 +761,7 @@ async fn evaluate_insight_value(
             let Some(def) = custom_def else {
                 return (0.0, Vec::new());
             };
-            evaluate_custom_insight(store, namespace, def, &valid_rows, as_of).await
+            evaluate_custom_insight(store, namespace, def, &valid_rows, prefix_forms, as_of).await
         }
     }
 }
@@ -745,14 +771,9 @@ async fn evaluate_custom_insight(
     namespace: &str,
     def: &InsightDefinition,
     valid_rows: &[&SearchResult],
+    prefix_forms: &[String],
     as_of: Option<i64>,
 ) -> (f64, Vec<String>) {
-    let prefix_norm = def
-        .path_prefix
-        .as_deref()
-        .map(crate::parser::ingest::normalize_node_path)
-        .filter(|s| !s.is_empty());
-
     match def.query_kind {
         InsightQueryKind::Lexical => {
             let mut matched_ids: BTreeSet<String> = BTreeSet::new();
@@ -770,10 +791,13 @@ async fn evaluate_custom_insight(
                     {
                         for hit in hits.results {
                             if let Some(r) = valid_by_id.get(hit.id.as_str()) {
-                                if let Some(pref) = &prefix_norm {
+                                if !prefix_forms.is_empty() {
                                     let p = extract_node_path(r).unwrap_or_default();
-                                    if !path_is_governed_by_any(&p, &BTreeSet::from([pref.clone()]))
-                                    {
+                                    if !crate::search::row_matches_prefix_forms(
+                                        &p,
+                                        &r.payload.metadata,
+                                        prefix_forms,
+                                    ) {
                                         continue;
                                     }
                                 }
@@ -796,9 +820,13 @@ async fn evaluate_custom_insight(
                     if matched_ids.contains(&r.id) {
                         continue;
                     }
-                    if let Some(pref) = &prefix_norm {
+                    if !prefix_forms.is_empty() {
                         let p = extract_node_path(r).unwrap_or_default();
-                        if !path_is_governed_by_any(&p, &BTreeSet::from([pref.clone()])) {
+                        if !crate::search::row_matches_prefix_forms(
+                            &p,
+                            &r.payload.metadata,
+                            prefix_forms,
+                        ) {
                             continue;
                         }
                     }
@@ -827,10 +855,14 @@ async fn evaluate_custom_insight(
                     continue;
                 }
                 let path = extract_node_path(r).unwrap_or_default();
-                if let Some(pref) = &prefix_norm {
-                    if !path_is_governed_by_any(&path, &BTreeSet::from([pref.clone()])) {
-                        continue;
-                    }
+                if !prefix_forms.is_empty()
+                    && !crate::search::row_matches_prefix_forms(
+                        &path,
+                        &r.payload.metadata,
+                        prefix_forms,
+                    )
+                {
+                    continue;
                 }
                 let mut calls_match = false;
                 if let Some(arr) = r.payload.metadata.get("calls").and_then(|v| v.as_array()) {
@@ -937,12 +969,21 @@ async fn build_series_report(
     builtin: bool,
     custom_def: Option<&InsightDefinition>,
     visible_rows: &[SearchResult],
+    prefix_forms: &[String],
     from_ts: Option<i64>,
     to_ts: Option<i64>,
     backfill_points: Option<usize>,
 ) -> InsightSeriesReport {
-    let (current_value, top_offenders) =
-        evaluate_insight_value(store, namespace, name, custom_def, visible_rows, None).await;
+    let (current_value, top_offenders) = evaluate_insight_value(
+        store,
+        namespace,
+        name,
+        custom_def,
+        visible_rows,
+        prefix_forms,
+        None,
+    )
+    .await;
     let now_ts = Utc::now().timestamp();
 
     let mut points_by_ts: BTreeMap<i64, InsightPoint> = BTreeMap::new();
@@ -1001,6 +1042,7 @@ async fn build_series_report(
                         name,
                         custom_def,
                         visible_rows,
+                        prefix_forms,
                         Some(step_ts),
                     )
                     .await;
@@ -1084,7 +1126,7 @@ pub async fn sample_insights_after_ingest(
 
     for (slug, _) in BUILTIN_INSIGHTS {
         let (val, _) =
-            evaluate_insight_value(store, namespace, slug, None, &visible_rows, None).await;
+            evaluate_insight_value(store, namespace, slug, None, &visible_rows, &[], None).await;
         ls.metrics.record(
             namespace,
             MetricKind::ArchitecturalInsight,
@@ -1096,10 +1138,25 @@ pub async fn sample_insights_after_ingest(
     }
 
     let custom_defs = load_custom_insights(store, namespace).await;
+    let Ok(registry_root) = crate::registry::cached_project_root(store, namespace).await else {
+        let _ = ls.flush_metrics().await;
+        return;
+    };
     for def in &custom_defs {
-        let (val, _) =
-            evaluate_insight_value(store, namespace, &def.name, Some(def), &visible_rows, None)
-                .await;
+        let prefix_forms = match resolve_insight_prefix_forms(def, None, registry_root.as_deref()) {
+            Ok(forms) => forms,
+            Err(_) => continue,
+        };
+        let (val, _) = evaluate_insight_value(
+            store,
+            namespace,
+            &def.name,
+            Some(def),
+            &visible_rows,
+            &prefix_forms,
+            None,
+        )
+        .await;
         ls.metrics.record(
             namespace,
             MetricKind::ArchitecturalInsight,
@@ -1137,6 +1194,9 @@ pub async fn execute_insights(
 
     match action.as_str() {
         "define" => {
+            let registry_root = crate::registry::cached_project_root(store, &namespace)
+                .await
+                .map_err(|e| e.to_string())?;
             let raw_name = request
                 .name
                 .as_deref()
@@ -1159,6 +1219,13 @@ pub async fn execute_insights(
                 path_prefix: request.path_prefix.clone(),
                 created_at: Utc::now().timestamp(),
             };
+            // Resolve before saving so an unresolvable absolute prefix fails
+            // closed on `define` rather than persisting an unusable insight.
+            let prefix_forms = resolve_insight_prefix_forms(
+                &def,
+                request.project_root.as_deref(),
+                registry_root.as_deref(),
+            )?;
             let saved = save_custom_insight(store, &namespace, def).await?;
             let visible_rows = load_visible_rows().await;
             let (val, _) = evaluate_insight_value(
@@ -1167,6 +1234,7 @@ pub async fn execute_insights(
                 &saved.name,
                 Some(&saved),
                 &visible_rows,
+                &prefix_forms,
                 None,
             )
             .await;
@@ -1191,6 +1259,7 @@ pub async fn execute_insights(
                 false,
                 Some(&saved),
                 &visible_rows,
+                &prefix_forms,
                 request.from_ts,
                 request.to_ts,
                 request.backfill_points,
@@ -1219,6 +1288,9 @@ pub async fn execute_insights(
             })
         }
         "snapshot" | "series" => {
+            let registry_root = crate::registry::cached_project_root(store, &namespace)
+                .await
+                .map_err(|e| e.to_string())?;
             let visible_rows = load_visible_rows().await;
             let custom_defs = load_custom_insights(store, &namespace).await;
             let filter_name = request
@@ -1228,6 +1300,7 @@ pub async fn execute_insights(
                 .filter(|s| !s.is_empty());
 
             let mut series = Vec::new();
+            let no_prefix_forms: Vec<String> = Vec::new();
             for (slug, title) in BUILTIN_INSIGHTS {
                 if let Some(target) = filter_name {
                     if target != slug {
@@ -1242,6 +1315,7 @@ pub async fn execute_insights(
                     true,
                     None,
                     &visible_rows,
+                    &no_prefix_forms,
                     request.from_ts,
                     request.to_ts,
                     request.backfill_points,
@@ -1256,6 +1330,11 @@ pub async fn execute_insights(
                         continue;
                     }
                 }
+                let prefix_forms = resolve_insight_prefix_forms(
+                    def,
+                    request.project_root.as_deref(),
+                    registry_root.as_deref(),
+                )?;
                 let report = build_series_report(
                     store,
                     &namespace,
@@ -1264,6 +1343,7 @@ pub async fn execute_insights(
                     false,
                     Some(def),
                     &visible_rows,
+                    &prefix_forms,
                     request.from_ts,
                     request.to_ts,
                     request.backfill_points,
@@ -1400,6 +1480,7 @@ mod tests {
             query_kind: None,
             query: None,
             path_prefix: None,
+            project_root: None,
             from_ts: None,
             to_ts: None,
             backfill_points: None,
@@ -1444,6 +1525,7 @@ mod tests {
             query_kind: Some(InsightQueryKind::Lexical),
             query: Some("check_caller_path".to_string()),
             path_prefix: None,
+            project_root: None,
             from_ts: None,
             to_ts: None,
             backfill_points: None,
@@ -1474,6 +1556,7 @@ mod tests {
             query_kind: None,
             query: None,
             path_prefix: None,
+            project_root: None,
             from_ts: Some(1000),
             to_ts: Some(3000),
             backfill_points: Some(3),
@@ -1597,6 +1680,7 @@ mod tests {
             query_kind: None,
             query: None,
             path_prefix: None,
+            project_root: None,
             from_ts: None,
             to_ts: None,
             backfill_points: None,

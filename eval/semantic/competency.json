@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "fixture_id": "neurostrata-competency-v1-synthetic",
+  "reasoning_profile": "owl-rl",
+  "dataset_nquads": "<urn:neurostrata:eval:class:Memory> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <urn:neurostrata:eval:class:CognitiveArtifact> .\n<urn:neurostrata:eval:class:CognitiveArtifact> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <urn:neurostrata:eval:class:KnowledgeStructure> .\n<urn:neurostrata:eval:mem:alpha> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <urn:neurostrata:eval:class:Memory> .\n<urn:neurostrata:eval:mem:beta> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <urn:neurostrata:eval:class:Memory> .\n<urn:neurostrata:eval:prop:parent> <http://www.w3.org/2002/07/owl#inverseOf> <urn:neurostrata:eval:prop:child> .\n<urn:neurostrata:eval:node:alice> <urn:neurostrata:eval:prop:parent> <urn:neurostrata:eval:node:bob> .\n<urn:neurostrata:eval:prop:partOf> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#TransitiveProperty> .\n<urn:neurostrata:eval:node:core> <urn:neurostrata:eval:prop:partOf> <urn:neurostrata:eval:node:engine> .\n<urn:neurostrata:eval:node:engine> <urn:neurostrata:eval:prop:partOf> <urn:neurostrata:eval:node:system> .\n<urn:neurostrata:eval:concept:memory> <http://www.w3.org/2004/02/skos/core#prefLabel> \"Memory\"@en .\n<urn:neurostrata:eval:concept:memory> <http://www.w3.org/2004/02/skos/core#altLabel> \"Recall\"@en .\n<urn:neurostrata:eval:mem:alpha> <urn:neurostrata:eval:prop:stableId> \"alpha-id\" .\n<urn:neurostrata:eval:mem:beta> <urn:neurostrata:eval:prop:stableId> \"beta-id\" .\n",
+  "queries": [
+    {
+      "id": "direct-type-assertion-present",
+      "rationale": "SPARQL 1.1 ASK must confirm an asserted type triple (W3C SPARQL 1.1 Query section 15.2).",
+      "curator": "bosun",
+      "sparql": "ASK { <urn:neurostrata:eval:mem:alpha> rdf:type <urn:neurostrata:eval:class:Memory> }",
+      "expected": { "ask": { "value": true } }
+    },
+    {
+      "id": "missing-type-assertion-absent",
+      "rationale": "Negative ASK proves an unasserted type is not hallucinated by the materializer (W3C OWL 2 RL cax-sco has no premise here).",
+      "curator": "bosun",
+      "sparql": "ASK { <urn:neurostrata:eval:mem:alpha> rdf:type <urn:neurostrata:eval:class:Episode> }",
+      "expected": { "ask": { "value": false } }
+    },
+    {
+      "id": "rdfs-subclass-entailment",
+      "rationale": "Certified OWL 2 RL cax-sco must entail supertype membership from rdfs:subClassOf (neurostrata OWL/RDFS reasoning spec section 2.2a).",
+      "curator": "bosun",
+      "sparql": "ASK { <urn:neurostrata:eval:mem:alpha> rdf:type <urn:neurostrata:eval:class:CognitiveArtifact> }",
+      "expected": { "ask": { "value": true } }
+    },
+    {
+      "id": "multi-level-subclass-select-exact-bindings",
+      "rationale": "Multi-level subclass closure must yield the exact multiset of instance bindings, with no duplicate or missing solutions (W3C SPARQL 1.1 SELECT semantics).",
+      "curator": "bosun",
+      "sparql": "SELECT ?s ?c WHERE { ?s rdf:type ?c . FILTER(?c = <urn:neurostrata:eval:class:KnowledgeStructure>) }",
+      "expected": {
+        "select": {
+          "rows": [
+            {
+              "s": { "kind": "named_node", "value": "urn:neurostrata:eval:mem:alpha" },
+              "c": { "kind": "named_node", "value": "urn:neurostrata:eval:class:KnowledgeStructure" }
+            },
+            {
+              "s": { "kind": "named_node", "value": "urn:neurostrata:eval:mem:beta" },
+              "c": { "kind": "named_node", "value": "urn:neurostrata:eval:class:KnowledgeStructure" }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "owl-inverse-relation",
+      "rationale": "Certified OWL 2 RL prp-inv must derive the inverse edge from owl:inverseOf (neurostrata OWL 2 RL rule inventory).",
+      "curator": "bosun",
+      "sparql": "ASK { <urn:neurostrata:eval:node:bob> <urn:neurostrata:eval:prop:child> <urn:neurostrata:eval:node:alice> }",
+      "expected": { "ask": { "value": true } }
+    },
+    {
+      "id": "owl-transitive-relation",
+      "rationale": "Certified OWL 2 RL prp-trp must derive the transitive edge from owl:TransitiveProperty (neurostrata OWL 2 RL rule inventory).",
+      "curator": "bosun",
+      "sparql": "ASK { <urn:neurostrata:eval:node:core> <urn:neurostrata:eval:prop:partOf> <urn:neurostrata:eval:node:system> }",
+      "expected": { "ask": { "value": true } }
+    },
+    {
+      "id": "skos-label-select-preserves-literals",
+      "rationale": "SKOS prefLabel/altLabel SELECT must preserve literal lexical form, language tag, and rdf:langString datatype rather than comparing display strings (W3C RDF 1.1 Concepts).",
+      "curator": "bosun",
+      "sparql": "SELECT ?term ?label WHERE { ?term skos:prefLabel ?label }",
+      "expected": {
+        "select": {
+          "rows": [
+            {
+              "term": { "kind": "named_node", "value": "urn:neurostrata:eval:concept:memory" },
+              "label": {
+                "kind": "literal",
+                "value": "Memory",
+                "datatype": "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString",
+                "language": "en"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "negative-cross-identity",
+      "rationale": "Distinct urn: resources must not be silently merged: alpha must not carry beta's stable identifier (zero-trust identity separation).",
+      "curator": "bosun",
+      "sparql": "ASK { <urn:neurostrata:eval:mem:alpha> <urn:neurostrata:eval:prop:stableId> \"beta-id\" }",
+      "expected": { "ask": { "value": false } }
+    }
+  ]
+}

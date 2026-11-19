@@ -3,13 +3,16 @@
 ## Core Memory & Graph Retrieval Tools
 
 - `neurostrata_add_memory` — store an architectural rule, project pattern, or task insight.
-- `neurostrata_search_memory` — query memory contents via vector + graph RAG.
+- `neurostrata_search_memory` — query memory contents via vector + graph RAG (accepts optional `project_root` alongside `path_prefix` for multi-form relative/absolute prefix resolution, including root-equal prefixes that match in-root relative and absolute paths).
 - `neurostrata_get_snapshot` — fetch current task state snapshot (<=800 chars).
 - `neurostrata_supersede_memory` — replace active version with new one atomically.
 - `neurostrata_memories_for_file` — inspect governing memories for a given path/file.
-- `neurostrata_related` — find related entities (`CONTAINS`, `GOVERNS`).
-- `neurostrata_diff_tour` — diff tour between versions.
+- `neurostrata_related` — find related entities (`CONTAINS`, `GOVERNS`; accepts optional `project_root`, resolves multi-form file seeds to one canonical in-namespace file node before single traversal, and returns additive `resolved_seed` metadata).
+- `neurostrata_diff_tour` — diff tour between versions (separates caller-facing display paths from internal multi-form lookup paths and records canonical project-relative paths in the Graph-First session ledger).
+- `neurostrata_locate` — locate structural code symbols and governing rules (resolves `path_prefix` against optional `project_root` and the namespace's cached `registry_root` across relative and absolute stored spellings, failing closed on unresolvable absolute prefixes).
+- `neurostrata_insights` — evaluate and track architectural insights (accepts optional `project_root`; resolves `path_prefix` dynamically at `snapshot`/`series` time for `lexical` and `ast_calls` insights across relative and absolute stored spellings, failing closed on unresolvable absolute prefixes).
 - `neurostrata_ingest_directory` — ingest a directory into the property graph.
+- `neurostrata_ingest_bounded` — ontology-scoped bounded RDF classification + ingest (Capability F). Inputs: `namespace`, `domain`, `candidates` (all required), optional `principal`, `user_id`, `reason`. Each candidate carries `subject`, `class`, `predicate` and an `object` that is either `{"iri": "<absolute-iri>"}` or `{"literal": {"value": "...", "datatype"?: "<iri>", "language"?: "<tag>"}}`. The requested `domain` is normalized before the governed class/predicate closure is selected under a fixed finite query budget; `governs_class` is exact-match only, so invented IRIs that collapse onto a slug are rejected. Finite caps apply to candidate count (256), IRI length (2048 bytes) and literal length (65536 bytes). The emitted Turtle and the `MemoryPayload` are SHACL-validated before any write; any violation, unknown/empty domain, budget exhaustion, ungoverned class/predicate, malformed term or cap breach fails closed with `{"ok": false, "error": ...}` and zero writes. A successful call commits exactly one idempotent batch memory (`bounded-ingest-<sha256>`) and returns `{"ok": true, "id", "namespace", "domain", "triple_count", "turtle"}`. A ReBAC namespace write gate (`can_write_namespace` on the resolved principal) protects the write; there is no permissive opt-out and no CLI/daemon surface for this tool.
 - `neurostrata_append_log` — append conversational transcript log entries.
 - `neurostrata_bootstrap` — initialize a new project namespace.
 - `neurostrata_task_setup` — configure task scaffolding.
@@ -17,16 +20,23 @@
 - `neurostrata_find_references` — locate referenced entities.
 - `neurostrata_find_duplicate_candidates` — locate duplicate memory candidates.
 
+`neurostrata_memories_for_file` (and the file part of `neurostrata_context_plan`) accepts an absolute file path as well as one relative to the ingested root. An absolute path is made relative to the caller's `project_root` when it contains the file, else to the namespace's registered project root when that root exists on this machine, else to the nearest ancestor that holds `.git` (a directory, or the `.git` file of a linked worktree). A nested repository inside the root rejects only that known root and falls through to another known root before the `.git` fallback; when no valid known root remains, it is left as given and matches nothing. A linked worktree under a project registered at a subdirectory, and a file in another repository, are left as given and match nothing when a known root exists; without one they fall back to `.git`. A linked worktree of a project registered at its checkout root resolves against that worktree. A supplied `project_root` constrains that fallback even when it is unusable on this machine (for example a moved root), so a file in another repository still stays `Outside`; an unusable registered root is ignored. If the registered root cannot be read from the store, an absolute path given without `project_root` is not placed by falling back to `.git`: `neurostrata_memories_for_file` answers it with an error, and `neurostrata_context_plan` (which takes no `project_root`) leaves that file out and marks the plan partial. Path comparison normalizes separators and drive letters, not case; the file system decides case through each path's canonical form. The store is also queried with the caller's absolute spelling, and a relative path also joined onto a known root, so memories stored with absolute paths are still found; stored memories are not rewritten. Hits from every spelling are merged by memory id and cut to the requested `limit` (at most 20); the file's symbols and imports in the reply are read with the same spellings. `..` is resolved on disk, and a symlinked file is looked up both under its target and as the caller spelled it. The response still echoes `path`; for an absolute path it adds `resolved_path` and `resolved_from` (`project_root`, `registry_root`, `marker` or `outside`). `project_root` still selects the ingest generation; a root found by the lookup does not.
+
 ## Central Executive Task & Procedure Tools
 
 - `neurostrata_task_create` — create a new task.
 - `neurostrata_task_list` — list tasks.
 - `neurostrata_task_get` — retrieve a single task.
-- `neurostrata_task_claim` — claim exclusivity over a task.
+- `neurostrata_task_claim` — claim exclusivity over a task and stamp caller `worktree`/`branch` scope (from explicit `worktree`/`branch`/`project_root` arguments or the namespace's registered `project_root`).
 - `neurostrata_task_update` — update status/notes on a task.
 - `neurostrata_task_complete` — finish a task (requires extracted memory → Lock 2).
 - `neurostrata_task_validate` — advisory gate report for a task.
 - `neurostrata_procedure_perform` — fire a recurring procedure.
+- `neurostrata_guard_validate` — validate PreToolUse actions against behavioral rules and Zero-Action Start (`git push`/`pull`/`fetch`/`status`/`log`/`diff`/`show`/`rev-parse` without file-output or exec-override flags like `--output`/`-c`, plus `neurostrata-mcp task` commands, are exempt from requiring an `in_progress` task so post-completion pushes pass without skipping the gate).
+
+Active-task resolution is session/worktree scoped: when the daemon returns several `in_progress` tasks, resolution prefers an explicit `preferredTaskId`, then a task whose `session_id` and `worktree` both match the caller's session and project root, then a session-only match, then a worktree-only match, and only then any in-progress task. A fallback task owned by a different session does not overwrite an already known `activeSessionId`.
+
+`neurostrata_guard_validate` unwraps a JSON shell payload via its `command`/`cmd` field when deciding whether a shell command is a read-only/verification exemption. The proxy caller's `cwd` (or `workdir`) is propagated into the guard request, with `worktree` defaulting to that `cwd`, so scope checks use the caller's real working tree rather than the daemon process directory.
 
 ## Code Intelligence & SCIP Call-Graph Tools
 
@@ -38,12 +48,17 @@
 ## Enterprise Ontology, Digital Twins, Scenarios & Kinetic Actions
 
 - `neurostrata_twin` — manage digital twin state.
-- `neurostrata_scenario` — define counterfactual scenarios.
+- `neurostrata_scenario` — define counterfactual scenarios. Operations: `create`, `stage_memory`, `stage_twin`, `apply_action`, `evaluate_sparql`, `diff`, `plan_ontology_diff`, `commit`, `drop`, `list`.
+  - `plan_ontology_diff` is a zero-mutation dry run (`POST /scenario` shares this same handler). It clones the active namespace RDF — or the named `scenario_id` overlay — into an ephemeral in-memory dataset, applies `add_turtle` (Turtle/N-Quads) and `retract_triples` (canonical N-Triple/N-Quad patterns), validates the post-image against `candidate_shacl_turtle` (or the governing shapes) via `ontobug::validate::shacl_turtle`, and returns a `plan` report: certified Capability A `added_entailments` (`DerivationStep`s) and `removed_entailments`, `validation_conforms`, `new_shacl_violations`, `consistency_violations`, ReBAC-filtered `impacted_memories`/`impacted_files`/`impacted_action_slugs` (from changed governance facts and SPARQL ASK outcomes), and `schema_ddl_diff` from `ontobug::diff_ontologies` + `generate_cypher_ddl`. Nothing is committed to a store, scenario, task, edge or the ontology cache.
 - `neurostrata_action` — apply kinetic actions (state-machine mutations) via `POST /action`.
 
 ## Central Agentic Kernel & DataConnector Tools
 
-- `neurostrata_data_connector` — execute an `AgentKernel` connector command: `list_connectors`, `describe_pool`, `register_pointer`, `list_pointers`, `resolve_pointer`, `apply_effect`, `mediate`.
+- `neurostrata_data_connector` — execute an `AgentKernel` connector command: `list_connectors`, `describe_pool`, `register_pointer`, `list_pointers`, `resolve_pointer`, `apply_effect`, `mediate` (runtime dispatch also accepts `register_pool`, `upsert_pool`, and `list_pools`). The MCP `tools/list` disclosure for its `args` object is operation-discriminated (`oneOf` on `operation`): each variant lists its own required fields and the nested `DataPointerRecord`, `DataSliceRequest`, and `ExternalEffectRequest` layouts. Omitted `namespace` defaults to `"global"` and omitted `principal` defaults to `None`, while present non-string, blank/whitespace, or whitespace-padded `namespace` and `principal` values are rejected at the handler boundary with `{"ok": false, "error": ...}` before constructing `AgentKernel`. Optional `now_secs` (u64) on `resolve_pointer`, `apply_effect`, and `mediate` defaults to the current epoch when omitted; the schema is discovery-only and runtime validation is unchanged.
+
+## Vault-LD Markdown Sync
+
+- `neurostrata_vault_sync` — bidirectional W3C YAML-LD 1.0 / Vault-LD Markdown sync with Open JSON Canvas 1.0 topology export. `action='export'`: one Markdown note per readable memory (ReBAC `can_read_memory` filter on `principal`), plus `topology.canvas` of the note graph grouped by epistemic tier. `action='import'`: walks the vault for `*.md`, secret-scans (`SecretScanner::scan_str`) and SHACL-validates (`ontobug::validate::shacl_turtle`, `Mode::Native`) every note BEFORE any store write — violations skip the note, never partially store it. Unresolved `[[WikiLinks]]` materialize as `stub: true` notes. Inputs: `action` (`export`|`import`, default `export`), `namespace` (default `NeuroStrata`), `vault_path` (required), `output_dir` (export only; defaults to `vault_path`), `principal` (ReBAC principal, optional). Over HTTP the daemon validates `vault_path`/`output_dir` against its startup root and `allowed_external_dirs` before any filesystem access; over CLI/MCP the process cwd is the J6 boundary.
 
 ## Subject-Matter Domain Expertise & SKOS Taxonomy
 
@@ -62,7 +77,14 @@
 | POST | `/scenario` | Create a counterfactual scenario |
 | POST | `/action` | Apply a kinetic action (state machine mutation) |
 | POST | `/data-connector` | Execute a DataConnector command (list/describe/register-pointer/resolve/apply-effect/mediate) |
+| POST | `/vault-sync` | Bidirectional Vault-LD Markdown sync (export/import); `vault_path`/`output_dir` validated against the daemon startup root + `allowed_external_dirs` before any filesystem access |
 | GET | `/taxonomy` | Query SKOS concept graph |
 | POST | `/graphql` | Execute GraphQL queries over the ontology |
 
 All endpoints are served by the **neurostrata-mcp daemon** on `127.0.0.1:34343`. Tauri acts as a lightweight HTTP client; Cursor MCP integration proxies stdio JSON-RPC requests.
+
+`POST /mcp` follows JSON-RPC 2.0: a method the server does not implement gets error `-32601` (method not found) with the request's `id`, `ping` gets an empty result, and a notification (no `id`) gets `202 Accepted` with an empty body. For an unknown method, an explicit `"id": null` is a request id, not a notification: it receives the `-32601` response above with `"id": null`; only an omitted `id` suppresses the reply.
+
+## Storage Status Surfaces
+
+`storage status` has two provenance layers since #212. The path-only (no-open) surface — used by the CLI's dispatch and by callers that must not open the store — reports filesystem and store-state sidecar facts: `wal_bytes`, `wal_age_secs` (age of the active WAL, regular files only), `checkpoint_failures`, and the persisted `last_recovery { at, kind, wal_bytes }` history. The live-handle surface additionally owns `opened_via_recovery` and its kind *exclusively*: a verified live store never reports recovery because the sidecar holds a `last_recovery` entry. Identity writes (`has_data`, descriptor) and health writes (checkpoint health) are split (`write_store_state_identity` vs. the health writers), and a fresh process still reports the last real checkpoint because `record_checkpoint_outcome` persists to the sidecar (best effort, never propagated).

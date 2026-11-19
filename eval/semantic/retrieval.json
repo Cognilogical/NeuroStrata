@@ -1,0 +1,1818 @@
+{
+  "schema_version": 1,
+  "fixture_id": "retrieval-synthetic-v1",
+  "evidence_class": "synthetic_deterministic",
+  "dimensions": 64,
+  "curation_notes": "Synthetic corpus authored for the offline semantic evaluation gate. All projects (Atlas Ledger, Northwind Ledger, Contoso), symbols, paths, documents and metrics are fictional and contain no private, production, or live-database data. Labels were assigned by the author from document content alone and were NOT tuned against any execution rankings or arm outputs; no gate result has been observed. Category distribution is fixed at 20 alias, 15 exact_identifier, 15 hierarchy, 10 adversarial. Hierarchy queries require parent-domain closure (flat aliases cannot express descendant answer sets); a subset of alias queries are negative controls where flat aliases alone suffice. Documents use only non-structural retrievable memory types (rule, fact, procedure, thesis, concept); no task/structural/data_pointer rows. forbidden_ids are always cross-project decoys that exist in the documents array. Grades are 1-3 relevance judgments. The 17 intended flat-alias negative-control queries are: q-alias-01, q-alias-02, q-alias-03, q-alias-04, q-alias-05, q-alias-06, q-alias-07, q-alias-08, q-alias-09, q-alias-10, q-alias-11, q-alias-12, q-alias-13, q-alias-14, q-alias-15, q-alias-16, q-alias-18.",
+  "documents": [
+    {
+      "id": "doc-wal-format",
+      "content": "Write-ahead log record format for Atlas Ledger: every mutation appends a framed record with CRC before pages flush.",
+      "memory_type": "rule",
+      "location": "atlas/src/storage/wal_format.rs",
+      "domain": "storage-wal",
+      "symbol": "wal::Frame"
+    },
+    {
+      "id": "doc-wal-replay",
+      "content": "WAL replay on startup scans frames from the last checkpoint and reapplies committed transactions idempotently.",
+      "memory_type": "fact",
+      "location": "atlas/src/storage/wal_replay.rs",
+      "domain": "storage-wal",
+      "symbol": "wal::replay_from"
+    },
+    {
+      "id": "doc-wal-checkpoint",
+      "content": "Checkpoint procedure: quiesce writers, flush dirty pages, truncate the write-ahead log, persist checkpoint LSN.",
+      "memory_type": "procedure",
+      "location": "atlas/src/storage/wal_checkpoint.rs",
+      "domain": "storage-wal",
+      "symbol": "wal::checkpoint"
+    },
+    {
+      "id": "doc-wal-archive",
+      "content": "Archived WAL segments are compressed with zstd and shipped to cold storage after checkpoint.",
+      "memory_type": "fact",
+      "location": "atlas/src/storage/wal_archive.rs",
+      "domain": "storage-wal",
+      "symbol": "wal::archive_segment"
+    },
+    {
+      "id": "doc-runbook-wal-full",
+      "content": "Runbook: disk full on WAL volume. Stop intake, expand volume, resume from last checkpoint.",
+      "memory_type": "procedure",
+      "location": "atlas/docs/runbooks/wal-disk-full.md",
+      "domain": "storage-wal",
+      "symbol": "runbook::wal_disk_full"
+    },
+    {
+      "id": "doc-btree-page",
+      "content": "B-tree page layout: 4 KiB pages, slotted directory, right-sibling links for range scans.",
+      "memory_type": "rule",
+      "location": "atlas/src/storage/btree_page.rs",
+      "domain": "storage-btree",
+      "symbol": "btree::Page"
+    },
+    {
+      "id": "doc-btree-split",
+      "content": "B-tree split policy: when a leaf exceeds capacity, split at the median key and propagate the separator upward.",
+      "memory_type": "fact",
+      "location": "atlas/src/storage/btree_split.rs",
+      "domain": "storage-btree",
+      "symbol": "btree::split_leaf"
+    },
+    {
+      "id": "doc-btree-vacuum",
+      "content": "B-tree vacuum procedure: merge underfull pages, update sibling links, rewrite the free-space map.",
+      "memory_type": "procedure",
+      "location": "atlas/src/storage/btree_vacuum.rs",
+      "domain": "storage-btree",
+      "symbol": "btree::vacuum"
+    },
+    {
+      "id": "doc-snapshot-cow",
+      "content": "Copy-on-write snapshots fork the page table; readers pin a snapshot LSN and never block writers.",
+      "memory_type": "rule",
+      "location": "atlas/src/storage/snapshot_cow.rs",
+      "domain": "storage-snapshot",
+      "symbol": "snapshot::fork_page_table"
+    },
+    {
+      "id": "doc-snapshot-gc",
+      "content": "Snapshot garbage collection reclaims pages whose LSN is older than the oldest pinned reader.",
+      "memory_type": "fact",
+      "location": "atlas/src/storage/snapshot_gc.rs",
+      "domain": "storage-snapshot",
+      "symbol": "snapshot::reclaim_before"
+    },
+    {
+      "id": "doc-faq-snapshot",
+      "content": "FAQ: snapshots are not backups; pair with WAL archiving for point-in-time recovery.",
+      "memory_type": "fact",
+      "location": "atlas/docs/faq/snapshots.md",
+      "domain": "storage-snapshot",
+      "symbol": null
+    },
+    {
+      "id": "doc-storage-overview",
+      "content": "Storage layer overview: write-ahead log, B-tree, and snapshots coordinate durability for Atlas Ledger.",
+      "memory_type": "concept",
+      "location": "atlas/docs/architecture/storage.md",
+      "domain": "storage",
+      "symbol": null
+    },
+    {
+      "id": "doc-glossary-lsn",
+      "content": "Glossary: LSN is the log sequence number ordering all WAL frames.",
+      "memory_type": "concept",
+      "location": "atlas/docs/glossary.md",
+      "domain": "storage",
+      "symbol": null
+    },
+    {
+      "id": "doc-repl-raft",
+      "content": "Replication uses Raft consensus; a write is durable once a majority of voters ack the WAL frame.",
+      "memory_type": "rule",
+      "location": "atlas/src/replication/raft.rs",
+      "domain": "replication",
+      "symbol": "repl::raft_ack"
+    },
+    {
+      "id": "doc-repl-lag",
+      "content": "Replica lag is bounded by 500 ms; lagging replicas drop out of the read quorum automatically.",
+      "memory_type": "fact",
+      "location": "atlas/src/replication/lag.rs",
+      "domain": "replication",
+      "symbol": null
+    },
+    {
+      "id": "doc-planner-stats",
+      "content": "Planner uses histograms and distinct-count sketches to estimate join cardinality.",
+      "memory_type": "fact",
+      "location": "atlas/src/planner/stats.rs",
+      "domain": "query-engine-planner",
+      "symbol": "planner::histogram_selectivity"
+    },
+    {
+      "id": "doc-planner-cost",
+      "content": "Cost model: seq-scan vs index-scan decided by selectivity threshold 0.083 with random-page cost 4.0.",
+      "memory_type": "rule",
+      "location": "atlas/src/planner/cost.rs",
+      "domain": "query-engine-planner",
+      "symbol": "planner::cost_model"
+    },
+    {
+      "id": "doc-planner-hints",
+      "content": "Planner hint procedure: attach INDEX(orders_idx) to force index access for known-hot predicates.",
+      "memory_type": "procedure",
+      "location": "atlas/src/planner/hints.rs",
+      "domain": "query-engine-planner",
+      "symbol": "planner::apply_hint"
+    },
+    {
+      "id": "doc-planner-join",
+      "content": "Join ordering enumerates left-deep trees up to 12 relations with dynamic programming.",
+      "memory_type": "fact",
+      "location": "atlas/src/planner/join.rs",
+      "domain": "query-engine-planner",
+      "symbol": "planner::join_order"
+    },
+    {
+      "id": "doc-exec-vectorized",
+      "content": "Executor runs vectorized batches of 1024 values with late materialization for column projections.",
+      "memory_type": "rule",
+      "location": "atlas/src/exec/vectorized.rs",
+      "domain": "query-engine-executor",
+      "symbol": "exec::vectorized_batch"
+    },
+    {
+      "id": "doc-exec-spill",
+      "content": "Executor spills the hash-join build side to disk when the memory budget exceeds 256 MiB.",
+      "memory_type": "fact",
+      "location": "atlas/src/exec/spill.rs",
+      "domain": "query-engine-executor",
+      "symbol": "exec::spill_build_side"
+    },
+    {
+      "id": "doc-exec-pipeline",
+      "content": "Executor pipeline breakers: hash-build, sort, and aggregate; everything else is streaming.",
+      "memory_type": "rule",
+      "location": "atlas/src/exec/pipeline.rs",
+      "domain": "query-engine-executor",
+      "symbol": "exec::pipeline_breaker"
+    },
+    {
+      "id": "doc-qe-overview",
+      "content": "Query engine overview: planner and executor turn SQL into page accesses against the storage layer.",
+      "memory_type": "concept",
+      "location": "atlas/docs/architecture/query-engine.md",
+      "domain": "query-engine",
+      "symbol": null
+    },
+    {
+      "id": "doc-auth-tokens",
+      "content": "Access tokens are Ed25519-signed JWTs, 15 minute TTL, rotated via refresh tokens bound to device keys.",
+      "memory_type": "rule",
+      "location": "atlas/src/auth/token_service.rs",
+      "domain": "auth-tokens",
+      "symbol": "auth::issue_token_pair"
+    },
+    {
+      "id": "doc-auth-refresh",
+      "content": "Refresh procedure: verify device key binding, rotate refresh token, emit a new access token pair.",
+      "memory_type": "procedure",
+      "location": "atlas/src/auth/refresh.rs",
+      "domain": "auth-tokens",
+      "symbol": "auth::rotate_refresh"
+    },
+    {
+      "id": "doc-auth-mfa",
+      "content": "Step-up MFA procedure for admin role elevation: WebAuthn challenge before granting admin scope.",
+      "memory_type": "procedure",
+      "location": "atlas/src/auth/step_up.rs",
+      "domain": "auth-tokens",
+      "symbol": "auth::step_up_webauthn"
+    },
+    {
+      "id": "doc-rbac-roles",
+      "content": "RBAC roles: reader, writer, auditor, and admin; permissions are additive with no deny overrides.",
+      "memory_type": "fact",
+      "location": "atlas/src/auth/rbac_roles.rs",
+      "domain": "auth-rbac",
+      "symbol": "rbac::grant"
+    },
+    {
+      "id": "doc-rbac-audit",
+      "content": "Audit rule: every rbac grant or revoke emits an immutable audit event with actor and reason.",
+      "memory_type": "rule",
+      "location": "atlas/src/auth/rbac_audit.rs",
+      "domain": "auth-rbac",
+      "symbol": "rbac::audit_event"
+    },
+    {
+      "id": "doc-auth-overview",
+      "content": "Thesis: capability-scoped short-lived tokens beat static API keys for Atlas Ledger agents.",
+      "memory_type": "thesis",
+      "location": "atlas/docs/architecture/auth.md",
+      "domain": "auth",
+      "symbol": null
+    },
+    {
+      "id": "doc-metrics-cardinality",
+      "content": "Metrics cardinality budget: max 10k series per service; label values from user input are rejected.",
+      "memory_type": "rule",
+      "location": "atlas/src/metrics/cardinality.rs",
+      "domain": "observability-metrics",
+      "symbol": "metrics::cardinality_budget"
+    },
+    {
+      "id": "doc-metrics-otel",
+      "content": "Metrics export via OTLP to the local collector; counters and histograms only, no gauges for latency.",
+      "memory_type": "fact",
+      "location": "atlas/src/metrics/otlp.rs",
+      "domain": "observability-metrics",
+      "symbol": "metrics::otlp_export"
+    },
+    {
+      "id": "doc-metrics-slo",
+      "content": "SLO dashboards use burn-rate alerts at 2 percent and 100 percent budget consumption windows.",
+      "memory_type": "fact",
+      "location": "atlas/src/metrics/slo.rs",
+      "domain": "observability-metrics",
+      "symbol": "metrics::burn_rate"
+    },
+    {
+      "id": "doc-tracing-spans",
+      "content": "Tracing spans carry trace_id, span_id, and parent_span_id; sampling is head-based at 10 percent.",
+      "memory_type": "fact",
+      "location": "atlas/src/tracing/spans.rs",
+      "domain": "observability-tracing",
+      "symbol": "tracing::start_span"
+    },
+    {
+      "id": "doc-tracing-baggage",
+      "content": "Baggage procedure: propagate tenant_id only in process-local spans; never across trust boundaries.",
+      "memory_type": "procedure",
+      "location": "atlas/src/tracing/baggage.rs",
+      "domain": "observability-tracing",
+      "symbol": "tracing::baggage_propagate"
+    },
+    {
+      "id": "doc-tracing-tail",
+      "content": "Tail sampling keeps traces with error status or latency above p99 for 24 hours.",
+      "memory_type": "rule",
+      "location": "atlas/src/tracing/tail.rs",
+      "domain": "observability-tracing",
+      "symbol": "tracing::tail_sample"
+    },
+    {
+      "id": "doc-obs-overview",
+      "content": "Observability overview: metrics, tracing, and logs share one correlation id across services.",
+      "memory_type": "concept",
+      "location": "atlas/docs/architecture/observability.md",
+      "domain": "observability",
+      "symbol": null
+    },
+    {
+      "id": "doc-billing-invoice",
+      "content": "Invoices close on the first of the month; usage is metered per committed transaction.",
+      "memory_type": "fact",
+      "location": "atlas/src/billing/invoice.rs",
+      "domain": "billing",
+      "symbol": null
+    },
+    {
+      "id": "doc-billing-retry",
+      "content": "Billing retry procedure: exponential backoff capped at 6 attempts, then quarantine the invoice.",
+      "memory_type": "procedure",
+      "location": "atlas/src/billing/retry.rs",
+      "domain": "billing",
+      "symbol": null
+    },
+    {
+      "id": "doc-billing-ledger",
+      "content": "Billing ledger is append-only; corrections are posted as reversing entries, never edits.",
+      "memory_type": "rule",
+      "location": "atlas/src/billing/ledger.rs",
+      "domain": "billing",
+      "symbol": "billing::post_reversing_entry"
+    },
+    {
+      "id": "nw-doc-wal",
+      "content": "Northwind Ledger write-ahead log uses a different framing: length-prefixed without CRC.",
+      "memory_type": "fact",
+      "location": "northwind/src/storage/wal.rs",
+      "domain": "northwind-storage",
+      "symbol": null
+    },
+    {
+      "id": "nw-doc-rbac",
+      "content": "Northwind RBAC uses predefined deny lists; roles are subtractive rather than additive.",
+      "memory_type": "fact",
+      "location": "northwind/src/auth/rbac.rs",
+      "domain": "northwind-auth",
+      "symbol": null
+    },
+    {
+      "id": "nw-doc-metrics",
+      "content": "Northwind metrics pipeline allows 100k series per service with unrestricted label values.",
+      "memory_type": "rule",
+      "location": "northwind/src/metrics/pipeline.rs",
+      "domain": "northwind-observability",
+      "symbol": null
+    },
+    {
+      "id": "ct-doc-query",
+      "content": "Contoso query engine pushes filters below joins unconditionally, ignoring cost.",
+      "memory_type": "fact",
+      "location": "contoso/src/planner/pushdown.rs",
+      "domain": "contoso-query",
+      "symbol": null
+    },
+    {
+      "id": "nw-doc-tokens",
+      "content": "Northwind tokens are HS256 shared-secret JWTs with a 24 hour TTL.",
+      "memory_type": "rule",
+      "location": "northwind/src/auth/tokens.rs",
+      "domain": "northwind-auth",
+      "symbol": null
+    },
+    {
+      "id": "nw-doc-billing",
+      "content": "Northwind billing closes invoices weekly with manual approval gates.",
+      "memory_type": "fact",
+      "location": "northwind/src/billing/close.rs",
+      "domain": "northwind-billing",
+      "symbol": null
+    }
+  ],
+  "flat_aliases": {
+    "wal": "write-ahead log",
+    "writeahead": "write-ahead",
+    "btree": "b-tree",
+    "cow": "copy-on-write",
+    "lsn": "log sequence number",
+    "mvcc": "snapshot",
+    "ckpt": "checkpoint",
+    "chekpoint": "checkpoint",
+    "vac": "vacuum",
+    "idx": "index",
+    "gc": "garbage collection",
+    "agg": "aggregate",
+    "jwt": "Ed25519",
+    "snap": "snapshot",
+    "repl": "replication",
+    "sla": "slo",
+    "otel": "OTLP",
+    "rbac": "roles",
+    "mfa": "MFA"
+  },
+  "domains": [
+    {
+      "slug": "storage",
+      "parent": null,
+      "aliases": [
+        "persistence"
+      ],
+      "concept_iri": null
+    },
+    {
+      "slug": "storage-wal",
+      "parent": "storage",
+      "aliases": [],
+      "concept_iri": null
+    },
+    {
+      "slug": "storage-btree",
+      "parent": "storage",
+      "aliases": [
+        "b-tree"
+      ],
+      "concept_iri": null
+    },
+    {
+      "slug": "storage-snapshot",
+      "parent": "storage",
+      "aliases": [
+        "snap"
+      ],
+      "concept_iri": null
+    },
+    {
+      "slug": "replication",
+      "parent": "storage",
+      "aliases": [
+        "raft"
+      ],
+      "concept_iri": null
+    },
+    {
+      "slug": "query-engine",
+      "parent": null,
+      "aliases": [
+        "qe"
+      ],
+      "concept_iri": null
+    },
+    {
+      "slug": "query-engine-planner",
+      "parent": "query-engine",
+      "aliases": [
+        "planner"
+      ],
+      "concept_iri": null
+    },
+    {
+      "slug": "query-engine-executor",
+      "parent": "query-engine",
+      "aliases": [
+        "executor"
+      ],
+      "concept_iri": null
+    },
+    {
+      "slug": "auth",
+      "parent": null,
+      "aliases": [
+        "authentication"
+      ],
+      "concept_iri": null
+    },
+    {
+      "slug": "auth-tokens",
+      "parent": "auth",
+      "aliases": [
+        "tokens"
+      ],
+      "concept_iri": null
+    },
+    {
+      "slug": "auth-rbac",
+      "parent": "auth",
+      "aliases": [
+        "roles"
+      ],
+      "concept_iri": null
+    },
+    {
+      "slug": "observability",
+      "parent": null,
+      "aliases": [
+        "telemetry"
+      ],
+      "concept_iri": null
+    },
+    {
+      "slug": "observability-metrics",
+      "parent": "observability",
+      "aliases": [
+        "metrics"
+      ],
+      "concept_iri": null
+    },
+    {
+      "slug": "observability-tracing",
+      "parent": "observability",
+      "aliases": [
+        "tracing"
+      ],
+      "concept_iri": null
+    },
+    {
+      "slug": "billing",
+      "parent": null,
+      "aliases": [
+        "invoicing"
+      ],
+      "concept_iri": null
+    },
+    {
+      "slug": "northwind-storage",
+      "parent": null,
+      "aliases": [],
+      "concept_iri": null
+    },
+    {
+      "slug": "northwind-auth",
+      "parent": null,
+      "aliases": [],
+      "concept_iri": null
+    },
+    {
+      "slug": "northwind-observability",
+      "parent": null,
+      "aliases": [],
+      "concept_iri": null
+    },
+    {
+      "slug": "northwind-billing",
+      "parent": null,
+      "aliases": [],
+      "concept_iri": null
+    },
+    {
+      "slug": "contoso-query",
+      "parent": null,
+      "aliases": [],
+      "concept_iri": null
+    }
+  ],
+  "queries": [
+    {
+      "id": "q-alias-01",
+      "text": "chekpoint truncate the log",
+      "domain": "storage-wal",
+      "category": "alias",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-wal-checkpoint",
+          "gain": 3
+        },
+        {
+          "id": "doc-wal-replay",
+          "gain": 1
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-wal"
+      ]
+    },
+    {
+      "id": "q-alias-02",
+      "text": "wal crc framing",
+      "domain": "storage-wal",
+      "category": "alias",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-wal-format",
+          "gain": 3
+        },
+        {
+          "id": "doc-wal-replay",
+          "gain": 2
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-wal"
+      ]
+    },
+    {
+      "id": "q-alias-03",
+      "text": "btree split propagation",
+      "domain": "storage-btree",
+      "category": "alias",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-btree-split",
+          "gain": 3
+        },
+        {
+          "id": "doc-btree-page",
+          "gain": 2
+        },
+        {
+          "id": "doc-btree-vacuum",
+          "gain": 1
+        }
+      ],
+      "forbidden_ids": [
+        "ct-doc-query"
+      ]
+    },
+    {
+      "id": "q-alias-04",
+      "text": "cow snapshot page table",
+      "domain": "storage-snapshot",
+      "category": "alias",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-snapshot-cow",
+          "gain": 3
+        },
+        {
+          "id": "doc-snapshot-gc",
+          "gain": 2
+        },
+        {
+          "id": "doc-faq-snapshot",
+          "gain": 1
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-wal"
+      ]
+    },
+    {
+      "id": "q-alias-05",
+      "text": "jwt ttl rotation",
+      "domain": "auth-tokens",
+      "category": "alias",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-auth-tokens",
+          "gain": 3
+        },
+        {
+          "id": "doc-auth-refresh",
+          "gain": 2
+        },
+        {
+          "id": "doc-auth-mfa",
+          "gain": 1
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-tokens"
+      ]
+    },
+    {
+      "id": "q-alias-06",
+      "text": "mvcc readers never block",
+      "domain": "storage-snapshot",
+      "category": "alias",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-snapshot-cow",
+          "gain": 3
+        },
+        {
+          "id": "doc-snapshot-gc",
+          "gain": 1
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-wal"
+      ]
+    },
+    {
+      "id": "q-alias-07",
+      "text": "lsn ordering glossary",
+      "domain": "storage",
+      "category": "alias",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-glossary-lsn",
+          "gain": 3
+        },
+        {
+          "id": "doc-wal-replay",
+          "gain": 2
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-wal"
+      ]
+    },
+    {
+      "id": "q-alias-08",
+      "text": "snap reclamation of old pages",
+      "domain": "storage-snapshot",
+      "category": "alias",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-snapshot-gc",
+          "gain": 3
+        },
+        {
+          "id": "doc-snapshot-cow",
+          "gain": 2
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-wal"
+      ]
+    },
+    {
+      "id": "q-alias-09",
+      "text": "repl raft majority ack",
+      "domain": "replication",
+      "category": "alias",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-repl-raft",
+          "gain": 3
+        },
+        {
+          "id": "doc-repl-lag",
+          "gain": 2
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-wal"
+      ]
+    },
+    {
+      "id": "q-alias-10",
+      "text": "vac merging underfull pages",
+      "domain": "storage-btree",
+      "category": "alias",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-btree-vacuum",
+          "gain": 3
+        },
+        {
+          "id": "doc-btree-page",
+          "gain": 1
+        }
+      ],
+      "forbidden_ids": [
+        "ct-doc-query"
+      ]
+    },
+    {
+      "id": "q-alias-11",
+      "text": "ckpt flush dirty pages",
+      "domain": "storage-wal",
+      "category": "alias",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-wal-checkpoint",
+          "gain": 3
+        },
+        {
+          "id": "doc-wal-archive",
+          "gain": 1
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-wal"
+      ]
+    },
+    {
+      "id": "q-alias-12",
+      "text": "agg pipeline breaker",
+      "domain": "query-engine-executor",
+      "category": "alias",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-exec-pipeline",
+          "gain": 3
+        },
+        {
+          "id": "doc-exec-vectorized",
+          "gain": 2
+        }
+      ],
+      "forbidden_ids": [
+        "ct-doc-query"
+      ]
+    },
+    {
+      "id": "q-alias-13",
+      "text": "idx selectivity threshold",
+      "domain": "query-engine-planner",
+      "category": "alias",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-planner-cost",
+          "gain": 3
+        },
+        {
+          "id": "doc-planner-hints",
+          "gain": 2
+        }
+      ],
+      "forbidden_ids": [
+        "ct-doc-query"
+      ]
+    },
+    {
+      "id": "q-alias-14",
+      "text": "writeahead log crash recovery",
+      "domain": "storage-wal",
+      "category": "alias",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-wal-replay",
+          "gain": 3
+        },
+        {
+          "id": "doc-wal-format",
+          "gain": 2
+        },
+        {
+          "id": "doc-runbook-wal-full",
+          "gain": 1
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-wal"
+      ]
+    },
+    {
+      "id": "q-alias-15",
+      "text": "sla burn rate alert",
+      "domain": "observability-metrics",
+      "category": "alias",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-metrics-slo",
+          "gain": 3
+        },
+        {
+          "id": "doc-metrics-cardinality",
+          "gain": 1
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-metrics"
+      ]
+    },
+    {
+      "id": "q-alias-16",
+      "text": "otel export counters histograms",
+      "domain": "observability-metrics",
+      "category": "alias",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-metrics-otel",
+          "gain": 3
+        },
+        {
+          "id": "doc-obs-overview",
+          "gain": 1
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-metrics"
+      ]
+    },
+    {
+      "id": "q-alias-17",
+      "text": "monthly invoice close metered usage",
+      "domain": "billing",
+      "category": "alias",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-billing-invoice",
+          "gain": 3
+        },
+        {
+          "id": "doc-billing-ledger",
+          "gain": 2
+        },
+        {
+          "id": "doc-billing-retry",
+          "gain": 1
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-billing"
+      ]
+    },
+    {
+      "id": "q-alias-18",
+      "text": "audit who granted rbac roles",
+      "domain": "auth-rbac",
+      "category": "alias",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-rbac-audit",
+          "gain": 3
+        },
+        {
+          "id": "doc-rbac-roles",
+          "gain": 2
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-rbac"
+      ]
+    },
+    {
+      "id": "q-alias-19",
+      "text": "invoice retry backoff quarantine",
+      "domain": "billing",
+      "category": "alias",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-billing-retry",
+          "gain": 3
+        },
+        {
+          "id": "doc-billing-invoice",
+          "gain": 1
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-billing"
+      ]
+    },
+    {
+      "id": "q-alias-20",
+      "text": "signing algorithm for access tokens",
+      "domain": "auth-tokens",
+      "category": "alias",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-auth-tokens",
+          "gain": 3
+        },
+        {
+          "id": "doc-auth-refresh",
+          "gain": 1
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-tokens"
+      ]
+    },
+    {
+      "id": "q-exact-01",
+      "text": "wal::Frame",
+      "domain": "storage-wal",
+      "category": "exact_identifier",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-wal-format",
+          "gain": 3
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-wal"
+      ]
+    },
+    {
+      "id": "q-exact-02",
+      "text": "wal::replay_from",
+      "domain": "storage-wal",
+      "category": "exact_identifier",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-wal-replay",
+          "gain": 3
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-wal"
+      ]
+    },
+    {
+      "id": "q-exact-03",
+      "text": "btree::split_leaf",
+      "domain": "storage-btree",
+      "category": "exact_identifier",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-btree-split",
+          "gain": 3
+        }
+      ],
+      "forbidden_ids": [
+        "ct-doc-query"
+      ]
+    },
+    {
+      "id": "q-exact-04",
+      "text": "snapshot::reclaim_before",
+      "domain": "storage-snapshot",
+      "category": "exact_identifier",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-snapshot-gc",
+          "gain": 3
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-wal"
+      ]
+    },
+    {
+      "id": "q-exact-05",
+      "text": "planner::cost_model",
+      "domain": "query-engine-planner",
+      "category": "exact_identifier",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-planner-cost",
+          "gain": 3
+        }
+      ],
+      "forbidden_ids": [
+        "ct-doc-query"
+      ]
+    },
+    {
+      "id": "q-exact-06",
+      "text": "exec::spill_build_side",
+      "domain": "query-engine-executor",
+      "category": "exact_identifier",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-exec-spill",
+          "gain": 3
+        }
+      ],
+      "forbidden_ids": [
+        "ct-doc-query"
+      ]
+    },
+    {
+      "id": "q-exact-07",
+      "text": "auth::rotate_refresh",
+      "domain": "auth-tokens",
+      "category": "exact_identifier",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-auth-refresh",
+          "gain": 3
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-tokens"
+      ]
+    },
+    {
+      "id": "q-exact-08",
+      "text": "rbac::audit_event",
+      "domain": "auth-rbac",
+      "category": "exact_identifier",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-rbac-audit",
+          "gain": 3
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-rbac"
+      ]
+    },
+    {
+      "id": "q-exact-09",
+      "text": "metrics::cardinality_budget",
+      "domain": "observability-metrics",
+      "category": "exact_identifier",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-metrics-cardinality",
+          "gain": 3
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-metrics"
+      ]
+    },
+    {
+      "id": "q-exact-10",
+      "text": "tracing::tail_sample",
+      "domain": "observability-tracing",
+      "category": "exact_identifier",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-tracing-tail",
+          "gain": 3
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-metrics"
+      ]
+    },
+    {
+      "id": "q-exact-11",
+      "text": "atlas/src/storage/wal_format.rs",
+      "domain": "storage-wal",
+      "category": "exact_identifier",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-wal-format",
+          "gain": 3
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-wal"
+      ]
+    },
+    {
+      "id": "q-exact-12",
+      "text": "atlas/src/auth/token_service.rs",
+      "domain": "auth-tokens",
+      "category": "exact_identifier",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-auth-tokens",
+          "gain": 3
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-tokens"
+      ]
+    },
+    {
+      "id": "q-exact-13",
+      "text": "doc-repl-raft",
+      "domain": "replication",
+      "category": "exact_identifier",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-repl-raft",
+          "gain": 3
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-wal"
+      ]
+    },
+    {
+      "id": "q-exact-14",
+      "text": "doc-billing-ledger",
+      "domain": "billing",
+      "category": "exact_identifier",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-billing-ledger",
+          "gain": 3
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-billing"
+      ]
+    },
+    {
+      "id": "q-exact-15",
+      "text": "repl::raft_ack majority",
+      "domain": "replication",
+      "category": "exact_identifier",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-repl-raft",
+          "gain": 3
+        },
+        {
+          "id": "doc-repl-lag",
+          "gain": 1
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-wal"
+      ]
+    },
+    {
+      "id": "q-hier-01",
+      "text": "durability guarantees for committed writes",
+      "domain": "storage",
+      "category": "hierarchy",
+      "ontology_targeted": true,
+      "relevant": [
+        {
+          "id": "doc-wal-replay",
+          "gain": 3
+        },
+        {
+          "id": "doc-wal-format",
+          "gain": 2
+        },
+        {
+          "id": "doc-wal-checkpoint",
+          "gain": 2
+        },
+        {
+          "id": "doc-storage-overview",
+          "gain": 1
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-wal"
+      ]
+    },
+    {
+      "id": "q-hier-02",
+      "text": "page layout and split behavior",
+      "domain": "storage",
+      "category": "hierarchy",
+      "ontology_targeted": true,
+      "relevant": [
+        {
+          "id": "doc-btree-page",
+          "gain": 3
+        },
+        {
+          "id": "doc-btree-split",
+          "gain": 2
+        },
+        {
+          "id": "doc-btree-vacuum",
+          "gain": 1
+        },
+        {
+          "id": "doc-storage-overview",
+          "gain": 1
+        }
+      ],
+      "forbidden_ids": [
+        "ct-doc-query"
+      ]
+    },
+    {
+      "id": "q-hier-03",
+      "text": "reader isolation and reclamation",
+      "domain": "storage",
+      "category": "hierarchy",
+      "ontology_targeted": true,
+      "relevant": [
+        {
+          "id": "doc-snapshot-cow",
+          "gain": 3
+        },
+        {
+          "id": "doc-snapshot-gc",
+          "gain": 2
+        },
+        {
+          "id": "doc-faq-snapshot",
+          "gain": 1
+        },
+        {
+          "id": "doc-storage-overview",
+          "gain": 1
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-wal"
+      ]
+    },
+    {
+      "id": "q-hier-04",
+      "text": "planner selectivity decisions",
+      "domain": "query-engine",
+      "category": "hierarchy",
+      "ontology_targeted": true,
+      "relevant": [
+        {
+          "id": "doc-planner-cost",
+          "gain": 3
+        },
+        {
+          "id": "doc-planner-stats",
+          "gain": 2
+        },
+        {
+          "id": "doc-planner-hints",
+          "gain": 1
+        },
+        {
+          "id": "doc-qe-overview",
+          "gain": 1
+        }
+      ],
+      "forbidden_ids": [
+        "ct-doc-query"
+      ]
+    },
+    {
+      "id": "q-hier-05",
+      "text": "join ordering strategy",
+      "domain": "query-engine",
+      "category": "hierarchy",
+      "ontology_targeted": true,
+      "relevant": [
+        {
+          "id": "doc-planner-join",
+          "gain": 3
+        },
+        {
+          "id": "doc-planner-stats",
+          "gain": 2
+        },
+        {
+          "id": "doc-planner-cost",
+          "gain": 1
+        },
+        {
+          "id": "doc-qe-overview",
+          "gain": 1
+        }
+      ],
+      "forbidden_ids": [
+        "ct-doc-query"
+      ]
+    },
+    {
+      "id": "q-hier-06",
+      "text": "memory pressure during execution",
+      "domain": "query-engine",
+      "category": "hierarchy",
+      "ontology_targeted": true,
+      "relevant": [
+        {
+          "id": "doc-exec-spill",
+          "gain": 3
+        },
+        {
+          "id": "doc-exec-pipeline",
+          "gain": 2
+        },
+        {
+          "id": "doc-exec-vectorized",
+          "gain": 1
+        },
+        {
+          "id": "doc-qe-overview",
+          "gain": 1
+        }
+      ],
+      "forbidden_ids": [
+        "ct-doc-query"
+      ]
+    },
+    {
+      "id": "q-hier-07",
+      "text": "credential lifetime policy",
+      "domain": "auth",
+      "category": "hierarchy",
+      "ontology_targeted": true,
+      "relevant": [
+        {
+          "id": "doc-auth-tokens",
+          "gain": 3
+        },
+        {
+          "id": "doc-auth-refresh",
+          "gain": 2
+        },
+        {
+          "id": "doc-auth-mfa",
+          "gain": 1
+        },
+        {
+          "id": "doc-auth-overview",
+          "gain": 1
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-tokens"
+      ]
+    },
+    {
+      "id": "q-hier-08",
+      "text": "permission model changes audit",
+      "domain": "auth",
+      "category": "hierarchy",
+      "ontology_targeted": true,
+      "relevant": [
+        {
+          "id": "doc-rbac-audit",
+          "gain": 3
+        },
+        {
+          "id": "doc-rbac-roles",
+          "gain": 2
+        },
+        {
+          "id": "doc-auth-overview",
+          "gain": 1
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-rbac"
+      ]
+    },
+    {
+      "id": "q-hier-09",
+      "text": "telemetry volume control",
+      "domain": "observability",
+      "category": "hierarchy",
+      "ontology_targeted": true,
+      "relevant": [
+        {
+          "id": "doc-metrics-cardinality",
+          "gain": 3
+        },
+        {
+          "id": "doc-tracing-tail",
+          "gain": 2
+        },
+        {
+          "id": "doc-metrics-otel",
+          "gain": 1
+        },
+        {
+          "id": "doc-obs-overview",
+          "gain": 1
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-metrics"
+      ]
+    },
+    {
+      "id": "q-hier-10",
+      "text": "cross-service correlation",
+      "domain": "observability",
+      "category": "hierarchy",
+      "ontology_targeted": true,
+      "relevant": [
+        {
+          "id": "doc-obs-overview",
+          "gain": 3
+        },
+        {
+          "id": "doc-tracing-spans",
+          "gain": 2
+        },
+        {
+          "id": "doc-metrics-otel",
+          "gain": 1
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-metrics"
+      ]
+    },
+    {
+      "id": "q-hier-11",
+      "text": "log sequence ordering of frames",
+      "domain": "storage",
+      "category": "hierarchy",
+      "ontology_targeted": true,
+      "relevant": [
+        {
+          "id": "doc-glossary-lsn",
+          "gain": 3
+        },
+        {
+          "id": "doc-wal-replay",
+          "gain": 2
+        },
+        {
+          "id": "doc-wal-checkpoint",
+          "gain": 1
+        },
+        {
+          "id": "doc-storage-overview",
+          "gain": 1
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-wal"
+      ]
+    },
+    {
+      "id": "q-hier-12",
+      "text": "elevating to admin",
+      "domain": "auth",
+      "category": "hierarchy",
+      "ontology_targeted": true,
+      "relevant": [
+        {
+          "id": "doc-auth-mfa",
+          "gain": 3
+        },
+        {
+          "id": "doc-rbac-roles",
+          "gain": 2
+        },
+        {
+          "id": "doc-rbac-audit",
+          "gain": 1
+        },
+        {
+          "id": "doc-auth-overview",
+          "gain": 1
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-rbac"
+      ]
+    },
+    {
+      "id": "q-hier-13",
+      "text": "forcing an access path",
+      "domain": "query-engine",
+      "category": "hierarchy",
+      "ontology_targeted": true,
+      "relevant": [
+        {
+          "id": "doc-planner-hints",
+          "gain": 3
+        },
+        {
+          "id": "doc-planner-cost",
+          "gain": 2
+        },
+        {
+          "id": "doc-planner-join",
+          "gain": 1
+        },
+        {
+          "id": "doc-qe-overview",
+          "gain": 1
+        }
+      ],
+      "forbidden_ids": [
+        "ct-doc-query"
+      ]
+    },
+    {
+      "id": "q-hier-14",
+      "text": "alerting on budgets",
+      "domain": "observability",
+      "category": "hierarchy",
+      "ontology_targeted": true,
+      "relevant": [
+        {
+          "id": "doc-metrics-slo",
+          "gain": 3
+        },
+        {
+          "id": "doc-metrics-cardinality",
+          "gain": 2
+        },
+        {
+          "id": "doc-tracing-tail",
+          "gain": 1
+        },
+        {
+          "id": "doc-obs-overview",
+          "gain": 1
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-metrics"
+      ]
+    },
+    {
+      "id": "q-hier-15",
+      "text": "recovering after crash",
+      "domain": "storage",
+      "category": "hierarchy",
+      "ontology_targeted": true,
+      "relevant": [
+        {
+          "id": "doc-wal-replay",
+          "gain": 3
+        },
+        {
+          "id": "doc-wal-checkpoint",
+          "gain": 2
+        },
+        {
+          "id": "doc-runbook-wal-full",
+          "gain": 1
+        },
+        {
+          "id": "doc-storage-overview",
+          "gain": 1
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-wal"
+      ]
+    },
+    {
+      "id": "q-adv-01",
+      "text": "write-ahead log framing and crc",
+      "domain": "storage-wal",
+      "category": "adversarial",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-wal-format",
+          "gain": 3
+        },
+        {
+          "id": "doc-wal-replay",
+          "gain": 1
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-wal"
+      ]
+    },
+    {
+      "id": "q-adv-02",
+      "text": "additive rbac deny overrides",
+      "domain": "auth-rbac",
+      "category": "adversarial",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-rbac-roles",
+          "gain": 3
+        },
+        {
+          "id": "doc-rbac-audit",
+          "gain": 2
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-rbac"
+      ]
+    },
+    {
+      "id": "q-adv-03",
+      "text": "token ttl 24 hours shared secret",
+      "domain": "auth-tokens",
+      "category": "adversarial",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-auth-tokens",
+          "gain": 2
+        },
+        {
+          "id": "doc-auth-refresh",
+          "gain": 1
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-tokens"
+      ]
+    },
+    {
+      "id": "q-adv-04",
+      "text": "metrics 100k series labels",
+      "domain": "observability-metrics",
+      "category": "adversarial",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-metrics-cardinality",
+          "gain": 3
+        },
+        {
+          "id": "doc-metrics-otel",
+          "gain": 1
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-metrics"
+      ]
+    },
+    {
+      "id": "q-adv-05",
+      "text": "invoice weekly close manual approval",
+      "domain": "billing",
+      "category": "adversarial",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-billing-invoice",
+          "gain": 2
+        },
+        {
+          "id": "doc-billing-retry",
+          "gain": 1
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-billing"
+      ]
+    },
+    {
+      "id": "q-adv-06",
+      "text": "filter pushdown below joins unconditionally",
+      "domain": "query-engine-planner",
+      "category": "adversarial",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-planner-cost",
+          "gain": 2
+        },
+        {
+          "id": "doc-planner-join",
+          "gain": 1
+        }
+      ],
+      "forbidden_ids": [
+        "ct-doc-query"
+      ]
+    },
+    {
+      "id": "q-adv-07",
+      "text": "jwt hs256 refresh forever",
+      "domain": "auth-tokens",
+      "category": "adversarial",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-auth-tokens",
+          "gain": 2
+        },
+        {
+          "id": "doc-auth-refresh",
+          "gain": 2
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-tokens"
+      ]
+    },
+    {
+      "id": "q-adv-08",
+      "text": "append only corrections reversing entries",
+      "domain": "billing",
+      "category": "adversarial",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-billing-ledger",
+          "gain": 3
+        },
+        {
+          "id": "doc-billing-invoice",
+          "gain": 1
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-billing"
+      ]
+    },
+    {
+      "id": "q-adv-09",
+      "text": "p99 tail sampling 24 hours error traces",
+      "domain": "observability-tracing",
+      "category": "adversarial",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-tracing-tail",
+          "gain": 3
+        },
+        {
+          "id": "doc-tracing-spans",
+          "gain": 1
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-metrics"
+      ]
+    },
+    {
+      "id": "q-adv-10",
+      "text": "majority raft ack durability",
+      "domain": "replication",
+      "category": "adversarial",
+      "ontology_targeted": false,
+      "relevant": [
+        {
+          "id": "doc-repl-raft",
+          "gain": 3
+        },
+        {
+          "id": "doc-repl-lag",
+          "gain": 2
+        }
+      ],
+      "forbidden_ids": [
+        "nw-doc-wal"
+      ]
+    }
+  ]
+}

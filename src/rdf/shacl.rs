@@ -1,7 +1,8 @@
 use crate::traits::MemoryPayload;
-use oxttl::TurtleParser;
 use serde_json::Value;
 use std::sync::OnceLock;
+
+use crate::rdf::provenance::validate_epistemic_metadata;
 
 static EMBEDDED_SHAPES: &[(&str, &str)] = &[
     (
@@ -41,21 +42,71 @@ static EMBEDDED_SHAPE_COUNT: OnceLock<usize> = OnceLock::new();
 pub fn parse_embedded_shapes() -> usize {
     *EMBEDDED_SHAPE_COUNT.get_or_init(|| {
         let mut count = 0usize;
-        for (_, content) in embedded_ttl_shapes() {
-            let parser = TurtleParser::new();
-            let mut ok = true;
-            for result in parser.for_reader(content.as_bytes()) {
-                if result.is_err() {
-                    ok = false;
-                    break;
-                }
-            }
-            if ok {
+        for (name, content) in embedded_ttl_shapes() {
+            // Validate the Turtle shapes graph with rudof's SHACL parser.
+            // A failure here means the shipped schemas drifted from strict
+            // W3C SHACL-Core compliance.
+            let schema_ok =
+                ontobug::validate::shacl_schema(content, &ontobug::validate::RDFFormat::Turtle)
+                    .is_ok();
+            if schema_ok {
                 count += 1;
+            } else {
+                tracing::warn!(shape = %name, "embedded SHACL shape failed to parse");
             }
         }
         count
     })
+}
+
+/// Validate RDF data against SHACL shapes using ontobug/rudof.
+///
+/// Accepts Turtle or N-Triples data. Returns violations as `ShaclViolation` rows.
+pub fn validate_rdf_with_ontobug(
+    data: &str,
+    shapes_ttl: &str,
+) -> anyhow::Result<Vec<ShaclViolation>> {
+    let mode = ontobug::validate::Mode::Native;
+    let report = match ontobug::validate::shacl_turtle(data, shapes_ttl, &mode) {
+        Ok(report) => report,
+        Err(turtle_err) => ontobug::validate::shacl(
+            data,
+            shapes_ttl,
+            &ontobug::validate::RDFFormat::NTriples,
+            &mode,
+        )
+        .map_err(|_| anyhow::anyhow!(turtle_err))?,
+    };
+    Ok(report
+        .results
+        .into_iter()
+        .map(|finding| ShaclViolation {
+            field: finding.path.unwrap_or_else(|| finding.focus.clone()),
+            why: finding
+                .message
+                .unwrap_or_else(|| format!("{} ({})", finding.component, finding.severity)),
+        })
+        .collect())
+}
+
+/// Validate RDF data against a ShExC schema using ontobug/rudof.
+///
+/// `shape_map` is a compact shape-map string such as `<http://ex/a>@<http://ex/Shape>`.
+pub fn validate_shex_with_ontobug(
+    data: &str,
+    shexc: &str,
+    base: &str,
+    shape_map: &str,
+) -> anyhow::Result<Vec<ShaclViolation>> {
+    let results = ontobug::validate::shex(data, shexc, base, shape_map)?;
+    Ok(results
+        .into_iter()
+        .filter(|r| !r.conformant)
+        .map(|r| ShaclViolation {
+            field: r.shape,
+            why: format!("node {}: {}", r.node, r.reason),
+        })
+        .collect())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -545,6 +596,17 @@ pub fn validate_memory(payload: &MemoryPayload) -> Vec<ShaclViolation> {
         }
     }
 
+    // Capability C: epistemic tier provenance validation (fail-closed).
+    // Every invariant break surfaces as a violation the caller must act on;
+    // absent metadata carries no tier => verified by backward-compatible
+    // unverified semantics, so no warning here either.
+    for w in validate_epistemic_metadata(&payload.metadata, payload.agent_name.as_deref()) {
+        out.push(ShaclViolation {
+            field: w.field,
+            why: w.message,
+        });
+    }
+
     out
 }
 
@@ -619,12 +681,40 @@ pub fn infer_shape(payload: &crate::traits::MemoryPayload) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn parse_embedded_shapes_returns_count() {
         assert!(
             parse_embedded_shapes() > 0,
             "embedded SHACL .ttl shapes must parse"
+        );
+    }
+
+    #[test]
+    fn ontobug_validation_accepts_turtle_without_prefix_directives() {
+        let shapes = r#"
+            @prefix sh: <http://www.w3.org/ns/shacl#> .
+            @prefix ex: <http://example.com/> .
+            @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+            ex:PersonShape a sh:NodeShape ;
+                sh:targetClass ex:Person ;
+                sh:property [
+                    sh:path ex:name ;
+                    sh:minCount 1 ;
+                    sh:datatype xsd:string
+                ] .
+        "#;
+        let data = r#"
+            <http://example.com/alice> a <http://example.com/Person> ;
+                <http://example.com/name> "Alice" .
+        "#;
+
+        let violations = validate_rdf_with_ontobug(data, shapes)
+            .expect("prefix-less Turtle must be parsed as Turtle, not N-Triples");
+        assert!(
+            violations.is_empty(),
+            "unexpected violations: {violations:?}"
         );
     }
 
@@ -785,5 +875,74 @@ mod tests {
             "structural file with empty content must not emit content violation: got {:?}",
             v
         );
+    }
+
+    fn payload_with_metadata(metadata: Value) -> MemoryPayload {
+        MemoryPayload {
+            content: "content".to_string(),
+            user_id: "u1".to_string(),
+            memory_type: "fact".to_string(),
+            agent_name: Some("agent-1".to_string()),
+            location: "".to_string(),
+            location_lines: "".to_string(),
+            metadata,
+        }
+    }
+
+    #[test]
+    fn embedded_shape_inventory_is_exactly_eight() {
+        assert_eq!(embedded_ttl_shapes().len(), 8);
+        assert_eq!(parse_embedded_shapes(), 8);
+    }
+
+    #[test]
+    fn validate_memory_malformed_stale_after_is_a_violation() {
+        let bad = validate_memory(&payload_with_metadata(json!({"stale_after": "not-a-date"})));
+        assert!(
+            bad.iter().any(|v| v.field == "stale_after"),
+            "malformed stale_after must surface on validate_memory: {bad:?}"
+        );
+        let good = validate_memory(&payload_with_metadata(json!({
+            "stale_after": "2026-01-01T00:00:00Z"
+        })));
+        assert!(good.iter().all(|v| v.field != "stale_after"));
+    }
+
+    #[test]
+    fn validate_memory_unknown_tier_is_a_violation() {
+        let v = validate_memory(&payload_with_metadata(json!({
+            "epistemic_tier": "not-a-tier",
+            "verified_by": "v"
+        })));
+        assert!(v.iter().any(|x| x.field == "epistemic_tier"), "{v:?}");
+    }
+
+    #[test]
+    fn validate_memory_nested_self_verification_is_a_violation() {
+        let v = validate_memory(&payload_with_metadata(json!({
+            "generated_by": "agent-1",
+            "provenance": {"verified_by": "agent-1", "epistemic_tier": "unverified_agent"}
+        })));
+        assert!(
+            v.iter()
+                .any(|x| x.field == "verified_by" && x.why.contains("self-verification")),
+            "{v:?}"
+        );
+    }
+
+    #[test]
+    fn validate_memory_odd_provenance_shapes_never_panic() {
+        let shapes = [
+            json!(null),
+            json!({"source": null, "provenance": null}),
+            json!({"not_definition": []}),
+            json!({"not_definition": [1, null, {}]}),
+            json!({"epistemic_tier": 123}),
+            json!({"stale_after": [1, 2]}),
+            json!({"provenance": {"verified_by": null, "generated_by": []}}),
+        ];
+        for metadata in shapes {
+            let _ = validate_memory(&payload_with_metadata(metadata));
+        }
     }
 }

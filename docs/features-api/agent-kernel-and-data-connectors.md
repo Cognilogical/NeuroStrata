@@ -16,7 +16,7 @@ Central Agentic Kernel (`AgentKernel`) unifies workflow lifecycle, cognitive rec
 
 ## Principal-Scoped Kernel Ports
 
-- `MemoryPort` (`LadybugMemoryPort`): `get_visible_memory`, `register_data_pointer`, `get_data_pointer`, `list_data_pointers`.
+- `MemoryPort` (`LadybugMemoryPort`): `get_visible_memory`, `register_data_pointer`, `get_data_pointer`, `list_data_pointers`, `register_data_pool`, `list_data_pools`.
 - `ExecutivePort` (`LadybugExecutivePort`): `list_tasks`, `get_task`, `verify_task_extraction_count`, `evaluate_workflow_transition`.
 - `OntologyPort` (`LadybugOntologyPort`): `list_ontology_entities`, `get_ontology_entity`, `verify_active_action_receipt`.
 
@@ -24,7 +24,7 @@ Central Agentic Kernel (`AgentKernel`) unifies workflow lifecycle, cognitive rec
 
 - Constructor: `AgentKernel::new`, `AgentKernel::with_ports`.
 - Typed accessors: `memory()`, `executive()`, `ontology()`, `workflows()`, `connectors()`, `bus()`.
-- Operations: `register_pointer`, `resolve_pointer`, `apply_external_effect`, `execute_connector_command`, `mediate_workflow_data`.
+- Operations: `register_pool` (persisting namespace-scoped pool schemas via `scoped_connector_pool_id` and preserving stored `pool_records` when `records` is omitted; `describe_pool_with_hydration` applies persisted namespace overrides without mutating other namespaces' built-in defaults), `register_pointer`, `resolve_pointer`, `apply_external_effect`, `execute_connector_command` (`list_connectors`, `describe_pool`, `register_pool`, `upsert_pool`, `list_pools`, `register_pointer`, `list_pointers`, `resolve_pointer`, `apply_effect`, `mediate`), `mediate_workflow_data`.
 
 ## Two-Phase DataConnector Gate
 
@@ -47,6 +47,15 @@ Central Agentic Kernel (`AgentKernel`) unifies workflow lifecycle, cognitive rec
 - MCP tool: `neurostrata_data_connector`
 - HTTP endpoint: `POST /data-connector`
 - CLI: `neurostrata-mcp data-connector <list|describe|register-pointer|resolve|apply-effect|mediate>`
+
+## Schema Discovery
+
+The `neurostrata_data_connector` MCP tool discloses an operation-discriminated `args` schema (`oneOf` keyed on `operation`): each of `list_connectors`, `list_pointers`, `describe_pool`, `register_pointer`, `resolve_pointer`, `apply_effect`, and `mediate` declares its own required fields, including the nested `DataPointerRecord`, `DataSliceRequest`, and `ExternalEffectRequest` layouts. The schema is discovery-only: the runtime still accepts anything it accepts today, so clients are never constrained by the disclosure.
+
+- `now_secs` (optional u64) is accepted by `resolve_pointer`, `apply_effect`, and `mediate`; omission defaults to the current epoch.
+- `mediate` accepts optional `gate_passed` (boolean); omission defaults to `false` at runtime.
+- `list_pointers`, `resolve_pointer`, `apply_effect`, `register_pointer`, and pool operations exclude retired/inactive rows (`valid_to` expired, `archived == true`, `retired == true`, or non-empty `superseded_by`).
+- `handle_data_connector` defaults omitted `namespace` to `"global"` and omitted `principal` to `None`, while rejecting present non-string, blank/whitespace, or whitespace-padded `namespace` and `principal` values before `AgentKernel` construction; pool operations (`register_pool`, `upsert_pool`, `list_pools`) are also accepted at runtime via `execute_connector_command`.
 
 ## Verification
 

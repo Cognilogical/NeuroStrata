@@ -108,12 +108,36 @@ pub struct ConceptSpec {
     pub evidence_refs: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concept_iri: Option<String>,
+    /// Explicit negative scope boundary (spec §4.2.3). Backward-compatible:
+    /// absent on every pre-C concept row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_definition: Option<Value>,
+    /// Governed deprecation annotation `{status, superseded_by, reason,
+    /// effective_at}`. Backward-compatible: absent on older rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deprecation: Option<Value>,
+    /// Deterministic banner derived from `deprecation` at read time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deprecation_banner: Option<String>,
 }
 
 impl ConceptSpec {
     pub fn from_payload(payload: &MemoryPayload) -> Option<Self> {
         let obj = payload.metadata.get("concept")?;
         let mut spec: Self = serde_json::from_value(obj.clone()).ok()?;
+        if spec.not_definition.is_none() {
+            spec.not_definition = obj
+                .get("not_definition")
+                .filter(|v| !v.is_null())
+                .cloned();
+        }
+        if spec.deprecation.is_none() {
+            spec.deprecation = obj.get("deprecation").filter(|v| v.is_object()).cloned();
+        }
+        spec.deprecation_banner = spec
+            .deprecation
+            .as_ref()
+            .and_then(crate::rdf::provenance::deprecation_banner);
         if spec.aliases.is_empty() {
             spec.aliases = extract_string_vec_from_meta(obj, "alt_labels");
         }
@@ -161,6 +185,12 @@ pub struct HydratedConcept {
     pub locations: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concept_iri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_definition: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deprecation: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deprecation_banner: Option<String>,
     pub epistemic_status: String,
     pub epistemic_weight_bps: u32,
     pub descendant_count: usize,
@@ -317,6 +347,11 @@ pub struct TaxonomyRequest {
     pub evidence_refs: Option<Vec<String>>,
     #[serde(default)]
     pub concept_iri: Option<String>,
+    /// Capability C: structured negative boundary and deprecation annotation.
+    #[serde(default)]
+    pub not_definition: Option<Value>,
+    #[serde(default)]
+    pub deprecation: Option<Value>,
     #[serde(default)]
     pub governs: Option<Vec<String>>,
     #[serde(default)]
@@ -1002,6 +1037,9 @@ pub fn build_principal_taxonomy_view(
                 governs,
                 locations,
                 concept_iri: spec.concept_iri.clone(),
+                not_definition: spec.not_definition.clone(),
+                deprecation: spec.deprecation.clone(),
+                deprecation_banner: spec.deprecation_banner.clone(),
                 epistemic_status: ep_status.as_str().to_string(),
                 epistemic_weight_bps: ep_status.weight_bps(),
                 descendant_count,
@@ -1052,6 +1090,79 @@ fn compute_axis_alignment_bps(
     ((sum / (scores.len() as u64)) as u32).min(10000)
 }
 
+#[cfg(test)]
+#[derive(Default, Clone, Copy)]
+struct TestTaxonomyProbeState {
+    fail_probe_list: bool,
+    probe_typed_lists: usize,
+    full_reads: usize,
+}
+
+#[cfg(test)]
+fn test_taxonomy_probe_map() -> &'static std::sync::Mutex<BTreeMap<String, TestTaxonomyProbeState>> {
+    static MAP: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, TestTaxonomyProbeState>>> =
+        std::sync::OnceLock::new();
+    MAP.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn set_test_probe_fail_for_namespace(namespace: &str, fail: bool) {
+    let mut map = test_taxonomy_probe_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    map.entry(namespace.to_string()).or_default().fail_probe_list = fail;
+}
+
+#[cfg(test)]
+fn reset_test_taxonomy_read_counters(namespace: &str) {
+    let mut map = test_taxonomy_probe_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let entry = map.entry(namespace.to_string()).or_default();
+    entry.probe_typed_lists = 0;
+    entry.full_reads = 0;
+}
+
+#[cfg(test)]
+fn test_probe_typed_list_count(namespace: &str) -> usize {
+    test_taxonomy_probe_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(namespace)
+        .map_or(0, |s| s.probe_typed_lists)
+}
+
+#[cfg(test)]
+fn test_full_taxonomy_read_count(namespace: &str) -> usize {
+    test_taxonomy_probe_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(namespace)
+        .map_or(0, |s| s.full_reads)
+}
+
+async fn list_taxonomy_rows_by_type(
+    store: &LadybugStore,
+    namespace: &str,
+    memory_type: &str,
+) -> anyhow::Result<Vec<crate::traits::SearchResult>> {
+    #[cfg(test)]
+    {
+        let should_fail = {
+            let mut map = test_taxonomy_probe_map()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let entry = map.entry(namespace.to_string()).or_default();
+            entry.probe_typed_lists += 1;
+            entry.fail_probe_list
+        };
+        if should_fail {
+            anyhow::bail!("injected taxonomy probe list failure for '{namespace}' ({memory_type})");
+        }
+    }
+    store.list(namespace, None, Some(memory_type)).await
+}
+
 async fn load_active_rows_and_edges(
     store: &LadybugStore,
     namespace: &str,
@@ -1063,6 +1174,13 @@ async fn load_active_rows_and_edges(
     ),
     String,
 > {
+    #[cfg(test)]
+    {
+        let mut map = test_taxonomy_probe_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        map.entry(namespace.to_string()).or_default().full_reads += 1;
+    }
     let records = store
         .list(namespace, None, None)
         .await
@@ -1118,6 +1236,40 @@ pub async fn execute_taxonomy(
         obj.insert("ok".to_string(), json!(true));
     }
     Ok(res)
+}
+
+/// Encode a namespace into an injective, IRI-safe taxonomy ID token so
+/// distinct namespaces never collide in LadybugStore's global row ID space
+/// (including when one namespace is `a-b` with slug `c` and another is `a`
+/// with slug `b-c`).
+pub fn taxonomy_namespace_token(namespace: &str) -> String {
+    let mut out = String::with_capacity(namespace.len());
+    let bytes = namespace.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        let is_double_dash = b == b'-' && (i > 0 && bytes[i - 1] == b'-');
+        match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' => out.push(b as char),
+            b'-' if !is_double_dash => out.push('-'),
+            _ => {
+                use std::fmt::Write;
+                let _ = write!(&mut out, "~{:02x}", b);
+            }
+        }
+    }
+    out
+}
+
+/// Deterministic, namespace-qualified row ID for a thesis version.
+pub fn thesis_row_id(namespace: &str, version: u64) -> String {
+    format!("thesis-{}--v{version}", taxonomy_namespace_token(namespace))
+}
+
+/// Deterministic, namespace-qualified row ID for a SKOS concept version.
+pub fn concept_row_id(namespace: &str, slug: &str, version: u64) -> String {
+    format!(
+        "concept-{}--{slug}-v{version}",
+        taxonomy_namespace_token(namespace)
+    )
 }
 
 async fn execute_set_thesis(
@@ -1221,7 +1373,7 @@ async fn execute_set_thesis(
     } else {
         (1u64, None)
     };
-    let new_id = format!("thesis-v{next_ver}");
+    let new_id = thesis_row_id(namespace, next_ver);
     expected_heads.push(ExpectedHead::AbsentOrInactive {
         row_id: new_id.clone(),
     });
@@ -1615,6 +1767,12 @@ async fn execute_upsert_concept(
         evaluation_scores: evaluation_scores.clone(),
         evidence_refs: evidence_refs.clone(),
         concept_iri: concept_iri.clone(),
+        not_definition: req.not_definition.clone().filter(|v| !v.is_null()),
+        deprecation: req.deprecation.clone().filter(|v| v.is_object()),
+        deprecation_banner: req
+            .deprecation
+            .as_ref()
+            .and_then(crate::rdf::provenance::deprecation_banner),
     };
 
     // Collect existing active concept rows in namespace and check global DAG + SKOS S27 disjointness
@@ -1655,7 +1813,7 @@ async fn execute_upsert_concept(
     } else {
         (1u64, None)
     };
-    let new_id = format!("concept-{slug}-v{next_ver}");
+    let new_id = concept_row_id(namespace, &slug, next_ver);
 
     let mut expected_heads: Vec<ExpectedHead> = vec![ExpectedHead::AbsentOrInactive {
         row_id: new_id.clone(),
@@ -1743,6 +1901,12 @@ async fn execute_upsert_concept(
         "valid_from": now_ts,
         "updated_at": now_ts,
     });
+    if let Some(nd) = &candidate_spec.not_definition {
+        meta["concept"]["not_definition"] = nd.clone();
+    }
+    if let Some(dep) = &candidate_spec.deprecation {
+        meta["concept"]["deprecation"] = dep.clone();
+    }
     if let Some(d) = &domain_slug {
         meta["domain"] = json!(d);
     }
@@ -2569,6 +2733,29 @@ async fn execute_compare(
     }))
 }
 
+/// Capability C: compact, deterministic list of concepts that carry a
+/// negative boundary or a deprecation annotation. Shared by `gaps`, `advise`,
+/// and the snapshot taxonomy strip so those surfaces cannot drift.
+fn concept_deprecation_and_boundaries(view: &PrincipalTaxonomyView) -> Vec<Value> {
+    view.concepts
+        .values()
+        .filter(|c| c.deprecation_banner.is_some() || c.not_definition.is_some())
+        .map(|c| {
+            let mut item = json!({
+                "slug": c.slug,
+                "pref_label": c.pref_label,
+            });
+            if let Some(banner) = &c.deprecation_banner {
+                item["deprecation_banner"] = json!(banner);
+            }
+            if let Some(boundary) = &c.not_definition {
+                item["not_definition"] = boundary.clone();
+            }
+            item
+        })
+        .collect()
+}
+
 pub fn compute_gaps_from_view(view: &PrincipalTaxonomyView) -> Value {
     let mut n_seed: usize = 0;
     let mut n_defined: usize = 0;
@@ -2768,6 +2955,10 @@ pub fn compute_gaps_from_view(view: &PrincipalTaxonomyView) -> Value {
         "dangling_concept_refs": dangling_concept_refs,
         "shallow_concepts": shallow_concepts,
         "anti_patterns": anti_patterns,
+        // Capability C: explicit advisory surface for negative boundaries and
+        // deprecations. Restricted concepts never reach `view`, so privacy is
+        // unchanged. Advisory only — never a blocking gate violation.
+        "deprecation_and_boundaries": concept_deprecation_and_boundaries(view),
     })
 }
 
@@ -3148,25 +3339,125 @@ async fn execute_advise(
         "recommendations": recommendations,
         "insufficient_evidence_concepts": insufficient_evidence_concepts,
         "external_research_agenda": external_research_agenda,
+        // Capability C: the advisor must see which canonical concepts are
+        // bounded or deprecated before recommending them as evidence anchors.
+        "deprecation_and_boundaries": concept_deprecation_and_boundaries(&view),
     }))
+}
+
+/// Whether a taxonomy row (`"thesis"` or `"concept"`) is active, non-conflicting,
+/// unrestricted (`is_public_access_policy`), and carries a valid specification
+/// so it would actually appear in the auto-briefing taxonomy view.
+fn is_visible_autobriefing_taxonomy_row(
+    payload: &MemoryPayload,
+    memory_type: &str,
+    now_ts: i64,
+) -> bool {
+    if !is_active_non_conflicting(payload, now_ts) || !is_public_access_policy(&payload.metadata) {
+        return false;
+    }
+    match memory_type {
+        "thesis" => ThesisSpec::from_payload(payload).is_some(),
+        "concept" => ConceptSpec::from_payload(payload)
+            .filter(|spec| !spec.slug.trim().is_empty())
+            .is_some(),
+        _ => false,
+    }
+}
+
+enum TaxonomyProbeOutcome {
+    Empty,
+    ThesisOnly(Vec<(String, MemoryPayload)>),
+    NeedsFullRead,
+}
+
+/// Probe `"concept"` then `"thesis"` rows by type before running the full namespace + edge read:
+/// - If any active, unrestricted concept row exists (or a typed probe fails), fall back to the
+///   full read (`NeedsFullRead`) so concept hydration can inspect rules/facts/interfaces/edges.
+/// - If no visible concept exists, probe `"thesis"` and reuse the visible thesis rows directly
+///   (`ThesisOnly`) without listing the whole namespace or its edges.
+/// - If neither has any visible row, return `Empty`.
+async fn probe_autobriefing_taxonomy_rows(
+    store: &LadybugStore,
+    namespace: &str,
+    now_ts: i64,
+) -> TaxonomyProbeOutcome {
+    match list_taxonomy_rows_by_type(store, namespace, "concept").await {
+        Ok(rows) => {
+            if rows
+                .iter()
+                .any(|r| is_visible_autobriefing_taxonomy_row(&r.payload, "concept", now_ts))
+            {
+                return TaxonomyProbeOutcome::NeedsFullRead;
+            }
+        }
+        // Narrow read failed: conservatively fall back to the full read.
+        Err(_) => return TaxonomyProbeOutcome::NeedsFullRead,
+    }
+
+    match list_taxonomy_rows_by_type(store, namespace, "thesis").await {
+        Ok(rows) => {
+            let visible_thesis_rows: Vec<(String, MemoryPayload)> = rows
+                .into_iter()
+                .filter(|r| is_visible_autobriefing_taxonomy_row(&r.payload, "thesis", now_ts))
+                .map(|r| (r.id, r.payload))
+                .collect();
+            if visible_thesis_rows.is_empty() {
+                TaxonomyProbeOutcome::Empty
+            } else {
+                TaxonomyProbeOutcome::ThesisOnly(visible_thesis_rows)
+            }
+        }
+        // Narrow read failed: conservatively fall back to the full read.
+        Err(_) => TaxonomyProbeOutcome::NeedsFullRead,
+    }
+}
+
+/// Whether the namespace has any active, non-conflicting, unrestricted thesis or concept row
+/// (or conservatively `true` when the narrow typed probe fails). Reading by type keeps
+/// `get_snapshot` and every task block from listing the whole namespace (code rows included)
+/// and all its edges when no visible taxonomy rows exist.
+async fn namespace_has_taxonomy_rows(store: &LadybugStore, namespace: &str) -> bool {
+    let now_ts = chrono::Utc::now().timestamp();
+    !matches!(
+        probe_autobriefing_taxonomy_rows(store, namespace, now_ts).await,
+        TaxonomyProbeOutcome::Empty
+    )
+}
+
+async fn load_autobriefing_taxonomy_view(
+    store: &LadybugStore,
+    namespace: &str,
+) -> Option<PrincipalTaxonomyView> {
+    let now_ts = chrono::Utc::now().timestamp();
+    let view = match probe_autobriefing_taxonomy_rows(store, namespace, now_ts).await {
+        TaxonomyProbeOutcome::Empty => return None,
+        TaxonomyProbeOutcome::ThesisOnly(thesis_rows) => {
+            build_principal_taxonomy_view(&thesis_rows, &[], "admin")
+        }
+        TaxonomyProbeOutcome::NeedsFullRead => {
+            let (active_rows, active_edges) =
+                load_active_rows_and_edges(store, namespace, now_ts).await.ok()?;
+            let unrestricted_rows: Vec<(String, MemoryPayload)> = active_rows
+                .into_iter()
+                .filter(|(_id, pl)| is_public_access_policy(&pl.metadata))
+                .collect();
+            build_principal_taxonomy_view(&unrestricted_rows, &active_edges, "admin")
+        }
+    };
+    if view.thesis.is_none() && view.concepts.is_empty() {
+        None
+    } else {
+        Some(view)
+    }
 }
 
 /// Render the context-budgeted `### Project Thesis & Domain Expertise:` section (`<= 800` chars)
 /// for `neurostrata_get_snapshot`. Only includes unrestricted (`is_public_access_policy`) rows.
 pub async fn render_snapshot_taxonomy_section(store: &LadybugStore, namespace: &str) -> String {
-    let now_ts = chrono::Utc::now().timestamp();
-    let Ok((active_rows, active_edges)) = load_active_rows_and_edges(store, namespace, now_ts).await
-    else {
+    let Some(view) = load_autobriefing_taxonomy_view(store, namespace).await else {
         return String::new();
     };
-    let unrestricted_rows: Vec<(String, MemoryPayload)> = active_rows
-        .into_iter()
-        .filter(|(_id, pl)| is_public_access_policy(&pl.metadata))
-        .collect();
-    let view = build_principal_taxonomy_view(&unrestricted_rows, &active_edges, "admin");
-    if view.thesis.is_none() && view.concepts.is_empty() {
-        return String::new();
-    }
 
     let statuses: Vec<EpistemicStatus> = view
         .concepts
@@ -3245,6 +3536,27 @@ pub async fn render_snapshot_taxonomy_section(store: &LadybugStore, namespace: &
         lines.push(format!("  - Top Epistemic Gaps: {}", gap_items.join(", ")));
     }
 
+    // Capability C: surface bounded/deprecated concepts in the snapshot strip.
+    // The autobriefing view already excludes restricted rows, so this adds no
+    // new privacy exposure. Kept compact to respect the 800-char budget.
+    let annotations = concept_deprecation_and_boundaries(&view);
+    if !annotations.is_empty() {
+        let summary: Vec<String> = annotations
+            .iter()
+            .take(3)
+            .filter_map(|a| {
+                let slug = a.get("slug")?.as_str()?;
+                match a.get("deprecation_banner").and_then(Value::as_str) {
+                    Some(banner) => Some(format!("{slug}({banner})")),
+                    None => Some(format!("{slug}(NOT DEFINITION)")),
+                }
+            })
+            .collect();
+        if !summary.is_empty() {
+            lines.push(format!("  - Deprecated / Bounded Concepts: {}", summary.join("; ")));
+        }
+    }
+
     let out = lines.join("\n");
     if out.chars().count() > 800 {
         let mut s: String = out.chars().take(797).collect();
@@ -3262,19 +3574,9 @@ pub async fn build_task_taxonomy_context(
     namespace: &str,
     task_text: &str,
 ) -> (Value, Value, String) {
-    let now_ts = chrono::Utc::now().timestamp();
-    let Ok((active_rows, active_edges)) = load_active_rows_and_edges(store, namespace, now_ts).await
-    else {
+    let Some(view) = load_autobriefing_taxonomy_view(store, namespace).await else {
         return (Value::Null, Value::Array(Vec::new()), String::new());
     };
-    let unrestricted_rows: Vec<(String, MemoryPayload)> = active_rows
-        .into_iter()
-        .filter(|(_id, pl)| is_public_access_policy(&pl.metadata))
-        .collect();
-    let view = build_principal_taxonomy_view(&unrestricted_rows, &active_edges, "admin");
-    if view.thesis.is_none() && view.concepts.is_empty() {
-        return (Value::Null, Value::Array(Vec::new()), String::new());
-    }
 
     let thesis_json = view
         .thesis
@@ -3399,10 +3701,10 @@ mod tests {
         )
         .await
         .expect("set_thesis v1");
-        assert_eq!(r1["thesis_id"], "thesis-v1");
+        assert_eq!(r1["thesis_id"], thesis_row_id(ns, 1));
         assert!(r1["superseded_id"].is_null());
 
-        // 2. Second set_thesis supersedes thesis-v1 with thesis-v2
+        // 2. Second set_thesis supersedes thesis v1 with thesis v2
         let r2 = execute_taxonomy(
             &store,
             &embedder,
@@ -3421,14 +3723,18 @@ mod tests {
         )
         .await
         .expect("set_thesis v2");
-        assert_eq!(r2["thesis_id"], "thesis-v2");
-        assert_eq!(r2["superseded_id"], "thesis-v1");
+        assert_eq!(r2["thesis_id"], thesis_row_id(ns, 2));
+        assert_eq!(r2["superseded_id"], thesis_row_id(ns, 1));
 
-        // Verify thesis-v1 has superseded_by = "thesis-v2"
-        let (_v1_vec, v1_pl) = store.get(ns, "thesis-v1").await.unwrap().unwrap();
-        assert_eq!(v1_pl.metadata["superseded_by"], "thesis-v2");
+        // Verify thesis v1 has superseded_by = thesis v2
+        let (_v1_vec, v1_pl) = store
+            .get(ns, &thesis_row_id(ns, 1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(v1_pl.metadata["superseded_by"], thesis_row_id(ns, 2));
 
-        // 3. Upsert concept twice with same slug -> concept-bitemporal-graph-v1 superseded by v2
+        // 3. Upsert concept twice with same slug -> v1 superseded by v2
         let c1 = execute_taxonomy(
             &store,
             &embedder,
@@ -3445,7 +3751,10 @@ mod tests {
         )
         .await
         .expect("upsert_concept v1");
-        assert_eq!(c1["concept_id"], "concept-bitemporal-graph-v1");
+        assert_eq!(
+            c1["concept_id"],
+            concept_row_id(ns, "bitemporal-graph", 1)
+        );
         assert!(c1["superseded_id"].is_null());
 
         let c2 = execute_taxonomy(
@@ -3464,8 +3773,65 @@ mod tests {
         )
         .await
         .expect("upsert_concept v2");
-        assert_eq!(c2["concept_id"], "concept-bitemporal-graph-v2");
-        assert_eq!(c2["superseded_id"], "concept-bitemporal-graph-v1");
+        assert_eq!(
+            c2["concept_id"],
+            concept_row_id(ns, "bitemporal-graph", 2)
+        );
+        assert_eq!(
+            c2["superseded_id"],
+            concept_row_id(ns, "bitemporal-graph", 1)
+        );
+
+        // 4. Cross-namespace set_thesis and upsert_concept (#246): a second
+        // namespace in the same store must mint distinct row IDs and never
+        // collide in commit_action_batch.
+        let ns2 = "tax-cas-ns-other";
+        store.init(ns2).await.expect("init ns2");
+        let r_ns2 = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "set_thesis".to_string(),
+                namespace: ns2.to_string(),
+                primary_domain: Some("cognitive-memory".to_string()),
+                mission: Some("Second namespace mission".to_string()),
+                direction: Some("Second namespace direction".to_string()),
+                core_pillars: Some(vec!["graph-memory".to_string()]),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("set_thesis in second namespace must not collide");
+        assert_eq!(r_ns2["thesis_id"], thesis_row_id(ns2, 1));
+        assert_ne!(r_ns2["thesis_id"], r1["thesis_id"]);
+
+        let c_ns2 = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "upsert_concept".to_string(),
+                namespace: ns2.to_string(),
+                slug: Some("bitemporal-graph".to_string()),
+                pref_label: Some("Bitemporal Property Graph".to_string()),
+                definition: Some("Second namespace definition".to_string()),
+                domain: Some("graph-memory".to_string()),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("upsert_concept in second namespace with same slug must not collide");
+        assert_eq!(
+            c_ns2["concept_id"],
+            concept_row_id(ns2, "bitemporal-graph", 1)
+        );
+        assert_ne!(c_ns2["concept_id"], c1["concept_id"]);
+        // Adversarial delimiter boundary: ("a-b", "c") vs ("a", "b-c") must remain distinct.
+        assert_ne!(
+            concept_row_id("a-b", "c", 1),
+            concept_row_id("a", "b-c", 1)
+        );
     }
 
     #[tokio::test]
@@ -4053,6 +4419,347 @@ mod tests {
         assert!(insuff.contains(&"retrieval".to_string()));
     }
 
+    /// A namespace with no thesis or concept rows gets no taxonomy section and
+    /// no task taxonomy context, and the check is by row type. A concept alone,
+    /// without a thesis, still counts.
+    #[tokio::test]
+    async fn auto_briefing_skips_namespaces_without_taxonomy_rows() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-autobrief-none";
+        store.init(ns).await.expect("init");
+        for i in 0..3 {
+            store
+                .upsert(ns, &format!("rule-{i}"), vec![0.1; 4], MemoryPayload {
+                    content: format!("An ordinary rule {i} about retrieval."),
+                    user_id: "kenton".to_string(),
+                    memory_type: "rule".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({}),
+                })
+                .await
+                .expect("seed rule");
+        }
+        assert!(!namespace_has_taxonomy_rows(&store, ns).await);
+        assert_eq!(render_snapshot_taxonomy_section(&store, ns).await, "");
+        let (thesis, concepts, prompt) =
+            build_task_taxonomy_context(&store, ns, "improve retrieval").await;
+        assert!(thesis.is_null());
+        assert_eq!(concepts, json!([]));
+        assert_eq!(prompt, "");
+
+        execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "upsert_concept".to_string(),
+                namespace: ns.to_string(),
+                slug: Some("rrf-fusion".to_string()),
+                pref_label: Some("RRF Fusion".to_string()),
+                definition: Some("Reciprocal rank fusion of retrieval lists.".to_string()),
+                domain: Some("retrieval".to_string()),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("concept without a thesis");
+        assert!(namespace_has_taxonomy_rows(&store, ns).await);
+        assert!(render_snapshot_taxonomy_section(&store, ns).await.contains("1 unrestricted concepts"));
+    }
+
+    #[tokio::test]
+    async fn auto_briefing_probe_error_falls_back_to_full_read() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-autobrief-probe-err";
+        store.init(ns).await.expect("init");
+
+        execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "set_thesis".to_string(),
+                namespace: ns.to_string(),
+                primary_domain: Some("cognitive-memory".to_string()),
+                mission: Some("Verifiable cognitive memory engine".to_string()),
+                direction: Some("Graph-first reasoning and formal verification".to_string()),
+                core_pillars: Some(vec!["retrieval".to_string()]),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("set_thesis");
+
+        execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "upsert_concept".to_string(),
+                namespace: ns.to_string(),
+                slug: Some("rrf-fusion".to_string()),
+                pref_label: Some("RRF Fusion".to_string()),
+                definition: Some("Reciprocal rank fusion of retrieval lists.".to_string()),
+                domain: Some("retrieval".to_string()),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("upsert_concept");
+
+        reset_test_taxonomy_read_counters(ns);
+        set_test_probe_fail_for_namespace(ns, true);
+
+        assert!(
+            namespace_has_taxonomy_rows(&store, ns).await,
+            "probe error must conservatively report true so callers fall back to full read"
+        );
+        let snap = render_snapshot_taxonomy_section(&store, ns).await;
+        assert!(
+            snap.contains("cognitive-memory") && snap.contains("1 unrestricted concepts"),
+            "snapshot auto-briefing must fall back to full read on probe error: {snap}"
+        );
+        let (thesis, concepts, prompt) =
+            build_task_taxonomy_context(&store, ns, "rrf fusion").await;
+        assert!(!thesis.is_null());
+        assert_eq!(concepts.as_array().map(|a| a.len()), Some(1));
+        assert!(prompt.contains("rrf-fusion"));
+        assert_eq!(
+            test_full_taxonomy_read_count(ns),
+            2,
+            "both snapshot and task auto-briefing must execute load_active_rows_and_edges when the probe errors"
+        );
+
+        set_test_probe_fail_for_namespace(ns, false);
+
+        // Also verify an empty namespace degrades cleanly when the probe errors.
+        let empty_ns = "tax-autobrief-probe-err-empty";
+        store.init(empty_ns).await.expect("init empty");
+        reset_test_taxonomy_read_counters(empty_ns);
+        set_test_probe_fail_for_namespace(empty_ns, true);
+        assert!(namespace_has_taxonomy_rows(&store, empty_ns).await);
+        assert_eq!(render_snapshot_taxonomy_section(&store, empty_ns).await, "");
+        let (empty_thesis, empty_concepts, empty_prompt) =
+            build_task_taxonomy_context(&store, empty_ns, "anything").await;
+        assert!(empty_thesis.is_null());
+        assert_eq!(empty_concepts, json!([]));
+        assert_eq!(empty_prompt, "");
+        assert_eq!(test_full_taxonomy_read_count(empty_ns), 2);
+        set_test_probe_fail_for_namespace(empty_ns, false);
+    }
+
+    #[tokio::test]
+    async fn auto_briefing_probe_skips_non_visible_rows_and_avoids_redundant_reads() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+
+        // 1. Namespace with ONLY non-visible (restricted, retired, conflicting) thesis/concept rows
+        let ns_hidden = "tax-autobrief-nonvisible";
+        store.init(ns_hidden).await.expect("init hidden");
+        execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "set_thesis".to_string(),
+                namespace: ns_hidden.to_string(),
+                primary_domain: Some("stealth-domain".to_string()),
+                mission: Some("Confidential mission".to_string()),
+                direction: Some("Restricted direction".to_string()),
+                core_pillars: Some(vec!["stealth".to_string()]),
+                access_policy: Some(json!({
+                    "public": false,
+                    "allowed_users": ["alice"]
+                })),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("restricted thesis");
+
+        execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "upsert_concept".to_string(),
+                namespace: ns_hidden.to_string(),
+                slug: Some("restricted-concept".to_string()),
+                pref_label: Some("Restricted Concept".to_string()),
+                definition: Some("Only visible to alice.".to_string()),
+                domain: Some("stealth".to_string()),
+                access_policy: Some(json!({
+                    "public": false,
+                    "allowed_users": ["alice"]
+                })),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("restricted concept");
+
+        // Seed an expired/retired public concept and a conflicting public concept
+        store
+            .upsert(
+                ns_hidden,
+                &concept_row_id(ns_hidden, "retired-concept", 1),
+                vec![0.1; 4],
+                MemoryPayload {
+                    content: "Retired concept".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "concept".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({
+                        "concept": {
+                            "slug": "retired-concept",
+                            "pref_label": "Retired Concept",
+                            "definition": "Already expired."
+                        },
+                        "valid_from": 1,
+                        "valid_to": 2
+                    }),
+                },
+            )
+            .await
+            .expect("seed retired concept");
+
+        store
+            .upsert(
+                ns_hidden,
+                &concept_row_id(ns_hidden, "conflicting-concept", 1),
+                vec![0.1; 4],
+                MemoryPayload {
+                    content: "Conflicting concept".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "concept".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({
+                        "concept": {
+                            "slug": "conflicting-concept",
+                            "pref_label": "Conflicting Concept",
+                            "definition": "Unresolved mesh conflict."
+                        },
+                        "mesh": {
+                            "conflict": true
+                        }
+                    }),
+                },
+            )
+            .await
+            .expect("seed conflicting concept");
+
+        reset_test_taxonomy_read_counters(ns_hidden);
+        assert!(
+            !namespace_has_taxonomy_rows(&store, ns_hidden).await,
+            "namespace with only restricted/retired/conflicting taxonomy rows must report false"
+        );
+        assert_eq!(render_snapshot_taxonomy_section(&store, ns_hidden).await, "");
+        let (h_thesis, h_concepts, h_prompt) =
+            build_task_taxonomy_context(&store, ns_hidden, "stealth").await;
+        assert!(h_thesis.is_null());
+        assert_eq!(h_concepts, json!([]));
+        assert_eq!(h_prompt, "");
+        assert_eq!(
+            test_full_taxonomy_read_count(ns_hidden),
+            0,
+            "non-visible taxonomy rows must skip load_active_rows_and_edges"
+        );
+
+        // 2. Thesis-only namespace (unrestricted active thesis, no unrestricted active concepts)
+        // reuses the probed thesis rows directly without running load_active_rows_and_edges.
+        let ns_thesis_only = "tax-autobrief-thesis-only";
+        store.init(ns_thesis_only).await.expect("init thesis only");
+        execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "set_thesis".to_string(),
+                namespace: ns_thesis_only.to_string(),
+                primary_domain: Some("distributed-consensus".to_string()),
+                mission: Some("Deterministic consensus kernel".to_string()),
+                direction: Some("Leaderless quorum replication".to_string()),
+                core_pillars: Some(vec!["quorum".to_string(), "replication".to_string()]),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("public thesis");
+
+        reset_test_taxonomy_read_counters(ns_thesis_only);
+        let thesis_snap = render_snapshot_taxonomy_section(&store, ns_thesis_only).await;
+        assert!(thesis_snap.contains("distributed-consensus"));
+        assert!(thesis_snap.contains("0 unrestricted concepts"));
+        let (t_json, c_json, t_prompt) =
+            build_task_taxonomy_context(&store, ns_thesis_only, "quorum replication").await;
+        assert_eq!(t_json["primary_domain"], "distributed-consensus");
+        assert_eq!(c_json, json!([]));
+        assert!(t_prompt.contains("distributed-consensus"));
+        assert_eq!(
+            test_full_taxonomy_read_count(ns_thesis_only),
+            0,
+            "thesis-only namespace must render from probed thesis rows without calling load_active_rows_and_edges"
+        );
+
+        // 3. Concept-present namespace short-circuits on the first typed probe ("concept")
+        // without issuing a second typed "thesis" probe before the full read.
+        let ns_concept = "tax-autobrief-concept-present";
+        store.init(ns_concept).await.expect("init concept present");
+        execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "set_thesis".to_string(),
+                namespace: ns_concept.to_string(),
+                primary_domain: Some("cognitive-memory".to_string()),
+                mission: Some("Memory kernel".to_string()),
+                direction: Some("Graph-first".to_string()),
+                core_pillars: Some(vec!["retrieval".to_string()]),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("thesis");
+        execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "upsert_concept".to_string(),
+                namespace: ns_concept.to_string(),
+                slug: Some("rrf-fusion".to_string()),
+                pref_label: Some("RRF Fusion".to_string()),
+                definition: Some("Reciprocal rank fusion.".to_string()),
+                domain: Some("retrieval".to_string()),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("concept");
+
+        reset_test_taxonomy_read_counters(ns_concept);
+        let c_snap = render_snapshot_taxonomy_section(&store, ns_concept).await;
+        assert!(c_snap.contains("1 unrestricted concepts"));
+        assert_eq!(
+            test_probe_typed_list_count(ns_concept),
+            1,
+            "concept-present namespace must short-circuit after the first typed probe ('concept') without probing 'thesis'"
+        );
+        assert_eq!(test_full_taxonomy_read_count(ns_concept), 1);
+    }
+
     #[tokio::test]
     async fn auto_briefing_enforces_character_budgets_and_excludes_restricted_concepts() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -4538,7 +5245,7 @@ mod tests {
             src_store.as_ref(),
             ns,
             &crate::events::ThalamicPulse::Created {
-                id: "concept-shared-concept-v1".to_string(),
+                id: concept_row_id(ns, "shared-concept", 1),
                 namespace: ns.to_string(),
                 kind: "concept".to_string(),
             },
@@ -4597,7 +5304,7 @@ mod tests {
             Some("shared-concept")
         );
 
-        // 3. Supersede thesis-v1 -> thesis-v2 via handle_taxonomy_with_bus (single Superseded pulse)
+        // 3. Supersede thesis v1 -> thesis v2 via handle_taxonomy_with_bus (single Superseded pulse)
         let thesis_v2_out = crate::handlers::taxonomy::handle_taxonomy_with_bus(
             &json!({
                 "operation": "set_thesis",
@@ -4614,7 +5321,7 @@ mod tests {
         )
         .await;
         assert!(
-            thesis_v2_out.contains("\"superseded_id\": \"thesis-v1\""),
+            thesis_v2_out.contains(&format!("\"superseded_id\": \"{}\"", thesis_row_id(ns, 1))),
             "thesis_v2_out: {thesis_v2_out}"
         );
         for _ in 0..20 {
@@ -4687,5 +5394,142 @@ mod tests {
             }),
         };
         assert!(!crate::rdf::shacl::validate_memory(&bad_concept).is_empty());
+    }
+
+    // ── Capability C: taxonomy surfaces carry boundary + deprecation ─────
+    #[tokio::test]
+    async fn concept_boundary_and_deprecation_reach_briefing_compare_gaps_advise_and_snapshot() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-capc-ns";
+        store.init(ns).await.expect("init");
+
+        for (slug, label, def) in [
+            ("legacy-concept", "Legacy Concept", "an older concept"),
+            ("new-concept", "New Concept", "the replacement concept"),
+        ] {
+            execute_taxonomy(
+                &store,
+                &embedder,
+                TaxonomyRequest {
+                    operation: "upsert_concept".to_string(),
+                    namespace: ns.to_string(),
+                    slug: Some(slug.to_string()),
+                    pref_label: Some(label.to_string()),
+                    definition: Some(def.to_string()),
+                    ..Default::default()
+                },
+                &sec("alice"),
+            )
+            .await
+            .expect("seed concept");
+        }
+
+        let concept_id = concept_row_id(ns, "legacy-concept", 1);
+        let (_, mut pl) = store
+            .get(ns, &concept_id)
+            .await
+            .expect("read concept row")
+            .expect("concept row exists");
+        {
+            let concept = pl
+                .metadata
+                .get_mut("concept")
+                .and_then(Value::as_object_mut)
+                .expect("concept metadata object");
+            concept.insert(
+                "not_definition".to_string(),
+                json!("not a replacement for live concepts"),
+            );
+            concept.insert(
+                "deprecation".to_string(),
+                json!({
+                    "status": "deprecated",
+                    "superseded_by": "concept-new",
+                    "reason": "renamed to the new concept",
+                    "effective_at": 1700000000
+                }),
+            );
+        }
+        store
+            .upsert(ns, &concept_id, embedder.embed("legacy concept").await.unwrap(), pl)
+            .await
+            .expect("write annotated concept");
+
+        let banner = "[DEPRECATED — SUPERSEDED BY concept-new: renamed to the new concept]";
+
+        let briefing = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "briefing".to_string(),
+                namespace: ns.to_string(),
+                query: Some("legacy".to_string()),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("briefing");
+        let matched = briefing["matched_concepts"][0].clone();
+        assert_eq!(matched["not_definition"], json!("not a replacement for live concepts"));
+        assert_eq!(matched["deprecation_banner"], json!(banner));
+
+        let compare = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "compare".to_string(),
+                namespace: ns.to_string(),
+                slugs: Some(vec!["legacy-concept".to_string(), "new-concept".to_string()]),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("compare");
+        let compared = compare["concepts"][0].clone();
+        assert_eq!(compared["not_definition"], json!("not a replacement for live concepts"));
+        assert_eq!(compared["deprecation_banner"], json!(banner));
+
+        let gaps = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "gaps".to_string(),
+                namespace: ns.to_string(),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("gaps");
+        let gap_str = gaps.to_string();
+        assert!(gap_str.contains("not a replacement for live concepts"), "gaps must expose boundary: {gap_str}");
+        assert!(gap_str.contains(banner), "gaps must expose banner: {gap_str}");
+
+        let advise = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "advise".to_string(),
+                namespace: ns.to_string(),
+                top_k: Some(2),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("advise");
+        let advise_str = advise.to_string();
+        assert!(advise_str.contains("not a replacement for live concepts"), "advise must expose boundary: {advise_str}");
+        assert!(advise_str.contains(banner), "advise must expose banner: {advise_str}");
+
+        let snap = render_snapshot_taxonomy_section(&store, ns).await;
+        assert!(
+            snap.contains("DEPRECATED") || snap.contains("not_definition"),
+            "snapshot taxonomy must expose the annotation: {snap}"
+        );
     }
 }

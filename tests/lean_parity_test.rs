@@ -22,19 +22,23 @@ use std::process::Command;
 
 use formal_kernel::{
     action_gate_tag, action_revert_tag, action_task_effect_tag, allocate_hybrid_slots,
-    claim_decision_tag, claim_scope_verdict_tag, classify_merge_decision_tag, classify_tour_stop,
-    epoch_gate_tag, evaluate_action_gate, evaluate_action_revert, evaluate_action_task_effect,
-    evaluate_claim_decision, evaluate_claim_scope_gate, evaluate_connector_post_gate,
-    evaluate_connector_pre_gate, evaluate_import_precheck, evaluate_insight_define,
-    evaluate_procedure_fire, evaluate_reducer_total, evaluate_retention_gate,
-    evaluate_scenario_commit, evaluate_seq_continuity, evaluate_sovereignty_gate,
-    import_precheck_tag, intersect_var_bounds, is_action_memory_shareable, is_memory_valid_at,
-    join_task_status, lifecycle_can_transition, procedure_fire_tag, resolve_cross_file_call,
-    resolve_scenario_row, retention_verdict_tag, seq_decision_tag, sovereignty_decision_tag,
-    task_step_tag, ActionMemoryKind, ActionReceiptState, ActionTaskTargetStatus, EpistemicStatus,
-    KernelActionReceiptState, KernelConnectorOp, KernelConnectorPostGateInput,
-    KernelConnectorPostVerdict, KernelConnectorPreGateInput, KernelConnectorPreVerdict,
-    KernelProcedureTrust, ReducerOpKind, TwinBoundError,
+    cert_verdict_tag, claim_decision_tag, claim_scope_verdict_tag, classify_merge_decision_tag,
+    classify_tour_stop, epoch_gate_tag, evaluate_action_gate, evaluate_action_revert,
+    evaluate_action_task_effect, evaluate_claim_decision, evaluate_claim_scope_gate,
+    evaluate_connector_post_gate, evaluate_connector_pre_gate, evaluate_import_precheck,
+    evaluate_insight_define, evaluate_procedure_fire, evaluate_reducer_total,
+    evaluate_retention_gate, evaluate_scenario_commit, evaluate_seq_continuity,
+    evaluate_sovereignty_gate, hash_verdict_tag, import_precheck_tag, intersect_var_bounds,
+    is_action_memory_shareable, is_memory_valid_at, join_task_status, lifecycle_can_transition,
+    owl2rl_rule_tag, procedure_fire_tag, resolve_cross_file_call, resolve_scenario_row,
+    retention_verdict_tag, seq_decision_tag, sovereignty_decision_tag, step_verdict_tag,
+    kernel_rule_tag, task_step_tag, verify_certificate_chain, verify_certificate_chain_slices,
+    verify_certificate_hash, verify_derivation_certificate, verify_derivation_step_structure,
+    ActionMemoryKind, ActionReceiptState, ActionTaskTargetStatus, EpistemicStatus,
+    KernelActionReceiptState, KernelCertificateStep, KernelCertificateVerdict, KernelCertVerdict,
+    KernelConnectorOp, KernelConnectorPostGateInput, KernelConnectorPostVerdict,
+    KernelConnectorPreGateInput, KernelConnectorPreVerdict, KernelHashVerdict,
+    KernelOwl2RlRuleId, KernelProcedureTrust, KernelStepVerdict, ReducerOpKind, TwinBoundError,
 };
 
 /// The statuses in the exact order used by `proofs/Main.lean`.
@@ -70,6 +74,38 @@ fn connector_post_verdict_tag(v: KernelConnectorPostVerdict) -> &'static str {
     }
 }
 
+/// Fixed-size 64-element bool array with the given prefix set, rest `false`.
+fn bool_array_64(prefix: &[bool]) -> [bool; 64] {
+    let mut arr = [false; 64];
+    for (i, &b) in prefix.iter().enumerate() {
+        arr[i] = b;
+    }
+    arr
+}
+
+/// Render a `[bool; 64]` exactly like Lean prints its `List Bool` literal:
+/// `[true,true,false,...]` (no spaces after commas), matching the hardcoded
+/// `CERT_CHAIN` rows in `proofs/Main.lean`.
+fn bool_array_str(b: &[bool; 64]) -> String {
+    let parts: Vec<String> = b.iter().map(|x| if *x { "true".to_string() } else { "false".to_string() }).collect();
+    format!("[{}]", parts.join(","))
+}
+
+/// Render a bool slice exactly like Lean prints a `List Bool` literal.
+fn bool_slice_str(b: &[bool]) -> String {
+    let parts: Vec<String> = b.iter().map(|x| if *x { "true".to_string() } else { "false".to_string() }).collect();
+    format!("[{}]", parts.join(","))
+}
+
+/// Render certificate step witnesses as `tag:pc:avail,...`.
+fn cert_steps_str(steps: &[KernelCertificateStep]) -> String {
+    let parts: Vec<String> = steps
+        .iter()
+        .map(|s| format!("{}:{}:{}", s.rule_tag, s.premise_count, s.premises_available))
+        .collect();
+    format!("[{}]", parts.join(","))
+}
+
 fn repo_root() -> PathBuf {
     // CARGO_MANIFEST_DIR points at the crate root that owns this test target.
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -78,7 +114,7 @@ fn repo_root() -> PathBuf {
 /// Generates the canonical 1011-line truth table in `proofs/Main.lean` order:
 /// 891 base/action/code-intel/ontology rows + 120 taxonomy rows.
 fn generate_rust_truth_table() -> Vec<String> {
-    let mut lines: Vec<String> = Vec::with_capacity(1172);
+    let mut lines: Vec<String> = Vec::with_capacity(1273);
 
     for &from in TASK_STATUSES.iter() {
         for &to in TASK_STATUSES.iter() {
@@ -1027,6 +1063,163 @@ fn generate_rust_truth_table() -> Vec<String> {
         lines.push(format!("PROCEDURE_NEXT_DUE|{}|{}", label, due));
     }
 
+    // WAL_VERDICT: 32 rows (4 commit-evidence values x commit_proved x
+    // checkpoint_observed x applied_at_least_one) — the removed-frozen-WAL
+    // verdict of `#228`, shared with the recovery funnel through the formal
+    // kernel so there is exactly one truth table.
+    let wal_evidences: [formal_kernel::KernelWalCommitEvidence; 4] = [
+        formal_kernel::KernelWalCommitEvidence::CommitSeen,
+        formal_kernel::KernelWalCommitEvidence::NoCommit,
+        formal_kernel::KernelWalCommitEvidence::Unverifiable,
+        formal_kernel::KernelWalCommitEvidence::Unreadable,
+    ];
+    for evidence in wal_evidences.iter() {
+        for commit_proved in [false, true].iter() {
+            for checkpoint_observed in [false, true].iter() {
+                for applied_at_least_one in [false, true].iter() {
+                    let verdict = formal_kernel::evaluate_removed_wal_verdict(
+                        *evidence,
+                        *commit_proved,
+                        *checkpoint_observed,
+                        *applied_at_least_one,
+                    );
+                    lines.push(format!(
+                        "WAL_VERDICT|{}|{}|{}|{}|{}",
+                        formal_kernel::wal_commit_evidence_tag(*evidence),
+                        bool_str(*commit_proved),
+                        bool_str(*checkpoint_observed),
+                        bool_str(*applied_at_least_one),
+                        formal_kernel::removed_wal_verdict_tag(verdict),
+                    ));
+                }
+            }
+        }
+    }
+
+    // DERIVATION_STEP: 52 rows (26 rules x 2: min, min-1). >= min is valid.
+    for &rule in formal_kernel::KernelOwl2RlRuleId::ALL.iter() {
+        let pc_ok = rule.min_premise_count();
+        let pc_bad = pc_ok.saturating_sub(1);
+        let v_ok = formal_kernel::step_verdict_tag(
+            formal_kernel::verify_derivation_step_structure(rule, pc_ok),
+        );
+        let v_bad = formal_kernel::step_verdict_tag(
+            formal_kernel::verify_derivation_step_structure(rule, pc_bad),
+        );
+        lines.push(format!(
+            "DERIVATION_STEP|{}|{}|{}",
+            formal_kernel::owl2rl_rule_tag(rule),
+            pc_ok,
+            v_ok
+        ));
+        lines.push(format!(
+            "DERIVATION_STEP|{}|{}|{}",
+            formal_kernel::owl2rl_rule_tag(rule),
+            pc_bad,
+            v_bad
+        ));
+    }
+
+    // CERT_CHAIN: 7 rows (baseline 4 + short-list fail-closed 2 + 64-cap 1)
+    let short_cases: [(
+        usize,
+        &[bool],
+        &[bool],
+        &[bool],
+        bool,
+    ); 6] = [
+        (2, &[true, true], &[true, true], &[true, true], true),
+        (2, &[true, true], &[true, true], &[true, true], false),
+        (2, &[true, true], &[true, false], &[true, true], true),
+        (2, &[true, false], &[true, true], &[true, true], true),
+        (3, &[true, true], &[true, true], &[true, true], true),
+        (
+            3,
+            &[true, true, true],
+            &[true, true, false],
+            &[true, true, true],
+            true,
+        ),
+    ];
+    for (step_count, rv, pc, cc, proof) in short_cases.iter() {
+        let verdict = formal_kernel::verify_certificate_chain_slices(*step_count, rv, pc, cc, *proof);
+        lines.push(format!(
+            "CERT_CHAIN|{}|{}|{}|{}|{}|{}",
+            step_count,
+            bool_slice_str(rv),
+            bool_slice_str(pc),
+            bool_slice_str(cc),
+            proof,
+            formal_kernel::cert_verdict_tag(verdict),
+        ));
+    }
+    // I1: legacy window is a hard cap; 65 steps must fail closed (matches Lean).
+    let all_true_64 = [true; 64];
+    let cap_verdict = formal_kernel::verify_certificate_chain(
+        65,
+        &all_true_64,
+        &all_true_64,
+        &all_true_64,
+        true,
+    );
+    lines.push(format!(
+        "CERT_CHAIN|65|{}|{}|{}|true|{}",
+        bool_array_str(&all_true_64),
+        bool_array_str(&all_true_64),
+        bool_array_str(&all_true_64),
+        formal_kernel::cert_verdict_tag(cap_verdict),
+    ));
+
+    // CERT_HASH: 2 rows (match / mismatch)
+    for (expected, actual) in [(42u64, 42u64), (42u64, 99u64)].iter() {
+        let verdict = formal_kernel::verify_certificate_hash(*expected, *actual);
+        lines.push(format!(
+            "CERT_HASH|{}|{}|{}",
+            expected,
+            actual,
+            formal_kernel::hash_verdict_tag(verdict),
+        ));
+    }
+
+    // CERT_FULL: full certificate verifier (no 64-step bypass)
+    let tag_sco = kernel_rule_tag(formal_kernel::KernelOwl2RlRuleId::CaxSco);
+    let tag_trp = kernel_rule_tag(formal_kernel::KernelOwl2RlRuleId::PrpTrp);
+    let step_sco = KernelCertificateStep { rule_tag: tag_sco, premise_count: 2, premises_available: true };
+    let step_trp = KernelCertificateStep { rule_tag: tag_trp, premise_count: 3, premises_available: true };
+    let step_bad_rule = KernelCertificateStep { rule_tag: 255, premise_count: 2, premises_available: true };
+    let step_bad_pc = KernelCertificateStep { rule_tag: tag_sco, premise_count: 1, premises_available: true };
+    let step_bad_chain = KernelCertificateStep { rule_tag: tag_sco, premise_count: 2, premises_available: false };
+    let big_steps: Vec<KernelCertificateStep> = (0..70).map(|_| step_sco).collect();
+    let full_cases: [(u8, bool, &[KernelCertificateStep], bool, &str); 8] = [
+        (1, true, &[step_sco, step_trp], true, "[8:2:true,2:3:true]"),
+        (1, true, &[step_bad_rule], true, "[255:2:true]"),
+        (1, true, &[step_bad_pc], true, "[8:1:true]"),
+        (1, true, &[step_bad_chain], true, "[8:2:false]"),
+        (1, false, &[step_sco], true, "[8:2:true]"),
+        (2, true, &[step_sco], true, "[8:2:true]"),
+        (1, true, &[step_sco], false, "[8:2:true]"),
+        (1, true, &big_steps, true, "70x[8:2:true]"),
+    ];
+    for (profile, digest, steps, proof, label) in full_cases.iter() {
+        let verdict = verify_derivation_certificate(*profile, *digest, steps, *proof);
+        lines.push(format!(
+            "CERT_FULL|{}|{}|{}|{}|{}",
+            profile,
+            digest,
+            label,
+            proof,
+            match verdict {
+                KernelCertificateVerdict::Valid => "valid",
+                KernelCertificateVerdict::InvalidProfile => "invalid_profile",
+                KernelCertificateVerdict::DigestMismatch => "digest_mismatch",
+                KernelCertificateVerdict::MissingProof => "missing_proof",
+                KernelCertificateVerdict::UnknownRule => "unknown_rule",
+                KernelCertificateVerdict::PremiseCountMismatch => "premise_count_mismatch",
+                KernelCertificateVerdict::BrokenChain => "broken_chain",
+            }
+        ));
+    }
+
     lines
 }
 
@@ -1128,8 +1321,8 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
     let rust_lines = generate_rust_truth_table();
     assert_eq!(
         rust_lines.len(),
-        1172,
-        "expected 1172 canonical lines (1155 existing + 17 Kani parity rows)"
+        1273,
+        "expected 1273 canonical lines (891 base/action/code-intel/ontology + 120 taxonomy + 144 workflow + 17 Kani parity + 32 WAL verdict + 69 derivation-cert)"
     );
 
     // Section-count verification: 64 TASK_FSM + 16 LIFECYCLE + 128 MESH_MERGE
@@ -1272,6 +1465,31 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
         144,
         "expected 144 WORKFLOW_STAGE rows"
     );
+    assert_eq!(
+        *section_counts.get("WAL_VERDICT").unwrap_or(&0),
+        32,
+        "expected 32 WAL_VERDICT rows"
+    );
+    assert_eq!(
+        *section_counts.get("DERIVATION_STEP").unwrap_or(&0),
+        52,
+        "expected 52 DERIVATION_STEP rows"
+    );
+    assert_eq!(
+        *section_counts.get("CERT_CHAIN").unwrap_or(&0),
+        7,
+        "expected 7 CERT_CHAIN rows"
+    );
+    assert_eq!(
+        *section_counts.get("CERT_HASH").unwrap_or(&0),
+        2,
+        "expected 2 CERT_HASH rows"
+    );
+    assert_eq!(
+        *section_counts.get("CERT_FULL").unwrap_or(&0),
+        8,
+        "expected 8 CERT_FULL rows"
+    );
 
     let lake = find_lake().expect(
         "lake not found on PATH or ~/.elan/bin/lake; install elan to run Lean parity tests",
@@ -1369,6 +1587,24 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
         "ACTION_SHAREABLE|action_receipt|false|false",
         "ACTION_SHAREABLE|action_type|true|true",
         "ACTION_SHAREABLE|action_type|false|false",
+        // `#228`: a removed frozen WAL is a replay only on positive evidence.
+        "WAL_VERDICT|commit_seen|true|false|false|committed_lost",
+        "WAL_VERDICT|commit_seen|false|false|false|unknown_unverifiable",
+        "WAL_VERDICT|commit_seen|true|false|true|replayed_inferred",
+        "WAL_VERDICT|no_commit|false|false|false|nothing_committed",
+        "WAL_VERDICT|unverifiable|false|false|false|unknown_unverifiable",
+        "WAL_VERDICT|unreadable|false|false|false|unknown_unreadable",
+        "WAL_VERDICT|commit_seen|true|true|false|replayed_observed",
+        "DERIVATION_STEP|prp-dom|2|valid",
+        "DERIVATION_STEP|prp-dom|1|premise_count_mismatch",
+        "DERIVATION_STEP|cax-sco|2|valid",
+        "DERIVATION_STEP|cax-dw|3|valid",
+        "DERIVATION_STEP|cax-dw|2|premise_count_mismatch",
+        "DERIVATION_STEP|owl-universe|0|valid",
+        "CERT_FULL|1|true|70x[8:2:true]|true|valid",
+        "CERT_FULL|1|true|[255:2:true]|true|unknown_rule",
+        "CERT_HASH|42|42|valid",
+        "CERT_HASH|42|99|mismatch",
     ] {
         assert!(
             rust_lines.iter().any(|l| l == expected),

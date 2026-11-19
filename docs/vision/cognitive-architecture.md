@@ -58,7 +58,7 @@ An AI's memory and task state must never decouple. Goals (tracked work) are Engr
 
 ### 9. Extended Cognition Workspace (Human-AI Symbiosis via NeuroVault)
 *Inspired by the extended mind thesis.*
-Memory is not locked in a black-box database: the graph is inspectable through the web UI (`web-ui/`), the CLI graph export (`neurostrata-mcp export-graph`), and the RDF/SPARQL surface (`neurostrata_sparql_query`, `neurostrata_export_canonical_rdf`). **The planned NeuroVault Obsidian mirror — a bidirectional Markdown vault that a human can curate — is not implemented yet**: there is no `src/obsidian.rs`, no `neurostrata_sync_obsidian` tool, and no `obsidian-sync` command. It is tracked by NeuroStrata task `neurostrata-dlag`; see `docs/ops/obsidian.md`.
+Memory is not locked in a black-box database: the graph is inspectable through the web UI (`web-ui/`), the CLI graph export (`neurostrata-mcp export-graph`), and the RDF/SPARQL surface (`neurostrata_sparql_query`, `neurostrata_export_canonical_rdf`). **The NeuroVault Obsidian mirror — a bidirectional Markdown vault that a human can curate — shipped in v1.19.0**: `src/vault_ld/` implements YAML-LD 1.0 / Vault-LD import/export with `[[WikiLink]]` edges and Open JSON Canvas `1.0` `topology.canvas` export, exposed as the `neurostrata_vault_sync` MCP tool, the `neurostrata-mcp vault-sync` CLI subcommand, and `POST /vault-sync` on the daemon. See `docs/features-api/ops/obsidian.md`.
 
 ### 10. Asynchronous Delegation (Orchestrator-Worker Pattern)
 *Inspired by the brain's division of labor across specialized regions.*

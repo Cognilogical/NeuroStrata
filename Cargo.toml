@@ -1,10 +1,10 @@
 [workspace]
-members = ["crates/neurostrata-wasm"]
+members = ["crates/neurostrata-wasm", "crates/ontobug"]
 exclude = ["src-tauri"]
 
 [package]
 name = "neurostrata-mcp"
-version = "1.18.0"
+version = "1.19.0"
 edition = "2021"
 
 [[bin]]
@@ -76,6 +76,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 async-trait = "0.1"
 anyhow = "1.0"
+serde_yaml = "0.9"
+ontobug = { path = "crates/ontobug" }
 fs2 = "0.4"
 fastembed = { version = "7", default-features = false, features = [
     "ort-download-binaries-rustls-tls",
@@ -98,7 +100,7 @@ tree-sitter-go = "0.25.0"
 tree-sitter-java = "0.23.5"
 regex = "1.13"
 tempfile = "3.14"
-cxx = "1.0.197"
+cxx = "=1.0.205"
 lbug = "0.22.3"
 arc-swap = "1"
 axum = "0.8"
@@ -111,6 +113,7 @@ hex = "0.4"
 tar = "0.4"
 flate2 = "1.1"
 oxrdf = { version = "0.3", features = ["rdf-12"] }
+reasonable = { version = "0.5.0-a1", features = ["rdf-12"] }
 oxttl = { version = "0.2", features = ["rdf-12"] }
 zstd = "0.14"
 spargebra = { version = "0.4", features = ["sparql-12"] }
@@ -119,7 +122,6 @@ spareval = { version = "0.2", features = ["sparql-12"] }
 sparesults = { version = "0.3", features = ["sparql-12"] }
 oxiri = "0.2"
 graphql-parser = "0.4"
-shacl = "0.3"
 
 # native-tls (pulled in by reqwest, ureq and hf-hub) only needs OpenSSL on
 # platforms without a system TLS stack: Windows uses SChannel and Apple targets
@@ -155,7 +157,7 @@ tower = { version = "0.5", features = ["util"] }
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 
 [build-dependencies]
-cxx-build = "1.0.197"
+cxx-build = "=1.0.205"
 
 [features]
 default = []
@@ -181,6 +183,10 @@ path = "tests/recall_exact_identifier.rs"
 [[test]]
 name = "procedure_ack_contract"
 path = "tests/procedure_ack_contract.rs"
+
+[[test]]
+name = "semantic_eval_metrics_test"
+path = "tests/semantic_eval_metrics_test.rs"
 
 
 

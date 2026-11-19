@@ -47,7 +47,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Toolchain versions
         shell: bash
@@ -137,7 +137,7 @@ jobs:
       LBUG_VERSION: '0.22.3'
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Toolchain versions
         shell: bash
@@ -165,10 +165,21 @@ jobs:
         shell: bash
         run: bash scripts/check-include-str-targets.sh
 
+      # elan is fetched by commit, not by "master": the install script is
+      # what decides which toolchain gets downloaded onto the runner, so it
+      # is verified before it runs.
+      #   leanprover/elan v4.2.4 = commit 227caca133724d5516bee25c2aeb3e609478f2d8
+      #   elan-init.sh sha256 = a620ff1641616222c8d37c54845492004bb84d6877cdbc944dd65c1aa685bf53
       - name: Install Lean 4 toolchain (elan)
         shell: bash
         run: |
-          curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain "$(tr -d '[:space:]' < proofs/lean-toolchain)"
+          set -euo pipefail
+          ELAN_COMMIT=227caca133724d5516bee25c2aeb3e609478f2d8
+          ELAN_SHA256=a620ff1641616222c8d37c54845492004bb84d6877cdbc944dd65c1aa685bf53
+          ELAN_SCRIPT="$RUNNER_TEMP/elan-init.sh"
+          curl -sSfL "https://raw.githubusercontent.com/leanprover/elan/${ELAN_COMMIT}/elan-init.sh" -o "$ELAN_SCRIPT"
+          echo "${ELAN_SHA256}  ${ELAN_SCRIPT}" | sha256sum -c -
+          sh "$ELAN_SCRIPT" -y --default-toolchain "$(tr -d '[:space:]' < proofs/lean-toolchain)"
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
           "$HOME/.elan/bin/lake" --dir proofs build
 
@@ -219,7 +230,7 @@ jobs:
         os: [windows-latest, macos-15]
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Toolchain versions
         shell: bash
@@ -277,7 +288,7 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Node version
         shell: bash
@@ -296,7 +307,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Backup script tests
         shell: bash
@@ -305,3 +316,58 @@ jobs:
       - name: Gate receipt self-test
         shell: bash
         run: bash scripts/test-gate-receipt.sh
+
+      - name: Gate receipt live-path harness
+        shell: bash
+        run: bash scripts/test-gate-receipt-live.sh
+
+      # The disk-hygiene script is shell behaviour too: it deletes things, so
+      # its self-test runs against copies of the fixtures, never against the
+      # runner's real filesystem.
+      - name: Disk hygiene self-test
+        shell: bash
+        run: bash scripts/test-disk-hygiene.sh
+
+      - name: Main ruleset specification self-test
+        shell: bash
+        run: bash scripts/test-main-ruleset.sh
+
+  # The dependency graph carries known advisories, so the audit is a gate
+  # rather than a report: cargo-audit fails the job on any vulnerability that
+  # is not in the dated exception list in .cargo/audit.toml. The tool version
+  # is pinned so a new release cannot change the verdict on an old commit.
+  audit:
+    name: audit (cargo-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install cargo-audit
+        shell: bash
+        run: cargo install cargo-audit --version 0.22.1 --locked
+
+      # cargo-audit reads the project configuration from .cargo/audit.toml,
+      # which is why this runs from the repository root.
+      - name: Audit dependencies
+        shell: bash
+        run: cargo audit
+
+  # The release narrative names MCP tools, daemon routes, CLI subcommands and
+  # in-tree files. A name that never shipped is a user-facing failure, so the
+  # current release section and its release note are resolved against the
+  # source registries on every PR. See scripts/check-release-references.sh.
+  release-references:
+    name: release references
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Self-test the release-reference check
+        shell: bash
+        run: bash scripts/check-release-references.test.sh
+
+      - name: Validate release-narrative references
+        shell: bash
+        run: bash scripts/check-release-references.sh

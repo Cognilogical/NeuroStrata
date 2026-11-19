@@ -1,4 +1,5 @@
 import NeuroStrata
+import NeuroStrata.DerivationCertificate
 
 open NeuroStrata.TaskMachine
 open NeuroStrata.SynapticMesh
@@ -14,8 +15,69 @@ open NeuroStrata.TwinInterface
 open NeuroStrata
 open NeuroStrata.Taxonomy
 open NeuroStrata.WorkflowStage
+open NeuroStrata.DerivationCertificate
 
 def boolToStr (b : Bool) : String := if b then "true" else "false"
+
+/-- Render a bool list as Rust prints `[bool; 64]`: no spaces after commas. -/
+def boolListStr (bs : List Bool) : String :=
+  "[" ++ String.intercalate "," (bs.map boolToStr) ++ "]"
+
+/-- Pad a prefix with `false` to the kernel's fixed 64-element arrays. -/
+def boolArray64 (pfx : List Bool) : List Bool :=
+  pfx ++ List.replicate (64 - pfx.length) false
+
+/-- The commit evidence a WAL side the engine removed carries (`#228`). -/
+inductive WalCommitEvidence where
+  | commitSeen
+  | noCommit
+  | unverifiable
+  | unreadable
+  deriving DecidableEq, Repr
+
+/-- The accounting verdict for a WAL side the engine removed (`#228`). -/
+inductive WalVerdict where
+  | replayedObserved
+  | replayedInferred
+  | committedLost
+  | unknownUnverifiable
+  | unknownUnreadable
+  | nothingCommitted
+  deriving DecidableEq, Repr
+
+def WalCommitEvidence.asTag : WalCommitEvidence → String
+  | .commitSeen => "commit_seen"
+  | .noCommit => "no_commit"
+  | .unverifiable => "unverifiable"
+  | .unreadable => "unreadable"
+
+def WalVerdict.asTag : WalVerdict → String
+  | .replayedObserved => "replayed_observed"
+  | .replayedInferred => "replayed_inferred"
+  | .committedLost => "committed_lost"
+  | .unknownUnverifiable => "unknown_unverifiable"
+  | .unknownUnreadable => "unknown_unreadable"
+  | .nothingCommitted => "nothing_committed"
+
+/-- The removed-WAL verdict (`#228`).
+A WAL side the engine removed is a replay only on positive evidence: an
+observed `CHECKPOINT` record, or an applied-record count of at least one.
+Otherwise the commit evidence decides: a proved commit that is gone is a
+committed loss, an unproved commit or an unverifiable WAL is unknown, and a
+sound walk that held no commit lost nothing. -/
+@[simp]
+def evaluateWalVerdict (evidence : WalCommitEvidence) (commitProved : Bool)
+    (checkpointObserved : Bool) (appliedAtLeastOne : Bool) : WalVerdict :=
+  if checkpointObserved then
+    .replayedObserved
+  else if appliedAtLeastOne then
+    .replayedInferred
+  else
+    (match evidence with
+     | .commitSeen => if commitProved then .committedLost else .unknownUnverifiable
+     | .noCommit => .nothingCommitted
+     | .unverifiable => .unknownUnverifiable
+     | .unreadable => .unknownUnreadable)
 
 def main : IO Unit := do
   let statuses : List Status := [.openState, .inProgress, .blocked, .done]
@@ -253,3 +315,68 @@ def main : IO Unit := do
   for (label, now, last, dayCad, sessCad, sessElapsed) in nextDueCases do
     let due := computeProcedureNextDue now last dayCad sessCad sessElapsed
     IO.println s!"PROCEDURE_NEXT_DUE|{label}|{due}"
+  let walEvidences : List WalCommitEvidence := [.commitSeen, .noCommit, .unverifiable, .unreadable]
+  for e in walEvidences do
+    for proved in [false, true] do
+      for ckpt in [false, true] do
+        for applied in [false, true] do
+          let tag := evaluateWalVerdict e proved ckpt applied |>.asTag
+          IO.println s!"WAL_VERDICT|{e.asTag}|{boolToStr proved}|{boolToStr ckpt}|{boolToStr applied}|{tag}"
+  -- OWL 2 RL derivation certificate verification (Capability A, neurostrata-s0l0)
+  for rule in [.prpDom, .prpRng, .prpTrp, .prpSymp, .prpInv, .prpSpo1, .prpSpo2, .prpEqp, .caxSco, .caxEqc, .clsHv, .clsSvf, .clsAvf, .caxDwViolation, .owlUniverse, .scmEqc, .rdfsScoTrans, .eqSym, .eqTrans, .eqRepS, .eqRepP, .eqRepO, .clsInt1, .clsInt2, .clsUni, .rdfsContainer] do
+    let pcOk := minPremiseCount rule
+    let pcBad := pcOk - 1
+    let vOk := verifyDerivationStepStructure rule pcOk |>.asStr
+    let vBad := verifyDerivationStepStructure rule pcBad |>.asStr
+    IO.println s!"DERIVATION_STEP|{rule.asStr}|{pcOk}|{vOk}"
+    IO.println s!"DERIVATION_STEP|{rule.asStr}|{pcBad}|{vBad}"
+  -- certificate chain verdicts (short lists; missing entries default false)
+  let rvTT := [true, true]
+  let rvTF := [true, false]
+  let pcTT := [true, true]
+  let pcTF := [true, false]
+  let ccTT := [true, true]
+  let chainValid := verifyCertificateChain 2 rvTT pcTT ccTT true |>.asStr
+  let chainMissing := verifyCertificateChain 2 rvTT pcTT ccTT false |>.asStr
+  let chainBroken := verifyCertificateChain 2 rvTT pcTF ccTT true |>.asStr
+  let chainUnknown := verifyCertificateChain 2 rvTF pcTT ccTT true |>.asStr
+  IO.println s!"CERT_CHAIN|2|{boolListStr rvTT}|{boolListStr pcTT}|{boolListStr ccTT}|true|{chainValid}"
+  IO.println s!"CERT_CHAIN|2|{boolListStr rvTT}|{boolListStr pcTT}|{boolListStr ccTT}|false|{chainMissing}"
+  IO.println s!"CERT_CHAIN|2|{boolListStr rvTT}|{boolListStr pcTF}|{boolListStr ccTT}|true|{chainBroken}"
+  IO.println s!"CERT_CHAIN|2|{boolListStr rvTF}|{boolListStr pcTT}|{boolListStr ccTT}|true|{chainUnknown}"
+  let chainShortRv := verifyCertificateChain 3 [true, true] [true, true] [true, true] true |>.asStr
+  let chainShortPc := verifyCertificateChain 3 [true, true, true] [true, true, false] [true, true, true] true |>.asStr
+  IO.println s!"CERT_CHAIN|3|{boolListStr [true,true]}|{boolListStr [true,true]}|{boolListStr [true,true]}|true|{chainShortRv}"
+  IO.println s!"CERT_CHAIN|3|{boolListStr [true,true,true]}|{boolListStr [true,true,false]}|{boolListStr [true,true,true]}|true|{chainShortPc}"
+  -- I1: the legacy 64-step window is a hard cap; 65 steps must fail closed.
+  let allTrue64 := List.replicate 64 true
+  let chainCap := verifyCertificateChain 65 allTrue64 allTrue64 allTrue64 true |>.asStr
+  IO.println s!"CERT_CHAIN|65|{boolListStr allTrue64}|{boolListStr allTrue64}|{boolListStr allTrue64}|true|{chainCap}"
+  -- certificate hash verdicts
+  let hashOk := verifyCertificateHash (42 : UInt64) (42 : UInt64) |>.asStr
+  let hashBad := verifyCertificateHash (42 : UInt64) (99 : UInt64) |>.asStr
+  IO.println s!"CERT_HASH|42|42|{hashOk}"
+  IO.println s!"CERT_HASH|42|99|{hashBad}"
+  -- full certificate verification (C3: no 64-step bypass)
+  let stepSco : CertificateStep := ⟨8, 2, true⟩
+  let stepTrp : CertificateStep := ⟨2, 3, true⟩
+  let stepBadRule : CertificateStep := ⟨255, 2, true⟩
+  let stepBadPc : CertificateStep := ⟨8, 1, true⟩
+  let stepBadChain : CertificateStep := ⟨8, 2, false⟩
+  let fValid := verifyDerivationCertificate 1 true [stepSco, stepTrp] true |>.asStr
+  let fUnknown := verifyDerivationCertificate 1 true [stepBadRule] true |>.asStr
+  let fPc := verifyDerivationCertificate 1 true [stepBadPc] true |>.asStr
+  let fChain := verifyDerivationCertificate 1 true [stepBadChain] true |>.asStr
+  let fDigest := verifyDerivationCertificate 1 false [stepSco] true |>.asStr
+  let fProfile := verifyDerivationCertificate 2 true [stepSco] true |>.asStr
+  let fProof := verifyDerivationCertificate 1 true [stepSco] false |>.asStr
+  let bigSteps := List.replicate 70 stepSco
+  let fBig := verifyDerivationCertificate 1 true bigSteps true |>.asStr
+  IO.println s!"CERT_FULL|1|true|[8:2:true,2:3:true]|true|{fValid}"
+  IO.println s!"CERT_FULL|1|true|[255:2:true]|true|{fUnknown}"
+  IO.println s!"CERT_FULL|1|true|[8:1:true]|true|{fPc}"
+  IO.println s!"CERT_FULL|1|true|[8:2:false]|true|{fChain}"
+  IO.println s!"CERT_FULL|1|false|[8:2:true]|true|{fDigest}"
+  IO.println s!"CERT_FULL|2|true|[8:2:true]|true|{fProfile}"
+  IO.println s!"CERT_FULL|1|true|[8:2:true]|false|{fProof}"
+  IO.println s!"CERT_FULL|1|true|70x[8:2:true]|true|{fBig}"

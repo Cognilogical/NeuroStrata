@@ -11,6 +11,7 @@ pub struct SearchFilters {
     pub memory_types: Vec<String>,
     pub fact_shape: Option<String>, // decision/topology/attempt/any
     pub path_prefix: Option<String>,
+    pub path_prefix_forms: Vec<String>,
     pub exclude_stale: bool,
     pub include_code_ast: bool,
 }
@@ -40,9 +41,18 @@ pub fn type_allowed(memory_type: &str, filters: &SearchFilters) -> bool {
 /// Whether a fact shape matches the requested shape.
 pub fn fact_shape_matches(metadata: &Value, shape: &str) -> bool {
     match shape {
-        "decision" => metadata.get("decision").map(|v| !v.is_null()).unwrap_or(false),
-        "topology" => metadata.get("topology").map(|v| !v.is_null()).unwrap_or(false),
-        "attempt" => metadata.get("attempt").map(|v| !v.is_null()).unwrap_or(false),
+        "decision" => metadata
+            .get("decision")
+            .map(|v| !v.is_null())
+            .unwrap_or(false),
+        "topology" => metadata
+            .get("topology")
+            .map(|v| !v.is_null())
+            .unwrap_or(false),
+        "attempt" => metadata
+            .get("attempt")
+            .map(|v| !v.is_null())
+            .unwrap_or(false),
         "any" | "" => true,
         _ => false,
     }
@@ -68,9 +78,135 @@ pub fn decision_shape_boost(metadata: &Value) -> f32 {
 pub fn path_prefix_matches(location: &str, prefix: Option<&str>) -> bool {
     match prefix {
         None => true,
-        Some(p) if p.is_empty() => true,
-        Some(p) => location.starts_with(p),
+        Some(p) if p.trim().is_empty() => true,
+        Some(p) => single_prefix_matches(location, p),
     }
+}
+
+/// Canonicalize a value for boundary-aware prefix comparison: host-separator
+/// folding, duplicate-separator collapsing, `./` stripping, and edge `/` trim.
+pub fn normalize_prefix_comparison_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.trim().chars() {
+        let mapped = if ch == '\\' { '/' } else { ch };
+        if mapped == '/' && out.ends_with('/') {
+            continue;
+        }
+        out.push(mapped);
+    }
+    while let Some(rest) = out.strip_prefix("./") {
+        out = rest.to_string();
+    }
+    let trimmed = out.trim_matches('/');
+    if trimmed == "." {
+        return String::new();
+    }
+    let mut normalized = trimmed.to_string();
+    if normalized.len() >= 2
+        && normalized.as_bytes()[0].is_ascii_alphabetic()
+        && normalized.as_bytes()[1] == b':'
+    {
+        normalized.as_mut_str()[..1].make_ascii_uppercase();
+    }
+    normalized
+}
+
+fn is_absolute_any_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    path.starts_with('/')
+        || path.starts_with('\\')
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && (bytes[2] == b'/' || bytes[2] == b'\\'))
+}
+
+/// Match one prefix against a location using normalized, separator- and
+/// segment-boundary-aware comparison. Relative prefix forms match only relative
+/// locations; absolute prefix forms match only absolute locations.
+pub fn single_prefix_matches(location: &str, prefix: &str) -> bool {
+    if prefix.trim().is_empty() {
+        return true;
+    }
+    if location.trim().is_empty() {
+        return false;
+    }
+    if is_absolute_any_path(location) != is_absolute_any_path(prefix) {
+        return false;
+    }
+    let loc = normalize_prefix_comparison_value(location);
+    if loc.is_empty() {
+        return false;
+    }
+    let pref = normalize_prefix_comparison_value(prefix);
+    if pref.is_empty() {
+        return loc != ".." && !loc.starts_with("../");
+    }
+    loc == pref
+        || loc
+            .strip_prefix(&pref)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// A location matches when any resolved spelling of the requested prefix matches.
+pub fn path_prefix_forms_match(location: &str, forms: &[String]) -> bool {
+    if forms.is_empty() {
+        return true;
+    }
+    forms
+        .iter()
+        .any(|form| path_prefix_matches(location, Some(form.as_str())))
+}
+
+/// Match a row against resolved prefix spellings across its location and the
+/// path-shaped metadata fields used by structural and governance rows.
+pub fn row_matches_prefix_forms(location: &str, metadata: &Value, forms: &[String]) -> bool {
+    if forms.is_empty() {
+        return true;
+    }
+    if !location.trim().is_empty() && path_prefix_forms_match(location, forms) {
+        return true;
+    }
+    for key in ["relative_path", "path"] {
+        if let Some(p) = metadata.get(key).and_then(|v| v.as_str()) {
+            if path_prefix_forms_match(p, forms) {
+                return true;
+            }
+        }
+    }
+    if let Some(locs) = metadata.get("locations").and_then(|v| v.as_array()) {
+        for item in locs {
+            if let Some(p) = item.get("path").and_then(|v| v.as_str()) {
+                if path_prefix_forms_match(p, forms) {
+                    return true;
+                }
+            }
+        }
+    }
+    if let Some(gov) = metadata.get("governs") {
+        match gov {
+            Value::String(p) => {
+                if path_prefix_forms_match(p, forms) {
+                    return true;
+                }
+            }
+            Value::Array(arr) => {
+                for item in arr {
+                    if let Some(p) = item.as_str() {
+                        if path_prefix_forms_match(p, forms) {
+                            return true;
+                        }
+                    } else if let Some(p) = item.get("path").and_then(|v| v.as_str()) {
+                        if path_prefix_forms_match(p, forms) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// exclude_stale: exclude memories whose source currency is changed AND semantic validation != verified.
@@ -87,7 +223,12 @@ pub fn is_stale_for_filter(metadata: &Value) -> bool {
     source == "changed" && semantic != "verified"
 }
 
-pub fn passes_filters(memory_type: &str, metadata: &Value, location: &str, filters: &SearchFilters) -> bool {
+pub fn passes_filters(
+    memory_type: &str,
+    metadata: &Value,
+    location: &str,
+    filters: &SearchFilters,
+) -> bool {
     if !type_allowed(memory_type, filters) {
         return false;
     }
@@ -100,8 +241,18 @@ pub fn passes_filters(memory_type: &str, metadata: &Value, location: &str, filte
             }
         }
     }
-    if !path_prefix_matches(location, filters.path_prefix.as_deref()) {
-        return false;
+    if !filters.path_prefix_forms.is_empty() {
+        if !row_matches_prefix_forms(location, metadata, &filters.path_prefix_forms) {
+            return false;
+        }
+    } else if let Some(p) = filters
+        .path_prefix
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        if !row_matches_prefix_forms(location, metadata, &[p.to_string()]) {
+            return false;
+        }
     }
     if filters.exclude_stale && is_stale_for_filter(metadata) {
         return false;
@@ -194,6 +345,19 @@ mod tests {
     }
 
     #[test]
+    fn root_prefix_forms_match_in_root_relative_and_absolute_locations_only() {
+        let forms = vec![".".to_string(), "/repo".to_string()];
+        assert!(path_prefix_forms_match("src/lib.rs", &forms));
+        assert!(path_prefix_forms_match("Cargo.toml", &forms));
+        assert!(path_prefix_forms_match("./src/lib.rs", &forms));
+        assert!(path_prefix_forms_match("/repo/src/lib.rs", &forms));
+        assert!(!path_prefix_forms_match("/repo-other/src/lib.rs", &forms));
+        assert!(!path_prefix_forms_match("/other/src/lib.rs", &forms));
+        assert!(!path_prefix_forms_match("../other/src/lib.rs", &forms));
+        assert!(!path_prefix_forms_match("", &forms));
+    }
+
+    #[test]
     fn is_stale_for_filter_variants() {
         let stale = json!({"source_currency":"changed","verification":{"status":"unverified"}});
         assert!(is_stale_for_filter(&stale));
@@ -217,7 +381,8 @@ mod tests {
         // wrong path
         assert!(!passes_filters("fact", &meta, "lib/x.rs", &f));
         // stale excluded
-        let stale_meta = json!({"source_currency":"changed","verification":{"status":"unverified"}});
+        let stale_meta =
+            json!({"source_currency":"changed","verification":{"status":"unverified"}});
         assert!(!passes_filters("fact", &stale_meta, "src/x.rs", &f));
         // fact_shape filter
         let mut f2 = f.clone();

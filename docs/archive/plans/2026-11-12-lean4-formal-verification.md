@@ -95,7 +95,7 @@ Write `src/formal_kernel.rs` using only `core`/`std` primitives (`Copy` enums/st
 - [ ] **Step 3: Create `proofs/scripts/extract-aeneas.sh` (executable)**
 
 Create `proofs/scripts/extract-aeneas.sh` (`chmod +x`) that:
-1. Verifies standalone compilation of `src/formal_kernel.rs` with bare `rustc --edition=2021 --crate-type=lib src/formal_kernel.rs -o /tmp/opencode/libformal_kernel.rlib`.
+1. Verifies standalone compilation of `src/formal_kernel.rs` with bare `rustc --edition=2021 --crate-type=lib src/formal_kernel.rs -o <tmp>/libformal_kernel.rlib`.
 2. When `charon` and `aeneas` are present (or `--podman` is passed), runs Charon LLBC extraction and `aeneas -backend lean` to generate Lean 4 definitions from `src/formal_kernel.rs`.
 
 - [ ] **Step 4: Verify standalone `rustc` kernel check and Cargo unit tests**

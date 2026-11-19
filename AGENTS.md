@@ -27,6 +27,7 @@ Work is NOT complete until `neurostrata_task_complete` succeeded, the task gate 
      - `git push` — the pre-push hook runs `neurostrata-mcp task gate <namespace> --strict`; violations (an `in_progress` task on the current branch/worktree or an unattributed legacy claim, `done` without an extracted memory, P0 open >24h) block the push.
      - `git status` (Must show "up to date with origin")
   - Escape hatch for a wedged/unavailable database (an ops problem, not agent misconduct): `NEUROSTRATA_SKIP_GATE=1 git push`.
+- **Zero-Stash Completion (MANDATORY):** Stashes are temporary recovery tools, never final storage. Before task/session completion and push, run `git stash list` and audit every entry, including agent-created, autostash, and pre-existing entries. Restore relevant work or verify it is merged, superseded, or obsolete before dropping it; never drop unaudited content, and obtain owner authorization for destructive cleanup. Completion is blocked until `git stash list` is empty.
 - **Never Strand Work:** Never stop before pushing. Never say "ready to push when you are" (the agent must do it).
 
 ## 3. NeuroStrata Memory & The 3 Resilient Soft Locks

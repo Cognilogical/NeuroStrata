@@ -735,3 +735,231 @@ mod ensure_ready_tests {
         );
     }
 }
+
+// ── Contradiction check queue (Capability E production hook) ──────────────────
+//
+// A negative outcome (action revert / failed attempt) does not "run a check" in
+// process: it appends a durable, idempotent request to a per-learning-root JSONL
+// queue. The Laya training pipeline consumes this file; the queue itself is
+// deterministic, duplicate-safe, and independent of the duplicate-provider
+// circuit breaker. No "unavailable" stub: a failed append is an error the caller
+// surfaces, never a silently discarded request.
+
+/// One durable contradiction-check request, as persisted in the queue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedContradiction {
+    pub target_memory_id: String,
+    pub action_receipt_id: Option<String>,
+    pub reason: String,
+    pub queued_at: i64,
+}
+
+/// Durable append-only contradiction queue under a learning root.
+/// Idempotency key = (target_memory_id, action_receipt_id), re-derived from the
+/// on-disk log on every enqueue so it survives restarts without an in-memory
+/// cache that could drift from the file. A dedicated advisory lock file guards
+/// the whole check-then-append critical section across processes.
+#[derive(Debug, Clone)]
+pub struct ContradictionQueue {
+    path: PathBuf,
+    lock_path: PathBuf,
+}
+
+impl ContradictionQueue {
+    /// Queue rooted at `<learning-root>/contradiction_queue.jsonl`.
+    pub fn new(learning_root: impl Into<PathBuf>) -> Self {
+        let learning_root = learning_root.into();
+        Self {
+            path: learning_root.join("contradiction_queue.jsonl"),
+            lock_path: learning_root.join("contradiction_queue.lock"),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// All durable requests, oldest first. Unreadable lines are skipped (a
+    /// torn tail is never treated as a successful enqueue).
+    pub fn pending(&self) -> Result<Vec<QueuedContradiction>> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let text = std::fs::read_to_string(&self.path)?;
+        Ok(text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<QueuedContradiction>(line).ok())
+            .collect())
+    }
+
+    /// Append one request unless its idempotency key already exists.
+    /// Returns `true` only when a NEW durable record was appended. The duplicate
+    /// re-read and the append share one process-wide exclusive lock so two
+    /// concurrent callers can never both observe an empty log and both append.
+    pub fn enqueue(
+        &self,
+        target_memory_id: &str,
+        action_receipt_id: Option<&str>,
+        reason: &str,
+        queued_at: i64,
+    ) -> Result<bool> {
+        if target_memory_id.trim().is_empty() {
+            return Err(anyhow!("contradiction target_memory_id must be non-empty"));
+        }
+        if reason.trim().is_empty() {
+            return Err(anyhow!("contradiction reason must be non-empty"));
+        }
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        use fs2::FileExt;
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&self.lock_path)?;
+        lock.lock_exclusive()?;
+        let result = self.enqueue_locked(target_memory_id, action_receipt_id, reason, queued_at);
+        // Dropping the file also releases the advisory lock; explicit unlock
+        // keeps the critical-section boundary obvious.
+        let _ = FileExt::unlock(&lock);
+        result
+    }
+
+    /// Called with `self.lock_path` held exclusively. Re-derives the key from
+    /// the on-disk log, appends a new record, and fsyncs both the file and its
+    /// parent directory so a newly created entry is durable.
+    fn enqueue_locked(
+        &self,
+        target_memory_id: &str,
+        action_receipt_id: Option<&str>,
+        reason: &str,
+        queued_at: i64,
+    ) -> Result<bool> {
+        let key = |r: &QueuedContradiction| {
+            (
+                r.target_memory_id.clone(),
+                r.action_receipt_id.clone(),
+            )
+        };
+        let wanted = (
+            target_memory_id.to_string(),
+            action_receipt_id.map(|s| s.to_string()),
+        );
+        if self.pending()?.iter().any(|r| key(r) == wanted) {
+            return Ok(false);
+        }
+        let record = QueuedContradiction {
+            target_memory_id: target_memory_id.to_string(),
+            action_receipt_id: action_receipt_id.map(|s| s.to_string()),
+            reason: reason.to_string(),
+            queued_at,
+        };
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        let mut buf = serde_json::to_vec(&record)?;
+        buf.push(b'\n');
+        f.write_all(&buf)?;
+        f.flush()?;
+        f.sync_data()?;
+        // A newly created queue file (and its lock file) is only durable once
+        // the containing directory entry has been flushed to stable storage.
+        // Windows cannot open a directory with File::open (Access is denied),
+        // and NTFS journals the directory entry itself, so this is Unix-only.
+        #[cfg(unix)]
+        if let Some(parent) = self.path.parent() {
+            let dir = std::fs::File::open(parent)?;
+            dir.sync_all()?;
+        }
+        Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod contradiction_queue_tests {
+    use super::*;
+
+    #[test]
+    fn enqueue_is_durable_and_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let q = ContradictionQueue::new(tmp.path());
+        assert!(q.enqueue("rule-1", Some("receipt-9"), "revert", 100).unwrap());
+        // Duplicate delivery (same target + receipt) must not append again.
+        assert!(!q.enqueue("rule-1", Some("receipt-9"), "revert", 100).unwrap());
+        // Different receipt or target is a genuinely new request.
+        assert!(q.enqueue("rule-1", Some("receipt-10"), "revert", 101).unwrap());
+        assert!(q.enqueue("rule-2", None, "failed attempt", 102).unwrap());
+        let pending = q.pending().unwrap();
+        assert_eq!(pending.len(), 3);
+        assert_eq!(pending[0].target_memory_id, "rule-1");
+        assert_eq!(pending[0].action_receipt_id.as_deref(), Some("receipt-9"));
+        assert!(q.path().exists(), "queue file must exist");
+    }
+
+    #[test]
+    fn enqueue_rejects_empty_target_or_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        let q = ContradictionQueue::new(tmp.path());
+        assert!(q.enqueue("  ", Some("r"), "why", 1).is_err());
+        assert!(q.enqueue("rule-1", None, "   ", 1).is_err());
+        assert!(q.pending().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pending_survives_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let q = ContradictionQueue::new(tmp.path());
+            q.enqueue("rule-9", Some("rev-3"), "why", 7).unwrap();
+        }
+        let q2 = ContradictionQueue::new(tmp.path());
+        let pending = q2.pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(!q2.enqueue("rule-9", Some("rev-3"), "why", 7).unwrap());
+    }
+
+    #[test]
+    fn concurrent_same_key_enqueue_appends_exactly_one_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        const N: usize = 8;
+        let barrier = Arc::new(std::sync::Barrier::new(N));
+        let mut handles = Vec::new();
+        for _ in 0..N {
+            let root = root.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                let q = ContradictionQueue::new(&root);
+                barrier.wait();
+                q.enqueue("rule-concurrent", Some("receipt-1"), "revert", 100)
+                    .unwrap()
+            }));
+        }
+        let appended: usize = handles
+            .into_iter()
+            .map(|h| h.join().unwrap() as usize)
+            .sum();
+        assert_eq!(appended, 1, "only one concurrent same-key enqueue may append");
+        let q = ContradictionQueue::new(&root);
+        assert_eq!(q.pending().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn enqueue_creates_and_fsyncs_nested_parent_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nested = tmp.path().join("learning").join("nested");
+        let q = ContradictionQueue::new(&nested);
+        assert!(q.enqueue("rule-durable", Some("receipt-2"), "why", 5).unwrap());
+        assert!(nested.exists(), "parent directory must be created durably");
+        let q2 = ContradictionQueue::new(&nested);
+        let pending = q2.pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].target_memory_id, "rule-durable");
+        assert_eq!(pending[0].action_receipt_id.as_deref(), Some("receipt-2"));
+        // A lock artefact proves the critical section is process-guarded.
+        assert!(nested.join("contradiction_queue.lock").exists());
+    }
+}

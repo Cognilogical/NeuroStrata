@@ -34,6 +34,8 @@ pub struct MockStore {
     rows: Mutex<Vec<Row>>,
     /// Toggle to make search/search_with_domain return an error.
     search_fails: Mutex<bool>,
+    /// Toggle to make `get` return an error.
+    get_fails: Mutex<bool>,
     /// Track which (namespace, id) pairs have had increment_access_count called.
     incremented_ids: Mutex<Vec<(String, String)>>,
 }
@@ -43,6 +45,7 @@ impl MockStore {
         Self {
             rows: Mutex::new(Vec::new()),
             search_fails: Mutex::new(false),
+            get_fails: Mutex::new(false),
             incremented_ids: Mutex::new(Vec::new()),
         }
     }
@@ -76,6 +79,11 @@ impl MockStore {
     /// Used by tests to exercise error paths.
     pub(crate) fn set_search_fails(&self, fails: bool) {
         *self.search_fails.lock().expect("mock store lock") = fails;
+    }
+
+    /// Configure whether `get` should fail, as a store read error would.
+    pub(crate) fn set_get_fails(&self, fails: bool) {
+        *self.get_fails.lock().expect("mock store lock") = fails;
     }
 }
 
@@ -312,6 +320,9 @@ impl VectorStore for MockStore {
     }
 
     async fn get(&self, namespace: &str, id: &str) -> Result<Option<(Vec<f32>, MemoryPayload)>> {
+        if *self.get_fails.lock().expect("mock store lock") {
+            return Err(anyhow::anyhow!("MockStore get configured to fail"));
+        }
         let rows = self.rows.lock().expect("mock store lock");
         Ok(rows
             .iter()

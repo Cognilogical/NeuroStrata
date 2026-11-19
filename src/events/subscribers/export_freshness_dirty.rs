@@ -461,10 +461,33 @@ mod tests {
         );
 
         // The concurrent pair: two pulses for different namespaces emitted back
-        // to back, so the dispatcher runs them in the same round.
+        // to back, so the dispatcher runs them in the same round. Because each
+        // namespace already holds a flag row from the first pair, `await_flag`
+        // alone would return immediately with the first pair's payload if the
+        // second round is still in flight after `DISPATCH_WAIT`; poll until
+        // both updated reasons land and all 4 pulses are handled.
         bus.emit(superseded("a"), &RecursionToken::root());
         bus.emit(created("b"), &RecursionToken::root());
         tokio::time::sleep(DISPATCH_WAIT).await;
+        let deadline = Instant::now() + FLAG_WAIT;
+        loop {
+            let a_ready = flag_of(&store, "a")
+                .await
+                .map(|p| p.metadata["dirty_reason"] == serde_json::json!("superseded"))
+                .unwrap_or(false);
+            let b_ready = flag_of(&store, "b")
+                .await
+                .map(|p| p.metadata["dirty_reason"] == serde_json::json!("created"))
+                .unwrap_or(false);
+            if a_ready && b_ready && bus.metrics().dispatcher_handled >= 4 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "dispatcher did not finish second-wave pulses within {FLAG_WAIT:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
 
         let a = await_flag(&store, "a").await;
         let b = await_flag(&store, "b").await;

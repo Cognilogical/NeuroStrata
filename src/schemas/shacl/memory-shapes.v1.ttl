@@ -45,21 +45,21 @@ ns:DomainPropertyShape a sh:PropertyShape ;
     sh:path ns:domain ;
     sh:or (
         [ sh:datatype xsd:string ]
-        [ sh:nodeKind sh:List ; sh:qualifiedValueShape [ sh:datatype xsd:string ] ]
+        [ sh:nodeKind sh:BlankNodeOrIRI ; sh:qualifiedValueShape [ sh:datatype xsd:string ] ]
     ) ;
     sh:message "domain must be a string or array of strings" .
 
 # Mentions metadata property shape
 ns:MentionsPropertyShape a sh:PropertyShape ;
     sh:path ns:mentions ;
-    sh:nodeKind sh:List ;
+    sh:nodeKind sh:BlankNodeOrIRI ;
     sh:qualifiedValueShape [ sh:datatype xsd:string ] ;
     sh:message "mentions must be an array of strings" .
 
 # Facets metadata property shape
 ns:FacetsPropertyShape a sh:PropertyShape ;
     sh:path ns:facets ;
-    sh:nodeKind sh:List ;
+    sh:nodeKind sh:BlankNodeOrIRI ;
     sh:qualifiedValueShape [ sh:datatype xsd:string ] ;
     sh:message "facets must be an array of strings" .
 
@@ -162,3 +162,49 @@ ns:TaskShape a sh:NodeShape ;
             sh:message "status must be open/in_progress/blocked/done" ;
         ] ;
     ] .
+
+# Capability C: epistemic-tier provenance property shapes (SHACL Core only).
+# Datatype/cardinality constraints for the five metadata keys. Cross-field
+# invariants (verified_by presence, self-verification, evidence) stay in
+# Rust (validate_epistemic_metadata) — SHACL Core cannot express them.
+ns:GeneratedByPropertyShape a sh:PropertyShape ;
+    sh:path ns:generated_by ;
+    sh:minCount 0 ;
+    sh:maxCount 1 ;
+    sh:datatype xsd:string ;
+    sh:message "generated_by must be a string" .
+
+ns:VerifiedByPropertyShape a sh:PropertyShape ;
+    sh:path ns:verified_by ;
+    sh:minCount 0 ;
+    sh:maxCount 1 ;
+    sh:datatype xsd:string ;
+    sh:message "verified_by must be a string" .
+
+ns:EpistemicTierPropertyShape a sh:PropertyShape ;
+    sh:path ns:epistemic_tier ;
+    sh:minCount 0 ;
+    sh:maxCount 1 ;
+    sh:in ( "unverified" "unverified_agent" "empirical_verified" "formal_verified" "human_governed" ) ;
+    sh:message "epistemic_tier must be one of unverified/unverified_agent/empirical_verified/formal_verified/human_governed" .
+
+ns:StaleAfterPropertyShape a sh:PropertyShape ;
+    sh:path ns:stale_after ;
+    sh:minCount 0 ;
+    sh:maxCount 1 ;
+    sh:or (
+        [ sh:datatype xsd:string ]
+        [ sh:datatype xsd:integer ]
+    ) ;
+    sh:message "stale_after must be an RFC3339 timestamp string or integer epoch seconds" .
+
+ns:NotDefinitionPropertyShape a sh:PropertyShape ;
+    sh:path ns:not_definition ;
+    sh:minCount 0 ;
+    sh:maxCount 1 ;
+    sh:or (
+        [ sh:datatype xsd:string ]
+        [ sh:datatype xsd:boolean ]
+        [ sh:nodeKind sh:BlankNodeOrIRI ]
+    ) ;
+    sh:message "not_definition must be a string, boolean, or boundary list" .
