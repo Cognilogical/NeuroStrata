@@ -2,6 +2,7 @@
 //!
 //! Contains the shared MCP + CLI handler plus entry-point export/import logic.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -13,7 +14,7 @@ use tracing::warn;
 use crate::rebac;
 use crate::secrets::SecretScanner;
 use crate::traits::{Embedder, SearchResult, VectorStore};
-use crate::vault_ld::{CanvasDocument, CanvasNode, VaultNote, YAML_LD_CONTEXT, VAULT_LD_SHAPES_V1};
+use crate::vault_ld::{CanvasDocument, CanvasNode, VAULT_LD_SHAPES_V1, VaultNote, YAML_LD_CONTEXT};
 
 /// Configuration for a vault sync operation
 #[derive(Debug, Clone)]
@@ -50,6 +51,30 @@ pub struct VaultImportResult {
     pub notes_imported: usize,
     pub topology_imported: bool,
     pub errors: Vec<String>,
+}
+
+/// Default resource caps for a single vault sync operation.
+pub const MAX_VAULT_FILES: usize = 10_000;
+pub const MAX_VAULT_FILE_BYTES: u64 = 4 * 1024 * 1024;
+pub const MAX_VAULT_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Resource caps for a vault import/export. The default entry points use the
+/// published constants; tests tighten them to exercise fail-closed paths.
+#[derive(Debug, Clone)]
+pub struct VaultSyncLimits {
+    pub max_files: usize,
+    pub max_file_bytes: u64,
+    pub max_total_bytes: u64,
+}
+
+impl Default for VaultSyncLimits {
+    fn default() -> Self {
+        Self {
+            max_files: MAX_VAULT_FILES,
+            max_file_bytes: MAX_VAULT_FILE_BYTES,
+            max_total_bytes: MAX_VAULT_TOTAL_BYTES,
+        }
+    }
 }
 
 /// Canonicalize a path using J6 caller-path authority
@@ -94,8 +119,81 @@ pub fn validate_shacl(data_ttl: &str) -> Result<(), String> {
     }
 }
 
-/// Convert VaultNote to Turtle (RDF)
-pub fn note_to_turtle(note: &VaultNote) -> String {
+/// Escape a value for a double-quoted Turtle literal. Backslashes must be
+/// replaced first so the escapes introduced below are not doubled.
+pub fn escape_turtle_literal(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
+/// Characters that cannot appear inside an IRIREF or a prefixed name without
+/// letting untrusted frontmatter break out of the generated Turtle.
+fn is_iri_unsafe_char(c: char) -> bool {
+    matches!(c, '<' | '>' | '"' | '{' | '}' | '|' | '^' | '`' | '\\')
+        || (c as u32) <= 0x20
+        || c == '\u{7f}'
+}
+
+/// Strict Turtle `PNAME_LN`:
+/// - `PN_PREFIX`: `[A-Za-z_][A-Za-z0-9_.-]*`, never ending in `.`
+/// - `PN_LOCAL`: `[A-Za-z0-9_:][A-Za-z0-9_.:-]*`, never ending in `.`
+fn is_strict_prefixed_name(s: &str) -> bool {
+    fn valid_prefix(prefix: &str) -> bool {
+        if prefix.ends_with('.') {
+            return false;
+        }
+        let mut chars = prefix.chars();
+        match chars.next() {
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+            _ => return false,
+        }
+        chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    }
+    fn valid_local(local: &str) -> bool {
+        if local.ends_with('.') {
+            return false;
+        }
+        let mut chars = local.chars();
+        match chars.next() {
+            Some(c) if c.is_ascii_alphanumeric() || c == '_' || c == ':' => {}
+            _ => return false,
+        }
+        chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+    }
+    match s.split_once(':') {
+        Some((prefix, local)) => valid_prefix(prefix) && valid_local(local),
+        None => false,
+    }
+}
+
+/// A fully-bracketed `<IRI>` whose interior carries no IRI-unsafe character.
+fn is_safe_iri_literal(s: &str) -> bool {
+    if s.len() < 3 || !s.starts_with('<') || !s.ends_with('>') {
+        return false;
+    }
+    let inner = &s[1..s.len() - 1];
+    !inner.is_empty() && !inner.chars().any(is_iri_unsafe_char)
+}
+
+/// Convert VaultNote to Turtle (RDF). Untrusted frontmatter can reach the
+/// subject IRI and the class position verbatim, so both are validated here
+/// and every literal value is escaped before interpolation.
+pub fn note_to_turtle(note: &VaultNote) -> Result<String, String> {
+    if note.id.is_empty() || note.id.chars().any(is_iri_unsafe_char) {
+        return Err(format!("invalid id for Turtle subject IRI: {:?}", note.id));
+    }
+    // rdf_type is interpolated into `a yaml:VaultNote, {rdf_type}` — a raw
+    // value there could mint arbitrary additional triples.
+    if !is_strict_prefixed_name(&note.rdf_type) && !is_safe_iri_literal(&note.rdf_type) {
+        return Err(format!(
+            "invalid rdf_type for Turtle class position: {:?}",
+            note.rdf_type
+        ));
+    }
+
     let mut turtle = String::new();
 
     turtle.push_str("@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n");
@@ -117,16 +215,28 @@ pub fn note_to_turtle(note: &VaultNote) -> String {
         "<{}> a yaml:VaultNote, {} ;\n",
         subject, note.rdf_type
     ));
-    turtle.push_str(&format!("  yaml:rdfType \"{}\" ;\n", note.rdf_type));
-    turtle.push_str(&format!("  yaml:epistemicTier \"{}\" ;\n", note.epistemic_tier));
-    turtle.push_str(&format!("  yaml:canonicalSha256 \"{}\" ;\n", note.canonical_sha256));
+    turtle.push_str(&format!(
+        "  yaml:rdfType \"{}\" ;\n",
+        escape_turtle_literal(&note.rdf_type)
+    ));
+    turtle.push_str(&format!(
+        "  yaml:epistemicTier \"{}\" ;\n",
+        escape_turtle_literal(&note.epistemic_tier)
+    ));
+    turtle.push_str(&format!(
+        "  yaml:canonicalSha256 \"{}\" ;\n",
+        escape_turtle_literal(&note.canonical_sha256)
+    ));
 
     if !note.related.is_empty() {
         turtle.push_str("  yaml:related [\n");
         let last = note.related.len().saturating_sub(1);
         for (i, target) in note.related.iter().enumerate() {
             turtle.push_str("    a yaml:RelatedTarget ;\n");
-            turtle.push_str(&format!("    yaml:targetId \"{}\"", target));
+            turtle.push_str(&format!(
+                "    yaml:targetId \"{}\"",
+                escape_turtle_literal(target)
+            ));
             if i < last {
                 turtle.push_str(" ;\n");
             } else {
@@ -136,14 +246,12 @@ pub fn note_to_turtle(note: &VaultNote) -> String {
         turtle.push_str("  ] ;\n");
     }
 
-    let escaped_content = note
-        .content
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n");
-    turtle.push_str(&format!("  yaml:content \"{}\" .\n\n", escaped_content));
+    turtle.push_str(&format!(
+        "  yaml:content \"{}\" .\n\n",
+        escape_turtle_literal(&note.content)
+    ));
 
-    turtle
+    Ok(turtle)
 }
 
 /// Generate Canvas document from vault notes
@@ -253,10 +361,103 @@ fn export_filename_for_id(id: &str) -> String {
     stem
 }
 
-/// Export vault contents to the configured path
+/// Issue #297: refuse to write through an existing symlink or non-regular
+/// destination file inside the vault/output directory.
+fn ensure_safe_export_destination(path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            let ft = meta.file_type();
+            if ft.is_symlink() {
+                Err(format!(
+                    "Refusing to write through symlink destination {}",
+                    path.display()
+                ))
+            } else if !ft.is_file() {
+                Err(format!(
+                    "Refusing to overwrite non-regular destination {}",
+                    path.display()
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!(
+            "Failed to inspect export destination {}: {}",
+            path.display(),
+            e
+        )),
+    }
+}
+
+/// Open an export destination for a truncating write.
+///
+/// `ensure_safe_export_destination` inspects the path first, but that check
+/// and the write are separate syscalls: a symlink swapped in between them
+/// would otherwise be followed. On Unix the open itself carries
+/// `O_NOFOLLOW`, so the kernel refuses the final-component symlink (ELOOP)
+/// and closes that race.
+#[cfg(unix)]
+fn open_export_destination(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+/// Non-Unix: there is no `O_NOFOLLOW` equivalent for reparse points, so the
+/// `symlink_metadata` precheck remains the only guard. A reparse point
+/// swapped in after that check can still be followed; this is the documented
+/// residual gap.
+#[cfg(not(unix))]
+fn open_export_destination(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+}
+
+/// Write one export artifact, refusing symlink and non-regular destinations.
+///
+/// The `ensure_safe_export_destination` precheck gives the caller a clear
+/// refusal before any byte is written; `open_export_destination` narrows the
+/// final-component race between that check and the write.
+fn write_export_destination(path: &Path, contents: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+
+    ensure_safe_export_destination(path)?;
+    let mut file = open_export_destination(path).map_err(|e| {
+        #[cfg(unix)]
+        if e.raw_os_error() == Some(libc::ELOOP) {
+            return format!(
+                "Refusing to write through symlink destination {}",
+                path.display()
+            );
+        }
+        format!("Failed to write {}: {}", path.display(), e)
+    })?;
+    file.write_all(contents)
+        .map_err(|e| format!("Failed to write {}: {}", path.display(), e))
+}
+
+/// Export vault contents to the configured path using the default caps.
 pub async fn export_vault(
     config: VaultSyncConfig,
     store: Arc<dyn VectorStore>,
+) -> Result<VaultExportResult, String> {
+    export_vault_with_limits(config, store, VaultSyncLimits::default()).await
+}
+
+/// Export vault contents with explicit resource caps.
+pub async fn export_vault_with_limits(
+    config: VaultSyncConfig,
+    store: Arc<dyn VectorStore>,
+    limits: VaultSyncLimits,
 ) -> Result<VaultExportResult, String> {
     // Validate both paths with J6 and use the canonical results for ALL I/O.
     let project_root = config
@@ -281,9 +482,7 @@ pub async fn export_vault(
     let principal = config.principal.as_deref().unwrap_or("default");
     let filtered: Vec<SearchResult> = memories
         .into_iter()
-        .filter(|m| {
-            rebac::can_read_memory(principal, &m.payload.user_id, &m.payload.metadata)
-        })
+        .filter(|m| rebac::can_read_memory(principal, &m.payload.user_id, &m.payload.metadata))
         .collect();
 
     // Convert to VaultNotes
@@ -299,12 +498,43 @@ pub async fn export_vault(
 
     notes.sort_by(|a, b| a.id.cmp(&b.id));
 
-    // Write each note as markdown file
-    let mut exported = 0;
+    // Enforce caps on candidates before any file is written: a capped export
+    // must leave the vault directory untouched.
+    if notes.len() > limits.max_files {
+        return Err(format!(
+            "vault export file count exceeds maximum of {} files",
+            limits.max_files
+        ));
+    }
+    let mut export_total_bytes: u64 = 0;
+    for note in &notes {
+        let size = note.to_markdown().len() as u64;
+        if size > limits.max_file_bytes {
+            return Err(format!(
+                "vault export file for id '{}' exceeds maximum of {} bytes",
+                note.id, limits.max_file_bytes
+            ));
+        }
+        export_total_bytes = export_total_bytes.saturating_add(size);
+        if export_total_bytes > limits.max_total_bytes {
+            return Err(format!(
+                "vault export total bytes exceed maximum of {} bytes",
+                limits.max_total_bytes
+            ));
+        }
+    }
+
+    // Plan every note write and check every destination before the first
+    // write: a refused note or canvas must not leave a partial export behind.
+    // Flattened ids can collide (a/b, a:b, a\b -> a_b.md); never overwrite an
+    // already-planned note and never inflate the exported count with a
+    // silently lost note.
     let mut errors = Vec::new();
+    let mut written_filenames: BTreeMap<String, String> = BTreeMap::new();
+    let mut planned_writes: Vec<(PathBuf, String)> = Vec::new();
+    let mut unsafe_destination = false;
 
     for note in &notes {
-        let markdown = note.to_markdown();
         let filename = export_filename_for_id(&note.id);
         let filepath = canonical_vault.join(&filename);
         // Fail closed: the J6-validated vault root is the only legal parent.
@@ -317,22 +547,56 @@ pub async fn export_vault(
             continue;
         }
 
-        if let Err(e) = std::fs::write(&filepath, markdown) {
-            errors.push(format!("Failed to write {}: {}", filepath.display(), e));
-        } else {
-            exported += 1;
+        if let Some(existing_id) = written_filenames.get(&filename) {
+            if existing_id != &note.id {
+                errors.push(format!(
+                    "export filename collision for id '{}': '{}' already written by id '{}'",
+                    note.id, filename, existing_id
+                ));
+            }
+            continue;
         }
+        written_filenames.insert(filename, note.id.clone());
+
+        if let Err(e) = ensure_safe_export_destination(&filepath) {
+            errors.push(format!("Export destination unsafe for {} failed: {}", filepath.display(), e));
+            unsafe_destination = true;
+            continue;
+        }
+        planned_writes.push((filepath, note.to_markdown()));
     }
 
-    // Generate and write Canvas topology
+    // Generate the Canvas and check its destination too, still before any
+    // note is written. A refused canvas is a typed error with zero writes.
     let canvas = generate_canvas(&notes, &config.namespace);
     let canvas_path = canonical_output.join("topology.canvas");
 
     let canvas_json = serde_json::to_string_pretty(&canvas)
         .map_err(|e| format!("Failed to serialize canvas: {}", e))?;
 
-    std::fs::write(&canvas_path, canvas_json)
-        .map_err(|e| format!("Failed to write canvas: {}", e))?;
+    ensure_safe_export_destination(&canvas_path)?;
+
+    if unsafe_destination {
+        return Ok(VaultExportResult {
+            success: false,
+            message: "Exported 0 notes".to_string(),
+            notes_exported: 0,
+            topology_exported: false,
+            canvas_path: None,
+            errors,
+        });
+    }
+
+    let mut exported = 0;
+    for (filepath, markdown) in &planned_writes {
+        if let Err(e) = write_export_destination(filepath, markdown.as_bytes()) {
+            errors.push(format!("Export destination unsafe for {} failed: {}", filepath.display(), e));
+        } else {
+            exported += 1;
+        }
+    }
+
+    write_export_destination(&canvas_path, canvas_json.as_bytes())?;
 
     Ok(VaultExportResult {
         success: errors.is_empty(),
@@ -382,7 +646,10 @@ fn retire_metadata(metadata: &mut serde_json::Value, new_id: &str, now: i64) {
     if let Some(obj) = metadata.as_object_mut() {
         obj.insert("valid_to".to_string(), serde_json::json!(now));
         obj.insert("superseded_by".to_string(), serde_json::json!(new_id));
-        obj.insert("archived_by_vault_import".to_string(), serde_json::json!(true));
+        obj.insert(
+            "archived_by_vault_import".to_string(),
+            serde_json::json!(true),
+        );
     }
 }
 
@@ -443,11 +710,21 @@ fn writable_prior(principal: &str, prior: &crate::traits::MemoryPayload) -> Resu
     Ok(())
 }
 
-/// Import vault contents into the database
+/// Import vault contents into the database using the default caps.
 pub async fn import_vault(
     config: VaultSyncConfig,
     store: Arc<dyn VectorStore>,
     embedder: Arc<dyn Embedder>,
+) -> Result<VaultImportResult, String> {
+    import_vault_with_limits(config, store, embedder, VaultSyncLimits::default()).await
+}
+
+/// Import vault contents with explicit resource caps.
+pub async fn import_vault_with_limits(
+    config: VaultSyncConfig,
+    store: Arc<dyn VectorStore>,
+    embedder: Arc<dyn Embedder>,
+    limits: VaultSyncLimits,
 ) -> Result<VaultImportResult, String> {
     // Serialize the whole pipeline. The store's write lock guards one upsert
     // statement, not a multi-note import; holding it across upserts would
@@ -465,21 +742,84 @@ pub async fn import_vault(
     let allowed = config.allowed_external_dirs.clone().unwrap_or_default();
     let canonical_vault = canonicalize_vault_path(&config.vault_path, &project_root, &allowed)?;
 
-    // ---- Phase 1: preflight (validation + embedding, no writes) ----
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(&canonical_vault)
-        .map_err(|e| format!("Failed to read vault directory: {}", e))?
-        .filter_map(|entry| entry.ok().map(|e| e.path()))
-        .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("md"))
-        .collect();
-    paths.sort();
-
+    // ---- Phase 1: collect + pre-read (validation, no writes) ----
+    let mut paths: Vec<PathBuf> = Vec::new();
     let mut notes = Vec::new();
     let mut errors = Vec::new();
 
-    for path in paths {
-        let content = std::fs::read_to_string(&path)
-            .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+    // Count `.md` entries as they are collected. A cap violation is a typed
+    // error returned before any note is read or upserted.
+    for entry in std::fs::read_dir(&canonical_vault)
+        .map_err(|e| format!("Failed to read vault directory: {}", e))?
+    {
+        let path = match entry {
+            Ok(entry) => entry.path(),
+            Err(e) => {
+                errors.push(format!("Failed to read vault entry: {}", e));
+                continue;
+            }
+        };
+        if path.extension().and_then(|s| s.to_str()) != Some("md") {
+            continue;
+        }
+        if paths.len() >= limits.max_files {
+            return Err(format!(
+                "vault file count exceeds maximum of {} files",
+                limits.max_files
+            ));
+        }
+        paths.push(path);
+    }
+    paths.sort();
 
+    // Read every candidate in deterministic order and enforce byte caps
+    // before the upsert loop. Per-file failures are collected and skipped;
+    // a global total-byte violation is a typed cap error with zero writes.
+    let mut preloaded: Vec<(PathBuf, String)> = Vec::new();
+    let mut total_bytes: u64 = 0;
+    for path in &paths {
+        let metadata = match std::fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(e) => {
+                errors.push(format!(
+                    "Skipping unreadable vault file {}: {}",
+                    path.display(),
+                    e
+                ));
+                continue;
+            }
+        };
+        if metadata.len() > limits.max_file_bytes {
+            errors.push(format!(
+                "Skipping oversized vault file {}: {} bytes exceeds maximum of {} bytes",
+                path.display(),
+                metadata.len(),
+                limits.max_file_bytes
+            ));
+            continue;
+        }
+        let content = match std::fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(e) => {
+                errors.push(format!(
+                    "Skipping unreadable vault file {}: {}",
+                    path.display(),
+                    e
+                ));
+                continue;
+            }
+        };
+        total_bytes = total_bytes.saturating_add(metadata.len());
+        if total_bytes > limits.max_total_bytes {
+            return Err(format!(
+                "vault total bytes exceed maximum of {} bytes",
+                limits.max_total_bytes
+            ));
+        }
+        preloaded.push((path.clone(), content));
+    }
+
+    for (path, content) in preloaded {
         if let Err(e) = scan_secrets(&content, &path.to_string_lossy()) {
             errors.push(e);
             continue;
@@ -498,7 +838,14 @@ pub async fn import_vault(
             }
         };
 
-        if let Err(e) = validate_shacl(&note_to_turtle(&note)) {
+        let turtle = match note_to_turtle(&note) {
+            Ok(turtle) => turtle,
+            Err(e) => {
+                errors.push(format!("Invalid frontmatter in {}: {}", path.display(), e));
+                continue;
+            }
+        };
+        if let Err(e) = validate_shacl(&turtle) {
             errors.push(format!(
                 "SHACL validation failed for {}: {}",
                 path.display(),
@@ -514,8 +861,18 @@ pub async fn import_vault(
     let mut stub_ids = std::collections::BTreeSet::new();
     for target in unresolved_wiki_targets(&notes) {
         let stub = stub_note(&target);
-        if let Err(e) = validate_shacl(&note_to_turtle(&stub)) {
-            errors.push(format!("SHACL validation failed for stub {}: {}", target, e));
+        let turtle = match note_to_turtle(&stub) {
+            Ok(turtle) => turtle,
+            Err(e) => {
+                errors.push(format!("Invalid stub id {}: {}", target, e));
+                continue;
+            }
+        };
+        if let Err(e) = validate_shacl(&turtle) {
+            errors.push(format!(
+                "SHACL validation failed for stub {}: {}",
+                target, e
+            ));
             continue;
         }
         stub_ids.insert(target);
@@ -601,6 +958,14 @@ pub async fn import_vault(
                 ));
                 continue;
             }
+            if let Some(prior_obj) = prior.metadata.as_object() {
+                if let Some(visible_to) = prior_obj.get("visible_to") {
+                    metadata["visible_to"] = visible_to.clone();
+                }
+                if let Some(eligibility) = prior_obj.get("eligibility") {
+                    metadata["eligibility"] = eligibility.clone();
+                }
+            }
             let history_id = format!("{}.vault-history.{}", note.id, uuid::Uuid::new_v4());
             retire_metadata(&mut prior.metadata, &note.id, now);
             metadata["supersedes"] = serde_json::json!(history_id);
@@ -612,7 +977,11 @@ pub async fn import_vault(
             vector,
             metadata,
             content: note.content,
-            memory_type: note.rdf_type.strip_prefix("yaml:").unwrap_or("symbol").to_string(),
+            memory_type: note
+                .rdf_type
+                .strip_prefix("yaml:")
+                .unwrap_or("symbol")
+                .to_string(),
             history,
         });
     }
@@ -623,7 +992,12 @@ pub async fn import_vault(
         let cleanup_id = item.history.as_ref().map(|(id, _, _)| id.clone());
         if let Some((history_id, history_vector, history_payload)) = item.history {
             if let Err(e) = store
-                .upsert(&config.namespace, &history_id, history_vector, history_payload)
+                .upsert(
+                    &config.namespace,
+                    &history_id,
+                    history_vector,
+                    history_payload,
+                )
                 .await
             {
                 errors.push(format!("Failed to preserve history for {}: {}", item.id, e));
@@ -709,42 +1083,43 @@ pub async fn handle_vault_sync(
         allowed_external_dirs,
     };
 
-    let result = match action {
-        "export" => match export_vault(config, store).await {
-            Ok(r) => serde_json::to_string(&r)
-                .unwrap_or_else(|e| format!("Serialization error: {}", e)),
-            Err(e) => serde_json::to_string(&VaultExportResult {
+    let result =
+        match action {
+            "export" => match export_vault(config, store).await {
+                Ok(r) => serde_json::to_string(&r)
+                    .unwrap_or_else(|e| format!("Serialization error: {}", e)),
+                Err(e) => serde_json::to_string(&VaultExportResult {
+                    success: false,
+                    message: e,
+                    notes_exported: 0,
+                    topology_exported: false,
+                    canvas_path: None,
+                    errors: Vec::new(),
+                })
+                .unwrap(),
+            },
+            "import" => match import_vault(config, store, embedder).await {
+                Ok(r) => serde_json::to_string(&r)
+                    .unwrap_or_else(|e| format!("Serialization error: {}", e)),
+                Err(e) => serde_json::to_string(&VaultImportResult {
+                    success: false,
+                    message: e,
+                    notes_imported: 0,
+                    topology_imported: false,
+                    errors: Vec::new(),
+                })
+                .unwrap(),
+            },
+            _ => serde_json::to_string(&VaultExportResult {
                 success: false,
-                message: e,
+                message: format!("Unknown action: {}", action),
                 notes_exported: 0,
                 topology_exported: false,
                 canvas_path: None,
                 errors: Vec::new(),
             })
             .unwrap(),
-        },
-        "import" => match import_vault(config, store, embedder).await {
-            Ok(r) => serde_json::to_string(&r)
-                .unwrap_or_else(|e| format!("Serialization error: {}", e)),
-            Err(e) => serde_json::to_string(&VaultImportResult {
-                success: false,
-                message: e,
-                notes_imported: 0,
-                topology_imported: false,
-                errors: Vec::new(),
-            })
-            .unwrap(),
-        },
-        _ => serde_json::to_string(&VaultExportResult {
-            success: false,
-            message: format!("Unknown action: {}", action),
-            notes_exported: 0,
-            topology_exported: false,
-            canvas_path: None,
-            errors: Vec::new(),
-        })
-        .unwrap(),
-    };
+        };
 
     result
 }
@@ -850,8 +1225,7 @@ mod tests {
         let mut changed = note("note-1", &["missing-target"]);
         changed.content = "Changed body".to_string();
         changed.canonical_sha256 = hex::encode(Sha256::digest(changed.content.as_bytes()));
-        std::fs::write(vault.join("note-1.md"), changed.to_markdown())
-            .expect("write changed note");
+        std::fs::write(vault.join("note-1.md"), changed.to_markdown()).expect("write changed note");
         let second = import_vault(config.clone(), store.clone(), embedder.clone())
             .await
             .expect("second import");
@@ -911,7 +1285,9 @@ mod tests {
         let a = note("a", &["b"]);
         let b = note("b", &[]);
         let c = note("c", &["a", "b"]);
-        let first = serde_json::to_string(&generate_canvas(&[a.clone(), b.clone(), c.clone()], "ns")).unwrap();
+        let first =
+            serde_json::to_string(&generate_canvas(&[a.clone(), b.clone(), c.clone()], "ns"))
+                .unwrap();
         let second = serde_json::to_string(&generate_canvas(&[c, a, b], "ns")).unwrap();
         assert_eq!(first, second);
     }
@@ -949,7 +1325,9 @@ mod tests {
             project_root: Some(root.clone()),
             allowed_external_dirs: None,
         };
-        import_vault(config.clone(), store.clone(), embedder.clone()).await.unwrap();
+        import_vault(config.clone(), store.clone(), embedder.clone())
+            .await
+            .unwrap();
 
         let mut edited = original.clone();
         edited.related = vec!["second".to_string()];
@@ -1008,8 +1386,11 @@ mod tests {
             .await
             .expect("seed mesh row");
 
-        std::fs::write(vault.join("mesh-note.md"), note("mesh-note", &[]).to_markdown())
-            .expect("write note");
+        std::fs::write(
+            vault.join("mesh-note.md"),
+            note("mesh-note", &[]).to_markdown(),
+        )
+        .expect("write note");
         let config = VaultSyncConfig {
             namespace: ns.to_string(),
             vault_path: vault.clone(),
@@ -1053,8 +1434,11 @@ mod tests {
             )
             .await
             .expect("seed private row");
-        std::fs::write(vault.join("priv-note.md"), note("priv-note", &[]).to_markdown())
-            .expect("write note");
+        std::fs::write(
+            vault.join("priv-note.md"),
+            note("priv-note", &[]).to_markdown(),
+        )
+        .expect("write note");
         let config = VaultSyncConfig {
             namespace: ns.to_string(),
             vault_path: vault.clone(),
@@ -1067,7 +1451,10 @@ mod tests {
             .await
             .expect("import");
         assert!(
-            result.errors.iter().any(|e| e.contains("private") || e.contains("foreign")),
+            result
+                .errors
+                .iter()
+                .any(|e| e.contains("private") || e.contains("foreign")),
             "foreign private row must be refused: {:?}",
             result.errors
         );
@@ -1104,7 +1491,11 @@ mod tests {
         )
         .await;
         let result: VaultExportResult = serde_json::from_str(&res).expect("valid result");
-        assert!(result.success, "nested output must be created: {:?}", result);
+        assert!(
+            result.success,
+            "nested output must be created: {:?}",
+            result
+        );
         assert!(out.join("topology.canvas").exists(), "canvas written");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1330,7 +1721,10 @@ mod tests {
         let out = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
             .await
             .expect("import");
-        assert_eq!(out.notes_imported, 0, "whitespace-only difference is a no-op");
+        assert_eq!(
+            out.notes_imported, 0,
+            "whitespace-only difference is a no-op"
+        );
         assert!(out.errors.is_empty(), "{:?}", out.errors);
         assert_eq!(store.list(ns, None, None).await.unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&root);
@@ -1473,9 +1867,117 @@ mod tests {
         .await;
         let out: VaultImportResult = serde_json::from_str(&res).expect("valid result");
         assert!(!out.success);
-        assert!(out.errors.iter().any(|e| e.to_lowercase().contains("secret")));
+        assert!(
+            out.errors
+                .iter()
+                .any(|e| e.to_lowercase().contains("secret"))
+        );
         assert!(store.list(ns, None, None).await.unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Issue #288: every Turtle string literal escapes the five characters
+    /// that can terminate or distort a quoted literal.
+    #[test]
+    fn escape_turtle_literal_escapes_backslash_quote_and_controls() {
+        assert_eq!(
+            escape_turtle_literal("a\\b\"c\nd\re\tf"),
+            "a\\\\b\\\"c\\nd\\re\\tf"
+        );
+        assert_eq!(escape_turtle_literal("plain"), "plain");
+    }
+
+    /// Issue #288: a quote in epistemic_tier is escaped into a single valid
+    /// Turtle literal; rejection comes from the SHACL value constraint, not
+    /// from a broken Turtle document or an injected extra triple.
+    #[test]
+    fn note_to_turtle_escapes_epistemic_tier_and_shacl_rejects_bad_tier() {
+        let mut n = note("tier-note", &[]);
+        n.epistemic_tier = "bad\" tier".to_string();
+        let turtle = note_to_turtle(&n).expect("quote must be escaped, not fatal to rendering");
+        assert!(
+            turtle.contains("yaml:epistemicTier \"bad\\\" tier\""),
+            "{}",
+            turtle
+        );
+        assert_eq!(turtle.matches("yaml:epistemicTier").count(), 1);
+        let err = validate_shacl(&turtle).expect_err("SHACL value constraint must reject tier");
+        assert!(err.contains("SHACL"), "{}", err);
+        assert!(err.contains("epistemicTier"), "{}", err);
+    }
+
+    /// Issue #288: hostile ids are rejected before they can form a Turtle IRI.
+    #[test]
+    fn note_to_turtle_rejects_iri_unsafe_and_empty_id() {
+        for bad_id in ["evil>id", "", "bad\nid"] {
+            let mut n = note(bad_id, &[]);
+            n.canonical_sha256 = hex::encode(Sha256::digest(bad_id.as_bytes()));
+            let err = note_to_turtle(&n).expect_err("unsafe id must fail closed");
+            assert!(err.to_lowercase().contains("id"), "{}", err);
+        }
+    }
+
+    /// Issue #288: a newline/quote in canonical_sha256 is escaped into one
+    /// literal; the SHACL pattern constraint rejects it cleanly.
+    #[test]
+    fn note_to_turtle_escapes_canonical_sha256_and_shacl_rejects_bad_hash() {
+        let mut n = note("hash-note", &[]);
+        n.canonical_sha256 = "bad\"\nsha".to_string();
+        let turtle = note_to_turtle(&n).expect("turtle renders");
+        assert!(
+            turtle.contains("yaml:canonicalSha256 \"bad\\\"\\nsha\""),
+            "{}",
+            turtle
+        );
+        assert_eq!(turtle.matches("yaml:canonicalSha256").count(), 1);
+        let err = validate_shacl(&turtle).expect_err("SHACL pattern must reject hash");
+        assert!(err.contains("canonicalSha256"), "{}", err);
+    }
+
+    /// Issue #288: a hostile related target is escaped inside its literal so
+    /// no extra triples are injected and the graph matches the stored note.
+    #[test]
+    fn note_to_turtle_escapes_hostile_related_target_without_injection() {
+        let target = "evil\" wikilink\n<evil> a yaml:VaultNote";
+        let mut n = note("rel-note", &[target]);
+        n.canonical_sha256 = hex::encode(Sha256::digest(n.id.as_bytes()));
+        let turtle = note_to_turtle(&n).expect("turtle renders");
+        assert!(
+            turtle.contains("yaml:targetId \"evil\\\" wikilink\\n<evil> a yaml:VaultNote\""),
+            "{}",
+            turtle
+        );
+        assert_eq!(
+            turtle.matches("yaml:targetId").count(),
+            1,
+            "no injected triples"
+        );
+        assert_eq!(turtle.matches(" a yaml:VaultNote,").count(), 1);
+        assert!(validate_shacl(&turtle).is_ok(), "{}", turtle);
+    }
+
+    /// Issue #288: minted link stubs carry an untrusted target as their id;
+    /// an unsafe target must fail closed at Turtle generation.
+    #[test]
+    fn stub_note_with_unsafe_target_id_fails_closed() {
+        for bad_target in ["evil\"target", "target\nwith-newline"] {
+            let stub = stub_note(bad_target);
+            let err = note_to_turtle(&stub).expect_err("unsafe stub id must fail closed");
+            assert!(err.to_lowercase().contains("id"), "{}", err);
+        }
+    }
+
+    /// Issue #288: a hostile rdf_type cannot inject arbitrary Turtle syntax
+    /// through the `a yaml:VaultNote, ...` position.
+    #[test]
+    fn note_to_turtle_rejects_unsafe_rdf_type() {
+        let mut n = note("type-note", &[]);
+        n.rdf_type = "yaml:fact> <evil".to_string();
+        let err = note_to_turtle(&n).expect_err("unsafe rdf_type must fail closed");
+        assert!(err.to_lowercase().contains("rdf_type"), "{}", err);
+        let mut bracket = note("bracket-note", &[]);
+        bracket.rdf_type = "yaml:fact] a <evil".to_string();
+        assert!(note_to_turtle(&bracket).is_err());
     }
 
     /// Closure finding 4: handler-level SHACL rejection, with zero writes.
@@ -1490,8 +1992,9 @@ mod tests {
         );
         let ns = "vault_shacl";
         store.init(ns).await.expect("init");
-        // A double quote inside epistemic_tier is not escaped by note_to_turtle,
-        // so the generated Turtle fails to parse and SHACL rejects the note.
+        // Issue #288: a double quote inside epistemic_tier is escaped into a
+        // valid Turtle literal. Rejection must come from the SHACL value
+        // constraint on the tier, never from Turtle injection or a parse error.
         let markdown = format!(
             "---\n@context: \"{}\"\n@id: \"shacl-note\"\n@type: \"yaml:fact\"\n\
              epistemic_tier: 'bad\" tier'\ncanonical_sha256: \"{}\"\nrelated: []\n---\n\n\
@@ -1517,7 +2020,13 @@ mod tests {
         .await;
         let out: VaultImportResult = serde_json::from_str(&res).expect("valid result");
         assert!(!out.success);
-        assert!(out.errors.iter().any(|e| e.contains("SHACL")));
+        assert!(
+            out.errors
+                .iter()
+                .any(|e| e.contains("SHACL") && e.contains("epistemicTier")),
+            "SHACL tier value constraint must fire: {:?}",
+            out.errors
+        );
         assert!(store.list(ns, None, None).await.unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1563,6 +2072,343 @@ mod tests {
                 "must be a single path component: {name:?}"
             );
         }
+    }
+
+    /// Issue #284: an unreadable per-file entry is reported and skipped; the
+    /// remaining valid notes still import.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn import_continues_past_unreadable_file() {
+        let root = std::env::temp_dir().join(format!("ns-cap-broken-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_cap_broken";
+        store.init(ns).await.expect("init");
+        std::fs::write(vault.join("good-1.md"), note("good-1", &[]).to_markdown())
+            .expect("write good-1");
+        std::fs::write(vault.join("good-2.md"), note("good-2", &[]).to_markdown())
+            .expect("write good-2");
+        std::os::unix::fs::symlink("nonexistent_target", vault.join("broken.md"))
+            .expect("create broken symlink");
+        let config = VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.clone()),
+            allowed_external_dirs: None,
+        };
+        let result = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("import");
+        assert_eq!(result.notes_imported, 2, "{:?}", result.errors);
+        assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+        assert!(
+            result.errors[0].contains("broken.md"),
+            "{:?}",
+            result.errors
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Issue #284: file-count cap is enforced while collecting paths, before
+    /// any note is read or upserted.
+    #[tokio::test]
+    async fn import_file_count_cap_fails_before_any_write() {
+        let root = std::env::temp_dir().join(format!("ns-cap-files-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_cap_files";
+        store.init(ns).await.expect("init");
+        for id in ["one", "two"] {
+            std::fs::write(vault.join(format!("{id}.md")), note(id, &[]).to_markdown())
+                .expect("write note");
+        }
+        let config = VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.clone()),
+            allowed_external_dirs: None,
+        };
+        let limits = VaultSyncLimits {
+            max_files: 1,
+            max_file_bytes: MAX_VAULT_FILE_BYTES,
+            max_total_bytes: MAX_VAULT_TOTAL_BYTES,
+        };
+        let err = import_vault_with_limits(
+            config,
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+            limits,
+        )
+        .await
+        .expect_err("file count cap");
+        assert!(
+            err.contains("file count exceeds maximum of 1 files"),
+            "{}",
+            err
+        );
+        assert!(store.list(ns, None, None).await.unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Issue #284: total-byte cap is enforced in the pre-read pass, before the
+    /// upsert loop starts.
+    #[tokio::test]
+    async fn import_total_bytes_cap_fails_before_any_write() {
+        let root = std::env::temp_dir().join(format!("ns-cap-total-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_cap_total";
+        store.init(ns).await.expect("init");
+        for id in ["one", "two"] {
+            std::fs::write(vault.join(format!("{id}.md")), note(id, &[]).to_markdown())
+                .expect("write note");
+        }
+        let config = VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.clone()),
+            allowed_external_dirs: None,
+        };
+        let limits = VaultSyncLimits {
+            max_files: MAX_VAULT_FILES,
+            max_file_bytes: MAX_VAULT_FILE_BYTES,
+            max_total_bytes: 1,
+        };
+        let err = import_vault_with_limits(
+            config,
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+            limits,
+        )
+        .await
+        .expect_err("total bytes cap");
+        assert!(
+            err.contains("total bytes exceed maximum of 1 bytes"),
+            "{}",
+            err
+        );
+        assert!(store.list(ns, None, None).await.unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Issue #284: an oversized file is a per-file error, not a whole-import
+    /// abort.
+    #[tokio::test]
+    async fn import_oversized_file_is_reported_and_skipped() {
+        let root = std::env::temp_dir().join(format!("ns-cap-size-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_cap_size";
+        store.init(ns).await.expect("init");
+        std::fs::write(vault.join("big.md"), note("big", &[]).to_markdown()).expect("write big");
+        let config = VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.clone()),
+            allowed_external_dirs: None,
+        };
+        let limits = VaultSyncLimits {
+            max_files: MAX_VAULT_FILES,
+            max_file_bytes: 10,
+            max_total_bytes: MAX_VAULT_TOTAL_BYTES,
+        };
+        let result = import_vault_with_limits(
+            config,
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+            limits,
+        )
+        .await
+        .expect("import");
+        assert_eq!(result.notes_imported, 0);
+        assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+        assert!(
+            result.errors[0].contains("exceeds maximum of 10 bytes"),
+            "{:?}",
+            result.errors
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Issue #284: export honors the same caps before touching the filesystem.
+    #[tokio::test]
+    async fn export_file_count_cap_fails_without_writing() {
+        let root = std::env::temp_dir().join(format!("ns-cap-exp-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_cap_export";
+        store.init(ns).await.expect("init");
+        for id in ["one", "two"] {
+            store
+                .upsert(
+                    ns,
+                    id,
+                    vec![0.0; 4],
+                    crate::traits::MemoryPayload {
+                        content: id.to_string(),
+                        user_id: "default".to_string(),
+                        memory_type: "fact".to_string(),
+                        agent_name: None,
+                        location: String::new(),
+                        location_lines: String::new(),
+                        metadata: serde_json::json!({}),
+                    },
+                )
+                .await
+                .expect("seed note");
+        }
+        let config = VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.clone()),
+            allowed_external_dirs: None,
+        };
+        let limits = VaultSyncLimits {
+            max_files: 1,
+            max_file_bytes: MAX_VAULT_FILE_BYTES,
+            max_total_bytes: MAX_VAULT_TOTAL_BYTES,
+        };
+        let err = export_vault_with_limits(config, store, limits)
+            .await
+            .expect_err("export file count cap");
+        assert!(
+            err.contains("file count exceeds maximum of 1 files"),
+            "{}",
+            err
+        );
+        assert_eq!(
+            std::fs::read_dir(&vault)
+                .expect("read vault")
+                .filter_map(|e| e.ok())
+                .count(),
+            0,
+            "no files written when the cap is exceeded"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Issue #291: `/`, `\` and `:` all flatten to `_`, so distinct ids can
+    /// map to one filename. The collision must be reported and counted once,
+    /// never silently overwritten while inflating `notes_exported`.
+    #[tokio::test]
+    async fn export_vault_reports_filename_collision_without_overwrite() {
+        let root = std::env::temp_dir().join(format!("ns-col-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_collision";
+        store.init(ns).await.expect("init");
+        for id in ["a/b", "a:b", r"a\b"] {
+            store
+                .upsert(
+                    ns,
+                    id,
+                    vec![0.0; 4],
+                    crate::traits::MemoryPayload {
+                        content: format!("body of {id}"),
+                        user_id: "default".to_string(),
+                        memory_type: "fact".to_string(),
+                        agent_name: None,
+                        location: String::new(),
+                        location_lines: String::new(),
+                        metadata: serde_json::json!({}),
+                    },
+                )
+                .await
+                .expect("seed note");
+        }
+        let config = VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.clone()),
+            allowed_external_dirs: None,
+        };
+        let result = export_vault(config, store.clone()).await.expect("export");
+        assert_eq!(result.notes_exported, 1, "honest count: {:?}", result);
+        assert_eq!(result.errors.len(), 2, "{:?}", result.errors);
+        assert!(
+            result
+                .errors
+                .iter()
+                .all(|e| e.contains("filename collision")),
+            "{:?}",
+            result.errors
+        );
+        assert!(
+            result.errors.iter().any(|e| e.contains("a_b.md")),
+            "{:?}",
+            result.errors
+        );
+        let md_count = std::fs::read_dir(&vault)
+            .expect("read vault")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("md"))
+            .count();
+        assert_eq!(md_count, 1, "only one file may be written");
+
+        // Re-import into a fresh store + namespace: count must match export.
+        let fresh_ns = "vault_collision_reimport";
+        let fresh_store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&root.join("db2"), 4)
+                .expect("fresh temp store"),
+        );
+        fresh_store
+            .init(fresh_ns)
+            .await
+            .expect("init fresh namespace");
+        let import_config = VaultSyncConfig {
+            namespace: fresh_ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.clone()),
+            allowed_external_dirs: None,
+        };
+        let imported = import_vault(
+            import_config,
+            fresh_store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("reimport");
+        assert!(imported.errors.is_empty(), "{:?}", imported.errors);
+        assert_eq!(imported.notes_imported, 1);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Codex 4610878281 P1: an imported id carrying Windows separators must
@@ -1625,5 +2471,348 @@ mod tests {
             names
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Codex PR #295 P2: valid custom Turtle local-name characters (dots,
+    /// leading digits, colons) in `rdf_type` must be accepted so exported
+    /// memories with custom `memory_type` values such as `custom.kind`
+    /// round-trip through `export_vault` -> `import_vault`, while trailing
+    /// dots (which terminate a Turtle statement) remain rejected.
+    #[tokio::test]
+    async fn custom_dotted_memory_type_roundtrips_through_export_and_import() {
+        for valid_type in ["yaml:custom.kind", "yaml:123_custom", "yaml:ns:sub.kind"] {
+            let mut n = note("dotted-note", &[]);
+            n.rdf_type = valid_type.to_string();
+            let turtle = note_to_turtle(&n).unwrap_or_else(|e| {
+                panic!("expected valid Turtle type {valid_type:?} to render, got {e}")
+            });
+            validate_shacl(&turtle).unwrap_or_else(|e| {
+                panic!("expected valid Turtle type {valid_type:?} to pass SHACL, got {e}")
+            });
+        }
+
+        for invalid_type in ["yaml:custom.", "yaml.:custom", "yaml:"] {
+            let mut n = note("trailing-dot-note", &[]);
+            n.rdf_type = invalid_type.to_string();
+            assert!(
+                note_to_turtle(&n).is_err(),
+                "invalid prefixed name {invalid_type:?} must fail closed"
+            );
+        }
+
+        let root = std::env::temp_dir().join(format!("ns-custom-type-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_custom_type";
+        store.init(ns).await.expect("init");
+        store
+            .upsert(
+                ns,
+                "custom-1",
+                vec![0.0; 4],
+                crate::traits::MemoryPayload {
+                    content: "custom kind note".to_string(),
+                    user_id: "default".to_string(),
+                    memory_type: "custom.kind".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("seed custom.kind memory");
+
+        let export_cfg = VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.clone()),
+            allowed_external_dirs: None,
+        };
+        let exported = export_vault(export_cfg, store.clone())
+            .await
+            .expect("export");
+        assert_eq!(exported.notes_exported, 1, "{:?}", exported.errors);
+
+        let import_ns = "vault_custom_type_imported";
+        let fresh_store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&root.join("db2"), 4)
+                .expect("fresh temp store"),
+        );
+        fresh_store.init(import_ns).await.expect("init import ns");
+        let import_cfg = VaultSyncConfig {
+            namespace: import_ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.clone()),
+            allowed_external_dirs: None,
+        };
+        let imported = import_vault(
+            import_cfg,
+            fresh_store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("import");
+        assert!(imported.errors.is_empty(), "{:?}", imported.errors);
+        assert_eq!(imported.notes_imported, 1);
+        let (_, payload) = fresh_store
+            .get(import_ns, "custom-1")
+            .await
+            .expect("get")
+            .expect("imported row exists");
+        assert_eq!(payload.memory_type, "custom.kind");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Issue #296: re-importing a note preserves the prior head's
+    /// visible_to and eligibility metadata; the new head must not widen access
+    /// to a wider audience than the prior head granted.
+    #[tokio::test]
+    async fn import_preserves_prior_head_visible_to_and_eligibility() {
+        let root = std::env::temp_dir().join(format!("ns-visible-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_visible";
+        store.init(ns).await.expect("init");
+        let seeded_metadata = serde_json::json!({
+            "visible_to": ["default"],
+            "eligibility": "shareable",
+            "canonical_sha256": "old-hash"
+        });
+        store
+            .upsert(
+                ns,
+                "vis-note",
+                vec![0.0; 4],
+                seed_payload("default", seeded_metadata.clone()),
+            )
+            .await
+            .expect("seed prior head");
+        assert!(
+            !rebac::can_read_memory("stranger", "default", &seeded_metadata),
+            "stranger must not read seeded head"
+        );
+        let mut changed = note("vis-note", &[]);
+        changed.content = "updated body".to_string();
+        changed.canonical_sha256 = hex::encode(Sha256::digest(changed.content.as_bytes()));
+        std::fs::write(vault.join("vis-note.md"), changed.to_markdown()).expect("write note");
+        let config = VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.clone()),
+            allowed_external_dirs: None,
+        };
+        let result = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("import");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.notes_imported, 1);
+        let (_, head) = store.get(ns, "vis-note").await.unwrap().unwrap();
+        assert_eq!(head.content, "updated body");
+        assert!(head.metadata["supersedes"].is_string());
+        assert_eq!(head.metadata["visible_to"], serde_json::json!(["default"]));
+        assert_eq!(head.metadata["eligibility"], serde_json::json!("shareable"));
+        assert!(
+            !rebac::can_read_memory("stranger", &head.user_id, &head.metadata),
+            "stranger must not read tightened head"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Issue #297: the open that performs the write must itself refuse a
+    /// symlink final component. The metadata precheck is deliberately
+    /// bypassed here to model the TOCTOU window between that check and the
+    /// write; only `O_NOFOLLOW` closes it.
+    #[cfg(unix)]
+    #[test]
+    fn open_export_destination_refuses_symlink_without_precheck() {
+        let root = std::env::temp_dir().join(format!("ns-exp-open-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create root");
+        let victim = root.join("victim.md");
+        std::fs::write(&victim, "untouched").expect("write victim");
+        let dest = root.join("dest.md");
+        std::os::unix::fs::symlink(&victim, &dest).expect("symlink destination");
+
+        let err = open_export_destination(&dest).expect_err("symlink open must be refused");
+        assert_eq!(err.raw_os_error(), Some(libc::ELOOP));
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("read victim"),
+            "untouched",
+            "the symlink target must not be truncated"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Issue #297: export refuses to write through a symlinked note or canvas destination.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn export_refuses_symlinked_note_and_canvas_destinations() {
+        let root = std::env::temp_dir().join(format!("ns-expsym-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let outside = std::env::temp_dir().join(format!("ns-outsym-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&outside).expect("create outside");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_export_sym";
+        store.init(ns).await.expect("init");
+        store
+            .upsert(
+                ns,
+                "link-note",
+                vec![0.0; 4],
+                seed_payload("default", serde_json::json!({"canonical_sha256": "test"})),
+            )
+            .await
+            .expect("seed note");
+
+        let victim_note = outside.join("victim_note.md");
+        let victim_canvas = outside.join("victim_canvas.json");
+        std::fs::write(&victim_note, "untouched note").expect("write victim note");
+        std::fs::write(&victim_canvas, "untouched canvas").expect("write victim canvas");
+
+        // Case (a): note destination is a symlink.
+        std::os::unix::fs::symlink(&victim_note, vault.join("link-note.md")).expect("symlink note");
+        let config = VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.clone()),
+            allowed_external_dirs: None,
+        };
+        let result = export_vault(config, store.clone()).await.expect("export");
+        assert!(
+            result.errors.iter().any(|e| e.contains("symlink")),
+            "{:?}",
+            result.errors
+        );
+        assert_eq!(result.notes_exported, 0);
+        assert!(!result.success);
+        assert_eq!(
+            std::fs::read_to_string(&victim_note).unwrap(),
+            "untouched note",
+            "symlink target must be untouched"
+        );
+
+        // Case (b): canvas destination is a symlink.
+        std::fs::remove_file(vault.join("link-note.md")).expect("remove note symlink");
+        let _ = std::fs::remove_file(vault.join("topology.canvas"));
+        std::os::unix::fs::symlink(&victim_canvas, vault.join("topology.canvas")).expect("symlink canvas");
+        let config2 = VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.clone()),
+            allowed_external_dirs: None,
+        };
+        let err = export_vault(config2, store.clone()).await.unwrap_err();
+        assert!(
+            err.contains("symlink"),
+            "{}",
+            err
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim_canvas).unwrap(),
+            "untouched canvas",
+            "symlink target must be untouched"
+        );
+        assert!(
+            !vault.join("link-note.md").exists(),
+            "a refused canvas must not leave notes written"
+        );
+        let md_count = std::fs::read_dir(&vault)
+            .expect("read vault")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("md"))
+            .count();
+        assert_eq!(md_count, 0, "canvas refusal must write no note files");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// Issue #297: one refused note destination must not leave the other
+    /// notes already written; all destinations are checked before the first
+    /// write.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn export_refuses_all_notes_when_one_destination_is_symlinked() {
+        let root = std::env::temp_dir().join(format!("ns-expsym-partial-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let outside = std::env::temp_dir().join(format!("ns-outsym-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&outside).expect("create outside");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_export_sym_partial";
+        store.init(ns).await.expect("init");
+        for id in ["link-note", "safe-note"] {
+            store
+                .upsert(
+                    ns,
+                    id,
+                    vec![0.0; 4],
+                    seed_payload("default", serde_json::json!({"canonical_sha256": "test"})),
+                )
+                .await
+                .expect("seed note");
+        }
+        let victim = outside.join("victim_note.md");
+        std::fs::write(&victim, "untouched note").expect("write victim note");
+        std::os::unix::fs::symlink(&victim, vault.join("link-note.md")).expect("symlink note");
+
+        let config = VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.clone()),
+            allowed_external_dirs: None,
+        };
+        let result = export_vault(config, store.clone()).await.expect("export");
+        assert!(!result.success);
+        assert_eq!(
+            result.notes_exported, 0,
+            "no note may be written when any destination is refused: {:?}",
+            result.errors
+        );
+        assert!(
+            result.errors.iter().any(|e| e.contains("symlink")),
+            "{:?}",
+            result.errors
+        );
+        assert!(
+            !vault.join("safe-note.md").exists(),
+            "a refused note must not leave safe notes already written"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "untouched note",
+            "symlink target must be untouched"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 }

@@ -59,7 +59,7 @@ All changes preserve namespace isolation, nested/foreign repository vetoes, exis
 - `src/graph_read/diff_tour.rs`: parses/normalizes diff paths for processing and emits user-visible stops/rules/files; session-ledger/governance path handling must be made explicit so ingestion/governance use resolved forms while supplied display paths are preserved.
 - `src/telemetry/insights.rs`, `src/server.rs`, and `src/store/ladybug.rs`: prefix filtering is tool-specific today and can silently empty on absolute prefixes / mismatched stored spellings; `neurostrata_search_memory` and `neurostrata_insights` tool schemas currently lack optional `project_root` while `locate` already accepts it.
 - CodeQL open alerts on `main@6f805d15`: `src/rdf/reasoning.rs:2687,2700` and `src/semantic_eval/competency.rs:749,750` interpolate computed values into assertion diagnostics in tests (`rust/cleartext-logging`).
-- Inventories: open issues `#266-#274` (+ excluded `#68,#264`) in `/tmp/opencode/open-issues-2026-11-18.json` and `/tmp/opencode/issue-triage-current.json`; open alerts in `/tmp/opencode/code-scanning-open-2026-11-18.json`.
+- Inventories: open issues `#266-#274` (+ excluded `#68,#264`) in `<tmp>/open-issues-2026-11-18.json` and `<tmp>/issue-triage-current.json`; open alerts in `<tmp>/code-scanning-open-2026-11-18.json`.
 
 ---
 

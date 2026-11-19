@@ -63,7 +63,14 @@ fn parse_absolute(raw: &str) -> Option<AbsPath> {
     // a Windows client spells it. Any other pair of leading separators (`//`,
     // `/\`, `\/`) is the POSIX root there.
     let lead = raw.as_bytes();
-    let posix_double_slash = !cfg!(windows)
+    // Win32 verbatim/device prefixes are absolute even though they begin with
+    // `//`; they must not be mistaken for a POSIX double slash off Windows.
+    let is_verbatim_prefix = raw.starts_with(r"\\?\")
+        || raw.starts_with(r"\\.\")
+        || raw.starts_with("//?/")
+        || raw.starts_with("//./");
+    let posix_double_slash = !is_verbatim_prefix
+        && !cfg!(windows)
         && lead.len() >= 2
         && matches!(lead[0], b'/' | b'\\')
         && matches!(lead[1], b'/' | b'\\')
@@ -368,12 +375,18 @@ pub fn to_project_relative(
             alternates: Vec::new(),
         };
     }
+    let caller_raw = raw.replace('\\', "/");
     let input = follow_parent_components(raw);
     match choose_root(&input, project_root, registry_root) {
         Some((root, rel, source)) => {
             let path = with_disk_spelling(&input, &root, rel.clone());
             let mut alternates = vec![rel.clone(), input.clone()];
             alternates.extend(parse_absolute(&input).map(|p| p.to_path_string()));
+            // A legacy memory may be stored under the caller's literal `..`
+            // spelling; keep it queryable alongside the resolved form.
+            if !caller_raw.is_empty() && caller_raw != rel && !alternates.contains(&caller_raw) {
+                alternates.push(caller_raw);
+            }
             // A broader `project_root` wins for `path`/`source`, but a deeper
             // usable registry root may hold the file under a shorter relative
             // spelling. Keep that spelling as an alternate — only when the
@@ -435,12 +448,21 @@ fn follow_parent_components(raw: &str) -> String {
     let Some(host) = host_path(raw).map(|_| PathBuf::from(raw)) else {
         return raw.to_string();
     };
-    let resolved = match host.file_name() {
-        Some(name) => host.parent().and_then(canonical).map(|dir| dir.join(name)),
-        // The path ends in `..`: it names a directory, resolve all of it.
-        None => canonical(&host),
-    };
-    resolved.map_or_else(|| raw.to_string(), |p| p.to_string_lossy().to_string())
+    // Walk existing ancestors longest-first. The OS resolves a directory
+    // symlink before `..`, so canonicalizing the longest surviving prefix
+    // pins the real parent even when a later component does not exist yet.
+    // Skip the file itself: a symlinked file keeps its own name here.
+    for ancestor in host.ancestors().skip(1) {
+        if let Some(dir) = canonical(ancestor) {
+            let tail = host
+                .strip_prefix(ancestor)
+                .unwrap_or_else(|_| Path::new(""));
+            let mut resolved = dir;
+            resolved.push(tail);
+            return resolved.to_string_lossy().to_string();
+        }
+    }
+    raw.to_string()
 }
 
 /// `rel` (the part of `path` below `root`) re-read from the filesystem when
@@ -533,11 +555,36 @@ pub fn lookup_forms(raw: &str, lookup: &LookupPath, known_root: Option<&str>) ->
     match lookup.source {
         RootSource::Outside => {}
         RootSource::Relative => {
+            let has_parent = raw.split(['/', '\\']).any(|c| c == "..");
             let joined = known_root.filter(|r| is_usable_root(r)).and_then(|root| {
-                let joined = parse_absolute(&format!("{root}/{raw}"))?.to_path_string();
+                let normalized = raw.replace('\\', "/");
+                let normalized = normalized.strip_prefix("./").unwrap_or(&normalized);
+                // Resolve `..` on disk before parsing: across a symlinked
+                // directory the lexical join names a different file.
+                let joined_raw = format!("{}/{}", root.trim_end_matches('/'), normalized);
+                let joined = if has_parent {
+                    follow_parent_components(&joined_raw)
+                } else {
+                    joined_raw
+                };
+                let joined = parse_absolute(&joined)?.to_path_string();
                 relative_to(&joined, root).map(|_| joined)
             });
-            forms.extend(joined);
+            if let Some(joined) = joined {
+                if has_parent {
+                    // The raw spelling may cross a symlink; also query the
+                    // on-disk target under its project-relative name.
+                    if let Some(rel) = known_root
+                        .filter(|r| is_usable_root(r))
+                        .and_then(|root| relative_to(&joined, root))
+                    {
+                        if rel != raw {
+                            forms.push(rel);
+                        }
+                    }
+                }
+                forms.push(joined);
+            }
         }
         RootSource::ProjectRoot | RootSource::RegistryRoot | RootSource::Marker => {
             forms.extend(lookup.alternates.iter().cloned());
@@ -697,11 +744,16 @@ pub fn lookup_forms_for_scope(
             if !is_usable_root(root) {
                 continue;
             }
-            let joined = format!(
+            let joined_raw = format!(
                 "{}/{}",
                 root.trim_end_matches('/'),
                 lookup.path.trim_start_matches('/')
             );
+            let joined = if has_parent_traversal {
+                follow_parent_components(&joined_raw)
+            } else {
+                joined_raw
+            };
             let Some(joined) = parse_absolute(&joined).map(|p| p.to_path_string()) else {
                 continue;
             };
@@ -756,17 +808,29 @@ pub fn resolve_in_scope_forms(
         {
             if reg != project {
                 let has_parent_traversal = raw.split(['/', '\\']).any(|c| c == "..");
-                let joined = format!(
+                let joined_raw = format!(
                     "{}/{}",
                     reg.trim_end_matches('/'),
                     raw.trim_start_matches('/')
                 );
+                let joined = if has_parent_traversal {
+                    follow_parent_components(&joined_raw)
+                } else {
+                    joined_raw
+                };
                 if let Some(joined) = parse_absolute(&joined).map(|p| p.to_path_string()) {
                     if (scope == PathResolutionScope::Prefix
                         && !has_parent_traversal
                         && same_location(&joined, reg))
                         || relative_to(&joined, reg).is_some()
                     {
+                        if has_parent_traversal {
+                            if let Some(rel) = relative_to(&joined, reg) {
+                                if rel != raw {
+                                    forms.push(rel);
+                                }
+                            }
+                        }
                         forms.push(joined);
                     }
                 }
@@ -1469,10 +1533,12 @@ mod tests {
         )
         .expect("in-scope prefix");
         assert_eq!(resolved.lookup.source, RootSource::ProjectRoot);
-        assert!(resolved
-            .forms
-            .iter()
-            .any(|f| f == "src/graph" || f == "src/graph/"));
+        assert!(
+            resolved
+                .forms
+                .iter()
+                .any(|f| f == "src/graph" || f == "src/graph/")
+        );
         assert!(resolved.forms.iter().any(
             |f| f == &format!("{}/src/graph", root_s) || f == &format!("{}/src/graph/", root_s)
         ));
@@ -1494,8 +1560,8 @@ mod tests {
     }
 
     #[test]
-    fn to_project_relative_retains_deeper_valid_registry_relative_alternate_when_broader_project_root_wins(
-    ) {
+    fn to_project_relative_retains_deeper_valid_registry_relative_alternate_when_broader_project_root_wins()
+     {
         let tmp = std::env::temp_dir().join("ns-v1190-alternates");
         let project = tmp.join("repo");
         let registry = project.join("platform");
@@ -1565,18 +1631,194 @@ mod tests {
         }
 
         // Foreign checkout root stays vetoed when a project_root or registry_root is configured.
-        assert!(resolve_in_scope_forms(
-            &foreign_s,
-            Some(&root_s),
-            None,
-            PathResolutionScope::Prefix,
-        )
-        .is_err());
+        assert!(
+            resolve_in_scope_forms(&foreign_s, Some(&root_s), None, PathResolutionScope::Prefix,)
+                .is_err()
+        );
 
         // File scope still rejects the root directory itself.
         assert!(
             resolve_in_scope_forms(&root_s, Some(&root_s), None, PathResolutionScope::File,)
                 .is_err()
+        );
+    }
+
+    // ---- Regression: post-merge #286 (items 1-3) and #293 ----
+
+    /// Root with `a/b`, `a/file.rs`, a same-named root `file.rs`, and `link`
+    /// symlinked to `a/b`. A lexical `..` collapse names the wrong root file.
+    #[cfg(unix)]
+    fn layout_with_symlinked_dir() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = canonical(tmp.path()).unwrap().join("repo");
+        std::fs::create_dir_all(root.join("a").join("b")).unwrap();
+        touch(&root.join("a").join("file.rs"));
+        touch(&root.join("file.rs"));
+        std::os::unix::fs::symlink(root.join("a").join("b"), root.join("link")).unwrap();
+        (tmp, root)
+    }
+
+    /// #286 item 1: the caller's own `..` spelling must stay queryable even
+    /// though `follow_parent_components` resolves the path for the primary form.
+    #[test]
+    fn caller_raw_parent_spelling_is_kept_as_an_alternate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = canonical(tmp.path()).unwrap().join("repo");
+        touch(&root.join("src").join("lib.rs"));
+        let root_s = s(&root);
+        let caller = s(&root.join("src").join("..").join("src").join("lib.rs"));
+        let lookup = to_project_relative(&caller, Some(&root_s), None);
+        assert_eq!(lookup.path, "src/lib.rs");
+        let forms = lookup_forms(&caller, &lookup, Some(&root_s));
+        assert!(forms.iter().any(|f| f == &caller), "{forms:?}");
+        assert!(forms.iter().any(|f| f == "src/lib.rs"), "{forms:?}");
+        let abs = s(&root.join("src").join("lib.rs"));
+        assert!(forms.iter().any(|f| f == &abs), "{forms:?}");
+    }
+
+    /// #286 item 2: a missing component after `..` must not defeat on-disk
+    /// symlink resolution of the prefix.
+    #[cfg(unix)]
+    #[test]
+    fn parent_traversal_before_a_missing_component_follows_the_symlink() {
+        let (_tmp, root) = layout_with_symlinked_dir();
+        let root_s = s(&root);
+        let true_rel = "a/newdir/file.rs".to_string();
+        let true_abs = s(&root.join("a").join("newdir").join("file.rs"));
+        let wrong_abs = s(&root.join("newdir").join("file.rs"));
+        let wrong_rel = "newdir/file.rs".to_string();
+        assert!(!root.join("newdir").exists());
+
+        let raws = [
+            s(&root.join("link").join("..").join("newdir").join("file.rs")),
+            s(Path::new("link/../newdir/file.rs")),
+        ];
+        for raw in raws {
+            let resolved =
+                resolve_in_scope_forms(&raw, Some(&root_s), None, PathResolutionScope::File)
+                    .unwrap();
+            assert!(
+                resolved.forms.contains(&true_rel),
+                "{raw}: {:?}",
+                resolved.forms
+            );
+            assert!(
+                resolved.forms.contains(&true_abs),
+                "{raw}: {:?}",
+                resolved.forms
+            );
+            assert!(
+                !resolved.forms.contains(&wrong_rel) && !resolved.forms.contains(&wrong_abs),
+                "the collapsed spelling names another file: {raw}: {:?}",
+                resolved.forms
+            );
+        }
+    }
+
+    /// #286 item 3: forward-slash verbatim prefixes are stripped on every host.
+    #[test]
+    fn forward_slash_verbatim_prefixes_strip_on_every_host() {
+        for path in ["//?/C:/repo/src/lib.rs", "//./C:/repo/src/lib.rs"] {
+            assert_eq!(
+                relative_to(path, "C:/repo").as_deref(),
+                Some("src/lib.rs"),
+                "{path}"
+            );
+        }
+        let verbatim_unc = "//?/UNC/server/share/repo/src/lib.rs";
+        let parsed = parse_absolute(verbatim_unc).unwrap();
+        assert!(parsed.windows);
+        assert_eq!(parsed.root, "//server/share");
+        assert_eq!(parsed.parts, ["repo", "src", "lib.rs"]);
+        // A UNC root is spelled with backslashes for a cross-host lookup: a
+        // leading `//` is the POSIX root off Windows by design (#269).
+        assert_eq!(
+            relative_to(verbatim_unc, r"\\server\share\repo").as_deref(),
+            Some("src/lib.rs")
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            relative_to(verbatim_unc, "//server/share/repo").as_deref(),
+            Some("src/lib.rs")
+        );
+        assert_eq!(
+            relative_to(r"\\?\C:\repo\src\lib.rs", "C:/repo").as_deref(),
+            Some("src/lib.rs")
+        );
+        // A non-verbatim leading `//` is still host-native.
+        #[cfg(not(windows))]
+        {
+            let parsed = parse_absolute("//work/src/lib.rs").unwrap();
+            assert!(!parsed.windows);
+            assert_eq!(parsed.to_path_string(), "/work/src/lib.rs");
+        }
+        #[cfg(windows)]
+        {
+            let parsed = parse_absolute("//work/src/lib.rs").unwrap();
+            assert!(parsed.windows);
+            assert_eq!(parsed.root, "//work/src");
+        }
+    }
+
+    /// #293: a relative `..` that crosses a symlinked directory names the
+    /// on-disk target, never the lexical sibling. Both `lookup_forms` and
+    /// `resolve_in_scope_forms` must agree.
+    #[cfg(unix)]
+    #[test]
+    fn relative_parent_traversal_follows_a_symlinked_directory() {
+        let (_tmp, root) = layout_with_symlinked_dir();
+        let root_s = s(&root);
+        let rel = "link/../file.rs";
+        let true_rel = "a/file.rs".to_string();
+        let true_abs = s(&root.join("a").join("file.rs"));
+        let wrong_rel = "file.rs".to_string();
+        let wrong_abs = s(&root.join("file.rs"));
+
+        let lookup = to_project_relative(rel, Some(&root_s), None);
+        assert_eq!(lookup.source, RootSource::Relative);
+        let forms = lookup_forms(rel, &lookup, Some(&root_s));
+        assert!(forms.contains(&true_rel), "{forms:?}");
+        assert!(forms.contains(&true_abs), "{forms:?}");
+        assert!(!forms.contains(&wrong_rel), "{forms:?}");
+        assert!(!forms.contains(&wrong_abs), "{forms:?}");
+
+        let resolved =
+            resolve_in_scope_forms(rel, Some(&root_s), None, PathResolutionScope::File).unwrap();
+        assert!(resolved.forms.contains(&true_rel), "{:?}", resolved.forms);
+        assert!(resolved.forms.contains(&true_abs), "{:?}", resolved.forms);
+        assert!(!resolved.forms.contains(&wrong_rel), "{:?}", resolved.forms);
+        assert!(!resolved.forms.contains(&wrong_abs), "{:?}", resolved.forms);
+
+        std::fs::create_dir_all(root.join("a").join("src")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let rel_prefix = "link/../src";
+        let true_prefix_rel = "a/src".to_string();
+        let true_prefix_abs = s(&root.join("a").join("src"));
+        let wrong_prefix_rel = "src".to_string();
+        let wrong_prefix_abs = s(&root.join("src"));
+
+        let resolved_prefix =
+            resolve_in_scope_forms(rel_prefix, Some(&root_s), None, PathResolutionScope::Prefix)
+                .unwrap();
+        assert!(
+            resolved_prefix.forms.contains(&true_prefix_rel),
+            "{:?}",
+            resolved_prefix.forms
+        );
+        assert!(
+            resolved_prefix.forms.contains(&true_prefix_abs),
+            "{:?}",
+            resolved_prefix.forms
+        );
+        assert!(
+            !resolved_prefix.forms.contains(&wrong_prefix_rel),
+            "{:?}",
+            resolved_prefix.forms
+        );
+        assert!(
+            !resolved_prefix.forms.contains(&wrong_prefix_abs),
+            "{:?}",
+            resolved_prefix.forms
         );
     }
 }

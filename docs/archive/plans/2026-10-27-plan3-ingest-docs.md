@@ -48,4 +48,4 @@
 ## Execution Handoff
 Plan complete. Execute natively? (recommended)
 "", "path">
-/home/kenton/Documents/NeuroStrata/docs/superpowers/plans/2026-10-27-plan3-ingest-docs.md
+docs/superpowers/plans/2026-10-27-plan3-ingest-docs.md

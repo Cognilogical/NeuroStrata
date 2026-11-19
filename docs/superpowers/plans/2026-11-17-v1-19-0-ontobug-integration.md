@@ -16,16 +16,16 @@
 ### Task 1: Create Workspace Crate `crates/ontobug` Aligned to `lbug = "0.22.3"` & Shared `Arc<Database>`
 
 **Files:**
-- Modify: `/home/kenton/.local/share/opencode/worktree/1ebe42/feat-kinetic-actions/Cargo.toml`
-- Create: `/home/kenton/.local/share/opencode/worktree/1ebe42/feat-kinetic-actions/crates/ontobug/Cargo.toml`
-- Create: `/home/kenton/.local/share/opencode/worktree/1ebe42/feat-kinetic-actions/crates/ontobug/LICENSE-MIT`
-- Create: `/home/kenton/.local/share/opencode/worktree/1ebe42/feat-kinetic-actions/crates/ontobug/LICENSE-APACHE`
-- Create: `/home/kenton/.local/share/opencode/worktree/1ebe42/feat-kinetic-actions/crates/ontobug/src/lib.rs`
-- Create: `/home/kenton/.local/share/opencode/worktree/1ebe42/feat-kinetic-actions/crates/ontobug/src/error.rs`
-- Create: `/home/kenton/.local/share/opencode/worktree/1ebe42/feat-kinetic-actions/crates/ontobug/src/registry.rs`
-- Create: `/home/kenton/.local/share/opencode/worktree/1ebe42/feat-kinetic-actions/crates/ontobug/src/ladybug.rs`
-- Create: `/home/kenton/.local/share/opencode/worktree/1ebe42/feat-kinetic-actions/crates/ontobug/src/catalog.rs`
-- Create: `/home/kenton/.local/share/opencode/worktree/1ebe42/feat-kinetic-actions/crates/ontobug/src/validate.rs`
+- Modify: `Cargo.toml`
+- Create: `crates/ontobug/Cargo.toml`
+- Create: `crates/ontobug/LICENSE-MIT`
+- Create: `crates/ontobug/LICENSE-APACHE`
+- Create: `crates/ontobug/src/lib.rs`
+- Create: `crates/ontobug/src/error.rs`
+- Create: `crates/ontobug/src/registry.rs`
+- Create: `crates/ontobug/src/ladybug.rs`
+- Create: `crates/ontobug/src/catalog.rs`
+- Create: `crates/ontobug/src/validate.rs`
 
 **Steps:**
 1. Add `"crates/ontobug"` to `[workspace].members` and `ontobug = { path = "crates/ontobug" }` to `[dependencies]` in root `Cargo.toml`. Also bump `version = "1.19.0"` in root `Cargo.toml`.
@@ -39,13 +39,13 @@
 ### Task 2: Normalize Embedded `.ttl` Shapes & Wire `ontobug` into `src/rdf/shacl.rs`, `src/rdf/ontology.rs`, and `src/store/ladybug.rs`
 
 **Files:**
-- Modify: `/home/kenton/.local/share/opencode/worktree/1ebe42/feat-kinetic-actions/src/schemas/shacl/memory-shapes.v1.ttl`
-- Modify: `/home/kenton/.local/share/opencode/worktree/1ebe42/feat-kinetic-actions/src/schemas/shacl/fact.ttl`
-- Modify: `/home/kenton/.local/share/opencode/worktree/1ebe42/feat-kinetic-actions/src/schemas/shacl/attempt-shapes.v1.ttl`
-- Modify: `/home/kenton/.local/share/opencode/worktree/1ebe42/feat-kinetic-actions/src/schemas/shacl/multimodal-shapes.v1.ttl`
-- Modify: `/home/kenton/.local/share/opencode/worktree/1ebe42/feat-kinetic-actions/src/rdf/shacl.rs`
-- Modify: `/home/kenton/.local/share/opencode/worktree/1ebe42/feat-kinetic-actions/src/rdf/ontology.rs`
-- Modify: `/home/kenton/.local/share/opencode/worktree/1ebe42/feat-kinetic-actions/src/store/ladybug.rs`
+- Modify: `src/schemas/shacl/memory-shapes.v1.ttl`
+- Modify: `src/schemas/shacl/fact.ttl`
+- Modify: `src/schemas/shacl/attempt-shapes.v1.ttl`
+- Modify: `src/schemas/shacl/multimodal-shapes.v1.ttl`
+- Modify: `src/rdf/shacl.rs`
+- Modify: `src/rdf/ontology.rs`
+- Modify: `src/store/ladybug.rs`
 
 **Steps:**
 1. Fix W3C SHACL-Core compliance in the 4 embedded `.ttl` files:
@@ -69,8 +69,8 @@
 ### Task 3: Update Version & Documentation (`v1.19.0`) and Run Independent Verification (`checker-free` + `reviewer`)
 
 **Files:**
-- Modify: `/home/kenton/.local/share/opencode/worktree/1ebe42/feat-kinetic-actions/CHANGELOG.md`
-- Modify: `/home/kenton/.local/share/opencode/worktree/1ebe42/feat-kinetic-actions/docs/` (if needed for Doc-Sync Gate)
+- Modify: `CHANGELOG.md`
+- Modify: `docs/` (if needed for Doc-Sync Gate)
 
 **Steps:**
 1. Update `CHANGELOG.md` with the `[1.19.0]` release entry covering the `LadybugDB/ontobug` + `rudof` RDF/OWL/SHACL/ShEx integration, the LadybugDB ecosystem audit, the Bidirectional Doc-Sync Gate, and Zero-Config Workflow Connectors.
