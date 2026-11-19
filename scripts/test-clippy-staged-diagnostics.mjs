@@ -348,6 +348,85 @@ test('runner-style --staged with several paths catches a diagnostic in the secon
   assert.match(res.stdout, /warning: something/)
 })
 
+test('dep-info coverage distinguishes built and unbuilt staged Rust files', async () => {
+  const { findUnbuiltStagedRustFiles } = await import(
+    './clippy-staged-diagnostics.mjs'
+  )
+  assert.equal(typeof findUnbuiltStagedRustFiles, 'function')
+  const deps = [
+    'target/debug/deps/main.d: /repo/src/main.rs /repo/src/lib.rs',
+    'target/debug/deps/tool.d:/repo/src/bin/tool.rs'
+  ]
+  assert.deepEqual(
+    findUnbuiltStagedRustFiles(deps, '/repo', [
+      'src/main.rs',
+      'src/lib.rs',
+      'src/bin/tool.rs',
+      'Cargo.toml'
+    ]),
+    []
+  )
+  assert.deepEqual(
+    findUnbuiltStagedRustFiles(deps, '/repo', [
+      'src/main.rs',
+      'fixtures/input.rs'
+    ]),
+    ['fixtures/input.rs']
+  )
+})
+
+test('dep-info coverage handles escaped spaces and symlinked roots', async () => {
+  const { findUnbuiltStagedRustFiles } = await import(
+    './clippy-staged-diagnostics.mjs'
+  )
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'clippy-dep-info-'))
+  const realRoot = path.join(dir, 'real')
+  fs.mkdirSync(path.join(realRoot, 'src'), { recursive: true })
+  fs.writeFileSync(path.join(realRoot, 'src', 'a b.rs'), 'fn a() {}\n')
+  const linkRoot = path.join(dir, 'link')
+  fs.symlinkSync(realRoot, linkRoot)
+  const deps = [
+    `target/debug/deps/a.d: ${realRoot}/src/a\\ b.rs`
+  ]
+  assert.deepEqual(
+    findUnbuiltStagedRustFiles(deps, linkRoot, ['src/a b.rs']),
+    []
+  )
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('CLI dep-info rejects unbuilt staged Rust and preserves diagnostics', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'clippy-dep-cli-'))
+  const depRoot = path.join(dir, 'target')
+  fs.mkdirSync(path.join(depRoot, 'debug', 'deps'), { recursive: true })
+  fs.writeFileSync(
+    path.join(depRoot, 'debug', 'deps', 'main.d'),
+    `${dir}/target/debug/deps/main: ${dir}/src/main.rs\n`
+  )
+  const common = ['--root', dir, '--dep-info-root', depRoot, '--staged']
+  const clean = runFilter({
+    input: '',
+    args: [...common, 'src/main.rs']
+  })
+  assert.equal(clean.status, 0)
+
+  const unbuilt = runFilter({
+    input: '',
+    args: [...common, 'src/main.rs', 'fixtures/input.rs']
+  })
+  assert.equal(unbuilt.status, 1)
+  assert.match(unbuilt.stderr, /fixtures\/input\.rs.*not.*build/i)
+
+  const both = runFilter({
+    input: JSON.stringify(diag({ file: `${dir}/src/main.rs` })),
+    args: [...common, 'src/main.rs', 'fixtures/input.rs']
+  })
+  assert.equal(both.status, 1)
+  assert.match(both.stdout, /warning: something/)
+  assert.match(both.stderr, /fixtures\/input\.rs.*not.*build/i)
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
 test('symlinked CLI path still runs main (exit 1)', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'clippy-symlink-'))
   const link = path.join(dir, 'filter-link.mjs')

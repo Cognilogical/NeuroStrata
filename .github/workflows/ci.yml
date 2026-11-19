@@ -198,6 +198,10 @@ jobs:
           chmod +x "$HOME/.cargo/bin/kani"
           NEUROSTRATA_REQUIRE_KANI=1 bash proofs/scripts/extract-aeneas.sh
 
+      - name: Kani mutation checks must reject all six broken kernels
+        shell: bash
+        run: NEUROSTRATA_REQUIRE_KANI=1 bash scripts/kani-mutation-check.sh
+
       - name: Test
         shell: bash
         run: cargo test --locked -- --test-threads=1
@@ -311,6 +315,14 @@ jobs:
       - name: Backup script tests
         shell: bash
         run: bash scripts/test-backup.sh
+
+      - name: Staged-quality integration fixtures
+        shell: bash
+        run: bash scripts/test-staged-quality.sh
+
+      - name: Clippy staged-diagnostic fixtures
+        shell: bash
+        run: node scripts/test-clippy-staged-diagnostics.mjs
 
       - name: Gate receipt self-test
         shell: bash

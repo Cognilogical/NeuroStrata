@@ -1875,9 +1875,21 @@ pub const fn verify_certificate_chain_slices(
     }
     let mut i = 0usize;
     while i < step_count {
-        let rv = if i < rule_validity.len() { rule_validity[i] } else { false };
-        let pc = if i < premise_count_ok.len() { premise_count_ok[i] } else { false };
-        let cc = if i < chain_continuity.len() { chain_continuity[i] } else { false };
+        let rv = if i < rule_validity.len() {
+            rule_validity[i]
+        } else {
+            false
+        };
+        let pc = if i < premise_count_ok.len() {
+            premise_count_ok[i]
+        } else {
+            false
+        };
+        let cc = if i < chain_continuity.len() {
+            chain_continuity[i]
+        } else {
+            false
+        };
         if !rv {
             return KernelCertVerdict::UnknownRule;
         }
@@ -2241,9 +2253,112 @@ pub const fn classify_epistemic_status(
     }
 }
 
-/// Deterministic iterative reachability over a directed edge slice (`start ->+ target`).
-/// Free of `HashMap`/`HashSet` OS-seeded `RandomState` and heap allocation for `<= 64` edges
-/// so CBMC/Kani and Aeneas can model-check it in milliseconds (`neurostrata-zbe7`).
+#[cfg(not(kani))]
+struct TaxonomyGraph {
+    indices: std::collections::BTreeMap<u32, usize>,
+    adjacency: Vec<Vec<usize>>,
+}
+
+#[cfg(not(kani))]
+impl TaxonomyGraph {
+    fn new(edges: &[(u32, u32)]) -> Self {
+        let mut indices = std::collections::BTreeMap::new();
+        for &(u, v) in edges {
+            for node in [u, v] {
+                if !indices.contains_key(&node) {
+                    let next = indices.len();
+                    indices.insert(node, next);
+                }
+            }
+        }
+        let mut adjacency = vec![Vec::new(); indices.len()];
+        for &(u, v) in edges {
+            adjacency[indices[&u]].push(indices[&v]);
+        }
+        Self { indices, adjacency }
+    }
+
+    fn is_valid_dag(&self, edges: &[(u32, u32)]) -> bool {
+        if edges.iter().any(|&(u, v)| u == v) {
+            return false;
+        }
+        let mut indegree = vec![0usize; self.indices.len()];
+        for &(u, v) in edges {
+            indegree[self.indices[&v]] += 1;
+            let _ = u;
+        }
+        let mut queue: Vec<usize> = indegree
+            .iter()
+            .enumerate()
+            .filter_map(|(node, &degree)| if degree == 0 { Some(node) } else { None })
+            .collect();
+        let mut processed = 0usize;
+        while processed < queue.len() {
+            let node = queue[processed];
+            processed += 1;
+            for &next in &self.adjacency[node] {
+                indegree[next] -= 1;
+                if indegree[next] == 0 {
+                    queue.push(next);
+                }
+            }
+        }
+        processed == self.indices.len()
+    }
+
+    fn is_reachable(&self, start: u32, target: u32) -> bool {
+        let (Some(&start), Some(&target)) = (self.indices.get(&start), self.indices.get(&target))
+        else {
+            return false;
+        };
+        let mut visited = vec![false; self.indices.len()];
+        let mut queue = vec![start];
+        visited[start] = true;
+        let mut head = 0usize;
+        while head < queue.len() {
+            let node = queue[head];
+            head += 1;
+            for &next in &self.adjacency[node] {
+                if next == target {
+                    return true;
+                }
+                if !visited[next] {
+                    visited[next] = true;
+                    queue.push(next);
+                }
+            }
+        }
+        false
+    }
+}
+
+/// Validates that `broader_edges` form a DAG in O(V + E).
+#[cfg(not(kani))]
+pub fn validate_taxonomy_dag(broader_edges: &[(u32, u32)]) -> bool {
+    TaxonomyGraph::new(broader_edges).is_valid_dag(broader_edges)
+}
+
+/// Validates SKOS disjointness against the transitive broader hierarchy.
+#[cfg(not(kani))]
+pub fn validate_skos_disjointness(
+    broader_edges: &[(u32, u32)],
+    related_edges: &[(u32, u32)],
+    contrast_edges: &[(u32, u32)],
+) -> bool {
+    let graph = TaxonomyGraph::new(broader_edges);
+    if !graph.is_valid_dag(broader_edges) {
+        return false;
+    }
+    for &(u, v) in related_edges.iter().chain(contrast_edges) {
+        if u == v || graph.is_reachable(u, v) || graph.is_reachable(v, u) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Deterministic bounded reachability used by Kani proofs.
+#[cfg(kani)]
 fn is_reachable_in_edges(edges: &[(u32, u32)], start: u32, target: u32) -> bool {
     #[cfg(kani)]
     const CAP: usize = 8;
@@ -2309,7 +2424,8 @@ fn is_reachable_in_edges(edges: &[(u32, u32)], start: u32, target: u32) -> bool 
     false
 }
 
-/// Validates that `broader_edges` form a DAG (no self-loops, no cycles).
+/// Validates the bounded DAG semantics exercised by Kani.
+#[cfg(kani)]
 pub fn validate_taxonomy_dag(broader_edges: &[(u32, u32)]) -> bool {
     let mut i = 0;
     while i < broader_edges.len() {
@@ -2322,8 +2438,8 @@ pub fn validate_taxonomy_dag(broader_edges: &[(u32, u32)]) -> bool {
     true
 }
 
-/// Validates SKOS disjointness: related/contrast edges must not overlap with
-/// transitive broader hierarchy in either direction.
+/// Validates bounded SKOS disjointness semantics for Kani.
+#[cfg(kani)]
 pub fn validate_skos_disjointness(
     broader_edges: &[(u32, u32)],
     related_edges: &[(u32, u32)],
@@ -2582,6 +2698,31 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_taxonomy_dag_duplicate_and_disconnected_edges() {
+        assert!(validate_taxonomy_dag(&[(1, 2), (1, 2), (10, 11)]));
+        assert!(!validate_taxonomy_dag(&[
+            (1, 2),
+            (1, 2),
+            (10, 11),
+            (11, 12),
+            (12, 10),
+        ]));
+        assert!(validate_taxonomy_dag(&[]));
+    }
+
+    #[test]
+    fn test_validate_taxonomy_dag_long_chain_is_linear() {
+        let edges: Vec<(u32, u32)> = (0..2_000).map(|n| (n, n + 1)).collect();
+        let start = std::time::Instant::now();
+        assert!(validate_taxonomy_dag(&edges));
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(500),
+            "2,000-edge DAG validation regressed to quadratic reachability: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
     fn test_validate_skos_disjointness() {
         // direct overlap broader == related -> violation -> false
         assert!(!validate_skos_disjointness(&[(0, 1)], &[(0, 1)], &[]));
@@ -2608,6 +2749,17 @@ mod tests {
             &[(0, 1), (1, 2)],
             &[],
             &[(0, 2)]
+        ));
+        // Reverse transitive contrast and unknown endpoint IDs.
+        assert!(!validate_skos_disjointness(
+            &[(0, 1), (1, 2)],
+            &[],
+            &[(2, 0)]
+        ));
+        assert!(validate_skos_disjointness(
+            &[(0, 1), (1, 2)],
+            &[(90, 91)],
+            &[(92, 93)]
         ));
     }
 

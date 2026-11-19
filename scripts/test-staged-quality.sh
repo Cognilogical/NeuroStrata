@@ -30,6 +30,16 @@ RUSTFMT_EOF
 #!/usr/bin/env bash
 echo "cargo $*" >> "$FAKE_TOOL_LOG"
 if [[ "$*" == *"clippy"* ]] && [[ "$*" == *"--message-format=json"* ]]; then
+    mkdir -p "$CARGO_TARGET_DIR/debug/deps"
+    {
+        printf 'fake-target:'
+        while IFS= read -r -d '' file; do
+            file=${file#./}
+            escaped=${file// /\\ }
+            printf ' %s/%s' "$PWD" "$escaped"
+        done < <(find . -type f -name '*.rs' -print0)
+        printf '\n'
+    } > "$CARGO_TARGET_DIR/debug/deps/fake.d"
     echo '{"reason":"compiler-message","message":{"spans":[{"file_name":"src/unstaged.rs","is_primary":true}],"message":"warning: unused variable","code":{"code":"unused_variables"},"level":"warning","rendered":"warning: unused variable: `y`\n --> src/unstaged.rs:1:10\n"}}'
     exit 0
 fi
@@ -628,11 +638,8 @@ E_EOF
 
     PATH="$bindir:$PATH" bash "$SCRIPT_PATH" > "$tmpdir/out.log" 2>&1
     local exit_code=$?
-    local expected_cwd
-    expected_cwd=$(cd "$repo/web-ui" && pwd -P)
-
     [ $exit_code -eq 0 ] || { echo "Expected exit 0, got $exit_code" >&2; cat "$tmpdir/out.log" >&2; return 1; }
-    grep -Fxq "$expected_cwd" "$ESLINT_LOG" || { echo "ESLint cwd was not \$ROOT/web-ui (expected $expected_cwd)" >&2; cat "$ESLINT_LOG" >&2; return 1; }
+    grep -Eq '/tree/web-ui$' "$ESLINT_LOG" || { echo "ESLint cwd was not the staged snapshot web-ui" >&2; cat "$ESLINT_LOG" >&2; return 1; }
     grep -Fxq "ARG:src/a file.ts" "$ESLINT_LOG" || { echo "ESLint did not receive web-ui-relative 'src/a file.ts' as one arg" >&2; cat "$ESLINT_LOG" >&2; return 1; }
     ! grep -q "ARG:src/b.js" "$ESLINT_LOG" || { echo "ESLint received non-web-ui src/b.js" >&2; cat "$ESLINT_LOG" >&2; return 1; }
     ! grep -q "ARG:web-ui/src/a file.ts" "$ESLINT_LOG" || { echo "ESLint received non-relative web-ui/ prefix" >&2; cat "$ESLINT_LOG" >&2; return 1; }
@@ -874,41 +881,185 @@ RF_EOF
     return 0
 }
 
-# Test 18: Staged content that diverges from the worktree fails closed
-test_staged_worktree_divergence_fails() {
-    local tmpdir
-    tmpdir=$(mktemp -d)
-    local repo="$tmpdir/repo"
-    local bindir="$tmpdir/bin"
-    export FAKE_TOOL_LOG="$tmpdir/tool.log"
-
+# Tests 18-19: tools consume staged blobs, never divergent worktree content
+setup_partial_staging_repo() {
+    local repo="$1"
+    local bindir="$2"
     setup_fake_tools "$bindir"
+    cat > "$bindir/rustfmt" <<'RF_EOF'
+#!/usr/bin/env bash
+echo "rustfmt $*" >> "$FAKE_TOOL_LOG"
+for file; do
+    if [ -f "$file" ] && grep -q 'let x=1' "$file"; then
+        echo "unformatted staged Rust" >&2
+        exit 1
+    fi
+done
+exit 0
+RF_EOF
+    chmod +x "$bindir/rustfmt"
     mkdir -p "$repo/src"
-    printf 'fn main(){let x=1;}\n' > "$repo/src/main.rs"
+    cd "$repo"
+    git init -q
+    git config user.email "test@test.com"
+    git config user.name "Test"
+}
+
+test_bad_staged_rust_fails_despite_formatted_worktree() {
+    local tmpdir repo bindir exit_code
+    tmpdir=$(mktemp -d)
+    repo="$tmpdir/repo"
+    bindir="$tmpdir/bin"
+    export FAKE_TOOL_LOG="$tmpdir/tool.log"
+    setup_partial_staging_repo "$repo" "$bindir"
+    printf 'fn main(){let x=1;}\n' > src/main.rs
+    git add src/main.rs
+    printf 'fn main() {\n    let x = 1;\n}\n' > src/main.rs
+
+    PATH="$bindir:$PATH" bash "$SCRIPT_PATH" > "$tmpdir/out.log" 2>&1
+    exit_code=$?
+    [ $exit_code -ne 0 ] || { echo "Bad staged blob passed behind formatted worktree" >&2; cd - >/dev/null; return 1; }
+    grep -q "unformatted staged Rust" "$tmpdir/out.log" || { echo "Rustfmt did not read staged blob" >&2; cd - >/dev/null; return 1; }
+    cd - >/dev/null
+    rm -rf "$tmpdir"
+}
+
+test_good_staged_rust_passes_despite_bad_worktree() {
+    local tmpdir repo bindir exit_code
+    tmpdir=$(mktemp -d)
+    repo="$tmpdir/repo"
+    bindir="$tmpdir/bin"
+    export FAKE_TOOL_LOG="$tmpdir/tool.log"
+    setup_partial_staging_repo "$repo" "$bindir"
+    printf 'fn main() {\n    let x = 1;\n}\n' > src/main.rs
+    git add src/main.rs
+    printf 'fn main(){let x=1;}\n' > src/main.rs
+
+    PATH="$bindir:$PATH" bash "$SCRIPT_PATH" > "$tmpdir/out.log" 2>&1
+    exit_code=$?
+    [ $exit_code -eq 0 ] || { echo "Good staged blob rejected due to worktree content" >&2; cat "$tmpdir/out.log" >&2; cd - >/dev/null; return 1; }
+    cd - >/dev/null
+    rm -rf "$tmpdir"
+}
+
+# Test 20: extensionless staged Bash hooks are syntax-checked and shellchecked
+test_extensionless_bash_hook_is_checked() {
+    local tmpdir repo bindir exit_code
+    tmpdir=$(mktemp -d)
+    repo="$tmpdir/repo"
+    bindir="$tmpdir/bin"
+    export FAKE_TOOL_LOG="$tmpdir/tool.log"
+    setup_fake_tools "$bindir"
+    cat > "$bindir/shellcheck" <<'SC_EOF'
+#!/usr/bin/env bash
+echo "shellcheck $*" >> "$FAKE_TOOL_LOG"
+for file; do
+    if [ -f "$file" ] && grep -q 'echo $unquoted' "$file"; then
+        echo "SC2086: quote staged hook expansion" >&2
+        exit 1
+    fi
+done
+exit 0
+SC_EOF
+    chmod +x "$bindir/shellcheck"
+    mkdir -p "$repo/hooks"
+    # shellcheck disable=SC2016  # fixture intentionally contains an unquoted expansion
+    printf '#!/usr/bin/env bash\necho $unquoted\n' > "$repo/hooks/pre-commit"
+    chmod +x "$repo/hooks/pre-commit"
+    cd "$repo"
+    git init -q
+    git config user.email "test@test.com"
+    git config user.name "Test"
+    git add hooks/pre-commit
+
+    PATH="$bindir:$PATH" bash "$SCRIPT_PATH" > "$tmpdir/out.log" 2>&1
+    exit_code=$?
+    [ $exit_code -ne 0 ] || { echo "Extensionless Bash hook skipped ShellCheck" >&2; cd - >/dev/null; return 1; }
+    grep -q "hooks/pre-commit" "$FAKE_TOOL_LOG" || { echo "Hook was not passed to ShellCheck" >&2; cd - >/dev/null; return 1; }
+    cd - >/dev/null
+    rm -rf "$tmpdir"
+}
+# Test 21: staged Rust with no Cargo dep-info is not silently skipped
+test_unbuilt_staged_rust_fails() {
+    local tmpdir repo bindir exit_code
+    tmpdir=$(mktemp -d)
+    repo="$tmpdir/repo"
+    bindir="$tmpdir/bin"
+    export FAKE_TOOL_LOG="$tmpdir/tool.log"
+    setup_fake_tools "$bindir"
+    cat > "$bindir/cargo" <<'CARGO_EOF'
+#!/usr/bin/env bash
+echo "cargo $*" >> "$FAKE_TOOL_LOG"
+exit 0
+CARGO_EOF
+    chmod +x "$bindir/cargo"
+    mkdir -p "$repo/src" "$repo/fixtures"
+    printf 'fn main() {}\n' > "$repo/src/main.rs"
+    printf 'fn fixture() {}\n' > "$repo/fixtures/input.rs"
+    cd "$repo"
+    git init -q
+    git config user.email "test@test.com"
+    git config user.name "Test"
+    git add src/main.rs fixtures/input.rs
+
+    PATH="$bindir:$PATH" bash "$SCRIPT_PATH" > "$tmpdir/out.log" 2>&1
+    exit_code=$?
+    [ $exit_code -ne 0 ] || { echo "Unbuilt staged Rust was silently skipped" >&2; cd - >/dev/null; return 1; }
+    grep -q "fixtures/input.rs" "$tmpdir/out.log" || { echo "Missing unbuilt Rust diagnostic" >&2; cat "$tmpdir/out.log" >&2; cd - >/dev/null; return 1; }
+    cd - >/dev/null
+    rm -rf "$tmpdir"
+}
+
+# Test 22: quality and mutation regressions execute as blocking CI steps
+test_quality_suites_are_wired_into_ci() {
+    local workflow="$REPO_ROOT/.github/workflows/ci.yml"
+    local command
+    for command in \
+        "bash scripts/test-staged-quality.sh" \
+        "node scripts/test-clippy-staged-diagnostics.mjs" \
+        "NEUROSTRATA_REQUIRE_KANI=1 bash scripts/kani-mutation-check.sh"
+    do
+        grep -Fq -- "run: $command" "$workflow" || {
+            echo "Missing blocking CI step: $command" >&2
+            return 1
+        }
+        if grep -F -A3 -- "run: $command" "$workflow" | grep -q 'continue-on-error'; then
+            echo "Quality step is report-only: $command" >&2
+            return 1
+        fi
+    done
+}
+
+# Test 23: repo-local tools stay reachable after entering the staged snapshot
+test_local_rustfmt_survives_snapshot_cwd() {
+    local tmpdir repo bindir exit_code
+    tmpdir=$(mktemp -d)
+    repo="$tmpdir/repo"
+    bindir="$tmpdir/bin"
+    export FAKE_TOOL_LOG="$tmpdir/tool.log"
+    setup_fake_tools "$bindir"
+    mkdir -p "$repo/src" "$repo/node_modules/.bin"
+    cat > "$repo/node_modules/.bin/rustfmt" <<'RUSTFMT_EOF'
+#!/usr/bin/env bash
+echo "local-rustfmt $*" >> "$FAKE_TOOL_LOG"
+exit 0
+RUSTFMT_EOF
+    chmod +x "$repo/node_modules/.bin/rustfmt"
+    printf 'fn main() {}\n' > "$repo/src/main.rs"
     cd "$repo"
     git init -q
     git config user.email "test@test.com"
     git config user.name "Test"
     git add src/main.rs
 
-    # Same index, different worktree: the staged blob is unformatted.
-    printf 'fn main() {\n    let x = 1;\n}\n' > src/main.rs
-
     PATH="$bindir:$PATH" bash "$SCRIPT_PATH" > "$tmpdir/out.log" 2>&1
-    local exit_code=$?
-
-    [ $exit_code -ne 0 ] || { echo "Expected nonzero exit when worktree differs from index" >&2; cat "$tmpdir/out.log" >&2; return 1; }
-    grep -q "staged content differs" "$tmpdir/out.log" || { echo "Missing divergence diagnostic" >&2; cat "$tmpdir/out.log" >&2; return 1; }
-    if grep -q "rustfmt" "$FAKE_TOOL_LOG" 2>/dev/null; then
-        echo "rustfmt ran on diverging content" >&2
-        cat "$FAKE_TOOL_LOG" >&2
-        return 1
-    fi
-
+    exit_code=$?
+    [ $exit_code -eq 0 ] || { echo "Repo-local rustfmt was not resolved from the original root" >&2; cat "$tmpdir/out.log" >&2; cd - >/dev/null; return 1; }
+    grep -Fq "local-rustfmt --edition 2021" "$FAKE_TOOL_LOG" || { echo "Repo-local rustfmt was not called" >&2; cd - >/dev/null; return 1; }
     cd - >/dev/null
     rm -rf "$tmpdir"
-    return 0
 }
+
 run_test "Staged routing table" test_staged_routing
 run_test "Whitespace-safe arguments" test_whitespace_safe_args
 run_test "Deleted and internal filtering" test_deleted_and_internal_filtering
@@ -926,7 +1077,12 @@ run_test "ESLint cwd and web-ui-relative args" test_eslint_cwd_and_args
 run_test "Pre-commit delegation quality failure nonzero, ledger unchanged" test_pre_commit_hook_delegation_quality_failure_propagates_nonzero_ledger_unchanged
 run_test "Pre-commit delegation quality success preserves ledger" test_pre_commit_hook_delegation_quality_success_preserves_ledger
 run_test "Pre-commit delegation absent quality script generic ledger" test_pre_commit_hook_delegation_absent_quality_script
-run_test "Staged/worktree divergence fails closed" test_staged_worktree_divergence_fails
+run_test "Bad staged Rust fails despite formatted worktree" test_bad_staged_rust_fails_despite_formatted_worktree
+run_test "Good staged Rust passes despite bad worktree" test_good_staged_rust_passes_despite_bad_worktree
+run_test "Extensionless Bash hook is checked" test_extensionless_bash_hook_is_checked
+run_test "Unbuilt staged Rust fails" test_unbuilt_staged_rust_fails
+run_test "Quality suites are wired into CI" test_quality_suites_are_wired_into_ci
+run_test "Local Rustfmt survives snapshot cwd" test_local_rustfmt_survives_snapshot_cwd
 
 echo ""
 echo "=== Summary ==="

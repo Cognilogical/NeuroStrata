@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # Staged quality runner: checks staged files for formatting and lint compliance.
 # Called by the pre-commit hook. Exits 0 only when all relevant checks pass.
-# Validates committed content: refuses to run when a staged blob differs from its
-# working-tree file, because every check reads the working tree. This keeps a
-# stale worktree from masking a bad staged blob. Never writes project files or
+# Validates committed content in a temporary full-index checkout, so partially
+# staged files are checked exactly as committed. Never writes project files or
 # the Git index.
 set -euo pipefail
 
@@ -22,9 +21,23 @@ while IFS= read -r -d '' file; do
     StagedFiles+=("$file")
 done < <(git diff --cached --name-only --diff-filter=ACMR -z 2>/dev/null)
 
+CHECK_ROOT="$ROOT"
+if [ ${#StagedFiles[@]} -gt 0 ]; then
+    tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/staged-quality.XXXXXX")
+    # shellcheck disable=SC2154  # rc is assigned inside the trap itself
+    trap 'rc=$?; trap - EXIT; rm -rf "$tmpdir"; exit "$rc"' EXIT
+    CHECK_ROOT="$tmpdir/tree"
+    mkdir -p "$CHECK_ROOT"
+    if ! git checkout-index --all --prefix="$CHECK_ROOT/"; then
+        echo "error: could not materialize staged content" >&2
+        exit 1
+    fi
+fi
+
 # ── Classify files by type ──────────────────────────────────────────────────
 RustFiles=()
 ShellFiles=()
+BashFiles=()
 JsTsFiles=()
 JsTsStaged=()
 OtherFiles=()
@@ -33,11 +46,21 @@ ClippyStaged=()
 for file in ${StagedFiles[@]+"${StagedFiles[@]}"}; do
     case "$file" in
         *.rs) RustFiles+=("$file"); ClippyStaged+=("$file") ;;
-        *.sh) ShellFiles+=("$file") ;;
+        *.sh) ShellFiles+=("$file"); BashFiles+=("$file") ;;
         *.js|*.jsx|*.ts|*.tsx|*.mjs|*.cjs) JsTsFiles+=("$file") ;;
         *.json|*.css|*.scss|*.html|*.md|*.yml|*.yaml) OtherFiles+=("$file") ;;
         */Cargo.toml|Cargo.toml) ClippyStaged+=("$file") ;;
-        *) ;;
+        *)
+            if [ -f "$CHECK_ROOT/$file" ] && [ ! -L "$CHECK_ROOT/$file" ]; then
+                IFS= read -r first_line < "$CHECK_ROOT/$file" || true
+                case "$first_line" in
+                    '#!/bin/bash'|'#!/usr/bin/bash'|'#!/usr/bin/env bash')
+                        ShellFiles+=("$file"); BashFiles+=("$file") ;;
+                    '#!/bin/sh'|'#!/usr/bin/sh'|'#!/usr/bin/env sh')
+                        ShellFiles+=("$file") ;;
+                esac
+            fi
+            ;;
     esac
 done
 
@@ -48,30 +71,24 @@ for file in ${StagedFiles[@]+"${StagedFiles[@]}"}; do
     esac
 done
 
-# ── Index/worktree consistency ──────────────────────────────────────────────
-# Checks below run against working-tree paths. If a staged blob differs from
-# the worktree, the tools would validate content the commit does not contain.
-# Fail closed and ask for the content to be staged.
-if [ ${#StagedFiles[@]} -gt 0 ]; then
-    if ! git diff --quiet -- "${StagedFiles[@]}" 2>/dev/null; then
-        echo "error: staged content differs from the working tree:" >&2
-        git diff --name-only -- "${StagedFiles[@]}" >&2 || true
-        echo "  stage the current content (git add <path>) or restore the worktree, then retry." >&2
-        exit 1
-    fi
-fi
-
 # ── Tool resolution: local paths only ───────────────────────────────────────
 resolve_tool() {
-    local name="$1"; shift
+    local name="$1" candidate resolved; shift
     for candidate in "$@"; do
-        if [ -x "$candidate" ]; then
-            printf '%s' "$candidate"
+        case "$candidate" in
+            /*) resolved="$candidate" ;;
+            *) resolved="$ROOT/$candidate" ;;
+        esac
+        if [ -x "$resolved" ]; then
+            printf '%s' "$resolved"
             return 0
         fi
     done
-    if command -v "$name" >/dev/null 2>&1; then
-        command -v "$name"
+    if resolved=$(command -v "$name" 2>/dev/null); then
+        case "$resolved" in
+            /*) printf '%s' "$resolved" ;;
+            *) printf '%s/%s' "$ROOT" "$resolved" ;;
+        esac
         return 0
     fi
     printf ''
@@ -92,7 +109,7 @@ if [ ${#RustFiles[@]} -gt 0 ]; then
     if [ -z "$RUSTFMT" ]; then
         missing_tool rustfmt "rustup component add rustfmt"
     fi
-    "$RUSTFMT" --edition 2021 --config skip_children=true --check "${RustFiles[@]}" || {
+    (cd "$CHECK_ROOT" && "$RUSTFMT" --edition 2021 --config skip_children=true --check "${RustFiles[@]}") || {
         echo "error: rustfmt check failed" >&2
         exit 1
     }
@@ -105,13 +122,10 @@ if [ ${#ClippyStaged[@]} -gt 0 ]; then
         missing_tool cargo "install the Rust toolchain via https://rustup.rs"
     fi
 
-    # collision-safe temp files, cleaned on any exit; preserve the real status
-    tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/staged-quality.XXXXXX")
-    # shellcheck disable=SC2154  # rc is assigned inside the trap itself
-    trap 'rc=$?; trap - EXIT; rm -rf "$tmpdir"; exit "$rc"' EXIT
-
     clippy_stderr="$tmpdir/clippy-stderr.log"
     filter_stderr="$tmpdir/filter-stderr.log"
+    clippy_target_dir="$tmpdir/clippy-target"
+    mkdir -p "$clippy_target_dir"
 
     # node must be available for the filter step — this produces a setup
     # diagnostic before cargo+node pipeline runs.
@@ -125,8 +139,8 @@ if [ ${#ClippyStaged[@]} -gt 0 ]; then
     # node filter receives the JSON stream on stdin and outputs matched
     # diagnostics to stdout.  Any nonzero cargo exit or node exit is fatal
     # (including cargo exit 1 with no diagnostics — it's captured via PIPESTATUS).
-    "$CARGO" clippy --workspace --all-targets --locked --message-format=json 2>"$clippy_stderr" \
-        | "$NODE" "$CLIPPY_FILTER" --root "$ROOT" --staged "${ClippyStaged[@]}" 2>"$filter_stderr"
+    (cd "$CHECK_ROOT" && CARGO_TARGET_DIR="$clippy_target_dir" "$CARGO" clippy --workspace --all-targets --locked --message-format=json) 2>"$clippy_stderr" \
+        | "$NODE" "$CLIPPY_FILTER" --root "$CHECK_ROOT" --dep-info-root "$clippy_target_dir" --staged "${ClippyStaged[@]}" 2>"$filter_stderr"
     statuses=("${PIPESTATUS[@]}")
     set -e
     cargo_status=${statuses[0]:-0}
@@ -145,7 +159,8 @@ if [ ${#ClippyStaged[@]} -gt 0 ]; then
         cat "$filter_stderr" >&2 || true
         exit 1
     elif [ "$node_status" -ne 0 ]; then
-        # exit 1 = staged warning/error found; rendered diagnostics went to stdout.
+        # exit 1 = staged diagnostics or Rust files absent from Cargo dep-info.
+        cat "$filter_stderr" >&2 || true
         exit 1
     fi
 fi
@@ -160,10 +175,10 @@ for file in ${JsTsFiles[@]+"${JsTsFiles[@]}"} ${OtherFiles[@]+"${OtherFiles[@]}"
 done
 
 if [ ${#PRETTIER_FILES[@]} -gt 0 ]; then
-    if [ ! -x node_modules/.bin/prettier ]; then
+    if [ ! -x "$ROOT/node_modules/.bin/prettier" ]; then
         missing_tool prettier "npm ci"
     fi
-    node_modules/.bin/prettier --check "${PRETTIER_FILES[@]}" || {
+    (cd "$CHECK_ROOT" && "$ROOT/node_modules/.bin/prettier" --check "${PRETTIER_FILES[@]}") || {
         echo "error: prettier check failed" >&2
         exit 1
     }
@@ -178,10 +193,10 @@ for file in ${JsTsStaged[@]+"${JsTsStaged[@]}"}; do
 done
 
 if [ ${#WEB_UI_FILES[@]} -gt 0 ]; then
-    if [ ! -x web-ui/node_modules/.bin/eslint ]; then
+    if [ ! -x "$ROOT/web-ui/node_modules/.bin/eslint" ]; then
         missing_tool eslint "npm --prefix web-ui ci"
     fi
-    ( cd "$ROOT/web-ui" && ./node_modules/.bin/eslint "${WEB_UI_FILES[@]}" ) || {
+    ( cd "$CHECK_ROOT/web-ui" && "$ROOT/web-ui/node_modules/.bin/eslint" "${WEB_UI_FILES[@]}" ) || {
         echo "error: eslint check failed" >&2
         exit 1
     }
@@ -189,17 +204,17 @@ fi
 
 # ── Check 5: Shell scripts ──────────────────────────────────────────────────
 if [ ${#ShellFiles[@]} -gt 0 ]; then
-    for file in "${ShellFiles[@]}"; do
-        bash -n "$file" || {
+    for file in ${BashFiles[@]+"${BashFiles[@]}"}; do
+        bash -n "$CHECK_ROOT/$file" || {
             echo "error: bash syntax check failed for $file" >&2
             exit 1
         }
     done
-    SHELLCHECK=$(resolve_tool shellcheck node_modules/.bin/shellcheck || true)
+    SHELLCHECK=$(resolve_tool shellcheck "$ROOT/node_modules/.bin/shellcheck" || true)
     if [ -z "$SHELLCHECK" ]; then
         missing_tool shellcheck "shellcheck --help for installation instructions"
     fi
-    "$SHELLCHECK" "${ShellFiles[@]}" || {
+    (cd "$CHECK_ROOT" && "$SHELLCHECK" "${ShellFiles[@]}") || {
         echo "error: shellcheck failed" >&2
         exit 1
     }

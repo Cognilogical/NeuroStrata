@@ -12,7 +12,7 @@ The engine unifies:
 
 - A property-graph memory with bitemporal versioning and supersession
 - A W3C RDF semantic layer (SPARQL 1.1, SHACL validation, RDF-star provenance)
-- SKOS domain taxonomies with disjointness and subsumption reasoning
+- SKOS domain taxonomies with linear DAG validation and transitive disjointness reasoning
 - Polymorphic digital twins fed by telemetry
 - Counterfactual copy-on-write ontology scenarios
 - Fail-closed kinetic actions with bitemporal revert logs
