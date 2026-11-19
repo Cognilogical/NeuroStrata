@@ -10,19 +10,12 @@ ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
 cd "$ROOT" || exit 0
 
 # Determine diff range: upstream if tracking branch exists, else origin/main..HEAD or HEAD~1..HEAD
-if git rev-parse --verify --quiet @{u} >/dev/null 2>&1; then
+if git rev-parse --verify --quiet '@{u}' >/dev/null 2>&1; then
     RANGE="@{u}..HEAD"
 elif git rev-parse --verify --quiet origin/main >/dev/null 2>&1; then
     RANGE="origin/main..HEAD"
 else
     RANGE="HEAD~1..HEAD"
-fi
-
-# Exclude commits already on origin/main when pushing a feature branch that merged main
-EXCLUDE_MAIN=()
-CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
-if [ "$CURRENT_BRANCH" != "main" ] && git rev-parse --verify --quiet origin/main >/dev/null 2>&1; then
-    EXCLUDE_MAIN=("^origin/main")
 fi
 
 # Include renames so modified renames expose additions; R100 diffs have no added lines.

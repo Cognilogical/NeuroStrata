@@ -23,7 +23,7 @@
 //! day-cadence trigger gets a real `next_due`.
 
 use crate::formal_kernel::{
-    compute_procedure_next_due, evaluate_procedure_fire, procedure_is_lapsed, procedure_is_untrusted,
+    evaluate_procedure_fire, procedure_is_lapsed, procedure_is_untrusted,
     KernelProcedureFireOutcome, KernelProcedureTrust,
 };
 use crate::traits::{SearchResult, VectorStore};
@@ -41,7 +41,9 @@ const ROLLOVER_BYTES: u64 = 500 * 1024;
 /// the same `remaining_fires` — double-spending the budget against a single
 /// counter. The async mutex is held from the row's authoritative re-read
 /// through `store.upsert`, so concurrent firings serialize.
-static PROCEDURE_FIRE_LOCKS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>> = std::sync::OnceLock::new();
+static PROCEDURE_FIRE_LOCKS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+> = std::sync::OnceLock::new();
 
 fn fire_lock(key: &str) -> Arc<tokio::sync::Mutex<()>> {
     let map = PROCEDURE_FIRE_LOCKS
@@ -63,9 +65,13 @@ fn fire_lock(key: &str) -> Arc<tokio::sync::Mutex<()>> {
 /// absent or explicitly null never lapses, and a value that is not an integer
 /// reads as 0 (long expired) rather than as "expires in the far future".
 pub(crate) fn is_lapsed(metadata: &Value, now: i64) -> bool {
-    let vt = metadata
-        .get("valid_to")
-        .and_then(|v| if v.is_null() { None } else { Some(v.as_i64().unwrap_or(0)) });
+    let vt = metadata.get("valid_to").and_then(|v| {
+        if v.is_null() {
+            None
+        } else {
+            Some(v.as_i64().unwrap_or(0))
+        }
+    });
     procedure_is_lapsed(vt, now)
 }
 
@@ -117,10 +123,7 @@ fn last_episodic_pointer(metadata: &Value) -> Option<String> {
 /// `synaptic_mesh::import`), and no local write path writes one, so the
 /// object's presence is the provenance signal the gate discriminates on.
 fn has_import_provenance(metadata: &Value) -> bool {
-    metadata
-        .get("mesh")
-        .map(|m| m.is_object())
-        .unwrap_or(false)
+    metadata.get("mesh").map(|m| m.is_object()).unwrap_or(false)
 }
 
 /// Whether the fire gate blocks this row. The trust stamp is
@@ -172,7 +175,10 @@ pub(crate) fn stamp_local_trust(metadata: &mut Value) {
 /// `i64::MAX` and rejects non-positive cadences instead of overflowing.
 fn next_due(metadata: &Value, now: i64) -> i64 {
     let last_performed = last_performed_at(metadata);
-    let trigger = metadata.get("trigger").and_then(|v| v.as_str()).unwrap_or("");
+    let trigger = metadata
+        .get("trigger")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let day_cadence = trigger
         .strip_prefix("every-n-days:")
         .and_then(|n| n.trim().parse::<i64>().ok());
@@ -258,7 +264,11 @@ pub(crate) fn procedures_due_strap_filtered(
     let filtered: Vec<Value> = all
         .into_iter()
         .filter(|row| {
-            let trigger = row.get("trigger").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+            let trigger = row
+                .get("trigger")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_lowercase();
             let mem = memories
                 .iter()
                 .find(|m| m.id == row.get("id").and_then(|v| v.as_str()).unwrap_or(""));
@@ -267,17 +277,23 @@ pub(crate) fn procedures_due_strap_filtered(
                 .unwrap_or(false);
             // Domain-aware matching (F19): also match when the needle is a
             // domain slug that the procedure's metadata.domain expands to.
-            let domain_ok = mem.map(|m| {
-                let domains: Vec<String> = match m.payload.metadata.get("domain") {
-                    Some(serde_json::Value::String(s)) => vec![s.clone()],
-                    Some(serde_json::Value::Array(arr)) => arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect(),
-                    _ => vec![],
-                };
-                domains.iter().any(|d| {
-                    let slug = crate::domain::normalize_domain_slug(d).unwrap_or_else(|| d.to_lowercase());
-                    slug == needle || d.to_lowercase() == needle
+            let domain_ok = mem
+                .map(|m| {
+                    let domains: Vec<String> = match m.payload.metadata.get("domain") {
+                        Some(serde_json::Value::String(s)) => vec![s.clone()],
+                        Some(serde_json::Value::Array(arr)) => arr
+                            .iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect(),
+                        _ => vec![],
+                    };
+                    domains.iter().any(|d| {
+                        let slug = crate::domain::normalize_domain_slug(d)
+                            .unwrap_or_else(|| d.to_lowercase());
+                        slug == needle || d.to_lowercase() == needle
+                    })
                 })
-            }).unwrap_or(false);
+                .unwrap_or(false);
             trigger.contains(&needle) || content_ok || domain_ok
         })
         .collect();
@@ -521,12 +537,23 @@ pub async fn handle_procedure_perform(arguments: Value, store: Arc<dyn VectorSto
         prior_count_u64,
     );
     let (after_remaining, after_count) = match outcome {
-        KernelProcedureFireOutcome::Fired { remaining_fires, performance_count } => (
+        KernelProcedureFireOutcome::Fired {
+            remaining_fires,
+            performance_count,
+        } => (
             remaining_fires.map(|n| n.min(i64::MAX as u64) as i64),
             performance_count.min(i64::MAX as u64) as i64,
         ),
         KernelProcedureFireOutcome::RefuseUntrusted => {
-            return reply(false, false, false, budget, count, pointer_before, "untrusted");
+            return reply(
+                false,
+                false,
+                false,
+                budget,
+                count,
+                pointer_before,
+                "untrusted",
+            );
         }
         KernelProcedureFireOutcome::RefuseLapsed => {
             return reply(false, true, false, budget, count, pointer_before, "lapsed");

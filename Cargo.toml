@@ -149,6 +149,11 @@ openssl = { version = "0.10.82", features = ["vendored"] }
 # so the daemon middleware wiring test can drive a Router in-process.
 tower = { version = "0.5", features = ["util"] }
 
+# Canonicalize the nightly verification cfg name used by the formal-kernel
+# `cfg(kani)` gates: register it as a known cfg instead of blanket-allowing.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
 [build-dependencies]
 cxx-build = "1.0.197"
 

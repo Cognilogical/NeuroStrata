@@ -27,7 +27,7 @@ jobs:
       # LBUG_VERSION pins the engine archive the lbug build script
       # downloads; keep it equal to the lbug crate version in Cargo.toml
       # and move it whenever that version changes.
-      LBUG_VERSION: "0.22.3"
+      LBUG_VERSION: '0.22.3'
     strategy:
       fail-fast: false
       matrix:
@@ -134,7 +134,7 @@ jobs:
       # LBUG_VERSION pins the engine archive the lbug build script
       # downloads; keep it equal to the lbug crate version in Cargo.toml
       # and move it whenever that version changes.
-      LBUG_VERSION: "0.22.3"
+      LBUG_VERSION: '0.22.3'
     steps:
       - name: Checkout
         uses: actions/checkout@v7.0.1
@@ -212,7 +212,7 @@ jobs:
     name: test (${{ matrix.os }}, report-only)
     runs-on: ${{ matrix.os }}
     env:
-      LBUG_VERSION: "0.22.3"
+      LBUG_VERSION: '0.22.3'
     strategy:
       fail-fast: false
       matrix:

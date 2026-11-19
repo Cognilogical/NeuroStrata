@@ -6310,27 +6310,29 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn claim_stamps_the_current_branch_and_worktree() {
+    #[test]
+    fn claim_stamps_the_current_branch_and_worktree() {
         let _env_guard = crate::daemon::project_root_env_test_lock();
-        let store = store_with_namespace("MyProj").await;
-        let id = create_task(&store, "MyProj", "the work", 2).await;
-        let expected = gate::GateScope::capture(&crate::daemon::resolve_project_root());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let store = store_with_namespace("MyProj").await;
+            let id = create_task(&store, "MyProj", "the work", 2).await;
+            let expected = gate::GateScope::capture(&crate::daemon::resolve_project_root());
 
-        let reply = handle_task_claim(
-            json!({ "namespace": "MyProj", "id": id, "assignee": "agent-a", "session_id": "ses_a" }),
-            store.clone(),
-        )
-        .await;
-        assert!(reply.contains("\"status\": \"in_progress\""), "{}", reply);
+            let reply = handle_task_claim(
+                json!({ "namespace": "MyProj", "id": id, "assignee": "agent-a", "session_id": "ses_a" }),
+                store.clone(),
+            )
+            .await;
+            assert!(reply.contains("\"status\": \"in_progress\""), "{}", reply);
 
-        let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
-        assert_eq!(payload.metadata["task"]["branch"], json!(expected.branch));
-        assert_eq!(
-            payload.metadata["task"]["worktree"],
-            json!(expected.worktree)
-        );
+            let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+            assert_eq!(payload.metadata["task"]["branch"], json!(expected.branch));
+            assert_eq!(
+                payload.metadata["task"]["worktree"],
+                json!(expected.worktree)
+            );
+        });
     }
 
     #[tokio::test]
@@ -6405,46 +6407,48 @@ mod tests {
         assert_eq!(task_meta["session_id"], json!("ses_other"));
     }
 
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn task_update_claim_stamps_scope_for_the_strict_gate() {
+    #[test]
+    fn task_update_claim_stamps_scope_for_the_strict_gate() {
         let _env_guard = crate::daemon::project_root_env_test_lock();
-        let store = store_with_namespace("MyProj").await;
-        let id = create_task(&store, "MyProj", "the work", 2).await;
-        let expected = gate::GateScope::capture(&crate::daemon::resolve_project_root());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let store = store_with_namespace("MyProj").await;
+            let id = create_task(&store, "MyProj", "the work", 2).await;
+            let expected = gate::GateScope::capture(&crate::daemon::resolve_project_root());
 
-        let reply = handle_task_update(
-            json!({
-                "namespace": "MyProj",
-                "id": id,
-                "status": "in_progress",
-                "assignee": "agent-a",
-                "session_id": "ses_a"
-            }),
-            emb(),
-            store.clone(),
-        )
-        .await;
-        assert!(reply.contains("\"status\": \"in_progress\""), "{}", reply);
+            let reply = handle_task_update(
+                json!({
+                    "namespace": "MyProj",
+                    "id": id,
+                    "status": "in_progress",
+                    "assignee": "agent-a",
+                    "session_id": "ses_a"
+                }),
+                emb(),
+                store.clone(),
+            )
+            .await;
+            assert!(reply.contains("\"status\": \"in_progress\""), "{}", reply);
 
-        let same_scope = gate::run_scoped(&store, "MyProj", Some(&expected))
-            .await
-            .unwrap();
-        assert!(same_scope
-            .violations
-            .iter()
-            .any(|v| v.kind == "in_progress"));
-        let independent = gate::GateScope {
-            branch: Some("feature/independent".to_string()),
-            worktree: Some("/repo/independent".to_string()),
-        };
-        let other_scope = gate::run_scoped(&store, "MyProj", Some(&independent))
-            .await
-            .unwrap();
-        assert!(!other_scope
-            .violations
-            .iter()
-            .any(|v| v.kind == "in_progress"));
+            let same_scope = gate::run_scoped(&store, "MyProj", Some(&expected))
+                .await
+                .unwrap();
+            assert!(same_scope
+                .violations
+                .iter()
+                .any(|v| v.kind == "in_progress"));
+            let independent = gate::GateScope {
+                branch: Some("feature/independent".to_string()),
+                worktree: Some("/repo/independent".to_string()),
+            };
+            let other_scope = gate::run_scoped(&store, "MyProj", Some(&independent))
+                .await
+                .unwrap();
+            assert!(!other_scope
+                .violations
+                .iter()
+                .any(|v| v.kind == "in_progress"));
+        });
     }
 
     #[tokio::test]
@@ -6591,68 +6595,70 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn same_session_reclaim_backfills_missing_legacy_attribution_and_preserves_existing() {
+    #[test]
+    fn same_session_reclaim_backfills_missing_legacy_attribution_and_preserves_existing() {
         let _env_guard = crate::daemon::project_root_env_test_lock();
-        let store = store_with_namespace("MyProj").await;
-        let id = create_task(&store, "MyProj", "the work", 2).await;
-        let args = json!({ "namespace": "MyProj", "id": id, "assignee": "agent-a", "session_id": "ses_a" });
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let store = store_with_namespace("MyProj").await;
+            let id = create_task(&store, "MyProj", "the work", 2).await;
+            let args = json!({ "namespace": "MyProj", "id": id, "assignee": "agent-a", "session_id": "ses_a" });
 
-        handle_task_claim(args.clone(), store.clone()).await;
+            handle_task_claim(args.clone(), store.clone()).await;
 
-        // Simulate a legacy row: attribution dropped, claim intact.
-        let expected = gate::GateScope::capture(&crate::daemon::resolve_project_root());
-        let (vector, mut payload) = store.get("MyProj", &id).await.unwrap().unwrap();
-        payload.metadata["task"]
-            .as_object_mut()
-            .unwrap()
-            .remove("branch");
-        payload.metadata["task"]
-            .as_object_mut()
-            .unwrap()
-            .remove("worktree");
-        store.upsert("MyProj", &id, vector, payload).await.unwrap();
+            // Simulate a legacy row: attribution dropped, claim intact.
+            let expected = gate::GateScope::capture(&crate::daemon::resolve_project_root());
+            let (vector, mut payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+            payload.metadata["task"]
+                .as_object_mut()
+                .unwrap()
+                .remove("branch");
+            payload.metadata["task"]
+                .as_object_mut()
+                .unwrap()
+                .remove("worktree");
+            store.upsert("MyProj", &id, vector, payload).await.unwrap();
 
-        let backfill = handle_task_claim(args.clone(), store.clone()).await;
-        assert!(
-            backfill.contains("already claimed by this session"),
-            "{}",
-            backfill
-        );
+            let backfill = handle_task_claim(args.clone(), store.clone()).await;
+            assert!(
+                backfill.contains("already claimed by this session"),
+                "{}",
+                backfill
+            );
 
-        let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
-        assert_eq!(
-            payload.metadata["task"]["branch"],
-            json!(expected.branch),
-            "legacy branch attribution must be backfilled"
-        );
-        assert_eq!(
-            payload.metadata["task"]["worktree"],
-            json!(expected.worktree),
-            "legacy worktree attribution must be backfilled"
-        );
+            let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+            assert_eq!(
+                payload.metadata["task"]["branch"],
+                json!(expected.branch),
+                "legacy branch attribution must be backfilled"
+            );
+            assert_eq!(
+                payload.metadata["task"]["worktree"],
+                json!(expected.worktree),
+                "legacy worktree attribution must be backfilled"
+            );
 
-        // Idempotency: an already-attributed row keeps its exact attribution.
-        let (vector, mut payload) = store.get("MyProj", &id).await.unwrap().unwrap();
-        payload.metadata["task"]["branch"] = json!("legacy/branch");
-        payload.metadata["task"]["worktree"] = json!("/legacy/worktree");
-        store.upsert("MyProj", &id, vector, payload).await.unwrap();
+            // Idempotency: an already-attributed row keeps its exact attribution.
+            let (vector, mut payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+            payload.metadata["task"]["branch"] = json!("legacy/branch");
+            payload.metadata["task"]["worktree"] = json!("/legacy/worktree");
+            store.upsert("MyProj", &id, vector, payload).await.unwrap();
 
-        let again = handle_task_claim(args, store.clone()).await;
-        assert!(
-            again.contains("already claimed by this session"),
-            "{}",
-            again
-        );
+            let again = handle_task_claim(args, store.clone()).await;
+            assert!(
+                again.contains("already claimed by this session"),
+                "{}",
+                again
+            );
 
-        let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
-        assert_eq!(payload.metadata["task"]["branch"], json!("legacy/branch"));
-        assert_eq!(
-            payload.metadata["task"]["worktree"],
-            json!("/legacy/worktree"),
-            "existing attribution must not be overwritten"
-        );
+            let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+            assert_eq!(payload.metadata["task"]["branch"], json!("legacy/branch"));
+            assert_eq!(
+                payload.metadata["task"]["worktree"],
+                json!("/legacy/worktree"),
+                "existing attribution must not be overwritten"
+            );
+        });
     }
 
     #[tokio::test]

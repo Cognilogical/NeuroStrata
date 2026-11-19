@@ -3,3 +3,4 @@ dist/
 *.canvas
 .env
 .DS_Store
+.NeuroStrata/

@@ -872,6 +872,7 @@ RF_EOF
     rm -rf "$tmpdir"
     return 0
 }
+run_test "Staged routing table" test_staged_routing
 run_test "Whitespace-safe arguments" test_whitespace_safe_args
 run_test "Deleted and internal filtering" test_deleted_and_internal_filtering
 run_test "Missing tool diagnostic" test_missing_tool_diagnostic

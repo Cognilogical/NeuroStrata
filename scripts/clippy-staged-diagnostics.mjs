@@ -64,6 +64,8 @@ function normalizePath(p, rootNorm) {
   if (!p) return ''
   // Replace backslashes with forward slashes (Windows safety)
   let s = p.replace(/\\/g, '/')
+  // Lexically collapse `.` and `..` segments (never touches disk)
+  s = path.posix.normalize(s)
   // Strip leading ./
   while (s.startsWith('./')) s = s.slice(2)
   // Strip absolute root prefix

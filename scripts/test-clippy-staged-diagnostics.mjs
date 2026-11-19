@@ -239,6 +239,42 @@ test('custom root with Windows backslashes is normalized for matching', () => {
   assert.ok(matched[0].includes('type mismatch'))
 })
 
+test('tests/../src/... lexically normalizes to src/... and matches (exit 1)', () => {
+  const input = JSON.stringify(diag({ file: 'tests/../src/main.rs' }))
+  const res = runFilter({
+    input,
+    args: ['--root', ROOT, '--staged', 'src/main.rs']
+  })
+  assert.equal(res.status, 1)
+})
+
+test('tests/../src/... matches via pure findStagedDiagnostics', () => {
+  const msg = diag({ file: 'tests/../src/main.rs' })
+  const matched = findStagedDiagnostics([msg], ROOT, ['src/main.rs'])
+  assert.equal(matched.length, 1)
+})
+
+test('tests/../src/... does NOT match a different staged file (exit 0)', () => {
+  const input = JSON.stringify(diag({ file: 'tests/../src/other.rs' }))
+  const res = runFilter({
+    input,
+    args: ['--root', ROOT, '--staged', 'src/main.rs']
+  })
+  assert.equal(res.status, 0)
+})
+
+test('deeply nested ../ segments normalize correctly', () => {
+  const msg = diag({ file: 'a/b/../../src/main.rs' })
+  const matched = findStagedDiagnostics([msg], ROOT, ['src/main.rs'])
+  assert.equal(matched.length, 1)
+})
+
+test('non-ASCII and special characters in paths are preserved', () => {
+  const msg = diag({ file: 'src/café/naïve.rs' })
+  const matched = findStagedDiagnostics([msg], ROOT, ['src/café/naïve.rs'])
+  assert.equal(matched.length, 1)
+})
+
 test('staged warning with missing rendered still matches via fallback (exit 1)', () => {
   const msg = {
     reason: 'compiler-message',

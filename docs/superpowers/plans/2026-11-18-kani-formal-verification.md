@@ -13,6 +13,7 @@
 ### Task 1: Write Failing Unit & Integration Regression Tests for the 4 Discovered Bugs (`neurostrata-zbe7`)
 
 **Files:**
+
 - Modify: `src/formal_kernel.rs`
 - Modify: `src/kernel/mod.rs`
 - Modify: `src/tools/procedure.rs`
@@ -28,6 +29,7 @@
 ### Task 2: Implement Kernel Helpers, Deterministic DAG/SKOS Reachability, and Kani Harnesses (`neurostrata-zbe7`)
 
 **Files:**
+
 - Modify: `src/formal_kernel.rs`
 - Modify: `src/kernel/mod.rs`
 - Modify: `src/tools/procedure.rs`
@@ -40,6 +42,7 @@
 ### Task 3: Update Lean 4 Proofs, Parity Runner, and Documentation Co-Change (`neurostrata-zbe7`)
 
 **Files:**
+
 - Modify: `proofs/NeuroStrata/ConnectorGate.lean`
 - Modify: `proofs/NeuroStrata/Procedure.lean`
 - Modify: `proofs/Main.lean`
@@ -53,6 +56,7 @@
 ### Task 4: Wire Kani into `extract-aeneas.sh`, `task-coverage-gate.sh`, and `.github/workflows/ci.yml` (`neurostrata-zbe7`)
 
 **Files:**
+
 - Modify: `proofs/scripts/extract-aeneas.sh`
 - Modify: `scripts/task-coverage-gate.sh`
 - Modify: `.github/workflows/ci.yml`
