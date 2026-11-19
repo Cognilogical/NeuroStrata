@@ -2258,8 +2258,7 @@ mod tests {
         for t in &out.inferred_triples {
             assert!(
                 certified.contains(nt_triple(t).as_str()),
-                "inferred triple {} must carry a certified derivation",
-                nt_triple(t)
+                "inferred triple must carry a certified derivation"
             );
         }
         assert_eq!(
@@ -2395,7 +2394,7 @@ mod tests {
             .expect_err("limit 0 must fail closed");
         match err {
             ReasoningMaterializeError::InferredLimitExceeded { max, .. } => assert_eq!(max, 0),
-            other => panic!("expected InferredLimitExceeded, got {other:?}"),
+            _ => panic!("expected InferredLimitExceeded"),
         }
     }
 
@@ -2437,7 +2436,7 @@ mod tests {
             .expect_err("base above MAX_BASE_TRIPLES must fail closed immediately");
         assert!(
             err.to_string().contains("exceeds maximum"),
-            "unexpected error: {err}"
+            "unexpected error"
         );
     }
 
@@ -2487,8 +2486,7 @@ mod tests {
             for premise in &st.premises {
                 assert!(
                     seen.contains(premise.as_str()),
-                    "premise {premise} must precede its consumer {0}",
-                    st.conclusion
+                    "premise must precede its consumer"
                 );
             }
             seen.insert(st.conclusion.as_str());

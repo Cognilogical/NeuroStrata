@@ -744,11 +744,16 @@ pub fn lookup_forms_for_scope(
             if !is_usable_root(root) {
                 continue;
             }
-            let joined = format!(
+            let joined_raw = format!(
                 "{}/{}",
                 root.trim_end_matches('/'),
                 lookup.path.trim_start_matches('/')
             );
+            let joined = if has_parent_traversal {
+                follow_parent_components(&joined_raw)
+            } else {
+                joined_raw
+            };
             let Some(joined) = parse_absolute(&joined).map(|p| p.to_path_string()) else {
                 continue;
             };
@@ -803,17 +808,29 @@ pub fn resolve_in_scope_forms(
         {
             if reg != project {
                 let has_parent_traversal = raw.split(['/', '\\']).any(|c| c == "..");
-                let joined = format!(
+                let joined_raw = format!(
                     "{}/{}",
                     reg.trim_end_matches('/'),
                     raw.trim_start_matches('/')
                 );
+                let joined = if has_parent_traversal {
+                    follow_parent_components(&joined_raw)
+                } else {
+                    joined_raw
+                };
                 if let Some(joined) = parse_absolute(&joined).map(|p| p.to_path_string()) {
                     if (scope == PathResolutionScope::Prefix
                         && !has_parent_traversal
                         && same_location(&joined, reg))
                         || relative_to(&joined, reg).is_some()
                     {
+                        if has_parent_traversal {
+                            if let Some(rel) = relative_to(&joined, reg) {
+                                if rel != raw {
+                                    forms.push(rel);
+                                }
+                            }
+                        }
                         forms.push(joined);
                     }
                 }
@@ -1771,5 +1788,37 @@ mod tests {
         assert!(resolved.forms.contains(&true_abs), "{:?}", resolved.forms);
         assert!(!resolved.forms.contains(&wrong_rel), "{:?}", resolved.forms);
         assert!(!resolved.forms.contains(&wrong_abs), "{:?}", resolved.forms);
+
+        std::fs::create_dir_all(root.join("a").join("src")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let rel_prefix = "link/../src";
+        let true_prefix_rel = "a/src".to_string();
+        let true_prefix_abs = s(&root.join("a").join("src"));
+        let wrong_prefix_rel = "src".to_string();
+        let wrong_prefix_abs = s(&root.join("src"));
+
+        let resolved_prefix =
+            resolve_in_scope_forms(rel_prefix, Some(&root_s), None, PathResolutionScope::Prefix)
+                .unwrap();
+        assert!(
+            resolved_prefix.forms.contains(&true_prefix_rel),
+            "{:?}",
+            resolved_prefix.forms
+        );
+        assert!(
+            resolved_prefix.forms.contains(&true_prefix_abs),
+            "{:?}",
+            resolved_prefix.forms
+        );
+        assert!(
+            !resolved_prefix.forms.contains(&wrong_prefix_rel),
+            "{:?}",
+            resolved_prefix.forms
+        );
+        assert!(
+            !resolved_prefix.forms.contains(&wrong_prefix_abs),
+            "{:?}",
+            resolved_prefix.forms
+        );
     }
 }
