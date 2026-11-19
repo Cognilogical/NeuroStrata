@@ -250,7 +250,12 @@ pub fn validate_assertion_iri(iri: &str) -> bool {
     {
         return false;
     }
-    let tail = &parts[3..];
+    let Some(tail) = parts.get(3..) else {
+        return false;
+    };
+    if tail.is_empty() {
+        return false;
+    }
     let has_g = tail.iter().any(|p| p.starts_with('g') && p.len() > 1);
     let has_v = tail.iter().any(|p| p.starts_with('v') && p.len() > 1);
     let filled = |idx: usize| tail.get(idx).map(|p| !p.is_empty()).unwrap_or(false);
@@ -1091,6 +1096,13 @@ mod tests {
         assert!(validate_assertion_iri("urn:neurostrata:assertion:ns:memory:m:sl:0:1"));
         assert!(validate_assertion_iri("urn:neurostrata:assertion:ns:edge:r:a:b:g1:v0"));
         assert!(!validate_assertion_iri("nope"));
+    }
+
+    #[test]
+    fn validate_assertion_iri_rejects_short_inputs_without_panicking() {
+        assert!(!validate_assertion_iri("urn:neurostrata:assertion"));
+        assert!(!validate_assertion_iri(""));
+        assert!(!validate_assertion_iri("urn:neurostrata"));
     }
 
     #[test]

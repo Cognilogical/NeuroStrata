@@ -382,7 +382,7 @@ Offered explicitly, because the panel's disagreement is the point.
 
 ## 5. Source anchors
 
-**HyperSkill** (cloned to `/tmp/opencode/HyperSkill`, commit `a34978a`):
+**HyperSkill** (cloned to `<tmp>/HyperSkill`, commit `a34978a`):
 `hyperskill/hypergraph_core.py:494` `add_hyperedge`; `:532-536` episode node
 and membership edges; `:551-557` membership read-back; `:568` `retrieve`;
 `:602-617` subtask path; `:667` `_rank_skills_mistakes` (κ, sort key `(c, sim)`

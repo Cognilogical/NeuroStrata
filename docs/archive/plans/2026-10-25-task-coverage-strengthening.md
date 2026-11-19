@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust (NeuroStrata core), shell scripting (pre-push hook), markdown parsing (intent detection), JSON-RPC (NeuroStrata tools)
 
-**Spec:** /home/kenton/Documents/NeuroStrata/docs/design-task-subsystem.md
+**Spec:** docs/design-task-subsystem.md
 
 ---
 

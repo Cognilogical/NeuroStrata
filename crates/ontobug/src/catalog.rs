@@ -11,8 +11,8 @@
 //! empty registry from one. Oxigraph remains only as the RDF parser and model.
 
 use crate::error::{Error, Result};
-use crate::ladybug::{graph_token, LadybugSchemaStore, NamespaceInfo, Projected, TripleRow};
-use crate::registry::{self, owl, rdfs, SchemaGraph, SchemaRole, RDF_TYPE};
+use crate::ladybug::{LadybugSchemaStore, NamespaceInfo, Projected, TripleRow, graph_token};
+use crate::registry::{self, RDF_TYPE, SchemaGraph, SchemaRole, owl, rdfs};
 use crate::validate::{self, Mode, Report, ShexResult};
 use oxigraph::io::{RdfFormat, RdfParser};
 use oxigraph::model::{GraphName, GraphNameRef, NamedNode};
@@ -297,14 +297,16 @@ impl Catalog {
         format: RdfFormat,
         replace: bool,
     ) -> Result<()> {
-        let target = graph_token(graph);
-        if replace {
-            self.registry.delete_graph_triples(&target)?;
-        }
+        // Parse before mutating: a malformed document must leave the existing graph
+        // intact, so the delete only happens once parsing has succeeded.
         let items: Vec<(String, Triple)> = parse_document(graph, data, format)?
             .iter()
             .map(ingest_item)
             .collect();
+        let target = graph_token(graph);
+        if replace {
+            self.registry.delete_graph_triples(&target)?;
+        }
         self.registry.ingest_quads(&items)?;
         self.registry.refresh_namespaces()?;
         Ok(())
@@ -821,4 +823,30 @@ fn harvest_turtle_prefixes(document: &[u8]) -> Vec<(String, String)> {
         out.push((name.to_owned(), iri.to_owned()));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_replace_malformed_document_preserves_existing_triples() {
+        let catalog = Catalog::new().unwrap();
+        let g = NamedNode::new("http://example.org/g").unwrap();
+        let graph = GraphNameRef::NamedNode((&g).into());
+        let good = b"@prefix ex: <http://example.org/> . ex:s ex:p ex:o .";
+        catalog.load(graph, good, RdfFormat::Turtle, false).unwrap();
+        let before = catalog.graph_ntriples(graph).unwrap();
+        assert_eq!(catalog.graph_len(graph).unwrap(), 1);
+
+        // Malformed Turtle must fail parsing BEFORE the existing triples are deleted.
+        let bad = b"@prefix ex: <http://example.org/> . ex:s ex:p";
+        let err = catalog
+            .load(graph, bad, RdfFormat::Turtle, true)
+            .unwrap_err();
+        assert!(matches!(err, Error::Other(_)), "unexpected error: {err:?}");
+
+        assert_eq!(catalog.graph_ntriples(graph).unwrap(), before);
+        assert_eq!(catalog.graph_len(graph).unwrap(), 1);
+    }
 }
