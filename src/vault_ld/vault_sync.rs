@@ -524,12 +524,15 @@ pub async fn export_vault_with_limits(
         }
     }
 
-    // Write each note as markdown file. Flattened ids can collide (a/b,
-    // a:b, a\b -> a_b.md); never overwrite an already-written note and
-    // never inflate the exported count with a silently lost note.
-    let mut exported = 0;
+    // Plan every note write and check every destination before the first
+    // write: a refused note or canvas must not leave a partial export behind.
+    // Flattened ids can collide (a/b, a:b, a\b -> a_b.md); never overwrite an
+    // already-planned note and never inflate the exported count with a
+    // silently lost note.
     let mut errors = Vec::new();
     let mut written_filenames: BTreeMap<String, String> = BTreeMap::new();
+    let mut planned_writes: Vec<(PathBuf, String)> = Vec::new();
+    let mut unsafe_destination = false;
 
     for note in &notes {
         let filename = export_filename_for_id(&note.id);
@@ -555,20 +558,43 @@ pub async fn export_vault_with_limits(
         }
         written_filenames.insert(filename, note.id.clone());
 
-        let markdown = note.to_markdown();
-        if let Err(e) = write_export_destination(&filepath, markdown.as_bytes()) {
+        if let Err(e) = ensure_safe_export_destination(&filepath) {
             errors.push(format!("Export destination unsafe for {} failed: {}", filepath.display(), e));
+            unsafe_destination = true;
             continue;
         }
-        exported += 1;
+        planned_writes.push((filepath, note.to_markdown()));
     }
 
-    // Generate and write Canvas topology
+    // Generate the Canvas and check its destination too, still before any
+    // note is written. A refused canvas is a typed error with zero writes.
     let canvas = generate_canvas(&notes, &config.namespace);
     let canvas_path = canonical_output.join("topology.canvas");
 
     let canvas_json = serde_json::to_string_pretty(&canvas)
         .map_err(|e| format!("Failed to serialize canvas: {}", e))?;
+
+    ensure_safe_export_destination(&canvas_path)?;
+
+    if unsafe_destination {
+        return Ok(VaultExportResult {
+            success: false,
+            message: "Exported 0 notes".to_string(),
+            notes_exported: 0,
+            topology_exported: false,
+            canvas_path: None,
+            errors,
+        });
+    }
+
+    let mut exported = 0;
+    for (filepath, markdown) in &planned_writes {
+        if let Err(e) = write_export_destination(filepath, markdown.as_bytes()) {
+            errors.push(format!("Export destination unsafe for {} failed: {}", filepath.display(), e));
+        } else {
+            exported += 1;
+        }
+    }
 
     write_export_destination(&canvas_path, canvas_json.as_bytes())?;
 
@@ -2707,6 +2733,82 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&victim_canvas).unwrap(),
             "untouched canvas",
+            "symlink target must be untouched"
+        );
+        assert!(
+            !vault.join("link-note.md").exists(),
+            "a refused canvas must not leave notes written"
+        );
+        let md_count = std::fs::read_dir(&vault)
+            .expect("read vault")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("md"))
+            .count();
+        assert_eq!(md_count, 0, "canvas refusal must write no note files");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// Issue #297: one refused note destination must not leave the other
+    /// notes already written; all destinations are checked before the first
+    /// write.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn export_refuses_all_notes_when_one_destination_is_symlinked() {
+        let root = std::env::temp_dir().join(format!("ns-expsym-partial-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let outside = std::env::temp_dir().join(format!("ns-outsym-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&outside).expect("create outside");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_export_sym_partial";
+        store.init(ns).await.expect("init");
+        for id in ["link-note", "safe-note"] {
+            store
+                .upsert(
+                    ns,
+                    id,
+                    vec![0.0; 4],
+                    seed_payload("default", serde_json::json!({"canonical_sha256": "test"})),
+                )
+                .await
+                .expect("seed note");
+        }
+        let victim = outside.join("victim_note.md");
+        std::fs::write(&victim, "untouched note").expect("write victim note");
+        std::os::unix::fs::symlink(&victim, vault.join("link-note.md")).expect("symlink note");
+
+        let config = VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.clone()),
+            allowed_external_dirs: None,
+        };
+        let result = export_vault(config, store.clone()).await.expect("export");
+        assert!(!result.success);
+        assert_eq!(
+            result.notes_exported, 0,
+            "no note may be written when any destination is refused: {:?}",
+            result.errors
+        );
+        assert!(
+            result.errors.iter().any(|e| e.contains("symlink")),
+            "{:?}",
+            result.errors
+        );
+        assert!(
+            !vault.join("safe-note.md").exists(),
+            "a refused note must not leave safe notes already written"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "untouched note",
             "symlink target must be untouched"
         );
 
