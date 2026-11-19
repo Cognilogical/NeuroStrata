@@ -5474,7 +5474,11 @@ async fn handle_get_snapshot(
                 .and_then(|v| v.as_str())
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .map(str::to_string)
+                .map(|s| {
+                    crate::task::resolve_session_root_dir(std::path::Path::new(s))
+                        .to_string_lossy()
+                        .into_owned()
+                })
         })
         .or_else(|| {
             arguments
@@ -5482,7 +5486,11 @@ async fn handle_get_snapshot(
                 .and_then(|v| v.as_str())
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .map(str::to_string)
+                .map(|s| {
+                    crate::task::resolve_session_root_dir(std::path::Path::new(s))
+                        .to_string_lossy()
+                        .into_owned()
+                })
         })
         .or(cached_root);
 

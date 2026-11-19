@@ -1050,6 +1050,28 @@ pub fn recorded_graph_queries_for_tests() -> Vec<(String, String, String)> {
     mutex.lock().map(|g| g.clone()).unwrap_or_default()
 }
 
+/// Resolve a caller directory (which may be a subdirectory of a Git worktree)
+/// to its enclosing worktree/project root so `.NeuroStrata/active_session.json`
+/// and `.NeuroStrata/session_queries.json` are always read and written at the
+/// worktree root rather than a nested subdirectory.
+pub fn resolve_session_root_dir(dir: &std::path::Path) -> std::path::PathBuf {
+    if let Some(wt) = gate::GateScope::capture(dir).worktree {
+        return std::path::PathBuf::from(wt);
+    }
+    let mut cur = if dir.is_dir() {
+        Some(dir)
+    } else {
+        dir.parent()
+    };
+    while let Some(d) = cur {
+        if d.join(".git").exists() || d.join(".NeuroStrata").exists() {
+            return d.to_path_buf();
+        }
+        cur = d.parent().filter(|p| !p.as_os_str().is_empty());
+    }
+    dir.to_path_buf()
+}
+
 /// Record a graph or memory lookup against any active `in_progress` task in
 /// `namespace` and append to `.NeuroStrata/session_queries.json` if a project
 /// root is known.
@@ -1092,7 +1114,11 @@ pub async fn record_graph_query_with_root(
     let mut project_root: Option<String> = caller_root
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
+        .map(|s| {
+            resolve_session_root_dir(std::path::Path::new(s))
+                .to_string_lossy()
+                .into_owned()
+        });
     if project_root.is_none() {
         let hint_path = std::path::Path::new(query_hint);
         if hint_path.is_absolute() {
@@ -1452,10 +1478,11 @@ async fn resolve_task_scope(
     }
     if scope.worktree.is_none() {
         if let Some(ref explicit_wt) = explicit_root {
-            let canonical = explicit_wt
+            let root_dir = resolve_session_root_dir(explicit_wt);
+            let canonical = root_dir
                 .canonicalize()
                 .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| explicit_wt.to_string_lossy().into_owned());
+                .unwrap_or_else(|_| root_dir.to_string_lossy().into_owned());
             scope.worktree = Some(canonical);
         }
     }
@@ -1666,8 +1693,12 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
         .or_else(|| arg_str(&args, "project_root"))
         .or_else(|| arg_str(&args, "cwd"))
         .map(std::path::PathBuf::from);
-    let session_root = if explicit_root.is_some() {
-        explicit_root
+    let session_root = if let Some(ref exp) = explicit_root {
+        scope
+            .worktree
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .or_else(|| Some(resolve_session_root_dir(exp)))
     } else {
         let rid = crate::registry::registry_row_id(&namespace);
         if let Ok(Some((_, reg_p))) = store.get(&namespace, &rid).await {
@@ -6531,6 +6562,36 @@ mod tests {
             claimed_payload.metadata["task"]["branch"],
             Value::Null,
             "non-git explicit cwd without branch arg must not inherit daemon_root branch"
+        );
+
+        // When the proxy runs from a subdirectory of a Git worktree, `cwd` is
+        // that subdirectory, while `active_session.json` must still be written
+        // at the worktree root so plugin readers at the project root find it.
+        let wt_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(wt_dir.path().join(".git")).unwrap();
+        let nested_cwd = wt_dir.path().join("crates").join("sub");
+        std::fs::create_dir_all(&nested_cwd).unwrap();
+        let id2 = create_task(&store, "MyProj", "scope nested cwd", 1).await;
+        handle_task_claim(
+            json!({
+                "namespace": "MyProj",
+                "id": id2,
+                "assignee": "agent",
+                "session_id": "ses_nested",
+                "cwd": nested_cwd.to_string_lossy().to_string(),
+            }),
+            store.clone(),
+        )
+        .await;
+        let root_session = wt_dir.path().join(".NeuroStrata").join("active_session.json");
+        let nested_session = nested_cwd.join(".NeuroStrata").join("active_session.json");
+        assert!(
+            root_session.exists(),
+            "active_session.json must be written at the enclosing worktree root"
+        );
+        assert!(
+            !nested_session.exists(),
+            "active_session.json must not be stranded in a nested subdirectory"
         );
     }
 
