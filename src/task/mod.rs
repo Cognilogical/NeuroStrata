@@ -930,9 +930,10 @@ pub(crate) async fn refresh_active_session_file(
 }
 
 /// When task `task_id` stops being in progress (completed, released, blocked),
-/// remove its fields from the session file at the namespace's registered
-/// project root, the file `task_claim` wrote, so the next session start does
-/// not announce a finished task. Only a file that still names this task is
+/// remove its fields from each session file `task_claim` may have written:
+/// the worktree the claim recorded, the caller's own root (see
+/// [`caller_session_root`]), and the namespace's registered project root. So
+/// the next session start does not announce a finished task. Only a file that still names this task is
 /// touched: another task claimed since keeps its fields, and so does this
 /// task when another session has claimed it again meanwhile (its row is
 /// read again under the session file lock). Best effort.
@@ -940,36 +941,78 @@ pub(crate) async fn clear_finished_task_from_session_file(
     store: &Arc<dyn VectorStore>,
     namespace: &str,
     task_id: &str,
+    roots: &[std::path::PathBuf],
 ) {
     let rid = crate::registry::registry_row_id(namespace);
-    let Ok(Some((_, registry))) = store.get(namespace, &rid).await else {
-        return;
+    let registry_root = match store.get(namespace, &rid).await {
+        Ok(Some((_, registry))) => registry
+            .metadata
+            .get("project_root")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(std::path::PathBuf::from),
+        _ => None,
     };
-    let Some(root) = registry.metadata.get("project_root").and_then(|v| v.as_str()) else {
-        return;
-    };
+    let mut seen = HashSet::new();
+    let roots: Vec<&std::path::PathBuf> = roots
+        .iter()
+        .chain(registry_root.as_ref())
+        .filter(|root| seen.insert(root.join(".NeuroStrata")))
+        .collect();
     let _session_guard = SESSION_FILE_LOCK.lock().await;
-    let session_path = std::path::Path::new(root).join(".NeuroStrata").join("active_session.json");
-    let Some(mut active) = std::fs::read_to_string(&session_path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .and_then(|v| v.as_object().cloned())
-    else {
-        return;
-    };
-    if active.get("task_id").and_then(|v| v.as_str()) != Some(task_id) {
-        return;
+    let mut still_in_progress: Option<bool> = None;
+    for root in roots {
+        let session_path = root.join(".NeuroStrata").join("active_session.json");
+        let Some(mut active) = std::fs::read_to_string(&session_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .and_then(|v| v.as_object().cloned())
+        else {
+            continue;
+        };
+        if active.get("task_id").and_then(|v| v.as_str()) != Some(task_id) {
+            continue;
+        }
+        // Read the row once, under the lock: another session may have
+        // claimed this task again meanwhile, or the read may fail.
+        if still_in_progress.is_none() {
+            still_in_progress = Some(!matches!(
+                in_progress_task(store, namespace, task_id).await,
+                Ok(None)
+            ));
+        }
+        if still_in_progress == Some(true) {
+            return;
+        }
+        for key in ["task_id", "status", "session_id", "subagent_prompt_injection"] {
+            active.remove(key);
+        }
+        active.insert("updated_at".to_string(), json!(machine::timestamp()));
+        if let Ok(serialized) = serde_json::to_string_pretty(&Value::Object(active)) {
+            let _ = std::fs::write(&session_path, serialized);
+        }
     }
-    if !matches!(in_progress_task(store, namespace, task_id).await, Ok(None)) {
-        return;
-    }
-    for key in ["task_id", "status", "session_id", "subagent_prompt_injection"] {
-        active.remove(key);
-    }
-    active.insert("updated_at".to_string(), json!(machine::timestamp()));
-    if let Ok(serialized) = serde_json::to_string_pretty(&Value::Object(active)) {
-        let _ = std::fs::write(&session_path, serialized);
-    }
+}
+
+/// The session-file roots a task finishing now may have been written to:
+/// the worktree its claim recorded, and the root the caller names.
+fn session_file_roots_for(args: &Value, task: &Task) -> Vec<std::path::PathBuf> {
+    let recorded = task
+        .task_field("worktree")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(std::path::PathBuf::from);
+    recorded.into_iter().chain(caller_session_root(args)).collect()
+}
+
+/// The root `task_claim` writes the session file into for a caller that names
+/// `worktree`, `project_root` or `cwd`: the enclosing worktree, else the
+/// nearest folder with `.git` or `.NeuroStrata`.
+fn caller_session_root(args: &Value) -> Option<std::path::PathBuf> {
+    let explicit = arg_str(args, "worktree")
+        .or_else(|| arg_str(args, "project_root"))
+        .or_else(|| arg_str(args, "cwd"))?;
+    Some(resolve_session_root_dir(std::path::Path::new(explicit)))
 }
 
 /// Auto-retrieve relevant governing rules, memories, code symbols, and 1-hop
@@ -2715,6 +2758,8 @@ pub async fn handle_task_update(
         Err(e) => return e,
     };
     let from = task.status();
+    // Before an unclaim drops the worktree mark the claim recorded.
+    let session_roots = session_file_roots_for(&args, &task);
 
     // A rename is history, not a transition: without a caller's note the
     // history entry says what the title became, so Working Memory keeps the
@@ -2878,7 +2923,7 @@ pub async fn handle_task_update(
         return e;
     }
     if from == Status::InProgress && task.status() != Status::InProgress {
-        clear_finished_task_from_session_file(&store, &namespace, &id).await;
+        clear_finished_task_from_session_file(&store, &namespace, &id, &session_roots).await;
     }
     let event_id = arg_str(&args, "event_id")
         .unwrap_or(&format!("update-{}", id))
@@ -3567,7 +3612,8 @@ pub async fn handle_task_complete(
         }
     }
     save_task(&store, &namespace, &id, vector, completed.payload.clone()).await?;
-    clear_finished_task_from_session_file(&store, &namespace, &id).await;
+    let session_roots = session_file_roots_for(&args, &task);
+    clear_finished_task_from_session_file(&store, &namespace, &id, &session_roots).await;
     let event_id = arg_str(&args, "event_id")
         .unwrap_or(&format!("complete-{}", id))
         .to_string();
