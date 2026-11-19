@@ -743,11 +743,14 @@ pub fn bounded_classify(
 /// Classify, then commit exactly one batch memory to the real `VectorStore`.
 /// All validation happens inside `bounded_classify` before the single
 /// `upsert`; any failure aborts with zero writes. The deterministic id is
-/// derived from the trimmed namespace and the canonical Turtle bytes, so
-/// re-ingesting the same batch is idempotent within a namespace while the
-/// same batch in a different namespace gets a distinct id. A row already
-/// stored under a pre-#298 legacy content-only id in the same namespace is
-/// reused in place, so re-ingesting such a batch never creates a duplicate.
+/// derived from the trimmed namespace, the principal (`user_id`), and the
+/// canonical Turtle bytes, so re-ingesting the same batch by the same principal
+/// is idempotent within a namespace while a different namespace or a different
+/// principal gets a distinct id without transferring row ownership. If the
+/// same principal already holds a pre-#302 or pre-#298 row for that batch in
+/// `namespace`, a single legacy row is reused in place; if a downgrade/upgrade
+/// cycle left both a current and a legacy sibling row for the same principal,
+/// the canonical row is updated and the stale sibling is retired.
 pub async fn ingest_bounded_classification<S: VectorStore + ?Sized>(
     store: &S,
     namespace: &str,
@@ -767,27 +770,50 @@ pub async fn ingest_bounded_classification<S: VectorStore + ?Sized>(
         .embed(&batch.memory_payload.content)
         .await
         .map_err(|e| IngestError::Embedding(e.to_string()))?;
-    let legacy_id = format!(
+    let user_id = batch.memory_payload.user_id.trim();
+    let content = &batch.memory_payload.content;
+    let legacy_content_id = format!("bounded-ingest-{}", nquads_digest(content));
+    let legacy_ns_id = format!(
         "bounded-ingest-{}",
-        nquads_digest(&batch.memory_payload.content)
+        nquads_digest(&format!("{namespace}\x1f{content}"))
     );
-    let id = if store
-        .get(namespace, &legacy_id)
-        .await
-        .map_err(IngestError::Store)?
-        .is_some()
-    {
-        legacy_id
-    } else {
-        format!(
-            "bounded-ingest-{}",
-            nquads_digest(&format!("{namespace}\x1f{}", batch.memory_payload.content))
-        )
+    let scoped_id = format!(
+        "bounded-ingest-{}",
+        nquads_digest(&format!("{namespace}\x1f{user_id}\x1f{content}"))
+    );
+
+    let mut owned_existing: Vec<String> = Vec::new();
+    for candidate_id in [&scoped_id, &legacy_ns_id, &legacy_content_id] {
+        if owned_existing.iter().any(|existing| existing == candidate_id) {
+            continue;
+        }
+        if let Some((_, payload)) = store
+            .get(namespace, candidate_id)
+            .await
+            .map_err(IngestError::Store)?
+        {
+            if payload.user_id.trim() == user_id {
+                owned_existing.push(candidate_id.clone());
+            }
+        }
+    }
+
+    let (id, siblings_to_remove) = match owned_existing.as_slice() {
+        [] => (scoped_id, Vec::new()),
+        [only] => (only.clone(), Vec::new()),
+        [primary, rest @ ..] => (primary.clone(), rest.to_vec()),
     };
+
     let report = store
         .upsert(namespace, &id, vector, batch.memory_payload.clone())
         .await
         .map_err(IngestError::Store)?;
+    for sibling_id in siblings_to_remove {
+        store
+            .delete(namespace, &sibling_id)
+            .await
+            .map_err(IngestError::Store)?;
+    }
     Ok(IngestOutcome {
         id: report.id,
         turtle: batch.turtle,
@@ -1599,6 +1625,112 @@ mod tests {
         assert_ne!(
             other_outcome.id, legacy_id,
             "other-ns has no legacy row, so it must use the namespace-scoped id"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn cross_user_ingest_does_not_transfer_row_ownership() {
+        let index = make_index();
+        let dir = temp_store_dir();
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp db");
+        store.init("test-ns").await.expect("init schema");
+
+        let mut alice_req = request(vec![valid_candidate()]);
+        alice_req.user_id = "alice".to_string();
+        let mut bob_req = request(vec![valid_candidate()]);
+        bob_req.user_id = "bob".to_string();
+
+        let alice_out = ingest_bounded_classification(
+            &store, "test-ns", &index, &budget(), &alice_req, &StubEmbedder,
+        )
+        .await
+        .expect("alice ingest");
+        let bob_out = ingest_bounded_classification(
+            &store, "test-ns", &index, &budget(), &bob_req, &StubEmbedder,
+        )
+        .await
+        .expect("bob ingest");
+
+        assert_ne!(
+            alice_out.id, bob_out.id,
+            "distinct principals ingesting identical content must not share or overwrite one row id"
+        );
+        let (_, alice_row) = store
+            .get("test-ns", &alice_out.id)
+            .await
+            .expect("get alice row")
+            .expect("alice row exists");
+        assert_eq!(
+            alice_row.user_id, "alice",
+            "alice must retain ownership of her row after bob ingests the same batch"
+        );
+        let (_, bob_row) = store
+            .get("test-ns", &bob_out.id)
+            .await
+            .expect("get bob row")
+            .expect("bob row exists");
+        assert_eq!(bob_row.user_id, "bob");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn downgrade_and_restore_retires_legacy_sibling_rows() {
+        let index = make_index();
+        let dir = temp_store_dir();
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp db");
+        store.init("test-ns").await.expect("init schema");
+
+        let req = request(vec![valid_candidate()]);
+        // 1. Head ingest creates the principal+namespace-scoped row.
+        let head_first = ingest_bounded_classification(
+            &store, "test-ns", &index, &budget(), &req, &StubEmbedder,
+        )
+        .await
+        .expect("initial head ingest");
+
+        // 2. Simulate a downgrade to a pre-#298 or pre-#302 binary that writes
+        // a legacy content-only sibling row for the same batch and principal.
+        let batch = bounded_classify(&index, &budget(), &req).expect("classify");
+        let legacy_content_id = format!(
+            "bounded-ingest-{}",
+            nquads_digest(&batch.memory_payload.content)
+        );
+        store
+            .upsert(
+                "test-ns",
+                &legacy_content_id,
+                vec![0.25f32; 4],
+                batch.memory_payload.clone(),
+            )
+            .await
+            .expect("seed downgrade legacy sibling");
+
+        // 3. Re-ingesting on head must keep the canonical head row and retire
+        // the legacy sibling so search returns a single row for the batch.
+        let head_restored = ingest_bounded_classification(
+            &store, "test-ns", &index, &budget(), &req, &StubEmbedder,
+        )
+        .await
+        .expect("head re-ingest after downgrade");
+        assert_eq!(head_restored.id, head_first.id);
+        assert!(
+            store
+                .get("test-ns", &legacy_content_id)
+                .await
+                .expect("get legacy sibling")
+                .is_none(),
+            "stale legacy sibling must be retired on restore"
+        );
+        let hits = store
+            .search("test-ns", vec![0.25f32; 4], 10, false, false)
+            .await
+            .expect("search test-ns");
+        assert_eq!(
+            hits.len(), 1,
+            "search must return one row for the batch after downgrade/restore"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
