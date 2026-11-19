@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Staged quality runner: checks staged files for formatting and lint compliance.
 # Called by the pre-commit hook. Exits 0 only when all relevant checks pass.
-# Never writes project files or the Git index.
+# Validates committed content: refuses to run when a staged blob differs from its
+# working-tree file, because every check reads the working tree. This keeps a
+# stale worktree from masking a bad staged blob. Never writes project files or
+# the Git index.
 set -euo pipefail
 
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
@@ -27,7 +30,7 @@ JsTsStaged=()
 OtherFiles=()
 ClippyStaged=()
 
-for file in "${StagedFiles[@]}"; do
+for file in ${StagedFiles[@]+"${StagedFiles[@]}"}; do
     case "$file" in
         *.rs) RustFiles+=("$file"); ClippyStaged+=("$file") ;;
         *.sh) ShellFiles+=("$file") ;;
@@ -39,11 +42,24 @@ for file in "${StagedFiles[@]}"; do
 done
 
 # Web UI TS/TSX files for ESLint
-for file in "${StagedFiles[@]}"; do
+for file in ${StagedFiles[@]+"${StagedFiles[@]}"}; do
     case "$file" in
         web-ui/*.ts|web-ui/*.tsx) JsTsStaged+=("$file") ;;
     esac
 done
+
+# ── Index/worktree consistency ──────────────────────────────────────────────
+# Checks below run against working-tree paths. If a staged blob differs from
+# the worktree, the tools would validate content the commit does not contain.
+# Fail closed and ask for the content to be staged.
+if [ ${#StagedFiles[@]} -gt 0 ]; then
+    if ! git diff --quiet -- "${StagedFiles[@]}" 2>/dev/null; then
+        echo "error: staged content differs from the working tree:" >&2
+        git diff --name-only -- "${StagedFiles[@]}" >&2 || true
+        echo "  stage the current content (git add <path>) or restore the worktree, then retry." >&2
+        exit 1
+    fi
+fi
 
 # ── Tool resolution: local paths only ───────────────────────────────────────
 resolve_tool() {
@@ -89,9 +105,10 @@ if [ ${#ClippyStaged[@]} -gt 0 ]; then
         missing_tool cargo "install the Rust toolchain via https://rustup.rs"
     fi
 
-    # collision-safe temp files, cleaned on any exit
+    # collision-safe temp files, cleaned on any exit; preserve the real status
     tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/staged-quality.XXXXXX")
-    trap 'rm -rf "$tmpdir"' EXIT
+    # shellcheck disable=SC2154  # rc is assigned inside the trap itself
+    trap 'rc=$?; trap - EXIT; rm -rf "$tmpdir"; exit "$rc"' EXIT
 
     clippy_stderr="$tmpdir/clippy-stderr.log"
     filter_stderr="$tmpdir/filter-stderr.log"
@@ -135,7 +152,7 @@ fi
 
 # ── Check 3: JavaScript/TypeScript formatting (Prettier) ─────────────────────
 PRETTIER_FILES=()
-for file in "${JsTsFiles[@]}" "${OtherFiles[@]}"; do
+for file in ${JsTsFiles[@]+"${JsTsFiles[@]}"} ${OtherFiles[@]+"${OtherFiles[@]}"}; do
     case "$file" in
         dist/*|*/dist/*) continue ;;
         *) PRETTIER_FILES+=("$file") ;;
@@ -156,7 +173,7 @@ fi
 # Convert staged web-ui paths to web-ui-relative arguments and run from
 # $ROOT/web-ui so ESLint flat config discovery resolves real project config.
 WEB_UI_FILES=()
-for file in "${JsTsStaged[@]}"; do
+for file in ${JsTsStaged[@]+"${JsTsStaged[@]}"}; do
     WEB_UI_FILES+=("${file#web-ui/}")
 done
 

@@ -3307,18 +3307,32 @@ mod kani_proofs {
 
     #[kani::proof]
     fn proof_task_edge_guard_legal_edges() {
+        use KernelTaskStatus::*;
         let from = kani::any::<KernelTaskStatus>();
         let to = kani::any::<KernelTaskStatus>();
-        let guard = task_edge_guard(from, to);
-        // If guard is Some, the transition is legal (covered by the match arm).
-        if let KernelGuard::RequireReason = guard.unwrap_or(KernelGuard::None) {
-            assert!(matches!(
-                (from, to),
-                (KernelTaskStatus::Open, KernelTaskStatus::Blocked)
-                    | (KernelTaskStatus::InProgress, KernelTaskStatus::Blocked)
-                    | (KernelTaskStatus::Blocked, KernelTaskStatus::Open)
-                    | (KernelTaskStatus::Done, KernelTaskStatus::Open)
-            ));
+
+        // Exact legality table: all sixteen pairs are classified.
+        let expected = match (from, to) {
+            (Open, InProgress) | (InProgress, Open) => Some(KernelGuard::None),
+            (Open, Blocked) | (InProgress, Blocked) | (Blocked, Open) | (Done, Open) => {
+                Some(KernelGuard::RequireReason)
+            }
+            (Open, Done) | (InProgress, Done) => Some(KernelGuard::ExtractionRequired),
+            _ => None,
+        };
+        assert_eq!(task_edge_guard(from, to), expected);
+
+        // task_step enforces each guard, so a dropped guard changes the result.
+        let has_reason = kani::any::<bool>();
+        let extraction_edge_exists = kani::any::<bool>();
+        let step = task_step(from, to, has_reason, extraction_edge_exists);
+        match expected {
+            None => assert!(step.is_err()),
+            Some(KernelGuard::None) => assert!(step.is_ok()),
+            Some(KernelGuard::RequireReason) => assert_eq!(step.is_ok(), has_reason),
+            Some(KernelGuard::ExtractionRequired) => {
+                assert_eq!(step.is_ok(), extraction_edge_exists)
+            }
         }
     }
 
@@ -3327,11 +3341,14 @@ mod kani_proofs {
         let candidate = kani::any::<u32>();
         let manifest = kani::any::<u32>();
         let decision = epoch_gate_decision(candidate, manifest);
-        // Exactly one of the three decisions must hold.
-        let apply = matches!(decision, KernelEpochDecision::Apply);
-        let quarantine = matches!(decision, KernelEpochDecision::QuarantineOld);
-        let refuse = matches!(decision, KernelEpochDecision::RefuseFuture);
-        assert!((apply as u32) + (quarantine as u32) + (refuse as u32) == 1);
+        let expected = if candidate == manifest {
+            KernelEpochDecision::Apply
+        } else if candidate < manifest {
+            KernelEpochDecision::QuarantineOld
+        } else {
+            KernelEpochDecision::RefuseFuture
+        };
+        assert_eq!(decision, expected);
     }
 
     #[kani::proof]
@@ -3381,13 +3398,32 @@ mod kani_proofs {
         let perf_count = kani::any::<u64>();
         let outcome =
             evaluate_procedure_fire(trust, has_provenance, valid_to, now, remaining, perf_count);
-        // If bounded and fired, remaining_fires must not have underflowed.
-        if let KernelProcedureFireOutcome::Fired {
-            remaining_fires: Some(r),
-            ..
-        } = outcome
-        {
-            assert!(r <= u64::MAX);
+        // Budget conservation: a fired rehearsal decrements exactly one slot.
+        match outcome {
+            KernelProcedureFireOutcome::Fired {
+                remaining_fires: Some(r),
+                performance_count: p,
+            } => {
+                let budget = remaining.expect("bounded fire requires a budget");
+                assert!(budget > 0);
+                assert_eq!(r, budget - 1);
+                assert_eq!(p, perf_count.saturating_add(1));
+            }
+            KernelProcedureFireOutcome::Fired {
+                remaining_fires: None,
+                performance_count: p,
+            } => {
+                assert!(remaining.is_none());
+                assert_eq!(p, perf_count.saturating_add(1));
+            }
+            KernelProcedureFireOutcome::RefuseSpent => assert_eq!(remaining, Some(0)),
+            KernelProcedureFireOutcome::RefuseUntrusted => {
+                assert!(procedure_is_untrusted(trust, has_provenance))
+            }
+            KernelProcedureFireOutcome::RefuseLapsed => {
+                assert!(!procedure_is_untrusted(trust, has_provenance));
+                assert!(procedure_is_lapsed(valid_to, now));
+            }
         }
     }
 
@@ -3399,8 +3435,29 @@ mod kani_proofs {
         let sessions = kani::any::<Option<i64>>();
         let since = kani::any::<Option<i64>>();
         let due = compute_procedure_next_due(now, last, days, sessions, since);
-        // Result must never wrap (saturating) and must be finite.
-        assert!(due >= i64::MIN && due <= i64::MAX);
+        // Exact cadence spec: day cadence wins, then session cadence, else now.
+        match (last, days, sessions) {
+            (Some(l), Some(d), _) if d > 0 => {
+                assert_eq!(
+                    due,
+                    l.saturating_add(d.saturating_mul(PROCEDURE_DAY_SECONDS))
+                );
+                assert!(due >= l);
+            }
+            (Some(l), _, Some(n)) if n > 1 => {
+                let elapsed = match since {
+                    Some(s) if s > 0 => s,
+                    Some(_) => 0,
+                    None => n - 1,
+                };
+                assert_eq!(
+                    due,
+                    l.saturating_add(elapsed.saturating_mul(PROCEDURE_SESSION_ESTIMATE_SECONDS))
+                );
+                assert!(due >= l);
+            }
+            _ => assert_eq!(due, now),
+        }
     }
 
     #[kani::proof]
@@ -3432,7 +3489,28 @@ mod kani_proofs {
     #[kani::proof]
     fn proof_evaluate_connector_post_gate_total() {
         let input = kani::any::<KernelConnectorPostGateInput>();
-        let _ = evaluate_connector_post_gate(input);
+        let verdict = evaluate_connector_post_gate(input);
+        let bounds_exceeded = matches!(input.op, KernelConnectorOp::ResolveSlice)
+            && (input.observed_rows > input.max_slice_rows
+                || input.observed_bytes > input.max_slice_bytes);
+        // Precedence is observable: bounds, then source digest, then CAS.
+        if bounds_exceeded {
+            assert_eq!(
+                verdict,
+                KernelConnectorPostVerdict::DenyObservedBoundsExceeded
+            );
+        } else if !input.source_digest_matches {
+            assert_eq!(
+                verdict,
+                KernelConnectorPostVerdict::DenySourceDigestMismatch
+            );
+        } else if matches!(input.op, KernelConnectorOp::ApplyWriteBack)
+            && !input.cas_expected_matches
+        {
+            assert_eq!(verdict, KernelConnectorPostVerdict::DenyCasConflict);
+        } else {
+            assert_eq!(verdict, KernelConnectorPostVerdict::AllowPostOutput);
+        }
     }
 
     #[kani::proof]
@@ -3453,9 +3531,35 @@ mod kani_proofs {
             schema_bytes,
             src_match,
         );
-        // Saturate never wraps; caps are within schema bounds.
-        assert!(input.max_slice_rows <= req_rows || input.max_slice_rows <= schema_rows);
-        assert!(input.max_slice_bytes <= req_bytes || input.max_slice_bytes <= schema_bytes);
+        // The saturated observable count and the effective caps are exact.
+        let expected_observed = if observed_len > (u32::MAX as usize) {
+            u32::MAX
+        } else {
+            observed_len as u32
+        };
+        assert_eq!(input.observed_rows, expected_observed);
+        assert_eq!(input.max_slice_rows, min_u32(req_rows, schema_rows));
+        assert_eq!(input.max_slice_bytes, min_u32(req_bytes, schema_bytes));
+        assert_eq!(input.op, KernelConnectorOp::ResolveSlice);
+        assert!(input.cas_expected_matches);
+
+        // The post-gate consumes those fields and rejects an over-limit result.
+        let verdict = evaluate_connector_post_gate(input);
+        if input.observed_rows > input.max_slice_rows
+            || input.observed_bytes > input.max_slice_bytes
+        {
+            assert_eq!(
+                verdict,
+                KernelConnectorPostVerdict::DenyObservedBoundsExceeded
+            );
+        } else if !src_match {
+            assert_eq!(
+                verdict,
+                KernelConnectorPostVerdict::DenySourceDigestMismatch
+            );
+        } else {
+            assert_eq!(verdict, KernelConnectorPostVerdict::AllowPostOutput);
+        }
     }
 
     #[kani::proof]
@@ -3469,6 +3573,19 @@ mod kani_proofs {
         // Pointer digest match and CAS match are independent flags.
         assert!(input.source_digest_matches == ptr_match);
         assert!(input.cas_expected_matches == cas_match);
+
+        // Pre-write digest failure wins over a CAS conflict.
+        let verdict = evaluate_connector_post_gate(input);
+        if !ptr_match {
+            assert_eq!(
+                verdict,
+                KernelConnectorPostVerdict::DenySourceDigestMismatch
+            );
+        } else if !cas_match {
+            assert_eq!(verdict, KernelConnectorPostVerdict::DenyCasConflict);
+        } else {
+            assert_eq!(verdict, KernelConnectorPostVerdict::AllowPostOutput);
+        }
     }
 
     #[kani::proof]
@@ -3572,6 +3689,17 @@ mod kani_proofs {
         if e0 == e1 || e2 == e3 {
             assert!(!valid);
         }
+
+        // A two-edge cycle is rejected even when every edge is non-reflexive.
+        let a = kani::any::<u32>();
+        let b = kani::any::<u32>();
+        kani::assume(a != b);
+        assert!(!validate_taxonomy_dag(&[(a, b), (b, a)]));
+
+        // Fixed 2- and 3-cycles, and a valid chain.
+        assert!(!validate_taxonomy_dag(&[(0, 1), (1, 0)]));
+        assert!(!validate_taxonomy_dag(&[(0, 1), (1, 2), (2, 0)]));
+        assert!(validate_taxonomy_dag(&[(0, 1), (1, 2), (2, 3)]));
     }
 
     #[kani::proof]
@@ -3582,6 +3710,15 @@ mod kani_proofs {
         let related = [(a, b)];
         let contrast: [(u32, u32); 0] = [];
         assert!(!validate_skos_disjointness(&broader, &related, &contrast));
+
+        // A related edge that equals the transitive broader closure is invalid,
+        // while an unrelated pair stays valid.
+        assert!(!validate_skos_disjointness(
+            &[(0, 1), (1, 2)],
+            &[(0, 2)],
+            &[]
+        ));
+        assert!(validate_skos_disjointness(&[(0, 1)], &[(2, 3)], &[]));
     }
 
     #[kani::proof]
