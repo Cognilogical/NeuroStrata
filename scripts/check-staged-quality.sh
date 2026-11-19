@@ -107,11 +107,11 @@ missing_tool() {
 }
 
 # ── Check 1: Rust formatting ────────────────────────────────────────────────
-# Follow the crate edition instead of hard-coding it, so an edition bump cannot
-# silently format with stale rules.
+# Read the crate edition from the staged snapshot (CHECK_ROOT), not the working
+# tree, so rustfmt matches the staged content it actually checks.
 EDITION=""
-if [ -f Cargo.toml ]; then
-    EDITION="$(sed -n 's/^edition[[:space:]]*=[[:space:]]*"\([0-9][0-9]*\)".*/\1/p' Cargo.toml 2>/dev/null | head -n 1 || true)"
+if [ -f "$CHECK_ROOT/Cargo.toml" ]; then
+    EDITION="$(sed -n 's/^edition[[:space:]]*=[[:space:]]*"\([0-9][0-9]*\)".*/\1/p' "$CHECK_ROOT/Cargo.toml" 2>/dev/null | head -n 1 || true)"
 fi
 if [ -z "$EDITION" ]; then
     EDITION="2021"
