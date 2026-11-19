@@ -37,7 +37,13 @@ for file in ${StagedFiles[@]+"${StagedFiles[@]}"}; do
         *.js|*.jsx|*.ts|*.tsx|*.mjs|*.cjs) JsTsFiles+=("$file") ;;
         *.json|*.css|*.scss|*.html|*.md|*.yml|*.yaml) OtherFiles+=("$file") ;;
         */Cargo.toml|Cargo.toml) ClippyStaged+=("$file") ;;
-        *) ;;
+        *)
+            # Extensionless shell scripts (notably scripts/hooks/pre-commit)
+            # are identified by shebang so they get bash -n and ShellCheck.
+            if [ -f "$file" ] && head -n 1 "$file" 2>/dev/null | grep -qE '^#!.*(bash|sh)'; then
+                ShellFiles+=("$file")
+            fi
+            ;;
     esac
 done
 

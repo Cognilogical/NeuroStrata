@@ -244,11 +244,11 @@ RF_EOF
     git config user.name "Test"
     git add src/main.rs
 
-    PATH="$bindir:$PATH" bash "$SCRIPT_PATH" > "$tmpdir/out.log" 2>&1
+    PATH="$bindir:/usr/bin:/bin" bash "$SCRIPT_PATH" > "$tmpdir/out.log" 2>&1
     local exit_code=$?
 
     [ $exit_code -ne 0 ] || { echo "Expected nonzero exit when cargo missing" >&2; cat "$tmpdir/out.log" >&2; return 1; }
-    grep -qi "cargo" "$tmpdir/out.log" || { echo "Missing tool diagnostic should mention cargo" >&2; cat "$tmpdir/out.log" >&2; return 1; }
+    grep -q "required tool 'cargo' not found" "$tmpdir/out.log" || { echo "Expected the missing-tool diagnostic, not a cargo failure" >&2; cat "$tmpdir/out.log" >&2; return 1; }
 
     cd - >/dev/null
     rm -rf "$tmpdir"
@@ -689,7 +689,10 @@ RF_EOF
         cp "$HOOK_SRC" "$repo/.git/hooks/pre-commit"
         chmod +x "$repo/.git/hooks/pre-commit"
     else
-        echo "warning: pre-commit hook source not found at $HOOK_SRC" >&2
+        echo "FAIL: pre-commit hook source not found at $HOOK_SRC" >&2
+        cd - >/dev/null
+        rm -rf "$tmpdir"
+        return 1
     fi
 
     # Run the pre-commit hook
@@ -909,6 +912,34 @@ test_staged_worktree_divergence_fails() {
     rm -rf "$tmpdir"
     return 0
 }
+
+# Test 19: Extensionless shell hook is syntax-checked
+test_extensionless_shell_hook_syntax() {
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    local repo="$tmpdir/repo"
+    local bindir="$tmpdir/bin"
+    export FAKE_TOOL_LOG="$tmpdir/tool.log"
+
+    setup_fake_tools "$bindir"
+    mkdir -p "$repo/scripts/hooks"
+    printf '#!/usr/bin/env bash\nif [ 1 -eq 1 ; then\n' > "$repo/scripts/hooks/pre-commit"
+    cd "$repo"
+    git init -q
+    git config user.email "test@test.com"
+    git config user.name "Test"
+    git add scripts/hooks/pre-commit
+
+    PATH="$bindir:$PATH" bash "$SCRIPT_PATH" > "$tmpdir/out.log" 2>&1
+    local exit_code=$?
+
+    [ $exit_code -ne 0 ] || { echo "Expected nonzero exit for a broken hook" >&2; cat "$tmpdir/out.log" >&2; return 1; }
+    grep -q "bash syntax check failed" "$tmpdir/out.log" || { echo "Hook was not syntax-checked" >&2; cat "$tmpdir/out.log" >&2; return 1; }
+
+    cd - >/dev/null
+    rm -rf "$tmpdir"
+    return 0
+}
 run_test "Staged routing table" test_staged_routing
 run_test "Whitespace-safe arguments" test_whitespace_safe_args
 run_test "Deleted and internal filtering" test_deleted_and_internal_filtering
@@ -927,6 +958,7 @@ run_test "Pre-commit delegation quality failure nonzero, ledger unchanged" test_
 run_test "Pre-commit delegation quality success preserves ledger" test_pre_commit_hook_delegation_quality_success_preserves_ledger
 run_test "Pre-commit delegation absent quality script generic ledger" test_pre_commit_hook_delegation_absent_quality_script
 run_test "Staged/worktree divergence fails closed" test_staged_worktree_divergence_fails
+run_test "Extensionless shell hook is syntax-checked" test_extensionless_shell_hook_syntax
 
 echo ""
 echo "=== Summary ==="
