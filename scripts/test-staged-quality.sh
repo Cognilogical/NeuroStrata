@@ -1060,6 +1060,66 @@ RUSTFMT_EOF
     rm -rf "$tmpdir"
 }
 
+# Test: Type-change (symlink -> regular file) is staged and checked
+test_type_change_is_checked() {
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    local repo="$tmpdir/repo"
+    local bindir="$tmpdir/bin"
+    export FAKE_TOOL_LOG="$tmpdir/tool.log"
+
+    setup_fake_tools "$bindir"
+    mkdir -p "$repo/src"
+    echo 'fn main() {}' > "$repo/target.rs"
+    ln -s ../target.rs "$repo/src/link.rs"
+    cd "$repo"
+    git init -q
+    git config user.email "test@test.com"
+    git config user.name "Test"
+    git add target.rs src/link.rs
+    git commit -q -m "initial"
+
+    rm src/link.rs
+    echo 'fn main(){}' > src/link.rs
+    git add src/link.rs
+
+    PATH="$bindir:$PATH" bash "$SCRIPT_PATH" > "$tmpdir/out.log" 2>&1
+    local exit_code=$?
+
+    [ $exit_code -eq 0 ] || { echo "Expected exit 0, got $exit_code" >&2; cat "$tmpdir/out.log" >&2; return 1; }
+    grep -q "file: src/link.rs" "$FAKE_TOOL_LOG" || { echo "type-changed file was not checked" >&2; cat "$FAKE_TOOL_LOG" >&2; return 1; }
+
+    cd - >/dev/null
+    rm -rf "$tmpdir"
+    return 0
+}
+
+# Test: Outside a git repository the gate fails closed
+test_outside_repo_fails_closed() {
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    cd "$tmpdir"
+    bash "$SCRIPT_PATH" > "$tmpdir/out.log" 2>&1
+    local exit_code=$?
+    cd - >/dev/null
+
+    if [ $exit_code -eq 0 ]; then
+        echo "Expected nonzero exit outside a repo" >&2
+        cat "$tmpdir/out.log" >&2
+        rm -rf "$tmpdir"
+        return 1
+    fi
+    if ! grep -q "not inside a git repository" "$tmpdir/out.log"; then
+        echo "Missing not-a-repo diagnostic" >&2
+        cat "$tmpdir/out.log" >&2
+        rm -rf "$tmpdir"
+        return 1
+    fi
+
+    rm -rf "$tmpdir"
+    return 0
+}
+
 run_test "Staged routing table" test_staged_routing
 run_test "Whitespace-safe arguments" test_whitespace_safe_args
 run_test "Deleted and internal filtering" test_deleted_and_internal_filtering
@@ -1083,6 +1143,8 @@ run_test "Extensionless Bash hook is checked" test_extensionless_bash_hook_is_ch
 run_test "Unbuilt staged Rust fails" test_unbuilt_staged_rust_fails
 run_test "Quality suites are wired into CI" test_quality_suites_are_wired_into_ci
 run_test "Local Rustfmt survives snapshot cwd" test_local_rustfmt_survives_snapshot_cwd
+run_test "Type-change is checked" test_type_change_is_checked
+run_test "Outside a repo fails closed" test_outside_repo_fails_closed
 
 echo ""
 echo "=== Summary ==="
