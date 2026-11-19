@@ -2545,7 +2545,10 @@ mod tests {
             .await
             .expect("import");
         assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.notes_imported, 1);
         let (_, head) = store.get(ns, "vis-note").await.unwrap().unwrap();
+        assert_eq!(head.content, "updated body");
+        assert!(head.metadata["supersedes"].is_string());
         assert_eq!(head.metadata["visible_to"], serde_json::json!(["default"]));
         assert_eq!(head.metadata["eligibility"], serde_json::json!("shareable"));
         assert!(
