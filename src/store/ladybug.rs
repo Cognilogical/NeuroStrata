@@ -6151,7 +6151,7 @@ fn plan_hygiene_row(
         let src = meta.get("source").and_then(|v| v.as_str()).unwrap_or("");
         let usable = crate::traits::has_source(&meta) && src != "N/A";
         if !usable {
-            let val = if !loc.is_empty() && loc != "N/A" {
+            let val = if !loc.is_empty() && loc != "N/A" && !crate::paths::is_absolute_any(loc) {
                 loc.clone()
             } else {
                 "legacy-rule".to_string()
@@ -24716,6 +24716,31 @@ eurostrata\src\daemon.rs",
             "the repair must not overwrite an object source with a string"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn repair_hygiene_stamps_portable_source_for_absolute_rule_location() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(dir.path().join("hygiene.lbug"), 4).unwrap();
+        store.init("probe").await.unwrap();
+
+        let mut rule = retired_test_payload("rule", "agent", json!({}));
+        rule.location = "/private/sentinel/rule.md".to_string();
+        store
+            .upsert("probe", "rule-without-source", vec![0.1, 0.2, 0.3, 0.4], rule)
+            .await
+            .unwrap();
+
+        store.repair_namespace_hygiene("probe").await.unwrap();
+
+        let rows = store.list_memories("probe", None, None).await.unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r.id == "rule-without-source")
+            .expect("the row survives the repair");
+        let source = row.payload.metadata["source"].as_str().unwrap();
+        assert_eq!(source, "legacy-rule");
+        assert!(!source.contains("sentinel"));
     }
 
     /// The batched repair must do what the per-row one did: archive refs that
