@@ -115,22 +115,37 @@ function makeDependencies(text) {
 
 /** Returns staged .rs paths absent from every Cargo dep-info dependency set. */
 function findUnbuiltStagedRustFiles(depInfoTexts, root, stagedPaths) {
+  const lexicalRoot = path.resolve(root).replace(/\\/g, '/').replace(/\/$/, '')
   const canonicalRoot = existingRealPath(root)
     .replace(/\\/g, '/')
     .replace(/\/$/, '')
+
+  // Map a path (absolute or repo-relative) to a repo-relative spelling under
+  // the canonical root. Nonexistent staged files fall back to their lexical
+  // path, so rewrite the lexical root prefix before comparing. This matters on
+  // macOS, where os.tmpdir() is under /var but realpath() returns /private/var.
+  function repoRelative(p) {
+    const absolute = path.isAbsolute(p) ? p : path.join(canonicalRoot, p)
+    let resolved = existingRealPath(absolute).replace(/\\/g, '/')
+    if (resolved.startsWith(lexicalRoot + '/')) {
+      resolved = canonicalRoot + resolved.slice(lexicalRoot.length)
+    }
+    return normalizePath(resolved, canonicalRoot)
+  }
+
   const built = new Set()
   for (const text of depInfoTexts) {
     for (const dependency of makeDependencies(text)) {
-      const resolved = path.isAbsolute(dependency)
+      const absolute = path.isAbsolute(dependency)
         ? dependency
         : path.join(canonicalRoot, dependency)
-      const normalized = normalizePath(existingRealPath(resolved), canonicalRoot)
+      const normalized = repoRelative(absolute)
       if (normalized.endsWith('.rs')) built.add(normalized)
     }
   }
   return stagedPaths
     .filter((p) => p.endsWith('.rs'))
-    .map((p) => normalizePath(p, canonicalRoot))
+    .map((p) => repoRelative(p))
     .filter((p) => !built.has(p))
 }
 
