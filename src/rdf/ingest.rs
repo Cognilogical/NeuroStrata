@@ -770,12 +770,19 @@ pub async fn ingest_bounded_classification<S: VectorStore + ?Sized>(
         .embed(&batch.memory_payload.content)
         .await
         .map_err(|e| IngestError::Embedding(e.to_string()))?;
-    let user_id = batch.memory_payload.user_id.trim();
+    // Keep the exact raw principal string as stored on `MemoryPayload.user_id`
+    // and compared by ReBAC so principals differing only by surrounding
+    // whitespace cannot share an ID or overwrite each other's row.
+    let user_id = &batch.memory_payload.user_id;
     let content = &batch.memory_payload.content;
     let legacy_content_id = format!("bounded-ingest-{}", nquads_digest(content));
     let legacy_ns_id = format!(
         "bounded-ingest-{}",
         nquads_digest(&format!("{namespace}\x1f{content}"))
+    );
+    let legacy_trimmed_scoped_id = format!(
+        "bounded-ingest-{}",
+        nquads_digest(&format!("{namespace}\x1f{}\x1f{content}", user_id.trim()))
     );
     let scoped_id = format!(
         "bounded-ingest-{}",
@@ -783,7 +790,12 @@ pub async fn ingest_bounded_classification<S: VectorStore + ?Sized>(
     );
 
     let mut owned_existing: Vec<String> = Vec::new();
-    for candidate_id in [&scoped_id, &legacy_ns_id, &legacy_content_id] {
+    for candidate_id in [
+        &scoped_id,
+        &legacy_trimmed_scoped_id,
+        &legacy_ns_id,
+        &legacy_content_id,
+    ] {
         if owned_existing.iter().any(|existing| existing == candidate_id) {
             continue;
         }
@@ -792,7 +804,7 @@ pub async fn ingest_bounded_classification<S: VectorStore + ?Sized>(
             .await
             .map_err(IngestError::Store)?
         {
-            if payload.user_id.trim() == user_id {
+            if &payload.user_id == user_id {
                 owned_existing.push(candidate_id.clone());
             }
         }
@@ -808,6 +820,9 @@ pub async fn ingest_bounded_classification<S: VectorStore + ?Sized>(
         .upsert(namespace, &id, vector, batch.memory_payload.clone())
         .await
         .map_err(IngestError::Store)?;
+    if !siblings_to_remove.is_empty() {
+        retarget_sibling_references(store, namespace, &id, &siblings_to_remove).await?;
+    }
     for sibling_id in siblings_to_remove {
         store
             .delete(namespace, &sibling_id)
@@ -820,6 +835,181 @@ pub async fn ingest_bounded_classification<S: VectorStore + ?Sized>(
         triple_count: batch.triple_count,
         memory_payload: batch.memory_payload,
     })
+}
+
+/// Redirect any inbound or outbound references (declared relation metadata
+/// arrays, `superseded_by`, and materialized graph edges) in `namespace` from
+/// `siblings_to_remove` onto `primary_id` before the sibling rows are deleted.
+async fn retarget_sibling_references<S: VectorStore + ?Sized>(
+    store: &S,
+    namespace: &str,
+    primary_id: &str,
+    siblings_to_remove: &[String],
+) -> Result<(), IngestError> {
+    const RELATION_KEYS: [(&str, &str, bool); 5] = [
+        ("related_to", "RELATES_TO", true),
+        ("contained_by", "CONTAINS", false),
+        ("governs", "GOVERNS", true),
+        ("extracted_from", "EXTRACTED_FROM", true),
+        ("depends_on", "DEPENDS_ON", true),
+    ];
+
+    let is_sibling = |candidate: &str| -> bool {
+        siblings_to_remove.iter().any(|sib| {
+            candidate == sib || candidate == format!("{namespace}::{sib}")
+        })
+    };
+
+    let mut candidate_ids: Vec<String> = Vec::new();
+    let mut push_unique = |id: String| {
+        if !siblings_to_remove.contains(&id) && !candidate_ids.contains(&id) {
+            candidate_ids.push(id);
+        }
+    };
+
+    for row in store
+        .list(namespace, None, None)
+        .await
+        .map_err(IngestError::Store)?
+    {
+        push_unique(row.id);
+    }
+
+    // Track (declaring_id, metadata_key, target_id) implied by materialized
+    // graph edges touching any sibling so even direct edges are re-materialized
+    // on `primary_id` when the declaring memory is re-upserted.
+    let mut edge_additions: Vec<(String, &'static str, String)> = Vec::new();
+    for (from_id, rel, to_id, _) in store
+        .list_edges(namespace)
+        .await
+        .map_err(IngestError::Store)?
+    {
+        let from_is_sib = siblings_to_remove.contains(&from_id);
+        let to_is_sib = siblings_to_remove.contains(&to_id);
+        if !from_is_sib && !to_is_sib {
+            continue;
+        }
+        let Some(&(meta_key, _, points_at_target)) = RELATION_KEYS
+            .iter()
+            .find(|(_, rel_name, _)| *rel_name == rel.as_str())
+        else {
+            continue;
+        };
+        let new_from = if from_is_sib {
+            primary_id.to_string()
+        } else {
+            from_id
+        };
+        let new_to = if to_is_sib {
+            primary_id.to_string()
+        } else {
+            to_id
+        };
+        if new_from == new_to {
+            continue;
+        }
+        let (declaring_id, target_id) = if points_at_target {
+            (new_from, new_to)
+        } else {
+            (new_to, new_from)
+        };
+        push_unique(declaring_id.clone());
+        edge_additions.push((declaring_id, meta_key, target_id));
+    }
+
+    for candidate_id in candidate_ids {
+        let Some((vec, mut payload)) = store
+            .get(namespace, &candidate_id)
+            .await
+            .map_err(IngestError::Store)?
+        else {
+            continue;
+        };
+        let mut changed = false;
+
+        if let Some(meta_obj) = payload.metadata.as_object_mut() {
+            for &(key, _, _) in &RELATION_KEYS {
+                if let Some(Value::Array(arr)) = meta_obj.get_mut(key) {
+                    let mut rewritten: Vec<Value> = Vec::with_capacity(arr.len());
+                    let mut arr_changed = false;
+                    for item in arr.iter() {
+                        if let Some(raw) = item.as_str() {
+                            if is_sibling(raw) {
+                                arr_changed = true;
+                                let replacement = if raw.contains("::") {
+                                    format!("{namespace}::{primary_id}")
+                                } else {
+                                    primary_id.to_string()
+                                };
+                                if replacement != candidate_id
+                                    && replacement != format!("{namespace}::{candidate_id}")
+                                    && !rewritten
+                                        .iter()
+                                        .any(|v| v.as_str() == Some(replacement.as_str()))
+                                {
+                                    rewritten.push(Value::String(replacement));
+                                }
+                                continue;
+                            }
+                        }
+                        if !rewritten.iter().any(|v| v == item) {
+                            rewritten.push(item.clone());
+                        } else {
+                            arr_changed = true;
+                        }
+                    }
+                    if arr_changed {
+                        *arr = rewritten;
+                        changed = true;
+                    }
+                }
+            }
+
+            if let Some(Value::String(sup)) = meta_obj.get("superseded_by").cloned() {
+                if is_sibling(&sup) {
+                    let replacement = if sup.contains("::") {
+                        format!("{namespace}::{primary_id}")
+                    } else {
+                        primary_id.to_string()
+                    };
+                    meta_obj.insert("superseded_by".to_string(), Value::String(replacement));
+                    changed = true;
+                }
+            }
+
+            for (decl_id, meta_key, target_id) in &edge_additions {
+                if decl_id != &candidate_id {
+                    continue;
+                }
+                let entry = meta_obj
+                    .entry((*meta_key).to_string())
+                    .or_insert_with(|| Value::Array(Vec::new()));
+                if let Value::Array(arr) = entry {
+                    let qualified_target = format!("{namespace}::{target_id}");
+                    let already_present = arr.iter().any(|v| {
+                        v.as_str() == Some(target_id.as_str())
+                            || v.as_str() == Some(qualified_target.as_str())
+                    });
+                    if !already_present {
+                        arr.push(Value::String(target_id.clone()));
+                    }
+                }
+                // Even if the metadata array already listed `primary_id`,
+                // re-upserting `candidate_id` ensures the graph edge to
+                // `primary_id` is materialized before the sibling is deleted.
+                changed = true;
+            }
+        }
+
+        if changed {
+            store
+                .upsert(namespace, &candidate_id, vec, payload)
+                .await
+                .map_err(IngestError::Store)?;
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1673,6 +1863,38 @@ mod tests {
             .expect("bob row exists");
         assert_eq!(bob_row.user_id, "bob");
 
+        // Principals differing only by surrounding whitespace (`"alice"` vs
+        // `" alice "`) are distinct in ReBAC and must not collide or overwrite
+        // the stored owner.
+        let mut padded_alice_req = request(vec![valid_candidate()]);
+        padded_alice_req.user_id = " alice ".to_string();
+        let padded_alice_out = ingest_bounded_classification(
+            &store,
+            "test-ns",
+            &index,
+            &budget(),
+            &padded_alice_req,
+            &StubEmbedder,
+        )
+        .await
+        .expect("padded alice ingest");
+        assert_ne!(
+            alice_out.id, padded_alice_out.id,
+            "surrounding-whitespace principal must receive a distinct row id"
+        );
+        let (_, alice_row_after) = store
+            .get("test-ns", &alice_out.id)
+            .await
+            .expect("get alice row after padded ingest")
+            .expect("alice row still exists");
+        assert_eq!(alice_row_after.user_id, "alice");
+        let (_, padded_row) = store
+            .get("test-ns", &padded_alice_out.id)
+            .await
+            .expect("get padded alice row")
+            .expect("padded alice row exists");
+        assert_eq!(padded_row.user_id, " alice ");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1692,7 +1914,8 @@ mod tests {
         .expect("initial head ingest");
 
         // 2. Simulate a downgrade to a pre-#298 or pre-#302 binary that writes
-        // a legacy content-only sibling row for the same batch and principal.
+        // a legacy content-only sibling row for the same batch and principal,
+        // plus another memory linking to that legacy sibling ID.
         let batch = bounded_classify(&index, &budget(), &req).expect("classify");
         let legacy_content_id = format!(
             "bounded-ingest-{}",
@@ -1708,8 +1931,29 @@ mod tests {
             .await
             .expect("seed downgrade legacy sibling");
 
-        // 3. Re-ingesting on head must keep the canonical head row and retire
-        // the legacy sibling so search returns a single row for the batch.
+        let referrer_payload = MemoryPayload {
+            content: "Referrer pointing at legacy sibling".to_string(),
+            user_id: req.user_id.clone(),
+            memory_type: "fact".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: serde_json::json!({
+                "related_to": [legacy_content_id.clone()],
+            }),
+        };
+        store
+            .upsert(
+                "test-ns",
+                "referrer-mem",
+                vec![0.25f32; 4],
+                referrer_payload,
+            )
+            .await
+            .expect("seed referrer pointing at legacy sibling");
+
+        // 3. Re-ingesting on head must keep the canonical head row, retarget
+        // inbound references onto it, and retire the legacy sibling.
         let head_restored = ingest_bounded_classification(
             &store, "test-ns", &index, &budget(), &req, &StubEmbedder,
         )
@@ -1724,13 +1968,32 @@ mod tests {
                 .is_none(),
             "stale legacy sibling must be retired on restore"
         );
+        let (_, updated_referrer) = store
+            .get("test-ns", "referrer-mem")
+            .await
+            .expect("get referrer")
+            .expect("referrer exists");
+        assert_eq!(
+            updated_referrer.metadata["related_to"],
+            serde_json::json!([head_first.id.clone()]),
+            "inbound metadata reference must be retargeted to the retained primary id"
+        );
+        let edges = VectorStore::list_edges(&store, "test-ns")
+            .await
+            .expect("list edges");
+        assert!(
+            edges.iter().any(|(from, rel, to, _)| {
+                from == "referrer-mem" && rel == "RELATES_TO" && to == &head_first.id
+            }),
+            "inbound graph edge must be retargeted to the retained primary id before sibling deletion: {edges:?}"
+        );
         let hits = store
             .search("test-ns", vec![0.25f32; 4], 10, false, false)
             .await
             .expect("search test-ns");
         assert_eq!(
-            hits.len(), 1,
-            "search must return one row for the batch after downgrade/restore"
+            hits.len(), 2,
+            "search must return only the canonical batch row and the referrer row"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
