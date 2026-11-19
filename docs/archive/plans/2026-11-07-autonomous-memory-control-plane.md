@@ -31,9 +31,9 @@
 ### Task 1.1: Fix OpenCode V2 `execute.after`, `location` Root Resolution, and Epoch Hooks in `plugins/core/index.ts`
 
 **Files:**
-- Modify: `/home/kenton/Documents/NeuroStrata/plugins/core/index.ts`
-- Modify: `/home/kenton/Documents/NeuroStrata/plugins/core/test.mjs`
-- Modify: `/home/kenton/Documents/NeuroStrata/plugins/opencode/test.mjs`
+- Modify: `<repo-root>/plugins/core/index.ts`
+- Modify: `<repo-root>/plugins/core/test.mjs`
+- Modify: `<repo-root>/plugins/opencode/test.mjs`
 
 - [ ] **Step 1: Write failing tests in `plugins/core/test.mjs` and `plugins/opencode/test.mjs` for OpenCode V2 contracts**
 
@@ -166,8 +166,8 @@ Expected: PASS (0 failures across all 7 test suites).
 ### Task 1.2: Fix OpenCode `.opencode/opencode.json` Self-Healing & Daemon Startup Plugin Refresh in Rust
 
 **Files:**
-- Modify: `/home/kenton/Documents/NeuroStrata/src/task/harness_plugins.rs`
-- Modify: `/home/kenton/Documents/NeuroStrata/src/daemon.rs`
+- Modify: `<repo-root>/src/task/harness_plugins.rs`
+- Modify: `<repo-root>/src/daemon.rs`
 
 - [ ] **Step 1: Write a failing Rust unit test in `src/task/harness_plugins.rs` for `.opencode/opencode.json` self-healing**
 
@@ -233,7 +233,7 @@ Expected: PASS.
 ### Task 2.1: Filter Inactive AST/Doc Generations and Reserve Normative Slots in `LadybugStore::search_inner`
 
 **Files:**
-- Modify: `/home/kenton/Documents/NeuroStrata/src/store/ladybug.rs`
+- Modify: `<repo-root>/src/store/ladybug.rs`
 
 - [ ] **Step 1: Write a failing unit test in `src/store/ladybug.rs` proving stale `code_ast`/`doc_section` generations crowd out normative memories in `search`**
 
@@ -317,7 +317,7 @@ Expected: PASS.
 ### Task 2.2: Deduplicate SPARQL Dataset Projection & Filter Inactive Generations in `src/rdf/sparql.rs`
 
 **Files:**
-- Modify: `/home/kenton/Documents/NeuroStrata/src/rdf/sparql.rs`
+- Modify: `<repo-root>/src/rdf/sparql.rs`
 
 - [ ] **Step 1: Write a failing test in `src/rdf/sparql.rs` for active-generation filtering and single-graph quad budget**
 
@@ -346,9 +346,9 @@ Expected: PASS.
 ### Task 3.1: Synthesize 2-Hop Cross-Domain `conceptual_bridges` in `build_task_graph_context` and `memories_for_file`
 
 **Files:**
-- Modify: `/home/kenton/Documents/NeuroStrata/src/task/mod.rs`
-- Modify: `/home/kenton/Documents/NeuroStrata/src/graph_read/memories_for_file.rs`
-- Modify: `/home/kenton/Documents/NeuroStrata/src/server.rs`
+- Modify: `<repo-root>/src/task/mod.rs`
+- Modify: `<repo-root>/src/graph_read/memories_for_file.rs`
+- Modify: `<repo-root>/src/server.rs`
 
 - [ ] **Step 1: Write a failing test in `src/task/mod.rs` for `conceptual_bridges` and normative/structural split in `build_task_graph_context`**
 
@@ -386,10 +386,10 @@ Expected: PASS.
 ### Task 4.1: Extend `src/task/intake.rs` and `src/server.rs` with Tiered Auto-Commit, Provenance Spans, and Lock 2 Obligation Check
 
 **Files:**
-- Modify: `/home/kenton/Documents/NeuroStrata/src/task/intake.rs`
-- Modify: `/home/kenton/Documents/NeuroStrata/src/task/mod.rs`
-- Modify: `/home/kenton/Documents/NeuroStrata/src/server.rs`
-- Modify: `/home/kenton/Documents/NeuroStrata/plugins/core/index.ts`
+- Modify: `<repo-root>/src/task/intake.rs`
+- Modify: `<repo-root>/src/task/mod.rs`
+- Modify: `<repo-root>/src/server.rs`
+- Modify: `<repo-root>/plugins/core/index.ts`
 
 - [ ] **Step 1: Write failing tests in `src/task/intake.rs` and `src/task/mod.rs` for tiered auto-commit and Lock 2 undisposed obligation gating**
 
@@ -438,8 +438,8 @@ Expected: PASS.
 ### Task 5.1: Full Test Matrix, Binary Rebuild, Local Workspace Refresh, and PR Creation
 
 **Files:**
-- Modify: `/home/kenton/Documents/NeuroStrata/plugins/*/dist/index.js`
-- Modify: `/home/kenton/Documents/NeuroStrata/plugins/*/dist/index.d.ts`
+- Modify: `<repo-root>/plugins/*/dist/index.js`
+- Modify: `<repo-root>/plugins/*/dist/index.d.ts`
 
 - [ ] **Step 1: Run all Node.js plugin tests across all 7 packages**
 
@@ -465,7 +465,7 @@ Run:
 ```bash
 cargo install --path . --force
 ```
-Expected: `/home/kenton/.cargo/bin/neurostrata-mcp` updated and `neurostrata_get_snapshot` refreshes `.opencode/plugins/neurostrata.js` and cleans `.opencode/opencode.json`.
+Expected: `~/.cargo/bin/neurostrata-mcp` updated and `neurostrata_get_snapshot` refreshes `.opencode/plugins/neurostrata.js` and cleans `.opencode/opencode.json`.
 
 - [ ] **Step 4: Extract architectural memory, complete task `neurostrata-a1si`, push branch, and open PR**
 

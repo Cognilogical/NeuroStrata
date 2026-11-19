@@ -1,0 +1,96 @@
+{
+  "schema_version": 1,
+  "fixture_id": "neurostrata-competency-v1-synthetic",
+  "fixture_sha256": "e936e3a9977466dbfd2e53ddd9fa0a47765f6520d82cbd5b222b5ca00e4a6b9b",
+  "reasoning_profile": "owl-rl",
+  "materialization": {
+    "requested_profile": "owl-rl",
+    "applied_profile": "owl-rl",
+    "base_triple_count": 13,
+    "inferred_triple_count": 22,
+    "certificate_sha256": "7e51c968e37f1b6fcf919182029e24f1ce4caab3f6e72b12a94bdf637d52f95d",
+    "rule_selection": "full_owl2_rl",
+    "inference_graph": "https://neurostrata.io/ns/graph/inferred#urn:neurostrata:eval:competency",
+    "rdf_star_annotations": [
+      "<< <http://www.w3.org/2002/07/owl#Nothing> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Class> >> <https://neurostrata.io/ns/derivedByRule> \"owl-universe\" .",
+      "<< <http://www.w3.org/2002/07/owl#Nothing> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Class> >> <https://neurostrata.io/ns/certificateHash> \"7e51c968e37f1b6fcf919182029e24f1ce4caab3f6e72b12a94bdf637d52f95d\" .",
+      "<< <http://www.w3.org/2002/07/owl#Nothing> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Thing> >> <https://neurostrata.io/ns/derivedByRule> \"owl-universe\" .",
+      "<< <http://www.w3.org/2002/07/owl#Nothing> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Thing> >> <https://neurostrata.io/ns/certificateHash> \"7e51c968e37f1b6fcf919182029e24f1ce4caab3f6e72b12a94bdf637d52f95d\" .",
+      "<< <http://www.w3.org/2002/07/owl#Thing> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Class> >> <https://neurostrata.io/ns/derivedByRule> \"owl-universe\" .",
+      "<< <http://www.w3.org/2002/07/owl#Thing> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Class> >> <https://neurostrata.io/ns/certificateHash> \"7e51c968e37f1b6fcf919182029e24f1ce4caab3f6e72b12a94bdf637d52f95d\" .",
+      "<< <http://www.w3.org/2002/07/owl#Thing> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Thing> >> <https://neurostrata.io/ns/derivedByRule> \"owl-universe\" .",
+      "<< <http://www.w3.org/2002/07/owl#Thing> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Thing> >> <https://neurostrata.io/ns/certificateHash> \"7e51c968e37f1b6fcf919182029e24f1ce4caab3f6e72b12a94bdf637d52f95d\" .",
+      "<< <urn:neurostrata:eval:class:CognitiveArtifact> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Thing> >> <https://neurostrata.io/ns/derivedByRule> \"owl-universe\" .",
+      "<< <urn:neurostrata:eval:class:CognitiveArtifact> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Thing> >> <https://neurostrata.io/ns/certificateHash> \"7e51c968e37f1b6fcf919182029e24f1ce4caab3f6e72b12a94bdf637d52f95d\" .",
+      "<< <urn:neurostrata:eval:class:Memory> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Thing> >> <https://neurostrata.io/ns/derivedByRule> \"owl-universe\" .",
+      "<< <urn:neurostrata:eval:class:Memory> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Thing> >> <https://neurostrata.io/ns/certificateHash> \"7e51c968e37f1b6fcf919182029e24f1ce4caab3f6e72b12a94bdf637d52f95d\" .",
+      "<< <urn:neurostrata:eval:class:Memory> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <urn:neurostrata:eval:class:KnowledgeStructure> >> <https://neurostrata.io/ns/derivedByRule> \"rdfs11-subClassOf\" .",
+      "<< <urn:neurostrata:eval:class:Memory> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <urn:neurostrata:eval:class:KnowledgeStructure> >> <https://neurostrata.io/ns/certificateHash> \"7e51c968e37f1b6fcf919182029e24f1ce4caab3f6e72b12a94bdf637d52f95d\" .",
+      "<< <urn:neurostrata:eval:concept:memory> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Thing> >> <https://neurostrata.io/ns/derivedByRule> \"owl-universe\" .",
+      "<< <urn:neurostrata:eval:concept:memory> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Thing> >> <https://neurostrata.io/ns/certificateHash> \"7e51c968e37f1b6fcf919182029e24f1ce4caab3f6e72b12a94bdf637d52f95d\" .",
+      "<< <urn:neurostrata:eval:mem:alpha> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Thing> >> <https://neurostrata.io/ns/derivedByRule> \"owl-universe\" .",
+      "<< <urn:neurostrata:eval:mem:alpha> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Thing> >> <https://neurostrata.io/ns/certificateHash> \"7e51c968e37f1b6fcf919182029e24f1ce4caab3f6e72b12a94bdf637d52f95d\" .",
+      "<< <urn:neurostrata:eval:mem:alpha> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <urn:neurostrata:eval:class:CognitiveArtifact> >> <https://neurostrata.io/ns/derivedByRule> \"cax-sco\" .",
+      "<< <urn:neurostrata:eval:mem:alpha> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <urn:neurostrata:eval:class:CognitiveArtifact> >> <https://neurostrata.io/ns/certificateHash> \"7e51c968e37f1b6fcf919182029e24f1ce4caab3f6e72b12a94bdf637d52f95d\" .",
+      "<< <urn:neurostrata:eval:mem:alpha> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <urn:neurostrata:eval:class:KnowledgeStructure> >> <https://neurostrata.io/ns/derivedByRule> \"cax-sco\" .",
+      "<< <urn:neurostrata:eval:mem:alpha> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <urn:neurostrata:eval:class:KnowledgeStructure> >> <https://neurostrata.io/ns/certificateHash> \"7e51c968e37f1b6fcf919182029e24f1ce4caab3f6e72b12a94bdf637d52f95d\" .",
+      "<< <urn:neurostrata:eval:mem:beta> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Thing> >> <https://neurostrata.io/ns/derivedByRule> \"owl-universe\" .",
+      "<< <urn:neurostrata:eval:mem:beta> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Thing> >> <https://neurostrata.io/ns/certificateHash> \"7e51c968e37f1b6fcf919182029e24f1ce4caab3f6e72b12a94bdf637d52f95d\" .",
+      "<< <urn:neurostrata:eval:mem:beta> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <urn:neurostrata:eval:class:CognitiveArtifact> >> <https://neurostrata.io/ns/derivedByRule> \"cax-sco\" .",
+      "<< <urn:neurostrata:eval:mem:beta> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <urn:neurostrata:eval:class:CognitiveArtifact> >> <https://neurostrata.io/ns/certificateHash> \"7e51c968e37f1b6fcf919182029e24f1ce4caab3f6e72b12a94bdf637d52f95d\" .",
+      "<< <urn:neurostrata:eval:mem:beta> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <urn:neurostrata:eval:class:KnowledgeStructure> >> <https://neurostrata.io/ns/derivedByRule> \"cax-sco\" .",
+      "<< <urn:neurostrata:eval:mem:beta> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <urn:neurostrata:eval:class:KnowledgeStructure> >> <https://neurostrata.io/ns/certificateHash> \"7e51c968e37f1b6fcf919182029e24f1ce4caab3f6e72b12a94bdf637d52f95d\" .",
+      "<< <urn:neurostrata:eval:node:alice> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Thing> >> <https://neurostrata.io/ns/derivedByRule> \"owl-universe\" .",
+      "<< <urn:neurostrata:eval:node:alice> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Thing> >> <https://neurostrata.io/ns/certificateHash> \"7e51c968e37f1b6fcf919182029e24f1ce4caab3f6e72b12a94bdf637d52f95d\" .",
+      "<< <urn:neurostrata:eval:node:bob> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Thing> >> <https://neurostrata.io/ns/derivedByRule> \"owl-universe\" .",
+      "<< <urn:neurostrata:eval:node:bob> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Thing> >> <https://neurostrata.io/ns/certificateHash> \"7e51c968e37f1b6fcf919182029e24f1ce4caab3f6e72b12a94bdf637d52f95d\" .",
+      "<< <urn:neurostrata:eval:node:bob> <urn:neurostrata:eval:prop:child> <urn:neurostrata:eval:node:alice> >> <https://neurostrata.io/ns/derivedByRule> \"prp-inv\" .",
+      "<< <urn:neurostrata:eval:node:bob> <urn:neurostrata:eval:prop:child> <urn:neurostrata:eval:node:alice> >> <https://neurostrata.io/ns/certificateHash> \"7e51c968e37f1b6fcf919182029e24f1ce4caab3f6e72b12a94bdf637d52f95d\" .",
+      "<< <urn:neurostrata:eval:node:core> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Thing> >> <https://neurostrata.io/ns/derivedByRule> \"owl-universe\" .",
+      "<< <urn:neurostrata:eval:node:core> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Thing> >> <https://neurostrata.io/ns/certificateHash> \"7e51c968e37f1b6fcf919182029e24f1ce4caab3f6e72b12a94bdf637d52f95d\" .",
+      "<< <urn:neurostrata:eval:node:core> <urn:neurostrata:eval:prop:partOf> <urn:neurostrata:eval:node:system> >> <https://neurostrata.io/ns/derivedByRule> \"prp-trp\" .",
+      "<< <urn:neurostrata:eval:node:core> <urn:neurostrata:eval:prop:partOf> <urn:neurostrata:eval:node:system> >> <https://neurostrata.io/ns/certificateHash> \"7e51c968e37f1b6fcf919182029e24f1ce4caab3f6e72b12a94bdf637d52f95d\" .",
+      "<< <urn:neurostrata:eval:node:engine> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Thing> >> <https://neurostrata.io/ns/derivedByRule> \"owl-universe\" .",
+      "<< <urn:neurostrata:eval:node:engine> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Thing> >> <https://neurostrata.io/ns/certificateHash> \"7e51c968e37f1b6fcf919182029e24f1ce4caab3f6e72b12a94bdf637d52f95d\" .",
+      "<< <urn:neurostrata:eval:prop:parent> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Thing> >> <https://neurostrata.io/ns/derivedByRule> \"owl-universe\" .",
+      "<< <urn:neurostrata:eval:prop:parent> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Thing> >> <https://neurostrata.io/ns/certificateHash> \"7e51c968e37f1b6fcf919182029e24f1ce4caab3f6e72b12a94bdf637d52f95d\" .",
+      "<< <urn:neurostrata:eval:prop:partOf> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Thing> >> <https://neurostrata.io/ns/derivedByRule> \"owl-universe\" .",
+      "<< <urn:neurostrata:eval:prop:partOf> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Thing> >> <https://neurostrata.io/ns/certificateHash> \"7e51c968e37f1b6fcf919182029e24f1ce4caab3f6e72b12a94bdf637d52f95d\" ."
+    ]
+  },
+  "results": [
+    {
+      "query_id": "direct-type-assertion-present",
+      "verdict": "PASS"
+    },
+    {
+      "query_id": "missing-type-assertion-absent",
+      "verdict": "PASS"
+    },
+    {
+      "query_id": "rdfs-subclass-entailment",
+      "verdict": "PASS"
+    },
+    {
+      "query_id": "multi-level-subclass-select-exact-bindings",
+      "verdict": "PASS"
+    },
+    {
+      "query_id": "owl-inverse-relation",
+      "verdict": "PASS"
+    },
+    {
+      "query_id": "owl-transitive-relation",
+      "verdict": "PASS"
+    },
+    {
+      "query_id": "skos-label-select-preserves-literals",
+      "verdict": "PASS"
+    },
+    {
+      "query_id": "negative-cross-identity",
+      "verdict": "PASS"
+    }
+  ],
+  "verdict": "PASS"
+}

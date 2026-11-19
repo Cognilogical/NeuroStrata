@@ -204,8 +204,10 @@ fn parse_turtle(ttl: &str) -> Result<OntologySnapshot> {
             RDFS_CLASS | OWL_CLASS => {
                 snap.classes.entry(s).or_default();
             }
-            OWL_OBJECT_PROPERTY | OWL_DATATYPE_PROPERTY
-            | OWL_ANNOTATION_PROPERTY | RDF_PROPERTY => {
+            OWL_OBJECT_PROPERTY
+            | OWL_DATATYPE_PROPERTY
+            | OWL_ANNOTATION_PROPERTY
+            | RDF_PROPERTY => {
                 let entry = snap.properties.entry(s).or_insert((None, None, None));
                 let replace = match entry.2.as_deref() {
                     None => true,
@@ -228,7 +230,10 @@ fn parse_turtle(ttl: &str) -> Result<OntologySnapshot> {
     for q in &quads {
         let p = q.predicate.as_str();
         let class_edge = matches!(p, OWL_SUBCLASS_OF | OWL_EQUIVALENT_CLASS);
-        let prop_edge = matches!(p, RDFS_DOMAIN | RDFS_RANGE | SDO_DOMAIN_INCLUDES | SDO_RANGE_INCLUDES);
+        let prop_edge = matches!(
+            p,
+            RDFS_DOMAIN | RDFS_RANGE | SDO_DOMAIN_INCLUDES | SDO_RANGE_INCLUDES
+        );
         if !class_edge && !prop_edge {
             continue;
         }
@@ -371,11 +376,15 @@ fn diff_snapshots(old: &OntologySnapshot, new: &OntologySnapshot) -> OntologyDif
         }
     }
 
-    let datatypes_of = |snap: &OntologySnapshot, iri: &str| {
-        snap.datatypes.get(iri).cloned().unwrap_or_default()
-    };
+    let datatypes_of =
+        |snap: &OntologySnapshot, iri: &str| snap.datatypes.get(iri).cloned().unwrap_or_default();
     for (iri, (label, comment, kind)) in &new.properties {
-        let after = (label.clone(), comment.clone(), kind.clone(), datatypes_of(&new, iri));
+        let after = (
+            label.clone(),
+            comment.clone(),
+            kind.clone(),
+            datatypes_of(&new, iri),
+        );
         let before = old
             .properties
             .get(iri)
@@ -414,10 +423,26 @@ fn diff_snapshots(old: &OntologySnapshot, new: &OntologySnapshot) -> OntologyDif
         }
     }
 
-    d.added_subclass_of = new.subclass_of.difference(&old.subclass_of).cloned().collect();
-    d.removed_subclass_of = old.subclass_of.difference(&new.subclass_of).cloned().collect();
-    d.added_equivalent_class = new.equivalent_class.difference(&old.equivalent_class).cloned().collect();
-    d.removed_equivalent_class = old.equivalent_class.difference(&new.equivalent_class).cloned().collect();
+    d.added_subclass_of = new
+        .subclass_of
+        .difference(&old.subclass_of)
+        .cloned()
+        .collect();
+    d.removed_subclass_of = old
+        .subclass_of
+        .difference(&new.subclass_of)
+        .cloned()
+        .collect();
+    d.added_equivalent_class = new
+        .equivalent_class
+        .difference(&old.equivalent_class)
+        .cloned()
+        .collect();
+    d.removed_equivalent_class = old
+        .equivalent_class
+        .difference(&new.equivalent_class)
+        .cloned()
+        .collect();
     d.added_domain = new.domain.difference(&old.domain).cloned().collect();
     d.removed_domain = old.domain.difference(&new.domain).cloned().collect();
     d.added_range = new.range.difference(&old.range).cloned().collect();
@@ -442,8 +467,19 @@ fn namespace_of(iri: &str) -> String {
 }
 
 /// A Ladybug content node id: owning graph plus IRI, separated by `\x1f`.
+///
+/// A part that itself contains the separator would alias a different (graph, iri)
+/// pair, so escape those parts first. Parts without `\x1f` stay byte-exact,
+/// preserving every previously written id.
 fn content_id(graph_label: &str, iri: &str) -> String {
-    format!("{graph_label}\x1f{iri}")
+    let escape_part = |part: &str| {
+        if part.contains('\x1f') {
+            part.replace('\\', "\\\\").replace('\x1f', "\x1e")
+        } else {
+            part.to_owned()
+        }
+    };
+    format!("{}\x1f{}", escape_part(graph_label), escape_part(iri))
 }
 
 /// The `rangeDatatypes` column value: a sorted JSON array, exactly as written by
@@ -454,12 +490,14 @@ fn range_datatypes_json(dts: &BTreeSet<String>) -> Result<String> {
 
 /// Escape a string for a Cypher single-quoted literal. Backslashes are escaped first so
 /// the control-character escapes inserted afterwards are not doubled on a second pass.
-fn esc(s: &str) -> String {
+pub(crate) fn esc(s: &str) -> String {
     s.replace('\\', "\\\\")
-        .replace('\'', "''")
+        .replace('\'', "\\'")
         .replace('\n', "\\n")
         .replace('\r', "\\r")
         .replace('\t', "\\t")
+        .replace('\0', "\\0")
+        .replace('\x1f', "\\u001f")
 }
 
 /// Render a structural diff as deterministic, idempotent LadybugDB Cypher statements.
@@ -731,7 +769,7 @@ ex:C a rdfs:Class .
         assert_eq!(
             generate_cypher_ddl(&d, "test").unwrap(),
             vec![
-                "MERGE (n:OntologyClass {id: 'test\u{1f}http://example.org/C'}) ON CREATE SET n.iri = 'http://example.org/C', n.label = '', n.comment = '', n.namespace = 'http://example.org/', n.graph = 'test'"
+                "MERGE (n:OntologyClass {id: 'test\\u001fhttp://example.org/C'}) ON CREATE SET n.iri = 'http://example.org/C', n.label = '', n.comment = '', n.namespace = 'http://example.org/', n.graph = 'test'"
                     .to_owned()
             ]
         );
@@ -747,7 +785,7 @@ ex:C a rdfs:Class .
         assert_eq!(
             generate_cypher_ddl(&d, "test").unwrap(),
             vec![
-                "MATCH (n:OntologyClass) WHERE n.id = 'test\u{1f}http://example.org/C' DETACH DELETE n"
+                "MATCH (n:OntologyClass) WHERE n.id = 'test\\u001fhttp://example.org/C' DETACH DELETE n"
                     .to_owned()
             ]
         );
@@ -764,8 +802,43 @@ ex:C a rdfs:Class .
 "#;
         let d = diff_ontologies(ttl1, ttl2).unwrap();
         let stmts = generate_cypher_ddl(&d, "test").unwrap();
-        // The IRI contains a single quote; escaped in Cypher string literal
-        assert!(stmts.iter().any(|s| s.contains("O''Reilly")));
+        // LadybugDB escapes a literal apostrophe as `\'` (never `''`, which would
+        // terminate the string and permit Cypher injection).
+        assert!(stmts.iter().any(|s| s.contains("O\\'Reilly")));
+    }
+
+    #[test]
+    fn content_id_escapes_unit_separator_to_avoid_aliasing() {
+        // The graph label and IRI are the two parts joined by `\x1f`. If either part
+        // itself contains `\x1f` it must be escaped, otherwise distinct nodes alias.
+        assert_ne!(content_id("a\x1fb", "c"), content_id("a", "b\x1fc"));
+        // Ordinary parts keep their exact historical id encoding.
+        assert_eq!(
+            content_id("g", "http://example.org/C"),
+            "g\x1fhttp://example.org/C"
+        );
+    }
+
+    #[test]
+    fn generated_ddl_with_apostrophe_iri_executes_live() {
+        use crate::LadybugSchemaStore;
+        let store = LadybugSchemaStore::open_in_memory().unwrap();
+        let ttl = r#"@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+<http://example.org/O'Reilly> a rdfs:Class .
+"#;
+        let d = diff_ontologies("", ttl).unwrap();
+        let stmts = generate_cypher_ddl(&d, "g").unwrap();
+        for s in &stmts {
+            store
+                .cypher(s)
+                .unwrap_or_else(|e| panic!("invalid DDL `{s}`: {e}"));
+        }
+        assert_eq!(
+            store
+                .cypher("MATCH (n:OntologyClass) RETURN n.iri")
+                .unwrap(),
+            vec![vec!["http://example.org/O'Reilly".to_owned()]]
+        );
     }
 
     #[test]
@@ -785,7 +858,7 @@ ex:C a rdfs:Class .
         let expected: Vec<String> = ["A", "B", "C"]
             .iter()
             .map(|x| {
-                let id = format!("test\u{1f}http://example.org/{x}");
+                let id = format!("test\\u001fhttp://example.org/{x}");
                 format!(
                     "MERGE (n:OntologyClass {{id: '{id}'}}) ON CREATE SET n.iri = 'http://example.org/{x}', n.label = '', n.comment = '', n.namespace = 'http://example.org/', n.graph = 'test'"
                 )
@@ -826,8 +899,16 @@ ex:C a rdfs:Class .
         assert_eq!(d.added_properties.len(), 1);
         let p = d.added_properties.iter().next().unwrap();
         assert_eq!(p.iri, "http://example.org/p");
-        assert_eq!(p.label.as_deref(), Some("p-label"), "label must be tuple slot 0");
-        assert_eq!(p.comment.as_deref(), Some("p-comment"), "comment must be tuple slot 1");
+        assert_eq!(
+            p.label.as_deref(),
+            Some("p-label"),
+            "label must be tuple slot 0"
+        );
+        assert_eq!(
+            p.comment.as_deref(),
+            Some("p-comment"),
+            "comment must be tuple slot 1"
+        );
         assert_eq!(
             p.kind.as_deref(),
             Some("http://www.w3.org/2002/07/owl#ObjectProperty"),
@@ -900,8 +981,16 @@ ex:C a rdfs:Class .
             "no plain CREATE node/relationship pattern (non-idempotent): {:?}",
             stmts
         );
-        assert!(stmts.iter().any(|s| s.starts_with("MERGE (n:OntologyClass")));
-        assert!(stmts.iter().any(|s| s.starts_with("MERGE (n:OntologyProperty")));
+        assert!(
+            stmts
+                .iter()
+                .any(|s| s.starts_with("MERGE (n:OntologyClass"))
+        );
+        assert!(
+            stmts
+                .iter()
+                .any(|s| s.starts_with("MERGE (n:OntologyProperty"))
+        );
         let edges: Vec<_> = stmts
             .iter()
             .filter(|s| s.contains("SUBCLASS_OF") || s.contains("DOMAIN") || s.contains("RANGE"))
@@ -918,8 +1007,14 @@ ex:C a rdfs:Class .
             .iter()
             .filter(|s| s.contains("SUBCLASS_OF") || s.contains("DOMAIN") || s.contains("RANGE"))
         {
-            assert!(s.contains("MERGE (a)-[:") || s.contains("MERGE (p)-[:") || s.contains("MERGE (c)-[:") || s.contains(")-[:DOMAIN]->") || s.contains(")-[:RANGE]->"),
-                "edge must use MERGE: {s}");
+            assert!(
+                s.contains("MERGE (a)-[:")
+                    || s.contains("MERGE (p)-[:")
+                    || s.contains("MERGE (c)-[:")
+                    || s.contains(")-[:DOMAIN]->")
+                    || s.contains(")-[:RANGE]->"),
+                "edge must use MERGE: {s}"
+            );
             assert!(!s.contains("CREATE ("), "edge must not CREATE: {s}");
         }
     }
@@ -934,7 +1029,10 @@ ex:C a rdfs:Class .
             .collect();
         assert!(!edge_stmts.is_empty());
         for s in edge_stmts {
-            assert!(s.contains("WHERE "), "must use proven MATCH ... WHERE form: {s}");
+            assert!(
+                s.contains("WHERE "),
+                "must use proven MATCH ... WHERE form: {s}"
+            );
             assert!(
                 !s.contains("{iri:"),
                 "inline endpoint property maps are unproven: {s}"
@@ -1035,8 +1133,8 @@ ex:C a rdfs:Class .
         );
         let d = diff_ontologies(&old, &new).unwrap();
         let stmts = generate_cypher_ddl(&d, "g").unwrap();
-        let cid = format!("g\u{1f}http://example.org/C");
-        let pid = format!("g\u{1f}http://example.org/p");
+        let cid = format!("g\\u001fhttp://example.org/C");
+        let pid = format!("g\\u001fhttp://example.org/p");
         assert_eq!(
             stmts,
             vec![
@@ -1052,7 +1150,10 @@ ex:C a rdfs:Class .
 
     #[test]
     fn escaping_orders_backslash_then_quote_then_control_chars() {
-        assert_eq!(esc("a\\b'c\nd\re\tf"), "a\\\\b''c\\nd\\re\\tf");
+        assert_eq!(
+            esc("a\\b'c\nd\re\tf\x00g\x1fh"),
+            "a\\\\b\\'c\\nd\\re\\tf\\0g\\u001fh"
+        );
     }
 
     #[test]
@@ -1073,12 +1174,15 @@ ex:C a rdfs:Class .
         assert!(d.added_properties.is_empty() && d.removed_properties.is_empty());
         let stmts = generate_cypher_ddl(&d, "g").unwrap();
         assert!(
-            stmts.iter().any(|s| s.contains("n.label = 'New'") && s.contains("n.comment = ''")),
+            stmts
+                .iter()
+                .any(|s| s.contains("n.label = 'New'") && s.contains("n.comment = ''")),
             "class annotation update with cleared comment: {:?}",
             stmts
         );
         assert!(
-            stmts.iter().any(|s| s.contains("n.kind = 'http://www.w3.org/2002/07/owl#DatatypeProperty'")
+            stmts.iter().any(|s| s
+                .contains("n.kind = 'http://www.w3.org/2002/07/owl#DatatypeProperty'")
                 && s.contains("n.label = ''")
                 && s.contains("n.comment = 'New pc'")),
             "property kind/label/comment update: {:?}",
@@ -1103,8 +1207,10 @@ ex:C a rdfs:Class .
         assert_eq!(d.added_range.len(), 1);
         let stmts = generate_cypher_ddl(&d, "g").unwrap();
         assert!(
-            stmts.iter().any(|s| s.starts_with("MERGE (n:OntologyProperty")
-                && s.contains("http://example.org/undeclared")),
+            stmts
+                .iter()
+                .any(|s| s.starts_with("MERGE (n:OntologyProperty")
+                    && s.contains("http://example.org/undeclared")),
             "{:?}",
             stmts
         );
@@ -1155,8 +1261,8 @@ ex:C a rdfs:Class .
     fn generated_ddl_is_exact_ordered_with_exact_metadata() {
         let d = diff_ontologies("", &exact_new_ttl()).unwrap();
         let stmts = generate_cypher_ddl(&d, "g").unwrap();
-        let cid = format!("g\u{1f}http://example.org/Person");
-        let pid = format!("g\u{1f}http://example.org/knows");
+        let cid = format!("g\\u001fhttp://example.org/Person");
+        let pid = format!("g\\u001fhttp://example.org/knows");
         let expected = vec![
             format!(
                 "MERGE (n:OntologyClass {{id: '{cid}'}}) ON CREATE SET n.iri = 'http://example.org/Person', n.label = 'Person', n.comment = 'A person.', n.namespace = 'http://example.org/', n.graph = 'g'"
@@ -1210,7 +1316,9 @@ ex:C a rdfs:Class .
         let add_stmts = generate_cypher_ddl(&add, "g").unwrap();
         for _ in 0..2 {
             for s in &add_stmts {
-                store.cypher(s).unwrap_or_else(|e| panic!("invalid DDL `{s}`: {e}"));
+                store
+                    .cypher(s)
+                    .unwrap_or_else(|e| panic!("invalid DDL `{s}`: {e}"));
             }
         }
         let count = |q: &str| store.cypher(q).unwrap()[0][0].clone();
@@ -1223,7 +1331,9 @@ ex:C a rdfs:Class .
         // Raw U+001F inside the id literal survives the live engine round-trip:
         // schema `content_id = {graph}\x1f{iri}` stays exactly compatible.
         assert_eq!(
-            store.cypher("MATCH (n:OntologyClass) RETURN n.id, n.iri ORDER BY n.iri").unwrap(),
+            store
+                .cypher("MATCH (n:OntologyClass) RETURN n.id, n.iri ORDER BY n.iri")
+                .unwrap(),
             vec![
                 vec![
                     "g\u{1f}http://example.org/Employee".to_owned(),
@@ -1242,7 +1352,9 @@ ex:C a rdfs:Class .
         let delta_stmts = generate_cypher_ddl(&delta, "g").unwrap();
         for _ in 0..2 {
             for s in &delta_stmts {
-                store.cypher(s).unwrap_or_else(|e| panic!("invalid DDL `{s}`: {e}"));
+                store
+                    .cypher(s)
+                    .unwrap_or_else(|e| panic!("invalid DDL `{s}`: {e}"));
             }
         }
         assert_eq!(count("MATCH (n:OntologyClass) RETURN count(n)"), "1");
@@ -1276,7 +1388,7 @@ ex:C a rdfs:Class .
                 "http://www.w3.org/2001/XMLSchema#string"
             ]
         );
-        let pid = format!("g\u{1f}http://example.org/p");
+        let pid = format!("g\\u001fhttp://example.org/p");
         assert_eq!(
             generate_cypher_ddl(&d, "g").unwrap(),
             vec![format!(
@@ -1306,9 +1418,16 @@ ex:C a rdfs:Class .
         // Object -> Datatype: kind changes, valid datatype metadata is preserved.
         let d = diff_ontologies(&old, &flip).unwrap();
         let p = d.changed_properties.iter().next().unwrap();
-        assert_eq!(p.kind.as_deref(), Some("http://www.w3.org/2002/07/owl#DatatypeProperty"));
-        assert_eq!(p.range_datatypes.len(), 2, "datatypes must not be erased on a kind flip");
-        let pid = format!("g\u{1f}http://example.org/p");
+        assert_eq!(
+            p.kind.as_deref(),
+            Some("http://www.w3.org/2002/07/owl#DatatypeProperty")
+        );
+        assert_eq!(
+            p.range_datatypes.len(),
+            2,
+            "datatypes must not be erased on a kind flip"
+        );
+        let pid = format!("g\\u001fhttp://example.org/p");
         let flip_ddl = generate_cypher_ddl(&d, "g").unwrap();
         assert_eq!(
             flip_ddl,
@@ -1320,7 +1439,10 @@ ex:C a rdfs:Class .
         // Datatype -> Object (reverse) keeps the same exact metadata.
         let d = diff_ontologies(&flip, &old).unwrap();
         let p = d.changed_properties.iter().next().unwrap();
-        assert_eq!(p.kind.as_deref(), Some("http://www.w3.org/2002/07/owl#ObjectProperty"));
+        assert_eq!(
+            p.kind.as_deref(),
+            Some("http://www.w3.org/2002/07/owl#ObjectProperty")
+        );
         assert_eq!(p.range_datatypes.len(), 2);
 
         // Datatype-list-only change updates ON MATCH to the new post-image.

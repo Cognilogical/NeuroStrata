@@ -590,6 +590,8 @@ pub struct DerivationCertificate {
 /// Fail-closed outcome for `materialize_owl2_rl_with_proofs`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReasoningMaterializeError {
+    /// Explicit base triple count exceeded the hard materialization bound.
+    BaseLimitExceeded { max: usize, actual: usize },
     /// Inferred closure exceeded the caller-provided bound.
     InferredLimitExceeded { max: usize, actual: usize },
     /// An inferred triple's derivation could not be reconstructed by audit.
@@ -602,6 +604,10 @@ pub enum ReasoningMaterializeError {
 impl std::fmt::Display for ReasoningMaterializeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::BaseLimitExceeded { max, actual } => write!(
+                f,
+                "OWL 2 RL base triple count {actual} exceeds maximum {max}"
+            ),
             Self::InferredLimitExceeded { max, actual } => write!(
                 f,
                 "inferred triple count {actual} exceeds max_inferred_triples {max}"
@@ -1826,33 +1832,69 @@ fn topo_order_steps(
     steps: Vec<DerivationStep>,
     base_nt: &HashSet<String>,
 ) -> Result<Vec<DerivationStep>, ReasoningMaterializeError> {
+    let n = steps.len();
     let mut available: HashSet<String> = base_nt.clone();
-    let mut remaining = steps;
-    let mut out = Vec::with_capacity(remaining.len());
-    loop {
-        if remaining.is_empty() {
-            return Ok(out);
-        }
-        let pick = remaining
-            .iter()
-            .enumerate()
-            .filter(|(_, st)| st.premises.iter().all(|p| available.contains(p)))
-            .min_by(|a, b| a.1.conclusion.cmp(&b.1.conclusion))
-            .map(|(i, _)| i);
-        match pick {
-            Some(i) => {
-                let st = remaining.remove(i);
-                available.insert(st.conclusion.clone());
-                out.push(st);
+
+    // For every not-yet-available premise, record which steps wait on it and
+    // how many distinct premises each step still needs. Distinct premises
+    // matter: a step listing the same premise twice needs it only once.
+    let mut waiting: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut unmet = vec![0usize; n];
+    for (i, st) in steps.iter().enumerate() {
+        let mut seen = HashSet::new();
+        for premise in &st.premises {
+            if base_nt.contains(premise) || !seen.insert(premise.as_str()) {
+                continue;
             }
-            None => {
-                return Err(ReasoningMaterializeError::ProofUnavailable {
-                    triple: remaining[0].conclusion.clone(),
-                    reason: "unresolvable premise dependency cycle".to_string(),
-                })
+            waiting.entry(premise.clone()).or_default().push(i);
+            unmet[i] += 1;
+        }
+    }
+
+    // The original greedy scan picked the ready step with the smallest
+    // conclusion (index-stable ties). Keying the ready set by
+    // (conclusion, index) reproduces that exact order in O(n log n) with no
+    // Vec::remove shifts or repeated full rescans.
+    let mut ready: BTreeSet<(String, usize)> = BTreeSet::new();
+    for i in 0..n {
+        if unmet[i] == 0 {
+            ready.insert((steps[i].conclusion.clone(), i));
+        }
+    }
+
+    let mut emitted = vec![false; n];
+    let mut out = Vec::with_capacity(n);
+    while let Some((_, i)) = ready.pop_first() {
+        emitted[i] = true;
+        let conclusion = steps[i].conclusion.clone();
+        out.push(steps[i].clone());
+        if !available.insert(conclusion.clone()) {
+            continue;
+        }
+        if let Some(waiters) = waiting.get(&conclusion) {
+            for &w in waiters {
+                if emitted[w] {
+                    continue;
+                }
+                unmet[w] -= 1;
+                if unmet[w] == 0 {
+                    ready.insert((steps[w].conclusion.clone(), w));
+                }
             }
         }
     }
+
+    if out.len() != n {
+        // Cycle fallback: no step can make progress; append the unreachable
+        // remainder in original index order. Downstream independent
+        // certificate verification still fails closed on unavailable premises.
+        for (i, st) in steps.into_iter().enumerate() {
+            if !emitted[i] {
+                out.push(st);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Independently verify a persisted materialization certificate.
@@ -1994,12 +2036,10 @@ pub fn verify_persisted_certificate(
     Ok(())
 }
 
-/// Base triples are fed to the reasoner in bounded batches so the
-/// `max_inferred_triples` cap is enforced before an oversized closure is ever
-/// materialized. After each batch the incremental output is inspected by
-/// reference (no `to_vec`) for a monotonic lower bound on the final inferred
-/// count; exceeding the cap aborts immediately.
-const REASON_BATCH: usize = 16;
+/// Hard cap on explicit base triples accepted by OWL 2 RL materialization.
+/// Checked before any allocation or reasoning so an oversized input fails
+/// closed immediately instead of driving an unbounded reasoner load.
+pub const MAX_BASE_TRIPLES: usize = 50_000;
 
 impl ReasoningAdapter {
     /// Materialize the DataFrog OWL 2 RL closure over `base_triples` and return
@@ -2017,32 +2057,24 @@ impl ReasoningAdapter {
         max_inferred_triples: usize,
         profile: ReasoningProfile,
     ) -> Result<MaterializationCertificate, ReasoningMaterializeError> {
+        // Fail before allocating the base set or constructing a reasoner. The
+        // inferred cap is enforced below, but that bound is only meaningful if
+        // the explicit input itself is bounded first.
+        if base_triples.len() > MAX_BASE_TRIPLES {
+            return Err(ReasoningMaterializeError::BaseLimitExceeded {
+                max: MAX_BASE_TRIPLES,
+                actual: base_triples.len(),
+            });
+        }
         let base_nt: HashSet<String> = base_triples.iter().map(nt_triple).collect();
 
-        // Bound CPU/allocation: load in small batches and check the cap after
-        // each incremental materialization. closure(S) ⊆ closure(base) for any
-        // subset S, so a non-base count above the cap here is a monotonic lower
-        // bound on the final inferred count and rejection is sound.
+        // Single load + single full materialization. Re-deriving the closure
+        // after every 16 explicit triples did not make the cap check any
+        // earlier: only the post-`reason_full` check bounds the final result.
         let mut reasoner = reasonable::reasoner::Reasoner::new();
-        for batch in base_triples.chunks(REASON_BATCH) {
-            reasoner.load_triples(batch.to_vec());
-            reasoner.reason();
-            let inferred_so_far = reasoner
-                .view_output()
-                .iter()
-                .filter(|t| !base_nt.contains(&nt_triple(t)))
-                .count();
-            if inferred_so_far > max_inferred_triples {
-                return Err(ReasoningMaterializeError::InferredLimitExceeded {
-                    max: max_inferred_triples,
-                    actual: inferred_so_far,
-                });
-            }
-        }
+        reasoner.load_triples(base_triples.to_vec());
 
-        // Canonical full materialization regardless of incremental internals.
-        // Reachable only with inferred_so_far ≤ cap, so this pass is bounded.
-        // Enforce the cap once more on the borrowed view BEFORE copying the
+        // Enforce the inferred cap on the borrowed view BEFORE copying the
         // closure or allocating any proof/nquad vectors (I2, I6).
         reasoner.reason_full();
         let inferred_len = reasoner
@@ -2395,6 +2427,76 @@ mod tests {
         assert_eq!(out.certificate.profile.as_str(), "rdfs");
     }
 
+    #[test]
+    fn materialize_owl2_rl_rejects_oversized_base_before_reasoning() {
+        let one = ex_tb("http://ex.org/s", "http://ex.org/p", "http://ex.org/o");
+        let base = vec![one; MAX_BASE_TRIPLES + 1];
+        let adapter = ReasoningAdapter::new();
+        let err = adapter
+            .materialize_owl2_rl_with_proofs(&base, "test/ns", 50_000, ReasoningProfile::OwlRl)
+            .expect_err("base above MAX_BASE_TRIPLES must fail closed immediately");
+        assert!(
+            err.to_string().contains("exceeds maximum"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn topo_order_steps_orders_chain_with_conclusion_tie_break() {
+        let base_nt: HashSet<String> = ["http://ex.org/base"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mk = |conclusion: &str, premises: &[&str]| DerivationStep {
+            rule: Owl2RlRuleId::CaxSco,
+            premises: premises.iter().map(|s| s.to_string()).collect(),
+            conclusion: conclusion.to_string(),
+        };
+        // Deliberately shuffled. After `s1` is emitted, `s_a` and `s_b`
+        // become ready together; the original greedy scan tie-breaks by
+        // conclusion string, so `s_a` must precede `s_b`.
+        let steps = vec![
+            mk("s_b", &["s1"]),
+            mk("s_a", &["s1"]),
+            mk("s2", &["s_a", "s_b"]),
+            mk("s1", &["http://ex.org/base"]),
+        ];
+        let ordered = topo_order_steps(steps, &base_nt).expect("chain must be orderable");
+        let conclusions: Vec<&str> = ordered.iter().map(|s| s.conclusion.as_str()).collect();
+        assert_eq!(conclusions, vec!["s1", "s_a", "s_b", "s2"]);
+    }
+
+    #[test]
+    fn multi_step_materialization_chain_preserves_topological_order_and_certificate() {
+        let p = "http://ex.org/p";
+        let base = vec![
+            ex_tb(p, RDF_TYPE, EX_TRP),
+            ex_tb("http://ex.org/a", p, "http://ex.org/b"),
+            ex_tb("http://ex.org/b", p, "http://ex.org/c"),
+            ex_tb("http://ex.org/c", p, "http://ex.org/d"),
+            ex_tb("http://ex.org/d", p, "http://ex.org/e"),
+        ];
+        let adapter = ReasoningAdapter::new();
+        let out = adapter
+            .materialize_owl2_rl_with_proofs(&base, "test/ns", 50_000, ReasoningProfile::OwlRl)
+            .expect("materialization must certify");
+
+        let base_nt: HashSet<String> = base.iter().map(nt_triple).collect();
+        let mut seen: HashSet<&str> = base_nt.iter().map(|s| s.as_str()).collect();
+        for st in &out.certificate.steps {
+            for premise in &st.premises {
+                assert!(
+                    seen.contains(premise.as_str()),
+                    "premise {premise} must precede its consumer {0}",
+                    st.conclusion
+                );
+            }
+            seen.insert(st.conclusion.as_str());
+        }
+        verify_persisted_certificate(&out.certificate, &out.inferred_triples, &base)
+            .expect("topologically ordered certificate must verify");
+    }
+
     // ---- independent-review remediation (C1-C4, I1-I10) ----
 
     #[test]
@@ -2664,11 +2766,11 @@ mod tests {
     }
 
     #[test]
-    fn inferred_limit_aborts_before_full_closure() {
-        // P2: with a large cap the transitive-property fixture yields a large
-        // inferred closure. A tiny cap must abort materialization early instead
-        // of first building/copying that entire closure; the reported `actual`
-        // must therefore be far below the full closure size.
+    fn inferred_limit_rejected_before_certificate_allocation() {
+        // P2: base triples are now loaded and reasoned in a single pass. The
+        // cap is enforced on the borrowed full view BEFORE `view_output().to_vec()`
+        // or any proof/nquad vector is allocated, but `actual` therefore reports
+        // the true full closure size rather than a partial batch count.
         let p = "http://ex.org/tp";
         let mut base = vec![ex_tb(p, RDF_TYPE, EX_TRP)];
         for i in 0..40 {
@@ -2692,9 +2794,9 @@ mod tests {
         ) {
             Err(ReasoningMaterializeError::InferredLimitExceeded { max, actual }) => {
                 assert_eq!(max, 8);
-                assert!(
-                    actual < full_count,
-                    "tiny cap must abort before building the full closure"
+                assert_eq!(
+                    actual, full_count,
+                    "cap is checked on the full borrowed view before allocation"
                 );
             }
             Err(_) | Ok(_) => panic!("expected InferredLimitExceeded"),

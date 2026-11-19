@@ -10,6 +10,6 @@
 
 **Tech Stack:** OpenRouter Free Router (auto-selects from available :free models), Context7 documentation, Git, systemd, MCP HTTP API (ns-wave43)
 
-**Spec:** /home/kenton/Documents/NeuroStrata/docs/AGENTS.md (Ruling 2026-10-25), Wave 43 commit message, /tmp/opencode/wave43_create.py
+**Spec:** docs/AGENTS.md (Ruling 2026-10-25), Wave 43 commit message, <tmp>/wave43_create.py
 
 ---

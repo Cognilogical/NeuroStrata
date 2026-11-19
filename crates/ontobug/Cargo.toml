@@ -24,6 +24,4 @@ shex_validation = "0.3.21"
 clap = { version = "4", features = ["derive", "env"], optional = true }
 lbug = "0.22.3"
 serde_json = "1"
-
-[dev-dependencies]
-tempfile = "3"
+tempfile = "3.27.0"

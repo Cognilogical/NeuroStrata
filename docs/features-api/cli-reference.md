@@ -217,15 +217,15 @@ neurostrata-mcp semantic-eval \
   --competency eval/semantic/competency.json \
   --retrieval eval/semantic/retrieval.json \
   --iterations 3 \
-  --output /tmp/opencode/semantic-eval.json \
   --check
 ```
+* **Committed receipts:** the strict per-suite results are committed at `eval/semantic/competency-receipt.json` and `eval/semantic/retrieval-receipt.json`.
 * `--iterations >= 3` is required by the corrected timing contract (warmup excluded; per-query latency = median across measured iterations; arm p95 over per-query medians).
 * `--check` writes the receipt and exits nonzero on any gate failure or validation/execution error (fail-closed; an error never yields an empty-result PASS). Without `--check` the receipt is written and the verdict reported but the process exits zero.
 * **Strict receipt (minimum):** `schema_version`, package version, fixture ids and SHA-256 digests, `evidence_class: "synthetic_deterministic"`, `production_roi_claimed: false`, competency per-query results, all four arms' aggregate/per-query metrics and rankings, ontology-targeted Recall@5, p95 overhead, derived-storage percentage, determinism SHA-256, `gate_violations`, `not_evaluated`, and overall `verdict: "PASS" | "FAIL"`.
 * **Evidence boundary:** the corpus is `synthetic_deterministic`, not owner-labeled or production. `production_roi_claimed` is `false`, and `not_evaluated` names `owner_labeled_production_roi`, `blind_agent_answer_accuracy`, `owner_labeled_corpus`, `rollback_validation`, `curation_cost`, and `real_namespace_accuracy`. No production ROI, owner-labeled-corpus, blind-agent, rollback, curation-cost, or real-namespace claim is implied.
 * **Current status (honest FAIL):** the registered mixed alias+hierarchy subset yields `insufficient_ontology_subset_lift 0.042857 < 0.10`; competency queries pass 8/8; overall `verdict = "FAIL"` and both final `--check` runs exit nonzero. This is the gate failing closed, not a CLI defect. Strict receipts are complete: remediation 65/65 with zero ignored/failed, six `not_evaluated` exclusions, and identical determinism SHA-256 `5f378d7b6d2666dbaef44a06fa80de1b75f5dec2c99951559593f52db4f45583`. The 1.19.0 release record references the `--output` receipt and remediation-runner JSON; no semantic-gate PASS or production claim is made.
-* **Remediation runner:** `eval/registry.json` suite `semantic-evaluation` pins the 36 named `semantic_eval_metrics_test` cases plus 17 competency and 12 ablation inline tests with `ignored: 0`. Run `EVAL_ALLOW_DIRTY=1 scripts/remediation-eval.sh semantic-evaluation --json /tmp/opencode/semantic-evaluation-remediation.json` on intentionally dirty trees only; it never ignores test failures.
+* **Remediation runner:** `eval/registry.json` suite `semantic-evaluation` pins the 36 named `semantic_eval_metrics_test` cases plus 17 competency and 12 ablation inline tests with `ignored: 0`. Run `EVAL_ALLOW_DIRTY=1 scripts/remediation-eval.sh semantic-evaluation` with `--json` pointed at a repo-relative path on intentionally dirty trees only; it never ignores test failures. Suite-level results are reflected in the committed `eval/semantic/competency-receipt.json` and `eval/semantic/retrieval-receipt.json`.
 
 ---
 

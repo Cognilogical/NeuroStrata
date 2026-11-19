@@ -1,0 +1,4723 @@
+{
+  "schema_version": 1,
+  "fixture_id": "retrieval-synthetic-v1",
+  "fixture_sha256": "82c50fb132ecf7e73b8f919d64c78c43328405cdce894a0fa7bae05afd316bff",
+  "evidence_class": "synthetic_deterministic",
+  "production_roi_claimed": false,
+  "dimensions": 64,
+  "iterations": {
+    "warmup": 1,
+    "measured": 3,
+    "query_count": 60
+  },
+  "arms": [
+    {
+      "arm": "baseline",
+      "registry_variant": "none",
+      "exact": false,
+      "search_mode": "default",
+      "deterministic": true,
+      "query_texts": [
+        "chekpoint truncate the log",
+        "wal crc framing",
+        "btree split propagation",
+        "cow snapshot page table",
+        "jwt ttl rotation",
+        "mvcc readers never block",
+        "lsn ordering glossary",
+        "snap reclamation of old pages",
+        "repl raft majority ack",
+        "vac merging underfull pages",
+        "ckpt flush dirty pages",
+        "agg pipeline breaker",
+        "idx selectivity threshold",
+        "writeahead log crash recovery",
+        "sla burn rate alert",
+        "otel export counters histograms",
+        "monthly invoice close metered usage",
+        "audit who granted rbac roles",
+        "invoice retry backoff quarantine",
+        "signing algorithm for access tokens",
+        "wal::Frame",
+        "wal::replay_from",
+        "btree::split_leaf",
+        "snapshot::reclaim_before",
+        "planner::cost_model",
+        "exec::spill_build_side",
+        "auth::rotate_refresh",
+        "rbac::audit_event",
+        "metrics::cardinality_budget",
+        "tracing::tail_sample",
+        "atlas/src/storage/wal_format.rs",
+        "atlas/src/auth/token_service.rs",
+        "doc-repl-raft",
+        "doc-billing-ledger",
+        "repl::raft_ack majority",
+        "durability guarantees for committed writes",
+        "page layout and split behavior",
+        "reader isolation and reclamation",
+        "planner selectivity decisions",
+        "join ordering strategy",
+        "memory pressure during execution",
+        "credential lifetime policy",
+        "permission model changes audit",
+        "telemetry volume control",
+        "cross-service correlation",
+        "log sequence ordering of frames",
+        "elevating to admin",
+        "forcing an access path",
+        "alerting on budgets",
+        "recovering after crash",
+        "write-ahead log framing and crc",
+        "additive rbac deny overrides",
+        "token ttl 24 hours shared secret",
+        "metrics 100k series labels",
+        "invoice weekly close manual approval",
+        "filter pushdown below joins unconditionally",
+        "jwt hs256 refresh forever",
+        "append only corrections reversing entries",
+        "p99 tail sampling 24 hours error traces",
+        "majority raft ack durability"
+      ],
+      "rankings": [
+        {
+          "query_id": "q-alias-01",
+          "ranked_ids": [
+            "doc-wal-checkpoint",
+            "doc-wal-format",
+            "doc-wal-replay",
+            "doc-runbook-wal-full",
+            "doc-wal-archive"
+          ]
+        },
+        {
+          "query_id": "q-alias-02",
+          "ranked_ids": [
+            "doc-wal-format",
+            "doc-wal-archive",
+            "doc-wal-replay",
+            "doc-runbook-wal-full",
+            "doc-wal-checkpoint"
+          ]
+        },
+        {
+          "query_id": "q-alias-03",
+          "ranked_ids": [
+            "doc-btree-split",
+            "doc-btree-vacuum",
+            "doc-btree-page"
+          ]
+        },
+        {
+          "query_id": "q-alias-04",
+          "ranked_ids": [
+            "doc-snapshot-cow",
+            "doc-faq-snapshot",
+            "doc-snapshot-gc"
+          ]
+        },
+        {
+          "query_id": "q-alias-05",
+          "ranked_ids": [
+            "doc-auth-mfa",
+            "doc-auth-refresh",
+            "doc-auth-tokens"
+          ]
+        },
+        {
+          "query_id": "q-alias-06",
+          "ranked_ids": [
+            "doc-snapshot-cow",
+            "doc-snapshot-gc",
+            "doc-faq-snapshot"
+          ]
+        },
+        {
+          "query_id": "q-alias-07",
+          "ranked_ids": [
+            "doc-glossary-lsn",
+            "doc-storage-overview"
+          ]
+        },
+        {
+          "query_id": "q-alias-08",
+          "ranked_ids": [
+            "doc-snapshot-gc",
+            "doc-snapshot-cow",
+            "doc-faq-snapshot"
+          ]
+        },
+        {
+          "query_id": "q-alias-09",
+          "ranked_ids": [
+            "doc-repl-raft",
+            "doc-repl-lag"
+          ]
+        },
+        {
+          "query_id": "q-alias-10",
+          "ranked_ids": [
+            "doc-btree-vacuum",
+            "doc-btree-page",
+            "doc-btree-split"
+          ]
+        },
+        {
+          "query_id": "q-alias-11",
+          "ranked_ids": [
+            "doc-wal-checkpoint",
+            "doc-wal-format",
+            "doc-runbook-wal-full",
+            "doc-wal-replay",
+            "doc-wal-archive"
+          ]
+        },
+        {
+          "query_id": "q-alias-12",
+          "ranked_ids": [
+            "doc-exec-pipeline",
+            "doc-exec-vectorized",
+            "doc-exec-spill"
+          ]
+        },
+        {
+          "query_id": "q-alias-13",
+          "ranked_ids": [
+            "doc-planner-hints",
+            "doc-planner-cost",
+            "doc-planner-stats",
+            "doc-planner-join"
+          ]
+        },
+        {
+          "query_id": "q-alias-14",
+          "ranked_ids": [
+            "doc-wal-format",
+            "doc-wal-replay",
+            "doc-runbook-wal-full",
+            "doc-wal-checkpoint",
+            "doc-wal-archive"
+          ]
+        },
+        {
+          "query_id": "q-alias-15",
+          "ranked_ids": [
+            "doc-metrics-slo",
+            "doc-metrics-otel",
+            "doc-metrics-cardinality"
+          ]
+        },
+        {
+          "query_id": "q-alias-16",
+          "ranked_ids": [
+            "doc-metrics-otel",
+            "doc-metrics-slo",
+            "doc-metrics-cardinality"
+          ]
+        },
+        {
+          "query_id": "q-alias-17",
+          "ranked_ids": [
+            "doc-billing-invoice",
+            "doc-billing-retry",
+            "doc-billing-ledger"
+          ]
+        },
+        {
+          "query_id": "q-alias-18",
+          "ranked_ids": [
+            "doc-rbac-audit",
+            "doc-rbac-roles"
+          ]
+        },
+        {
+          "query_id": "q-alias-19",
+          "ranked_ids": [
+            "doc-billing-retry",
+            "doc-billing-invoice",
+            "doc-billing-ledger"
+          ]
+        },
+        {
+          "query_id": "q-alias-20",
+          "ranked_ids": [
+            "doc-auth-mfa",
+            "doc-auth-refresh",
+            "doc-auth-tokens"
+          ]
+        },
+        {
+          "query_id": "q-exact-01",
+          "ranked_ids": [
+            "doc-wal-format",
+            "doc-wal-replay",
+            "doc-wal-checkpoint",
+            "doc-runbook-wal-full",
+            "doc-wal-archive"
+          ]
+        },
+        {
+          "query_id": "q-exact-02",
+          "ranked_ids": [
+            "doc-wal-archive",
+            "doc-wal-format",
+            "doc-wal-replay",
+            "doc-runbook-wal-full",
+            "doc-wal-checkpoint"
+          ]
+        },
+        {
+          "query_id": "q-exact-03",
+          "ranked_ids": [
+            "doc-btree-vacuum",
+            "doc-btree-split",
+            "doc-btree-page"
+          ]
+        },
+        {
+          "query_id": "q-exact-04",
+          "ranked_ids": [
+            "doc-snapshot-cow",
+            "doc-faq-snapshot",
+            "doc-snapshot-gc"
+          ]
+        },
+        {
+          "query_id": "q-exact-05",
+          "ranked_ids": [
+            "doc-planner-cost",
+            "doc-planner-stats",
+            "doc-planner-join",
+            "doc-planner-hints"
+          ]
+        },
+        {
+          "query_id": "q-exact-06",
+          "ranked_ids": [
+            "doc-exec-vectorized",
+            "doc-exec-spill",
+            "doc-exec-pipeline"
+          ]
+        },
+        {
+          "query_id": "q-exact-07",
+          "ranked_ids": [
+            "doc-auth-refresh",
+            "doc-auth-tokens",
+            "doc-auth-mfa"
+          ]
+        },
+        {
+          "query_id": "q-exact-08",
+          "ranked_ids": [
+            "doc-rbac-audit",
+            "doc-rbac-roles"
+          ]
+        },
+        {
+          "query_id": "q-exact-09",
+          "ranked_ids": [
+            "doc-metrics-cardinality",
+            "doc-metrics-otel",
+            "doc-metrics-slo"
+          ]
+        },
+        {
+          "query_id": "q-exact-10",
+          "ranked_ids": [
+            "doc-tracing-tail",
+            "doc-tracing-spans",
+            "doc-tracing-baggage"
+          ]
+        },
+        {
+          "query_id": "q-exact-11",
+          "ranked_ids": [
+            "doc-wal-format",
+            "doc-wal-archive",
+            "doc-runbook-wal-full",
+            "doc-wal-replay",
+            "doc-wal-checkpoint"
+          ]
+        },
+        {
+          "query_id": "q-exact-12",
+          "ranked_ids": [
+            "doc-auth-mfa",
+            "doc-auth-refresh",
+            "doc-auth-tokens"
+          ]
+        },
+        {
+          "query_id": "q-exact-13",
+          "ranked_ids": [
+            "doc-repl-raft",
+            "doc-repl-lag"
+          ]
+        },
+        {
+          "query_id": "q-exact-14",
+          "ranked_ids": [
+            "doc-billing-ledger",
+            "doc-billing-invoice",
+            "doc-billing-retry"
+          ]
+        },
+        {
+          "query_id": "q-exact-15",
+          "ranked_ids": [
+            "doc-repl-raft",
+            "doc-repl-lag"
+          ]
+        },
+        {
+          "query_id": "q-hier-01",
+          "ranked_ids": [
+            "doc-storage-overview",
+            "doc-glossary-lsn"
+          ]
+        },
+        {
+          "query_id": "q-hier-02",
+          "ranked_ids": [
+            "doc-glossary-lsn",
+            "doc-storage-overview"
+          ]
+        },
+        {
+          "query_id": "q-hier-03",
+          "ranked_ids": [
+            "doc-glossary-lsn",
+            "doc-storage-overview"
+          ]
+        },
+        {
+          "query_id": "q-hier-04",
+          "ranked_ids": [
+            "doc-qe-overview"
+          ]
+        },
+        {
+          "query_id": "q-hier-05",
+          "ranked_ids": [
+            "doc-qe-overview"
+          ]
+        },
+        {
+          "query_id": "q-hier-06",
+          "ranked_ids": [
+            "doc-qe-overview"
+          ]
+        },
+        {
+          "query_id": "q-hier-07",
+          "ranked_ids": [
+            "doc-auth-overview"
+          ]
+        },
+        {
+          "query_id": "q-hier-08",
+          "ranked_ids": [
+            "doc-auth-overview"
+          ]
+        },
+        {
+          "query_id": "q-hier-09",
+          "ranked_ids": [
+            "doc-obs-overview"
+          ]
+        },
+        {
+          "query_id": "q-hier-10",
+          "ranked_ids": [
+            "doc-obs-overview"
+          ]
+        },
+        {
+          "query_id": "q-hier-11",
+          "ranked_ids": [
+            "doc-glossary-lsn",
+            "doc-storage-overview"
+          ]
+        },
+        {
+          "query_id": "q-hier-12",
+          "ranked_ids": [
+            "doc-auth-overview"
+          ]
+        },
+        {
+          "query_id": "q-hier-13",
+          "ranked_ids": [
+            "doc-qe-overview"
+          ]
+        },
+        {
+          "query_id": "q-hier-14",
+          "ranked_ids": [
+            "doc-obs-overview"
+          ]
+        },
+        {
+          "query_id": "q-hier-15",
+          "ranked_ids": [
+            "doc-glossary-lsn",
+            "doc-storage-overview"
+          ]
+        },
+        {
+          "query_id": "q-adv-01",
+          "ranked_ids": [
+            "doc-wal-format",
+            "doc-wal-checkpoint",
+            "doc-wal-replay",
+            "doc-runbook-wal-full",
+            "doc-wal-archive"
+          ]
+        },
+        {
+          "query_id": "q-adv-02",
+          "ranked_ids": [
+            "doc-rbac-roles",
+            "doc-rbac-audit"
+          ]
+        },
+        {
+          "query_id": "q-adv-03",
+          "ranked_ids": [
+            "doc-auth-refresh",
+            "doc-auth-mfa",
+            "doc-auth-tokens"
+          ]
+        },
+        {
+          "query_id": "q-adv-04",
+          "ranked_ids": [
+            "doc-metrics-cardinality",
+            "doc-metrics-otel",
+            "doc-metrics-slo"
+          ]
+        },
+        {
+          "query_id": "q-adv-05",
+          "ranked_ids": [
+            "doc-billing-invoice",
+            "doc-billing-ledger",
+            "doc-billing-retry"
+          ]
+        },
+        {
+          "query_id": "q-adv-06",
+          "ranked_ids": [
+            "doc-planner-join",
+            "doc-planner-cost",
+            "doc-planner-stats",
+            "doc-planner-hints"
+          ]
+        },
+        {
+          "query_id": "q-adv-07",
+          "ranked_ids": [
+            "doc-auth-refresh",
+            "doc-auth-tokens",
+            "doc-auth-mfa"
+          ]
+        },
+        {
+          "query_id": "q-adv-08",
+          "ranked_ids": [
+            "doc-billing-ledger",
+            "doc-billing-retry",
+            "doc-billing-invoice"
+          ]
+        },
+        {
+          "query_id": "q-adv-09",
+          "ranked_ids": [
+            "doc-tracing-tail",
+            "doc-tracing-baggage",
+            "doc-tracing-spans"
+          ]
+        },
+        {
+          "query_id": "q-adv-10",
+          "ranked_ids": [
+            "doc-repl-raft",
+            "doc-repl-lag"
+          ]
+        }
+      ],
+      "metrics": {
+        "arm": "baseline",
+        "ndcg_at_10": 0.7216111441675284,
+        "recall_at_5": 0.8027777777777778,
+        "precision_at_5": 0.3166666666666662,
+        "ontology_recall_at_5": 0.2777777777777778,
+        "p95_ms": 103.496104,
+        "queries": [
+          {
+            "query_id": "q-alias-01",
+            "category": "alias",
+            "ndcg_at_10": 0.9828422279067397,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-02",
+            "category": "alias",
+            "ndcg_at_10": 0.95583058934618,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-03",
+            "category": "alias",
+            "ndcg_at_10": 0.9721212198129313,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.6,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-04",
+            "category": "alias",
+            "ndcg_at_10": 0.9721212198129313,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.6,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-05",
+            "category": "alias",
+            "ndcg_at_10": 0.6806060567602009,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.6,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-06",
+            "category": "alias",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-07",
+            "category": "alias",
+            "ndcg_at_10": 0.7871546029909718,
+            "recall_at_5": 0.5,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-08",
+            "category": "alias",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-09",
+            "category": "alias",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-10",
+            "category": "alias",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-11",
+            "category": "alias",
+            "ndcg_at_10": 0.9680147827042069,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-12",
+            "category": "alias",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-13",
+            "category": "alias",
+            "ndcg_at_10": 0.8339912323981488,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-14",
+            "category": "alias",
+            "ndcg_at_10": 0.8428282648809379,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.6,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-15",
+            "category": "alias",
+            "ndcg_at_10": 0.9828422279067397,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-16",
+            "category": "alias",
+            "ndcg_at_10": 0.9173194127129571,
+            "recall_at_5": 0.5,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-17",
+            "category": "alias",
+            "ndcg_at_10": 0.9721212198129313,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.6,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-18",
+            "category": "alias",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-19",
+            "category": "alias",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-20",
+            "category": "alias",
+            "ndcg_at_10": 0.5413402936435214,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-01",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-02",
+            "category": "exact_identifier",
+            "ndcg_at_10": 0.5,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-03",
+            "category": "exact_identifier",
+            "ndcg_at_10": 0.6309297535714575,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-04",
+            "category": "exact_identifier",
+            "ndcg_at_10": 0.5,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-05",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-06",
+            "category": "exact_identifier",
+            "ndcg_at_10": 0.6309297535714575,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-07",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-08",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-09",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-10",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-11",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-12",
+            "category": "exact_identifier",
+            "ndcg_at_10": 0.5,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-13",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-14",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-15",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-01",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.09239184719040397,
+            "recall_at_5": 0.25,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-02",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.0642267978746136,
+            "recall_at_5": 0.25,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-03",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.0642267978746136,
+            "recall_at_5": 0.25,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-04",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.1017970661726598,
+            "recall_at_5": 0.25,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-05",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.1017970661726598,
+            "recall_at_5": 0.25,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-06",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.1017970661726598,
+            "recall_at_5": 0.25,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-07",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.1017970661726598,
+            "recall_at_5": 0.25,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-08",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.10646464774659967,
+            "recall_at_5": 0.3333333333333333,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-09",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.1017970661726598,
+            "recall_at_5": 0.25,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-10",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.7452525342261976,
+            "recall_at_5": 0.3333333333333333,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-11",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.7768062610832323,
+            "recall_at_5": 0.5,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-12",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.1017970661726598,
+            "recall_at_5": 0.25,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-13",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.1017970661726598,
+            "recall_at_5": 0.25,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-14",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.1017970661726598,
+            "recall_at_5": 0.25,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-15",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.0642267978746136,
+            "recall_at_5": 0.25,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-adv-01",
+            "category": "adversarial",
+            "ndcg_at_10": 0.9828422279067397,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-adv-02",
+            "category": "adversarial",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-adv-03",
+            "category": "adversarial",
+            "ndcg_at_10": 0.6885288809404666,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-adv-04",
+            "category": "adversarial",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-adv-05",
+            "category": "adversarial",
+            "ndcg_at_10": 0.9639404333166532,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-adv-06",
+            "category": "adversarial",
+            "ndcg_at_10": 0.7967075809905066,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-adv-07",
+            "category": "adversarial",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-adv-08",
+            "category": "adversarial",
+            "ndcg_at_10": 0.9828422279067397,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-adv-09",
+            "category": "adversarial",
+            "ndcg_at_10": 0.9828422279067397,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-adv-10",
+            "category": "adversarial",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          }
+        ]
+      },
+      "latency": {
+        "measured_iterations": 3,
+        "warmup_iterations": 1,
+        "per_query_medians_ms": [
+          99.311311,
+          103.769233,
+          99.66654199999999,
+          95.708873,
+          103.496104,
+          87.005974,
+          94.303609,
+          97.991505,
+          96.49788199999999,
+          96.564494,
+          105.683287,
+          98.55909,
+          94.97550700000001,
+          87.280583,
+          89.18781100000001,
+          88.616782,
+          92.055297,
+          100.314471,
+          84.491467,
+          86.98694,
+          96.19291700000001,
+          86.632984,
+          84.426132,
+          81.93253,
+          92.208026,
+          89.334817,
+          86.127873,
+          79.32416,
+          77.916231,
+          79.810187,
+          81.33854,
+          90.994669,
+          81.623919,
+          100.818461,
+          101.125536,
+          91.178288,
+          102.87416300000001,
+          92.35900099999999,
+          96.497421,
+          91.139492,
+          90.557276,
+          100.47827600000001,
+          95.141131,
+          78.29427799999999,
+          86.334786,
+          77.407341,
+          90.84450600000001,
+          91.004121,
+          76.19810100000001,
+          93.826999,
+          108.12733200000001,
+          93.574379,
+          91.400648,
+          93.15467,
+          92.386382,
+          88.219691,
+          85.597067,
+          85.02830999999999,
+          86.66586,
+          92.326133
+        ],
+        "arm_p95_ms": 103.496104
+      }
+    },
+    {
+      "arm": "exact",
+      "registry_variant": "none",
+      "exact": true,
+      "search_mode": "default",
+      "deterministic": true,
+      "query_texts": [
+        "chekpoint truncate the log",
+        "wal crc framing",
+        "btree split propagation",
+        "cow snapshot page table",
+        "jwt ttl rotation",
+        "mvcc readers never block",
+        "lsn ordering glossary",
+        "snap reclamation of old pages",
+        "repl raft majority ack",
+        "vac merging underfull pages",
+        "ckpt flush dirty pages",
+        "agg pipeline breaker",
+        "idx selectivity threshold",
+        "writeahead log crash recovery",
+        "sla burn rate alert",
+        "otel export counters histograms",
+        "monthly invoice close metered usage",
+        "audit who granted rbac roles",
+        "invoice retry backoff quarantine",
+        "signing algorithm for access tokens",
+        "wal::Frame",
+        "wal::replay_from",
+        "btree::split_leaf",
+        "snapshot::reclaim_before",
+        "planner::cost_model",
+        "exec::spill_build_side",
+        "auth::rotate_refresh",
+        "rbac::audit_event",
+        "metrics::cardinality_budget",
+        "tracing::tail_sample",
+        "atlas/src/storage/wal_format.rs",
+        "atlas/src/auth/token_service.rs",
+        "doc-repl-raft",
+        "doc-billing-ledger",
+        "repl::raft_ack majority",
+        "durability guarantees for committed writes",
+        "page layout and split behavior",
+        "reader isolation and reclamation",
+        "planner selectivity decisions",
+        "join ordering strategy",
+        "memory pressure during execution",
+        "credential lifetime policy",
+        "permission model changes audit",
+        "telemetry volume control",
+        "cross-service correlation",
+        "log sequence ordering of frames",
+        "elevating to admin",
+        "forcing an access path",
+        "alerting on budgets",
+        "recovering after crash",
+        "write-ahead log framing and crc",
+        "additive rbac deny overrides",
+        "token ttl 24 hours shared secret",
+        "metrics 100k series labels",
+        "invoice weekly close manual approval",
+        "filter pushdown below joins unconditionally",
+        "jwt hs256 refresh forever",
+        "append only corrections reversing entries",
+        "p99 tail sampling 24 hours error traces",
+        "majority raft ack durability"
+      ],
+      "rankings": [
+        {
+          "query_id": "q-alias-01",
+          "ranked_ids": [
+            "doc-wal-checkpoint",
+            "doc-wal-format",
+            "doc-wal-replay",
+            "doc-runbook-wal-full",
+            "doc-wal-archive"
+          ]
+        },
+        {
+          "query_id": "q-alias-02",
+          "ranked_ids": [
+            "doc-wal-format",
+            "doc-wal-archive",
+            "doc-wal-replay",
+            "doc-runbook-wal-full",
+            "doc-wal-checkpoint"
+          ]
+        },
+        {
+          "query_id": "q-alias-03",
+          "ranked_ids": [
+            "doc-btree-split",
+            "doc-btree-vacuum",
+            "doc-btree-page"
+          ]
+        },
+        {
+          "query_id": "q-alias-04",
+          "ranked_ids": [
+            "doc-snapshot-cow",
+            "doc-faq-snapshot",
+            "doc-snapshot-gc"
+          ]
+        },
+        {
+          "query_id": "q-alias-05",
+          "ranked_ids": [
+            "doc-auth-mfa",
+            "doc-auth-refresh",
+            "doc-auth-tokens"
+          ]
+        },
+        {
+          "query_id": "q-alias-06",
+          "ranked_ids": [
+            "doc-snapshot-cow",
+            "doc-snapshot-gc",
+            "doc-faq-snapshot"
+          ]
+        },
+        {
+          "query_id": "q-alias-07",
+          "ranked_ids": [
+            "doc-glossary-lsn",
+            "doc-storage-overview"
+          ]
+        },
+        {
+          "query_id": "q-alias-08",
+          "ranked_ids": [
+            "doc-snapshot-gc",
+            "doc-snapshot-cow",
+            "doc-faq-snapshot"
+          ]
+        },
+        {
+          "query_id": "q-alias-09",
+          "ranked_ids": [
+            "doc-repl-raft",
+            "doc-repl-lag"
+          ]
+        },
+        {
+          "query_id": "q-alias-10",
+          "ranked_ids": [
+            "doc-btree-vacuum",
+            "doc-btree-page",
+            "doc-btree-split"
+          ]
+        },
+        {
+          "query_id": "q-alias-11",
+          "ranked_ids": [
+            "doc-wal-checkpoint",
+            "doc-wal-format",
+            "doc-runbook-wal-full",
+            "doc-wal-replay",
+            "doc-wal-archive"
+          ]
+        },
+        {
+          "query_id": "q-alias-12",
+          "ranked_ids": [
+            "doc-exec-pipeline",
+            "doc-exec-vectorized",
+            "doc-exec-spill"
+          ]
+        },
+        {
+          "query_id": "q-alias-13",
+          "ranked_ids": [
+            "doc-planner-hints",
+            "doc-planner-cost",
+            "doc-planner-stats",
+            "doc-planner-join"
+          ]
+        },
+        {
+          "query_id": "q-alias-14",
+          "ranked_ids": [
+            "doc-wal-format",
+            "doc-wal-replay",
+            "doc-runbook-wal-full",
+            "doc-wal-checkpoint",
+            "doc-wal-archive"
+          ]
+        },
+        {
+          "query_id": "q-alias-15",
+          "ranked_ids": [
+            "doc-metrics-slo",
+            "doc-metrics-otel",
+            "doc-metrics-cardinality"
+          ]
+        },
+        {
+          "query_id": "q-alias-16",
+          "ranked_ids": [
+            "doc-metrics-otel",
+            "doc-metrics-slo",
+            "doc-metrics-cardinality"
+          ]
+        },
+        {
+          "query_id": "q-alias-17",
+          "ranked_ids": [
+            "doc-billing-invoice",
+            "doc-billing-retry",
+            "doc-billing-ledger"
+          ]
+        },
+        {
+          "query_id": "q-alias-18",
+          "ranked_ids": [
+            "doc-rbac-audit",
+            "doc-rbac-roles"
+          ]
+        },
+        {
+          "query_id": "q-alias-19",
+          "ranked_ids": [
+            "doc-billing-retry",
+            "doc-billing-invoice",
+            "doc-billing-ledger"
+          ]
+        },
+        {
+          "query_id": "q-alias-20",
+          "ranked_ids": [
+            "doc-auth-mfa",
+            "doc-auth-refresh",
+            "doc-auth-tokens"
+          ]
+        },
+        {
+          "query_id": "q-exact-01",
+          "ranked_ids": [
+            "doc-wal-format",
+            "doc-wal-replay",
+            "doc-wal-checkpoint",
+            "doc-runbook-wal-full",
+            "doc-wal-archive"
+          ]
+        },
+        {
+          "query_id": "q-exact-02",
+          "ranked_ids": [
+            "doc-wal-replay",
+            "doc-wal-archive",
+            "doc-wal-format",
+            "doc-runbook-wal-full",
+            "doc-wal-checkpoint"
+          ]
+        },
+        {
+          "query_id": "q-exact-03",
+          "ranked_ids": [
+            "doc-btree-split",
+            "doc-btree-vacuum",
+            "doc-btree-page"
+          ]
+        },
+        {
+          "query_id": "q-exact-04",
+          "ranked_ids": [
+            "doc-snapshot-gc",
+            "doc-snapshot-cow",
+            "doc-faq-snapshot"
+          ]
+        },
+        {
+          "query_id": "q-exact-05",
+          "ranked_ids": [
+            "doc-planner-cost",
+            "doc-planner-stats",
+            "doc-planner-join",
+            "doc-planner-hints"
+          ]
+        },
+        {
+          "query_id": "q-exact-06",
+          "ranked_ids": [
+            "doc-exec-spill",
+            "doc-exec-vectorized",
+            "doc-exec-pipeline"
+          ]
+        },
+        {
+          "query_id": "q-exact-07",
+          "ranked_ids": [
+            "doc-auth-refresh",
+            "doc-auth-tokens",
+            "doc-auth-mfa"
+          ]
+        },
+        {
+          "query_id": "q-exact-08",
+          "ranked_ids": [
+            "doc-rbac-audit",
+            "doc-rbac-roles"
+          ]
+        },
+        {
+          "query_id": "q-exact-09",
+          "ranked_ids": [
+            "doc-metrics-cardinality",
+            "doc-metrics-otel",
+            "doc-metrics-slo"
+          ]
+        },
+        {
+          "query_id": "q-exact-10",
+          "ranked_ids": [
+            "doc-tracing-tail",
+            "doc-tracing-spans",
+            "doc-tracing-baggage"
+          ]
+        },
+        {
+          "query_id": "q-exact-11",
+          "ranked_ids": [
+            "doc-wal-format",
+            "doc-wal-archive",
+            "doc-runbook-wal-full",
+            "doc-wal-replay",
+            "doc-wal-checkpoint"
+          ]
+        },
+        {
+          "query_id": "q-exact-12",
+          "ranked_ids": [
+            "doc-auth-tokens",
+            "doc-auth-mfa",
+            "doc-auth-refresh"
+          ]
+        },
+        {
+          "query_id": "q-exact-13",
+          "ranked_ids": [
+            "doc-repl-raft",
+            "doc-repl-lag"
+          ]
+        },
+        {
+          "query_id": "q-exact-14",
+          "ranked_ids": [
+            "doc-billing-ledger",
+            "doc-billing-invoice",
+            "doc-billing-retry"
+          ]
+        },
+        {
+          "query_id": "q-exact-15",
+          "ranked_ids": [
+            "doc-repl-raft",
+            "doc-repl-lag"
+          ]
+        },
+        {
+          "query_id": "q-hier-01",
+          "ranked_ids": [
+            "doc-storage-overview",
+            "doc-glossary-lsn"
+          ]
+        },
+        {
+          "query_id": "q-hier-02",
+          "ranked_ids": [
+            "doc-glossary-lsn",
+            "doc-storage-overview"
+          ]
+        },
+        {
+          "query_id": "q-hier-03",
+          "ranked_ids": [
+            "doc-glossary-lsn",
+            "doc-storage-overview"
+          ]
+        },
+        {
+          "query_id": "q-hier-04",
+          "ranked_ids": [
+            "doc-qe-overview"
+          ]
+        },
+        {
+          "query_id": "q-hier-05",
+          "ranked_ids": [
+            "doc-qe-overview"
+          ]
+        },
+        {
+          "query_id": "q-hier-06",
+          "ranked_ids": [
+            "doc-qe-overview"
+          ]
+        },
+        {
+          "query_id": "q-hier-07",
+          "ranked_ids": [
+            "doc-auth-overview"
+          ]
+        },
+        {
+          "query_id": "q-hier-08",
+          "ranked_ids": [
+            "doc-auth-overview"
+          ]
+        },
+        {
+          "query_id": "q-hier-09",
+          "ranked_ids": [
+            "doc-obs-overview"
+          ]
+        },
+        {
+          "query_id": "q-hier-10",
+          "ranked_ids": [
+            "doc-obs-overview"
+          ]
+        },
+        {
+          "query_id": "q-hier-11",
+          "ranked_ids": [
+            "doc-glossary-lsn",
+            "doc-storage-overview"
+          ]
+        },
+        {
+          "query_id": "q-hier-12",
+          "ranked_ids": [
+            "doc-auth-overview"
+          ]
+        },
+        {
+          "query_id": "q-hier-13",
+          "ranked_ids": [
+            "doc-qe-overview"
+          ]
+        },
+        {
+          "query_id": "q-hier-14",
+          "ranked_ids": [
+            "doc-obs-overview"
+          ]
+        },
+        {
+          "query_id": "q-hier-15",
+          "ranked_ids": [
+            "doc-glossary-lsn",
+            "doc-storage-overview"
+          ]
+        },
+        {
+          "query_id": "q-adv-01",
+          "ranked_ids": [
+            "doc-wal-format",
+            "doc-wal-checkpoint",
+            "doc-wal-replay",
+            "doc-runbook-wal-full",
+            "doc-wal-archive"
+          ]
+        },
+        {
+          "query_id": "q-adv-02",
+          "ranked_ids": [
+            "doc-rbac-roles",
+            "doc-rbac-audit"
+          ]
+        },
+        {
+          "query_id": "q-adv-03",
+          "ranked_ids": [
+            "doc-auth-refresh",
+            "doc-auth-mfa",
+            "doc-auth-tokens"
+          ]
+        },
+        {
+          "query_id": "q-adv-04",
+          "ranked_ids": [
+            "doc-metrics-cardinality",
+            "doc-metrics-otel",
+            "doc-metrics-slo"
+          ]
+        },
+        {
+          "query_id": "q-adv-05",
+          "ranked_ids": [
+            "doc-billing-invoice",
+            "doc-billing-ledger",
+            "doc-billing-retry"
+          ]
+        },
+        {
+          "query_id": "q-adv-06",
+          "ranked_ids": [
+            "doc-planner-join",
+            "doc-planner-cost",
+            "doc-planner-stats",
+            "doc-planner-hints"
+          ]
+        },
+        {
+          "query_id": "q-adv-07",
+          "ranked_ids": [
+            "doc-auth-refresh",
+            "doc-auth-tokens",
+            "doc-auth-mfa"
+          ]
+        },
+        {
+          "query_id": "q-adv-08",
+          "ranked_ids": [
+            "doc-billing-ledger",
+            "doc-billing-retry",
+            "doc-billing-invoice"
+          ]
+        },
+        {
+          "query_id": "q-adv-09",
+          "ranked_ids": [
+            "doc-tracing-tail",
+            "doc-tracing-baggage",
+            "doc-tracing-spans"
+          ]
+        },
+        {
+          "query_id": "q-adv-10",
+          "ranked_ids": [
+            "doc-repl-raft",
+            "doc-repl-lag"
+          ]
+        }
+      ],
+      "metrics": {
+        "arm": "exact",
+        "ndcg_at_10": 0.758913485715146,
+        "recall_at_5": 0.8027777777777778,
+        "precision_at_5": 0.3166666666666662,
+        "ontology_recall_at_5": 0.2777777777777778,
+        "p95_ms": 105.54377600000001,
+        "queries": [
+          {
+            "query_id": "q-alias-01",
+            "category": "alias",
+            "ndcg_at_10": 0.9828422279067397,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-02",
+            "category": "alias",
+            "ndcg_at_10": 0.95583058934618,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-03",
+            "category": "alias",
+            "ndcg_at_10": 0.9721212198129313,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.6,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-04",
+            "category": "alias",
+            "ndcg_at_10": 0.9721212198129313,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.6,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-05",
+            "category": "alias",
+            "ndcg_at_10": 0.6806060567602009,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.6,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-06",
+            "category": "alias",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-07",
+            "category": "alias",
+            "ndcg_at_10": 0.7871546029909718,
+            "recall_at_5": 0.5,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-08",
+            "category": "alias",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-09",
+            "category": "alias",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-10",
+            "category": "alias",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-11",
+            "category": "alias",
+            "ndcg_at_10": 0.9680147827042069,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-12",
+            "category": "alias",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-13",
+            "category": "alias",
+            "ndcg_at_10": 0.8339912323981488,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-14",
+            "category": "alias",
+            "ndcg_at_10": 0.8428282648809379,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.6,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-15",
+            "category": "alias",
+            "ndcg_at_10": 0.9828422279067397,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-16",
+            "category": "alias",
+            "ndcg_at_10": 0.9173194127129571,
+            "recall_at_5": 0.5,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-17",
+            "category": "alias",
+            "ndcg_at_10": 0.9721212198129313,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.6,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-18",
+            "category": "alias",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-19",
+            "category": "alias",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-20",
+            "category": "alias",
+            "ndcg_at_10": 0.5413402936435214,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-01",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-02",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-03",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-04",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-05",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-06",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-07",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-08",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-09",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-10",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-11",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-12",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-13",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-14",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-15",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-01",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.09239184719040397,
+            "recall_at_5": 0.25,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-02",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.0642267978746136,
+            "recall_at_5": 0.25,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-03",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.0642267978746136,
+            "recall_at_5": 0.25,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-04",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.1017970661726598,
+            "recall_at_5": 0.25,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-05",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.1017970661726598,
+            "recall_at_5": 0.25,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-06",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.1017970661726598,
+            "recall_at_5": 0.25,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-07",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.1017970661726598,
+            "recall_at_5": 0.25,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-08",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.10646464774659967,
+            "recall_at_5": 0.3333333333333333,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-09",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.1017970661726598,
+            "recall_at_5": 0.25,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-10",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.7452525342261976,
+            "recall_at_5": 0.3333333333333333,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-11",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.7768062610832323,
+            "recall_at_5": 0.5,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-12",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.1017970661726598,
+            "recall_at_5": 0.25,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-13",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.1017970661726598,
+            "recall_at_5": 0.25,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-14",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.1017970661726598,
+            "recall_at_5": 0.25,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-15",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.0642267978746136,
+            "recall_at_5": 0.25,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-adv-01",
+            "category": "adversarial",
+            "ndcg_at_10": 0.9828422279067397,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-adv-02",
+            "category": "adversarial",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-adv-03",
+            "category": "adversarial",
+            "ndcg_at_10": 0.6885288809404666,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-adv-04",
+            "category": "adversarial",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-adv-05",
+            "category": "adversarial",
+            "ndcg_at_10": 0.9639404333166532,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-adv-06",
+            "category": "adversarial",
+            "ndcg_at_10": 0.7967075809905066,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-adv-07",
+            "category": "adversarial",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-adv-08",
+            "category": "adversarial",
+            "ndcg_at_10": 0.9828422279067397,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-adv-09",
+            "category": "adversarial",
+            "ndcg_at_10": 0.9828422279067397,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-adv-10",
+            "category": "adversarial",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          }
+        ]
+      },
+      "latency": {
+        "measured_iterations": 3,
+        "warmup_iterations": 1,
+        "per_query_medians_ms": [
+          98.89495500000001,
+          93.81009,
+          91.139399,
+          92.745621,
+          93.49928,
+          98.398511,
+          87.809902,
+          90.006915,
+          87.19198899999999,
+          101.770441,
+          108.709731,
+          99.469808,
+          95.89697699999999,
+          98.918318,
+          92.369455,
+          99.114721,
+          92.348907,
+          88.652148,
+          98.729648,
+          105.54377600000001,
+          87.43099,
+          96.425133,
+          84.219956,
+          90.51974,
+          99.712925,
+          99.517203,
+          96.95283500000001,
+          109.421609,
+          103.400553,
+          89.24776700000001,
+          97.433305,
+          91.949872,
+          105.365363,
+          97.524494,
+          91.004715,
+          87.815597,
+          89.77130199999999,
+          109.929535,
+          92.67864200000001,
+          95.635361,
+          79.455471,
+          99.982809,
+          87.867553,
+          92.984195,
+          86.192493,
+          92.054992,
+          87.90028799999999,
+          83.99545,
+          101.21994500000001,
+          80.215509,
+          96.808192,
+          96.69629,
+          92.27698,
+          100.858149,
+          97.096592,
+          98.319946,
+          92.285036,
+          91.14900300000001,
+          97.003794,
+          95.61950399999999
+        ],
+        "arm_p95_ms": 105.54377600000001
+      }
+    },
+    {
+      "arm": "flat_aliases",
+      "registry_variant": "alias_only",
+      "exact": true,
+      "search_mode": "default",
+      "deterministic": true,
+      "query_texts": [
+        "chekpoint truncate the log",
+        "wal crc framing",
+        "btree split propagation",
+        "cow snapshot page table",
+        "jwt ttl rotation",
+        "mvcc readers never block",
+        "lsn ordering glossary",
+        "snap reclamation of old pages",
+        "repl raft majority ack",
+        "vac merging underfull pages",
+        "ckpt flush dirty pages",
+        "agg pipeline breaker",
+        "idx selectivity threshold",
+        "writeahead log crash recovery",
+        "sla burn rate alert",
+        "otel export counters histograms",
+        "monthly invoice close metered usage",
+        "audit who granted rbac roles",
+        "invoice retry backoff quarantine",
+        "signing algorithm for access tokens",
+        "wal::Frame",
+        "wal::replay_from",
+        "btree::split_leaf",
+        "snapshot::reclaim_before",
+        "planner::cost_model",
+        "exec::spill_build_side",
+        "auth::rotate_refresh",
+        "rbac::audit_event",
+        "metrics::cardinality_budget",
+        "tracing::tail_sample",
+        "atlas/src/storage/wal_format.rs",
+        "atlas/src/auth/token_service.rs",
+        "doc-repl-raft",
+        "doc-billing-ledger",
+        "repl::raft_ack majority",
+        "durability guarantees for committed writes",
+        "page layout and split behavior",
+        "reader isolation and reclamation",
+        "planner selectivity decisions",
+        "join ordering strategy",
+        "memory pressure during execution",
+        "credential lifetime policy",
+        "permission model changes audit",
+        "telemetry volume control",
+        "cross-service correlation",
+        "log sequence ordering of frames",
+        "elevating to admin",
+        "forcing an access path",
+        "alerting on budgets",
+        "recovering after crash",
+        "write-ahead log framing and crc",
+        "additive rbac deny overrides",
+        "token ttl 24 hours shared secret",
+        "metrics 100k series labels",
+        "invoice weekly close manual approval",
+        "filter pushdown below joins unconditionally",
+        "jwt hs256 refresh forever",
+        "append only corrections reversing entries",
+        "p99 tail sampling 24 hours error traces",
+        "majority raft ack durability"
+      ],
+      "rankings": [
+        {
+          "query_id": "q-alias-01",
+          "ranked_ids": [
+            "doc-wal-checkpoint",
+            "doc-wal-format",
+            "doc-wal-replay",
+            "doc-runbook-wal-full",
+            "doc-wal-archive"
+          ]
+        },
+        {
+          "query_id": "q-alias-02",
+          "ranked_ids": [
+            "doc-wal-format",
+            "doc-wal-archive",
+            "doc-wal-replay",
+            "doc-runbook-wal-full",
+            "doc-wal-checkpoint"
+          ]
+        },
+        {
+          "query_id": "q-alias-03",
+          "ranked_ids": [
+            "doc-btree-split",
+            "doc-btree-vacuum",
+            "doc-btree-page"
+          ]
+        },
+        {
+          "query_id": "q-alias-04",
+          "ranked_ids": [
+            "doc-snapshot-cow",
+            "doc-faq-snapshot",
+            "doc-snapshot-gc"
+          ]
+        },
+        {
+          "query_id": "q-alias-05",
+          "ranked_ids": [
+            "doc-auth-mfa",
+            "doc-auth-refresh",
+            "doc-auth-tokens"
+          ]
+        },
+        {
+          "query_id": "q-alias-06",
+          "ranked_ids": [
+            "doc-snapshot-cow",
+            "doc-snapshot-gc",
+            "doc-faq-snapshot"
+          ]
+        },
+        {
+          "query_id": "q-alias-07",
+          "ranked_ids": [
+            "doc-glossary-lsn",
+            "doc-storage-overview"
+          ]
+        },
+        {
+          "query_id": "q-alias-08",
+          "ranked_ids": [
+            "doc-snapshot-gc",
+            "doc-snapshot-cow",
+            "doc-faq-snapshot"
+          ]
+        },
+        {
+          "query_id": "q-alias-09",
+          "ranked_ids": [
+            "doc-repl-raft",
+            "doc-repl-lag"
+          ]
+        },
+        {
+          "query_id": "q-alias-10",
+          "ranked_ids": [
+            "doc-btree-vacuum",
+            "doc-btree-page",
+            "doc-btree-split"
+          ]
+        },
+        {
+          "query_id": "q-alias-11",
+          "ranked_ids": [
+            "doc-wal-checkpoint",
+            "doc-wal-format",
+            "doc-runbook-wal-full",
+            "doc-wal-replay",
+            "doc-wal-archive"
+          ]
+        },
+        {
+          "query_id": "q-alias-12",
+          "ranked_ids": [
+            "doc-exec-pipeline",
+            "doc-exec-vectorized",
+            "doc-exec-spill"
+          ]
+        },
+        {
+          "query_id": "q-alias-13",
+          "ranked_ids": [
+            "doc-planner-hints",
+            "doc-planner-cost",
+            "doc-planner-stats",
+            "doc-planner-join"
+          ]
+        },
+        {
+          "query_id": "q-alias-14",
+          "ranked_ids": [
+            "doc-wal-format",
+            "doc-wal-replay",
+            "doc-runbook-wal-full",
+            "doc-wal-checkpoint",
+            "doc-wal-archive"
+          ]
+        },
+        {
+          "query_id": "q-alias-15",
+          "ranked_ids": [
+            "doc-metrics-slo",
+            "doc-metrics-otel",
+            "doc-metrics-cardinality"
+          ]
+        },
+        {
+          "query_id": "q-alias-16",
+          "ranked_ids": [
+            "doc-metrics-otel",
+            "doc-metrics-slo",
+            "doc-metrics-cardinality"
+          ]
+        },
+        {
+          "query_id": "q-alias-17",
+          "ranked_ids": [
+            "doc-billing-invoice",
+            "doc-billing-retry",
+            "doc-billing-ledger"
+          ]
+        },
+        {
+          "query_id": "q-alias-18",
+          "ranked_ids": [
+            "doc-rbac-audit",
+            "doc-rbac-roles"
+          ]
+        },
+        {
+          "query_id": "q-alias-19",
+          "ranked_ids": [
+            "doc-billing-retry",
+            "doc-billing-invoice",
+            "doc-billing-ledger"
+          ]
+        },
+        {
+          "query_id": "q-alias-20",
+          "ranked_ids": [
+            "doc-auth-mfa",
+            "doc-auth-refresh",
+            "doc-auth-tokens"
+          ]
+        },
+        {
+          "query_id": "q-exact-01",
+          "ranked_ids": [
+            "doc-wal-format",
+            "doc-wal-replay",
+            "doc-wal-checkpoint",
+            "doc-runbook-wal-full",
+            "doc-wal-archive"
+          ]
+        },
+        {
+          "query_id": "q-exact-02",
+          "ranked_ids": [
+            "doc-wal-replay",
+            "doc-wal-archive",
+            "doc-wal-format",
+            "doc-runbook-wal-full",
+            "doc-wal-checkpoint"
+          ]
+        },
+        {
+          "query_id": "q-exact-03",
+          "ranked_ids": [
+            "doc-btree-split",
+            "doc-btree-vacuum",
+            "doc-btree-page"
+          ]
+        },
+        {
+          "query_id": "q-exact-04",
+          "ranked_ids": [
+            "doc-snapshot-gc",
+            "doc-snapshot-cow",
+            "doc-faq-snapshot"
+          ]
+        },
+        {
+          "query_id": "q-exact-05",
+          "ranked_ids": [
+            "doc-planner-cost",
+            "doc-planner-stats",
+            "doc-planner-join",
+            "doc-planner-hints"
+          ]
+        },
+        {
+          "query_id": "q-exact-06",
+          "ranked_ids": [
+            "doc-exec-spill",
+            "doc-exec-vectorized",
+            "doc-exec-pipeline"
+          ]
+        },
+        {
+          "query_id": "q-exact-07",
+          "ranked_ids": [
+            "doc-auth-refresh",
+            "doc-auth-tokens",
+            "doc-auth-mfa"
+          ]
+        },
+        {
+          "query_id": "q-exact-08",
+          "ranked_ids": [
+            "doc-rbac-audit",
+            "doc-rbac-roles"
+          ]
+        },
+        {
+          "query_id": "q-exact-09",
+          "ranked_ids": [
+            "doc-metrics-cardinality",
+            "doc-metrics-otel",
+            "doc-metrics-slo"
+          ]
+        },
+        {
+          "query_id": "q-exact-10",
+          "ranked_ids": [
+            "doc-tracing-tail",
+            "doc-tracing-spans",
+            "doc-tracing-baggage"
+          ]
+        },
+        {
+          "query_id": "q-exact-11",
+          "ranked_ids": [
+            "doc-wal-format",
+            "doc-wal-archive",
+            "doc-runbook-wal-full",
+            "doc-wal-replay",
+            "doc-wal-checkpoint"
+          ]
+        },
+        {
+          "query_id": "q-exact-12",
+          "ranked_ids": [
+            "doc-auth-tokens",
+            "doc-auth-mfa",
+            "doc-auth-refresh"
+          ]
+        },
+        {
+          "query_id": "q-exact-13",
+          "ranked_ids": [
+            "doc-repl-raft",
+            "doc-repl-lag"
+          ]
+        },
+        {
+          "query_id": "q-exact-14",
+          "ranked_ids": [
+            "doc-billing-ledger",
+            "doc-billing-invoice",
+            "doc-billing-retry"
+          ]
+        },
+        {
+          "query_id": "q-exact-15",
+          "ranked_ids": [
+            "doc-repl-raft",
+            "doc-repl-lag"
+          ]
+        },
+        {
+          "query_id": "q-hier-01",
+          "ranked_ids": [
+            "doc-storage-overview",
+            "doc-glossary-lsn"
+          ]
+        },
+        {
+          "query_id": "q-hier-02",
+          "ranked_ids": [
+            "doc-glossary-lsn",
+            "doc-storage-overview"
+          ]
+        },
+        {
+          "query_id": "q-hier-03",
+          "ranked_ids": [
+            "doc-glossary-lsn",
+            "doc-storage-overview"
+          ]
+        },
+        {
+          "query_id": "q-hier-04",
+          "ranked_ids": [
+            "doc-qe-overview"
+          ]
+        },
+        {
+          "query_id": "q-hier-05",
+          "ranked_ids": [
+            "doc-qe-overview"
+          ]
+        },
+        {
+          "query_id": "q-hier-06",
+          "ranked_ids": [
+            "doc-qe-overview"
+          ]
+        },
+        {
+          "query_id": "q-hier-07",
+          "ranked_ids": [
+            "doc-auth-overview"
+          ]
+        },
+        {
+          "query_id": "q-hier-08",
+          "ranked_ids": [
+            "doc-auth-overview"
+          ]
+        },
+        {
+          "query_id": "q-hier-09",
+          "ranked_ids": [
+            "doc-obs-overview"
+          ]
+        },
+        {
+          "query_id": "q-hier-10",
+          "ranked_ids": [
+            "doc-obs-overview"
+          ]
+        },
+        {
+          "query_id": "q-hier-11",
+          "ranked_ids": [
+            "doc-glossary-lsn",
+            "doc-storage-overview"
+          ]
+        },
+        {
+          "query_id": "q-hier-12",
+          "ranked_ids": [
+            "doc-auth-overview"
+          ]
+        },
+        {
+          "query_id": "q-hier-13",
+          "ranked_ids": [
+            "doc-qe-overview"
+          ]
+        },
+        {
+          "query_id": "q-hier-14",
+          "ranked_ids": [
+            "doc-obs-overview"
+          ]
+        },
+        {
+          "query_id": "q-hier-15",
+          "ranked_ids": [
+            "doc-glossary-lsn",
+            "doc-storage-overview"
+          ]
+        },
+        {
+          "query_id": "q-adv-01",
+          "ranked_ids": [
+            "doc-wal-format",
+            "doc-wal-checkpoint",
+            "doc-wal-replay",
+            "doc-runbook-wal-full",
+            "doc-wal-archive"
+          ]
+        },
+        {
+          "query_id": "q-adv-02",
+          "ranked_ids": [
+            "doc-rbac-roles",
+            "doc-rbac-audit"
+          ]
+        },
+        {
+          "query_id": "q-adv-03",
+          "ranked_ids": [
+            "doc-auth-refresh",
+            "doc-auth-mfa",
+            "doc-auth-tokens"
+          ]
+        },
+        {
+          "query_id": "q-adv-04",
+          "ranked_ids": [
+            "doc-metrics-cardinality",
+            "doc-metrics-otel",
+            "doc-metrics-slo"
+          ]
+        },
+        {
+          "query_id": "q-adv-05",
+          "ranked_ids": [
+            "doc-billing-invoice",
+            "doc-billing-ledger",
+            "doc-billing-retry"
+          ]
+        },
+        {
+          "query_id": "q-adv-06",
+          "ranked_ids": [
+            "doc-planner-join",
+            "doc-planner-cost",
+            "doc-planner-stats",
+            "doc-planner-hints"
+          ]
+        },
+        {
+          "query_id": "q-adv-07",
+          "ranked_ids": [
+            "doc-auth-refresh",
+            "doc-auth-tokens",
+            "doc-auth-mfa"
+          ]
+        },
+        {
+          "query_id": "q-adv-08",
+          "ranked_ids": [
+            "doc-billing-ledger",
+            "doc-billing-retry",
+            "doc-billing-invoice"
+          ]
+        },
+        {
+          "query_id": "q-adv-09",
+          "ranked_ids": [
+            "doc-tracing-tail",
+            "doc-tracing-baggage",
+            "doc-tracing-spans"
+          ]
+        },
+        {
+          "query_id": "q-adv-10",
+          "ranked_ids": [
+            "doc-repl-raft",
+            "doc-repl-lag"
+          ]
+        }
+      ],
+      "metrics": {
+        "arm": "flat_aliases",
+        "ndcg_at_10": 0.758913485715146,
+        "recall_at_5": 0.8027777777777778,
+        "precision_at_5": 0.3166666666666662,
+        "ontology_recall_at_5": 0.2777777777777778,
+        "p95_ms": 108.999346,
+        "queries": [
+          {
+            "query_id": "q-alias-01",
+            "category": "alias",
+            "ndcg_at_10": 0.9828422279067397,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-02",
+            "category": "alias",
+            "ndcg_at_10": 0.95583058934618,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-03",
+            "category": "alias",
+            "ndcg_at_10": 0.9721212198129313,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.6,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-04",
+            "category": "alias",
+            "ndcg_at_10": 0.9721212198129313,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.6,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-05",
+            "category": "alias",
+            "ndcg_at_10": 0.6806060567602009,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.6,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-06",
+            "category": "alias",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-07",
+            "category": "alias",
+            "ndcg_at_10": 0.7871546029909718,
+            "recall_at_5": 0.5,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-08",
+            "category": "alias",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-09",
+            "category": "alias",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-10",
+            "category": "alias",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-11",
+            "category": "alias",
+            "ndcg_at_10": 0.9680147827042069,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-12",
+            "category": "alias",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-13",
+            "category": "alias",
+            "ndcg_at_10": 0.8339912323981488,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-14",
+            "category": "alias",
+            "ndcg_at_10": 0.8428282648809379,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.6,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-15",
+            "category": "alias",
+            "ndcg_at_10": 0.9828422279067397,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-16",
+            "category": "alias",
+            "ndcg_at_10": 0.9173194127129571,
+            "recall_at_5": 0.5,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-17",
+            "category": "alias",
+            "ndcg_at_10": 0.9721212198129313,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.6,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-18",
+            "category": "alias",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-19",
+            "category": "alias",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-20",
+            "category": "alias",
+            "ndcg_at_10": 0.5413402936435214,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-01",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-02",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-03",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-04",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-05",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-06",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-07",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-08",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-09",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-10",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-11",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-12",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-13",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-14",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-15",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-01",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.09239184719040397,
+            "recall_at_5": 0.25,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-02",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.0642267978746136,
+            "recall_at_5": 0.25,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-03",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.0642267978746136,
+            "recall_at_5": 0.25,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-04",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.1017970661726598,
+            "recall_at_5": 0.25,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-05",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.1017970661726598,
+            "recall_at_5": 0.25,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-06",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.1017970661726598,
+            "recall_at_5": 0.25,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-07",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.1017970661726598,
+            "recall_at_5": 0.25,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-08",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.10646464774659967,
+            "recall_at_5": 0.3333333333333333,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-09",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.1017970661726598,
+            "recall_at_5": 0.25,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-10",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.7452525342261976,
+            "recall_at_5": 0.3333333333333333,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-11",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.7768062610832323,
+            "recall_at_5": 0.5,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-12",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.1017970661726598,
+            "recall_at_5": 0.25,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-13",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.1017970661726598,
+            "recall_at_5": 0.25,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-14",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.1017970661726598,
+            "recall_at_5": 0.25,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-15",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.0642267978746136,
+            "recall_at_5": 0.25,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-adv-01",
+            "category": "adversarial",
+            "ndcg_at_10": 0.9828422279067397,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-adv-02",
+            "category": "adversarial",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-adv-03",
+            "category": "adversarial",
+            "ndcg_at_10": 0.6885288809404666,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-adv-04",
+            "category": "adversarial",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-adv-05",
+            "category": "adversarial",
+            "ndcg_at_10": 0.9639404333166532,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-adv-06",
+            "category": "adversarial",
+            "ndcg_at_10": 0.7967075809905066,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-adv-07",
+            "category": "adversarial",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-adv-08",
+            "category": "adversarial",
+            "ndcg_at_10": 0.9828422279067397,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-adv-09",
+            "category": "adversarial",
+            "ndcg_at_10": 0.9828422279067397,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-adv-10",
+            "category": "adversarial",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          }
+        ]
+      },
+      "latency": {
+        "measured_iterations": 3,
+        "warmup_iterations": 1,
+        "per_query_medians_ms": [
+          109.457213,
+          105.523484,
+          101.543521,
+          108.999346,
+          100.296071,
+          101.062555,
+          88.001689,
+          92.599372,
+          88.081515,
+          80.723443,
+          100.085064,
+          78.314106,
+          79.346445,
+          73.61744,
+          91.742386,
+          92.66100200000001,
+          100.051874,
+          88.85095199999999,
+          96.893015,
+          98.905942,
+          95.920824,
+          114.237454,
+          109.05814799999999,
+          103.523701,
+          92.13326300000001,
+          91.335656,
+          95.309421,
+          98.365992,
+          92.699838,
+          92.960925,
+          100.284515,
+          83.820805,
+          88.11199,
+          85.518062,
+          85.810794,
+          83.77677,
+          90.542726,
+          93.001376,
+          76.22365,
+          80.10754200000001,
+          88.316312,
+          81.162619,
+          80.503227,
+          89.265823,
+          103.735822,
+          102.288996,
+          103.473269,
+          94.76186799999999,
+          100.38337,
+          87.980029,
+          108.238743,
+          101.72396499999999,
+          86.847857,
+          89.49678899999999,
+          97.84150899999999,
+          107.101253,
+          95.619372,
+          99.580817,
+          95.27194399999999,
+          93.01357
+        ],
+        "arm_p95_ms": 108.999346
+      }
+    },
+    {
+      "arm": "ontology",
+      "registry_variant": "alias+hierarchy",
+      "exact": true,
+      "search_mode": "default",
+      "deterministic": true,
+      "query_texts": [
+        "chekpoint truncate the log",
+        "wal crc framing",
+        "btree split propagation",
+        "cow snapshot page table",
+        "jwt ttl rotation",
+        "mvcc readers never block",
+        "lsn ordering glossary",
+        "snap reclamation of old pages",
+        "repl raft majority ack",
+        "vac merging underfull pages",
+        "ckpt flush dirty pages",
+        "agg pipeline breaker",
+        "idx selectivity threshold",
+        "writeahead log crash recovery",
+        "sla burn rate alert",
+        "otel export counters histograms",
+        "monthly invoice close metered usage",
+        "audit who granted rbac roles",
+        "invoice retry backoff quarantine",
+        "signing algorithm for access tokens",
+        "wal::Frame",
+        "wal::replay_from",
+        "btree::split_leaf",
+        "snapshot::reclaim_before",
+        "planner::cost_model",
+        "exec::spill_build_side",
+        "auth::rotate_refresh",
+        "rbac::audit_event",
+        "metrics::cardinality_budget",
+        "tracing::tail_sample",
+        "atlas/src/storage/wal_format.rs",
+        "atlas/src/auth/token_service.rs",
+        "doc-repl-raft",
+        "doc-billing-ledger",
+        "repl::raft_ack majority",
+        "durability guarantees for committed writes",
+        "page layout and split behavior",
+        "reader isolation and reclamation",
+        "planner selectivity decisions",
+        "join ordering strategy",
+        "memory pressure during execution",
+        "credential lifetime policy",
+        "permission model changes audit",
+        "telemetry volume control",
+        "cross-service correlation",
+        "log sequence ordering of frames",
+        "elevating to admin",
+        "forcing an access path",
+        "alerting on budgets",
+        "recovering after crash",
+        "write-ahead log framing and crc",
+        "additive rbac deny overrides",
+        "token ttl 24 hours shared secret",
+        "metrics 100k series labels",
+        "invoice weekly close manual approval",
+        "filter pushdown below joins unconditionally",
+        "jwt hs256 refresh forever",
+        "append only corrections reversing entries",
+        "p99 tail sampling 24 hours error traces",
+        "majority raft ack durability"
+      ],
+      "rankings": [
+        {
+          "query_id": "q-alias-01",
+          "ranked_ids": [
+            "doc-wal-checkpoint",
+            "doc-wal-format",
+            "doc-glossary-lsn",
+            "doc-btree-split",
+            "doc-wal-replay",
+            "doc-runbook-wal-full",
+            "doc-storage-overview",
+            "doc-snapshot-gc",
+            "doc-wal-archive",
+            "doc-snapshot-cow"
+          ]
+        },
+        {
+          "query_id": "q-alias-02",
+          "ranked_ids": [
+            "doc-faq-snapshot",
+            "doc-wal-format",
+            "doc-glossary-lsn",
+            "doc-wal-archive",
+            "doc-wal-replay",
+            "doc-runbook-wal-full",
+            "doc-btree-split",
+            "doc-snapshot-gc",
+            "doc-storage-overview",
+            "doc-btree-vacuum"
+          ]
+        },
+        {
+          "query_id": "q-alias-03",
+          "ranked_ids": [
+            "doc-btree-split",
+            "doc-btree-vacuum",
+            "doc-snapshot-gc",
+            "doc-snapshot-cow",
+            "doc-btree-page",
+            "doc-wal-checkpoint",
+            "doc-wal-replay",
+            "doc-runbook-wal-full",
+            "doc-repl-lag",
+            "doc-wal-format"
+          ]
+        },
+        {
+          "query_id": "q-alias-04",
+          "ranked_ids": [
+            "doc-snapshot-cow",
+            "doc-wal-archive",
+            "doc-repl-raft",
+            "doc-faq-snapshot",
+            "doc-btree-page",
+            "doc-wal-checkpoint",
+            "doc-snapshot-gc",
+            "doc-btree-vacuum",
+            "doc-storage-overview",
+            "doc-runbook-wal-full"
+          ]
+        },
+        {
+          "query_id": "q-alias-05",
+          "ranked_ids": [
+            "doc-auth-mfa",
+            "doc-rbac-audit",
+            "doc-auth-overview",
+            "doc-auth-refresh",
+            "doc-auth-tokens",
+            "doc-rbac-roles"
+          ]
+        },
+        {
+          "query_id": "q-alias-06",
+          "ranked_ids": [
+            "doc-btree-split",
+            "doc-snapshot-cow",
+            "doc-btree-page",
+            "doc-snapshot-gc",
+            "doc-glossary-lsn",
+            "doc-wal-replay",
+            "doc-btree-vacuum",
+            "doc-wal-archive",
+            "doc-storage-overview",
+            "doc-runbook-wal-full"
+          ]
+        },
+        {
+          "query_id": "q-alias-07",
+          "ranked_ids": [
+            "doc-glossary-lsn",
+            "doc-wal-archive",
+            "doc-snapshot-cow",
+            "doc-repl-raft",
+            "doc-faq-snapshot",
+            "doc-btree-split",
+            "doc-runbook-wal-full",
+            "doc-wal-replay",
+            "doc-btree-page",
+            "doc-btree-vacuum"
+          ]
+        },
+        {
+          "query_id": "q-alias-08",
+          "ranked_ids": [
+            "doc-snapshot-gc",
+            "doc-btree-page",
+            "doc-wal-archive",
+            "doc-wal-replay",
+            "doc-repl-raft",
+            "doc-btree-vacuum",
+            "doc-snapshot-cow",
+            "doc-btree-split",
+            "doc-wal-format",
+            "doc-faq-snapshot"
+          ]
+        },
+        {
+          "query_id": "q-alias-09",
+          "ranked_ids": [
+            "doc-storage-overview",
+            "doc-repl-raft",
+            "doc-snapshot-cow",
+            "doc-wal-archive",
+            "doc-faq-snapshot",
+            "doc-btree-split",
+            "doc-wal-replay",
+            "doc-wal-checkpoint",
+            "doc-btree-vacuum",
+            "doc-runbook-wal-full"
+          ]
+        },
+        {
+          "query_id": "q-alias-10",
+          "ranked_ids": [
+            "doc-btree-vacuum",
+            "doc-btree-page",
+            "doc-btree-split",
+            "doc-wal-format",
+            "doc-snapshot-gc",
+            "doc-wal-checkpoint",
+            "doc-wal-replay",
+            "doc-repl-lag",
+            "doc-repl-raft",
+            "doc-glossary-lsn"
+          ]
+        },
+        {
+          "query_id": "q-alias-11",
+          "ranked_ids": [
+            "doc-wal-checkpoint",
+            "doc-repl-raft",
+            "doc-btree-split",
+            "doc-faq-snapshot",
+            "doc-btree-page",
+            "doc-snapshot-gc",
+            "doc-glossary-lsn",
+            "doc-wal-format",
+            "doc-runbook-wal-full",
+            "doc-wal-replay"
+          ]
+        },
+        {
+          "query_id": "q-alias-12",
+          "ranked_ids": [
+            "doc-exec-pipeline",
+            "doc-exec-vectorized",
+            "doc-qe-overview",
+            "doc-planner-stats",
+            "doc-planner-hints",
+            "doc-planner-cost",
+            "doc-planner-join",
+            "doc-exec-spill"
+          ]
+        },
+        {
+          "query_id": "q-alias-13",
+          "ranked_ids": [
+            "doc-planner-hints",
+            "doc-planner-cost",
+            "doc-planner-stats",
+            "doc-exec-vectorized",
+            "doc-qe-overview",
+            "doc-planner-join",
+            "doc-exec-pipeline",
+            "doc-exec-spill"
+          ]
+        },
+        {
+          "query_id": "q-alias-14",
+          "ranked_ids": [
+            "doc-wal-format",
+            "doc-wal-replay",
+            "doc-storage-overview",
+            "doc-glossary-lsn",
+            "doc-btree-split",
+            "doc-runbook-wal-full",
+            "doc-btree-page",
+            "doc-wal-checkpoint",
+            "doc-snapshot-gc",
+            "doc-faq-snapshot"
+          ]
+        },
+        {
+          "query_id": "q-alias-15",
+          "ranked_ids": [
+            "doc-metrics-slo",
+            "doc-tracing-baggage",
+            "doc-obs-overview",
+            "doc-metrics-otel",
+            "doc-metrics-cardinality",
+            "doc-tracing-tail",
+            "doc-tracing-spans"
+          ]
+        },
+        {
+          "query_id": "q-alias-16",
+          "ranked_ids": [
+            "doc-metrics-otel",
+            "doc-metrics-slo",
+            "doc-metrics-cardinality",
+            "doc-obs-overview",
+            "doc-tracing-spans",
+            "doc-tracing-baggage",
+            "doc-tracing-tail"
+          ]
+        },
+        {
+          "query_id": "q-alias-17",
+          "ranked_ids": [
+            "doc-billing-invoice",
+            "doc-billing-retry",
+            "doc-billing-ledger"
+          ]
+        },
+        {
+          "query_id": "q-alias-18",
+          "ranked_ids": [
+            "doc-auth-tokens",
+            "doc-auth-refresh",
+            "doc-rbac-audit",
+            "doc-auth-overview",
+            "doc-auth-mfa",
+            "doc-rbac-roles"
+          ]
+        },
+        {
+          "query_id": "q-alias-19",
+          "ranked_ids": [
+            "doc-billing-retry",
+            "doc-billing-invoice",
+            "doc-billing-ledger"
+          ]
+        },
+        {
+          "query_id": "q-alias-20",
+          "ranked_ids": [
+            "doc-auth-mfa",
+            "doc-auth-overview",
+            "doc-rbac-audit",
+            "doc-auth-refresh",
+            "doc-rbac-roles",
+            "doc-auth-tokens"
+          ]
+        },
+        {
+          "query_id": "q-exact-01",
+          "ranked_ids": [
+            "doc-wal-format",
+            "doc-wal-replay",
+            "doc-storage-overview",
+            "doc-btree-split",
+            "doc-wal-checkpoint",
+            "doc-glossary-lsn",
+            "doc-btree-page",
+            "doc-runbook-wal-full",
+            "doc-wal-archive",
+            "doc-btree-vacuum"
+          ]
+        },
+        {
+          "query_id": "q-exact-02",
+          "ranked_ids": [
+            "doc-wal-replay",
+            "doc-wal-archive",
+            "doc-wal-format",
+            "doc-snapshot-gc",
+            "doc-snapshot-cow",
+            "doc-glossary-lsn",
+            "doc-repl-raft",
+            "doc-runbook-wal-full",
+            "doc-repl-lag",
+            "doc-btree-split"
+          ]
+        },
+        {
+          "query_id": "q-exact-03",
+          "ranked_ids": [
+            "doc-btree-split",
+            "doc-glossary-lsn",
+            "doc-btree-vacuum",
+            "doc-wal-checkpoint",
+            "doc-faq-snapshot",
+            "doc-snapshot-gc",
+            "doc-wal-archive",
+            "doc-wal-replay",
+            "doc-btree-page",
+            "doc-snapshot-cow"
+          ]
+        },
+        {
+          "query_id": "q-exact-04",
+          "ranked_ids": [
+            "doc-snapshot-gc",
+            "doc-snapshot-cow",
+            "doc-wal-archive",
+            "doc-faq-snapshot",
+            "doc-repl-raft",
+            "doc-wal-format",
+            "doc-wal-replay",
+            "doc-btree-vacuum",
+            "doc-storage-overview",
+            "doc-btree-split"
+          ]
+        },
+        {
+          "query_id": "q-exact-05",
+          "ranked_ids": [
+            "doc-planner-cost",
+            "doc-qe-overview",
+            "doc-exec-vectorized",
+            "doc-planner-stats",
+            "doc-planner-join",
+            "doc-planner-hints",
+            "doc-exec-pipeline",
+            "doc-exec-spill"
+          ]
+        },
+        {
+          "query_id": "q-exact-06",
+          "ranked_ids": [
+            "doc-exec-spill",
+            "doc-exec-vectorized",
+            "doc-qe-overview",
+            "doc-exec-pipeline",
+            "doc-planner-cost",
+            "doc-planner-hints",
+            "doc-planner-join",
+            "doc-planner-stats"
+          ]
+        },
+        {
+          "query_id": "q-exact-07",
+          "ranked_ids": [
+            "doc-auth-refresh",
+            "doc-auth-tokens",
+            "doc-auth-mfa",
+            "doc-auth-overview",
+            "doc-rbac-audit",
+            "doc-rbac-roles"
+          ]
+        },
+        {
+          "query_id": "q-exact-08",
+          "ranked_ids": [
+            "doc-rbac-audit",
+            "doc-auth-overview",
+            "doc-auth-refresh",
+            "doc-auth-tokens",
+            "doc-auth-mfa",
+            "doc-rbac-roles"
+          ]
+        },
+        {
+          "query_id": "q-exact-09",
+          "ranked_ids": [
+            "doc-metrics-cardinality",
+            "doc-metrics-otel",
+            "doc-obs-overview",
+            "doc-metrics-slo",
+            "doc-tracing-baggage",
+            "doc-tracing-tail",
+            "doc-tracing-spans"
+          ]
+        },
+        {
+          "query_id": "q-exact-10",
+          "ranked_ids": [
+            "doc-tracing-tail",
+            "doc-obs-overview",
+            "doc-tracing-spans",
+            "doc-metrics-otel",
+            "doc-tracing-baggage",
+            "doc-metrics-slo",
+            "doc-metrics-cardinality"
+          ]
+        },
+        {
+          "query_id": "q-exact-11",
+          "ranked_ids": [
+            "doc-wal-format",
+            "doc-snapshot-cow",
+            "doc-storage-overview",
+            "doc-btree-split",
+            "doc-faq-snapshot",
+            "doc-wal-archive",
+            "doc-runbook-wal-full",
+            "doc-glossary-lsn",
+            "doc-wal-replay",
+            "doc-btree-page"
+          ]
+        },
+        {
+          "query_id": "q-exact-12",
+          "ranked_ids": [
+            "doc-auth-tokens",
+            "doc-auth-mfa",
+            "doc-rbac-roles",
+            "doc-auth-overview",
+            "doc-rbac-audit",
+            "doc-auth-refresh"
+          ]
+        },
+        {
+          "query_id": "q-exact-13",
+          "ranked_ids": [
+            "doc-snapshot-gc",
+            "doc-wal-replay",
+            "doc-runbook-wal-full",
+            "doc-btree-vacuum",
+            "doc-storage-overview",
+            "doc-snapshot-cow",
+            "doc-btree-split",
+            "doc-btree-page",
+            "doc-repl-raft",
+            "doc-wal-format"
+          ]
+        },
+        {
+          "query_id": "q-exact-14",
+          "ranked_ids": [
+            "doc-billing-ledger",
+            "doc-billing-invoice",
+            "doc-billing-retry"
+          ]
+        },
+        {
+          "query_id": "q-exact-15",
+          "ranked_ids": [
+            "doc-repl-raft",
+            "doc-btree-split",
+            "doc-btree-page",
+            "doc-storage-overview",
+            "doc-faq-snapshot",
+            "doc-wal-format",
+            "doc-snapshot-cow",
+            "doc-wal-archive",
+            "doc-btree-vacuum",
+            "doc-wal-replay"
+          ]
+        },
+        {
+          "query_id": "q-hier-01",
+          "ranked_ids": [
+            "doc-storage-overview",
+            "doc-wal-replay",
+            "doc-snapshot-cow",
+            "doc-btree-page",
+            "doc-wal-archive",
+            "doc-wal-format",
+            "doc-btree-vacuum",
+            "doc-faq-snapshot",
+            "doc-glossary-lsn",
+            "doc-btree-split"
+          ]
+        },
+        {
+          "query_id": "q-hier-02",
+          "ranked_ids": [
+            "doc-wal-archive",
+            "doc-snapshot-gc",
+            "doc-snapshot-cow",
+            "doc-wal-replay",
+            "doc-btree-split",
+            "doc-btree-page",
+            "doc-repl-raft",
+            "doc-runbook-wal-full",
+            "doc-faq-snapshot",
+            "doc-wal-format"
+          ]
+        },
+        {
+          "query_id": "q-hier-03",
+          "ranked_ids": [
+            "doc-wal-replay",
+            "doc-faq-snapshot",
+            "doc-btree-split",
+            "doc-snapshot-gc",
+            "doc-wal-archive",
+            "doc-glossary-lsn",
+            "doc-runbook-wal-full",
+            "doc-wal-format",
+            "doc-snapshot-cow",
+            "doc-btree-page"
+          ]
+        },
+        {
+          "query_id": "q-hier-04",
+          "ranked_ids": [
+            "doc-planner-stats",
+            "doc-qe-overview",
+            "doc-planner-cost",
+            "doc-planner-hints",
+            "doc-exec-vectorized",
+            "doc-planner-join",
+            "doc-exec-spill",
+            "doc-exec-pipeline"
+          ]
+        },
+        {
+          "query_id": "q-hier-05",
+          "ranked_ids": [
+            "doc-planner-join",
+            "doc-exec-pipeline",
+            "doc-planner-hints",
+            "doc-exec-vectorized",
+            "doc-qe-overview",
+            "doc-exec-spill",
+            "doc-planner-cost",
+            "doc-planner-stats"
+          ]
+        },
+        {
+          "query_id": "q-hier-06",
+          "ranked_ids": [
+            "doc-planner-join",
+            "doc-exec-pipeline",
+            "doc-exec-spill",
+            "doc-planner-stats",
+            "doc-planner-hints",
+            "doc-qe-overview",
+            "doc-exec-vectorized",
+            "doc-planner-cost"
+          ]
+        },
+        {
+          "query_id": "q-hier-07",
+          "ranked_ids": [
+            "doc-auth-overview",
+            "doc-rbac-audit",
+            "doc-auth-mfa",
+            "doc-rbac-roles",
+            "doc-auth-refresh",
+            "doc-auth-tokens"
+          ]
+        },
+        {
+          "query_id": "q-hier-08",
+          "ranked_ids": [
+            "doc-auth-tokens",
+            "doc-rbac-roles",
+            "doc-rbac-audit",
+            "doc-auth-refresh",
+            "doc-auth-mfa",
+            "doc-auth-overview"
+          ]
+        },
+        {
+          "query_id": "q-hier-09",
+          "ranked_ids": [
+            "doc-metrics-otel",
+            "doc-metrics-cardinality",
+            "doc-obs-overview",
+            "doc-metrics-slo",
+            "doc-tracing-baggage",
+            "doc-tracing-spans",
+            "doc-tracing-tail"
+          ]
+        },
+        {
+          "query_id": "q-hier-10",
+          "ranked_ids": [
+            "doc-obs-overview",
+            "doc-metrics-slo",
+            "doc-metrics-cardinality",
+            "doc-tracing-baggage",
+            "doc-metrics-otel",
+            "doc-tracing-tail",
+            "doc-tracing-spans"
+          ]
+        },
+        {
+          "query_id": "q-hier-11",
+          "ranked_ids": [
+            "doc-glossary-lsn",
+            "doc-faq-snapshot",
+            "doc-wal-replay",
+            "doc-wal-format",
+            "doc-btree-page",
+            "doc-btree-split",
+            "doc-storage-overview",
+            "doc-repl-raft",
+            "doc-wal-checkpoint",
+            "doc-wal-archive"
+          ]
+        },
+        {
+          "query_id": "q-hier-12",
+          "ranked_ids": [
+            "doc-auth-mfa",
+            "doc-auth-tokens",
+            "doc-rbac-roles",
+            "doc-auth-overview",
+            "doc-auth-refresh",
+            "doc-rbac-audit"
+          ]
+        },
+        {
+          "query_id": "q-hier-13",
+          "ranked_ids": [
+            "doc-planner-hints",
+            "doc-exec-pipeline",
+            "doc-qe-overview",
+            "doc-planner-stats",
+            "doc-exec-spill",
+            "doc-planner-cost",
+            "doc-planner-join",
+            "doc-exec-vectorized"
+          ]
+        },
+        {
+          "query_id": "q-hier-14",
+          "ranked_ids": [
+            "doc-metrics-slo",
+            "doc-tracing-baggage",
+            "doc-metrics-otel",
+            "doc-metrics-cardinality",
+            "doc-tracing-spans",
+            "doc-obs-overview",
+            "doc-tracing-tail"
+          ]
+        },
+        {
+          "query_id": "q-hier-15",
+          "ranked_ids": [
+            "doc-glossary-lsn",
+            "doc-wal-archive",
+            "doc-btree-split",
+            "doc-btree-page",
+            "doc-snapshot-cow",
+            "doc-storage-overview",
+            "doc-faq-snapshot",
+            "doc-repl-raft",
+            "doc-wal-replay",
+            "doc-btree-vacuum"
+          ]
+        },
+        {
+          "query_id": "q-adv-01",
+          "ranked_ids": [
+            "doc-wal-format",
+            "doc-wal-checkpoint",
+            "doc-wal-replay",
+            "doc-storage-overview",
+            "doc-glossary-lsn",
+            "doc-faq-snapshot",
+            "doc-btree-split",
+            "doc-snapshot-cow",
+            "doc-runbook-wal-full",
+            "doc-btree-vacuum"
+          ]
+        },
+        {
+          "query_id": "q-adv-02",
+          "ranked_ids": [
+            "doc-rbac-roles",
+            "doc-auth-tokens",
+            "doc-auth-mfa",
+            "doc-auth-overview",
+            "doc-rbac-audit",
+            "doc-auth-refresh"
+          ]
+        },
+        {
+          "query_id": "q-adv-03",
+          "ranked_ids": [
+            "doc-rbac-audit",
+            "doc-rbac-roles",
+            "doc-auth-overview",
+            "doc-auth-refresh",
+            "doc-auth-mfa",
+            "doc-auth-tokens"
+          ]
+        },
+        {
+          "query_id": "q-adv-04",
+          "ranked_ids": [
+            "doc-metrics-cardinality",
+            "doc-metrics-otel",
+            "doc-obs-overview",
+            "doc-metrics-slo",
+            "doc-tracing-tail",
+            "doc-tracing-spans",
+            "doc-tracing-baggage"
+          ]
+        },
+        {
+          "query_id": "q-adv-05",
+          "ranked_ids": [
+            "doc-billing-invoice",
+            "doc-billing-ledger",
+            "doc-billing-retry"
+          ]
+        },
+        {
+          "query_id": "q-adv-06",
+          "ranked_ids": [
+            "doc-qe-overview",
+            "doc-exec-spill",
+            "doc-planner-join",
+            "doc-planner-cost",
+            "doc-planner-stats",
+            "doc-exec-vectorized",
+            "doc-planner-hints",
+            "doc-exec-pipeline"
+          ]
+        },
+        {
+          "query_id": "q-adv-07",
+          "ranked_ids": [
+            "doc-auth-refresh",
+            "doc-auth-overview",
+            "doc-auth-tokens",
+            "doc-rbac-audit",
+            "doc-auth-mfa",
+            "doc-rbac-roles"
+          ]
+        },
+        {
+          "query_id": "q-adv-08",
+          "ranked_ids": [
+            "doc-billing-ledger",
+            "doc-billing-retry",
+            "doc-billing-invoice"
+          ]
+        },
+        {
+          "query_id": "q-adv-09",
+          "ranked_ids": [
+            "doc-tracing-tail",
+            "doc-tracing-baggage",
+            "doc-tracing-spans",
+            "doc-metrics-otel",
+            "doc-obs-overview",
+            "doc-metrics-slo",
+            "doc-metrics-cardinality"
+          ]
+        },
+        {
+          "query_id": "q-adv-10",
+          "ranked_ids": [
+            "doc-snapshot-cow",
+            "doc-storage-overview",
+            "doc-wal-archive",
+            "doc-btree-split",
+            "doc-repl-raft",
+            "doc-btree-vacuum",
+            "doc-wal-checkpoint",
+            "doc-wal-replay",
+            "doc-faq-snapshot",
+            "doc-snapshot-gc"
+          ]
+        }
+      ],
+      "metrics": {
+        "arm": "ontology",
+        "ndcg_at_10": 0.8131274260776001,
+        "recall_at_5": 0.786111111111111,
+        "precision_at_5": 0.33666666666666634,
+        "ontology_recall_at_5": 0.5555555555555556,
+        "p95_ms": 108.19023399999999,
+        "queries": [
+          {
+            "query_id": "q-alias-01",
+            "category": "alias",
+            "ndcg_at_10": 0.9680147827042069,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-02",
+            "category": "alias",
+            "ndcg_at_10": 0.6271448173568673,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-03",
+            "category": "alias",
+            "ndcg_at_10": 0.9359826917490579,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.6,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-04",
+            "category": "alias",
+            "ndcg_at_10": 0.8975690100207991,
+            "recall_at_5": 0.6666666666666666,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-05",
+            "category": "alias",
+            "ndcg_at_10": 0.5323231668546659,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.6,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-06",
+            "category": "alias",
+            "ndcg_at_10": 0.6352023920551748,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-07",
+            "category": "alias",
+            "ndcg_at_10": 0.8935773014954859,
+            "recall_at_5": 0.5,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-08",
+            "category": "alias",
+            "ndcg_at_10": 0.8996052605611106,
+            "recall_at_5": 0.5,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-09",
+            "category": "alias",
+            "ndcg_at_10": 0.4966392596877323,
+            "recall_at_5": 0.5,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-10",
+            "category": "alias",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-11",
+            "category": "alias",
+            "ndcg_at_10": 0.9173194127129571,
+            "recall_at_5": 0.5,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-12",
+            "category": "alias",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-13",
+            "category": "alias",
+            "ndcg_at_10": 0.8339912323981488,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-14",
+            "category": "alias",
+            "ndcg_at_10": 0.8275194137079007,
+            "recall_at_5": 0.6666666666666666,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-15",
+            "category": "alias",
+            "ndcg_at_10": 0.9680147827042069,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-16",
+            "category": "alias",
+            "ndcg_at_10": 0.9737576937588317,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-17",
+            "category": "alias",
+            "ndcg_at_10": 0.9721212198129313,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.6,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-18",
+            "category": "alias",
+            "ndcg_at_10": 0.5137444987600056,
+            "recall_at_5": 0.5,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-19",
+            "category": "alias",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-alias-20",
+            "category": "alias",
+            "ndcg_at_10": 0.38319404872793994,
+            "recall_at_5": 0.5,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-01",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-02",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-03",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-04",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-05",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-06",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-07",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-08",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-09",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-10",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-11",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-12",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-13",
+            "category": "exact_identifier",
+            "ndcg_at_10": 0.3010299956639812,
+            "recall_at_5": 0.0,
+            "precision_at_5": 0.0,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-14",
+            "category": "exact_identifier",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-exact-15",
+            "category": "exact_identifier",
+            "ndcg_at_10": 0.9173194127129571,
+            "recall_at_5": 0.5,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-01",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.5991731248476014,
+            "recall_at_5": 0.5,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-02",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.3719673686318879,
+            "recall_at_5": 0.25,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-03",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.4102594208381778,
+            "recall_at_5": 0.5,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-04",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.7697493380781129,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.8,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-05",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.8822324962285594,
+            "recall_at_5": 0.5,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-06",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.619163327216249,
+            "recall_at_5": 0.5,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-07",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.5246629678908776,
+            "recall_at_5": 0.75,
+            "precision_at_5": 0.6,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-08",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.612064881713864,
+            "recall_at_5": 0.6666666666666666,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-09",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.7040802505539447,
+            "recall_at_5": 0.75,
+            "precision_at_5": 0.6,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-10",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.892903329824806,
+            "recall_at_5": 0.6666666666666666,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-11",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.9298513882470567,
+            "recall_at_5": 0.5,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-12",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.9453775191460313,
+            "recall_at_5": 0.75,
+            "precision_at_5": 0.6,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-13",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.9061928914774722,
+            "recall_at_5": 0.5,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-14",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.9142974954403493,
+            "recall_at_5": 0.5,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-hier-15",
+            "category": "hierarchy",
+            "ndcg_at_10": 0.2507686393171449,
+            "recall_at_5": 0.0,
+            "precision_at_5": 0.0,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-adv-01",
+            "category": "adversarial",
+            "ndcg_at_10": 0.9828422279067397,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-adv-02",
+            "category": "adversarial",
+            "ndcg_at_10": 0.9176601606601069,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-adv-03",
+            "category": "adversarial",
+            "ndcg_at_10": 0.41292402253795163,
+            "recall_at_5": 0.5,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-adv-04",
+            "category": "adversarial",
+            "ndcg_at_10": 1.0,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-adv-05",
+            "category": "adversarial",
+            "ndcg_at_10": 0.9639404333166532,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-adv-06",
+            "category": "adversarial",
+            "ndcg_at_10": 0.4935456744811716,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-adv-07",
+            "category": "adversarial",
+            "ndcg_at_10": 0.9197207891481876,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-adv-08",
+            "category": "adversarial",
+            "ndcg_at_10": 0.9828422279067397,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-adv-09",
+            "category": "adversarial",
+            "ndcg_at_10": 0.9828422279067397,
+            "recall_at_5": 1.0,
+            "precision_at_5": 0.4,
+            "forbidden_hits": []
+          },
+          {
+            "query_id": "q-adv-10",
+            "category": "adversarial",
+            "ndcg_at_10": 0.30451296789464855,
+            "recall_at_5": 0.5,
+            "precision_at_5": 0.2,
+            "forbidden_hits": []
+          }
+        ]
+      },
+      "latency": {
+        "measured_iterations": 3,
+        "warmup_iterations": 1,
+        "per_query_medians_ms": [
+          107.701885,
+          92.28380999999999,
+          84.772607,
+          99.74433400000001,
+          81.355908,
+          92.68960299999999,
+          95.405964,
+          113.433543,
+          94.915312,
+          103.89284599999999,
+          93.801692,
+          109.220153,
+          91.044709,
+          96.957799,
+          93.48421499999999,
+          80.208106,
+          105.73549,
+          120.198736,
+          101.12726099999999,
+          102.132918,
+          99.142887,
+          98.294466,
+          108.19023399999999,
+          87.464722,
+          87.07736200000001,
+          90.961917,
+          94.885072,
+          98.382504,
+          93.40096700000001,
+          82.435306,
+          91.52847899999999,
+          93.453728,
+          82.041915,
+          89.121303,
+          100.762284,
+          92.92769200000001,
+          103.322593,
+          85.216028,
+          81.24593800000001,
+          100.030118,
+          90.492302,
+          94.394337,
+          90.60720599999999,
+          80.916635,
+          98.656183,
+          98.969086,
+          89.38866800000001,
+          95.868228,
+          92.116384,
+          91.921877,
+          94.55514099999999,
+          92.13494999999999,
+          86.559124,
+          94.427595,
+          83.05069700000001,
+          96.990315,
+          80.27354100000001,
+          87.933841,
+          91.688386,
+          98.548181
+        ],
+        "arm_p95_ms": 108.19023399999999
+      }
+    }
+  ],
+  "derived_storage": {
+    "numerator_bytes": 1635,
+    "denominator_bytes": 44904,
+    "ratio": 0.03641101015499733
+  },
+  "p95_overhead_ms": -0.8091120000000132,
+  "deterministic": true,
+  "determinism_sha256": "5f378d7b6d2666dbaef44a06fa80de1b75f5dec2c99951559593f52db4f45583",
+  "gate": {
+    "verdict": "fail",
+    "violations": [
+      {
+        "code": "insufficient_ontology_subset_lift",
+        "detail": "alias+hierarchy Recall@5 subset lift 0.042857 < 0.10 (baseline 0.661905, candidate 0.704762)"
+      }
+    ]
+  },
+  "verdict": "FAIL",
+  "not_evaluated": [
+    "owner_labeled_production_roi",
+    "blind_agent_answer_accuracy",
+    "owner_labeled_corpus",
+    "rollback_validation",
+    "curation_cost",
+    "real_namespace_accuracy"
+  ]
+}

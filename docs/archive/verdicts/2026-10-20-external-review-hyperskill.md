@@ -571,7 +571,7 @@ from this document is the *mechanism* and the *question*, not any consumer fact.
 
 ## 7. Source anchors
 
-**HyperSkill** (cloned to `/tmp/opencode/HyperSkill`, commit `a34978a`):
+**HyperSkill** (cloned to `<tmp>/HyperSkill`, commit `a34978a`):
 - `hyperskill/hypergraph_core.py:568` `retrieve` (dual path);
   `:667` `_rank_skills_mistakes` (κ co-occurrence, `_rank = (c, sim)` at `:689`);
   `:698` `maintain_graph`; `:724` `_prune_low_utility` (delete at `:746`);

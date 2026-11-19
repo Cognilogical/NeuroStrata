@@ -349,7 +349,7 @@ Add the four `const fn` models to `src/formal_kernel.rs`, author `proofs/NeuroSt
 
 Run:
 ```bash
-rustc --edition=2021 --crate-type=lib src/formal_kernel.rs -o /tmp/opencode/libformal_kernel.rlib
+rustc --edition=2021 --crate-type=lib src/formal_kernel.rs -o <tmp>/libformal_kernel.rlib
 lake --dir proofs build
 cargo test --locked --test lean_parity_test -- --nocapture
 ```
@@ -379,7 +379,7 @@ Document strict-vs-warn-first boundaries, trusted principal model, offline crite
 - [ ] **Step 3: Run complete verification**
 
 ```bash
-rustc --edition=2021 --crate-type=lib src/formal_kernel.rs -o /tmp/opencode/libformal_kernel.rlib
+rustc --edition=2021 --crate-type=lib src/formal_kernel.rs -o <tmp>/libformal_kernel.rlib
 lake --dir proofs build
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
