@@ -390,6 +390,61 @@ fn ensure_safe_export_destination(path: &Path) -> Result<(), String> {
     }
 }
 
+/// Open an export destination for a truncating write.
+///
+/// `ensure_safe_export_destination` inspects the path first, but that check
+/// and the write are separate syscalls: a symlink swapped in between them
+/// would otherwise be followed. On Unix the open itself carries
+/// `O_NOFOLLOW`, so the kernel refuses the final-component symlink (ELOOP)
+/// and closes that race.
+#[cfg(unix)]
+fn open_export_destination(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+/// Non-Unix: there is no `O_NOFOLLOW` equivalent for reparse points, so the
+/// `symlink_metadata` precheck remains the only guard. A reparse point
+/// swapped in after that check can still be followed; this is the documented
+/// residual gap.
+#[cfg(not(unix))]
+fn open_export_destination(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+}
+
+/// Write one export artifact, refusing symlink and non-regular destinations.
+///
+/// The `ensure_safe_export_destination` precheck gives the caller a clear
+/// refusal before any byte is written; `open_export_destination` narrows the
+/// final-component race between that check and the write.
+fn write_export_destination(path: &Path, contents: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+
+    ensure_safe_export_destination(path)?;
+    let mut file = open_export_destination(path).map_err(|e| {
+        #[cfg(unix)]
+        if e.raw_os_error() == Some(libc::ELOOP) {
+            return format!(
+                "Refusing to write through symlink destination {}",
+                path.display()
+            );
+        }
+        format!("Failed to write {}: {}", path.display(), e)
+    })?;
+    file.write_all(contents)
+        .map_err(|e| format!("Failed to write {}: {}", path.display(), e))
+}
+
 /// Export vault contents to the configured path using the default caps.
 pub async fn export_vault(
     config: VaultSyncConfig,
@@ -501,15 +556,11 @@ pub async fn export_vault_with_limits(
         written_filenames.insert(filename, note.id.clone());
 
         let markdown = note.to_markdown();
-        if let Err(e) = ensure_safe_export_destination(&filepath) {
+        if let Err(e) = write_export_destination(&filepath, markdown.as_bytes()) {
             errors.push(format!("Export destination unsafe for {} failed: {}", filepath.display(), e));
             continue;
         }
-        if let Err(e) = std::fs::write(&filepath, markdown) {
-            errors.push(format!("Failed to write {}: {}", filepath.display(), e));
-        } else {
-            exported += 1;
-        }
+        exported += 1;
     }
 
     // Generate and write Canvas topology
@@ -519,9 +570,7 @@ pub async fn export_vault_with_limits(
     let canvas_json = serde_json::to_string_pretty(&canvas)
         .map_err(|e| format!("Failed to serialize canvas: {}", e))?;
 
-    ensure_safe_export_destination(&canvas_path)?;
-    std::fs::write(&canvas_path, canvas_json)
-        .map_err(|e| format!("Failed to write canvas: {}", e))?;
+    write_export_destination(&canvas_path, canvas_json.as_bytes())?;
 
     Ok(VaultExportResult {
         success: errors.is_empty(),
@@ -2555,6 +2604,31 @@ mod tests {
             !rebac::can_read_memory("stranger", &head.user_id, &head.metadata),
             "stranger must not read tightened head"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Issue #297: the open that performs the write must itself refuse a
+    /// symlink final component. The metadata precheck is deliberately
+    /// bypassed here to model the TOCTOU window between that check and the
+    /// write; only `O_NOFOLLOW` closes it.
+    #[cfg(unix)]
+    #[test]
+    fn open_export_destination_refuses_symlink_without_precheck() {
+        let root = std::env::temp_dir().join(format!("ns-exp-open-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create root");
+        let victim = root.join("victim.md");
+        std::fs::write(&victim, "untouched").expect("write victim");
+        let dest = root.join("dest.md");
+        std::os::unix::fs::symlink(&victim, &dest).expect("symlink destination");
+
+        let err = open_export_destination(&dest).expect_err("symlink open must be refused");
+        assert_eq!(err.raw_os_error(), Some(libc::ELOOP));
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("read victim"),
+            "untouched",
+            "the symlink target must not be truncated"
+        );
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
