@@ -364,18 +364,42 @@ jobs:
           set -euo pipefail
           base_sha="${{ github.event.pull_request.base.sha }}"
           git fetch --no-tags --depth=1 origin "$base_sha"
-          staged=0
-          while IFS= read -r file; do
-            [ -n "$file" ] || continue
-            if [ -f "$file" ]; then
-              git add -- "$file"
-              staged=1
-            fi
-          done < <(git diff --name-only --diff-filter=ACMR "$base_sha" HEAD -- '*.sh' 'scripts/hooks/*')
-          if [ "$staged" -eq 0 ]; then
+
+          changed=$(git diff --name-only --diff-filter=ACMR "$base_sha" HEAD -- '*.sh' 'scripts/hooks/*')
+          if [ -z "$changed" ]; then
             echo "no changed shell files"
             exit 0
           fi
+
+          # `git add` in the PR checkout is a no-op: the index already matches
+          # HEAD, so the gate would see an empty diff. Stage the PR versions
+          # against the base commit in a disposable worktree instead.
+          orig="$PWD"
+          tmp=$(mktemp -d)
+          cleanup() {
+            cd "$orig"
+            git worktree remove --force "$tmp/wt" >/dev/null 2>&1 || true
+            rm -rf "$tmp"
+          }
+          trap cleanup EXIT
+          git worktree add --detach "$tmp/wt" "$base_sha"
+
+          while IFS= read -r file; do
+            [ -n "$file" ] || continue
+            [ -f "$file" ] || continue
+            mkdir -p "$tmp/wt/$(dirname "$file")"
+            cp -p "$file" "$tmp/wt/$file"
+          done <<< "$changed"
+
+          # Exercise the PR's gate implementation, not the base one.
+          cp scripts/check-staged-quality.sh "$tmp/wt/scripts/check-staged-quality.sh"
+          cp scripts/clippy-staged-diagnostics.mjs "$tmp/wt/scripts/clippy-staged-diagnostics.mjs"
+
+          cd "$tmp/wt"
+          while IFS= read -r file; do
+            [ -n "$file" ] || continue
+            [ -f "$file" ] && git add -- "$file"
+          done <<< "$changed"
           bash scripts/check-staged-quality.sh
 
   # The dependency graph carries known advisories, so the audit is a gate
