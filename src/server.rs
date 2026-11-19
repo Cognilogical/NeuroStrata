@@ -2982,7 +2982,9 @@ async fn implicit_source_from_location(
     let (lookup, _) = lookup_path_for(store, namespace, location, project_root)
         .await
         .ok()?;
-    (lookup.source != crate::paths::RootSource::Outside).then_some(lookup.path)
+    (lookup.source != crate::paths::RootSource::Outside
+        && !crate::paths::is_absolute_any(&lookup.path))
+    .then_some(lookup.path)
 }
 
 /// The registered root to resolve `path` with, given the result of reading it.
@@ -16654,10 +16656,19 @@ mod tests {
         .await;
         assert_eq!(row.payload.metadata["source"], serde_json::json!("src/lib.rs"));
 
-        // Under no known root: the generic fallback, not the path.
+        // Under no known root: the generic fallback, not the path. A temp dir
+        // inside a git checkout makes that checkout the root; the source must
+        // then still be relative.
         let (_, outside_row) =
             stored(add("keep release notes short", &outside, None).await).await;
-        assert_eq!(outside_row.payload.metadata["source"], serde_json::json!("agent"));
+        let temp_in_checkout = std::iter::successors(outside.parent(), |p| p.parent())
+            .any(|p| p.join(".git").exists());
+        if temp_in_checkout {
+            let source = outside_row.payload.metadata["source"].as_str().unwrap_or_default();
+            assert!(!crate::paths::is_absolute_any(source), "{source}");
+        } else {
+            assert_eq!(outside_row.payload.metadata["source"], serde_json::json!("agent"));
+        }
 
         // What a mesh peer receives: the published record, its canonical
         // N-Quads included, names no local directory.
