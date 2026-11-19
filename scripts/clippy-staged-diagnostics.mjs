@@ -5,6 +5,7 @@
 // Usage from test import: import { findStagedDiagnostics } from "./clippy-staged-diagnostics.mjs" (named export)
 
 import { fileURLToPath } from 'node:url'
+import { realpathSync } from 'node:fs'
 import path from 'node:path'
 
 /**
@@ -91,8 +92,12 @@ function main() {
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--root' && i + 1 < args.length) {
       root = args[++i]
-    } else if (args[i] === '--staged' && i + 1 < args.length) {
-      staged.push(args[++i])
+    } else if (args[i] === '--staged') {
+      // The runner passes every staged path after a single flag. Consume until
+      // the next option instead of taking only the first path.
+      while (i + 1 < args.length && !args[i + 1].startsWith('--')) {
+        staged.push(args[++i])
+      }
     }
   }
 
@@ -145,10 +150,19 @@ function main() {
 // Export pure function for importing tests
 export { findStagedDiagnostics }
 
-// Run main() only when executed as CLI (not imported)
-const isMain =
-  process.argv[1] &&
-  path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
-if (isMain) {
+// Run main() only when executed as CLI (not imported). Compare real paths so a
+// symlinked checkout (macOS /tmp, iCloud, symlinked worktrees) still runs main().
+function isMainModule() {
+  if (!process.argv[1]) return false
+  try {
+    return (
+      realpathSync(process.argv[1]) ===
+      realpathSync(fileURLToPath(import.meta.url))
+    )
+  } catch {
+    return false
+  }
+}
+if (isMainModule()) {
   main()
 }
