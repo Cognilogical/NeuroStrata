@@ -788,10 +788,20 @@ pub async fn ingest_bounded_classification<S: VectorStore + ?Sized>(
         "bounded-ingest-{}",
         nquads_digest(&format!("{namespace}\x1f{user_id}\x1f{content}"))
     );
+    let collision_scoped_id = format!(
+        "bounded-ingest-{}",
+        nquads_digest(&format!(
+            "{}:{namespace}\x1f{}:{user_id}\x1f{content}",
+            namespace.len(),
+            user_id.len(),
+        ))
+    );
 
     let mut owned_existing: Vec<String> = Vec::new();
+    let mut scoped_id_is_foreign = false;
     for candidate_id in [
         &scoped_id,
+        &collision_scoped_id,
         &legacy_trimmed_scoped_id,
         &legacy_ns_id,
         &legacy_content_id,
@@ -806,11 +816,14 @@ pub async fn ingest_bounded_classification<S: VectorStore + ?Sized>(
         {
             if &payload.user_id == user_id {
                 owned_existing.push(candidate_id.clone());
+            } else if candidate_id == &scoped_id {
+                scoped_id_is_foreign = true;
             }
         }
     }
 
     let (id, siblings_to_remove) = match owned_existing.as_slice() {
+        [] if scoped_id_is_foreign => (collision_scoped_id, Vec::new()),
         [] => (scoped_id, Vec::new()),
         [only] => (only.clone(), Vec::new()),
         [primary, rest @ ..] => (primary.clone(), rest.to_vec()),
@@ -1894,6 +1907,61 @@ mod tests {
             .expect("get padded alice row")
             .expect("padded alice row exists");
         assert_eq!(padded_row.user_id, " alice ");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn foreign_owned_trimmed_legacy_id_is_not_overwritten() {
+        let index = make_index();
+        let dir = temp_store_dir();
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp db");
+        store.init("test-ns").await.expect("init schema");
+
+        let mut padded_req = request(vec![valid_candidate()]);
+        padded_req.user_id = " alice ".to_string();
+        let padded_batch = bounded_classify(&index, &budget(), &padded_req).expect("classify");
+        let legacy_trimmed_id = format!(
+            "bounded-ingest-{}",
+            nquads_digest(&format!(
+                "test-ns\x1falice\x1f{}",
+                padded_batch.memory_payload.content
+            ))
+        );
+        store
+            .upsert(
+                "test-ns",
+                &legacy_trimmed_id,
+                vec![0.25f32; 4],
+                padded_batch.memory_payload.clone(),
+            )
+            .await
+            .expect("seed padded principal's trimmed legacy row");
+
+        let mut alice_req = request(vec![valid_candidate()]);
+        alice_req.user_id = "alice".to_string();
+        let alice_out = ingest_bounded_classification(
+            &store, "test-ns", &index, &budget(), &alice_req, &StubEmbedder,
+        )
+        .await
+        .expect("un-padded alice ingest");
+
+        assert_ne!(
+            alice_out.id, legacy_trimmed_id,
+            "a foreign-owned trimmed legacy ID must not be reused by the un-padded principal"
+        );
+        let (_, padded_row) = store
+            .get("test-ns", &legacy_trimmed_id)
+            .await
+            .expect("get padded legacy row")
+            .expect("padded legacy row still exists");
+        assert_eq!(padded_row.user_id, " alice ");
+        let (_, alice_row) = store
+            .get("test-ns", &alice_out.id)
+            .await
+            .expect("get alice row")
+            .expect("alice row exists");
+        assert_eq!(alice_row.user_id, "alice");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
