@@ -685,6 +685,15 @@ export function isFileTouchTool(name) {
 export function isMutatingTool(name) {
     return MUTATING_TOOLS.has(name);
 }
+// Tool output (stdout / file contents) is not user or assistant speech: intent
+// markers such as TODO:/defer found there are code or log noise, not a task
+// obligation. Never post intake candidates from read-only inspection tools.
+const READ_ONLY_INSPECTION_TOOLS = new Set([
+    "read", "read_file", "shell", "bash", "local_shell", "grep", "glob", "view", "cat",
+]);
+export function isReadOnlyInspectionTool(name) {
+    return READ_ONLY_INSPECTION_TOOLS.has(String(name).toLowerCase());
+}
 export function isSubagentTool(name) {
     return SUBAGENT_TOOLS.has(name);
 }
@@ -1241,20 +1250,67 @@ export function formatFileTouchRecallBlock(filePath, snippets) {
 // Subagent prompt injection (Enhancement 2 & 3)
 // ──────────────────────────────────────────────────────────────────────
 export const SUBAGENT_CONTEXT_MARKER = "### NeuroStrata Task & Graph Context";
-export function buildSubagentContextHeader(namespace, taskId, extraContext) {
+// Read-only subagents (review / check / explore) have no NeuroStrata MCP tools
+// available. Telling them to call task_update/memories_for_file produces
+// InvalidToolCallsError churn, so their header omits the tool-call directive.
+const READ_ONLY_SUBAGENT_AGENTS = new Set([
+    "reviewer", "checker", "checker-free", "explore",
+]);
+export function isReadOnlySubagentAgent(agentId) {
+    if (!agentId)
+        return false;
+    const normalized = String(agentId).trim().toLowerCase().replace(/^.*[/:]/, "");
+    return READ_ONLY_SUBAGENT_AGENTS.has(normalized);
+}
+/** Resolve the subagent agent id from the fields harnesses use to name it. */
+export function resolveSubagentAgentId(target) {
+    const nested = asRecord(target.input);
+    const raw = target.agent ??
+        target.subagent_type ??
+        target.subagentType ??
+        target.subagent ??
+        target.agent_type ??
+        nested.agent ??
+        nested.subagent_type ??
+        nested.subagent;
+    const id = asString(raw);
+    return id && id.trim() ? id.trim() : undefined;
+}
+/** Code-Mode harnesses (OpenCode V2) expose MCP via `execute` + tools.neurostrata.*. */
+export function detectCodeMode(ctx, cfg) {
+    if (ctx?.codeMode === true || ctx?.tool?.codeMode === true || cfg?.codeMode === true) {
+        return true;
+    }
+    const harness = (asString(ctx?.harness ?? ctx?.harnessName ?? ctx?.adapter?.name ?? ctx?.tool?.name ?? activeHarnessName) ?? "").toLowerCase();
+    return harness.includes("opencode") || harness.includes("code-mode") || harness.includes("codemode");
+}
+export function buildSubagentContextHeader(namespace, taskId, extraContext, options) {
     const taskLabel = taskId ?? "unclaimed (claim a task first)";
     const extra = extraContext && extraContext.trim() ? `\n${extraContext.trim()}\n` : "";
+    let lookupRule;
+    if (isReadOnlySubagentAgent(options?.agentId)) {
+        lookupRule =
+            "- Read-Only Subagent: no NeuroStrata MCP mutation tools are available; skip the graph-lookup and task_update directives (review/edit tools only).\n";
+    }
+    else if (options?.codeMode === true) {
+        lookupRule =
+            "- Mandatory Graph-First Lookup Rule: Before editing any file, check whether its path and governing memory IDs (`mem-...`) are already listed in the auto-injected context block in your prompt. For any file you touch that is NOT listed, call `tools.neurostrata.memories_for_file` (and `tools.neurostrata.task_update` after notes) via the `execute` tool, not bare MCP tool names.\n";
+    }
+    else {
+        lookupRule =
+            "- Mandatory Graph-First Lookup Rule: Before editing any file, check whether its path and governing memory IDs (`mem-...`) are already listed in the auto-injected context block in your prompt. For any file you touch that is NOT listed in that block, call `neurostrata_memories_for_file` first (or `neurostrata_search_memory` / `neurostrata_related`).\n";
+    }
     return (`${SUBAGENT_CONTEXT_MARKER} (AUTO-INJECTED BY NEUROSTRATA PLUGIN)\n` +
         `- Namespace: \`${namespace}\` | Active Task ID: \`${taskLabel}\`\n` +
-        `- Mandatory Graph-First Lookup Rule: Before editing any file, check whether its path and governing memory IDs (\`mem-...\`) are already listed under \`### NeuroStrata Task & Graph Context\` in your prompt. For any file you touch that is NOT listed in that block, call \`neurostrata_memories_for_file\` first (or \`neurostrata_search_memory\` / \`neurostrata_related\`).\n` +
+        lookupRule +
         extra +
         `\n`);
 }
-export function injectSubagentPrompt(target, namespace, taskId, extraContext) {
+export function injectSubagentPrompt(target, namespace, taskId, extraContext, options) {
     const raw = typeof target.prompt === "string" ? target.prompt : null;
     if (raw === null || raw.includes(SUBAGENT_CONTEXT_MARKER))
         return false;
-    target.prompt = buildSubagentContextHeader(namespace, taskId, extraContext) + raw;
+    target.prompt = buildSubagentContextHeader(namespace, taskId, extraContext, options) + raw;
     return true;
 }
 export function extractRepoFilePaths(promptText) {
@@ -1437,6 +1493,10 @@ export async function enrichAndInjectSubagentPrompt(target, namespace, taskId) {
     else {
         injection = cachedTaskInjection.get(effectiveTaskId) ?? null;
     }
+    const headerOptions = {
+        agentId: resolveSubagentAgentId(target),
+        codeMode: detectCodeMode(pluginCtx, config),
+    };
     const extraLines = [];
     if (injection)
         extraLines.push(injection);
@@ -1451,12 +1511,15 @@ export async function enrichAndInjectSubagentPrompt(target, namespace, taskId) {
             // prefetch failures never block subagent injection
         }
     }
-    return injectSubagentPrompt(target, namespace, effectiveTaskId, extraLines.join("\n"));
+    return injectSubagentPrompt(target, namespace, effectiveTaskId, extraLines.join("\n"), headerOptions);
 }
 // ──────────────────────────────────────────────────────────────────────
 // Session / task tracking state
 // ──────────────────────────────────────────────────────────────────────
 let config = DEFAULT_CONFIG;
+// Set by createHarnessPlugin(); lets core phrase subagent directives for the
+// hosting harness (OpenCode is a Code-Mode harness: tools.neurostrata.* via execute).
+let activeHarnessName = null;
 let mcpClient = undefined;
 let pluginCtx = null;
 const TASK_MUTATION_TOOLS = new Set([
@@ -1954,7 +2017,7 @@ const executeAfterHandler = async (output, secondArg) => {
     }
     // Wave 4: extract task-intent obligations from the tool output text and
     // post them fail-soft to the intake ledger (never blocks the tool output).
-    if (config.intentDetection.enabled && rawText) {
+    if (config.intentDetection.enabled && rawText && !isReadOnlyInspectionTool(toolName)) {
         const activeTaskId = readActiveTaskId(effectiveProjectRoot(config));
         const candidates = extractTurnCandidates({
             role: "assistant",
@@ -2046,7 +2109,10 @@ const executeBeforeHandler = async (input) => {
                 await enrichAndInjectSubagentPrompt(target, config.namespace, activeTaskId);
             }
             catch {
-                injectSubagentPrompt(target, config.namespace, activeTaskId);
+                injectSubagentPrompt(target, config.namespace, activeTaskId, undefined, {
+                    agentId: resolveSubagentAgentId(target),
+                    codeMode: detectCodeMode(pluginCtx, config),
+                });
             }
         }
     }
@@ -2078,9 +2144,13 @@ const executeBeforeHandler = async (input) => {
             confirmPrefetchDelivery(config.namespace, filePath);
         return { additionalContext: block, neurostrataContext: block, snippets };
     }
-    // Mutating tool guard (fail closed).
+    // Mutating tool guard (fail closed). A provably read-only / verification
+    // shell segment is NOT a mutation: tell the daemon so it does not apply the
+    // Unpreflighted or Breath gates (Lock 2 completes the task before push, so
+    // demanding an active task for `git push` would be an unbreakable Catch-22).
     if (isMutatingTool(toolName)) {
         const payload = JSON.stringify(args);
+        const shellExempt = isZeroActionExemptShellPayload(toolName, payload);
         if (config.strictMode) {
             const call = {
                 name: toolName,
@@ -2104,7 +2174,7 @@ const executeBeforeHandler = async (input) => {
                     action_type: toolName,
                     payload,
                     cwd,
-                    is_mutating: true,
+                    is_mutating: !shellExempt,
                     use_sandbox: false,
                     mutations_since_note: mutationsSinceNote,
                 });
@@ -2126,7 +2196,7 @@ const executeBeforeHandler = async (input) => {
                 throw new Error(`Guard validation unavailable (NeuroStrata core degraded): ${message}`);
             }
         }
-        if (!isZeroActionExemptShellPayload(toolName, payload))
+        if (!shellExempt)
             mutationsSinceNote++;
     }
     if (filePath)
@@ -2336,6 +2406,7 @@ export async function handleHookEvent(event) {
             }
             const callArgs = firstRecord(toolInput);
             const payload = JSON.stringify(callArgs);
+            const shellExempt = isZeroActionExemptShellPayload(toolNameRaw, payload);
             if (config.strictMode) {
                 const projectRoot = effectiveProjectRoot(config);
                 const cwd = asString(callArgs.cwd) ?? asString(callArgs.workdir) ?? projectRoot;
@@ -2353,7 +2424,7 @@ export async function handleHookEvent(event) {
                         action_type: toolNameRaw,
                         payload,
                         cwd,
-                        is_mutating: true,
+                        is_mutating: !shellExempt,
                         use_sandbox: false,
                         mutations_since_note: mutationsSinceNote,
                     });
@@ -2372,7 +2443,7 @@ export async function handleHookEvent(event) {
                     return denyWithRecall(`Guard unavailable: ${message}`);
                 }
             }
-            if (!isZeroActionExemptShellPayload(toolNameRaw, payload))
+            if (!shellExempt)
                 mutationsSinceNote++;
         }
         if (recalledFilePath)
@@ -2426,6 +2497,7 @@ export async function fetchContextPlan(opts) {
 // Adapter factory
 // ──────────────────────────────────────────────────────────────────────
 export function createHarnessPlugin(pluginId = "neurostrata", harnessName = "OpenCode") {
+    activeHarnessName = harnessName;
     return {
         id: pluginId,
         name: harnessName,

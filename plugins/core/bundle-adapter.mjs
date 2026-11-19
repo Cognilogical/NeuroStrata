@@ -66,7 +66,11 @@ function extractPluginLines(indexTsPath) {
         continue;
       }
       // Once we hit the actual plugin export, we're past the import section
-      if (trimmed.startsWith("export const plugin = createHarnessPlugin(") || trimmed.startsWith("export default plugin;")) {
+      if (
+        trimmed.startsWith("export const plugin = createHarnessPlugin(") ||
+        trimmed.startsWith("export default plugin;") ||
+        trimmed.startsWith("export default {")
+      ) {
         inCoreImportSection = false;
         pluginLines.push(line);
       }
