@@ -2306,12 +2306,11 @@ impl TaxonomyGraph {
         processed == self.indices.len()
     }
 
-    fn is_reachable(&self, start: u32, target: u32) -> bool {
-        let (Some(&start), Some(&target)) = (self.indices.get(&start), self.indices.get(&target))
-        else {
-            return false;
-        };
+    fn reachable_from(&self, start: u32) -> Vec<bool> {
         let mut visited = vec![false; self.indices.len()];
+        let Some(&start) = self.indices.get(&start) else {
+            return visited;
+        };
         let mut queue = vec![start];
         visited[start] = true;
         let mut head = 0usize;
@@ -2319,16 +2318,27 @@ impl TaxonomyGraph {
             let node = queue[head];
             head += 1;
             for &next in &self.adjacency[node] {
-                if next == target {
-                    return true;
-                }
                 if !visited[next] {
                     visited[next] = true;
                     queue.push(next);
                 }
             }
         }
-        false
+        visited
+    }
+
+    fn is_reachable(
+        &self,
+        cache: &mut std::collections::BTreeMap<u32, Vec<bool>>,
+        start: u32,
+        target: u32,
+    ) -> bool {
+        let Some(&target) = self.indices.get(&target) else {
+            return false;
+        };
+        cache
+            .entry(start)
+            .or_insert_with(|| self.reachable_from(start))[target]
     }
 }
 
@@ -2349,8 +2359,12 @@ pub fn validate_skos_disjointness(
     if !graph.is_valid_dag(broader_edges) {
         return false;
     }
+    let mut reachability = std::collections::BTreeMap::new();
     for &(u, v) in related_edges.iter().chain(contrast_edges) {
-        if u == v || graph.is_reachable(u, v) || graph.is_reachable(v, u) {
+        if u == v
+            || graph.is_reachable(&mut reachability, u, v)
+            || graph.is_reachable(&mut reachability, v, u)
+        {
             return false;
         }
     }
@@ -2718,6 +2732,45 @@ mod tests {
         assert!(
             start.elapsed() < std::time::Duration::from_millis(500),
             "2,000-edge DAG validation regressed to quadratic reachability: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn test_validate_taxonomy_dag_large_and_sparse() {
+        let chain: Vec<(u32, u32)> = (0..5_000).map(|n| (n, n + 1)).collect();
+        assert!(validate_taxonomy_dag(&chain));
+        let mut cycle = chain;
+        cycle.push((5_000, 0));
+        assert!(!validate_taxonomy_dag(&cycle));
+        assert!(validate_taxonomy_dag(&[(1_000_000, 1_000_001)]));
+        assert!(!validate_taxonomy_dag(&[
+            (1_000_000, 1_000_001),
+            (1_000_001, 1_000_000),
+        ]));
+        assert!(!validate_taxonomy_dag(&[(u32::MAX, u32::MAX)]));
+    }
+
+    #[test]
+    fn test_validate_skos_disjointness_reuses_reachability() {
+        let mut broader = Vec::new();
+        for base in [0, 10_000] {
+            broader.extend((0..2_000).map(|n| (base + n, base + n + 1)));
+        }
+        let related: Vec<(u32, u32)> = (0..20_000)
+            .map(|n| {
+                if n % 2 == 0 {
+                    (0, 10_000 + (n % 2_000))
+                } else {
+                    (10_000, n % 2_000)
+                }
+            })
+            .collect();
+        let start = std::time::Instant::now();
+        assert!(validate_skos_disjointness(&broader, &related, &[]));
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(500),
+            "disjointness restarted reachability for every pair: {:?}",
             start.elapsed()
         );
     }

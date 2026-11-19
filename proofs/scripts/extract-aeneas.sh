@@ -26,6 +26,11 @@ elif [ -x "${HOME:-}/.cargo/bin/kani" ]; then
     KANI_BIN="${HOME}/.cargo/bin/kani"
 fi
 
+if [ "${NEUROSTRATA_REQUIRE_KANI:-0}" = "1" ] && [ "${NEUROSTRATA_SKIP_KANI:-0}" = "1" ]; then
+    echo "[extract-aeneas] ERROR: NEUROSTRATA_REQUIRE_KANI=1 conflicts with NEUROSTRATA_SKIP_KANI=1" >&2
+    exit 1
+fi
+
 if [ "${NEUROSTRATA_SKIP_KANI:-0}" = "1" ]; then
     echo "[extract-aeneas] NEUROSTRATA_SKIP_KANI=1; skipping Kani verification"
 elif [ -n "${KANI_BIN}" ]; then

@@ -196,6 +196,10 @@ jobs:
           TC_LIB="$HOME/.rustup/toolchains/${KANI_TC}/lib"
           printf '#!/usr/bin/env bash\nexport LD_LIBRARY_PATH="%s:${LD_LIBRARY_PATH:-}"\nexport PATH="$HOME/.kani/kani-%s/bin:$PATH"\nexec "$HOME/.kani/kani-%s/bin/kani-driver" "$@"\n' "$TC_LIB" "$KANI_VER" "$KANI_VER" > "$HOME/.cargo/bin/kani"
           chmod +x "$HOME/.cargo/bin/kani"
+          # End-to-end smoke: exercises the wrapper, the driver, and goto-cc
+          # before the full harness module runs.
+          printf '#[kani::proof]\nfn smoke() { assert!(1 + 1 == 2); }\n' > /tmp/kani-smoke.rs
+          kani /tmp/kani-smoke.rs
           NEUROSTRATA_REQUIRE_KANI=1 bash proofs/scripts/extract-aeneas.sh
 
       - name: Kani mutation checks must reject all six broken kernels
@@ -316,14 +320,6 @@ jobs:
         shell: bash
         run: bash scripts/test-backup.sh
 
-      - name: Staged-quality integration fixtures
-        shell: bash
-        run: bash scripts/test-staged-quality.sh
-
-      - name: Clippy staged-diagnostic fixtures
-        shell: bash
-        run: node scripts/test-clippy-staged-diagnostics.mjs
-
       - name: Gate receipt self-test
         shell: bash
         run: bash scripts/test-gate-receipt.sh
@@ -342,6 +338,73 @@ jobs:
       - name: Main ruleset specification self-test
         shell: bash
         run: bash scripts/test-main-ruleset.sh
+
+  # The staged-quality gate is a local pre-commit path. These tests keep the
+  # gate honest, and a shell-only run exercises it server-side so `--no-verify`
+  # cannot bypass shell syntax/lint checks.
+  staged-quality:
+    name: staged-quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install tools
+        shell: bash
+        run: sudo apt-get update && sudo apt-get install -y shellcheck jq
+
+      - name: Gate fixture tests
+        shell: bash
+        run: bash scripts/test-staged-quality.sh
+
+      - name: Clippy filter tests
+        shell: bash
+        run: node scripts/test-clippy-staged-diagnostics.mjs
+
+      - name: Gate changed shell files
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+          base_sha="${{ github.event.pull_request.base.sha }}"
+          git fetch --no-tags --depth=1 origin "$base_sha"
+
+          changed=$(git diff --name-only --diff-filter=ACMR "$base_sha" HEAD -- '*.sh' 'scripts/hooks/*')
+          if [ -z "$changed" ]; then
+            echo "no changed shell files"
+            exit 0
+          fi
+
+          # `git add` in the PR checkout is a no-op: the index already matches
+          # HEAD, so the gate would see an empty diff. Stage the PR versions
+          # against the base commit in a disposable worktree instead.
+          orig="$PWD"
+          tmp=$(mktemp -d)
+          cleanup() {
+            cd "$orig"
+            git worktree remove --force "$tmp/wt" >/dev/null 2>&1 || true
+            rm -rf "$tmp"
+          }
+          trap cleanup EXIT
+          git worktree add --detach "$tmp/wt" "$base_sha"
+
+          while IFS= read -r file; do
+            [ -n "$file" ] || continue
+            [ -f "$file" ] || continue
+            mkdir -p "$tmp/wt/$(dirname "$file")"
+            cp -p "$file" "$tmp/wt/$file"
+          done <<< "$changed"
+
+          # Exercise the PR's gate implementation, not the base one.
+          cp scripts/check-staged-quality.sh "$tmp/wt/scripts/check-staged-quality.sh"
+          cp scripts/clippy-staged-diagnostics.mjs "$tmp/wt/scripts/clippy-staged-diagnostics.mjs"
+
+          cd "$tmp/wt"
+          while IFS= read -r file; do
+            [ -n "$file" ] || continue
+            [ -f "$file" ] && git add -- "$file"
+          done <<< "$changed"
+          bash scripts/check-staged-quality.sh
 
   # The dependency graph carries known advisories, so the audit is a gate
   # rather than a report: cargo-audit fails the job on any vulnerability that

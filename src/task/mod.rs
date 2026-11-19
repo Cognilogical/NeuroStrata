@@ -3341,7 +3341,7 @@ case "$ROOT" in
 esac
 fold_case() {
     if [ "$FOLD" = "1" ]; then
-        printf '%s' "$1" | LC_ALL=C tr 'A-Z' 'a-z'
+        printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]'
     else
         printf '%s' "$1"
     fi
@@ -3857,10 +3857,9 @@ pub(crate) fn hook_hygiene(root: &std::path::Path) -> String {
     let repo_scripts_hooks = root.join("scripts/hooks");
     if repo_scripts_hooks.is_dir() {
         let repo_pc = repo_scripts_hooks.join("pre-commit");
-        let needs_repo_pc = std::fs::read_to_string(&repo_pc)
-            .map(|c| c != SCAFFOLDED_PRE_COMMIT_HOOK)
-            .unwrap_or(true);
-        if needs_repo_pc && std::fs::write(&repo_pc, SCAFFOLDED_PRE_COMMIT_HOOK).is_ok() {
+        // The repo-side hook is tracked. Only seed it when absent: an older
+        // binary must never clobber a newer checked-in hook or local edits.
+        if !repo_pc.exists() && std::fs::write(&repo_pc, SCAFFOLDED_PRE_COMMIT_HOOK).is_ok() {
             set_executable(&repo_pc);
         }
     }
