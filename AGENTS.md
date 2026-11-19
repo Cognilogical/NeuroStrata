@@ -71,7 +71,7 @@ A statement of future/deferred work is a TASK, not a note:
 
 When this project is joined to a SynapticMesh (`neurostrata-mcp synaptic-mesh status` tells you), some memory mutations are additionally mirrored to the team mesh. The rules an agent must not bend:
 
-- **What is shared vs not:** `rule`/`fact`/`procedure` _definitions_ cross the mesh only when they carry `eligibility: shareable` — and procedure definitions travel WITHOUT their runtime counters (`remaining_fires`, `performance_count`, `last_performed_at`, `last_episodic_pointer` are strictly local; a shared record carrying any of them is refused on receipt). Tasks, `structural` rows, embeddings, and private rows never travel.
+- **What is shared vs not:** `rule`/`fact`/`procedure` _definitions_ cross the mesh only when they carry `eligibility: shareable` — and procedure definitions travel WITHOUT their runtime counters (`remaining_fires`, `performance_count`, `last_performed_at`, `last_episodic_pointer` are strictly local; a shared record carrying any of them is refused on receipt). Tasks, `structural` rows, embeddings, and private rows never travel. (neurostrata-oc64)
 - **Private rows are sovereign:** never edit, overwrite, or "refresh" a row that carries mesh provenance you did not write, and never import over a private row that owns an id. Conflicts between mesh variants are preserved, never silently resolved — if `mesh status` reports unresolved conflicts, stop synthesizing over that id and say so.
 - **Honesty rules for the mesh surfaces:**
   - **Explicit-zero status lines:** when there is nothing pending/unresolved, `mesh status` and sync replies say `0`/`no pending`, never noise or silence — a blank field is a lie an operator cannot debug.
