@@ -743,8 +743,9 @@ pub fn bounded_classify(
 /// Classify, then commit exactly one batch memory to the real `VectorStore`.
 /// All validation happens inside `bounded_classify` before the single
 /// `upsert`; any failure aborts with zero writes. The deterministic id is
-/// derived from the canonical Turtle bytes, so re-ingesting the same batch is
-/// idempotent at the id level.
+/// derived from the trimmed namespace and the canonical Turtle bytes, so
+/// re-ingesting the same batch is idempotent within a namespace while the
+/// same batch in a different namespace gets a distinct id.
 pub async fn ingest_bounded_classification<S: VectorStore + ?Sized>(
     store: &S,
     namespace: &str,
@@ -766,7 +767,7 @@ pub async fn ingest_bounded_classification<S: VectorStore + ?Sized>(
         .map_err(|e| IngestError::Embedding(e.to_string()))?;
     let id = format!(
         "bounded-ingest-{}",
-        nquads_digest(&batch.memory_payload.content)
+        nquads_digest(&format!("{namespace}\x1f{}", batch.memory_payload.content))
     );
     let report = store
         .upsert(namespace, &id, vector, batch.memory_payload.clone())
@@ -1461,5 +1462,73 @@ mod tests {
             Some("memory"),
             "persist the resolved domain slug, not the raw request"
         );
+    }
+
+    #[tokio::test]
+    async fn same_bounded_classification_ingests_into_two_namespaces_with_distinct_ids() {
+        let index = make_index();
+        let dir = temp_store_dir();
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp db");
+        store.init("test-ns").await.expect("init schema");
+        store.init("other-ns").await.expect("init schema");
+
+        let outcome_a = ingest_bounded_classification(
+            &store,
+            "test-ns",
+            &index,
+            &budget(),
+            &request(vec![valid_candidate()]),
+            &StubEmbedder,
+        )
+        .await
+        .expect("ingest into test-ns");
+        let outcome_b = ingest_bounded_classification(
+            &store,
+            "other-ns",
+            &index,
+            &budget(),
+            &request(vec![valid_candidate()]),
+            &StubEmbedder,
+        )
+        .await
+        .expect("ingest into other-ns");
+
+        assert_ne!(
+            outcome_a.id, outcome_b.id,
+            "identical payloads in different namespaces must get distinct ids"
+        );
+
+        assert!(
+            store
+                .get("test-ns", &outcome_a.id)
+                .await
+                .expect("get from test-ns")
+                .is_some(),
+            "row a exists in test-ns"
+        );
+        assert!(
+            store
+                .get("other-ns", &outcome_b.id)
+                .await
+                .expect("get from other-ns")
+                .is_some(),
+            "row b exists in other-ns"
+        );
+
+        let reingested = ingest_bounded_classification(
+            &store,
+            "test-ns",
+            &index,
+            &budget(),
+            &request(vec![valid_candidate()]),
+            &StubEmbedder,
+        )
+        .await
+        .expect("re-ingest into test-ns");
+        assert_eq!(
+            reingested.id, outcome_a.id,
+            "re-ingesting the same request in the same namespace is idempotent"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -3311,40 +3311,51 @@ pub async fn revert_action(
                 let mut expected_after_payload = delta.after_payload.clone();
                 if expected_after_payload.metadata != current_row.metadata
                     && expected_after_payload.metadata.is_object()
-                    && (current_row.metadata.get("facets").is_some()
-                        || current_row.metadata.get("facets_bitemporal").is_some())
                 {
-                    let old_entries = expected_after_payload
-                        .metadata
-                        .get("facets_bitemporal")
-                        .and_then(|v| v.as_array());
-                    let new_entries = current_row
-                        .metadata
-                        .get("facets_bitemporal")
-                        .and_then(|v| v.as_array());
-                    let old_len = old_entries.map(|a| a.len()).unwrap_or(0);
-                    let appended_ts = new_entries
-                        .and_then(|arr| arr.get(old_len))
-                        .and_then(|entry| entry.get("valid_from"))
-                        .and_then(|v| v.as_i64());
-                    let retracted_ts =
-                        old_entries.zip(new_entries).and_then(|(old_arr, new_arr)| {
-                            old_arr.iter().zip(new_arr.iter()).find_map(|(o, n)| {
-                                if o.get("valid_to").map(|v| v.is_null()).unwrap_or(true) {
-                                    n.get("valid_to").and_then(|v| v.as_i64())
-                                } else {
-                                    None
-                                }
-                            })
-                        });
-                    let facet_ts = appended_ts
-                        .or(retracted_ts)
-                        .unwrap_or(active_receipt.executed_at);
-                    crate::domain::materialize_facets_bitemporal(
-                        &expected_after_payload.memory_type,
-                        &mut expected_after_payload.metadata,
-                        facet_ts,
-                    );
+                    // Legacy receipts stored raw topology before #251 normalized
+                    // it on write; replay their expected after-image against the
+                    // same canonical form the persisted row carries.
+                    if let Some(topology) = expected_after_payload.metadata.get_mut("topology") {
+                        crate::rdf::canonicalize_topology(
+                            topology,
+                            &store.get_ontology(&invocation.namespace),
+                        );
+                    }
+                    if current_row.metadata.get("facets").is_some()
+                        || current_row.metadata.get("facets_bitemporal").is_some()
+                    {
+                        let old_entries = expected_after_payload
+                            .metadata
+                            .get("facets_bitemporal")
+                            .and_then(|v| v.as_array());
+                        let new_entries = current_row
+                            .metadata
+                            .get("facets_bitemporal")
+                            .and_then(|v| v.as_array());
+                        let old_len = old_entries.map(|a| a.len()).unwrap_or(0);
+                        let appended_ts = new_entries
+                            .and_then(|arr| arr.get(old_len))
+                            .and_then(|entry| entry.get("valid_from"))
+                            .and_then(|v| v.as_i64());
+                        let retracted_ts =
+                            old_entries.zip(new_entries).and_then(|(old_arr, new_arr)| {
+                                old_arr.iter().zip(new_arr.iter()).find_map(|(o, n)| {
+                                    if o.get("valid_to").map(|v| v.is_null()).unwrap_or(true) {
+                                        n.get("valid_to").and_then(|v| v.as_i64())
+                                    } else {
+                                        None
+                                    }
+                                })
+                            });
+                        let facet_ts = appended_ts
+                            .or(retracted_ts)
+                            .unwrap_or(active_receipt.executed_at);
+                        crate::domain::materialize_facets_bitemporal(
+                            &expected_after_payload.memory_type,
+                            &mut expected_after_payload.metadata,
+                            facet_ts,
+                        );
+                    }
                 }
 
                 let current_fp =
@@ -7756,6 +7767,138 @@ mod tests {
         .await
         .expect("pre-normalization upsert_memory receipt must remain revertible");
         assert!(!rev3.forced);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn legacy_receipt_with_raw_topology_reverts_without_force() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ns-action-legacy-topology-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = crate::store::ladybug::LadybugStore::for_testing(&tmp, 4).expect("store");
+        let ns = "ns-legacy-topology-revert";
+        store.init(ns).await.unwrap();
+
+        store
+            .upsert(
+                ns,
+                "act-legacy-topology",
+                vec![0.1; 4],
+                MemoryPayload {
+                    content: "Action: legacy-topology".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "action_type".to_string(),
+                    agent_name: None,
+                    location: "".to_string(),
+                    location_lines: "".to_string(),
+                    metadata: json!({
+                        "action_type": {
+                            "slug": "legacy-topology",
+                            "title": "Legacy Topology",
+                            "description": "Upserts a row carrying topology metadata",
+                            "required_role": "editor",
+                            "parameters": {
+                                "tag": { "param_type": "string", "required": true }
+                            },
+                            "submission_criteria": [],
+                            "effects": [
+                                {
+                                    "op": "upsert_memory",
+                                    "memory_type": "fact",
+                                    "content_template": "Topology fact tag={{tag}}",
+                                    "metadata_template": {
+                                        "domain": "ops",
+                                        "topology": {
+                                            "component": "Ladybug DB",
+                                            "target_system": "Storage Subsystem",
+                                            "channel": "ipc",
+                                            "credential_boundary": "local",
+                                            "reason": "test"
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+
+        let inv = ActionInvocation {
+            namespace: ns.to_string(),
+            slug: "legacy-topology".to_string(),
+            security: ActionSecurityContext {
+                authenticated_principal: "alice".to_string(),
+                requested_principal: None,
+            },
+            params: BTreeMap::from([("tag".to_string(), json!("steady"))]),
+        };
+
+        let raw_topology = json!({
+            "component": "Ladybug DB",
+            "target_system": "Storage Subsystem",
+            "channel": "ipc",
+            "credential_boundary": "local",
+            "reason": "test"
+        });
+
+        let apply = apply_action(&store, &inv, &DummyActionEmbedder)
+            .await
+            .expect("apply");
+        let receipt_id = apply.receipt_id().expect("receipt id").to_string();
+        let row_id = apply.receipt().unwrap().row_deltas[0].after_id.clone();
+
+        // Write path canonicalized topology on the persisted row (#251).
+        let (_, persisted_row) = store
+            .get(ns, &row_id)
+            .await
+            .unwrap()
+            .expect("persisted row");
+        let mut canonical_topology = raw_topology.clone();
+        crate::rdf::canonicalize_topology(&mut canonical_topology, &store.get_ontology(ns));
+        assert_ne!(
+            raw_topology, canonical_topology,
+            "raw topology must differ from canonical topology"
+        );
+        assert_eq!(
+            persisted_row.metadata["topology"], canonical_topology,
+            "apply_action must persist canonical topology"
+        );
+
+        // Simulate a pre-#251 receipt whose embedded after-image still carries
+        // the raw topology alias, with no other intervening edit.
+        let (receipt_vec, mut receipt_payload) = store
+            .get(ns, &receipt_id)
+            .await
+            .unwrap()
+            .expect("receipt row");
+        receipt_payload.metadata["action_receipt"]["row_deltas"][0]["after_payload"]
+            ["metadata"]["topology"] = raw_topology;
+        store
+            .upsert(ns, &receipt_id, receipt_vec, receipt_payload)
+            .await
+            .expect("persist legacy receipt with raw topology");
+
+        let rev = revert_action(
+            &store,
+            &RevertInvocation {
+                namespace: ns.to_string(),
+                receipt_id,
+                security: ActionSecurityContext {
+                    authenticated_principal: "alice".to_string(),
+                    requested_principal: None,
+                },
+                force: false,
+            },
+            &DummyActionEmbedder,
+        )
+        .await
+        .expect("legacy pre-#251 receipt with raw topology must revert cleanly");
+        assert!(!rev.forced);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

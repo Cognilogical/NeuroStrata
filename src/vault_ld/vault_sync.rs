@@ -361,6 +361,35 @@ fn export_filename_for_id(id: &str) -> String {
     stem
 }
 
+/// Issue #297: refuse to write through an existing symlink or non-regular
+/// destination file inside the vault/output directory.
+fn ensure_safe_export_destination(path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            let ft = meta.file_type();
+            if ft.is_symlink() {
+                Err(format!(
+                    "Refusing to write through symlink destination {}",
+                    path.display()
+                ))
+            } else if !ft.is_file() {
+                Err(format!(
+                    "Refusing to overwrite non-regular destination {}",
+                    path.display()
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!(
+            "Failed to inspect export destination {}: {}",
+            path.display(),
+            e
+        )),
+    }
+}
+
 /// Export vault contents to the configured path using the default caps.
 pub async fn export_vault(
     config: VaultSyncConfig,
@@ -472,6 +501,10 @@ pub async fn export_vault_with_limits(
         written_filenames.insert(filename, note.id.clone());
 
         let markdown = note.to_markdown();
+        if let Err(e) = ensure_safe_export_destination(&filepath) {
+            errors.push(format!("Export destination unsafe for {} failed: {}", filepath.display(), e));
+            continue;
+        }
         if let Err(e) = std::fs::write(&filepath, markdown) {
             errors.push(format!("Failed to write {}: {}", filepath.display(), e));
         } else {
@@ -486,6 +519,7 @@ pub async fn export_vault_with_limits(
     let canvas_json = serde_json::to_string_pretty(&canvas)
         .map_err(|e| format!("Failed to serialize canvas: {}", e))?;
 
+    ensure_safe_export_destination(&canvas_path)?;
     std::fs::write(&canvas_path, canvas_json)
         .map_err(|e| format!("Failed to write canvas: {}", e))?;
 
@@ -848,6 +882,14 @@ pub async fn import_vault_with_limits(
                     note.id
                 ));
                 continue;
+            }
+            if let Some(prior_obj) = prior.metadata.as_object() {
+                if let Some(visible_to) = prior_obj.get("visible_to") {
+                    metadata["visible_to"] = visible_to.clone();
+                }
+                if let Some(eligibility) = prior_obj.get("eligibility") {
+                    metadata["eligibility"] = eligibility.clone();
+                }
             }
             let history_id = format!("{}.vault-history.{}", note.id, uuid::Uuid::new_v4());
             retire_metadata(&mut prior.metadata, &note.id, now);
@@ -2453,5 +2495,145 @@ mod tests {
             .expect("imported row exists");
         assert_eq!(payload.memory_type, "custom.kind");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Issue #296: re-importing a note preserves the prior head's
+    /// visible_to and eligibility metadata; the new head must not widen access
+    /// to a wider audience than the prior head granted.
+    #[tokio::test]
+    async fn import_preserves_prior_head_visible_to_and_eligibility() {
+        let root = std::env::temp_dir().join(format!("ns-visible-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_visible";
+        store.init(ns).await.expect("init");
+        let seeded_metadata = serde_json::json!({
+            "visible_to": ["default"],
+            "eligibility": "shareable",
+            "canonical_sha256": "old-hash"
+        });
+        store
+            .upsert(
+                ns,
+                "vis-note",
+                vec![0.0; 4],
+                seed_payload("default", seeded_metadata.clone()),
+            )
+            .await
+            .expect("seed prior head");
+        assert!(
+            !rebac::can_read_memory("stranger", "default", &seeded_metadata),
+            "stranger must not read seeded head"
+        );
+        let mut changed = note("vis-note", &[]);
+        changed.content = "updated body".to_string();
+        changed.canonical_sha256 = hex::encode(Sha256::digest(changed.content.as_bytes()));
+        std::fs::write(vault.join("vis-note.md"), changed.to_markdown()).expect("write note");
+        let config = VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.clone()),
+            allowed_external_dirs: None,
+        };
+        let result = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("import");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let (_, head) = store.get(ns, "vis-note").await.unwrap().unwrap();
+        assert_eq!(head.metadata["visible_to"], serde_json::json!(["default"]));
+        assert_eq!(head.metadata["eligibility"], serde_json::json!("shareable"));
+        assert!(
+            !rebac::can_read_memory("stranger", &head.user_id, &head.metadata),
+            "stranger must not read tightened head"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Issue #297: export refuses to write through a symlinked note or canvas destination.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn export_refuses_symlinked_note_and_canvas_destinations() {
+        let root = std::env::temp_dir().join(format!("ns-expsym-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let outside = std::env::temp_dir().join(format!("ns-outsym-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&outside).expect("create outside");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_export_sym";
+        store.init(ns).await.expect("init");
+        store
+            .upsert(
+                ns,
+                "link-note",
+                vec![0.0; 4],
+                seed_payload("default", serde_json::json!({"canonical_sha256": "test"})),
+            )
+            .await
+            .expect("seed note");
+
+        let victim_note = outside.join("victim_note.md");
+        let victim_canvas = outside.join("victim_canvas.json");
+        std::fs::write(&victim_note, "untouched note").expect("write victim note");
+        std::fs::write(&victim_canvas, "untouched canvas").expect("write victim canvas");
+
+        // Case (a): note destination is a symlink.
+        std::os::unix::fs::symlink(&victim_note, vault.join("link-note.md")).expect("symlink note");
+        let config = VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.clone()),
+            allowed_external_dirs: None,
+        };
+        let result = export_vault(config, store.clone()).await.expect("export");
+        assert!(
+            result.errors.iter().any(|e| e.contains("symlink")),
+            "{:?}",
+            result.errors
+        );
+        assert_eq!(result.notes_exported, 0);
+        assert!(!result.success);
+        assert_eq!(
+            std::fs::read_to_string(&victim_note).unwrap(),
+            "untouched note",
+            "symlink target must be untouched"
+        );
+
+        // Case (b): canvas destination is a symlink.
+        std::fs::remove_file(vault.join("link-note.md")).expect("remove note symlink");
+        let _ = std::fs::remove_file(vault.join("topology.canvas"));
+        std::os::unix::fs::symlink(&victim_canvas, vault.join("topology.canvas")).expect("symlink canvas");
+        let config2 = VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.clone()),
+            allowed_external_dirs: None,
+        };
+        let err = export_vault(config2, store.clone()).await.unwrap_err();
+        assert!(
+            err.contains("symlink"),
+            "{}",
+            err
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim_canvas).unwrap(),
+            "untouched canvas",
+            "symlink target must be untouched"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 }
