@@ -10794,7 +10794,7 @@ impl VectorStore for LadybugStore {
                         _ => (None, None),
                     };
                     let evidence_id = match (&file, &content_hash) {
-                        (Some(f), Some(h)) => format!("{}:{}:{}", f, payload.location_lines.trim(), &h[..h.len().min(12)]),
+                        (Some(f), Some(h)) => format!("{}:{}:{}", f, payload.location_lines.trim(), &h[..h.floor_char_boundary(12)]),
                         (Some(f), None) => format!("{}:{}", f, payload.location_lines.trim()),
                         _ => id.clone(),
                     };
@@ -23747,6 +23747,75 @@ eurostrata\src\daemon.rs",
         assert_eq!(es.get("line_end").and_then(|v| v.as_i64()), Some(25));
         assert_eq!(es.get("extractor").and_then(|v| v.as_str()), Some("upsert"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    async fn assert_f6_evidence_id_hash(hash_field: &str, hash: &str, expected: &str) {
+        let store = retired_test_store().await;
+        let v = vec![0.1, 0.2, 0.3, 0.4];
+        store
+            .upsert(
+                "probe",
+                "target-node",
+                v.clone(),
+                retired_test_payload("fact", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+
+        let mut metadata = json!({
+            "governs": ["target-node"],
+            "absolute_path": "src/a.rs",
+            "source": "src/a.rs"
+        });
+        metadata[hash_field] = json!(hash);
+        let mut declarer = retired_test_payload("rule", "agent", metadata);
+        declarer.location = "src/a.rs".to_string();
+        declarer.location_lines = "3-4".to_string();
+        store
+            .upsert("probe", "declaring-rule", v, declarer)
+            .await
+            .expect("persist declaration and its resolved edge");
+
+        let evidence_ids = store
+            .with_conn(|conn| {
+                let rows = conn.query(
+                    "MATCH (a:Memory {id: 'declaring-rule'})-[r:GOVERNS]->(b:Memory {id: 'target-node'}) RETURN r.evidence_id",
+                )?;
+                Ok(rows.map(|row| format!("{}", row[0])).collect::<Vec<_>>())
+            })
+            .await
+            .unwrap();
+        assert_eq!(evidence_ids, vec![expected.to_string()]);
+
+        let (_, payload) = store
+            .get("probe", "declaring-rule")
+            .await
+            .unwrap()
+            .expect("persisted declaration");
+        let sources = payload.metadata["edge_sources"].as_array().unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0]["evidence_id"], expected);
+        assert_eq!(sources[0]["content_hash"], hash);
+        assert_eq!(sources[0]["file"], "src/a.rs");
+        assert_eq!(sources[0]["line_start"], 3);
+        assert_eq!(sources[0]["line_end"], 4);
+    }
+
+    #[tokio::test]
+    async fn test_f6_evidence_id_hash_multibyte_byte_cap() {
+        let hash = "abcdefghijkérest";
+        assert!(!hash.is_char_boundary(12));
+        assert_f6_evidence_id_hash("file_sha256", hash, "src/a.rs:3-4:abcdefghijk").await;
+    }
+
+    #[tokio::test]
+    async fn test_f6_evidence_id_hash_long_ascii_unchanged() {
+        assert_f6_evidence_id_hash(
+            "span_sha256",
+            "0123456789abcdef0123456789abcdef",
+            "src/a.rs:3-4:0123456789ab",
+        )
+        .await;
     }
 
     #[tokio::test]
