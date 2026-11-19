@@ -7,7 +7,7 @@
 //! Three contracts:
 //! 1. the kernel compiles standalone with zero `--extern` flags (Aeneas/Charon
 //!    extractability precondition);
-//! 2. the exhaustive 421-row truth table produced by the Rust kernel equals the
+//! 2. the exhaustive 1,273-row truth table produced by the Rust kernel equals the
 //!    one emitted by `lake --dir proofs exe neurostrata-proofs`;
 //! 3. no Lean proof source carries a `sorry` placeholder or an `axiom`.
 
@@ -1245,6 +1245,7 @@ fn find_lake() -> Option<PathBuf> {
 /// The formal kernel must keep compiling as a dependency-free standalone crate
 /// so Charon/Aeneas can translate it. This runs the real extract script (which
 /// invokes `rustc -D warnings --crate-type=lib` with zero `--extern` flags).
+/// Kani runs in its own CI step, so skip the duplicate run here.
 #[test]
 fn formal_kernel_compiles_standalone_for_aeneas_extraction() {
     let root = repo_root();

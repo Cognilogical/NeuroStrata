@@ -1060,6 +1060,154 @@ RUSTFMT_EOF
     rm -rf "$tmpdir"
 }
 
+# Test: Type-change (symlink -> regular file) is staged and checked
+test_type_change_is_checked() {
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    local repo="$tmpdir/repo"
+    local bindir="$tmpdir/bin"
+    export FAKE_TOOL_LOG="$tmpdir/tool.log"
+
+    setup_fake_tools "$bindir"
+    mkdir -p "$repo/src"
+    echo 'fn main() {}' > "$repo/target.rs"
+    ln -s ../target.rs "$repo/src/link.rs"
+    cd "$repo"
+    git init -q
+    git config user.email "test@test.com"
+    git config user.name "Test"
+    git add target.rs src/link.rs
+    git commit -q -m "initial"
+
+    rm src/link.rs
+    echo 'fn main(){}' > src/link.rs
+    git add src/link.rs
+
+    PATH="$bindir:$PATH" bash "$SCRIPT_PATH" > "$tmpdir/out.log" 2>&1
+    local exit_code=$?
+
+    [ $exit_code -eq 0 ] || { echo "Expected exit 0, got $exit_code" >&2; cat "$tmpdir/out.log" >&2; return 1; }
+    grep -q "file: src/link.rs" "$FAKE_TOOL_LOG" || { echo "type-changed file was not checked" >&2; cat "$FAKE_TOOL_LOG" >&2; return 1; }
+
+    cd - >/dev/null
+    rm -rf "$tmpdir"
+    return 0
+}
+
+# Test: rustfmt edition comes from the staged snapshot, not the working tree
+test_edition_comes_from_staged_snapshot() {
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    local repo="$tmpdir/repo"
+    local bindir="$tmpdir/bin"
+    export FAKE_TOOL_LOG="$tmpdir/tool.log"
+
+    setup_fake_tools "$bindir"
+    mkdir -p "$repo/src"
+    cat > "$repo/Cargo.toml" <<'CARGO_EOF'
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2021"
+CARGO_EOF
+    echo 'fn main() {}' > "$repo/src/main.rs"
+    cd "$repo"
+    git init -q
+    git config user.email "test@test.com"
+    git config user.name "Test"
+    git add Cargo.toml src/main.rs
+    git commit -q -m "initial"
+
+    # Unstaged working-tree edition bump; staged Rust is still edition 2021.
+    sed -i 's/edition = "2021"/edition = "2024"/' Cargo.toml
+    echo '// staged change' >> src/main.rs
+    git add src/main.rs
+
+    PATH="$bindir:$PATH" bash "$SCRIPT_PATH" > "$tmpdir/out.log" 2>&1
+    local exit_code=$?
+
+    [ $exit_code -eq 0 ] || { echo "Expected exit 0, got $exit_code" >&2; cat "$tmpdir/out.log" >&2; cd - >/dev/null; rm -rf "$tmpdir"; return 1; }
+    grep -Fq "rustfmt --edition 2021 --config skip_children=true --check src/main.rs" "$FAKE_TOOL_LOG" || {
+        echo "rustfmt did not use the staged edition (2021)" >&2; cat "$FAKE_TOOL_LOG" >&2; cd - >/dev/null; rm -rf "$tmpdir"; return 1;
+    }
+    if grep -Fq -- "--edition 2024" "$FAKE_TOOL_LOG"; then
+        echo "rustfmt used the unstaged working-tree edition (2024)" >&2; cat "$FAKE_TOOL_LOG" >&2; cd - >/dev/null; rm -rf "$tmpdir"; return 1;
+    fi
+
+    cd - >/dev/null
+    rm -rf "$tmpdir"
+    return 0
+}
+
+# Test: a staged Cargo.toml edition wins over an unstaged working-tree edit
+test_edition_uses_staged_manifest() {
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    local repo="$tmpdir/repo"
+    local bindir="$tmpdir/bin"
+    export FAKE_TOOL_LOG="$tmpdir/tool.log"
+
+    setup_fake_tools "$bindir"
+    mkdir -p "$repo/src"
+    cat > "$repo/Cargo.toml" <<'CARGO_EOF'
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2021"
+CARGO_EOF
+    echo 'fn main() {}' > "$repo/src/main.rs"
+    cd "$repo"
+    git init -q
+    git config user.email "test@test.com"
+    git config user.name "Test"
+    git add Cargo.toml src/main.rs
+    git commit -q -m "initial"
+
+    sed -i 's/edition = "2021"/edition = "2024"/' Cargo.toml
+    git add Cargo.toml
+    sed -i 's/edition = "2024"/edition = "2021"/' Cargo.toml
+    echo '// staged change' >> src/main.rs
+    git add src/main.rs
+
+    PATH="$bindir:$PATH" bash "$SCRIPT_PATH" > "$tmpdir/out.log" 2>&1
+    local exit_code=$?
+
+    [ $exit_code -eq 0 ] || { echo "Expected exit 0, got $exit_code" >&2; cat "$tmpdir/out.log" >&2; cd - >/dev/null; rm -rf "$tmpdir"; return 1; }
+    grep -Fq "rustfmt --edition 2024 --config skip_children=true --check src/main.rs" "$FAKE_TOOL_LOG" || {
+        echo "rustfmt did not use the staged Cargo.toml edition (2024)" >&2; cat "$FAKE_TOOL_LOG" >&2; cd - >/dev/null; rm -rf "$tmpdir"; return 1;
+    }
+
+    cd - >/dev/null
+    rm -rf "$tmpdir"
+    return 0
+}
+
+# Test: Outside a git repository the gate fails closed
+test_outside_repo_fails_closed() {
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    cd "$tmpdir"
+    bash "$SCRIPT_PATH" > "$tmpdir/out.log" 2>&1
+    local exit_code=$?
+    cd - >/dev/null
+
+    if [ $exit_code -eq 0 ]; then
+        echo "Expected nonzero exit outside a repo" >&2
+        cat "$tmpdir/out.log" >&2
+        rm -rf "$tmpdir"
+        return 1
+    fi
+    if ! grep -q "not inside a git repository" "$tmpdir/out.log"; then
+        echo "Missing not-a-repo diagnostic" >&2
+        cat "$tmpdir/out.log" >&2
+        rm -rf "$tmpdir"
+        return 1
+    fi
+
+    rm -rf "$tmpdir"
+    return 0
+}
+
 run_test "Staged routing table" test_staged_routing
 run_test "Whitespace-safe arguments" test_whitespace_safe_args
 run_test "Deleted and internal filtering" test_deleted_and_internal_filtering
@@ -1083,6 +1231,10 @@ run_test "Extensionless Bash hook is checked" test_extensionless_bash_hook_is_ch
 run_test "Unbuilt staged Rust fails" test_unbuilt_staged_rust_fails
 run_test "Quality suites are wired into CI" test_quality_suites_are_wired_into_ci
 run_test "Local Rustfmt survives snapshot cwd" test_local_rustfmt_survives_snapshot_cwd
+run_test "Type-change is checked" test_type_change_is_checked
+run_test "Edition comes from staged snapshot" test_edition_comes_from_staged_snapshot
+run_test "Edition uses staged manifest" test_edition_uses_staged_manifest
+run_test "Outside a repo fails closed" test_outside_repo_fails_closed
 
 echo ""
 echo "=== Summary ==="

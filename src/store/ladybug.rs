@@ -6151,6 +6151,8 @@ fn plan_hygiene_row(
         let src = meta.get("source").and_then(|v| v.as_str()).unwrap_or("");
         let usable = crate::traits::has_source(&meta) && src != "N/A";
         if !usable {
+            // `source` is published to mesh peers and exported, so an
+            // absolute location (the author's machine) is not copied there.
             let val = if !loc.is_empty() && loc != "N/A" && !crate::paths::is_absolute_any(loc) {
                 loc.clone()
             } else {
@@ -24718,29 +24720,45 @@ eurostrata\src\daemon.rs",
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `source` is published to mesh peers, so the repair fills a missing one
+    /// from the row's location only when that location is relative. An
+    /// absolute one names the author's machine (Windows or POSIX).
     #[tokio::test]
-    async fn repair_hygiene_stamps_portable_source_for_absolute_rule_location() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = LadybugStore::for_testing(dir.path().join("hygiene.lbug"), 4).unwrap();
-        store.init("probe").await.unwrap();
+    async fn repair_hygiene_never_copies_an_absolute_location_into_source() {
+        let dir = std::env::temp_dir().join(format!("ns-repair-abs-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("init");
+        let v = vec![0.1, 0.2, 0.3, 0.4];
 
-        let mut rule = retired_test_payload("rule", "agent", json!({}));
-        rule.location = "/private/sentinel/rule.md".to_string();
-        store
-            .upsert("probe", "rule-without-source", vec![0.1, 0.2, 0.3, 0.4], rule)
-            .await
-            .unwrap();
+        for (id, location) in [
+            ("rule-windows", r"C:\Users\src-leak-sentinel\proj\src\lib.rs"),
+            ("rule-posix", "/home/src-leak-sentinel/proj/src/lib.rs"),
+            ("rule-relative", "src/lib.rs"),
+        ] {
+            let rule = MemoryPayload {
+                location: location.to_string(),
+                ..retired_test_payload("rule", "agent", json!({}))
+            };
+            store.upsert("probe", id, v.clone(), rule).await.unwrap();
+        }
 
         store.repair_namespace_hygiene("probe").await.unwrap();
 
         let rows = store.list_memories("probe", None, None).await.unwrap();
-        let row = rows
-            .iter()
-            .find(|r| r.id == "rule-without-source")
-            .expect("the row survives the repair");
-        let source = row.payload.metadata["source"].as_str().unwrap();
-        assert_eq!(source, "legacy-rule");
-        assert!(!source.contains("sentinel"));
+        let source = |id: &str| {
+            rows.iter()
+                .find(|r| r.id == id)
+                .and_then(|r| r.payload.metadata.get("source").cloned())
+        };
+        assert_eq!(source("rule-windows"), Some(json!("legacy-rule")));
+        assert_eq!(source("rule-posix"), Some(json!("legacy-rule")));
+        assert_eq!(source("rule-relative"), Some(json!("src/lib.rs")));
+        // Neither absolute location (Windows nor POSIX) may leak a host path.
+        for id in ["rule-windows", "rule-posix", "rule-relative"] {
+            let s = source(id).and_then(|v| v.as_str().map(str::to_string)).unwrap();
+            assert!(!s.contains("src-leak-sentinel"), "{id} leaked a host path");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The batched repair must do what the per-row one did: archive refs that

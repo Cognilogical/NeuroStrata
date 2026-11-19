@@ -6,7 +6,10 @@
 # the Git index.
 set -euo pipefail
 
-ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+if ! ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+    echo "error: not inside a git repository" >&2
+    exit 1
+fi
 cd "$ROOT"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -19,7 +22,7 @@ while IFS= read -r -d '' file; do
         .NeuroStrata/*|"") continue ;;
     esac
     StagedFiles+=("$file")
-done < <(git diff --cached --name-only --diff-filter=ACMR -z 2>/dev/null)
+done < <(git diff --cached --name-only --diff-filter=ACMRT -z 2>/dev/null)
 
 CHECK_ROOT="$ROOT"
 if [ ${#StagedFiles[@]} -gt 0 ]; then
@@ -104,12 +107,22 @@ missing_tool() {
 }
 
 # ── Check 1: Rust formatting ────────────────────────────────────────────────
+# Read the crate edition from the staged snapshot (CHECK_ROOT), not the working
+# tree, so rustfmt matches the staged content it actually checks.
+EDITION=""
+if [ -f "$CHECK_ROOT/Cargo.toml" ]; then
+    EDITION="$(sed -n 's/^edition[[:space:]]*=[[:space:]]*"\([0-9][0-9]*\)".*/\1/p' "$CHECK_ROOT/Cargo.toml" 2>/dev/null | head -n 1 || true)"
+fi
+if [ -z "$EDITION" ]; then
+    EDITION="2021"
+fi
+
 if [ ${#RustFiles[@]} -gt 0 ]; then
     RUSTFMT=$(resolve_tool rustfmt node_modules/.bin/rustfmt || true)
     if [ -z "$RUSTFMT" ]; then
         missing_tool rustfmt "rustup component add rustfmt"
     fi
-    (cd "$CHECK_ROOT" && "$RUSTFMT" --edition 2021 --config skip_children=true --check "${RustFiles[@]}") || {
+    (cd "$CHECK_ROOT" && "$RUSTFMT" --edition "$EDITION" --config skip_children=true --check "${RustFiles[@]}") || {
         echo "error: rustfmt check failed" >&2
         exit 1
     }

@@ -404,6 +404,8 @@ jobs:
             [ -n "$file" ] || continue
             [ -f "$file" ] && git add -- "$file"
           done <<< "$changed"
+          echo "gate files:"
+          git diff --cached --name-only
           bash scripts/check-staged-quality.sh
 
   # The dependency graph carries known advisories, so the audit is a gate
