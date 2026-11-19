@@ -11,6 +11,14 @@
 
 The plugin is harness-agnostic: the same `createHarnessPlugin` function works for OpenCode, Claude, Hermes, and Codex because it only depends on the harness hook interface, not on harness internals.
 
+## Session- & worktree-aware task state
+
+`resolveActiveTaskFromDaemon` never picks the first `in_progress` task blindly. Among in-progress tasks it prefers, in strict order: an explicit `preferredTaskId`, a task matching both `activeSessionId` and the current `effectiveProjectRoot`, a task matching `activeSessionId`, a task matching the worktree, then any in-progress task. A fallback owned by a different session never overwrites a known `activeSessionId`, which prevents cross-session / cross-worktree Breath bleed between child worktrees.
+
+`inspectCodeModeExecution` detects key presence (`id`, `session_id`, `note`) even when the value is a variable or template literal — for example `neurostrata_task_claim({ id: created.id, session_id: ses.id })` or a note built as a Breath template literal. Such a claim is marked as claimed but clears any stale `activeTaskId`, so the next check re-resolves the real id from the daemon using `activeSessionId`. Explicit `undefined`/`null` values are not treated as real keys.
+
+`isZeroActionExemptShellPayload` (exported from `plugins/core`) keeps the Breath mutation counter from advancing on provably read-only / verification shell commands only. It accepts `bash`/`shell`/`command`/`exec` tools, unwraps JSON `{command, cmd}` payloads, and uses a fail-closed allowlist: read-only git subcommands (`status`, `log`, `diff`, `show`, `rev-parse`, `fetch`, `stash list|show`, read-only `branch` flags), `neurostrata-mcp task|doc-gate|synaptic-mesh status`, the `cargo` check/test family, read-only `gh` subcommands and `gh api` without write flags, `node --test` / `*test.mjs`, gate-receipt scripts, and `rustc --version`. Substitutions, redirection, and chains containing any non-exempt segment fail closed. The `neurostrata_guard_validate` call itself is never skipped for an exempt command.
+
 ## Implementing a New Harness Adapter
 
 To add a new harness adapter:

@@ -17,6 +17,16 @@ nothing.
 `--check` / `-CheckOnly` reports the resolved toolchain and builds nothing.
 Output lands in `target/release/` (`.exe` on Windows).
 
+## Fast linking on Linux
+
+`.cargo/config.toml` sets `rustflags = ["-C", "link-arg=-fuse-ld=lld"]` for the
+`x86_64-unknown-linux-gnu` target, so Linux dev/test links use lld instead of
+the system default linker. This is a rustflags-only setting: the repo installs
+no linker — the host still needs `ld.lld` available for the flag to take
+effect. The setting is scoped to that single target, so Windows and macOS
+builds are unaffected; remove or override the file if the environment's lld
+is unavailable.
+
 ---
 
 ## What a build needs

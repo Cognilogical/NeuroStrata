@@ -2003,7 +2003,23 @@ pub async fn process_mcp_request(
                                 })
                                 .and_then(|v| v.as_str())
                                 .unwrap_or(name);
-                            crate::task::record_graph_query(&store, ns, name, hint).await;
+                            let caller_root = args_ref
+                                .and_then(|a| {
+                                    a.get("project_root")
+                                        .or_else(|| a.get("worktree"))
+                                        .or_else(|| a.get("cwd"))
+                                })
+                                .and_then(|v| v.as_str())
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty());
+                            crate::task::record_graph_query_with_root(
+                                &store,
+                                ns,
+                                name,
+                                hint,
+                                caller_root,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -2708,6 +2724,48 @@ fn proxy_client() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
+/// The MCP proxy runs in the harness process, so `std::env::current_dir()` is
+/// the caller's worktree. Stamp it onto `tools/call` arguments that carry no
+/// explicit root, so downstream task handlers attribute the call to the right
+/// worktree instead of the daemon's global checkout.
+fn inject_proxy_caller_cwd(request: &Value, caller_cwd: Option<&std::path::Path>) -> Value {
+    let is_tools_call = request
+        .get("method")
+        .and_then(|v| v.as_str())
+        == Some("tools/call");
+    let (Some(cwd_path), true) = (caller_cwd, is_tools_call) else {
+        return request.clone();
+    };
+    let Some(args) = request
+        .get("params")
+        .and_then(|p| p.get("arguments"))
+        .and_then(|v| v.as_object())
+    else {
+        return request.clone();
+    };
+    let has_explicit_root = ["cwd", "worktree", "project_root"].iter().any(|key| {
+        args.get(*key)
+            .and_then(|v| v.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
+    });
+    if has_explicit_root {
+        return request.clone();
+    }
+    let mut out = request.clone();
+    if let Some(obj) = out
+        .get_mut("params")
+        .and_then(|p| p.get_mut("arguments"))
+        .and_then(|v| v.as_object_mut())
+    {
+        obj.insert(
+            "cwd".to_string(),
+            serde_json::json!(cwd_path.to_string_lossy()),
+        );
+    }
+    out
+}
+
 /// One forwarding attempt: POST the JSON-RPC request to the daemon's
 /// /mcp endpoint with the proxy client. The startup-wait loop in
 /// `start_mcp_proxy` retries this on connect errors while the daemon is
@@ -2727,7 +2785,8 @@ async fn forward_mcp_request(
     request: &Value,
 ) -> reqwest::Result<reqwest::Response> {
     let token = crate::daemon::read_token_file("daemon.token");
-    let mut attempt = client.post(url).json(request);
+    let payload = inject_proxy_caller_cwd(request, std::env::current_dir().ok().as_deref());
+    let mut attempt = client.post(url).json(&payload);
     if let Some(token) = token {
         if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token)) {
             attempt = attempt.header(reqwest::header::AUTHORIZATION, val);
@@ -3292,9 +3351,21 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
     // Direct invocations of handle_memories_for_file also record the
     // touched file path in `.NeuroStrata/session_queries.json` and bump
     // `graph_queries_count` on the active in_progress task.
-    let _ =
-        crate::task::record_graph_query(&store, &namespace, "neurostrata_memories_for_file", path)
-            .await;
+    let caller_root = arguments
+        .get("project_root")
+        .or_else(|| arguments.get("worktree"))
+        .or_else(|| arguments.get("cwd"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let _ = crate::task::record_graph_query_with_root(
+        &store,
+        &namespace,
+        "neurostrata_memories_for_file",
+        path,
+        caller_root,
+    )
+    .await;
 
     let symbol = arguments.get("symbol").and_then(|s| s.as_str());
     let include_ancestors = arguments
@@ -5391,7 +5462,29 @@ async fn handle_get_snapshot(
     } else {
         None
     };
-    let project_root = project_root_arg.clone().or(cached_root);
+    // The root used for hygiene/session-file writes prefers the caller's own
+    // worktree/cwd over the cached registry root. project_root_arg itself is
+    // kept separate above so an injected cwd never overwrites the registry's
+    // durable project_root via cache_project_root.
+    let project_root = project_root_arg
+        .clone()
+        .or_else(|| {
+            arguments
+                .get("worktree")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            arguments
+                .get("cwd")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+        .or(cached_root);
 
     // Cache an explicitly-provided project_root into the registry row (best-effort).
     if let Some(pr) = &project_root_arg {
@@ -5505,17 +5598,29 @@ async fn handle_get_snapshot(
         crate::task::collect_golden_rules(&store, namespace, Some(&all_memories)).await;
     let golden_section = crate::task::format_golden_rules_section(&golden_rules);
     if let Some(root_str) = &inferred_root {
+        let is_active = |m: &SearchResult| {
+            m.payload.memory_type == "task"
+                && m.payload
+                    .metadata
+                    .get("task")
+                    .and_then(|t| t.get("status"))
+                    .and_then(|v| v.as_str())
+                    == Some("in_progress")
+        };
+        let matches_root = |m: &SearchResult| {
+            m.payload
+                .metadata
+                .get("task")
+                .and_then(|t| t.get("worktree"))
+                .and_then(|v| v.as_str())
+                == Some(root_str.as_str())
+        };
+        // A task attributed to this worktree wins over an arbitrary in_progress
+        // task from a different worktree/session.
         let active_task = all_memories
             .iter()
-            .find(|m| {
-                m.payload.memory_type == "task"
-                    && m.payload
-                        .metadata
-                        .get("task")
-                        .and_then(|t| t.get("status"))
-                        .and_then(|v| v.as_str())
-                        == Some("in_progress")
-            })
+            .find(|m| is_active(m) && matches_root(m))
+            .or_else(|| all_memories.iter().find(|m| is_active(m)))
             .map(|m| (m.id.as_str(), &m.payload));
         crate::task::persist_active_session_file(
             std::path::Path::new(root_str),
@@ -11846,14 +11951,76 @@ fn is_zero_action_exempt_shell_segment(segment: &str) -> bool {
             let Some(&subcmd) = rest.first() else {
                 return false;
             };
-            matches!(
-                subcmd,
-                "push" | "pull" | "fetch" | "status" | "log" | "diff" | "show" | "rev-parse"
-            ) && !rest[1..]
+            if rest[1..]
                 .iter()
                 .any(|arg| is_disallowed_git_subcommand_arg(arg))
+            {
+                return false;
+            }
+            match subcmd {
+                "push" | "pull" | "fetch" | "status" | "log" | "diff" | "show" | "rev-parse" => true,
+                "stash" => matches!(rest.get(1).copied(), Some("list" | "show")),
+                "branch" => {
+                    rest.len() >= 2
+                        && rest[1..].iter().all(|t| {
+                            matches!(
+                                *t,
+                                "--show-current" | "-a" | "-r" | "--list" | "-v" | "-vv"
+                            )
+                        })
+                }
+                _ => false,
+            }
         }
-        "neurostrata-mcp" => matches!(tokens.next(), Some("task")),
+        "neurostrata-mcp" => {
+            let rest: Vec<&str> = tokens.collect();
+            match rest.first().copied() {
+                Some("task" | "doc-gate") => true,
+                Some("synaptic-mesh") => matches!(rest.get(1).copied(), Some("status")),
+                _ => false,
+            }
+        }
+        "cargo" => {
+            let mut rest: Vec<&str> = tokens.collect();
+            if rest.first().is_some_and(|t| t.starts_with('+')) {
+                rest.remove(0);
+            }
+            matches!(
+                rest.first().copied(),
+                Some("test" | "check" | "clippy" | "bench" | "metadata" | "tree" | "version" | "--version")
+            )
+        }
+        "gh" => {
+            let rest: Vec<&str> = tokens.collect();
+            match rest.first().copied() {
+                Some("pr") => matches!(
+                    rest.get(1).copied(),
+                    Some("view" | "list" | "checks" | "status" | "diff")
+                ),
+                Some("issue") => matches!(rest.get(1).copied(), Some("view" | "list" | "status")),
+                Some("run") => matches!(rest.get(1).copied(), Some("view" | "list" | "watch")),
+                Some("api") => !rest[1..].iter().any(|arg| {
+                    matches!(
+                        *arg,
+                        "-X" | "--method" | "-f" | "-F" | "--field" | "--raw-field" | "--input"
+                    ) || arg.starts_with("--method=")
+                        || arg.starts_with("--field=")
+                        || arg.starts_with("--raw-field=")
+                        || arg.starts_with("--input=")
+                }),
+                _ => false,
+            }
+        }
+        "node" => {
+            let rest: Vec<&str> = tokens.collect();
+            rest.iter()
+                .any(|t| *t == "--test" || t.ends_with("test.mjs"))
+        }
+        "gate-receipt.sh" | "check-include-str-targets.sh" => true,
+        "bash" => tokens.next().is_some_and(|t| {
+            t.ends_with("gate-receipt.sh") || t.ends_with("check-include-str-targets.sh")
+        }),
+        "rustc" => matches!(tokens.next(), Some("--version" | "-V")),
         _ => false,
     }
 }
@@ -11865,7 +12032,29 @@ pub(crate) fn is_zero_action_exempt_shell_payload(action_type: &str, payload: &s
     ) {
         return false;
     }
-    let trimmed = payload.trim();
+    // Harness plugins send payload = JSON.stringify(call.args), e.g.
+    // {"command":"git status --short"}. Unwrap the command before segmenting;
+    // a JSON object with no string command is never exempt.
+    let parsed: Option<serde_json::Value> = if payload.trim_start().starts_with('{') {
+        match serde_json::from_str(payload) {
+            Ok(value @ serde_json::Value::Object(_)) => Some(value),
+            _ => return false,
+        }
+    } else {
+        None
+    };
+    let command = match &parsed {
+        Some(serde_json::Value::Object(obj)) => match obj
+            .get("command")
+            .or_else(|| obj.get("cmd"))
+            .and_then(|v| v.as_str())
+        {
+            Some(s) => s,
+            None => return false,
+        },
+        _ => payload,
+    };
+    let trimmed = command.trim();
     if trimmed.is_empty()
         || trimmed.contains('`')
         || trimmed.contains("$(")
@@ -11993,30 +12182,64 @@ async fn handle_guard_validate(
                     serde_json::to_string_pretty(&body).unwrap_or_default()
                 );
             }
-            // AC2: a claimed task exists, so the mutating action must pass
-            // the session/worktree preflight before rule validation runs.
-            // Caller-named active task wins when it is InProgress; else any
-            // InProgress row in the namespace.
-            // Resolve the active InProgress task: caller-named active_task_id
-            // wins when it is an InProgress row; else any InProgress row.
+            // AC2: a claimed task exists, so the mutating action must pass the
+            // session/worktree preflight before rule validation runs. Resolve
+            // the active InProgress task in strict specificity order, so one
+            // session's task cannot hijack another worktree's Breath gate:
+            // named id > session+worktree > session > worktree > first row.
+            let caller_session = arguments
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && *s != "unknown");
+            let caller_worktree = arguments
+                .get("worktree")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .or_else(|| (!cwd.trim().is_empty()).then_some(cwd.trim()));
+            let in_progress = |m: &SearchResult| {
+                crate::task::gate::is_task(m)
+                    && crate::task::gate::task_status(m)
+                        == crate::task::machine::Status::InProgress
+            };
+            let task_matches = |m: &SearchResult, key: &str, expected: &str| {
+                m.payload
+                    .metadata
+                    .get("task")
+                    .and_then(|t| t.get(key))
+                    .and_then(|v| v.as_str())
+                    == Some(expected)
+            };
             let active_task_row: Option<&SearchResult> = arguments
                 .get("active_task_id")
                 .and_then(|v| v.as_str())
-                .and_then(|tid| {
-                    memories.iter().find(|m| {
-                        m.id == tid
-                            && crate::task::gate::is_task(m)
-                            && crate::task::gate::task_status(m)
-                                == crate::task::machine::Status::InProgress
+                .and_then(|tid| memories.iter().find(|m| m.id == tid && in_progress(m)))
+                .or_else(|| {
+                    match (caller_session, caller_worktree) {
+                        (Some(s), Some(w)) => memories.iter().find(|m| {
+                            in_progress(m)
+                                && task_matches(m, "session_id", s)
+                                && task_matches(m, "worktree", w)
+                        }),
+                        _ => None,
+                    }
+                })
+                .or_else(|| {
+                    caller_session.and_then(|s| {
+                        memories
+                            .iter()
+                            .find(|m| in_progress(m) && task_matches(m, "session_id", s))
                     })
                 })
                 .or_else(|| {
-                    memories.iter().find(|m| {
-                        crate::task::gate::is_task(m)
-                            && crate::task::gate::task_status(m)
-                                == crate::task::machine::Status::InProgress
+                    caller_worktree.and_then(|w| {
+                        memories
+                            .iter()
+                            .find(|m| in_progress(m) && task_matches(m, "worktree", w))
                     })
-                });
+                })
+                .or_else(|| memories.iter().find(|m| in_progress(m)));
             let active_task_id = active_task_row.map(|m| m.id.as_str());
             let session_id = arguments
                 .get("session_id")
@@ -12352,6 +12575,139 @@ mod tests {
     use super::*;
     use crate::events::{RecursionToken, ThalamicBus, ThalamicPulse};
     use crate::guard::testkit::MockStore;
+
+    #[test]
+    fn inject_proxy_caller_cwd_stamps_cwd_and_preserves_explicit_roots() {
+        let req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {
+                "name": "neurostrata_task_claim",
+                "arguments": { "id": "t" }
+            }
+        });
+        let cwd = std::path::Path::new("/caller/wt");
+        let injected = inject_proxy_caller_cwd(&req, Some(cwd));
+        assert_eq!(
+            injected["params"]["arguments"]["cwd"],
+            serde_json::json!(cwd.to_string_lossy())
+        );
+        // The request is cloned, never mutated in place.
+        assert!(req["params"]["arguments"].get("cwd").is_none());
+
+        for key in ["cwd", "worktree", "project_root"] {
+            let mut args = serde_json::Map::new();
+            args.insert("id".to_string(), serde_json::json!("t"));
+            args.insert(key.to_string(), serde_json::json!("/explicit/root"));
+            let explicit = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": { "name": "neurostrata_task_claim", "arguments": args }
+            });
+            let out = inject_proxy_caller_cwd(&explicit, Some(cwd));
+            assert_eq!(
+                out["params"]["arguments"][key],
+                serde_json::json!("/explicit/root"),
+                "explicit {key} must be preserved"
+            );
+            assert!(
+                out["params"]["arguments"].get("cwd").is_none() || key == "cwd",
+                "no cwd should be injected when {key} is already present"
+            );
+        }
+
+        // Non tools/call methods carry no tool arguments to stamp.
+        let notify = serde_json::json!({
+            "jsonrpc": "2.0", "method": "notifications/initialized", "params": {}
+        });
+        assert_eq!(inject_proxy_caller_cwd(&notify, Some(cwd)), notify);
+        assert_eq!(inject_proxy_caller_cwd(&req, None), req);
+    }
+
+    #[test]
+    fn json_wrapped_shell_payloads_expand_readonly_exemptions() {
+        for payload in [
+            r#"{"command":"git status --short"}"#,
+            r#"{"command":"cargo test --bin neurostrata-mcp"}"#,
+            r#"{"command":"gh pr view 300 --json state; git stash list"}"#,
+            r#"{"command":"./scripts/gate-receipt.sh --pr 300"}"#,
+        ] {
+            assert!(
+                is_zero_action_exempt_shell_payload("bash", payload),
+                "expected exempt: {payload}"
+            );
+        }
+        for payload in [
+            r#"{"command":"echo 1"}"#,
+            r#"{"command":"rm -rf /tmp/x"}"#,
+            r#"{"command":"git checkout -b foo"}"#,
+            r#"{"command":"git stash drop"}"#,
+            r#"{"command":"gh api repos/x/y -X POST -f body=hi"}"#,
+        ] {
+            assert!(
+                !is_zero_action_exempt_shell_payload("bash", payload),
+                "expected not exempt: {payload}"
+            );
+        }
+        // A JSON object with no string command is never exempt.
+        assert!(!is_zero_action_exempt_shell_payload("bash", r#"{"cmd":42}"#));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn guard_validate_resolves_active_task_by_session_and_worktree() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let vector = StubEmbedder.embed("task").await.unwrap();
+
+        let task = |id: &str, sid: &str, wt: &str| {
+            let mut p = payload(id);
+            p.memory_type = "task".to_string();
+            p.metadata = serde_json::json!({
+                "task": {
+                    "status": "in_progress",
+                    "session_id": sid,
+                    "worktree": wt,
+                }
+            });
+            (id.to_string(), p)
+        };
+        let (id_a, p_a) = task("task-A", "ses_A", "/wt/a");
+        let (id_b, p_b) = task("task-B", "ses_B", "/wt/b");
+        for (id, p) in [(&id_a, p_a), (&id_b, p_b)] {
+            store.upsert("probe", id, vector.clone(), p).await.unwrap();
+        }
+
+        // The BreathRequired rejection names the resolved task id, so it is a
+        // direct observation of which in_progress row the handler selected.
+        for extra in [
+            serde_json::json!({ "session_id": "ses_B" }),
+            serde_json::json!({ "worktree": "/wt/b" }),
+        ] {
+            let mut args = serde_json::json!({
+                "namespace": "probe",
+                "action_type": "write",
+                "payload": "/tmp/scratch.txt",
+                "cwd": "/wt/b",
+                "mutations_since_note": 5
+            });
+            if let (Some(obj), Some(extra_obj)) = (args.as_object_mut(), extra.as_object()) {
+                for (k, v) in extra_obj {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            let reply = handle_guard_validate(
+                args,
+                store.clone(),
+                Arc::new(StubEmbedder),
+                recording_bus().0,
+            )
+            .await;
+            assert!(
+                reply.contains(&id_b) && !reply.contains(&id_a),
+                "expected Task B resolved, got: {}",
+                reply
+            );
+        }
+    }
 
     #[test]
     fn ast_neighborhood_union_preserves_truncation_and_recomputes_blast_radius() {
