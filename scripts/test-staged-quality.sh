@@ -4,8 +4,9 @@
 # failure propagation, and unchanged file/index hashes.
 set -euo pipefail
 
-SCRIPT_PATH="/home/kenton/Documents/NeuroStrata/scripts/check-staged-quality.sh"
-HOOK_SCRIPT_PATH="$(dirname "$SCRIPT_PATH")/hooks/pre-commit"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_PATH="$REPO_ROOT/scripts/check-staged-quality.sh"
+HOOK_SCRIPT_PATH="$REPO_ROOT/scripts/hooks/pre-commit"
 
 # Create fake tool wrappers that log invocations to FAKE_TOOL_LOG
 setup_fake_tools() {
@@ -872,6 +873,42 @@ RF_EOF
     rm -rf "$tmpdir"
     return 0
 }
+
+# Test 18: Staged content that diverges from the worktree fails closed
+test_staged_worktree_divergence_fails() {
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    local repo="$tmpdir/repo"
+    local bindir="$tmpdir/bin"
+    export FAKE_TOOL_LOG="$tmpdir/tool.log"
+
+    setup_fake_tools "$bindir"
+    mkdir -p "$repo/src"
+    printf 'fn main(){let x=1;}\n' > "$repo/src/main.rs"
+    cd "$repo"
+    git init -q
+    git config user.email "test@test.com"
+    git config user.name "Test"
+    git add src/main.rs
+
+    # Same index, different worktree: the staged blob is unformatted.
+    printf 'fn main() {\n    let x = 1;\n}\n' > src/main.rs
+
+    PATH="$bindir:$PATH" bash "$SCRIPT_PATH" > "$tmpdir/out.log" 2>&1
+    local exit_code=$?
+
+    [ $exit_code -ne 0 ] || { echo "Expected nonzero exit when worktree differs from index" >&2; cat "$tmpdir/out.log" >&2; return 1; }
+    grep -q "staged content differs" "$tmpdir/out.log" || { echo "Missing divergence diagnostic" >&2; cat "$tmpdir/out.log" >&2; return 1; }
+    if grep -q "rustfmt" "$FAKE_TOOL_LOG" 2>/dev/null; then
+        echo "rustfmt ran on diverging content" >&2
+        cat "$FAKE_TOOL_LOG" >&2
+        return 1
+    fi
+
+    cd - >/dev/null
+    rm -rf "$tmpdir"
+    return 0
+}
 run_test "Staged routing table" test_staged_routing
 run_test "Whitespace-safe arguments" test_whitespace_safe_args
 run_test "Deleted and internal filtering" test_deleted_and_internal_filtering
@@ -889,6 +926,7 @@ run_test "ESLint cwd and web-ui-relative args" test_eslint_cwd_and_args
 run_test "Pre-commit delegation quality failure nonzero, ledger unchanged" test_pre_commit_hook_delegation_quality_failure_propagates_nonzero_ledger_unchanged
 run_test "Pre-commit delegation quality success preserves ledger" test_pre_commit_hook_delegation_quality_success_preserves_ledger
 run_test "Pre-commit delegation absent quality script generic ledger" test_pre_commit_hook_delegation_absent_quality_script
+run_test "Staged/worktree divergence fails closed" test_staged_worktree_divergence_fails
 
 echo ""
 echo "=== Summary ==="

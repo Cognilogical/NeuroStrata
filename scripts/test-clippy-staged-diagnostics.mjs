@@ -5,12 +5,14 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { findStagedDiagnostics } from './clippy-staged-diagnostics.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const FILTER = path.join(HERE, 'clippy-staged-diagnostics.mjs')
-const ROOT = '/home/kenton/Documents/NeuroStrata'
+const ROOT = path.resolve(HERE, '..')
 
 function diag({
   file = 'src/main.rs',
@@ -307,8 +309,7 @@ test('staged warning with missing rendered still matches via fallback (exit 1)',
   assert.ok(res.stdout.includes('dead code detected'))
 })
 
-test('staged error with empty rendered still matches via fallback (exit 1)', () => {
-  const msg = {
+test('staged error with empty rendered still matches via fallback (exit 1)', () => {  const msg = {
     reason: 'compiler-message',
     message: {
       level: 'error',
@@ -335,4 +336,32 @@ test('staged error with empty rendered still matches via fallback (exit 1)', () 
   assert.equal(res.status, 1)
   assert.ok(res.stdout.includes('type annotation required'))
   assert.ok(res.stdout.includes('src/err.rs:5:4'))
+})
+
+test('runner-style --staged with several paths catches a diagnostic in the second', () => {
+  const input = JSON.stringify(diag({ file: 'src/second.rs' }))
+  const res = runFilter({
+    input,
+    args: ['--root', ROOT, '--staged', 'src/first.rs', 'src/second.rs']
+  })
+  assert.equal(res.status, 1)
+  assert.match(res.stdout, /warning: something/)
+})
+
+test('symlinked CLI path still runs main (exit 1)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'clippy-symlink-'))
+  const link = path.join(dir, 'filter-link.mjs')
+  fs.symlinkSync(FILTER, link)
+  const res = spawnSync(
+    process.execPath,
+    [link, '--root', ROOT, '--staged', 'src/main.rs'],
+    {
+      input: JSON.stringify(diag({ file: 'src/main.rs' })),
+      encoding: 'utf8',
+      cwd: ROOT
+    }
+  )
+  fs.rmSync(dir, { recursive: true, force: true })
+  assert.equal(res.status, 1)
+  assert.match(res.stdout, /warning: something/)
 })
