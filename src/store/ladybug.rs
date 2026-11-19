@@ -4760,6 +4760,32 @@ impl LadybugStore {
         Self::with_system_config(local_path, dimensions, cfg)
     }
 
+    /// Test-only: replace a row's metadata exactly as given, bypassing the
+    /// write-path topology canonicalization. Reconstructs pre-#251 legacy
+    /// rows so revert comparisons can be exercised against raw state.
+    #[cfg(test)]
+    pub(crate) async fn overwrite_row_metadata_for_test(
+        &self,
+        namespace: &str,
+        id: &str,
+        metadata: serde_json::Value,
+    ) -> Result<()> {
+        let namespace = namespace.to_string();
+        let id = id.to_string();
+        let metadata = serde_json::to_string(&metadata)?;
+        self.write_with_deadline("test raw metadata overwrite", move |conn| {
+            let query = format!(
+                "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' SET m.metadata = '{}'",
+                escape_ladybug_string(&namespace),
+                escape_ladybug_string(&id),
+                escape_ladybug_string(&metadata)
+            );
+            conn.query(&query)?;
+            Ok(())
+        })
+        .await
+    }
+
     pub fn new(local_path: impl Into<PathBuf>, dimensions: usize) -> Result<Self> {
         // Test harnesses opt into the bounded test configuration by env so the
         // same constructor path serves both production and test binaries.

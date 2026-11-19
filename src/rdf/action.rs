@@ -3309,17 +3309,22 @@ pub async fn revert_action(
                 }
 
                 let mut expected_after_payload = delta.after_payload.clone();
+                // Legacy rows written before #251 may still carry raw topology
+                // too. Compare and fingerprint a canonicalized clone without
+                // touching the persisted payload used for staging.
+                let mut comparison_current_row = current_row.clone();
                 if expected_after_payload.metadata != current_row.metadata
                     && expected_after_payload.metadata.is_object()
                 {
+                    let ontology = store.get_ontology(&invocation.namespace);
                     // Legacy receipts stored raw topology before #251 normalized
                     // it on write; replay their expected after-image against the
                     // same canonical form the persisted row carries.
                     if let Some(topology) = expected_after_payload.metadata.get_mut("topology") {
-                        crate::rdf::canonicalize_topology(
-                            topology,
-                            &store.get_ontology(&invocation.namespace),
-                        );
+                        crate::rdf::canonicalize_topology(topology, &ontology);
+                    }
+                    if let Some(topology) = comparison_current_row.metadata.get_mut("topology") {
+                        crate::rdf::canonicalize_topology(topology, &ontology);
                     }
                     if current_row.metadata.get("facets").is_some()
                         || current_row.metadata.get("facets_bitemporal").is_some()
@@ -3358,8 +3363,10 @@ pub async fn revert_action(
                     }
                 }
 
-                let current_fp =
-                    crate::rdf::scenario::fingerprint_live_row(Some(&current_row), now_ts);
+                let comparison_current_fp = crate::rdf::scenario::fingerprint_live_row(
+                    Some(&comparison_current_row),
+                    now_ts,
+                );
                 let expected_after_fp = crate::rdf::scenario::fingerprint_live_row(
                     Some(&expected_after_payload),
                     now_ts,
@@ -3367,13 +3374,14 @@ pub async fn revert_action(
 
                 if !invocation.force {
                     if !is_active_payload(&current_row, now_ts)
-                        || current_fp != expected_after_fp
-                        || current_row.content != expected_after_payload.content
-                        || current_row.memory_type != expected_after_payload.memory_type
-                        || current_row.user_id != expected_after_payload.user_id
-                        || current_row.location != expected_after_payload.location
-                        || current_row.location_lines != expected_after_payload.location_lines
-                        || current_row.metadata != expected_after_payload.metadata
+                        || comparison_current_fp != expected_after_fp
+                        || comparison_current_row.content != expected_after_payload.content
+                        || comparison_current_row.memory_type != expected_after_payload.memory_type
+                        || comparison_current_row.user_id != expected_after_payload.user_id
+                        || comparison_current_row.location != expected_after_payload.location
+                        || comparison_current_row.location_lines
+                            != expected_after_payload.location_lines
+                        || comparison_current_row.metadata != expected_after_payload.metadata
                     {
                         let sup = current_row
                             .metadata
@@ -3389,11 +3397,11 @@ pub async fn revert_action(
                 }
 
                 if seen_expected_rows.insert(delta.after_id.clone()) {
-                    let expected_fingerprint = if invocation.force {
-                        current_fp
-                    } else {
-                        expected_after_fp
-                    };
+                    // The commit CAS fingerprints the row as persisted, so a
+                    // legacy raw row must be expected in its raw form even when
+                    // the comparison used a canonicalized clone.
+                    let expected_fingerprint =
+                        crate::rdf::scenario::fingerprint_live_row(Some(&current_row), now_ts);
                     expected_heads.push(ExpectedHead::RowFingerprint {
                         row_id: delta.after_id.clone(),
                         expected_fingerprint,
@@ -7898,6 +7906,147 @@ mod tests {
         )
         .await
         .expect("legacy pre-#251 receipt with raw topology must revert cleanly");
+        assert!(!rev.forced);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Issue #299: a pre-#251 row that still carries the raw topology alias
+    /// must not false-conflict with a pre-#251 receipt that also carries the
+    /// raw alias. The comparison canonicalizes both sides.
+    #[tokio::test]
+    async fn legacy_raw_row_and_receipt_revert_without_force() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ns-action-legacy-raw-both-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = crate::store::ladybug::LadybugStore::for_testing(&tmp, 4).expect("store");
+        let ns = "ns-legacy-raw-both-revert";
+        store.init(ns).await.unwrap();
+
+        store
+            .upsert(
+                ns,
+                "act-legacy-raw-both",
+                vec![0.1; 4],
+                MemoryPayload {
+                    content: "Action: legacy-raw-both".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "action_type".to_string(),
+                    agent_name: None,
+                    location: "".to_string(),
+                    location_lines: "".to_string(),
+                    metadata: json!({
+                        "action_type": {
+                            "slug": "legacy-raw-both",
+                            "title": "Legacy Raw Both",
+                            "description": "Upserts a row carrying topology metadata",
+                            "required_role": "editor",
+                            "parameters": {
+                                "tag": { "param_type": "string", "required": true }
+                            },
+                            "submission_criteria": [],
+                            "effects": [
+                                {
+                                    "op": "upsert_memory",
+                                    "memory_type": "fact",
+                                    "content_template": "Topology fact tag={{tag}}",
+                                    "metadata_template": {
+                                        "domain": "ops",
+                                        "decision": "choose-raw-legacy",
+                                        "topology": {
+                                            "component": "Ladybug DB",
+                                            "target_system": "Storage Subsystem",
+                                            "channel": "ipc",
+                                            "credential_boundary": "local",
+                                            "reason": "test"
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+
+        let inv = ActionInvocation {
+            namespace: ns.to_string(),
+            slug: "legacy-raw-both".to_string(),
+            security: ActionSecurityContext {
+                authenticated_principal: "alice".to_string(),
+                requested_principal: None,
+            },
+            params: BTreeMap::from([("tag".to_string(), json!("steady"))]),
+        };
+
+        let raw_topology = json!({
+            "component": "Ladybug DB",
+            "target_system": "Storage Subsystem",
+            "channel": "ipc",
+            "credential_boundary": "local",
+            "reason": "test"
+        });
+
+        let apply = apply_action(&store, &inv, &DummyActionEmbedder)
+            .await
+            .expect("apply");
+        let receipt_id = apply.receipt_id().expect("receipt id").to_string();
+        let row_id = apply.receipt().unwrap().row_deltas[0].after_id.clone();
+
+        // Rewrite the persisted row through the raw test hook: pre-#251 rows
+        // were written before the store canonicalized topology.
+        let (_, mut raw_row) = store
+            .get(ns, &row_id)
+            .await
+            .unwrap()
+            .expect("persisted row");
+        assert!(
+            raw_row.metadata.get("facets").is_some(),
+            "fixture must entail a facet so the legacy comparison block runs"
+        );
+        raw_row.metadata["topology"] = raw_topology.clone();
+        store
+            .overwrite_row_metadata_for_test(ns, &row_id, raw_row.metadata.clone())
+            .await
+            .expect("persist legacy raw row");
+
+        // And the receipt's embedded after-image is pre-#251: raw topology and
+        // no facets, so the comparison block must replay both reconciliations.
+        let (receipt_vec, mut receipt_payload) = store
+            .get(ns, &receipt_id)
+            .await
+            .unwrap()
+            .expect("receipt row");
+        let after_metadata = &mut receipt_payload.metadata["action_receipt"]["row_deltas"][0]
+            ["after_payload"]["metadata"];
+        after_metadata["topology"] = raw_topology;
+        if let Some(obj) = after_metadata.as_object_mut() {
+            obj.remove("facets");
+            obj.remove("facets_bitemporal");
+        }
+        store
+            .upsert(ns, &receipt_id, receipt_vec, receipt_payload)
+            .await
+            .expect("persist legacy receipt with raw topology");
+
+        let rev = revert_action(
+            &store,
+            &RevertInvocation {
+                namespace: ns.to_string(),
+                receipt_id,
+                security: ActionSecurityContext {
+                    authenticated_principal: "alice".to_string(),
+                    requested_principal: None,
+                },
+                force: false,
+            },
+            &DummyActionEmbedder,
+        )
+        .await
+        .expect("legacy raw row and raw receipt must revert cleanly");
         assert!(!rev.forced);
 
         let _ = std::fs::remove_dir_all(&tmp);
