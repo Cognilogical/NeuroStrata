@@ -1073,6 +1073,54 @@ fn formal_kernel_compiles_standalone_for_aeneas_extraction() {
     assert!(status.success(), "extract-aeneas.sh exited non-zero");
 }
 
+#[test]
+fn ci_kani_wrapper_dispatches_standalone_file_to_driver() {
+    let root = repo_root();
+    let workflow =
+        std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read CI workflow");
+    let setup = workflow
+        .lines()
+        .find(|line| line.trim_start().starts_with("printf '#!/usr/bin/env bash"))
+        .expect("Kani wrapper setup")
+        .trim();
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(temp.path().join(".cargo/bin")).expect("Cargo bin dir");
+    let bin_dir = temp.path().join(".kani/kani-0.68.0/bin");
+    std::fs::create_dir_all(&bin_dir).expect("Kani bin dir");
+    let driver = bin_dir.join("kani-driver");
+    std::fs::write(
+        &driver,
+        "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > \"$KANI_ARGS_OUT\"\n",
+    )
+    .expect("write fake driver");
+    let mut permissions = std::fs::metadata(&driver)
+        .expect("driver metadata")
+        .permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&driver, permissions).expect("driver executable");
+    }
+
+    let args_out = temp.path().join("args");
+    let status = Command::new("bash")
+        .arg("-c")
+        .arg(format!(
+            "set -euo pipefail\nTC_LIB=/unused\nKANI_VER=0.68.0\n{setup}\nchmod +x \"$HOME/.cargo/bin/kani\"\n\"$HOME/.cargo/bin/kani\" src/formal_kernel.rs"
+        ))
+        .env("HOME", temp.path())
+        .env("KANI_ARGS_OUT", &args_out)
+        .status()
+        .expect("run CI wrapper");
+    assert!(status.success(), "CI wrapper setup failed");
+    assert_eq!(
+        std::fs::read_to_string(args_out).expect("driver arguments"),
+        "src/formal_kernel.rs\n"
+    );
+}
+
 /// Live parity: the Rust kernel's exhaustive truth table must equal the Lean
 /// generated executable's stdout line-for-line.
 #[test]

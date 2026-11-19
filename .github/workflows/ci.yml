@@ -184,7 +184,7 @@ jobs:
           KANI_TC="$(tr -d '[:space:]' < "$HOME/.kani/kani-${KANI_VER}/rust-toolchain-version")"
           rustup toolchain install "$KANI_TC" --profile minimal --component rust-src
           TC_LIB="$HOME/.rustup/toolchains/${KANI_TC}-x86_64-unknown-linux-gnu/lib"
-          printf '#!/usr/bin/env bash\nexport LD_LIBRARY_PATH="%s:${LD_LIBRARY_PATH:-}"\nexec "$HOME/.kani/kani-%s/bin/kani-driver" kani "$@"\n' "$TC_LIB" "$KANI_VER" > "$HOME/.cargo/bin/kani"
+          printf '#!/usr/bin/env bash\nexport LD_LIBRARY_PATH="%s:${LD_LIBRARY_PATH:-}"\nexec "$HOME/.kani/kani-%s/bin/kani-driver" "$@"\n' "$TC_LIB" "$KANI_VER" > "$HOME/.cargo/bin/kani"
           chmod +x "$HOME/.cargo/bin/kani"
           NEUROSTRATA_REQUIRE_KANI=1 bash proofs/scripts/extract-aeneas.sh
 
