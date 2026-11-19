@@ -12,9 +12,9 @@ use crate::connectors::{
 };
 use crate::events::ThalamicBus;
 use crate::formal_kernel::{
-    evaluate_connector_post_gate, evaluate_connector_pre_gate, KernelActionReceiptState,
-    KernelConnectorOp, KernelConnectorPostGateInput, KernelConnectorPreGateInput,
-    KernelConnectorPreVerdict, KernelConnectorPostVerdict,
+    build_resolve_post_gate_input, build_writeback_post_gate_input, evaluate_connector_post_gate,
+    evaluate_connector_pre_gate, KernelActionReceiptState, KernelConnectorOp,
+    KernelConnectorPreGateInput, KernelConnectorPreVerdict, KernelConnectorPostVerdict,
 };
 use crate::kernel::ports::{
     ExecutivePort, KernelWorkflowTransitionVerdict, LadybugExecutivePort, LadybugMemoryPort,
@@ -275,20 +275,21 @@ impl AgentKernel {
             .resolve_slice(&pointer.pool_id, &pointer.pointer_uri, req.offset, req.limit, req.max_bytes)
             .await?;
         slice.pointer_id = pointer.pointer_id.clone();
-        let source_digest_matches = pointer.expected_source_sha256.as_ref()
-            .map(|exp| exp == &slice.source_sha256)
-            .unwrap_or(true);
-        let post_input = KernelConnectorPostGateInput {
-            op: KernelConnectorOp::ResolveSlice,
-            observed_rows: slice.records.len() as u32,
-            max_slice_rows: schema.max_slice_rows,
-            observed_bytes: slice.payload_bytes,
-            max_slice_bytes: req.max_bytes.min(schema.max_slice_bytes),
-            source_digest_matches,
-            cas_expected_matches: true,
+        let source_digest_matches = match &pointer.expected_source_sha256 {
+            Some(expected) => expected == &slice.source_sha256,
+            None => true,
         };
-        if evaluate_connector_post_gate(post_input) != KernelConnectorPostVerdict::AllowPostOutput {
-            anyhow::bail!("Post-gate denied slice resolution");
+        let post_verdict = evaluate_connector_post_gate(build_resolve_post_gate_input(
+            slice.records.len(),
+            req.limit,
+            schema.max_slice_rows,
+            slice.payload_bytes,
+            req.max_bytes,
+            schema.max_slice_bytes,
+            source_digest_matches,
+        ));
+        if post_verdict != KernelConnectorPostVerdict::AllowPostOutput {
+            anyhow::bail!("Post-gate denied slice resolution: {:?}", post_verdict);
         }
         Ok(slice)
     }
@@ -352,20 +353,22 @@ impl AgentKernel {
             anyhow::bail!("Pre-gate denied write-back: {:?}", pre_verdict);
         }
         let receipt = connector.apply_external_effect(&pointer.pool_id, &pointer.pointer_uri, req).await?;
-        let source_digest_matches = req.expected_source_sha256.as_ref()
-            .map(|exp| exp == &receipt.prior_source_sha256)
-            .unwrap_or(true);
-        let post_input = KernelConnectorPostGateInput {
-            op: KernelConnectorOp::ApplyWriteBack,
-            observed_rows: 0,
-            max_slice_rows: schema.max_slice_rows,
-            observed_bytes: 0,
-            max_slice_bytes: schema.max_slice_bytes,
-            source_digest_matches,
-            cas_expected_matches: true,
+        let pointer_source_digest_matches = match &pointer.expected_source_sha256 {
+            Some(expected) => expected == &receipt.prior_source_sha256,
+            None => true,
         };
-        if evaluate_connector_post_gate(post_input) != KernelConnectorPostVerdict::AllowPostOutput {
-            anyhow::bail!("Post-gate denied write-back");
+        let request_cas_expected_matches = match &req.expected_source_sha256 {
+            Some(expected) => expected == &receipt.prior_source_sha256,
+            None => true,
+        };
+        let post_verdict = evaluate_connector_post_gate(build_writeback_post_gate_input(
+            schema.max_slice_rows,
+            schema.max_slice_bytes,
+            pointer_source_digest_matches,
+            request_cas_expected_matches,
+        ));
+        if post_verdict != KernelConnectorPostVerdict::AllowPostOutput {
+            anyhow::bail!("Post-gate denied write-back: {:?}", post_verdict);
         }
         let mut receipt = receipt;
         receipt.pointer_id = pointer.pointer_id.clone();
@@ -1168,5 +1171,151 @@ mod tests {
         assert_eq!(ids.len(), 2);
         assert!(ids.contains(&json!("json_file")));
         assert!(ids.contains(&json!("memory_pool")));
+    }
+
+    #[tokio::test]
+    async fn post_gate_rejects_rows_exceeding_request_limit_below_schema_cap() {
+        struct OverReturningConnector;
+        #[async_trait]
+        impl DataConnector for OverReturningConnector {
+            fn connector_id(&self) -> &str {
+                "over_rows"
+            }
+            async fn describe_pool(&self, _pool_id: &str) -> Result<DataPoolSchema> {
+                Ok(DataPoolSchema {
+                    connector_id: "over_rows".to_string(),
+                    pool_id: "pool1".to_string(),
+                    access_mode: DataPoolAccessMode::ReadWrite,
+                    entity_types: vec![],
+                    max_slice_rows: 10,
+                    max_slice_bytes: 1024,
+                    description: "over".to_string(),
+                })
+            }
+            async fn resolve_slice(
+                &self,
+                _pool_id: &str,
+                pointer_uri: &str,
+                _offset: u32,
+                _limit: u32,
+                _max_bytes: u32,
+            ) -> Result<DataSlicePayload> {
+                // Returns 5 rows (<= schema.max_slice_rows=10, but > req.limit=2).
+                Ok(DataSlicePayload {
+                    pointer_id: "unset".to_string(),
+                    connector_id: "over_rows".to_string(),
+                    pool_id: "pool1".to_string(),
+                    pointer_uri: pointer_uri.to_string(),
+                    records: (0..5).map(|i| json!({"i": i})).collect(),
+                    payload_bytes: 32,
+                    source_sha256: "good-source-digest".to_string(),
+                    slice_sha256: "slice-sha".to_string(),
+                    observed_at_secs: 0,
+                })
+            }
+            async fn apply_external_effect(
+                &self,
+                _pool_id: &str,
+                _pointer_uri: &str,
+                req: &ExternalEffectRequest,
+            ) -> Result<ExternalEffectReceipt> {
+                Ok(ExternalEffectReceipt {
+                    pointer_id: req.pointer_id.clone(),
+                    connector_id: "over_rows".to_string(),
+                    pool_id: "pool1".to_string(),
+                    operation: req.operation.clone(),
+                    idempotency_key: req.idempotency_key.clone(),
+                    applied: true,
+                    prior_source_sha256: "prior".to_string(),
+                    new_source_sha256: "new".to_string(),
+                    details: "ok".to_string(),
+                })
+            }
+        }
+
+        let ns = "ns1";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(LadybugStore::new(dir.path().join("db"), 4).expect("store init"));
+        let bus = Arc::new(ThalamicBus::new(64));
+        let store_trait: Arc<dyn VectorStore> = store.clone();
+        let memory: Arc<dyn MemoryPort> = Arc::new(LadybugMemoryPort::new(store_trait.clone()));
+        let executive: Arc<dyn ExecutivePort> = Arc::new(LadybugExecutivePort::new(store_trait.clone()));
+        let ontology: Arc<dyn OntologyPort> = Arc::new(LadybugOntologyPort::new(store_trait.clone()));
+        let workflows = Arc::new(WorkflowRegistry::new());
+        let connectors = DataConnectorRegistry::new();
+        connectors.register(Arc::new(OverReturningConnector)).expect("register");
+        let kernel = AgentKernel::with_ports(
+            store_trait,
+            bus,
+            memory,
+            executive,
+            ontology,
+            workflows,
+            Arc::new(connectors),
+        );
+        store.init(ns).await.expect("init");
+        kernel
+            .register_pointer(ns, &pointer_record("ptr_over", "over_rows", 1000, 100), Some(ns))
+            .await
+            .expect("register");
+        let err = kernel
+            .resolve_pointer(ns, &slice_request("ptr_over", 2, 256), 1000, Some(ns))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("DenyObservedBoundsExceeded"),
+            "expected DenyObservedBoundsExceeded, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_back_post_gate_enforces_pointer_digest_and_cas_conflict_distinctly() {
+        let ns = "ns1";
+        let spy = Arc::new(SpyConnector::new("spy", DataPoolAccessMode::ReadWrite, 10, 1024));
+        let (kernel, store, _dir) = build_kernel(spy.clone());
+        store.init(ns).await.expect("init");
+
+        // 1. Pointer pins expected_source_sha256 = "pinned-sha" (!= receipt.prior_source_sha256 "prior").
+        // Even when req.expected_source_sha256 is None, post-gate must reject with DenySourceDigestMismatch.
+        let mut pinned_ptr = pointer_record("ptr_pinned_mismatch", "spy", 1000, 100);
+        pinned_ptr.expected_source_sha256 = Some("pinned-sha".to_string());
+        kernel
+            .register_pointer(ns, &pinned_ptr, Some(ns))
+            .await
+            .expect("register");
+        seed_receipt(&store, ns, "rcpt_pinned", "ptr_pinned_mismatch", "pool1", false).await;
+        let err = kernel
+            .apply_external_effect(
+                ns,
+                &writeback_request("ptr_pinned_mismatch", "rcpt_pinned"),
+                1000,
+                Some(ns),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("DenySourceDigestMismatch"),
+            "expected DenySourceDigestMismatch, got: {err}"
+        );
+
+        // 2. Pointer digest matches ("prior"), but request CAS expected_source_sha256 mismatches ("wrong-cas").
+        // Post-gate must reject with DenyCasConflict.
+        let mut matching_ptr = pointer_record("ptr_cas_conflict", "spy", 1000, 100);
+        matching_ptr.expected_source_sha256 = Some("prior".to_string());
+        kernel
+            .register_pointer(ns, &matching_ptr, Some(ns))
+            .await
+            .expect("register");
+        seed_receipt(&store, ns, "rcpt_cas_conflict", "ptr_cas_conflict", "pool1", false).await;
+        let mut cas_req = writeback_request("ptr_cas_conflict", "rcpt_cas_conflict");
+        cas_req.expected_source_sha256 = Some("wrong-cas".to_string());
+        let err = kernel
+            .apply_external_effect(ns, &cas_req, 1000, Some(ns))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("DenyCasConflict"),
+            "expected DenyCasConflict, got: {err}"
+        );
     }
 }

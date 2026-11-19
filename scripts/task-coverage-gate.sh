@@ -68,13 +68,13 @@ fi
 # gate / CRDT modules must keep proofs/NeuroStrata/*.lean and the parity test
 # in step with src/formal_kernel.rs.
 ALL_CHANGED=$(git diff --name-only "$RANGE" || true)
-GOVERNED_ALT='src/task/machine\.rs|src/task/gate\.rs|src/task/mod\.rs|src/workflow/machine\.rs|src/synaptic_mesh/record\.rs|src/synaptic_mesh/frame\.rs|src/synaptic_mesh/import\.rs|src/synaptic_mesh/reactor\.rs|src/tools/procedure\.rs|src/retention/gate\.rs'
+GOVERNED_ALT='src/task/machine\.rs|src/task/gate\.rs|src/task/mod\.rs|src/workflow/machine\.rs|src/synaptic_mesh/record\.rs|src/synaptic_mesh/frame\.rs|src/synaptic_mesh/import\.rs|src/synaptic_mesh/reactor\.rs|src/tools/procedure\.rs|src/retention/gate\.rs|src/kernel/mod\.rs'
 GOVERNED_RE="^(${GOVERNED_ALT})$"
 if echo "$ALL_CHANGED" | grep -qE "^(src/formal_kernel\.rs|proofs/|${GOVERNED_ALT})"; then
     # 1. Standalone Aeneas/rustc check for the extracted kernel, when the extractor is present.
     if [ -f "$ROOT/proofs/scripts/extract-aeneas.sh" ]; then
         bash "$ROOT/proofs/scripts/extract-aeneas.sh" >/dev/null \
-            || { echo "lean-formal-gate: ERROR: src/formal_kernel.rs failed standalone Aeneas/rustc check" >&2; exit 1; }
+            || { echo "lean-formal-gate: ERROR: src/formal_kernel.rs failed standalone Aeneas/Kani/rustc check" >&2; exit 1; }
     fi
     # 2. Zero forbidden sorry/axiom anywhere in proofs/ (excluding .lake build cache) and no deleted proof modules.
     if [ -d "$ROOT/proofs" ] && grep -rnE --exclude-dir=.lake --include='*.lean' '\b(sorry|axiom)\b' "$ROOT/proofs/" >/dev/null 2>&1; then

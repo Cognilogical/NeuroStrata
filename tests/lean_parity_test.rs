@@ -61,6 +61,15 @@ fn bool_str(b: bool) -> &'static str {
     }
 }
 
+fn connector_post_verdict_tag(v: KernelConnectorPostVerdict) -> &'static str {
+    match v {
+        KernelConnectorPostVerdict::AllowPostOutput => "allow_post_output",
+        KernelConnectorPostVerdict::DenyObservedBoundsExceeded => "deny_observed_bounds_exceeded",
+        KernelConnectorPostVerdict::DenySourceDigestMismatch => "deny_source_digest_mismatch",
+        KernelConnectorPostVerdict::DenyCasConflict => "deny_cas_conflict",
+    }
+}
+
 fn repo_root() -> PathBuf {
     // CARGO_MANIFEST_DIR points at the crate root that owns this test target.
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -69,7 +78,7 @@ fn repo_root() -> PathBuf {
 /// Generates the canonical 1011-line truth table in `proofs/Main.lean` order:
 /// 891 base/action/code-intel/ontology rows + 120 taxonomy rows.
 fn generate_rust_truth_table() -> Vec<String> {
-    let mut lines: Vec<String> = Vec::with_capacity(1155);
+    let mut lines: Vec<String> = Vec::with_capacity(1172);
 
     for &from in TASK_STATUSES.iter() {
         for &to in TASK_STATUSES.iter() {
@@ -817,6 +826,53 @@ fn generate_rust_truth_table() -> Vec<String> {
         }
     }
 
+    // CONNECTOR_RESOLVE_POST_BOUNDED: 4 rows (neurostrata-zbe7 Kani parity)
+    let resolve_post_cases: [(&str, usize, u32, u32, u32, u32, u32, bool); 4] = [
+        ("within_both", 2, 2, 10, 32, 64, 1024, true),
+        ("over_req_under_schema", 5, 2, 10, 32, 64, 1024, true),
+        ("over_u32_wrap", 4294967296, 2, 10, 32, 64, 1024, true),
+        ("bad_digest", 2, 2, 10, 32, 64, 1024, false),
+    ];
+    for &(label, obs_r, req_r, max_r, obs_b, req_b, max_b, sdm) in resolve_post_cases.iter() {
+        let v = evaluate_connector_post_gate(formal_kernel::build_resolve_post_gate_input(
+            obs_r, req_r, max_r, obs_b, req_b, max_b, sdm,
+        ));
+        lines.push(format!(
+            "CONNECTOR_RESOLVE_POST_BOUNDED|{}|{}",
+            label,
+            connector_post_verdict_tag(v)
+        ));
+    }
+    for ptr_ok in [false, true] {
+        for cas_ok in [false, true] {
+            let v = evaluate_connector_post_gate(formal_kernel::build_writeback_post_gate_input(
+                10, 1024, ptr_ok, cas_ok,
+            ));
+            lines.push(format!(
+                "CONNECTOR_WRITEBACK_POST_BOUNDED|{}|{}|{}",
+                bool_str(ptr_ok),
+                bool_str(cas_ok),
+                connector_post_verdict_tag(v)
+            ));
+        }
+    }
+    // PROCEDURE_NEXT_DUE: 9 rows (neurostrata-zbe7 Kani parity)
+    let next_due_cases: [(&str, i64, Option<i64>, Option<i64>, Option<i64>, Option<i64>); 9] = [
+        ("never_performed", 1000000, None, Some(3), None, None),
+        ("days_positive", 1000000, Some(900000), Some(2), None, None),
+        ("days_zero", 1000000, Some(900000), Some(0), None, None),
+        ("days_negative", 1000000, Some(900000), Some(-5), None, None),
+        ("days_overflow", 1000000, Some(1000000), Some(9223372036854775807), None, None),
+        ("sessions_default", 1000000, Some(900000), None, Some(4), None),
+        ("sessions_explicit", 1000000, Some(900000), None, Some(4), Some(2)),
+        ("sessions_negative_elapsed", 1000000, Some(900000), None, Some(4), Some(-3)),
+        ("sessions_overflow", 1000000, Some(1000000), None, Some(9223372036854775807), None),
+    ];
+    for &(label, now, last, day_cad, sess_cad, sess_elapsed) in next_due_cases.iter() {
+        let due = formal_kernel::compute_procedure_next_due(now, last, day_cad, sess_cad, sess_elapsed);
+        lines.push(format!("PROCEDURE_NEXT_DUE|{}|{}", label, due));
+    }
+
     lines
 }
 
@@ -870,8 +926,8 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
     let rust_lines = generate_rust_truth_table();
     assert_eq!(
         rust_lines.len(),
-        1155,
-        "expected 1155 canonical lines (891 base/action/code-intel/ontology + 120 taxonomy + 144 workflow)"
+        1172,
+        "expected 1172 canonical lines (1155 existing + 17 Kani parity rows)"
     );
 
     // Section-count verification: 64 TASK_FSM + 16 LIFECYCLE + 128 MESH_MERGE

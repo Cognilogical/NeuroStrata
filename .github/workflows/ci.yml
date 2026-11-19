@@ -172,6 +172,22 @@ jobs:
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
           "$HOME/.elan/bin/lake" --dir proofs build
 
+      - name: Install and run Kani Rust Verifier (formal_kernel.rs)
+        shell: bash
+        run: |
+          set -euo pipefail
+          KANI_VER="0.68.0"
+          mkdir -p "$HOME/.kani" "$HOME/.cargo/bin"
+          curl -sSL "https://github.com/model-checking/kani/releases/download/kani-${KANI_VER}/kani-${KANI_VER}-x86_64-unknown-linux-gnu.tar.gz" | tar -xz -C "$HOME/.kani"
+          rm -rf "$HOME/.kani/kani-${KANI_VER}"
+          mv "$HOME/.kani/kani-${KANI_VER}-x86_64-unknown-linux-gnu" "$HOME/.kani/kani-${KANI_VER}"
+          KANI_TC="$(tr -d '[:space:]' < "$HOME/.kani/kani-${KANI_VER}/rust-toolchain-version")"
+          rustup toolchain install "$KANI_TC" --profile minimal --component rust-src
+          TC_LIB="$HOME/.rustup/toolchains/${KANI_TC}-x86_64-unknown-linux-gnu/lib"
+          printf '#!/usr/bin/env bash\nexport LD_LIBRARY_PATH="%s:${LD_LIBRARY_PATH:-}"\nexec "$HOME/.kani/kani-%s/bin/kani-driver" kani "$@"\n' "$TC_LIB" "$KANI_VER" > "$HOME/.cargo/bin/kani"
+          chmod +x "$HOME/.cargo/bin/kani"
+          NEUROSTRATA_REQUIRE_KANI=1 bash proofs/scripts/extract-aeneas.sh
+
       - name: Test
         shell: bash
         run: cargo test --locked -- --test-threads=1
