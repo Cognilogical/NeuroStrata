@@ -61,7 +61,7 @@ Formatting and lint enforcement is staged and non-destructive: the pre-commit ho
 
 ### What the gate enforces
 
-- Rust staged files: `rustfmt --edition 2021 --config skip_children=true --check`; Clippy with staged-file diagnostics filtered by `scripts/clippy-staged-diagnostics.mjs`.
+- Rust staged files: `rustfmt --edition <crate edition> --config skip_children=true --check`; Clippy with staged-file diagnostics filtered by `scripts/clippy-staged-diagnostics.mjs`.
 - Shell staged files: `bash -n` and `shellcheck`.
 - JS/TS staged files: Prettier via local `node_modules/.bin/prettier` (and web-ui ESLint via `web-ui/node_modules/.bin/eslint`).
 - Full runner: `scripts/check-staged-quality.sh`; all checks use local, repo-locked tools. The hook is fail-closed: if a required tool is absent, the gate reports what is missing and exits nonzero.
@@ -73,19 +73,19 @@ There is no automated auto-fix or auto-restage in the hook path. Run the checks 
 - `bash -n scripts/*.sh` and `shellcheck scripts/*.sh`
 - `node scripts/clippy-staged-diagnostics.mjs --root "$PWD" --staged src/task/mod.rs`
 - `npx prettier` is out of scope — use `./node_modules/.bin/prettier --check <paths>` and `./node_modules/.bin/eslint <paths>` instead
-- `rustfmt --edition 2021 --config skip_children=true --check src/task/mod.rs`
+- `rustfmt --edition "$(sed -n 's/^edition *= *"\([0-9]*\)"/\1/p' Cargo.toml)" --config skip_children=true --check src/task/mod.rs`
 
 ### Incremental staged-file policy
 
-The gate runs incrementally: only files that are staged in the commit are checked. Unchanged files, generated bundles, and `.NeuroStrata/` internal files are excluded to keep CI and local commits fast and deterministic.
+The gate runs incrementally: only files that are staged in the commit are checked. Unchanged files, generated bundles, and `.NeuroStrata/` internal files are excluded to keep local commits fast and deterministic (CI runs the gate for changed shell files).
 
 ### No auto rewrite / no auto restage
 
 Formatting is strictly manual. Neither the checked-in hook nor any `npm` script rewrites staged files or modifies the index. If `shellcheck`, `rustfmt`, or `prettier` finds issues, fix them in the working tree, then `git add` again before committing.
 
-### Fail-closed, no downloads
+### Fail-closed, no auto-install
 
-Required tools must be installed before the hook runs. The runner never downloads packages (`npm install`, `npx <pkg>`, `rustup` fetches) on its own. Missing tools produce a clear diagnostic and a nonzero exit. Because the hook delegates to the project's `scripts/check-staged-quality.sh` when present, consumer projects can keep their own gates without modifying this repository.
+Required tools must be installed before the hook runs. The runner does not install tools or restage files. Clippy may populate `target/` and the Cargo registry cache; a cold cache can fetch registry crates under `--locked`. Missing tools produce a clear diagnostic and a nonzero exit. Because the hook delegates to the project's `scripts/check-staged-quality.sh` when present, consumer projects can keep their own gates without modifying this repository.
 
 ### Verification
 

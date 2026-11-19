@@ -43,13 +43,13 @@
 
 **Files:**
 
-- Modify: `proofs/NeuroStrata/ConnectorGate.lean`
+- Modify: `proofs/NeuroStrata/DataConnector.lean`
 - Modify: `proofs/NeuroStrata/Procedure.lean`
 - Modify: `proofs/Main.lean`
 - Modify: `tests/lean_parity_test.rs`
 - Modify: `docs/vision/product-vision.md`
 
-- [ ] **Step 1 (`neurostrata-zbe7`):** Mechanize `buildResolvePostGateInput`, `buildWritebackPostGateInput`, and `computeProcedureNextDue` (plus soundness theorems) in `proofs/NeuroStrata/ConnectorGate.lean` and `proofs/NeuroStrata/Procedure.lean`.
+- [ ] **Step 1 (`neurostrata-zbe7`):** Mechanize `buildResolvePostGateInput`, `buildWritebackPostGateInput`, and `computeProcedureNextDue` (plus soundness theorems) in `proofs/NeuroStrata/DataConnector.lean` and `proofs/NeuroStrata/Procedure.lean`.
 - [ ] **Step 2 (`neurostrata-zbe7`):** Expose the new vectors in `proofs/Main.lean` and assert 1:1 parity in `tests/lean_parity_test.rs`.
 - [ ] **Step 3 (`neurostrata-zbe7`):** Update `docs/vision/product-vision.md` (required co-change target for `src/formal_kernel.rs` under `docs/manifest.json`) to document Kani symbolic model checking alongside Lean 4 verification.
 
