@@ -1092,7 +1092,9 @@ fn resolve_prefix_root_lookup(
     alternates.extend(parse_absolute(&root).map(|p| p.to_path_string()));
     alternates.push(root.clone());
     alternates.extend(parse_absolute(&input).map(|p| p.to_path_string()));
+    let literal = (input != raw).then(|| raw.to_string());
     alternates.push(input);
+    alternates.extend(literal);
     let mut seen = std::collections::HashSet::new();
     alternates.retain(|a| seen.insert(crate::parser::ingest::normalize_node_path(a)));
     Some(LookupPath {
@@ -1911,6 +1913,25 @@ mod tests {
             resolved("docs/new.md", RootSource::ProjectRoot)
         );
         assert!(file.exists());
+    }
+
+    #[test]
+    fn a_prefix_with_parent_components_keeps_its_literal_spelling() {
+        // A prefix that names the root through `..`, as a memory may carry it.
+        let (_tmp, root, _) = project_with_worktree();
+        let raw = s(&root.join("src").join(".."));
+        let forms = prefix_lookup_forms(&raw, Some(&s(&root)), None).unwrap();
+        assert_eq!(forms[0], ".");
+        assert!(forms.contains(&raw), "{forms:?}");
+        // As a directory filter, the literal spelling matches what is under
+        // it, not a sibling reached through another `..`.
+        let raw = s(&root.join("src").join("..").join("src"));
+        let forms = prefix_lookup_forms(&raw, Some(&s(&root)), None).unwrap();
+        assert!(forms.contains(&raw), "{forms:?}");
+        let under = s(&Path::new(&raw).join("lib.rs"));
+        let sibling = s(&Path::new(&raw).join("..").join("Cargo.toml"));
+        assert!(crate::search::path_prefix_forms_match(&under, &forms));
+        assert!(!crate::search::path_prefix_forms_match(&sibling, &forms));
     }
 
     #[cfg(unix)]
