@@ -745,7 +745,9 @@ pub fn bounded_classify(
 /// `upsert`; any failure aborts with zero writes. The deterministic id is
 /// derived from the trimmed namespace and the canonical Turtle bytes, so
 /// re-ingesting the same batch is idempotent within a namespace while the
-/// same batch in a different namespace gets a distinct id.
+/// same batch in a different namespace gets a distinct id. A row already
+/// stored under a pre-#298 legacy content-only id in the same namespace is
+/// reused in place, so re-ingesting such a batch never creates a duplicate.
 pub async fn ingest_bounded_classification<S: VectorStore + ?Sized>(
     store: &S,
     namespace: &str,
@@ -765,10 +767,23 @@ pub async fn ingest_bounded_classification<S: VectorStore + ?Sized>(
         .embed(&batch.memory_payload.content)
         .await
         .map_err(|e| IngestError::Embedding(e.to_string()))?;
-    let id = format!(
+    let legacy_id = format!(
         "bounded-ingest-{}",
-        nquads_digest(&format!("{namespace}\x1f{}", batch.memory_payload.content))
+        nquads_digest(&batch.memory_payload.content)
     );
+    let id = if store
+        .get(namespace, &legacy_id)
+        .await
+        .map_err(IngestError::Store)?
+        .is_some()
+    {
+        legacy_id
+    } else {
+        format!(
+            "bounded-ingest-{}",
+            nquads_digest(&format!("{namespace}\x1f{}", batch.memory_payload.content))
+        )
+    };
     let report = store
         .upsert(namespace, &id, vector, batch.memory_payload.clone())
         .await
@@ -1529,6 +1544,63 @@ mod tests {
             reingested.id, outcome_a.id,
             "re-ingesting the same request in the same namespace is idempotent"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn reingest_reuses_legacy_content_only_id_in_same_namespace_without_duplicating() {
+        let index = make_index();
+        let dir = temp_store_dir();
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp db");
+        store.init("test-ns").await.expect("init schema");
+        store.init("other-ns").await.expect("init schema");
+
+        let req = request(vec![valid_candidate()]);
+        let batch = bounded_classify(&index, &budget(), &req).expect("governed candidate classifies");
+        let legacy_id = format!(
+            "bounded-ingest-{}",
+            nquads_digest(&batch.memory_payload.content)
+        );
+
+        // Seed a pre-#298 content-only row in "test-ns".
+        store
+            .upsert(
+                "test-ns",
+                &legacy_id,
+                vec![0.25f32; 4],
+                batch.memory_payload.clone(),
+            )
+            .await
+            .expect("seed legacy row");
+
+        let outcome = ingest_bounded_classification(
+            &store, "test-ns", &index, &budget(), &req, &StubEmbedder,
+        )
+        .await
+        .expect("re-ingest into test-ns");
+        assert_eq!(
+            outcome.id, legacy_id,
+            "pre-existing legacy content-only id must be reused in place"
+        );
+        let hits = store
+            .search("test-ns", vec![0.25f32; 4], 10, false, false)
+            .await
+            .expect("search test-ns");
+        assert_eq!(
+            hits.len(), 1,
+            "re-ingest must update the legacy row in place, not create a duplicate"
+        );
+
+        let other_outcome = ingest_bounded_classification(
+            &store, "other-ns", &index, &budget(), &req, &StubEmbedder,
+        )
+        .await
+        .expect("ingest into other-ns");
+        assert_ne!(
+            other_outcome.id, legacy_id,
+            "other-ns has no legacy row, so it must use the namespace-scoped id"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
