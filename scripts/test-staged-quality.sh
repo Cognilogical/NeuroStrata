@@ -1119,7 +1119,7 @@ CARGO_EOF
     git commit -q -m "initial"
 
     # Unstaged working-tree edition bump; staged Rust is still edition 2021.
-    sed -i 's/edition = "2021"/edition = "2024"/' Cargo.toml
+    sed 's/edition = "2021"/edition = "2024"/' Cargo.toml > Cargo.toml.new && mv Cargo.toml.new Cargo.toml
     echo '// staged change' >> src/main.rs
     git add src/main.rs
 
@@ -1163,9 +1163,9 @@ CARGO_EOF
     git add Cargo.toml src/main.rs
     git commit -q -m "initial"
 
-    sed -i 's/edition = "2021"/edition = "2024"/' Cargo.toml
+    sed 's/edition = "2021"/edition = "2024"/' Cargo.toml > Cargo.toml.new && mv Cargo.toml.new Cargo.toml
     git add Cargo.toml
-    sed -i 's/edition = "2024"/edition = "2021"/' Cargo.toml
+    sed 's/edition = "2024"/edition = "2021"/' Cargo.toml > Cargo.toml.new && mv Cargo.toml.new Cargo.toml
     echo '// staged change' >> src/main.rs
     git add src/main.rs
 

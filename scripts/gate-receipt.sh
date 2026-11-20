@@ -72,6 +72,7 @@ combine() {
 # One tokenizer, used by every mode. It drops fenced blocks (``` and ~~~, any
 # run length, unclosed to EOF), 4-space/tab indented lines, and inline code
 # spans delimited by one or more backticks (longest opening run wins).
+# shellcheck disable=SC2016  # jq program: $vars are jq identifiers, not shell
 tokenizer_def='
   def clean:
     (split("\n")) as $lines
@@ -100,6 +101,7 @@ fixed_sha_targets() {
 # Shared jq definitions. Markers and receipts are extracted only from cleaned
 # bodies; receipts must come from an allowed author and not from the finding
 # comment; fixed@/filed targets must pass the mode's validation.
+# shellcheck disable=SC2016  # jq program: $vars are jq identifiers, not shell
 jq_defs="${tokenizer_def}"'
   def mcount: [scan($marker_re; "i")] | length;
   def ucount: [scan("ruled:"; "i")] | length;
@@ -207,6 +209,7 @@ load_threads_fixture() {
   ' "$1"
 }
 
+# shellcheck disable=SC2016  # GraphQL query: $vars bind in GraphQL, not shell
 threads_query='
   query($owner: String!, $name: String!, $pr: Int!, $endCursor: String) {
     repository(owner: $owner, name: $name) {
@@ -295,7 +298,6 @@ if [ -n "$fixture" ]; then
   else
     marker_entries=$(jq -cn --rawfile body "$fixture" '{body:$body, author_association:"OWNER", author:""}')
   fi
-  receipt_entries=$marker_entries
   echo "gate-receipt: legacy --reviews-file mode: receipt authorship enforced; commit/issue targets not validated" >&2
 elif [ -n "$fixtures_dir" ]; then
   mode=fixture
@@ -344,7 +346,7 @@ elif [ -n "$fixtures_dir" ]; then
     exit 2
   fi
 else
-  mode=pr
+  mode="pr"
   [ -n "$pr" ] || { echo "usage: gate-receipt.sh --pr <n> | --reviews-file <path> | --fixtures-dir <path>" >&2; exit 2; }
   # The repository may be overridden (a fork checkout checks the upstream PR).
   # An unresolvable repository is a fetch failure, not a clearance.

@@ -315,9 +315,18 @@ rm -f "$BACKUP_FILE.prev-$$" "$COMPANION_FILE.prev-$$" "$WAL_COMPANION_FILE.prev
 # not by mtime: an operator touching or restoring an older backup must
 # not make it look newest and escape pruning.
 if [ "$MAX_BACKUPS" -gt 0 ]; then
-    PRUNE_COUNT=$(ls -1d "$BACKUP_DIR"/db-* 2>/dev/null | grep -v -e '\.store-state\.json$' -e '\.wal$' -e '\.tmp-' -e '\.prev-' | sort -r | wc -l)
+    backup_candidates() {
+        for entry in "$BACKUP_DIR"/db-*; do
+            [ -e "$entry" ] || continue
+            case "$entry" in
+                *.store-state.json|*.wal|*.tmp-*|*.prev-*) continue ;;
+            esac
+            printf '%s\n' "$entry"
+        done
+    }
+    PRUNE_COUNT=$(backup_candidates | sort -r | wc -l | tr -d '[:space:]')
     if [ "$PRUNE_COUNT" -gt "$MAX_BACKUPS" ]; then
-        ls -1d "$BACKUP_DIR"/db-* 2>/dev/null | grep -v -e '\.store-state\.json$' -e '\.wal$' -e '\.tmp-' -e '\.prev-' | sort -r | tail -n +$((MAX_BACKUPS + 1)) | while IFS= read -r OLD_BACKUP; do
+        backup_candidates | sort -r | tail -n +"$((MAX_BACKUPS + 1))" | while IFS= read -r OLD_BACKUP; do
             rm -f "$OLD_BACKUP" "$OLD_BACKUP.store-state.json" "$OLD_BACKUP.wal"
         done
         log "pruned $((PRUNE_COUNT - MAX_BACKUPS)) old backup(s), keeping $MAX_BACKUPS"
