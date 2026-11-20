@@ -3490,6 +3490,36 @@ mod tests {
             LAST
         );
     }
+
+    #[test]
+    fn home_folder_is_not_a_session_root() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".NeuroStrata")).unwrap();
+        let scratch = home.path().join("work").join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let got = resolve_session_root_with_home(None, &scratch, Some(home.path()));
+        assert_ne!(got, home.path().to_path_buf());
+        assert_eq!(got, scratch);
+
+        // Home itself without .git: the marker rule is skipped, the walk
+        // finds no .git and falls back to the start folder.
+        let got = resolve_session_root_with_home(None, home.path(), Some(home.path()));
+        assert_eq!(got, home.path().to_path_buf());
+
+        // Home with .git: returned through the .git walk.
+        std::fs::create_dir_all(home.path().join(".git")).unwrap();
+        let got = resolve_session_root_with_home(None, &scratch, Some(home.path()));
+        assert_eq!(got, home.path().to_path_buf());
+    }
+
+    #[test]
+    fn non_git_project_with_neurostrata_still_counts() {
+        let home = tempfile::tempdir().unwrap();
+        let project = home.path().join("example-project");
+        std::fs::create_dir_all(project.join(".NeuroStrata")).unwrap();
+        let got = resolve_session_root_with_home(None, &project, Some(home.path()));
+        assert_eq!(got, project);
+    }
 }
 
 /// Kani proof harnesses for the formal kernel decision functions.
@@ -4589,6 +4619,16 @@ pub fn resolve_session_root(
     explicit: Option<&std::path::Path>,
     cwd: &std::path::Path,
 ) -> std::path::PathBuf {
+    resolve_session_root_with_home(explicit, cwd, dirs::home_dir().as_deref())
+}
+
+/// The user's home folder is never a project root by way of a `.NeuroStrata`
+/// directory (SynapticMesh keeps its node id in `~/.NeuroStrata`).
+fn resolve_session_root_with_home(
+    explicit: Option<&std::path::Path>,
+    cwd: &std::path::Path,
+    home: Option<&std::path::Path>,
+) -> std::path::PathBuf {
     let start = explicit.unwrap_or(cwd);
     let start = if start.is_dir() {
         start
@@ -4598,7 +4638,14 @@ pub fn resolve_session_root(
 
     // The given directory itself is authoritative when it carries
     // .NeuroStrata (non-git project roots), matching the pre-kernel behavior.
-    if start.join(".NeuroStrata").exists() {
+    let is_home = home
+        .map(|h| {
+            dunce::canonicalize(h).ok().is_some_and(|h| {
+                dunce::canonicalize(start).is_ok_and(|s| s == h)
+            })
+        })
+        .unwrap_or(false);
+    if !is_home && start.join(".NeuroStrata").exists() {
         return start.to_path_buf();
     }
 
