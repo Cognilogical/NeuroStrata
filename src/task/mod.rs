@@ -481,6 +481,8 @@ const MAX_NORMATIVE_MEMORIES: usize = 4;
 const MAX_STRUCTURAL_ANCHORS: usize = 3;
 /// Max cross-domain conceptual bridges emitted per task context.
 const MAX_CONCEPTUAL_BRIDGES: usize = 2;
+const MAX_RELATED_SEEDS: usize = 5;
+const MAX_RELATED_EDGES: usize = 15;
 /// Relations traversed when synthesising 2-hop conceptual bridges.
 const BRIDGE_RELATIONS: &[&str] = &[
     "GOVERNS",
@@ -736,11 +738,32 @@ pub async fn build_task_graph_context(
         golden_json.push(entry);
     }
 
-    let raw_hits = store
-        .search(namespace, vector.to_vec(), 12, false, false)
+    // Hybrid seed selection (R2.1): use the hybrid search path rather than raw
+    // vector `store.search`, so graph-expanded IDs are available as seeds.
+    let raw_hits = if let Some(lb) = VectorStore::as_any(&**store).downcast_ref::<LadybugStore>() {
+        lb.search_hybrid_with_domain(
+            namespace,
+            vector.to_vec(),
+            12,
+            false,
+            false,
+            true,
+            &[],
+            Some(&payload.content),
+            false,
+            crate::traits::SearchMode::Hybrid,
+        )
         .await
-        .unwrap_or_default();
+        .map(|o| o.results)
+        .unwrap_or_default()
+    } else {
+        store
+            .search(namespace, vector.to_vec(), 12, false, false)
+            .await
+            .unwrap_or_default()
+    };
     let mut hits_json = Vec::new();
+    let mut hit_lines: Vec<String> = Vec::new();
     for r in raw_hits {
         if r.id == task_id
             || seen_ids.contains(&r.id)
@@ -776,7 +799,7 @@ pub async fn build_task_graph_context(
             .get("depends_on")
             .cloned()
             .unwrap_or(Value::Null);
-        prompt_lines.push(format!(
+        hit_lines.push(format!(
             "  - [{}] `{}` ({}): {}",
             r.payload.memory_type,
             r.id,
@@ -805,12 +828,22 @@ pub async fn build_task_graph_context(
             break;
         }
     }
-    let hits_block = if prompt_lines.is_empty() {
-        "  - (no pre-existing memories matched; run neurostrata_search_memory / neurostrata_memories_for_file as you explore)".to_string()
-    } else {
-        prompt_lines.join("\n")
-    };
-
+    let mut kept_hits = hit_lines.clone();
+    let mut hits_block = String::new();
+    loop {
+        let mut combined: Vec<String> = prompt_lines.clone();
+        combined.extend(kept_hits.clone());
+        let hb = if combined.is_empty() {
+            "  - (no pre-existing memories matched; run neurostrata_search_memory / neurostrata_memories_for_file as you explore)".to_string()
+        } else {
+            combined.join("\n")
+        };
+        if hb.chars().count() <= 3200 || kept_hits.is_empty() {
+            hits_block = hb;
+            break;
+        }
+        kept_hits.pop();
+    }
     // Partition the retrieved items into reserved normative memories and structural anchors.
     let normative_memories: Vec<Value> = hits_json
         .iter()
@@ -841,11 +874,123 @@ pub async fn build_task_graph_context(
             (Value::Null, Value::Array(Vec::new()), String::new())
         };
 
+    // R2.2/R2.3: collect at most MAX_RELATED_EDGES one-hop edges from at most
+    // MAX_RELATED_SEEDS seed items, plus metadata-declared AST calls/imports.
+    let mut related_edges: Vec<Value> = Vec::new();
+    let mut seen_edges: HashSet<(String, String, String)> = HashSet::new();
+    let mut expansion_error: Option<String> = None;
+
+    // Metadata-declared edges (GOVERNS / DEPENDS_ON / calls / imports).
+    for h in &hits_json {
+        let sid = h.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        if sid.is_empty() {
+            continue;
+        }
+        let meta = h.get("metadata").cloned().unwrap_or(Value::Null);
+        let pairs: &[(&str, &str)] = &[
+            ("governs", "GOVERNS"),
+            ("depends_on", "DEPENDS_ON"),
+            ("calls", "calls"),
+            ("imports", "imports"),
+        ];
+        for (key, rel) in pairs {
+            if let Some(arr) = meta.get(*key).and_then(|v| v.as_array()) {
+                for t in arr {
+                    if let Some(tid) = t.as_str() {
+                        let edge_key = (sid.to_string(), rel.to_string(), tid.to_string());
+                        if seen_edges.insert(edge_key) && related_edges.len() < MAX_RELATED_EDGES {
+                            related_edges.push(json!({
+                                "source": sid,
+                                "relation": rel,
+                                "target": tid,
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 1-hop graph edges via LadybugStore::related (bounded).
+    let seeds: Vec<String> = hits_json
+        .iter()
+        .filter_map(|h| h.get("id").and_then(|v| v.as_str()).map(String::from))
+        .take(MAX_RELATED_SEEDS)
+        .collect();
+    if let Some(lb) = VectorStore::as_any(&**store).downcast_ref::<LadybugStore>() {
+        let relations: Vec<String> = vec![
+            "GOVERNS".to_string(),
+            "DEPENDS_ON".to_string(),
+            "CONTAINS".to_string(),
+            "RELATES_TO".to_string(),
+        ];
+        let policy = crate::graph_read::traversal::CrossNamespacePolicy::default();
+        for seed in &seeds {
+            if related_edges.len() >= MAX_RELATED_EDGES {
+                break;
+            }
+            match lb
+                .related(
+                    namespace,
+                    seed,
+                    &relations,
+                    crate::graph_read::related::Direction::Both,
+                    1,
+                    &[],
+                    MAX_RELATED_EDGES,
+                    None,
+                    &policy,
+                )
+                .await
+            {
+                Ok(res) => {
+                    for e in res.edges {
+                        if related_edges.len() >= MAX_RELATED_EDGES {
+                            break;
+                        }
+                        let edge_key = (e.source.clone(), e.relation.clone(), e.target.clone());
+                        if seen_edges.insert(edge_key) {
+                            related_edges.push(json!({
+                                "source": e.source,
+                                "relation": e.relation,
+                                "target": e.target,
+                            }));
+                        }
+                    }
+                }
+                Err(err) => {
+                    related_edges.clear();
+                    seen_edges.clear();
+                    expansion_error = Some(err.to_string());
+                    break;
+                }
+            }
+        }
+    }
+
+    // next_hop_calls: <=3 copy-pasteable related calls derived from returned IDs.
+    let mut next_hop_calls: Vec<Value> = Vec::new();
+    for seed in seeds.iter().take(3) {
+        let trigger = crate::task::routing::RouteTrigger {
+            id: "T_HIGH_BLAST",
+            tool: "neurostrata_related",
+            args: json!({"namespace": namespace, "id": "", "max_hops": 2}),
+            reason: "graph expansion follow-up".to_string(),
+        };
+        next_hop_calls.push(crate::task::routing::next_action(&trigger, &[seed.clone()]));
+    }
+
+    let expansion_error_value = expansion_error
+        .map(Value::String)
+        .unwrap_or(Value::Null);
+
     let auto_retrieved_context = json!({
         "query": payload.content,
         "golden_rules": golden_json,
         "items": hits_json,
-        "related_edges": Value::Array(Vec::new()),
+        "related_edges": related_edges,
+        "next_hop_calls": next_hop_calls,
+        "expansion_error": expansion_error_value,
         "normative_memories": normative_memories,
         "structural_anchors": structural_anchors,
         "conceptual_bridges": conceptual_bridges,
@@ -853,7 +998,7 @@ pub async fn build_task_graph_context(
         "domain_concepts": domain_concepts,
     });
 
-    let bridges_prompt = conceptual_bridges
+    let mut bridges_prompt = conceptual_bridges
         .as_array()
         .map(|arr| {
             if arr.is_empty() {
@@ -9638,6 +9783,121 @@ mod tests {
             golden.iter().any(|g| g["id"] == "pinned-local-1"),
             "golden_rules must include local pinned rule: {golden:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn task_context_carries_real_related_edges() {
+        let store = store_with_namespace("probe").await;
+        // Two memories connected by a GOVERNS edge.
+        let a = "mem-a".to_string();
+        let b = "mem-b".to_string();
+        for id in [&a, &b] {
+            store
+                .upsert(
+                    "probe",
+                    id,
+                    vec![0.0f32; 4],
+                    MemoryPayload {
+                        content: format!("memory {}", id),
+                        user_id: "owner".to_string(),
+                        memory_type: "rule".to_string(),
+                        agent_name: None,
+                        location: String::new(),
+                        location_lines: String::new(),
+                        metadata: json!({}),
+                    },
+                )
+                .await
+                .expect("seed");
+        }
+        let ladybug = VectorStore::as_any(&*store)
+            .downcast_ref::<LadybugStore>()
+            .expect("ladybug");
+        ladybug
+            .with_conn(move |conn| {
+                conn.query(&format!(
+                    "MERGE (a:Memory {{id: 'mem-a'}}), (b:Memory {{id: 'mem-b'}}) MERGE (a)-[r:GOVERNS {{source: 'test', valid_from: 0, valid_to: 0, generation: 0, extractor: 'test', evidence_id: 'e', origin: 'local'}}]->(b)"
+                ))?;
+                Ok(())
+            })
+            .await
+            .expect("edge");
+
+        let payload = MemoryPayload {
+            content: "memory mem-a".to_string(),
+            user_id: "owner".to_string(),
+            memory_type: "task".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: json!({}),
+        };
+        let (ctx, _prompt) =
+            build_task_graph_context(&store, "probe", "task-1", &[0.0f32; 4], &payload).await;
+        let edges = ctx["related_edges"].as_array().expect("related_edges array");
+        assert!(!edges.is_empty(), "related_edges must be non-empty: {edges:?}");
+        let calls = ctx["next_hop_calls"].as_array().expect("next_hop_calls array");
+        assert!(!calls.is_empty(), "next_hop_calls must be non-empty");
+        assert_eq!(calls[0]["tool"], "neurostrata_related");
+    }
+
+    #[tokio::test]
+    async fn golden_rules_survive_graph_expansion_budget() {
+        let store = temp_store().await;
+        store.init("probe").await.expect("init probe");
+        // Golden rule.
+        store
+            .upsert(
+                "probe",
+                "golden-1",
+                vec![0.5f32; 4],
+                MemoryPayload {
+                    content: "Never use unwrap in production code paths.".to_string(),
+                    user_id: "owner".to_string(),
+                    memory_type: "rule".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({"pinned": true, "access_count": 0}),
+                },
+            )
+            .await
+            .expect("seed golden");
+        // Bloat structural memories.
+        for i in 0..5 {
+            store
+                .upsert(
+                    "probe",
+                    &format!("struct-{}", i),
+                    vec![0.5f32; 4],
+                    MemoryPayload {
+                        content: "x".repeat(2000),
+                        user_id: "owner".to_string(),
+                        memory_type: "code_ast".to_string(),
+                        agent_name: None,
+                        location: format!("src/file{}.rs", i),
+                        location_lines: String::new(),
+                        metadata: json!({}),
+                    },
+                )
+                .await
+                .expect("seed struct");
+        }
+        let payload = MemoryPayload {
+            content: "implement feature x".to_string(),
+            user_id: "owner".to_string(),
+            memory_type: "task".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: json!({}),
+        };
+        let (ctx, prompt) =
+            build_task_graph_context(&store, "probe", "task-1", &[0.5f32; 4], &payload).await;
+        assert!(prompt.chars().count() <= 3500, "prompt too long: {}", prompt.chars().count());
+        assert!(prompt.contains("golden-1"), "golden rule must survive truncation: {prompt}");
+        let golden = ctx["golden_rules"].as_array().expect("golden_rules");
+        assert!(!golden.is_empty(), "golden_rules must remain present");
     }
 
     // ── Capability C: task views + task_validate production surfaces ──────
