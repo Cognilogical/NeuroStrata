@@ -14,13 +14,29 @@ if [ "$NEUROSTRATA_SKIP_GATE" = "1" ]; then
     exit 0
 fi
 
-# The namespace configured for this project, resolved in one place
-# (`neurostrata-mcp namespace resolve`); a failed lookup blocks the push.
-# The folder name, the namespace this gate checked before, is gated too.
-NAMESPACE=$(neurostrata-mcp namespace resolve) || { echo "error: neurostrata-mcp namespace resolve failed — gate NOT run for this push (an older neurostrata-mcp without the namespace resolve command is a likely cause: upgrade it)" >&2; exit 1; }
+# The namespaces this push must pass the gate for, worked out in one call
+# from the refs git hands this hook on stdin: the folder name (the namespace
+# this gate always checked), the namespace configured for this project, and
+# the namespace of every path the pushed commits change (`neurostrata-mcp
+# namespace resolve --pushed`). A failed call blocks the push.
+PUSH_REFS=$(cat)
 FOLDER_NAMESPACE=$(basename "$(git rev-parse --show-toplevel)")
-GATE_NAMESPACES=("$NAMESPACE")
-[ "$FOLDER_NAMESPACE" = "$NAMESPACE" ] || GATE_NAMESPACES+=("$FOLDER_NAMESPACE")
+PUSHED_NAMESPACES=$(printf '%s\n' "$PUSH_REFS" | neurostrata-mcp namespace resolve --pushed) || {
+    if neurostrata-mcp namespace resolve --help 2>/dev/null | grep -q -- '--pushed'; then
+        echo "error: neurostrata-mcp namespace resolve --pushed failed — gate NOT run for this push" >&2
+    else
+        echo "error: neurostrata-mcp namespace resolve --pushed failed — gate NOT run for this push (neurostrata-mcp is too old for this hook; upgrade it)" >&2
+    fi
+    exit 1
+}
+GATE_NAMESPACES=("$FOLDER_NAMESPACE")
+while IFS= read -r ns; do
+    [ -n "$ns" ] || continue
+    case " ${GATE_NAMESPACES[*]} " in
+        *" $ns "*) ;;
+        *) GATE_NAMESPACES+=("$ns") ;;
+    esac
+done <<< "$PUSHED_NAMESPACES"
 
 # ── NeuroStrata gate (required) ────────────────────────────────────────────
 # --strict maps an unavailable database to a blocking exit too, so a 1
@@ -57,4 +73,4 @@ if [ ${#PROJECT_GATES[@]} -gt 0 ]; then
 fi
 
 exit 0   # the gate passed and all project guards passed
-# neurostrata-hook-sha256: 5a3b7ea2ec3f8b14761ee1a4efe8dc985a16706e8a18c820064fb5c52ac49e9c
+# neurostrata-hook-sha256: 180416ac6711b5395d614c188955e78d549bb5e921d8ea0a7e0ed2607eb988e8

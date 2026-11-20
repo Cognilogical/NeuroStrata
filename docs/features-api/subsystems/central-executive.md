@@ -27,7 +27,15 @@ Before an agent touches any file or runs any mutating command, it must first cla
 
 ### Lock 1 — Pre-Push Git Gate
 
-`git push` runs `neurostrata-mcp task gate <namespace> --strict`. The gate refuses to ship when any of the following exist:
+`git push` runs `neurostrata-mcp task gate <namespace> --strict` once for each namespace the push touches. The hook reads the refs git hands it on stdin and passes them to one call, `neurostrata-mcp namespace resolve --pushed`, which prints each namespace once:
+
+1. The checkout's folder name, always, so a push is never gated on fewer namespaces than before.
+2. The namespace configured for the project (`neurostrata-mcp namespace resolve`).
+3. The namespace of every path the pushed commits change. The changed paths are `git diff <remote sha> <local sha>` when the remote tip is known locally. For a new branch or a remote tip never fetched, they are the paths touched by the commits on no remote-tracking ref (`git rev-list <local sha> --not --remotes`); when that lists nothing, the tip commit's own paths. A deleted path counts and resolves from its parent folder. Each path's project marker (`.NeuroStrata/config.json`) is read from the pushed commit (`git show <sha>:<folder>/.NeuroStrata/config.json`, walking up to the checkout top), then from untracked markers in the working tree and the main checkout. The deeper marker wins. A path with no marker maps to the folder name.
+
+The hook blocks the push (exit 1) when `neurostrata-mcp` is missing, when `--pushed` fails (an invalid marker on a pushed path, or a committed and an untracked marker in the same folder naming different namespaces), when `neurostrata-mcp` is too old to know `--pushed` (it says to upgrade), or when a gate exits with anything but 0. `NEUROSTRATA_SKIP_GATE=1` is the only way past it. Nothing is stored, so a split committed on another branch or in another clone, a nested split, and a marker added by hand are all gated.
+
+The gate refuses to ship when any of the following exist:
 
 **Task conditions** (`src/task/gate.rs`):
 
