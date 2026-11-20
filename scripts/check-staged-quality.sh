@@ -17,7 +17,7 @@ CLIPPY_FILTER="$SCRIPT_DIR/clippy-staged-diagnostics.mjs"
 
 classify_shebang() {
     local line="${1%$'\r'}"
-    if [[ "$line" =~ ^#!/bin/bash([[:space:]]|$) ]]; then
+    if [[ "$line" =~ ^#!/(bin|usr/bin)/bash([[:space:]]|$) ]]; then
         printf 'bash'
         return 0
     fi
@@ -25,7 +25,7 @@ classify_shebang() {
         printf 'bash'
         return 0
     fi
-    if [[ "$line" =~ ^#!/bin/sh([[:space:]]|$) ]]; then
+    if [[ "$line" =~ ^#!/(bin|usr/bin)/sh([[:space:]]|$) ]]; then
         printf 'sh'
         return 0
     fi
