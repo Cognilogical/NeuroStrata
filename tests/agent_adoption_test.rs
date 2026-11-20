@@ -942,3 +942,84 @@ fn validate_warns_only_on_unresolved_applicable_triggers() {
         "advisories never embed gate violations"
     );
 }
+
+/// Spec §6 R8: the evaluation contract is a checked-in, strict-JSON declaration.
+fn load_evaluation_contract() -> Value {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("eval/agent_adoption/evaluation_contract.json");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("missing evaluation contract at {}: {e}", path.display()));
+    serde_json::from_str(&text).expect("evaluation contract must be strict JSON")
+}
+
+/// Spec §6 R8.3: pin every acceptance threshold to its exact declared value,
+/// and assert the owner-labeled task sets are a declaration only.
+#[test]
+fn evaluation_contract_matches_spec_thresholds() {
+    let contract = load_evaluation_contract();
+    let t = &contract["thresholds"];
+
+    assert_eq!(t["route_coverage"].as_f64(), Some(0.95));
+    assert_eq!(t["follow_through"].as_f64(), Some(0.80));
+    assert_eq!(t["routing_precision"].as_f64(), Some(0.90));
+    assert_eq!(t["unnecessary_ontology_routing"].as_f64(), Some(0.05));
+    assert_eq!(t["blind_accuracy_lift"].as_f64(), Some(0.10));
+    assert_eq!(t["regression_floor"].as_f64(), Some(-0.02));
+    assert_eq!(t["response_p95_bytes"].as_u64(), Some(32768));
+    assert_eq!(t["routing_p95_ms"].as_u64(), Some(750));
+    assert_eq!(t["ontology_lift"].as_f64(), Some(0.10));
+
+    // R8.2: a declaration of 120 owner-labeled tasks across three sets -- never
+    // fabricated labels. The real suite is tracked separately as neurostrata-pqhb.
+    let sets = &contract["task_sets"];
+    assert_eq!(sets["label_source"].as_str(), Some("owner"));
+    assert_eq!(sets["total_tasks"].as_u64(), Some(120));
+    assert!(
+        sets.get("labels").is_none(),
+        "task sets are a declaration, not fabricated labels"
+    );
+    let declared = sets["sets"]
+        .as_array()
+        .expect("task_sets.sets must be an array");
+    assert_eq!(declared.len(), 3);
+    for (id, count) in [
+        ("routine_edits", 40u64),
+        ("cross_file_impact", 40),
+        ("ontology_relevant", 40),
+    ] {
+        let set = declared
+            .iter()
+            .find(|s| s["id"] == id)
+            .unwrap_or_else(|| panic!("missing task set {id}"));
+        assert_eq!(set["count"].as_u64(), Some(count));
+        assert_eq!(set["label_source"].as_str(), Some("owner"));
+    }
+
+    assert_eq!(contract["production_roi_claimed"].as_bool(), Some(false));
+}
+
+/// Spec §6 R8.1/R8.4: the ontology lift gate stays honestly FAILING while the
+/// measured mixed alias+hierarchy subset lift is below 0.10. No default-ranking
+/// ROI claim is allowed anywhere.
+#[test]
+fn semantic_lift_gate_remains_honest() {
+    let contract = load_evaluation_contract();
+    assert_eq!(contract["production_roi_claimed"].as_bool(), Some(false));
+
+    let gate = &contract["semantic_lift_gate"];
+    let measured = gate["measured_alias_hierarchy_recall_at_5_lift"]
+        .as_f64()
+        .expect("gate must record the measured subset lift");
+    let threshold = gate["threshold"]
+        .as_f64()
+        .expect("gate must record its threshold");
+    assert_eq!(threshold, 0.10);
+    assert!(
+        measured < 0.10,
+        "measured lift {measured} must remain below the 0.10 floor"
+    );
+    assert_eq!(gate["verdict"].as_str(), Some("FAIL"));
+    assert_ne!(gate["verdict"].as_str(), Some("PASS"));
+    assert_eq!(gate["production_claim"].as_bool(), Some(false));
+    assert_eq!(gate["default_ranking_roi_claimed"].as_bool(), Some(false));
+}
