@@ -151,7 +151,7 @@ Expected: commit succeeds.
 
 - [ ] **Step 1: Add failing two-argument tests**
 
-In `plugins/core/test.mjs`, post an `execute` event in `(input, output)` form with the tool name only on `input` and `TODO: deferred cleanup` in `output`; assert zero intake calls and no `TASK INTENT DETECTED` reminder. Mirror with the name only on `output`. Update the existing fixture at `test.mjs:2542-2569` that expects a nudge on `bash` output.
+In `plugins/core/test.mjs`, post an `execute` event in `(input, output)` form with the tool name only on `input` and a recognized intent marker in `output` (see the existing fixture vocabulary); assert zero intake calls and no `TASK INTENT DETECTED` reminder. Mirror with the name only on `output`. Update the existing fixture at `test.mjs:2542-2569` that expects a nudge on `bash` output.
 
 Run: `npm --prefix plugins/core test`
 Expected: FAIL on the `input`-only shape (two intake calls, reminder appended).
