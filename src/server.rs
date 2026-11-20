@@ -2015,16 +2015,24 @@ pub async fn process_mcp_request(
                                 .map(str::trim)
                                 .filter(|s| !s.is_empty());
                             let ns = resolve_namespace(&store, ns_arg).await;
-                            let fields = crate::task::tool_receipts::build_dispatch_receipt(
-                                uuid::Uuid::new_v4().to_string(),
-                                chrono::Utc::now().timestamp(),
-                                crate::task::current_session_id(),
-                                ns.clone(),
-                                name.to_string(),
-                                query_raw,
+                            // R7: the real handler response carries §5
+                            // next_actions/next_hop_calls with trigger ids and
+                            // action ids. Thread them into the receipt so task
+                            // validation can find applicable escalations with
+                            // no caller-supplied signals.
+                            let fields = crate::task::tool_receipts::attach_trigger_context(
+                                crate::task::tool_receipts::build_dispatch_receipt(
+                                    uuid::Uuid::new_v4().to_string(),
+                                    chrono::Utc::now().timestamp(),
+                                    crate::task::current_session_id(),
+                                    ns.clone(),
+                                    name.to_string(),
+                                    query_raw,
+                                    &result_text,
+                                    error_response.is_some(),
+                                    dispatch_started.elapsed().as_millis() as u64,
+                                ),
                                 &result_text,
-                                error_response.is_some(),
-                                dispatch_started.elapsed().as_millis() as u64,
                             );
                             crate::task::record_tool_receipt(&store, fields, caller_root).await;
                         }

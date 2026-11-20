@@ -1278,6 +1278,26 @@ pub fn resolve_session_root_dir(dir: &std::path::Path) -> std::path::PathBuf {
     dir.to_path_buf()
 }
 
+/// The single ledger-root policy shared by the receipt recorder and by
+/// `task_validate`: honour a caller worktree hint, then walk up to the
+/// enclosing worktree marker. Without this, a receipt written from a
+/// worktree can be invisible to the very validation that reads it.
+fn receipt_ledger_root(caller_root: Option<&str>) -> std::path::PathBuf {
+    let mut root = caller_root
+        .map(|s| resolve_session_root_dir(std::path::Path::new(s)))
+        .unwrap_or_else(|| crate::daemon::resolve_project_root());
+    while !root.as_os_str().is_empty()
+        && !root.join(".git").exists()
+        && !root.join(".NeuroStrata").exists()
+    {
+        match root.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => root = parent.to_path_buf(),
+            _ => break,
+        }
+    }
+    root
+}
+
 /// Record a graph or memory lookup against any active `in_progress` task in
 /// `namespace` and append to `.NeuroStrata/session_queries.json` if a project
 /// root is known.
@@ -1529,18 +1549,7 @@ pub async fn record_tool_receipt(
     // versioned `events[]` receipt and the additive `tool_invocations`
     // counter. Legacy `queries[]` rows belong exclusively to the handler-
     // internal ledger recorders, so none are written here.
-    let mut root = caller_root
-        .map(|s| resolve_session_root_dir(std::path::Path::new(s)))
-        .unwrap_or_else(|| crate::daemon::resolve_project_root());
-    while !root.as_os_str().is_empty()
-        && !root.join(".git").exists()
-        && !root.join(".NeuroStrata").exists()
-    {
-        match root.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => root = parent.to_path_buf(),
-            _ => break,
-        }
-    }
+    let root = receipt_ledger_root(caller_root);
     if root.as_os_str().is_empty() {
         return;
     }
@@ -2358,9 +2367,16 @@ pub async fn handle_task_update(
             dirty_tree_hash: binding.dirty_tree_hash,
         });
     }
-    // R7.2 replaced the count-based nudge: a legacy `queries[]` stamp can no
-    // longer certify graph lookup. Applicability and compliance now come from
-    // post-dispatch receipts in `task_validate`'s non-blocking advisories.
+    // Byte-compat: both legacy keys stay on the wire. The nudge is retired
+    // (always null) because a legacy `queries[]` stamp can no longer certify
+    // graph lookup; receipt-based advisories supersede it in `task_validate`.
+    let graph_queries_count = task
+        .payload
+        .metadata
+        .get("task")
+        .and_then(|t| t.get("graph_queries_count"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
     encode(&json!({
         "id": id,
         "namespace": namespace,
@@ -2368,6 +2384,8 @@ pub async fn handle_task_update(
         "transition": transition,
         "renamed": rename_note,
         "task": task_summary(&id, &task.payload),
+        "graph_queries_count": graph_queries_count,
+        "graph_lookup_nudge": Value::Null,
     }))
 }
 
@@ -3234,7 +3252,12 @@ pub async fn handle_task_validate(args: Value, store: Arc<dyn VectorStore>) -> S
             .map(|r| (r.id.clone(), gate::task_status(r).as_str().to_string()))
             .collect::<Vec<_>>(),
     );
-    let root = crate::daemon::resolve_project_root();
+    // Same ledger-root policy as the receipt recorder: a caller worktree hint
+    // wins, so a receipt written from a worktree is visible to validation.
+    let caller_hint = arg_str(&args, "worktree")
+        .or_else(|| arg_str(&args, "project_root"))
+        .or_else(|| arg_str(&args, "cwd"));
+    let root = receipt_ledger_root(caller_hint);
     let ledger: Value =
         std::fs::read_to_string(root.join(".NeuroStrata").join("session_queries.json"))
             .ok()
@@ -3257,9 +3280,15 @@ pub async fn handle_task_validate(args: Value, store: Arc<dyn VectorStore>) -> S
         &ledger,
         &active_ids,
     ));
+    // ReBAC: restricted concept/thesis rows are neither counted nor exposed.
+    // Reuse the same public-access policy the taxonomy view applies, so an
+    // advisory cannot leak the existence of a private row through a boolean.
     let concept_rows: Vec<&SearchResult> = memories
         .iter()
-        .filter(|r| matches!(r.payload.memory_type.as_str(), "concept" | "thesis"))
+        .filter(|r| {
+            matches!(r.payload.memory_type.as_str(), "concept" | "thesis")
+                && crate::rdf::taxonomy::is_public_access_policy(&r.payload.metadata)
+        })
         .collect();
     let taxonomy_available = !concept_rows.is_empty();
     let concept_grounding_linked = concept_rows.iter().any(|r| {
@@ -6423,6 +6452,25 @@ mod tests {
         assert_eq!(history[0]["note"], "3 of 5: parser done");
     }
 
+    /// R7 fix round 1: the count-based nudge is retired but its two wire
+    /// fields stay present, so existing `task_update` consumers keep parsing
+    /// the same shape. The nudge itself is null, never a manufactured warning.
+    #[tokio::test]
+    async fn task_update_keeps_legacy_graph_fields_byte_compatible() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+
+        let reply = handle_task_update(
+            json!({ "namespace": "MyProj", "id": id, "note": "still here" }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&reply).expect("json reply");
+        assert_eq!(parsed.get("graph_queries_count"), Some(&json!(0)));
+        assert_eq!(parsed.get("graph_lookup_nudge"), Some(&Value::Null));
+    }
+
     #[tokio::test]
     async fn task_update_refuses_an_illegal_transition_with_the_legal_set() {
         let store = store_with_namespace("MyProj").await;
@@ -8963,6 +9011,124 @@ mod tests {
         assert_eq!(parsed["violations"][0]["kind"], json!("in_progress"));
         assert!(parsed.get("stale").is_some());
         assert!(parsed.get("unextracted_done").is_some());
+    }
+
+    /// R7 fix round 1: a REAL `memories_for_file` response carrying a
+    /// `T_HIGH_BLAST` next_action is threaded into the receipt, and validation
+    /// warns from that live receipt with NO caller-supplied trigger args.
+    /// A genuine `related` receipt then resolves it.
+    #[tokio::test]
+    async fn task_validate_uses_live_receipt_trigger_context_without_manual_args() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        claim(&store, &id).await;
+
+        // A realistic handler response carrying the §5 escalation action.
+        let result_text = serde_json::json!({
+            "namespace": "MyProj",
+            "root": "ok",
+            "next_actions": [{
+                "trigger_id": "T_HIGH_BLAST",
+                "action_id": "T_HIGH_BLAST:abc123",
+                "tool": "neurostrata_related",
+                "reason": "high blast radius"
+            }]
+        })
+        .to_string();
+
+        let fields = tool_receipts::attach_trigger_context(
+            tool_receipts::build_dispatch_receipt(
+                "evt-1".to_string(),
+                1,
+                "sess-1".to_string(),
+                "MyProj".to_string(),
+                "neurostrata_memories_for_file".to_string(),
+                "src/task/mod.rs",
+                &result_text,
+                false,
+                12,
+            ),
+            &result_text,
+        );
+        assert_eq!(fields.trigger_id, "T_HIGH_BLAST");
+        assert!(fields
+            .prescribed_action_ids
+            .iter()
+            .any(|a| a == "T_HIGH_BLAST:abc123"));
+
+        // Isolated worktree ledger seeded with that attributed receipt.
+        let tmp = std::env::temp_dir().join(format!(
+            "ns-advisory-e2e-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let ns_dir = tmp.join(".NeuroStrata");
+        std::fs::create_dir_all(&ns_dir).unwrap();
+        let mut event = fields.to_value();
+        event["task_id"] = serde_json::json!(id);
+        let ledger = serde_json::json!({
+            "events_version": 1,
+            "events": [event.clone()]
+        });
+        let ledger_path = ns_dir.join("session_queries.json");
+        std::fs::write(&ledger_path, ledger.to_string()).unwrap();
+        let worktree = tmp.to_string_lossy().to_string();
+
+        // No `applicable_triggers` / `strategic` arg at all.
+        let reply = handle_task_validate(
+            serde_json::json!({ "namespace": "MyProj", "worktree": worktree }),
+            store.clone(),
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&reply).expect("json reply");
+        let codes: Vec<&str> = parsed["advisories"]["graph_ontology"]["recommendations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(
+            codes.contains(&"W_GRAPH_NO_EXPANSION"),
+            "live receipt must warn without manual args: {:?}",
+            codes
+        );
+        assert_eq!(
+            parsed["advisories"]["graph_ontology"]["high_blast_radius_unexplored"],
+            json!(true)
+        );
+
+        // A genuine `related` receipt for the same trigger resolves it.
+        let related = serde_json::json!({
+            "task_id": id,
+            "tool": "neurostrata_related",
+            "operation": "related",
+            "trigger_id": "T_HIGH_BLAST",
+            "status": "success",
+            "returned_ids": ["mem-x"]
+        });
+        let resolved = serde_json::json!({
+            "events_version": 1,
+            "events": [event, related]
+        });
+        std::fs::write(&ledger_path, resolved.to_string()).unwrap();
+        let reply2 = handle_task_validate(
+            serde_json::json!({ "namespace": "MyProj", "worktree": worktree }),
+            store.clone(),
+        )
+        .await;
+        let parsed2: Value = serde_json::from_str(&reply2).expect("json reply");
+        let codes2: Vec<&str> = parsed2["advisories"]["graph_ontology"]["recommendations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(
+            !codes2.contains(&"W_GRAPH_NO_EXPANSION"),
+            "genuine related receipt must resolve: {:?}",
+            codes2
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     // ── snapshot prefix (section 6.1) ───────────────────────────────────

@@ -9,6 +9,7 @@
 
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 
 /// Ledger schema version for the additive `events[]` section. Legacy
 /// `queries[]` stays untouched for compatibility but is excluded from every
@@ -416,4 +417,51 @@ pub fn build_dispatch_receipt(
         query_raw,
         result_text,
     )
+}
+
+/// Read §5 action objects from the REAL handler response text. `next_actions`
+/// (used by `memories_for_file`) and `next_hop_calls` (used by task context)
+/// both carry `trigger_id` and `action_id`; neither is synthesized here.
+pub fn trigger_context_from_result(result_text: &str) -> (String, Vec<String>) {
+    let Ok(value) = serde_json::from_str::<Value>(result_text) else {
+        return (String::new(), Vec::new());
+    };
+    let mut triggers: BTreeSet<String> = BTreeSet::new();
+    let mut action_ids: Vec<String> = Vec::new();
+    for key in ["next_actions", "next_hop_calls"] {
+        let Some(actions) = value.get(key).and_then(Value::as_array) else {
+            continue;
+        };
+        for action in actions {
+            if let Some(id) = action.get("trigger_id").and_then(Value::as_str) {
+                if !id.trim().is_empty() {
+                    triggers.insert(id.to_string());
+                }
+            }
+            if let Some(id) = action.get("action_id").and_then(Value::as_str) {
+                if !id.trim().is_empty() {
+                    action_ids.push(id.to_string());
+                }
+            }
+        }
+    }
+    (
+        triggers.into_iter().next().unwrap_or_default(),
+        action_ids,
+    )
+}
+
+/// Fill the two trigger-attribution fields from the REAL response, leaving a
+/// post-dispatch receipt otherwise untouched. No response actions means no
+/// trigger context — the advisory layer then honestly reports no applicable
+/// escalation instead of inventing one.
+pub fn attach_trigger_context(mut fields: ReceiptFields, result_text: &str) -> ReceiptFields {
+    let (trigger_id, action_ids) = trigger_context_from_result(result_text);
+    if !trigger_id.is_empty() {
+        fields.trigger_id = trigger_id;
+    }
+    if !action_ids.is_empty() {
+        fields.prescribed_action_ids = action_ids;
+    }
+    fields
 }
