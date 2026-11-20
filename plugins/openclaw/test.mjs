@@ -1,3 +1,4 @@
+import http from "node:http";
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { resolveConfig, parseGuardValidate, detectTaskIntentsLocal, parseFileMemoryHits, buildSubagentContextHeader, injectSubagentPrompt } from './dist/index.js';
@@ -34,5 +35,76 @@ describe("audit W4: openclaw header namespace sanitization (#316)", () => {
     assert.ok(header.includes("- Namespace: `ns"), header);
     const benign = buildSubagentContextHeader("MyProject", "mem-1");
     assert.ok(benign.includes("- Namespace: `MyProject`"), benign);
+  });
+});
+
+describe("audit W1 follow-ups on openclaw (#326)", () => {
+  it("a strict-pass file operation counts once toward the Breath counter", async () => {
+    const mod = await import("./dist/index.js");
+    mod.resetState();
+    const recorded = [];
+    const server = http.createServer(async (req, res) => {
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      let call = null;
+      try { call = JSON.parse(body); } catch {}
+      const name = call?.params?.name ?? "";
+      if (name === "tools/list") {
+        res.end(JSON.stringify({ jsonrpc: "2.0", id: call.id, result: { tools: ["neurostrata_guard_validate", "neurostrata_memories_for_file"].map((n) => ({ name: n })) } }));
+        return;
+      }
+      if (name === "neurostrata_guard_validate") recorded.push(call.params.arguments);
+      res.end(JSON.stringify({
+        jsonrpc: "2.0",
+        id: call ? call.id : 1,
+        result: { content: [{ type: "text", text: JSON.stringify({ verdict: { bucket: "DeterministicAccept", reasons: [], constraints: [] } }) }] },
+      }));
+    });
+    await new Promise((r) => server.listen(0, "127.0.0.1", r));
+    const url = `http://127.0.0.1:${server.address().port}/mcp`;
+    let wrap = null;
+    let injected = [];
+    try {
+      await mod.initialize({
+        config: { namespace: "oc-count", endpoint: url, bearerToken: "tok", strictMode: true, requestTimeoutMs: 2000 },
+        hooks: { beforeFileOp: (fn) => { wrap = fn; }, onTurnEnd: () => {} },
+        conversation: { injectSystemMessage: (t) => injected.push(String(t)) },
+        logger: { info() {}, warn() {}, error() {} },
+      });
+      assert.equal(typeof wrap, "function");
+      for (let i = 0; i < 4; i++) {
+        await wrap({ type: "write", path: "/tmp/oc-a.rs", content: "x" });
+      }
+      const seq = recorded.map((a) => a.mutations_since_note);
+      assert.deepEqual(seq, [0, 1, 2, 3], `each pass must count once; guard saw: ${JSON.stringify(seq)}`);
+    } finally {
+      server.close();
+      mod.resetState();
+    }
+  });
+
+  it("a Stop runner event with a transcript reaches the turn-end handler", async () => {
+    const mod = await import("./dist/index.js");
+    mod.resetState();
+    let injected = [];
+    try {
+      await mod.initialize({
+        config: { namespace: "oc-stop", bearerToken: "tok", requestTimeoutMs: 500 },
+        hooks: { beforeFileOp: () => {}, onTurnEnd: () => {} },
+        conversation: { injectSystemMessage: (t) => injected.push(String(t)) },
+        logger: { info() {}, warn() {}, error() {} },
+      });
+      const out = await mod.handleHookEvent({
+        hook_event_name: "Stop",
+        transcript: "follow-up: clean up the temp dir before closing the task",
+      });
+      assert.deepEqual(out, { continue: true });
+      assert.ok(
+        injected.some((t) => t.includes("Task intent detected")),
+        "the Stop transcript must reach onTurnEnd's nudge; saw: " + JSON.stringify(injected)
+      );
+    } finally {
+      mod.resetState();
+    }
   });
 });
