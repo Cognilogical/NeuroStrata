@@ -3602,17 +3602,18 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
 }
 
 #[cfg(test)]
-static RELATED_TRAVERSAL_COUNTER: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+std::thread_local! {
+    static RELATED_TRAVERSAL_COUNTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 #[cfg(test)]
 pub(crate) fn reset_related_traversal_counter_for_tests() {
-    RELATED_TRAVERSAL_COUNTER.store(0, std::sync::atomic::Ordering::SeqCst);
+    RELATED_TRAVERSAL_COUNTER.with(|c| c.set(0));
 }
 
 #[cfg(test)]
 pub(crate) fn related_traversal_counter_for_tests() -> usize {
-    RELATED_TRAVERSAL_COUNTER.load(std::sync::atomic::Ordering::SeqCst)
+    RELATED_TRAVERSAL_COUNTER.with(|c| c.get())
 }
 
 /// Whether a `related` seed names a file path (and so needs canonical
@@ -3810,7 +3811,7 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
     }
 
     #[cfg(test)]
-    RELATED_TRAVERSAL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    RELATED_TRAVERSAL_COUNTER.with(|c| c.set(c.get() + 1));
 
     match store
         .related(
