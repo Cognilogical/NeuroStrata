@@ -1505,58 +1505,28 @@ pub async fn record_tool_receipt(
     caller_root: Option<&str>,
 ) {
     let ns = crate::server::resolve_namespace(store, &fields.namespace).await;
-    let hint = if fields.operation.is_empty() {
-        fields.tool.as_str()
-    } else {
-        fields.operation.as_str()
-    };
-    let entry_str = format!(
-        "{}:{}",
-        fields.tool,
-        hint.chars().take(80).collect::<String>()
-    );
 
-    // Stamp every active in-progress task, attributing the receipt to the
-    // first one — the same attribution rule the legacy recorder uses.
-    if let Ok(rows) = store.list(&ns, None, Some("task")).await {
-        for r in &rows {
-            if gate::is_task(r) && gate::task_status(r) == Status::InProgress {
-                if fields.task_id.is_empty() {
+    // Review fix round 2: ATTRIBUTION ONLY. Find the active in-progress task so
+    // the receipt can be attributed (snapshot readiness diversity counts it),
+    // but never touch `graph_queries_count`, `graph_queried` or `recent_queries`.
+    // Those counters are stamped exclusively by the handler-internal ledger
+    // recorders; incrementing them here double-counts a single dispatch.
+    if fields.task_id.is_empty() {
+        if let Ok(rows) = store.list(&ns, None, Some("task")).await {
+            for r in &rows {
+                if gate::is_task(r) && gate::task_status(r) == Status::InProgress {
                     fields.task_id = r.id.clone();
-                }
-                if let Ok(Some((vec, mut payload))) = store.get(&ns, &r.id).await {
-                    let obj = task_obj_mut(&mut payload);
-                    let count = obj
-                        .get("graph_queries_count")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0)
-                        + 1;
-                    obj.insert("graph_queries_count".to_string(), json!(count));
-                    obj.insert("graph_queried".to_string(), json!(true));
-                    let mut recent: Vec<String> = obj
-                        .get("recent_queries")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|x| x.as_str().map(String::from))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    recent.push(entry_str.clone());
-                    if recent.len() > 10 {
-                        let drop_n = recent.len() - 10;
-                        recent.drain(0..drop_n);
-                    }
-                    obj.insert("recent_queries".to_string(), json!(recent));
-                    let _ = store.upsert(&ns, &r.id, vec, payload).await;
+                    break;
                 }
             }
         }
     }
 
     // Resolve the ledger root: explicit caller root, then cwd walked up to a
-    // worktree marker. No raw text leaves this function — the legacy row uses
-    // the query digest, never the query itself.
+    // worktree marker. Review fix round 2: this recorder writes ONLY the
+    // versioned `events[]` receipt and the additive `tool_invocations`
+    // counter. Legacy `queries[]` rows belong exclusively to the handler-
+    // internal ledger recorders, so none are written here.
     let mut root = caller_root
         .map(|s| resolve_session_root_dir(std::path::Path::new(s)))
         .unwrap_or_else(|| crate::daemon::resolve_project_root());
@@ -1580,14 +1550,6 @@ pub async fn record_tool_receipt(
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| json!({ "namespace": ns, "queries": [] }));
-    if let Some(arr) = doc.get_mut("queries").and_then(|v| v.as_array_mut()) {
-        arr.push(json!({
-            "ts": fields.ts,
-            "tool": fields.tool,
-            "query": fields.query_digest,
-            "governed_prefixes": [],
-        }));
-    }
     let tool = fields.tool.clone();
     tool_receipts::append_event(&mut doc, fields.to_value());
     tool_receipts::bump_tool_invocation(&mut doc, &tool);
@@ -5568,6 +5530,100 @@ mod tests {
         let parsed: Value = serde_json::from_str(reply)
             .unwrap_or_else(|e| panic!("json reply: {} -- {}", reply, e));
         parsed["task"]["title"].as_str().expect("title").to_string()
+    }
+
+    /// Review fix round 2: one graph-tool dispatch must not double-count the
+    /// task counters. `record_tool_receipt` attributes the receipt to the active
+    /// in-progress task but must leave `graph_queries_count`, `graph_queried`,
+    /// `recent_queries` and legacy `queries[]` untouched — those belong solely
+    /// to the handler-internal ledger recorders.
+    #[tokio::test]
+    async fn tool_receipt_never_double_stamps_task_counters() {
+        use crate::guard::testkit::MockStore;
+        use crate::task::tool_receipts::build_dispatch_receipt;
+
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        let ns = "T6Fix2";
+        let task_id = "task-in-progress";
+        let vector = StubEmbedder.embed("seed").await.unwrap();
+        store
+            .upsert(
+                ns,
+                task_id,
+                vector,
+                MemoryPayload {
+                    content: "active task".to_string(),
+                    user_id: "kenton".to_string(),
+                    memory_type: "task".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({
+                        "task": {
+                            "status": "in_progress",
+                            "title": "active task",
+                            "task_type": "task",
+                            "priority": 1,
+                        }
+                    }),
+                },
+            )
+            .await
+            .expect("seed active task");
+
+        let before = store
+            .get(ns, task_id)
+            .await
+            .unwrap()
+            .expect("task exists")
+            .1
+            .metadata
+            .clone();
+        assert!(before["task"].get("graph_queries_count").is_none());
+        assert!(before["task"].get("graph_queried").is_none());
+        assert!(before["task"].get("recent_queries").is_none());
+
+        let response = serde_json::json!({ "memories": [ { "id": "m1" } ] }).to_string();
+        let fields = build_dispatch_receipt(
+            "evt-fix2".to_string(),
+            1,
+            "ses".to_string(),
+            ns.to_string(),
+            "neurostrata_locate".to_string(),
+            "q",
+            &response,
+            false,
+            4,
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        // Marker so resolve_session_root_dir keeps the ledger inside the
+        // tempdir instead of walking out to the enclosing worktree root.
+        std::fs::create_dir_all(tmp.path().join(".NeuroStrata")).unwrap();
+        let caller_root = tmp.path().to_str().unwrap().to_string();
+        record_tool_receipt(&store, fields, Some(&caller_root)).await;
+
+        // Counters and task metadata must be byte-identical after recording.
+        let after = store
+            .get(ns, task_id)
+            .await
+            .unwrap()
+            .expect("task exists")
+            .1
+            .metadata;
+        assert_eq!(after, before, "record_tool_receipt must not mutate task counters");
+
+        // Attribution still lands on the receipt, and no legacy row is written.
+        let ledger_path = tmp.path().join(".NeuroStrata/session_queries.json");
+        let ledger: Value = serde_json::from_str(
+            &std::fs::read_to_string(&ledger_path).expect("ledger written"),
+        )
+        .expect("valid ledger");
+        assert_eq!(ledger["events"][0]["task_id"].as_str(), Some(task_id));
+        assert_eq!(
+            ledger["queries"].as_array().map(|a| a.len()),
+            Some(0),
+            "no legacy queries[] row from the receipt recorder"
+        );
     }
 
     /// The git branch of the wiring panel (Q2/Q5): the default instance is
