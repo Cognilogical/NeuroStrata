@@ -47,6 +47,10 @@ pub enum UndecidedWhy {
     /// A path whose `source_context.source_id` is bound to a project context
     /// whose root is not this one.
     OtherSourceRoot,
+    /// An absolute `location` inside the root that is not the first ref's
+    /// path: supersede sets `location` from the first of `locations`, so the
+    /// call would replace it.
+    LocationDiffersFromFirstRef,
 }
 
 impl UndecidedWhy {
@@ -56,6 +60,9 @@ impl UndecidedWhy {
                 "names no file under the root (moved, deleted, or relative to another root)"
             }
             UndecidedWhy::OtherSourceRoot => "its source_id is bound to a different root",
+            UndecidedWhy::LocationDiffersFromFirstRef => {
+                "location differs from the first ref; supersede would replace it with the first ref's path"
+            }
         }
     }
 }
@@ -77,6 +84,11 @@ impl AuditReport {
             "Fixable ({}): apply each line as a neurostrata_supersede_memory call",
             self.fixable.len()
         )];
+        out.push(
+            "  note: supersede has no location argument, so a call for a memory with only a \
+             location also stores that path as its first ref"
+                .to_string(),
+        );
         if self.fixable.is_empty() {
             out.push("  none".to_string());
         }
@@ -260,6 +272,7 @@ pub fn audit_rows(
         let mut rewrote = false;
         let mut other_root = false;
         let mut other_root_paths: Vec<String> = Vec::new();
+        let mut location_conflict = false;
 
         // `locations`: the refs, each kept whole with only its path rewritten,
         // or the bare location when the memory has no refs.
@@ -270,6 +283,7 @@ pub fn audit_rows(
         let mut locations: Option<Vec<Value>> = None;
         if let Some(refs) = refs {
             let mut out = Vec::with_capacity(refs.len());
+            let mut first_raw: Option<Option<String>> = None;
             for reference in refs {
                 let mut obj: Map<String, Value> =
                     reference.as_object().cloned().unwrap_or_default();
@@ -278,6 +292,9 @@ pub fn audit_rows(
                     .remove("file")
                     .or_else(|| obj.remove("path"))
                     .and_then(|v| v.as_str().map(str::to_string));
+                if first_raw.is_none() {
+                    first_raw = Some(raw.clone());
+                }
                 if let Some(raw) = raw {
                     let mut spelled = raw.clone();
                     if bound_elsewhere(reference, root, bindings) {
@@ -301,6 +318,26 @@ pub fn audit_rows(
                 out.push(Value::Object(obj));
             }
             locations = Some(out);
+            // Supersede sets `location` from the first of `locations`. An
+            // absolute in-root location that is not the first ref's path would
+            // be replaced, so that memory is left for the user to decide.
+            let location = payload.location.as_str();
+            if location_is_path(location)
+                && matches!(judge(location, root, &root_str), Verdict::Rewrite(_))
+            {
+                let same = first_raw.flatten().is_some_and(|first| {
+                    crate::parser::ingest::normalize_node_path(&first)
+                        == crate::parser::ingest::normalize_node_path(location)
+                });
+                if !same {
+                    location_conflict = true;
+                    note(
+                        location,
+                        UndecidedWhy::LocationDiffersFromFirstRef,
+                        &mut undecided,
+                    );
+                }
+            }
         } else if location_is_path(&payload.location) {
             let raw = payload.location.clone();
             let mut spelled = raw.clone();
@@ -324,7 +361,7 @@ pub fn audit_rows(
         }
 
         // `governs`: every entry kept, path entries inside the root rewritten.
-        let mut governs: Option<Vec<Value>> = None;
+        let mut governs: Option<Value> = None;
         if let Some(entries) = meta.get("governs").and_then(Value::as_array) {
             let mut out = Vec::with_capacity(entries.len());
             for entry in entries {
@@ -350,13 +387,22 @@ pub fn audit_rows(
                     Verdict::Keep => out.push(entry.clone()),
                 }
             }
-            governs = Some(out);
+            governs = Some(Value::Array(out));
+        }
+        // Supersede derives governs from `locations` unless `governs` is
+        // passed, so a call with `locations` always carries the stored value
+        // (`[]` when there is none) and adds nothing.
+        if locations.is_some() && governs.is_none() {
+            governs = Some(match meta.get("governs") {
+                None | Some(Value::Null) => Value::Array(Vec::new()),
+                Some(other) => other.clone(),
+            });
         }
 
         needs_decision.extend(undecided);
         // One memory is one supersede call: a memory with a path bound to
         // another root is left whole for the user to decide.
-        if rewrote && !other_root {
+        if rewrote && !other_root && !location_conflict {
             let mut args = Map::new();
             args.insert("id".to_string(), json!(row.id));
             args.insert("namespace".to_string(), json!(namespace));
@@ -366,7 +412,7 @@ pub fn audit_rows(
                 args.insert("locations".to_string(), Value::Array(locations));
             }
             if let Some(governs) = governs {
-                args.insert("governs".to_string(), Value::Array(governs));
+                args.insert("governs".to_string(), governs);
             }
             fixable.push(FixableRow {
                 id: row.id.clone(),
@@ -393,8 +439,8 @@ pub async fn audit_namespace(
     Ok(audit_rows(&rows, namespace, root, bindings))
 }
 
-/// Every relative path key a row stores: `location`, `refs` files and
-/// `governs` entries.
+/// Every relative path key a row stores: `location`, `refs` files and the
+/// `governs` entries that name paths (never memory ids or domains).
 fn relative_keys(row: &SearchResult) -> Vec<String> {
     let payload = &row.payload;
     let mut keys = Vec::new();
@@ -413,7 +459,13 @@ fn relative_keys(row: &SearchResult) -> Vec<String> {
         }
     }
     if let Some(governs) = payload.metadata.get("governs").and_then(Value::as_array) {
-        keys.extend(governs.iter().filter_map(Value::as_str).map(str::to_string));
+        keys.extend(
+            governs
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|g| governs_is_path(g))
+                .map(str::to_string),
+        );
     }
     keys.retain(|k| !crate::paths::is_absolute_any(k));
     keys
@@ -792,7 +844,85 @@ mod tests {
         assert_eq!(report.exit_code(), 1);
         assert!(report
             .to_text()
+            .contains("also stores that path as its first ref"));
+        assert!(report
+            .to_text()
             .contains("\"reason\":\"path made project-relative\""));
+    }
+
+    #[tokio::test]
+    async fn location_only_row_passes_empty_governs() {
+        let (_tmp, root) = tmp_root();
+        touch(&root, "src/a.rs");
+        let a = abs(&root, "src/a.rs");
+        let store = store_with(vec![
+            ("m1", payload("Rule.", &a, json!({}))),
+            ("m2", payload("Rule.", &a, json!({ "governs": null }))),
+            // Refs without governs: the call must not let supersede derive any.
+            (
+                "m3",
+                payload("Rule.", &a, json!({ "refs": [{ "file": a }] })),
+            ),
+        ])
+        .await;
+        let report = audit_namespace(&store, "example-project", &root, &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(report.fixable.len(), 3, "{:?}", report.needs_decision);
+        for row in &report.fixable {
+            assert_eq!(row.supersede_args["governs"], json!([]), "{}", row.id);
+            assert_eq!(
+                row.supersede_args["locations"][0]["path"],
+                json!("src/a.rs"),
+                "{}",
+                row.id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn location_differing_from_first_ref_needs_decision() {
+        let (_tmp, root) = tmp_root();
+        touch(&root, "src/a.rs");
+        touch(&root, "src/b.rs");
+        let a = abs(&root, "src/a.rs");
+        let b = abs(&root, "src/b.rs");
+        let store = store_with(vec![
+            (
+                "m1",
+                payload(
+                    "Rule.",
+                    &b,
+                    json!({ "refs": [{ "file": a }], "governs": [a] }),
+                ),
+            ),
+            (
+                "m2",
+                payload(
+                    "Rule.",
+                    &a,
+                    json!({ "refs": [{ "file": a }], "governs": [a] }),
+                ),
+            ),
+        ])
+        .await;
+        let report = audit_namespace(&store, "example-project", &root, &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            report.needs_decision,
+            vec![UndecidedRow {
+                id: "m1".to_string(),
+                path: b,
+                why: UndecidedWhy::LocationDiffersFromFirstRef,
+            }]
+        );
+        assert_eq!(report.fixable.len(), 1);
+        assert_eq!(report.fixable[0].id, "m2");
+        assert_eq!(
+            report.fixable[0].supersede_args["governs"],
+            json!(["src/a.rs"])
+        );
     }
 
     #[tokio::test]
@@ -852,6 +982,7 @@ mod tests {
         let (_tmp, top) = tmp_root();
         let sub = top.join("sub");
         touch(&sub, "a.rs");
+        touch(&sub, "auth");
         let store = store_with(vec![
             (
                 "m1",
@@ -861,6 +992,8 @@ mod tests {
             ("m2", payload("Rule.", &abs(&sub, "a.rs"), json!({}))),
             // Names nothing under the current root: not lost by the move.
             ("m3", payload("Rule.", "nothing.rs", json!({}))),
+            // A governs id or domain that happens to name a folder is not a key.
+            ("m4", payload("Rule.", "", json!({ "governs": ["auth"] }))),
         ])
         .await;
         let lost = rows_lost_by_root_change(&store, "example-project", &sub, &top)
