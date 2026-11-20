@@ -34,11 +34,16 @@ one-line hint when the project has no marker yet.
      (correct the data first, steps 2 to 5).
    - When another namespace's marker already covers the folder, it installs
      nothing and points at `root set ... --replace`.
+   - In a second clone of a project whose cached root is the first clone
+     (which has its own marker), it writes the marker in this clone and
+     leaves the cached root on the first clone. `root set` in this clone
+     moves it.
 2. **Before moving a project folder or changing its root, run
    `neurostrata-mcp root audit`.** Memories stored with absolute paths stop
-   matching after a move, so correct them first. `root set` runs the same
-   check and refuses a root change that would stop memories matching; it
-   lists their ids. `--force` changes the root anyway.
+   matching after a move, so correct them first. When the new root is inside
+   the current one or contains it, `root set`, `hooks install` and setup run
+   the same check and refuse a root change that would stop memories
+   matching; they list their ids. `root set --force` changes the root anyway.
 3. **Apply each printed `neurostrata_supersede_memory` call.** The old
    version stays as history, with the reason recorded. An agent can work
    through the list.
@@ -65,8 +70,9 @@ neurostrata-mcp root set <dir> --namespace <ns> [--source-id <id>] [--replace] [
 ```
 
 - Writes the marker (in the main checkout when `<dir>` is in a linked
-  worktree) and sets the namespace's cached root. A running daemon makes the
-  change; with no daemon it opens the store itself.
+  worktree) and sets the namespace's cached root. The command itself writes
+  every file; a running daemon only updates the cached root, and with no
+  daemon the command opens the store itself.
 - Refuses the home folder, a drive or filesystem root, and a non-git folder
   with git checkouts below it.
 - Refuses a folder that holds another namespace's marker, or a second marker

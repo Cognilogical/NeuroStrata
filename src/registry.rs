@@ -779,9 +779,9 @@ pub async fn cache_project_root(
     emb: Option<&Arc<dyn Embedder>>,
     namespace: &str,
     project_root: &str,
-) {
+) -> bool {
     let _guard = REGISTRY_ROW_LOCK.lock().await;
-    cache_project_root_locked(store, emb, namespace, project_root).await;
+    cache_project_root_locked(store, emb, namespace, project_root).await
 }
 
 /// Like [`cache_project_root`], but a namespace whose root a marker names is
@@ -810,14 +810,16 @@ pub async fn cache_project_root_unless_marked(
 
 /// Set the namespace's cached root to `root` (for the marker's writers). A
 /// root inside a linked worktree is stored in its main checkout's spelling.
+/// `false` when the row could not be written (or is missing and there is no
+/// embedder to create it).
 pub async fn set_project_root(
     store: &Arc<dyn VectorStore>,
     emb: Option<&Arc<dyn Embedder>>,
     namespace: &str,
     root: &std::path::Path,
-) {
+) -> bool {
     let spelled = crate::root_marker::in_main_checkout(root);
-    cache_project_root(store, emb, namespace, &spelled.to_string_lossy()).await;
+    cache_project_root(store, emb, namespace, &spelled.to_string_lossy()).await
 }
 
 async fn cache_project_root_locked(
@@ -825,18 +827,18 @@ async fn cache_project_root_locked(
     emb: Option<&Arc<dyn Embedder>>,
     namespace: &str,
     project_root: &str,
-) {
+) -> bool {
     let registry_id = registry_row_id(namespace);
     let (vector, mut payload) = match store.get(namespace, &registry_id).await {
         Ok(Some(found)) => found,
         _ => {
-            let Some(emb) = emb else { return };
+            let Some(emb) = emb else { return false };
             let content = registry_content(namespace);
             let vector = match emb.embed(&content).await {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!("cache_project_root embed failed for '{namespace}': {e}");
-                    return;
+                    return false;
                 }
             };
             (
@@ -861,7 +863,9 @@ async fn cache_project_root_locked(
     }
     if let Err(e) = store.upsert(namespace, &registry_id, vector, payload).await {
         tracing::warn!("registry upsert failed for '{namespace}:{registry_id}': {e}");
+        return false;
     }
+    true
 }
 
 /// Merge `doctor_state` into the registry row, re-reading the row under the

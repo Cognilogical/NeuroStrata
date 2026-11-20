@@ -482,6 +482,12 @@ pub async fn rows_lost_by_root_change(
     new: &Path,
 ) -> anyhow::Result<Vec<String>> {
     let rows = store.list(namespace, None, None).await?;
+    Ok(rows_lost_in(&rows, current, new))
+}
+
+/// [`rows_lost_by_root_change`] over rows already listed (the CLI reads them
+/// through the daemon's `/cli/read`).
+pub fn rows_lost_in(rows: &[SearchResult], current: &Path, new: &Path) -> Vec<String> {
     let now = now_secs();
     let current_str = current
         .to_string_lossy()
@@ -507,7 +513,7 @@ pub async fn rows_lost_by_root_change(
         }
     }
     lost.sort();
-    Ok(lost)
+    lost
 }
 
 #[cfg(test)]

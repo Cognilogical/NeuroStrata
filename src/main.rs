@@ -2473,17 +2473,74 @@ async fn root_show_cached_root(
     }
 }
 
-/// Where the marker writers (`root set`, `hooks install`) send their registry
-/// change: the answering daemon, else the store opened here.
-enum CliWriteStore {
-    Daemon,
-    Direct(Arc<dyn VectorStore>, Option<Arc<dyn crate::traits::Embedder>>),
+/// [`crate::root_marker::RootRegistry`] over an answering daemon: reads go
+/// through `/cli/read` (`project_root`, `list`), and the only write is
+/// `/cli/root`'s `cache_root`. All file work stays in this process.
+struct DaemonRootRegistry;
+
+impl DaemonRootRegistry {
+    /// The namespace as the store spells it (matched case-insensitively) and
+    /// its cached root.
+    async fn project_root(namespace: &str) -> Result<(String, Option<String>), String> {
+        let v = cli_read_op(
+            serde_json::json!({ "op": "project_root", "namespace": namespace }),
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .map_err(|e| format!("daemon: {e}"))?;
+        Ok((
+            v["namespace"].as_str().unwrap_or(namespace).to_string(),
+            v["project_root"].as_str().map(str::to_string),
+        ))
+    }
 }
 
-async fn open_cli_write_store(probe: DaemonProbe) -> Result<CliWriteStore, String> {
+#[async_trait::async_trait]
+impl crate::root_marker::RootRegistry for DaemonRootRegistry {
+    async fn cached_root(&self, namespace: &str) -> Result<Option<String>, String> {
+        Ok(Self::project_root(namespace).await?.1)
+    }
+
+    async fn rows(&self, namespace: &str) -> Result<Vec<crate::traits::SearchResult>, String> {
+        let (namespace, _) = Self::project_root(namespace).await?;
+        let v = cli_read_op(
+            serde_json::json!({ "op": "list", "namespace": namespace }),
+            std::time::Duration::from_secs(120),
+        )
+        .await
+        .map_err(|e| format!("daemon: {e}"))?;
+        serde_json::from_value(v["rows"].clone()).map_err(|e| e.to_string())
+    }
+
+    async fn set_root(&self, namespace: &str, root: &std::path::Path) -> bool {
+        let sent = daemon_http_client()
+            .post("http://127.0.0.1:34343/cli/root")
+            .json(&serde_json::json!({
+                "op": "cache_root",
+                "namespace": namespace,
+                "root": root.to_string_lossy(),
+            }))
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await;
+        match sent {
+            Ok(res) if res.status().is_success() => res
+                .json::<serde_json::Value>()
+                .await
+                .is_ok_and(|v| v["ok"].as_bool() == Some(true)),
+            _ => false,
+        }
+    }
+}
+
+/// The registry the marker writers (`root set`, `hooks install`) use: the
+/// answering daemon, else the store opened here. Never starts a daemon.
+async fn open_cli_root_registry(
+    probe: DaemonProbe,
+) -> Result<Box<dyn crate::root_marker::RootRegistry>, String> {
     if probe == DaemonProbe::Responsive {
         gate_verify_daemon(fetch_daemon_info().await.as_ref(), daemon::exe_fingerprint())?;
-        return Ok(CliWriteStore::Daemon);
+        return Ok(Box::new(DaemonRootRegistry));
     }
     let config = Config::load().map_err(|e| format!("the config could not be read: {e}"))?;
     if daemon_holds_lock(&config.db_path) {
@@ -2499,112 +2556,100 @@ async fn open_cli_write_store(probe: DaemonProbe) -> Result<CliWriteStore, Strin
         .map_err(|e| format!("the store could not be opened: {e}"))?;
     let store = LadybugStore::new(config.db_path.to_string_lossy().to_string(), dimensions)
         .map_err(|e| format!("the store could not be opened: {e}"))?;
-    Ok(CliWriteStore::Direct(Arc::new(store), embed::build_embedder().ok()))
+    Ok(Box::new(crate::root_marker::StoreRegistry {
+        store: Arc::new(store),
+        emb: embed::build_embedder().ok(),
+        checkpoint: true,
+    }))
 }
 
-/// One op on the daemon's `/cli/root`.
-async fn cli_root_op(body: serde_json::Value) -> Result<serde_json::Value, String> {
-    let res = daemon_http_client()
-        .post("http://127.0.0.1:34343/cli/root")
-        .json(&body)
-        .timeout(std::time::Duration::from_secs(120))
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    let status = res.status();
-    let text = res.text().await.map_err(|e| e.to_string())?;
-    if !status.is_success() {
-        return Err(format!("the daemon answered {status} on /cli/root: {text}"));
-    }
-    serde_json::from_str(&text).map_err(|e| e.to_string())
-}
-
-/// `root set`, through the daemon when one answers.
+/// `root set`: the file work here, the cache through the daemon or the store.
 async fn run_root_set(args: &crate::root_marker::RootSetArgs) -> Result<Vec<String>, String> {
-    match open_cli_write_store(probe_daemon().await).await? {
-        CliWriteStore::Daemon => {
-            let v = cli_root_op(serde_json::json!({
-                "op": "set",
-                "dir": args.dir.to_string_lossy(),
-                "namespace": args.namespace,
-                "source_id": args.source_id,
-                "replace": args.replace,
-                "force": args.force,
-            }))
-            .await?;
-            if v["ok"].as_bool() == Some(true) {
-                Ok(v["lines"]
-                    .as_array()
-                    .map(|a| a.iter().filter_map(|l| l.as_str().map(str::to_string)).collect())
-                    .unwrap_or_default())
-            } else {
-                Err(v["error"].as_str().unwrap_or("root set failed").to_string())
-            }
-        }
-        CliWriteStore::Direct(store, emb) => {
-            let lines = crate::root_marker::root_set(&store, emb.as_ref(), args).await;
-            let _ = store.checkpoint().await;
-            lines
-        }
-    }
+    let registry = open_cli_root_registry(probe_daemon().await).await?;
+    let result = crate::root_marker::root_set_with(registry.as_ref(), args, None).await;
+    registry.finish().await;
+    result
 }
 
-/// `hooks install`'s marker step: (kind, message, marker root). The namespace
-/// is resolved here, from this process's environment, before the daemon is
-/// asked.
-async fn hooks_install_marker(
+/// What `hooks install` printed and its exit code.
+#[derive(Debug, Default)]
+struct HooksInstallReport {
+    code: i32,
+    out: Vec<String>,
+    err: Vec<String>,
+}
+
+/// `hooks install` in the git checkout `root`: the marker step (the
+/// namespace resolved from this process's environment; the registry opened
+/// by `open_registry` only when a namespace is known), then the hooks and
+/// plugins. Another namespace's marker installs nothing (exit 1); every other
+/// marker outcome still installs the hooks.
+async fn run_hooks_install<F>(
     root: &std::path::Path,
+    force: bool,
     namespace: Option<&str>,
-) -> (String, Option<String>, Option<std::path::PathBuf>) {
+    open_registry: impl FnOnce() -> F,
+) -> HooksInstallReport
+where
+    F: std::future::Future<Output = Result<Box<dyn crate::root_marker::RootRegistry>, String>>,
+{
+    use crate::root_marker::SetupMarker;
+    let mut report = HooksInstallReport::default();
     let namespace = match namespace {
-        Some(ns) => ns.to_string(),
-        None => match crate::task::harness_plugins::explicit_namespace(root) {
-            Ok(ns) => ns,
-            Err(candidates) => {
-                let outcome = crate::root_marker::SetupMarker::AskNamespace(candidates);
-                return (outcome.kind().to_string(), outcome.message("", root), None);
+        Some(ns) => Ok(ns.to_string()),
+        None => crate::task::harness_plugins::explicit_namespace(root),
+    };
+    let (message, marker_root) = match namespace {
+        Err(candidates) => (SetupMarker::AskNamespace(candidates).message("", root), None),
+        Ok(ns) => match open_registry().await {
+            Err(why) => (Some(format!("No .NeuroStrata/config.json written: {why}.")), None),
+            Ok(registry) => {
+                let outcome =
+                    crate::root_marker::ensure_marker_with(registry.as_ref(), root, Some(&ns)).await;
+                registry.finish().await;
+                if !outcome.installs_plugins() {
+                    report.err.extend(outcome.message(&ns, root));
+                    report.code = 1;
+                    return report;
+                }
+                (outcome.message(&ns, root), outcome.root().map(std::path::Path::to_path_buf))
             }
         },
     };
-    let unwritten = |why: String| {
-        (
-            "refused".to_string(),
-            Some(format!("No .NeuroStrata/config.json written: {why}.")),
-            None,
-        )
-    };
-    match open_cli_write_store(probe_daemon().await).await {
-        Err(why) => unwritten(why),
-        Ok(CliWriteStore::Daemon) => match cli_root_op(serde_json::json!({
-            "op": "setup",
-            "dir": root.to_string_lossy(),
-            "namespace": namespace,
-        }))
-        .await
-        {
-            Ok(v) => (
-                v["kind"].as_str().unwrap_or("refused").to_string(),
-                v["message"].as_str().map(str::to_string),
-                v["root"].as_str().map(std::path::PathBuf::from),
-            ),
-            Err(e) => unwritten(format!("daemon: {e}")),
-        },
-        Ok(CliWriteStore::Direct(store, emb)) => {
-            let outcome = crate::root_marker::ensure_marker_for_setup(
-                &store,
-                emb.as_ref(),
+    match install_pre_push_hook(root, force) {
+        Ok(target) => {
+            let _ = install_pre_commit_hook(root);
+            // Harness configs get a namespace only from an explicit source
+            // (the marker, a harness config or NEUROSTRATA_NAMESPACE), never
+            // the ledger or the folder name; each config keeps its own.
+            let explicit = match crate::task::harness_plugins::namespace_for_refresh(root, true) {
+                Ok(ns) => ns,
+                Err(e) => {
+                    report.err.push(format!("warning: harness configs left as they are: {e}"));
+                    None
+                }
+            };
+            let _ = crate::task::harness_plugins::auto_install_detected_plugins(
                 root,
-                Some(&namespace),
-            )
-            .await;
-            let _ = store.checkpoint().await;
-            (
-                outcome.kind().to_string(),
-                outcome.message(&namespace, root),
-                outcome.root().map(std::path::Path::to_path_buf),
-            )
+                crate::task::harness_plugins::ConfigNamespace::Keep(explicit.as_deref()),
+                None,
+            );
+            report.out.push(format!(
+                "Installed the NeuroStrata task gate at {} (plus pre-commit ledger and detected harness plugins).",
+                target.display()
+            ));
+            report.out.extend(message);
+            report
+                .out
+                .extend(marker_root.as_deref().and_then(crate::root_marker::commit_advice));
+        }
+        Err(e) => {
+            report.err.extend(message);
+            report.err.push(e.to_string());
+            report.code = 1;
         }
     }
+    report
 }
 
 /// `root audit`: the root is the marker's when it names the audited
@@ -6197,6 +6242,107 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    // ── hooks install: the marker branch (root-marker spec 6.4) ──────────
+
+    /// A fresh git checkout whose hooks go to its own `.git/hooks`, whatever
+    /// the developer's global `core.hooksPath` says.
+    fn hooks_repo(tmp: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
+        let root = dunce::canonicalize(tmp.path()).unwrap().join(name);
+        std::fs::create_dir_all(&root).unwrap();
+        for args in [&["init", "-q"][..], &["config", "core.hooksPath", ".git/hooks"][..]] {
+            let out = std::process::Command::new("git").args(args).current_dir(&root).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        }
+        root
+    }
+
+    fn mock_registry() -> Box<dyn crate::root_marker::RootRegistry> {
+        Box::new(crate::root_marker::StoreRegistry {
+            store: Arc::new(crate::guard::testkit::MockStore::new()),
+            emb: Some(Arc::new(crate::guard::testkit::StubEmbedder)),
+            checkpoint: false,
+        })
+    }
+
+    fn marker_file(root: &std::path::Path) -> std::path::PathBuf {
+        root.join(".NeuroStrata").join("config.json")
+    }
+
+    #[tokio::test]
+    async fn hooks_install_ask_namespace_still_installs_hooks() {
+        let _env = crate::daemon::project_root_env_test_lock();
+        std::env::remove_var("NEUROSTRATA_NAMESPACE");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = hooks_repo(&tmp, "example-project");
+        let opened = std::sync::atomic::AtomicBool::new(false);
+        let opened_ref = &opened;
+        let report = run_hooks_install(&root, false, None, move || async move {
+            opened_ref.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(mock_registry())
+        })
+        .await;
+        assert_eq!(report.code, 0, "{report:?}");
+        assert!(root.join(".git").join("hooks").join("pre-push").is_file(), "{report:?}");
+        assert!(
+            report.out.iter().any(|l| l.contains("hooks install --namespace <ns>") && l.contains("example-project")),
+            "{report:?}"
+        );
+        assert!(!marker_file(&root).exists());
+        assert!(!opened.load(std::sync::atomic::Ordering::SeqCst), "no registry needed to ask");
+    }
+
+    #[tokio::test]
+    async fn hooks_install_under_other_namespace_marker_installs_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = hooks_repo(&tmp, "example-project");
+        std::fs::create_dir_all(root.join(".NeuroStrata")).unwrap();
+        std::fs::write(marker_file(&root), br#"{"version":1,"namespace":"other-project"}"#).unwrap();
+        let report =
+            run_hooks_install(&root, false, Some("example-project"), || async { Ok(mock_registry()) }).await;
+        assert_eq!(report.code, 1, "{report:?}");
+        assert!(report.err.iter().any(|l| l.contains("other-project")), "{report:?}");
+        assert!(report.out.is_empty(), "{report:?}");
+        assert!(!root.join(".git").join("hooks").join("pre-push").exists());
+        assert!(!root.join(".git").join("hooks").join("pre-commit").exists());
+        assert!(!root.join(".NeuroStrata").join("plugins").exists());
+        assert_eq!(
+            std::fs::read(marker_file(&root)).unwrap(),
+            br#"{"version":1,"namespace":"other-project"}"#.to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn hooks_install_with_daemon_unreachable_installs_hooks_without_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = hooks_repo(&tmp, "example-project");
+        let report = run_hooks_install(&root, false, Some("example-project"), || async {
+            Err("no daemon answered and the store is locked".to_string())
+        })
+        .await;
+        assert_eq!(report.code, 0, "{report:?}");
+        assert!(root.join(".git").join("hooks").join("pre-push").is_file());
+        assert!(
+            report.out.iter().any(|l| l
+                == "No .NeuroStrata/config.json written: no daemon answered and the store is locked."),
+            "{report:?}"
+        );
+        assert!(!marker_file(&root).exists());
+    }
+
+    #[tokio::test]
+    async fn hooks_install_with_namespace_writes_marker_and_hooks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = hooks_repo(&tmp, "example-project");
+        let report =
+            run_hooks_install(&root, false, Some("example-project"), || async { Ok(mock_registry()) }).await;
+        assert_eq!(report.code, 0, "{report:?}");
+        assert!(root.join(".git").join("hooks").join("pre-push").is_file());
+        assert!(marker_file(&root).is_file());
+        assert!(report.out.iter().any(|l| l.starts_with("Wrote ")), "{report:?}");
+        // The file is neither committed nor ignored: one line suggests either.
+        assert!(report.out.iter().any(|l| l.contains(".gitignore")), "{report:?}");
+    }
 }
 
 /// Where every CLI HTTP call goes. A constant because `bus-metrics` names it
@@ -8008,59 +8154,20 @@ async fn run() -> anyhow::Result<()> {
                         );
                         std::process::exit(1);
                     }
-                    let (marker_kind, marker_message, marker_root) =
-                        hooks_install_marker(&root, namespace.as_deref()).await;
-                    if marker_kind == "other_namespace" {
-                        // Another namespace owns this folder: install nothing
-                        // that would name a different one.
-                        if let Some(message) = &marker_message {
-                            eprintln!("{message}");
-                        }
-                        std::process::exit(1);
+                    let report = run_hooks_install(&root, force, namespace.as_deref(), || async {
+                        open_cli_root_registry(probe_daemon().await).await
+                    })
+                    .await;
+                    for line in &report.out {
+                        println!("{line}");
                     }
-                    match install_pre_push_hook(&root, force) {
-                        Ok(target) => {
-                            let _ = install_pre_commit_hook(&root);
-                            // Harness configs get a namespace only from an
-                            // explicit source (a harness config or
-                            // NEUROSTRATA_NAMESPACE), never the ledger or the
-                            // folder name; each config keeps its own.
-                            let explicit =
-                                match crate::task::harness_plugins::namespace_for_refresh(
-                                    &root, true,
-                                ) {
-                                    Ok(ns) => ns,
-                                    Err(e) => {
-                                        eprintln!("warning: harness configs left as they are: {e}");
-                                        None
-                                    }
-                                };
-                            let _ = crate::task::harness_plugins::auto_install_detected_plugins(
-                                &root,
-                                crate::task::harness_plugins::ConfigNamespace::Keep(
-                                    explicit.as_deref(),
-                                ),
-                                None,
-                            );
-                            println!(
-                                "Installed the NeuroStrata task gate at {} (plus pre-commit ledger and detected harness plugins).",
-                                target.display()
-                            );
-                            if let Some(message) = &marker_message {
-                                println!("{message}");
-                            }
-                            if let Some(advice) =
-                                marker_root.as_deref().and_then(crate::root_marker::commit_advice)
-                            {
-                                println!("{advice}");
-                            }
-                            return Ok(());
-                        }
-                        Err(e) => {
-                            eprintln!("{}", e);
-                            std::process::exit(1);
-                        }
+                    for line in &report.err {
+                        eprintln!("{line}");
                     }
+                    if report.code != 0 {
+                        std::process::exit(report.code);
+                    }
+                    return Ok(());
                 }
                 HooksCommands::InstallPreCommit => {
                     let root = match git_toplevel().or_else(|| std::env::current_dir().ok()) {

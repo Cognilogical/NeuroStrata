@@ -1692,62 +1692,46 @@ async fn handle_cli_read(
 #[derive(serde::Deserialize)]
 struct RootReq {
     op: String,
-    dir: String,
-    namespace: Option<String>,
-    source_id: Option<String>,
-    #[serde(default)]
-    replace: bool,
-    #[serde(default)]
-    force: bool,
+    namespace: String,
+    root: String,
 }
 
-/// The marker writers of `hooks install` (`setup`) and `root set` (`set`),
-/// run here so the registry change goes through the daemon that holds the
-/// store. The CLI resolves the namespace from its own environment first.
+/// The one registry change `hooks install` and `root set` need from the
+/// daemon: set the namespace's cached root. Every file change (the marker,
+/// old markers, the user config) stays in the CLI process, which checked the
+/// folder before asking; this route only writes the registry row.
 async fn handle_cli_root(
     State(state): State<AppState>,
     Json(req): Json<RootReq>,
 ) -> Result<String, (axum::http::StatusCode, String)> {
-    let dir = std::path::PathBuf::from(&req.dir);
-    let value = match req.op.as_str() {
-        "setup" => {
-            let outcome = crate::root_marker::ensure_marker_for_setup(
-                &state.vector_store,
-                Some(&state.embedder),
-                &dir,
-                req.namespace.as_deref(),
-            )
-            .await;
-            let ns = req.namespace.clone().unwrap_or_default();
-            outcome.to_json(&ns, &dir)
-        }
-        "set" => {
-            let Some(namespace) = req.namespace.clone() else {
+    cli_root_value(&state.vector_store, &state.embedder, &req)
+        .await
+        .map(|v| v.to_string())
+}
+
+async fn cli_root_value(
+    store: &Arc<dyn VectorStore>,
+    emb: &Arc<dyn Embedder>,
+    req: &RootReq,
+) -> Result<serde_json::Value, (axum::http::StatusCode, String)> {
+    match req.op.as_str() {
+        "cache_root" => {
+            let root = std::path::Path::new(&req.root);
+            if !root.is_absolute() {
                 return Err((
                     axum::http::StatusCode::BAD_REQUEST,
-                    "root set needs a namespace".to_string(),
+                    format!("root must be an absolute path, got '{}'", req.root),
                 ));
-            };
-            let args = crate::root_marker::RootSetArgs {
-                dir,
-                namespace,
-                source_id: req.source_id.clone(),
-                replace: req.replace,
-                force: req.force,
-            };
-            match crate::root_marker::root_set(&state.vector_store, Some(&state.embedder), &args).await {
-                Ok(lines) => serde_json::json!({ "ok": true, "lines": lines }),
-                Err(error) => serde_json::json!({ "ok": false, "error": error }),
             }
+            let ns = crate::server::resolve_namespace(store, &req.namespace).await;
+            let ok = crate::registry::set_project_root(store, Some(emb), &ns, root).await;
+            Ok(serde_json::json!({ "ok": ok, "namespace": ns }))
         }
-        other => {
-            return Err((
-                axum::http::StatusCode::BAD_REQUEST,
-                format!("unknown root op '{other}': expected 'setup' or 'set'"),
-            ))
-        }
-    };
-    Ok(value.to_string())
+        other => Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("unknown root op '{other}': expected 'cache_root'"),
+        )),
+    }
 }
 
 /// How long to wait after a checkpoint that could not get its quiet moment.
@@ -2520,6 +2504,45 @@ async fn handle_http_learning_control(
     clippy::cloned_ref_to_slice_refs
 )]
 mod tests {
+    #[tokio::test]
+    async fn cli_root_cache_root_op_sets_only_the_cache() {
+        use crate::guard::testkit::{MockStore, StubEmbedder};
+        let store: std::sync::Arc<dyn crate::traits::VectorStore> = std::sync::Arc::new(MockStore::new());
+        let emb: std::sync::Arc<dyn crate::traits::Embedder> = std::sync::Arc::new(StubEmbedder);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(tmp.path()).unwrap().join("example-project");
+        std::fs::create_dir_all(&root).unwrap();
+        let req = |op: &str, root: &str| super::RootReq {
+            op: op.to_string(),
+            namespace: "example-project".to_string(),
+            root: root.to_string(),
+        };
+
+        let v = super::cli_root_value(&store, &emb, &req("cache_root", &root.to_string_lossy()))
+            .await
+            .unwrap();
+        assert_eq!(v["ok"], serde_json::json!(true), "{v}");
+        assert_eq!(v["namespace"], serde_json::json!("example-project"));
+        assert_eq!(
+            crate::registry::cached_project_root(&store, "example-project").await.unwrap(),
+            Some(root.to_string_lossy().into_owned())
+        );
+        // The daemon writes no file in the folder.
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+
+        // The removed writer ops and a relative root are refused.
+        for op in ["setup", "set"] {
+            let err = super::cli_root_value(&store, &emb, &req(op, &root.to_string_lossy()))
+                .await
+                .unwrap_err();
+            assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST, "{op}");
+        }
+        let err = super::cli_root_value(&store, &emb, &req("cache_root", "relative/dir"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+    }
+
     #[test]
     fn gate_scope_is_optional_for_older_cli_callers() {
         let old: TaskGateReq = serde_json::from_value(serde_json::json!({

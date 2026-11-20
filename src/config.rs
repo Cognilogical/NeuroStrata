@@ -352,7 +352,9 @@ const CONFIG_LOCK_STALE: std::time::Duration = std::time::Duration::from_secs(60
 const CONFIG_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// An exclusive lock on the user config: the file `<config>.lock` beside it,
-/// created with `create_new` and removed on drop. A read-check-write of the
+/// created with `create_new` and removed on drop; one left older than
+/// [`CONFIG_LOCK_STALE`] by a dead process is broken (see
+/// `break_stale_lock`). A read-check-write of the
 /// config holds it so two writers cannot overwrite each other in between.
 pub struct ConfigLock {
     path: PathBuf,
@@ -378,13 +380,8 @@ impl ConfigLock {
                     return Ok(ConfigLock { path });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let stale = fs::metadata(&path)
-                        .and_then(|m| m.modified())
-                        .ok()
-                        .and_then(|t| t.elapsed().ok())
-                        .is_some_and(|age| age > CONFIG_LOCK_STALE);
-                    if stale {
-                        let _ = fs::remove_file(&path);
+                    if is_stale(&path) {
+                        break_stale_lock(&path);
                         continue;
                     }
                     if started.elapsed() > CONFIG_LOCK_WAIT {
@@ -395,10 +392,55 @@ impl ConfigLock {
                     }
                     std::thread::sleep(std::time::Duration::from_millis(25));
                 }
+                // Windows answers "access denied" while another process's
+                // delete or rename of the lock file is still pending: the
+                // lock is changing hands, so wait like for a held lock.
+                Err(e)
+                    if cfg!(windows)
+                        && e.kind() == std::io::ErrorKind::PermissionDenied
+                        && started.elapsed() <= CONFIG_LOCK_WAIT =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
                 Err(e) => {
                     return Err(e).with_context(|| format!("Could not create {}", path.display()))
                 }
             }
+        }
+    }
+}
+
+fn is_stale(path: &Path) -> bool {
+    fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age > CONFIG_LOCK_STALE)
+}
+
+/// Remove the stale lock at `path`, serialized by a short-lived second lock
+/// (`<lock>.break`) and re-checked under it: two waiters that both saw the
+/// same stale file cannot both remove "it", because the second one would
+/// find the first one's successor fresh and leave it alone. A `.break` file
+/// itself older than the stale limit was left by a process that died while
+/// breaking, and is removed.
+fn break_stale_lock(path: &Path) {
+    let mut breaker = path.as_os_str().to_owned();
+    breaker.push(".break");
+    let breaker = PathBuf::from(breaker);
+    match fs::OpenOptions::new().write(true).create_new(true).open(&breaker) {
+        Ok(file) => {
+            drop(file);
+            if is_stale(path) {
+                let _ = fs::remove_file(path);
+            }
+            let _ = fs::remove_file(&breaker);
+        }
+        Err(_) => {
+            if is_stale(&breaker) {
+                let _ = fs::remove_file(&breaker);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
 }
@@ -808,6 +850,47 @@ mod tests {
         assert_eq!(outcome, BindOutcome::LiveElsewhere(live.clone()));
         let config = Config::load_from(&config_path).unwrap();
         assert_eq!(config.project_contexts.get("example-project"), Some(&live));
+    }
+
+    #[test]
+    fn waiters_on_a_stale_config_lock_hold_it_one_at_a_time() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for round in 0..5 {
+            let root = temp_dir("config-lock-stale-race");
+            let config_path = write_config(&root);
+            let lock = config_path.with_file_name("config.json.lock");
+            fs::write(&lock, "12345").unwrap();
+            let old = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+            fs::File::options().write(true).open(&lock).unwrap().set_modified(old).unwrap();
+
+            let inside = std::sync::Arc::new(AtomicUsize::new(0));
+            let most = std::sync::Arc::new(AtomicUsize::new(0));
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+            let waiters: Vec<_> = (0..4)
+                .map(|_| {
+                    let (config_path, inside, most, barrier) =
+                        (config_path.clone(), inside.clone(), most.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        let _held = ConfigLock::acquire(&config_path).unwrap();
+                        let now = inside.fetch_add(1, Ordering::SeqCst) + 1;
+                        most.fetch_max(now, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(30));
+                        inside.fetch_sub(1, Ordering::SeqCst);
+                    })
+                })
+                .collect();
+            for w in waiters {
+                w.join().unwrap();
+            }
+            assert_eq!(most.load(Ordering::SeqCst), 1, "round {round}");
+            let left: Vec<_> = fs::read_dir(&root)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|n| n.contains(".lock"))
+                .collect();
+            assert!(left.is_empty(), "round {round}: {left:?}");
+        }
     }
 
     #[test]
