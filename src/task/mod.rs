@@ -5387,6 +5387,33 @@ mod tests {
         );
     }
 
+    /// `neurostrata-mcp hooks install` and `scripts/install-hooks.sh` must
+    /// install the same fail-closed gate; a stale checked-in copy would let
+    /// one install path bypass the task gate (audit #317).
+    #[test]
+    fn pre_push_hook_sources_stay_byte_identical() {
+        let checked_in = include_str!("../../scripts/hooks/pre-push");
+        if SCAFFOLDED_PRE_PUSH_HOOK != checked_in {
+            panic!(
+                "embedded pre-push hook ({} bytes) differs from scripts/hooks/pre-push ({} bytes)",
+                SCAFFOLDED_PRE_PUSH_HOOK.len(),
+                checked_in.len()
+            );
+        }
+        assert!(
+            !checked_in.contains("NEUROSTRATA_SKIP_GATE=1 git push"),
+            "the blocked message must not advertise the escape hatch"
+        );
+        assert!(
+            checked_in.contains("error: neurostrata-mcp not found"),
+            "a missing gate binary must block the push"
+        );
+        assert!(
+            checked_in.contains("if [ $code -ne 0 ]"),
+            "a non-zero gate exit must block the push"
+        );
+    }
+
     /// A store whose `namespace` already holds one rule, so the namespace
     /// exists for task_create's existence check.
     async fn store_with_namespace(namespace: &str) -> Arc<dyn VectorStore> {

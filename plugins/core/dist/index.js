@@ -863,7 +863,8 @@ function isZeroActionExemptShellSegment(segment) {
         if (sub === 'stash')
             return subArgs[0] === 'list' || subArgs[0] === 'show';
         if (sub === 'branch') {
-            return subArgs.every((arg) => ['--show-current', '-a', '-r', '--list', '-v', '-vv'].includes(arg));
+            return (subArgs.length > 0 &&
+                subArgs.every((arg) => ['--show-current', '-a', '-r', '--list', '-v', '-vv'].includes(arg)));
         }
         return false;
     }

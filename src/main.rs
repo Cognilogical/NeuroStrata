@@ -7007,9 +7007,9 @@ async fn run() -> anyhow::Result<()> {
                             eprintln!(
                                 "[neurostrata:gate] {}",
                                 if strict {
-                                    "--strict: an unavailable database blocks the push. Skip explicitly with NEUROSTRATA_SKIP_GATE=1 git push."
+                                    "--strict: an unavailable database blocks the push."
                                 } else {
-                                    "continuing anyway: an unavailable database is an ops problem, not agent misconduct. Set NEUROSTRATA_SKIP_GATE=1 to silence this, or pass --strict to block."
+                                    "continuing anyway: an unavailable database is an ops problem, not agent misconduct. Pass --strict to block."
                                 }
                             );
                             std::process::exit(gate_exit_code(None, strict));
