@@ -3743,7 +3743,7 @@ mod tests {
         );
         for behavior in [
             "command -v neurostrata-mcp",
-            "NAMESPACE=$(neurostrata-mcp namespace resolve) || exit 1",
+            "NAMESPACE=$(neurostrata-mcp namespace resolve) || { echo \"error: neurostrata-mcp namespace resolve failed — gate NOT run for this push",
             "FOLDER_NAMESPACE=$(basename \"$(git rev-parse --show-toplevel)\")",
             "neurostrata-mcp task gate \"$GATE_NAMESPACE\" --strict",
             "code=$?",

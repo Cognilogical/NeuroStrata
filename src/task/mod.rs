@@ -3845,7 +3845,7 @@ fi
 # The namespace configured for this project, resolved in one place
 # (`neurostrata-mcp namespace resolve`); a failed lookup blocks the push.
 # The folder name, the namespace this gate checked before, is gated too.
-NAMESPACE=$(neurostrata-mcp namespace resolve) || exit 1
+NAMESPACE=$(neurostrata-mcp namespace resolve) || { echo "error: neurostrata-mcp namespace resolve failed — gate NOT run for this push (an older neurostrata-mcp without the namespace resolve command is a likely cause: upgrade it)" >&2; exit 1; }
 FOLDER_NAMESPACE=$(basename "$(git rev-parse --show-toplevel)")
 GATE_NAMESPACES=("$NAMESPACE")
 [ "$FOLDER_NAMESPACE" = "$NAMESPACE" ] || GATE_NAMESPACES+=("$FOLDER_NAMESPACE")
@@ -3885,7 +3885,7 @@ if [ ${#PROJECT_GATES[@]} -gt 0 ]; then
 fi
 
 exit 0   # the gate passed and all project guards passed
-# neurostrata-hook-sha256: 82ed7ad6560afbf45a67ee8e9170aeaeb4dc78b5495969ac9c3566c0ecc83164
+# neurostrata-hook-sha256: 5a3b7ea2ec3f8b14761ee1a4efe8dc985a16706e8a18c820064fb5c52ac49e9c
 "#;
 
 /// SHA-256 of the scaffolded pre-push hook body (excluding the trailing
@@ -6081,7 +6081,7 @@ mod tests {
                         .all(|name| !d.join(name).is_file())
                 })
                 .collect();
-        let run = |with_stub: bool, envs: &[(&str, &str)]| -> Option<i32> {
+        let run = |with_stub: bool, envs: &[(&str, &str)]| -> (Option<i32>, String) {
             let mut dirs = Vec::new();
             if with_stub {
                 dirs.push(stub_dir.clone());
@@ -6101,20 +6101,23 @@ mod tests {
             for (key, value) in envs {
                 cmd.env(key, value);
             }
-            cmd.output().expect("the hook runs").status.code()
+            let out = cmd.output().expect("the hook runs");
+            (out.status.code(), String::from_utf8_lossy(&out.stderr).to_string())
         };
-        assert_eq!(run(false, &[]), Some(1), "no neurostrata-mcp on PATH blocks the push");
-        assert_eq!(
-            run(true, &[("STUB_RESOLVE_EXIT", "2")]),
-            Some(1),
-            "a namespace resolve that exits 2 blocks the push"
+        let (code, stderr) = run(false, &[]);
+        assert_eq!(code, Some(1), "no neurostrata-mcp on PATH blocks the push");
+        assert!(stderr.contains("error: neurostrata-mcp not found"), "{stderr}");
+        let (code, stderr) = run(true, &[("STUB_RESOLVE_EXIT", "2")]);
+        assert_eq!(code, Some(1), "a namespace resolve that exits 2 blocks the push");
+        assert!(
+            stderr.contains("error: neurostrata-mcp namespace resolve failed — gate NOT run for this push")
+                && stderr.contains("upgrade it"),
+            "a failed resolve is announced, never silent: {stderr}"
         );
-        assert_eq!(
-            run(true, &[("STUB_GATE_EXIT", "2")]),
-            Some(1),
-            "a gate that exits 2 blocks the push"
-        );
-        assert_eq!(run(true, &[]), Some(0), "a passing gate lets the push through");
+        let (code, stderr) = run(true, &[("STUB_GATE_EXIT", "2")]);
+        assert_eq!(code, Some(1), "a gate that exits 2 blocks the push");
+        assert!(stderr.contains("the gate could NOT run for this push"), "{stderr}");
+        assert_eq!(run(true, &[]).0, Some(0), "a passing gate lets the push through");
     }
 
     /// `neurostrata-mcp hooks install` and `scripts/install-hooks.sh` must

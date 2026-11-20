@@ -17,7 +17,7 @@ fi
 # The namespace configured for this project, resolved in one place
 # (`neurostrata-mcp namespace resolve`); a failed lookup blocks the push.
 # The folder name, the namespace this gate checked before, is gated too.
-NAMESPACE=$(neurostrata-mcp namespace resolve) || exit 1
+NAMESPACE=$(neurostrata-mcp namespace resolve) || { echo "error: neurostrata-mcp namespace resolve failed — gate NOT run for this push (an older neurostrata-mcp without the namespace resolve command is a likely cause: upgrade it)" >&2; exit 1; }
 FOLDER_NAMESPACE=$(basename "$(git rev-parse --show-toplevel)")
 GATE_NAMESPACES=("$NAMESPACE")
 [ "$FOLDER_NAMESPACE" = "$NAMESPACE" ] || GATE_NAMESPACES+=("$FOLDER_NAMESPACE")
@@ -57,4 +57,4 @@ if [ ${#PROJECT_GATES[@]} -gt 0 ]; then
 fi
 
 exit 0   # the gate passed and all project guards passed
-# neurostrata-hook-sha256: 82ed7ad6560afbf45a67ee8e9170aeaeb4dc78b5495969ac9c3566c0ecc83164
+# neurostrata-hook-sha256: 5a3b7ea2ec3f8b14761ee1a4efe8dc985a16706e8a18c820064fb5c52ac49e9c
