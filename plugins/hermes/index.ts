@@ -548,6 +548,13 @@ export async function prefetchMemoriesForFile(
 
 export const SUBAGENT_CONTEXT_MARKER = "### NeuroStrata Task & Graph Context";
 
+/** Collapse backticks and newlines so a caller-supplied value cannot break
+ *  out of the header's code span (issue #316: the namespace can arrive from
+ *  a committed .NeuroStrata/session_queries.json). */
+function codeSpanValue(value: unknown): string {
+  return String(value ?? "").replace(/[`\r\n]+/g, " ");
+}
+
 export function buildSubagentContextHeader(
   namespace: string,
   taskId: string | null,
@@ -555,7 +562,7 @@ export function buildSubagentContextHeader(
   const taskLabel = taskId ?? "unclaimed (claim a task first)";
   return (
     `${SUBAGENT_CONTEXT_MARKER} (AUTO-INJECTED BY NEUROSTRATA PLUGIN)\n` +
-    `- Namespace: \`${namespace}\` | Active Task ID: \`${taskLabel}\`\n` +
+    `- Namespace: \`${codeSpanValue(namespace)}\` | Active Task ID: \`${codeSpanValue(taskLabel)}\`\n` +
     `- Mandatory Graph-First Lookup Rule: Before blind \`grep\`/\`glob\` or editing files, query \`neurostrata_memories_for_file\`, \`neurostrata_related\`, \`neurostrata_search_memory\` (\`include_related: true\`), or \`neurostrata_sparql_query\` (or \`neurostrata-mcp\` CLI) to inspect governing rules (\`GOVERNS\`) and AST call/import edges (\`DEPENDS_ON\`, \`calls\`, \`imports\`).\n\n`
   );
 }

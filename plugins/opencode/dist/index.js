@@ -1301,7 +1301,18 @@ export function detectCodeMode(ctx, cfg) {
     const harness = (asString(ctx?.harness ?? ctx?.harnessName ?? ctx?.adapter?.name ?? ctx?.tool?.name ?? activeHarnessName) ?? "").toLowerCase();
     return harness.includes("opencode") || harness.includes("code-mode") || harness.includes("codemode");
 }
-export function buildSubagentContextHeader(namespace, taskId, extraContext, options) {
+/**
+ * Render a value inside a markdown backtick code span without allowing a
+ * breakout: backticks close the span and newlines end its line, so both are
+ * collapsed to single spaces. The namespace is not privileged input — it can
+ * arrive from a committed `.NeuroStrata/session_queries.json`, plugin config,
+ * or an environment variable — so every header interpolation goes through
+ * here (issue #316).
+ */
+export function markdownCodeSpanValue(value) {
+    return String(value ?? "").replace(/[`\r\n]+/g, " ");
+}
+function buildSubagentContextHeaderInternal(namespace, taskId, extraContext, options) {
     const taskLabel = taskId ?? "unclaimed (claim a task first)";
     const extra = extraContext && extraContext.trim() ? `\n${extraContext.trim()}\n` : "";
     let lookupRule;
@@ -1318,10 +1329,17 @@ export function buildSubagentContextHeader(namespace, taskId, extraContext, opti
             "- Mandatory Graph-First Lookup Rule: Before editing any file, check whether its path and governing memory IDs (`mem-...`) are already listed in the auto-injected context block in your prompt. For any file you touch that is NOT listed in that block, call `neurostrata_memories_for_file` first (or `neurostrata_search_memory` / `neurostrata_related`).\n";
     }
     return (`${SUBAGENT_CONTEXT_MARKER} (AUTO-INJECTED BY NEUROSTRATA PLUGIN)\n` +
-        `- Namespace: \`${namespace}\` | Active Task ID: \`${taskLabel}\`\n` +
+        `- Namespace: \`${markdownCodeSpanValue(namespace)}\` | Active Task ID: \`${markdownCodeSpanValue(taskLabel)}\`\n` +
         lookupRule +
         extra +
         `\n`);
+}
+/**
+ * Public header builder: sanitizes the two caller-supplied values before
+ * rendering (issue #316).
+ */
+export function buildSubagentContextHeader(namespace, taskId, extraContext, options) {
+    return buildSubagentContextHeaderInternal(namespace, taskId, extraContext, options);
 }
 export function injectSubagentPrompt(target, namespace, taskId, extraContext, options) {
     const raw = typeof target.prompt === "string" ? target.prompt : null;
@@ -1708,7 +1726,7 @@ export async function sessionContextHandler(event, config) {
         const parts = [];
         if (taskId) {
             const status = asString(active.status) ?? "";
-            parts.push(`[NeuroStrata Active Context] Namespace: ${ns} | Active Task: ${taskId} [${status}]`);
+            parts.push(`[NeuroStrata Active Context] Namespace: ${markdownCodeSpanValue(ns)} | Active Task: ${markdownCodeSpanValue(taskId)} [${markdownCodeSpanValue(status)}]`);
         }
         if (goldenRules.length > 0) {
             parts.push(`[NeuroStrata Golden Rules — ALWAYS ENFORCED]\n${goldenRules.map((g) => `  - ${g}`).join("\n")}`);
@@ -1918,7 +1936,10 @@ const executeAfterHandler = async (output, secondArg) => {
     }
     const targetRec = asRecord(target);
     const event = target;
-    const toolName = extractToolName(event);
+    // Resolve the tool name from BOTH arguments (issue #311): in the
+    // two-argument (input, output) form Code Mode hosts carry the name on the
+    // input argument, while the output argument holds the result text.
+    const toolName = extractToolName(event) || extractToolName(output);
     // OpenCode V2 envelope: { name, callID, args, status, result: { content, output, metadata } }
     // Read raw tool text in priority order. OpenCode v2.2.6 delivers
     // `event.result.content` as an array of content parts `[{ type: "text", text: ... }]`.
@@ -1949,8 +1970,13 @@ const executeAfterHandler = async (output, secondArg) => {
         (meta ? meta.neurostrataContext : undefined);
     if (pendingBlock)
         suffixParts.push(pendingBlock);
-    // 2. Task-intent nudge on non-NeuroStrata-native tools.
-    if (toolName !== "" && !NEUROSTRATA_NATIVE_TOOLS.has(toolName) && config.intentDetection.injectReminder) {
+    // 2. Task-intent nudge on non-NeuroStrata-native tools. Read-only
+    //  inspection output is not user or assistant speech, so it never nudges
+    //  either (issue #311): the reminder shares the intake gate.
+    if (toolName !== "" &&
+        !NEUROSTRATA_NATIVE_TOOLS.has(toolName) &&
+        !isReadOnlyInspectionTool(toolName) &&
+        config.intentDetection.injectReminder) {
         const signals = detectTaskIntentsLocal(rawText);
         if (signals.length > 0) {
             const markerList = signals.map((s) => s.marker).join(", ");

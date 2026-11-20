@@ -546,7 +546,7 @@ test("OpenCode V2 execute.after mutates event.result.content and registers sessi
   assert.equal(typeof toolHooks.get("execute.after"), "function");
 
   const afterEvent = {
-    name: "read",
+    name: "write",
     callID: "call_1",
     args: { path: "src/server.rs" },
     status: "completed",
@@ -609,7 +609,7 @@ test("OpenCode V2 execute.after preserves array content[0].text and appends TASK
   assert.equal(typeof toolHooks.get("execute.after"), "function");
 
   const afterEvent = {
-    name: "read",
+    name: "write",
     callID: "call_array_1",
     args: { path: "src/server.rs" },
     status: "completed",

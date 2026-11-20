@@ -1488,7 +1488,19 @@ export interface SubagentHeaderOptions {
   codeMode?: boolean;
 }
 
-export function buildSubagentContextHeader(
+/**
+ * Render a value inside a markdown backtick code span without allowing a
+ * breakout: backticks close the span and newlines end its line, so both are
+ * collapsed to single spaces. The namespace is not privileged input — it can
+ * arrive from a committed `.NeuroStrata/session_queries.json`, plugin config,
+ * or an environment variable — so every header interpolation goes through
+ * here (issue #316).
+ */
+export function markdownCodeSpanValue(value: unknown): string {
+  return String(value ?? "").replace(/[`\r\n]+/g, " ");
+}
+
+function buildSubagentContextHeaderInternal(
   namespace: string,
   taskId: string | null,
   extraContext?: string,
@@ -1509,11 +1521,24 @@ export function buildSubagentContextHeader(
   }
   return (
     `${SUBAGENT_CONTEXT_MARKER} (AUTO-INJECTED BY NEUROSTRATA PLUGIN)\n` +
-    `- Namespace: \`${namespace}\` | Active Task ID: \`${taskLabel}\`\n` +
+    `- Namespace: \`${markdownCodeSpanValue(namespace)}\` | Active Task ID: \`${markdownCodeSpanValue(taskLabel)}\`\n` +
     lookupRule +
     extra +
     `\n`
   );
+}
+
+/**
+ * Public header builder: sanitizes the two caller-supplied values before
+ * rendering (issue #316).
+ */
+export function buildSubagentContextHeader(
+  namespace: string,
+  taskId: string | null,
+  extraContext?: string,
+  options?: SubagentHeaderOptions,
+): string {
+  return buildSubagentContextHeaderInternal(namespace, taskId, extraContext, options);
 }
 
 export function injectSubagentPrompt(
@@ -1931,7 +1956,7 @@ export async function sessionContextHandler(event: any, config: ResolvedConfig):
     const parts: string[] = [];
     if (taskId) {
       const status = asString(active.status) ?? "";
-      parts.push(`[NeuroStrata Active Context] Namespace: ${ns} | Active Task: ${taskId} [${status}]`);
+      parts.push(`[NeuroStrata Active Context] Namespace: ${markdownCodeSpanValue(ns)} | Active Task: ${markdownCodeSpanValue(taskId)} [${markdownCodeSpanValue(status)}]`);
     }
     if (goldenRules.length > 0) {
       parts.push(
@@ -2170,7 +2195,10 @@ const executeAfterHandler = async (output: any, secondArg?: any): Promise<any> =
   const targetRec = asRecord(target);
   const event = target;
 
-  const toolName = extractToolName(event);
+  // Resolve the tool name from BOTH arguments (issue #311): in the
+  // two-argument (input, output) form Code Mode hosts carry the name on the
+  // input argument, while the output argument holds the result text.
+  const toolName = extractToolName(event) || extractToolName(output);
 
   // OpenCode V2 envelope: { name, callID, args, status, result: { content, output, metadata } }
   // Read raw tool text in priority order. OpenCode v2.2.6 delivers
@@ -2207,8 +2235,15 @@ const executeAfterHandler = async (output: any, secondArg?: any): Promise<any> =
     (meta ? (meta.neurostrataContext as string | undefined) : undefined);
   if (pendingBlock) suffixParts.push(pendingBlock);
 
-  // 2. Task-intent nudge on non-NeuroStrata-native tools.
-  if (toolName !== "" && !NEUROSTRATA_NATIVE_TOOLS.has(toolName) && config.intentDetection.injectReminder) {
+  // 2. Task-intent nudge on non-NeuroStrata-native tools. Read-only
+  //  inspection output is not user or assistant speech, so it never nudges
+  //  either (issue #311): the reminder shares the intake gate.
+  if (
+    toolName !== "" &&
+    !NEUROSTRATA_NATIVE_TOOLS.has(toolName) &&
+    !isReadOnlyInspectionTool(toolName) &&
+    config.intentDetection.injectReminder
+  ) {
     const signals = detectTaskIntentsLocal(rawText);
     if (signals.length > 0) {
       const markerList = signals.map((s) => s.marker).join(", ");
