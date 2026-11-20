@@ -6,7 +6,7 @@ use search::{
 };
 use serde_json::json;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[test]
 fn excludes_code_ast_by_default() {
@@ -97,48 +97,58 @@ fn search_memory_contract_prefers_explicit_include_references() {
     assert_eq!(warnings.len(), 1, "one warning for the deprecated alias");
 }
 
-const GRAPH_CONTRACT_SITES: [&str; 6] = [
+// Tracked sites, including the generation source for the harness skill
+// (`.agents/.../SKILL.md`, pulled in via include_str! in harness_plugins.rs).
+// These are ALWAYS asserted — a missing tracked file is a failure, not a skip.
+const GRAPH_CONTRACT_TRACKED_SITES: [&str; 5] = [
     "AGENTS.md",
     ".agents/skills/neurostrata/SKILL.md",
-    ".opencode/skills/neurostrata/SKILL.md",
     "src/task/mod.rs",
     "src/task/wiring.rs",
     "src/task/harness_plugins.rs",
 ];
 
+// Generated from the tracked .agents/ skill at runtime and gitignored; checked
+// only as an additional assertion when present in the working tree.
+const GENERATED_SKILL_SITE: &str = ".opencode/skills/neurostrata/SKILL.md";
+
+fn assert_graph_contract(root: &Path, rel: &str) {
+    let path = root.join(rel);
+    let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+    assert!(
+        !text.contains("include_related: true"),
+        "{rel} still prescribes the removed include_related flag"
+    );
+    for line in text.lines() {
+        let lower = line.to_ascii_lowercase();
+        if (lower.contains("search_memory") || lower.contains("mode"))
+            && lower.contains("vector")
+            && lower.contains("default")
+            && !lower.contains("hybrid")
+        {
+            panic!("{rel} still claims vector is the default mode: {line}");
+        }
+    }
+    if text.contains("search_memory") {
+        assert!(
+            text.contains("hybrid"),
+            "{rel} must document hybrid as the default mode"
+        );
+        assert!(
+            text.contains("include_references"),
+            "{rel} must document include_references"
+        );
+    }
+}
+
 #[test]
 fn prompt_sites_have_no_stale_graph_contract() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    for rel in GRAPH_CONTRACT_SITES {
-        let path = root.join(rel);
-        // .opencode/ is generated from the tracked .agents/ skill and gitignored.
-        if !path.exists() {
-            continue;
-        }
-        let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {rel}: {e}"));
-        assert!(
-            !text.contains("include_related: true"),
-            "{rel} still prescribes the removed include_related flag"
-        );
-        for line in text.lines() {
-            let lower = line.to_ascii_lowercase();
-            if (lower.contains("search_memory") || lower.contains("mode"))
-                && lower.contains("vector")
-                && lower.contains("default")
-                && !lower.contains("hybrid")
-            {
-                panic!("{rel} still claims vector is the default mode: {line}");
-            }
-        }
-        if text.contains("search_memory") {
-            assert!(
-                text.contains("hybrid"),
-                "{rel} must document hybrid as the default mode"
-            );
-            assert!(
-                text.contains("include_references"),
-                "{rel} must document include_references"
-            );
-        }
+    for rel in GRAPH_CONTRACT_TRACKED_SITES {
+        assert_graph_contract(&root, rel);
+    }
+    let generated = root.join(GENERATED_SKILL_SITE);
+    if generated.exists() {
+        assert_graph_contract(&root, GENERATED_SKILL_SITE);
     }
 }

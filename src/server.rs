@@ -11065,7 +11065,11 @@ async fn handle_search_memory(
         results.truncate(DEFAULT_LIMIT);
 
         if results.is_empty() {
-            return "No relevant memories found.".to_string();
+            return finalize_search_report(
+                "No relevant memories found.".to_string(),
+                &arguments,
+                &results,
+            );
         }
 
         for res in &results {
@@ -14788,6 +14792,45 @@ mod tests {
         assert!(
             text.contains("lexical-inhouse"),
             "the derivation is visible: {text}"
+        );
+    }
+
+    /// The lexical empty-results path must still emit the additive response
+    /// contract, otherwise `include_related` is a silent no-op and
+    /// `graph_expanded_ids` disappears on exactly the path callers hit most.
+    #[tokio::test]
+    async fn lexical_empty_results_report_include_related_warning_and_graph_contract() {
+        let dir = std::env::temp_dir().join(format!("ns-lex-empty-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database"),
+        );
+        store.init("probe").await.expect("init the schema");
+        let text = handle_search_memory(
+            serde_json::json!({
+                "namespace": "probe",
+                "query": "no such memory exists here",
+                "mode": "lexical-inhouse",
+                "include_related": true
+            }),
+            Arc::new(StubEmbedder),
+            store,
+        )
+        .await;
+        assert!(
+            text.contains("No relevant memories found."),
+            "empty-result message preserved: {text}"
+        );
+        assert!(
+            text.contains(crate::search::INCLUDE_RELATED_DEPRECATION_WARNING),
+            "deprecation warning must appear on the empty lexical path: {text}"
+        );
+        assert!(
+            text.contains("graph_expanded_ids"),
+            "graph contract line must appear on the empty lexical path: {text}"
+        );
+        assert!(
+            text.contains("search_contract"),
+            "additive contract line must be present: {text}"
         );
     }
 
