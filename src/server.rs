@@ -377,7 +377,8 @@ pub async fn process_mcp_request(
                                 "memory_types": { "type": "array", "items": { "type": "string" }, "description": "Memory types to return. Default [\"rule\",\"fact\",\"procedure\"]." },
                                 "exclude_ids": { "type": "array", "items": { "type": "string" }, "description": "Optional ids to exclude from the results." },
                                 "limit": { "type": "integer", "description": "Max results. Default 5, max 20." },
-                                "include_ast_edges": { "type": "boolean", "description": "Also bundle 1-hop related memories (DEPENDS_ON/SUPERSEDES/RELATES_TO) and a compact AST neighborhood summary (symbols/callers/callees/imports/importers/blast_radius_count). Default true." }
+                                "include_ast_edges": { "type": "boolean", "description": "Also bundle 1-hop related memories (DEPENDS_ON/SUPERSEDES/RELATES_TO) and a compact AST neighborhood summary (symbols/callers/callees/imports/importers/blast_radius_count). Default true." },
+                                "staged_file_count": { "type": "integer", "minimum": 0, "default": 0, "description": "Optional count of files in the current edit scope. At 3 or more, adds a T_DIFF recommendation to neurostrata_diff_tour. Absent means no diff-tour trigger." }
                             },
                             "required": ["namespace", "path"]
                         }
@@ -18789,6 +18790,39 @@ mod tests {
             "expected the canonical no-mesh answer, got: {text}"
         );
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// The T_DIFF escalation trigger is fed by a caller-supplied scope count,
+    /// so `staged_file_count` must be a declared (optional) schema property.
+    #[tokio::test]
+    async fn memories_for_file_schema_declares_optional_staged_file_count() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: "tools/list".to_string(),
+            params: Some(serde_json::json!({})),
+        };
+        let (bus, _seen) = recording_bus();
+        let response =
+            process_mcp_request(request, Arc::new(StubEmbedder), store, ingests, None, bus).await;
+        let tools = response["result"]["tools"]
+            .as_array()
+            .expect("tools/list returns an array");
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == "neurostrata_memories_for_file")
+            .expect("memories_for_file tool must be listed");
+        let schema = &tool["inputSchema"];
+        assert_eq!(schema["properties"]["staged_file_count"]["type"], "integer");
+        let required = schema["required"].as_array().expect("required array");
+        assert!(
+            !required
+                .iter()
+                .any(|v| v.as_str() == Some("staged_file_count")),
+            "staged_file_count must stay optional (absent = no diff-tour trigger)"
+        );
     }
 
     /// Every tool the surface exposes, in the order tools/list returns them.

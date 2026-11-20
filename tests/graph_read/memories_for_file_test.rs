@@ -333,3 +333,24 @@ fn staged_diff_scope_emits_schema_valid_args_only() {
         "diff_tour has no git_ref arg"
     );
 }
+
+#[test]
+fn high_blast_without_seed_emits_no_related_action() {
+    // A high blast radius with no usable seed must NOT emit a schema-invalid
+    // related action with args.id == "".
+    let resp = recommended_next_actions(16, &[], 0, false, "NeuroStrata", None);
+    assert_eq!(resp["next_actions"].as_array().unwrap().len(), 0);
+    let reason = resp["suppressed_reason"].as_str().unwrap();
+    assert!(reason.contains("usable seed"), "reason was {reason:?}");
+
+    // Whitespace-only seed is equally unusable.
+    let resp = recommended_next_actions(16, &[], 0, false, "NeuroStrata", Some("   "));
+    assert_eq!(resp["next_actions"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn next_actions_are_capped_at_three() {
+    let bridges: Vec<String> = (0..5).map(|i| format!("bridge-{i}")).collect();
+    let resp = recommended_next_actions(16, &bridges, 3, false, "NeuroStrata", Some("sym::x"));
+    assert_eq!(resp["next_actions"].as_array().unwrap().len(), 3);
+}

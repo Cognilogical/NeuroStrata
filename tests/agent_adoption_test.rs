@@ -4,6 +4,8 @@
 //! crate-free `task::routing` module from its real path -- the same pattern
 //! `tests/graph_read/memories_for_file_test.rs` uses for its ranking helpers.
 
+#[path = "../src/graph_read/memories_for_file.rs"]
+mod memories_for_file;
 #[path = "../src/task/routing.rs"]
 mod routing;
 
@@ -295,4 +297,51 @@ fn routing_expected_decision_single_source_matches_next_action() {
             "{id}: next_action drifted from contract"
         );
     }
+}
+
+/// Controller drift guard: the crate-free escalation module duplicates values
+/// from `routing` because it cannot import crate code. Pin every duplicate to
+/// the canonical contract so a future edit cannot silently diverge.
+#[test]
+fn memories_for_file_escalation_constants_match_routing_contract() {
+    let contract = agent_routing_contract_json();
+    let triggers = contract["triggers"].as_array().unwrap();
+    let trigger = |id: &str| -> &Value {
+        triggers
+            .iter()
+            .find(|t| t["trigger_id"] == id)
+            .unwrap_or_else(|| panic!("missing trigger {id}"))
+    };
+
+    // Thresholds (and the §5 action cap) have a single numeric source.
+    assert_eq!(
+        memories_for_file::HIGH_BLAST_THRESHOLD,
+        routing::HIGH_BLAST_THRESHOLD
+    );
+    assert_eq!(memories_for_file::HIGH_BLAST_THRESHOLD, 15);
+    assert_eq!(
+        memories_for_file::DIFF_STAGED_FILE_THRESHOLD,
+        routing::DIFF_STAGED_FILE_THRESHOLD
+    );
+    assert_eq!(memories_for_file::DIFF_STAGED_FILE_THRESHOLD, 3);
+    assert_eq!(memories_for_file::MAX_NEXT_ACTIONS, 3);
+    assert_eq!(trigger("T_HIGH_BLAST")["args"]["max_hops"], 2);
+
+    // Expected-decision strings: three canonical triggers plus the seed-edge
+    // fallback, which deliberately resolves to routing's unknown case.
+    for (id, local) in [
+        ("T_AMBIGUOUS", memories_for_file::EXPECTED_AMBIGUOUS),
+        ("T_HIGH_BLAST", memories_for_file::EXPECTED_HIGH_BLAST),
+        ("T_DIFF", memories_for_file::EXPECTED_DIFF),
+    ] {
+        assert_eq!(
+            local,
+            trigger(id)["expected_decision"].as_str().unwrap(),
+            "{id}: duplicated expected_decision drifted"
+        );
+    }
+    assert_eq!(
+        memories_for_file::EXPECTED_SEED_EDGE,
+        routing::EXPECTED_DECISION_UNKNOWN
+    );
 }

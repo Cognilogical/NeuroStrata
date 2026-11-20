@@ -215,16 +215,19 @@ pub fn rank_hits(hits: &mut [MemoryHit]) {
 // integration test can compile it from its real path; hence the duplication.
 
 /// R4: an AST blast radius at or above this value needs a two-hop expansion.
-const HIGH_BLAST_THRESHOLD: usize = 15;
+/// `pub` so `tests/agent_adoption_test.rs` can pin it against `routing`.
+pub const HIGH_BLAST_THRESHOLD: usize = 15;
 /// R4: at least this many staged files (or a PR review scope) needs a diff tour.
-const DIFF_STAGED_FILE_THRESHOLD: usize = 3;
+pub const DIFF_STAGED_FILE_THRESHOLD: usize = 3;
+/// §5: no response may recommend more than three follow-up actions.
+pub const MAX_NEXT_ACTIONS: usize = 3;
 
-const EXPECTED_AMBIGUOUS: &str = "Pick a localized symbol/path, then re-run the path lookup.";
-const EXPECTED_HIGH_BLAST: &str =
+pub const EXPECTED_AMBIGUOUS: &str = "Pick a localized symbol/path, then re-run the path lookup.";
+pub const EXPECTED_HIGH_BLAST: &str =
     "Expand two hops; re-plan edits around unchanged callers before proceeding.";
-const EXPECTED_SEED_EDGE: &str =
+pub const EXPECTED_SEED_EDGE: &str =
     "Use the result to decide the next step; abstain when it adds no evidence.";
-const EXPECTED_DIFF: &str =
+pub const EXPECTED_DIFF: &str =
     "Review by dependency stop; audit unchanged callers and governing rules.";
 
 /// FNV-1a over the emitted args plus relevant ids. Stable across runs so an
@@ -269,8 +272,9 @@ fn next_action(
 ///
 /// - `empty` -> `status:"empty"` + `T_AMBIGUOUS` to `neurostrata_locate`.
 ///   An empty lookup is NOT "no governance" and is never described as such.
-/// - `blast_radius_count >= 15` -> `T_HIGH_BLAST` to `neurostrata_related`
-///   with `max_hops:2` (one-hop data is already in the response).
+/// - `blast_radius_count >= 15` **and a usable seed id** -> `T_HIGH_BLAST` to
+///   `neurostrata_related` with `max_hops:2`. An empty/whitespace seed is never
+///   emitted as `args.id`; with no seed the trigger is skipped.
 /// - a non-empty conceptual bridge -> `T_SEED_EDGE` to `neurostrata_object_view`.
 /// - `staged_file_count >= 3` -> `T_DIFF` to `neurostrata_diff_tour` with
 ///   only the schema-valid `{namespace, diff_text}` args (`git_ref`, if any,
@@ -301,18 +305,21 @@ pub fn recommended_next_actions(
         ));
     } else {
         if blast_radius_count >= HIGH_BLAST_THRESHOLD {
-            let id = seed_id.unwrap_or("");
-            let args = json!({ "namespace": namespace, "id": id, "max_hops": 2 });
-            actions.push(next_action(
-                "T_HIGH_BLAST",
-                "neurostrata_related",
-                &args,
-                &[id.to_string()],
-                &format!(
-                    "Blast radius {blast_radius_count} >= 15: expand two hops before editing."
-                ),
-                EXPECTED_HIGH_BLAST,
-            ));
+            // `routing::next_action` likewise refuses an empty seed id: a
+            // related call with args.id == "" is schema-invalid, so abstain.
+            if let Some(id) = seed_id.filter(|id| !id.trim().is_empty()) {
+                let args = json!({ "namespace": namespace, "id": id, "max_hops": 2 });
+                actions.push(next_action(
+                    "T_HIGH_BLAST",
+                    "neurostrata_related",
+                    &args,
+                    &[id.to_string()],
+                    &format!(
+                        "Blast radius {blast_radius_count} >= 15: expand two hops before editing."
+                    ),
+                    EXPECTED_HIGH_BLAST,
+                ));
+            }
         }
         if let Some(bridge_id) = bridge_ids.iter().find(|id| !id.is_empty()) {
             let args = json!({ "namespace": namespace, "id": bridge_id });
@@ -340,15 +347,18 @@ pub fn recommended_next_actions(
         ));
     }
 
-    actions.truncate(3);
+    actions.truncate(MAX_NEXT_ACTIONS);
     let mut response = json!({ "status": status, "next_actions": actions });
     if response["next_actions"]
         .as_array()
         .is_some_and(Vec::is_empty)
     {
-        response["suppressed_reason"] = Value::String(format!(
-            "Single-file lookup already carries 1-hop related memories; no escalation (blast radius {blast_radius_count} < 15, no conceptual bridges, staged scope {staged_file_count} < 3)."
-        ));
+        // State the *conditions* for escalation, not the observed values: a
+        // high-radius lookup with no usable seed also lands here.
+        response["suppressed_reason"] = Value::String(
+            "Single-file lookup already carries 1-hop related memories; no trigger fired (high-blast needs radius >= 15 and a usable seed, no conceptual bridge, staged scope < 3)."
+                .to_string(),
+        );
     }
     response
 }
