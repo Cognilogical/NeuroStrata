@@ -1454,7 +1454,12 @@ mod tests {
     async fn list_pointers_excludes_retired_rows_and_keeps_active_visible() {
         let now = now_epoch();
         let ns = "ns1";
-        let spy = Arc::new(SpyConnector::new("spy", DataPoolAccessMode::ReadWrite, 10, 1024));
+        let spy = Arc::new(SpyConnector::new(
+            "spy",
+            DataPoolAccessMode::ReadWrite,
+            10,
+            1024,
+        ));
         let (kernel, store, _dir) = build_kernel(spy.clone());
         store.init(ns).await.expect("init");
 
@@ -1465,10 +1470,16 @@ mod tests {
         let active = pointer_record("ptr_active", "spy", now, 3600);
         seed_pointer(&store, ns, &active, "alice", None).await;
         let retired_cases = [
-            ("ptr_retired_valid_to", json!({"valid_to": now.saturating_sub(1)})),
+            (
+                "ptr_retired_valid_to",
+                json!({"valid_to": now.saturating_sub(1)}),
+            ),
             ("ptr_retired_archived", json!({"archived": true})),
             ("ptr_retired_flag", json!({"retired": true})),
-            ("ptr_retired_superseded", json!({"superseded_by": "ptr_active"})),
+            (
+                "ptr_retired_superseded",
+                json!({"superseded_by": "ptr_active"}),
+            ),
         ];
         for (pid, marker) in &retired_cases {
             let rec = pointer_record(pid, "spy", now, 3600);

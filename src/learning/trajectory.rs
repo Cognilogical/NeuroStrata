@@ -153,9 +153,9 @@ pub async fn mine_procedures(
                 Ok(key) => key,
                 Err(_) => continue,
             };
-            let entry = patterns.entry(key).or_insert_with(|| {
-                (window.to_vec(), BTreeSet::new(), BTreeSet::new())
-            });
+            let entry = patterns
+                .entry(key)
+                .or_insert_with(|| (window.to_vec(), BTreeSet::new(), BTreeSet::new()));
             entry.1.insert(task.task_id.clone());
             entry
                 .2
@@ -183,7 +183,14 @@ pub async fn mine_procedures(
             receipt_ids: receipt_ids.into_iter().collect(),
             pattern,
         };
-        if dedup_safe(&candidate, existing_procedures, judge.as_deref(), confidence_threshold).await {
+        if dedup_safe(
+            &candidate,
+            existing_procedures,
+            judge.as_deref(),
+            confidence_threshold,
+        )
+        .await
+        {
             candidates.push(candidate);
         }
     }
@@ -384,7 +391,11 @@ mod tests {
             row_deltas: vec![],
             task_deltas: vec![],
             reverted_at: if reverted { Some(1_700_001_000) } else { None },
-            reverted_by_receipt_id: if reverted { Some(format!("rev-{tag}")) } else { None },
+            reverted_by_receipt_id: if reverted {
+                Some(format!("rev-{tag}"))
+            } else {
+                None
+            },
             reverts_receipt_id: None,
             forced_by: None,
             forced_at: None,
@@ -517,9 +528,24 @@ mod tests {
     /// Three distinct qualifying tasks sharing `s`.
     fn three_tasks(s: &TrajectoryStep) -> Vec<TaskEvidence> {
         vec![
-            task("t1", Status::Done, vec![receipt("r1", false)], vec![s.clone()]),
-            task("t2", Status::Done, vec![receipt("r2", false)], vec![s.clone()]),
-            task("t3", Status::Done, vec![receipt("r3", false)], vec![s.clone()]),
+            task(
+                "t1",
+                Status::Done,
+                vec![receipt("r1", false)],
+                vec![s.clone()],
+            ),
+            task(
+                "t2",
+                Status::Done,
+                vec![receipt("r2", false)],
+                vec![s.clone()],
+            ),
+            task(
+                "t3",
+                Status::Done,
+                vec![receipt("r3", false)],
+                vec![s.clone()],
+            ),
         ]
     }
 
@@ -527,14 +553,28 @@ mod tests {
     async fn two_occurrences_rejected_three_accepted() {
         let s = step("session-start", vec!["tool_a", "tool_b"], Some("gate_ok"));
         let tasks_2 = vec![
-            task("t1", Status::Done, vec![receipt("r1", false)], vec![s.clone()]),
-            task("t2", Status::Done, vec![receipt("r2", false)], vec![s.clone()]),
+            task(
+                "t1",
+                Status::Done,
+                vec![receipt("r1", false)],
+                vec![s.clone()],
+            ),
+            task(
+                "t2",
+                Status::Done,
+                vec![receipt("r2", false)],
+                vec![s.clone()],
+            ),
         ];
         let cands_2 = mine_procedures(&tasks_2, 1, &[], Some(no_dup()), 0.8).await;
         assert_eq!(cands_2.len(), 0, "two occurrences must be rejected");
 
         let cands_3 = mine_procedures(&three_tasks(&s), 1, &[], Some(no_dup()), 0.8).await;
-        assert_eq!(cands_3.len(), 1, "three occurrences must yield one candidate");
+        assert_eq!(
+            cands_3.len(),
+            1,
+            "three occurrences must yield one candidate"
+        );
         assert_eq!(cands_3[0].task_ids, vec!["t1", "t2", "t3"]);
         assert_eq!(cands_3[0].receipt_ids, vec!["r1", "r2", "r3"]);
     }
@@ -549,7 +589,11 @@ mod tests {
             vec![s.clone(), s.clone(), s.clone()],
         )];
         let cands = mine_procedures(&tasks, 1, &[], Some(no_dup()), 0.8).await;
-        assert_eq!(cands.len(), 0, "one task repeated is not three distinct tasks");
+        assert_eq!(
+            cands.len(),
+            0,
+            "one task repeated is not three distinct tasks"
+        );
     }
 
     #[tokio::test]
@@ -557,21 +601,55 @@ mod tests {
         let s_ab = step("session-start", vec!["A", "B"], None);
         let s_ba = step("session-start", vec!["B", "A"], None);
         let tasks = vec![
-            task("t1", Status::Done, vec![receipt("r1", false)], vec![s_ab.clone()]),
-            task("t2", Status::Done, vec![receipt("r2", false)], vec![s_ba.clone()]),
-            task("t3", Status::Done, vec![receipt("r3", false)], vec![s_ab.clone()]),
+            task(
+                "t1",
+                Status::Done,
+                vec![receipt("r1", false)],
+                vec![s_ab.clone()],
+            ),
+            task(
+                "t2",
+                Status::Done,
+                vec![receipt("r2", false)],
+                vec![s_ba.clone()],
+            ),
+            task(
+                "t3",
+                Status::Done,
+                vec![receipt("r3", false)],
+                vec![s_ab.clone()],
+            ),
         ];
         let cands = mine_procedures(&tasks, 1, &[], Some(no_dup()), 0.8).await;
-        assert_eq!(cands.len(), 0, "distinct order patterns must not be conflated");
+        assert_eq!(
+            cands.len(),
+            0,
+            "distinct order patterns must not be conflated"
+        );
     }
 
     #[tokio::test]
     async fn any_revert_blocks_candidate() {
         let s = step("session-start", vec!["a", "b"], None);
         let tasks = vec![
-            task("t1", Status::Done, vec![receipt("r1", false)], vec![s.clone()]),
-            task("t2", Status::Done, vec![receipt("r2", true)], vec![s.clone()]),
-            task("t3", Status::Done, vec![receipt("r3", false)], vec![s.clone()]),
+            task(
+                "t1",
+                Status::Done,
+                vec![receipt("r1", false)],
+                vec![s.clone()],
+            ),
+            task(
+                "t2",
+                Status::Done,
+                vec![receipt("r2", true)],
+                vec![s.clone()],
+            ),
+            task(
+                "t3",
+                Status::Done,
+                vec![receipt("r3", false)],
+                vec![s.clone()],
+            ),
         ];
         let cands = mine_procedures(&tasks, 1, &[], Some(no_dup()), 0.8).await;
         assert_eq!(cands.len(), 0, "reverted receipt must block candidate");
@@ -589,11 +667,25 @@ mod tests {
         };
         let tasks = vec![
             no_receipt,
-            task("t2", Status::Done, vec![receipt("r2", false)], vec![s.clone()]),
-            task("t3", Status::Done, vec![receipt("r3", false)], vec![s.clone()]),
+            task(
+                "t2",
+                Status::Done,
+                vec![receipt("r2", false)],
+                vec![s.clone()],
+            ),
+            task(
+                "t3",
+                Status::Done,
+                vec![receipt("r3", false)],
+                vec![s.clone()],
+            ),
         ];
         let cands = mine_procedures(&tasks, 1, &[], Some(no_dup()), 0.8).await;
-        assert_eq!(cands.len(), 0, "empty receipt chain must not count as evidence");
+        assert_eq!(
+            cands.len(),
+            0,
+            "empty receipt chain must not count as evidence"
+        );
     }
 
     #[tokio::test]
@@ -608,11 +700,25 @@ mod tests {
         };
         let tasks = vec![
             no_extraction,
-            task("t2", Status::Done, vec![receipt("r2", false)], vec![s.clone()]),
-            task("t3", Status::Done, vec![receipt("r3", false)], vec![s.clone()]),
+            task(
+                "t2",
+                Status::Done,
+                vec![receipt("r2", false)],
+                vec![s.clone()],
+            ),
+            task(
+                "t3",
+                Status::Done,
+                vec![receipt("r3", false)],
+                vec![s.clone()],
+            ),
         ];
         let cands = mine_procedures(&tasks, 1, &[], Some(no_dup()), 0.8).await;
-        assert_eq!(cands.len(), 0, "no extracted memory must not count as evidence");
+        assert_eq!(
+            cands.len(),
+            0,
+            "no extracted memory must not count as evidence"
+        );
     }
 
     #[tokio::test]
@@ -683,17 +789,36 @@ mod tests {
         assert_eq!(cands.len(), 1);
         let mem = candidate_to_memory(&cands[0]);
         let violations = crate::rdf::shacl::validate_memory(&mem);
-        assert!(violations.is_empty(), "candidate memory must pass SHACL: {:?}", violations);
+        assert!(
+            violations.is_empty(),
+            "candidate memory must pass SHACL: {:?}",
+            violations
+        );
         assert_eq!(mem.memory_type, "procedure");
         let md = mem.metadata;
-        assert_eq!(md.get("generated_by").and_then(|v| v.as_str()), Some("trajectory-miner"));
-        assert_eq!(md.get("epistemic_tier").and_then(|v| v.as_str()), Some("empirical_verified"));
+        assert_eq!(
+            md.get("generated_by").and_then(|v| v.as_str()),
+            Some("trajectory-miner")
+        );
+        assert_eq!(
+            md.get("epistemic_tier").and_then(|v| v.as_str()),
+            Some("empirical_verified")
+        );
         assert_eq!(md.get("remaining_fires").and_then(|v| v.as_i64()), Some(10));
-        assert_eq!(md.get("performance_count").and_then(|v| v.as_i64()), Some(0));
+        assert_eq!(
+            md.get("performance_count").and_then(|v| v.as_i64()),
+            Some(0)
+        );
         let vb = md.get("verified_by").and_then(|v| v.as_str()).unwrap_or("");
-        assert_eq!(vb, "receipts:r1,r2,r3", "verified_by must cite exact receipt ids");
+        assert_eq!(
+            vb, "receipts:r1,r2,r3",
+            "verified_by must cite exact receipt ids"
+        );
         let src = md.get("source").and_then(|v| v.as_str()).unwrap_or("");
-        assert_eq!(src, "receipts:r1,r2,r3", "source must cite exact receipt ids");
+        assert_eq!(
+            src, "receipts:r1,r2,r3",
+            "source must cite exact receipt ids"
+        );
         assert_eq!(src, vb, "empirical_verified requires source == verified_by");
         let evidence = md.get("source_evidence").unwrap();
         let receipt_ids = evidence.get("receipt_ids").unwrap().as_array().unwrap();
@@ -722,7 +847,14 @@ mod tests {
             "no receipt => canonical unverified_agent tier"
         );
         assert!(!md.to_string().contains("empirical_verified"));
-        assert!(md.get("source_evidence").unwrap().get("receipt_ids").unwrap().as_array().unwrap().is_empty());
+        assert!(md
+            .get("source_evidence")
+            .unwrap()
+            .get("receipt_ids")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -733,10 +865,18 @@ mod tests {
 
         let dup_judge: Arc<dyn JudgmentProvider> = Arc::new(AlwaysDupProvider);
         let cands_dup = mine_procedures(&tasks, 1, &existing, Some(dup_judge), 0.8).await;
-        assert_eq!(cands_dup.len(), 0, "duplicate found by judge must block candidate");
+        assert_eq!(
+            cands_dup.len(),
+            0,
+            "duplicate found by judge must block candidate"
+        );
 
         let cands_none = mine_procedures(&tasks, 1, &existing, None, 0.8).await;
-        assert_eq!(cands_none.len(), 0, "absent judge must be treated as unsafe");
+        assert_eq!(
+            cands_none.len(),
+            0,
+            "absent judge must be treated as unsafe"
+        );
 
         let err_judge: Arc<dyn JudgmentProvider> = Arc::new(ErrorProvider);
         let cands_err = mine_procedures(&tasks, 1, &existing, Some(err_judge), 0.8).await;
@@ -759,7 +899,9 @@ mod tests {
         // Action-effect metadata must mirror candidate_to_memory exactly and
         // use the canonical verified vocabulary.
         let template = match &def.effects[0] {
-            ActionEffectTemplate::UpsertMemory { metadata_template, .. } => metadata_template.clone(),
+            ActionEffectTemplate::UpsertMemory {
+                metadata_template, ..
+            } => metadata_template.clone(),
             other @ ActionEffectTemplate::SetTwinState { .. } => {
                 panic!("candidate_to_action_type must produce UpsertMemory, got {other:?}")
             }
@@ -781,10 +923,22 @@ mod tests {
                 "effect metadata '{field}' must mirror procedure metadata"
             );
         }
-        assert_eq!(template.get("generated_by").and_then(|v| v.as_str()), Some("trajectory-miner"));
-        assert_eq!(template.get("verified_by").and_then(|v| v.as_str()), Some("receipts:r1,r2,r3"));
-        assert_eq!(template.get("source").and_then(|v| v.as_str()), Some("receipts:r1,r2,r3"));
-        assert_eq!(template.get("epistemic_tier").and_then(|v| v.as_str()), Some("empirical_verified"));
+        assert_eq!(
+            template.get("generated_by").and_then(|v| v.as_str()),
+            Some("trajectory-miner")
+        );
+        assert_eq!(
+            template.get("verified_by").and_then(|v| v.as_str()),
+            Some("receipts:r1,r2,r3")
+        );
+        assert_eq!(
+            template.get("source").and_then(|v| v.as_str()),
+            Some("receipts:r1,r2,r3")
+        );
+        assert_eq!(
+            template.get("epistemic_tier").and_then(|v| v.as_str()),
+            Some("empirical_verified")
+        );
 
         let def_payload = MemoryPayload {
             content: def.title.clone(),
@@ -820,7 +974,9 @@ mod tests {
         };
         let def = candidate_to_action_type(&candidate).unwrap().definition;
         let template = match &def.effects[0] {
-            ActionEffectTemplate::UpsertMemory { metadata_template, .. } => metadata_template.clone(),
+            ActionEffectTemplate::UpsertMemory {
+                metadata_template, ..
+            } => metadata_template.clone(),
             other @ ActionEffectTemplate::SetTwinState { .. } => {
                 panic!("candidate_to_action_type must produce UpsertMemory, got {other:?}")
             }
@@ -834,9 +990,18 @@ mod tests {
                 panic!("candidate_to_action_type must produce UpsertMemory, got {other:?}")
             }
         };
-        assert_eq!(template.get("epistemic_tier").and_then(|v| v.as_str()), Some("unverified_agent"));
-        assert_eq!(template.get("verified_by").and_then(|v| v.as_str()), Some("tasks:t1"));
-        assert_eq!(template.get("source").and_then(|v| v.as_str()), Some("tasks:t1"));
+        assert_eq!(
+            template.get("epistemic_tier").and_then(|v| v.as_str()),
+            Some("unverified_agent")
+        );
+        assert_eq!(
+            template.get("verified_by").and_then(|v| v.as_str()),
+            Some("tasks:t1")
+        );
+        assert_eq!(
+            template.get("source").and_then(|v| v.as_str()),
+            Some("tasks:t1")
+        );
         assert!(!template.to_string().contains("empirical_verified"));
         // Mirrors the procedure payload for the same evidence-free candidate.
         let proc_md = candidate_to_memory(&candidate).metadata;

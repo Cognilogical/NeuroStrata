@@ -122,8 +122,15 @@ pub fn format_iri(iri: &str) -> Result<String, ParseError> {
         {
             escaped.push(ch);
         } else if c > 0x007F || c <= 0x0020 {
-            if ch == '<' || ch == '>' || ch == '"' || ch == '{' || ch == '}' || ch == '|'
-                || ch == '^' || ch == '\\' || ch == '`'
+            if ch == '<'
+                || ch == '>'
+                || ch == '"'
+                || ch == '{'
+                || ch == '}'
+                || ch == '|'
+                || ch == '^'
+                || ch == '\\'
+                || ch == '`'
             {
                 return Err(ParseError::InvalidTerm {
                     line: 0,
@@ -144,11 +151,7 @@ pub fn format_iri(iri: &str) -> Result<String, ParseError> {
     Ok(format!("<{}>", escaped))
 }
 
-pub fn format_literal(
-    value: &str,
-    datatype: Option<&str>,
-    lang: Option<&str>,
-) -> String {
+pub fn format_literal(value: &str, datatype: Option<&str>, lang: Option<&str>) -> String {
     let mut escaped = String::new();
     for ch in value.chars() {
         match ch {
@@ -169,7 +172,10 @@ pub fn format_literal(
     }
     let mut result = format!("\"{}\"", escaped);
     if let Some(dt) = datatype {
-        result.push_str(&format!("^^{}", format_iri(dt).unwrap_or_else(|_| format!("<{}>", dt))));
+        result.push_str(&format!(
+            "^^{}",
+            format_iri(dt).unwrap_or_else(|_| format!("<{}>", dt))
+        ));
     }
     if let Some(l) = lang {
         result.push_str(&format!("@{}", l));
@@ -226,24 +232,39 @@ impl Stream {
             let s = match format_iri(&delta.subject) {
                 Ok(formatted) => formatted,
                 Err(e) => {
-                    tracing::warn!("streaming to_patch: malformed subject IRI {:?}: {}", delta.subject, e);
+                    tracing::warn!(
+                        "streaming to_patch: malformed subject IRI {:?}: {}",
+                        delta.subject,
+                        e
+                    );
                     delta.subject.clone()
                 }
             };
             let p = match format_iri(&delta.predicate) {
                 Ok(formatted) => formatted,
                 Err(e) => {
-                    tracing::warn!("streaming to_patch: malformed predicate IRI {:?}: {}", delta.predicate, e);
+                    tracing::warn!(
+                        "streaming to_patch: malformed predicate IRI {:?}: {}",
+                        delta.predicate,
+                        e
+                    );
                     delta.predicate.clone()
                 }
             };
-            let o = if delta.object.starts_with('"') || delta.object.starts_with("_") || delta.object.starts_with('<') {
+            let o = if delta.object.starts_with('"')
+                || delta.object.starts_with("_")
+                || delta.object.starts_with('<')
+            {
                 delta.object.clone()
             } else {
                 match format_term(&delta.object) {
                     Ok(formatted) => formatted,
                     Err(e) => {
-                        tracing::warn!("streaming to_patch: malformed object term {:?}: {}", delta.object, e);
+                        tracing::warn!(
+                            "streaming to_patch: malformed object term {:?}: {}",
+                            delta.object,
+                            e
+                        );
                         delta.object.clone()
                     }
                 }
@@ -337,7 +358,11 @@ impl Stream {
                         i += 1;
                     }
                     // Consume optional datatype (^^<...>) or language tag (@lang) suffix.
-                    if i < chars.len() && chars[i] == '^' && i + 1 < chars.len() && chars[i + 1] == '^' {
+                    if i < chars.len()
+                        && chars[i] == '^'
+                        && i + 1 < chars.len()
+                        && chars[i + 1] == '^'
+                    {
                         term_chars.push(chars[i]);
                         term_chars.push(chars[i + 1]);
                         i += 2;
@@ -418,8 +443,14 @@ impl Stream {
 
             results.push(Delta {
                 op,
-                subject: subject.trim_start_matches('<').trim_end_matches('>').to_string(),
-                predicate: predicate.trim_start_matches('<').trim_end_matches('>').to_string(),
+                subject: subject
+                    .trim_start_matches('<')
+                    .trim_end_matches('>')
+                    .to_string(),
+                predicate: predicate
+                    .trim_start_matches('<')
+                    .trim_end_matches('>')
+                    .to_string(),
                 object: object,
                 graph,
             });
@@ -468,7 +499,11 @@ impl Stream {
                         i += 1;
                     }
                     // Consume optional datatype (^^<...>) or language tag (@lang) suffix.
-                    if i < chars.len() && chars[i] == '^' && i + 1 < chars.len() && chars[i + 1] == '^' {
+                    if i < chars.len()
+                        && chars[i] == '^'
+                        && i + 1 < chars.len()
+                        && chars[i + 1] == '^'
+                    {
                         term_chars.push(chars[i]);
                         term_chars.push(chars[i + 1]);
                         i += 2;
@@ -540,12 +575,12 @@ impl Stream {
                 None
             };
             let subject = if subject_raw.starts_with('<') && subject_raw.ends_with('>') {
-                subject_raw[1..subject_raw.len()-1].to_string()
+                subject_raw[1..subject_raw.len() - 1].to_string()
             } else {
                 subject_raw
             };
             let predicate = if predicate_raw.starts_with('<') && predicate_raw.ends_with('>') {
-                predicate_raw[1..predicate_raw.len()-1].to_string()
+                predicate_raw[1..predicate_raw.len() - 1].to_string()
             } else {
                 predicate_raw
             };
@@ -556,7 +591,7 @@ impl Stream {
             };
             let graph = graph_raw.as_ref().map(|g| {
                 if g.starts_with('<') && g.ends_with('>') {
-                    g[1..g.len()-1].to_string()
+                    g[1..g.len() - 1].to_string()
                 } else {
                     g.clone()
                 }
@@ -741,7 +776,8 @@ mod tests {
 
     #[test]
     fn test_from_nquads() {
-        let nquads = "<http://example.org/s> <http://example.org/p> \"test\" <http://example.org/g> .";
+        let nquads =
+            "<http://example.org/s> <http://example.org/p> \"test\" <http://example.org/g> .";
         let stream = Stream::from_nquads(nquads, PatchOp::Add).unwrap();
         assert_eq!(stream.len(), 1);
         assert_eq!(stream.events[0].op, PatchOp::Add);

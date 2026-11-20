@@ -25,8 +25,17 @@ pub fn evaluate_fsm_guard(
     if !is_mutating
         || matches!(
             action_lower.as_str(),
-            "read" | "read_file" | "get" | "list" | "search" | "query" | "view" | "cat"
-                | "inspect" | "grep" | "glob"
+            "read"
+                | "read_file"
+                | "get"
+                | "list"
+                | "search"
+                | "query"
+                | "view"
+                | "cat"
+                | "inspect"
+                | "grep"
+                | "glob"
         )
     {
         return (true, None);

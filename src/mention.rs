@@ -9,9 +9,7 @@ use std::collections::HashMap;
 
 const MENTION_CAP: usize = 32;
 
-const STOPWORDS: &[&str] = &[
-    "id", "x", "i", "t", "n", "ok", "err", "new", "get", "set",
-];
+const STOPWORDS: &[&str] = &["id", "x", "i", "t", "n", "ok", "err", "new", "get", "set"];
 
 /// Strip surrounding punctuation from a token, returning the inner string.
 fn strip_surrounding_punct(s: &str) -> String {
@@ -20,7 +18,10 @@ fn strip_surrounding_punct(s: &str) -> String {
     let bytes = s.as_bytes();
     while start < end {
         let c = bytes[start] as char;
-        if matches!(c, '`' | '"' | '\'' | '(' | '[' | '{' | '<' | ',' | ';' | ':' | '.' | '!' | '?') {
+        if matches!(
+            c,
+            '`' | '"' | '\'' | '(' | '[' | '{' | '<' | ',' | ';' | ':' | '.' | '!' | '?'
+        ) {
             start += 1;
         } else {
             break;
@@ -28,7 +29,10 @@ fn strip_surrounding_punct(s: &str) -> String {
     }
     while end > start {
         let c = bytes[end - 1] as char;
-        if matches!(c, '`' | '"' | '\'' | ')' | ']' | '}' | '>' | ',' | ';' | ':' | '.' | '!' | '?') {
+        if matches!(
+            c,
+            '`' | '"' | '\'' | ')' | ']' | '}' | '>' | ',' | ';' | ':' | '.' | '!' | '?'
+        ) {
             end -= 1;
         } else {
             break;
@@ -125,9 +129,8 @@ fn has_unattached_occurrence(text: &str, needle: &str) -> bool {
     for (pos, mat) in text.match_indices(needle) {
         let left = text[..pos].chars().next_back();
         let right = text[pos + mat.len()..].chars().next();
-        let glued = |c: char| {
-            matches!(c, '/' | '\\' | ':' | '-' | '_' | '.') || c.is_alphanumeric()
-        };
+        let glued =
+            |c: char| matches!(c, '/' | '\\' | ':' | '-' | '_' | '.') || c.is_alphanumeric();
         if !left.map_or(false, glued) && !right.map_or(false, glued) {
             return true;
         }

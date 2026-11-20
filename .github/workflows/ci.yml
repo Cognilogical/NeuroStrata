@@ -369,8 +369,12 @@ jobs:
           base_sha="${{ github.event.pull_request.base.sha }}"
           git fetch --no-tags --depth=1 origin "$base_sha"
 
-          changed=$(git diff --name-only --diff-filter=ACMR "$base_sha" HEAD -- '*.sh' 'scripts/hooks/*')
-          if [ -z "$changed" ]; then
+          tmp=$(mktemp -d)
+          trap 'rm -rf "$tmp"' EXIT
+          changed_file="$tmp/changed"
+          # git -z emits NUL terminators; command substitution would drop them.
+          git diff --name-only --diff-filter=ACMRT -z "$base_sha" HEAD -- '*.sh' 'scripts/hooks/*' > "$changed_file"
+          if [ ! -s "$changed_file" ]; then
             echo "no changed shell files"
             exit 0
           fi
@@ -379,7 +383,6 @@ jobs:
           # HEAD, so the gate would see an empty diff. Stage the PR versions
           # against the base commit in a disposable worktree instead.
           orig="$PWD"
-          tmp=$(mktemp -d)
           cleanup() {
             cd "$orig"
             git worktree remove --force "$tmp/wt" >/dev/null 2>&1 || true
@@ -388,22 +391,22 @@ jobs:
           trap cleanup EXIT
           git worktree add --detach "$tmp/wt" "$base_sha"
 
-          while IFS= read -r file; do
+          while IFS= read -r -d '' file; do
             [ -n "$file" ] || continue
             [ -f "$file" ] || continue
             mkdir -p "$tmp/wt/$(dirname "$file")"
             cp -p "$file" "$tmp/wt/$file"
-          done <<< "$changed"
+          done < "$changed_file"
 
           # Exercise the PR's gate implementation, not the base one.
           cp scripts/check-staged-quality.sh "$tmp/wt/scripts/check-staged-quality.sh"
           cp scripts/clippy-staged-diagnostics.mjs "$tmp/wt/scripts/clippy-staged-diagnostics.mjs"
 
           cd "$tmp/wt"
-          while IFS= read -r file; do
+          while IFS= read -r -d '' file; do
             [ -n "$file" ] || continue
             [ -f "$file" ] && git add -- "$file"
-          done <<< "$changed"
+          done < "$changed_file"
           echo "gate files:"
           git diff --cached --name-only
           bash scripts/check-staged-quality.sh

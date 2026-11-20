@@ -114,11 +114,7 @@ pub struct ConceptualBridge {
 pub fn memory_type_priority(memory_type: &str, metadata: &Value) -> u8 {
     match memory_type {
         "rule" => {
-            if metadata
-                .get("enforcement")
-                .and_then(|v| v.as_str())
-                == Some("ENFORCED")
-            {
+            if metadata.get("enforcement").and_then(|v| v.as_str()) == Some("ENFORCED") {
                 0
             } else {
                 1
@@ -176,7 +172,10 @@ fn is_direct(kind: GraphMatchKind) -> bool {
 }
 
 fn valid_from(metadata: &Value) -> i64 {
-    metadata.get("valid_from").and_then(|v| v.as_i64()).unwrap_or(0)
+    metadata
+        .get("valid_from")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
 }
 
 /// Sort hits by the spec's ranking: match kind, then memory-type priority,

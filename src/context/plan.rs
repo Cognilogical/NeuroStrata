@@ -117,8 +117,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::model::ContextItem;
+    use super::*;
 
     fn item(id: &str, content: &str) -> ContextItem {
         ContextItem {
@@ -156,8 +156,7 @@ mod tests {
         let items = vec![item("a", &"x".repeat(400)), item("b", &"y".repeat(400))];
         // Each item costs 108 tokens and the 10_000 ceiling starts with 9_900
         // already spent, so both must be cut even though per_call allows them.
-        let budget = Budget::from(10_000usize)
-            .with_prior_usage(9_900, 9_900);
+        let budget = Budget::from(10_000usize).with_prior_usage(9_900, 9_900);
         let out = rank_dedup_budget(items, budget);
         assert!(out.is_empty());
     }

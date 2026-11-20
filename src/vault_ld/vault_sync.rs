@@ -14,7 +14,7 @@ use tracing::warn;
 use crate::rebac;
 use crate::secrets::SecretScanner;
 use crate::traits::{Embedder, SearchResult, VectorStore};
-use crate::vault_ld::{CanvasDocument, CanvasNode, VAULT_LD_SHAPES_V1, VaultNote, YAML_LD_CONTEXT};
+use crate::vault_ld::{CanvasDocument, CanvasNode, VaultNote, VAULT_LD_SHAPES_V1, YAML_LD_CONTEXT};
 
 /// Configuration for a vault sync operation
 #[derive(Debug, Clone)]
@@ -559,7 +559,11 @@ pub async fn export_vault_with_limits(
         written_filenames.insert(filename, note.id.clone());
 
         if let Err(e) = ensure_safe_export_destination(&filepath) {
-            errors.push(format!("Export destination unsafe for {} failed: {}", filepath.display(), e));
+            errors.push(format!(
+                "Export destination unsafe for {} failed: {}",
+                filepath.display(),
+                e
+            ));
             unsafe_destination = true;
             continue;
         }
@@ -590,7 +594,11 @@ pub async fn export_vault_with_limits(
     let mut exported = 0;
     for (filepath, markdown) in &planned_writes {
         if let Err(e) = write_export_destination(filepath, markdown.as_bytes()) {
-            errors.push(format!("Export destination unsafe for {} failed: {}", filepath.display(), e));
+            errors.push(format!(
+                "Export destination unsafe for {} failed: {}",
+                filepath.display(),
+                e
+            ));
         } else {
             exported += 1;
         }
@@ -1867,11 +1875,10 @@ mod tests {
         .await;
         let out: VaultImportResult = serde_json::from_str(&res).expect("valid result");
         assert!(!out.success);
-        assert!(
-            out.errors
-                .iter()
-                .any(|e| e.to_lowercase().contains("secret"))
-        );
+        assert!(out
+            .errors
+            .iter()
+            .any(|e| e.to_lowercase().contains("secret")));
         assert!(store.list(ns, None, None).await.unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2715,7 +2722,8 @@ mod tests {
         // Case (b): canvas destination is a symlink.
         std::fs::remove_file(vault.join("link-note.md")).expect("remove note symlink");
         let _ = std::fs::remove_file(vault.join("topology.canvas"));
-        std::os::unix::fs::symlink(&victim_canvas, vault.join("topology.canvas")).expect("symlink canvas");
+        std::os::unix::fs::symlink(&victim_canvas, vault.join("topology.canvas"))
+            .expect("symlink canvas");
         let config2 = VaultSyncConfig {
             namespace: ns.to_string(),
             vault_path: vault.clone(),
@@ -2725,11 +2733,7 @@ mod tests {
             allowed_external_dirs: None,
         };
         let err = export_vault(config2, store.clone()).await.unwrap_err();
-        assert!(
-            err.contains("symlink"),
-            "{}",
-            err
-        );
+        assert!(err.contains("symlink"), "{}", err);
         assert_eq!(
             std::fs::read_to_string(&victim_canvas).unwrap(),
             "untouched canvas",

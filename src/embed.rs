@@ -3,13 +3,13 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use sha2::{Digest, Sha256};
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct AcceptableEmbedder {
@@ -31,17 +31,17 @@ pub struct AcceptableEmbedder {
 /// The built-in default acceptable-embedder list: the single full-size
 /// Nomic entry every fresh install starts from.
 pub(crate) fn default_acceptable_embedders() -> Vec<AcceptableEmbedder> {
-    vec![
-        AcceptableEmbedder {
-            model_name: "NomicEmbedTextV15".to_string(),
-            dimensions: 768,
-            base_url: None,
-            api_key_env: None,
-            api_model: None,
-            // Real SHA-256 of the fastembed Nomic v1.5 ONNX weights (computed).
-            model_sha256: Some("147d5aa88c2101237358e17796cf3a227cead1ec304ec34b465bb08e9d952965".to_string()),
-        },
-    ]
+    vec![AcceptableEmbedder {
+        model_name: "NomicEmbedTextV15".to_string(),
+        dimensions: 768,
+        base_url: None,
+        api_key_env: None,
+        api_model: None,
+        // Real SHA-256 of the fastembed Nomic v1.5 ONNX weights (computed).
+        model_sha256: Some(
+            "147d5aa88c2101237358e17796cf3a227cead1ec304ec34b465bb08e9d952965".to_string(),
+        ),
+    }]
 }
 
 /// The operator's config directory (`~/.config/neurostrata`).
@@ -125,8 +125,8 @@ fn find_existing_cache_dir() -> Result<PathBuf> {
     // Same reason as above: $HOME is absent on Windows, and an empty home turns
     // every candidate below into a relative path, which is how a 523 MB model
     // cache ends up inside the caller's working directory.
-    let home_path = dirs::home_dir()
-        .context("Could not find home directory ($HOME / USERPROFILE unset)")?;
+    let home_path =
+        dirs::home_dir().context("Could not find home directory ($HOME / USERPROFILE unset)")?;
 
     // Adopt the Neuro cache pattern: share models across all Neuro* tools
     let primary_neuro_cache = home_path.join(".cache/neuro/models/fastembed");
@@ -208,11 +208,14 @@ fn arena_disabled_for(value: Option<&str>) -> bool {
 /// Sharing this singleton across `FastEmbedder`, `GlinerExtractor`, and `LayaOnnx`
 /// guarantees they never collide regardless of initialization order.
 pub fn shared_ort_environment() -> Result<&'static ort::environment::Environment> {
-    static ORT_ENV: std::sync::OnceLock<std::result::Result<ort::environment::Environment, String>> =
-        std::sync::OnceLock::new();
+    static ORT_ENV: std::sync::OnceLock<
+        std::result::Result<ort::environment::Environment, String>,
+    > = std::sync::OnceLock::new();
     match ORT_ENV.get_or_init(|| ort::init().build().map_err(|e| e.to_string())) {
         Ok(env) => Ok(env),
-        Err(msg) => Err(anyhow!("Failed to initialize ONNX Runtime environment: {msg}")),
+        Err(msg) => Err(anyhow!(
+            "Failed to initialize ONNX Runtime environment: {msg}"
+        )),
     }
 }
 
@@ -220,9 +223,7 @@ pub fn shared_ort_environment() -> Result<&'static ort::environment::Environment
 /// decision: a pinned CPU provider with the arena allocator off, or `None` to
 /// leave fastembed's default. Extracted so the decision-to-wiring path is a
 /// value a test can inspect without loading a model.
-fn arena_execution_providers(
-    disabled: bool,
-) -> Option<Vec<ort::ep::ExecutionProviderDispatch>> {
+fn arena_execution_providers(disabled: bool) -> Option<Vec<ort::ep::ExecutionProviderDispatch>> {
     if disabled {
         Some(vec![ort::ep::CPU::default()
             .with_arena_allocator(false)
@@ -368,22 +369,21 @@ impl FastEmbedder {
 
         // The descriptor must describe the model actually loaded: an unknown
         // configured name silently falls back to NomicEmbedTextV15 (768 dims).
-        let (model_enum, loaded_model_name, loaded_dims) = match EmbeddingModel::from_str(
-            &target_model.model_name,
-        ) {
-            Ok(m) => (m, target_model.model_name.clone(), target_model.dimensions),
-            Err(_) => {
-                tracing::warn!(
+        let (model_enum, loaded_model_name, loaded_dims) =
+            match EmbeddingModel::from_str(&target_model.model_name) {
+                Ok(m) => (m, target_model.model_name.clone(), target_model.dimensions),
+                Err(_) => {
+                    tracing::warn!(
                     "Unknown embedding model '{}', falling back to NomicEmbedTextV15 (768 dims)",
                     target_model.model_name
                 );
-                (
-                    EmbeddingModel::NomicEmbedTextV15,
-                    "NomicEmbedTextV15".to_string(),
-                    768,
-                )
-            }
-        };
+                    (
+                        EmbeddingModel::NomicEmbedTextV15,
+                        "NomicEmbedTextV15".to_string(),
+                        768,
+                    )
+                }
+            };
 
         let cache_dir = find_existing_cache_dir()?;
 
@@ -421,7 +421,11 @@ impl FastEmbedder {
         SAID_ARENA.call_once(|| {
             eprintln!(
                 "Embedding CPU arena: {}",
-                if disable_arena { "disabled" } else { "enabled (NEUROSTRATA_EMBED_ARENA)" }
+                if disable_arena {
+                    "disabled"
+                } else {
+                    "enabled (NEUROSTRATA_EMBED_ARENA)"
+                }
             );
         });
         if let Some(providers) = arena_execution_providers(disable_arena) {
@@ -629,9 +633,7 @@ impl RemoteEmbedder {
                         return Err(e);
                     }
                     if let Some(s) = e.downcast_ref::<StatusError>() {
-                        if s.0 == reqwest::StatusCode::TOO_MANY_REQUESTS
-                            || s.0.is_server_error()
-                        {
+                        if s.0 == reqwest::StatusCode::TOO_MANY_REQUESTS || s.0.is_server_error() {
                             tokio::time::sleep(Duration::from_secs(1)).await;
                             continue;
                         }
@@ -653,9 +655,7 @@ impl RemoteEmbedder {
                         return Err(e);
                     }
                     if let Some(s) = e.downcast_ref::<StatusError>() {
-                        if s.0 == reqwest::StatusCode::TOO_MANY_REQUESTS
-                            || s.0.is_server_error()
-                        {
+                        if s.0 == reqwest::StatusCode::TOO_MANY_REQUESTS || s.0.is_server_error() {
                             tokio::time::sleep(Duration::from_secs(1)).await;
                             continue;
                         }
@@ -807,10 +807,9 @@ impl RemoteEmbedder {
         for (pos, item) in data.iter().enumerate() {
             let index = match item.get("index") {
                 Some(v) if !v.is_null() => {
-                    let idx = v
-                        .as_u64()
-                        .ok_or_else(|| anyhow!("remote embedding contained invalid non-integer index"))?
-                        as usize;
+                    let idx = v.as_u64().ok_or_else(|| {
+                        anyhow!("remote embedding contained invalid non-integer index")
+                    })? as usize;
                     if idx >= by_index.len() {
                         anyhow::bail!(
                             "remote embedding index {} out of bounds for batch of {}",
@@ -828,15 +827,17 @@ impl RemoteEmbedder {
                     index
                 );
             }
-            let arr = item["embedding"].as_array().context("Missing embedding in response")?;
+            let arr = item["embedding"]
+                .as_array()
+                .context("Missing embedding in response")?;
             if arr.is_empty() {
                 anyhow::bail!("remote embedding was empty");
             }
             let mut embedding = Vec::with_capacity(arr.len());
             for v in arr {
-                let val = v
-                    .as_f64()
-                    .ok_or_else(|| anyhow!("remote embedding contained non-finite or non-numeric value"))?;
+                let val = v.as_f64().ok_or_else(|| {
+                    anyhow!("remote embedding contained non-finite or non-numeric value")
+                })?;
                 if !val.is_finite() {
                     anyhow::bail!("remote embedding contained non-finite or non-numeric value");
                 }
@@ -854,7 +855,9 @@ impl RemoteEmbedder {
         Ok(by_index
             .into_iter()
             .map(|opt| {
-                opt.ok_or_else(|| anyhow!("remote embedding batch was missing an entry for every text"))
+                opt.ok_or_else(|| {
+                    anyhow!("remote embedding batch was missing an entry for every text")
+                })
             })
             .collect::<Result<Vec<Vec<f32>>>>()?)
     }
@@ -909,9 +912,9 @@ impl RemoteEmbedder {
         }
         let mut embedding = Vec::with_capacity(arr.len());
         for v in arr {
-            let val = v
-                .as_f64()
-                .ok_or_else(|| anyhow!("remote embedding contained non-finite or non-numeric value"))?;
+            let val = v.as_f64().ok_or_else(|| {
+                anyhow!("remote embedding contained non-finite or non-numeric value")
+            })?;
             if !val.is_finite() {
                 anyhow::bail!("remote embedding contained non-finite or non-numeric value");
             }
@@ -1159,11 +1162,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.expect("accept");
             let req = read_http_request(&mut sock).await;
-            assert!(
-                req.contains("POST /embeddings"),
-                "request: {}",
-                req
-            );
+            assert!(req.contains("POST /embeddings"), "request: {}", req);
             assert!(
                 req.to_ascii_lowercase()
                     .contains("authorization: bearer test-key"),
@@ -1199,7 +1198,8 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.expect("accept");
             let _ = read_http_request(&mut sock).await;
-            let body = r#"{"data":[{"embedding":[1.0,2.0,3.0,4.0]},{"embedding":[5.0,6.0,7.0,8.0]}]}"#;
+            let body =
+                r#"{"data":[{"embedding":[1.0,2.0,3.0,4.0]},{"embedding":[5.0,6.0,7.0,8.0]}]}"#;
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
@@ -1220,7 +1220,10 @@ mod tests {
             .embed_batch(&["a".to_string(), "b".to_string()])
             .await
             .unwrap();
-        assert_eq!(v, vec![vec![1.0f32, 2.0, 3.0, 4.0], vec![5.0, 6.0, 7.0, 8.0]]);
+        assert_eq!(
+            v,
+            vec![vec![1.0f32, 2.0, 3.0, 4.0], vec![5.0, 6.0, 7.0, 8.0]]
+        );
         server.await.unwrap();
     }
 
@@ -1240,8 +1243,7 @@ mod tests {
             let server = tokio::spawn(async move {
                 let (mut sock, _) = listener.accept().await.expect("accept");
                 let _ = read_http_request(&mut sock).await;
-                let body =
-                    format!(r#"{{"data":[{{"embedding":{}}}]}}"#, body_vec);
+                let body = format!(r#"{{"data":[{{"embedding":{}}}]}}"#, body_vec);
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
@@ -1310,7 +1312,10 @@ mod tests {
         let v = embedder.embed("retry me").await.unwrap();
         assert_eq!(v, vec![1.0f32, 2.0, 3.0, 4.0]);
         let handled = server.await.unwrap();
-        assert_eq!(handled, 2, "server must see both the failed and the retried attempt");
+        assert_eq!(
+            handled, 2,
+            "server must see both the failed and the retried attempt"
+        );
     }
 
     #[test]
@@ -1629,7 +1634,9 @@ mod tests {
     #[tokio::test]
     async fn embed_batch_default_preserves_order_and_handles_empty() {
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let embedder = OrderEmbedder { calls: Arc::clone(&calls) };
+        let embedder = OrderEmbedder {
+            calls: Arc::clone(&calls),
+        };
 
         let empty = embedder.embed_batch(&[]).await.unwrap();
         assert!(empty.is_empty());
@@ -1649,7 +1656,9 @@ mod tests {
 
     /// Spawns a one-shot OpenAI-compatible `/embeddings` server that answers
     /// every request with `response_body` before closing.
-    async fn spawn_embed_server(response_body: &'static str) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    async fn spawn_embed_server(
+        response_body: &'static str,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -1690,7 +1699,8 @@ mod tests {
 
     #[tokio::test]
     async fn remote_embedder_batch_rejects_dimension_mismatch() {
-        let (addr, server) = spawn_embed_server(r#"{"data":[{"index":0,"embedding":[1.0,2.0,3.0]}]}"#).await;
+        let (addr, server) =
+            spawn_embed_server(r#"{"data":[{"index":0,"embedding":[1.0,2.0,3.0]}]}"#).await;
         let embedder = RemoteEmbedder::new(
             format!("http://{}", addr),
             "test-key".to_string(),
@@ -1708,7 +1718,10 @@ mod tests {
 
     #[tokio::test]
     async fn remote_embedder_batch_rejects_non_numeric_vector() {
-        let (addr, server) = spawn_embed_server(r#"{"data":[{"index":0,"embedding":[1.0, "not-a-number", 3.0, 4.0]}]}"#).await;
+        let (addr, server) = spawn_embed_server(
+            r#"{"data":[{"index":0,"embedding":[1.0, "not-a-number", 3.0, 4.0]}]}"#,
+        )
+        .await;
         let embedder = RemoteEmbedder::new(
             format!("http://{}", addr),
             "test-key".to_string(),

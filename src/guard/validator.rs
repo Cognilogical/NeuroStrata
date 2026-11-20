@@ -17,7 +17,11 @@ pub struct GuardValidator {
 }
 
 impl GuardValidator {
-    pub async fn new(store: Arc<dyn VectorStore>, embedder: Arc<dyn Embedder>, namespace: &str) -> Self {
+    pub async fn new(
+        store: Arc<dyn VectorStore>,
+        embedder: Arc<dyn Embedder>,
+        namespace: &str,
+    ) -> Self {
         let semantic = SemanticEvaluator::new(store, embedder, namespace);
         // No engine probe here: the sandbox detects Podman on its first use.
         let sandbox = SandboxEvaluator::new();
@@ -131,12 +135,18 @@ impl GuardValidator {
                     };
 
                     match &mut verdict {
-                        ValidateVerdict::SandboxReject { constraints: ref mut c, .. } => {
+                        ValidateVerdict::SandboxReject {
+                            constraints: ref mut c,
+                            ..
+                        } => {
                             if c.is_empty() {
                                 *c = constraints;
                             }
                         }
-                        ValidateVerdict::DeterministicReject { constraints: ref mut c, .. } => {
+                        ValidateVerdict::DeterministicReject {
+                            constraints: ref mut c,
+                            ..
+                        } => {
                             if c.is_empty() {
                                 *c = constraints;
                             }
@@ -377,7 +387,7 @@ impl GuardValidator {
             const PATCH_KEYS: &[&str] = &["patchText", "patch", "diff"];
 
             for key in PATH_KEYS {
-                if let Some( s) = map.get(*key).and_then(|v| v.as_str()) {
+                if let Some(s) = map.get(*key).and_then(|v| v.as_str()) {
                     paths.push(s.trim().to_lowercase());
                 }
             }
@@ -437,7 +447,9 @@ impl GuardValidator {
             return false;
         }
         if trimmed.starts_with('.') && trimmed.len() > 1 {
-            return paths.iter().any(|p| Self::path_matches_extension(p, trimmed));
+            return paths
+                .iter()
+                .any(|p| Self::path_matches_extension(p, trimmed));
         }
 
         if paths.iter().any(|p| {
@@ -591,9 +603,7 @@ impl GuardValidator {
     fn is_env_assignment(token: &str) -> bool {
         if let Some((lhs, _)) = token.split_once('=') {
             !lhs.is_empty()
-                && lhs
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && lhs.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
                 && !lhs.chars().next().unwrap_or('0').is_ascii_digit()
         } else {
             false
@@ -714,7 +724,11 @@ impl GuardValidator {
                     idx += 1;
                     continue;
                 }
-                let base = tok.rsplit('/').next().unwrap_or(tok.as_str()).to_lowercase();
+                let base = tok
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(tok.as_str())
+                    .to_lowercase();
                 if !quoted && Self::is_command_wrapper(&base) {
                     idx += 1;
                     while idx < tokens.len() && !tokens[idx].1 && tokens[idx].0.starts_with('-') {
@@ -725,9 +739,7 @@ impl GuardValidator {
                         && Self::is_wrapper_subcommand(&base, &tokens[idx].0.to_lowercase())
                     {
                         idx += 1;
-                        while idx < tokens.len()
-                            && !tokens[idx].1
-                            && tokens[idx].0.starts_with('-')
+                        while idx < tokens.len() && !tokens[idx].1 && tokens[idx].0.starts_with('-')
                         {
                             idx += 1;
                         }
@@ -1076,13 +1088,16 @@ mod tests {
             .await
             .expect("seed global rule");
 
-        let proj_validator =
-            GuardValidator::new(store.clone(), Arc::new(StubEmbedder), NS).await;
+        let proj_validator = GuardValidator::new(store.clone(), Arc::new(StubEmbedder), NS).await;
         let (verdict, fired) = proj_validator
             .validate("bash", "python3 script.py", "/tmp", false)
             .await;
 
-        assert_eq!(fired, vec!["global-no-python".to_string()], "global rule must fire in project namespace");
+        assert_eq!(
+            fired,
+            vec!["global-no-python".to_string()],
+            "global rule must fire in project namespace"
+        );
         match verdict {
             ValidateVerdict::DeterministicReject { constraints, .. } => {
                 assert_eq!(
@@ -1107,12 +1122,26 @@ mod tests {
     async fn a_validate_without_the_sandbox_never_probes_the_engine() {
         let (_store, validator) =
             validator_with(vec![rule("rule.fires", "rm -rf", "never rm -rf", "active")]).await;
-        assert_eq!(validator.sandbox_engine_probes(), 0, "the constructor does not probe");
+        assert_eq!(
+            validator.sandbox_engine_probes(),
+            0,
+            "the constructor does not probe"
+        );
 
-        let (pass, _) = validator.validate("bash", "echo hello", "/tmp", false).await;
-        assert!(matches!(pass, ValidateVerdict::SandboxPassHighFidelity { .. }));
-        let (reject, fired) = validator.validate("bash", "rm -rf /tmp/x", "/tmp", false).await;
-        assert!(matches!(reject, ValidateVerdict::DeterministicReject { .. }));
+        let (pass, _) = validator
+            .validate("bash", "echo hello", "/tmp", false)
+            .await;
+        assert!(matches!(
+            pass,
+            ValidateVerdict::SandboxPassHighFidelity { .. }
+        ));
+        let (reject, fired) = validator
+            .validate("bash", "rm -rf /tmp/x", "/tmp", false)
+            .await;
+        assert!(matches!(
+            reject,
+            ValidateVerdict::DeterministicReject { .. }
+        ));
         assert_eq!(fired, vec!["rule.fires".to_string()]);
 
         assert_eq!(
@@ -1165,7 +1194,10 @@ mod tests {
             .validate("bash", "cargo test --lib", "/tmp", false)
             .await;
         assert!(f2.is_empty(), "unrelated command must not fire");
-        assert!(matches!(v2, ValidateVerdict::SandboxPassHighFidelity { .. }));
+        assert!(matches!(
+            v2,
+            ValidateVerdict::SandboxPassHighFidelity { .. }
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1205,7 +1237,10 @@ mod tests {
             1,
             "guard_rule must still be matched even when >3 non-rule memories precede it in search()"
         );
-        assert!(matches!(verdict, ValidateVerdict::DeterministicReject { .. }));
+        assert!(matches!(
+            verdict,
+            ValidateVerdict::DeterministicReject { .. }
+        ));
     }
 
     fn no_py_trigger() -> String {
@@ -1235,7 +1270,10 @@ mod tests {
             "prose inside write content must not fire command/extension rules: {:?}",
             f_write
         );
-        assert!(matches!(v_write, ValidateVerdict::SandboxPassHighFidelity { .. }));
+        assert!(matches!(
+            v_write,
+            ValidateVerdict::SandboxPassHighFidelity { .. }
+        ));
 
         let edit_payload = serde_json::json!({
             "path": "/workspace/src/guard/validator.rs",
@@ -1251,7 +1289,10 @@ mod tests {
             "prose inside edit oldString/newString must not fire: {:?}",
             f_edit
         );
-        assert!(matches!(v_edit, ValidateVerdict::SandboxPassHighFidelity { .. }));
+        assert!(matches!(
+            v_edit,
+            ValidateVerdict::SandboxPassHighFidelity { .. }
+        ));
 
         let non_py_ext_payload = serde_json::json!({
             "path": "/workspace/docs/no.python.md",
@@ -1314,7 +1355,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn shell_json_payloads_ignore_prose_descriptions_and_commit_messages_but_reject_invocations() {
+    async fn shell_json_payloads_ignore_prose_descriptions_and_commit_messages_but_reject_invocations(
+    ) {
         let (_store, validator) = validator_with(vec![rule(
             "global-no-python",
             &no_py_trigger(),
@@ -1336,7 +1378,10 @@ mod tests {
             "git commit message and tool description must not fire command guard: {:?}",
             f_commit
         );
-        assert!(matches!(v_commit, ValidateVerdict::SandboxPassHighFidelity { .. }));
+        assert!(matches!(
+            v_commit,
+            ValidateVerdict::SandboxPassHighFidelity { .. }
+        ));
 
         let invoke_payload = serde_json::json!({
             "command": "cargo test && python3 -m http.server",
@@ -1347,7 +1392,10 @@ mod tests {
             .validate("shell", &invoke_payload, "/workspace", false)
             .await;
         assert_eq!(f_invoke, vec!["global-no-python".to_string()]);
-        assert!(matches!(v_invoke, ValidateVerdict::DeterministicReject { .. }));
+        assert!(matches!(
+            v_invoke,
+            ValidateVerdict::DeterministicReject { .. }
+        ));
 
         let subshell_payload = serde_json::json!({
             "command": "sh -c \"pip install requests\"",
@@ -1369,7 +1417,10 @@ mod tests {
             .validate("bash", &cmd_sub_payload, "/workspace", false)
             .await;
         assert_eq!(f_csub, vec!["global-no-python".to_string()]);
-        assert!(matches!(v_csub, ValidateVerdict::DeterministicReject { .. }));
+        assert!(matches!(
+            v_csub,
+            ValidateVerdict::DeterministicReject { .. }
+        ));
 
         let runner_payload = serde_json::json!({
             "command": "uv run pytest",
@@ -1380,7 +1431,10 @@ mod tests {
             .validate("bash", &runner_payload, "/workspace", false)
             .await;
         assert_eq!(f_runner, vec!["global-no-python".to_string()]);
-        assert!(matches!(v_runner, ValidateVerdict::DeterministicReject { .. }));
+        assert!(matches!(
+            v_runner,
+            ValidateVerdict::DeterministicReject { .. }
+        ));
 
         let search_and_test_payload = serde_json::json!({
             "command": "rg python3 src/ && cargo test global_no_python --nocapture",
@@ -1395,6 +1449,9 @@ mod tests {
             "search arguments and cargo test filters must not fire command guard: {:?}",
             f_search
         );
-        assert!(matches!(v_search, ValidateVerdict::SandboxPassHighFidelity { .. }));
+        assert!(matches!(
+            v_search,
+            ValidateVerdict::SandboxPassHighFidelity { .. }
+        ));
     }
 }

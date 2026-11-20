@@ -4,10 +4,10 @@
 //! the daemon's HTTP routes, and the CLI. Living here keeps one implementation
 //! so the surfaces cannot drift from each other.
 
-use crate::traits::VectorStore;
-use std::sync::Arc;
-use serde_json::Value;
 use crate::server::format_memory;
+use crate::traits::VectorStore;
+use serde_json::Value;
+use std::sync::Arc;
 
 pub async fn handle_get_memory(arguments: Value, store: Arc<dyn VectorStore>) -> String {
     let id = match arguments.get("id").and_then(|v| v.as_str()) {

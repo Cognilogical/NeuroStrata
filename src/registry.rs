@@ -9,9 +9,9 @@
 //! and never a rejection.
 
 use crate::traits::{Embedder, MemoryPayload, VectorStore};
+use chrono::Utc;
 use serde_json::Value;
 use std::sync::Arc;
-use chrono::Utc;
 
 /// One registry row per namespace. The id is a deterministic UUID because the
 /// mesh skips any row whose id is not a parseable UUID.
@@ -46,7 +46,10 @@ pub fn registry_domains(metadata: &Value) -> Vec<String> {
                     if let Some(s) = value.as_str() {
                         Some(s.to_string())
                     } else {
-                        value.get("slug").and_then(|s| s.as_str()).map(|s| s.to_string())
+                        value
+                            .get("slug")
+                            .and_then(|s| s.as_str())
+                            .map(|s| s.to_string())
                     }
                 })
                 .collect()
@@ -77,7 +80,10 @@ pub fn registry_domain_entries(metadata: &Value) -> Vec<Value> {
             let slug = v.get("slug").and_then(|s| s.as_str()).unwrap_or("");
             let parent = v.get("parent").cloned().unwrap_or(serde_json::Value::Null);
             let aliases = v.get("aliases").cloned().unwrap_or(serde_json::json!([]));
-            let concept_iri = v.get("concept_iri").cloned().unwrap_or(serde_json::Value::Null);
+            let concept_iri = v
+                .get("concept_iri")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
             out.push(serde_json::json!({
                 "slug": slug,
                 "parent": parent,
@@ -186,11 +192,19 @@ pub fn validate_domain_entries(entries: &[Value]) -> Result<(), String> {
             }
         }
 
-        let concept_iri = obj.get("concept_iri").cloned().unwrap_or(serde_json::Value::Null);
+        let concept_iri = obj
+            .get("concept_iri")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         match concept_iri {
             serde_json::Value::Null => {}
             serde_json::Value::String(_) => {}
-            _ => return Err(format!("entry {} concept_iri must be a string or null", idx)),
+            _ => {
+                return Err(format!(
+                    "entry {} concept_iri must be a string or null",
+                    idx
+                ))
+            }
         }
 
         slugs.push(slug.to_string());
@@ -201,7 +215,10 @@ pub fn validate_domain_entries(entries: &[Value]) -> Result<(), String> {
     for (slug, parent) in &parent_of {
         if let Some(p) = parent {
             if !slugs.contains(p) {
-                return Err(format!("parent '{}' of '{}' is not a declared slug", p, slug));
+                return Err(format!(
+                    "parent '{}' of '{}' is not a declared slug",
+                    p, slug
+                ));
             }
         }
     }
@@ -229,15 +246,20 @@ pub fn validate_domain_entries(entries: &[Value]) -> Result<(), String> {
     let mut seen_alias_normalized = std::collections::BTreeSet::new();
     // Collect slugs for collision check.
     let slug_set: std::collections::BTreeSet<String> = slugs.iter().cloned().collect();
-    let slug_normalized_set: std::collections::BTreeSet<String> =
-        slugs.iter().filter_map(|s| crate::domain::normalize_domain_slug(s)).collect();
+    let slug_normalized_set: std::collections::BTreeSet<String> = slugs
+        .iter()
+        .filter_map(|s| crate::domain::normalize_domain_slug(s))
+        .collect();
     for entry in entries {
         if let Some(arr) = entry.get("aliases").and_then(|v| v.as_array()) {
             for alias in arr {
                 if let Some(s) = alias.as_str() {
                     let lower = s.to_lowercase();
                     if !seen_aliases.insert(lower.clone()) {
-                        return Err(format!("alias '{}' collides with an existing alias (case-folded)", s));
+                        return Err(format!(
+                            "alias '{}' collides with an existing alias (case-folded)",
+                            s
+                        ));
                     }
                     // slug-normalized collision
                     if let Some(norm) = crate::domain::normalize_domain_slug(s) {
@@ -245,7 +267,10 @@ pub fn validate_domain_entries(entries: &[Value]) -> Result<(), String> {
                             return Err(format!("alias '{}' collides with slug '{}'", s, norm));
                         }
                         if !seen_alias_normalized.insert(norm.clone()) {
-                            return Err(format!("alias '{}' collides with an existing alias (normalized)", s));
+                            return Err(format!(
+                                "alias '{}' collides with an existing alias (normalized)",
+                                s
+                            ));
                         }
                     }
                     // case-folded alias vs slug
@@ -337,14 +362,22 @@ pub async fn check_domain(
     };
 
     // Check if all slugs are cached.
-    let missing: Vec<String> = slugs.iter().filter(|s| !cached.contains(s)).cloned().collect();
+    let missing: Vec<String> = slugs
+        .iter()
+        .filter(|s| !cached.contains(s))
+        .cloned()
+        .collect();
     if missing.is_empty() {
         return Ok(ungoverned());
     }
 
     // Reconcile: derive from rows.
     let derived = derived_domains(store, namespace).await?;
-    let still_missing: Vec<String> = missing.iter().filter(|s| !derived.contains(s)).cloned().collect();
+    let still_missing: Vec<String> = missing
+        .iter()
+        .filter(|s| !derived.contains(s))
+        .cloned()
+        .collect();
     if still_missing.is_empty() {
         let mut repaired = cached;
         repaired.extend(slugs.clone());
@@ -379,7 +412,11 @@ pub fn build_merged_registry_payload(
     let existing_domains_slugs: Vec<String> = if existing_meta.get("domain_registry").is_some() {
         registry_domain_entries(&existing_meta)
             .iter()
-            .filter_map(|e| e.get("slug").and_then(|s| s.as_str()).map(|s| s.to_string()))
+            .filter_map(|e| {
+                e.get("slug")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.to_string())
+            })
             .collect()
     } else {
         vec![]
@@ -415,9 +452,10 @@ pub fn build_merged_registry_payload(
         {
             let mut entries = registry_domain_entries(&existing_meta);
             for slug in &wanted_slugs {
-                if !entries.iter().any(|e| {
-                    e.get("slug").and_then(|s| s.as_str()) == Some(slug.as_str())
-                }) {
+                if !entries
+                    .iter()
+                    .any(|e| e.get("slug").and_then(|s| s.as_str()) == Some(slug.as_str()))
+                {
                     entries.push(serde_json::json!({
                         "slug": slug,
                         "parent": serde_json::Value::Null,
@@ -482,11 +520,19 @@ pub async fn write_registry(
             ))
         }
     };
-    let existing_meta = existing.as_ref().map(|(_, p)| p.metadata.clone()).unwrap_or(serde_json::json!({}));
+    let existing_meta = existing
+        .as_ref()
+        .map(|(_, p)| p.metadata.clone())
+        .unwrap_or(serde_json::json!({}));
     let existing_domains_slugs: Vec<String> = if existing_meta.get("domain_registry").is_some() {
         // v2 entries -> slugs; v1 -> strings
-        registry_domain_entries(&existing_meta).iter()
-            .filter_map(|e| e.get("slug").and_then(|s| s.as_str()).map(|s| s.to_string()))
+        registry_domain_entries(&existing_meta)
+            .iter()
+            .filter_map(|e| {
+                e.get("slug")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.to_string())
+            })
             .collect()
     } else {
         vec![]
@@ -494,8 +540,10 @@ pub async fn write_registry(
     let is_v2 = existing_meta
         .get("domain_registry")
         .and_then(|r| r.get("version"))
-        .and_then(|v| v.as_u64()) == Some(2)
-        || existing_meta.get("domain_registry")
+        .and_then(|v| v.as_u64())
+        == Some(2)
+        || existing_meta
+            .get("domain_registry")
             .and_then(|r| r.get("domains"))
             .and_then(|d| d.as_array())
             .map(|a| a.iter().any(|v| v.is_object()))
@@ -508,10 +556,7 @@ pub async fn write_registry(
 
     // Embed only when there is no usable existing vector: a fresh registry row
     // needs a vector, but cache-refresh writes reuse the stored one.
-    let needs_embed = existing
-        .as_ref()
-        .map(|(v, _)| v.is_empty())
-        .unwrap_or(true);
+    let needs_embed = existing.as_ref().map(|(v, _)| v.is_empty()).unwrap_or(true);
     let vector = if needs_embed {
         match emb.embed(&registry_content(namespace)).await {
             Ok(vector) => vector,
@@ -535,17 +580,22 @@ pub async fn write_registry(
         }
         let obj = meta.as_object_mut().unwrap();
 
-        if is_v2 || obj.get("domain_registry")
-            .and_then(|r| r.get("domains"))
-            .and_then(|d| d.as_array())
-            .map(|a| a.iter().any(|v| v.is_object()))
-            .unwrap_or(false)
+        if is_v2
+            || obj
+                .get("domain_registry")
+                .and_then(|r| r.get("domains"))
+                .and_then(|d| d.as_array())
+                .map(|a| a.iter().any(|v| v.is_object()))
+                .unwrap_or(false)
         {
             // v2 path: preserve entries, add new slugs.
             let mut entries = registry_domain_entries(&existing_meta);
             // add missing slugs
             for slug in &wanted_slugs {
-                if !entries.iter().any(|e| e.get("slug").and_then(|s| s.as_str()) == Some(slug.as_str())) {
+                if !entries
+                    .iter()
+                    .any(|e| e.get("slug").and_then(|s| s.as_str()) == Some(slug.as_str()))
+                {
                     entries.push(serde_json::json!({
                         "slug": slug,
                         "parent": serde_json::Value::Null,
@@ -585,7 +635,10 @@ pub async fn write_registry(
             metadata: meta,
         };
         // vector reuse if existing
-        let vec_to_use = existing.as_ref().map(|(v, _)| v.clone()).unwrap_or_else(|| vector.clone());
+        let vec_to_use = existing
+            .as_ref()
+            .map(|(v, _)| v.clone())
+            .unwrap_or_else(|| vector.clone());
         if let Err(e) = store
             .upsert(namespace, &registry_id, vec_to_use, payload)
             .await
@@ -594,14 +647,21 @@ pub async fn write_registry(
         }
         match store.get(namespace, &registry_id).await {
             Ok(Some((_, landed))) => {
-                let landed_slugs: Vec<String> = if landed.metadata.get("domain_registry")
+                let landed_slugs: Vec<String> = if landed
+                    .metadata
+                    .get("domain_registry")
                     .and_then(|r| r.get("domains"))
                     .and_then(|d| d.as_array())
                     .map(|a| a.iter().any(|v| v.is_object()))
                     .unwrap_or(false)
                 {
-                    registry_domain_entries(&landed.metadata).iter()
-                        .filter_map(|e| e.get("slug").and_then(|s| s.as_str()).map(|s| s.to_string()))
+                    registry_domain_entries(&landed.metadata)
+                        .iter()
+                        .filter_map(|e| {
+                            e.get("slug")
+                                .and_then(|s| s.as_str())
+                                .map(|s| s.to_string())
+                        })
                         .collect()
                 } else {
                     registry_domains(&landed.metadata)
@@ -612,7 +672,9 @@ pub async fn write_registry(
                 wanted_slugs = merge(&landed_slugs, &wanted_slugs);
             }
             Ok(None) => {
-                return Some("the registry row did not stick: it is absent after the write".to_string())
+                return Some(
+                    "the registry row did not stick: it is absent after the write".to_string(),
+                )
             }
             Err(e) => return Some(format!("the registry row could not be re-read: {}", e)),
         }
@@ -743,7 +805,10 @@ pub async fn cache_project_root(
         }
     };
     if let Some(obj) = payload.metadata.as_object_mut() {
-        obj.insert("project_root".to_string(), serde_json::Value::String(project_root.to_string()));
+        obj.insert(
+            "project_root".to_string(),
+            serde_json::Value::String(project_root.to_string()),
+        );
     }
     if let Err(e) = store.upsert(namespace, &registry_id, vector, payload).await {
         tracing::warn!("registry upsert failed for '{namespace}:{registry_id}': {e}");
@@ -1032,16 +1097,32 @@ mod tests {
             {"slug":"auth","parent":null,"aliases":["AUTH"],"concept_iri":null}
         ]);
         let err = validate_domain_entries(&case_collision.as_array().unwrap()).unwrap_err();
-        assert!(err.contains("collides"), "expected alias collision, got: {}", err);
+        assert!(
+            err.contains("collides"),
+            "expected alias collision, got: {}",
+            err
+        );
 
         // registry_metadata_v2 sorts and preserves v2 shape; write_registry preserves unrelated keys
         let entries = serde_json::json!([
             {"slug":"auth","parent":null,"aliases":["authentication"],"concept_iri":"http://example/auth"}
         ]).as_array().unwrap().to_vec();
         let v2_meta = registry_metadata_v2(&entries);
-        assert!(v2_meta.get("domain_registry").unwrap().get("version").unwrap().as_u64() == Some(2));
-        let slugs: Vec<String> = v2_meta.get("domain_registry").unwrap()["domains"].as_array().unwrap().iter()
-            .map(|v| v.get("slug").unwrap().as_str().unwrap().to_string()).collect();
+        assert!(
+            v2_meta
+                .get("domain_registry")
+                .unwrap()
+                .get("version")
+                .unwrap()
+                .as_u64()
+                == Some(2)
+        );
+        let slugs: Vec<String> = v2_meta.get("domain_registry").unwrap()["domains"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.get("slug").unwrap().as_str().unwrap().to_string())
+            .collect();
         assert_eq!(slugs, vec!["auth"]);
     }
 
@@ -1049,8 +1130,8 @@ mod tests {
     #[tokio::test]
     async fn test_f12_enrichment_watermark_persistence_and_normalization() {
         use crate::guard::testkit::{MockStore, StubEmbedder};
-        use std::sync::Arc;
         use crate::traits::VectorStore;
+        use std::sync::Arc;
         let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
         let emb_trait: Arc<dyn crate::traits::Embedder> = Arc::new(StubEmbedder);
         let _emb = Arc::new(StubEmbedder);
@@ -1068,7 +1149,14 @@ mod tests {
                 "eligibility":"private"
             }),
         };
-        let _ = store.upsert(namespace, &registry_row_id(namespace), vec![0.0; 4], payload).await;
+        let _ = store
+            .upsert(
+                namespace,
+                &registry_row_id(namespace),
+                vec![0.0; 4],
+                payload,
+            )
+            .await;
 
         let wm = serde_json::json!({
             "last_enriched_at":"2026-01-01T00:00:00Z",
@@ -1076,9 +1164,23 @@ mod tests {
             "extractor_fingerprint":"fp-1",
             "source_digest":"digest-abc"
         });
-        enrichment_commit(&store, Some(&emb_trait), namespace, wm.clone(), serde_json::json!({"stages":[]})).await.unwrap();
+        enrichment_commit(
+            &store,
+            Some(&emb_trait),
+            namespace,
+            wm.clone(),
+            serde_json::json!({"stages":[]}),
+        )
+        .await
+        .unwrap();
 
-        let meta = store.get(namespace, &registry_row_id(namespace)).await.unwrap().unwrap().1.metadata;
+        let meta = store
+            .get(namespace, &registry_row_id(namespace))
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .metadata;
         let state = enrichment_state(&meta);
         let stored_wm = state.get("watermark").cloned().unwrap();
         assert_eq!(stored_wm["enriched_count"], 42);
@@ -1131,9 +1233,16 @@ mod tests {
         assert_eq!(state_before.get("state").unwrap(), "running");
         assert_eq!(state_before.get("lock_holder").unwrap(), "worker-3");
         // Direct construction of failed record (mirrors enrichment_fail)
-        let failed_state = enrichment_state_record("failed", serde_json::json!(null), None, None, vec![], serde_json::json!({
-            "stages":[{"name":"ingest","count":2,"failures":1,"latency_ms":30,"fingerprint":"","last_error":"bad file"}]
-        }));
+        let failed_state = enrichment_state_record(
+            "failed",
+            serde_json::json!(null),
+            None,
+            None,
+            vec![],
+            serde_json::json!({
+                "stages":[{"name":"ingest","count":2,"failures":1,"latency_ms":30,"fingerprint":"","last_error":"bad file"}]
+            }),
+        );
         assert_eq!(failed_state["state"], "failed");
         assert!(failed_state.get("lock_holder").unwrap().is_null());
         let t = failed_state.get("telemetry").unwrap();
@@ -1146,8 +1255,8 @@ mod tests {
     #[tokio::test]
     async fn test_f24_enrichment_lock_acquire_conflict_and_release() {
         use crate::guard::testkit::{MockStore, StubEmbedder};
-        use std::sync::Arc;
         use crate::traits::VectorStore;
+        use std::sync::Arc;
         let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
         let emb_trait: Arc<dyn crate::traits::Embedder> = Arc::new(StubEmbedder);
         let _emb = Arc::new(StubEmbedder);
@@ -1164,21 +1273,42 @@ mod tests {
                 "eligibility":"private"
             }),
         };
-        let _ = store.upsert(namespace, &registry_row_id(namespace), vec![0.0; 4], payload).await;
+        let _ = store
+            .upsert(
+                namespace,
+                &registry_row_id(namespace),
+                vec![0.0; 4],
+                payload,
+            )
+            .await;
 
         // Acquire for worker-1
-        let res = enrichment_start(&store, Some(&emb_trait), namespace, "worker-1").await.unwrap();
+        let res = enrichment_start(&store, Some(&emb_trait), namespace, "worker-1")
+            .await
+            .unwrap();
         assert_eq!(res["acquired"], true);
 
         // Conflict while locked
-        let res2 = enrichment_start(&store, Some(&emb_trait), namespace, "worker-2").await.unwrap();
+        let res2 = enrichment_start(&store, Some(&emb_trait), namespace, "worker-2")
+            .await
+            .unwrap();
         assert_eq!(res2["acquired"], false);
         assert_eq!(res2["lock_held"], true);
         assert_eq!(res2["holder"], "worker-1");
 
         // Commit clears lock; subsequent acquire succeeds
-        enrichment_commit(&store, Some(&emb_trait), namespace, serde_json::json!({}), serde_json::json!({})).await.unwrap();
-        let res3 = enrichment_start(&store, Some(&emb_trait), namespace, "worker-2").await.unwrap();
+        enrichment_commit(
+            &store,
+            Some(&emb_trait),
+            namespace,
+            serde_json::json!({}),
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+        let res3 = enrichment_start(&store, Some(&emb_trait), namespace, "worker-2")
+            .await
+            .unwrap();
         assert_eq!(res3["acquired"], true);
     }
 }
@@ -1219,8 +1349,14 @@ pub async fn enrichment_start(
     };
     let state = enrichment_state(&payload.metadata);
     let running = state.get("state").and_then(|v| v.as_str()) == Some("running");
-    let lock_holder = state.get("lock_holder").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let acquired_at = state.get("lock_acquired_at").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let lock_holder = state
+        .get("lock_holder")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let acquired_at = state
+        .get("lock_acquired_at")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let stale = if running {
         match acquired_at.as_deref() {
             Some(ts) => chrono::DateTime::parse_from_rfc3339(ts)
@@ -1244,11 +1380,17 @@ pub async fn enrichment_start(
     let now = Utc::now().to_rfc3339();
     let new_state = enrichment_state_record(
         "running",
-        state.get("watermark").cloned().unwrap_or(serde_json::Value::Null),
+        state
+            .get("watermark")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
         Some(holder_id),
         Some(now.clone()),
         Vec::new(),
-        state.get("telemetry").cloned().unwrap_or(serde_json::json!({})),
+        state
+            .get("telemetry")
+            .cloned()
+            .unwrap_or(serde_json::json!({})),
     );
     if let Some(obj) = payload.metadata.as_object_mut() {
         obj.insert("enrichment_state".to_string(), new_state);
@@ -1340,15 +1482,26 @@ pub async fn enrichment_fail(
         Err(e) => return Err(e.to_string()),
     };
     let mut state = enrichment_state(&payload.metadata);
-    let mut telemetry = state.get("telemetry").cloned().unwrap_or(serde_json::json!({}));
-    let mut stages = telemetry.get("stages").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let mut telemetry = state
+        .get("telemetry")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
+    let mut stages = telemetry
+        .get("stages")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
     // find or create stage entry
     let mut found = false;
     for st in stages.iter_mut() {
         if st.get("name").and_then(|v| v.as_str()) == Some(stage) {
             let failures = st.get("failures").and_then(|v| v.as_u64()).unwrap_or(0);
-            st.as_object_mut().unwrap().insert("failures".to_string(), serde_json::json!(failures + 1));
-            st.as_object_mut().unwrap().insert("last_error".to_string(), serde_json::json!(error));
+            st.as_object_mut()
+                .unwrap()
+                .insert("failures".to_string(), serde_json::json!(failures + 1));
+            st.as_object_mut()
+                .unwrap()
+                .insert("last_error".to_string(), serde_json::json!(error));
             found = true;
         }
     }
@@ -1363,9 +1516,19 @@ pub async fn enrichment_fail(
         }));
     }
     telemetry = serde_json::json!({"stages": stages});
-    let watermark = state.get("watermark").cloned().unwrap_or(serde_json::Value::Null);
+    let watermark = state
+        .get("watermark")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     let telemetry = normalize_telemetry(telemetry);
-    state = enrichment_state_record("failed", normalize_watermark(watermark), None, None, Vec::new(), telemetry);
+    state = enrichment_state_record(
+        "failed",
+        normalize_watermark(watermark),
+        None,
+        None,
+        Vec::new(),
+        telemetry,
+    );
     if let Some(obj) = payload.metadata.as_object_mut() {
         obj.insert("enrichment_state".to_string(), state);
     }
@@ -1376,21 +1539,55 @@ pub async fn enrichment_fail(
     Ok(())
 }
 pub fn enrichment_state(metadata: &Value) -> Value {
-    let base = metadata.get("enrichment_state").cloned().unwrap_or(serde_json::json!({}));
+    let base = metadata
+        .get("enrichment_state")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
     normalize_enrichment_state(base)
 }
 
 fn normalize_enrichment_state(mut state: Value) -> Value {
-    if !state.is_object() { state = serde_json::json!({}); }
+    if !state.is_object() {
+        state = serde_json::json!({});
+    }
     let obj = state.as_object_mut().unwrap();
-    if !obj.contains_key("state") { obj.insert("state".to_string(), serde_json::json!("pending")); }
-    if !obj.contains_key("watermark") { obj.insert("watermark".to_string(), serde_json::json!(null)); }
-    obj.insert("watermark".to_string(), normalize_watermark(obj.get("watermark").cloned().unwrap_or(serde_json::Value::Null)));
-    if !obj.contains_key("lock_holder") { obj.insert("lock_holder".to_string(), serde_json::Value::Null); }
-    if !obj.contains_key("lock_acquired_at") { obj.insert("lock_acquired_at".to_string(), serde_json::Value::Null); }
-    if !obj.contains_key("rerun_passes") { obj.insert("rerun_passes".to_string(), serde_json::json!([])); }
-    if !obj.contains_key("telemetry") { obj.insert("telemetry".to_string(), serde_json::json!({"stages":[],"totals":{"count":0,"failures":0,"latency_ms":0}})); }
-    obj.insert("telemetry".to_string(), normalize_telemetry(obj.get("telemetry").cloned().unwrap_or(serde_json::json!({}))));
+    if !obj.contains_key("state") {
+        obj.insert("state".to_string(), serde_json::json!("pending"));
+    }
+    if !obj.contains_key("watermark") {
+        obj.insert("watermark".to_string(), serde_json::json!(null));
+    }
+    obj.insert(
+        "watermark".to_string(),
+        normalize_watermark(
+            obj.get("watermark")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        ),
+    );
+    if !obj.contains_key("lock_holder") {
+        obj.insert("lock_holder".to_string(), serde_json::Value::Null);
+    }
+    if !obj.contains_key("lock_acquired_at") {
+        obj.insert("lock_acquired_at".to_string(), serde_json::Value::Null);
+    }
+    if !obj.contains_key("rerun_passes") {
+        obj.insert("rerun_passes".to_string(), serde_json::json!([]));
+    }
+    if !obj.contains_key("telemetry") {
+        obj.insert(
+            "telemetry".to_string(),
+            serde_json::json!({"stages":[],"totals":{"count":0,"failures":0,"latency_ms":0}}),
+        );
+    }
+    obj.insert(
+        "telemetry".to_string(),
+        normalize_telemetry(
+            obj.get("telemetry")
+                .cloned()
+                .unwrap_or(serde_json::json!({})),
+        ),
+    );
     state
 }
 
@@ -1419,19 +1616,23 @@ pub fn normalize_watermark(w: Value) -> Value {
 }
 
 pub fn normalize_telemetry(t: Value) -> Value {
-    let mut stages: Vec<Value> = t.get("stages").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-    stages.sort_by(|a,b| {
-        let an = a.get("name").and_then(|v|v.as_str()).unwrap_or("");
-        let bn = b.get("name").and_then(|v|v.as_str()).unwrap_or("");
+    let mut stages: Vec<Value> = t
+        .get("stages")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    stages.sort_by(|a, b| {
+        let an = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let bn = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
         an.cmp(bn)
     });
     let mut total_count = 0u64;
     let mut total_failures = 0u64;
     let mut total_latency = 0u64;
     for st in &stages {
-        total_count += st.get("count").and_then(|v|v.as_u64()).unwrap_or(0);
-        total_failures += st.get("failures").and_then(|v|v.as_u64()).unwrap_or(0);
-        total_latency += st.get("latency_ms").and_then(|v|v.as_u64()).unwrap_or(0);
+        total_count += st.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+        total_failures += st.get("failures").and_then(|v| v.as_u64()).unwrap_or(0);
+        total_latency += st.get("latency_ms").and_then(|v| v.as_u64()).unwrap_or(0);
     }
     serde_json::json!({
         "stages": stages,
@@ -1444,7 +1645,14 @@ pub fn normalize_telemetry(t: Value) -> Value {
 }
 
 /// Build an enrichment state record.
-pub fn enrichment_state_record(state: &str, watermark: Value, lock_holder: Option<&str>, lock_acquired_at: Option<String>, rerun_passes: Vec<String>, telemetry: Value) -> Value {
+pub fn enrichment_state_record(
+    state: &str,
+    watermark: Value,
+    lock_holder: Option<&str>,
+    lock_acquired_at: Option<String>,
+    rerun_passes: Vec<String>,
+    telemetry: Value,
+) -> Value {
     serde_json::json!({
         "state": state,
         "watermark": normalize_watermark(watermark),

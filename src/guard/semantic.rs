@@ -168,7 +168,9 @@ impl SemanticEvaluator {
                         )));
                     }
                     Err(e) => {
-                        tracing::warn!("guard could not list {memory_type} rows in '{namespace}': {e}");
+                        tracing::warn!(
+                            "guard could not list {memory_type} rows in '{namespace}': {e}"
+                        );
                         continue;
                     }
                 };
@@ -397,8 +399,22 @@ mod tests {
         for i in 0..40 {
             seed(&store, "guard", &format!("plain-{i}"), "rule", json!({})).await;
         }
-        seed(&store, "guard", "seeded-rule", "rule", guard_fields("seeded-rule", "docker")).await;
-        seed(&store, "guard", "listed-guard", "guard_rule", guard_fields("listed-guard", "rm -rf")).await;
+        seed(
+            &store,
+            "guard",
+            "seeded-rule",
+            "rule",
+            guard_fields("seeded-rule", "docker"),
+        )
+        .await;
+        seed(
+            &store,
+            "guard",
+            "listed-guard",
+            "guard_rule",
+            guard_fields("listed-guard", "rm -rf"),
+        )
+        .await;
 
         assert_eq!(
             candidates(store, "guard").await,
@@ -422,24 +438,67 @@ mod tests {
             m
         };
         seed(&store, "guard", "live", "rule", with(json!({}))).await;
-        seed(&store, "guard", "retired", "rule", with(json!({ "valid_to": 1 }))).await;
-        seed(&store, "guard", "conflicting", "rule", with(json!({ "mesh": { "conflict": true } }))).await;
+        seed(
+            &store,
+            "guard",
+            "retired",
+            "rule",
+            with(json!({ "valid_to": 1 })),
+        )
+        .await;
+        seed(
+            &store,
+            "guard",
+            "conflicting",
+            "rule",
+            with(json!({ "mesh": { "conflict": true } })),
+        )
+        .await;
 
         let ids = candidates(store, "guard").await;
-        assert_eq!(ids, vec!["x".to_string()], "only the live row's guard id remains: {ids:?}");
+        assert_eq!(
+            ids,
+            vec!["x".to_string()],
+            "only the live row's guard id remains: {ids:?}"
+        );
     }
 
     #[tokio::test]
     async fn global_rules_apply_in_every_namespace_without_repeating() {
         use crate::guard::testkit::MockStore;
         let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
-        seed(&store, "global", "g-rule", "rule", guard_fields("g-rule", "docker")).await;
-        seed(&store, "global", "g-guard", "guard_rule", guard_fields("g-guard", "rm -rf")).await;
-        seed(&store, "proj", "p-rule", "rule", guard_fields("p-rule", "force")).await;
+        seed(
+            &store,
+            "global",
+            "g-rule",
+            "rule",
+            guard_fields("g-rule", "docker"),
+        )
+        .await;
+        seed(
+            &store,
+            "global",
+            "g-guard",
+            "guard_rule",
+            guard_fields("g-guard", "rm -rf"),
+        )
+        .await;
+        seed(
+            &store,
+            "proj",
+            "p-rule",
+            "rule",
+            guard_fields("p-rule", "force"),
+        )
+        .await;
 
         assert_eq!(
             candidates(store.clone(), "proj").await,
-            vec!["g-guard".to_string(), "g-rule".to_string(), "p-rule".to_string()]
+            vec![
+                "g-guard".to_string(),
+                "g-rule".to_string(),
+                "p-rule".to_string()
+            ]
         );
         assert_eq!(
             candidates(store, "global").await,
@@ -453,8 +512,8 @@ mod tests {
     #[test]
     fn listing_cap_is_honored() {
         assert!(enforce_rule_cap("probe", MAX_GUARD_RULES).is_ok());
-        let err = enforce_rule_cap("probe", MAX_GUARD_RULES + 1)
-            .expect_err("over the cap must refuse");
+        let err =
+            enforce_rule_cap("probe", MAX_GUARD_RULES + 1).expect_err("over the cap must refuse");
         let message = err.to_string();
         assert!(message.contains("exceed the"), "{message}");
         assert!(message.contains(&MAX_GUARD_RULES.to_string()), "{message}");
@@ -471,9 +530,13 @@ mod tests {
         rows.push(rule_row("enforceable", 0.0, "guard_rule"));
         rows.extend(std::iter::repeat_n(generic, MAX_GUARD_RULES + 10));
 
-        let rules = rules_within_cap("probe", rows)
-            .expect("many non-guard rules must not trip the cap");
-        assert_eq!(rules.len(), 1, "only the guard-shaped row survives conversion");
+        let rules =
+            rules_within_cap("probe", rows).expect("many non-guard rules must not trip the cap");
+        assert_eq!(
+            rules.len(),
+            1,
+            "only the guard-shaped row survives conversion"
+        );
     }
 
     /// Above the cap of actually enforceable rules the guard still refuses.
@@ -530,7 +593,10 @@ mod tests {
             }));
         }
         for handle in handles {
-            handle.await.expect("task joins").expect("increment succeeds");
+            handle
+                .await
+                .expect("task joins")
+                .expect("increment succeeds");
         }
 
         let (_, payload) = store

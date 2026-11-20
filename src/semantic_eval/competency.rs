@@ -59,8 +59,12 @@ pub struct CompetencyQuery {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExpectedSparqlResult {
-    Ask { value: bool },
-    Select { rows: Vec<BTreeMap<String, ExpectedTerm>> },
+    Ask {
+        value: bool,
+    },
+    Select {
+        rows: Vec<BTreeMap<String, ExpectedTerm>>,
+    },
 }
 
 /// Canonical RDF-term record. Also used as the normalized actual-term form so
@@ -69,15 +73,21 @@ pub enum ExpectedSparqlResult {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExpectedTerm {
-    NamedNode { value: String },
-    BlankNode { value: String },
+    NamedNode {
+        value: String,
+    },
+    BlankNode {
+        value: String,
+    },
     Literal {
         value: String,
         datatype: String,
         #[serde(default)]
         language: Option<String>,
     },
-    Triple { value: String },
+    Triple {
+        value: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -161,15 +171,16 @@ fn parse_profile(value: &str) -> Result<Option<ReasoningProfile>> {
         "none" => Ok(None),
         "rdfs" => Ok(Some(ReasoningProfile::Rdfs)),
         "owl-rl" => Ok(Some(ReasoningProfile::OwlRl)),
-        _ => bail!(
-            "unsupported reasoning_profile '{value}'; expected 'none', 'rdfs', or 'owl-rl'"
-        ),
+        _ => bail!("unsupported reasoning_profile '{value}'; expected 'none', 'rdfs', or 'owl-rl'"),
     }
 }
 
 fn validate_fixture(f: &CompetencyFixture) -> Result<()> {
     if f.schema_version != 1 {
-        bail!("unsupported schema_version {} (expected 1)", f.schema_version);
+        bail!(
+            "unsupported schema_version {} (expected 1)",
+            f.schema_version
+        );
     }
     if f.fixture_id.trim().is_empty() {
         bail!("fixture_id must not be empty");
@@ -266,12 +277,7 @@ fn materialize(
 ) -> Result<MaterializationEvidence> {
     let adapter = ReasoningAdapter::new();
     let certified = adapter
-        .materialize_owl2_rl_with_proofs(
-            base,
-            CERT_NAMESPACE,
-            limits.max_inferred_triples,
-            profile,
-        )
+        .materialize_owl2_rl_with_proofs(base, CERT_NAMESPACE, limits.max_inferred_triples, profile)
         .map_err(|e| anyhow::anyhow!("certified materialization failed: {e}"))?;
     if certified.inferred_triples.len() > limits.max_dataset_quads {
         bail!(
@@ -282,7 +288,8 @@ fn materialize(
     // Consume the certified N-Quads verbatim: each entailment is placed in
     // its isolating named graph, never merged into the explicit-assertion
     // graph. Anything not carrying the expected graph is rejected fail-closed.
-    let inf_graph = oxrdf::GraphName::NamedNode(NamedNode::new_unchecked(&certified.inference_graph));
+    let inf_graph =
+        oxrdf::GraphName::NamedNode(NamedNode::new_unchecked(&certified.inference_graph));
     for nq in &certified.inferred_nquads {
         let quad = oxttl::NQuadsParser::new()
             .for_slice(nq.as_bytes())
@@ -357,9 +364,8 @@ async fn evaluate_inner(
         );
     }
 
-    let algebra_nodes = crate::rdf::sparql::count_algebra_nodes(
-        crate::rdf::sparql::sparql_pattern(&parsed),
-    );
+    let algebra_nodes =
+        crate::rdf::sparql::count_algebra_nodes(crate::rdf::sparql::sparql_pattern(&parsed));
     if algebra_nodes > limits.max_algebra_nodes {
         bail!(
             "query exceeded max_algebra_nodes budget ({algebra_nodes} > {})",
@@ -564,7 +570,9 @@ mod tests {
     );
 
     fn named(v: &str) -> ExpectedTerm {
-        ExpectedTerm::NamedNode { value: v.to_string() }
+        ExpectedTerm::NamedNode {
+            value: v.to_string(),
+        }
     }
     fn plain(v: &str) -> ExpectedTerm {
         ExpectedTerm::Literal {
@@ -582,7 +590,11 @@ mod tests {
             expected: ExpectedSparqlResult::Ask { value },
         }
     }
-    fn select(id: &str, sparql: &str, rows: Vec<BTreeMap<String, ExpectedTerm>>) -> CompetencyQuery {
+    fn select(
+        id: &str,
+        sparql: &str,
+        rows: Vec<BTreeMap<String, ExpectedTerm>>,
+    ) -> CompetencyQuery {
         CompetencyQuery {
             id: id.to_string(),
             rationale: "inline unit-test question".to_string(),
@@ -613,13 +625,22 @@ mod tests {
             .unwrap_or_else(|| panic!("no result for query {id}"))
     }
     fn assert_pass(r: &CompetencyReceipt, id: &str) {
-        assert_eq!(qr(r, id).verdict, "PASS", "{}: {:?}", id, qr(r, id).diagnostic);
+        assert_eq!(
+            qr(r, id).verdict,
+            "PASS",
+            "{}: {:?}",
+            id,
+            qr(r, id).diagnostic
+        );
     }
     fn assert_fail(r: &CompetencyReceipt, id: &str, needle: &str) {
         let q = qr(r, id);
         assert_eq!(q.verdict, "FAIL", "{id} should fail: {:?}", q.diagnostic);
         let d = q.diagnostic.as_deref().unwrap_or("");
-        assert!(d.contains(needle), "diagnostic {d:?} must contain {needle:?}");
+        assert!(
+            d.contains(needle),
+            "diagnostic {d:?} must contain {needle:?}"
+        );
     }
 
     #[tokio::test]
@@ -648,13 +669,31 @@ mod tests {
             "<urn:neurostrata:eval:c> <urn:neurostrata:eval:label> \"same\"@en .\n",
         );
         let rows = vec![
-            row(vec![("s", named("urn:neurostrata:eval:a")), ("l", plain("same"))]),
-            row(vec![("s", named("urn:neurostrata:eval:b")), ("l", plain("same"))]),
-            row(vec![("s", named("urn:neurostrata:eval:c")), ("l", ExpectedTerm::Literal {
-                value: "same".into(), datatype: RDF_LANG_STRING.into(), language: Some("en".into())
-            })]),
+            row(vec![
+                ("s", named("urn:neurostrata:eval:a")),
+                ("l", plain("same")),
+            ]),
+            row(vec![
+                ("s", named("urn:neurostrata:eval:b")),
+                ("l", plain("same")),
+            ]),
+            row(vec![
+                ("s", named("urn:neurostrata:eval:c")),
+                (
+                    "l",
+                    ExpectedTerm::Literal {
+                        value: "same".into(),
+                        datatype: RDF_LANG_STRING.into(),
+                        language: Some("en".into()),
+                    },
+                ),
+            ]),
         ];
-        let q = select("labels", "SELECT ?s ?l WHERE { ?s <urn:neurostrata:eval:label> ?l }", rows);
+        let q = select(
+            "labels",
+            "SELECT ?s ?l WHERE { ?s <urn:neurostrata:eval:label> ?l }",
+            rows,
+        );
         let f = fixture("none", nq, vec![q]);
         let r = run(&f).await;
         assert_pass(&r, "labels");
@@ -663,7 +702,9 @@ mod tests {
         if let ExpectedSparqlResult::Select { rows } = &mut wrong.queries[0].expected {
             if let Some(t) = rows[2].get_mut("l") {
                 *t = ExpectedTerm::Literal {
-                    value: "same".into(), datatype: RDF_LANG_STRING.into(), language: Some("fr".into())
+                    value: "same".into(),
+                    datatype: RDF_LANG_STRING.into(),
+                    language: Some("fr".into()),
                 };
             }
         }
@@ -677,11 +718,19 @@ mod tests {
             "<urn:neurostrata:eval:b> <urn:neurostrata:eval:p> \"dup\" .\n",
         );
         let one = row(vec![("v", plain("dup"))]);
-        let q = select("dups", "SELECT ?v WHERE { ?s <urn:neurostrata:eval:p> ?v }", vec![one.clone()]);
+        let q = select(
+            "dups",
+            "SELECT ?v WHERE { ?s <urn:neurostrata:eval:p> ?v }",
+            vec![one.clone()],
+        );
         let r = run(&fixture("none", nq, vec![q])).await;
         assert_fail(&r, "dups", "row count");
 
-        let q = select("dups2", "SELECT ?v WHERE { ?s <urn:neurostrata:eval:p> ?v }", vec![one.clone(), one]);
+        let q = select(
+            "dups2",
+            "SELECT ?v WHERE { ?s <urn:neurostrata:eval:p> ?v }",
+            vec![one.clone(), one],
+        );
         assert_pass(&run(&fixture("none", nq, vec![q])).await, "dups2");
     }
 
@@ -709,7 +758,10 @@ mod tests {
         let f = fixture("owl-rl", BASE_NQ, vec![
             ask("sub", "ASK { <urn:neurostrata:eval:mem:alpha> rdf:type <urn:neurostrata:eval:class:CognitiveArtifact> }", true),
         ]);
-        let limits = Limits { max_inferred_triples: 0, ..Limits::default() };
+        let limits = Limits {
+            max_inferred_triples: 0,
+            ..Limits::default()
+        };
         let err = run_with_limits(&f, &limits, b"inline").await.unwrap_err();
         assert!(format!("{err}").contains("materialization"), "{err}");
     }
@@ -752,8 +804,14 @@ mod tests {
 
         // RDF-star provenance is persisted in the receipt, not discarded.
         assert!(!ev.rdf_star_annotations.is_empty());
-        assert!(ev.rdf_star_annotations.iter().any(|a| a.contains("derivedByRule")));
-        assert!(ev.rdf_star_annotations.iter().any(|a| a.contains("certificateHash")));
+        assert!(ev
+            .rdf_star_annotations
+            .iter()
+            .any(|a| a.contains("derivedByRule")));
+        assert!(ev
+            .rdf_star_annotations
+            .iter()
+            .any(|a| a.contains("certificateHash")));
     }
 
     #[test]
@@ -764,7 +822,9 @@ mod tests {
         limits.max_inferred_triples = 0;
         let (mut dataset, base) = build_dataset(BASE_NQ, &limits).expect("dataset builds");
         assert!(materialize(ReasoningProfile::OwlRl, &base, &mut dataset, &limits).is_err());
-        let inf_graph = oxrdf::GraphName::NamedNode(NamedNode::new_unchecked(&inference_graph_iri(CERT_NAMESPACE)));
+        let inf_graph = oxrdf::GraphName::NamedNode(NamedNode::new_unchecked(
+            &inference_graph_iri(CERT_NAMESPACE),
+        ));
         assert_eq!(dataset.quads_for_graph_name(&inf_graph).count(), 0);
     }
 
@@ -794,40 +854,82 @@ mod tests {
             ask("sub", "ASK { <urn:neurostrata:eval:mem:alpha> rdf:type <urn:neurostrata:eval:class:CognitiveArtifact> }", true),
             ask("union", "ASK { { <urn:neurostrata:eval:a> <urn:neurostrata:eval:p> <urn:neurostrata:eval:b> } UNION { <urn:neurostrata:eval:c> <urn:neurostrata:eval:p> <urn:neurostrata:eval:d> } }", true),
         ]);
-        let ds = Limits { max_dataset_quads: 1, ..Limits::default() };
-        assert!(format!("{}", run_with_limits(&f, &ds, b"x").await.unwrap_err()).contains("dataset"));
+        let ds = Limits {
+            max_dataset_quads: 1,
+            ..Limits::default()
+        };
+        assert!(
+            format!("{}", run_with_limits(&f, &ds, b"x").await.unwrap_err()).contains("dataset")
+        );
 
-        let alg = Limits { max_algebra_nodes: 1, ..Limits::default() };
-        assert_fail(&run_with_limits(&f, &alg, b"x").await.expect("receipt"), "union", "algebra");
+        let alg = Limits {
+            max_algebra_nodes: 1,
+            ..Limits::default()
+        };
+        assert_fail(
+            &run_with_limits(&f, &alg, b"x").await.expect("receipt"),
+            "union",
+            "algebra",
+        );
 
-        let timeout = Limits { timeout_ms: 0, ..Limits::default() };
-        assert_fail(&run_with_limits(&f, &timeout, b"x").await.expect("receipt"), "sub", "timeout");
+        let timeout = Limits {
+            timeout_ms: 0,
+            ..Limits::default()
+        };
+        assert_fail(
+            &run_with_limits(&f, &timeout, b"x").await.expect("receipt"),
+            "sub",
+            "timeout",
+        );
 
-        let sel = fixture("none", BASE_NQ, vec![select(
+        let sel = fixture(
+            "none",
+            BASE_NQ,
+            vec![select(
+                "many",
+                "SELECT ?s WHERE { ?s <urn:neurostrata:eval:prop:partOf> ?o }",
+                vec![
+                    row(vec![("s", named("urn:neurostrata:eval:node:core"))]),
+                    row(vec![("s", named("urn:neurostrata:eval:node:engine"))]),
+                ],
+            )],
+        );
+        let sol = Limits {
+            max_solutions: 1,
+            ..Limits::default()
+        };
+        assert_fail(
+            &run_with_limits(&sel, &sol, b"x").await.expect("receipt"),
             "many",
-            "SELECT ?s WHERE { ?s <urn:neurostrata:eval:prop:partOf> ?o }",
-            vec![
-                row(vec![("s", named("urn:neurostrata:eval:node:core"))]),
-                row(vec![("s", named("urn:neurostrata:eval:node:engine"))]),
-            ],
-        )]);
-        let sol = Limits { max_solutions: 1, ..Limits::default() };
-        assert_fail(&run_with_limits(&sel, &sol, b"x").await.expect("receipt"), "many", "truncated");
+            "truncated",
+        );
     }
 
     #[tokio::test]
     async fn malformed_inputs_report_query_specific_diagnostics() {
-        let bad_sparql = fixture("none", BASE_NQ, vec![ask("bad", "ASK { this is not sparql", true)]);
+        let bad_sparql = fixture(
+            "none",
+            BASE_NQ,
+            vec![ask("bad", "ASK { this is not sparql", true)],
+        );
         assert_fail(&run(&bad_sparql).await, "bad", "parse");
 
-        let bad_rdf = fixture("none", "<<< not nquads >>>", vec![ask("x", "ASK { ?s ?p ?o }", true)]);
+        let bad_rdf = fixture(
+            "none",
+            "<<< not nquads >>>",
+            vec![ask("x", "ASK { ?s ?p ?o }", true)],
+        );
         let err = run_fixture(&bad_rdf).await.unwrap_err();
         assert!(format!("{err}").contains("N-Quads"), "{err}");
 
-        let dup = fixture("none", BASE_NQ, vec![
-            ask("same", "ASK { ?s ?p ?o }", true),
-            ask("same", "ASK { ?s ?p ?o }", true),
-        ]);
+        let dup = fixture(
+            "none",
+            BASE_NQ,
+            vec![
+                ask("same", "ASK { ?s ?p ?o }", true),
+                ask("same", "ASK { ?s ?p ?o }", true),
+            ],
+        );
         let err = run_fixture(&dup).await.unwrap_err();
         assert!(format!("{err}").contains("duplicate query id"), "{err}");
 
@@ -837,20 +939,28 @@ mod tests {
 
     #[tokio::test]
     async fn wrong_result_form_and_expected_bindings_fail() {
-        let f = fixture("none", BASE_NQ, vec![CompetencyQuery {
-            id: "form".into(),
-            rationale: "t".into(),
-            curator: "bosun".into(),
-            sparql: "ASK { ?s ?p ?o }".into(),
-            expected: ExpectedSparqlResult::Select { rows: vec![] },
-        }]);
+        let f = fixture(
+            "none",
+            BASE_NQ,
+            vec![CompetencyQuery {
+                id: "form".into(),
+                rationale: "t".into(),
+                curator: "bosun".into(),
+                sparql: "ASK { ?s ?p ?o }".into(),
+                expected: ExpectedSparqlResult::Select { rows: vec![] },
+            }],
+        );
         assert_fail(&run(&f).await, "form", "result form");
 
-        let wrong_rows = fixture("none", BASE_NQ, vec![select(
-            "rows",
-            "SELECT ?s WHERE { ?s <urn:neurostrata:eval:prop:partOf> ?o }",
-            vec![row(vec![("s", named("urn:neurostrata:eval:node:missing"))])],
-        )]);
+        let wrong_rows = fixture(
+            "none",
+            BASE_NQ,
+            vec![select(
+                "rows",
+                "SELECT ?s WHERE { ?s <urn:neurostrata:eval:prop:partOf> ?o }",
+                vec![row(vec![("s", named("urn:neurostrata:eval:node:missing"))])],
+            )],
+        );
         assert_fail(&run(&wrong_rows).await, "rows", "binding");
     }
 
@@ -906,7 +1016,9 @@ mod tests {
                 assert_eq!(m.applied_profile, profile);
             }
         }
-        let err = run_fixture(&fixture("owl_rl", BASE_NQ, q)).await.unwrap_err();
+        let err = run_fixture(&fixture("owl_rl", BASE_NQ, q))
+            .await
+            .unwrap_err();
         assert!(format!("{err}").contains("reasoning_profile"), "{err}");
     }
 
@@ -917,7 +1029,9 @@ mod tests {
             "ASK { <urn:neurostrata:eval:mem:alpha> rdf:type <urn:neurostrata:eval:class:CognitiveArtifact> }",
             true,
         )])).await;
-        let m = r.materialization.expect("rdfs still materializes via full closure");
+        let m = r
+            .materialization
+            .expect("rdfs still materializes via full closure");
         assert_eq!(m.requested_profile, "rdfs");
         assert_eq!(m.applied_profile, "rdfs");
         assert_eq!(m.rule_selection, "full_owl2_rl");
@@ -926,9 +1040,15 @@ mod tests {
 
     #[tokio::test]
     async fn custom_functions_are_registered_but_inert() {
-        let f = fixture("none", BASE_NQ, vec![
-            ask("salience", "ASK { FILTER(ns:salience(\"urn:neurostrata:eval:a\") = 0.0) }", true),
-        ]);
+        let f = fixture(
+            "none",
+            BASE_NQ,
+            vec![ask(
+                "salience",
+                "ASK { FILTER(ns:salience(\"urn:neurostrata:eval:a\") = 0.0) }",
+                true,
+            )],
+        );
         assert_pass(&run(&f).await, "salience");
     }
 

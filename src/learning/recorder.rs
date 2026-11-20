@@ -3,10 +3,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
 
-
-use crate::learning::observation::{
-    DecisionObservation, LearningOutcome, PayloadHash,
-};
+use crate::learning::observation::{DecisionObservation, LearningOutcome, PayloadHash};
 
 pub struct LearningRecorder {
     root: PathBuf,
@@ -53,7 +50,11 @@ impl LearningRecorder {
         Ok(())
     }
 
-    pub async fn record_blob_hash(&self, payload_hash: &PayloadHash, input: &crate::traits::MemoryPayload) -> Result<()> {
+    pub async fn record_blob_hash(
+        &self,
+        payload_hash: &PayloadHash,
+        input: &crate::traits::MemoryPayload,
+    ) -> Result<()> {
         let path = self.root.join("blob_index.jsonl");
         let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
         let entry = serde_json::json!({
@@ -103,7 +104,8 @@ mod tests {
         // we close and reopen before the second flush completes.
         let tmpdir = std::env::temp_dir().join("ns_learn_test");
         std::fs::create_dir_all(&tmpdir).unwrap();
-        let rec = futures::executor::block_on(LearningRecorder::open(tmpdir.clone(), None)).unwrap();
+        let rec =
+            futures::executor::block_on(LearningRecorder::open(tmpdir.clone(), None)).unwrap();
         let v1 = DecisionObservation {
             schema_version: 1,
             observation_id: "obs-1".into(),
@@ -184,7 +186,10 @@ mod tests {
                 .unwrap_or_else(|| panic!("{label}: this run's record is in the file"));
             assert_eq!(parsed.observation_id, observation.observation_id);
             assert_eq!(parsed.namespace, observation.namespace);
-            assert_eq!(parsed.context.connection_id, observation.context.connection_id);
+            assert_eq!(
+                parsed.context.connection_id,
+                observation.context.connection_id
+            );
             assert_eq!(parsed.result_memory_id, observation.result_memory_id);
             assert_eq!(parsed.decision, observation.decision);
         }

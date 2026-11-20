@@ -1,5 +1,5 @@
-use async_trait::async_trait;
 use anyhow::{anyhow, Result};
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -152,7 +152,9 @@ impl DataConnectorRegistry {
     }
 
     fn load_configured_pool_schemas(workspace_root: &Path) -> Vec<DataPoolSchema> {
-        let config_path = workspace_root.join(".NeuroStrata").join("connector_pools.json");
+        let config_path = workspace_root
+            .join(".NeuroStrata")
+            .join("connector_pools.json");
         let Ok(raw) = std::fs::read_to_string(&config_path) else {
             return Vec::new();
         };
@@ -245,11 +247,14 @@ impl InMemoryPoolConnector {
         if let Some(entry) = pools.get_mut(&pool_id) {
             entry.schema = schema;
         } else {
-            pools.insert(pool_id, InMemoryPoolEntry {
-                schema,
-                records: HashMap::new(),
-                idempotency: HashMap::new(),
-            });
+            pools.insert(
+                pool_id,
+                InMemoryPoolEntry {
+                    schema,
+                    records: HashMap::new(),
+                    idempotency: HashMap::new(),
+                },
+            );
         }
     }
 
@@ -338,7 +343,9 @@ impl DataConnector for InMemoryPoolConnector {
         max_bytes: u32,
     ) -> Result<DataSlicePayload> {
         let pools = self.pools.read().unwrap();
-        let pool = pools.get(pool_id).ok_or_else(|| anyhow!("pool '{}' not found", pool_id))?;
+        let pool = pools
+            .get(pool_id)
+            .ok_or_else(|| anyhow!("pool '{}' not found", pool_id))?;
         let all_records = pool.records.get(pointer_uri).ok_or_else(|| {
             anyhow!(
                 "pointer_uri '{}' not found in pool '{}'",
@@ -379,7 +386,9 @@ impl DataConnector for InMemoryPoolConnector {
         req: &ExternalEffectRequest,
     ) -> Result<ExternalEffectReceipt> {
         let mut pools = self.pools.write().unwrap();
-        let pool = pools.get_mut(pool_id).ok_or_else(|| anyhow!("pool '{}' not found", pool_id))?;
+        let pool = pools
+            .get_mut(pool_id)
+            .ok_or_else(|| anyhow!("pool '{}' not found", pool_id))?;
         let idempotency_key = format!("{}:{}:{}", pool_id, pointer_uri, req.idempotency_key);
         if pool.schema.access_mode == DataPoolAccessMode::ReadOnly {
             return Err(anyhow!("pool '{}' is read-only", pool_id));
@@ -474,13 +483,22 @@ impl JsonFilePoolConnector {
             match comp {
                 std::path::Component::Normal(_) | std::path::Component::CurDir => {}
                 std::path::Component::ParentDir => {
-                    return Err(anyhow!("pointer_uri '{}' must not contain '..'", pointer_uri));
+                    return Err(anyhow!(
+                        "pointer_uri '{}' must not contain '..'",
+                        pointer_uri
+                    ));
                 }
                 std::path::Component::RootDir => {
-                    return Err(anyhow!("pointer_uri '{}' must be relative to workspace root", pointer_uri));
+                    return Err(anyhow!(
+                        "pointer_uri '{}' must be relative to workspace root",
+                        pointer_uri
+                    ));
                 }
                 std::path::Component::Prefix(_) => {
-                    return Err(anyhow!("pointer_uri '{}' must not contain a prefix component", pointer_uri));
+                    return Err(anyhow!(
+                        "pointer_uri '{}' must not contain a prefix component",
+                        pointer_uri
+                    ));
                 }
             }
         }
@@ -489,14 +507,21 @@ impl JsonFilePoolConnector {
         } else {
             self.workspace_root.join(&p)
         };
-        let root_canonical = self.workspace_root.canonicalize().unwrap_or_else(|_| self.workspace_root.clone());
+        let root_canonical = self
+            .workspace_root
+            .canonicalize()
+            .unwrap_or_else(|_| self.workspace_root.clone());
         let canonical = match abs.canonicalize() {
             Ok(c) => c,
             Err(_) => {
                 // If pointer does not exist yet (e.g. for append), resolve the parent and join file name
                 let parent = abs.parent().unwrap_or_else(|| Path::new("."));
-                let file_name = abs.file_name().ok_or_else(|| anyhow!("invalid pointer path '{}'", pointer_uri))?;
-                let parent_canonical = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
+                let file_name = abs
+                    .file_name()
+                    .ok_or_else(|| anyhow!("invalid pointer path '{}'", pointer_uri))?;
+                let parent_canonical = parent
+                    .canonicalize()
+                    .unwrap_or_else(|_| parent.to_path_buf());
                 let canonical = parent_canonical.join(file_name);
                 canonical
             }
@@ -526,12 +551,16 @@ impl JsonFilePoolConnector {
             if line.is_empty() {
                 continue;
             }
-            let value: Value = serde_json::from_str(line)
-                .map_err(|e| anyhow!("invalid JSON line in {}: {} -> {}", path.display(), line, e))?;
+            let value: Value = serde_json::from_str(line).map_err(|e| {
+                anyhow!("invalid JSON line in {}: {} -> {}", path.display(), line, e)
+            })?;
             records.push(value);
         }
         if records.is_empty() {
-            return Err(anyhow!("file {} is empty or not valid JSON/JSONL", path.display()));
+            return Err(anyhow!(
+                "file {} is empty or not valid JSON/JSONL",
+                path.display()
+            ));
         }
         Ok(records)
     }
@@ -757,7 +786,9 @@ mod tests {
         });
         c.seed_records("p", "uri", vec![json!(1), json!(2), json!(3)]);
         let rt = rt();
-        let payload = rt.block_on(c.resolve_slice("p", "uri", 1, 1, 1024)).unwrap();
+        let payload = rt
+            .block_on(c.resolve_slice("p", "uri", 1, 1, 1024))
+            .unwrap();
         assert_eq!(payload.records.len(), 1);
         assert_eq!(payload.records[0], json!(2));
         // source hash = hash of full vec, slice hash = hash of slice
@@ -792,12 +823,16 @@ mod tests {
             expected_source_sha256: None,
             idempotency_key: "key1".into(),
         };
-        let receipt = rt.block_on(c.apply_external_effect("p", "uri", &req)).unwrap();
+        let receipt = rt
+            .block_on(c.apply_external_effect("p", "uri", &req))
+            .unwrap();
         assert!(receipt.applied);
         // prior and new should differ after append
         assert_ne!(receipt.prior_source_sha256, receipt.new_source_sha256);
         // Replay idempotency
-        let receipt2 = rt.block_on(c.apply_external_effect("p", "uri", &req)).unwrap();
+        let receipt2 = rt
+            .block_on(c.apply_external_effect("p", "uri", &req))
+            .unwrap();
         assert_eq!(receipt2.new_source_sha256, receipt.new_source_sha256);
         // CAS conflict
         let bad_req = ExternalEffectRequest {
@@ -808,7 +843,9 @@ mod tests {
             expected_source_sha256: Some("0000".into()),
             idempotency_key: "key2".into(),
         };
-        let err = rt.block_on(c.apply_external_effect("p", "uri", &bad_req)).unwrap_err();
+        let err = rt
+            .block_on(c.apply_external_effect("p", "uri", &bad_req))
+            .unwrap_err();
         assert!(err.to_string().contains("CAS conflict"));
     }
 
@@ -834,7 +871,9 @@ mod tests {
             expected_source_sha256: None,
             idempotency_key: "key1".into(),
         };
-        let err = rt.block_on(c.apply_external_effect("ro", "uri", &req)).unwrap_err();
+        let err = rt
+            .block_on(c.apply_external_effect("ro", "uri", &req))
+            .unwrap_err();
         assert!(err.to_string().contains("read-only"));
     }
 
@@ -857,11 +896,15 @@ mod tests {
             description: "test".into(),
         });
         let rt = rt();
-        let payload = rt.block_on(c.resolve_slice("jp", "data.json", 0, 10, 1024)).unwrap();
+        let payload = rt
+            .block_on(c.resolve_slice("jp", "data.json", 0, 10, 1024))
+            .unwrap();
         assert_eq!(payload.records.len(), 2);
         assert_eq!(payload.source_sha256, payload.slice_sha256);
         // Path traversal
-        let err = rt.block_on(c.resolve_slice("jp", "../outside.json", 0, 10, 1024)).unwrap_err();
+        let err = rt
+            .block_on(c.resolve_slice("jp", "../outside.json", 0, 10, 1024))
+            .unwrap_err();
         assert!(err.to_string().contains("must not contain '..'"));
         // Write-back
         let req = ExternalEffectRequest {
@@ -872,7 +915,9 @@ mod tests {
             expected_source_sha256: None,
             idempotency_key: "k1".into(),
         };
-        let receipt = rt.block_on(c.apply_external_effect("jp", "data.json", &req)).unwrap();
+        let receipt = rt
+            .block_on(c.apply_external_effect("jp", "data.json", &req))
+            .unwrap();
         assert!(receipt.applied);
         // Check file
         let new_content = std::fs::read_to_string(&file_path).unwrap();
@@ -900,10 +945,16 @@ mod tests {
             description: "test".into(),
         });
         let rt = rt();
-        let err = rt.block_on(c.resolve_slice("jp", "nonexistent_dir/../../outside.json", 0, 10, 1024)).unwrap_err();
+        let err = rt
+            .block_on(c.resolve_slice("jp", "nonexistent_dir/../../outside.json", 0, 10, 1024))
+            .unwrap_err();
         assert!(err.to_string().contains("must not contain '..'"));
-        let err = rt.block_on(c.resolve_slice("jp", "/etc/passwd", 0, 10, 1024)).unwrap_err();
-        assert!(err.to_string().contains("must be relative to workspace root"));
+        let err = rt
+            .block_on(c.resolve_slice("jp", "/etc/passwd", 0, 10, 1024))
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("must be relative to workspace root"));
         let req = ExternalEffectRequest {
             pointer_id: "../outside.json".into(),
             operation: "append".into(),
@@ -912,7 +963,9 @@ mod tests {
             expected_source_sha256: None,
             idempotency_key: "k1".into(),
         };
-        let err = rt.block_on(c.apply_external_effect("jp", "../outside.json", &req)).unwrap_err();
+        let err = rt
+            .block_on(c.apply_external_effect("jp", "../outside.json", &req))
+            .unwrap_err();
         assert!(err.to_string().contains("must not contain '..'"));
         std::fs::remove_dir_all(&root).unwrap();
     }

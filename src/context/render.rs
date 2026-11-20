@@ -25,7 +25,10 @@ pub fn render_plan(plan: &ContextPlan) -> String {
             if let Some(f) = &item.freshness {
                 out.push_str(&format!(
                     " [source={}, semantic={}, coverage={}, lifecycle={}]",
-                    f.source_currency, f.semantic_validation, f.index_coverage, f.decision_lifecycle
+                    f.source_currency,
+                    f.semantic_validation,
+                    f.index_coverage,
+                    f.decision_lifecycle
                 ));
             }
             out.push('\n');
@@ -39,8 +42,8 @@ pub fn render_plan(plan: &ContextPlan) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::model::{ContextItem, ContextPlan, Degradation};
+    use super::*;
 
     #[test]
     fn render_marks_truncation() {

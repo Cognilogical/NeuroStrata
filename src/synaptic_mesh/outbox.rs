@@ -115,7 +115,14 @@ pub const OP_ARCHIVED: &str = "archived";
 /// definitions). Everything else — `action_receipt`, tasks,
 /// structural/source-ingestion rows, embeddings, the bus's own
 /// sentinel/audit rows — is strictly local.
-const SHAREABLE_MEMORY_TYPES: &[&str] = &["rule", "fact", "procedure", "action_type", "thesis", "concept"];
+const SHAREABLE_MEMORY_TYPES: &[&str] = &[
+    "rule",
+    "fact",
+    "procedure",
+    "action_type",
+    "thesis",
+    "concept",
+];
 
 /// Whether `memory_type` is a type the mesh may carry. Used by both the
 /// subscriber (to decide what to capture) and the worker (to decide what to

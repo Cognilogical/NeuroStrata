@@ -55,24 +55,34 @@ impl LayaOnnxProvider {
         // Read manifest to validate embedder identity and extract version/temperature/tier
         let manifest_text = std::fs::read_to_string(&manifest_path)
             .map_err(|e| anyhow!(format!("Cannot read manifest: {e}")))?;
-        let manifest: serde_json::Value =
-            serde_json::from_str(&manifest_text).map_err(|e| anyhow!(format!("Bad manifest JSON: {e}")))?;
+        let manifest: serde_json::Value = serde_json::from_str(&manifest_text)
+            .map_err(|e| anyhow!(format!("Bad manifest JSON: {e}")))?;
 
-        let model_version = manifest.get("model_version")
+        let model_version = manifest
+            .get("model_version")
             .or(manifest.get("version"))
             .and_then(|x| x.as_str())
             .unwrap_or("v0.1.0-local")
             .to_string();
 
-        let temperature = manifest.get("temperature")
+        let temperature = manifest
+            .get("temperature")
             .and_then(|x| x.as_f64())
             .map(|v| v as f32)
             .unwrap_or(1.0f32);
-        let temperature = if temperature > 0.0 { temperature } else { 1.0f32 };
+        let temperature = if temperature > 0.0 {
+            temperature
+        } else {
+            1.0f32
+        };
 
-        let calibration_tier = if let Some(t) = manifest.get("calibration_tier").and_then(|x| x.as_str()) {
+        let calibration_tier = if let Some(t) =
+            manifest.get("calibration_tier").and_then(|x| x.as_str())
+        {
             match t {
-                "GoldShipped" | "gold_shipped" | "DatasetCalibrated" | "dataset_calibrated" => crate::judgment::CalibrationTier::Gold,
+                "GoldShipped" | "gold_shipped" | "DatasetCalibrated" | "dataset_calibrated" => {
+                    crate::judgment::CalibrationTier::Gold
+                }
                 "Uncalibrated" | "uncalibrated" => crate::judgment::CalibrationTier::ProxyInternal,
                 _ => crate::judgment::CalibrationTier::ProxyInternal,
             }
@@ -83,7 +93,8 @@ impl LayaOnnxProvider {
         // SHA-256 verification if present
         if let Some(expected_sha) = manifest.get("model_sha256").and_then(|x| x.as_str()) {
             use sha2::{Digest, Sha256};
-            let bytes = std::fs::read(&model_path).map_err(|e| anyhow!(format!("Cannot read model: {e}")))?;
+            let bytes = std::fs::read(&model_path)
+                .map_err(|e| anyhow!(format!("Cannot read model: {e}")))?;
             let mut hasher = Sha256::new();
             hasher.update(&bytes);
             let actual = hex::encode(hasher.finalize());
@@ -92,9 +103,10 @@ impl LayaOnnxProvider {
             }
         }
 
-        let embedder_id = manifest["embedder_id"].as_str().ok_or_else(|| {
-            anyhow!("Manifest missing embedder_id")
-        })?.to_string();
+        let embedder_id = manifest["embedder_id"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Manifest missing embedder_id"))?
+            .to_string();
 
         // Build session directly from file (local-first; graceful on bad model).
         let inference_session = {
@@ -208,7 +220,11 @@ impl LayaOnnxProvider {
             ));
         }
 
-        println!("Laya model '{}' fetched and verified to '{}'", model_id, target_path.display());
+        println!(
+            "Laya model '{}' fetched and verified to '{}'",
+            model_id,
+            target_path.display()
+        );
         Ok(())
     }
 }
@@ -288,29 +304,34 @@ impl JudgmentProvider for LayaOnnxProvider {
                 let cand_tokens = tokenize_content(&payload_content, tokenizer.as_deref());
                 let intersection: usize = new_tokens.intersection(&cand_tokens).count();
                 let union: usize = new_tokens.union(&cand_tokens).count();
-                let token_overlap = if union == 0 { 0.0f32 } else { intersection as f32 / union as f32 };
+                let token_overlap = if union == 0 {
+                    0.0f32
+                } else {
+                    intersection as f32 / union as f32
+                };
                 let fallback_logit = (token_overlap - 0.5) * 4.0;
                 let (similarity, reason) = if let Some(ref session_ref) = session_arc {
                     let mut session = session_ref.lock().unwrap_or_else(|e| e.into_inner());
                     let jaccard_sim = token_overlap;
                     let feature_vec = [jaccard_sim as f32, (1.0 - score.clamp(0.0, 1.0)) as f32];
-                    let feature_array = match ndarray::Array2::from_shape_vec((1, 2), feature_vec.to_vec())
-                    {
-                        Ok(arr) => match ort::value::Value::from_array(arr) {
-                            Ok(v) => Some(v),
+                    let feature_array =
+                        match ndarray::Array2::from_shape_vec((1, 2), feature_vec.to_vec()) {
+                            Ok(arr) => match ort::value::Value::from_array(arr) {
+                                Ok(v) => Some(v),
+                                Err(_) => None,
+                            },
                             Err(_) => None,
-                        },
-                        Err(_) => None,
-                    };
+                        };
                     match feature_array {
                         Some(arr) => match session.run(ort::inputs! {"input" => arr}) {
                             Ok(outputs) => {
-                                let model_logit = outputs.iter().next().and_then(|(_name, value)| {
-                                    match value.try_extract_tensor::<f32>() {
-                                        Ok((_, data)) => laya_logit_from_tensor(data),
-                                        Err(_) => None,
-                                    }
-                                });
+                                let model_logit =
+                                    outputs.iter().next().and_then(|(_name, value)| {
+                                        match value.try_extract_tensor::<f32>() {
+                                            Ok((_, data)) => laya_logit_from_tensor(data),
+                                            Err(_) => None,
+                                        }
+                                    });
                                 match model_logit {
                                     Some(logit) => (
                                         temperature_scaled_sigmoid(logit, temperature),
@@ -357,8 +378,8 @@ impl JudgmentProvider for LayaOnnxProvider {
     /// Reports true when the ONNX inference session is loaded and state is Ready.
     async fn health_check(&self) -> Result<bool> {
         {
-            let is_healthy = self.inference_session().is_some() &&
-                           self.state() == crate::judgment::RuntimeState::Ready;
+            let is_healthy = self.inference_session().is_some()
+                && self.state() == crate::judgment::RuntimeState::Ready;
             // Model identity is part of the health record: a green health
             // check for the wrong bundle is an operator-visible failure.
             tracing::debug!(
@@ -398,7 +419,10 @@ fn temperature_scaled_sigmoid(logit: f32, temperature: f32) -> f32 {
 
 /// Tokenizes text content, using the tokenizer file when available,
 /// otherwise falling back to subword/whitespace token IDs.
-fn tokenize_content(content: &str, tokenizer: Option<&tokenizers::Tokenizer>) -> std::collections::HashSet<u32> {
+fn tokenize_content(
+    content: &str,
+    tokenizer: Option<&tokenizers::Tokenizer>,
+) -> std::collections::HashSet<u32> {
     let mut ids = std::collections::HashSet::new();
     if let Some(tok) = tokenizer {
         // When tokenizer.json exists: use tokenizer.encode to produce IDs.
@@ -411,7 +435,9 @@ fn tokenize_content(content: &str, tokenizer: Option<&tokenizers::Tokenizer>) ->
                 return ids;
             }
             Err(e) => {
-                tracing::warn!("Laya tokenizer encode failed: {e}; falling back to whitespace hashing");
+                tracing::warn!(
+                    "Laya tokenizer encode failed: {e}; falling back to whitespace hashing"
+                );
             }
         }
     }
@@ -437,8 +463,7 @@ mod tests {
     #[test]
     fn laya_logit_extraction_computes_different_confidences_for_different_slices() {
         let conf = |slice: &[f32]| {
-            laya_logit_from_tensor(slice)
-                .map(|logit| temperature_scaled_sigmoid(logit, 1.0))
+            laya_logit_from_tensor(slice).map(|logit| temperature_scaled_sigmoid(logit, 1.0))
         };
         // [neg, pos] => pos - neg = 5.0 => high confidence
         let high = conf(&[-2.0, 3.0]);
@@ -446,7 +471,10 @@ mod tests {
         let low = conf(&[3.0, -2.0]);
         assert_eq!(high, Some(1.0 / (1.0 + (-5.0_f32).exp())));
         assert_eq!(low, Some(1.0 / (1.0 + 5.0_f32.exp())));
-        assert_ne!(high, low, "different tensor slices must yield different confidences");
+        assert_ne!(
+            high, low,
+            "different tensor slices must yield different confidences"
+        );
         // Single-element tensor: the logit is used directly.
         assert_eq!(conf(&[0.0]), Some(0.5));
         // Empty tensor or unsupported shape: extraction fails => caller falls back.
@@ -463,7 +491,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let manifest = serde_json::json!({"embedder_id": "laya", "model_version": "v1"});
-        std::fs::write(dir.join("manifest.json"), serde_json::to_string(&manifest).unwrap()).unwrap();
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
         // Place a model.onnx file so the judge enters the inference branch
         std::fs::write(dir.join("model.onnx"), b"fake").unwrap();
         if let Ok(p) = LayaOnnxProvider::load(&dir, sem) {
@@ -503,11 +535,16 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             let manifest = serde_json::json!({"embedder_id": "laya", "model_version": "v1"});
-            std::fs::write(dir.join("manifest.json"), serde_json::to_string(&manifest).unwrap()).unwrap();
+            std::fs::write(
+                dir.join("manifest.json"),
+                serde_json::to_string(&manifest).unwrap(),
+            )
+            .unwrap();
             // Place model.onnx file
             std::fs::write(dir.join("model.onnx"), b"fake").unwrap();
             // With fake model, session creation will fail -> health_check false
-            let p = LayaOnnxProvider::load(&dir, sem).expect("bundle with manifest and model loads");
+            let p =
+                LayaOnnxProvider::load(&dir, sem).expect("bundle with manifest and model loads");
             assert!(!p.health_check().await.unwrap());
             let _ = std::fs::remove_dir_all(&dir);
         }
@@ -521,11 +558,16 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             let manifest = serde_json::json!({"embedder_id": "laya", "model_version": "v1"});
-            std::fs::write(dir.join("manifest.json"), serde_json::to_string(&manifest).unwrap()).unwrap();
+            std::fs::write(
+                dir.join("manifest.json"),
+                serde_json::to_string(&manifest).unwrap(),
+            )
+            .unwrap();
             std::fs::write(dir.join("model.onnx"), b"fake").unwrap();
-            let p = LayaOnnxProvider::load(&dir, sem).expect("bundle with manifest and model loads");
+            let p =
+                LayaOnnxProvider::load(&dir, sem).expect("bundle with manifest and model loads");
             assert_eq!(p.state(), RuntimeState::Unavailable); // fake model fails session creation
-            // Manifest fields must be stored, not discarded.
+                                                              // Manifest fields must be stored, not discarded.
             assert_eq!(p.model_version(), "v1");
             assert_eq!(p.embedder_id(), "laya");
             let _ = std::fs::remove_dir_all(&dir);
@@ -543,7 +585,11 @@ mod tests {
             "model_version": "v1",
             "calibration_tier": "GoldShipped"
         });
-        std::fs::write(dir.join("manifest.json"), serde_json::to_string(&manifest).unwrap()).unwrap();
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
         std::fs::write(dir.join("model.onnx"), b"fake").unwrap();
         let p = LayaOnnxProvider::load(&dir, sem).expect("bundle loads");
         assert_eq!(p.calibration_tier(), crate::judgment::CalibrationTier::Gold);
@@ -714,8 +760,7 @@ mod ensure_ready_tests {
         let mgr = LearningRuntimeManager::new(LearningPaths::new(tmp.path()));
         let state = mgr.ensure_ready().await;
         assert_eq!(
-            state,
-            Ready,
+            state, Ready,
             "model.onnx present must report Ready, got {:?}",
             state
         );
@@ -728,8 +773,7 @@ mod ensure_ready_tests {
         let mgr = LearningRuntimeManager::new(LearningPaths::new(tmp.path()));
         let state = mgr.ensure_ready().await;
         assert_eq!(
-            state,
-            Ready,
+            state, Ready,
             "laya-train binary present must report Ready, got {:?}",
             state
         );
@@ -836,12 +880,8 @@ impl ContradictionQueue {
         reason: &str,
         queued_at: i64,
     ) -> Result<bool> {
-        let key = |r: &QueuedContradiction| {
-            (
-                r.target_memory_id.clone(),
-                r.action_receipt_id.clone(),
-            )
-        };
+        let key =
+            |r: &QueuedContradiction| (r.target_memory_id.clone(), r.action_receipt_id.clone());
         let wanted = (
             target_memory_id.to_string(),
             action_receipt_id.map(|s| s.to_string()),
@@ -886,11 +926,17 @@ mod contradiction_queue_tests {
     fn enqueue_is_durable_and_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
         let q = ContradictionQueue::new(tmp.path());
-        assert!(q.enqueue("rule-1", Some("receipt-9"), "revert", 100).unwrap());
+        assert!(q
+            .enqueue("rule-1", Some("receipt-9"), "revert", 100)
+            .unwrap());
         // Duplicate delivery (same target + receipt) must not append again.
-        assert!(!q.enqueue("rule-1", Some("receipt-9"), "revert", 100).unwrap());
+        assert!(!q
+            .enqueue("rule-1", Some("receipt-9"), "revert", 100)
+            .unwrap());
         // Different receipt or target is a genuinely new request.
-        assert!(q.enqueue("rule-1", Some("receipt-10"), "revert", 101).unwrap());
+        assert!(q
+            .enqueue("rule-1", Some("receipt-10"), "revert", 101)
+            .unwrap());
         assert!(q.enqueue("rule-2", None, "failed attempt", 102).unwrap());
         let pending = q.pending().unwrap();
         assert_eq!(pending.len(), 3);
@@ -942,7 +988,10 @@ mod contradiction_queue_tests {
             .into_iter()
             .map(|h| h.join().unwrap() as usize)
             .sum();
-        assert_eq!(appended, 1, "only one concurrent same-key enqueue may append");
+        assert_eq!(
+            appended, 1,
+            "only one concurrent same-key enqueue may append"
+        );
         let q = ContradictionQueue::new(&root);
         assert_eq!(q.pending().unwrap().len(), 1);
     }
@@ -952,7 +1001,9 @@ mod contradiction_queue_tests {
         let tmp = tempfile::tempdir().unwrap();
         let nested = tmp.path().join("learning").join("nested");
         let q = ContradictionQueue::new(&nested);
-        assert!(q.enqueue("rule-durable", Some("receipt-2"), "why", 5).unwrap());
+        assert!(q
+            .enqueue("rule-durable", Some("receipt-2"), "why", 5)
+            .unwrap());
         assert!(nested.exists(), "parent directory must be created durably");
         let q2 = ContradictionQueue::new(&nested);
         let pending = q2.pending().unwrap();

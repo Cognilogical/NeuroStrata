@@ -204,7 +204,8 @@ pub fn compare_receipts(
             } else {
                 0.0
             };
-            let regressed = p50_delta_pct > max_regression_pct || p95_delta_pct > max_regression_pct;
+            let regressed =
+                p50_delta_pct > max_regression_pct || p95_delta_pct > max_regression_pct;
             if regressed {
                 passed = false;
             }
@@ -273,10 +274,7 @@ pub async fn persist_receipt_metrics_to_store(
 }
 
 fn git_output(args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .args(args)
-        .output()
-        .ok()?;
+    let out = std::process::Command::new("git").args(args).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -317,8 +315,8 @@ async fn run_ingest_suite(iterations: usize) -> SuiteReceipt {
         std::fs::write(dir.join("b.rs"), "pub struct Bar { pub y: i32 }\n").unwrap();
         std::fs::write(dir.join("c.md"), "# Title\n\nSome docs.\n").unwrap();
         let store_path = tmp.path().join("store");
-        let store = crate::store::ladybug::LadybugStore::for_testing(&store_path, dims)
-            .expect("store");
+        let store =
+            crate::store::ladybug::LadybugStore::for_testing(&store_path, dims).expect("store");
         let store: std::sync::Arc<dyn crate::traits::VectorStore> = std::sync::Arc::new(store);
         store.init("bench").await.expect("init bench namespace");
         let embedder: std::sync::Arc<dyn crate::traits::Embedder> =
@@ -335,7 +333,9 @@ async fn run_ingest_suite(iterations: usize) -> SuiteReceipt {
 
 async fn run_embed_suite(iterations: usize) -> SuiteReceipt {
     let embedder = BenchEmbedder::new(64);
-    let texts: Vec<String> = (0..32).map(|i| format!("function number {} does work", i)).collect();
+    let texts: Vec<String> = (0..32)
+        .map(|i| format!("function number {} does work", i))
+        .collect();
     let mut samples = Vec::new();
     for _ in 0..iterations.max(1) {
         let start = Instant::now();
@@ -455,10 +455,16 @@ pub async fn run_benchmarks(cfg: &BenchConfig) -> anyhow::Result<PerfReceipt> {
 
     if let Some(path) = &cfg.baseline {
         let raw = std::fs::read_to_string(path).with_context(|| {
-            format!("failed to read benchmark baseline receipt from {}", path.display())
+            format!(
+                "failed to read benchmark baseline receipt from {}",
+                path.display()
+            )
         })?;
         let base: PerfReceipt = serde_json::from_str(&raw).with_context(|| {
-            format!("failed to parse benchmark baseline receipt from {}", path.display())
+            format!(
+                "failed to parse benchmark baseline receipt from {}",
+                path.display()
+            )
         })?;
         receipt.comparison = Some(compare_receipts(&receipt, &base, cfg.max_regression_pct));
     }
@@ -473,9 +479,8 @@ pub async fn run_benchmarks(cfg: &BenchConfig) -> anyhow::Result<PerfReceipt> {
         }
         let serialized = serde_json::to_string_pretty(&receipt)
             .context("failed to serialize benchmark receipt")?;
-        std::fs::write(path, serialized).with_context(|| {
-            format!("failed to write benchmark receipt to {}", path.display())
-        })?;
+        std::fs::write(path, serialized)
+            .with_context(|| format!("failed to write benchmark receipt to {}", path.display()))?;
     }
 
     if let Some(ns) = &cfg.record_metrics {
@@ -490,11 +495,9 @@ pub async fn run_benchmarks(cfg: &BenchConfig) -> anyhow::Result<PerfReceipt> {
             crate::config::Config::from_default_path()?.db_path
         };
         let dims = crate::embed::configured_dimensions().unwrap_or(64).max(1);
-        let store = crate::store::ladybug::LadybugStore::new(
-            db_path.to_string_lossy().to_string(),
-            dims,
-        )
-        .with_context(|| format!("failed to open metrics store at {}", db_path.display()))?;
+        let store =
+            crate::store::ladybug::LadybugStore::new(db_path.to_string_lossy().to_string(), dims)
+                .with_context(|| format!("failed to open metrics store at {}", db_path.display()))?;
         persist_receipt_metrics_to_store(&receipt, &store, ns).await?;
     }
 
@@ -728,10 +731,19 @@ mod tests {
             }],
             comparison: None,
         };
-        let written = persist_receipt_metrics_to_store(&receipt, &store, "ns").await.unwrap();
+        let written = persist_receipt_metrics_to_store(&receipt, &store, "ns")
+            .await
+            .unwrap();
         assert!(written > 0);
         let samples = store
-            .query_db_metrics("ns", crate::time_series::MetricKind::EnrichmentLatencyMs, "ingest", None, None, 10)
+            .query_db_metrics(
+                "ns",
+                crate::time_series::MetricKind::EnrichmentLatencyMs,
+                "ingest",
+                None,
+                None,
+                10,
+            )
             .await
             .unwrap();
         assert!(!samples.is_empty());

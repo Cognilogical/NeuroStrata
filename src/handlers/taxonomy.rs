@@ -30,11 +30,9 @@ pub async fn tee_taxonomy_pulse_to_project_outbox(
     };
     let outbox_dir = crate::synaptic_mesh::outbox::outbox_dir_for(&mesh_dir);
     let wake = Arc::new(tokio::sync::Notify::new());
-    let Ok(sub) = crate::events::subscribers::MeshOutbox::new(
-        outbox_dir,
-        wake,
-        mesh.manifest().epoch,
-    ) else {
+    let Ok(sub) =
+        crate::events::subscribers::MeshOutbox::new(outbox_dir, wake, mesh.manifest().epoch)
+    else {
         return;
     };
     let ctx = SubscriberContext {

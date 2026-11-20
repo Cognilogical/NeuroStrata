@@ -91,7 +91,7 @@ pub const fn task_step(
         KernelGuard::None => {}
         KernelGuard::RequireReason if !has_reason => return Err(MissingReason),
         KernelGuard::ExtractionRequired if !extraction_edge_exists => {
-            return Err(KernelTaskStepError::ExtractionRequired)
+            return Err(KernelTaskStepError::ExtractionRequired);
         }
         KernelGuard::RequireReason | KernelGuard::ExtractionRequired => {}
     }
@@ -3970,4 +3970,643 @@ mod kani_proofs {
             }
         }
     }
+}
+
+// ─── Shell exemption classifier (issues #314, #315) ───
+
+/// Pure, option-aware classifier for shell payloads. Returns true when every
+/// segment of the payload is a provably read-only / verification command.
+/// Handles JSON unwrapping, lone-`&` rejection, quote stripping, short-option
+/// bundling, forced refspecs, destructive push flags, and attached `gh api`
+/// write flags. Mirrors `plugins/core/index.ts::isZeroActionExemptShellSegment`.
+pub fn evaluate_shell_exemption(payload: &str) -> bool {
+    let trimmed = payload.trim();
+    // action_type is checked by the caller; here payload may be JSON or raw.
+    // JSON unwrap.
+    let command = if trimmed.starts_with('{') {
+        match parse_json_command_fields(trimmed) {
+            Some((command, cmd)) => {
+                let pick = |value: Option<String>| value.filter(|s| !s.trim().is_empty());
+                pick(command).or_else(|| pick(cmd)).unwrap_or_default()
+            }
+            None => return false,
+        }
+    } else {
+        trimmed.to_string()
+    };
+    let cmd = command.trim();
+    if cmd.is_empty()
+        || cmd.contains('`')
+        || cmd.contains("$(")
+        || cmd.contains('>')
+        || cmd.contains('<')
+    {
+        return false;
+    }
+    // reject lone '&' (background operator) but allow '&&'
+    let without_andand = cmd.replace("&&", "");
+    if without_andand.contains('&') {
+        return false;
+    }
+    let segments: Vec<String> = cmd
+        .split(|c| c == ';' || c == '\n' || c == '|' || c == '&')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if segments.is_empty() {
+        return false;
+    }
+    segments.iter().all(|s| is_exempt_segment(s))
+}
+
+/// Minimal strict JSON reader for the shell-exemption decision. The kernel is
+/// compiled standalone with no crates, so this mirrors `JSON.parse` closely
+/// enough to fail closed on anything it cannot fully validate.
+struct JsonReader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> JsonReader<'a> {
+    fn skip_ws(&mut self) {
+        while self.pos < self.bytes.len()
+            && matches!(self.bytes[self.pos], b' ' | b'\t' | b'\n' | b'\r')
+        {
+            self.pos += 1;
+        }
+    }
+
+    fn hex4(&mut self) -> Option<u32> {
+        if self.pos + 4 > self.bytes.len() {
+            return None;
+        }
+        let mut value = 0u32;
+        for _ in 0..4 {
+            let digit = match self.bytes[self.pos] {
+                b'0'..=b'9' => (self.bytes[self.pos] - b'0') as u32,
+                b'a'..=b'f' => (self.bytes[self.pos] - b'a' + 10) as u32,
+                b'A'..=b'F' => (self.bytes[self.pos] - b'A' + 10) as u32,
+                _ => return None,
+            };
+            value = value * 16 + digit;
+            self.pos += 1;
+        }
+        Some(value)
+    }
+
+    fn string(&mut self) -> Option<String> {
+        if self.bytes.get(self.pos) != Some(&b'"') {
+            return None;
+        }
+        self.pos += 1;
+        // Buffer raw UTF-8 bytes plus decoded escape scalars, then validate
+        // once so multi-byte characters match `JSON.parse` exactly.
+        let mut raw: Vec<u8> = Vec::new();
+        while self.pos < self.bytes.len() {
+            let b = self.bytes[self.pos];
+            if b == b'"' {
+                self.pos += 1;
+                return String::from_utf8(raw).ok();
+            }
+            if b < 0x20 {
+                return None;
+            }
+            if b == b'\\' {
+                self.pos += 1;
+                let escape = *self.bytes.get(self.pos)?;
+                self.pos += 1;
+                let ch = match escape {
+                    b'"' => '"',
+                    b'\\' => '\\',
+                    b'/' => '/',
+                    b'b' => '\u{0008}',
+                    b'f' => '\u{000C}',
+                    b'n' => '\n',
+                    b'r' => '\r',
+                    b't' => '\t',
+                    b'u' => {
+                        let first = self.hex4()?;
+                        let scalar = if (0xD800..=0xDBFF).contains(&first) {
+                            if self.bytes.get(self.pos) != Some(&b'\\')
+                                || self.bytes.get(self.pos + 1) != Some(&b'u')
+                            {
+                                return None;
+                            }
+                            self.pos += 2;
+                            let second = self.hex4()?;
+                            if !(0xDC00..=0xDFFF).contains(&second) {
+                                return None;
+                            }
+                            0x10000 + ((first - 0xD800) << 10) + (second - 0xDC00)
+                        } else if (0xDC00..=0xDFFF).contains(&first) {
+                            return None;
+                        } else {
+                            first
+                        };
+                        char::from_u32(scalar)?
+                    }
+                    _ => return None,
+                };
+                let mut buf = [0u8; 4];
+                raw.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                continue;
+            }
+            raw.push(b);
+            self.pos += 1;
+        }
+        None
+    }
+
+    fn literal(&mut self, word: &[u8]) -> Option<()> {
+        if self.bytes.get(self.pos..self.pos + word.len()) == Some(word) {
+            self.pos += word.len();
+            Some(())
+        } else {
+            None
+        }
+    }
+
+    fn number(&mut self) -> Option<()> {
+        if self.bytes.get(self.pos) == Some(&b'-') {
+            self.pos += 1;
+        }
+        match self.bytes.get(self.pos) {
+            Some(b'0') => {
+                self.pos += 1;
+                if matches!(self.bytes.get(self.pos), Some(b'0'..=b'9')) {
+                    return None;
+                }
+            }
+            Some(b'1'..=b'9') => {
+                while matches!(self.bytes.get(self.pos), Some(b'0'..=b'9')) {
+                    self.pos += 1;
+                }
+            }
+            _ => return None,
+        }
+        if self.bytes.get(self.pos) == Some(&b'.') {
+            self.pos += 1;
+            if !matches!(self.bytes.get(self.pos), Some(b'0'..=b'9')) {
+                return None;
+            }
+            while matches!(self.bytes.get(self.pos), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+        }
+        if matches!(self.bytes.get(self.pos), Some(b'e') | Some(b'E')) {
+            self.pos += 1;
+            if matches!(self.bytes.get(self.pos), Some(b'+') | Some(b'-')) {
+                self.pos += 1;
+            }
+            if !matches!(self.bytes.get(self.pos), Some(b'0'..=b'9')) {
+                return None;
+            }
+            while matches!(self.bytes.get(self.pos), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+        }
+        Some(())
+    }
+
+    fn skip_value(&mut self) -> Option<()> {
+        self.skip_ws();
+        match self.bytes.get(self.pos).copied()? {
+            b'"' => {
+                self.string()?;
+                Some(())
+            }
+            b'{' => {
+                self.pos += 1;
+                self.skip_ws();
+                if self.bytes.get(self.pos) == Some(&b'}') {
+                    self.pos += 1;
+                    return Some(());
+                }
+                loop {
+                    self.skip_ws();
+                    self.string()?;
+                    self.skip_ws();
+                    if self.bytes.get(self.pos) != Some(&b':') {
+                        return None;
+                    }
+                    self.pos += 1;
+                    self.skip_value()?;
+                    self.skip_ws();
+                    match self.bytes.get(self.pos) {
+                        Some(b',') => {
+                            self.pos += 1;
+                            self.skip_ws();
+                            if self.bytes.get(self.pos) == Some(&b'}') {
+                                return None;
+                            }
+                        }
+                        Some(b'}') => {
+                            self.pos += 1;
+                            return Some(());
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+            b'[' => {
+                self.pos += 1;
+                self.skip_ws();
+                if self.bytes.get(self.pos) == Some(&b']') {
+                    self.pos += 1;
+                    return Some(());
+                }
+                loop {
+                    self.skip_value()?;
+                    self.skip_ws();
+                    match self.bytes.get(self.pos) {
+                        Some(b',') => {
+                            self.pos += 1;
+                            self.skip_ws();
+                            if self.bytes.get(self.pos) == Some(&b']') {
+                                return None;
+                            }
+                        }
+                        Some(b']') => {
+                            self.pos += 1;
+                            return Some(());
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+            b't' => self.literal(b"true"),
+            b'f' => self.literal(b"false"),
+            b'n' => self.literal(b"null"),
+            b'-' | b'0'..=b'9' => self.number(),
+            _ => None,
+        }
+    }
+}
+
+/// Parse a JSON object, returning only top-level `command`/`cmd` string values.
+/// Invalid JSON (including trailing content) fails closed. Duplicate keys are
+/// last-wins and a non-string value clears the field, matching `JSON.parse`
+/// plus `asString` in the TS plugin.
+fn parse_json_command_fields(json: &str) -> Option<(Option<String>, Option<String>)> {
+    let mut reader = JsonReader {
+        bytes: json.as_bytes(),
+        pos: 0,
+    };
+    reader.skip_ws();
+    if reader.bytes.get(reader.pos) != Some(&b'{') {
+        return None;
+    }
+    reader.pos += 1;
+    reader.skip_ws();
+    let mut command: Option<String> = None;
+    let mut cmd: Option<String> = None;
+    if reader.bytes.get(reader.pos) == Some(&b'}') {
+        reader.pos += 1;
+    } else {
+        loop {
+            reader.skip_ws();
+            let key = reader.string()?;
+            reader.skip_ws();
+            if reader.bytes.get(reader.pos) != Some(&b':') {
+                return None;
+            }
+            reader.pos += 1;
+            reader.skip_ws();
+            if reader.bytes.get(reader.pos) == Some(&b'"') {
+                let value = reader.string()?;
+                if key == "command" {
+                    command = Some(value);
+                } else if key == "cmd" {
+                    cmd = Some(value);
+                }
+            } else {
+                reader.skip_value()?;
+                if key == "command" {
+                    command = None;
+                } else if key == "cmd" {
+                    cmd = None;
+                }
+            }
+            reader.skip_ws();
+            match reader.bytes.get(reader.pos) {
+                Some(b',') => {
+                    reader.pos += 1;
+                    reader.skip_ws();
+                    if reader.bytes.get(reader.pos) == Some(&b'}') {
+                        return None;
+                    }
+                }
+                Some(b'}') => {
+                    reader.pos += 1;
+                    break;
+                }
+                _ => return None,
+            }
+        }
+    }
+    reader.skip_ws();
+    if reader.pos != reader.bytes.len() {
+        return None;
+    }
+    Some((command, cmd))
+}
+
+fn strip_matching_quotes(tok: &str) -> String {
+    let t = tok.trim();
+    if t.len() >= 2 {
+        let first = t.chars().next().unwrap();
+        let last = t.chars().last().unwrap();
+        if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+            return t[1..t.len() - 1].to_string();
+        }
+    }
+    t.to_string()
+}
+
+fn is_exempt_segment(segment: &str) -> bool {
+    let mut tokens: Vec<String> = segment
+        .split_whitespace()
+        .map(strip_matching_quotes)
+        .collect();
+    // env assignment stripping
+    while !tokens.is_empty() && is_env_assignment(&tokens[0]) {
+        tokens.remove(0);
+    }
+    if tokens.is_empty() {
+        return false;
+    }
+    let bin = std::path::Path::new(&tokens[0])
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&tokens[0])
+        .to_string();
+    let args: Vec<String> = tokens[1..].to_vec();
+    let has_flag = |flags: &[&str]| -> bool {
+        args.iter().any(|arg| {
+            flags.iter().any(|flag| {
+                if *flag == arg {
+                    true
+                } else if flag.starts_with("--") {
+                    arg.starts_with(&format!("{}=", flag))
+                } else {
+                    arg.starts_with(flag)
+                }
+            })
+        })
+    };
+
+    match bin.as_str() {
+        "git" => {
+            // strip git global options
+            let mut rest: Vec<String> = args.clone();
+            loop {
+                if rest.len() >= 2
+                    && (rest[0] == "-C" || rest[0] == "--git-dir" || rest[0] == "--work-tree")
+                {
+                    rest.drain(..2);
+                } else if !rest.is_empty()
+                    && (rest[0] == "--no-pager"
+                        || rest[0] == "-P"
+                        || rest[0] == "--no-optional-locks"
+                        || rest[0].starts_with("--git-dir=")
+                        || rest[0].starts_with("--work-tree="))
+                {
+                    rest.remove(0);
+                } else {
+                    break;
+                }
+            }
+            if rest.is_empty() {
+                return false;
+            }
+            if rest[0].starts_with('-') {
+                return false;
+            }
+            let subcmd = rest[0].clone();
+            let sub_args: Vec<String> = rest[1..].to_vec();
+            // Reject disallowed git subcommand args before classifying.
+            for a in &sub_args {
+                if is_disallowed_git_arg(a) {
+                    return false;
+                }
+            }
+            match subcmd.as_str() {
+                "push" => {
+                    // mutating if any push arg indicates force/delete/etc.
+                    for arg in &sub_args {
+                        let a = arg.as_str();
+                        if a.starts_with('+') {
+                            return false;
+                        }
+                        if a.starts_with("--force") {
+                            return false;
+                        }
+                        if a == "--mirror" || a == "--delete" || a == "--prune" {
+                            return false;
+                        }
+                        // unambiguous long-option prefixes (--dele* → --delete)
+                        if a.starts_with("--dele") {
+                            return false;
+                        }
+                        // short-bundle d|f only before '=' (and only for a real
+                        // short cluster, not a long option name like -oformat)
+                        if a.starts_with('-') && !a.starts_with("--") {
+                            let bundle = a.split('=').next().unwrap_or(a);
+                            // Parse the short-option cluster left-to-right: `-o`
+                            // (--push-option) consumes the rest as its attached
+                            // value (`-fometa` = `-f -o meta`).
+                            for ch in bundle[1..].chars() {
+                                if !ch.is_ascii_alphabetic() {
+                                    break;
+                                }
+                                if ch == 'f' || ch == 'd' {
+                                    return false;
+                                }
+                                if ch == 'o' {
+                                    break;
+                                }
+                            }
+                        }
+                        // --no-verify always mutating
+                        if a == "--no-verify" {
+                            return false;
+                        }
+                        // empty-source :refspec
+                        if a.starts_with(':') && a.len() > 1 {
+                            // :refs/heads/scratch etc -> delete
+                            return false;
+                        }
+                    }
+                    // also :refspec anywhere (src:dst where src empty)
+                    // handled above by starts_with(':')
+                    true
+                }
+                "pull" | "fetch" | "status" | "log" | "diff" | "show" | "rev-parse" => {
+                    !has_flag(&[
+                        "--output",
+                        "-O",
+                        "--ext-diff",
+                        "--textconv",
+                        "--exec",
+                        "-x",
+                        "--upload-pack",
+                        "--receive-pack",
+                    ])
+                }
+                "stash" => matches!(sub_args.first().map(|s| s.as_str()), Some("list" | "show")),
+                "branch" => {
+                    sub_args.len() >= 1 // allow empty? original requires all listed; empty args -> true? original: all() on empty true but len>=2 check
+                        && sub_args.iter().all(|t| {
+                            matches!(t.as_str(), "--show-current" | "-a" | "-r" | "--list" | "-v" | "-vv")
+                        })
+                        && rest.len() >= 2
+                }
+                _ => false,
+            }
+        }
+        "neurostrata-mcp" => match args.first().map(|s| s.as_str()) {
+            Some("task" | "doc-gate") => true,
+            Some("synaptic-mesh") => matches!(args.get(1).map(|s| s.as_str()), Some("status")),
+            _ => false,
+        },
+        "cargo" => {
+            let rest: Vec<String> = if args.first().map(|s| s.starts_with('+')).unwrap_or(false) {
+                args[1..].to_vec()
+            } else {
+                args.clone()
+            };
+            matches!(
+                rest.first().map(|s| s.as_str()),
+                Some(
+                    "test"
+                        | "check"
+                        | "clippy"
+                        | "bench"
+                        | "metadata"
+                        | "tree"
+                        | "version"
+                        | "--version"
+                )
+            )
+        }
+        "gh" => {
+            match args.first().map(|s| s.as_str()) {
+                Some("pr") => matches!(
+                    args.get(1).map(|s| s.as_str()),
+                    Some("view" | "list" | "checks" | "status" | "diff")
+                ),
+                Some("issue") => matches!(
+                    args.get(1).map(|s| s.as_str()),
+                    Some("view" | "list" | "status")
+                ),
+                Some("run") => matches!(
+                    args.get(1).map(|s| s.as_str()),
+                    Some("view" | "list" | "watch")
+                ),
+                Some("api") => {
+                    // attached -X|-f|-F values count as writes
+                    let mut writes = false;
+                    for a in &args[1..] {
+                        if a == "-X"
+                            || a == "--method"
+                            || a == "-f"
+                            || a == "-F"
+                            || a == "--field"
+                            || a == "--raw-field"
+                            || a == "--input"
+                        {
+                            writes = true;
+                        } else if a.starts_with("-X") || a.starts_with("-f") || a.starts_with("-F")
+                        {
+                            // attached short flag with value, e.g. -XPOST, -fbody=hi
+                            // only count if there's more than the flag letter
+                            if a.len() > 2 {
+                                writes = true;
+                            }
+                        } else if a.starts_with("--method=")
+                            || a.starts_with("--field=")
+                            || a.starts_with("--raw-field=")
+                            || a.starts_with("--input=")
+                        {
+                            writes = true;
+                        }
+                    }
+                    !writes
+                }
+                _ => false,
+            }
+        }
+        "node" => args
+            .iter()
+            .any(|t| t == "--test" || t.ends_with("test.mjs")),
+        "gate-receipt.sh" | "check-include-str-targets.sh" => true,
+        "bash" => args
+            .first()
+            .map(|t| t.ends_with("gate-receipt.sh") || t.ends_with("check-include-str-targets.sh"))
+            .unwrap_or(false),
+        "rustc" => matches!(args.first().map(|s| s.as_str()), Some("--version" | "-V")),
+        _ => false,
+    }
+}
+
+fn is_env_assignment(tok: &str) -> bool {
+    // VAR=value at start
+    if let Some(eq) = tok.find('=') {
+        let name = &tok[..eq];
+        if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            let first = name.chars().next().unwrap();
+            if first.is_ascii_alphabetic() || first == '_' {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Resolve a session root from an explicit caller directory and an ambient
+/// current working directory. An explicit directory always wins as the
+/// starting point; otherwise `cwd` is used. The walk stops at the nearest
+/// `.git` ancestor, so an ambient `.NeuroStrata` directory outside that
+/// boundary can never capture the session.
+pub fn resolve_session_root(
+    explicit: Option<&std::path::Path>,
+    cwd: &std::path::Path,
+) -> std::path::PathBuf {
+    let start = explicit.unwrap_or(cwd);
+    let start = if start.is_dir() {
+        start
+    } else {
+        start.parent().unwrap_or(start)
+    };
+
+    // The given directory itself is authoritative when it carries
+    // .NeuroStrata (non-git project roots), matching the pre-kernel behavior.
+    if start.join(".NeuroStrata").exists() {
+        return start.to_path_buf();
+    }
+
+    let mut cur = Some(start);
+    while let Some(dir) = cur {
+        if dir.join(".git").exists() {
+            return dir.to_path_buf();
+        }
+        cur = dir.parent().filter(|p| !p.as_os_str().is_empty());
+    }
+    start.to_path_buf()
+}
+
+fn is_disallowed_git_arg(arg: &str) -> bool {
+    arg == "--output"
+        || arg == "-O"
+        || arg.starts_with("--output=")
+        || arg == "--ext-diff"
+        || arg == "--textconv"
+        || arg == "--exec"
+        || arg.starts_with("--exec=")
+        || arg == "-x"
+        || arg == "--upload-pack"
+        || arg.starts_with("--upload-pack=")
+        || arg == "--receive-pack"
+        || arg.starts_with("--receive-pack=")
 }

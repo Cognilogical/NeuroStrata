@@ -30,10 +30,7 @@ pub fn edge_priority_weight(rel: &str) -> u32 {
 
 /// Weight of a whole path.
 pub fn path_weight(relations: &[&str]) -> u32 {
-    relations
-        .iter()
-        .map(|rel| edge_priority_weight(rel))
-        .sum()
+    relations.iter().map(|rel| edge_priority_weight(rel)).sum()
 }
 
 /// One ranked neighbour: the reached id, its hop distance from the seed, the

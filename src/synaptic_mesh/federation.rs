@@ -1,8 +1,16 @@
 //! Federation (in-house approximation): query a remote daemon instance over HTTP.
 //! `remote_list` is also exercised in production by
 //! `MeshService::status_report`, which probes the configured HTTP peer.
-pub async fn remote_list(base_url: &str, namespace: &str, token: &str) -> Result<Vec<serde_json::Value>, String> {
-    let url = format!("{}/list?namespace={}", base_url.trim_end_matches('/'), namespace);
+pub async fn remote_list(
+    base_url: &str,
+    namespace: &str,
+    token: &str,
+) -> Result<Vec<serde_json::Value>, String> {
+    let url = format!(
+        "{}/list?namespace={}",
+        base_url.trim_end_matches('/'),
+        namespace
+    );
     let client = reqwest::Client::new();
     // An empty (unset) token must not send a bare `Authorization: Bearer` header.
     let token = token.trim();
@@ -12,12 +20,17 @@ pub async fn remote_list(base_url: &str, namespace: &str, token: &str) -> Result
     }
     let resp = req.send().await.map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
-        return Err(format!("federation endpoint returned HTTP {}", resp.status()));
+        return Err(format!(
+            "federation endpoint returned HTTP {}",
+            resp.status()
+        ));
     }
     let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
     v.as_array()
         .cloned()
-        .ok_or_else(|| anyhow::anyhow!("remote_list expected JSON array from {base_url}, got non-array"))
+        .ok_or_else(|| {
+            anyhow::anyhow!("remote_list expected JSON array from {base_url}, got non-array")
+        })
         .map_err(|e| format!("{:#}", e))
 }
 
@@ -83,7 +96,11 @@ mod tests {
 
     #[test]
     fn url_format() {
-        let u = format!("{}/list?namespace={}", "http://x".trim_end_matches('/'), "ns");
+        let u = format!(
+            "{}/list?namespace={}",
+            "http://x".trim_end_matches('/'),
+            "ns"
+        );
         assert_eq!(u, "http://x/list?namespace=ns");
     }
 
@@ -124,8 +141,7 @@ mod tests {
             "application/json",
             body,
         ));
-        let result =
-            remote_list(&format!("http://127.0.0.1:{}", addr.port()), "ns", "   ").await;
+        let result = remote_list(&format!("http://127.0.0.1:{}", addr.port()), "ns", "   ").await;
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(result.unwrap()[0]["id"], "m1");
         let request = task.await.unwrap().to_lowercase();
@@ -147,8 +163,7 @@ mod tests {
             "text/plain",
             "gone",
         ));
-        let result =
-            remote_list(&format!("http://127.0.0.1:{}", addr.port()), "ns", "t").await;
+        let result = remote_list(&format!("http://127.0.0.1:{}", addr.port()), "ns", "t").await;
         let err = result.expect_err("a 404 cannot be a JSON decode path");
         assert!(err.contains("HTTP 404"), "got: {err}");
         let request = task.await.unwrap().to_lowercase();

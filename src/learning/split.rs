@@ -29,9 +29,15 @@ impl DatasetSplits {
 
     pub fn insert(&mut self, observation_id: &str, split: Split) {
         match split {
-            Split::Train => { let _ = self.train.insert(observation_id.to_string()); }
-            Split::Calibration => { let _ = self.calibration.insert(observation_id.to_string()); }
-            Split::Eval => { let _ = self.eval.insert(observation_id.to_string()); }
+            Split::Train => {
+                let _ = self.train.insert(observation_id.to_string());
+            }
+            Split::Calibration => {
+                let _ = self.calibration.insert(observation_id.to_string());
+            }
+            Split::Eval => {
+                let _ = self.eval.insert(observation_id.to_string());
+            }
         }
     }
 
@@ -77,7 +83,7 @@ impl UnionFind {
         }
         Self { parent, rank }
     }
-    
+
     fn find(&mut self, x: usize) -> usize {
         if self.parent[x] != x {
             let root = self.find(self.parent[x]);
@@ -85,12 +91,14 @@ impl UnionFind {
         }
         self.parent[x]
     }
-    
+
     fn union(&mut self, x: usize, y: usize) {
         let rx = self.find(x);
         let ry = self.find(y);
-        if rx == ry { return; }
-        
+        if rx == ry {
+            return;
+        }
+
         if self.rank[rx] < self.rank[ry] {
             self.parent[rx] = ry;
         } else if self.rank[rx] > self.rank[ry] {
@@ -100,7 +108,7 @@ impl UnionFind {
             self.rank[rx] += 1;
         }
     }
-    
+
     fn components(&mut self) -> HashMap<usize, Vec<usize>> {
         let mut map: HashMap<usize, Vec<usize>> = HashMap::new();
         for i in 0..self.parent.len() {
@@ -118,16 +126,16 @@ impl UnionFind {
 /// violations (connected components that cross boundaries).
 pub fn split_observations(
     observation_ids: &[String],
-    memory_ids: &[HashSet<String>],    // per-observation memory ID sets
+    memory_ids: &[HashSet<String>], // per-observation memory ID sets
     payload_hashes: &[HashSet<String>], // per-observation payload hash sets
     supersession_lineages: &[Option<String>], // per-observation superseded-by
-    governance_targets: &[Option<String>],   // per-observation governance target
-    time_windows: &[i64],                    // per-observation timestamp
+    governance_targets: &[Option<String>], // per-observation governance target
+    time_windows: &[i64],           // per-observation timestamp
 ) -> Result<DatasetSplits> {
     let mut splits = DatasetSplits::new();
     let n = observation_ids.len();
     let mut uf = UnionFind::new(n);
-    
+
     // Union observations based on shared signals
     // Memory IDs
     let mut memory_id_to_indices: HashMap<String, Vec<usize>> = HashMap::new();
@@ -144,7 +152,7 @@ pub fn split_observations(
             }
         }
     }
-    
+
     // Payload hashes
     let mut ph_to_indices: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, phs) in payload_hashes.iter().enumerate() {
@@ -160,7 +168,7 @@ pub fn split_observations(
             }
         }
     }
-    
+
     // Supersession lineages (same Some(sup) value)
     let mut sup_to_indices: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, sup_opt) in supersession_lineages.iter().enumerate() {
@@ -176,7 +184,7 @@ pub fn split_observations(
             }
         }
     }
-    
+
     // Governance targets (same Some(gov) value)
     let mut gov_to_indices: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, gov_opt) in governance_targets.iter().enumerate() {
@@ -192,7 +200,7 @@ pub fn split_observations(
             }
         }
     }
-    
+
     // Time windows (same 1-hour bucket when > 0)
     let mut time_to_indices: HashMap<i64, Vec<usize>> = HashMap::new();
     for (i, &ts) in time_windows.iter().enumerate() {
@@ -209,14 +217,14 @@ pub fn split_observations(
             }
         }
     }
-    
+
     // Group observations by their root components
     let components: HashMap<usize, Vec<usize>> = uf.components();
     let mut component_list: Vec<Vec<usize>> = components.values().cloned().collect();
     component_list.sort_by(|a, b| {
         a[0].cmp(&b[0]) // deterministic ordering
     });
-    
+
     // Assign each component deterministically to Train/Calibration/Eval
     for (idx, component) in component_list.iter().enumerate() {
         let split = match idx % 3 {
@@ -224,7 +232,7 @@ pub fn split_observations(
             1 => Split::Calibration,
             _ => Split::Eval,
         };
-        
+
         for &obs_idx in component {
             let obs_id = &observation_ids[obs_idx];
             if !splits.contains(obs_id) {
@@ -232,7 +240,7 @@ pub fn split_observations(
             }
         }
     }
-    
+
     // Validate no connected group (canonical union-find component) spans
     // multiple splits.
     let group_roots: Vec<usize> = (0..n).map(|i| uf.find(i)).collect();
@@ -292,8 +300,14 @@ mod tests {
         // supersession lineages, shared governance targets, and time.
         // Assert no connected component crosses train/calibration/evaluation.
         let obs_ids = vec!["obs-1".to_string(), "obs-2".to_string()];
-        let memory_ids = vec![HashSet::from(["mid-1".to_string()]), HashSet::from(["mid-2".to_string()])];
-        let payload_hashes = vec![HashSet::from(["ph-1".to_string()]), HashSet::from(["ph-2".to_string()])];
+        let memory_ids = vec![
+            HashSet::from(["mid-1".to_string()]),
+            HashSet::from(["mid-2".to_string()]),
+        ];
+        let payload_hashes = vec![
+            HashSet::from(["ph-1".to_string()]),
+            HashSet::from(["ph-2".to_string()]),
+        ];
         let supersession_lineages = vec![None, None];
         let governance_targets = vec![None, None];
         let time_windows = vec![1000, 2000];
@@ -315,8 +329,14 @@ mod tests {
     fn split_disjointness_no_cross_component() {
         // Step 3: verify that no connected component crosses train/calibration/eval
         let obs_ids = vec!["obs-1".to_string(), "obs-2".to_string()];
-        let memory_ids = vec![HashSet::from(["mid-1".to_string()]), HashSet::from(["mid-1".to_string()])]; // shared memory ID
-        let payload_hashes = vec![HashSet::from(["ph-1".to_string()]), HashSet::from(["ph-1".to_string()])];
+        let memory_ids = vec![
+            HashSet::from(["mid-1".to_string()]),
+            HashSet::from(["mid-1".to_string()]),
+        ]; // shared memory ID
+        let payload_hashes = vec![
+            HashSet::from(["ph-1".to_string()]),
+            HashSet::from(["ph-1".to_string()]),
+        ];
         let supersession_lineages = vec![None, None];
         let governance_targets = vec![None, None];
         let time_windows = vec![1000, 2000];
@@ -334,7 +354,10 @@ mod tests {
         let obs1_in_train = splits.train.contains("obs-1");
         let obs2_in_train = splits.train.contains("obs-2");
         // They should both be in the same split (train, for this test)
-        assert_eq!(obs1_in_train, obs2_in_train, "shared memory ID must not cross split boundaries");
+        assert_eq!(
+            obs1_in_train, obs2_in_train,
+            "shared memory ID must not cross split boundaries"
+        );
     }
 
     #[test]
@@ -342,7 +365,10 @@ mod tests {
         // Shared payload hash should keep observations in same split
         let obs_ids = vec!["obs-1".to_string(), "obs-2".to_string()];
         let memory_ids = vec![HashSet::new(), HashSet::new()];
-        let payload_hashes = vec![HashSet::from(["ph-1".to_string()]), HashSet::from(["ph-1".to_string()])];
+        let payload_hashes = vec![
+            HashSet::from(["ph-1".to_string()]),
+            HashSet::from(["ph-1".to_string()]),
+        ];
         let supersession_lineages = vec![None, None];
         let governance_targets = vec![None, None];
         let time_windows = vec![1000, 2000];
@@ -358,7 +384,10 @@ mod tests {
         let splits = result.expect("splits");
         let obs1_in_train = splits.train.contains("obs-1");
         let obs2_in_train = splits.train.contains("obs-2");
-        assert_eq!(obs1_in_train, obs2_in_train, "shared payload hash must not cross split boundaries");
+        assert_eq!(
+            obs1_in_train, obs2_in_train,
+            "shared payload hash must not cross split boundaries"
+        );
     }
 
     #[test]
@@ -382,14 +411,21 @@ mod tests {
         let splits = result.expect("splits");
         let obs1_in_train = splits.train.contains("obs-1");
         let obs2_in_train = splits.train.contains("obs-2");
-        assert_eq!(obs1_in_train, obs2_in_train, "shared governance target must not cross split boundaries");
+        assert_eq!(
+            obs1_in_train, obs2_in_train,
+            "shared governance target must not cross split boundaries"
+        );
     }
 
     #[test]
     fn time_window_groups_share_split() {
         // Observations within the same hour bucket are unioned into one group,
         // so they must land in the exact same split.
-        let obs_ids = vec!["obs-a".to_string(), "obs-b".to_string(), "obs-c".to_string()];
+        let obs_ids = vec![
+            "obs-a".to_string(),
+            "obs-b".to_string(),
+            "obs-c".to_string(),
+        ];
         let empty = || HashSet::new();
         let result = split_observations(
             &obs_ids,
@@ -400,7 +436,10 @@ mod tests {
             &[1000, 2000, 1500], // all in the same 1-hour bucket
         );
         let splits = result.expect("splits");
-        let assigned: Vec<Split> = obs_ids.iter().map(|id| splits.split_of(id).expect("assigned")).collect();
+        let assigned: Vec<Split> = obs_ids
+            .iter()
+            .map(|id| splits.split_of(id).expect("assigned"))
+            .collect();
         assert!(
             assigned.iter().all(|s| *s == assigned[0]),
             "same time-window group must share one split, got {:?}",
@@ -419,7 +458,12 @@ mod tests {
         let err = verify_no_group_leakage(&obs_ids, &[7, 7, 7], &splits)
             .err()
             .expect("group spanning multiple splits must bail");
-        assert!(err.to_string().contains("Component-disjoint constraint violations"), "err={}", err);
+        assert!(
+            err.to_string()
+                .contains("Component-disjoint constraint violations"),
+            "err={}",
+            err
+        );
     }
 
     #[test]
@@ -437,18 +481,33 @@ mod tests {
     fn chained_keys_through_two_fields_share_split() {
         // obs1 ~ obs2 by memory id, obs2 ~ obs3 by payload hash: transitivity
         // of the union-find must carry all three into one split.
-        let obs_ids = vec!["obs-1".to_string(), "obs-2".to_string(), "obs-3".to_string()];
+        let obs_ids = vec![
+            "obs-1".to_string(),
+            "obs-2".to_string(),
+            "obs-3".to_string(),
+        ];
         let empty = || HashSet::new();
         let result = split_observations(
             &obs_ids,
-            &[HashSet::from(["mid-1".to_string()]), HashSet::from(["mid-1".to_string()]), empty()],
-            &[empty(), HashSet::from(["ph-9".to_string()]), HashSet::from(["ph-9".to_string()])],
+            &[
+                HashSet::from(["mid-1".to_string()]),
+                HashSet::from(["mid-1".to_string()]),
+                empty(),
+            ],
+            &[
+                empty(),
+                HashSet::from(["ph-9".to_string()]),
+                HashSet::from(["ph-9".to_string()]),
+            ],
             &[None, None, None],
             &[None, None, None],
             &[1000, 2000, 3000], // distinct hour buckets so time unions nothing
         );
         let splits = result.expect("splits");
-        let assigned: Vec<Split> = obs_ids.iter().map(|id| splits.split_of(id).expect("assigned")).collect();
+        let assigned: Vec<Split> = obs_ids
+            .iter()
+            .map(|id| splits.split_of(id).expect("assigned"))
+            .collect();
         assert!(
             assigned.iter().all(|s| *s == assigned[0]),
             "transitive two-field chain must share one split, got {:?}",
@@ -463,18 +522,41 @@ mod tests {
         // obs4's parent pointer is then stale, so grouping by the raw parent
         // vector instead of find() used to tear obs4 into its own component,
         // faking a group-leakage violation.
-        let obs_ids = vec!["obs-1".to_string(), "obs-2".to_string(), "obs-3".to_string(), "obs-4".to_string()];
+        let obs_ids = vec![
+            "obs-1".to_string(),
+            "obs-2".to_string(),
+            "obs-3".to_string(),
+            "obs-4".to_string(),
+        ];
         let empty = || HashSet::new();
         let result = split_observations(
             &obs_ids,
-            &[HashSet::from(["mid-A".to_string()]), HashSet::from(["mid-A".to_string()]), empty(), empty()],
-            &[empty(), empty(), HashSet::from(["ph-X".to_string()]), HashSet::from(["ph-X".to_string()])],
+            &[
+                HashSet::from(["mid-A".to_string()]),
+                HashSet::from(["mid-A".to_string()]),
+                empty(),
+                empty(),
+            ],
+            &[
+                empty(),
+                empty(),
+                HashSet::from(["ph-X".to_string()]),
+                HashSet::from(["ph-X".to_string()]),
+            ],
             &[None, None, None, None],
-            &[None, Some("gov-G".to_string()), Some("gov-G".to_string()), None],
+            &[
+                None,
+                Some("gov-G".to_string()),
+                Some("gov-G".to_string()),
+                None,
+            ],
             &[1000, 2000, 3000, 4000], // distinct hour buckets so time unions nothing
         );
         let splits = result.expect("splits");
-        let assigned: Vec<Split> = obs_ids.iter().map(|id| splits.split_of(id).expect("assigned")).collect();
+        let assigned: Vec<Split> = obs_ids
+            .iter()
+            .map(|id| splits.split_of(id).expect("assigned"))
+            .collect();
         assert!(
             assigned.iter().all(|s| *s == assigned[0]),
             "stale-pointer component must stay in one split, got {:?}",

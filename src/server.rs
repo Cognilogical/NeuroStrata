@@ -78,8 +78,7 @@ pub(crate) fn annotate_daemon_memory_error(msg: &str) -> String {
         || lower.contains("out of memory")
         || lower.contains("cannot allocate memory")
     {
-        let advice =
-            " [NEUROSTRATA_ADVICE[daemon_memory]: raise NEUROSTRATA_BUFFER_POOL_MB or storage_hygiene.buffer_pool_mb and restart the daemon]";
+        let advice = " [NEUROSTRATA_ADVICE[daemon_memory]: raise NEUROSTRATA_BUFFER_POOL_MB or storage_hygiene.buffer_pool_mb and restart the daemon]";
         if !msg.contains("NEUROSTRATA_ADVICE[daemon_memory]") {
             return format!("{msg}{advice}");
         }
@@ -2729,10 +2728,7 @@ fn proxy_client() -> reqwest::Client {
 /// explicit root, so downstream task handlers attribute the call to the right
 /// worktree instead of the daemon's global checkout.
 fn inject_proxy_caller_cwd(request: &Value, caller_cwd: Option<&std::path::Path>) -> Value {
-    let is_tools_call = request
-        .get("method")
-        .and_then(|v| v.as_str())
-        == Some("tools/call");
+    let is_tools_call = request.get("method").and_then(|v| v.as_str()) == Some("tools/call");
     let (Some(cwd_path), true) = (caller_cwd, is_tools_call) else {
         return request.clone();
     };
@@ -3004,8 +3000,7 @@ async fn implicit_source_from_location(
             .find(|path| crate::paths::is_absolute_any(path))?;
         crate::paths::to_project_relative(joined, project_root, registry_root.as_deref())
     };
-    (placed.root.is_some() && !crate::paths::is_absolute_any(&placed.path))
-        .then_some(placed.path)
+    (placed.root.is_some() && !crate::paths::is_absolute_any(&placed.path)).then_some(placed.path)
 }
 
 /// The registered root to resolve `path` with, given the result of reading it.
@@ -3614,6 +3609,16 @@ pub(crate) fn reset_related_traversal_counter_for_tests() {
 #[cfg(test)]
 pub(crate) fn related_traversal_counter_for_tests() -> usize {
     RELATED_TRAVERSAL_COUNTER.with(|c| c.get())
+}
+
+#[cfg(test)]
+static RELATED_TRAVERSAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn related_traversal_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    RELATED_TRAVERSAL_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
 }
 
 /// Whether a `related` seed names a file path (and so needs canonical
@@ -4616,7 +4621,10 @@ async fn handle_add_memory(
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
                 if !create_new_namespace {
-                    return format!("ERROR: No .NeuroStrata directory found at {}. This indicates the project does not have a designated context/namespace yet. Do NOT guess the namespace. Ask the user if they want to initialize this directory as a new context, and if so, call this tool again with create_new_namespace=true.", project_root);
+                    return format!(
+                        "ERROR: No .NeuroStrata directory found at {}. This indicates the project does not have a designated context/namespace yet. Do NOT guess the namespace. Ask the user if they want to initialize this directory as a new context, and if so, call this tool again with create_new_namespace=true.",
+                        project_root
+                    );
                 } else {
                     if let Err(e) = tokio::fs::create_dir_all(&ns_dir).await {
                         return format!("ERROR: Failed to create .NeuroStrata directory: {}", e);
@@ -4959,7 +4967,10 @@ async fn handle_add_memory(
                     return match decision {
                         DedupDecision::LinkedExisting => {
                             let id = linked_id.unwrap_or_default();
-                            format!("Reused existing memory for namespace: {}\nMemory ID: {}", namespace, id)
+                            format!(
+                                "Reused existing memory for namespace: {}\nMemory ID: {}",
+                                namespace, id
+                            )
                         }
                         DedupDecision::BlockedExact => format!(
                             "Potential duplicate detected: Memory is similar to an existing memory. Use neurostrata_supersede_memory to update the existing memory instead, or neurostrata_archive_memory to archive it."
@@ -5114,7 +5125,7 @@ pub async fn handle_task_candidates(
         Some("resolve") => "resolve",
         Some("dismiss") => "dismiss",
         Some(a) => {
-            return format!("ERROR: unknown action '{a}' (expected record|list|resolve|dismiss).")
+            return format!("ERROR: unknown action '{a}' (expected record|list|resolve|dismiss).");
         }
     };
 
@@ -6722,7 +6733,7 @@ async fn handle_export_canonical_rdf(arguments: &Value, store: Arc<dyn VectorSto
             Ok(u) => u.to_string(),
             Err(e) => {
                 return serde_json::json!({"ok":false,"error":format!("invalid memory_id: {e}")})
-                    .to_string()
+                    .to_string();
             }
         }],
         None => match store.list(namespace_str, None, None).await {
@@ -7015,14 +7026,14 @@ async fn handle_validate_canonical_rdf(arguments: &Value, store: Arc<dyn VectorS
         Some(n) => n.to_string(),
         None => {
             return serde_json::json!({"ok":false,"valid":false,"violations":["namespace missing"]})
-                .to_string()
+                .to_string();
         }
     };
     let memory_id = match arguments.get("memory_id").and_then(|v| v.as_str()) {
         Some(i) => i.to_string(),
         None => {
             return serde_json::json!({"ok":false,"valid":false,"violations":["memory_id missing"]})
-                .to_string()
+                .to_string();
         }
     };
 
@@ -7053,7 +7064,7 @@ async fn handle_validate_canonical_rdf(arguments: &Value, store: Arc<dyn VectorS
                             "valid":false,
                             "violations":[format!("invalid lifecycle_state: {lifecycle_state}")]
                         })
-                        .to_string()
+                        .to_string();
                     }
                 };
             // created_at is required for deterministic canonical RDF (fail closed).
@@ -7071,7 +7082,7 @@ async fn handle_validate_canonical_rdf(arguments: &Value, store: Arc<dyn VectorS
                         "valid":false,
                         "violations":[format!("invalid created_at (not RFC3339): {e}")]
                     })
-                    .to_string()
+                    .to_string();
                 }
             };
             let created_by = &payload.user_id;
@@ -7249,7 +7260,7 @@ pub(crate) async fn handle_sparql_query(arguments: &Value, store: Arc<dyn Vector
     let query = match arguments.get("query").and_then(|v| v.as_str()) {
         Some(q) => q.to_string(),
         None => {
-            return serde_json::json!({"ok":false,"error":"query parameter required"}).to_string()
+            return serde_json::json!({"ok":false,"error":"query parameter required"}).to_string();
         }
     };
 
@@ -7609,7 +7620,7 @@ pub(crate) async fn handle_twin_set(
                         "ok": false,
                         "error": format!("invalid attributes object: {}", e)
                     })
-                    .to_string()
+                    .to_string();
                 }
             };
         if let Err(e) = crate::digital_twin::set_attributes(&mut base_payload, &attrs, merge) {
@@ -9818,13 +9829,13 @@ async fn handle_supersede_memory(
     let id = match arguments.get("id").and_then(|v| v.as_str()) {
         Some(i) => i,
         None => {
-            return "Missing 'id' parameter: supersede needs the memory it replaces.".to_string()
+            return "Missing 'id' parameter: supersede needs the memory it replaces.".to_string();
         }
     };
     let content = match arguments.get("content").and_then(|c| c.as_str()) {
         Some(c) => c,
         None => {
-            return "Missing 'content' parameter: supersede needs the corrected text.".to_string()
+            return "Missing 'content' parameter: supersede needs the corrected text.".to_string();
         }
     };
     let namespace = match arguments.get("namespace").and_then(|n| n.as_str()) {
@@ -10063,7 +10074,7 @@ async fn handle_supersede_memory(
             return format!(
                 "Failed to embed the new content, nothing was changed: {}",
                 e
-            )
+            );
         }
     };
 
@@ -10076,7 +10087,7 @@ async fn handle_supersede_memory(
             return format!(
                 "Failed to store the replacement, nothing was changed: {}",
                 e
-            )
+            );
         }
     };
 
@@ -10871,7 +10882,7 @@ async fn handle_search_memory(
             Err(e) => {
                 return format!(
                     "ERROR [PATH_PREFIX]: failed to read namespace registry root for '{namespace}': {e}"
-                )
+                );
             }
         };
         let prefix_forms = match crate::paths::prefix_lookup_forms(
@@ -11408,13 +11419,11 @@ async fn handle_search_memory(
                     "domain filter: skipped — the domain did not normalize; the results are unfiltered (vector)"
                 } else {
                     match mode {
-                                crate::traits::DomainMatchMode::Domain => {
-                                    "domain filter: applied (domain)"
-                                }
-                                crate::traits::DomainMatchMode::Vector => {
-                                    "domain filter: skipped — no row matched the domain; the results are unfiltered (vector)"
-                                }
-                            }
+                        crate::traits::DomainMatchMode::Domain => "domain filter: applied (domain)",
+                        crate::traits::DomainMatchMode::Vector => {
+                            "domain filter: skipped — no row matched the domain; the results are unfiltered (vector)"
+                        }
+                    }
                 };
                 format!("{}\n\n{}", mode_line, report)
             }
@@ -11832,7 +11841,10 @@ fn render_evidence_suffix(result: &SearchResult, remaining_bytes: usize) -> Opti
                     continue;
                 }
                 let rendered_path = render_path(ev, orig);
-                format!("\nPath [governs_2hop]: {}\nWhy: This memory governs a node one hop from a direct match.", rendered_path)
+                format!(
+                    "\nPath [governs_2hop]: {}\nWhy: This memory governs a node one hop from a direct match.",
+                    rendered_path
+                )
             }
             crate::traits::EvidenceKind::EpisodeSibling => {
                 // Two hops: primary -(EXTRACTED_FROM)-> task <-EXTRACTED_FROM- sibling (result)
@@ -11855,7 +11867,10 @@ fn render_evidence_suffix(result: &SearchResult, remaining_bytes: usize) -> Opti
                     continue;
                 }
                 let rendered_path = render_path(ev, orig);
-                format!("\nPath [episode_sibling]: {}\nWhy: This memory and a direct match were both extracted from the same task.", rendered_path)
+                format!(
+                    "\nPath [episode_sibling]: {}\nWhy: This memory and a direct match were both extracted from the same task.",
+                    rendered_path
+                )
             }
         };
 
@@ -11945,149 +11960,6 @@ async fn build_guard_validator(
     Ok((validator, namespace.to_string()))
 }
 
-fn is_env_assignment_token(tok: &str) -> bool {
-    let Some((name, _)) = tok.split_once('=') else {
-        return false;
-    };
-    !name.is_empty()
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        && !name.chars().next().unwrap().is_ascii_digit()
-}
-
-fn is_disallowed_git_subcommand_arg(arg: &str) -> bool {
-    arg == "--output"
-        || arg.starts_with("--output=")
-        || arg.starts_with("-O")
-        || arg == "--ext-diff"
-        || arg == "--textconv"
-        || arg == "--exec"
-        || arg.starts_with("--exec=")
-        || arg == "-x"
-        || arg == "--upload-pack"
-        || arg.starts_with("--upload-pack=")
-        || arg == "--receive-pack"
-        || arg.starts_with("--receive-pack=")
-}
-
-fn is_zero_action_exempt_shell_segment(segment: &str) -> bool {
-    let mut tokens = segment
-        .split_whitespace()
-        .skip_while(|t| is_env_assignment_token(t));
-    let Some(first) = tokens.next() else {
-        return false;
-    };
-    let bin = std::path::Path::new(first)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(first);
-    match bin {
-        "git" => {
-            let mut rest: Vec<&str> = tokens.collect();
-            loop {
-                if rest.len() >= 2 && matches!(rest[0], "-C" | "--git-dir" | "--work-tree") {
-                    rest.drain(..2);
-                } else if !rest.is_empty()
-                    && (matches!(rest[0], "--no-pager" | "-P" | "--no-optional-locks")
-                        || rest[0].starts_with("--git-dir=")
-                        || rest[0].starts_with("--work-tree="))
-                {
-                    rest.remove(0);
-                } else {
-                    break;
-                }
-            }
-            if rest.first().is_some_and(|t| t.starts_with('-')) {
-                return false;
-            }
-            let Some(&subcmd) = rest.first() else {
-                return false;
-            };
-            if rest[1..]
-                .iter()
-                .any(|arg| is_disallowed_git_subcommand_arg(arg))
-            {
-                return false;
-            }
-            match subcmd {
-                // Force-push rewrites remote history: never exempt it from the
-                // active-task gate. Mirror the plugin's flag detection here.
-                // Inspect the whole argument list: bundled short flags
-                // (-vf/-uf), forced refspecs (+main) and destructive remote
-                // operations must all stay mutating, in parity with the plugin.
-                "push" => !rest[1..].iter().copied().any(|arg| {
-                    arg.starts_with('+')
-                        || arg == "--force"
-                        || arg.starts_with("--force-")
-                        || matches!(arg, "--mirror" | "--delete" | "--prune")
-                        || (arg.starts_with('-') && !arg.starts_with("--") && arg[1..].contains('f'))
-                }),
-                "pull" | "fetch" | "status" | "log" | "diff" | "show" | "rev-parse" => true,
-                "stash" => matches!(rest.get(1).copied(), Some("list" | "show")),
-                "branch" => {
-                    rest.len() >= 2
-                        && rest[1..].iter().all(|t| {
-                            matches!(
-                                *t,
-                                "--show-current" | "-a" | "-r" | "--list" | "-v" | "-vv"
-                            )
-                        })
-                }
-                _ => false,
-            }
-        }
-        "neurostrata-mcp" => {
-            let rest: Vec<&str> = tokens.collect();
-            match rest.first().copied() {
-                Some("task" | "doc-gate") => true,
-                Some("synaptic-mesh") => matches!(rest.get(1).copied(), Some("status")),
-                _ => false,
-            }
-        }
-        "cargo" => {
-            let mut rest: Vec<&str> = tokens.collect();
-            if rest.first().is_some_and(|t| t.starts_with('+')) {
-                rest.remove(0);
-            }
-            matches!(
-                rest.first().copied(),
-                Some("test" | "check" | "clippy" | "bench" | "metadata" | "tree" | "version" | "--version")
-            )
-        }
-        "gh" => {
-            let rest: Vec<&str> = tokens.collect();
-            match rest.first().copied() {
-                Some("pr") => matches!(
-                    rest.get(1).copied(),
-                    Some("view" | "list" | "checks" | "status" | "diff")
-                ),
-                Some("issue") => matches!(rest.get(1).copied(), Some("view" | "list" | "status")),
-                Some("run") => matches!(rest.get(1).copied(), Some("view" | "list" | "watch")),
-                Some("api") => !rest[1..].iter().any(|arg| {
-                    matches!(
-                        *arg,
-                        "-X" | "--method" | "-f" | "-F" | "--field" | "--raw-field" | "--input"
-                    ) || arg.starts_with("--method=")
-                        || arg.starts_with("--field=")
-                        || arg.starts_with("--raw-field=")
-                        || arg.starts_with("--input=")
-                }),
-                _ => false,
-            }
-        }
-        "node" => {
-            let rest: Vec<&str> = tokens.collect();
-            rest.iter()
-                .any(|t| *t == "--test" || t.ends_with("test.mjs"))
-        }
-        "gate-receipt.sh" | "check-include-str-targets.sh" => true,
-        "bash" => tokens.next().is_some_and(|t| {
-            t.ends_with("gate-receipt.sh") || t.ends_with("check-include-str-targets.sh")
-        }),
-        "rustc" => matches!(tokens.next(), Some("--version" | "-V")),
-        _ => false,
-    }
-}
-
 pub(crate) fn is_zero_action_exempt_shell_payload(action_type: &str, payload: &str) -> bool {
     if !matches!(
         action_type.to_lowercase().as_str(),
@@ -12095,46 +11967,7 @@ pub(crate) fn is_zero_action_exempt_shell_payload(action_type: &str, payload: &s
     ) {
         return false;
     }
-    // Harness plugins send payload = JSON.stringify(call.args), e.g.
-    // {"command":"git status --short"}. Unwrap the command before segmenting;
-    // a JSON object with no string command is never exempt.
-    let parsed: Option<serde_json::Value> = if payload.trim_start().starts_with('{') {
-        match serde_json::from_str(payload) {
-            Ok(value @ serde_json::Value::Object(_)) => Some(value),
-            _ => return false,
-        }
-    } else {
-        None
-    };
-    let command = match &parsed {
-        Some(serde_json::Value::Object(obj)) => match obj
-            .get("command")
-            .or_else(|| obj.get("cmd"))
-            .and_then(|v| v.as_str())
-        {
-            Some(s) => s,
-            None => return false,
-        },
-        _ => payload,
-    };
-    let trimmed = command.trim();
-    if trimmed.is_empty()
-        || trimmed.contains('`')
-        || trimmed.contains("$(")
-        || trimmed.contains('>')
-        || trimmed.contains('<')
-    {
-        return false;
-    }
-    let segments: Vec<&str> = trimmed
-        .split(|c| c == ';' || c == '\n' || c == '|' || c == '&')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
-    !segments.is_empty()
-        && segments
-            .into_iter()
-            .all(is_zero_action_exempt_shell_segment)
+    crate::formal_kernel::evaluate_shell_exemption(payload)
 }
 
 /// Validate an action against stored behavioral rules and (optionally) the
@@ -12263,8 +12096,7 @@ async fn handle_guard_validate(
                 .or_else(|| (!cwd.trim().is_empty()).then_some(cwd.trim()));
             let in_progress = |m: &SearchResult| {
                 crate::task::gate::is_task(m)
-                    && crate::task::gate::task_status(m)
-                        == crate::task::machine::Status::InProgress
+                    && crate::task::gate::task_status(m) == crate::task::machine::Status::InProgress
             };
             let task_matches = |m: &SearchResult, key: &str, expected: &str| {
                 m.payload
@@ -12278,15 +12110,13 @@ async fn handle_guard_validate(
                 .get("active_task_id")
                 .and_then(|v| v.as_str())
                 .and_then(|tid| memories.iter().find(|m| m.id == tid && in_progress(m)))
-                .or_else(|| {
-                    match (caller_session, caller_worktree) {
-                        (Some(s), Some(w)) => memories.iter().find(|m| {
-                            in_progress(m)
-                                && task_matches(m, "session_id", s)
-                                && task_matches(m, "worktree", w)
-                        }),
-                        _ => None,
-                    }
+                .or_else(|| match (caller_session, caller_worktree) {
+                    (Some(s), Some(w)) => memories.iter().find(|m| {
+                        in_progress(m)
+                            && task_matches(m, "session_id", s)
+                            && task_matches(m, "worktree", w)
+                    }),
+                    _ => None,
                 })
                 .or_else(|| {
                     caller_session.and_then(|s| {
@@ -12446,7 +12276,12 @@ async fn handle_guard_learn(
     };
     let rule: BehavioralRule = match serde_json::from_value(rule_value) {
         Ok(r) => r,
-        Err(e) => return format!("ERROR [RULE SHAPE]: {}; required: id, version, rule_class, trigger_pattern, constraint_text, hit_count, status", e),
+        Err(e) => {
+            return format!(
+                "ERROR [RULE SHAPE]: {}; required: id, version, rule_class, trigger_pattern, constraint_text, hit_count, status",
+                e
+            );
+        }
     };
     let (validator, namespace) =
         match build_guard_validator(&arguments, store, embedder, "learn").await {
@@ -12713,7 +12548,30 @@ mod tests {
             );
         }
         // A JSON object with no string command is never exempt.
-        assert!(!is_zero_action_exempt_shell_payload("bash", r#"{"cmd":42}"#));
+        assert!(!is_zero_action_exempt_shell_payload(
+            "bash",
+            r#"{"cmd":42}"#
+        ));
+    }
+
+    #[test]
+    fn shell_exemption_corpus_agrees() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/shell-exemption-verdicts.json"
+        );
+        let raw = std::fs::read_to_string(path).expect("read corpus");
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("parse corpus");
+        for case in v["cases"].as_array().expect("cases") {
+            let name = case["name"].as_str().unwrap_or("");
+            let payload = case["payload"].as_str().expect("payload");
+            let expected = case["exempt"].as_bool().expect("exempt");
+            let got = is_zero_action_exempt_shell_payload("bash", payload);
+            assert_eq!(
+                got, expected,
+                "corpus case mismatch: {name} payload={payload} got={got} expected={expected}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -15136,6 +14994,7 @@ mod tests {
 
     #[tokio::test]
     async fn related_surface_emits_deprecation_presentation() {
+        let _related_guard = crate::server::related_traversal_test_lock();
         let (store, rule_id) = store_with_deprecated_rule("probe").await;
         let lb = crate::traits::VectorStore::as_any(store.as_ref())
             .downcast_ref::<crate::store::LadybugStore>()
@@ -15175,9 +15034,10 @@ mod tests {
 
     #[tokio::test]
     async fn related_resolves_file_seed_across_absolute_and_relative_spellings() {
+        let _related_guard = crate::server::related_traversal_test_lock();
         let tmp = tempfile::tempdir().expect("temp dir");
         let store: Arc<dyn VectorStore> = Arc::new(
-            crate::store::ladybug::LadybugStore::for_testing(&tmp.path().join("db"), 4)
+            crate::store::ladybug::LadybugStore::for_testing(tmp.path().join("db"), 4)
                 .expect("open temp database"),
         );
         store.init("ns").await.expect("init namespace");
@@ -15242,9 +15102,10 @@ mod tests {
 
     #[tokio::test]
     async fn related_unresolvable_absolute_file_seed_returns_explicit_error() {
+        let _related_guard = crate::server::related_traversal_test_lock();
         let tmp = tempfile::tempdir().expect("temp dir");
         let store: Arc<dyn VectorStore> = Arc::new(
-            crate::store::ladybug::LadybugStore::for_testing(&tmp.path().join("db"), 4)
+            crate::store::ladybug::LadybugStore::for_testing(tmp.path().join("db"), 4)
                 .expect("open temp database"),
         );
         store.init("ns").await.expect("init namespace");
@@ -15873,7 +15734,7 @@ mod tests {
     async fn memories_for_file_absolute_and_relative_spellings_resolve_identically() {
         let tmp = tempfile::tempdir().expect("temp dir");
         let store: Arc<dyn VectorStore> = Arc::new(
-            crate::store::ladybug::LadybugStore::for_testing(&tmp.path().join("db"), 4)
+            crate::store::ladybug::LadybugStore::for_testing(tmp.path().join("db"), 4)
                 .expect("open temp database"),
         );
         store.init("ns").await.expect("init namespace");
@@ -15960,7 +15821,7 @@ mod tests {
     async fn memories_for_file_and_context_plan_reject_unresolvable_outside_path_even_if_stored() {
         let tmp = tempfile::tempdir().expect("temp dir");
         let store: Arc<dyn VectorStore> = Arc::new(
-            crate::store::ladybug::LadybugStore::for_testing(&tmp.path().join("db"), 4)
+            crate::store::ladybug::LadybugStore::for_testing(tmp.path().join("db"), 4)
                 .expect("open temp database"),
         );
         store.init("ns").await.expect("init namespace");
@@ -16048,7 +15909,7 @@ mod tests {
     async fn memories_for_file_unions_ast_neighborhood_across_equivalent_spellings() {
         let tmp = tempfile::tempdir().expect("temp dir");
         let store: Arc<dyn VectorStore> = Arc::new(
-            crate::store::ladybug::LadybugStore::for_testing(&tmp.path().join("db"), 4)
+            crate::store::ladybug::LadybugStore::for_testing(tmp.path().join("db"), 4)
                 .expect("open temp database"),
         );
         store.init("ns").await.expect("init namespace");
@@ -16926,25 +16787,33 @@ mod tests {
             .await,
         )
         .await;
-        assert_eq!(row.payload.metadata["source"], serde_json::json!("src/lib.rs"));
+        assert_eq!(
+            row.payload.metadata["source"],
+            serde_json::json!("src/lib.rs")
+        );
 
         // Under no known root: the generic fallback, not the path. A temp dir
         // inside a git checkout makes that checkout the root; the source must
         // then still be relative.
-        let (_, outside_row) =
-            stored(add("keep release notes short", &outside, None).await).await;
+        let (_, outside_row) = stored(add("keep release notes short", &outside, None).await).await;
         let temp_in_checkout = std::iter::successors(outside.parent(), |p| p.parent())
             .any(|p| p.join(".git").exists());
         if temp_in_checkout {
-            let source = outside_row.payload.metadata["source"].as_str().unwrap_or_default();
+            let source = outside_row.payload.metadata["source"]
+                .as_str()
+                .unwrap_or_default();
             assert!(!crate::paths::is_absolute_any(source), "{source}");
         } else {
-            assert_eq!(outside_row.payload.metadata["source"], serde_json::json!("agent"));
+            assert_eq!(
+                outside_row.payload.metadata["source"],
+                serde_json::json!("agent")
+            );
         }
 
         // What a mesh peer receives: the published record, its canonical
         // N-Quads included, names no local directory.
-        let mesh_base = std::env::temp_dir().join(format!("ns-src-leak-mesh-{}", uuid::Uuid::new_v4()));
+        let mesh_base =
+            std::env::temp_dir().join(format!("ns-src-leak-mesh-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&mesh_base).unwrap();
         let mesh = crate::synaptic_mesh::storage::MeshStorage::init(
             &mesh_base,
@@ -16974,17 +16843,29 @@ mod tests {
             .unwrap();
         let report =
             crate::synaptic_mesh::worker::drain_once(&outbox, &mesh, "node-author").unwrap();
-        assert_eq!(report.applied, 1, "the shareable rule is published: {report:?}");
+        assert_eq!(
+            report.applied, 1,
+            "the shareable rule is published: {report:?}"
+        );
         let text = std::fs::read_to_string(
-            mesh.root().join("probe").join("memories").join(format!("{id}.json")),
+            mesh.root()
+                .join("probe")
+                .join("memories")
+                .join(format!("{id}.json")),
         )
         .expect("the record file exists");
-        let record: crate::synaptic_mesh::record::MeshRecord =
-            serde_json::from_str(&text).unwrap();
+        let record: crate::synaptic_mesh::record::MeshRecord = serde_json::from_str(&text).unwrap();
         assert_eq!(record.metadata["source"], serde_json::json!("src/lib.rs"));
-        let quads = &record.rdf.as_ref().expect("the record carries N-Quads").quads;
+        let quads = &record
+            .rdf
+            .as_ref()
+            .expect("the record carries N-Quads")
+            .quads;
         assert!(quads.contains("\"src/lib.rs\""), "{quads}");
-        assert!(!text.contains(SENTINEL), "a local path reached the mesh: {text}");
+        assert!(
+            !text.contains(SENTINEL),
+            "a local path reached the mesh: {text}"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&mesh_base);
@@ -22445,7 +22326,7 @@ mod context_plan_tests {
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let store: Arc<dyn VectorStore> = Arc::new(
-            crate::store::LadybugStore::for_testing(&tmp.path().join("db"), 4).expect("open"),
+            crate::store::LadybugStore::for_testing(tmp.path().join("db"), 4).expect("open"),
         );
         store.init("ns").await.expect("init ns");
 
@@ -22868,7 +22749,7 @@ mod context_plan_tests {
             serde_json::json!({"namespace":"test","max_items":2,"format":"json","query":"test"});
         let embedder = Arc::new(LocalStubEmbedder);
         let store: Arc<dyn crate::traits::VectorStore> = Arc::new(
-            crate::store::LadybugStore::for_testing(&std::env::temp_dir().join("plan-test"), 4)
+            crate::store::LadybugStore::for_testing(std::env::temp_dir().join("plan-test"), 4)
                 .expect("open"),
         );
         store.init("test").await.unwrap();
@@ -22909,7 +22790,7 @@ mod context_plan_tests {
         let embedder = Arc::new(LocalStubEmbedder);
         let store: Arc<dyn crate::traits::VectorStore> = Arc::new(
             crate::store::LadybugStore::for_testing(
-                &std::env::temp_dir().join("plan-alias-test"),
+                std::env::temp_dir().join("plan-alias-test"),
                 4,
             )
             .expect("open"),
@@ -22986,9 +22867,8 @@ mod context_plan_tests {
         use crate::traits::MemoryPayload;
         let tmp_dir = std::env::temp_dir().join(format!("ns-golden-snap-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
-        let store: Arc<dyn crate::traits::VectorStore> = Arc::new(
-            crate::store::LadybugStore::for_testing(&tmp_dir.join("db"), 4).expect("open"),
-        );
+        let store: Arc<dyn crate::traits::VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(tmp_dir.join("db"), 4).expect("open"));
         store.init("global").await.unwrap();
         store.init("probe").await.unwrap();
 
@@ -23102,7 +22982,7 @@ mod context_plan_tests {
     async fn scenario_plan_ontology_diff_dispatches_zero_mutation_report() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let store: Arc<dyn crate::traits::VectorStore> = Arc::new(
-            crate::store::LadybugStore::for_testing(&tmp.path().join("db"), 4)
+            crate::store::LadybugStore::for_testing(tmp.path().join("db"), 4)
                 .expect("open temp database"),
         );
         store.init("probe-plan").await.expect("init namespace");

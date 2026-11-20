@@ -29,16 +29,16 @@ use formal_kernel::{
     evaluate_insight_define, evaluate_procedure_fire, evaluate_reducer_total,
     evaluate_retention_gate, evaluate_scenario_commit, evaluate_seq_continuity,
     evaluate_sovereignty_gate, hash_verdict_tag, import_precheck_tag, intersect_var_bounds,
-    is_action_memory_shareable, is_memory_valid_at, join_task_status, lifecycle_can_transition,
-    owl2rl_rule_tag, procedure_fire_tag, resolve_cross_file_call, resolve_scenario_row,
-    retention_verdict_tag, seq_decision_tag, sovereignty_decision_tag, step_verdict_tag,
-    kernel_rule_tag, task_step_tag, verify_certificate_chain, verify_certificate_chain_slices,
+    is_action_memory_shareable, is_memory_valid_at, join_task_status, kernel_rule_tag,
+    lifecycle_can_transition, owl2rl_rule_tag, procedure_fire_tag, resolve_cross_file_call,
+    resolve_scenario_row, retention_verdict_tag, seq_decision_tag, sovereignty_decision_tag,
+    step_verdict_tag, task_step_tag, verify_certificate_chain, verify_certificate_chain_slices,
     verify_certificate_hash, verify_derivation_certificate, verify_derivation_step_structure,
     ActionMemoryKind, ActionReceiptState, ActionTaskTargetStatus, EpistemicStatus,
-    KernelActionReceiptState, KernelCertificateStep, KernelCertificateVerdict, KernelCertVerdict,
+    KernelActionReceiptState, KernelCertVerdict, KernelCertificateStep, KernelCertificateVerdict,
     KernelConnectorOp, KernelConnectorPostGateInput, KernelConnectorPostVerdict,
-    KernelConnectorPreGateInput, KernelConnectorPreVerdict, KernelHashVerdict,
-    KernelOwl2RlRuleId, KernelProcedureTrust, KernelStepVerdict, ReducerOpKind, TwinBoundError,
+    KernelConnectorPreGateInput, KernelConnectorPreVerdict, KernelHashVerdict, KernelOwl2RlRuleId,
+    KernelProcedureTrust, KernelStepVerdict, ReducerOpKind, TwinBoundError,
 };
 
 /// The statuses in the exact order used by `proofs/Main.lean`.
@@ -87,13 +87,31 @@ fn bool_array_64(prefix: &[bool]) -> [bool; 64] {
 /// `[true,true,false,...]` (no spaces after commas), matching the hardcoded
 /// `CERT_CHAIN` rows in `proofs/Main.lean`.
 fn bool_array_str(b: &[bool; 64]) -> String {
-    let parts: Vec<String> = b.iter().map(|x| if *x { "true".to_string() } else { "false".to_string() }).collect();
+    let parts: Vec<String> = b
+        .iter()
+        .map(|x| {
+            if *x {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
+        })
+        .collect();
     format!("[{}]", parts.join(","))
 }
 
 /// Render a bool slice exactly like Lean prints a `List Bool` literal.
 fn bool_slice_str(b: &[bool]) -> String {
-    let parts: Vec<String> = b.iter().map(|x| if *x { "true".to_string() } else { "false".to_string() }).collect();
+    let parts: Vec<String> = b
+        .iter()
+        .map(|x| {
+            if *x {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
+        })
+        .collect();
     format!("[{}]", parts.join(","))
 }
 
@@ -101,7 +119,12 @@ fn bool_slice_str(b: &[bool]) -> String {
 fn cert_steps_str(steps: &[KernelCertificateStep]) -> String {
     let parts: Vec<String> = steps
         .iter()
-        .map(|s| format!("{}:{}:{}", s.rule_tag, s.premise_count, s.premises_available))
+        .map(|s| {
+            format!(
+                "{}:{}:{}",
+                s.rule_tag, s.premise_count, s.premises_available
+            )
+        })
         .collect();
     format!("[{}]", parts.join(","))
 }
@@ -1121,13 +1144,7 @@ fn generate_rust_truth_table() -> Vec<String> {
     }
 
     // CERT_CHAIN: 7 rows (baseline 4 + short-list fail-closed 2 + 64-cap 1)
-    let short_cases: [(
-        usize,
-        &[bool],
-        &[bool],
-        &[bool],
-        bool,
-    ); 6] = [
+    let short_cases: [(usize, &[bool], &[bool], &[bool], bool); 6] = [
         (2, &[true, true], &[true, true], &[true, true], true),
         (2, &[true, true], &[true, true], &[true, true], false),
         (2, &[true, true], &[true, false], &[true, true], true),
@@ -1142,7 +1159,8 @@ fn generate_rust_truth_table() -> Vec<String> {
         ),
     ];
     for (step_count, rv, pc, cc, proof) in short_cases.iter() {
-        let verdict = formal_kernel::verify_certificate_chain_slices(*step_count, rv, pc, cc, *proof);
+        let verdict =
+            formal_kernel::verify_certificate_chain_slices(*step_count, rv, pc, cc, *proof);
         lines.push(format!(
             "CERT_CHAIN|{}|{}|{}|{}|{}|{}",
             step_count,
@@ -1155,13 +1173,8 @@ fn generate_rust_truth_table() -> Vec<String> {
     }
     // I1: legacy window is a hard cap; 65 steps must fail closed (matches Lean).
     let all_true_64 = [true; 64];
-    let cap_verdict = formal_kernel::verify_certificate_chain(
-        65,
-        &all_true_64,
-        &all_true_64,
-        &all_true_64,
-        true,
-    );
+    let cap_verdict =
+        formal_kernel::verify_certificate_chain(65, &all_true_64, &all_true_64, &all_true_64, true);
     lines.push(format!(
         "CERT_CHAIN|65|{}|{}|{}|true|{}",
         bool_array_str(&all_true_64),
@@ -1184,11 +1197,31 @@ fn generate_rust_truth_table() -> Vec<String> {
     // CERT_FULL: full certificate verifier (no 64-step bypass)
     let tag_sco = kernel_rule_tag(formal_kernel::KernelOwl2RlRuleId::CaxSco);
     let tag_trp = kernel_rule_tag(formal_kernel::KernelOwl2RlRuleId::PrpTrp);
-    let step_sco = KernelCertificateStep { rule_tag: tag_sco, premise_count: 2, premises_available: true };
-    let step_trp = KernelCertificateStep { rule_tag: tag_trp, premise_count: 3, premises_available: true };
-    let step_bad_rule = KernelCertificateStep { rule_tag: 255, premise_count: 2, premises_available: true };
-    let step_bad_pc = KernelCertificateStep { rule_tag: tag_sco, premise_count: 1, premises_available: true };
-    let step_bad_chain = KernelCertificateStep { rule_tag: tag_sco, premise_count: 2, premises_available: false };
+    let step_sco = KernelCertificateStep {
+        rule_tag: tag_sco,
+        premise_count: 2,
+        premises_available: true,
+    };
+    let step_trp = KernelCertificateStep {
+        rule_tag: tag_trp,
+        premise_count: 3,
+        premises_available: true,
+    };
+    let step_bad_rule = KernelCertificateStep {
+        rule_tag: 255,
+        premise_count: 2,
+        premises_available: true,
+    };
+    let step_bad_pc = KernelCertificateStep {
+        rule_tag: tag_sco,
+        premise_count: 1,
+        premises_available: true,
+    };
+    let step_bad_chain = KernelCertificateStep {
+        rule_tag: tag_sco,
+        premise_count: 2,
+        premises_available: false,
+    };
     let big_steps: Vec<KernelCertificateStep> = (0..70).map(|_| step_sco).collect();
     let full_cases: [(u8, bool, &[KernelCertificateStep], bool, &str); 8] = [
         (1, true, &[step_sco, step_trp], true, "[8:2:true,2:3:true]"),
@@ -1242,6 +1275,51 @@ fn find_lake() -> Option<PathBuf> {
     }
 }
 
+#[test]
+fn shell_exemption_review_edge_cases() {
+    assert!(!formal_kernel::evaluate_shell_exemption(
+        "git push -fometa origin main"
+    ));
+    assert!(!formal_kernel::evaluate_shell_exemption(
+        "{\"options\":{\"command\":\"git status\"},\"cmd\":\"git push --force origin main\"}"
+    ));
+    assert!(formal_kernel::evaluate_shell_exemption(
+        "{\"options\":{\"command\":\"rm -rf /x\"},\"cmd\":\"git status\"}"
+    ));
+    assert!(!formal_kernel::evaluate_shell_exemption(
+        "{\"cmd\":\"git status\",\"cmd\":\"git push --force origin main\"}"
+    ));
+    assert!(formal_kernel::evaluate_shell_exemption(
+        "{\"command\":\"\",\"cmd\":\"git status\"}"
+    ));
+    assert!(!formal_kernel::evaluate_shell_exemption(
+        "{\"cmd\":\"git status\"} trailing"
+    ));
+    assert!(!formal_kernel::evaluate_shell_exemption(
+        "git push --force=true origin main"
+    ));
+}
+
+#[test]
+fn shell_exemption_json_reader_regressions() {
+    // \u0026 chain → decodes to '&' background operator → reject
+    assert!(!formal_kernel::evaluate_shell_exemption(
+        "{\"cmd\":\"git status \\u0026 echo pwned\"}"
+    ));
+    // trailing comma → invalid JSON → fail closed
+    assert!(!formal_kernel::evaluate_shell_exemption(
+        "{\"cmd\":\"git status\",}"
+    ));
+    // invalid escape \x → fail closed
+    assert!(!formal_kernel::evaluate_shell_exemption(
+        "{\"cmd\":\"git status \\xZZ\"}"
+    ));
+    // multibyte UTF-8 (em-dash U+2014) is not a shell metacharacter → accept
+    assert!(formal_kernel::evaluate_shell_exemption(
+        "{\"cmd\":\"git status \u{2014} ok\"}"
+    ));
+}
+
 /// The formal kernel must keep compiling as a dependency-free standalone crate
 /// so Charon/Aeneas can translate it. This runs the real extract script (which
 /// invokes `rustc -D warnings --crate-type=lib` with zero `--extern` flags).
@@ -1260,7 +1338,7 @@ fn formal_kernel_compiles_standalone_for_aeneas_extraction() {
     );
 
     // Normal `cargo test` must stay fast: the extract script also runs the
-    // 40+ Kani symbolic proof harnesses when `kani` is installed (450-520s).
+    // 28 Kani symbolic proof harnesses when `kani` is installed (450-520s).
     // Skip Kani by default and only run it when the dedicated proof job opts
     // in via NEUROSTRATA_REQUIRE_KANI=1. The script itself rejects a
     // conflicting SKIP=1 + REQUIRE=1 pair, so never set SKIP when REQUIRE=1.

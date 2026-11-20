@@ -27,12 +27,24 @@ export interface PluginConfig {
         injectReminder: boolean;
     };
 }
-export declare function resolveConfig(raw: unknown): PluginConfig;
+export declare function resolveConfig(raw: unknown, cwd?: string): PluginConfig;
+/**
+ * Walk up from resolve(startDir) to the filesystem root looking for `.git`
+ * (dir or file) or `.NeuroStrata`; return the directory containing it, or
+ * resolve(startDir) if none found.
+ */
+export declare function findProjectRoot(startDir?: string): string;
+/**
+ * 1. Walk up to findProjectRoot(startDir) checking <dir>/.NeuroStrata/session_queries.json;
+ *    if it parses as JSON with a non-empty string .namespace, return it trimmed.
+ * 2. Otherwise return basename(findProjectRoot(startDir)) || "default".
+ */
+export declare function discoverProjectNamespace(startDir?: string): string;
 export declare function daemonTokenPath(tokenFile?: string | null): string;
 export declare function loadDaemonToken(tokenFile?: string | null): string | null;
 export declare function buildHeaders(token: string | null): Record<string, string>;
 export interface JsonRpcRequest {
-    jsonrpc: "2.0";
+    jsonrpc: '2.0';
     id: number;
     method: string;
     params?: unknown;
@@ -72,7 +84,7 @@ export declare class NeuroStrataMCPClient {
     private post;
 }
 export interface GuardValidateResult {
-    verdict: "pass" | "reject";
+    verdict: 'pass' | 'reject';
     bucket: string;
     reasons: string[];
     constraints: string[];
@@ -80,7 +92,7 @@ export interface GuardValidateResult {
     rule_ids: string[];
 }
 export declare function parseGuardValidate(text: string): GuardValidateResult;
-export type AdapterState = "uninitialized" | "ready" | "degraded" | "unavailable";
+export type AdapterState = 'uninitialized' | 'ready' | 'degraded' | 'unavailable';
 export interface AdapterStatus {
     state: AdapterState;
     endpoint: string;
@@ -112,12 +124,13 @@ export interface FileMemoryHit {
 export declare function parseFileMemoryHits(text: string): FileMemoryHit[];
 export declare function prefetchMemoriesForFile(namespace: string, filePath: string): Promise<string[]>;
 export declare const SUBAGENT_CONTEXT_MARKER = "### NeuroStrata Task & Graph Context";
+export declare function sanitizeSubagentHeaderToken(value: string): string;
 export declare function buildSubagentContextHeader(namespace: string, taskId: string | null): string;
 export declare function injectSubagentPrompt(target: Record<string, unknown>, namespace: string, taskId: string | null): boolean;
 export declare function resetClientForTesting(): void;
 export declare function initialize(ctx: any): Promise<void>;
 export declare function onTurnEnd(turn: {
-    role: "user" | "assistant";
+    role: 'user' | 'assistant';
     content: string;
 }): Promise<void>;
 /**
@@ -135,12 +148,15 @@ export declare function fetchContextPlan(opts: {
     file_path?: string;
     max_items?: number;
     max_bytes?: number;
-    format?: "json" | "text";
+    format?: 'json' | 'text';
 }): Promise<string>;
+export declare const handleClaudeHookEvent: typeof handleHookEvent;
 declare const _default: {
     id: string;
     setup: typeof initialize;
     initialize: typeof initialize;
+    handleHookEvent: typeof handleHookEvent;
+    handleClaudeHookEvent: typeof handleHookEvent;
 };
 export default _default;
 //# sourceMappingURL=index.d.ts.map

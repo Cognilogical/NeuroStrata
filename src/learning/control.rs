@@ -8,7 +8,12 @@ use crate::learning::trainer::ActiveManifest;
 /// Control action for the learning loop.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum LearningControlAction { Pause, Resume, Rollback, Reset }
+pub enum LearningControlAction {
+    Pause,
+    Resume,
+    Rollback,
+    Reset,
+}
 
 /// Strict control request for `POST /learning/control`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,8 +111,7 @@ pub fn apply_control_at(
     if request.purge_observations {
         return Err("purge_observations is rejected while running".to_string());
     }
-    std::fs::create_dir_all(root)
-        .map_err(|e| format!("learning dir {}: {}", root.display(), e))?;
+    std::fs::create_dir_all(root).map_err(|e| format!("learning dir {}: {}", root.display(), e))?;
     let mut status = load_status(root);
     let mut manifest = load_manifest(root);
 
@@ -151,24 +155,22 @@ pub fn apply_control_at(
 }
 
 fn persist_status(root: &Path, status: &LearnStatus) -> Result<(), String> {
-    let raw = serde_json::to_string_pretty(status)
-        .map_err(|e| format!("status serialize: {}", e))?;
-    std::fs::write(root.join(STATUS_FILE), raw)
-        .map_err(|e| format!("status.json write: {}", e))
+    let raw =
+        serde_json::to_string_pretty(status).map_err(|e| format!("status serialize: {}", e))?;
+    std::fs::write(root.join(STATUS_FILE), raw).map_err(|e| format!("status.json write: {}", e))
 }
 
 fn persist_manifest(root: &Path, manifest: &ActiveManifest) -> Result<(), String> {
-    let raw = serde_json::to_string_pretty(manifest)
-        .map_err(|e| format!("manifest serialize: {}", e))?;
+    let raw =
+        serde_json::to_string_pretty(manifest).map_err(|e| format!("manifest serialize: {}", e))?;
     std::fs::write(root.join(MANIFEST_FILE), raw)
         .map_err(|e| format!("active_manifest.json write: {}", e))
 }
 
 fn persist_control(root: &Path, request: &LearningControlRequest) -> Result<(), String> {
-    let raw = serde_json::to_string_pretty(request)
-        .map_err(|e| format!("control serialize: {}", e))?;
-    std::fs::write(root.join(CONTROL_FILE), raw)
-        .map_err(|e| format!("control.json write: {}", e))
+    let raw =
+        serde_json::to_string_pretty(request).map_err(|e| format!("control serialize: {}", e))?;
+    std::fs::write(root.join(CONTROL_FILE), raw).map_err(|e| format!("control.json write: {}", e))
 }
 
 /// Apply a control action against the default learning root.
@@ -270,8 +272,14 @@ mod tests {
         // The persisted active manifest must also drop candidate/shadow refs.
         let manifest_text = std::fs::read_to_string(root.join("active_manifest.json")).unwrap();
         let manifest: ActiveManifest = serde_json::from_str(&manifest_text).unwrap();
-        assert!(manifest.candidate_version.is_none(), "reset must clear manifest.candidate_version");
-        assert!(manifest.shadow_version.is_none(), "reset must clear manifest.shadow_version");
+        assert!(
+            manifest.candidate_version.is_none(),
+            "reset must clear manifest.candidate_version"
+        );
+        assert!(
+            manifest.shadow_version.is_none(),
+            "reset must clear manifest.shadow_version"
+        );
     }
 
     #[test]
@@ -297,7 +305,10 @@ mod tests {
     fn read_control_fails_on_corrupt_json() {
         let root = temp_root();
         std::fs::write(root.join("control.json"), b"not json").unwrap();
-        assert!(read_control(&root).is_err(), "corrupt control.json must error");
+        assert!(
+            read_control(&root).is_err(),
+            "corrupt control.json must error"
+        );
     }
 
     #[test]
@@ -313,7 +324,10 @@ mod tests {
     }
 }
 
-pub fn purge_observations_offline_at(root: &Path, confirm_purge: bool) -> Result<LearningControlResult, String> {
+pub fn purge_observations_offline_at(
+    root: &Path,
+    confirm_purge: bool,
+) -> Result<LearningControlResult, String> {
     if !confirm_purge {
         return Err("--purge-observations requires --confirm-purge".to_string());
     }
@@ -323,10 +337,13 @@ pub fn purge_observations_offline_at(root: &Path, confirm_purge: bool) -> Result
             let _ = std::fs::remove_dir_all(&p);
         }
     }
-    let res = apply_control_at(root, &LearningControlRequest {
-        action: LearningControlAction::Reset,
-        purge_observations: false,
-    })?;
+    let res = apply_control_at(
+        root,
+        &LearningControlRequest {
+            action: LearningControlAction::Reset,
+            purge_observations: false,
+        },
+    )?;
     let mut status = res.status;
     status.observation_count = 0;
     status.labeled_pair_count = 0;
@@ -355,7 +372,11 @@ mod offline_purge_tests {
 
     #[test]
     fn purge_observations_offline_discards_observations_and_dataset() {
-        let dir = std::env::temp_dir().join(format!("ns-purge-{}-{}", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()));
+        let dir = std::env::temp_dir().join(format!(
+            "ns-purge-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::create_dir_all(dir.join("observations")).unwrap();
@@ -367,9 +388,13 @@ mod offline_purge_tests {
         assert!(!dir.join("observations").exists());
         assert!(!dir.join("blobs").exists());
         assert!(!dir.join("dataset").exists());
-        let status: LearnStatus = serde_json::from_str(&std::fs::read_to_string(dir.join("status.json")).unwrap()).unwrap();
+        let status: LearnStatus =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("status.json")).unwrap())
+                .unwrap();
         assert_eq!(status.observation_count, 0);
         assert_eq!(status.labeled_pair_count, 0);
-        assert!(std::fs::read_to_string(dir.join("control.json")).unwrap().contains("\"action\""));
+        assert!(std::fs::read_to_string(dir.join("control.json"))
+            .unwrap()
+            .contains("\"action\""));
     }
 }

@@ -1,9 +1,9 @@
 pub mod canonical;
 pub mod circuit_breaker;
+pub mod laya_onnx;
 pub mod policy;
 pub mod provider;
 pub mod typesafe_jev;
-pub mod laya_onnx;
 
 pub use policy::{CalibrationTier, DedupDecision};
 
@@ -46,7 +46,7 @@ pub trait JudgmentProvider: Send + Sync {
     fn name(&self) -> &str;
 }
 
-use crate::config::{DeduplicationConfig, DedupProviderMode};
+use crate::config::{DedupProviderMode, DeduplicationConfig};
 
 /// Circuit breaker configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,21 +95,31 @@ pub fn select_dedup_providers(
     laya: Option<Arc<dyn JudgmentProvider>>,
     jev: Option<Arc<dyn JudgmentProvider>>,
 ) -> Result<ProviderSet> {
-    let (active, shadow): (Option<Arc<dyn JudgmentProvider>>, Option<Arc<dyn JudgmentProvider>>) = match config.provider {
+    let (active, shadow): (
+        Option<Arc<dyn JudgmentProvider>>,
+        Option<Arc<dyn JudgmentProvider>>,
+    ) = match config.provider {
         DedupProviderMode::Auto => {
             // Auto: local heuristic as active, Laya local as shadow if available
-            let active = Some(Arc::new(crate::judgment::provider::HeuristicJudgmentProvider) as Arc<dyn JudgmentProvider>);
+            let active = Some(
+                Arc::new(crate::judgment::provider::HeuristicJudgmentProvider)
+                    as Arc<dyn JudgmentProvider>,
+            );
             let shadow = laya;
             (active, shadow)
         }
         DedupProviderMode::Heuristic => {
             // Heuristic: local heuristic only, no shadow
-            let active = Some(Arc::new(crate::judgment::provider::HeuristicJudgmentProvider) as Arc<dyn JudgmentProvider>);
+            let active = Some(
+                Arc::new(crate::judgment::provider::HeuristicJudgmentProvider)
+                    as Arc<dyn JudgmentProvider>,
+            );
             (active, None)
         }
         DedupProviderMode::LayaLocal => {
             // LayaLocal: use provided Laya model as active, no shadow
-            let active = laya.ok_or_else(|| anyhow::anyhow!("LayaLocal requires a Laya provider"))?;
+            let active =
+                laya.ok_or_else(|| anyhow::anyhow!("LayaLocal requires a Laya provider"))?;
             (Some(active), None)
         }
         DedupProviderMode::Jev => {
@@ -140,7 +150,11 @@ impl DeduplicationChecker {
         // Load a real Laya ONNX provider from the bundle when it exists and
         // parses; otherwise log WHY it is absent (at warn, so misconfiguration
         // is visible) and continue without a laya provider.
-        let laya_bundle_path = if config.laya_bundle_path.trim().is_empty() { std::path::PathBuf::from("artifacts/laya-bundle") } else { std::path::PathBuf::from(&config.laya_bundle_path) };
+        let laya_bundle_path = if config.laya_bundle_path.trim().is_empty() {
+            std::path::PathBuf::from("artifacts/laya-bundle")
+        } else {
+            std::path::PathBuf::from(&config.laya_bundle_path)
+        };
         let laya_provider = match crate::judgment::laya_onnx::LayaOnnxProvider::load(
             &laya_bundle_path,
             Arc::new(Semaphore::new(4)),
@@ -224,17 +238,12 @@ impl DeduplicationChecker {
             // verdict from an earlier request must never leak into a later
             // one when the shadow fails, times out, or is not invoked.
             *self.last_shadow.lock().unwrap_or_else(|e| e.into_inner()) = None;
-            let shadow_result = tokio::time::timeout(
-                timeout,
-                shadow.judge_duplicates(new_memory, candidates),
-            )
-            .await;
+            let shadow_result =
+                tokio::time::timeout(timeout, shadow.judge_duplicates(new_memory, candidates))
+                    .await;
             match shadow_result {
                 Ok(Ok(verdict)) => {
-                    *self
-                        .last_shadow
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner()) =
+                    *self.last_shadow.lock().unwrap_or_else(|e| e.into_inner()) =
                         Some((shadow.name().to_string(), verdict));
                 }
                 Ok(Err(e)) => {
@@ -338,7 +347,10 @@ impl DeduplicationChecker {
 
     /// The last recorded shadow provider verdict, if any: (provider name, judgments).
     pub fn last_shadow_verdict(&self) -> Option<(String, DuplicateVerdict)> {
-        self.last_shadow.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.last_shadow
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Test-only constructor injecting both an active and a shadow provider.
@@ -433,13 +445,23 @@ mod tests {
         let config = DeduplicationConfig::default();
         let checker = DeduplicationChecker::new_with_active_and_shadow(
             config,
-            Arc::new(FakeJudgmentProvider { name: "active", confidence: 0.9, fail: false }),
-            Arc::new(FakeJudgmentProvider { name: "shadow-test", confidence: 0.95, fail: false }),
+            Arc::new(FakeJudgmentProvider {
+                name: "active",
+                confidence: 0.9,
+                fail: false,
+            }),
+            Arc::new(FakeJudgmentProvider {
+                name: "shadow-test",
+                confidence: 0.95,
+                fail: false,
+            }),
         );
         let mem = dummy_memory();
         let cands = vec![dummy_candidate("c1")];
         checker.check_duplicates(&mem, &cands).await;
-        let verdict = checker.last_shadow_verdict().expect("shadow verdict must be stored");
+        let verdict = checker
+            .last_shadow_verdict()
+            .expect("shadow verdict must be stored");
         assert_eq!(verdict.0, "shadow-test");
         assert_eq!(verdict.1.len(), 1);
         assert_eq!(verdict.1[0].existing_memory_id, "c1");
@@ -451,12 +473,23 @@ mod tests {
         let config = DeduplicationConfig::default();
         let checker = DeduplicationChecker::new_with_active_and_shadow(
             config,
-            Arc::new(FakeJudgmentProvider { name: "active", confidence: 0.9, fail: false }),
-            Arc::new(FakeJudgmentProvider { name: "shadow-test", confidence: 0.95, fail: true }),
+            Arc::new(FakeJudgmentProvider {
+                name: "active",
+                confidence: 0.9,
+                fail: false,
+            }),
+            Arc::new(FakeJudgmentProvider {
+                name: "shadow-test",
+                confidence: 0.95,
+                fail: true,
+            }),
         );
         let mem = dummy_memory();
         let cands = vec![dummy_candidate("c1")];
         checker.check_duplicates(&mem, &cands).await;
-        assert!(checker.last_shadow_verdict().is_none(), "failed shadow must not fabricate a verdict");
+        assert!(
+            checker.last_shadow_verdict().is_none(),
+            "failed shadow must not fabricate a verdict"
+        );
     }
 }

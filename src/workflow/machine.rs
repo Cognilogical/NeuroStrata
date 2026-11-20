@@ -93,29 +93,144 @@ const COMPLETE_GUARD: &str = "has_extracted_memory && dirty_targets == 0";
 /// The static workflow transition table. Every row is a legal edge; guards
 /// name the runtime condition that selects the edge.
 pub const WORKFLOW_TABLE: &[WorkflowEdgeSpec] = &[
-    WorkflowEdgeSpec { from: "unpreflighted", event: "load_context", to: "context_loaded", guard: "" },
-    WorkflowEdgeSpec { from: "context_loaded", event: "load_context", to: "context_loaded", guard: "" },
-    WorkflowEdgeSpec { from: "context_loaded", event: "claim_task", to: "claimed", guard: CLAIM_GUARD },
-    WorkflowEdgeSpec { from: "claimed", event: "claim_task", to: "claimed", guard: CLAIM_GUARD },
-    WorkflowEdgeSpec { from: "mutating", event: "claim_task", to: "claimed", guard: CLAIM_GUARD },
-    WorkflowEdgeSpec { from: "claimed", event: "mutate", to: "mutating", guard: BREATH_GUARD_LOW },
-    WorkflowEdgeSpec { from: "claimed", event: "mutate", to: "breath_required", guard: BREATH_GUARD_HIGH },
-    WorkflowEdgeSpec { from: "mutating", event: "mutate", to: "mutating", guard: BREATH_GUARD_LOW },
-    WorkflowEdgeSpec { from: "mutating", event: "mutate", to: "breath_required", guard: BREATH_GUARD_HIGH },
-    WorkflowEdgeSpec { from: "breath_required", event: "record_breath_note", to: "mutating", guard: "" },
-    WorkflowEdgeSpec { from: "mutating", event: "record_breath_note", to: "mutating", guard: "" },
-    WorkflowEdgeSpec { from: "claimed", event: "record_breath_note", to: "mutating", guard: "" },
-    WorkflowEdgeSpec { from: "claimed", event: "trigger_pre_checkpoint", to: "pre_checkpoint", guard: CHECKPOINT_GUARD },
-    WorkflowEdgeSpec { from: "mutating", event: "trigger_pre_checkpoint", to: "pre_checkpoint", guard: CHECKPOINT_GUARD },
-    WorkflowEdgeSpec { from: "pre_checkpoint", event: "checkpoint_passed", to: "mutating", guard: "" },
-    WorkflowEdgeSpec { from: "claimed", event: "trigger_pre_publish", to: "pre_publish", guard: PUBLISH_GUARD },
-    WorkflowEdgeSpec { from: "mutating", event: "trigger_pre_publish", to: "pre_publish", guard: PUBLISH_GUARD },
-    WorkflowEdgeSpec { from: "pre_checkpoint", event: "trigger_pre_publish", to: "pre_publish", guard: PUBLISH_GUARD },
-    WorkflowEdgeSpec { from: "pre_publish", event: "publish_passed", to: "mutating", guard: "" },
-    WorkflowEdgeSpec { from: "claimed", event: "complete_task", to: "completed", guard: COMPLETE_GUARD },
-    WorkflowEdgeSpec { from: "mutating", event: "complete_task", to: "completed", guard: COMPLETE_GUARD },
-    WorkflowEdgeSpec { from: "pre_checkpoint", event: "complete_task", to: "completed", guard: COMPLETE_GUARD },
-    WorkflowEdgeSpec { from: "pre_publish", event: "complete_task", to: "completed", guard: COMPLETE_GUARD },
+    WorkflowEdgeSpec {
+        from: "unpreflighted",
+        event: "load_context",
+        to: "context_loaded",
+        guard: "",
+    },
+    WorkflowEdgeSpec {
+        from: "context_loaded",
+        event: "load_context",
+        to: "context_loaded",
+        guard: "",
+    },
+    WorkflowEdgeSpec {
+        from: "context_loaded",
+        event: "claim_task",
+        to: "claimed",
+        guard: CLAIM_GUARD,
+    },
+    WorkflowEdgeSpec {
+        from: "claimed",
+        event: "claim_task",
+        to: "claimed",
+        guard: CLAIM_GUARD,
+    },
+    WorkflowEdgeSpec {
+        from: "mutating",
+        event: "claim_task",
+        to: "claimed",
+        guard: CLAIM_GUARD,
+    },
+    WorkflowEdgeSpec {
+        from: "claimed",
+        event: "mutate",
+        to: "mutating",
+        guard: BREATH_GUARD_LOW,
+    },
+    WorkflowEdgeSpec {
+        from: "claimed",
+        event: "mutate",
+        to: "breath_required",
+        guard: BREATH_GUARD_HIGH,
+    },
+    WorkflowEdgeSpec {
+        from: "mutating",
+        event: "mutate",
+        to: "mutating",
+        guard: BREATH_GUARD_LOW,
+    },
+    WorkflowEdgeSpec {
+        from: "mutating",
+        event: "mutate",
+        to: "breath_required",
+        guard: BREATH_GUARD_HIGH,
+    },
+    WorkflowEdgeSpec {
+        from: "breath_required",
+        event: "record_breath_note",
+        to: "mutating",
+        guard: "",
+    },
+    WorkflowEdgeSpec {
+        from: "mutating",
+        event: "record_breath_note",
+        to: "mutating",
+        guard: "",
+    },
+    WorkflowEdgeSpec {
+        from: "claimed",
+        event: "record_breath_note",
+        to: "mutating",
+        guard: "",
+    },
+    WorkflowEdgeSpec {
+        from: "claimed",
+        event: "trigger_pre_checkpoint",
+        to: "pre_checkpoint",
+        guard: CHECKPOINT_GUARD,
+    },
+    WorkflowEdgeSpec {
+        from: "mutating",
+        event: "trigger_pre_checkpoint",
+        to: "pre_checkpoint",
+        guard: CHECKPOINT_GUARD,
+    },
+    WorkflowEdgeSpec {
+        from: "pre_checkpoint",
+        event: "checkpoint_passed",
+        to: "mutating",
+        guard: "",
+    },
+    WorkflowEdgeSpec {
+        from: "claimed",
+        event: "trigger_pre_publish",
+        to: "pre_publish",
+        guard: PUBLISH_GUARD,
+    },
+    WorkflowEdgeSpec {
+        from: "mutating",
+        event: "trigger_pre_publish",
+        to: "pre_publish",
+        guard: PUBLISH_GUARD,
+    },
+    WorkflowEdgeSpec {
+        from: "pre_checkpoint",
+        event: "trigger_pre_publish",
+        to: "pre_publish",
+        guard: PUBLISH_GUARD,
+    },
+    WorkflowEdgeSpec {
+        from: "pre_publish",
+        event: "publish_passed",
+        to: "mutating",
+        guard: "",
+    },
+    WorkflowEdgeSpec {
+        from: "claimed",
+        event: "complete_task",
+        to: "completed",
+        guard: COMPLETE_GUARD,
+    },
+    WorkflowEdgeSpec {
+        from: "mutating",
+        event: "complete_task",
+        to: "completed",
+        guard: COMPLETE_GUARD,
+    },
+    WorkflowEdgeSpec {
+        from: "pre_checkpoint",
+        event: "complete_task",
+        to: "completed",
+        guard: COMPLETE_GUARD,
+    },
+    WorkflowEdgeSpec {
+        from: "pre_publish",
+        event: "complete_task",
+        to: "completed",
+        guard: COMPLETE_GUARD,
+    },
 ];
 
 fn to_kernel_stage(stage: WorkflowStage) -> KernelWorkflowStage {
@@ -150,21 +265,33 @@ fn to_kernel_event(event: WorkflowEvent) -> KernelWorkflowEvent {
         WorkflowEvent::ClaimTask { has_valid_scope } => {
             KernelWorkflowEvent::ClaimTask { has_valid_scope }
         }
-        WorkflowEvent::Mutate { mutations_since_note_after, breath_limit } => {
-            KernelWorkflowEvent::Mutate { mutations_since_note_after, breath_limit }
-        }
+        WorkflowEvent::Mutate {
+            mutations_since_note_after,
+            breath_limit,
+        } => KernelWorkflowEvent::Mutate {
+            mutations_since_note_after,
+            breath_limit,
+        },
         WorkflowEvent::RecordBreathNote => KernelWorkflowEvent::RecordBreathNote,
         WorkflowEvent::TriggerPreCheckpoint { has_receipt } => {
             KernelWorkflowEvent::TriggerPreCheckpoint { has_receipt }
         }
         WorkflowEvent::CheckpointPassed => KernelWorkflowEvent::CheckpointPassed,
-        WorkflowEvent::TriggerPrePublish { task_gate_ok, doc_gate_ok } => {
-            KernelWorkflowEvent::TriggerPrePublish { task_gate_ok, doc_gate_ok }
-        }
+        WorkflowEvent::TriggerPrePublish {
+            task_gate_ok,
+            doc_gate_ok,
+        } => KernelWorkflowEvent::TriggerPrePublish {
+            task_gate_ok,
+            doc_gate_ok,
+        },
         WorkflowEvent::PublishPassed => KernelWorkflowEvent::PublishPassed,
-        WorkflowEvent::CompleteTask { has_extracted_memory, dirty_targets } => {
-            KernelWorkflowEvent::CompleteTask { has_extracted_memory, dirty_targets }
-        }
+        WorkflowEvent::CompleteTask {
+            has_extracted_memory,
+            dirty_targets,
+        } => KernelWorkflowEvent::CompleteTask {
+            has_extracted_memory,
+            dirty_targets,
+        },
     }
 }
 
@@ -208,17 +335,34 @@ mod tests {
         assert_eq!(out.to, Some(stage(WorkflowStage::ContextLoaded)));
         current = out.to.unwrap();
 
-        let out = evaluate_workflow_transition(current, WorkflowEvent::ClaimTask { has_valid_scope: true });
+        let out = evaluate_workflow_transition(
+            current,
+            WorkflowEvent::ClaimTask {
+                has_valid_scope: true,
+            },
+        );
         assert!(out.allowed);
         assert_eq!(out.to, Some(stage(WorkflowStage::Claimed)));
         current = out.to.unwrap();
 
-        let out = evaluate_workflow_transition(current, WorkflowEvent::Mutate { mutations_since_note_after: 2, breath_limit: 5 });
+        let out = evaluate_workflow_transition(
+            current,
+            WorkflowEvent::Mutate {
+                mutations_since_note_after: 2,
+                breath_limit: 5,
+            },
+        );
         assert!(out.allowed);
         assert_eq!(out.to, Some(stage(WorkflowStage::Mutating)));
         current = out.to.unwrap();
 
-        let out = evaluate_workflow_transition(current, WorkflowEvent::Mutate { mutations_since_note_after: 5, breath_limit: 5 });
+        let out = evaluate_workflow_transition(
+            current,
+            WorkflowEvent::Mutate {
+                mutations_since_note_after: 5,
+                breath_limit: 5,
+            },
+        );
         assert!(out.allowed);
         assert_eq!(out.to, Some(stage(WorkflowStage::BreathRequired)));
         current = out.to.unwrap();
@@ -228,7 +372,10 @@ mod tests {
         assert_eq!(out.to, Some(stage(WorkflowStage::Mutating)));
         current = out.to.unwrap();
 
-        let out = evaluate_workflow_transition(current, WorkflowEvent::TriggerPreCheckpoint { has_receipt: true });
+        let out = evaluate_workflow_transition(
+            current,
+            WorkflowEvent::TriggerPreCheckpoint { has_receipt: true },
+        );
         assert!(out.allowed);
         assert_eq!(out.to, Some(stage(WorkflowStage::PreCheckpoint)));
         current = out.to.unwrap();
@@ -238,7 +385,13 @@ mod tests {
         assert_eq!(out.to, Some(stage(WorkflowStage::Mutating)));
         current = out.to.unwrap();
 
-        let out = evaluate_workflow_transition(current, WorkflowEvent::TriggerPrePublish { task_gate_ok: true, doc_gate_ok: true });
+        let out = evaluate_workflow_transition(
+            current,
+            WorkflowEvent::TriggerPrePublish {
+                task_gate_ok: true,
+                doc_gate_ok: true,
+            },
+        );
         assert!(out.allowed);
         assert_eq!(out.to, Some(stage(WorkflowStage::PrePublish)));
         current = out.to.unwrap();
@@ -248,7 +401,13 @@ mod tests {
         assert_eq!(out.to, Some(stage(WorkflowStage::Mutating)));
         current = out.to.unwrap();
 
-        let out = evaluate_workflow_transition(current, WorkflowEvent::CompleteTask { has_extracted_memory: true, dirty_targets: 0 });
+        let out = evaluate_workflow_transition(
+            current,
+            WorkflowEvent::CompleteTask {
+                has_extracted_memory: true,
+                dirty_targets: 0,
+            },
+        );
         assert!(out.allowed);
         assert_eq!(out.to, Some(stage(WorkflowStage::Completed)));
         assert_eq!(out.reason, None);
@@ -256,22 +415,58 @@ mod tests {
 
     #[test]
     fn workflow_fsm_guard_rejections() {
-        let out = evaluate_workflow_transition(WorkflowStage::BreathRequired, WorkflowEvent::Mutate { mutations_since_note_after: 0, breath_limit: 5 });
+        let out = evaluate_workflow_transition(
+            WorkflowStage::BreathRequired,
+            WorkflowEvent::Mutate {
+                mutations_since_note_after: 0,
+                breath_limit: 5,
+            },
+        );
         assert!(!out.allowed);
         assert_eq!(out.to, None);
-        assert_eq!(out.reason.as_deref(), Some("BreathNoteRequiredBeforeFurtherMutation"));
+        assert_eq!(
+            out.reason.as_deref(),
+            Some("BreathNoteRequiredBeforeFurtherMutation")
+        );
 
-        let out = evaluate_workflow_transition(WorkflowStage::Claimed, WorkflowEvent::TriggerPrePublish { task_gate_ok: true, doc_gate_ok: false });
+        let out = evaluate_workflow_transition(
+            WorkflowStage::Claimed,
+            WorkflowEvent::TriggerPrePublish {
+                task_gate_ok: true,
+                doc_gate_ok: false,
+            },
+        );
         assert!(!out.allowed);
-        assert_eq!(out.reason.as_deref(), Some("PublishBlockedByDocumentationGate"));
+        assert_eq!(
+            out.reason.as_deref(),
+            Some("PublishBlockedByDocumentationGate")
+        );
 
-        let out = evaluate_workflow_transition(WorkflowStage::Claimed, WorkflowEvent::CompleteTask { has_extracted_memory: false, dirty_targets: 0 });
+        let out = evaluate_workflow_transition(
+            WorkflowStage::Claimed,
+            WorkflowEvent::CompleteTask {
+                has_extracted_memory: false,
+                dirty_targets: 0,
+            },
+        );
         assert!(!out.allowed);
-        assert_eq!(out.reason.as_deref(), Some("CompletionRequiresExtractedMemory"));
+        assert_eq!(
+            out.reason.as_deref(),
+            Some("CompletionRequiresExtractedMemory")
+        );
 
-        let out = evaluate_workflow_transition(WorkflowStage::Claimed, WorkflowEvent::CompleteTask { has_extracted_memory: true, dirty_targets: 2 });
+        let out = evaluate_workflow_transition(
+            WorkflowStage::Claimed,
+            WorkflowEvent::CompleteTask {
+                has_extracted_memory: true,
+                dirty_targets: 2,
+            },
+        );
         assert!(!out.allowed);
-        assert_eq!(out.reason.as_deref(), Some("CompletionBlockedByDirtyTargets"));
+        assert_eq!(
+            out.reason.as_deref(),
+            Some("CompletionBlockedByDirtyTargets")
+        );
     }
 
     #[test]
@@ -309,12 +504,20 @@ mod tests {
         fn representative_event(edge: &WorkflowEdgeSpec) -> WorkflowEvent {
             match edge.event {
                 "load_context" => WorkflowEvent::LoadContext,
-                "claim_task" => WorkflowEvent::ClaimTask { has_valid_scope: true },
+                "claim_task" => WorkflowEvent::ClaimTask {
+                    has_valid_scope: true,
+                },
                 "mutate" => {
                     if edge.to == "breath_required" {
-                        WorkflowEvent::Mutate { mutations_since_note_after: 5, breath_limit: 5 }
+                        WorkflowEvent::Mutate {
+                            mutations_since_note_after: 5,
+                            breath_limit: 5,
+                        }
                     } else {
-                        WorkflowEvent::Mutate { mutations_since_note_after: 1, breath_limit: 5 }
+                        WorkflowEvent::Mutate {
+                            mutations_since_note_after: 1,
+                            breath_limit: 5,
+                        }
                     }
                 }
                 "record_breath_note" => WorkflowEvent::RecordBreathNote,
@@ -322,22 +525,26 @@ mod tests {
                     WorkflowEvent::TriggerPreCheckpoint { has_receipt: true }
                 }
                 "checkpoint_passed" => WorkflowEvent::CheckpointPassed,
-                "trigger_pre_publish" => {
-                    WorkflowEvent::TriggerPrePublish { task_gate_ok: true, doc_gate_ok: true }
-                }
+                "trigger_pre_publish" => WorkflowEvent::TriggerPrePublish {
+                    task_gate_ok: true,
+                    doc_gate_ok: true,
+                },
                 "publish_passed" => WorkflowEvent::PublishPassed,
-                "complete_task" => {
-                    WorkflowEvent::CompleteTask { has_extracted_memory: true, dirty_targets: 0 }
-                }
+                "complete_task" => WorkflowEvent::CompleteTask {
+                    has_extracted_memory: true,
+                    dirty_targets: 0,
+                },
                 other => panic!("unknown event in WORKFLOW_TABLE: {other}"),
             }
         }
-        assert_eq!(WORKFLOW_TABLE.len(), 23, "WORKFLOW_TABLE must hold 23 edges");
+        assert_eq!(
+            WORKFLOW_TABLE.len(),
+            23,
+            "WORKFLOW_TABLE must hold 23 edges"
+        );
         for edge in WORKFLOW_TABLE {
-            let out = evaluate_workflow_transition(
-                parse_stage(edge.from),
-                representative_event(edge),
-            );
+            let out =
+                evaluate_workflow_transition(parse_stage(edge.from), representative_event(edge));
             assert!(
                 out.allowed,
                 "table row {} --{}--> {} rejected by kernel: {:?}",
@@ -347,7 +554,9 @@ mod tests {
                 out.to.map(stage_str),
                 Some(edge.to),
                 "table row {} --{}--> {} lands elsewhere in the kernel",
-                edge.from, edge.event, edge.to
+                edge.from,
+                edge.event,
+                edge.to
             );
         }
     }

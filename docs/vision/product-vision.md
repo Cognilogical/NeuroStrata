@@ -35,6 +35,7 @@ On top of these strata sits **SynapticGraph**, the retrieval substrate: a usage-
 - Bitemporal correctness — every memory mutation is versioned and revertible
 - Formal verification of the core decision kernels and state machines — Lean 4 parity for the taxonomy, procedure, and connector theorems, plus Kani bounded proofs for gate, budget, bounds, and ordering properties
 - v1.19.0 certified OWL 2 RL materialization: a 26-rule formal kernel independently verifies a complete derivation certificate for every inferred triple, with Lean parity evidence. Certification covers only this implemented kernel — not arbitrary reasoning.
+- v1.19.0 fail-closed gates: pre-push and staged-quality checks no longer silently succeed when a checker is missing or exits abnormally.
 - Graph-first exploration that keeps agent context windows small
 - Deterministic, auditable retrieval
 

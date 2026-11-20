@@ -546,7 +546,12 @@ mod tests {
                 .args(args)
                 .output()
                 .expect("git available in test env");
-            assert!(out.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
         run(&["init", "-q"]);
         run(&["config", "user.email", "worker@example.com"]);
@@ -568,13 +573,22 @@ mod tests {
         )
         .unwrap();
         let state = crate::task::receipt::compute_worktree_state(root);
-        assert_ne!(state.0, "declared-rev-0000", "receipt must not bind the declared revision");
-        assert_ne!(state.1, "declared-clean-hash", "receipt must not bind the declared hash");
+        assert_ne!(
+            state.0, "declared-rev-0000",
+            "receipt must not bind the declared revision"
+        );
+        assert_ne!(
+            state.1, "declared-clean-hash",
+            "receipt must not bind the declared hash"
+        );
         assert_eq!(state, GitWorkflowConnector.capture_state_digest(root));
         // Dirtying the tree must change the observed state.
         std::fs::write(root.join("tracked.txt"), "v2").unwrap();
         let dirty = crate::task::receipt::compute_worktree_state(root);
-        assert_ne!(dirty, state, "receipt state must change when the tree changes");
+        assert_ne!(
+            dirty, state,
+            "receipt state must change when the tree changes"
+        );
         // Committing must change it again (HEAD observation), still not declared.
         run(&["add", "."]);
         run(&["commit", "-q", "-m", "change"]);
@@ -610,7 +624,12 @@ mod tests {
                 .args(args)
                 .output()
                 .expect("git available in test env");
-            assert!(out.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
         run(&["init", "-q"]);
         run(&["config", "user.email", "worker@example.com"]);

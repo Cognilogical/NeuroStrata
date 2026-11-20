@@ -113,8 +113,7 @@ impl P2pMeshTransport {
     }
 
     fn encrypt_wire_packet(&self, frame: &MeshFrame) -> Result<Vec<u8>, MeshTransportError> {
-        let plain =
-            serde_json::to_vec(frame).map_err(|e| MeshTransportError::Io(e.to_string()))?;
+        let plain = serde_json::to_vec(frame).map_err(|e| MeshTransportError::Io(e.to_string()))?;
         if plain.len() > MAX_MESH_FRAME_BYTES {
             return Err(MeshTransportError::FrameTooLarge(plain.len()));
         }
@@ -125,7 +124,10 @@ impl P2pMeshTransport {
         for i in 0..4 {
             nonce[i] ^= sender_digest[i];
         }
-        let seq_n = self.nonce_counter.fetch_add(1, Ordering::Relaxed).to_be_bytes();
+        let seq_n = self
+            .nonce_counter
+            .fetch_add(1, Ordering::Relaxed)
+            .to_be_bytes();
         for i in 0..8 {
             nonce[4 + i] ^= seq_n[i];
         }
@@ -151,7 +153,10 @@ impl P2pMeshTransport {
         Ok(packet)
     }
 
-    async fn handle_inbound_stream(&self, stream: &mut TcpStream) -> Result<(), MeshTransportError> {
+    async fn handle_inbound_stream(
+        &self,
+        stream: &mut TcpStream,
+    ) -> Result<(), MeshTransportError> {
         loop {
             let mut len_buf = [0u8; 4];
             if stream.read_exact(&mut len_buf).await.is_err() {
@@ -186,7 +191,9 @@ impl P2pMeshTransport {
                 Ok(p) => p,
                 Err(e) => {
                     self.record_rejected_frame();
-                    return Err(MeshTransportError::Auth(format!("AEAD decrypt failed: {e}")));
+                    return Err(MeshTransportError::Auth(format!(
+                        "AEAD decrypt failed: {e}"
+                    )));
                 }
             };
 
@@ -234,9 +241,7 @@ impl MeshTransport for P2pMeshTransport {
         })
     }
 
-    async fn subscribe(
-        &self,
-    ) -> Result<broadcast::Receiver<MeshFrame>, MeshTransportError> {
+    async fn subscribe(&self) -> Result<broadcast::Receiver<MeshFrame>, MeshTransportError> {
         Ok(self.inbound_tx.subscribe())
     }
 

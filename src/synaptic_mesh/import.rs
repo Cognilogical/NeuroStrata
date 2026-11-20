@@ -49,7 +49,7 @@ use crate::formal_kernel::{evaluate_import_precheck, KernelImportPrecheck};
 
 use super::manifest::Trust;
 use super::record::{
-    Lifecycle, LifecycleState, MeshRecord, Relationship, RdfBlock, MESH_RECORD_SCHEMA_VERSION,
+    Lifecycle, LifecycleState, MeshRecord, RdfBlock, Relationship, MESH_RECORD_SCHEMA_VERSION,
 };
 use super::storage::MeshStorage;
 use crate::traits::{Embedder, MemoryPayload, VectorStore};
@@ -62,7 +62,14 @@ pub const IMPORT_CURSOR_SCHEMA_VERSION: &str = "synaptic-mesh-import-cursor/v1";
 /// definitions). `action_receipt` and `structural` records are strictly
 /// node-local and never travel; anything unknown (future vocabulary) is
 /// rejected at import (hard error), never applied, never crash.
-const SHAREABLE_MEMORY_TYPES: [&str; 6] = ["rule", "fact", "procedure", "action_type", "thesis", "concept"];
+const SHAREABLE_MEMORY_TYPES: [&str; 6] = [
+    "rule",
+    "fact",
+    "procedure",
+    "action_type",
+    "thesis",
+    "concept",
+];
 
 /// Runtime procedure counters are strictly local (spec §"Record format":
 /// "they never leave the node"). A shared record carrying ANY of these keys
@@ -913,7 +920,9 @@ fn validate_parsed_record(
     // exactly as it arrived — no metadata mutation before verify_record_signature.
     let mut diagnostic = None;
     if let Some(ref rdf_block) = record.rdf {
-        if let Err(violations) = crate::rdf::dataset_canonical::validate_canonical_rdf(&record, rdf_block) {
+        if let Err(violations) =
+            crate::rdf::dataset_canonical::validate_canonical_rdf(&record, rdf_block)
+        {
             // Phase 1: emit diagnostic (spec §5.3 warn-first); record is still
             // applied. The violation is carried out-of-band for later attachment.
             tracing::warn!(
@@ -1196,9 +1205,7 @@ fn classify_merge(
     match kernel {
         crate::formal_kernel::KernelMergeDecision::Apply => MergeDecision::Apply,
         crate::formal_kernel::KernelMergeDecision::ApplyCombinationArchiveEdit => {
-            MergeDecision::ApplyCombination(
-                "archive + edit; edited content stays archived",
-            )
+            MergeDecision::ApplyCombination("archive + edit; edited content stays archived")
         }
         crate::formal_kernel::KernelMergeDecision::Skip => MergeDecision::Skip,
         crate::formal_kernel::KernelMergeDecision::RefuseTombstoneWins => {
@@ -1208,9 +1215,7 @@ fn classify_merge(
             MergeDecision::Refuse("superseded; rejected stale restore".to_string())
         }
         crate::formal_kernel::KernelMergeDecision::RefuseIllegalTransition => {
-            MergeDecision::Refuse(format!(
-                "illegal transition {local_state} -> {cand_state}"
-            ))
+            MergeDecision::Refuse(format!("illegal transition {local_state} -> {cand_state}"))
         }
         crate::formal_kernel::KernelMergeDecision::ConflictTwoReplacements => {
             MergeDecision::Conflict("two different replacements")
@@ -1279,7 +1284,11 @@ pub fn classify_merge_parity_tag(
         patch: None,
     };
     let local_superseded_by = if local_state == LifecycleState::Superseded {
-        Some(if same_superseded_by { PARITY_REPLACED_BY_A } else { PARITY_REPLACED_BY_B })
+        Some(if same_superseded_by {
+            PARITY_REPLACED_BY_A
+        } else {
+            PARITY_REPLACED_BY_B
+        })
     } else {
         None
     };
@@ -1564,10 +1573,16 @@ async fn apply_one(
         Err(e) => return Disposition::Ignored(format!("store read failed for {id}: {e}")),
     };
 
-    let existing_update_id = existing.as_ref().and_then(|(_, payload)| mesh_update_id_of(&payload.metadata));
+    let existing_update_id = existing
+        .as_ref()
+        .and_then(|(_, payload)| mesh_update_id_of(&payload.metadata));
     let same_update_id = existing_update_id.as_deref() == Some(&record.update_id.to_string());
 
-    match evaluate_import_precheck(existing.is_some(), existing_update_id.is_some(), same_update_id) {
+    match evaluate_import_precheck(
+        existing.is_some(),
+        existing_update_id.is_some(),
+        same_update_id,
+    ) {
         KernelImportPrecheck::SkipSameUpdateId => return Disposition::Skipped,
         KernelImportPrecheck::RefusePrivateSovereign => {
             return Disposition::Ignored(format!(
@@ -1581,132 +1596,127 @@ async fn apply_one(
     // Mesh-owned row at another revision: gate the transition.
     if let Some((vector, payload)) = existing {
         let accepted = existing_update_id.as_deref().unwrap();
-                let Some((local_state, local_superseded_by)) = local_mesh_state(&payload.metadata)
-                else {
-                    return Disposition::Ignored(format!(
-                        "mesh row {id} has unreadable lifecycle provenance"
-                    ));
-                };
-                // Tracked-stale-bundle guard (issue #44, Gate G2 option
-                // (a)): a bundle-only candidate on a DIFF pass whose
-                // UUIDv7 update_id predates the accepted revision would
-                // otherwise pass `classify_merge` as a plain forward edit
-                // and silently roll the live row back. The guard is
-                // deliberately narrow — bundle route only, diff pass
-                // only (full-tree passes stay concurrent/conflicted),
-                // both sides live and in the SAME state (transitions and
-                // combinations are untouched), content actually
-                // differing, and both update_ids UUIDv7 with the
-                // candidate STRICTLY older (millisecond comparison;
-                // ties and any non-v7 id leave it inert).
-                if from_bundle && !concurrent {
-                    let both_live_same_state = matches!(
-                        local_state,
-                        LifecycleState::Active | LifecycleState::Archived
-                    ) && record.lifecycle.state == local_state;
-                    if both_live_same_state && payload.content != content_text(&record) {
-                        let accepted_v7 = Uuid::parse_str(&accepted)
-                            .ok()
-                            .and_then(|u| update_id_v7_millis(&u));
-                        let candidate_v7 = update_id_v7_millis(&record.update_id);
-                        if let (Some(accepted_ts), Some(candidate_ts)) = (accepted_v7, candidate_v7)
-                        {
-                            if candidate_ts < accepted_ts {
-                                return Disposition::Ignored(format!(
+        let Some((local_state, local_superseded_by)) = local_mesh_state(&payload.metadata) else {
+            return Disposition::Ignored(format!(
+                "mesh row {id} has unreadable lifecycle provenance"
+            ));
+        };
+        // Tracked-stale-bundle guard (issue #44, Gate G2 option
+        // (a)): a bundle-only candidate on a DIFF pass whose
+        // UUIDv7 update_id predates the accepted revision would
+        // otherwise pass `classify_merge` as a plain forward edit
+        // and silently roll the live row back. The guard is
+        // deliberately narrow — bundle route only, diff pass
+        // only (full-tree passes stay concurrent/conflicted),
+        // both sides live and in the SAME state (transitions and
+        // combinations are untouched), content actually
+        // differing, and both update_ids UUIDv7 with the
+        // candidate STRICTLY older (millisecond comparison;
+        // ties and any non-v7 id leave it inert).
+        if from_bundle && !concurrent {
+            let both_live_same_state = matches!(
+                local_state,
+                LifecycleState::Active | LifecycleState::Archived
+            ) && record.lifecycle.state == local_state;
+            if both_live_same_state && payload.content != content_text(&record) {
+                let accepted_v7 = Uuid::parse_str(&accepted)
+                    .ok()
+                    .and_then(|u| update_id_v7_millis(&u));
+                let candidate_v7 = update_id_v7_millis(&record.update_id);
+                if let (Some(accepted_ts), Some(candidate_ts)) = (accepted_v7, candidate_v7) {
+                    if candidate_ts < accepted_ts {
+                        return Disposition::Ignored(format!(
                                     "{id}: stale bundle revision refused — candidate update_id {} predates accepted {accepted}",
                                     record.update_id
                                 ));
-                            }
-                        }
                     }
                 }
-                match classify_merge(
-                    local_state,
-                    local_superseded_by,
-                    &payload.content,
+            }
+        }
+        match classify_merge(
+            local_state,
+            local_superseded_by,
+            &payload.content,
+            &record,
+            concurrent,
+        ) {
+            MergeDecision::Skip => return Disposition::Skipped,
+            MergeDecision::Refuse(reason) => {
+                return Disposition::Ignored(format!("{id}: {reason}"));
+            }
+            MergeDecision::Conflict(reason) => {
+                // Preserve the candidate, register the overlay, and
+                // annotate the EXISTING row (content untouched) with
+                // the suppression marker.
+                if let Err(e) = conflict::register_conflict(
+                    root,
+                    &namespace,
+                    &id,
+                    &record.update_id.to_string(),
+                    reason,
+                    ConflictKind::Unresolved,
                     &record,
-                    concurrent,
                 ) {
-                    MergeDecision::Skip => return Disposition::Skipped,
-                    MergeDecision::Refuse(reason) => {
-                        return Disposition::Ignored(format!("{id}: {reason}"));
-                    }
-                    MergeDecision::Conflict(reason) => {
-                        // Preserve the candidate, register the overlay, and
-                        // annotate the EXISTING row (content untouched) with
-                        // the suppression marker.
-                        if let Err(e) = conflict::register_conflict(
-                            root,
-                            &namespace,
-                            &id,
-                            &record.update_id.to_string(),
-                            reason,
-                            ConflictKind::Unresolved,
-                            &record,
-                        ) {
-                            return Disposition::Ignored(format!(
-                                "conflict overlay write failed for {id}: {e}"
-                            ));
-                        }
-                        if let Err(e) =
-                            annotate_conflicting(&store, &namespace, &id, &vector, &payload, reason)
-                                .await
-                        {
-                            return Disposition::Ignored(format!(
-                                "conflict marker write failed for {id}: {e}"
-                            ));
-                        }
-                        return Disposition::Conflicted(id);
-                    }
-                    MergeDecision::SupersedeWinsPreserveEdit => {
-                        return preserve_superseded_edit(
-                            root,
-                            mesh_id,
-                            &id,
-                            &namespace,
-                            local_state,
-                            &payload,
-                            &record,
-                            store,
-                            emb,
-                            import_trust,
-                            head_signature,
-                            signature_disposition,
-                        )
-                        .await;
-                    }
-                    MergeDecision::ApplyCombination(reason) => {
-                        // Edited content stays archived. The edited content
-                        // is whichever side is ACTIVE (they edited; we
-                        // archived, or vice-versa).
-                        let edited = if local_state == LifecycleState::Archived {
-                            content_text(&record)
-                        } else {
-                            payload.content.clone()
-                        };
-                        return match apply_effective(
-                            root,
-                            mesh_id,
-                            &id,
-                            &namespace,
-                            &record,
-                            store,
-                            emb,
-                            ApplyShape::ArchivedCombination { edited },
-                            Some(import_trust),
-                            head_signature,
-                            signature_disposition,
-                        )
-                        .await
-                        {
-                            Disposition::Applied => {
-                                Disposition::AppliedCombination(reason.to_string())
-                            }
-                            other => other,
-                        };
-                    }
-                    MergeDecision::Apply => {}
+                    return Disposition::Ignored(format!(
+                        "conflict overlay write failed for {id}: {e}"
+                    ));
                 }
+                if let Err(e) =
+                    annotate_conflicting(&store, &namespace, &id, &vector, &payload, reason).await
+                {
+                    return Disposition::Ignored(format!(
+                        "conflict marker write failed for {id}: {e}"
+                    ));
+                }
+                return Disposition::Conflicted(id);
+            }
+            MergeDecision::SupersedeWinsPreserveEdit => {
+                return preserve_superseded_edit(
+                    root,
+                    mesh_id,
+                    &id,
+                    &namespace,
+                    local_state,
+                    &payload,
+                    &record,
+                    store,
+                    emb,
+                    import_trust,
+                    head_signature,
+                    signature_disposition,
+                )
+                .await;
+            }
+            MergeDecision::ApplyCombination(reason) => {
+                // Edited content stays archived. The edited content
+                // is whichever side is ACTIVE (they edited; we
+                // archived, or vice-versa).
+                let edited = if local_state == LifecycleState::Archived {
+                    content_text(&record)
+                } else {
+                    payload.content.clone()
+                };
+                return match apply_effective(
+                    root,
+                    mesh_id,
+                    &id,
+                    &namespace,
+                    &record,
+                    store,
+                    emb,
+                    ApplyShape::ArchivedCombination { edited },
+                    Some(import_trust),
+                    head_signature,
+                    signature_disposition,
+                )
+                .await
+                {
+                    Disposition::Applied => Disposition::AppliedCombination(reason.to_string()),
+                    other => other,
+                };
+            }
+            MergeDecision::Apply => {}
+        }
     }
 
     apply_effective(
@@ -1901,10 +1911,12 @@ async fn apply_effective(
     // matching concept_iri. Idempotent on replay.
     let current_update_id = record.update_id.to_string();
     let already_imported = match store.get(namespace, id).await {
-        Ok(found) => found
-            .and_then(|(_, p)| mesh_update_id_of(&p.metadata))
-            .as_deref()
-            == Some(current_update_id.as_str()),
+        Ok(found) => {
+            found
+                .and_then(|(_, p)| mesh_update_id_of(&p.metadata))
+                .as_deref()
+                == Some(current_update_id.as_str())
+        }
         Err(e) => {
             tracing::warn!("[neurostrata:mesh] store read failed for {id}: {e}");
             false
@@ -1915,7 +1927,10 @@ async fn apply_effective(
         if let Some(concept_val) = metadata.get("concept_iri").cloned() {
             let iris: Vec<String> = match &concept_val {
                 Value::String(s) => vec![s.clone()],
-                Value::Array(arr) => arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect(),
+                Value::Array(arr) => arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect(),
                 _ => vec![],
             };
             let rid = crate::registry::registry_row_id(namespace);
@@ -1923,9 +1938,7 @@ async fn apply_effective(
                 Ok(Some((_, rp))) => crate::registry::registry_domain_entries(&rp.metadata),
                 Ok(None) => vec![],
                 Err(e) => {
-                    tracing::warn!(
-                        "[neurostrata:mesh] registry row {rid} unreadable: {e}"
-                    );
+                    tracing::warn!("[neurostrata:mesh] registry row {rid} unreadable: {e}");
                     vec![]
                 }
             };
@@ -1935,7 +1948,9 @@ async fn apply_effective(
                     .iter()
                     .filter_map(|e| {
                         if e.get("concept_iri").and_then(|v| v.as_str()) == Some(iri.as_str()) {
-                            e.get("slug").and_then(|v| v.as_str()).map(|s| s.to_string())
+                            e.get("slug")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
                         } else {
                             None
                         }
@@ -1952,7 +1967,8 @@ async fn apply_effective(
                         // ambiguous
                         tracing::warn!(
                             "[neurostrata:mesh] ambiguous concept_iri {} matches {} local domains",
-                            iri, n
+                            iri,
+                            n
                         );
                     }
                 }
@@ -1960,7 +1976,10 @@ async fn apply_effective(
             if !matched_slugs.is_empty() {
                 let mut existing: Vec<String> = match metadata.get("domain") {
                     Some(Value::String(s)) => vec![s.clone()],
-                    Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect(),
+                    Some(Value::Array(a)) => a
+                        .iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect(),
                     _ => vec![],
                 };
                 for s in &matched_slugs {
@@ -2005,13 +2024,9 @@ async fn apply_effective(
     // Union the imported record's domain into the local registry (a cache).
     // A failure here is a warning, never a refusal: the row is already stored.
     if let Some(domain) = imported_domain {
-        if let Some(warning) = crate::registry::write_registry(
-            &store,
-            &emb,
-            namespace,
-            std::slice::from_ref(&domain),
-        )
-        .await
+        if let Some(warning) =
+            crate::registry::write_registry(&store, &emb, namespace, std::slice::from_ref(&domain))
+                .await
         {
             tracing::warn!(
                 "registry union failed for imported record {id} in {namespace}: {warning}"
@@ -2146,10 +2161,7 @@ fn local_origin(payload: &MemoryPayload) -> String {
     payload
         .metadata
         .get("mesh")
-        .and_then(|m| {
-            m.get("claimed_created_by")
-                .or_else(|| m.get("origin"))
-        })
+        .and_then(|m| m.get("claimed_created_by").or_else(|| m.get("origin")))
         .and_then(Value::as_str)
         .unwrap_or("unknown")
         .to_string()
@@ -2263,11 +2275,18 @@ fn preserved_edit_record(
     // Curated metadata for RDF projection
     let eligibility = metadata.get("eligibility").and_then(|v| v.as_str());
     let source = metadata.get("source").and_then(|v| v.as_str());
-    let tags: Vec<String> = metadata.get("tags").and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+    let tags: Vec<String> = metadata
+        .get("tags")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     let concept_iri = metadata.get("concept_iri").and_then(|v| v.as_str());
-    let rdf_relationships: Vec<(String, String)> = rels.iter()
+    let rdf_relationships: Vec<(String, String)> = rels
+        .iter()
         .map(|r| (r.kind.clone(), r.target.to_string()))
         .collect();
     let state_str = "active";
@@ -2966,10 +2985,9 @@ mod tests {
         force_track_bundle(&mesh, "bundles/test.bundle.zst");
         let store = fresh_store("bundle-only").await;
 
-        let report =
-            apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
-                .await
-                .expect("full-tree replay applies the bundle record");
+        let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
+            .await
+            .expect("full-tree replay applies the bundle record");
 
         assert_eq!(report.applied, 1, "report: {report:?}");
         assert!(
@@ -3540,13 +3558,8 @@ mod tests {
             v7_update_id(REV_OLD_MILLIS, 0x18),
         ))
         .unwrap();
-        let (report, store) = tracked_bundle_second_pass(
-            "tracked-stale-cross-state",
-            &local,
-            candidate,
-            false,
-        )
-        .await;
+        let (report, store) =
+            tracked_bundle_second_pass("tracked-stale-cross-state", &local, candidate, false).await;
         assert!(
             !report
                 .ignored
@@ -4446,10 +4459,7 @@ mod tests {
     }
 
     /// The stored `metadata.mesh` provenance object of an applied row.
-    async fn stored_mesh_provenance(
-        store: &std::sync::Arc<dyn VectorStore>,
-        id: &Uuid,
-    ) -> Value {
+    async fn stored_mesh_provenance(store: &std::sync::Arc<dyn VectorStore>, id: &Uuid) -> Value {
         let (_, payload) = store
             .get("probe", &id.to_string())
             .await
@@ -4489,10 +4499,7 @@ mod tests {
         // so the RDF payload still verifies; the canonical-JSON payload
         // covers `metadata`, so the JSON branch fails.
         if let Some(obj) = record.metadata.as_object_mut() {
-            obj.insert(
-                "unprojected_note".to_string(),
-                json!("added after signing"),
-            );
+            obj.insert("unprojected_note".to_string(), json!("added after signing"));
         }
         let (report, store) =
             run_bundle_route_with_signers("rdf-only-tampered", record, None, signers).await;
@@ -4666,8 +4673,7 @@ mod tests {
         sign_record_legacy_rdf(&mut record, &key_path);
         let signer_did = record.signer_did.clone().expect("signed record has a DID");
         let signers = vec![signer_entry_for(&record)];
-        let (report, store) =
-            run_json_route_with_signers("rdf-only-json", record, signers).await;
+        let (report, store) = run_json_route_with_signers("rdf-only-json", record, signers).await;
         assert_eq!(report.applied, 1, "report: {report:?}");
         assert!(
             report.applied_ids.contains(&id.to_string()),
@@ -4767,13 +4773,9 @@ mod tests {
             .clone()
             .expect("signed record has a DID");
         let rdf_signers = vec![signer_entry_for(&rdf_record)];
-        let (rdf_report, rdf_store) = run_bundle_route_with_signers(
-            "rdf-only-attribution",
-            rdf_record,
-            None,
-            rdf_signers,
-        )
-        .await;
+        let (rdf_report, rdf_store) =
+            run_bundle_route_with_signers("rdf-only-attribution", rdf_record, None, rdf_signers)
+                .await;
         assert_eq!(rdf_report.applied, 1, "report: {rdf_report:?}");
         assert_eq!(rdf_report.rdf_only_verified, 1, "report: {rdf_report:?}");
         assert_eq!(rdf_report.verified_signed, 0, "report: {rdf_report:?}");
@@ -4805,13 +4807,9 @@ mod tests {
             .clone()
             .expect("signed record has a DID");
         let full_signers = vec![signer_entry_for(&full_record)];
-        let (full_report, full_store) = run_bundle_route_with_signers(
-            "full-attribution",
-            full_record,
-            None,
-            full_signers,
-        )
-        .await;
+        let (full_report, full_store) =
+            run_bundle_route_with_signers("full-attribution", full_record, None, full_signers)
+                .await;
         assert_eq!(full_report.applied, 1, "report: {full_report:?}");
         assert_eq!(full_report.verified_signed, 1, "report: {full_report:?}");
         assert_eq!(full_report.rdf_only_verified, 0, "report: {full_report:?}");
@@ -4856,8 +4854,7 @@ mod tests {
         candidate.lifecycle.archived_at = Some(chrono::Utc::now());
         let key_dir = scratch("combo-local-active-key");
         let key_path = key_dir.join("signing.key");
-        crate::synaptic_mesh::worker::sign_record(&mut candidate, &key_path)
-            .expect("record signs");
+        crate::synaptic_mesh::worker::sign_record(&mut candidate, &key_path).expect("record signs");
         let signers = vec![signer_entry_for(&candidate)];
 
         let (_base, mesh) = mesh_with_commit("combo-local-active");
@@ -6156,13 +6153,26 @@ mod tests {
         // Superseded local + archived candidate + content edit → preserve edit.
         let archived_cand = record_at(Uuid::new_v4(), LifecycleState::Archived, None, "edited");
         assert_eq!(
-            classify_merge(LifecycleState::Superseded, Some(u1), "orig", &archived_cand, true),
+            classify_merge(
+                LifecycleState::Superseded,
+                Some(u1),
+                "orig",
+                &archived_cand,
+                true
+            ),
             MergeDecision::SupersedeWinsPreserveEdit
         );
         // Archived local + superseded candidate + content edit → preserve edit.
-        let superseded_cand = record_at(Uuid::new_v4(), LifecycleState::Superseded, Some(u1), "orig");
+        let superseded_cand =
+            record_at(Uuid::new_v4(), LifecycleState::Superseded, Some(u1), "orig");
         assert_eq!(
-            classify_merge(LifecycleState::Archived, None, "edited", &superseded_cand, true),
+            classify_merge(
+                LifecycleState::Archived,
+                None,
+                "edited",
+                &superseded_cand,
+                true
+            ),
             MergeDecision::SupersedeWinsPreserveEdit
         );
         // Same content on a retired id is a stale restore: refused, never applied.
@@ -6210,35 +6220,83 @@ mod tests {
             "supersede_wins_preserve_edit"
         );
         assert_eq!(
-            classify_merge_parity_tag(LifecycleState::Active, LifecycleState::Tombstoned, true, false, false),
+            classify_merge_parity_tag(
+                LifecycleState::Active,
+                LifecycleState::Tombstoned,
+                true,
+                false,
+                false
+            ),
             "apply"
         );
         assert_eq!(
-            classify_merge_parity_tag(LifecycleState::Active, LifecycleState::Archived, true, true, true),
+            classify_merge_parity_tag(
+                LifecycleState::Active,
+                LifecycleState::Archived,
+                true,
+                true,
+                true
+            ),
             "apply_combination_archive_edit"
         );
         assert_eq!(
-            classify_merge_parity_tag(LifecycleState::Superseded, LifecycleState::Superseded, true, false, true),
+            classify_merge_parity_tag(
+                LifecycleState::Superseded,
+                LifecycleState::Superseded,
+                true,
+                false,
+                true
+            ),
             "skip"
         );
         assert_eq!(
-            classify_merge_parity_tag(LifecycleState::Tombstoned, LifecycleState::Active, true, false, true),
+            classify_merge_parity_tag(
+                LifecycleState::Tombstoned,
+                LifecycleState::Active,
+                true,
+                false,
+                true
+            ),
             "refuse_tombstone_wins"
         );
         assert_eq!(
-            classify_merge_parity_tag(LifecycleState::Superseded, LifecycleState::Archived, true, false, true),
+            classify_merge_parity_tag(
+                LifecycleState::Superseded,
+                LifecycleState::Archived,
+                true,
+                false,
+                true
+            ),
             "refuse_stale_restore"
         );
         assert_eq!(
-            classify_merge_parity_tag(LifecycleState::Superseded, LifecycleState::Superseded, false, false, true),
+            classify_merge_parity_tag(
+                LifecycleState::Superseded,
+                LifecycleState::Superseded,
+                false,
+                false,
+                true
+            ),
             "conflict_two_replacements"
         );
         assert_eq!(
-            classify_merge_parity_tag(LifecycleState::Active, LifecycleState::Archived, true, false, true),
+            classify_merge_parity_tag(
+                LifecycleState::Active,
+                LifecycleState::Archived,
+                true,
+                false,
+                true
+            ),
             "conflict_restore_archive"
         );
         assert_eq!(
-            classify_merge_parity_tag(LifecycleState::Active, LifecycleState::Active, true, true, true),
+            classify_merge_parity_tag(
+                LifecycleState::Active,
+                LifecycleState::Active,
+                true,
+                true,
+                true
+            ),
             "conflict_incompatible_edits"
         );
     }
@@ -6925,7 +6983,8 @@ mod tests {
             format!("{json}\n"),
         )
         .unwrap();
-        mesh.commit_all("policy change", "node-import-test").unwrap();
+        mesh.commit_all("policy change", "node-import-test")
+            .unwrap();
         MeshStorage::open(mesh.root()).unwrap()
     }
 
@@ -7110,7 +7169,11 @@ mod tests {
             "the refusal names the scan: {:?}",
             report.ignored
         );
-        assert_eq!(row_count(&store, "probe").await, 0, "nothing reached the store");
+        assert_eq!(
+            row_count(&store, "probe").await,
+            0,
+            "nothing reached the store"
+        );
     }
 
     /// Program Task 3 (fix round, M-1): the scanner builds its location
@@ -7128,10 +7191,7 @@ mod tests {
         let mut metadata = serde_json::Map::new();
         metadata.insert("eligibility".to_string(), json!("shareable"));
         metadata.insert("trust".to_string(), json!("untrusted"));
-        metadata.insert(
-            evil_key.clone(),
-            json!({ "nested": secret_value.clone() }),
-        );
+        metadata.insert(evil_key.clone(), json!({ "nested": secret_value.clone() }));
         value["metadata"] = Value::Object(metadata);
         commit_record_json(
             &mesh,
@@ -7163,7 +7223,11 @@ mod tests {
             !entry.contains(&secret_value),
             "the report must not echo the secret value: {entry}"
         );
-        assert_eq!(row_count(&store, "probe").await, 0, "nothing reached the store");
+        assert_eq!(
+            row_count(&store, "probe").await,
+            0,
+            "nothing reached the store"
+        );
     }
 
     /// J3 (provenance leg): the row keeps the sender's claimed author for
@@ -7203,7 +7267,12 @@ mod tests {
         );
     }
 
-    async fn seed_row(store: &std::sync::Arc<dyn VectorStore>, id: &str, memory_type: &str, metadata: Value) {
+    async fn seed_row(
+        store: &std::sync::Arc<dyn VectorStore>,
+        id: &str,
+        memory_type: &str,
+        metadata: Value,
+    ) {
         store
             .upsert(
                 "probe",
@@ -7224,11 +7293,7 @@ mod tests {
     }
 
     async fn trust_stamp_of(store: &std::sync::Arc<dyn VectorStore>, id: &str) -> Value {
-        let (_, payload) = store
-            .get("probe", id)
-            .await
-            .unwrap()
-            .expect("row present");
+        let (_, payload) = store.get("probe", id).await.unwrap().expect("row present");
         payload
             .metadata
             .get("trust")
@@ -7244,7 +7309,13 @@ mod tests {
     async fn backfill_stamps_by_provenance() {
         let store = fresh_store("backfill").await;
         store.init("probe").await.unwrap();
-        seed_row(&store, "proc-local", "procedure", json!({"trigger": "session-start"})).await;
+        seed_row(
+            &store,
+            "proc-local",
+            "procedure",
+            json!({"trigger": "session-start"}),
+        )
+        .await;
         seed_row(
             &store,
             "proc-imported",
@@ -7255,13 +7326,22 @@ mod tests {
             }),
         )
         .await;
-        seed_row(&store, "proc-promoted", "procedure", json!({"trust": "promoted"})).await;
+        seed_row(
+            &store,
+            "proc-promoted",
+            "procedure",
+            json!({"trust": "promoted"}),
+        )
+        .await;
         seed_row(&store, "rule-plain", "rule", json!({})).await;
 
         let (local, imported) = backfill_imported_procedure_trust(&store).await;
         assert_eq!((local, imported), (1, 1), "one of each class stamped");
         assert_eq!(trust_stamp_of(&store, "proc-local").await, json!("local"));
-        assert_eq!(trust_stamp_of(&store, "proc-imported").await, json!("untrusted"));
+        assert_eq!(
+            trust_stamp_of(&store, "proc-imported").await,
+            json!("untrusted")
+        );
         assert_eq!(
             trust_stamp_of(&store, "proc-promoted").await,
             json!("promoted"),
@@ -7274,6 +7354,10 @@ mod tests {
         );
 
         let (local2, imported2) = backfill_imported_procedure_trust(&store).await;
-        assert_eq!((local2, imported2), (0, 0), "idempotent: nothing left to classify");
+        assert_eq!(
+            (local2, imported2),
+            (0, 0),
+            "idempotent: nothing left to classify"
+        );
     }
 }

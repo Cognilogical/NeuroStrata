@@ -44,8 +44,10 @@ impl TypeSafeJevProvider {
         if loopback {
             return Ok(());
         }
-        let permitted =
-            std::env::var("NEUROSTRATA_ALLOW_REMOTE_EGRESS").ok().as_deref() == Some("1");
+        let permitted = std::env::var("NEUROSTRATA_ALLOW_REMOTE_EGRESS")
+            .ok()
+            .as_deref()
+            == Some("1");
         let has_key = !self.api_key.trim().is_empty();
         if !permitted || !has_key {
             anyhow::bail!(
@@ -114,7 +116,9 @@ impl TypeSafeJevProvider {
             if let Some(answer) = answers.get(&question_key) {
                 let confidence = match answer.get("probability") {
                     Some(prob) if prob.is_f64() => prob.as_f64(),
-                    Some(prob) if prob.is_i64() => Some((prob.as_i64().unwrap_or(0) as f64) / 100.0),
+                    Some(prob) if prob.is_i64() => {
+                        Some((prob.as_i64().unwrap_or(0) as f64) / 100.0)
+                    }
                     Some(prob) if prob.is_string() => {
                         let s = prob.as_str().unwrap_or("");
                         match s.to_ascii_lowercase().as_str() {
@@ -124,11 +128,19 @@ impl TypeSafeJevProvider {
                         }
                     }
                     // Fallback: check for SystemOne noul in alternative fields
-                    _ => answer.get("answer").or_else(|| answer.get("verdict")).or_else(|| answer.get("noul")).and_then(|v| v.as_str()).map(|s| Some(match s.to_ascii_lowercase().as_str() {
-                        "yes" | "true" | "duplicate" => 0.9,
-                        "no" | "false" => 0.1,
-                        _ => 0.0,
-                    })).flatten(),
+                    _ => answer
+                        .get("answer")
+                        .or_else(|| answer.get("verdict"))
+                        .or_else(|| answer.get("noul"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| {
+                            Some(match s.to_ascii_lowercase().as_str() {
+                                "yes" | "true" | "duplicate" => 0.9,
+                                "no" | "false" => 0.1,
+                                _ => 0.0,
+                            })
+                        })
+                        .flatten(),
                 };
                 let confidence = confidence.unwrap_or(0.0) as f32;
 
@@ -168,11 +180,12 @@ impl JudgmentProvider for TypeSafeJevProvider {
 
         let request = self.build_request(new_memory, candidates);
 
-        let post_url = if self.base_url.ends_with("/systemone") || self.base_url.ends_with("/evaluate") {
-            self.base_url.clone()
-        } else {
-            format!("{}/systemone", self.base_url.trim_end_matches('/'))
-        };
+        let post_url =
+            if self.base_url.ends_with("/systemone") || self.base_url.ends_with("/evaluate") {
+                self.base_url.clone()
+            } else {
+                format!("{}/systemone", self.base_url.trim_end_matches('/'))
+            };
         let response = self
             .client
             .post(&post_url)
@@ -249,10 +262,7 @@ mod tests {
         let err = provider
             .assert_egress_authorized()
             .expect_err("remote base_url without authorization is refused");
-        assert!(
-            err.to_string().contains("(R13)"),
-            "unexpected error: {err}"
-        );
+        assert!(err.to_string().contains("(R13)"), "unexpected error: {err}");
 
         // Fail closed through the actual judgment path (network call never
         // attempts to reach the remote host).
@@ -292,8 +302,8 @@ mod tests {
 
     #[tokio::test]
     async fn loopback_base_url_is_exempt_from_egress_gate() {
-        let mut provider = TypeSafeJevProvider::new("test-key".to_string())
-            .expect("provider constructs");
+        let mut provider =
+            TypeSafeJevProvider::new("test-key".to_string()).expect("provider constructs");
         provider.base_url = "http://127.0.0.1:8080/v1".to_string();
         provider
             .assert_egress_authorized()
@@ -333,9 +343,7 @@ mod tests {
             payload: new_mem.clone(),
             evidence: None,
         });
-        let judgments = provider
-            .parse_response(&resp_yes, &cands)
-            .unwrap();
+        let judgments = provider.parse_response(&resp_yes, &cands).unwrap();
         assert!(!judgments.is_empty());
         assert!(
             judgments[0].confidence > 0.5,
@@ -353,7 +361,10 @@ mod tests {
             }
         });
         let judgments2 = provider.parse_response(&resp_no, &cands).unwrap();
-        assert!(judgments2.is_empty(), "noui 'no' should yield confidence <= 0.5");
+        assert!(
+            judgments2.is_empty(),
+            "noui 'no' should yield confidence <= 0.5"
+        );
 
         // Probability answer still works
         let resp_prob = serde_json::json!({
