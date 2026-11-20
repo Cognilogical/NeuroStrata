@@ -5873,7 +5873,7 @@ async fn handle_get_snapshot(
 
     // Cache an explicitly-provided project_root into the registry row (best-effort).
     if let Some(pr) = &project_root_arg {
-        crate::registry::cache_project_root(&store, None, namespace, pr).await;
+        crate::registry::cache_project_root_unless_marked(&store, None, namespace, pr).await;
     }
 
     // Fetch all memories first so hook hygiene can infer a git root when none
@@ -16043,6 +16043,68 @@ mod tests {
 
         assert!(v.get("error").and_then(|e| e.as_str()).is_some(), "{v}");
         assert_eq!(related_traversal_counter_for_tests(), 0);
+    }
+
+    #[tokio::test]
+    async fn marked_namespace_cache_is_not_overwritten_by_append_log_ingest_or_snapshot() {
+        let (store, _) = store_with_one_rule("ns").await;
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let base = dunce::canonicalize(tmp.path()).expect("canonical");
+        let repo = base.join("repo");
+        let sub = repo.join("sub");
+        std::fs::create_dir_all(repo.join(".git")).expect("repo .git");
+        std::fs::create_dir_all(repo.join(".NeuroStrata")).expect("marker dir");
+        std::fs::create_dir_all(&sub).expect("sub");
+        std::fs::write(sub.join("lib.rs"), "fn main() {}").expect("source");
+        std::fs::write(
+            repo.join(".NeuroStrata").join("config.json"),
+            br#"{"version":1,"namespace":"ns"}"#,
+        )
+        .expect("marker");
+        let root = repo.to_string_lossy().into_owned();
+        crate::registry::cache_project_root(&store, Some(&emb), "ns", &root).await;
+        let cached = || async {
+            crate::registry::cached_project_root(&store, "ns")
+                .await
+                .expect("read cache")
+        };
+
+        let reply = crate::buffer::handle_append_log(
+            serde_json::json!({
+                "namespace": "ns",
+                "content": "a note",
+                "project_root": sub.to_string_lossy(),
+            }),
+            emb.clone(),
+            store.clone(),
+        )
+        .await;
+        assert!(!reply.starts_with("ERROR"), "{reply}");
+        assert_eq!(cached().await, Some(root.clone()), "after append_log");
+
+        let schema = crate::parser::schema::ParserSchema::load(include_str!("schema.json"))
+            .expect("shipped schema parses");
+        crate::parser::ingest::ingest_directory(
+            &sub,
+            &schema,
+            emb.clone(),
+            store.clone(),
+            "ns",
+            None,
+            &[],
+        )
+        .await
+        .expect("ingest");
+        assert_eq!(cached().await, Some(root.clone()), "after ingest");
+
+        handle_get_snapshot(
+            serde_json::json!({ "namespace": "ns", "project_root": sub.to_string_lossy() }),
+            store.clone(),
+        )
+        .await
+        .expect("snapshot");
+        assert_eq!(cached().await, Some(root), "after snapshot");
     }
 
     #[tokio::test]

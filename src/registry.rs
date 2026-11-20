@@ -494,6 +494,11 @@ pub fn build_merged_registry_payload(
     }
 }
 
+/// Serializes every read-modify-write of a registry row in this process.
+/// A `tokio` mutex (guards are held across awaits) and not reentrant: a
+/// function that holds it must not call another function that takes it.
+pub(crate) static REGISTRY_ROW_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Read-merge-write the registry under a process-wide mutex (the guard is held
 /// across awaits, so this is a `tokio` mutex). `None` on success; `Some(warning)`
 /// when the cache did not stick -- the write it belongs to has already been
@@ -504,9 +509,7 @@ pub async fn write_registry(
     namespace: &str,
     domains: &[String],
 ) -> Option<String> {
-    static REGISTRY_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    let _guard = REGISTRY_MUTEX.lock().await;
+    let _guard = REGISTRY_ROW_LOCK.lock().await;
     let registry_id = registry_row_id(namespace);
     // Read existing row (metadata + vector) for merge. Fail the write on a
     // read error: merging `wanted_slugs` into an empty "existing" would
@@ -777,6 +780,52 @@ pub async fn cache_project_root(
     namespace: &str,
     project_root: &str,
 ) {
+    let _guard = REGISTRY_ROW_LOCK.lock().await;
+    cache_project_root_locked(store, emb, namespace, project_root).await;
+}
+
+/// Like [`cache_project_root`], but a namespace whose root a marker names is
+/// left alone: only the marker's writers change that root. An unreadable
+/// marker is no reason to overwrite a root that may be right, so it is a
+/// no-op too (one warning).
+pub async fn cache_project_root_unless_marked(
+    store: &Arc<dyn VectorStore>,
+    emb: Option<&Arc<dyn Embedder>>,
+    namespace: &str,
+    project_root: &str,
+) {
+    match crate::root_marker::find_root_marker(std::path::Path::new(project_root)) {
+        Ok(Some(found)) if found.config.namespace.eq_ignore_ascii_case(namespace) => return,
+        Err((path, reason)) => {
+            tracing::warn!(
+                "root marker {} is unreadable ({reason}); the cached project_root of '{namespace}' was left as it is",
+                path.display()
+            );
+            return;
+        }
+        _ => {}
+    }
+    cache_project_root(store, emb, namespace, project_root).await;
+}
+
+/// Set the namespace's cached root to `root` (for the marker's writers). A
+/// root inside a linked worktree is stored in its main checkout's spelling.
+pub async fn set_project_root(
+    store: &Arc<dyn VectorStore>,
+    emb: Option<&Arc<dyn Embedder>>,
+    namespace: &str,
+    root: &std::path::Path,
+) {
+    let spelled = crate::root_marker::in_main_checkout(root);
+    cache_project_root(store, emb, namespace, &spelled.to_string_lossy()).await;
+}
+
+async fn cache_project_root_locked(
+    store: &Arc<dyn VectorStore>,
+    emb: Option<&Arc<dyn Embedder>>,
+    namespace: &str,
+    project_root: &str,
+) {
     let registry_id = registry_row_id(namespace);
     let (vector, mut payload) = match store.get(namespace, &registry_id).await {
         Ok(Some(found)) => found,
@@ -849,6 +898,120 @@ pub async fn cached_project_root(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_marker(dir: &std::path::Path, ns: &str) {
+        std::fs::create_dir_all(dir.join(".NeuroStrata")).unwrap();
+        std::fs::write(
+            dir.join(".NeuroStrata").join("config.json"),
+            format!(r#"{{"version":1,"namespace":"{ns}"}}"#),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn marked_namespace_cache_ignores_a_caller_root() {
+        use crate::guard::testkit::{MockStore, StubEmbedder};
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        let repo = base.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("sub")).unwrap();
+        write_marker(&repo, "example-project");
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        let root = repo.to_string_lossy().into_owned();
+        cache_project_root(&store, Some(&emb), "example-project", &root).await;
+
+        let sub = repo.join("sub").to_string_lossy().into_owned();
+        // The marker names the namespace in any case spelling.
+        for ns in ["example-project", "Example-Project"] {
+            cache_project_root_unless_marked(&store, Some(&emb), ns, &sub).await;
+            assert_eq!(
+                cached_project_root(&store, "example-project").await.unwrap(),
+                Some(root.clone())
+            );
+        }
+
+        // A broken marker is no reason to overwrite either.
+        write_marker(&repo.join("sub"), "x");
+        std::fs::write(
+            repo.join("sub").join(".NeuroStrata").join("config.json"),
+            b"{ no",
+        )
+        .unwrap();
+        cache_project_root_unless_marked(&store, Some(&emb), "example-project", &sub).await;
+        assert_eq!(
+            cached_project_root(&store, "example-project").await.unwrap(),
+            Some(root)
+        );
+    }
+
+    #[tokio::test]
+    async fn unmarked_namespace_cache_still_follows_callers() {
+        use crate::guard::testkit::{MockStore, StubEmbedder};
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        let repo = base.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        // A marker that names another namespace does not pin this one.
+        write_marker(&repo, "other-project");
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        let first = repo.to_string_lossy().into_owned();
+        cache_project_root_unless_marked(&store, Some(&emb), "example-project", &first).await;
+        assert_eq!(
+            cached_project_root(&store, "example-project").await.unwrap(),
+            Some(first)
+        );
+        let plain = base.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let second = plain.to_string_lossy().into_owned();
+        cache_project_root_unless_marked(&store, Some(&emb), "example-project", &second).await;
+        assert_eq!(
+            cached_project_root(&store, "example-project").await.unwrap(),
+            Some(second)
+        );
+    }
+
+    #[tokio::test]
+    async fn set_project_root_stores_the_given_root() {
+        use crate::guard::testkit::{MockStore, StubEmbedder};
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        set_project_root(&store, Some(&emb), "example-project", &base).await;
+        assert_eq!(
+            cached_project_root(&store, "example-project").await.unwrap(),
+            Some(base.to_string_lossy().into_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_write_and_domain_registry_write_both_survive() {
+        use crate::guard::testkit::{MockStore, StubEmbedder};
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        for i in 0..50 {
+            let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+            let root = format!("/example/root-{i}");
+            let domains = vec!["auth".to_string()];
+            let (_, warning) = tokio::join!(
+                cache_project_root(&store, Some(&emb), "example-project", &root),
+                write_registry(&store, &emb, "example-project", &domains),
+            );
+            assert_eq!(warning, None, "round {i}");
+            assert_eq!(
+                cached_project_root(&store, "example-project").await.unwrap(),
+                Some(root),
+                "round {i}: the cached root"
+            );
+            assert_eq!(
+                read_domains(&store, "example-project").await.unwrap(),
+                domains,
+                "round {i}: the domain registry"
+            );
+        }
+    }
 
     #[test]
     fn a_registry_row_id_is_stable_and_namespaced() {

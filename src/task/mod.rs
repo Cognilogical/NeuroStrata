@@ -8196,6 +8196,61 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn claim_from_linked_worktree_keeps_worktree_scope() {
+        let _env_guard = crate::daemon::project_root_env_test_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        let main = base.join("main");
+        let linked = base.join("linked");
+        std::fs::create_dir_all(&main).unwrap();
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&main, &["init", "-b", "main"]);
+        git(&main, &["commit", "--allow-empty", "-m", "init"]);
+        git(
+            &main,
+            &["worktree", "add", "-b", "feature/linked", linked.to_str().unwrap()],
+        );
+
+        std::env::set_var("NEUROSTRATA_PROJECT_ROOT", &main);
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "linked work", 2).await;
+        let reply = handle_task_claim(
+            json!({
+                "namespace": "MyProj",
+                "id": id,
+                "assignee": "agent-a",
+                "session_id": "ses_linked",
+                "project_root": linked.to_string_lossy(),
+            }),
+            store.clone(),
+        )
+        .await;
+        std::env::remove_var("NEUROSTRATA_PROJECT_ROOT");
+        assert!(reply.contains("\"status\": \"in_progress\""), "{}", reply);
+
+        let expected = gate::GateScope::capture(&linked);
+        assert_eq!(expected.branch.as_deref(), Some("feature/linked"));
+        let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+        assert_eq!(payload.metadata["task"]["branch"], json!(expected.branch));
+        assert_eq!(
+            payload.metadata["task"]["worktree"],
+            json!(expected.worktree)
+        );
+    }
+
     #[test]
     fn task_summary_exposes_branch_and_worktree() {
         let payload = MemoryPayload {

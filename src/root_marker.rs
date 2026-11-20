@@ -349,7 +349,7 @@ impl FoundMarker {
 /// `dir` spelled in its main checkout when it lies in a linked worktree (the
 /// main checkout's top joined with the part below the worktree's top), else
 /// `dir` itself. The registry caches a worktree's root in this spelling.
-fn in_main_checkout(dir: &Path) -> PathBuf {
+pub(crate) fn in_main_checkout(dir: &Path) -> PathBuf {
     checkout_top(dir)
         .and_then(|top| {
             let main = linked_main_checkout(&top)?;
