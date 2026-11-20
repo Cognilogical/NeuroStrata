@@ -9,8 +9,8 @@
 mod memories_for_file;
 
 use memories_for_file::{
-    fan_out_bucket, freshness_priority, memory_type_priority, rank_hits, GraphMatchKind, MemoryHit,
-    DEFAULT_LIMIT, DEFAULT_MEMORY_TYPES, MAX_LIMIT,
+    fan_out_bucket, freshness_priority, memory_type_priority, rank_hits, recommended_next_actions,
+    GraphMatchKind, MemoryHit, DEFAULT_LIMIT, DEFAULT_MEMORY_TYPES, MAX_LIMIT,
 };
 use serde_json::{json, Value};
 
@@ -133,17 +133,11 @@ fn fan_out_still_breaks_ties_within_one_enforcement_class() {
 
 #[test]
 fn match_kind_priority_orders_best_first() {
-    assert!(
-        GraphMatchKind::ExactSymbol.priority() < GraphMatchKind::ExactFile.priority()
-    );
+    assert!(GraphMatchKind::ExactSymbol.priority() < GraphMatchKind::ExactFile.priority());
     assert!(GraphMatchKind::ExactFile.priority() < GraphMatchKind::SymbolTwoHop.priority());
     assert!(GraphMatchKind::SymbolTwoHop.priority() < GraphMatchKind::AncestorDirectory.priority());
-    assert!(
-        GraphMatchKind::AncestorDirectory.priority() < GraphMatchKind::Related.priority()
-    );
-    assert!(
-        GraphMatchKind::Related.priority() < GraphMatchKind::MetadataFallback.priority()
-    );
+    assert!(GraphMatchKind::AncestorDirectory.priority() < GraphMatchKind::Related.priority());
+    assert!(GraphMatchKind::Related.priority() < GraphMatchKind::MetadataFallback.priority());
 }
 
 #[test]
@@ -152,19 +146,13 @@ fn memory_type_priority_ranks_enforced_rules_first() {
     let partial = json!({ "enforcement": "PARTIAL" });
     let shaped_fact = json!({ "topology": {} });
     let plain_fact = json!({});
+    assert!(memory_type_priority("rule", &enforced) < memory_type_priority("rule", &partial));
+    assert!(memory_type_priority("rule", &partial) < memory_type_priority("fact", &shaped_fact));
     assert!(
-        memory_type_priority("rule", &enforced) < memory_type_priority("rule", &partial)
+        memory_type_priority("fact", &shaped_fact) < memory_type_priority("procedure", &json!({}))
     );
     assert!(
-        memory_type_priority("rule", &partial) < memory_type_priority("fact", &shaped_fact)
-    );
-    assert!(
-        memory_type_priority("fact", &shaped_fact)
-            < memory_type_priority("procedure", &json!({}))
-    );
-    assert!(
-        memory_type_priority("procedure", &json!({}))
-            < memory_type_priority("fact", &plain_fact)
+        memory_type_priority("procedure", &json!({})) < memory_type_priority("fact", &plain_fact)
     );
 }
 
@@ -190,7 +178,13 @@ fn rank_hits_orders_by_kind_then_type_then_access_count() {
             100,
             json!({ "enforcement": "ENFORCED" }),
         ),
-        hit("exact-fact", GraphMatchKind::ExactFile, "fact", 100, json!({})),
+        hit(
+            "exact-fact",
+            GraphMatchKind::ExactFile,
+            "fact",
+            100,
+            json!({}),
+        ),
         hit(
             "exact-rule",
             GraphMatchKind::ExactFile,
@@ -255,4 +249,87 @@ fn constants_match_the_spec_defaults() {
     assert_eq!(DEFAULT_LIMIT, 5);
     assert_eq!(MAX_LIMIT, 20);
     assert_eq!(DEFAULT_MEMORY_TYPES, ["rule", "fact", "procedure"]);
+}
+
+// --- Task 4: conditional escalation from memories_for_file -----------------
+
+#[test]
+fn high_blast_radius_escalates_to_two_hop() {
+    // blast_radius_count >= 15 -> T_HIGH_BLAST -> neurostrata_related(max_hops:2).
+    let resp = recommended_next_actions(16, &[], 0, false, "NeuroStrata", Some("sym::foo"));
+    assert_eq!(resp["status"], "success");
+    let actions = resp["next_actions"].as_array().expect("next_actions array");
+    assert!(!actions.is_empty(), "expected an escalation action");
+    assert_eq!(actions[0]["trigger_id"], "T_HIGH_BLAST");
+    assert_eq!(actions[0]["tool"], "neurostrata_related");
+    assert_eq!(actions[0]["args"]["max_hops"], 2);
+    assert_eq!(actions[0]["args"]["id"], "sym::foo");
+    assert_eq!(actions[0]["args"]["namespace"], "NeuroStrata");
+}
+
+#[test]
+fn empty_lookup_routes_to_locate() {
+    // An empty lookup is T_AMBIGUOUS -> neurostrata_locate. Empty is NOT
+    // "no governance": no response field may claim governance absence.
+    let resp = recommended_next_actions(0, &[], 0, true, "NeuroStrata", Some("src/foo.rs"));
+    assert_eq!(resp["status"], "empty");
+    let actions = resp["next_actions"].as_array().expect("next_actions array");
+    assert_eq!(actions[0]["trigger_id"], "T_AMBIGUOUS");
+    assert_eq!(actions[0]["tool"], "neurostrata_locate");
+    assert_eq!(actions[0]["args"]["namespace"], "NeuroStrata");
+    assert_eq!(actions[0]["args"]["query"], "src/foo.rs");
+    let lowered = resp.to_string().to_ascii_lowercase();
+    for forbidden in ["no governance", "no rules", "governance absence"] {
+        assert!(
+            !lowered.contains(forbidden),
+            "field claims absence: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn ordinary_single_file_edit_does_not_escalate() {
+    // blast radius 3, no bridges -> no escalation; one-hop data is already
+    // present in the response. suppressed_reason explains the abstention.
+    let resp = recommended_next_actions(3, &[], 0, false, "NeuroStrata", Some("sym::x"));
+    assert_eq!(resp["status"], "success");
+    assert_eq!(resp["next_actions"].as_array().unwrap().len(), 0);
+    let reason = resp["suppressed_reason"]
+        .as_str()
+        .expect("suppressed_reason");
+    assert!(reason.contains("1-hop"), "reason was {reason:?}");
+}
+
+#[test]
+fn conceptual_bridge_suggests_object_view() {
+    let resp = recommended_next_actions(
+        3,
+        &["target-rule".to_string()],
+        0,
+        false,
+        "NeuroStrata",
+        Some("sym::seed"),
+    );
+    let actions = resp["next_actions"].as_array().unwrap();
+    assert_eq!(actions[0]["trigger_id"], "T_SEED_EDGE");
+    assert_eq!(actions[0]["tool"], "neurostrata_object_view");
+    assert_eq!(actions[0]["args"]["id"], "target-rule");
+    assert_eq!(actions[0]["args"]["namespace"], "NeuroStrata");
+}
+
+#[test]
+fn staged_diff_scope_emits_schema_valid_args_only() {
+    // diff_tour declares no `git_ref` argument: emit only {namespace, diff_text}.
+    let resp = recommended_next_actions(3, &[], 3, false, "NeuroStrata", Some("sym::x"));
+    let actions = resp["next_actions"].as_array().unwrap();
+    assert_eq!(actions[0]["trigger_id"], "T_DIFF");
+    assert_eq!(actions[0]["tool"], "neurostrata_diff_tour");
+    let args = actions[0]["args"].as_object().unwrap();
+    let mut keys: Vec<&str> = args.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, vec!["diff_text", "namespace"]);
+    assert!(
+        !args.contains_key("git_ref"),
+        "diff_tour has no git_ref arg"
+    );
 }

@@ -3481,6 +3481,8 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
             "memories": [],
             "unsupported": true,
             "path": original_path,
+            "status": "unsupported",
+            "next_actions": [],
         })
         .to_string();
     };
@@ -3585,6 +3587,53 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
                         response["ast_error"] = serde_json::Value::String(e.to_string());
                     }
                 }
+            }
+
+            // Task 4: conditional escalation decided by a crate-free pure
+            // function so the decision itself is testable without a store.
+            // All fields here are additive; existing fields stay byte-stable.
+            let blast_radius_count = response
+                .get("ast_summary")
+                .and_then(|v| v.get("blast_radius_count"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
+            let bridge_ids: Vec<String> = hits
+                .iter()
+                .flat_map(|h| h.conceptual_bridges.iter())
+                .map(|b| b.target_id.clone())
+                .collect();
+            let staged_file_count = arguments
+                .get("staged_file_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
+            // Prefer a returned symbol id, then a returned memory id, then the
+            // queried path (all valid `related` seeds; an empty lookup supplies
+            // the path as the `locate` query).
+            let seed_id = response
+                .get("ast_summary")
+                .and_then(|v| v.get("symbols"))
+                .and_then(serde_json::Value::as_array)
+                .and_then(|a| a.first())
+                .and_then(|s| s.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| hit_ids.first().map(String::as_str))
+                .unwrap_or(original_path);
+            let escalation = crate::graph_read::memories_for_file::recommended_next_actions(
+                blast_radius_count,
+                &bridge_ids,
+                staged_file_count,
+                hits.is_empty(),
+                &namespace,
+                Some(seed_id),
+            );
+            if let Some(status) = escalation.get("status").and_then(serde_json::Value::as_str) {
+                response["status"] = serde_json::Value::String(status.to_string());
+            }
+            if let Some(actions) = escalation.get("next_actions") {
+                response["next_actions"] = actions.clone();
+            }
+            if let Some(reason) = escalation.get("suppressed_reason") {
+                response["suppressed_reason"] = reason.clone();
             }
             response.to_string()
         }
