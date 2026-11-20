@@ -3198,3 +3198,20 @@ describe("nb9q FIX3: no task-intent intake from read-only tool output", () => {
     }
   });
 });
+
+// ──────────────────────────────────────────────────────────────────────
+// Audit W2: two-class classifier corpus
+// ──────────────────────────────────────────────────────────────────────
+describe("audit W2: classifier corpus (JS side)", () => {
+  it("plugin verdicts match the adjudicated corpus (red on main)", async () => {
+    const corpus = JSON.parse(readFileSync(join(REPO_ROOT, "scripts", "classifier-corpus.json"), "utf8"));
+    assert.ok(corpus.cases && corpus.cases.length > 0, "corpus has cases");
+    const mod = await import("./dist/index.js");
+    const mismatches = [];
+    for (const row of corpus.cases) {
+      const actual = mod.isZeroActionExemptShellPayload(row.action, row.payload);
+      if (actual !== row.exempt) mismatches.push({ id: row.id, actual, expected: row.exempt });
+    }
+    assert.deepEqual(mismatches, [], `corpus mismatches: ${JSON.stringify(mismatches)}`);
+  });
+});

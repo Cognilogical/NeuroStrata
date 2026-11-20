@@ -12716,6 +12716,25 @@ mod tests {
         assert!(!is_zero_action_exempt_shell_payload("bash", r#"{"cmd":42}"#));
     }
 
+    #[test]
+    fn zero_action_exempt_classifier_matches_the_corpus() {
+        let corpus: Value =
+            serde_json::from_str(include_str!("../scripts/classifier-corpus.json")).unwrap();
+        let cases = corpus["cases"].as_array().unwrap();
+        assert!(!cases.is_empty(), "corpus is non-empty");
+        let mut mismatches = Vec::new();
+        for case in cases {
+            let action = case["action"].as_str().unwrap();
+            let payload = case["payload"].as_str().unwrap();
+            let exempt = is_zero_action_exempt_shell_payload(action, payload);
+            let expected = case["exempt"].as_bool().unwrap();
+            if exempt != expected {
+                mismatches.push(format!("{}: {payload:?}", case["id"].as_str().unwrap()));
+            }
+        }
+        assert!(mismatches.is_empty(), "corpus mismatches: {mismatches:?}");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn guard_validate_resolves_active_task_by_session_and_worktree() {
         let (store, _) = store_with_one_rule("probe").await;

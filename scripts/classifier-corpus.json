@@ -1,0 +1,29 @@
+{
+  "note": "Two-class classifier corpus (adjudicated by the main-branch remediation plan's W2 gate). Consumed by the Node consumer in plugins/core/test.mjs (the plugin bundle) and the Rust consumer in src/server.rs tests (the daemon helper). Every row is a (action, payload, expected exempt) triple; both consumers must agree on every row. Consumers run every row; the corpus's `note` fields name the issue each row guards.",
+  "cases": [
+    {"id": "push-delete-short", "action": "bash", "payload": "git push -d origin main", "exempt": false, "note": "#312 (both classes: daemon was exempt, plugin was exempt)"},
+    {"id": "push-delete-bundled", "action": "bash", "payload": "git push -vd origin scratch", "exempt": false, "note": "#312 (both)"},
+    {"id": "push-plus-refspec", "action": "bash", "payload": "git push origin +main", "exempt": false, "note": "#312 (both)"},
+    {"id": "push-colon-refspec", "action": "bash", "payload": "git push origin :refs/heads/scratch", "exempt": false, "note": "#312 (both)"},
+    {"id": "push-quoted-force", "action": "bash", "payload": "git push \"--force\"", "exempt": false, "note": "#312 (daemon exempt, plugin exempt)"},
+    {"id": "push-abbrev-delete", "action": "bash", "payload": "git push --dele origin scratch", "exempt": false, "note": "#312 (both)"},
+    {"id": "push-force", "action": "bash", "payload": "git push -f", "exempt": false, "note": "#312 (both; baseline correct)"},
+    {"id": "push-force-bundle", "action": "bash", "payload": "git push -fv origin main", "exempt": false, "note": "#312 (both; baseline correct)"},
+    {"id": "push-env-assignment", "action": "bash", "payload": "FOO=1 git push -vf origin main", "exempt": false, "note": "#312 (both)"},
+    {"id": "push-backgrounded", "action": "bash", "payload": "git push origin main &", "exempt": false, "note": "#311 (daemon exempt, plugin mutating)"},
+    {"id": "push-status-backgrounded", "action": "bash", "payload": "git status &", "exempt": false, "note": "#311 (daemon exempt, plugin mutating)"},
+    {"id": "push-status-and-diff", "action": "bash", "payload": "git status && git diff", "exempt": true, "note": "unchanged behavior (both)"},
+    {"id": "push-plain", "action": "bash", "payload": "git push origin main", "exempt": true, "note": "post-complete push window (both)"},
+    {"id": "push-opformat-terse", "action": "bash", "payload": "git push -oformat=terse origin main", "exempt": true, "note": "both measured: the matcher should not classify a push option containing 'f' as force"},
+    {"id": "gh-api-attached-post", "action": "bash", "payload": "{\"command\": \"gh api -XPOST /repos/x\"}", "exempt": false, "note": "#315 (daemon exempt, plugin mutating)"},
+    {"id": "gh-api-attached-f", "action": "bash", "payload": "{\"command\": \"gh api -fbody=hi /x\"}", "exempt": false, "note": "#315 (daemon exempt, plugin mutating)"},
+    {"id": "gh-api-attached-F", "action": "bash", "payload": "{\"command\": \"gh api -Fbody=hi /x\"}", "exempt": false, "note": "#315 (daemon exempt, plugin mutating)"},
+    {"id": "gh-api-spaced-post", "action": "bash", "payload": "{\"command\": \"gh api -X POST /repos/x\"}", "exempt": false, "note": "#315 (both; plugin via hasFlag prefix, daemon via separate flags)"},
+    {"id": "gh-api-readonly", "action": "bash", "payload": "{\"command\": \"gh api repos/x\"}", "exempt": true, "note": "unchanged behavior (both)"},
+    {"id": "json-wrapped-push-background", "action": "bash", "payload": "{\"command\": \"git push origin main &\", \"cmd\": null}", "exempt": false, "note": "#311 daemon-exempt class, now mutating in both"},
+    {"id": "json-fallback-cmd", "action": "bash", "payload": "{\"cmd\": \"git push +ref\"}", "exempt": false, "note": "missing command key falls back to cmd (both decoders)"},
+    {"id": "json-whitespace-wrapper", "action": "bash", "payload": "﻿\u0085{\"command\": \"git push -f\"}", "exempt": false, "note": "the decoders parse as far as they do; both classify as mutating (safe): JS JSON.parse rejects the leading NEL, serde rejects the BOM/NEL form too"},
+    {"id": "json-irrelevant-property", "action": "bash", "payload": "{\"command\": \"git status\", \"note\": \"not read by the classifier\"}", "exempt": true, "note": "a property no classifier reads must not flip the verdict"},
+    {"id": "cargo-test-mutating", "action": "bash", "payload": "cargo test --test lean_parity_test", "exempt": true, "note": "universal-machine exempt stays (executes build.rs); red-free anchor"}
+  ]
+}
