@@ -306,6 +306,25 @@ impl SearchMemoryContract {
     }
 }
 
+/// Append the additive `search_contract` line to any report, including the
+/// plain strings returned on hard-error paths (missing params, bad mode, init
+/// or embed failure, search failure). Error paths pass no graph-expanded ids,
+/// but the rule set is identical to the success path: `hybrid` default,
+/// `include_related` deprecation warning, and an always-present id array.
+/// Kept crate-free so `upgraded_search_test` can pin the error rendering.
+pub fn append_search_contract_line(
+    mut report: String,
+    arguments: &Value,
+    graph_expanded_ids: Vec<String>,
+) -> String {
+    let contract = SearchMemoryContract::from_arguments(arguments, graph_expanded_ids);
+    report.push_str(&format!(
+        "\n\nsearch_contract: {}",
+        serde_json::to_string(&contract).unwrap_or_default()
+    ));
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

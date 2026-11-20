@@ -362,3 +362,22 @@ pub fn recommended_next_actions(
     }
     response
 }
+
+/// Additive fail-soft shape for a `memories_for_file` query failure.
+///
+/// The legacy fields (`memories`, `unsupported`, `path`, `error`) keep their
+/// exact values; the §5 receipt fields are added so a failed lookup is never
+/// misread as "no governing memory". `next_actions` is empty and a
+/// `suppressed_reason` is always present, matching the abstention rule in
+/// `recommended_next_actions` (empty actions must say why none fired).
+pub fn query_failure_response(path: &str, error: &str) -> Value {
+    json!({
+        "memories": [],
+        "unsupported": false,
+        "path": path,
+        "error": error,
+        "status": "failed",
+        "next_actions": [],
+        "suppressed_reason": "Query failed; no escalation actions were emitted because the lookup did not complete. A failed lookup is not evidence of no governing memory.",
+    })
+}

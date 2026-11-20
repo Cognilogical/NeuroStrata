@@ -3676,12 +3676,10 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
             }
             response.to_string()
         }
-        Err(e) => serde_json::json!({
-            "memories": [],
-            "unsupported": false,
-            "path": original_path,
-            "error": e.to_string(),
-        })
+        Err(e) => crate::graph_read::memories_for_file::query_failure_response(
+            original_path,
+            &e.to_string(),
+        )
         .to_string(),
     }
 }
@@ -10895,17 +10893,12 @@ fn graph_expanded_ids_from_results(results: &[SearchResult]) -> Vec<String> {
 /// Append the response contract as one additive JSON line. Older report
 /// fields stay byte-identical; parsers that ignore unknown lines are unaffected.
 fn finalize_search_report(
-    mut report: String,
+    report: String,
     arguments: &Value,
     results: &[SearchResult],
 ) -> String {
-    let mut contract = crate::search::SearchMemoryContract::from_arguments(arguments, Vec::new());
-    contract.graph_expanded_ids = graph_expanded_ids_from_results(results);
-    report.push_str(&format!(
-        "\n\nsearch_contract: {}",
-        serde_json::to_string(&contract).unwrap_or_default()
-    ));
-    report
+    let ids = graph_expanded_ids_from_results(results);
+    crate::search::append_search_contract_line(report, arguments, ids)
 }
 
 async fn handle_search_memory(
@@ -10915,11 +10908,19 @@ async fn handle_search_memory(
 ) -> String {
     let query = match arguments.get("query").and_then(|q| q.as_str()) {
         Some(q) => q,
-        None => return "Missing 'query' parameter.".to_string(),
+        None => {
+            return finalize_search_report("Missing 'query' parameter.".to_string(), &arguments, &[])
+        }
     };
     let namespace = match arguments.get("namespace").and_then(|n| n.as_str()) {
         Some(n) => n,
-        None => return "ERROR [NAMESPACE]: 'namespace' is missing. You MUST explicitly provide the specific project namespace to search in.".to_string(),
+        None => {
+            return finalize_search_report(
+                "ERROR [NAMESPACE]: 'namespace' is missing. You MUST explicitly provide the specific project namespace to search in.".to_string(),
+                &arguments,
+                &[],
+            )
+        }
     };
     let namespace = resolve_namespace(&store, namespace).await;
     let namespace = namespace.as_str();
@@ -10952,9 +10953,13 @@ async fn handle_search_memory(
         && search_mode != "lexical"
         && search_mode != "lexical-inhouse"
     {
-        return format!(
-            "ERROR [MODE]: unknown search mode '{}'. Use 'hybrid' (default), 'vector', 'lexical', or 'lexical-inhouse'.",
-            search_mode
+        return finalize_search_report(
+            format!(
+                "ERROR [MODE]: unknown search mode '{}'. Use 'hybrid' (default), 'vector', 'lexical', or 'lexical-inhouse'.",
+                search_mode
+            ),
+            &arguments,
+            &[],
         );
     }
     // No authenticated principal context exists on this local MCP surface yet;
@@ -11292,13 +11297,21 @@ async fn handle_search_memory(
 
     if let Err(e) = store.init(namespace).await {
         tracing::warn!("search_memory init failed for '{namespace}': {e}");
-        return format!("Failed to initialize namespace table.: {e}");
+        return finalize_search_report(
+            format!("Failed to initialize namespace table.: {e}"),
+            &arguments,
+            &[],
+        );
     }
     let vec = match emb.embed(&query).await {
         Ok(vec) => vec,
         Err(e) => {
             tracing::warn!("search_memory embedding failed for '{namespace}': {e}");
-            return format!("Failed to generate embedding for search.: {e}");
+            return finalize_search_report(
+                format!("Failed to generate embedding for search.: {e}"),
+                &arguments,
+                &[],
+            );
         }
     };
     let is_ladybug_store = crate::traits::VectorStore::as_any(store.as_ref())
@@ -11619,7 +11632,7 @@ async fn handle_search_memory(
             }
         }
     } else {
-        "Failed to search database.".to_string()
+        finalize_search_report("Failed to search database.".to_string(), &arguments, &[])
     }
 }
 

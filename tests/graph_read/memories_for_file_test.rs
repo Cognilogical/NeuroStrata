@@ -9,8 +9,9 @@
 mod memories_for_file;
 
 use memories_for_file::{
-    fan_out_bucket, freshness_priority, memory_type_priority, rank_hits, recommended_next_actions,
-    GraphMatchKind, MemoryHit, DEFAULT_LIMIT, DEFAULT_MEMORY_TYPES, MAX_LIMIT,
+    fan_out_bucket, freshness_priority, memory_type_priority, query_failure_response, rank_hits,
+    recommended_next_actions, GraphMatchKind, MemoryHit, DEFAULT_LIMIT, DEFAULT_MEMORY_TYPES,
+    MAX_LIMIT,
 };
 use serde_json::{json, Value};
 
@@ -353,4 +354,28 @@ fn next_actions_are_capped_at_three() {
     let bridges: Vec<String> = (0..5).map(|i| format!("bridge-{i}")).collect();
     let resp = recommended_next_actions(16, &bridges, 3, false, "NeuroStrata", Some("sym::x"));
     assert_eq!(resp["next_actions"].as_array().unwrap().len(), 3);
+}
+
+#[test]
+fn query_failure_response_keeps_legacy_fields_and_adds_receipt_fields() {
+    // Finding 1: a failed lookup carries the additive §5 receipt fields so it
+    // is never misread as "no governance". Legacy fields keep exact values.
+    let resp = query_failure_response("src/server.rs", "boom: query failed");
+    assert_eq!(resp["memories"], json!([]));
+    assert_eq!(resp["unsupported"], json!(false));
+    assert_eq!(resp["path"], json!("src/server.rs"));
+    assert_eq!(resp["error"], json!("boom: query failed"));
+    assert_eq!(resp["status"], "failed");
+    assert_eq!(resp["next_actions"], json!([]));
+    let reason = resp["suppressed_reason"]
+        .as_str()
+        .expect("suppressed_reason present when no actions fired");
+    assert!(
+        !reason.trim().is_empty(),
+        "abstention must say why no actions fired"
+    );
+    let lowered = resp.to_string().to_ascii_lowercase();
+    for forbidden in ["no governance", "no rules", "governance absence"] {
+        assert!(!lowered.contains(forbidden), "field claims absence: {forbidden}");
+    }
 }

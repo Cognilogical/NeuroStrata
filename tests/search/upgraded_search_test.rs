@@ -2,11 +2,59 @@
 mod search;
 
 use search::{
-    passes_filters, SearchFilters, SearchMemoryContract, INCLUDE_RELATED_DEPRECATION_WARNING,
+    append_search_contract_line, passes_filters, SearchFilters, SearchMemoryContract,
+    INCLUDE_RELATED_DEPRECATION_WARNING,
 };
 use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+// Finding 2: every hard-error return (missing query/namespace, bad mode, init
+// or embed failure, search failure) is normalized through this same helper,
+// so the additive contract line is present even when no results exist.
+
+#[test]
+fn missing_query_error_carries_additive_search_contract() {
+    let args = json!({ "namespace": "NeuroStrata", "include_related": true });
+    let out = append_search_contract_line("Missing 'query' parameter.".to_string(), &args, vec![]);
+    assert!(
+        out.starts_with("Missing 'query' parameter.\n\nsearch_contract: "),
+        "error text must stay byte-identical and contract appended: {out}"
+    );
+    let line = out.split("search_contract: ").nth(1).expect("contract line");
+    let contract: serde_json::Value = serde_json::from_str(line).expect("contract JSON");
+    assert_eq!(contract["mode"], "hybrid", "hybrid default on error path");
+    assert_eq!(contract["graph_expanded_ids"], json!([]));
+    let warnings = contract["warnings"].as_array().expect("warnings array");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str() == Some(INCLUDE_RELATED_DEPRECATION_WARNING)),
+        "deprecation warning must appear on error path: {contract}"
+    );
+}
+
+#[test]
+fn mode_and_search_errors_carry_additive_search_contract() {
+    for error in [
+        "ERROR [MODE]: unknown search mode 'bogus'. Use 'hybrid' (default), 'vector', 'lexical', or 'lexical-inhouse'.",
+        "Failed to search database.",
+    ] {
+        let out = append_search_contract_line(
+            error.to_string(),
+            &json!({ "mode": "lexical" }),
+            vec![],
+        );
+        assert!(
+            out.starts_with(&format!("{error}\n\nsearch_contract: ")),
+            "error text must stay byte-identical: {out}"
+        );
+        let line = out.split("search_contract: ").nth(1).expect("contract line");
+        let contract: serde_json::Value = serde_json::from_str(line).expect("contract JSON");
+        assert_eq!(contract["mode"], "lexical", "explicit mode preserved: {contract}");
+        assert_eq!(contract["graph_expanded_ids"], json!([]));
+    }
+}
 
 #[test]
 fn excludes_code_ast_by_default() {
