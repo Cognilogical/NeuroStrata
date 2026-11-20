@@ -46,6 +46,7 @@ mod rebac;
 mod recall_metrics;
 mod receipts;
 mod registry;
+mod root_marker;
 mod retention;
 mod search;
 mod secrets;

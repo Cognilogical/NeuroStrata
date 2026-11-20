@@ -1442,7 +1442,7 @@ fn session_home_dirs() -> Vec<std::path::PathBuf> {
     homes
 }
 
-fn is_home_folder(dir: &std::path::Path, home: Option<&std::path::Path>) -> bool {
+pub(crate) fn is_home_folder(dir: &std::path::Path, home: Option<&std::path::Path>) -> bool {
     let Some(home) = home.and_then(|h| dunce::canonicalize(h).ok()) else {
         return false;
     };
