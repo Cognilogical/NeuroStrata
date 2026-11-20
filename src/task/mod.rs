@@ -1495,10 +1495,11 @@ pub(crate) fn current_session_id() -> String {
 
 /// Record a fully-specified POST-DISPATCH receipt. This is the ONLY function
 /// that writes `events[]` receipts; every outcome field comes from the real
-/// handler response. It also stamps `graph_queries_count`/`graph_queried` on the
-/// active task (Task 7 attribution), preserves the legacy `queries[]` shape,
-/// and bumps the additive-only `tool_invocations` counter. Receipts stay in the
-/// local JSON ledger — never memory rows, so no ReBAC or mesh surface sees them.
+/// handler response. It fills `task_id` from the active in-progress task for
+/// attribution and bumps the additive-only `tool_invocations` counter. Legacy
+/// `queries[]` rows and the `graph_queries_count`/`graph_queried` stamps belong
+/// exclusively to the handler-internal recorders. Receipts stay in the local
+/// JSON ledger — never memory rows, so no ReBAC or mesh surface sees them.
 pub async fn record_tool_receipt(
     store: &Arc<dyn VectorStore>,
     mut fields: tool_receipts::ReceiptFields,
