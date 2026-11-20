@@ -11969,121 +11969,220 @@ fn is_disallowed_git_subcommand_arg(arg: &str) -> bool {
         || arg.starts_with("--receive-pack=")
 }
 
+/// POSIX-ish shell word tokenizer for one segment: whitespace separates
+/// (including C0 controls, NEL, and BOM); single/double quotes group until the
+/// matching quote; a backslash escapes the next character. Returns `None` when
+/// quotes are unbalanced (the segment is treated as mutating, fail-closed).
+fn shell_words(segment: &str) -> Option<Vec<String>> {
+    let mut words: Vec<String> = Vec::new();
+    let mut cur: Option<String> = None;
+    let mut chars = segment.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            _ if ch.is_ascii_control() || ch == ' ' || ch == '\u{85}' || ch == '\u{feff}' => {
+                if cur.is_some() {
+                    words.push(cur.take().unwrap());
+                }
+            }
+            '\'' | '"' => {
+                let quote = ch;
+                loop {
+                    match chars.next() {
+                        Some(c) if c == quote => break,
+                        Some('\\') if quote == '"' && chars.peek().is_some() => {
+                            let escaped = chars.next().unwrap();
+                            cur.get_or_insert_with(String::new).push(escaped);
+                        }
+                        Some(c) => cur.get_or_insert_with(String::new).push(c),
+                        None => return None,
+                    }
+                }
+            }
+            '\\' => match chars.next() {
+                Some(c) => cur.get_or_insert_with(String::new).push(c),
+                None => return None,
+            },
+            _ => cur.get_or_insert_with(String::new).push(ch),
+        }
+    }
+    if cur.is_some() {
+        words.push(cur.unwrap());
+    }
+    Some(words)
+}
+
+/// Skip leading `NAME=value` environment assignments.
+fn skip_env_assignments(words: Vec<String>) -> Vec<String> {
+    let mut words = words;
+    while let Some(first) = words.first() {
+        if !is_env_assignment_token(first) {
+            break;
+        }
+        words.remove(0);
+    }
+    words
+}
+
+/// Git global flags that precede the subcommand; matched in the legacy
+/// order: `-C`/`--git-dir`/`--work-tree` with a value, then the `=` forms and
+/// the boolean flags.
+fn skip_git_globals(rest: &[String]) -> &[String] {
+    let mut rest = rest;
+    loop {
+        if rest.len() >= 2 && matches!(rest[0].as_str(), "-C" | "--git-dir" | "--work-tree") {
+            rest = &rest[2..];
+        } else if rest.first().is_some_and(|t| {
+            matches!(t.as_str(), "--no-pager" | "-P" | "--no-optional-locks")
+                || t.starts_with("--git-dir=")
+                || t.starts_with("--work-tree=")
+        }) {
+            rest = &rest[1..];
+        } else {
+            break;
+        }
+    }
+    rest
+}
+
+/// Long-form git flags that make any git command mutating: forced ref
+/// updates (`--force`, `--force-with-lease`), destructive remote operations
+/// (`--mirror`, `--delete`, `--prune`). Git accepts unique prefixes and
+/// `=`-attached values of these, so the matcher matches prefix containment
+/// both ways.
+const MUTATING_GIT_LONG: [&str; 4] = ["--force", "--mirror", "--delete", "--prune"];
+
+fn is_mutating_git_long(arg: &str) -> bool {
+    MUTATING_GIT_LONG.iter().any(|t| t.starts_with(arg) || arg.starts_with(t))
+}
+
+/// Args that make any git subcommand mutating in the daemon: the `+`/`:`
+/// refspec forms, the forced/destructive long flags above, and the
+/// file-output and exec-override flags on the legacy disallowed list.
+fn is_mutating_git_common_arg(arg: &str) -> bool {
+    arg.starts_with('+')
+        || arg.starts_with(':')
+        || is_mutating_git_long(arg)
+        || is_disallowed_git_subcommand_arg(arg)
+}
+
+/// Args that make `git push` mutating.
+fn is_mutating_push_arg(arg: &str) -> bool {
+    is_mutating_git_common_arg(arg)
+        || arg == "--no-verify"
+        || (arg.starts_with('-')
+            && !arg.starts_with("--")
+            && !arg.contains('=')
+            && arg.chars().skip(1).any(|c| c == 'f' || c == 'd'))
+}
+
+/// Args that make `gh api` mutating: any `-X`/`-f`/`-F` token or the
+/// `--method`/`--field`/`--raw-field`/`--input` longs with or without `=`
+/// (attached values like `-XPOST` or `-fbody=hi` used to be missed).
+fn is_mutating_gh_api_arg(arg: &str) -> bool {
+    arg.starts_with("-X")
+        || arg.starts_with("-f")
+        || arg.starts_with("-F")
+        || matches!(
+            arg,
+            "--method" | "--field" | "--raw-field" | "--input"
+        )
+        || arg.starts_with("--method=")
+        || arg.starts_with("--field=")
+        || arg.starts_with("--raw-field=")
+        || arg.starts_with("--input=")
+}
+
+/// One shell segment (no `;`/`|`/`&`/newline separators) is exempt when its
+/// argv after the environment-assignment prefix and git globals is one of the
+/// allowlisted read-only calls.
 fn is_zero_action_exempt_shell_segment(segment: &str) -> bool {
-    let mut tokens = segment
-        .split_whitespace()
-        .skip_while(|t| is_env_assignment_token(t));
-    let Some(first) = tokens.next() else {
+    let Some(words) = shell_words(segment) else {
+        return false;
+    };
+    let words = skip_env_assignments(words);
+    let Some(first) = words.first() else {
         return false;
     };
     let bin = std::path::Path::new(first)
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or(first);
+    let rest: &[String] = &words[1..];
     match bin {
         "git" => {
-            let mut rest: Vec<&str> = tokens.collect();
-            loop {
-                if rest.len() >= 2 && matches!(rest[0], "-C" | "--git-dir" | "--work-tree") {
-                    rest.drain(..2);
-                } else if !rest.is_empty()
-                    && (matches!(rest[0], "--no-pager" | "-P" | "--no-optional-locks")
-                        || rest[0].starts_with("--git-dir=")
-                        || rest[0].starts_with("--work-tree="))
-                {
-                    rest.remove(0);
-                } else {
-                    break;
-                }
-            }
-            if rest.first().is_some_and(|t| t.starts_with('-')) {
-                return false;
-            }
-            let Some(&subcmd) = rest.first() else {
+            let rest = skip_git_globals(rest);
+            let Some(subcmd) = rest.first() else {
                 return false;
             };
-            if rest[1..]
-                .iter()
-                .any(|arg| is_disallowed_git_subcommand_arg(arg))
-            {
+            if rest[1..].iter().any(|arg| is_mutating_git_common_arg(arg)) {
                 return false;
             }
-            match subcmd {
-                // Force-push rewrites remote history: never exempt it from the
-                // active-task gate. Mirror the plugin's flag detection here.
-                // Inspect the whole argument list: bundled short flags
-                // (-vf/-uf), forced refspecs (+main) and destructive remote
-                // operations must all stay mutating, in parity with the plugin.
-                "push" => !rest[1..].iter().copied().any(|arg| {
-                    arg.starts_with('+')
-                        || arg == "--force"
-                        || arg.starts_with("--force-")
-                        || matches!(arg, "--mirror" | "--delete" | "--prune")
-                        || (arg.starts_with('-') && !arg.starts_with("--") && arg[1..].contains('f'))
-                }),
+            match subcmd.as_str() {
+                "push" => !rest[1..].iter().any(|arg| is_mutating_push_arg(arg)),
+                // `pull`/`fetch`/`status`/`log`/`diff`/`show`/`rev-parse`:
+                // the common check above already returned false for
+                // mutating args (`+`/`:` refspecs, `--force*`/`--mirror`/
+                // `--delete`/`--prune`; fetch: `--prune` included).
                 "pull" | "fetch" | "status" | "log" | "diff" | "show" | "rev-parse" => true,
-                "stash" => matches!(rest.get(1).copied(), Some("list" | "show")),
-                "branch" => {
-                    rest.len() >= 2
-                        && rest[1..].iter().all(|t| {
-                            matches!(
-                                *t,
-                                "--show-current" | "-a" | "-r" | "--list" | "-v" | "-vv"
-                            )
-                        })
-                }
+                "stash" => matches!(rest.get(1).map(|s| s.as_str()), Some("list" | "show")),
+                "branch" => rest[1..].iter().all(|t| {
+                    matches!(
+                        t.as_str(),
+                        "--show-current" | "-a" | "-r" | "--list" | "-v" | "-vv"
+                    )
+                }),
                 _ => false,
             }
         }
         "neurostrata-mcp" => {
-            let rest: Vec<&str> = tokens.collect();
-            match rest.first().copied() {
-                Some("task" | "doc-gate") => true,
-                Some("synaptic-mesh") => matches!(rest.get(1).copied(), Some("status")),
-                _ => false,
-            }
+            matches!(
+                rest.first().map(|s| s.as_str()),
+                Some("task") | Some("doc-gate")
+            ) || (rest.first().map(|s| s.as_str()) == Some("synaptic-mesh")
+                && rest.get(1).map(|s| s.as_str()) == Some("status"))
         }
         "cargo" => {
-            let mut rest: Vec<&str> = tokens.collect();
-            if rest.first().is_some_and(|t| t.starts_with('+')) {
-                rest.remove(0);
-            }
+            let rest = if rest.first().is_some_and(|t| t.starts_with('+')) {
+                &rest[1..]
+            } else {
+                rest
+            };
             matches!(
-                rest.first().copied(),
-                Some("test" | "check" | "clippy" | "bench" | "metadata" | "tree" | "version" | "--version")
+                rest.first().map(|s| s.as_str()),
+                Some("test")
+                    | Some("check")
+                    | Some("clippy")
+                    | Some("bench")
+                    | Some("metadata")
+                    | Some("tree")
+                    | Some("version")
+                    | Some("--version")
             )
         }
         "gh" => {
-            let rest: Vec<&str> = tokens.collect();
-            match rest.first().copied() {
+            match rest.first().map(|s| s.as_str()) {
                 Some("pr") => matches!(
-                    rest.get(1).copied(),
-                    Some("view" | "list" | "checks" | "status" | "diff")
+                    rest.get(1).map(|s| s.as_str()),
+                    Some("view") | Some("list") | Some("checks") | Some("status") | Some("diff")
                 ),
-                Some("issue") => matches!(rest.get(1).copied(), Some("view" | "list" | "status")),
-                Some("run") => matches!(rest.get(1).copied(), Some("view" | "list" | "watch")),
-                Some("api") => !rest[1..].iter().any(|arg| {
-                    matches!(
-                        *arg,
-                        "-X" | "--method" | "-f" | "-F" | "--field" | "--raw-field" | "--input"
-                    ) || arg.starts_with("--method=")
-                        || arg.starts_with("--field=")
-                        || arg.starts_with("--raw-field=")
-                        || arg.starts_with("--input=")
-                }),
+                Some("issue") => matches!(
+                    rest.get(1).map(|s| s.as_str()),
+                    Some("view") | Some("list") | Some("status")
+                ),
+                Some("run") => matches!(
+                    rest.get(1).map(|s| s.as_str()),
+                    Some("view") | Some("list") | Some("watch")
+                ),
+                Some("api") => !rest[1..].iter().any(|arg| is_mutating_gh_api_arg(arg)),
                 _ => false,
             }
         }
-        "node" => {
-            let rest: Vec<&str> = tokens.collect();
-            rest.iter()
-                .any(|t| *t == "--test" || t.ends_with("test.mjs"))
-        }
+        "node" => rest.iter().any(|t| t == "--test" || t.ends_with("test.mjs")),
         "gate-receipt.sh" | "check-include-str-targets.sh" => true,
-        "bash" => tokens.next().is_some_and(|t| {
-            t.ends_with("gate-receipt.sh") || t.ends_with("check-include-str-targets.sh")
-        }),
-        "rustc" => matches!(tokens.next(), Some("--version" | "-V")),
+        "bash" => rest
+            .first()
+            .is_some_and(|t| t.ends_with("gate-receipt.sh") || t.ends_with("check-include-str-targets.sh")),
+        "rustc" => matches!(rest.first().map(|s| s.as_str()), Some("--version") | Some("-V")),
         _ => false,
     }
 }
@@ -12106,7 +12205,7 @@ pub(crate) fn is_zero_action_exempt_shell_payload(action_type: &str, payload: &s
     } else {
         None
     };
-    let command = match &parsed {
+    let command: &str = match &parsed {
         Some(serde_json::Value::Object(obj)) => match obj
             .get("command")
             .or_else(|| obj.get("cmd"))
@@ -12117,24 +12216,29 @@ pub(crate) fn is_zero_action_exempt_shell_payload(action_type: &str, payload: &s
         },
         _ => payload,
     };
-    let trimmed = command.trim();
-    if trimmed.is_empty()
-        || trimmed.contains('`')
-        || trimmed.contains("$(")
-        || trimmed.contains('>')
-        || trimmed.contains('<')
+    // A trailing `&` (or any `&` that is not part of `&&`) backgrounds the
+    // command: the tool returns before it runs, so the active-task gate
+    // cannot see it. Fail closed (same rule as the plugin).
+    if command.replace("&&", "").contains('&') {
+        return false;
+    }
+    if command.trim().is_empty()
+        || command.contains('`')
+        || command.contains("$(")
+        || command.contains('>')
+        || command.contains('<')
     {
         return false;
     }
-    let segments: Vec<&str> = trimmed
+    let segments: Vec<&str> = command
         .split(|c| c == ';' || c == '\n' || c == '|' || c == '&')
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect();
     !segments.is_empty()
         && segments
-            .into_iter()
-            .all(is_zero_action_exempt_shell_segment)
+            .iter()
+            .all(|segment| is_zero_action_exempt_shell_segment(segment))
 }
 
 /// Validate an action against stored behavioral rules and (optionally) the
@@ -12170,7 +12274,7 @@ async fn handle_guard_validate(
     // actions, git push/sync/status commands (which are gated by the pre-push
     // task gate and run after task completion), task-tracking CLI invocations,
     // and namespaces with no task rows at all are exempt.
-    let mutating = !matches!(
+    let read_only_action = matches!(
         action_type.to_lowercase().as_str(),
         "read"
             | "read_file"
@@ -12183,7 +12287,16 @@ async fn handle_guard_validate(
             | "inspect"
             | "grep"
             | "glob"
-    ) && !is_zero_action_exempt_shell_payload(action_type, payload);
+    );
+    let mut mutating = !read_only_action && !is_zero_action_exempt_shell_payload(action_type, payload);
+    // Daemon authority: a caller-declared `is_mutating: true` stays gating
+    // on an otherwise-exempt shell (the plugin sends its classifier result
+    // on both hook paths; older callers may send the hint).
+    if !read_only_action
+        && arguments.get("is_mutating").and_then(|v| v.as_bool()) == Some(true)
+    {
+        mutating = true;
+    }
     if mutating {
         // Determine whether this namespace is task-enabled. Only task rows
         // matter here, so the type filter goes into the query: listing the

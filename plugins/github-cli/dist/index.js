@@ -703,53 +703,170 @@ export function isSubagentTool(name) {
 export function isCodeExecTool(name) {
     return CODE_EXEC_TOOLS.has(name);
 }
+// ── W2 shell-classifier grammar (shared with the daemon, src/server.rs) ──
+// Both implementations parse with:
+// - shell words: split on whitespace and newlines; C0 controls, U+0085, and
+//   U+FEFF count as separators; double quotes `"` and single quotes `'` group
+//   until the matching quote; a backslash escapes the next character; the
+//   whole command is required to parse (unbalanced quote → mutating).
+// - leading env assignments are skipped (`FOO=bar git push --force`).
+// - `git` global flags are skipped: `-C <dir>`/`--git-dir <d>`/`--work-tree <w>`,
+//   `--no-pager`/`-P`/`--no-optional-locks`, and the `=` forms.
+// - `push` is mutating if any arg is `+...`, `--force*`, `--mirror`,
+//   `--delete`, `--prune`, `--no-verify`, or a short bundle containing `f` or
+//   `d` (not attached to a value).
+// - `pull`/`fetch`/`status`/`log`/`diff`/`show`/`rev-parse` are mutating iff
+//   any arg is `+...` or in the same `--force*`/`--mirror`/`--delete`/`--prune`
+//   set (fetch: `--prune` included).
+// - `gh api` is mutating iff any token starts with `-X`/`-f`/`-F` or is
+//   `--method`/`--field`/`--raw-field`/`--input` (with or without `=`).
+// - JSON-wrapped payloads (`{"command": ...}`/`{"cmd": ...}`) unwrap the
+//   command; a trailing `&` (or any `&` that is not part of `&&`) is
+//   mutating (backgrounded).
+const SHELL_WS = /[ - \u0085\ufeff]/;
+const MUTATING_GIT_LONG = ["--force", "--mirror", "--delete", "--prune"];
+function shellWords(segment) {
+    const words = [];
+    let cur = null;
+    const pushCur = () => {
+        if (cur !== null) {
+            words.push(cur);
+            cur = null;
+        }
+    };
+    for (let i = 0; i < segment.length; i++) {
+        const ch = segment[i];
+        if (SHELL_WS.test(ch)) {
+            pushCur();
+        }
+        else if (ch === "'" || ch === '"') {
+            const quote = ch;
+            let closed = false;
+            for (i++; i < segment.length; i++) {
+                const c = segment[i];
+                if (c === quote) {
+                    closed = true;
+                    break;
+                }
+                if (quote === '"' && c === "\\" && i + 1 < segment.length) {
+                    cur = (cur ?? "") + segment[i + 1];
+                    i++;
+                }
+                else {
+                    cur = (cur ?? "") + c;
+                }
+            }
+            if (!closed)
+                return null;
+        }
+        else if (ch === "\\") {
+            if (i + 1 >= segment.length)
+                return null;
+            cur = (cur ?? "") + segment[i + 1];
+            i++;
+        }
+        else {
+            cur = (cur ?? "") + ch;
+        }
+    }
+    pushCur();
+    return words;
+}
+function isEnvAssignmentToken(tok) {
+    const eq = tok.indexOf("=");
+    if (eq < 0)
+        return false;
+    const name = tok.slice(0, eq);
+    return name.length > 0 && /^[A-Za-z0-9_]+$/.test(name) && !/^[0-9]/.test(name);
+}
+function skipGitGlobals(rest) {
+    for (;;) {
+        if (rest.length >= 2 && ["-C", "--git-dir", "--work-tree"].includes(rest[0])) {
+            rest = rest.slice(2);
+        }
+        else if (rest.length > 0 &&
+            (["--no-pager", "-P", "--no-optional-locks"].includes(rest[0]) ||
+                rest[0].startsWith("--git-dir=") ||
+                rest[0].startsWith("--work-tree="))) {
+            rest = rest.slice(1);
+        }
+        else {
+            break;
+        }
+    }
+    return rest;
+}
+function isMutatingGitLong(arg) {
+    return MUTATING_GIT_LONG.some((t) => t.startsWith(arg) || arg.startsWith(t));
+}
+function isDisallowedGitSubcommandArg(arg) {
+    return (arg === "--output" ||
+        arg.startsWith("--output=") ||
+        arg.startsWith("-O") ||
+        arg === "--ext-diff" ||
+        arg === "--textconv" ||
+        arg === "--exec" ||
+        arg.startsWith("--exec=") ||
+        arg === "-x" ||
+        arg === "--upload-pack" ||
+        arg.startsWith("--upload-pack=") ||
+        arg === "--receive-pack" ||
+        arg.startsWith("--receive-pack="));
+}
+function isMutatingGitCommonArg(arg) {
+    return (arg.startsWith("+") ||
+        arg.startsWith(":") ||
+        isMutatingGitLong(arg) ||
+        isDisallowedGitSubcommandArg(arg));
+}
+function isMutatingPushArg(arg) {
+    return (isMutatingGitCommonArg(arg) ||
+        arg === "--no-verify" ||
+        (arg.startsWith("-") &&
+            !arg.startsWith("--") &&
+            !arg.includes("=") &&
+            (arg.slice(1).includes("f") || arg.slice(1).includes("d"))));
+}
+function isMutatingGhApiArg(arg) {
+    return (arg.startsWith("-X") ||
+        arg.startsWith("-f") ||
+        arg.startsWith("-F") ||
+        arg === "--method" ||
+        arg.startsWith("--method=") ||
+        arg === "--field" ||
+        arg.startsWith("--field=") ||
+        arg === "--raw-field" ||
+        arg.startsWith("--raw-field=") ||
+        arg === "--input" ||
+        arg.startsWith("--input="));
+}
 /**
  * Fail-closed recognition of a single read-only / verification shell segment.
  * Only an explicit allowlist passes; anything else is treated as mutating.
  */
 function isZeroActionExemptShellSegment(segment) {
-    let tokens = segment.trim().split(/\s+/).filter(Boolean);
-    while (tokens.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0])) {
-        tokens = tokens.slice(1);
-    }
-    if (tokens.length === 0)
+    const words = shellWords(segment);
+    if (words === null)
         return false;
-    const bin = tokens[0].replace(/\\/g, "/").split("/").pop() ?? "";
-    const args = tokens.slice(1);
-    const hasFlag = (flags) => args.some((arg) => flags.some((flag) => arg === flag || (flag.startsWith("--") ? arg.startsWith(`${flag}=`) : arg.startsWith(flag))));
+    let rest = words;
+    while (rest.length > 0 && isEnvAssignmentToken(rest[0]))
+        rest = rest.slice(1);
+    if (rest.length === 0)
+        return false;
+    const bin = rest[0].replace(/\\/g, "/").split("/").pop() ?? "";
+    const args = rest.slice(1);
     if (bin === "git") {
-        let rest = args;
-        while (rest.length > 0) {
-            const head = rest[0];
-            if (head === "-C" || head === "--git-dir" || head === "--work-tree") {
-                rest = rest.slice(2);
-            }
-            else if (head === "--no-pager" ||
-                head === "-P" ||
-                head === "--no-optional-locks" ||
-                head.startsWith("--git-dir=") ||
-                head.startsWith("--work-tree=")) {
-                rest = rest.slice(1);
-            }
-            else {
-                break;
-            }
-        }
-        const sub = rest[0];
-        const subArgs = rest.slice(1);
-        // Fail closed on every way to force a push: bundled short flags (-vf,
-        // -uf), forced refspecs (+main), and destructive remote operations.
-        if (sub === "push" && subArgs.some((a) => a.startsWith("+") ||
-            a === "--force" ||
-            a.startsWith("--force-") ||
-            a === "--mirror" ||
-            a === "--delete" ||
-            a === "--prune" ||
-            (a.startsWith("-") && !a.startsWith("--") && a.slice(1).includes("f")))) {
+        const g = skipGitGlobals(args);
+        if (g.length === 0)
             return false;
-        }
-        if (["push", "pull", "fetch", "status", "log", "diff", "show", "rev-parse"].includes(sub)) {
-            return !hasFlag(["--output", "-O", "--ext-diff", "--textconv", "--exec", "-x", "--upload-pack", "--receive-pack"]);
+        if (g.slice(1).some(isMutatingGitCommonArg))
+            return false;
+        const sub = g[0];
+        const subArgs = g.slice(1);
+        if (sub === "push")
+            return !subArgs.some(isMutatingPushArg);
+        if (["pull", "fetch", "status", "log", "diff", "show", "rev-parse"].includes(sub)) {
+            return !subArgs.some(isMutatingGitCommonArg);
         }
         if (sub === "stash")
             return subArgs[0] === "list" || subArgs[0] === "show";
@@ -759,13 +876,13 @@ function isZeroActionExemptShellSegment(segment) {
         return false;
     }
     if (bin === "neurostrata-mcp") {
-        if (args[0] === "task" || args[0] === "doc-gate")
-            return true;
-        return args[0] === "synaptic-mesh" && args[1] === "status";
+        return (args[0] === "task" ||
+            args[0] === "doc-gate" ||
+            (args[0] === "synaptic-mesh" && args[1] === "status"));
     }
     if (bin === "cargo") {
-        const rest = args[0]?.startsWith("+") ? args.slice(1) : args;
-        return ["test", "check", "clippy", "bench", "metadata", "tree", "version", "--version"].includes(rest[0]);
+        const rest2 = args[0]?.startsWith("+") ? args.slice(1) : args;
+        return ["test", "check", "clippy", "bench", "metadata", "tree", "version", "--version"].includes(rest2[0]);
     }
     if (bin === "gh") {
         if (args[0] === "pr")
@@ -774,9 +891,8 @@ function isZeroActionExemptShellSegment(segment) {
             return ["view", "list", "status"].includes(args[1]);
         if (args[0] === "run")
             return ["view", "list", "watch"].includes(args[1]);
-        if (args[0] === "api") {
-            return !hasFlag(["-X", "--method", "-f", "-F", "--field", "--raw-field", "--input"]);
-        }
+        if (args[0] === "api")
+            return !args.slice(1).some(isMutatingGhApiArg);
         return false;
     }
     if (bin === "node") {
