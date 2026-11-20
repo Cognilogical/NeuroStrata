@@ -337,8 +337,8 @@ describe("findProjectRoot / discoverProjectNamespace", () => {
   });
 
   it("findProjectRoot walks up to the .git repo root", () => {
-    const underRepo = findProjectRoot(join(process.cwd(), "plugins", "core"));
-    assert.equal(underRepo, process.cwd());
+    const underRepo = findProjectRoot(join(REPO_ROOT, "plugins", "core"));
+    assert.equal(underRepo, REPO_ROOT);
   });
 
   it("discoverProjectNamespace reads .NeuroStrata/session_queries.json namespace", () => {
@@ -1227,7 +1227,7 @@ describe("createHarnessPlugin", () => {
 
 describe("ESM-only surface", () => {
   it("dist has no require() usage", async () => {
-    const src = readFileSync(join(process.cwd(), "plugins", "core", "dist", "index.js"), "utf8");
+    const src = readFileSync(join(REPO_ROOT, "plugins", "core", "dist", "index.js"), "utf8");
     // Strip // line comments and JSDoc */-prefixed lines so the word "require" in
     // comments (e.g. "Zero `require()` calls") doesn't trigger a false positive.
     const code = src.split("\n").filter((line) => {
@@ -1923,7 +1923,7 @@ describe("round-6: task_update title invalidation, AST summary formatting, dev s
     ];
     const expectedDev = 'tsc --project ../core/tsconfig.json && node ../core/bundle-adapter.mjs --watch';
     for (const f of pkgFiles) {
-      const content = readFileSync(join(process.cwd(), f), "utf8");
+      const content = readFileSync(join(REPO_ROOT, f), "utf8");
       const pkg = JSON.parse(content);
       assert.equal(pkg.scripts.dev, expectedDev, `${f} must have correct dev script`);
     }
