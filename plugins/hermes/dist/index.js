@@ -5,9 +5,9 @@
  * Provides Zero-Action Start guard, file-touch recall, and subagent
  * prompt auto-injection without requiring @opencode/plugin import.
  */
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 // ──────────────────────────────────────────────────────────────────────
 // Configuration
 // ──────────────────────────────────────────────────────────────────────
@@ -47,14 +47,19 @@ function asNumber(value) {
 function asBoolean(value) {
     return typeof value === 'boolean' ? value : undefined;
 }
-export function resolveConfig(raw) {
+export function resolveConfig(raw, cwd = process.cwd()) {
     const input = asRecord(raw);
     const intent = asRecord(input.intentDetection);
     const endpoint = asString(input.endpoint) ??
         asString(input.guardEndpoint) ??
         DEFAULT_CONFIG.endpoint;
+    // Preserve the exact namespace for MCP routing; sanitization happens only
+    // where the value is interpolated into a prompt header (#329 review).
+    const namespace = asString(input.namespace) ??
+        asString(process.env.NEUROSTRATA_NAMESPACE) ??
+        discoverProjectNamespace(cwd);
     return {
-        namespace: sanitizeSubagentHeaderToken(asString(input.namespace) ?? DEFAULT_CONFIG.namespace),
+        namespace,
         endpoint,
         bearerToken: asString(input.bearerToken) ?? null,
         tokenFile: asString(input.tokenFile) ?? null,
@@ -66,6 +71,71 @@ export function resolveConfig(raw) {
                 DEFAULT_CONFIG.intentDetection.injectReminder
         }
     };
+}
+/**
+ * Walk up from resolve(startDir) to the filesystem root looking for `.git`
+ * (dir or file) or `.NeuroStrata`; return the directory containing it, or
+ * resolve(startDir) if none found.
+ */
+export function findProjectRoot(startDir = process.cwd()) {
+    // Pass 1: walk up looking for `.git` first; a `.git` anchors the project root.
+    let current = resolve(startDir);
+    while (true) {
+        if (existsSync(join(current, '.git'))) {
+            return current;
+        }
+        const next = dirname(current);
+        if (next === current)
+            break;
+        current = next;
+    }
+    // Pass 2: only if no `.git` anywhere in the ancestor chain, walk up looking
+    // for `.NeuroStrata`. Otherwise fall back to resolve(startDir).
+    current = resolve(startDir);
+    while (true) {
+        if (existsSync(join(current, '.NeuroStrata'))) {
+            return current;
+        }
+        const next = dirname(current);
+        if (next === current)
+            break;
+        current = next;
+    }
+    return resolve(startDir);
+}
+/**
+ * 1. Walk up to findProjectRoot(startDir) checking <dir>/.NeuroStrata/session_queries.json;
+ *    if it parses as JSON with a non-empty string .namespace, return it trimmed.
+ * 2. Otherwise return basename(findProjectRoot(startDir)) || "default".
+ */
+export function discoverProjectNamespace(startDir = process.cwd()) {
+    const root = findProjectRoot(startDir);
+    let current = resolve(startDir);
+    while (true) {
+        const sessionQueriesPath = join(current, '.NeuroStrata', 'session_queries.json');
+        try {
+            if (existsSync(sessionQueriesPath)) {
+                const content = readFileSync(sessionQueriesPath, 'utf8');
+                const parsed = JSON.parse(content);
+                if (parsed !== null &&
+                    typeof parsed === 'object' &&
+                    typeof parsed.namespace === 'string' &&
+                    parsed.namespace.trim() !== '') {
+                    return parsed.namespace.trim();
+                }
+            }
+        }
+        catch {
+            // fall through to next ancestor
+        }
+        if (current === root)
+            break;
+        const next = dirname(current);
+        if (next === current)
+            break;
+        current = next;
+    }
+    return basename(root) || 'default';
 }
 // ──────────────────────────────────────────────────────────────────────
 // Credential
@@ -406,7 +476,7 @@ export function sanitizeSubagentHeaderToken(value) {
  *  out of the header's code span (issue #316: the namespace can arrive from
  *  a committed .NeuroStrata/session_queries.json). */
 function codeSpanValue(value) {
-    return String(value ?? '').replace(/[`\r\n]+/g, ' ');
+    return String(value ?? '').replace(/[`\r\n\u2028\u2029]+/g, ' ');
 }
 export function buildSubagentContextHeader(namespace, taskId) {
     const taskLabel = taskId ?? 'unclaimed (claim a task first)';

@@ -1275,6 +1275,51 @@ fn find_lake() -> Option<PathBuf> {
     }
 }
 
+#[test]
+fn shell_exemption_review_edge_cases() {
+    assert!(!formal_kernel::evaluate_shell_exemption(
+        "git push -fometa origin main"
+    ));
+    assert!(!formal_kernel::evaluate_shell_exemption(
+        "{\"options\":{\"command\":\"git status\"},\"cmd\":\"git push --force origin main\"}"
+    ));
+    assert!(formal_kernel::evaluate_shell_exemption(
+        "{\"options\":{\"command\":\"rm -rf /x\"},\"cmd\":\"git status\"}"
+    ));
+    assert!(!formal_kernel::evaluate_shell_exemption(
+        "{\"cmd\":\"git status\",\"cmd\":\"git push --force origin main\"}"
+    ));
+    assert!(formal_kernel::evaluate_shell_exemption(
+        "{\"command\":\"\",\"cmd\":\"git status\"}"
+    ));
+    assert!(!formal_kernel::evaluate_shell_exemption(
+        "{\"cmd\":\"git status\"} trailing"
+    ));
+    assert!(!formal_kernel::evaluate_shell_exemption(
+        "git push --force=true origin main"
+    ));
+}
+
+#[test]
+fn shell_exemption_json_reader_regressions() {
+    // \u0026 chain → decodes to '&' background operator → reject
+    assert!(!formal_kernel::evaluate_shell_exemption(
+        "{\"cmd\":\"git status \\u0026 echo pwned\"}"
+    ));
+    // trailing comma → invalid JSON → fail closed
+    assert!(!formal_kernel::evaluate_shell_exemption(
+        "{\"cmd\":\"git status\",}"
+    ));
+    // invalid escape \x → fail closed
+    assert!(!formal_kernel::evaluate_shell_exemption(
+        "{\"cmd\":\"git status \\xZZ\"}"
+    ));
+    // multibyte UTF-8 (em-dash U+2014) is not a shell metacharacter → accept
+    assert!(formal_kernel::evaluate_shell_exemption(
+        "{\"cmd\":\"git status \u{2014} ok\"}"
+    ));
+}
+
 /// The formal kernel must keep compiling as a dependency-free standalone crate
 /// so Charon/Aeneas can translate it. This runs the real extract script (which
 /// invokes `rustc -D warnings --crate-type=lib` with zero `--extern` flags).

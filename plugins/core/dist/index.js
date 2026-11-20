@@ -82,9 +82,11 @@ export function resolveConfig(pluginConfig = {}, cwd = process.cwd()) {
     const endpoint = asString(input.endpoint) ??
         asString(input.guardEndpoint) ??
         DEFAULT_CONFIG.endpoint;
-    const namespace = sanitizeSubagentHeaderToken(asString(input.namespace) ??
+    // Preserve the exact namespace for MCP routing; sanitization happens only
+    // where the value is interpolated into a prompt header (#329 review).
+    const namespace = asString(input.namespace) ??
         asString(process.env.NEUROSTRATA_NAMESPACE) ??
-        discoverProjectNamespace(cwd));
+        discoverProjectNamespace(cwd);
     return {
         namespace,
         endpoint,
@@ -814,7 +816,7 @@ function isZeroActionExemptShellSegment(segment) {
             const isMutatingPush = subArgs.some((a) => {
                 if (a.startsWith('+'))
                     return true;
-                if (a === '--force' || a.startsWith('--force-'))
+                if (a.startsWith('--force'))
                     return true;
                 if (a === '--mirror' || a === '--delete' || a === '--prune')
                     return true;
@@ -827,11 +829,16 @@ function isZeroActionExemptShellSegment(segment) {
                 if (a.startsWith('-') && !a.startsWith('--')) {
                     const bundle = a.split('=')[0];
                     const letters = bundle.slice(1);
-                    if (letters.length > 0 &&
-                        letters.length <= 4 &&
-                        /^[A-Za-z]+$/.test(letters) &&
-                        (letters.includes('d') || letters.includes('f'))) {
-                        return true;
+                    // Parse the short-option cluster left-to-right: `-o` (--push-option)
+                    // consumes the rest as its attached value, so only flags appearing
+                    // before it decide mutability (`-fometa` = `-f -o meta`).
+                    for (const ch of letters) {
+                        if (!/[A-Za-z]/.test(ch))
+                            break;
+                        if (ch === 'f' || ch === 'd')
+                            return true;
+                        if (ch === 'o')
+                            break;
                     }
                 }
                 return false;
@@ -861,7 +868,17 @@ function isZeroActionExemptShellSegment(segment) {
             ]);
         }
         if (sub === 'stash')
-            return subArgs[0] === 'list' || subArgs[0] === 'show';
+            return ((subArgs[0] === 'list' || subArgs[0] === 'show') &&
+                !hasFlag([
+                    '--output',
+                    '-O',
+                    '--ext-diff',
+                    '--textconv',
+                    '--exec',
+                    '-x',
+                    '--upload-pack',
+                    '--receive-pack'
+                ]));
         if (sub === 'branch') {
             return (subArgs.length > 0 &&
                 subArgs.every((arg) => ['--show-current', '-a', '-r', '--list', '-v', '-vv'].includes(arg)));
@@ -1500,12 +1517,10 @@ export function detectCodeMode(ctx, cfg) {
  * here (issue #316).
  */
 export function markdownCodeSpanValue(value) {
-    return String(value ?? '').replace(/[`\r\n]+/g, ' ');
+    return String(value ?? '').replace(/[`\r\n\u2028\u2029]+/g, ' ');
 }
 function buildSubagentContextHeaderInternal(namespace, taskId, extraContext, options) {
     const taskLabel = taskId ?? 'unclaimed (claim a task first)';
-    const safeNamespace = sanitizeSubagentHeaderToken(namespace);
-    const safeTaskLabel = taskId === null ? taskLabel : sanitizeSubagentHeaderToken(taskLabel);
     const extra = extraContext && extraContext.trim() ? `\n${extraContext.trim()}\n` : '';
     let lookupRule;
     if (isReadOnlySubagentAgent(options?.agentId)) {

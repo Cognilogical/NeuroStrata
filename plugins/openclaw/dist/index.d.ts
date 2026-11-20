@@ -101,6 +101,8 @@ export interface PluginConfig {
         enabled: boolean;
         injectReminder: boolean;
     };
+    /** Resolved project root directory (set in initialize from ctx.location / cwd). */
+    projectRoot?: string;
 }
 /**
  * Merge the host config over the defaults.
@@ -108,7 +110,19 @@ export interface PluginConfig {
  * `guardEndpoint` is still honored: it is what older installs wrote, and
  * silently ignoring it would point the shim at the wrong port.
  */
-export declare function resolveConfig(raw: unknown): PluginConfig;
+export declare function resolveConfig(raw: unknown, cwd?: string): PluginConfig;
+/**
+ * Walk up from resolve(startDir) to the filesystem root looking for `.git`
+ * (dir or file) or `.NeuroStrata`; return the directory containing it, or
+ * resolve(startDir) if none found.
+ */
+export declare function findProjectRoot(startDir?: string): string;
+/**
+ * 1. Walk up to findProjectRoot(startDir) checking <dir>/.NeuroStrata/session_queries.json;
+ *    if it parses as JSON with a non-empty string .namespace, return it trimmed.
+ * 2. Otherwise return basename(findProjectRoot(startDir)) || "default".
+ */
+export declare function discoverProjectNamespace(startDir?: string): string;
 /** The absolute path of the daemon token file. */
 export declare function daemonTokenPath(tokenFile?: string | null): string;
 /**

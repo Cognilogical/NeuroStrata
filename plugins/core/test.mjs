@@ -370,6 +370,10 @@ afterEach(() => {
 // ──────────────────────────────────────────────────────────────────────
 
 describe('resolveConfig namespace priority (never hardcodes NeuroStrata)', () => {
+  it('preserves a namespace containing spaces for MCP routing', () => {
+    assert.equal(resolveConfig({ namespace: 'My Project' }).namespace, 'My Project')
+  })
+
   it('pluginConfig.namespace wins', () => {
     const cfg = resolveConfig({ namespace: 'cfg-ns', strictMode: false })
     assert.equal(cfg.namespace, 'cfg-ns')

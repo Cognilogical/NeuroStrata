@@ -3984,10 +3984,13 @@ pub fn evaluate_shell_exemption(payload: &str) -> bool {
     // action_type is checked by the caller; here payload may be JSON or raw.
     // JSON unwrap.
     let command = if trimmed.starts_with('{') {
-        // find "command" or "cmd" string value
-        extract_json_string_field(trimmed, "command")
-            .or_else(|| extract_json_string_field(trimmed, "cmd"))
-            .unwrap_or_default()
+        match parse_json_command_fields(trimmed) {
+            Some((command, cmd)) => {
+                let pick = |value: Option<String>| value.filter(|s| !s.trim().is_empty());
+                pick(command).or_else(|| pick(cmd)).unwrap_or_default()
+            }
+            None => return false,
+        }
     } else {
         trimmed.to_string()
     };
@@ -4017,45 +4020,296 @@ pub fn evaluate_shell_exemption(payload: &str) -> bool {
     segments.iter().all(|s| is_exempt_segment(s))
 }
 
-fn extract_json_string_field(json: &str, field: &str) -> Option<String> {
-    // naive: find "field" : "value" handling simple escapes
-    let key = format!("\"{}\"", field);
-    let idx = json.find(&key)?;
-    let rest = &json[idx + key.len()..];
-    // skip whitespace and colon
-    let rest = rest.trim_start();
-    let rest = rest.strip_prefix(':')?.trim_start();
-    if !rest.starts_with('"') {
-        return None;
-    }
-    let mut i = 1usize;
-    let bytes = rest.as_bytes();
-    let mut out = String::new();
-    while i < bytes.len() {
-        let c = bytes[i] as char;
-        if c == '"' {
-            return Some(out);
+/// Minimal strict JSON reader for the shell-exemption decision. The kernel is
+/// compiled standalone with no crates, so this mirrors `JSON.parse` closely
+/// enough to fail closed on anything it cannot fully validate.
+struct JsonReader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> JsonReader<'a> {
+    fn skip_ws(&mut self) {
+        while self.pos < self.bytes.len()
+            && matches!(self.bytes[self.pos], b' ' | b'\t' | b'\n' | b'\r')
+        {
+            self.pos += 1;
         }
-        if c == '\\' && i + 1 < bytes.len() {
-            let n = bytes[i + 1] as char;
-            match n {
-                '"' => out.push('"'),
-                '\\' => out.push('\\'),
-                'n' => out.push('\n'),
-                't' => out.push('\t'),
-                'r' => out.push('\r'),
-                _ => {
-                    out.push('\\');
-                    out.push(n);
+    }
+
+    fn hex4(&mut self) -> Option<u32> {
+        if self.pos + 4 > self.bytes.len() {
+            return None;
+        }
+        let mut value = 0u32;
+        for _ in 0..4 {
+            let digit = match self.bytes[self.pos] {
+                b'0'..=b'9' => (self.bytes[self.pos] - b'0') as u32,
+                b'a'..=b'f' => (self.bytes[self.pos] - b'a' + 10) as u32,
+                b'A'..=b'F' => (self.bytes[self.pos] - b'A' + 10) as u32,
+                _ => return None,
+            };
+            value = value * 16 + digit;
+            self.pos += 1;
+        }
+        Some(value)
+    }
+
+    fn string(&mut self) -> Option<String> {
+        if self.bytes.get(self.pos) != Some(&b'"') {
+            return None;
+        }
+        self.pos += 1;
+        // Buffer raw UTF-8 bytes plus decoded escape scalars, then validate
+        // once so multi-byte characters match `JSON.parse` exactly.
+        let mut raw: Vec<u8> = Vec::new();
+        while self.pos < self.bytes.len() {
+            let b = self.bytes[self.pos];
+            if b == b'"' {
+                self.pos += 1;
+                return String::from_utf8(raw).ok();
+            }
+            if b < 0x20 {
+                return None;
+            }
+            if b == b'\\' {
+                self.pos += 1;
+                let escape = *self.bytes.get(self.pos)?;
+                self.pos += 1;
+                let ch = match escape {
+                    b'"' => '"',
+                    b'\\' => '\\',
+                    b'/' => '/',
+                    b'b' => '\u{0008}',
+                    b'f' => '\u{000C}',
+                    b'n' => '\n',
+                    b'r' => '\r',
+                    b't' => '\t',
+                    b'u' => {
+                        let first = self.hex4()?;
+                        let scalar = if (0xD800..=0xDBFF).contains(&first) {
+                            if self.bytes.get(self.pos) != Some(&b'\\')
+                                || self.bytes.get(self.pos + 1) != Some(&b'u')
+                            {
+                                return None;
+                            }
+                            self.pos += 2;
+                            let second = self.hex4()?;
+                            if !(0xDC00..=0xDFFF).contains(&second) {
+                                return None;
+                            }
+                            0x10000 + ((first - 0xD800) << 10) + (second - 0xDC00)
+                        } else if (0xDC00..=0xDFFF).contains(&first) {
+                            return None;
+                        } else {
+                            first
+                        };
+                        char::from_u32(scalar)?
+                    }
+                    _ => return None,
+                };
+                let mut buf = [0u8; 4];
+                raw.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                continue;
+            }
+            raw.push(b);
+            self.pos += 1;
+        }
+        None
+    }
+
+    fn literal(&mut self, word: &[u8]) -> Option<()> {
+        if self.bytes.get(self.pos..self.pos + word.len()) == Some(word) {
+            self.pos += word.len();
+            Some(())
+        } else {
+            None
+        }
+    }
+
+    fn number(&mut self) -> Option<()> {
+        if self.bytes.get(self.pos) == Some(&b'-') {
+            self.pos += 1;
+        }
+        match self.bytes.get(self.pos) {
+            Some(b'0') => {
+                self.pos += 1;
+                if matches!(self.bytes.get(self.pos), Some(b'0'..=b'9')) {
+                    return None;
                 }
             }
-            i += 2;
-            continue;
+            Some(b'1'..=b'9') => {
+                while matches!(self.bytes.get(self.pos), Some(b'0'..=b'9')) {
+                    self.pos += 1;
+                }
+            }
+            _ => return None,
         }
-        out.push(c);
-        i += 1;
+        if self.bytes.get(self.pos) == Some(&b'.') {
+            self.pos += 1;
+            if !matches!(self.bytes.get(self.pos), Some(b'0'..=b'9')) {
+                return None;
+            }
+            while matches!(self.bytes.get(self.pos), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+        }
+        if matches!(self.bytes.get(self.pos), Some(b'e') | Some(b'E')) {
+            self.pos += 1;
+            if matches!(self.bytes.get(self.pos), Some(b'+') | Some(b'-')) {
+                self.pos += 1;
+            }
+            if !matches!(self.bytes.get(self.pos), Some(b'0'..=b'9')) {
+                return None;
+            }
+            while matches!(self.bytes.get(self.pos), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+        }
+        Some(())
     }
-    None
+
+    fn skip_value(&mut self) -> Option<()> {
+        self.skip_ws();
+        match self.bytes.get(self.pos).copied()? {
+            b'"' => {
+                self.string()?;
+                Some(())
+            }
+            b'{' => {
+                self.pos += 1;
+                self.skip_ws();
+                if self.bytes.get(self.pos) == Some(&b'}') {
+                    self.pos += 1;
+                    return Some(());
+                }
+                loop {
+                    self.skip_ws();
+                    self.string()?;
+                    self.skip_ws();
+                    if self.bytes.get(self.pos) != Some(&b':') {
+                        return None;
+                    }
+                    self.pos += 1;
+                    self.skip_value()?;
+                    self.skip_ws();
+                    match self.bytes.get(self.pos) {
+                        Some(b',') => {
+                            self.pos += 1;
+                            self.skip_ws();
+                            if self.bytes.get(self.pos) == Some(&b'}') {
+                                return None;
+                            }
+                        }
+                        Some(b'}') => {
+                            self.pos += 1;
+                            return Some(());
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+            b'[' => {
+                self.pos += 1;
+                self.skip_ws();
+                if self.bytes.get(self.pos) == Some(&b']') {
+                    self.pos += 1;
+                    return Some(());
+                }
+                loop {
+                    self.skip_value()?;
+                    self.skip_ws();
+                    match self.bytes.get(self.pos) {
+                        Some(b',') => {
+                            self.pos += 1;
+                            self.skip_ws();
+                            if self.bytes.get(self.pos) == Some(&b']') {
+                                return None;
+                            }
+                        }
+                        Some(b']') => {
+                            self.pos += 1;
+                            return Some(());
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+            b't' => self.literal(b"true"),
+            b'f' => self.literal(b"false"),
+            b'n' => self.literal(b"null"),
+            b'-' | b'0'..=b'9' => self.number(),
+            _ => None,
+        }
+    }
+}
+
+/// Parse a JSON object, returning only top-level `command`/`cmd` string values.
+/// Invalid JSON (including trailing content) fails closed. Duplicate keys are
+/// last-wins and a non-string value clears the field, matching `JSON.parse`
+/// plus `asString` in the TS plugin.
+fn parse_json_command_fields(json: &str) -> Option<(Option<String>, Option<String>)> {
+    let mut reader = JsonReader {
+        bytes: json.as_bytes(),
+        pos: 0,
+    };
+    reader.skip_ws();
+    if reader.bytes.get(reader.pos) != Some(&b'{') {
+        return None;
+    }
+    reader.pos += 1;
+    reader.skip_ws();
+    let mut command: Option<String> = None;
+    let mut cmd: Option<String> = None;
+    if reader.bytes.get(reader.pos) == Some(&b'}') {
+        reader.pos += 1;
+    } else {
+        loop {
+            reader.skip_ws();
+            let key = reader.string()?;
+            reader.skip_ws();
+            if reader.bytes.get(reader.pos) != Some(&b':') {
+                return None;
+            }
+            reader.pos += 1;
+            reader.skip_ws();
+            if reader.bytes.get(reader.pos) == Some(&b'"') {
+                let value = reader.string()?;
+                if key == "command" {
+                    command = Some(value);
+                } else if key == "cmd" {
+                    cmd = Some(value);
+                }
+            } else {
+                reader.skip_value()?;
+                if key == "command" {
+                    command = None;
+                } else if key == "cmd" {
+                    cmd = None;
+                }
+            }
+            reader.skip_ws();
+            match reader.bytes.get(reader.pos) {
+                Some(b',') => {
+                    reader.pos += 1;
+                    reader.skip_ws();
+                    if reader.bytes.get(reader.pos) == Some(&b'}') {
+                        return None;
+                    }
+                }
+                Some(b'}') => {
+                    reader.pos += 1;
+                    break;
+                }
+                _ => return None,
+            }
+        }
+    }
+    reader.skip_ws();
+    if reader.pos != reader.bytes.len() {
+        return None;
+    }
+    Some((command, cmd))
 }
 
 fn strip_matching_quotes(tok: &str) -> String {
@@ -4131,7 +4385,7 @@ fn is_exempt_segment(segment: &str) -> bool {
             }
             let subcmd = rest[0].clone();
             let sub_args: Vec<String> = rest[1..].to_vec();
-            // disallowed git subcommand args (from is_disallowed_git_subcommand_arg)
+            // Reject disallowed git subcommand args before classifying.
             for a in &sub_args {
                 if is_disallowed_git_arg(a) {
                     return false;
@@ -4145,7 +4399,7 @@ fn is_exempt_segment(segment: &str) -> bool {
                         if a.starts_with('+') {
                             return false;
                         }
-                        if a == "--force" || a.starts_with("--force-") {
+                        if a.starts_with("--force") {
                             return false;
                         }
                         if a == "--mirror" || a == "--delete" || a == "--prune" {
@@ -4159,13 +4413,19 @@ fn is_exempt_segment(segment: &str) -> bool {
                         // short cluster, not a long option name like -oformat)
                         if a.starts_with('-') && !a.starts_with("--") {
                             let bundle = a.split('=').next().unwrap_or(a);
-                            let letters = &bundle[1..];
-                            if !letters.is_empty()
-                                && letters.len() <= 4
-                                && letters.chars().all(|c| c.is_ascii_alphabetic())
-                                && (letters.contains('d') || letters.contains('f'))
-                            {
-                                return false;
+                            // Parse the short-option cluster left-to-right: `-o`
+                            // (--push-option) consumes the rest as its attached
+                            // value (`-fometa` = `-f -o meta`).
+                            for ch in bundle[1..].chars() {
+                                if !ch.is_ascii_alphabetic() {
+                                    break;
+                                }
+                                if ch == 'f' || ch == 'd' {
+                                    return false;
+                                }
+                                if ch == 'o' {
+                                    break;
+                                }
                             }
                         }
                         // --no-verify always mutating

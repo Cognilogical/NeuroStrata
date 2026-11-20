@@ -85,6 +85,32 @@
       "name": "basic push origin main",
       "payload": "git push origin main",
       "exempt": true
-    }
+    },
+    {
+      "name": "push bundled force + push-option -fometa",
+      "payload": "git push -fometa origin main",
+      "exempt": false
+    },
+    {
+      "name": "nested benign command must not shadow top-level cmd",
+      "payload": "{\"options\":{\"command\":\"git status\"},\"cmd\":\"git push --force origin main\"}",
+      "exempt": false
+    },
+    {
+      "name": "nested mutating command must not shadow top-level benign cmd",
+      "payload": "{\"options\":{\"command\":\"rm -rf /x\"},\"cmd\":\"git status\"}",
+      "exempt": true
+    },
+    { "name": "duplicate cmd last wins", "payload": "{\"cmd\":\"git status\",\"cmd\":\"git push --force origin main\"}", "exempt": false },
+    { "name": "duplicate cmd last non-string wins", "payload": "{\"cmd\":\"git status\",\"cmd\":42}", "exempt": false },
+    { "name": "empty command falls back to cmd", "payload": "{\"command\":\"\",\"cmd\":\"git status\"}", "exempt": true },
+    { "name": "malformed trailing JSON", "payload": "{\"cmd\":\"git status\"} trailing", "exempt": false },
+    { "name": "push force attached equals", "payload": "git push --force=true origin main", "exempt": false },
+    { "name": "stash list with exec option", "payload": "git stash list --exec=foo", "exempt": false },
+    { "name": "unicode-escaped chain", "payload": "{\"cmd\":\"git status \\u0026\\u0026 rm -rf /\"}", "exempt": false },
+    { "name": "malformed trailing comma", "payload": "{\"cmd\":\"git status\",}", "exempt": false },
+    { "name": "malformed missing separator", "payload": "{\"cmd\":\"git status\" \"x\":\"y\"}", "exempt": false },
+    { "name": "malformed invalid escape", "payload": "{\"cmd\":\"git status \\x\"}", "exempt": false },
+    { "name": "malformed invalid literal", "payload": "{\"cmd\":\"git status\",\"x\":truex}", "exempt": false }
   ]
 }

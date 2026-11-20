@@ -27,7 +27,19 @@ export interface PluginConfig {
         injectReminder: boolean;
     };
 }
-export declare function resolveConfig(raw: unknown): PluginConfig;
+export declare function resolveConfig(raw: unknown, cwd?: string): PluginConfig;
+/**
+ * Walk up from resolve(startDir) to the filesystem root looking for `.git`
+ * (dir or file) or `.NeuroStrata`; return the directory containing it, or
+ * resolve(startDir) if none found.
+ */
+export declare function findProjectRoot(startDir?: string): string;
+/**
+ * 1. Walk up to findProjectRoot(startDir) checking <dir>/.NeuroStrata/session_queries.json;
+ *    if it parses as JSON with a non-empty string .namespace, return it trimmed.
+ * 2. Otherwise return basename(findProjectRoot(startDir)) || "default".
+ */
+export declare function discoverProjectNamespace(startDir?: string): string;
 export declare function daemonTokenPath(tokenFile?: string | null): string;
 export declare function loadDaemonToken(tokenFile?: string | null): string | null;
 export declare function buildHeaders(token: string | null): Record<string, string>;
