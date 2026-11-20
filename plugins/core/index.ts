@@ -984,14 +984,17 @@ function isDisallowedGitSubcommandArg(arg: string): boolean {
 function isMutatingGitCommonArg(arg: string): boolean {
   return (
     arg.startsWith("+") ||
-    arg.startsWith(":") ||
     isMutatingGitLong(arg) ||
     isDisallowedGitSubcommandArg(arg)
   );
 }
 
 function isMutatingPushArg(arg: string): boolean {
-  if (isMutatingGitCommonArg(arg) || arg === "--no-verify") return true;
+  // Deletion-refspec forms are push-specific: a colon prefix is a remote
+  // deletion on `git push :<refspec>`, but read-only inspection elsewhere
+  // reads colon paths (`git show :Cargo.toml`); apply it only here
+  // (Codex 331d1a6d#r4638436353).
+  if (isMutatingGitCommonArg(arg) || arg === "--no-verify" || arg.startsWith(":")) return true;
   if (!arg.startsWith("-") || arg.startsWith("--")) return false;
   // Parse the short-option bundle before its attached value: Git reads
   // `-foci.skip=true` as bundled `-f` + `-o ci.skip=true`, so a bundle

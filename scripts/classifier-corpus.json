@@ -26,6 +26,7 @@
     {"id": "json-irrelevant-property", "action": "bash", "payload": "{\"command\": \"git status\", \"note\": \"not read by the classifier\"}", "exempt": true, "note": "a property no classifier reads must not flip the verdict"},
     {"id": "cargo-test-mutating", "action": "bash", "payload": "cargo test --test lean_parity_test", "exempt": true, "note": "universal-machine exempt stays (executes build.rs); red-free anchor"},
     {"id": "push-force-in-attached-option", "action": "bash", "payload": "git push -foci.skip=true origin main", "exempt": false, "note": "Git parses the short-option bundle before its attached value: -foci.skip=true is bundled -f + -o ci.skip=true (Codex 331d1a6d#r4638358096); the `=` exclusion must not hide the force flag"},
-    {"id": "read-only-double-dash", "action": "bash", "payload": "git diff -- src/server.rs", "exempt": true, "note": "the bare `--` option terminator must not match as a long-flag prefix (Codex 331d1a6d#r4638358109)"}
+    {"id": "read-only-double-dash", "action": "bash", "payload": "git diff -- src/server.rs", "exempt": true, "note": "the bare `--` option terminator must not match as a long-flag prefix (Codex 331d1a6d#r4638358109)"},
+    {"id": "read-only-colon-pathspec", "action": "bash", "payload": "git show :Cargo.toml", "exempt": true, "note": "colon prefixes are read-only pathspecs in git show; deletion refspecs stay push-mutating (Codex 331d1a6d#r4638436353)"}
   ]
 }

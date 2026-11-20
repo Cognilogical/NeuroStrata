@@ -12058,19 +12058,27 @@ fn is_mutating_git_long(arg: &str) -> bool {
         && MUTATING_GIT_LONG.iter().any(|t| t.starts_with(arg) || arg.starts_with(t))
 }
 
-/// Args that make any git subcommand mutating in the daemon: the `+`/`:`
-/// refspec forms, the forced/destructive long flags above, and the
+/// Args that make any git subcommand mutating in the daemon: the `+`
+/// refspec form, the forced/destructive long flags above, and the
 /// file-output and exec-override flags on the legacy disallowed list.
+/// Deletion refspecs (`:`-prefixed) are push-specific; see
+/// `is_mutating_push_arg`.
 fn is_mutating_git_common_arg(arg: &str) -> bool {
     arg.starts_with('+')
-        || arg.starts_with(':')
         || is_mutating_git_long(arg)
         || is_disallowed_git_subcommand_arg(arg)
 }
 
 /// Args that make `git push` mutating.
 fn is_mutating_push_arg(arg: &str) -> bool {
-    if is_mutating_git_common_arg(arg) || arg == "--no-verify" {
+    // Deletion-refspec forms are push-specific: a colon prefix is a remote
+    // deletion on `git push :<refspec>`, but read-only inspection elsewhere
+    // reads colon paths (`git show :Cargo.toml`); apply it only here
+    // (Codex 331d1a6d#r4638436353).
+    if is_mutating_git_common_arg(arg)
+        || arg == "--no-verify"
+        || arg.starts_with(':')
+    {
         return true;
     }
     if !arg.starts_with('-') || arg.starts_with("--") {

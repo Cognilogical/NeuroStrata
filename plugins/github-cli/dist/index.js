@@ -819,12 +819,15 @@ function isDisallowedGitSubcommandArg(arg) {
 }
 function isMutatingGitCommonArg(arg) {
     return (arg.startsWith("+") ||
-        arg.startsWith(":") ||
         isMutatingGitLong(arg) ||
         isDisallowedGitSubcommandArg(arg));
 }
 function isMutatingPushArg(arg) {
-    if (isMutatingGitCommonArg(arg) || arg === "--no-verify")
+    // Deletion-refspec forms are push-specific: a colon prefix is a remote
+    // deletion on `git push :<refspec>`, but read-only inspection elsewhere
+    // reads colon paths (`git show :Cargo.toml`); apply it only here
+    // (Codex 331d1a6d#r4638436353).
+    if (isMutatingGitCommonArg(arg) || arg === "--no-verify" || arg.startsWith(":"))
         return true;
     if (!arg.startsWith("-") || arg.startsWith("--"))
         return false;
