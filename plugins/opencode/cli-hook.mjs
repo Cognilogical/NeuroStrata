@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 import { readFileSync } from "node:fs";
+import { dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import plugin, {
   initialize,
   onTurnEnd,
@@ -8,6 +10,7 @@ import plugin, {
 } from "./dist/index.js";
 
 const HARNESS = "opencode";
+const RUNNER_DIR = dirname(fileURLToPath(import.meta.url));
 
 async function main() {
   // Redirect all diagnostic logging to stderr so stdout carries only the
@@ -42,7 +45,7 @@ async function main() {
   // plugin reads NEUROSTRATA_NAMESPACE itself, after the project marker and
   // this config (the order of `neurostrata-mcp namespace resolve`).
   const projectDir = resolveHookProjectDir(HARNESS, event);
-  await initialize({ config: readHarnessConfig(HARNESS, projectDir), projectDir });
+  await initialize({ config: readHarnessConfig(HARNESS, projectDir, RUNNER_DIR), projectDir });
   // Handler chain: execute.before-style handleHookEvent takes precedence, then
   // the Claude handleClaudeHookEvent alias, falling back to the default export.
   const handler = plugin.handleHookEvent ?? plugin.handleClaudeHookEvent ?? plugin;

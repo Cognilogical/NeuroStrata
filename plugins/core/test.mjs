@@ -536,6 +536,20 @@ describe('project root marker and namespace order', () => {
     assert.deepEqual(readHarnessConfig('claude', under(base, 'wt')), { namespace: 'example-project' })
     assert.deepEqual(readHarnessConfig('codex', repo), {})
     assert.deepEqual(readHarnessConfig('unknown', repo), {})
+    // The runner's own install is read first: <root>/.NeuroStrata/plugins/<harness>.
+    buildLayout(base, ['other git-dir'])
+    const other = under(base, 'other')
+    mkdirSync(join(other, '.NeuroStrata', 'plugins', 'claude'), { recursive: true })
+    writeFileSync(
+      join(other, '.NeuroStrata', 'plugins', 'claude', 'neurostrata.json'),
+      JSON.stringify({ namespace: 'from-other' })
+    )
+    const runnerDir = join(repo, '.NeuroStrata', 'plugins', 'claude')
+    assert.deepEqual(readHarnessConfig('claude', other, runnerDir), { namespace: 'example-project' })
+    assert.deepEqual(readHarnessConfig('claude', other), { namespace: 'from-other' })
+    // A runner folder that is not an install, or another harness's, is skipped.
+    assert.deepEqual(readHarnessConfig('claude', other, join(repo, 'src')), { namespace: 'from-other' })
+    assert.deepEqual(readHarnessConfig('codex', other, runnerDir), {})
     writeFileSync(
       join(repo, '.NeuroStrata', 'plugins', 'claude', 'neurostrata.json'),
       JSON.stringify({ namespace: '$NS' })

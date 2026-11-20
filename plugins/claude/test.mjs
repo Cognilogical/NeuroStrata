@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -573,4 +573,60 @@ test("cli hook passes harness config, not env, as config", () => {
   }
   const source = readFileSync(RUNNER, "utf8");
   assert.ok(!source.includes("process.env.NEUROSTRATA_NAMESPACE"), "runner must not pass the env as config");
+});
+
+// The runner Claude Code actually runs is the one the installer embeds
+// (CLI_HOOK_RUNNER_MJS) and writes to <root>/.NeuroStrata/plugins/claude/;
+// it takes its harness from that folder's name.
+test("installed claude runner: config over env, and CLAUDE_PROJECT_DIR", () => {
+  const embedded = readFileSync(
+    new URL("../../src/task/harness_plugins.rs", import.meta.url),
+    "utf8"
+  ).match(/const CLI_HOOK_RUNNER_MJS: &str = r#"([\s\S]*?)"#;/);
+  assert.ok(embedded, "CLI_HOOK_RUNNER_MJS must be extractable");
+  const base = canonicalTempDir("ns-claude-installed-");
+  try {
+    buildLayout(base, ["repo git-dir", "repo neurostrata-dir", "repo/sub"]);
+    const repo = under(base, "repo");
+    const pluginDir = join(repo, ".NeuroStrata", "plugins", "claude");
+    mkdirSync(join(pluginDir, "dist"), { recursive: true });
+    copyFileSync(
+      fileURLToPath(new URL("./dist/index.js", import.meta.url)),
+      join(pluginDir, "dist", "index.js")
+    );
+    writeFileSync(join(pluginDir, "package.json"), JSON.stringify({ type: "module" }));
+    const runner = join(pluginDir, "cli-hook.mjs");
+    writeFileSync(runner, embedded[1]);
+    writeFileSync(
+      join(pluginDir, "neurostrata.json"),
+      JSON.stringify({ id: "neurostrata-claude", namespace: "from-config" })
+    );
+    const closedPort = JSON.stringify({ endpoint: "http://127.0.0.1:1/mcp" });
+    writeFileSync(join(repo, ".NeuroStrata", "neurostrata-plugin.json"), closedPort);
+    const run = (cwd, env) =>
+      namespaceIn(
+        spawnSync(process.execPath, [runner], {
+          input: JSON.stringify(stopEvent(cwd)),
+          cwd,
+          env,
+          encoding: "utf8",
+          timeout: 30000,
+        }).stderr ?? ""
+      );
+    const sub = under(base, "repo/sub");
+    assert.equal(
+      run(sub, runnerEnv({ CLAUDE_PROJECT_DIR: repo, NEUROSTRATA_NAMESPACE: "from-env" })),
+      "from-config"
+    );
+
+    // Markers: the session's folder decides, not the event's cwd.
+    writeMarker(repo, "example-outer");
+    const api = under(base, "repo/packages/api");
+    writeMarker(api, "example-inner");
+    writeFileSync(join(api, ".NeuroStrata", "neurostrata-plugin.json"), closedPort);
+    assert.equal(run(api, runnerEnv({ CLAUDE_PROJECT_DIR: repo })), "example-outer");
+    assert.equal(run(api, runnerEnv({ CLAUDE_PROJECT_DIR: api })), "example-inner");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
 });

@@ -145,8 +145,12 @@ export declare function findRootMarker(startDir: string): FoundRootMarker | null
  * whose untracked configs usually live only in the main checkout) the main
  * checkout's; outside git from `projectDir` itself. Empty when none names a
  * usable namespace.
+ *
+ * `runnerDir` is the folder of the hook runner the installer wrote,
+ * `<root>/.NeuroStrata/plugins/<harness>/`: the config of the project that
+ * installed it, `<root>`, is read first.
  */
-export declare function readHarnessConfig(harness: string, projectDir: string): {
+export declare function readHarnessConfig(harness: string, projectDir: string, runnerDir?: string): {
     namespace?: string;
 };
 /**

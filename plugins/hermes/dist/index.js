@@ -367,19 +367,35 @@ const HARNESS_CONFIG_FILES = {
  * whose untracked configs usually live only in the main checkout) the main
  * checkout's; outside git from `projectDir` itself. Empty when none names a
  * usable namespace.
+ *
+ * `runnerDir` is the folder of the hook runner the installer wrote,
+ * `<root>/.NeuroStrata/plugins/<harness>/`: the config of the project that
+ * installed it, `<root>`, is read first.
  */
-export function readHarnessConfig(harness, projectDir) {
+export function readHarnessConfig(harness, projectDir, runnerDir) {
     const spec = HARNESS_CONFIG_FILES[harness];
-    if (!spec || typeof projectDir !== 'string' || projectDir === '')
+    if (!spec)
         return {};
-    const start = canonicalThroughExisting(resolve(projectDir));
-    const top = checkoutTop(start);
-    const roots = top === null ? [start] : [top, linkedMainCheckout(top)];
+    const roots = [];
+    if (typeof runnerDir === 'string' && runnerDir !== '') {
+        const plugins = dirname(resolve(runnerDir));
+        const stateDir = dirname(plugins);
+        if (basename(resolve(runnerDir)) === harness &&
+            basename(plugins) === 'plugins' &&
+            basename(stateDir) === '.NeuroStrata') {
+            roots.push(dirname(stateDir));
+        }
+    }
+    if (typeof projectDir === 'string' && projectDir !== '') {
+        const start = canonicalThroughExisting(resolve(projectDir));
+        const top = checkoutTop(start);
+        roots.push(...(top === null ? [start] : [top, linkedMainCheckout(top)]));
+    }
     for (const root of roots) {
         if (root === null)
             continue;
         try {
-            let value = JSON.parse(readFileSync(join(root, ...spec.file), 'utf8').replace(/^﻿/, ''));
+            let value = JSON.parse(readFileSync(join(root, ...spec.file), 'utf8').replace(/^\uFEFF/, ''));
             for (const key of spec.key)
                 value = asRecord(value)[key];
             const namespace = usableNamespace(value);
