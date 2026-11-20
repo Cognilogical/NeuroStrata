@@ -671,6 +671,18 @@ export async function handleHookEvent(event) {
     const toolName = asString(event.tool_name) ?? asString(event.toolName) ?? "";
     const toolInput = firstRecord(event.tool_input ?? event.input ?? event.args ?? {});
     if (hookEventName !== "PreToolUse") {
+        // Stop turns carry the transcript; the daemon's CLI runner dispatches
+        // here before its own onTurnEnd fallback, so forward it ourselves or
+        // task-intent detection never runs for runner-carried Stop events
+        // (Codex review #326).
+        if (hookEventName === "Stop" && typeof event.transcript === "string") {
+            try {
+                await onTurnEnd({ role: "assistant", content: event.transcript });
+            }
+            catch {
+                // turn-end handling is fail-soft for the runner
+            }
+        }
         return { continue: true };
     }
     if (HERMES_MUTATING_TOOLS.includes(toolName)) {

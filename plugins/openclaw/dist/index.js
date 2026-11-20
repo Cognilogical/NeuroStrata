@@ -718,6 +718,18 @@ export async function handleHookEvent(event) {
     const rawInput = event.tool_input ?? event.input ?? event.args ?? {};
     const toolInput = rawInput && typeof rawInput === "object" ? rawInput : {};
     if (hookEventName !== "PreToolUse") {
+        // Stop turns carry the transcript; the daemon's CLI runner dispatches
+        // here before its own onTurnEnd fallback, so forward it ourselves or
+        // task-intent detection never runs for runner-carried Stop events
+        // (Codex review #326).
+        if (hookEventName === "Stop" && typeof event.transcript === "string") {
+            try {
+                await onTurnEnd({ role: "assistant", content: event.transcript });
+            }
+            catch {
+                // turn-end handling is fail-soft for the runner
+            }
+        }
         return { continue: true };
     }
     const fileOpType = OPENCLAW_FILE_OP_TOOLS[toolName];
@@ -795,8 +807,9 @@ async function wrapFileOp(op) {
             degraded: true,
         };
     }
-    // Allowed: the operation executes, so it counts as a mutation.
-    mutationsSinceNote++;
+    // Allowed: the operation executes, so it counts as a mutation. The count
+    // happens inside runActionGuard (shared with the runner entry point);
+    // counting again here would double every strict-pass (Codex review #326).
     return { allowed: true };
 }
 // ──────────────────────────────────────────────────────────────────────
