@@ -6367,8 +6367,9 @@ async fn run() -> anyhow::Result<()> {
                     Some(d) => d.clone(),
                     None => std::env::current_dir()?,
                 };
-                // Fail closed: a missing directory, a harness config that
-                // cannot be read, or no usable namespace exits non-zero, and
+                // Fail closed: a missing directory, a project marker or a
+                // harness config that cannot be read, or no usable namespace
+                // exits non-zero, and
                 // the pre-push hook blocks the push.
                 let resolved = match crate::task::harness_plugins::resolve_namespace(&dir) {
                     Ok(resolved) => resolved,

@@ -239,7 +239,6 @@ fn has_any_env(keys: &[&str]) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NamespaceSource {
     /// The project root marker (`.NeuroStrata/config.json`).
-    #[allow(dead_code)]
     Marker,
     /// A harness plugin config the installer wrote.
     HarnessConfig,
@@ -285,6 +284,9 @@ pub enum ResolveError {
     /// A harness config exists but could not be read, so the namespace it
     /// names is unknown and no answer is safe.
     UnreadableConfigs(Vec<UnreadableConfig>),
+    /// The project root marker (`.NeuroStrata/config.json`) that applies
+    /// cannot be read, so the namespace it names is unknown.
+    UnreadableMarker(UnreadableConfig),
     /// No source names a namespace and the folder name is not one.
     NoUsableNamespace { folder: String },
 }
@@ -301,6 +303,12 @@ impl std::fmt::Display for ResolveError {
                     listed.join("; ")
                 )
             }
+            ResolveError::UnreadableMarker(marker) => write!(
+                f,
+                "the project's namespace is unknown because the project marker {} could not be read: {}. Fix or remove the file",
+                marker.path.display(),
+                marker.reason
+            ),
             ResolveError::NoUsableNamespace { folder } => write!(
                 f,
                 "no namespace is configured and the folder name {folder:?} is not one (letters, digits, `-`, `_`, `.` and `:`, starting with a letter or digit); set NEUROSTRATA_NAMESPACE or configure a harness"
@@ -543,6 +551,8 @@ impl NamespaceRoots {
 }
 
 /// The namespace for `dir` and where it came from, in this order:
+/// 0. the project root marker (`.NeuroStrata/config.json`), found as
+///    [`crate::root_marker::find_root_marker`] does;
 /// 1. a harness config (the first in the fixed order), read from the first
 ///    of `dir`'s checkout, its main checkout, or (outside git) `dir` itself
 ///    that has any;
@@ -552,19 +562,24 @@ impl NamespaceRoots {
 /// 4. the main checkout's folder name; outside git, `dir`'s folder name, when
 ///    it is a usable namespace.
 ///
-/// A harness config that exists but cannot be read is an error, never
-/// skipped: the namespace it names is unknown.
+/// A marker or harness config that exists but cannot be read is an error,
+/// never skipped: the namespace it names is unknown.
 fn resolve_namespace_from(
     dir: &Path,
     env_namespace: Option<&str>,
 ) -> Result<ResolvedNamespace, ResolveError> {
     let roots = NamespaceRoots::of(dir)?;
+    let marker = crate::root_marker::find_root_marker(&roots.dir)
+        .map_err(|(path, reason)| ResolveError::UnreadableMarker(UnreadableConfig { path, reason }))?;
     let configs = roots.harness_namespaces().map_err(ResolveError::UnreadableConfigs)?;
     let resolved = |namespace: String, source: NamespaceSource| ResolvedNamespace {
         namespace,
         source,
         configs: configs.clone(),
     };
+    if let Some(found) = marker {
+        return Ok(resolved(found.config.namespace, NamespaceSource::Marker));
+    }
     if let Some((_, ns)) = configs.first() {
         return Ok(resolved(ns.clone(), NamespaceSource::HarnessConfig));
     }
@@ -625,6 +640,50 @@ pub(crate) fn namespace_for_refresh(
         Ok(resolved) if resolved.source.is_explicit() => Ok(Some(resolved.namespace)),
         Ok(_) | Err(ResolveError::NoUsableNamespace { .. }) => Ok(None),
         Err(e) => Err(e),
+    }
+}
+
+/// The namespace `dir` names on purpose: the root marker's, else the single
+/// namespace that the harness configs, `NEUROSTRATA_NAMESPACE` and the ledger
+/// all agree on. The folder name never counts. `Err` lists the distinct
+/// candidates found (just the folder name when nothing names one).
+pub fn explicit_namespace(dir: &Path) -> Result<String, Vec<String>> {
+    let env = std::env::var("NEUROSTRATA_NAMESPACE").ok();
+    explicit_namespace_from(dir, env.as_deref())
+}
+
+fn explicit_namespace_from(dir: &Path, env_namespace: Option<&str>) -> Result<String, Vec<String>> {
+    let Ok(roots) = NamespaceRoots::of(dir) else {
+        return Err(Vec::new());
+    };
+    if let Ok(Some(found)) = crate::root_marker::find_root_marker(&roots.dir) {
+        return Ok(found.config.namespace);
+    }
+    let mut candidates: Vec<String> = Vec::new();
+    let mut add = |ns: String| {
+        if !candidates.contains(&ns) {
+            candidates.push(ns);
+        }
+    };
+    // A config that cannot be read names nothing here: the answer then rests
+    // on the sources that can be read, and an unreadable one never decides.
+    for (_, ns) in roots.harness_namespaces().unwrap_or_default() {
+        add(ns);
+    }
+    if let Some(ns) = env_namespace.and_then(usable_env_namespace) {
+        add(ns);
+    }
+    if let Some(ns) = roots.ledger_order().find_map(|root| {
+        let text = std::fs::read_to_string(root.join(".NeuroStrata").join("session_queries.json")).ok()?;
+        let v: Value = serde_json::from_str(&text).ok()?;
+        usable_namespace(v.get("namespace")?.as_str()?)
+    }) {
+        add(ns);
+    }
+    match candidates.len() {
+        1 => Ok(candidates.remove(0)),
+        0 => Err(resolve_namespace_from(dir, None).map(|r| r.namespace).into_iter().collect()),
+        _ => Err(candidates),
     }
 }
 
@@ -776,8 +835,9 @@ pub fn detect_harnesses(
 }
 
 /// The namespaces the daemon's boot refresh may write into harness configs
-/// for `dir`, as `(harness, namespace)`: each harness keeps the one its own
-/// config already names. A harness's config is looked for in `dir` itself
+/// for `dir`, as `(harness, namespace)`: the root marker's for every harness
+/// when a marker applies, else each harness keeps the one its own config
+/// already names. A harness's config is looked for in `dir` itself
 /// first, then in `dir`'s checkout, its main checkout (for a linked
 /// worktree), or, outside git, `dir`; the first place that has one wins, and
 /// a config that cannot be read ends the search for that harness. A harness
@@ -796,6 +856,9 @@ pub fn boot_namespaces_for(dir: &Path) -> Vec<(String, String)> {
     }
     let harnesses =
         std::iter::once("claude").chain(PLUGIN_NAMESPACE_CONFIGS.iter().map(|(h, _, _)| *h));
+    if let Ok(Some(marker)) = crate::root_marker::find_root_marker(&roots.dir) {
+        return harnesses.map(|h| (h.to_string(), marker.config.namespace.clone())).collect();
+    }
     let mut found = Vec::new();
     for harness in harnesses {
         for place in &places {
@@ -1410,6 +1473,134 @@ mod tests {
             src_of(dir),
             ("example-project".into(), NamespaceSource::FolderName)
         );
+    }
+
+    fn marker_at(dir: &Path, ns: &str) {
+        let cfg = crate::root_marker::RootConfig::new(ns);
+        std::fs::create_dir_all(dir).unwrap();
+        crate::root_marker::replace_marker(dir, &cfg).unwrap();
+    }
+
+    fn git_project() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = dunce::canonicalize(tmp.path()).unwrap().join("example-project");
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        (tmp, dir)
+    }
+
+    #[test]
+    fn marker_beats_harness_config_and_env() {
+        let _env = no_namespace_env();
+        let (_tmp, dir) = git_project();
+        write_file(
+            &dir.join(".claude").join("settings.local.json"),
+            r#"{"env": {"NEUROSTRATA_NAMESPACE": "alpha"}}"#,
+        );
+        marker_at(&dir, "from-marker");
+        std::env::set_var("NEUROSTRATA_NAMESPACE", "beta");
+        assert_eq!(src_of(&dir), ("from-marker".into(), NamespaceSource::Marker));
+        // The daemon side honors the marker too.
+        assert_eq!(namespace_for_refresh(&dir, false), Ok(Some("from-marker".to_string())));
+        std::env::remove_var("NEUROSTRATA_NAMESPACE");
+    }
+
+    #[test]
+    fn split_marker_namespace_from_subfolder() {
+        let _env = no_namespace_env();
+        let (_tmp, dir) = git_project();
+        marker_at(&dir, "whole");
+        let sub = dir.join("packages").join("api");
+        marker_at(&sub, "api-part");
+        std::fs::create_dir_all(sub.join("src")).unwrap();
+        assert_eq!(ns_of(&sub.join("src")), "api-part");
+        assert_eq!(ns_of(&dir), "whole");
+        assert_eq!(ns_of(&dir.join("packages")), "whole");
+    }
+
+    #[test]
+    fn worktree_uses_main_checkout_marker() {
+        let _env = no_namespace_env();
+        let (_tmp, dir) = git_project();
+        marker_at(&dir, "from-main");
+        let wt = dir.join(".claude").join("worktrees").join("agent-1");
+        let gitdir = dir.join(".git").join("worktrees").join("agent-1");
+        std::fs::create_dir_all(&gitdir).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", gitdir.to_string_lossy().replace('\\', "/")),
+        )
+        .unwrap();
+        std::fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+        assert_eq!(src_of(&wt), ("from-main".into(), NamespaceSource::Marker));
+        assert!(boot_namespaces_for(&wt).iter().all(|(_, ns)| ns == "from-main"));
+        assert!(!boot_namespaces_for(&wt).is_empty());
+    }
+
+    #[test]
+    fn explicit_namespace_rejects_folder_name_only() {
+        let _env = no_namespace_env();
+        let (_tmp, dir) = git_project();
+        assert_eq!(explicit_namespace(&dir), Err(vec!["example-project".to_string()]));
+        // A single source is explicit.
+        std::env::set_var("NEUROSTRATA_NAMESPACE", "beta");
+        assert_eq!(explicit_namespace(&dir), Ok("beta".to_string()));
+        std::env::remove_var("NEUROSTRATA_NAMESPACE");
+        marker_at(&dir, "from-marker");
+        assert_eq!(explicit_namespace(&dir), Ok("from-marker".to_string()));
+    }
+
+    #[test]
+    fn explicit_namespace_rejects_disagreement() {
+        let _env = no_namespace_env();
+        let (_tmp, dir) = git_project();
+        write_file(
+            &dir.join(".claude").join("settings.local.json"),
+            r#"{"env": {"NEUROSTRATA_NAMESPACE": "alpha"}}"#,
+        );
+        write_file(
+            &dir.join(".NeuroStrata").join("session_queries.json"),
+            r#"{"namespace": "from-ledger", "queries": []}"#,
+        );
+        assert_eq!(
+            explicit_namespace_from(&dir, Some("beta")),
+            Err(vec!["alpha".to_string(), "beta".to_string(), "from-ledger".to_string()])
+        );
+        assert_eq!(
+            explicit_namespace_from(&dir, Some("alpha")),
+            Err(vec!["alpha".to_string(), "from-ledger".to_string()])
+        );
+    }
+
+    #[test]
+    fn boot_uses_marker_namespace() {
+        let _env = no_namespace_env();
+        let (_tmp, dir) = git_project();
+        write_file(
+            &dir.join(".hermes/plugins/neurostrata.json"),
+            r#"{"id": "neurostrata-hermes", "namespace": "from-config"}"#,
+        );
+        assert_eq!(
+            boot_namespaces_for(&dir),
+            vec![("hermes".to_string(), "from-config".to_string())]
+        );
+        marker_at(&dir, "from-marker");
+        let boot = boot_namespaces_for(&dir);
+        assert!(boot.contains(&("hermes".to_string(), "from-marker".to_string())));
+        assert!(boot.iter().all(|(_, ns)| ns == "from-marker"));
+    }
+
+    #[test]
+    fn namespace_resolve_cli_fails_on_unreadable_marker() {
+        let _env = no_namespace_env();
+        let (_tmp, dir) = git_project();
+        write_file(&dir.join(".NeuroStrata").join("config.json"), "{ not json");
+        let err = resolve_namespace(&dir).expect_err("unreadable marker must fail").to_string();
+        assert!(err.contains("config.json"), "names the file: {err}");
+        // A refresh writes no namespace it cannot know.
+        assert!(namespace_for_refresh(&dir, true).is_err());
+        marker_at(&dir, "fixed");
+        assert_eq!(ns_of(&dir), "fixed");
     }
 
     #[test]
