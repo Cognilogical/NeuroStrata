@@ -10,6 +10,25 @@ mod routing;
 use routing::{agent_routing_contract_json, evaluate_triggers, TaskContext};
 use serde_json::Value;
 
+const TRIGGER_TOOLS: [(&str, &str); 7] = [
+    ("T_PATH", "neurostrata_memories_for_file"),
+    ("T_AMBIGUOUS", "neurostrata_locate"),
+    ("T_HIGH_BLAST", "neurostrata_related"),
+    ("T_DIFF", "neurostrata_diff_tour"),
+    ("T_DOMAIN_NEW", "neurostrata_taxonomy"),
+    ("T_STRATEGIC", "neurostrata_taxonomy"),
+    ("T_INVARIANT", "neurostrata_sparql_query"),
+];
+const TRIGGER_IDS: [&str; 7] = [
+    "T_PATH",
+    "T_AMBIGUOUS",
+    "T_HIGH_BLAST",
+    "T_DIFF",
+    "T_DOMAIN_NEW",
+    "T_STRATEGIC",
+    "T_INVARIANT",
+];
+
 /// Spec §6 R4: exactly seven triggers, each naming a real MCP tool and
 /// carrying schema-valid arguments for that tool.
 #[test]
@@ -21,16 +40,7 @@ fn routing_contract_has_all_seven_triggers() {
         .expect("contract must expose a triggers array");
     assert_eq!(triggers.len(), 7, "R4 defines exactly seven triggers");
 
-    let expected = [
-        ("T_PATH", "neurostrata_memories_for_file"),
-        ("T_AMBIGUOUS", "neurostrata_locate"),
-        ("T_HIGH_BLAST", "neurostrata_related"),
-        ("T_DIFF", "neurostrata_diff_tour"),
-        ("T_DOMAIN_NEW", "neurostrata_taxonomy"),
-        ("T_STRATEGIC", "neurostrata_taxonomy"),
-        ("T_INVARIANT", "neurostrata_sparql_query"),
-    ];
-    for (trigger_id, tool) in expected {
+    for (trigger_id, tool) in TRIGGER_TOOLS {
         let trigger = triggers
             .iter()
             .find(|t| t.get("trigger_id").and_then(Value::as_str) == Some(trigger_id))
@@ -91,6 +101,7 @@ fn routing_abstains_on_routine_single_file_edit() {
         blast_radius_count: 0,
         blast_id: None,
         staged_file_count: 1,
+        diff_text: None,
         git_ref: None,
         task_type: "bug".to_string(),
         design_review: false,
@@ -115,6 +126,7 @@ fn routing_evaluates_all_triggers_in_table_order() {
         blast_radius_count: 15,
         blast_id: Some("mem-42".to_string()),
         staged_file_count: 3,
+        diff_text: Some("diff --git a/x.rs b/x.rs\n".to_string()),
         git_ref: Some("fix/routing".to_string()),
         task_type: "feature".to_string(),
         design_review: false,
@@ -184,4 +196,103 @@ fn routing_next_action_shape_is_deterministic_and_binds_ids() {
         action["action_id"],
         next_action(&trigger, &["mem-99".to_string()])["action_id"]
     );
+}
+
+/// Finding 1: T_DIFF args must contain only properties declared by the live
+/// `neurostrata_diff_tour` inputSchema. `git_ref` is a reason-only scope hint.
+#[test]
+fn routing_diff_trigger_args_match_diff_tour_schema() {
+    const DECLARED: &[&str] = &[
+        "namespace",
+        "diff_text",
+        "changed_spans",
+        "project_root",
+        "max_blast_radius_callers",
+        "principal",
+    ];
+
+    let contract = agent_routing_contract_json();
+    let template = contract["triggers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["trigger_id"] == "T_DIFF")
+        .unwrap();
+    let template_args = template["args"].as_object().unwrap();
+    for key in template_args.keys() {
+        assert!(
+            DECLARED.contains(&key.as_str()),
+            "contract T_DIFF leaks undeclared arg {key}"
+        );
+    }
+    assert!(template_args.contains_key("diff_text"));
+    let required: Vec<&str> = template["required_args"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(required.contains(&"diff_text"));
+    assert!(!required.contains(&"git_ref"));
+
+    let diff = "diff --git a/x.rs b/x.rs\n--- a/x.rs\n+++ b/x.rs\n".to_string();
+    let context = TaskContext {
+        namespace: "NeuroStrata".to_string(),
+        known_path: None,
+        ambiguous_query: None,
+        blast_radius_count: 0,
+        blast_id: None,
+        staged_file_count: 3,
+        diff_text: Some(diff.clone()),
+        git_ref: Some("fix/routing".to_string()),
+        task_type: "task".to_string(),
+        design_review: false,
+        strategic: false,
+        cross_row_invariant: false,
+        invariant_query: None,
+    };
+    let emitted = evaluate_triggers(context)
+        .into_iter()
+        .find(|t| t.id == "T_DIFF")
+        .expect("T_DIFF must fire at three staged files");
+    for key in emitted.args.as_object().unwrap().keys() {
+        assert!(
+            DECLARED.contains(&key.as_str()),
+            "emitted T_DIFF leaks undeclared arg {key}"
+        );
+    }
+    assert_eq!(emitted.args["diff_text"], diff);
+    assert!(emitted.args.get("git_ref").is_none());
+    assert!(emitted.reason.contains("fix/routing"));
+}
+
+/// Finding 2: `expected_decision` has one source. Both the resolver and the
+/// emitted `next_action` must match the canonical contract for every trigger.
+#[test]
+fn routing_expected_decision_single_source_matches_next_action() {
+    let contract = agent_routing_contract_json();
+    let triggers = contract["triggers"].as_array().unwrap();
+    for id in TRIGGER_IDS {
+        let entry = triggers
+            .iter()
+            .find(|t| t["trigger_id"] == id)
+            .unwrap_or_else(|| panic!("missing trigger {id}"));
+        let expected = entry["expected_decision"].as_str().unwrap();
+        assert_eq!(
+            routing::expected_decision(id),
+            expected,
+            "{id}: resolver drifted from contract"
+        );
+        let trigger = routing::RouteTrigger {
+            id,
+            tool: "neurostrata_locate",
+            args: serde_json::json!({ "namespace": "NeuroStrata" }),
+            reason: "parity check".to_string(),
+        };
+        assert_eq!(
+            routing::next_action(&trigger, &[])["expected_decision"],
+            expected,
+            "{id}: next_action drifted from contract"
+        );
+    }
 }

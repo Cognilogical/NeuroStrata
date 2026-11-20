@@ -25,6 +25,25 @@ pub const STRATEGIC_ADVISE_TOP_K: u64 = 5;
 /// cannot answer. Callers may replace it through `TaskContext::invariant_query`.
 pub const SPARQL_INVARIANT_QUERY_TEMPLATE: &str = "SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 25";
 
+/// Single source for `expected_decision`: the canonical contract JSON and
+/// `next_action` both render these constants, so they cannot drift apart.
+pub const EXPECTED_DECISION_T_PATH: &str =
+    "Apply returned governance before editing; an empty lookup routes to T_AMBIGUOUS.";
+pub const EXPECTED_DECISION_T_AMBIGUOUS: &str =
+    "Pick a localized symbol/path, then re-run the path lookup.";
+pub const EXPECTED_DECISION_T_HIGH_BLAST: &str =
+    "Expand two hops; re-plan edits around unchanged callers before proceeding.";
+pub const EXPECTED_DECISION_T_DIFF: &str =
+    "Review by dependency stop; audit unchanged callers and governing rules.";
+pub const EXPECTED_DECISION_T_DOMAIN_NEW: &str =
+    "Ground new domain terms from briefing then gaps before naming concepts.";
+pub const EXPECTED_DECISION_T_STRATEGIC: &str =
+    "Judge ranked advice against implemented interfaces; record accepted or rejected items.";
+pub const EXPECTED_DECISION_T_INVARIANT: &str =
+    "Decide from the read-only result; never mutate memory from this query.";
+pub const EXPECTED_DECISION_UNKNOWN: &str =
+    "Use the result to decide the next step; abstain when it adds no evidence.";
+
 /// The signals a caller feeds to the router. Every field is input-only; the
 /// router never reads the store or infers values it was not given.
 ///
@@ -36,7 +55,11 @@ pub const SPARQL_INVARIANT_QUERY_TEMPLATE: &str = "SELECT ?s ?p ?o WHERE { ?s ?p
 /// - `blast_id`: seed ID for the expansion; falls back to `known_path` because
 ///   `neurostrata_related` accepts a qualified file path as a seed.
 /// - `staged_file_count`: files in the current scope; `0` means scope absent.
-/// - `git_ref`: scope ref for a diff tour; defaults to `"HEAD"` when absent.
+/// - `diff_text`: caller-supplied unified diff for `diff_tour` (the tool's
+///   declared input); absent means the emitted `diff_text` is empty and must be
+///   filled by the caller before dispatch.
+/// - `git_ref`: scope hint only, rendered in `reason`; `diff_tour` declares no
+///   `git_ref` argument. Defaults to `"HEAD"` when absent.
 /// - `task_type`: task row type (`task`/`bug`/`feature`/`epic`).
 /// - `design_review`, `strategic`, `cross_row_invariant`: explicit caller flags.
 /// - `invariant_query`: optional SPARQL replacement for the template above.
@@ -48,6 +71,7 @@ pub struct TaskContext {
     pub blast_radius_count: usize,
     pub blast_id: Option<String>,
     pub staged_file_count: usize,
+    pub diff_text: Option<String>,
     pub git_ref: Option<String>,
     pub task_type: String,
     pub design_review: bool,
@@ -84,7 +108,7 @@ pub fn agent_routing_contract_json() -> Value {
                     "include_ast_edges": true
                 },
                 "follow_up_operations": [],
-                "expected_decision": "Apply returned governance before editing; an empty lookup routes to T_AMBIGUOUS."
+                "expected_decision": EXPECTED_DECISION_T_PATH
             },
             {
                 "trigger_id": "T_AMBIGUOUS",
@@ -96,7 +120,7 @@ pub fn agent_routing_contract_json() -> Value {
                     "query": "<symbol-or-path>"
                 },
                 "follow_up_operations": [],
-                "expected_decision": "Pick a localized symbol/path, then re-run the path lookup."
+                "expected_decision": EXPECTED_DECISION_T_AMBIGUOUS
             },
             {
                 "trigger_id": "T_HIGH_BLAST",
@@ -109,19 +133,19 @@ pub fn agent_routing_contract_json() -> Value {
                     "max_hops": 2
                 },
                 "follow_up_operations": [],
-                "expected_decision": "Expand two hops; re-plan edits around unchanged callers before proceeding."
+                "expected_decision": EXPECTED_DECISION_T_HIGH_BLAST
             },
             {
                 "trigger_id": "T_DIFF",
                 "condition": ">=3 staged files / PR review",
                 "tool": "neurostrata_diff_tour",
-                "required_args": ["namespace", "git_ref"],
+                "required_args": ["namespace", "diff_text"],
                 "args": {
                     "namespace": "<namespace>",
-                    "git_ref": "<git-ref>"
+                    "diff_text": "<unified-diff>"
                 },
                 "follow_up_operations": [],
-                "expected_decision": "Review by dependency stop; audit unchanged callers and governing rules."
+                "expected_decision": EXPECTED_DECISION_T_DIFF
             },
             {
                 "trigger_id": "T_DOMAIN_NEW",
@@ -133,7 +157,7 @@ pub fn agent_routing_contract_json() -> Value {
                     "operation": "briefing"
                 },
                 "follow_up_operations": ["gaps"],
-                "expected_decision": "Ground new domain terms from briefing then gaps before naming concepts."
+                "expected_decision": EXPECTED_DECISION_T_DOMAIN_NEW
             },
             {
                 "trigger_id": "T_STRATEGIC",
@@ -146,7 +170,7 @@ pub fn agent_routing_contract_json() -> Value {
                     "top_k": STRATEGIC_ADVISE_TOP_K
                 },
                 "follow_up_operations": [],
-                "expected_decision": "Judge ranked advice against implemented interfaces; record accepted or rejected items."
+                "expected_decision": EXPECTED_DECISION_T_STRATEGIC
             },
             {
                 "trigger_id": "T_INVARIANT",
@@ -158,7 +182,7 @@ pub fn agent_routing_contract_json() -> Value {
                     "query": SPARQL_INVARIANT_QUERY_TEMPLATE
                 },
                 "follow_up_operations": [],
-                "expected_decision": "Decide from the read-only result; never mutate memory from this query."
+                "expected_decision": EXPECTED_DECISION_T_INVARIANT
             }
         ]
     })
@@ -226,15 +250,14 @@ pub fn evaluate_triggers(ctx: TaskContext) -> Vec<RouteTrigger> {
     }
 
     if ctx.staged_file_count >= DIFF_STAGED_FILE_THRESHOLD {
-        let git_ref = non_empty(ctx.git_ref.as_deref())
-            .unwrap_or("HEAD")
-            .to_string();
+        let git_ref = non_empty(ctx.git_ref.as_deref()).unwrap_or("HEAD");
+        let diff_text = ctx.diff_text.clone().unwrap_or_default();
         routes.push(RouteTrigger {
             id: "T_DIFF",
             tool: "neurostrata_diff_tour",
-            args: json!({ "namespace": namespace, "git_ref": git_ref }),
+            args: json!({ "namespace": namespace, "diff_text": diff_text }),
             reason: format!(
-                "{} staged files >= {DIFF_STAGED_FILE_THRESHOLD}: take the dependency-ordered diff tour at '{git_ref}'.",
+                "{} staged files >= {DIFF_STAGED_FILE_THRESHOLD}: take the dependency-ordered diff tour (scope ref '{git_ref}'; diff_tour consumes diff_text, not a ref).",
                 ctx.staged_file_count
             ),
         });
@@ -299,22 +322,17 @@ fn stable_digest(args: &Value, ids: &[String]) -> String {
     format!("{hash:016x}")
 }
 
-fn expected_decision(trigger_id: &str) -> &'static str {
+/// Resolve the single-source expected-decision constant for a trigger ID.
+pub fn expected_decision(trigger_id: &str) -> &'static str {
     match trigger_id {
-        "T_PATH" => {
-            "Apply returned governance before editing; an empty lookup routes to T_AMBIGUOUS."
-        }
-        "T_AMBIGUOUS" => "Pick a localized symbol/path, then re-run the path lookup.",
-        "T_HIGH_BLAST" => {
-            "Expand two hops; re-plan edits around unchanged callers before proceeding."
-        }
-        "T_DIFF" => "Review by dependency stop; audit unchanged callers and governing rules.",
-        "T_DOMAIN_NEW" => "Ground new domain terms from briefing then gaps before naming concepts.",
-        "T_STRATEGIC" => {
-            "Judge ranked advice against implemented interfaces; record accepted or rejected items."
-        }
-        "T_INVARIANT" => "Decide from the read-only result; never mutate memory from this query.",
-        _ => "Use the result to decide the next step; abstain when it adds no evidence.",
+        "T_PATH" => EXPECTED_DECISION_T_PATH,
+        "T_AMBIGUOUS" => EXPECTED_DECISION_T_AMBIGUOUS,
+        "T_HIGH_BLAST" => EXPECTED_DECISION_T_HIGH_BLAST,
+        "T_DIFF" => EXPECTED_DECISION_T_DIFF,
+        "T_DOMAIN_NEW" => EXPECTED_DECISION_T_DOMAIN_NEW,
+        "T_STRATEGIC" => EXPECTED_DECISION_T_STRATEGIC,
+        "T_INVARIANT" => EXPECTED_DECISION_T_INVARIANT,
+        _ => EXPECTED_DECISION_UNKNOWN,
     }
 }
 
