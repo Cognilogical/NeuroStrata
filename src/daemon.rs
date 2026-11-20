@@ -1665,11 +1665,21 @@ async fn handle_cli_read(
                 .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
             serde_json::json!({ "rows": rows })
         }
+        // `root show`: the registry's cached project root for a namespace,
+        // matched case-insensitively the way tool calls are.
+        "project_root" => {
+            let requested = req.namespace.unwrap_or_default();
+            let ns = crate::server::resolve_namespace(&state.vector_store, &requested).await;
+            let root = crate::registry::cached_project_root(&state.vector_store, &ns)
+                .await
+                .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            serde_json::json!({ "namespace": ns, "project_root": root })
+        }
         other => {
             return Err((
                 axum::http::StatusCode::BAD_REQUEST,
                 format!(
-                    "unknown read op '{}': expected 'namespaces' or 'list'",
+                    "unknown read op '{}': expected 'namespaces', 'list' or 'project_root'",
                     other
                 ),
             ))

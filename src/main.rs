@@ -46,8 +46,8 @@ mod rebac;
 mod recall_metrics;
 mod receipts;
 mod registry;
-mod root_marker;
 mod retention;
+mod root_marker;
 mod search;
 mod secrets;
 mod semantic_eval;
@@ -420,6 +420,12 @@ enum Commands {
     Namespace {
         #[command(subcommand)]
         action: NamespaceCommands,
+    },
+
+    /// The project root marker (.NeuroStrata/config.json): show which one applies
+    Root {
+        #[command(subcommand)]
+        action: RootCommands,
     },
 
     /// Share what your agents learn with the team's agents (SynapticMesh)
@@ -906,6 +912,19 @@ pub(crate) enum NamespaceCommands {
     /// found. The git hooks call this.
     Resolve {
         /// Directory inside the project (default: the current directory)
+        dir: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+pub(crate) enum RootCommands {
+    /// Show the root marker that applies to a folder and how it was found,
+    /// its namespace and source_id, whether git tracks it, the cached root
+    /// and whether it still exists, other markers below the folder, and
+    /// project-context bindings that point at missing folders. Read-only:
+    /// never starts a daemon and never writes.
+    Show {
+        /// Folder or file inside the project (default: the current directory)
         dir: Option<std::path::PathBuf>,
     },
 }
@@ -2255,6 +2274,74 @@ fn hold_store_lock_for_copy(db_path: &std::path::Path) -> anyhow::Result<std::fs
             "Refusing the uncoordinated file copy: the store lock could not be taken ({}), so it cannot be shown that no daemon holds the store. Take a coordinated backup with `neurostrata-mcp backup <dir>` (without --no-open), or run `neurostrata-mcp shutdown` first.",
             e
         )),
+    }
+}
+
+/// The registry's cached root for `root show`: from a daemon that answers
+/// (after the same identity check the gate makes), else from the store opened
+/// here when no process holds it. Never starts a daemon, never writes: the
+/// store is not initialized and nothing is checkpointed.
+async fn root_show_cached_root(
+    probe: DaemonProbe,
+    namespace: &str,
+) -> crate::root_marker::CachedRoot {
+    use crate::root_marker::CachedRoot;
+    if probe == DaemonProbe::Responsive {
+        if let Err(e) =
+            gate_verify_daemon(fetch_daemon_info().await.as_ref(), daemon::exe_fingerprint())
+        {
+            return CachedRoot::Unknown(e);
+        }
+        let reply = async {
+            let res = daemon_http_client()
+                .post("http://127.0.0.1:34343/cli/read")
+                .json(&serde_json::json!({ "op": "project_root", "namespace": namespace }))
+                .timeout(std::time::Duration::from_secs(10))
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            if !res.status().is_success() {
+                return Err(format!("the daemon answered {} on /cli/read", res.status()));
+            }
+            res.json::<serde_json::Value>().await.map_err(|e| e.to_string())
+        }
+        .await;
+        return match reply {
+            Ok(v) => CachedRoot::Known(v["project_root"].as_str().map(str::to_string)),
+            Err(e) => CachedRoot::Unknown(format!("daemon: {e}")),
+        };
+    }
+    let config = match Config::load() {
+        Ok(config) => config,
+        Err(e) => return CachedRoot::Unknown(format!("the config could not be read: {e}")),
+    };
+    if daemon_holds_lock(&config.db_path) {
+        return CachedRoot::Unknown("no daemon, store locked".to_string());
+    }
+    if probe == DaemonProbe::Silent {
+        return CachedRoot::Unknown(
+            "nothing answered on 127.0.0.1:34343 within 500ms, so a daemon may be busy; not opening the store"
+                .to_string(),
+        );
+    }
+    if !config.db_path.exists() {
+        return CachedRoot::Unknown(format!("no store at {}", config.db_path.display()));
+    }
+    let read = async {
+        let dimensions = embed::configured_dimensions().map_err(|e| e.to_string())?;
+        let store: Arc<dyn VectorStore> = Arc::new(
+            LadybugStore::new(config.db_path.to_string_lossy().to_string(), dimensions)
+                .map_err(|e| e.to_string())?,
+        );
+        let namespace = crate::server::resolve_namespace(&store, namespace).await;
+        crate::registry::cached_project_root(&store, &namespace)
+            .await
+            .map_err(|e| e.to_string())
+    }
+    .await;
+    match read {
+        Ok(root) => CachedRoot::Known(root),
+        Err(e) => CachedRoot::Unknown(format!("the store could not be read: {e}")),
     }
 }
 
@@ -3892,6 +3979,23 @@ mod tests {
                 action: HooksCommands::Install { force },
             }) => assert!(!force),
             other => panic!("expected Hooks/Install, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn root_show_command_parses() {
+        let cli = Cli::try_parse_from(["neurostrata-mcp", "root", "show"]).expect("parses bare");
+        match cli.command {
+            Some(Commands::Root { action }) => assert_eq!(action, RootCommands::Show { dir: None }),
+            other => panic!("expected Root/Show, got {:?}", other),
+        }
+        let cli = Cli::try_parse_from(["neurostrata-mcp", "root", "show", "some/dir"])
+            .expect("parses with a dir");
+        match cli.command {
+            Some(Commands::Root { action }) => {
+                assert_eq!(action, RootCommands::Show { dir: Some("some/dir".into()) })
+            }
+            other => panic!("expected Root/Show, got {:?}", other),
         }
     }
 
@@ -6224,6 +6328,35 @@ async fn run() -> anyhow::Result<()> {
 
     // Check if the daemon is already running on port 34343
     let probe = probe_daemon().await;
+
+    // Read-only: asks an answering daemon or opens a free store, never starts
+    // a daemon and never writes.
+    if let Some(Commands::Root { action }) = cli.command.as_ref() {
+        match action {
+            RootCommands::Show { dir } => {
+                let cwd = std::env::current_dir()?;
+                let dir = dir.as_ref().map(|d| cwd.join(d)).unwrap_or(cwd);
+                let dir = dunce::canonicalize(&dir).unwrap_or(dir);
+                let folder = match dir.parent() {
+                    Some(parent) if dir.is_file() => parent.to_path_buf(),
+                    _ => dir.clone(),
+                };
+                let found = crate::root_marker::find_root_marker(&folder);
+                let namespace = match &found {
+                    Ok(Some(found)) => found.config.namespace.clone(),
+                    _ => crate::task::harness_plugins::resolve_project_namespace(&folder),
+                };
+                let cached = root_show_cached_root(probe, &namespace).await;
+                let bindings = Config::load().map(|c| c.project_contexts).unwrap_or_default();
+                println!(
+                    "{}",
+                    crate::root_marker::format_root_show(&folder, &found, &namespace, &cached, &bindings)
+                );
+            }
+        }
+        return Ok(());
+    }
+
     // Only a daemon that answered gets to hold the database lock as far as the
     // CLI is concerned. Treating silence as "running" would refuse every local
     // command on a machine where an empty port times out rather than refuses.
@@ -8988,6 +9121,7 @@ async fn run() -> anyhow::Result<()> {
                     | Commands::Bench { .. }
                     | Commands::SemanticEval { .. }
                     | Commands::Namespace { .. }
+                    | Commands::Root { .. }
                     // THE OUTER match already handles Learn (src/main.rs ~2822);
                     // this inner catch-all can never see it.
                     | Commands::Learn { .. } => unreachable!(),
