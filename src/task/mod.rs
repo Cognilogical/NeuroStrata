@@ -751,15 +751,39 @@ pub async fn build_task_graph_context(
         }
         let snippet: String = r.payload.content.chars().take(140).collect();
         let presented = crate::rdf::provenance::decorate_content(&snippet, &r.payload.metadata);
-        let calls = r.payload.metadata.get("calls").cloned().unwrap_or(Value::Null);
-        let imports = r.payload.metadata.get("imports").cloned().unwrap_or(Value::Null);
-        let governs = r.payload.metadata.get("governs").cloned().unwrap_or(Value::Null);
-        let depends_on = r.payload.metadata.get("depends_on").cloned().unwrap_or(Value::Null);
+        let calls = r
+            .payload
+            .metadata
+            .get("calls")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let imports = r
+            .payload
+            .metadata
+            .get("imports")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let governs = r
+            .payload
+            .metadata
+            .get("governs")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let depends_on = r
+            .payload
+            .metadata
+            .get("depends_on")
+            .cloned()
+            .unwrap_or(Value::Null);
         prompt_lines.push(format!(
             "  - [{}] `{}` ({}): {}",
             r.payload.memory_type,
             r.id,
-            if r.payload.location.is_empty() { "memory" } else { &r.payload.location },
+            if r.payload.location.is_empty() {
+                "memory"
+            } else {
+                &r.payload.location
+            },
             presented.replace('\n', " ")
         ));
         let mut entry = json!({
@@ -851,7 +875,7 @@ pub async fn build_task_graph_context(
         "### NeuroStrata Task & Graph Context (PASTE INTO ALL SUBAGENT PROMPTS)\n\
          - Namespace: `{}` | Task ID: `{}` | Goal: {}\n\
          - Auto-Retrieved Governing Rules & Graph Nodes:\n{}{}{}\n\
-         - Mandatory Graph-First Lookup Rule: Before editing any file, check whether its path and governing memory IDs (`mem-...`) are already listed under `### NeuroStrata Task & Graph Context` in your prompt. For any file you touch that is NOT listed in that block, call `neurostrata_memories_for_file` first (or `neurostrata_related` / `neurostrata_search_memory` with `include_related: true` / `neurostrata_sparql_query`).\
+         - Mandatory Graph-First Lookup Rule: Before editing any file, check whether its path and governing memory IDs (`mem-...`) are already listed under `### NeuroStrata Task & Graph Context` in your prompt. For any file you touch that is NOT listed in that block, call `neurostrata_memories_for_file` first (or `neurostrata_related` / `neurostrata_search_memory` with `mode`: `hybrid` (default) + `include_references`: true / `neurostrata_sparql_query`).\
          \n- Formal Verification Reflex: When adding or modifying a state machine, gate, sovereignty/ACL check, CRDT/merge rule, lease/claim rule, or conservation invariant, evaluate whether to extract the pure decision into `src/formal_kernel.rs`, prove its theorems in `proofs/NeuroStrata/*.lean` (zero `sorry`/`axiom`), and extend `tests/lean_parity_test.rs`.",
         namespace, task_id, payload.content, hits_block, bridges_prompt, taxonomy_prompt
     );
@@ -1114,7 +1138,11 @@ pub async fn record_graph_query_with_root(
         return;
     };
     let now = chrono::Utc::now().timestamp();
-    let entry_str = format!("{}:{}", tool_name, query_hint.chars().take(80).collect::<String>());
+    let entry_str = format!(
+        "{}:{}",
+        tool_name,
+        query_hint.chars().take(80).collect::<String>()
+    );
     let mut project_root: Option<String> = caller_root
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -1141,9 +1169,15 @@ pub async fn record_graph_query_with_root(
         }
     }
     if project_root.is_none() {
-        if let Ok(Some((_, registry))) = store.get(&ns, &crate::registry::registry_row_id(&ns)).await {
+        if let Ok(Some((_, registry))) =
+            store.get(&ns, &crate::registry::registry_row_id(&ns)).await
+        {
             if crate::registry::is_registry_row(&registry.metadata) {
-                if let Some(p) = registry.metadata.get("project_root").and_then(|v| v.as_str()) {
+                if let Some(p) = registry
+                    .metadata
+                    .get("project_root")
+                    .and_then(|v| v.as_str())
+                {
                     project_root = Some(p.to_string());
                 }
             }
@@ -2971,7 +3005,7 @@ pub fn snapshot_prefix(memories: &[SearchResult]) -> String {
     let mut out = String::from("Zero-Action Start: claim or create a task before editing.\n");
     out.push_str("General-Purpose Project Memory: NeuroStrata is a general-purpose, project-oriented memory, knowledge-base, and ontology system — projects do not need to be coding or document-oriented. Store user-provided facts, domain knowledge, entities, digital twins, and rules directly via neurostrata_add_memory (`locations` are optional and only needed when anchoring to files/symbols).\n");
     out.push_str("Task recognition: a statement of future/deferred work ('TODO:', 'we should also', 'later we need to', 'remaining work:', ...) is a task, not a note — capture it with neurostrata_task_create.\n");
-    out.push_str("Graph-First & Subagent Propagation: before blind grep/glob or editing files, query neurostrata_memories_for_file, neurostrata_related, neurostrata_search_memory (include_related: true), or neurostrata_sparql_query for GOVERNS/DEPENDS_ON/calls/imports edges. Write this into your session plan and paste the `subagent_prompt_injection` block from neurostrata_task_claim into EVERY subagent prompt you spawn.\n");
+    out.push_str("Graph-First & Subagent Propagation: before blind grep/glob or editing files, query neurostrata_memories_for_file, neurostrata_related, neurostrata_search_memory (mode hybrid default, include_references true), or neurostrata_sparql_query for GOVERNS/DEPENDS_ON/calls/imports edges. Write this into your session plan and paste the `subagent_prompt_injection` block from neurostrata_task_claim into EVERY subagent prompt you spawn.\n");
     out.push_str("Formal Verification Reflex: when adding or modifying a state machine, gate, sovereignty/ACL rule, CRDT/merge rule, lease/claim rule, or conservation invariant, evaluate whether to factor the pure decision into src/formal_kernel.rs, prove its invariants in proofs/NeuroStrata/*.lean (zero sorry/axiom), and add parity rows in tests/lean_parity_test.rs.\n");
     if claimed.is_empty() && ready.is_empty() {
         out.push_str("No tasks are claimed or ready in this namespace.\n");
@@ -3053,7 +3087,7 @@ Domain facts, user-told knowledge, entities, digital twins, architectural rules,
 decisions, and fixes -> `neurostrata_add_memory` (`locations` are optional and
 used only when anchoring to specific files or code symbols; correct outdated
 records via `neurostrata_supersede_memory`; never bulk-delete).
-- **Graph-First Lookup:** Before blind `grep`/`glob` or editing files, query `neurostrata_memories_for_file`, `neurostrata_related`, `neurostrata_trace_call_chain`, `neurostrata_impact_analysis`, `neurostrata_search_memory` (`include_related: true`), or `neurostrata_sparql_query` for `GOVERNS`, `DEPENDS_ON`, and AST `calls`/`imports` edges.
+- **Graph-First Lookup:** Before blind `grep`/`glob` or editing files, query `neurostrata_memories_for_file`, `neurostrata_related`, `neurostrata_trace_call_chain`, `neurostrata_impact_analysis`, `neurostrata_search_memory` (`mode`: `"hybrid"` (default), `include_references`: true), or `neurostrata_sparql_query` for `GOVERNS`, `DEPENDS_ON`, and AST `calls`/`imports` edges.
 - **Subagent Prompt Propagation:** Subagents start with a blank context window. Write the Graph-First rule into your session plan on init, and paste the `subagent_prompt_injection` block returned by `neurostrata_task_claim` into EVERY subagent prompt you spawn.
 - **Zero-Touch Harness Plugin Auto-Install & Hooks:** On init (`neurostrata_bootstrap`, `neurostrata_task_setup`, and `neurostrata_get_snapshot`), NeuroStrata automatically detects the active CLI/terminal agent harness (`opencode`, `openclaw`, `claude`, `hermes`, `codex`, `github-cli`), installs/wires the zero-dependency plugin under `.NeuroStrata/plugins/<harness>/`, and self-heals both `.git/hooks/pre-push` and `.git/hooks/pre-commit`.
 
@@ -5194,7 +5228,10 @@ mod tests {
     /// cannot run a hook against a Windows checkout.
     fn hook_bash() -> Option<std::path::PathBuf> {
         if cfg!(windows) {
-            let out = std::process::Command::new("git").arg("--exec-path").output().ok()?;
+            let out = std::process::Command::new("git")
+                .arg("--exec-path")
+                .output()
+                .ok()?;
             let exec = std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
             // <git>/mingw64/libexec/git-core -> <git>
             let git_root = exec.parent()?.parent()?.parent()?.to_path_buf();
@@ -5213,12 +5250,20 @@ mod tests {
             .args(args)
             .output()
             .expect("git runs");
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
     /// Runs the scaffolded pre-commit hook in `dir`; returns its stderr.
-    fn run_pre_commit(bash: &std::path::Path, hook: &std::path::Path, dir: &std::path::Path) -> String {
+    fn run_pre_commit(
+        bash: &std::path::Path,
+        hook: &std::path::Path,
+        dir: &std::path::Path,
+    ) -> String {
         let mut cmd = std::process::Command::new(bash);
         cmd.arg(hook).current_dir(dir);
         // Git for Windows puts its usr/bin (grep, sed, tr, ...) on PATH when it
@@ -5226,7 +5271,9 @@ mod tests {
         if cfg!(windows) {
             if let Some(bin) = bash.parent() {
                 let mut paths = vec![bin.to_path_buf()];
-                paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+                paths.extend(std::env::split_paths(
+                    &std::env::var_os("PATH").unwrap_or_default(),
+                ));
                 cmd.env("PATH", std::env::join_paths(paths).expect("join PATH"));
             }
         }
@@ -5264,7 +5311,10 @@ mod tests {
         git_stdout_in(&repo, &["init", "-q"]);
         git_stdout_in(&repo, &["config", "user.email", "t@example.invalid"]);
         git_stdout_in(&repo, &["config", "user.name", "t"]);
-        git_stdout_in(&repo, &["config", "core.hooksPath", &hooks_off.to_string_lossy()]);
+        git_stdout_in(
+            &repo,
+            &["config", "core.hooksPath", &hooks_off.to_string_lossy()],
+        );
         for f in ["a1", "a2", "a3", "a4", "a5", "a6", "Ä7"] {
             std::fs::write(repo.join("src").join("a").join(format!("{f}.rs")), "x").unwrap();
         }
@@ -5281,14 +5331,17 @@ mod tests {
             let msys = format!("/{}{}", root[..1].to_lowercase(), &root[2..]);
             queries.push(json!({"tool": "t", "query": format!("{msys}/src/a/a3.rs")}));
             queries.push(json!({"tool": "t", "query": format!(r"\\?\{back}\src\a\a4.rs")}));
-            queries.push(json!({"tool": "t", "query": format!("{}/SRC/A/A5.RS", root.to_uppercase())}));
+            queries.push(
+                json!({"tool": "t", "query": format!("{}/SRC/A/A5.RS", root.to_uppercase())}),
+            );
         } else {
             queries.push(json!({"tool": "t", "query": "./src/a/a3.rs"}));
             queries.push(json!({"tool": "t", "query": "src/a/a4.rs/"}));
             queries.push(json!({"tool": "t", "query": "src/a/a5.rs"}));
         }
         // `path` wins over a query naming another checkout's absolute path.
-        queries.push(json!({"tool": "t", "query": "/elsewhere/src/a/a6.rs", "path": "src/a/a6.rs"}));
+        queries
+            .push(json!({"tool": "t", "query": "/elsewhere/src/a/a6.rs", "path": "src/a/a6.rs"}));
         queries.push(json!({"tool": "t", "query": "/elsewhere/none.rs"}));
         // A non-ASCII name spelled the same on both sides matches: every
         // side folds only ASCII letters.
@@ -5296,7 +5349,10 @@ mod tests {
         let ledger = repo.join(".NeuroStrata").join("session_queries.json");
         std::fs::write(
             &ledger,
-            serde_json::to_string_pretty(&json!({"namespace": "example-project", "queries": queries})).unwrap(),
+            serde_json::to_string_pretty(
+                &json!({"namespace": "example-project", "queries": queries}),
+            )
+            .unwrap(),
         )
         .unwrap();
         let hook = base.join("pre-commit");
@@ -5304,9 +5360,15 @@ mod tests {
 
         git_stdout_in(&repo, &["add", "src", "none.rs"]);
         let stderr = run_pre_commit(&bash, &hook, &repo);
-        assert!(stderr.contains("file 'none.rs' has no recorded"), "{stderr}");
+        assert!(
+            stderr.contains("file 'none.rs' has no recorded"),
+            "{stderr}"
+        );
         for f in ["a1", "a2", "a3", "a4", "a5", "a6", "Ä7"] {
-            assert!(!stderr.contains(&format!("src/a/{f}.rs' has no recorded")), "{f}: {stderr}");
+            assert!(
+                !stderr.contains(&format!("src/a/{f}.rs' has no recorded")),
+                "{f}: {stderr}"
+            );
         }
     }
 
@@ -6533,7 +6595,10 @@ mod tests {
         assert_eq!(expected.branch.as_deref(), Some("feature/mcp-claim"));
         let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
         assert_eq!(payload.metadata["task"]["branch"], json!(expected.branch));
-        assert_eq!(payload.metadata["task"]["worktree"], json!(expected.worktree));
+        assert_eq!(
+            payload.metadata["task"]["worktree"],
+            json!(expected.worktree)
+        );
 
         // Another worktree pushing its own branch is not blocked by this MCP-claimed task.
         let other_scope = gate::GateScope {
@@ -6544,7 +6609,10 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !other_report.violations.iter().any(|v| v.kind == "in_progress"),
+            !other_report
+                .violations
+                .iter()
+                .any(|v| v.kind == "in_progress"),
             "other worktree must not be blocked: {:?}",
             other_report.violations
         );
@@ -6650,8 +6718,14 @@ mod tests {
         )
         .await;
 
-        let b_session = dir_b.path().join(".NeuroStrata").join("active_session.json");
-        let a_session = dir_a.path().join(".NeuroStrata").join("active_session.json");
+        let b_session = dir_b
+            .path()
+            .join(".NeuroStrata")
+            .join("active_session.json");
+        let a_session = dir_a
+            .path()
+            .join(".NeuroStrata")
+            .join("active_session.json");
         assert!(
             b_session.exists(),
             "active_session.json must be written in the explicit cwd dir_b"
@@ -6700,7 +6774,10 @@ mod tests {
             store.clone(),
         )
         .await;
-        let root_session = wt_dir.path().join(".NeuroStrata").join("active_session.json");
+        let root_session = wt_dir
+            .path()
+            .join(".NeuroStrata")
+            .join("active_session.json");
         let nested_session = nested_cwd.join(".NeuroStrata").join("active_session.json");
         assert!(
             root_session.exists(),
@@ -6776,8 +6853,7 @@ mod tests {
             "git -c core.sshCommand=evil push"
         ));
         assert!(!crate::server::is_zero_action_exempt_shell_payload(
-            "edit",
-            "git push"
+            "edit", "git push"
         ));
     }
 
@@ -9572,7 +9648,10 @@ mod tests {
             .upsert(
                 "MyProj",
                 &fact_id,
-                StubEmbedder.embed("decayed external API fact").await.unwrap(),
+                StubEmbedder
+                    .embed("decayed external API fact")
+                    .await
+                    .unwrap(),
                 MemoryPayload {
                     content: "external API fact that decayed".to_string(),
                     user_id: "kenton".to_string(),

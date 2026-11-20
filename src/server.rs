@@ -312,7 +312,8 @@ pub async fn process_mcp_request(
                                 "exclude_stale": { "type": "boolean", "default": false, "description": "Exclude memories marked stale." },
                                 "include_code_ast": { "type": "boolean", "default": true, "description": "Include structural code AST memories even when memory_type is not explicitly set to structural." },
                                 "include_archived": { "type": "boolean", "description": "When true, include archived memories in search results." },
-                                "include_references": { "type": "boolean", "description": "When true, append edge_sources provenance citations for each returned memory. Defaults to false." }
+                                "include_references": { "type": "boolean", "description": "When true, append edge_sources provenance citations for each returned memory. Defaults to false." },
+                                "include_related": { "type": "boolean", "description": "DEPRECATED alias for include_references. Emits a warning; do not use in new prompts." }
                             },
                             "required": ["query", "namespace"]
                         }
@@ -2729,10 +2730,7 @@ fn proxy_client() -> reqwest::Client {
 /// explicit root, so downstream task handlers attribute the call to the right
 /// worktree instead of the daemon's global checkout.
 fn inject_proxy_caller_cwd(request: &Value, caller_cwd: Option<&std::path::Path>) -> Value {
-    let is_tools_call = request
-        .get("method")
-        .and_then(|v| v.as_str())
-        == Some("tools/call");
+    let is_tools_call = request.get("method").and_then(|v| v.as_str()) == Some("tools/call");
     let (Some(cwd_path), true) = (caller_cwd, is_tools_call) else {
         return request.clone();
     };
@@ -3004,8 +3002,7 @@ async fn implicit_source_from_location(
             .find(|path| crate::paths::is_absolute_any(path))?;
         crate::paths::to_project_relative(joined, project_root, registry_root.as_deref())
     };
-    (placed.root.is_some() && !crate::paths::is_absolute_any(&placed.path))
-        .then_some(placed.path)
+    (placed.root.is_some() && !crate::paths::is_absolute_any(&placed.path)).then_some(placed.path)
 }
 
 /// The registered root to resolve `path` with, given the result of reading it.
@@ -10726,6 +10723,39 @@ fn token_set_tokens(content: &str) -> std::collections::HashSet<String> {
         .collect()
 }
 
+/// IDs surfaced only through graph expansion, never direct semantic hits.
+/// Evidence kind is the discriminator: `DirectMatch` is a direct hit; every
+/// other kind was discovered by traversing a graph edge.
+fn graph_expanded_ids_from_results(results: &[SearchResult]) -> Vec<String> {
+    let mut ids = Vec::new();
+    for result in results {
+        let expanded = result.evidence.as_ref().is_some_and(|evs| {
+            evs.iter()
+                .any(|ev| ev.kind != crate::traits::EvidenceKind::DirectMatch)
+        });
+        if expanded && !ids.contains(&result.id) {
+            ids.push(result.id.clone());
+        }
+    }
+    ids
+}
+
+/// Append the response contract as one additive JSON line. Older report
+/// fields stay byte-identical; parsers that ignore unknown lines are unaffected.
+fn finalize_search_report(
+    mut report: String,
+    arguments: &Value,
+    results: &[SearchResult],
+) -> String {
+    let mut contract = crate::search::SearchMemoryContract::from_arguments(arguments, Vec::new());
+    contract.graph_expanded_ids = graph_expanded_ids_from_results(results);
+    report.push_str(&format!(
+        "\n\nsearch_contract: {}",
+        serde_json::to_string(&contract).unwrap_or_default()
+    ));
+    report
+}
+
 async fn handle_search_memory(
     arguments: Value,
     emb: Arc<dyn Embedder>,
@@ -10822,10 +10852,12 @@ async fn handle_search_memory(
         .get("domain_expansion")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
-    let include_references = arguments
-        .get("include_references")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    // `include_related` never existed in this schema: it was silently ignored.
+    // Resolve it here as a deprecated alias so the caller gets both the provenance
+    // behaviour and an explicit warning in the response contract.
+    let search_contract =
+        crate::search::SearchMemoryContract::from_arguments(&arguments, Vec::new());
+    let include_references = search_contract.include_references;
 
     // Upgraded SearchFilters (src/search.rs). Optional: defaults preserve
     // existing search behavior (include_code_ast defaults to true so searches
@@ -11086,7 +11118,7 @@ async fn handle_search_memory(
             ));
         }
         if !domain_requested {
-            return report;
+            return finalize_search_report(report, &arguments, &results);
         }
         let mode_line = if slugs.is_empty() {
             "domain filter: skipped — the domain did not normalize; the results are unfiltered (lexical)"
@@ -11095,7 +11127,11 @@ async fn handle_search_memory(
         } else {
             "domain filter: skipped — no row matched the domain; the results are unfiltered (lexical)"
         };
-        return format!("{}\n\n{}", mode_line, report);
+        return format!(
+            "{}\n\n{}",
+            mode_line,
+            finalize_search_report(report, &arguments, &results)
+        );
     }
 
     if let Err(e) = store.init(namespace).await {
@@ -11341,7 +11377,11 @@ async fn handle_search_memory(
             );
         }
         if results.is_empty() {
-            "No relevant memories found.".to_string()
+            finalize_search_report(
+                "No relevant memories found.".to_string(),
+                &arguments,
+                &results,
+            )
         } else {
             // Increment access_count ONLY for direct hits (EvidenceKind::DirectMatch)
             for res in &results {
@@ -11395,7 +11435,7 @@ async fn handle_search_memory(
                 ));
             }
             if !domain_requested {
-                report
+                finalize_search_report(report, &arguments, &results)
             } else {
                 // A filter that was skipped is a substitution the caller
                 // has to be told about: a wrong domain must never blind
@@ -11415,7 +11455,11 @@ async fn handle_search_memory(
                                 }
                             }
                 };
-                format!("{}\n\n{}", mode_line, report)
+                format!(
+                    "{}\n\n{}",
+                    mode_line,
+                    finalize_search_report(report, &arguments, &results)
+                )
             }
         }
     } else {
@@ -12018,17 +12062,16 @@ fn is_zero_action_exempt_shell_segment(segment: &str) -> bool {
                         || arg == "--force"
                         || arg.starts_with("--force-")
                         || matches!(arg, "--mirror" | "--delete" | "--prune")
-                        || (arg.starts_with('-') && !arg.starts_with("--") && arg[1..].contains('f'))
+                        || (arg.starts_with('-')
+                            && !arg.starts_with("--")
+                            && arg[1..].contains('f'))
                 }),
                 "pull" | "fetch" | "status" | "log" | "diff" | "show" | "rev-parse" => true,
                 "stash" => matches!(rest.get(1).copied(), Some("list" | "show")),
                 "branch" => {
                     rest.len() >= 2
                         && rest[1..].iter().all(|t| {
-                            matches!(
-                                *t,
-                                "--show-current" | "-a" | "-r" | "--list" | "-v" | "-vv"
-                            )
+                            matches!(*t, "--show-current" | "-a" | "-r" | "--list" | "-v" | "-vv")
                         })
                 }
                 _ => false,
@@ -12049,7 +12092,16 @@ fn is_zero_action_exempt_shell_segment(segment: &str) -> bool {
             }
             matches!(
                 rest.first().copied(),
-                Some("test" | "check" | "clippy" | "bench" | "metadata" | "tree" | "version" | "--version")
+                Some(
+                    "test"
+                        | "check"
+                        | "clippy"
+                        | "bench"
+                        | "metadata"
+                        | "tree"
+                        | "version"
+                        | "--version"
+                )
             )
         }
         "gh" => {
@@ -12262,8 +12314,7 @@ async fn handle_guard_validate(
                 .or_else(|| (!cwd.trim().is_empty()).then_some(cwd.trim()));
             let in_progress = |m: &SearchResult| {
                 crate::task::gate::is_task(m)
-                    && crate::task::gate::task_status(m)
-                        == crate::task::machine::Status::InProgress
+                    && crate::task::gate::task_status(m) == crate::task::machine::Status::InProgress
             };
             let task_matches = |m: &SearchResult, key: &str, expected: &str| {
                 m.payload
@@ -12277,15 +12328,13 @@ async fn handle_guard_validate(
                 .get("active_task_id")
                 .and_then(|v| v.as_str())
                 .and_then(|tid| memories.iter().find(|m| m.id == tid && in_progress(m)))
-                .or_else(|| {
-                    match (caller_session, caller_worktree) {
-                        (Some(s), Some(w)) => memories.iter().find(|m| {
-                            in_progress(m)
-                                && task_matches(m, "session_id", s)
-                                && task_matches(m, "worktree", w)
-                        }),
-                        _ => None,
-                    }
+                .or_else(|| match (caller_session, caller_worktree) {
+                    (Some(s), Some(w)) => memories.iter().find(|m| {
+                        in_progress(m)
+                            && task_matches(m, "session_id", s)
+                            && task_matches(m, "worktree", w)
+                    }),
+                    _ => None,
                 })
                 .or_else(|| {
                     caller_session.and_then(|s| {
@@ -12712,7 +12761,10 @@ mod tests {
             );
         }
         // A JSON object with no string command is never exempt.
-        assert!(!is_zero_action_exempt_shell_payload("bash", r#"{"cmd":42}"#));
+        assert!(!is_zero_action_exempt_shell_payload(
+            "bash",
+            r#"{"cmd":42}"#
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -16925,25 +16977,33 @@ mod tests {
             .await,
         )
         .await;
-        assert_eq!(row.payload.metadata["source"], serde_json::json!("src/lib.rs"));
+        assert_eq!(
+            row.payload.metadata["source"],
+            serde_json::json!("src/lib.rs")
+        );
 
         // Under no known root: the generic fallback, not the path. A temp dir
         // inside a git checkout makes that checkout the root; the source must
         // then still be relative.
-        let (_, outside_row) =
-            stored(add("keep release notes short", &outside, None).await).await;
+        let (_, outside_row) = stored(add("keep release notes short", &outside, None).await).await;
         let temp_in_checkout = std::iter::successors(outside.parent(), |p| p.parent())
             .any(|p| p.join(".git").exists());
         if temp_in_checkout {
-            let source = outside_row.payload.metadata["source"].as_str().unwrap_or_default();
+            let source = outside_row.payload.metadata["source"]
+                .as_str()
+                .unwrap_or_default();
             assert!(!crate::paths::is_absolute_any(source), "{source}");
         } else {
-            assert_eq!(outside_row.payload.metadata["source"], serde_json::json!("agent"));
+            assert_eq!(
+                outside_row.payload.metadata["source"],
+                serde_json::json!("agent")
+            );
         }
 
         // What a mesh peer receives: the published record, its canonical
         // N-Quads included, names no local directory.
-        let mesh_base = std::env::temp_dir().join(format!("ns-src-leak-mesh-{}", uuid::Uuid::new_v4()));
+        let mesh_base =
+            std::env::temp_dir().join(format!("ns-src-leak-mesh-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&mesh_base).unwrap();
         let mesh = crate::synaptic_mesh::storage::MeshStorage::init(
             &mesh_base,
@@ -16973,17 +17033,29 @@ mod tests {
             .unwrap();
         let report =
             crate::synaptic_mesh::worker::drain_once(&outbox, &mesh, "node-author").unwrap();
-        assert_eq!(report.applied, 1, "the shareable rule is published: {report:?}");
+        assert_eq!(
+            report.applied, 1,
+            "the shareable rule is published: {report:?}"
+        );
         let text = std::fs::read_to_string(
-            mesh.root().join("probe").join("memories").join(format!("{id}.json")),
+            mesh.root()
+                .join("probe")
+                .join("memories")
+                .join(format!("{id}.json")),
         )
         .expect("the record file exists");
-        let record: crate::synaptic_mesh::record::MeshRecord =
-            serde_json::from_str(&text).unwrap();
+        let record: crate::synaptic_mesh::record::MeshRecord = serde_json::from_str(&text).unwrap();
         assert_eq!(record.metadata["source"], serde_json::json!("src/lib.rs"));
-        let quads = &record.rdf.as_ref().expect("the record carries N-Quads").quads;
+        let quads = &record
+            .rdf
+            .as_ref()
+            .expect("the record carries N-Quads")
+            .quads;
         assert!(quads.contains("\"src/lib.rs\""), "{quads}");
-        assert!(!text.contains(SENTINEL), "a local path reached the mesh: {text}");
+        assert!(
+            !text.contains(SENTINEL),
+            "a local path reached the mesh: {text}"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&mesh_base);
