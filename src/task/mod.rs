@@ -1058,9 +1058,19 @@ pub fn recorded_graph_queries_for_tests() -> Vec<(String, String, String)> {
 /// to its enclosing worktree/project root so `.NeuroStrata/active_session.json`
 /// and `.NeuroStrata/session_queries.json` are always read and written at the
 /// worktree root rather than a nested subdirectory.
+///
+/// A project root is marked by `.git` (directory or worktree file). A bare
+/// `.NeuroStrata` in an *ancestor* is not authority: anything can create one
+/// in a shared parent, including this resolver's own earlier fallback writes,
+/// and adopting it silently redirects session state for every caller below
+/// (issue #322). The given directory itself still counts when it carries
+/// `.NeuroStrata`, so non-git projects whose cwd is the root are unaffected.
 pub fn resolve_session_root_dir(dir: &std::path::Path) -> std::path::PathBuf {
     if let Some(wt) = gate::GateScope::capture(dir).worktree {
         return std::path::PathBuf::from(wt);
+    }
+    if dir.join(".NeuroStrata").exists() {
+        return dir.to_path_buf();
     }
     let mut cur = if dir.is_dir() {
         Some(dir)
@@ -1068,7 +1078,7 @@ pub fn resolve_session_root_dir(dir: &std::path::Path) -> std::path::PathBuf {
         dir.parent()
     };
     while let Some(d) = cur {
-        if d.join(".git").exists() || d.join(".NeuroStrata").exists() {
+        if d.join(".git").exists() {
             return d.to_path_buf();
         }
         cur = d.parent().filter(|p| !p.as_os_str().is_empty());
