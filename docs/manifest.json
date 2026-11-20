@@ -92,8 +92,10 @@
         "neurostrata_action",
         "neurostrata_taxonomy",
         "neurostrata_twin_get",
+        "neurostrata_vault_sync",
         "neurostrata_scenario",
-        "neurostrata_call_hierarchy"
+        "neurostrata_call_hierarchy",
+        "POST /vault-sync"
       ],
       "require_co_change_on_touch": true
     },

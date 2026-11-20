@@ -25,6 +25,15 @@ theorem evaluateShellExemption_deterministic (p : String) :
     evaluateShellExemption p = evaluateShellExemption p := by
   rfl
 
+/-- Parser resource limits are implementation-level fail-closed behaviour:
+    deeply nested caller JSON cannot turn a mutating command into an exempt
+    one. The Rust reader bounds recursion at 64 levels and returns no verdict
+    for shapes it cannot fully validate. -/
+theorem evaluateShellExemption_deeply_nested_mutating_command :
+    evaluateShellExemption
+      "{\"junk\":{\"a\":{\"a\":{\"a\":0}}},\"command\":\"git push -f\"}" = false := by
+  native_decide
+
 /-- A bundled force flag (`-fometa` = `-f -o meta`) must not be read as the
     attached value of `-o`. -/
 theorem evaluateShellExemption_bundled_force_flag :

@@ -1301,6 +1301,19 @@ fn shell_exemption_review_edge_cases() {
 }
 
 #[test]
+fn shell_exemption_json_depth_limit_fails_closed() {
+    // 200 nested unknown objects: the kernel's JSON reader must refuse the
+    // payload instead of recursing until the daemon stack overflows (#330).
+    let nested = format!("{}{}{}", "{\"a\":".repeat(200), "0", "}".repeat(200));
+    let deep = format!("{{\"junk\":{},\"command\":\"git status\"}}", nested);
+    assert!(!formal_kernel::evaluate_shell_exemption(&deep));
+    // Shallow nesting still yields a normal verdict for a mutating command.
+    assert!(!formal_kernel::evaluate_shell_exemption(
+        "{\"a\":{\"command\":\"git push -f\"}}"
+    ));
+}
+
+#[test]
 fn shell_exemption_json_reader_regressions() {
     // \u0026 chain → decodes to '&' background operator → reject
     assert!(!formal_kernel::evaluate_shell_exemption(

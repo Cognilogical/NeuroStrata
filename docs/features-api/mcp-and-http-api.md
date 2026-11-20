@@ -81,6 +81,8 @@ Active-task resolution is session/worktree scoped: when the daemon returns sever
 | POST   | `/taxonomy`       | Query SKOS concept graph                                                                                                                                                         |
 | POST   | `/graphql`        | Execute GraphQL queries over the ontology                                                                                                                                        |
 
+`POST /vault-sync` is the Vault-LD Markdown sync route; `vault_path` and `output_dir` are resolved against the daemon startup root or an explicit allowed external directory before any filesystem access.
+
 All endpoints are served by the **neurostrata-mcp daemon** on `127.0.0.1:34343`. Tauri acts as a lightweight HTTP client; Cursor MCP integration proxies stdio JSON-RPC requests.
 
 `POST /mcp` follows JSON-RPC 2.0: a method the server does not implement gets error `-32601` (method not found) with the request's `id`, `ping` gets an empty result, and a notification (no `id`) gets `202 Accepted` with an empty body. For an unknown method, an explicit `"id": null` is a request id, not a notification: it receives the `-32601` response above with `"id": null`; only an omitted `id` suppresses the reply.

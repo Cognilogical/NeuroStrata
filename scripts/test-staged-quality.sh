@@ -979,6 +979,55 @@ SC_EOF
     cd - >/dev/null
     rm -rf "$tmpdir"
 }
+
+# Direct /usr/bin interpreter paths must stay in the ShellCheck scan (#330).
+test_direct_usr_bin_shebang_is_checked() {
+    local shebang tmpdir repo bindir exit_code
+    for shebang in '#!/usr/bin/bash' '#!/usr/bin/sh'; do
+        tmpdir=$(mktemp -d)
+        repo="$tmpdir/repo"
+        bindir="$tmpdir/bin"
+        export FAKE_TOOL_LOG="$tmpdir/tool.log"
+        setup_fake_tools "$bindir"
+        cat > "$bindir/shellcheck" <<'SC_EOF'
+#!/usr/bin/env bash
+echo "shellcheck $*" >> "$FAKE_TOOL_LOG"
+for file; do
+    if [ -f "$file" ] && grep -q 'echo $unquoted' "$file"; then
+        echo "SC2086: quote staged hook expansion" >&2
+        exit 1
+    fi
+done
+exit 0
+SC_EOF
+        chmod +x "$bindir/shellcheck"
+        mkdir -p "$repo/hooks"
+        # shellcheck disable=SC2016  # fixture intentionally contains an unquoted expansion
+        printf '%s\necho $unquoted\n' "$shebang" > "$repo/hooks/pre-commit"
+        chmod +x "$repo/hooks/pre-commit"
+        cd "$repo"
+        git init -q
+        git config user.email "test@test.com"
+        git config user.name "Test"
+        git add hooks/pre-commit
+        PATH="$bindir:$PATH" bash "$SCRIPT_PATH" > "$tmpdir/out.log" 2>&1
+        exit_code=$?
+        [ "$exit_code" -ne 0 ] || {
+            echo "Direct /usr/bin shebang skipped ShellCheck: $shebang" >&2
+            cd - >/dev/null
+            rm -rf "$tmpdir"
+            return 1
+        }
+        grep -q "hooks/pre-commit" "$FAKE_TOOL_LOG" || {
+            echo "Hook was not passed to ShellCheck: $shebang" >&2
+            cd - >/dev/null
+            rm -rf "$tmpdir"
+            return 1
+        }
+        cd - >/dev/null
+        rm -rf "$tmpdir"
+    done
+}
 # Test 21: staged Rust with no Cargo dep-info is not silently skipped
 test_unbuilt_staged_rust_fails() {
     local tmpdir repo bindir exit_code
@@ -1228,6 +1277,7 @@ run_test "Pre-commit delegation absent quality script generic ledger" test_pre_c
 run_test "Bad staged Rust fails despite formatted worktree" test_bad_staged_rust_fails_despite_formatted_worktree
 run_test "Good staged Rust passes despite bad worktree" test_good_staged_rust_passes_despite_bad_worktree
 run_test "Extensionless Bash hook is checked" test_extensionless_bash_hook_is_checked
+run_test "Direct /usr/bin shebangs are checked" test_direct_usr_bin_shebang_is_checked
 run_test "Unbuilt staged Rust fails" test_unbuilt_staged_rust_fails
 run_test "Quality suites are wired into CI" test_quality_suites_are_wired_into_ci
 run_test "Local Rustfmt survives snapshot cwd" test_local_rustfmt_survives_snapshot_cwd

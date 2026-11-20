@@ -4026,7 +4026,12 @@ pub fn evaluate_shell_exemption(payload: &str) -> bool {
 struct JsonReader<'a> {
     bytes: &'a [u8],
     pos: usize,
+    depth: usize,
 }
+
+/// Caller-supplied JSON can nest arbitrarily deep; bound the recursive walk so
+/// a hostile payload fails closed instead of overflowing the daemon stack.
+const MAX_JSON_DEPTH: usize = 64;
 
 impl<'a> JsonReader<'a> {
     fn skip_ws(&mut self) {
@@ -4170,6 +4175,16 @@ impl<'a> JsonReader<'a> {
     }
 
     fn skip_value(&mut self) -> Option<()> {
+        if self.depth >= MAX_JSON_DEPTH {
+            return None;
+        }
+        self.depth += 1;
+        let result = self.skip_value_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn skip_value_inner(&mut self) -> Option<()> {
         self.skip_ws();
         match self.bytes.get(self.pos).copied()? {
             b'"' => {
@@ -4252,6 +4267,7 @@ fn parse_json_command_fields(json: &str) -> Option<(Option<String>, Option<Strin
     let mut reader = JsonReader {
         bytes: json.as_bytes(),
         pos: 0,
+        depth: 0,
     };
     reader.skip_ws();
     if reader.bytes.get(reader.pos) != Some(&b'{') {
