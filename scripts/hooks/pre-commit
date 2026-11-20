@@ -10,8 +10,15 @@
 
 ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 LEDGER="$ROOT/.NeuroStrata/session_queries.json"
+# The namespace configured for this project (harness settings; folder name
+# last), resolved in one place: `neurostrata-mcp namespace resolve`. The
+# ledger's own field and the folder name are fallbacks when the binary is
+# not on PATH.
 NAMESPACE=""
-if [ -f "$LEDGER" ]; then
+if command -v neurostrata-mcp >/dev/null 2>&1; then
+    NAMESPACE=$(neurostrata-mcp namespace resolve 2>/dev/null)
+fi
+if [ -z "$NAMESPACE" ] && [ -f "$LEDGER" ]; then
     NAMESPACE=$(grep -o '"namespace"[[:space:]]*:[[:space:]]*"[^"]*"' "$LEDGER" | head -n1 | sed 's/.*"namespace"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
 fi
 if [ -z "$NAMESPACE" ]; then

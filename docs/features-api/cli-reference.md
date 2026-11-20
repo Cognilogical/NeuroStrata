@@ -185,6 +185,13 @@ Installs `.git/hooks/pre-push` (strict task gate) and `.git/hooks/pre-commit` (g
 ```bash
 neurostrata-mcp hooks install [--force]
 ```
+The pre-push hook gates the project's configured namespace (see `namespace resolve`) and the checkout's folder name; the pre-commit hook records against the configured namespace. The pre-push hook blocks the push when `neurostrata-mcp` is missing, when `namespace resolve` fails, or when the gate exits with anything other than 0 or 1.
+
+### `namespace resolve`
+Prints the namespace configured for a project. Order: `NEUROSTRATA_NAMESPACE` in `.claude/settings.local.json` (its `env` block, else a hook command that starts with the assignment), then `namespace` in the opencode, codex, hermes, openclaw or GitHub CLI plugin config, read from the checkout, else from the main checkout of a linked worktree; then `NEUROSTRATA_NAMESPACE` in the environment (not read by `get_snapshot`'s hook refresh, since one daemon serves every project); then the `namespace` field of `.NeuroStrata/session_queries.json`; the main checkout's folder name last (outside git, the same files in `dir` itself, then its folder name). A namespace is letters, digits, `-`, `_`, `.` and `:`, starting with a letter or digit; any other value is skipped. When harness configs name different namespaces, it prints a warning on stderr and uses the first in the order above (Claude, opencode, codex, hermes, openclaw, GitHub CLI). A relative `dir` is taken against the current directory. It opens no database and starts no daemon. The `pre-push` and `pre-commit` hooks, `hooks install` and `get_snapshot`'s hook refresh all use it.
+```bash
+neurostrata-mcp namespace resolve [dir]
+```
 
 ---
 

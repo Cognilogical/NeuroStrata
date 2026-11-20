@@ -3842,22 +3842,30 @@ if [ "$NEUROSTRATA_SKIP_GATE" = "1" ]; then
     exit 0
 fi
 
-NAMESPACE=$(basename "$(git rev-parse --show-toplevel)")
+# The namespace configured for this project, resolved in one place
+# (`neurostrata-mcp namespace resolve`); a failed lookup blocks the push.
+# The folder name, the namespace this gate checked before, is gated too.
+NAMESPACE=$(neurostrata-mcp namespace resolve) || exit 1
+FOLDER_NAMESPACE=$(basename "$(git rev-parse --show-toplevel)")
+GATE_NAMESPACES=("$NAMESPACE")
+[ "$FOLDER_NAMESPACE" = "$NAMESPACE" ] || GATE_NAMESPACES+=("$FOLDER_NAMESPACE")
 
 # ── NeuroStrata gate (required) ────────────────────────────────────────────
 # --strict maps an unavailable database to a blocking exit too, so a 1
 # below is always a verdict: violations, or a database that could not be
 # checked under --strict. The hook blocks on the verdict code only.
-neurostrata-mcp task gate "$NAMESPACE" --strict
-code=$?
-if [ $code -eq 1 ]; then
-    echo "Push blocked: resolve the tasks above" >&2
-    exit 1
-fi
-if [ $code -ne 0 ]; then
-    echo "error: neurostrata-mcp task gate exited $code — the gate could NOT run for this push" >&2
-    exit 1
-fi
+for GATE_NAMESPACE in "${GATE_NAMESPACES[@]}"; do
+    neurostrata-mcp task gate "$GATE_NAMESPACE" --strict
+    code=$?
+    if [ $code -eq 1 ]; then
+        echo "Push blocked: resolve the tasks above" >&2
+        exit 1
+    fi
+    if [ $code -ne 0 ]; then
+        echo "error: neurostrata-mcp task gate exited $code — the gate could NOT run for this push" >&2
+        exit 1
+    fi
+done
 
 # ── project guards (add yours here) ────────────────────────────────────────
 # Add the path of each local guard; it runs before every push on every host.
@@ -3877,7 +3885,7 @@ if [ ${#PROJECT_GATES[@]} -gt 0 ]; then
 fi
 
 exit 0   # the gate passed and all project guards passed
-# neurostrata-hook-sha256: fde963068fb4002b941dd0f6aa4b4c110aaf6bbb86ded582c8bc7cf33b790688
+# neurostrata-hook-sha256: 82ed7ad6560afbf45a67ee8e9170aeaeb4dc78b5495969ac9c3566c0ecc83164
 "#;
 
 /// SHA-256 of the scaffolded pre-push hook body (excluding the trailing
@@ -3923,8 +3931,15 @@ pub(crate) const SCAFFOLDED_PRE_COMMIT_HOOK: &str = r#"#!/bin/bash
 
 ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 LEDGER="$ROOT/.NeuroStrata/session_queries.json"
+# The namespace configured for this project (harness settings; folder name
+# last), resolved in one place: `neurostrata-mcp namespace resolve`. The
+# ledger's own field and the folder name are fallbacks when the binary is
+# not on PATH.
 NAMESPACE=""
-if [ -f "$LEDGER" ]; then
+if command -v neurostrata-mcp >/dev/null 2>&1; then
+    NAMESPACE=$(neurostrata-mcp namespace resolve 2>/dev/null)
+fi
+if [ -z "$NAMESPACE" ] && [ -f "$LEDGER" ]; then
     NAMESPACE=$(grep -o '"namespace"[[:space:]]*:[[:space:]]*"[^"]*"' "$LEDGER" | head -n1 | sed 's/.*"namespace"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
 fi
 if [ -z "$NAMESPACE" ]; then
@@ -4244,11 +4259,13 @@ pub(crate) fn hook_hygiene(root: &std::path::Path) -> String {
     if !root.join(".git").exists() {
         return String::new();
     }
-    let repo_ns = root
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("default");
-    let _ = harness_plugins::auto_install_detected_plugins(root, repo_ns, None);
+    // The configured namespace (harness settings, then the main checkout's,
+    // ledger, folder name last) -- the answer the hooks get from
+    // `neurostrata-mcp namespace resolve`, so a refresh never rewrites a
+    // harness config with the folder name. The daemon's own environment is
+    // not read: one daemon serves every project.
+    let repo_ns = harness_plugins::resolve_project_namespace_ignoring_env(root);
+    let _ = harness_plugins::auto_install_detected_plugins(root, &repo_ns, None);
     let hooks_dir = git_hooks_dir(root);
     if !hooks_dir.is_dir() {
         if let Err(e) = std::fs::create_dir_all(&hooks_dir) {
@@ -6034,6 +6051,72 @@ mod tests {
         );
     }
 
+    /// The pre-push hook stays fail-closed around `namespace resolve`: with
+    /// no `neurostrata-mcp` on PATH, with a binary whose `namespace resolve`
+    /// exits 2, and with a gate that exits 2, the push is blocked (exit 1).
+    #[test]
+    fn pre_push_hook_blocks_when_cli_missing_and_on_exit_2() {
+        let Some(bash) = hook_bash() else {
+            eprintln!("skipped: no bash to run the hook with");
+            return;
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).unwrap();
+        git_stdout_in(&root, &["init", "-q"]);
+        let hook = root.join("pre-push");
+        std::fs::write(&hook, SCAFFOLDED_PRE_PUSH_HOOK).unwrap();
+        let stub_dir = root.join("stub-bin");
+        std::fs::create_dir_all(&stub_dir).unwrap();
+        write_exec_hook(
+            &stub_dir.join("neurostrata-mcp"),
+            "#!/bin/sh\nif [ \"$1\" = namespace ]; then\n    [ -n \"$STUB_RESOLVE_EXIT\" ] && exit \"$STUB_RESOLVE_EXIT\"\n    echo example-project\n    exit 0\nfi\nexit ${STUB_GATE_EXIT:-0}\n",
+        );
+        // The inherited PATH minus any installed neurostrata-mcp, so "missing"
+        // really is missing on a developer machine.
+        let inherited: Vec<std::path::PathBuf> =
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+                .filter(|d| {
+                    ["neurostrata-mcp", "neurostrata-mcp.exe", "neurostrata-mcp.cmd"]
+                        .iter()
+                        .all(|name| !d.join(name).is_file())
+                })
+                .collect();
+        let run = |with_stub: bool, envs: &[(&str, &str)]| -> Option<i32> {
+            let mut dirs = Vec::new();
+            if with_stub {
+                dirs.push(stub_dir.clone());
+            }
+            // Git for Windows' usr/bin (sh, basename) as git puts it there.
+            if let Some(bin) = bash.parent() {
+                dirs.push(bin.to_path_buf());
+            }
+            dirs.extend(inherited.iter().cloned());
+            let mut cmd = std::process::Command::new(&bash);
+            cmd.arg(&hook)
+                .current_dir(&root)
+                .env("PATH", std::env::join_paths(dirs).expect("join PATH"))
+                .env_remove("NEUROSTRATA_SKIP_GATE")
+                .env_remove("STUB_RESOLVE_EXIT")
+                .env_remove("STUB_GATE_EXIT");
+            for (key, value) in envs {
+                cmd.env(key, value);
+            }
+            cmd.output().expect("the hook runs").status.code()
+        };
+        assert_eq!(run(false, &[]), Some(1), "no neurostrata-mcp on PATH blocks the push");
+        assert_eq!(
+            run(true, &[("STUB_RESOLVE_EXIT", "2")]),
+            Some(1),
+            "a namespace resolve that exits 2 blocks the push"
+        );
+        assert_eq!(
+            run(true, &[("STUB_GATE_EXIT", "2")]),
+            Some(1),
+            "a gate that exits 2 blocks the push"
+        );
+        assert_eq!(run(true, &[]), Some(0), "a passing gate lets the push through");
+    }
+
     /// `neurostrata-mcp hooks install` and `scripts/install-hooks.sh` must
     /// install the same fail-closed gate; a stale checked-in copy would let
     /// one install path bypass the task gate (audit #317).
@@ -7028,7 +7111,11 @@ mod tests {
 
         // stub the gate: its exit code is the only variable
         let stub = root.join("bin").join("neurostrata-mcp");
-        std::fs::write(&stub, "#!/bin/sh\nexit ${STUB_GATE_EXIT:-0}\n").unwrap();
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\nif [ \"$1\" = namespace ]; then echo example-project; exit 0; fi\nexit ${STUB_GATE_EXIT:-0}\n",
+        )
+        .unwrap();
         let mut perms = std::fs::metadata(&stub).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&stub, perms).unwrap();

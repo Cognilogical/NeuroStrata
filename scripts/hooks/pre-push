@@ -14,22 +14,30 @@ if [ "$NEUROSTRATA_SKIP_GATE" = "1" ]; then
     exit 0
 fi
 
-NAMESPACE=$(basename "$(git rev-parse --show-toplevel)")
+# The namespace configured for this project, resolved in one place
+# (`neurostrata-mcp namespace resolve`); a failed lookup blocks the push.
+# The folder name, the namespace this gate checked before, is gated too.
+NAMESPACE=$(neurostrata-mcp namespace resolve) || exit 1
+FOLDER_NAMESPACE=$(basename "$(git rev-parse --show-toplevel)")
+GATE_NAMESPACES=("$NAMESPACE")
+[ "$FOLDER_NAMESPACE" = "$NAMESPACE" ] || GATE_NAMESPACES+=("$FOLDER_NAMESPACE")
 
 # ── NeuroStrata gate (required) ────────────────────────────────────────────
 # --strict maps an unavailable database to a blocking exit too, so a 1
 # below is always a verdict: violations, or a database that could not be
 # checked under --strict. The hook blocks on the verdict code only.
-neurostrata-mcp task gate "$NAMESPACE" --strict
-code=$?
-if [ $code -eq 1 ]; then
-    echo "Push blocked: resolve the tasks above" >&2
-    exit 1
-fi
-if [ $code -ne 0 ]; then
-    echo "error: neurostrata-mcp task gate exited $code — the gate could NOT run for this push" >&2
-    exit 1
-fi
+for GATE_NAMESPACE in "${GATE_NAMESPACES[@]}"; do
+    neurostrata-mcp task gate "$GATE_NAMESPACE" --strict
+    code=$?
+    if [ $code -eq 1 ]; then
+        echo "Push blocked: resolve the tasks above" >&2
+        exit 1
+    fi
+    if [ $code -ne 0 ]; then
+        echo "error: neurostrata-mcp task gate exited $code — the gate could NOT run for this push" >&2
+        exit 1
+    fi
+done
 
 # ── project guards (add yours here) ────────────────────────────────────────
 # Add the path of each local guard; it runs before every push on every host.
@@ -49,4 +57,4 @@ if [ ${#PROJECT_GATES[@]} -gt 0 ]; then
 fi
 
 exit 0   # the gate passed and all project guards passed
-# neurostrata-hook-sha256: fde963068fb4002b941dd0f6aa4b4c110aaf6bbb86ded582c8bc7cf33b790688
+# neurostrata-hook-sha256: 82ed7ad6560afbf45a67ee8e9170aeaeb4dc78b5495969ac9c3566c0ecc83164

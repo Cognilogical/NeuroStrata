@@ -415,6 +415,12 @@ enum Commands {
         action: HooksCommands,
     },
 
+    /// Project namespace lookups (no daemon, no database)
+    Namespace {
+        #[command(subcommand)]
+        action: NamespaceCommands,
+    },
+
     /// Share what your agents learn with the team's agents (SynapticMesh)
     ///
     /// The mesh is a standalone git repo the daemon owns; the project keeps
@@ -883,6 +889,21 @@ pub(crate) enum TaskCommands {
         /// Path to the exported JSONL (bd export .beads/beads.jsonl)
         #[arg(long)]
         from_beads: String,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+pub(crate) enum NamespaceCommands {
+    /// Print the namespace configured for a project: the harness settings
+    /// the installer wrote (.claude/settings.local.json, the opencode, codex,
+    /// hermes, openclaw or GitHub CLI plugin config) in the checkout or its
+    /// main checkout, else NEUROSTRATA_NAMESPACE, else the namespace in
+    /// .NeuroStrata/session_queries.json, else the main checkout's folder
+    /// name. Configs that disagree are reported on stderr; the first in that
+    /// order wins. The git hooks call this.
+    Resolve {
+        /// Directory inside the project (default: the current directory)
+        dir: Option<std::path::PathBuf>,
     },
 }
 
@@ -3307,8 +3328,9 @@ mod tests {
     }
 
     /// A stub `neurostrata-mcp` whose exit code is STUB_GATE_EXIT; every
-    /// invocation appends a line to the marker file, so a test can prove
-    /// the hook actually ran the gate.
+    /// gate invocation appends a line to the marker file, so a test can
+    /// prove the hook actually ran the gate. `namespace resolve` answers
+    /// `example-project`, as the real binary would.
     #[cfg(unix)]
     fn t4_stub_bin(root: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
         use std::os::unix::fs::PermissionsExt;
@@ -3316,7 +3338,7 @@ mod tests {
         std::fs::create_dir_all(&bin).unwrap();
         let marker = root.join("gate-ran.marker");
         let stub = format!(
-            "#!/bin/sh\necho ran >> \"{}\"\nexit ${{STUB_GATE_EXIT:-0}}\n",
+            "#!/bin/sh\nif [ \"$1\" = namespace ]; then echo example-project; exit 0; fi\necho ran >> \"{}\"\nexit ${{STUB_GATE_EXIT:-0}}\n",
             marker.display()
         );
         let stub_path = bin.join("neurostrata-mcp");
@@ -3721,8 +3743,9 @@ mod tests {
         );
         for behavior in [
             "command -v neurostrata-mcp",
-            "NAMESPACE=$(basename \"$(git rev-parse --show-toplevel)\")",
-            "neurostrata-mcp task gate \"$NAMESPACE\" --strict",
+            "NAMESPACE=$(neurostrata-mcp namespace resolve) || exit 1",
+            "FOLDER_NAMESPACE=$(basename \"$(git rev-parse --show-toplevel)\")",
+            "neurostrata-mcp task gate \"$GATE_NAMESPACE\" --strict",
             "code=$?",
             "if [ $code -eq 1 ]; then",
             "echo \"Push blocked: resolve the tasks above\" >&2",
@@ -3866,6 +3889,25 @@ mod tests {
                 action: HooksCommands::Install { force },
             }) => assert!(!force),
             other => panic!("expected Hooks/Install, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn the_namespace_resolve_command_parses() {
+        let cli = Cli::try_parse_from(["neurostrata-mcp", "namespace", "resolve"]).expect("parses bare");
+        match cli.command {
+            Some(Commands::Namespace { action }) => {
+                assert_eq!(action, NamespaceCommands::Resolve { dir: None })
+            }
+            other => panic!("expected Namespace/Resolve, got {:?}", other),
+        }
+        let cli = Cli::try_parse_from(["neurostrata-mcp", "namespace", "resolve", "some/dir"])
+            .expect("parses with a dir");
+        match cli.command {
+            Some(Commands::Namespace { action }) => {
+                assert_eq!(action, NamespaceCommands::Resolve { dir: Some("some/dir".into()) })
+            }
+            other => panic!("expected Namespace/Resolve, got {:?}", other),
         }
     }
 
@@ -6133,6 +6175,31 @@ async fn run() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Run by every git hook: answer at once, without probing or starting a
+    // daemon and without opening the database.
+    if let Some(Commands::Namespace { action }) = cli.command.as_ref() {
+        match action {
+            NamespaceCommands::Resolve { dir } => {
+                let dir = match dir {
+                    Some(d) => d.clone(),
+                    None => std::env::current_dir()?,
+                };
+                let configs = crate::task::harness_plugins::harness_namespaces(&dir);
+                if configs.iter().any(|(_, ns)| *ns != configs[0].1) {
+                    let listed: Vec<String> =
+                        configs.iter().map(|(harness, ns)| format!("{harness}={ns}")).collect();
+                    eprintln!(
+                        "warning: harness configs name different namespaces ({}); using {}",
+                        listed.join(", "),
+                        configs[0].1
+                    );
+                }
+                println!("{}", crate::task::harness_plugins::resolve_project_namespace(&dir));
+            }
+        }
+        return Ok(());
+    }
+
     // The crash breadcrumb, installed before anything long-running so the
     // daemon and the MCP proxy are both covered. A failure here costs a
     // diagnostic, not the run: the handler is never a prerequisite, so the
@@ -7320,12 +7387,10 @@ async fn run() -> anyhow::Result<()> {
                     match install_pre_push_hook(&root, force) {
                         Ok(target) => {
                             let _ = install_pre_commit_hook(&root);
-                            let repo_ns = root
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("default");
+                            let repo_ns =
+                                crate::task::harness_plugins::resolve_project_namespace(&root);
                             let _ = crate::task::harness_plugins::auto_install_detected_plugins(
-                                &root, repo_ns, None,
+                                &root, &repo_ns, None,
                             );
                             println!(
                                 "Installed the NeuroStrata task gate at {} (plus pre-commit ledger and detected harness plugins).",
@@ -8893,6 +8958,7 @@ async fn run() -> anyhow::Result<()> {
                     | Commands::Hooks { .. }
                     | Commands::Bench { .. }
                     | Commands::SemanticEval { .. }
+                    | Commands::Namespace { .. }
                     // THE OUTER match already handles Learn (src/main.rs ~2822);
                     // this inner catch-all can never see it.
                     | Commands::Learn { .. } => unreachable!(),
