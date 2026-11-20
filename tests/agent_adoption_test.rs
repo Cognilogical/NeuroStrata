@@ -8,6 +8,8 @@
 mod memories_for_file;
 #[path = "../src/task/routing.rs"]
 mod routing;
+#[path = "../src/task/snapshot_readiness.rs"]
+mod snapshot_readiness;
 
 use routing::{agent_routing_contract_json, evaluate_triggers, TaskContext};
 use serde_json::Value;
@@ -344,4 +346,144 @@ fn memories_for_file_escalation_constants_match_routing_contract() {
         memories_for_file::EXPECTED_SEED_EDGE,
         routing::EXPECTED_DECISION_UNKNOWN
     );
+}
+
+/// Spec §6 R5 / Review Focus item 3: ReBAC-restricted taxonomy rows must never
+/// reach readiness totals. Seed one restricted + one unrestricted concept; the
+/// report may count only the unrestricted one and must not name the restricted
+/// slug anywhere in the rendered section.
+#[test]
+fn snapshot_readiness_excludes_restricted_taxonomy() {
+    use snapshot_readiness::{
+        compute_readiness, render_readiness_section, ReadinessConcept, ReadinessInput,
+        MAX_RECOMMENDED_READS, SECTION_HEADING,
+    };
+
+    let input = ReadinessInput {
+        concepts: vec![
+            ReadinessConcept {
+                slug: "restricted-secret".to_string(),
+                restricted: true,
+                epistemic_status: "verified".to_string(),
+            },
+            ReadinessConcept {
+                slug: "public-anchor".to_string(),
+                restricted: false,
+                epistemic_status: "seed".to_string(),
+            },
+        ],
+        graph_tool_names: vec!["neurostrata_memories_for_file".to_string()],
+        has_thesis: false,
+    };
+
+    let report = compute_readiness(&input);
+    assert_eq!(
+        report.taxonomy_concepts_count, 1,
+        "only the unrestricted concept may be counted"
+    );
+    assert_eq!(
+        report.ungrounded_concepts_count, 1,
+        "the unrestricted seed concept is ungrounded"
+    );
+    assert_eq!(report.active_task_graph_tool_diversity, 1);
+    assert!(report.recommended_reads.len() <= MAX_RECOMMENDED_READS);
+
+    let section = render_readiness_section(&input);
+    assert!(section.contains(SECTION_HEADING));
+    assert!(section.contains("taxonomy_concepts_count: 1"));
+    assert!(section.contains("ungrounded_concepts_count: 1"));
+    assert!(section.contains("active_task_graph_tool_diversity: 1"));
+    assert!(
+        !section.contains("restricted-secret"),
+        "restricted slug leaked into snapshot readiness"
+    );
+}
+
+/// R5.2: zero thesis/concept rows emit exactly the prescribed hint line.
+#[test]
+fn snapshot_readiness_zero_concept_hint_is_exact() {
+    use snapshot_readiness::{render_readiness_section, ReadinessInput, ZERO_CONCEPT_HINT};
+
+    let empty = ReadinessInput {
+        concepts: vec![],
+        graph_tool_names: vec![],
+        has_thesis: false,
+    };
+    let section = render_readiness_section(&empty);
+    assert!(
+        section.lines().any(|line| line == ZERO_CONCEPT_HINT),
+        "zero-concept hint must appear verbatim as its own line; got:\n{section}"
+    );
+    assert!(section.contains("taxonomy_concepts_count: 0"));
+
+    // A thesis with no concepts still reports zero concepts, but the
+    // set_thesis hint only applies when there is no thesis either.
+    let thesis_only = ReadinessInput {
+        concepts: vec![],
+        graph_tool_names: vec![],
+        has_thesis: true,
+    };
+    assert!(!render_readiness_section(&thesis_only).contains(ZERO_CONCEPT_HINT));
+}
+
+/// R5.1: graph tool diversity is distinct-count, and recommended_reads is
+/// capped at three and deterministic.
+#[test]
+fn snapshot_readiness_diversity_distinct_and_reads_capped() {
+    use snapshot_readiness::{
+        compute_readiness, render_readiness_section, ReadinessConcept, ReadinessInput,
+        MAX_RECOMMENDED_READS,
+    };
+
+    let input = ReadinessInput {
+        concepts: vec![
+            ReadinessConcept {
+                slug: "a".to_string(),
+                restricted: false,
+                epistemic_status: "seed".to_string(),
+            },
+            ReadinessConcept {
+                slug: "a".to_string(),
+                restricted: false,
+                epistemic_status: "verified".to_string(),
+            },
+            ReadinessConcept {
+                slug: "b".to_string(),
+                restricted: false,
+                epistemic_status: "verified".to_string(),
+            },
+        ],
+        graph_tool_names: vec![
+            "neurostrata_related".to_string(),
+            "neurostrata_related".to_string(),
+            "neurostrata_sparql_query".to_string(),
+            "  ".to_string(),
+        ],
+        has_thesis: true,
+    };
+    let report = compute_readiness(&input);
+    assert_eq!(report.taxonomy_concepts_count, 2, "concepts dedupe by slug");
+    assert_eq!(
+        report.active_task_graph_tool_diversity, 2,
+        "tool names dedupe"
+    );
+    assert_eq!(report.recommended_reads.len(), 2, "briefing + gaps");
+    assert!(report.recommended_reads.len() <= MAX_RECOMMENDED_READS);
+    assert_eq!(
+        render_readiness_section(&input),
+        render_readiness_section(&input)
+    );
+
+    // Low tool diversity adds a third read and the cap holds at exactly three.
+    let low_diversity = ReadinessInput {
+        graph_tool_names: vec!["neurostrata_related".to_string()],
+        ..input
+    };
+    let capped = compute_readiness(&low_diversity);
+    assert_eq!(capped.recommended_reads.len(), MAX_RECOMMENDED_READS);
+    assert!(capped.recommended_reads.iter().any(|r| r.contains("gaps")));
+    assert!(capped
+        .recommended_reads
+        .iter()
+        .any(|r| r.contains("memories_for_file")));
 }

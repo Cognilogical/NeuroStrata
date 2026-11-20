@@ -14,6 +14,7 @@ pub mod machine;
 pub mod precheck;
 pub mod receipt;
 pub mod routing;
+pub mod snapshot_readiness;
 pub mod wiring;
 
 use crate::formal_kernel::{evaluate_claim_decision, KernelClaimDecision};

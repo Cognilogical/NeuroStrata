@@ -3567,6 +3567,33 @@ pub async fn render_snapshot_taxonomy_section(store: &LadybugStore, namespace: &
     }
 }
 
+/// R5 readiness view: whether an unrestricted thesis is visible plus one
+/// `(slug, read-time epistemic_status)` pair per visible concept. Reuses the
+/// same filtered view helpers as `render_snapshot_taxonomy_section`, so the
+/// snapshot readiness totals cannot diverge from the taxonomy section or leak
+/// a ReBAC-restricted row. Fail-soft: an unreadable store yields an empty view.
+pub async fn snapshot_taxonomy_readiness_view(
+    store: &LadybugStore,
+    namespace: &str,
+) -> (bool, Vec<(String, String)>) {
+    let now_ts = chrono::Utc::now().timestamp();
+    let Ok((active_rows, active_edges)) = load_active_rows_and_edges(store, namespace, now_ts).await
+    else {
+        return (false, Vec::new());
+    };
+    let unrestricted_rows: Vec<(String, MemoryPayload)> = active_rows
+        .into_iter()
+        .filter(|(_id, pl)| is_public_access_policy(&pl.metadata))
+        .collect();
+    let view = build_principal_taxonomy_view(&unrestricted_rows, &active_edges, "admin");
+    let concepts = view
+        .concepts
+        .values()
+        .map(|c| (c.slug.clone(), c.epistemic_status.clone()))
+        .collect();
+    (view.thesis.is_some(), concepts)
+}
+
 /// Build context-budgeted (`<= 1200` chars) unrestricted Project Thesis and up to 3 matched
 /// SKOS concepts for `build_task_graph_context` (`neurostrata_task_create` / `neurostrata_task_claim`).
 pub async fn build_task_taxonomy_context(

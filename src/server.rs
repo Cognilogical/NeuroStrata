@@ -5518,6 +5518,65 @@ fn apply_doctor_version(state: &mut Value, version: &str, allowed: bool) {
     }
 }
 
+/// Distinct graph/ontology MCP tool names recorded for active tasks. Reads the
+/// existing session ledger fail-soft; a missing/unreadable ledger yields an
+/// empty set (diversity 0), never a fabricated count. `events[]` (post-dispatch
+/// receipts) carry `task_id` and are preferred; legacy `queries[]` lack task
+/// attribution and are used only when no attributed event contributed a tool.
+fn active_task_graph_tool_names(
+    root: Option<&str>,
+    active_task_ids: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    let Some(root) = root else {
+        return Vec::new();
+    };
+    let path = std::path::Path::new(root).join(".NeuroStrata/session_queries.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(doc) = serde_json::from_str::<Value>(&text) else {
+        return Vec::new();
+    };
+    let mut tools: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    fn insert_graph_tool(tools: &mut std::collections::BTreeSet<String>, value: Option<&str>) {
+        if let Some(tool) = value {
+            const GRAPH_TOOLS: &[&str] = &[
+                "neurostrata_memories_for_file",
+                "neurostrata_related",
+                "neurostrata_locate",
+                "neurostrata_sparql_query",
+                "neurostrata_object_view",
+                "neurostrata_taxonomy",
+                "neurostrata_diff_tour",
+                "neurostrata_search_memory",
+            ];
+            if GRAPH_TOOLS.contains(&tool) {
+                tools.insert(tool.to_string());
+            }
+        }
+    }
+    if let Some(events) = doc.get("events").and_then(Value::as_array) {
+        for event in events {
+            let attributed = event
+                .get("task_id")
+                .and_then(Value::as_str)
+                .map(|id| active_task_ids.contains(id))
+                .unwrap_or(false);
+            if attributed {
+                insert_graph_tool(&mut tools, event.get("tool").and_then(Value::as_str));
+            }
+        }
+    }
+    if tools.is_empty() {
+        if let Some(queries) = doc.get("queries").and_then(Value::as_array) {
+            for query in queries {
+                insert_graph_tool(&mut tools, query.get("tool").and_then(Value::as_str));
+            }
+        }
+    }
+    tools.into_iter().collect()
+}
+
 async fn handle_get_snapshot(
     arguments: Value,
     store: Arc<dyn VectorStore>,
@@ -6350,6 +6409,39 @@ async fn handle_get_snapshot(
         None => String::new(),
     };
 
+    // R5: graph/ontology readiness. Concept data comes from the same ReBAC-
+    // filtered taxonomy view the section above renders, so restricted rows are
+    // never counted or named. Tool diversity is read fail-soft from the session
+    // ledger; no ledger means an honest 0, never a fabricated count.
+    let (has_thesis, concept_statuses) = match crate::traits::VectorStore::as_any(store.as_ref())
+        .downcast_ref::<crate::store::ladybug::LadybugStore>()
+    {
+        Some(ls) => crate::rdf::taxonomy::snapshot_taxonomy_readiness_view(ls, namespace).await,
+        None => (false, Vec::new()),
+    };
+    let readiness_concepts: Vec<crate::task::snapshot_readiness::ReadinessConcept> =
+        concept_statuses
+            .into_iter()
+            .map(|(slug, epistemic_status)| crate::task::snapshot_readiness::ReadinessConcept {
+                slug,
+                restricted: false,
+                epistemic_status,
+            })
+            .collect();
+    let active_task_ids: std::collections::BTreeSet<String> = all_memories
+        .iter()
+        .filter(|r| crate::task::gate::is_task(r))
+        .filter(|r| !crate::task::gate::is_retired(&r.payload.metadata, now))
+        .map(|r| r.id.clone())
+        .collect();
+    let readiness_input = crate::task::snapshot_readiness::ReadinessInput {
+        concepts: readiness_concepts,
+        graph_tool_names: active_task_graph_tool_names(inferred_root.as_deref(), &active_task_ids),
+        has_thesis,
+    };
+    let readiness_section =
+        crate::task::snapshot_readiness::render_readiness_section(&readiness_input);
+
     let mut parts: Vec<String> = vec![task_head.to_string()];
     if !hooks_line.is_empty() {
         parts.push(hooks_line.clone());
@@ -6360,6 +6452,7 @@ async fn handle_get_snapshot(
     if !taxonomy_section.is_empty() {
         parts.push(taxonomy_section);
     }
+    parts.push(readiness_section);
     if !stale_section.is_empty() {
         parts.push(stale_section);
     }
