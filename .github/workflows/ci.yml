@@ -339,6 +339,10 @@ jobs:
         shell: bash
         run: bash scripts/test-main-ruleset.sh
 
+      - name: Task coverage gate self-test
+        shell: bash
+        run: bash scripts/test-task-coverage-gate.sh
+
   # The staged-quality gate is a local pre-commit path. These tests keep the
   # gate honest, and a shell-only run exercises it server-side so `--no-verify`
   # cannot bypass shell syntax/lint checks.
