@@ -487,3 +487,69 @@ fn snapshot_readiness_diversity_distinct_and_reads_capped() {
         .iter()
         .any(|r| r.contains("memories_for_file")));
 }
+
+/// Fix round 1 / finding 1: legacy `queries[]` rows are excluded from quality
+/// metrics (spec R6). A legacy-only ledger, or one whose attributed events
+/// carry no allowlisted graph tool, must yield diversity 0 even when legacy
+/// rows name allowlisted tools or synthetic `pre-commit` rows exist.
+#[test]
+fn snapshot_readiness_legacy_ledger_rows_never_count() {
+    use snapshot_readiness::{active_task_ids, graph_tools_from_ledger};
+
+    let active = active_task_ids(&[("t1".to_string(), "in_progress".to_string())]);
+    let legacy_only = serde_json::json!({
+        "queries": [
+            { "tool": "neurostrata_related", "task_id": "t1" },
+            { "tool": "neurostrata_sparql_query", "task_id": "t1" },
+            { "tool": "pre-commit", "query": "x.rs" }
+        ]
+    });
+    assert!(
+        graph_tools_from_ledger(&legacy_only, &active).is_empty(),
+        "legacy queries[] must never contribute to diversity"
+    );
+
+    let non_graph_events = serde_json::json!({
+        "events": [{ "task_id": "t1", "tool": "neurostrata_add_memory" }],
+        "queries": [{ "tool": "neurostrata_related" }]
+    });
+    assert!(
+        graph_tools_from_ledger(&non_graph_events, &active).is_empty(),
+        "no fallback to legacy rows when attributed events yield no graph tool"
+    );
+}
+
+/// Fix round 1 / finding 2: only open/in_progress/blocked tasks are in flight.
+/// A done task's attributed receipt must not count; unknown statuses neither.
+#[test]
+fn snapshot_readiness_done_task_receipts_excluded() {
+    use snapshot_readiness::{active_task_ids, graph_tools_from_ledger, ACTIVE_TASK_STATUSES};
+
+    assert_eq!(ACTIVE_TASK_STATUSES, &["open", "in_progress", "blocked"]);
+    let ids = active_task_ids(&[
+        ("done-task".to_string(), "done".to_string()),
+        ("open-task".to_string(), "open".to_string()),
+        ("inprog-task".to_string(), "in_progress".to_string()),
+        ("blocked-task".to_string(), "blocked".to_string()),
+        ("weird-task".to_string(), "archived".to_string()),
+    ]);
+    assert!(!ids.contains("done-task"));
+    assert!(!ids.contains("weird-task"));
+    assert!(ids.contains("open-task"));
+    assert!(ids.contains("inprog-task"));
+    assert!(ids.contains("blocked-task"));
+
+    let ledger = serde_json::json!({
+        "events": [
+            { "task_id": "done-task", "tool": "neurostrata_related" },
+            { "task_id": "inprog-task", "tool": "neurostrata_sparql_query" },
+            { "task_id": "inprog-task", "tool": "neurostrata_related" },
+            { "tool": "neurostrata_locate" }
+        ]
+    });
+    assert_eq!(
+        graph_tools_from_ledger(&ledger, &ids),
+        vec!["neurostrata_related", "neurostrata_sparql_query"],
+        "done-task and unattributed receipts must not count"
+    );
+}

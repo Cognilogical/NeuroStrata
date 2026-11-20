@@ -5518,11 +5518,10 @@ fn apply_doctor_version(state: &mut Value, version: &str, allowed: bool) {
     }
 }
 
-/// Distinct graph/ontology MCP tool names recorded for active tasks. Reads the
-/// existing session ledger fail-soft; a missing/unreadable ledger yields an
-/// empty set (diversity 0), never a fabricated count. `events[]` (post-dispatch
-/// receipts) carry `task_id` and are preferred; legacy `queries[]` lack task
-/// attribution and are used only when no attributed event contributed a tool.
+/// Read the session ledger fail-soft and count only attributed post-dispatch
+/// graph tools from active tasks. A missing/unreadable ledger yields 0. Legacy
+/// `queries[]` rows are excluded from this metric by design (spec R6), so the
+/// thin wrapper delegates to the pure helper after parsing.
 fn active_task_graph_tool_names(
     root: Option<&str>,
     active_task_ids: &std::collections::BTreeSet<String>,
@@ -5537,44 +5536,7 @@ fn active_task_graph_tool_names(
     let Ok(doc) = serde_json::from_str::<Value>(&text) else {
         return Vec::new();
     };
-    let mut tools: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    fn insert_graph_tool(tools: &mut std::collections::BTreeSet<String>, value: Option<&str>) {
-        if let Some(tool) = value {
-            const GRAPH_TOOLS: &[&str] = &[
-                "neurostrata_memories_for_file",
-                "neurostrata_related",
-                "neurostrata_locate",
-                "neurostrata_sparql_query",
-                "neurostrata_object_view",
-                "neurostrata_taxonomy",
-                "neurostrata_diff_tour",
-                "neurostrata_search_memory",
-            ];
-            if GRAPH_TOOLS.contains(&tool) {
-                tools.insert(tool.to_string());
-            }
-        }
-    }
-    if let Some(events) = doc.get("events").and_then(Value::as_array) {
-        for event in events {
-            let attributed = event
-                .get("task_id")
-                .and_then(Value::as_str)
-                .map(|id| active_task_ids.contains(id))
-                .unwrap_or(false);
-            if attributed {
-                insert_graph_tool(&mut tools, event.get("tool").and_then(Value::as_str));
-            }
-        }
-    }
-    if tools.is_empty() {
-        if let Some(queries) = doc.get("queries").and_then(Value::as_array) {
-            for query in queries {
-                insert_graph_tool(&mut tools, query.get("tool").and_then(Value::as_str));
-            }
-        }
-    }
-    tools.into_iter().collect()
+    crate::task::snapshot_readiness::graph_tools_from_ledger(&doc, active_task_ids)
 }
 
 async fn handle_get_snapshot(
@@ -6428,12 +6390,21 @@ async fn handle_get_snapshot(
                 epistemic_status,
             })
             .collect();
-    let active_task_ids: std::collections::BTreeSet<String> = all_memories
+    // Only work in flight may attract tool receipts; done/retired tasks must
+    // not inflate diversity. Status mapping is the gate's own enum -> string.
+    let active_task_status_rows: Vec<(String, String)> = all_memories
         .iter()
         .filter(|r| crate::task::gate::is_task(r))
         .filter(|r| !crate::task::gate::is_retired(&r.payload.metadata, now))
-        .map(|r| r.id.clone())
+        .map(|r| {
+            (
+                r.id.clone(),
+                crate::task::gate::task_status(r).as_str().to_string(),
+            )
+        })
         .collect();
+    let active_task_ids =
+        crate::task::snapshot_readiness::active_task_ids(&active_task_status_rows);
     let readiness_input = crate::task::snapshot_readiness::ReadinessInput {
         concepts: readiness_concepts,
         graph_tool_names: active_task_graph_tool_names(inferred_root.as_deref(), &active_task_ids),
