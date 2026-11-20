@@ -1,10 +1,11 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { readFileSync, mkdirSync, writeFileSync, rmSync, mkdtempSync, existsSync } from "node:fs";
+import { readFileSync, mkdirSync, writeFileSync, rmSync, mkdtempSync, existsSync, copyFileSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
-import { join, isAbsolute } from "node:path";
-import { execFileSync as execFileSyncTop } from "node:child_process";
+import { join, isAbsolute, resolve, dirname } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { execFileSync as execFileSyncTop, spawn } from "node:child_process";
 
 // Windows cannot execute a .sh file directly (EFTYPE). Production hook
 // execution uses git's own shell, so resolve Git Bash through `git
@@ -25,6 +26,10 @@ function resolveGitBash() {
   }
 }
 const GIT_BASH = process.platform === "win32" ? resolveGitBash() : null;
+
+// The suite must pass from any cwd (repo root or plugins/core); derive the
+// repo root from this file's location instead of process.cwd().
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 
 function winHookSkip() {
   return process.platform === "win32" && !GIT_BASH
@@ -3192,4 +3197,150 @@ describe("nb9q FIX3: no task-intent intake from read-only tool output", () => {
       resetModuleState();
     }
   });
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// Installer CLI hook runner contract (#313, #310)
+// ──────────────────────────────────────────────────────────────────────
+// The daemon writes hook-runner.mjs (CLI_HOOK_RUNNER_MJS in
+// src/task/harness_plugins.rs) beside each adapter's dist/ and points the
+// harness config at it. A CLI host executes exactly that artifact, so this
+// contract is tested through the verbatim runner text in a spawned process:
+// a missing handler export or a crashing initialize must be visible as a
+// wrong decision on stdout, not as a passing string-count on dist text.
+
+describe("installer CLI hook runner contract", () => {
+  const ADAPTERS = ["claude", "codex", "github-cli", "opencode", "hermes", "openclaw"];
+
+  const runnerMatch = readFileSync(join(REPO_ROOT, "src", "task", "harness_plugins.rs"), "utf8")
+    .match(/const CLI_HOOK_RUNNER_MJS: &str = r#"([\s\S]*?)"#;/);
+  assert.ok(runnerMatch, "CLI_HOOK_RUNNER_MJS must be extractable from harness_plugins.rs");
+
+  const makeFixtureServer = () => {
+    const calls = [];
+    const server = http.createServer(async (req, res) => {
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      let call = null;
+      try {
+        call = JSON.parse(body);
+      } catch {
+        // fall through to a generic reply
+      }
+      if (call) calls.push(call);
+      const result =
+        call && call.method === "tools/list"
+          ? {
+              tools: [
+                "neurostrata_guard_validate",
+                "neurostrata_task_create",
+                "neurostrata_task_list",
+                "neurostrata_memories_for_file",
+                "neurostrata_get_snapshot",
+              ].map((name) => ({ name })),
+            }
+          : {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify({
+                    verdict: {
+                      bucket: "DeterministicReject",
+                      reasons: ["runner contract fixture"],
+                      constraints: [],
+                    },
+                  }),
+                },
+              ],
+            };
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: call ? call.id : 1, result }));
+    });
+    return { calls, server };
+  };
+
+  const runRunnerAgainstFixture = (adapter, endpoint) =>
+    new Promise((resolve, reject) => {
+      const dir = mkdtempSync(join(tmpdir(), `ns-runner-${adapter}-`));
+      const cleanup = () => rmSync(dir, { recursive: true, force: true });
+      try {
+        mkdirSync(join(dir, "dist"), { recursive: true });
+        copyFileSync(
+          join(REPO_ROOT, "plugins", adapter, "dist", "index.js"),
+          join(dir, "dist", "index.js")
+        );
+        writeFileSync(join(dir, "package.json"), JSON.stringify({ type: "module" }));
+        writeFileSync(join(dir, "hook-runner.mjs"), runnerMatch[1]);
+        // The plugins default their endpoint to the local daemon; the fixture
+        // intercepts fetch so the spawned runner talks to the test server.
+        writeFileSync(
+          join(dir, "fetch-fixture.mjs"),
+          "const realFetch = globalThis.fetch.bind(globalThis);\n" +
+            `globalThis.fetch = (_url, opts) => realFetch(${JSON.stringify(endpoint)}, opts);\n`
+        );
+        const event = {
+          hook_event_name: "PreToolUse",
+          tool_name: "bash",
+          tool_input: { command: "git commit -m 'runner contract fixture mutation'" },
+          session_id: "runner-contract-test",
+        };
+        // Async spawn: the parent must keep serving the fixture, so a
+        // synchronous spawn would deadlock the child against this server.
+        const child = spawn(
+          process.execPath,
+          ["--import", pathToFileURL(join(dir, "fetch-fixture.mjs")).href, join(dir, "hook-runner.mjs")],
+          { stdio: ["pipe", "pipe", "pipe"] }
+        );
+        let stdout = "";
+        let stderr = "";
+        child.stdout.on("data", (d) => (stdout += d));
+        child.stderr.on("data", (d) => (stderr += d));
+        const timer = setTimeout(() => child.kill("SIGKILL"), 30000);
+        child.on("error", (err) => {
+          clearTimeout(timer);
+          cleanup();
+          reject(err);
+        });
+        child.on("close", (code) => {
+          clearTimeout(timer);
+          cleanup();
+          resolve({ status: code ?? -1, stdout, stderr });
+        });
+        child.stdin.write(JSON.stringify(event));
+        child.stdin.end();
+      } catch (err) {
+        cleanup();
+        reject(err);
+      }
+    });
+
+  for (const adapter of ADAPTERS) {
+    it(`${adapter}: a denying guard must produce a deny decision and a guard call`, async () => {
+      const { calls, server } = makeFixtureServer();
+      await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+      const endpoint = `http://127.0.0.1:${server.address().port}/mcp`;
+      try {
+        const { status, stdout, stderr } = await runRunnerAgainstFixture(adapter, endpoint);
+        assert.equal(status, 0, `runner must exit 0 (stderr: ${stderr.slice(0, 200)})`);
+        const lastLine = stdout.trim().split("\n").pop() || "{}";
+        const out = JSON.parse(lastLine);
+        const decision = out?.hookSpecificOutput?.permissionDecision;
+        assert.equal(
+          decision,
+          "deny",
+          `runner must return a deny decision for ${adapter}, got: ${stdout.slice(0, 300)}`
+        );
+        assert.ok(
+          calls.some(
+            (c) =>
+              c.method === "tools/call" &&
+              /guard_validate/.test(String(c.params?.name))
+          ),
+          `neurostrata_guard_validate must have been called for ${adapter}`
+        );
+      } finally {
+        server.close();
+      }
+    });
+  }
 });
