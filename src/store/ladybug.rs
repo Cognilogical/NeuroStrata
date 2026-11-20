@@ -1677,6 +1677,7 @@ impl LadybugStore {
     /// this only moves for the hits no edge query reached (the metadata
     /// fallback), and the fallback reads them all in one query. A test that
     /// seeds a large hit set asserts it does not grow.
+    #[cfg(test)]
     pub fn census_reads(&self) -> u64 {
         self.census_reads.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -13553,8 +13554,11 @@ impl LadybugStore {
         hits: &mut [crate::graph_read::memories_for_file::MemoryHit],
     ) {
         #[cfg(test)]
-        if BRIDGE_ENRICHMENT_TEST_ACTIVE.with(|flag| flag.get()) && !hits.is_empty() {
-            BRIDGE_ENRICHMENT_COUNTER_FOR_TESTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if !hits.is_empty() {
+            if BRIDGE_ENRICHMENT_TEST_ACTIVE.with(|flag| flag.get()) {
+                BRIDGE_ENRICHMENT_COUNTER_FOR_TESTS
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             crate::server::context_plan_benchmark_instrumentation::record_bridge_enrichment_pass();
         }
 
