@@ -173,7 +173,11 @@ pub fn percentile(samples: &[f64], p: f64) -> f64 {
         return 0.0;
     }
     values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let p = if p.is_finite() { p.clamp(0.0, 100.0) } else { 100.0 };
+    let p = if p.is_finite() {
+        p.clamp(0.0, 100.0)
+    } else {
+        100.0
+    };
     if values.len() == 1 {
         return values[0];
     }
@@ -233,7 +237,10 @@ pub fn validate_arm_metrics(metrics: &ArmMetrics) -> Result<(), String> {
     ];
     for (name, value) in fields {
         if !value.is_finite() {
-            return Err(format!("arm {:?} field {} is not finite", metrics.arm, name));
+            return Err(format!(
+                "arm {:?} field {} is not finite",
+                metrics.arm, name
+            ));
         }
     }
     for query in &metrics.queries {
@@ -243,7 +250,10 @@ pub fn validate_arm_metrics(metrics: &ArmMetrics) -> Result<(), String> {
             ("precision_at_5", query.precision_at_5),
         ] {
             if !value.is_finite() {
-                return Err(format!("query {} field {} is not finite", query.query_id, name));
+                return Err(format!(
+                    "query {} field {} is not finite",
+                    query.query_id, name
+                ));
             }
         }
     }
@@ -254,7 +264,10 @@ fn mean_subset_recall(metrics: &ArmMetrics) -> Option<f64> {
     let mut sum = 0.0;
     let mut count = 0usize;
     for query in &metrics.queries {
-        if matches!(query.category, QueryCategory::Alias | QueryCategory::Hierarchy) {
+        if matches!(
+            query.category,
+            QueryCategory::Alias | QueryCategory::Hierarchy
+        ) {
             sum += query.recall_at_5;
             count += 1;
         }
@@ -267,7 +280,10 @@ fn mean_subset_recall(metrics: &ArmMetrics) -> Option<f64> {
 }
 
 fn violation(code: &str, detail: String) -> GateViolation {
-    GateViolation { code: code.to_string(), detail }
+    GateViolation {
+        code: code.to_string(),
+        detail,
+    }
 }
 
 /// Evaluate the accepted acceptance gate: arm 4 (ontology) vs arm 3 (flat
@@ -360,7 +376,9 @@ pub fn evaluate_thresholds(
         if overhead > 25.0 || relative > 0.10 {
             violations.push(violation(
                 "p95_overhead_exceeded",
-                format!("p95 overhead {overhead:.3} ms exceeds 25 ms or 10% relative ({relative:.6})"),
+                format!(
+                    "p95 overhead {overhead:.3} ms exceeds 25 ms or 10% relative ({relative:.6})"
+                ),
             ));
         }
     }
@@ -391,8 +409,15 @@ pub fn evaluate_thresholds(
         ));
     }
 
-    let verdict = if violations.is_empty() { GateVerdict::Pass } else { GateVerdict::Fail };
-    GateReport { verdict, violations }
+    let verdict = if violations.is_empty() {
+        GateVerdict::Pass
+    } else {
+        GateVerdict::Fail
+    };
+    GateReport {
+        verdict,
+        violations,
+    }
 }
 
 /// Median per-query p95 latency across measured iterations. Input is
@@ -401,20 +426,32 @@ pub fn evaluate_thresholds(
 /// malformed shape.
 pub fn per_query_p95_medians(samples: &[Vec<f64>]) -> Result<Vec<f64>, String> {
     if samples.len() < 3 {
-        return Err(format!("p95 requires at least 3 measured iterations, got {}", samples.len()));
+        return Err(format!(
+            "p95 requires at least 3 measured iterations, got {}",
+            samples.len()
+        ));
     }
     let query_count = samples[0].len();
     if query_count == 0 {
         return Err("p95 requires at least one query sample".to_string());
     }
-    if let Some((i, row)) = samples.iter().enumerate().find(|(_, row)| row.len() != query_count) {
+    if let Some((i, row)) = samples
+        .iter()
+        .enumerate()
+        .find(|(_, row)| row.len() != query_count)
+    {
         return Err(format!(
             "iteration {i} has {} query samples, expected {query_count}",
             row.len()
         ));
     }
     Ok((0..query_count)
-        .map(|q| percentile(&samples.iter().map(|row| row[q]).collect::<Vec<f64>>(), 50.0))
+        .map(|q| {
+            percentile(
+                &samples.iter().map(|row| row[q]).collect::<Vec<f64>>(),
+                50.0,
+            )
+        })
         .collect())
 }
 

@@ -114,10 +114,11 @@ export function resolveConfig(
     asString(input.endpoint) ??
     asString(input.guardEndpoint) ??
     DEFAULT_CONFIG.endpoint
-  const namespace =
+  const namespace = sanitizeSubagentHeaderToken(
     asString(input.namespace) ??
-    asString(process.env.NEUROSTRATA_NAMESPACE) ??
-    discoverProjectNamespace(cwd)
+      asString(process.env.NEUROSTRATA_NAMESPACE) ??
+      discoverProjectNamespace(cwd)
+  )
   return {
     namespace,
     endpoint,
@@ -1828,6 +1829,9 @@ function buildSubagentContextHeaderInternal(
   options?: SubagentHeaderOptions
 ): string {
   const taskLabel = taskId ?? 'unclaimed (claim a task first)'
+  const safeNamespace = sanitizeSubagentHeaderToken(namespace)
+  const safeTaskLabel =
+    taskId === null ? taskLabel : sanitizeSubagentHeaderToken(taskLabel)
   const extra =
     extraContext && extraContext.trim() ? `\n${extraContext.trim()}\n` : ''
   let lookupRule: string

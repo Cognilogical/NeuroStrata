@@ -89,10 +89,15 @@ mod unix_impl {
             Ok(path) => {
                 // Leaked on purpose: the handler reads it while the process
                 // is dying, and freeing it then would be a use-after-free.
-                if CRASH_DIR.set(path).is_err() && CRASH_DIR.get().map(|c| c.as_bytes()) != Some(crash_dir.as_os_str().as_bytes()) {
+                if CRASH_DIR.set(path).is_err()
+                    && CRASH_DIR.get().map(|c| c.as_bytes())
+                        != Some(crash_dir.as_os_str().as_bytes())
+                {
                     tracing::debug!(
                         "crash dir already initialized to {:?}; keeping it instead of {:?}",
-                        CRASH_DIR.get().map(|c| String::from_utf8_lossy(c.as_bytes())),
+                        CRASH_DIR
+                            .get()
+                            .map(|c| String::from_utf8_lossy(c.as_bytes())),
                         crash_dir
                     );
                 }

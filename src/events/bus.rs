@@ -197,7 +197,10 @@ impl Queue {
     }
 
     fn pop(&self) -> Option<ThalamicPulse> {
-        self.items.lock().unwrap_or_else(|e| e.into_inner()).pop_front()
+        self.items
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front()
     }
 
     fn len(&self) -> usize {
@@ -332,11 +335,7 @@ impl ThalamicBus {
         BusMetrics {
             events_emitted: self.metrics.events_emitted.load(Ordering::Relaxed),
             dispatcher_handled: self.metrics.dispatcher_handled.load(Ordering::Relaxed),
-            subscribers: self
-                .subs
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .len(),
+            subscribers: self.subs.lock().unwrap_or_else(|e| e.into_inner()).len(),
             queue_depth: self.queue.len(),
             drops_oldest: self.metrics.drops_oldest.load(Ordering::Relaxed),
             subscriber_panics: self.metrics.subscriber_panics.load(Ordering::Relaxed),
@@ -433,10 +432,8 @@ async fn dispatch(
             ts,
         };
 
-        let registered: Vec<Arc<dyn MemorySubscriber>> = subs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let registered: Vec<Arc<dyn MemorySubscriber>> =
+            subs.lock().unwrap_or_else(|e| e.into_inner()).clone();
         for sub in registered.iter() {
             // A fresh depth-1 token per subscriber: the token exists to refuse
             // a subscriber emitting from inside its own invocation.
@@ -488,7 +485,11 @@ async fn dispatch(
                         let ts = ts;
                         let name = name.clone();
                         tokio::spawn(async move {
-                            let ctx = SubscriberContext { store: store.as_ref(), namespace: &ns, ts };
+                            let ctx = SubscriberContext {
+                                store: store.as_ref(),
+                                namespace: &ns,
+                                ts,
+                            };
                             let retry = tokio::time::timeout(
                                 SUBSCRIBER_TIMEOUT * 4,
                                 AssertUnwindSafe(sub.handle(&event, &RecursionToken::new(), &ctx))
@@ -499,12 +500,18 @@ async fn dispatch(
                                 Ok(Ok(Ok(()))) => {}
                                 Ok(Ok(Err(err))) => {
                                     metrics.subscriber_failures.fetch_add(1, Ordering::Relaxed);
-                                    tracing::warn!(subscriber = name, "subscriber retry after timeout failed: {err:#}");
+                                    tracing::warn!(
+                                        subscriber = name,
+                                        "subscriber retry after timeout failed: {err:#}"
+                                    );
                                 }
                                 Ok(Err(payload)) => {
                                     metrics.subscriber_panics.fetch_add(1, Ordering::Relaxed);
                                     let text = panic_text(payload.as_ref());
-                                    tracing::warn!(subscriber = name, "subscriber panicked on retry after timeout: {text}");
+                                    tracing::warn!(
+                                        subscriber = name,
+                                        "subscriber panicked on retry after timeout: {text}"
+                                    );
                                 }
                                 Err(_) => {
                                     tracing::warn!(
@@ -887,7 +894,11 @@ mod tests {
             flipped.load(Ordering::Acquire),
             "the retry under the extended budget landed the flip"
         );
-        assert_eq!(calls.load(Ordering::Acquire), 2, "first attempt plus exactly one retry");
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            2,
+            "first attempt plus exactly one retry"
+        );
     }
 
     #[tokio::test]
@@ -1056,11 +1067,11 @@ mod tests {
         }
     }
 
-impl crate::traits::AsAny for RecordingStore {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+    impl crate::traits::AsAny for RecordingStore {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
     }
-}
 
     /// Calls `ctx.store.get` once per pulse and records the outcome: the
     /// observable difference between an attached store and the stand-in.

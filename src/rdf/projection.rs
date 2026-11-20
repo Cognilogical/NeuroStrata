@@ -531,10 +531,7 @@ pub fn memory_to_quads(
 
     // Thesis RDF projection
     if payload.memory_type == "thesis" {
-        let thesis_obj = payload
-            .metadata
-            .get("thesis")
-            .and_then(|v| v.as_object());
+        let thesis_obj = payload.metadata.get("thesis").and_then(|v| v.as_object());
         let get_field = |key: &str| -> Option<&serde_json::Value> {
             payload
                 .metadata
@@ -623,12 +620,9 @@ pub fn memory_to_quads(
     // Active visible `concept` rows project W3C SKOS triples into the
     // namespace RDF graph.
     if payload.memory_type == "concept" {
-        let skos = |name: &str| -> String {
-            format!("http://www.w3.org/2004/02/skos/core#{name}")
-        };
-        let concept_node_for_slug = |slug_str: &str| -> NamedNode {
-            canonical_concept_node(namespace, slug_str, None)
-        };
+        let skos = |name: &str| -> String { format!("http://www.w3.org/2004/02/skos/core#{name}") };
+        let concept_node_for_slug =
+            |slug_str: &str| -> NamedNode { canonical_concept_node(namespace, slug_str, None) };
         if let Some(c) = payload.metadata.get("concept").and_then(|v| v.as_object()) {
             let slug = c
                 .get("slug")
@@ -740,7 +734,10 @@ pub fn memory_to_quads(
                 })
                 .unwrap_or_default();
             for (idx, b_slug) in broader_vec.iter().enumerate() {
-                iri_quad!(ns_predicate(&format!("broaderConcept_{idx}")), b_slug.clone());
+                iri_quad!(
+                    ns_predicate(&format!("broaderConcept_{idx}")),
+                    b_slug.clone()
+                );
                 let parent_nn = concept_node_for_slug(b_slug);
                 let parent_subj = NamedOrBlankNode::NamedNode(parent_nn.clone());
                 push_concept_quad!(
@@ -767,7 +764,10 @@ pub fn memory_to_quads(
                 })
                 .unwrap_or_default();
             for (idx, r_slug) in related_vec.iter().enumerate() {
-                iri_quad!(ns_predicate(&format!("relatedConcept_{idx}")), r_slug.clone());
+                iri_quad!(
+                    ns_predicate(&format!("relatedConcept_{idx}")),
+                    r_slug.clone()
+                );
                 let rel_nn = concept_node_for_slug(r_slug);
                 let rel_subj = NamedOrBlankNode::NamedNode(rel_nn.clone());
                 push_concept_quad!(
@@ -1194,11 +1194,7 @@ pub fn twin_schema_and_reducer_quads_for_row(
 
 /// Construct the canonical SKOS concept IRI (`urn:neurostrata:concept:{namespace}:{slug}`)
 /// per Spec §4.2, honoring an explicit valid `custom_iri` when present.
-pub fn canonical_concept_node(
-    namespace: &str,
-    slug: &str,
-    custom_iri: Option<&str>,
-) -> NamedNode {
+pub fn canonical_concept_node(namespace: &str, slug: &str, custom_iri: Option<&str>) -> NamedNode {
     if let Some(iri) = custom_iri.map(str::trim).filter(|s| !s.is_empty()) {
         if NamedNode::new(iri).is_ok() {
             return NamedNode::new_unchecked(iri.to_string());
@@ -1266,7 +1262,12 @@ pub fn reconcile_concept_quads_with_view(
         &hydrated.epistemic_status,
         NamedNode::new_unchecked(XSD_STRING),
     ));
-    let q1 = Quad::new(concept_subject.clone(), ep_pred.clone(), ep_lit.clone(), graph.clone());
+    let q1 = Quad::new(
+        concept_subject.clone(),
+        ep_pred.clone(),
+        ep_lit.clone(),
+        graph.clone(),
+    );
     if !quads.contains(&q1) {
         quads.push(q1);
     }
@@ -1275,10 +1276,8 @@ pub fn reconcile_concept_quads_with_view(
         quads.push(q2);
     }
 
-    let skos_narrower =
-        NamedNode::new_unchecked("http://www.w3.org/2004/02/skos/core#narrower");
-    let skos_related =
-        NamedNode::new_unchecked("http://www.w3.org/2004/02/skos/core#related");
+    let skos_narrower = NamedNode::new_unchecked("http://www.w3.org/2004/02/skos/core#narrower");
+    let skos_related = NamedNode::new_unchecked("http://www.w3.org/2004/02/skos/core#related");
     let ns_contrasts = NamedNode::new_unchecked(ns_predicate("contrastsWith"));
 
     let concept_node_for_slug = |target_slug: &str| -> NamedNode {

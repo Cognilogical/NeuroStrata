@@ -3611,6 +3611,16 @@ pub(crate) fn related_traversal_counter_for_tests() -> usize {
     RELATED_TRAVERSAL_COUNTER.with(|c| c.get())
 }
 
+#[cfg(test)]
+static RELATED_TRAVERSAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn related_traversal_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    RELATED_TRAVERSAL_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
 /// Whether a `related` seed names a file path (and so needs canonical
 /// resolution before traversal) rather than a memory/task id. Qualified ids
 /// and symbol ids (`a::b`) are never file paths.
@@ -15135,6 +15145,7 @@ mod tests {
 
     #[tokio::test]
     async fn related_surface_emits_deprecation_presentation() {
+        let _related_guard = crate::server::related_traversal_test_lock();
         let (store, rule_id) = store_with_deprecated_rule("probe").await;
         let lb = crate::traits::VectorStore::as_any(store.as_ref())
             .downcast_ref::<crate::store::LadybugStore>()
@@ -15174,6 +15185,7 @@ mod tests {
 
     #[tokio::test]
     async fn related_resolves_file_seed_across_absolute_and_relative_spellings() {
+        let _related_guard = crate::server::related_traversal_test_lock();
         let tmp = tempfile::tempdir().expect("temp dir");
         let store: Arc<dyn VectorStore> = Arc::new(
             crate::store::ladybug::LadybugStore::for_testing(tmp.path().join("db"), 4)
@@ -15241,6 +15253,7 @@ mod tests {
 
     #[tokio::test]
     async fn related_unresolvable_absolute_file_seed_returns_explicit_error() {
+        let _related_guard = crate::server::related_traversal_test_lock();
         let tmp = tempfile::tempdir().expect("temp dir");
         let store: Arc<dyn VectorStore> = Arc::new(
             crate::store::ladybug::LadybugStore::for_testing(tmp.path().join("db"), 4)

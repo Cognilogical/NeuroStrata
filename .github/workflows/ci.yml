@@ -369,7 +369,7 @@ jobs:
           base_sha="${{ github.event.pull_request.base.sha }}"
           git fetch --no-tags --depth=1 origin "$base_sha"
 
-          changed=$(git diff --name-only --diff-filter=ACMR "$base_sha" HEAD -- '*.sh' 'scripts/hooks/*')
+          changed=$(git diff --name-only --diff-filter=ACMRT -z "$base_sha" HEAD -- '*.sh' 'scripts/hooks/*')
           if [ -z "$changed" ]; then
             echo "no changed shell files"
             exit 0
@@ -388,7 +388,7 @@ jobs:
           trap cleanup EXIT
           git worktree add --detach "$tmp/wt" "$base_sha"
 
-          while IFS= read -r file; do
+          while IFS= read -r -d '' file; do
             [ -n "$file" ] || continue
             [ -f "$file" ] || continue
             mkdir -p "$tmp/wt/$(dirname "$file")"
@@ -400,7 +400,7 @@ jobs:
           cp scripts/clippy-staged-diagnostics.mjs "$tmp/wt/scripts/clippy-staged-diagnostics.mjs"
 
           cd "$tmp/wt"
-          while IFS= read -r file; do
+          while IFS= read -r -d '' file; do
             [ -n "$file" ] || continue
             [ -f "$file" ] && git add -- "$file"
           done <<< "$changed"

@@ -174,23 +174,19 @@ pub fn extract_public_surface_identifiers(text: &str) -> Vec<String> {
 
 fn rename_source(root: &Path, range: &str, rel_path: &str) -> Option<String> {
     let out = std::process::Command::new("git")
-        .args([
-            "diff",
-            "-M",
-            "--name-status",
-            "--diff-filter=R",
-            range,
-        ])
+        .args(["diff", "-M", "--name-status", "--diff-filter=R", range])
         .current_dir(root)
         .output()
         .ok()?;
     if !out.status.success() {
         return None;
     }
-    String::from_utf8_lossy(&out.stdout).lines().find_map(|line| {
-        let fields: Vec<_> = line.split('\t').collect();
-        (fields.len() == 3 && fields[2] == rel_path).then(|| fields[1].to_string())
-    })
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|line| {
+            let fields: Vec<_> = line.split('\t').collect();
+            (fields.len() == 3 && fields[2] == rel_path).then(|| fields[1].to_string())
+        })
 }
 
 fn watched_added_lines(root: &Path, rel_path: &str) -> String {
@@ -218,14 +214,29 @@ fn watched_added_lines(root: &Path, rel_path: &str) -> String {
         }
         let mut diffs: Vec<Vec<String>> = Vec::new();
         if let Some(range) = &range {
-            let mut args = vec!["diff".into(), "-U0".into(), "-M".into(), range.clone(), "--".into()];
+            let mut args = vec![
+                "diff".into(),
+                "-U0".into(),
+                "-M".into(),
+                range.clone(),
+                "--".into(),
+            ];
             args.extend(diff_paths.clone());
             diffs.push(args);
         }
-        let mut args = vec!["diff".into(), "-U0".into(), "-M".into(), "HEAD".into(), "--".into()];
+        let mut args = vec![
+            "diff".into(),
+            "-U0".into(),
+            "-M".into(),
+            "HEAD".into(),
+            "--".into(),
+        ];
         args.extend(diff_paths);
         diffs.push(args);
-        for args in diffs.iter().map(|v| v.iter().map(|s| s.as_str()).collect::<Vec<_>>()) {
+        for args in diffs
+            .iter()
+            .map(|v| v.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+        {
             if let Ok(out) = std::process::Command::new("git")
                 .args(&args)
                 .current_dir(root)
@@ -472,7 +483,10 @@ pub fn evaluate_doc_gate(
                     rule_id: rule.id.clone(),
                     kind: "missing_required_heading".to_string(),
                     path: target_doc_path.to_string_lossy().to_string(),
-                    detail: format!("required heading '{}' missing in {}", heading, rule.target_doc),
+                    detail: format!(
+                        "required heading '{}' missing in {}",
+                        heading, rule.target_doc
+                    ),
                 });
             }
         }
@@ -656,7 +670,11 @@ mod tests {
         let bad_token_a = concat!("cog", "nee");
         let bad_token_b = concat!("oxi", "rs");
         let bad_name = format!("design-{}", bad_token_a);
-        std::fs::write(docs_dir.join("vision").join(format!("{}.md", bad_name)), "# Bad").unwrap();
+        std::fs::write(
+            docs_dir.join("vision").join(format!("{}.md", bad_name)),
+            "# Bad",
+        )
+        .unwrap();
         let manifest = serde_json::json!({
             "schema_version": 1,
             "allowed_root_files": ["README.md", "manifest.json"],
@@ -805,10 +823,7 @@ mod tests {
         }"###;
         std::fs::write(docs_dir.join("manifest.json"), manifest).unwrap();
 
-        let report = evaluate_doc_gate(
-            tmp_dir.path(),
-            Some(vec!["src/server.rs".to_string()]),
-        );
+        let report = evaluate_doc_gate(tmp_dir.path(), Some(vec!["src/server.rs".to_string()]));
         assert!(!report.passed);
         assert_eq!(report.violations.len(), 1);
         assert_eq!(
@@ -860,14 +875,10 @@ mod tests {
         }"###;
         std::fs::write(docs_dir.join("manifest.json"), manifest).unwrap();
 
-        let report = evaluate_doc_gate(
-            tmp_dir.path(),
-            Some(vec!["src/main.rs".to_string()]),
-        );
+        let report = evaluate_doc_gate(tmp_dir.path(), Some(vec!["src/main.rs".to_string()]));
         assert!(!report.passed);
         assert!(report.violations.iter().any(|v| {
-            v.kind == "undocumented_public_identifier"
-                && v.detail.contains("undocumented-new-cmd")
+            v.kind == "undocumented_public_identifier" && v.detail.contains("undocumented-new-cmd")
         }));
     }
 
@@ -918,7 +929,12 @@ mod tests {
                 .args(args)
                 .output()
                 .expect("git available in test env");
-            assert!(out.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
         run(&["init", "-q"]);
         run(&["config", "user.email", "worker@example.com"]);
@@ -937,9 +953,13 @@ mod tests {
             report.changed_paths
         );
         assert!(!report.passed);
-        assert!(report.violations.iter().any(|v| {
-            v.kind == "surface_changed_without_doc_update" && v.rule_id == "test-rule-1"
-        }), "expected co-change violation, got {:?}", report.violations);
+        assert!(
+            report.violations.iter().any(|v| {
+                v.kind == "surface_changed_without_doc_update" && v.rule_id == "test-rule-1"
+            }),
+            "expected co-change violation, got {:?}",
+            report.violations
+        );
     }
 
     #[test]
@@ -998,8 +1018,11 @@ mod tests {
         let tmp_dir = tempfile::tempdir().unwrap();
         let root = tmp_dir.path();
         std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src").join("old.rs"), "pub trait LegacyTrait {}\n")
-            .unwrap();
+        std::fs::write(
+            root.join("src").join("old.rs"),
+            "pub trait LegacyTrait {}\n",
+        )
+        .unwrap();
         init_git_repo(root);
         run_git(root, &["add", "."]);
         run_git(root, &["commit", "-q", "-m", "baseline"]);

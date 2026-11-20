@@ -242,7 +242,11 @@ pub const VALID_FIRES_ON: &[&str] = &[
 pub fn compute_lifecycle_delta(
     configured_wires: &[String],
     configured_fires_on: &[String],
-) -> (Vec<&'static Wire>, Vec<&'static Reminder>, Vec<&'static str>) {
+) -> (
+    Vec<&'static Wire>,
+    Vec<&'static Reminder>,
+    Vec<&'static str>,
+) {
     let new_auto: Vec<&'static Wire> = AUTOMATIC_WIRES
         .iter()
         .filter(|w| !configured_wires.iter().any(|c| c == w.id))
@@ -292,8 +296,14 @@ mod tests {
         assert!(!new_rem.is_empty());
         assert!(!new_fires.is_empty());
         let (new_auto2, new_rem2, new_fires2) = compute_lifecycle_delta(
-            &known_wire_ids().into_iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-            &VALID_FIRES_ON.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            &known_wire_ids()
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+            &VALID_FIRES_ON
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
         );
         assert!(new_auto2.is_empty());
         assert!(new_rem2.is_empty());

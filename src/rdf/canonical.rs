@@ -32,11 +32,27 @@ pub fn canonicalize_known_ids_alias(raw: &str, index: &OntologyIndex) -> String 
 pub fn memory_to_nquads(id: &str, payload: &crate::traits::MemoryPayload) -> String {
     let subj = format!("<urn:neurostrata:memory:{}>", id);
     let mut lines: Vec<String> = Vec::new();
-    lines.push(format!("{} <urn:neurostrata:content> \"{}\" .", subj, escape_nq(&payload.content)));
-    lines.push(format!("{} <urn:neurostrata:memory_type> \"{}\" .", subj, escape_nq(&payload.memory_type)));
-    lines.push(format!("{} <urn:neurostrata:user_id> \"{}\" .", subj, escape_nq(&payload.user_id)));
+    lines.push(format!(
+        "{} <urn:neurostrata:content> \"{}\" .",
+        subj,
+        escape_nq(&payload.content)
+    ));
+    lines.push(format!(
+        "{} <urn:neurostrata:memory_type> \"{}\" .",
+        subj,
+        escape_nq(&payload.memory_type)
+    ));
+    lines.push(format!(
+        "{} <urn:neurostrata:user_id> \"{}\" .",
+        subj,
+        escape_nq(&payload.user_id)
+    ));
     if !payload.location.is_empty() {
-        lines.push(format!("{} <urn:neurostrata:location> \"{}\" .", subj, escape_nq(&payload.location)));
+        lines.push(format!(
+            "{} <urn:neurostrata:location> \"{}\" .",
+            subj,
+            escape_nq(&payload.location)
+        ));
     }
     if let Some(obj) = payload.metadata.as_object() {
         for (k, v) in obj {
@@ -54,7 +70,11 @@ pub fn memory_to_nquads(id: &str, payload: &crate::traits::MemoryPayload) -> Str
         }
     }
     lines.sort();
-    if lines.is_empty() { String::new() } else { lines.join("\n") + "\n" }
+    if lines.is_empty() {
+        String::new()
+    } else {
+        lines.join("\n") + "\n"
+    }
 }
 
 /// SHA-256 digest of the canonical N-Quads projection.
@@ -66,14 +86,24 @@ pub fn nquads_digest(nquads: &str) -> String {
 }
 
 fn escape_nq(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r").replace('\t', "\\t")
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
 }
 
 /// Replace IRI-unsafe characters (<, >, ", whitespace, etc.) in a metadata
 /// key so the generated `urn:neurostrata:meta:{}` predicate stays a valid IRI.
 fn sanitize_meta_key(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || "-._~".contains(c) { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "-._~".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -112,10 +142,19 @@ mod tests {
         let index = OntologyIndex::from_registry_metadata(&meta);
         let mut topo = serde_json::json!({"component":"lbug","target_system":"Ladybug-DB"});
         canonicalize_topology(&mut topo, &index);
-        assert_eq!(topo.get("component").unwrap().as_str().unwrap(), "ladybugdb");
-        assert_eq!(topo.get("target_system").unwrap().as_str().unwrap(), "ladybugdb");
+        assert_eq!(
+            topo.get("component").unwrap().as_str().unwrap(),
+            "ladybugdb"
+        );
+        assert_eq!(
+            topo.get("target_system").unwrap().as_str().unwrap(),
+            "ladybugdb"
+        );
         assert_eq!(canonicalize_known_ids_alias("lbug", &index), "ladybugdb");
-        assert_eq!(canonicalize_known_ids_alias("LadybugDB", &index), "ladybugdb");
+        assert_eq!(
+            canonicalize_known_ids_alias("LadybugDB", &index),
+            "ladybugdb"
+        );
     }
 
     #[test]
@@ -134,7 +173,6 @@ mod tests {
         assert_eq!(d.len(), 64);
     }
 }
-
 
 /// Dual-write helper: returns both JSON payload echo and N-Quads projection.
 pub fn dual_write(id: &str, payload: &crate::traits::MemoryPayload) -> (String, String) {

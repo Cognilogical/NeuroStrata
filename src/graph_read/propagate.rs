@@ -199,7 +199,11 @@ mod tests {
             edge("rule", "GOVERNS", "file"),
             edge("file", "CONTAINS", "symbol"),
         ];
-        let tags = propagate_domains(&[seed("rule", "auth")], &edges, &PropagationConfig::default());
+        let tags = propagate_domains(
+            &[seed("rule", "auth")],
+            &edges,
+            &PropagationConfig::default(),
+        );
         let file = tags.iter().find(|t| t.node_id == "file").unwrap();
         assert_eq!(file.domain, "auth");
         assert_eq!(file.confidence, 0.5);
@@ -228,10 +232,7 @@ mod tests {
 
     #[test]
     fn min_confidence_stops_low_value_hops() {
-        let edges = vec![
-            edge("a", "GOVERNS", "b"),
-            edge("b", "GOVERNS", "c"),
-        ];
+        let edges = vec![edge("a", "GOVERNS", "b"), edge("b", "GOVERNS", "c")];
         let config = PropagationConfig {
             max_hops: 5,
             min_confidence: 0.4,

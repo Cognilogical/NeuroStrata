@@ -751,15 +751,39 @@ pub async fn build_task_graph_context(
         }
         let snippet: String = r.payload.content.chars().take(140).collect();
         let presented = crate::rdf::provenance::decorate_content(&snippet, &r.payload.metadata);
-        let calls = r.payload.metadata.get("calls").cloned().unwrap_or(Value::Null);
-        let imports = r.payload.metadata.get("imports").cloned().unwrap_or(Value::Null);
-        let governs = r.payload.metadata.get("governs").cloned().unwrap_or(Value::Null);
-        let depends_on = r.payload.metadata.get("depends_on").cloned().unwrap_or(Value::Null);
+        let calls = r
+            .payload
+            .metadata
+            .get("calls")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let imports = r
+            .payload
+            .metadata
+            .get("imports")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let governs = r
+            .payload
+            .metadata
+            .get("governs")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let depends_on = r
+            .payload
+            .metadata
+            .get("depends_on")
+            .cloned()
+            .unwrap_or(Value::Null);
         prompt_lines.push(format!(
             "  - [{}] `{}` ({}): {}",
             r.payload.memory_type,
             r.id,
-            if r.payload.location.is_empty() { "memory" } else { &r.payload.location },
+            if r.payload.location.is_empty() {
+                "memory"
+            } else {
+                &r.payload.location
+            },
             presented.replace('\n', " ")
         ));
         let mut entry = json!({
@@ -1069,21 +1093,7 @@ pub fn resolve_session_root_dir(dir: &std::path::Path) -> std::path::PathBuf {
     if let Some(wt) = gate::GateScope::capture(dir).worktree {
         return std::path::PathBuf::from(wt);
     }
-    if dir.join(".NeuroStrata").exists() {
-        return dir.to_path_buf();
-    }
-    let mut cur = if dir.is_dir() {
-        Some(dir)
-    } else {
-        dir.parent()
-    };
-    while let Some(d) = cur {
-        if d.join(".git").exists() {
-            return d.to_path_buf();
-        }
-        cur = d.parent().filter(|p| !p.as_os_str().is_empty());
-    }
-    dir.to_path_buf()
+    crate::formal_kernel::resolve_session_root(None, dir)
 }
 
 /// Record a graph or memory lookup against any active `in_progress` task in
@@ -1124,7 +1134,11 @@ pub async fn record_graph_query_with_root(
         return;
     };
     let now = chrono::Utc::now().timestamp();
-    let entry_str = format!("{}:{}", tool_name, query_hint.chars().take(80).collect::<String>());
+    let entry_str = format!(
+        "{}:{}",
+        tool_name,
+        query_hint.chars().take(80).collect::<String>()
+    );
     let mut project_root: Option<String> = caller_root
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -1151,9 +1165,15 @@ pub async fn record_graph_query_with_root(
         }
     }
     if project_root.is_none() {
-        if let Ok(Some((_, registry))) = store.get(&ns, &crate::registry::registry_row_id(&ns)).await {
+        if let Ok(Some((_, registry))) =
+            store.get(&ns, &crate::registry::registry_row_id(&ns)).await
+        {
             if crate::registry::is_registry_row(&registry.metadata) {
-                if let Some(p) = registry.metadata.get("project_root").and_then(|v| v.as_str()) {
+                if let Some(p) = registry
+                    .metadata
+                    .get("project_root")
+                    .and_then(|v| v.as_str())
+                {
                     project_root = Some(p.to_string());
                 }
             }
@@ -3245,7 +3265,7 @@ pub(crate) const SCAFFOLDED_PRE_PUSH_HOOK: &str = r#"#!/bin/bash
 # directory git actually runs hooks from, core.hooksPath honored — one
 # hook text for both install paths, so they cannot drift.)
 
-command -v neurostrata-mcp >/dev/null 2>&1 || { echo "warning: neurostrata-mcp not found — gate NOT run for this push" >&2; exit 0; }
+command -v neurostrata-mcp >/dev/null 2>&1 || { echo "error: neurostrata-mcp not found — gate NOT run for this push" >&2; exit 1; }
 if [ "$NEUROSTRATA_SKIP_GATE" = "1" ]; then
     echo "NeuroStrata task gate: skipped (NEUROSTRATA_SKIP_GATE=1) — the gate did NOT run for this push" >&2
     exit 0
@@ -3260,15 +3280,12 @@ NAMESPACE=$(basename "$(git rev-parse --show-toplevel)")
 neurostrata-mcp task gate "$NAMESPACE" --strict
 code=$?
 if [ $code -eq 1 ]; then
-    echo "Push blocked: resolve the tasks above, or NEUROSTRATA_SKIP_GATE=1 git push" >&2
+    echo "Push blocked: resolve the tasks above" >&2
     exit 1
 fi
-# A 2 here is never a verdict: under --strict the gate itself exits
-# only 0 or 1, so a 2 means the binary that answered was stale,
-# foreign, or died before it could report. Announced, never silent —
-# and it still does not block (0 and 2 pass, per the exit line below).
-if [ $code -eq 2 ]; then
-    echo "warning: neurostrata-mcp task gate exited 2 — the gate could NOT run for this push; proceeding without it" >&2
+if [ $code -ne 0 ]; then
+    echo "error: neurostrata-mcp task gate exited $code — the gate could NOT run for this push" >&2
+    exit 1
 fi
 
 # ── project guards (add yours here) ────────────────────────────────────────
@@ -3288,8 +3305,8 @@ if [ ${#PROJECT_GATES[@]} -gt 0 ]; then
     done
 fi
 
-exit 0   # 0 and 2 both pass here unless --strict flips 2 to blocking
-# neurostrata-hook-sha256: cb1c385835cfe2ddc026878074e34ea3661674f44d314679c8c85764ef7d70b7
+exit 0   # the gate passed and all project guards passed
+# neurostrata-hook-sha256: fde963068fb4002b941dd0f6aa4b4c110aaf6bbb86ded582c8bc7cf33b790688
 "#;
 
 /// SHA-256 of the scaffolded pre-push hook body (excluding the trailing
@@ -5204,7 +5221,10 @@ mod tests {
     /// cannot run a hook against a Windows checkout.
     fn hook_bash() -> Option<std::path::PathBuf> {
         if cfg!(windows) {
-            let out = std::process::Command::new("git").arg("--exec-path").output().ok()?;
+            let out = std::process::Command::new("git")
+                .arg("--exec-path")
+                .output()
+                .ok()?;
             let exec = std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
             // <git>/mingw64/libexec/git-core -> <git>
             let git_root = exec.parent()?.parent()?.parent()?.to_path_buf();
@@ -5223,12 +5243,20 @@ mod tests {
             .args(args)
             .output()
             .expect("git runs");
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
     /// Runs the scaffolded pre-commit hook in `dir`; returns its stderr.
-    fn run_pre_commit(bash: &std::path::Path, hook: &std::path::Path, dir: &std::path::Path) -> String {
+    fn run_pre_commit(
+        bash: &std::path::Path,
+        hook: &std::path::Path,
+        dir: &std::path::Path,
+    ) -> String {
         let mut cmd = std::process::Command::new(bash);
         cmd.arg(hook).current_dir(dir);
         // Git for Windows puts its usr/bin (grep, sed, tr, ...) on PATH when it
@@ -5236,7 +5264,9 @@ mod tests {
         if cfg!(windows) {
             if let Some(bin) = bash.parent() {
                 let mut paths = vec![bin.to_path_buf()];
-                paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+                paths.extend(std::env::split_paths(
+                    &std::env::var_os("PATH").unwrap_or_default(),
+                ));
                 cmd.env("PATH", std::env::join_paths(paths).expect("join PATH"));
             }
         }
@@ -5274,7 +5304,10 @@ mod tests {
         git_stdout_in(&repo, &["init", "-q"]);
         git_stdout_in(&repo, &["config", "user.email", "t@example.invalid"]);
         git_stdout_in(&repo, &["config", "user.name", "t"]);
-        git_stdout_in(&repo, &["config", "core.hooksPath", &hooks_off.to_string_lossy()]);
+        git_stdout_in(
+            &repo,
+            &["config", "core.hooksPath", &hooks_off.to_string_lossy()],
+        );
         for f in ["a1", "a2", "a3", "a4", "a5", "a6", "Ä7"] {
             std::fs::write(repo.join("src").join("a").join(format!("{f}.rs")), "x").unwrap();
         }
@@ -5291,14 +5324,17 @@ mod tests {
             let msys = format!("/{}{}", root[..1].to_lowercase(), &root[2..]);
             queries.push(json!({"tool": "t", "query": format!("{msys}/src/a/a3.rs")}));
             queries.push(json!({"tool": "t", "query": format!(r"\\?\{back}\src\a\a4.rs")}));
-            queries.push(json!({"tool": "t", "query": format!("{}/SRC/A/A5.RS", root.to_uppercase())}));
+            queries.push(
+                json!({"tool": "t", "query": format!("{}/SRC/A/A5.RS", root.to_uppercase())}),
+            );
         } else {
             queries.push(json!({"tool": "t", "query": "./src/a/a3.rs"}));
             queries.push(json!({"tool": "t", "query": "src/a/a4.rs/"}));
             queries.push(json!({"tool": "t", "query": "src/a/a5.rs"}));
         }
         // `path` wins over a query naming another checkout's absolute path.
-        queries.push(json!({"tool": "t", "query": "/elsewhere/src/a/a6.rs", "path": "src/a/a6.rs"}));
+        queries
+            .push(json!({"tool": "t", "query": "/elsewhere/src/a/a6.rs", "path": "src/a/a6.rs"}));
         queries.push(json!({"tool": "t", "query": "/elsewhere/none.rs"}));
         // A non-ASCII name spelled the same on both sides matches: every
         // side folds only ASCII letters.
@@ -5306,7 +5342,10 @@ mod tests {
         let ledger = repo.join(".NeuroStrata").join("session_queries.json");
         std::fs::write(
             &ledger,
-            serde_json::to_string_pretty(&json!({"namespace": "example-project", "queries": queries})).unwrap(),
+            serde_json::to_string_pretty(
+                &json!({"namespace": "example-project", "queries": queries}),
+            )
+            .unwrap(),
         )
         .unwrap();
         let hook = base.join("pre-commit");
@@ -5314,9 +5353,15 @@ mod tests {
 
         git_stdout_in(&repo, &["add", "src", "none.rs"]);
         let stderr = run_pre_commit(&bash, &hook, &repo);
-        assert!(stderr.contains("file 'none.rs' has no recorded"), "{stderr}");
+        assert!(
+            stderr.contains("file 'none.rs' has no recorded"),
+            "{stderr}"
+        );
         for f in ["a1", "a2", "a3", "a4", "a5", "a6", "Ä7"] {
-            assert!(!stderr.contains(&format!("src/a/{f}.rs' has no recorded")), "{f}: {stderr}");
+            assert!(
+                !stderr.contains(&format!("src/a/{f}.rs' has no recorded")),
+                "{f}: {stderr}"
+            );
         }
     }
 
@@ -6543,7 +6588,10 @@ mod tests {
         assert_eq!(expected.branch.as_deref(), Some("feature/mcp-claim"));
         let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
         assert_eq!(payload.metadata["task"]["branch"], json!(expected.branch));
-        assert_eq!(payload.metadata["task"]["worktree"], json!(expected.worktree));
+        assert_eq!(
+            payload.metadata["task"]["worktree"],
+            json!(expected.worktree)
+        );
 
         // Another worktree pushing its own branch is not blocked by this MCP-claimed task.
         let other_scope = gate::GateScope {
@@ -6554,7 +6602,10 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !other_report.violations.iter().any(|v| v.kind == "in_progress"),
+            !other_report
+                .violations
+                .iter()
+                .any(|v| v.kind == "in_progress"),
             "other worktree must not be blocked: {:?}",
             other_report.violations
         );
@@ -6660,8 +6711,14 @@ mod tests {
         )
         .await;
 
-        let b_session = dir_b.path().join(".NeuroStrata").join("active_session.json");
-        let a_session = dir_a.path().join(".NeuroStrata").join("active_session.json");
+        let b_session = dir_b
+            .path()
+            .join(".NeuroStrata")
+            .join("active_session.json");
+        let a_session = dir_a
+            .path()
+            .join(".NeuroStrata")
+            .join("active_session.json");
         assert!(
             b_session.exists(),
             "active_session.json must be written in the explicit cwd dir_b"
@@ -6710,7 +6767,10 @@ mod tests {
             store.clone(),
         )
         .await;
-        let root_session = wt_dir.path().join(".NeuroStrata").join("active_session.json");
+        let root_session = wt_dir
+            .path()
+            .join(".NeuroStrata")
+            .join("active_session.json");
         let nested_session = nested_cwd.join(".NeuroStrata").join("active_session.json");
         assert!(
             root_session.exists(),
@@ -6786,8 +6846,7 @@ mod tests {
             "git -c core.sshCommand=evil push"
         ));
         assert!(!crate::server::is_zero_action_exempt_shell_payload(
-            "edit",
-            "git push"
+            "edit", "git push"
         ));
     }
 
@@ -9582,7 +9641,10 @@ mod tests {
             .upsert(
                 "MyProj",
                 &fact_id,
-                StubEmbedder.embed("decayed external API fact").await.unwrap(),
+                StubEmbedder
+                    .embed("decayed external API fact")
+                    .await
+                    .unwrap(),
                 MemoryPayload {
                     content: "external API fact that decayed".to_string(),
                     user_id: "kenton".to_string(),

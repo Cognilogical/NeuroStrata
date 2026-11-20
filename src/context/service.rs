@@ -128,9 +128,11 @@ impl ContextService {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use super::super::model::{ContextItem, ContextRequest, Degradation, EgressPolicy, SourceIdentity};
+    use super::super::model::{
+        ContextItem, ContextRequest, Degradation, EgressPolicy, SourceIdentity,
+    };
     use super::super::plan::Budget;
+    use super::*;
 
     fn request() -> ContextRequest {
         ContextRequest {

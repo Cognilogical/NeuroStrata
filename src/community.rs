@@ -66,7 +66,10 @@ pub mod community_inner {
             .collect();
         let (communities, quality) =
             detect_communities_with_quality(&node_ids, &edge_f32, resolution)?;
-        Ok(CommunityResult { communities, quality })
+        Ok(CommunityResult {
+            communities,
+            quality,
+        })
     }
 
     /// Async wrapper around `detect_communities_with_resolution` that offloads
@@ -133,11 +136,13 @@ pub mod community_inner {
             }
         }
         for ((a, b), weight) in wmap {
-            builder.add_edge(a, b, weight as f64).map_err(|e| {
-                anyhow::anyhow!("leiden edge add failed ({a}->{b}): {e}")
-            })?;
+            builder
+                .add_edge(a, b, weight as f64)
+                .map_err(|e| anyhow::anyhow!("leiden edge add failed ({a}->{b}): {e}"))?;
         }
-        let graph = builder.build().map_err(|e| anyhow::anyhow!("leiden graph build: {e}"))?;
+        let graph = builder
+            .build()
+            .map_err(|e| anyhow::anyhow!("leiden graph build: {e}"))?;
 
         let config = LeidenConfig {
             seed: Some(42),
@@ -150,7 +155,9 @@ pub mod community_inner {
             ..LeidenConfig::default()
         };
         let leiden = Leiden::new(config);
-        let result = leiden.run(&graph).map_err(|e| anyhow::anyhow!("leiden run: {e}"))?;
+        let result = leiden
+            .run(&graph)
+            .map_err(|e| anyhow::anyhow!("leiden run: {e}"))?;
         let quality = result.quality;
         let partition = result.partition;
 
@@ -182,16 +189,13 @@ pub mod community_inner {
 
         // Sort by size DESC, min_member_id ASC (spec §5.2a canonical numbering).
         communities.sort_by(|a, b| {
-            b.member_ids
-                .len()
-                .cmp(&a.member_ids.len())
-                .then_with(|| {
-                    a.member_ids
-                        .iter()
-                        .min()
-                        .unwrap()
-                        .cmp(b.member_ids.iter().min().unwrap())
-                })
+            b.member_ids.len().cmp(&a.member_ids.len()).then_with(|| {
+                a.member_ids
+                    .iter()
+                    .min()
+                    .unwrap()
+                    .cmp(b.member_ids.iter().min().unwrap())
+            })
         });
 
         // Assign deterministic ids and size.
@@ -247,8 +251,12 @@ mod tests {
     fn two_cliques_yield_two_communities() -> anyhow::Result<()> {
         // Fixture: clique A (n1,n2,n3), clique B (n4,n5,n6), single edge n3-n4.
         let nodes = vec![
-            "c1".to_string(), "c2".to_string(), "c3".to_string(),
-            "c4".to_string(), "c5".to_string(), "c6".to_string(),
+            "c1".to_string(),
+            "c2".to_string(),
+            "c3".to_string(),
+            "c4".to_string(),
+            "c5".to_string(),
+            "c6".to_string(),
         ];
         let edges = vec![
             ("c1".to_string(), "c2".to_string(), 1.0),
@@ -267,7 +275,6 @@ mod tests {
             "two cliques connected by one edge yields 2 communities"
         );
 
-
         // Determinism across runs with same input.
         let second = detect_communities_with_quality(&nodes, &edges, 1.0).map(|(c, _)| c)?;
         assert_eq!(communities, second, "partition must be deterministic");
@@ -277,7 +284,8 @@ mod tests {
         shuffled_nodes.reverse();
         let mut shuffled_edges: Vec<(String, String, f32)> = edges.clone();
         shuffled_edges.reverse();
-        let third = detect_communities_with_quality(&shuffled_nodes, &shuffled_edges, 1.0).map(|(c, _)| c)?;
+        let third = detect_communities_with_quality(&shuffled_nodes, &shuffled_edges, 1.0)
+            .map(|(c, _)| c)?;
         assert_eq!(communities, third, "partition must be order-independent");
 
         Ok(())
@@ -306,8 +314,16 @@ mod tests {
         // keeps the cliques; γ=5.0 shatters every node into a singleton, so
         // the resolution really reaches LeidenConfig (was discarded before).
         let mut edges: Vec<(String, String, f64)> = vec![
-            ("a", "b"), ("b", "c"), ("a", "c"), ("d", "e"), ("e", "f"), ("d", "f"),
-        ].into_iter().map(|(s, t)| (s.into(), t.into(), 1.0)).collect();
+            ("a", "b"),
+            ("b", "c"),
+            ("a", "c"),
+            ("d", "e"),
+            ("e", "f"),
+            ("d", "f"),
+        ]
+        .into_iter()
+        .map(|(s, t)| (s.into(), t.into(), 1.0))
+        .collect();
         edges.push(("c".into(), "d".into(), 0.3));
 
         let low = detect_communities_with_resolution(&edges, 0.1)?;
@@ -316,7 +332,10 @@ mod tests {
             2,
             "γ=0.1 keeps both cliques as communities"
         );
-        assert!(low.quality > 0.0, "the clique split has positive modularity");
+        assert!(
+            low.quality > 0.0,
+            "the clique split has positive modularity"
+        );
 
         let high = detect_communities_with_resolution(&edges, 5.0)?;
         assert!(
@@ -370,11 +389,8 @@ mod tests {
         };
 
         // Empty access-count map → tie breaks to the smallest surviving id.
-        let out = filter_structural_with_access_counts(
-            vec![community],
-            &structural_ids,
-            &HashMap::new(),
-        );
+        let out =
+            filter_structural_with_access_counts(vec![community], &structural_ids, &HashMap::new());
 
         assert_eq!(out[0].member_ids, vec!["bbb_rule", "ccc_rule"]);
         assert_eq!(
@@ -431,14 +447,12 @@ mod tests {
     #[test]
     fn filter_structural_with_access_counts_retains_and_recomputes_hubs() {
         use std::collections::HashSet;
-        let communities = vec![
-            Community {
-                id: 0,
-                member_ids: vec!["s1".to_string(), "b".to_string(), "a".to_string()],
-                hub_id: "s1".to_string(),
-                size: 3,
-            },
-        ];
+        let communities = vec![Community {
+            id: 0,
+            member_ids: vec!["s1".to_string(), "b".to_string(), "a".to_string()],
+            hub_id: "s1".to_string(),
+            size: 3,
+        }];
         let structural: HashSet<String> = ["s1".to_string()].into_iter().collect();
         let mut counts = HashMap::new();
         counts.insert("a".to_string(), 2u64);
@@ -451,7 +465,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detect_communities_with_resolution_async_matches_sync_partition() -> anyhow::Result<()> {
+    async fn detect_communities_with_resolution_async_matches_sync_partition() -> anyhow::Result<()>
+    {
         let edges = vec![
             ("c1".to_string(), "c2".to_string(), 1.0),
             ("c2".to_string(), "c3".to_string(), 1.0),

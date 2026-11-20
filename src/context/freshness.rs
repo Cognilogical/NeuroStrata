@@ -56,9 +56,10 @@ fn source_currency(inputs: &FreshnessInputs) -> SourceCurrency {
         return SourceCurrency::NotApplicable;
     }
     // Span hash is authoritative when both sides carry it.
-    if let (Some(stored), Some(current)) =
-        (inputs.stored_span_sha256.as_deref(), inputs.current_span_sha256.as_deref())
-    {
+    if let (Some(stored), Some(current)) = (
+        inputs.stored_span_sha256.as_deref(),
+        inputs.current_span_sha256.as_deref(),
+    ) {
         if stored == current {
             return SourceCurrency::Unchanged;
         }

@@ -81,10 +81,22 @@ pub fn canonical_duplicate_key(namespace: &str, payload: &MemoryPayload) -> Resu
     let attempt = payload.metadata.get("attempt").cloned();
     let attempt_presence = attempt.is_some();
     let attempt_obj = attempt.unwrap_or(serde_json::Value::Null);
-    let attempt_approach = attempt_obj.get("approach").cloned().unwrap_or(serde_json::Value::Null);
-    let attempt_outcome = attempt_obj.get("outcome").cloned().unwrap_or(serde_json::Value::Null);
-    let attempt_failure_mode = attempt_obj.get("failure_mode").cloned().unwrap_or(serde_json::Value::Null);
-    let attempt_context = attempt_obj.get("context").cloned().unwrap_or(serde_json::Value::Null);
+    let attempt_approach = attempt_obj
+        .get("approach")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let attempt_outcome = attempt_obj
+        .get("outcome")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let attempt_failure_mode = attempt_obj
+        .get("failure_mode")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let attempt_context = attempt_obj
+        .get("context")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
 
     let key_obj = serde_json::json!({
         "namespace": namespace,
@@ -129,7 +141,10 @@ mod tests {
     fn identical_payloads_same_key() {
         let a = payload("hello", "fact");
         let b = payload("hello", "fact");
-        assert_eq!(canonical_duplicate_key("ns", &a).unwrap(), canonical_duplicate_key("ns", &b).unwrap());
+        assert_eq!(
+            canonical_duplicate_key("ns", &a).unwrap(),
+            canonical_duplicate_key("ns", &b).unwrap()
+        );
     }
 
     #[test]
@@ -137,7 +152,10 @@ mod tests {
         let mut a = payload("hello", "fact");
         a.metadata = serde_json::json!({"attempt": {"approach":"r","outcome":"failed","failure_mode":"t","context":"c"}});
         let b = payload("hello", "fact");
-        assert_ne!(canonical_duplicate_key("ns", &a).unwrap(), canonical_duplicate_key("ns", &b).unwrap());
+        assert_ne!(
+            canonical_duplicate_key("ns", &a).unwrap(),
+            canonical_duplicate_key("ns", &b).unwrap()
+        );
     }
 
     #[test]
@@ -146,6 +164,9 @@ mod tests {
         a.metadata = serde_json::json!({"attempt": {"approach":"r","outcome":"failed","failure_mode":"t","context":"c"}});
         let mut b = a.clone();
         b.metadata = serde_json::json!({"attempt": {"approach":"r2","outcome":"failed","failure_mode":"t","context":"c"}});
-        assert_ne!(canonical_duplicate_key("ns", &a).unwrap(), canonical_duplicate_key("ns", &b).unwrap());
+        assert_ne!(
+            canonical_duplicate_key("ns", &a).unwrap(),
+            canonical_duplicate_key("ns", &b).unwrap()
+        );
     }
 }

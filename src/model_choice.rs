@@ -1511,9 +1511,7 @@ mod tests {
             "BGESmallENV15Q shows its measured overlap"
         );
         assert!(
-            bge.contains(
-                "Measured: top-5 overlap with the FP32 default was 0.667."
-            ),
+            bge.contains("Measured: top-5 overlap with the FP32 default was 0.667."),
             "BGESmallENV15Q shows its measured quality line verbatim"
         );
         let nomic = render_offer(&top3[0..1]);

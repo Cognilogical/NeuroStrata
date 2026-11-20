@@ -4304,6 +4304,38 @@ fn is_env_assignment(tok: &str) -> bool {
     false
 }
 
+/// Resolve a session root from an explicit caller directory and an ambient
+/// current working directory. An explicit directory always wins as the
+/// starting point; otherwise `cwd` is used. The walk stops at the nearest
+/// `.git` ancestor, so an ambient `.NeuroStrata` directory outside that
+/// boundary can never capture the session.
+pub fn resolve_session_root(
+    explicit: Option<&std::path::Path>,
+    cwd: &std::path::Path,
+) -> std::path::PathBuf {
+    let start = explicit.unwrap_or(cwd);
+    let start = if start.is_dir() {
+        start
+    } else {
+        start.parent().unwrap_or(start)
+    };
+
+    // The given directory itself is authoritative when it carries
+    // .NeuroStrata (non-git project roots), matching the pre-kernel behavior.
+    if start.join(".NeuroStrata").exists() {
+        return start.to_path_buf();
+    }
+
+    let mut cur = Some(start);
+    while let Some(dir) = cur {
+        if dir.join(".git").exists() {
+            return dir.to_path_buf();
+        }
+        cur = dir.parent().filter(|p| !p.as_os_str().is_empty());
+    }
+    start.to_path_buf()
+}
+
 fn is_disallowed_git_arg(arg: &str) -> bool {
     arg == "--output"
         || arg == "-O"

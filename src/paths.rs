@@ -1533,12 +1533,10 @@ mod tests {
         )
         .expect("in-scope prefix");
         assert_eq!(resolved.lookup.source, RootSource::ProjectRoot);
-        assert!(
-            resolved
-                .forms
-                .iter()
-                .any(|f| f == "src/graph" || f == "src/graph/")
-        );
+        assert!(resolved
+            .forms
+            .iter()
+            .any(|f| f == "src/graph" || f == "src/graph/"));
         assert!(resolved.forms.iter().any(
             |f| f == &format!("{}/src/graph", root_s) || f == &format!("{}/src/graph/", root_s)
         ));
@@ -1560,8 +1558,8 @@ mod tests {
     }
 
     #[test]
-    fn to_project_relative_retains_deeper_valid_registry_relative_alternate_when_broader_project_root_wins()
-     {
+    fn to_project_relative_retains_deeper_valid_registry_relative_alternate_when_broader_project_root_wins(
+    ) {
         let tmp = std::env::temp_dir().join("ns-v1190-alternates");
         let project = tmp.join("repo");
         let registry = project.join("platform");
@@ -1631,10 +1629,13 @@ mod tests {
         }
 
         // Foreign checkout root stays vetoed when a project_root or registry_root is configured.
-        assert!(
-            resolve_in_scope_forms(&foreign_s, Some(&root_s), None, PathResolutionScope::Prefix,)
-                .is_err()
-        );
+        assert!(resolve_in_scope_forms(
+            &foreign_s,
+            Some(&root_s),
+            None,
+            PathResolutionScope::Prefix,
+        )
+        .is_err());
 
         // File scope still rejects the root directory itself.
         assert!(

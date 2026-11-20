@@ -61,9 +61,7 @@ fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
         if !haystack.is_char_boundary(start) {
             continue;
         }
-        if (0..nb.len()).all(|j| {
-            hb[start + j].to_ascii_lowercase() == nb[j].to_ascii_lowercase()
-        }) {
+        if (0..nb.len()).all(|j| hb[start + j].to_ascii_lowercase() == nb[j].to_ascii_lowercase()) {
             return Some(start);
         }
     }
@@ -89,10 +87,7 @@ pub fn detect_task_intents(text: &str) -> Vec<TaskIntentSignal> {
         }
         // negation guard: skip if the clause containing the marker starts with
         // a negation prefix (normative "never"/"do not" rule statements).
-        let clause_start = text[..idx]
-            .rfind('\n')
-            .map(|p| p + 1)
-            .unwrap_or(0);
+        let clause_start = text[..idx].rfind('\n').map(|p| p + 1).unwrap_or(0);
         // also consider sentence boundary ". "
         let mut start = clause_start;
         if let Some(pos) = text[..idx].rfind(". ") {
@@ -111,10 +106,7 @@ pub fn detect_task_intents(text: &str) -> Vec<TaskIntentSignal> {
         // excerpt: from marker to end of clause, capped 160
         let from = idx;
         let rest = &text[from..];
-        let end = rest
-            .find('\n')
-            .unwrap_or(rest.len())
-            .min(160);
+        let end = rest.find('\n').unwrap_or(rest.len()).min(160);
         let mut excerpt: String = safe_prefix(rest, end).trim_end().to_string();
         if excerpt.chars().count() > 160 {
             excerpt = excerpt.chars().take(160).collect();

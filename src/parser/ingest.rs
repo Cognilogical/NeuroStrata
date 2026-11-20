@@ -2330,9 +2330,7 @@ pub async fn ingest_directory(
                                     );
                                 }
                             }
-                            if let Some(serde_json::Value::Array(arr)) =
-                                o.get("imports").cloned()
-                            {
+                            if let Some(serde_json::Value::Array(arr)) = o.get("imports").cloned() {
                                 let updated: Vec<serde_json::Value> = arr
                                     .iter()
                                     .filter_map(|v| v.as_str())
@@ -5741,10 +5739,8 @@ use super::x;"#;
             "ns-inc-callee-removed-src-{}",
             uuid::Uuid::new_v4()
         ));
-        let db = std::env::temp_dir().join(format!(
-            "ns-inc-callee-removed-db-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let db =
+            std::env::temp_dir().join(format!("ns-inc-callee-removed-db-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
 
         std::fs::write(
@@ -5773,10 +5769,15 @@ use super::x;"#;
         .await
         .expect("gen 1 ingest");
 
-        let gen1_rows = store.list("inc-deps-ns", None, Some("code_ast")).await.unwrap();
+        let gen1_rows = store
+            .list("inc-deps-ns", None, Some("code_ast"))
+            .await
+            .unwrap();
         let caller_gen1 = gen1_rows
             .iter()
-            .find(|r| r.payload.metadata.get("symbol").and_then(|v| v.as_str()) == Some("invoke_caller"))
+            .find(|r| {
+                r.payload.metadata.get("symbol").and_then(|v| v.as_str()) == Some("invoke_caller")
+            })
             .expect("invoke_caller in gen 1");
         let gen1_deps = caller_gen1
             .payload
@@ -5802,10 +5803,15 @@ use super::x;"#;
         .await
         .expect("gen 2 incremental ingest");
 
-        let gen2_rows = store.list("inc-deps-ns", None, Some("code_ast")).await.unwrap();
+        let gen2_rows = store
+            .list("inc-deps-ns", None, Some("code_ast"))
+            .await
+            .unwrap();
         let caller_gen2 = gen2_rows
             .iter()
-            .find(|r| r.payload.metadata.get("symbol").and_then(|v| v.as_str()) == Some("invoke_caller"))
+            .find(|r| {
+                r.payload.metadata.get("symbol").and_then(|v| v.as_str()) == Some("invoke_caller")
+            })
             .expect("invoke_caller carried into gen 2");
         let gen2_deps = caller_gen2
             .payload
@@ -5832,7 +5838,11 @@ use super::x;"#;
             caller_gen2.payload.metadata
         );
         assert!(
-            caller_gen2.payload.metadata.get("cross_file_callees").is_none(),
+            caller_gen2
+                .payload
+                .metadata
+                .get("cross_file_callees")
+                .is_none(),
             "carried caller must clear stale cross_file_callees"
         );
 

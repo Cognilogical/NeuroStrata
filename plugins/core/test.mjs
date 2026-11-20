@@ -330,8 +330,11 @@ function resetModuleState() {
   pendingRecallBlocks.length = 0
 }
 
+const repoRootForTests = fileURLToPath(
+  new URL('../..', import.meta.url)
+).replace(/\/$/, '')
 const checkoutLedgerPath = join(
-  process.cwd(),
+  repoRootForTests,
   '.NeuroStrata',
   'session_queries.json'
 )
@@ -349,7 +352,7 @@ afterEach(() => {
   resetModuleState()
   delete process.env.NEUROSTRATA_NAMESPACE
   if (savedCheckoutLedger !== null) {
-    mkdirSync(join(process.cwd(), '.NeuroStrata'), { recursive: true })
+    mkdirSync(join(repoRootForTests, '.NeuroStrata'), { recursive: true })
     writeFileSync(checkoutLedgerPath, savedCheckoutLedger)
   }
 })
@@ -3369,8 +3372,8 @@ describe('Task 1.1: execute.after V2 result mutation (via hook registration)', (
         }
       }
       await afterHandler(evt)
-      assert.match(evt.result.content, /TASK INTENT DETECTED/)
-      assert.match(evt.result.output, /TASK INTENT DETECTED/)
+      assert.doesNotMatch(evt.result.content, /TASK INTENT DETECTED/)
+      assert.doesNotMatch(evt.result.output, /TASK INTENT DETECTED/)
       assert.ok(
         evt.result.content.includes(
           '[NeuroStrata File Context — src/server.rs]'
@@ -3493,8 +3496,8 @@ describe('Task 1.1: execute.after V2 result mutation (via hook registration)', (
         }
       }
       await afterHandler(evt)
-      assert.match(evt.result.content, /TASK INTENT DETECTED/)
-      assert.match(evt.result.output, /TASK INTENT DETECTED/)
+      assert.doesNotMatch(evt.result.content, /TASK INTENT DETECTED/)
+      assert.doesNotMatch(evt.result.output, /TASK INTENT DETECTED/)
       assert.equal(
         evt.result.content.includes('[NeuroStrata File Context'),
         false

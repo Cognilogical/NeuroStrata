@@ -318,12 +318,10 @@ static LAST_CHECKPOINT_DURATION_MS: std::sync::atomic::AtomicU64 =
 /// Unix-seconds timestamp of the most recent checkpoint recorded in this
 /// process (0 = none recorded yet). The directory mtime is only a proxy;
 /// this records the real event the moment it happens.
-static LAST_CHECKPOINT_AT_SECS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static LAST_CHECKPOINT_AT_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Count of failed checkpoints since process start (monotonic, never reset).
-static CHECKPOINT_FAILURES: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(0);
+static CHECKPOINT_FAILURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// The checkpoint latch as `compute_storage_status` can see it (#211): whether
 /// the store stopped checkpointing, and how many checkpoints that stopped.
@@ -404,10 +402,7 @@ pub fn record_checkpoint_outcome(store_path: &Path, duration_ms: u64, ok: bool) 
     }
 }
 
-pub fn compute_storage_status(
-    store_path: &Path,
-    config: &StorageHygieneConfig,
-) -> StorageStatus {
+pub fn compute_storage_status(store_path: &Path, config: &StorageHygieneConfig) -> StorageStatus {
     let store_bytes = fs::metadata(store_path).map(|m| m.len()).unwrap_or(0);
     let mut wal_os = store_path.as_os_str().to_os_string();
     wal_os.push(".wal");
@@ -683,9 +678,7 @@ pub fn sha256_file(path: &Path) -> Result<String, SnapshotError> {
                     None
                 }
             })
-            .filter(|e| {
-                e.path().is_file() || e.file_type().map(|ft| ft.is_file()).unwrap_or(false)
-            })
+            .filter(|e| e.path().is_file() || e.file_type().map(|ft| ft.is_file()).unwrap_or(false))
             .collect();
         entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
         for entry in entries {
@@ -712,7 +705,10 @@ pub fn sha256_file(path: &Path) -> Result<String, SnapshotError> {
         }
     }
     let digest = hasher.finalize();
-    Ok(digest.iter().map(|b| format!("{:02x}", b)).collect::<String>())
+    Ok(digest
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<String>())
 }
 
 pub fn write_checksums(dir: &Path) -> Result<SnapshotChecksums, SnapshotError> {
@@ -721,14 +717,10 @@ pub fn write_checksums(dir: &Path) -> Result<SnapshotChecksums, SnapshotError> {
     let manifest = dir.join("manifest.json");
 
     if !ladybug.exists() && !ladybug.is_dir() {
-        return Err(SnapshotError::MissingFile(
-            "ladybug.store".into(),
-        ));
+        return Err(SnapshotError::MissingFile("ladybug.store".into()));
     }
     if !manifest.exists() {
-        return Err(SnapshotError::MissingFile(
-            "manifest.json".into(),
-        ));
+        return Err(SnapshotError::MissingFile("manifest.json".into()));
     }
 
     let ladybug_sha = sha256_file(&ladybug)?;
@@ -799,14 +791,18 @@ pub fn write_checksums(dir: &Path) -> Result<SnapshotChecksums, SnapshotError> {
 pub fn verify_snapshot(dir: &Path) -> Result<SnapshotVerifyReport, SnapshotError> {
     let manifest_path = dir.join("manifest.json");
     if !manifest_path.exists() {
-        return Err(SnapshotError::MissingFile(
-            "manifest.json".into(),
-        ));
+        return Err(SnapshotError::MissingFile("manifest.json".into()));
     }
     let manifest_str = fs::read_to_string(&manifest_path)?;
     let manifest: serde_json::Value = serde_json::from_str(&manifest_str)?;
-    let format = manifest.get("format").and_then(|v| v.as_str()).unwrap_or("");
-    let version = manifest.get("version").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let format = manifest
+        .get("format")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let version = manifest
+        .get("version")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
     if format != SNAPSHOT_FORMAT || !snapshot_version_supported(version) {
         return Err(SnapshotError::InvalidManifest(format!(
             "unsupported snapshot: expected format={} version={} (legacy version {} is also readable), got format={:?} version={:?}",
@@ -887,9 +883,7 @@ pub fn verify_snapshot(dir: &Path) -> Result<SnapshotVerifyReport, SnapshotError
 
     let checksums_path = dir.join("checksums.json");
     if !checksums_path.exists() {
-        return Err(SnapshotError::MissingFile(
-            "checksums.json".into(),
-        ));
+        return Err(SnapshotError::MissingFile("checksums.json".into()));
     }
     let checksums_str = fs::read_to_string(&checksums_path)?;
     let checksums: SnapshotChecksums = serde_json::from_str(&checksums_str)?;
@@ -919,9 +913,7 @@ pub fn verify_snapshot(dir: &Path) -> Result<SnapshotVerifyReport, SnapshotError
             )));
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(SnapshotError::MissingFile(
-                "ladybug.store".into(),
-            ));
+            return Err(SnapshotError::MissingFile("ladybug.store".into()));
         }
         Err(e) => return Err(SnapshotError::Io(e)),
     }
@@ -1080,9 +1072,7 @@ pub fn verify_snapshot(dir: &Path) -> Result<SnapshotVerifyReport, SnapshotError
             &raw,
             crate::compression::zstd::DEFAULT_SNAPSHOT_MAX_DECOMPRESSED_BYTES,
         )
-        .map_err(|e| {
-            SnapshotError::InvalidManifest(format!("manifest.json.zst: {}", e))
-        })?;
+        .map_err(|e| SnapshotError::InvalidManifest(format!("manifest.json.zst: {}", e)))?;
         let expected_raw = fs::read(&manifest_path)?;
         if decompressed != expected_raw {
             return Err(SnapshotError::InvalidManifest(
@@ -1148,21 +1138,28 @@ pub fn select_expired_snapshots(root: &Path, keep: usize) -> Result<Vec<PathBuf>
                 continue;
             }
         };
-        let format = manifest.get("format").and_then(|v| v.as_str()).unwrap_or("");
-        let version = manifest.get("version").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let format = manifest
+            .get("format")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let version = manifest
+            .get("version")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
         if format != SNAPSHOT_FORMAT || !snapshot_version_supported(version) {
             continue;
         }
-        let created_at = manifest.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+        let created_at = manifest
+            .get("created_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if created_at.is_empty() {
             continue;
         }
         valid.push((path.clone(), created_at.to_string(), name));
     }
 
-    valid.sort_by(|a, b| {
-        b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2))
-    });
+    valid.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2)));
 
     let expired = if valid.len() > keep {
         valid[keep..].iter().map(|(p, _, _)| p.clone()).collect()
@@ -1577,14 +1574,13 @@ mod tests {
         let d = temp_dir("invalid_manifest");
         write_store(&d);
         let mut manifest = File::create(d.join("manifest.json")).unwrap();
-        manifest.write_all(b"{\"format\":\"bad\",\"version\":99}").unwrap();
+        manifest
+            .write_all(b"{\"format\":\"bad\",\"version\":99}")
+            .unwrap();
         let mut f = File::create(d.join("checksums.json")).unwrap();
         f.write_all(b"{}").unwrap();
         let result = verify_snapshot(&d);
-        assert!(matches!(
-            result,
-            Err(SnapshotError::InvalidManifest(..))
-        ));
+        assert!(matches!(result, Err(SnapshotError::InvalidManifest(..))));
     }
 
     #[test]
@@ -1818,7 +1814,8 @@ mod tests {
         // Setting a time needs write access on Windows.
         let file = File::options().write(true).open(&wal).unwrap();
         let future = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
-        file.set_times(fs::FileTimes::new().set_modified(future)).unwrap();
+        file.set_times(fs::FileTimes::new().set_modified(future))
+            .unwrap();
         drop(file);
 
         assert_eq!(
@@ -1912,7 +1909,9 @@ mod tests {
                 message.contains("coordinated") && message.contains("boolean"),
                 "the refusal names the field and its type: {message}"
             ),
-            other => panic!("a version 2 manifest with a non-boolean coordinated must be rejected: {other:?}"),
+            other => panic!(
+                "a version 2 manifest with a non-boolean coordinated must be rejected: {other:?}"
+            ),
         }
     }
 
@@ -1939,7 +1938,9 @@ mod tests {
                 message.contains("coordinated") && message.contains("boolean"),
                 "the refusal names the field and its type: {message}"
             ),
-            other => panic!("a version 1 manifest with a non-boolean coordinated must be rejected: {other:?}"),
+            other => panic!(
+                "a version 1 manifest with a non-boolean coordinated must be rejected: {other:?}"
+            ),
         }
     }
 
@@ -1960,10 +1961,17 @@ mod tests {
         .unwrap();
         write_checksums(&d).unwrap();
 
-        let report = verify_snapshot(&d).expect("an uncoordinated snapshot still verifies its bytes");
+        let report =
+            verify_snapshot(&d).expect("an uncoordinated snapshot still verifies its bytes");
         assert!(report.integrity_ok, "the bytes match their checksums");
-        assert!(!report.valid, "an uncoordinated snapshot is not fully valid");
-        assert!(!report.coordinated, "the verdict reports it as uncoordinated");
+        assert!(
+            !report.valid,
+            "an uncoordinated snapshot is not fully valid"
+        );
+        assert!(
+            !report.coordinated,
+            "the verdict reports it as uncoordinated"
+        );
         assert_eq!(
             report.provenance, PROVENANCE_UNVERIFIED,
             "an uncoordinated snapshot records the unverified provenance"
@@ -2179,7 +2187,11 @@ mod tests {
 
         let expired = select_expired_snapshots(&root, 2).unwrap();
         assert_eq!(expired.len(), 1);
-        assert!(expired[0].file_name().unwrap().to_string_lossy().contains("old1"));
+        assert!(expired[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains("old1"));
     }
 
     #[test]

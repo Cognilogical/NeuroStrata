@@ -6,8 +6,8 @@
 
 use serde_json::json;
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 #[cfg(test)]
 use std::sync::MutexGuard;
@@ -49,7 +49,9 @@ pub fn acquire_test_lock() -> TestLockGuard {
     }
     let guard = TEST_LOCK.lock().expect("test lock poisoned");
     HOLDING.set(true);
-    TestLockGuard { _guard: Some(guard) }
+    TestLockGuard {
+        _guard: Some(guard),
+    }
 }
 
 #[cfg(test)]
@@ -71,8 +73,7 @@ static SINGLE_DOMAIN_BYPASSES: AtomicU64 = AtomicU64::new(0);
 static RECALL_RESPONSES: AtomicU64 = AtomicU64::new(0);
 static RECALL_PROMOTIONS: AtomicU64 = AtomicU64::new(0);
 
-static RECENTLY_RECALLED: Mutex<Option<HashMap<String, VecDeque<String>>>> =
-    Mutex::new(None);
+static RECENTLY_RECALLED: Mutex<Option<HashMap<String, VecDeque<String>>>> = Mutex::new(None);
 
 pub fn domain_filter_snapshot() -> serde_json::Value {
     #[cfg(test)]
@@ -116,9 +117,7 @@ pub fn record_recall(namespace: &str, ids: &[String]) {
         // An empty recall response does not count toward the rate.
         return;
     }
-    let mut guard = RECENTLY_RECALLED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut guard = RECENTLY_RECALLED.lock().unwrap_or_else(|e| e.into_inner());
     let map = guard.get_or_insert_with(HashMap::new);
     let deque = map.entry(namespace.to_string()).or_default();
     for id in ids {
@@ -134,9 +133,7 @@ pub fn record_recall(namespace: &str, ids: &[String]) {
 pub fn record_promotion(namespace: &str, id: &str) -> bool {
     #[cfg(test)]
     let _lock = maybe_acquire();
-    let mut guard = RECENTLY_RECALLED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut guard = RECENTLY_RECALLED.lock().unwrap_or_else(|e| e.into_inner());
     let found = if let Some(map) = guard.as_mut() {
         if let Some(deque) = map.get_mut(namespace) {
             let before = deque.len();
@@ -154,7 +151,6 @@ pub fn record_promotion(namespace: &str, id: &str) -> bool {
     }
     found
 }
-
 
 #[cfg(test)]
 pub fn reset_counters_for_tests() {

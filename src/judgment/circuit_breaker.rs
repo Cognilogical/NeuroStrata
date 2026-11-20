@@ -63,7 +63,8 @@ impl CircuitBreaker {
                     );
                     // A fresh HalfOpen window starts with no probe in flight;
                     // immediately claim it for THIS request.
-                    self.half_open_probe_in_flight.store(false, Ordering::SeqCst);
+                    self.half_open_probe_in_flight
+                        .store(false, Ordering::SeqCst);
                     self.half_open_probe_in_flight
                         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                         .is_ok()
@@ -84,7 +85,8 @@ impl CircuitBreaker {
     /// Record a successful request.
     pub fn record_success(&self) {
         self.failure_count.store(0, Ordering::SeqCst);
-        self.half_open_probe_in_flight.store(false, Ordering::SeqCst);
+        self.half_open_probe_in_flight
+            .store(false, Ordering::SeqCst);
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         *state = CircuitState::Closed;
     }
@@ -97,7 +99,8 @@ impl CircuitBreaker {
             .as_secs();
 
         self.last_failure_time.store(now, Ordering::SeqCst);
-        self.half_open_probe_in_flight.store(false, Ordering::SeqCst);
+        self.half_open_probe_in_flight
+            .store(false, Ordering::SeqCst);
         let failures = self.failure_count.fetch_add(1, Ordering::SeqCst) + 1;
         tracing::debug!(
             failures = failures,
@@ -210,9 +213,15 @@ mod tests {
         // HalfOpen when now >= backoff_until.
         // Wait out the initial backoff (1s default) then take the probe.
         std::thread::sleep(Duration::from_millis(1050));
-        assert!(cb.allow_request(), "first post-backoff request takes the HalfOpen probe");
+        assert!(
+            cb.allow_request(),
+            "first post-backoff request takes the HalfOpen probe"
+        );
         assert_eq!(cb.state(), "HalfOpen");
-        assert!(!cb.allow_request(), "second concurrent request must be refused while the probe is in flight");
+        assert!(
+            !cb.allow_request(),
+            "second concurrent request must be refused while the probe is in flight"
+        );
         // The probe completes (success) -> circuit closes, slot released.
         cb.record_success();
         assert_eq!(cb.state(), "Closed");

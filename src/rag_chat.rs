@@ -43,10 +43,7 @@ pub fn truncate_snippet(content: &str, max_chars: usize) -> String {
         .chars()
         .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
         .collect::<String>();
-    let collapsed = cleaned
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
     let total = collapsed.chars().count();
     if total <= max_chars {
         collapsed
@@ -91,9 +88,21 @@ pub async fn retrieve_context_with_egress(
     require_shareable: bool,
     snippet_max_chars: usize,
 ) -> Result<RagContext, ChatError> {
-    let vector = emb.embed(query).await.map_err(|e| ChatError::Retrieval(format!("embed: {}", e)))?;
+    let vector = emb
+        .embed(query)
+        .await
+        .map_err(|e| ChatError::Retrieval(format!("embed: {}", e)))?;
     let outcome = store
-        .search_with_domain(namespace, vector, limit, include_tasks, include_archived, &[], Some(query), false)
+        .search_with_domain(
+            namespace,
+            vector,
+            limit,
+            include_tasks,
+            include_archived,
+            &[],
+            Some(query),
+            false,
+        )
         .await
         .map_err(|e| ChatError::Retrieval(format!("search: {}", e)))?;
     if outcome.incomplete {
@@ -103,7 +112,11 @@ pub async fn retrieve_context_with_egress(
             outcome.results.len()
         );
     }
-    let principal = if principal.is_empty() { "admin" } else { principal };
+    let principal = if principal.is_empty() {
+        "admin"
+    } else {
+        principal
+    };
     let mut results: Vec<crate::traits::SearchResult> = Vec::new();
     for r in outcome.results {
         let owner = crate::rebac::extract_resource_owner(&r.payload.user_id, &r.payload.metadata);
@@ -112,15 +125,18 @@ pub async fn retrieve_context_with_egress(
             continue;
         }
         if require_shareable {
-            if r.payload.metadata.get("eligibility").and_then(|v| v.as_str()) != Some("shareable") {
+            if r.payload
+                .metadata
+                .get("eligibility")
+                .and_then(|v| v.as_str())
+                != Some("shareable")
+            {
                 continue;
             }
         }
         results.push(r);
     }
-    results.sort_by(|a, b| {
-        a.score.total_cmp(&b.score).then_with(|| a.id.cmp(&b.id))
-    });
+    results.sort_by(|a, b| a.score.total_cmp(&b.score).then_with(|| a.id.cmp(&b.id)));
     let hits: Vec<RagHit> = results
         .into_iter()
         .enumerate()
@@ -167,7 +183,10 @@ pub fn build_prompt_with_citations(
     max_context_chars: usize,
 ) -> (String, Vec<String>) {
     let mut prompt = String::new();
-    prompt.push_str(&format!("System: {}\n", system.unwrap_or(DEFAULT_SYSTEM_PROMPT)));
+    prompt.push_str(&format!(
+        "System: {}\n",
+        system.unwrap_or(DEFAULT_SYSTEM_PROMPT)
+    ));
     prompt.push_str("Context:\n");
     let mut citations = Vec::new();
     let mut context_lines_total = 0;
@@ -188,7 +207,8 @@ pub fn build_prompt_with_citations(
             {
                 line = line.chars().take(max_context_chars).collect();
             }
-            if context_lines_total + line.chars().count() > max_context_chars && included_lines > 0 {
+            if context_lines_total + line.chars().count() > max_context_chars && included_lines > 0
+            {
                 break;
             }
             if included_lines == 0 && max_context_chars == 0 {
@@ -220,9 +240,18 @@ pub async fn retrieve_context(
     snippet_max_chars: usize,
 ) -> Result<RagContext, ChatError> {
     retrieve_context_with_egress(
-        store, emb, namespace, principal, query, limit,
-        include_tasks, include_archived, false, snippet_max_chars,
-    ).await
+        store,
+        emb,
+        namespace,
+        principal,
+        query,
+        limit,
+        include_tasks,
+        include_archived,
+        false,
+        snippet_max_chars,
+    )
+    .await
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -286,9 +315,15 @@ impl LlmProvider for OfflineProvider {
             }
         }
         if count == 0 {
-            Ok(format!("Offline answer: no relevant context found for question '{}'. No citations.", question))
+            Ok(format!(
+                "Offline answer: no relevant context found for question '{}'. No citations.",
+                question
+            ))
         } else {
-            Ok(format!("Offline answer: question='{}', citations={}, context included.", question, count))
+            Ok(format!(
+                "Offline answer: question='{}', citations={}, context included.",
+                question, count
+            ))
         }
     }
 }
@@ -310,24 +345,34 @@ impl OpenAiCompatibleProvider {
         allow_remote_base_url: bool,
     ) -> Result<Self, ChatError> {
         if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
-            return Err(ChatError::Config("base_url must start with http:// or https://".into()));
+            return Err(ChatError::Config(
+                "base_url must start with http:// or https://".into(),
+            ));
         }
         if base_url.contains('@') {
-            return Err(ChatError::Config("base_url must not contain userinfo (@)".into()));
+            return Err(ChatError::Config(
+                "base_url must not contain userinfo (@)".into(),
+            ));
         }
         let stripped = base_url.trim_end_matches('/').to_string();
-        let url = reqwest::Url::parse(&stripped).map_err(|e| ChatError::Config(format!("invalid url: {}", e)))?;
+        let url = reqwest::Url::parse(&stripped)
+            .map_err(|e| ChatError::Config(format!("invalid url: {}", e)))?;
         let host = url.host_str().unwrap_or("");
         let is_loopback = host == "localhost" || host == "127.0.0.1" || host == "[::1]";
         if !is_loopback && !allow_remote_base_url {
-            return Err(ChatError::Config("non-loopback base_url requires allow_remote_base_url".into()));
+            return Err(ChatError::Config(
+                "non-loopback base_url requires allow_remote_base_url".into(),
+            ));
         }
         let api_key = if let Some(env_name) = api_key_env {
             if env_name.is_empty() {
                 return Err(ChatError::Config("empty api_key_env".into()));
             }
             if !ALLOWED_API_KEY_ENV_VARS.contains(&env_name) {
-                return Err(ChatError::Config(format!("disallowed api_key_env: {}", env_name)));
+                return Err(ChatError::Config(format!(
+                    "disallowed api_key_env: {}",
+                    env_name
+                )));
             }
             match std::env::var(env_name) {
                 Ok(v) => {
@@ -370,18 +415,30 @@ impl LlmProvider for OpenAiCompatibleProvider {
     async fn answer(&self, prompt: &str) -> Result<String, ChatError> {
         let url = format!("{}/v1/chat/completions", self.base_url);
         let mut body = serde_json::Map::new();
-        body.insert("model".into(), serde_json::Value::String(self.model.clone()));
-        body.insert("messages".into(), serde_json::json!([{"role":"user","content":prompt}]));
+        body.insert(
+            "model".into(),
+            serde_json::Value::String(self.model.clone()),
+        );
+        body.insert(
+            "messages".into(),
+            serde_json::json!([{"role":"user","content":prompt}]),
+        );
         body.insert("temperature".into(), serde_json::json!(0));
         let mut req = self.client.post(&url).timeout(self.timeout).json(&body);
         if let Some(key) = &self.api_key {
             req = req.header("Authorization", format!("Bearer {}", key));
         }
-        let resp = req.send().await.map_err(|e| ChatError::Provider(format!("send: {}", e)))?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| ChatError::Provider(format!("send: {}", e)))?;
         if !resp.status().is_success() {
             return Err(ChatError::Provider(format!("http {}", resp.status())));
         }
-        let json: serde_json::Value = resp.json().await.map_err(|e| ChatError::Provider(format!("json: {}", e)))?;
+        let json: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| ChatError::Provider(format!("json: {}", e)))?;
         let content = json
             .get("choices")
             .and_then(|c| c.as_array())
@@ -414,24 +471,42 @@ pub async fn ask(
         return Err(ChatError::Disabled);
     }
     if provider.is_remote() && !remote_egress_allowed {
-        return Err(ChatError::EgressDenied("remote LLM egress is disabled by configuration".into()));
+        return Err(ChatError::EgressDenied(
+            "remote LLM egress is disabled by configuration".into(),
+        ));
     }
     let ctx = if !remote_egress_allowed {
         retrieve_context(
-            store.clone(), emb.clone(), namespace, principal, question, limit,
-            include_tasks, include_archived,
+            store.clone(),
+            emb.clone(),
+            namespace,
+            principal,
+            question,
+            limit,
+            include_tasks,
+            include_archived,
             // Snippets are the context budget's working unit: keep per-hit
             // truncation proportional to the prompt ceiling.
             (max_context_chars / 4).clamp(120, 1000),
-        ).await?
+        )
+        .await?
     } else {
         retrieve_context_with_egress(
-            store, emb, namespace, principal, question, limit,
-            include_tasks, include_archived, provider.is_remote(),
+            store,
+            emb,
+            namespace,
+            principal,
+            question,
+            limit,
+            include_tasks,
+            include_archived,
+            provider.is_remote(),
             (max_context_chars / 4).clamp(120, 1000),
-        ).await?
+        )
+        .await?
     };
-    let (prompt, citations) = build_prompt_with_citations(&ctx, question, system, max_context_chars);
+    let (prompt, citations) =
+        build_prompt_with_citations(&ctx, question, system, max_context_chars);
     let answer = provider.answer(&prompt).await?;
     let context_count = citations.len();
     Ok(ChatResponse {
@@ -462,8 +537,20 @@ mod tests {
         let ctx = RagContext {
             query: "q".into(),
             hits: vec![
-                RagHit { rank: 1, memory_id: "mem-abc".into(), score: 0.12, snippet: "hello".into(), derivation: vec!["vector".into()] },
-                RagHit { rank: 2, memory_id: "mem-def".into(), score: 0.34, snippet: "world".into(), derivation: vec!["vector".into()] },
+                RagHit {
+                    rank: 1,
+                    memory_id: "mem-abc".into(),
+                    score: 0.12,
+                    snippet: "hello".into(),
+                    derivation: vec!["vector".into()],
+                },
+                RagHit {
+                    rank: 2,
+                    memory_id: "mem-def".into(),
+                    score: 0.34,
+                    snippet: "world".into(),
+                    derivation: vec!["vector".into()],
+                },
             ],
             total: 2,
         };
@@ -503,8 +590,20 @@ mod tests {
         let ctx = RagContext {
             query: "q".into(),
             hits: vec![
-                RagHit { rank: 1, memory_id: "a".into(), score: 0.1, snippet: "x".into(), derivation: vec![] },
-                RagHit { rank: 2, memory_id: "b".into(), score: 0.2, snippet: "y".into(), derivation: vec![] },
+                RagHit {
+                    rank: 1,
+                    memory_id: "a".into(),
+                    score: 0.1,
+                    snippet: "x".into(),
+                    derivation: vec![],
+                },
+                RagHit {
+                    rank: 2,
+                    memory_id: "b".into(),
+                    score: 0.2,
+                    snippet: "y".into(),
+                    derivation: vec![],
+                },
             ],
             total: 2,
         };
@@ -514,25 +613,95 @@ mod tests {
 
     #[test]
     fn tie_breaking_by_score_then_id() {
-        let a = crate::traits::SearchResult { id: "b".into(), score: 0.5, payload: crate::traits::MemoryPayload { content: "".into(), user_id: "u".into(), memory_type: "m".into(), agent_name: None, location: "".into(), location_lines: "".into(), metadata: serde_json::json!({}) }, evidence: None };
-        let b = crate::traits::SearchResult { id: "a".into(), score: 0.5, payload: crate::traits::MemoryPayload { content: "".into(), user_id: "u".into(), memory_type: "m".into(), agent_name: None, location: "".into(), location_lines: "".into(), metadata: serde_json::json!({}) }, evidence: None };
-        let mut v = vec![a.clone(), b.clone()];
+        let a = crate::traits::SearchResult {
+            id: "b".into(),
+            score: 0.5,
+            payload: crate::traits::MemoryPayload {
+                content: "".into(),
+                user_id: "u".into(),
+                memory_type: "m".into(),
+                agent_name: None,
+                location: "".into(),
+                location_lines: "".into(),
+                metadata: serde_json::json!({}),
+            },
+            evidence: None,
+        };
+        let b = crate::traits::SearchResult {
+            id: "a".into(),
+            score: 0.5,
+            payload: crate::traits::MemoryPayload {
+                content: "".into(),
+                user_id: "u".into(),
+                memory_type: "m".into(),
+                agent_name: None,
+                location: "".into(),
+                location_lines: "".into(),
+                metadata: serde_json::json!({}),
+            },
+            evidence: None,
+        };
+        let mut v = [a.clone(), b.clone()];
         v.sort_by(|a, b| a.score.total_cmp(&b.score).then_with(|| a.id.cmp(&b.id)));
         assert_eq!(v[0].id, "a");
     }
 
     #[test]
     fn openai_provider_new_validation() {
-        assert!(OpenAiCompatibleProvider::new("http://localhost:11434/v1", Some("OPENAI_API_KEY"), "m", Duration::from_secs(5), false).is_ok());
-        assert!(OpenAiCompatibleProvider::new("bad", Some("OPENAI_API_KEY"), "m", Duration::from_secs(5), false).is_err());
-        assert!(OpenAiCompatibleProvider::new("https://evil.com", Some("OPENAI_API_KEY"), "m", Duration::from_secs(5), false).is_err());
-        assert!(OpenAiCompatibleProvider::new("https://evil.com", Some("OPENAI_API_KEY"), "m", Duration::from_secs(5), true).is_ok());
-        assert!(OpenAiCompatibleProvider::new("http://localhost/v1", Some("BAD"), "m", Duration::from_secs(5), false).is_err());
+        assert!(OpenAiCompatibleProvider::new(
+            "http://localhost:11434/v1",
+            Some("OPENAI_API_KEY"),
+            "m",
+            Duration::from_secs(5),
+            false
+        )
+        .is_ok());
+        assert!(OpenAiCompatibleProvider::new(
+            "bad",
+            Some("OPENAI_API_KEY"),
+            "m",
+            Duration::from_secs(5),
+            false
+        )
+        .is_err());
+        assert!(OpenAiCompatibleProvider::new(
+            "https://evil.com",
+            Some("OPENAI_API_KEY"),
+            "m",
+            Duration::from_secs(5),
+            false
+        )
+        .is_err());
+        assert!(OpenAiCompatibleProvider::new(
+            "https://evil.com",
+            Some("OPENAI_API_KEY"),
+            "m",
+            Duration::from_secs(5),
+            true
+        )
+        .is_ok());
+        assert!(OpenAiCompatibleProvider::new(
+            "http://localhost/v1",
+            Some("BAD"),
+            "m",
+            Duration::from_secs(5),
+            false
+        )
+        .is_err());
     }
 
     #[test]
     fn remote_egress_gate() {
-        let p = Arc::new(OpenAiCompatibleProvider::new("http://localhost/v1", None, "m", Duration::from_secs(5), false).unwrap());
+        let p = Arc::new(
+            OpenAiCompatibleProvider::new(
+                "http://localhost/v1",
+                None,
+                "m",
+                Duration::from_secs(5),
+                false,
+            )
+            .unwrap(),
+        );
         assert!(p.is_remote());
     }
 
@@ -543,8 +712,18 @@ mod tests {
         let emb: Arc<dyn crate::traits::Embedder> = Arc::new(StubEmbedder);
         let provider: Arc<dyn LlmProvider> = Arc::new(OfflineProvider);
         let err = ask(
-            store, emb, "ns", "local-user", "__disabled__", 5, None, 4000, provider,
-            false, false, false,
+            store,
+            emb,
+            "ns",
+            "local-user",
+            "__disabled__",
+            5,
+            None,
+            4000,
+            provider,
+            false,
+            false,
+            false,
         )
         .await
         .unwrap_err();
