@@ -829,21 +829,15 @@ pub async fn build_task_graph_context(
         }
     }
     let mut kept_hits = hit_lines.clone();
-    let mut hits_block = String::new();
-    loop {
+    let mut hits_block = {
         let mut combined: Vec<String> = prompt_lines.clone();
         combined.extend(kept_hits.clone());
-        let hb = if combined.is_empty() {
+        if combined.is_empty() {
             "  - (no pre-existing memories matched; run neurostrata_search_memory / neurostrata_memories_for_file as you explore)".to_string()
         } else {
             combined.join("\n")
-        };
-        if hb.chars().count() <= 3200 || kept_hits.is_empty() {
-            hits_block = hb;
-            break;
         }
-        kept_hits.pop();
-    }
+    };
     // Partition the retrieved items into reserved normative memories and structural anchors.
     let normative_memories: Vec<Value> = hits_json
         .iter()
@@ -911,6 +905,10 @@ pub async fn build_task_graph_context(
         }
     }
 
+    // Preserve the count of metadata-declared edges so a Ladybug traversal
+    // failure can drop only Ladybug-sourced edges, not provenance.
+    let metadata_edge_count = related_edges.len();
+
     // 1-hop graph edges via LadybugStore::related (bounded).
     let seeds: Vec<String> = hits_json
         .iter()
@@ -959,8 +957,7 @@ pub async fn build_task_graph_context(
                     }
                 }
                 Err(err) => {
-                    related_edges.clear();
-                    seen_edges.clear();
+                    related_edges.truncate(metadata_edge_count);
                     expansion_error = Some(err.to_string());
                     break;
                 }
@@ -969,13 +966,14 @@ pub async fn build_task_graph_context(
     }
 
     // next_hop_calls: <=3 copy-pasteable related calls derived from returned IDs.
+    // Honest trigger: do not claim T_HIGH_BLAST without a real blast_radius_count.
     let mut next_hop_calls: Vec<Value> = Vec::new();
     for seed in seeds.iter().take(3) {
         let trigger = crate::task::routing::RouteTrigger {
-            id: "T_HIGH_BLAST",
+            id: "T_SEED_EDGE",
             tool: "neurostrata_related",
             args: json!({"namespace": namespace, "id": "", "max_hops": 2}),
-            reason: "graph expansion follow-up".to_string(),
+            reason: "seed edge from hybrid expansion".to_string(),
         };
         next_hop_calls.push(crate::task::routing::next_action(&trigger, &[seed.clone()]));
     }
@@ -1016,6 +1014,37 @@ pub async fn build_task_graph_context(
             }
         })
         .unwrap_or_default();
+
+    // Full-prompt budget enforcement (Task 3 fix round 1).
+    let mut taxonomy_prompt_budget = taxonomy_prompt.clone();
+    loop {
+        let candidate = format!(
+            "### NeuroStrata Task & Graph Context (PASTE INTO ALL SUBAGENT PROMPTS)\n\
+             - Namespace: `{}` | Task ID: `{}` | Goal: {}\n\
+             - Auto-Retrieved Governing Rules & Graph Nodes:\n{}{}{}\n\
+             - Mandatory Graph-First Lookup Rule: Before editing any file, check whether its path and governing memory IDs (`mem-...`) are already listed under `### NeuroStrata Task & Graph Context` in your prompt. For any file you touch that is NOT listed in that block, call `neurostrata_memories_for_file` first (or `neurostrata_related` / `neurostrata_search_memory` with `mode`: `hybrid` (default) + `include_references`: true / `neurostrata_sparql_query`).\n\
+             - Formal Verification Reflex: When adding or modifying a state machine, gate, sovereignty/ACL check, CRDT/merge rule, lease/claim rule, or conservation invariant, evaluate whether to extract the pure decision into `src/formal_kernel.rs`, prove its theorems in `proofs/NeuroStrata/*.lean` (zero `sorry`/`axiom`), and extend `tests/lean_parity_test.rs`.",
+            namespace, task_id, payload.content, hits_block, bridges_prompt, taxonomy_prompt_budget
+        );
+        if candidate.chars().count() <= 3500 || kept_hits.is_empty() {
+            break;
+        }
+        kept_hits.pop();
+        let mut combined: Vec<String> = prompt_lines.clone();
+        combined.extend(kept_hits.clone());
+        hits_block = if combined.is_empty() {
+            "  - (no pre-existing memories matched; run neurostrata_search_memory / neurostrata_memories_for_file as you explore)".to_string()
+        } else {
+            combined.join("\n")
+        };
+    }
+    if format!("{}{}{}", hits_block, bridges_prompt, taxonomy_prompt_budget).chars().count() > 3500 {
+        bridges_prompt = String::new();
+    }
+    if format!("{}{}", hits_block, taxonomy_prompt_budget).chars().count() > 3500 {
+        taxonomy_prompt_budget = String::new();
+    }
+    let taxonomy_prompt = taxonomy_prompt_budget;
 
     let subagent_prompt = format!(
         "### NeuroStrata Task & Graph Context (PASTE INTO ALL SUBAGENT PROMPTS)\n\
