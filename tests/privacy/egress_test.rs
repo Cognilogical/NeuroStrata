@@ -6,6 +6,10 @@ mod model;
 mod source;
 #[path = "../../src/task/tool_receipts.rs"]
 mod tool_receipts;
+// The REAL production shareable-type predicate (crate-free module also used by
+// src/synaptic_mesh/outbox.rs) — not a drifting copy of the allowlist.
+#[path = "../../src/synaptic_mesh/shareable.rs"]
+mod shareable;
 
 use model::{EgressPolicy, LookupStatus};
 
@@ -35,7 +39,7 @@ fn lookup_status_variants() {
 /// receipt — even if one is handed to it as a candidate row.
 #[test]
 fn receipt_events_are_local_not_mesh_exportable() {
-    use tool_receipts::{mesh_exportable_rows, ReceiptFields, ReceiptStatus};
+    use tool_receipts::{ReceiptFields, ReceiptStatus};
 
     let receipt = ReceiptFields::new(
         "evt-egress".to_string(),
@@ -61,7 +65,6 @@ fn receipt_events_are_local_not_mesh_exportable() {
     assert!(receipt.get("memory_type").is_none());
     assert!(receipt.get("eligibility").is_none());
 
-    let shareable = ["rule", "fact", "procedure", "action_type", "thesis", "concept"];
     let candidates = vec![
         serde_json::json!({
             "memory_type": "fact",
@@ -70,7 +73,17 @@ fn receipt_events_are_local_not_mesh_exportable() {
         }),
         receipt,
     ];
-    let exported = mesh_exportable_rows(&candidates, &shareable);
+    // Apply the exact production predicate the outbox worker uses.
+    let exported: Vec<_> = candidates
+        .iter()
+        .filter(|row| {
+            row.get("memory_type")
+                .and_then(serde_json::Value::as_str)
+                .map(shareable::is_shareable_memory_type)
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
     assert_eq!(exported.len(), 1, "only the real fact row may be exported");
     assert!(
         exported.iter().all(|row| row.get("event_id").is_none()),

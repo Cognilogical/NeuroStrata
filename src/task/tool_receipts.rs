@@ -184,8 +184,16 @@ pub fn ensure_events_section(doc: &mut Value) {
 }
 
 /// Append one receipt event, dropping the oldest entries past [`MAX_EVENTS`].
-pub fn append_event(doc: &mut Value, event: Value) {
+pub fn append_event(doc: &mut Value, mut event: Value) {
     ensure_events_section(doc);
+    // Defense in depth: bound `returned_ids` even on events built by hand, not
+    // only through `ReceiptFields::new`. The ledger can never grow without bound
+    // from a single oversized response.
+    if let Some(ids) = event.get_mut("returned_ids").and_then(Value::as_array_mut) {
+        if ids.len() > MAX_RETURNED_IDS {
+            ids.truncate(MAX_RETURNED_IDS);
+        }
+    }
     let events = doc
         .get_mut("events")
         .and_then(Value::as_array_mut)
@@ -233,4 +241,179 @@ pub fn mesh_exportable_rows(rows: &[Value], shareable_types: &[&str]) -> Vec<Val
         })
         .cloned()
         .collect()
+}
+
+/// Derive the honest receipt status from a tool's REAL returned text. This is
+/// only ever called AFTER the handler returns — never at dispatch time — so an
+/// unsupported/empty/failed outcome cannot be recorded as `success`.
+pub fn derive_status(result_text: &str, is_error: bool) -> ReceiptStatus {
+    if is_error {
+        return ReceiptStatus::Failed;
+    }
+    let lower = result_text.to_ascii_lowercase();
+    if lower.contains("\"unsupported\":true")
+        || lower.contains("\"status\":\"unsupported\"")
+        || lower.contains("\"status\": \"unsupported\"")
+    {
+        return ReceiptStatus::Unsupported;
+    }
+    if let Ok(v) = serde_json::from_str::<Value>(result_text) {
+        if v.get("unsupported").and_then(Value::as_bool) == Some(true)
+            || v.get("status").and_then(Value::as_str) == Some("unsupported")
+        {
+            return ReceiptStatus::Unsupported;
+        }
+        if is_empty_result(&v) {
+            return ReceiptStatus::Empty;
+        }
+    }
+    if lower.contains("no relevant memories found.")
+        || lower.contains("no results")
+        || lower.contains("not found")
+    {
+        return ReceiptStatus::Empty;
+    }
+    if lower.starts_with("error")
+        || lower.contains("error [")
+        || lower.contains("error:")
+    {
+        return ReceiptStatus::Failed;
+    }
+    ReceiptStatus::Success
+}
+
+/// True when a JSON response carries only empty result collections.
+fn is_empty_result(v: &Value) -> bool {
+    const RESULT_KEYS: &[&str] = &[
+        "memories",
+        "results",
+        "symbols",
+        "concepts",
+        "related_memories",
+        "hits",
+        "rows",
+        "nodes",
+    ];
+    let arrays: Vec<&Vec<Value>> = RESULT_KEYS
+        .iter()
+        .filter_map(|k| v.get(k).and_then(Value::as_array))
+        .collect();
+    !arrays.is_empty() && arrays.iter().all(|a| a.is_empty())
+}
+
+/// Bounded result ids extracted from a REAL JSON response.
+pub fn extract_returned_ids(result_text: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<Value>(result_text) else {
+        return Vec::new();
+    };
+    let mut ids = Vec::new();
+    const RESULT_KEYS: &[&str] = &[
+        "memories",
+        "results",
+        "symbols",
+        "concepts",
+        "related_memories",
+        "hits",
+        "rows",
+    ];
+    for key in RESULT_KEYS {
+        if let Some(arr) = v.get(*key).and_then(Value::as_array) {
+            for item in arr {
+                if let Some(id) = item.get("id").and_then(Value::as_str) {
+                    if !id.is_empty() {
+                        ids.push(id.to_string());
+                        if ids.len() >= MAX_RETURNED_IDS {
+                            return ids;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    ids
+}
+
+/// Result count from a REAL JSON response (explicit count field or the sum of
+/// known result-array lengths). Never invented.
+pub fn result_count(result_text: &str) -> usize {
+    let Ok(v) = serde_json::from_str::<Value>(result_text) else {
+        return 0;
+    };
+    if let Some(n) = v
+        .get("result_count")
+        .and_then(Value::as_u64)
+        .or_else(|| v.get("count").and_then(Value::as_u64))
+        .or_else(|| v.get("total").and_then(Value::as_u64))
+    {
+        return n as usize;
+    }
+    const RESULT_KEYS: &[&str] = &[
+        "memories",
+        "results",
+        "symbols",
+        "concepts",
+        "related_memories",
+        "hits",
+        "rows",
+    ];
+    RESULT_KEYS
+        .iter()
+        .filter_map(|k| v.get(k).and_then(Value::as_array))
+        .map(|a| a.len())
+        .sum()
+}
+
+/// Coarse route class for a tool name, derived locally so receipt builders
+/// stay crate-free.
+pub fn route_class(tool: &str) -> &'static str {
+    if matches!(
+        tool,
+        "neurostrata_taxonomy" | "neurostrata_object_view" | "neurostrata_sparql_query"
+    ) {
+        "ontology"
+    } else {
+        "graph_read"
+    }
+}
+
+/// Build a fully-attributed receipt from the REAL outcome of a dispatch. All
+/// outcome fields (status, count, ids, digests, latency) come from the actual
+/// returned text — nothing here is a hardcoded success placeholder.
+#[allow(clippy::too_many_arguments)]
+pub fn build_dispatch_receipt(
+    event_id: String,
+    ts: i64,
+    session_id: String,
+    namespace: String,
+    tool: String,
+    query_raw: &str,
+    result_text: &str,
+    is_error: bool,
+    latency_ms: u64,
+) -> ReceiptFields {
+    let status = derive_status(result_text, is_error);
+    let returned_ids = extract_returned_ids(result_text);
+    let count = result_count(result_text);
+    let operation = tool.trim_start_matches("neurostrata_").to_string();
+    let schema_valid = !is_error && serde_json::from_str::<Value>(result_text).is_ok();
+    ReceiptFields::new(
+        event_id,
+        ts,
+        session_id,
+        String::new(), // task_id filled by the recorder that stamps the active task
+        namespace,
+        tool.clone(),
+        operation,
+        String::new(),
+        route_class(&tool).to_string(),
+        schema_valid,
+        status,
+        latency_ms,
+        count,
+        returned_ids,
+        Vec::new(),
+        Vec::new(),
+        query_raw,
+        result_text,
+    )
 }

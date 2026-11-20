@@ -1468,30 +1468,12 @@ pub async fn record_graph_query_with_root(
                 "governed_prefixes": [governed_prefix],
             }));
         }
-        // Post-dispatch receipt — written only because a graph/ontology tool
-        // actually ran. The pre-commit hook never fabricates these.
-        let receipt = tool_receipts::ReceiptFields::new(
-            uuid::Uuid::new_v4().to_string(),
-            now,
-            current_session_id(),
-            attributed_task_id,
-            ns.clone(),
-            tool_name.to_string(),
-            tool_name.trim_start_matches("neurostrata_").to_string(),
-            String::new(),
-            receipt_route_class(tool_name).to_string(),
-            true,
-            tool_receipts::ReceiptStatus::Success,
-            0,
-            0,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            query_hint,
-            "",
-        );
-        tool_receipts::append_event(&mut doc, receipt.to_value());
-        tool_receipts::bump_tool_invocation(&mut doc, tool_name);
+        // NOTE (spec §6 R6.2): this is the PRE-dispatch legacy path. It writes
+        // only the legacy `queries[]` row + task stamp above; it must NOT write
+        // an `events[]` receipt, because no outcome exists yet. Receipts are
+        // written exclusively by `record_tool_receipt` after the handler returns.
+        // `attributed_task_id` is intentionally unused here now.
+        let _ = attributed_task_id;
         if let Ok(serialized) = serde_json::to_string_pretty(&doc) {
             let _ = std::fs::write(&ledger_path, serialized);
         }
@@ -1500,7 +1482,7 @@ pub async fn record_graph_query_with_root(
 
 /// Session identifier stamped onto receipts. Prefer the harness-provided id;
 /// fall back to a process-local id so local runs still attribute an event.
-fn current_session_id() -> String {
+pub(crate) fn current_session_id() -> String {
     static SESSION_ID: OnceLock<String> = OnceLock::new();
     SESSION_ID
         .get_or_init(|| {
@@ -1511,27 +1493,73 @@ fn current_session_id() -> String {
         .clone()
 }
 
-/// Coarse route class for a tool name; callers passing full `ReceiptFields` to
-/// [`record_tool_receipt`] can supply a more precise value.
-fn receipt_route_class(tool: &str) -> &'static str {
-    if matches!(
-        tool,
-        "neurostrata_taxonomy" | "neurostrata_object_view" | "neurostrata_sparql_query"
-    ) {
-        "ontology"
+/// Record a fully-specified POST-DISPATCH receipt. This is the ONLY function
+/// that writes `events[]` receipts; every outcome field comes from the real
+/// handler response. It also stamps `graph_queries_count`/`graph_queried` on the
+/// active task (Task 7 attribution), preserves the legacy `queries[]` shape,
+/// and bumps the additive-only `tool_invocations` counter. Receipts stay in the
+/// local JSON ledger — never memory rows, so no ReBAC or mesh surface sees them.
+pub async fn record_tool_receipt(
+    store: &Arc<dyn VectorStore>,
+    mut fields: tool_receipts::ReceiptFields,
+    caller_root: Option<&str>,
+) {
+    let ns = crate::server::resolve_namespace(store, &fields.namespace).await;
+    let hint = if fields.operation.is_empty() {
+        fields.tool.as_str()
     } else {
-        "graph_read"
-    }
-}
+        fields.operation.as_str()
+    };
+    let entry_str = format!(
+        "{}:{}",
+        fields.tool,
+        hint.chars().take(80).collect::<String>()
+    );
 
-/// Record a fully-specified post-dispatch receipt. Receipts stay in the local
-/// JSON ledger — they are never memory rows, so no ReBAC or mesh surface sees
-/// them. Advanced subsystems may additionally read `tool_invocations`, which
-/// is additive-only (no gates, quotas or nudges).
-#[allow(dead_code)] // Public surface for handlers passing full ReceiptFields; generic callers use record_graph_query_with_root.
-pub fn record_tool_receipt(fields: tool_receipts::ReceiptFields) {
-    let tool = fields.tool.clone();
-    let mut root = crate::daemon::resolve_project_root();
+    // Stamp every active in-progress task, attributing the receipt to the
+    // first one — the same attribution rule the legacy recorder uses.
+    if let Ok(rows) = store.list(&ns, None, Some("task")).await {
+        for r in &rows {
+            if gate::is_task(r) && gate::task_status(r) == Status::InProgress {
+                if fields.task_id.is_empty() {
+                    fields.task_id = r.id.clone();
+                }
+                if let Ok(Some((vec, mut payload))) = store.get(&ns, &r.id).await {
+                    let obj = task_obj_mut(&mut payload);
+                    let count = obj
+                        .get("graph_queries_count")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0)
+                        + 1;
+                    obj.insert("graph_queries_count".to_string(), json!(count));
+                    obj.insert("graph_queried".to_string(), json!(true));
+                    let mut recent: Vec<String> = obj
+                        .get("recent_queries")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|x| x.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    recent.push(entry_str.clone());
+                    if recent.len() > 10 {
+                        let drop_n = recent.len() - 10;
+                        recent.drain(0..drop_n);
+                    }
+                    obj.insert("recent_queries".to_string(), json!(recent));
+                    let _ = store.upsert(&ns, &r.id, vec, payload).await;
+                }
+            }
+        }
+    }
+
+    // Resolve the ledger root: explicit caller root, then cwd walked up to a
+    // worktree marker. No raw text leaves this function — the legacy row uses
+    // the query digest, never the query itself.
+    let mut root = caller_root
+        .map(|s| resolve_session_root_dir(std::path::Path::new(s)))
+        .unwrap_or_else(|| crate::daemon::resolve_project_root());
     while !root.as_os_str().is_empty()
         && !root.join(".git").exists()
         && !root.join(".NeuroStrata").exists()
@@ -1551,7 +1579,16 @@ pub fn record_tool_receipt(fields: tool_receipts::ReceiptFields) {
     let mut doc: Value = std::fs::read_to_string(&ledger_path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| json!({ "queries": [] }));
+        .unwrap_or_else(|| json!({ "namespace": ns, "queries": [] }));
+    if let Some(arr) = doc.get_mut("queries").and_then(|v| v.as_array_mut()) {
+        arr.push(json!({
+            "ts": fields.ts,
+            "tool": fields.tool,
+            "query": fields.query_digest,
+            "governed_prefixes": [],
+        }));
+    }
+    let tool = fields.tool.clone();
     tool_receipts::append_event(&mut doc, fields.to_value());
     tool_receipts::bump_tool_invocation(&mut doc, &tool);
     if let Ok(serialized) = serde_json::to_string_pretty(&doc) {

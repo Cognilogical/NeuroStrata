@@ -737,3 +737,113 @@ fn receipts_are_private_and_digest_only() {
         "mesh export must contain zero receipt rows: {exported:?}"
     );
 }
+
+/// Review fix (Critical 1): a receipt built from a REAL empty / unsupported /
+/// failed response must carry that status — never a hardcoded Success.
+#[test]
+fn receipt_status_reflects_real_outcome_not_dispatch_time() {
+    use tool_receipts::{build_dispatch_receipt, ReceiptStatus};
+
+    let mk = |text: &str, is_error: bool| {
+        build_dispatch_receipt(
+            "evt-outcome".to_string(),
+            1,
+            "ses".to_string(),
+            "ns".to_string(),
+            "neurostrata_memories_for_file".to_string(),
+            "src/main.rs",
+            text,
+            is_error,
+            9,
+        )
+    };
+
+    let empty = serde_json::json!({ "memories": [], "unsupported": false }).to_string();
+    let unsupported = serde_json::json!({
+        "memories": [], "unsupported": true, "status": "unsupported"
+    })
+    .to_string();
+    let success = serde_json::json!({ "memories": [ { "id": "m1" } ] }).to_string();
+
+    assert_eq!(mk(&empty, false).status, ReceiptStatus::Empty);
+    assert_eq!(mk(&unsupported, false).status, ReceiptStatus::Unsupported);
+    assert_eq!(mk("No relevant memories found.", false).status, ReceiptStatus::Empty);
+    assert_eq!(mk("boom", true).status, ReceiptStatus::Failed);
+
+    let ok = mk(&success, false);
+    assert_eq!(ok.status, ReceiptStatus::Success);
+    assert_eq!(ok.result_count, 1);
+    assert_eq!(ok.returned_ids, vec!["m1".to_string()]);
+    assert_eq!(ok.latency_ms, 9);
+}
+
+/// Review fix (Critical 2): every tool in GRAPH_TOOLS must have a post-dispatch
+/// receipt path. GRAPH_TOOLS is the exact gate the MCP dispatcher uses, so a
+/// missing tool here means its dispatch writes no receipt.
+#[test]
+fn every_graph_tool_has_post_dispatch_receipt_path() {
+    use std::collections::BTreeSet;
+    use tool_receipts::{build_dispatch_receipt, route_class, RECEIPT_FIELD_NAMES};
+
+    let response = serde_json::json!({ "memories": [ { "id": "m1" } ] }).to_string();
+    let mut covered = BTreeSet::new();
+    for tool in snapshot_readiness::GRAPH_TOOLS {
+        let receipt = build_dispatch_receipt(
+            "evt-coverage".to_string(),
+            1,
+            "ses".to_string(),
+            "ns".to_string(),
+            (*tool).to_string(),
+            "q",
+            &response,
+            false,
+            3,
+        )
+        .to_value();
+        assert_eq!(receipt["tool"].as_str(), Some(*tool));
+        assert_eq!(receipt["status"].as_str(), Some("success"));
+        assert_eq!(receipt.as_object().unwrap().len(), RECEIPT_FIELD_NAMES.len());
+        assert!(!route_class(tool).is_empty());
+        covered.insert(*tool);
+    }
+    assert_eq!(covered.len(), 8, "R8 requires all eight graph tools covered");
+    for required in [
+        "neurostrata_memories_for_file",
+        "neurostrata_related",
+        "neurostrata_locate",
+        "neurostrata_sparql_query",
+        "neurostrata_object_view",
+        "neurostrata_taxonomy",
+        "neurostrata_diff_tour",
+        "neurostrata_search_memory",
+    ] {
+        assert!(covered.contains(required), "no receipt path for {required}");
+    }
+}
+
+/// Review fix (Minor 1): append_event bounds returned_ids even on a manually
+/// constructed event, not just through ReceiptFields::new.
+#[test]
+fn append_event_bounds_manual_returned_ids() {
+    let response = serde_json::json!({ "memories": [] }).to_string();
+    let mut event = tool_receipts::build_dispatch_receipt(
+        "evt-bound".to_string(),
+        1,
+        "ses".to_string(),
+        "ns".to_string(),
+        "neurostrata_related".to_string(),
+        "q",
+        &response,
+        false,
+        1,
+    )
+    .to_value();
+    let ids: Vec<serde_json::Value> = (0..(tool_receipts::MAX_RETURNED_IDS + 10))
+        .map(|i| serde_json::json!(format!("m{i}")))
+        .collect();
+    event["returned_ids"] = serde_json::json!(ids);
+    let mut doc = serde_json::json!({});
+    tool_receipts::append_event(&mut doc, event);
+    let stored = doc["events"][0]["returned_ids"].as_array().unwrap();
+    assert_eq!(stored.len(), tool_receipts::MAX_RETURNED_IDS);
+}

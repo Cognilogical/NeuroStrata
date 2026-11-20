@@ -1519,6 +1519,9 @@ pub async fn process_mcp_request(
             // and the error must surface as a -32603, not as a success
             // payload containing an error string.
             let mut error_response: Option<Value> = None;
+            // Spec §6 R6.2: latency is measured around the real dispatch and
+            // read only AFTER the handler returns.
+            let dispatch_started = std::time::Instant::now();
             if let Some(params) = &request.params {
                 if let Some(name) = params.get("name").and_then(|n| n.as_str()) {
                     let arguments = params
@@ -1977,23 +1980,20 @@ pub async fn process_mcp_request(
                         }
                     }
 
-                    if matches!(
-                        name,
-                        "neurostrata_search_memory"
-                            | "neurostrata_related"
-                            | "neurostrata_sparql_query"
-                            | "neurostrata_graphql_query"
-                            | "neurostrata_chat_ask"
-                            | "neurostrata_context_plan"
-                            | "neurostrata_provenance_for"
-                    ) {
-                        if let Some(ns) = params
-                            .get("arguments")
+                    // Spec §6 R6: record ONE post-dispatch receipt for every
+                    // in-scope graph/ontology tool, derived from the REAL
+                    // outcome the handler just returned — never a hardcoded
+                    // success/0/[]. GRAPH_TOOLS is the single source of truth,
+                    // so all eight tools get identical coverage.
+                    if crate::task::snapshot_readiness::GRAPH_TOOLS.contains(&name) {
+                        // `arguments` was moved into the handler; read the
+                        // original params value instead.
+                        let args_ref = params.get("arguments");
+                        if let Some(ns_arg) = args_ref
                             .and_then(|a| a.get("namespace"))
-                            .and_then(|v| v.as_str())
+                            .and_then(Value::as_str)
                         {
-                            let args_ref = params.get("arguments");
-                            let hint = args_ref
+                            let query_raw = args_ref
                                 .and_then(|a| {
                                     a.get("query")
                                         .or_else(|| a.get("path"))
@@ -2003,7 +2003,7 @@ pub async fn process_mcp_request(
                                         .or_else(|| a.get("question"))
                                         .or_else(|| a.get("goal"))
                                 })
-                                .and_then(|v| v.as_str())
+                                .and_then(Value::as_str)
                                 .unwrap_or(name);
                             let caller_root = args_ref
                                 .and_then(|a| {
@@ -2011,15 +2011,60 @@ pub async fn process_mcp_request(
                                         .or_else(|| a.get("worktree"))
                                         .or_else(|| a.get("cwd"))
                                 })
-                                .and_then(|v| v.as_str())
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty());
+                            let ns = resolve_namespace(&store, ns_arg).await;
+                            let fields = crate::task::tool_receipts::build_dispatch_receipt(
+                                uuid::Uuid::new_v4().to_string(),
+                                chrono::Utc::now().timestamp(),
+                                crate::task::current_session_id(),
+                                ns.clone(),
+                                name.to_string(),
+                                query_raw,
+                                &result_text,
+                                error_response.is_some(),
+                                dispatch_started.elapsed().as_millis() as u64,
+                            );
+                            crate::task::record_tool_receipt(&store, fields, caller_root).await;
+                        }
+                    } else if matches!(
+                        name,
+                        "neurostrata_graphql_query"
+                            | "neurostrata_chat_ask"
+                            | "neurostrata_context_plan"
+                            | "neurostrata_provenance_for"
+                    ) {
+                        // Legacy `queries[]` compatibility for tools that used
+                        // to be recorded here but are outside GRAPH_TOOLS.
+                        // `record_graph_query_with_root` is now legacy-only —
+                        // it cannot fabricate an `events[]` outcome receipt.
+                        let args_ref = params.get("arguments");
+                        if let Some(ns) = args_ref
+                            .and_then(|a| a.get("namespace"))
+                            .and_then(Value::as_str)
+                        {
+                            let hint = args_ref
+                                .and_then(|a| {
+                                    a.get("query")
+                                        .or_else(|| a.get("path"))
+                                        .or_else(|| a.get("id"))
+                                        .or_else(|| a.get("question"))
+                                        .or_else(|| a.get("goal"))
+                                })
+                                .and_then(Value::as_str)
+                                .unwrap_or(name);
+                            let caller_root = args_ref
+                                .and_then(|a| {
+                                    a.get("project_root")
+                                        .or_else(|| a.get("worktree"))
+                                        .or_else(|| a.get("cwd"))
+                                })
+                                .and_then(Value::as_str)
                                 .map(str::trim)
                                 .filter(|s| !s.is_empty());
                             crate::task::record_graph_query_with_root(
-                                &store,
-                                ns,
-                                name,
-                                hint,
-                                caller_root,
+                                &store, ns, name, hint, caller_root,
                             )
                             .await;
                         }
@@ -3389,24 +3434,9 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
     };
     let namespace = resolve_namespace(&store, namespace).await;
 
-    // Direct invocations of handle_memories_for_file also record the
-    // touched file path in `.NeuroStrata/session_queries.json` and bump
-    // `graph_queries_count` on the active in_progress task.
-    let caller_root = arguments
-        .get("project_root")
-        .or_else(|| arguments.get("worktree"))
-        .or_else(|| arguments.get("cwd"))
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let _ = crate::task::record_graph_query_with_root(
-        &store,
-        &namespace,
-        "neurostrata_memories_for_file",
-        path,
-        caller_root,
-    )
-    .await;
+    // Spec §6 R6.2: no pre-dispatch ledger write here. Receipts for this tool
+    // are written post-dispatch at the MCP tools/call boundary with the REAL
+    // result (success/empty/unsupported/failed), latency and returned ids.
 
     let symbol = arguments.get("symbol").and_then(|s| s.as_str());
     let include_ancestors = arguments
