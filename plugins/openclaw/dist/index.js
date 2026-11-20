@@ -525,10 +525,16 @@ export async function prefetchMemoriesForFile(namespace, filePath) {
     return capSnippets(out);
 }
 export const SUBAGENT_CONTEXT_MARKER = "### NeuroStrata Task & Graph Context";
+/** Collapse backticks and newlines so a caller-supplied value cannot break
+ *  out of the header's code span (issue #316: the namespace can arrive from
+ *  a committed .NeuroStrata/session_queries.json). */
+function codeSpanValue(value) {
+    return String(value ?? "").replace(/[`\r\n]+/g, " ");
+}
 export function buildSubagentContextHeader(namespace, taskId) {
     const taskLabel = taskId ?? "unclaimed (claim a task first)";
     return (`${SUBAGENT_CONTEXT_MARKER} (AUTO-INJECTED BY NEUROSTRATA PLUGIN)\n` +
-        `- Namespace: \`${namespace}\` | Active Task ID: \`${taskLabel}\`\n` +
+        `- Namespace: \`${codeSpanValue(namespace)}\` | Active Task ID: \`${codeSpanValue(taskLabel)}\`\n` +
         `- Mandatory Graph-First Lookup Rule: Before blind \`grep\`/\`glob\` or editing files, query \`neurostrata_memories_for_file\`, \`neurostrata_related\`, \`neurostrata_search_memory\` (\`include_related: true\`), or \`neurostrata_sparql_query\` (or \`neurostrata-mcp\` CLI) to inspect governing rules (\`GOVERNS\`) and AST call/import edges (\`DEPENDS_ON\`, \`calls\`, \`imports\`).\n\n`);
 }
 export function injectSubagentPrompt(target, namespace, taskId) {
@@ -558,8 +564,8 @@ function requireCtx() {
     return pluginCtx;
 }
 export async function initialize(ctx) {
-    pluginCtx = ctx;
-    config = resolveConfig(ctx.config);
+    pluginCtx = ctx ?? null;
+    config = resolveConfig(ctx?.config ?? ctx ?? {});
     const token = config.bearerToken ?? loadDaemonToken(config.tokenFile);
     mcpClient = new NeuroStrataMCPClient({
         endpoint: config.endpoint,
@@ -574,12 +580,14 @@ export async function initialize(ctx) {
         missingTools: [],
         lastError: undefined,
     });
-    // Register file operation hook
-    ctx.hooks.beforeFileOp(wrapFileOp);
+    // Register file operation hook. The CLI runner calls initialize with only
+    // a config object (no hooks host), so every registration is optional: the
+    // runner path dispatches through handleHookEvent instead.
+    ctx?.hooks?.beforeFileOp?.(wrapFileOp);
     // Register turn hook for intent detection
-    ctx.hooks.onTurnEnd(onTurnEnd);
+    ctx?.hooks?.onTurnEnd?.(onTurnEnd);
     await negotiateCapabilities();
-    ctx.logger.info("NeuroStrata OpenClaw plugin initialized", {
+    ctx?.logger?.info?.("NeuroStrata OpenClaw plugin initialized", {
         namespace: config.namespace,
         endpoint: config.endpoint,
         authenticated: status.authenticated,
@@ -616,9 +624,132 @@ async function negotiateCapabilities() {
         requireCtx().logger.warn("NeuroStrata core is unreachable; the shim is degraded", { error: String(err) });
     }
 }
-// ──────────────────────────────────────────────────────────────────────
-// File Op Hook: guard_validate before write/edit/delete
-// ──────────────────────────────────────────────────────────────────────
+/** Run the Zero-Action Start guard for one mutating action. Never throws:
+ *  wrapFileOp maps the verdict to a FileOpResult (preserving its log lines),
+ *  and the CLI runner entry point maps it to a hook decision. */
+async function runActionGuard(actionType, payload) {
+    if (!config.strictMode) {
+        mutationsSinceNote++;
+        return { verdict: "pass" };
+    }
+    const cwd = process.cwd();
+    try {
+        const text = await mcpClient.callTool("neurostrata_guard_validate", {
+            namespace: config.namespace,
+            session_id: activeSessionId ?? "unknown",
+            active_task_id: activeTaskId,
+            worktree: cwd,
+            action_type: actionType,
+            payload,
+            cwd,
+            is_mutating: true,
+            use_sandbox: false,
+            mutations_since_note: mutationsSinceNote,
+        });
+        const result = parseGuardValidate(text);
+        if (result.verdict === "reject") {
+            const reason = result.reasons.join("; ") ||
+                result.constraints.join("; ") ||
+                result.bucket;
+            return { verdict: "reject", reason, ruleIds: result.rule_ids, guardVerdict: result };
+        }
+    }
+    catch (err) {
+        return { verdict: "unavailable", message: String(err) };
+    }
+    mutationsSinceNote++;
+    return { verdict: "pass" };
+}
+/** Runner event tool names that map onto OpenClaw's native FileOperation. */
+const OPENCLAW_FILE_OP_TOOLS = {
+    write_file: "write",
+    write: "write",
+    edit: "edit",
+    patch_file: "edit",
+    delete: "delete",
+    mkdir: "mkdir",
+};
+/** Runner event tool names that are mutating shells. */
+const OPENCLAW_SHELL_TOOLS = ["terminal", "bash", "shell", "command"];
+const guardToHookResponse = (guard) => {
+    if (guard.verdict === "reject") {
+        return {
+            hookSpecificOutput: {
+                hookEventName: "PreToolUse",
+                permissionDecision: "deny",
+                permissionDecisionReason: `Zero-Action Start violation: ${guard.reason}`,
+            },
+        };
+    }
+    if (guard.verdict === "unavailable") {
+        return {
+            hookSpecificOutput: {
+                hookEventName: "PreToolUse",
+                permissionDecision: "deny",
+                permissionDecisionReason: `Guard validation unavailable (NeuroStrata core degraded): ${guard.message}`,
+            },
+        };
+    }
+    return {
+        continue: true,
+        hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow" },
+    };
+};
+/**
+ * CLI hook runner entry point. The daemon installs hook-runner.mjs beside
+ * dist/ and dispatches host hook events here; initialize may have been
+ * called with only a config object (no hooks host), so a default client is
+ * built the same way core's handleHookEvent does. File-op and shell events
+ * run the same guard as the native beforeFileOp hook, with a rejection
+ * returned as a deny decision instead of a failed FileOpResult.
+ */
+export async function handleHookEvent(event) {
+    if (!mcpClient) {
+        config = resolveConfig({});
+        const token = loadDaemonToken(config.tokenFile);
+        mcpClient = new NeuroStrataMCPClient({
+            endpoint: config.endpoint,
+            token,
+            timeoutMs: config.requestTimeoutMs,
+        });
+    }
+    const hookEventName = asString(event.hook_event_name) ?? asString(event.eventName) ?? "PreToolUse";
+    const toolName = asString(event.tool_name) ?? asString(event.toolName) ?? "";
+    const rawInput = event.tool_input ?? event.input ?? event.args ?? {};
+    const toolInput = rawInput && typeof rawInput === "object" ? rawInput : {};
+    if (hookEventName !== "PreToolUse") {
+        // Stop turns carry the transcript; the daemon's CLI runner dispatches
+        // here before its own onTurnEnd fallback, so forward it ourselves or
+        // task-intent detection never runs for runner-carried Stop events
+        // (Codex review #326).
+        if (hookEventName === "Stop" && typeof event.transcript === "string") {
+            try {
+                await onTurnEnd({ role: "assistant", content: event.transcript });
+            }
+            catch {
+                // turn-end handling is fail-soft for the runner
+            }
+        }
+        return { continue: true };
+    }
+    const fileOpType = OPENCLAW_FILE_OP_TOOLS[toolName];
+    if (fileOpType) {
+        const payload = JSON.stringify({
+            path: asString(toolInput.path) ?? asString(toolInput.filePath) ?? "",
+            content: asString(toolInput.content),
+            oldContent: asString(toolInput.oldContent),
+            newContent: asString(toolInput.newContent),
+        });
+        return guardToHookResponse(await runActionGuard(fileOpType, payload));
+    }
+    if (OPENCLAW_SHELL_TOOLS.includes(toolName)) {
+        return guardToHookResponse(await runActionGuard(toolName, JSON.stringify(toolInput)));
+    }
+    return {
+        continue: true,
+        hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow" },
+    };
+}
 async function wrapFileOp(op) {
     // File-touch recall (§4.5): before guarding the operation, prefetch the
     // memories governing this file and inject them as a system message.
@@ -649,54 +780,36 @@ async function wrapFileOp(op) {
         oldContent: op.oldContent,
         newContent: op.newContent,
     });
-    const cwd = process.cwd();
-    try {
-        const text = await mcpClient.callTool("neurostrata_guard_validate", {
-            namespace: config.namespace,
+    const guard = await runActionGuard(actionType, payload);
+    if (guard.verdict === "reject") {
+        requireCtx().logger.warn("Guard rejected file operation", {
+            actionType,
             session_id: activeSessionId ?? "unknown",
             active_task_id: activeTaskId,
-            worktree: cwd,
-            action_type: actionType,
-            payload,
-            cwd,
-            is_mutating: true,
-            use_sandbox: false,
-            mutations_since_note: mutationsSinceNote,
+            worktree: process.cwd(),
+            reason: guard.reason,
+            rule_ids: guard.ruleIds,
         });
-        const result = parseGuardValidate(text);
-        if (result.verdict === "reject") {
-            const reason = result.reasons.join("; ") ||
-                result.constraints.join("; ") ||
-                result.bucket;
-            requireCtx().logger.warn("Guard rejected file operation", {
-                actionType,
-                session_id: activeSessionId ?? "unknown",
-                active_task_id: activeTaskId,
-                worktree: cwd,
-                reason,
-                rule_ids: result.rule_ids,
-            });
-            return {
-                allowed: false,
-                reason: `Zero-Action Start violation: ${reason}`,
-                guardVerdict: result,
-                degraded: false,
-            };
-        }
+        return {
+            allowed: false,
+            reason: `Zero-Action Start violation: ${guard.reason}`,
+            guardVerdict: guard.guardVerdict,
+            degraded: false,
+        };
     }
-    catch (err) {
-        const message = String(err);
-        setStatus({ state: "unavailable", lastError: message });
-        requireCtx().logger.error("Guard validation failed", { error: message });
+    if (guard.verdict === "unavailable") {
+        setStatus({ state: "unavailable", lastError: guard.message });
+        requireCtx().logger.error("Guard validation failed", { error: guard.message });
         // Fail closed: a guard that cannot answer is not a guard that passed.
         return {
             allowed: false,
-            reason: `Guard validation unavailable (NeuroStrata core degraded): ${message}`,
+            reason: `Guard validation unavailable (NeuroStrata core degraded): ${guard.message}`,
             degraded: true,
         };
     }
-    // Allowed: the operation executes, so it counts as a mutation.
-    mutationsSinceNote++;
+    // Allowed: the operation executes, so it counts as a mutation. The count
+    // happens inside runActionGuard (shared with the runner entry point);
+    // counting again here would double every strict-pass (Codex review #326).
     return { allowed: true };
 }
 // ──────────────────────────────────────────────────────────────────────

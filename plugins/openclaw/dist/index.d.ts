@@ -235,7 +235,16 @@ export declare function prefetchMemoriesForFile(namespace: string, filePath: str
 export declare const SUBAGENT_CONTEXT_MARKER = "### NeuroStrata Task & Graph Context";
 export declare function buildSubagentContextHeader(namespace: string, taskId: string | null): string;
 export declare function injectSubagentPrompt(target: Record<string, unknown>, namespace: string, taskId: string | null): boolean;
-export declare function initialize(ctx: OpenClawPluginContext): Promise<void>;
+export declare function initialize(ctx: (Partial<OpenClawPluginContext> & Record<string, unknown>) | undefined): Promise<void>;
+/**
+ * CLI hook runner entry point. The daemon installs hook-runner.mjs beside
+ * dist/ and dispatches host hook events here; initialize may have been
+ * called with only a config object (no hooks host), so a default client is
+ * built the same way core's handleHookEvent does. File-op and shell events
+ * run the same guard as the native beforeFileOp hook, with a rejection
+ * returned as a deny decision instead of a failed FileOpResult.
+ */
+export declare function handleHookEvent(event: Record<string, unknown>): Promise<Record<string, unknown>>;
 declare const _default: {
     id: string;
     setup: typeof initialize;
