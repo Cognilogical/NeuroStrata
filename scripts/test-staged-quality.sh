@@ -814,7 +814,7 @@ LEDGER
     return 0
 }
 
-# Test 9: absent project quality script leaves generic ledger hook operational
+# Test 9: absent quality script warns honestly and writes no fabricated ledger row
 test_pre_commit_hook_delegation_absent_quality_script() {
     local tmpdir
     tmpdir=$(mktemp -d)
@@ -859,19 +859,32 @@ RF_EOF
         return 1
     fi
 
-    # Expect generic ledger operations (the hook should still write a ledger entry)
+    # Spec §6 R6.1: the hook must not fabricate `tool:"pre-commit"` rows for
+    # staged files with no real graph lookup. It may create an empty ledger and
+    # emit an honest warning — nothing more.
     local ledger="$repo/.NeuroStrata/session_queries.json"
     if [ ! -f "$ledger" ]; then
-        echo "pre-commit delegation without quality script should still write ledger" >&2
+        echo "pre-commit delegation without quality script should still create ledger" >&2
         rm -rf "$tmpdir"
         return 1
     fi
 
-    # Verify it has at least one entry
     local queries_count
     queries_count=$(jq -r '.queries | length' "$ledger")
-    if [ "$queries_count" -lt 1 ]; then
-        echo "ledger should have at least one query after hook run" >&2
+    if [ "$queries_count" -ne 0 ]; then
+        echo "hook must not fabricate ledger rows (found $queries_count)" >&2
+        cat "$ledger" >&2
+        rm -rf "$tmpdir"
+        return 1
+    fi
+    if jq -e '.queries[] | select(.tool == "pre-commit")' "$ledger" >/dev/null 2>&1; then
+        echo "hook wrote a synthetic tool:pre-commit row" >&2
+        rm -rf "$tmpdir"
+        return 1
+    fi
+    if ! grep -q "no recorded NeuroStrata graph/memory lookup" "$tmpdir/out.log"; then
+        echo "hook should emit an honest missing-lookup warning" >&2
+        cat "$tmpdir/out.log" >&2
         rm -rf "$tmpdir"
         return 1
     fi
@@ -1224,7 +1237,7 @@ run_test "Local ESLint mandatory over PATH" test_local_eslint_mandatory
 run_test "ESLint cwd and web-ui-relative args" test_eslint_cwd_and_args
 run_test "Pre-commit delegation quality failure nonzero, ledger unchanged" test_pre_commit_hook_delegation_quality_failure_propagates_nonzero_ledger_unchanged
 run_test "Pre-commit delegation quality success preserves ledger" test_pre_commit_hook_delegation_quality_success_preserves_ledger
-run_test "Pre-commit delegation absent quality script generic ledger" test_pre_commit_hook_delegation_absent_quality_script
+run_test "Pre-commit delegation absent quality script no fabrication" test_pre_commit_hook_delegation_absent_quality_script
 run_test "Bad staged Rust fails despite formatted worktree" test_bad_staged_rust_fails_despite_formatted_worktree
 run_test "Good staged Rust passes despite bad worktree" test_good_staged_rust_passes_despite_bad_worktree
 run_test "Extensionless Bash hook is checked" test_extensionless_bash_hook_is_checked

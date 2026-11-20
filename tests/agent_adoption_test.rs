@@ -10,6 +10,8 @@ mod memories_for_file;
 mod routing;
 #[path = "../src/task/snapshot_readiness.rs"]
 mod snapshot_readiness;
+#[path = "../src/task/tool_receipts.rs"]
+mod tool_receipts;
 
 use routing::{agent_routing_contract_json, evaluate_triggers, TaskContext};
 use serde_json::Value;
@@ -551,5 +553,187 @@ fn snapshot_readiness_done_task_receipts_excluded() {
         graph_tools_from_ledger(&ledger, &ids),
         vec!["neurostrata_related", "neurostrata_sparql_query"],
         "done-task and unattributed receipts must not count"
+    );
+}
+
+/// Spec §6 R6.1 / Review Focus item 4: the pre-commit hook must never fabricate
+/// `tool:"pre-commit"` lookup rows for staged files that had no real graph
+/// query. Run the real hook in a throwaway repo with one staged file and no
+/// ledger entries, then inspect the ledger it leaves behind.
+#[test]
+fn precommit_no_longer_fabricates_ledger_rows() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(repo.join(".git/hooks")).unwrap();
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+
+    let run = |args: &[&str]| {
+        let out = std::process::Command::new(args[0])
+            .args(&args[1..])
+            .current_dir(&repo)
+            .output()
+            .expect("run command");
+        assert!(
+            out.status.success(),
+            "{} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    run(&["git", "init", "-q"]);
+    run(&["git", "config", "user.email", "test@example.com"]);
+    run(&["git", "config", "user.name", "Test"]);
+    std::fs::write(repo.join("src/main.rs"), "fn main() {}\n").unwrap();
+    run(&["git", "add", "src/main.rs"]);
+
+    let hook_path = repo.join(".git/hooks/pre-commit");
+    std::fs::write(&hook_path, include_str!("../scripts/hooks/pre-commit")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&hook_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&hook_path, perms).unwrap();
+    }
+
+    let out = std::process::Command::new("bash")
+        .arg(&hook_path)
+        .current_dir(&repo)
+        .output()
+        .expect("run pre-commit hook");
+    assert!(
+        out.status.success(),
+        "hook failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let ledger_path = repo.join(".NeuroStrata/session_queries.json");
+    let ledger: Value = std::fs::read_to_string(&ledger_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let no_fabricated_rows = ledger
+        .get("queries")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter().all(|row| {
+                row.get("tool").and_then(Value::as_str) != Some("pre-commit")
+            })
+        })
+        .unwrap_or(true);
+    assert!(
+        no_fabricated_rows,
+        "pre-commit hook fabricated ledger rows: {ledger}"
+    );
+}
+
+/// Build a fully-populated receipt from raw query/content text. The raw text
+/// must never survive into the serialized receipt — only digests do.
+fn sample_receipt(query: &str, content: &str) -> tool_receipts::ReceiptFields {
+    use tool_receipts::{ReceiptFields, ReceiptStatus};
+    ReceiptFields::new(
+        "evt-1".to_string(),
+        1_700_000_000,
+        "ses-1".to_string(),
+        "t1".to_string(),
+        "NeuroStrata".to_string(),
+        "neurostrata_memories_for_file".to_string(),
+        "memories_for_file".to_string(),
+        "T_PATH".to_string(),
+        "graph-first".to_string(),
+        true,
+        ReceiptStatus::Success,
+        12,
+        2,
+        vec!["m1".to_string(), "m2".to_string()],
+        Vec::new(),
+        Vec::new(),
+        query,
+        content,
+    )
+}
+
+/// Spec §6 R6.2: a receipt carries digests only, never raw query/content.
+#[test]
+fn receipt_fields_are_digest_only() {
+    let raw_query = "SELECT * WHERE { ?s ?p ?o }";
+    let raw_content = "top-secret-memory-content";
+    let v = sample_receipt(raw_query, raw_content).to_value();
+    let obj = v.as_object().expect("receipt must be a JSON object");
+    assert!(!obj.contains_key("query"), "raw query must never be stored");
+    assert!(!obj.contains_key("content"), "raw content must never be stored");
+    let qd = tool_receipts::digest(raw_query);
+    let cd = tool_receipts::digest(raw_content);
+    assert_eq!(v["query_digest"].as_str(), Some(qd.as_str()));
+    assert_eq!(v["content_digest"].as_str(), Some(cd.as_str()));
+    assert!(
+        !v.to_string().contains(raw_content),
+        "serialized receipt leaked raw content"
+    );
+}
+
+/// Spec §6 R6.1: `events[]` is versioned and bounded so a long session cannot
+/// grow the ledger without limit.
+#[test]
+fn receipt_events_are_versioned_and_bounded() {
+    let mut doc = serde_json::json!({ "namespace": "NeuroStrata", "queries": [] });
+    tool_receipts::ensure_events_section(&mut doc);
+    assert_eq!(doc["events_version"].as_u64(), Some(1));
+    assert!(doc["events"].as_array().unwrap().is_empty());
+
+    for i in 0..(tool_receipts::MAX_EVENTS + 5) {
+        let mut receipt = sample_receipt("q", "c").to_value();
+        receipt["event_id"] = serde_json::json!(format!("e{i}"));
+        tool_receipts::append_event(&mut doc, receipt);
+    }
+    let events = doc["events"].as_array().unwrap();
+    assert_eq!(events.len(), tool_receipts::MAX_EVENTS);
+    assert_eq!(events.first().unwrap()["event_id"].as_str(), Some("e5"));
+    assert_eq!(doc["queries"].as_array().unwrap().len(), 0);
+}
+
+/// Spec §6 R6.3: advanced subsystems get additive counters only — no gates,
+/// quotas or nudges are introduced by the receipt recorder.
+#[test]
+fn receipt_tool_invocations_are_additive_only() {
+    let mut doc = serde_json::json!({});
+    tool_receipts::bump_tool_invocation(&mut doc, "neurostrata_related");
+    tool_receipts::bump_tool_invocation(&mut doc, "neurostrata_related");
+    tool_receipts::bump_tool_invocation(&mut doc, "neurostrata_taxonomy");
+    assert_eq!(doc["tool_invocations"]["neurostrata_related"].as_u64(), Some(2));
+    assert_eq!(doc["tool_invocations"]["neurostrata_taxonomy"].as_u64(), Some(1));
+    assert!(doc.get("quota").is_none());
+    assert!(doc.get("gate").is_none());
+    assert!(doc.get("nudge").is_none());
+}
+
+/// Spec §6 R6.4: receipts are private/local JSON events, never memory rows,
+/// so a SynapticMesh export over all candidate rows contains zero of them.
+#[test]
+fn receipts_are_private_and_digest_only() {
+    use tool_receipts::{mesh_exportable_rows, RECEIPT_FIELD_NAMES};
+
+    let receipt = sample_receipt("query with secret text", "content with secret text").to_value();
+    let obj = receipt.as_object().expect("receipt must be a JSON object");
+    assert_eq!(obj.len(), RECEIPT_FIELD_NAMES.len(), "exact R6 field set");
+    for key in RECEIPT_FIELD_NAMES {
+        assert!(obj.contains_key(*key), "missing R6 receipt field {key}");
+    }
+    for key in ["query", "content", "memory_type", "eligibility"] {
+        assert!(!obj.contains_key(key), "receipt must not carry {key}");
+    }
+    assert!(!receipt.to_string().contains("secret"));
+
+    let mut doc = serde_json::json!({ "namespace": "NeuroStrata", "queries": [] });
+    tool_receipts::ensure_events_section(&mut doc);
+    tool_receipts::append_event(&mut doc, receipt);
+    let mut candidates = doc["queries"].as_array().cloned().unwrap_or_default();
+    candidates.extend(doc["events"].as_array().cloned().unwrap_or_default());
+
+    let shareable = ["rule", "fact", "procedure", "action_type", "thesis", "concept"];
+    let exported = mesh_exportable_rows(&candidates, &shareable);
+    assert!(
+        exported.iter().all(|row| row.get("event_id").is_none()),
+        "mesh export must contain zero receipt rows: {exported:?}"
     );
 }

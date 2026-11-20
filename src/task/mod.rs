@@ -15,6 +15,7 @@ pub mod precheck;
 pub mod receipt;
 pub mod routing;
 pub mod snapshot_readiness;
+pub mod tool_receipts;
 pub mod wiring;
 
 use crate::formal_kernel::{evaluate_claim_decision, KernelClaimDecision};
@@ -1376,8 +1377,12 @@ pub async fn record_graph_query_with_root(
             }
         }
     }
+    let mut attributed_task_id = String::new();
     for r in &rows {
         if gate::is_task(r) && gate::task_status(r) == Status::InProgress {
+            if attributed_task_id.is_empty() {
+                attributed_task_id = r.id.clone();
+            }
             if let Ok(Some((vec, mut payload))) = store.get(&ns, &r.id).await {
                 let obj = task_obj_mut(&mut payload);
                 let count = obj
@@ -1454,16 +1459,103 @@ pub async fn record_graph_query_with_root(
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_else(|| json!({ "namespace": ns, "queries": [] }));
         if let Some(arr) = doc.get_mut("queries").and_then(|v| v.as_array_mut()) {
+            // Legacy rows stay for compatibility; every quality-metric reader
+            // ignores them in favour of attributed `events[]` receipts.
             arr.push(json!({
                 "ts": now,
                 "tool": tool_name,
                 "query": query_hint,
                 "governed_prefixes": [governed_prefix],
             }));
-            if let Ok(serialized) = serde_json::to_string_pretty(&doc) {
-                let _ = std::fs::write(&ledger_path, serialized);
-            }
         }
+        // Post-dispatch receipt — written only because a graph/ontology tool
+        // actually ran. The pre-commit hook never fabricates these.
+        let receipt = tool_receipts::ReceiptFields::new(
+            uuid::Uuid::new_v4().to_string(),
+            now,
+            current_session_id(),
+            attributed_task_id,
+            ns.clone(),
+            tool_name.to_string(),
+            tool_name.trim_start_matches("neurostrata_").to_string(),
+            String::new(),
+            receipt_route_class(tool_name).to_string(),
+            true,
+            tool_receipts::ReceiptStatus::Success,
+            0,
+            0,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            query_hint,
+            "",
+        );
+        tool_receipts::append_event(&mut doc, receipt.to_value());
+        tool_receipts::bump_tool_invocation(&mut doc, tool_name);
+        if let Ok(serialized) = serde_json::to_string_pretty(&doc) {
+            let _ = std::fs::write(&ledger_path, serialized);
+        }
+    }
+}
+
+/// Session identifier stamped onto receipts. Prefer the harness-provided id;
+/// fall back to a process-local id so local runs still attribute an event.
+fn current_session_id() -> String {
+    static SESSION_ID: OnceLock<String> = OnceLock::new();
+    SESSION_ID
+        .get_or_init(|| {
+            std::env::var("OPENCODE_SESSION_ID")
+                .or_else(|_| std::env::var("NEUROSTRATA_SESSION_ID"))
+                .unwrap_or_else(|_| format!("local-{}", uuid::Uuid::new_v4()))
+        })
+        .clone()
+}
+
+/// Coarse route class for a tool name; callers passing full `ReceiptFields` to
+/// [`record_tool_receipt`] can supply a more precise value.
+fn receipt_route_class(tool: &str) -> &'static str {
+    if matches!(
+        tool,
+        "neurostrata_taxonomy" | "neurostrata_object_view" | "neurostrata_sparql_query"
+    ) {
+        "ontology"
+    } else {
+        "graph_read"
+    }
+}
+
+/// Record a fully-specified post-dispatch receipt. Receipts stay in the local
+/// JSON ledger — they are never memory rows, so no ReBAC or mesh surface sees
+/// them. Advanced subsystems may additionally read `tool_invocations`, which
+/// is additive-only (no gates, quotas or nudges).
+#[allow(dead_code)] // Public surface for handlers passing full ReceiptFields; generic callers use record_graph_query_with_root.
+pub fn record_tool_receipt(fields: tool_receipts::ReceiptFields) {
+    let tool = fields.tool.clone();
+    let mut root = crate::daemon::resolve_project_root();
+    while !root.as_os_str().is_empty()
+        && !root.join(".git").exists()
+        && !root.join(".NeuroStrata").exists()
+    {
+        match root.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => root = parent.to_path_buf(),
+            _ => break,
+        }
+    }
+    if root.as_os_str().is_empty() {
+        return;
+    }
+    let ledger_path = root.join(".NeuroStrata/session_queries.json");
+    if let Some(parent) = ledger_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut doc: Value = std::fs::read_to_string(&ledger_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| json!({ "queries": [] }));
+    tool_receipts::append_event(&mut doc, fields.to_value());
+    tool_receipts::bump_tool_invocation(&mut doc, &tool);
+    if let Ok(serialized) = serde_json::to_string_pretty(&doc) {
+        let _ = std::fs::write(&ledger_path, serialized);
     }
 }
 
@@ -3526,9 +3618,10 @@ pub(crate) fn is_current_hook(content: &str) -> bool {
 pub(crate) const SCAFFOLDED_PRE_COMMIT_HOOK: &str = r#"#!/bin/bash
 # NeuroStrata pre-commit hook — scaffolded by neurostrata-bootstrap.
 #
-# Records the files/prefixes touched by this commit into `.NeuroStrata/session_queries.json`
-# and stamps `graph_queried` on the active in_progress task for the namespace.
-# Works across any repository layout (src/, pkg/, cmd/, apps/, packages/, scripts/, root files).
+# Warns when a staged file has no recorded NeuroStrata graph/memory lookup and
+# keeps the local `.NeuroStrata/session_queries.json` ledger readable. Receipts
+# are written post-dispatch by the graph/ontology tools; this hook never
+# fabricates lookup rows. Works across any repository layout.
 #
 # Install with:  neurostrata-mcp hooks install
 
@@ -3765,199 +3858,10 @@ if [ ! -f "$LEDGER" ]; then
     printf '{\n  "namespace": "%s",\n  "queries": [\n  ]\n}\n' "$NAMESPACE" > "$LEDGER"
 fi
 
-MissingFiles=()
-for raw_file in "${StagedFiles[@]}"; do
-    file=$(normalize_rel_path "$raw_file")
-    [ -z "$file" ] && continue
-    if [ -n "$LEDGER_PATHS" ]; then
-        if printf '%s\n' "$LEDGER_PATHS" | grep -qxF "$(fold_case "$file")"; then
-            continue
-        fi
-    fi
-    if ledger_has_file "$file"; then
-        continue
-    fi
-    MissingFiles+=("$file")
-done
 
-if [ "${#MissingFiles[@]}" -gt 0 ]; then
-    TS=$(date +%s)
-    export LEDGER NAMESPACE TS
-    if command -v node >/dev/null 2>&1; then
-        printf '%s\n' "${MissingFiles[@]}" | node -e '
-          const fs = require("fs");
-          const ledger = process.env.LEDGER;
-          const ns = process.env.NAMESPACE;
-          const ts = parseInt(process.env.TS, 10) || 0;
-          const files = fs.readFileSync(0, "utf8").split("\n").filter(Boolean);
-          let doc = { namespace: ns, queries: [] };
-          try {
-            const raw = fs.readFileSync(ledger, "utf8");
-            const parsed = JSON.parse(raw);
-            if (Array.isArray(parsed)) {
-              doc = { namespace: ns, queries: parsed };
-            } else if (parsed && typeof parsed === "object") {
-              doc = parsed;
-            }
-          } catch {}
-          if (typeof doc.namespace !== "string" || !doc.namespace) doc.namespace = ns;
-          if (!Array.isArray(doc.queries)) doc.queries = [];
-          const have = new Set(doc.queries.filter((q) => q && typeof q === "object" && typeof q.query === "string").map((q) => q.query));
-          for (const file of files) {
-            if (have.has(file)) continue;
-            have.add(file);
-            doc.queries.push({ ts, tool: "pre-commit", query: file, domains: [file], returned_ids: [], governed_prefixes: [file] });
-          }
-          fs.writeFileSync(ledger, JSON.stringify(doc, null, 2) + "\n");
-        ' 2>/dev/null || true
-    elif command -v python3 >/dev/null 2>&1; then
-        printf '%s\n' "${MissingFiles[@]}" | python3 -c '
-import json, os, sys
-ledger = os.environ["LEDGER"]
-ns = os.environ["NAMESPACE"]
-ts = int(os.environ.get("TS", "0") or "0")
-files = [line.rstrip("\n") for line in sys.stdin if line.strip()]
-try:
-    with open(ledger) as f:
-        parsed = json.load(f)
-except Exception:
-    parsed = {}
-if isinstance(parsed, list):
-    doc = {"namespace": ns, "queries": parsed}
-elif isinstance(parsed, dict):
-    doc = parsed
-else:
-    doc = {"namespace": ns, "queries": []}
-if not isinstance(doc.get("namespace"), str) or not doc.get("namespace"):
-    doc["namespace"] = ns
-if not isinstance(doc.get("queries"), list):
-    doc["queries"] = []
-have = {q.get("query") for q in doc["queries"] if isinstance(q, dict)}
-for file in files:
-    if file in have:
-        continue
-    have.add(file)
-    doc["queries"].append({"ts": ts, "tool": "pre-commit", "query": file, "domains": [file], "returned_ids": [], "governed_prefixes": [file]})
-with open(ledger, "w") as f:
-    json.dump(doc, f, indent=2, ensure_ascii=False)
-    f.write("\n")
-' 2>/dev/null || true
-    else
-        # awk fallback: still ONE invocation. Read missing files from a temp list.
-        FILELIST=$(mktemp)
-        printf '%s\n' "${MissingFiles[@]}" > "$FILELIST"
-        export FILELIST
-        TMP=$(mktemp)
-        if awk '
-          function json_escape(s,    i, n, c, out) {
-            out = ""
-            n = length(s)
-            for (i = 1; i <= n; i++) {
-              c = substr(s, i, 1)
-              if (c == "\\") out = out "\\\\"
-              else if (c == "\"") out = out "\\\""
-              else if (c == "\t") out = out "\\t"
-              else if (c == "\r") out = out "\\r"
-              else if (c == "\n") out = out "\\n"
-              else if (c == "\f") out = out "\\f"
-              else if (c == "\b") out = out "\\b"
-              else out = out c
-            }
-            return out
-          }
-          function entry_str(file, comma,    s) {
-            s = "    {\n"
-            s = s "      \"ts\": " ts ",\n"
-            s = s "      \"tool\": \"pre-commit\",\n"
-            s = s "      \"query\": \"" file "\",\n"
-            s = s "      \"domains\": [\"" file "\"],\n"
-            s = s "      \"returned_ids\": [],\n"
-            s = s "      \"governed_prefixes\": [\"" file "\"]\n"
-            s = s (comma ? "    }," : "    }")
-            return s
-          }
-          BEGIN {
-            ns = json_escape(ENVIRON["NAMESPACE"])
-            ts = ENVIRON["TS"] + 0
-            nfiles = 0
-            while ((getline line < ENVIRON["FILELIST"]) > 0) {
-              if (line != "") {
-                nfiles++
-                files[nfiles] = json_escape(line)
-              }
-            }
-            close(ENVIRON["FILELIST"])
-            doc = ""
-          }
-          {
-            doc = (NR == 1 ? $0 : doc "\n" $0)
-          }
-          END {
-            nent = 0
-            for (i = 1; i <= nfiles; i++) {
-              if (index(doc, "\"" files[i] "\"") > 0) continue
-              nent++
-              newf[nent] = files[i]
-            }
-            trimmed = doc
-            sub(/^[[:space:]]+/, "", trimmed)
-            sub(/[[:space:]]+$/, "", trimmed)
-            if (substr(trimmed, 1, 1) == "[" && substr(trimmed, length(trimmed), 1) == "]") {
-              inner = substr(trimmed, 2, length(trimmed) - 2)
-              sub(/^[[:space:]]*\n?/, "", inner)
-              sub(/\n?[[:space:]]*$/, "", inner)
-              print "{"
-              print "  \"namespace\": \"" ns "\","
-              print "  \"queries\": ["
-              if (nent == 0) {
-                if (inner != "") print inner
-              } else if (inner == "") {
-                for (i = 1; i <= nent; i++) print entry_str(newf[i], i < nent)
-              } else {
-                for (i = 1; i <= nent; i++) print entry_str(newf[i], 1)
-                print inner
-              }
-              print "  ]"
-              print "}"
-              exit
-            }
-            if (nent == 0) {
-              print doc
-              exit
-            }
-            if (match(doc, /"queries"[[:space:]]*:[[:space:]]*\[/)) {
-              open_idx = RSTART + RLENGTH - 1
-              prefix = substr(doc, 1, open_idx)
-              rest = substr(doc, open_idx + 1)
-              if (match(rest, /^[[:space:]]*\]/)) {
-                close_part = substr(rest, RSTART + RLENGTH - 1)
-                print prefix
-                for (i = 1; i <= nent; i++) print entry_str(newf[i], i < nent)
-                print "  " close_part
-                exit
-              } else {
-                sub(/^[[:space:]]*\n?/, "", rest)
-                print prefix
-                for (i = 1; i <= nent; i++) print entry_str(newf[i], 1)
-                print "    " rest
-                exit
-              }
-            }
-            print "{"
-            print "  \"namespace\": \"" ns "\","
-            print "  \"queries\": ["
-            for (i = 1; i <= nent; i++) print entry_str(newf[i], i < nent)
-            print "  ]"
-            print "}"
-          }
-        ' "$LEDGER" > "$TMP" 2>/dev/null && mv "$TMP" "$LEDGER"; then
-            :
-        else
-            rm -f "$TMP"
-        fi
-        rm -f "$FILELIST"
-    fi
-fi
+# Spec §6 R6.1: this hook never fabricates `tool:"pre-commit"` ledger rows.
+# A stale/unrecorded staged file only produces the honest warning above. Real
+# receipts are written post-dispatch by the graph/ontology tools themselves.
 
 exit 0
 "#;
