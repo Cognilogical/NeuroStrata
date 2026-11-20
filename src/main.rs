@@ -47,6 +47,7 @@ mod recall_metrics;
 mod receipts;
 mod registry;
 mod retention;
+mod root_audit;
 mod root_marker;
 mod search;
 mod secrets;
@@ -929,6 +930,21 @@ pub(crate) enum RootCommands {
     Show {
         /// Folder or file inside the project (default: the current directory)
         dir: Option<std::path::PathBuf>,
+    },
+    /// List the namespace's active memories whose stored paths are absolute
+    /// inside the root (each with the exact neurostrata_supersede_memory call
+    /// that makes them project-relative) and the paths that need a decision.
+    /// Read-only: never starts a daemon and never writes. Exits 0 when nothing
+    /// is fixable, else 1.
+    Audit {
+        /// Folder or file inside the project (default: the current directory)
+        dir: Option<std::path::PathBuf>,
+        /// Namespace to audit (default: the marker's namespace)
+        #[arg(long)]
+        namespace: Option<String>,
+        /// Print the report as JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -2303,75 +2319,54 @@ fn root_show_bindings_from(
         .map_err(|e| format!("{}: {e:#}", path.display()))
 }
 
-/// The registry's cached root for `root show`: from a daemon that answers
-/// (after the same identity check the gate makes), else from the store opened
-/// here while this process holds the store lock. Never starts a daemon and
-/// never writes the store (it may create the empty lock file): the
-/// store is opened only when it has no write-ahead log to replay and no
-/// recovery copies an open would prune, is not
+/// Where `root show` and `root audit` read the store: a daemon that answers
+/// (after the same identity check the gate makes), else the store opened here
+/// while this process holds the store lock (kept in `Direct` until the read
+/// is done). Never starts a daemon and never writes the store (it may create
+/// the empty lock file): the store is opened only when it has no write-ahead
+/// log to replay and no recovery copies an open would prune, is not
 /// initialized (`init` runs DDL and store-state sidecar writes), and is only
 /// read through `with_conn`, which leaves it clean, so drop does not
 /// checkpoint.
-async fn root_show_cached_root(
-    probe: DaemonProbe,
-    namespace: &str,
-) -> crate::root_marker::CachedRoot {
-    use crate::root_marker::CachedRoot;
+enum CliReadStore {
+    Daemon,
+    /// The store and the held store lock.
+    Direct(Arc<dyn VectorStore>, std::fs::File),
+}
+
+/// The read source for the `root` commands, or why there is none.
+async fn open_cli_read_store(probe: DaemonProbe) -> Result<CliReadStore, String> {
     if probe == DaemonProbe::Responsive {
-        if let Err(e) =
-            gate_verify_daemon(fetch_daemon_info().await.as_ref(), daemon::exe_fingerprint())
-        {
-            return CachedRoot::Unknown(e);
-        }
-        let reply = async {
-            let res = daemon_http_client()
-                .post("http://127.0.0.1:34343/cli/read")
-                .json(&serde_json::json!({ "op": "project_root", "namespace": namespace }))
-                .timeout(std::time::Duration::from_secs(10))
-                .send()
-                .await
-                .map_err(|e| e.to_string())?;
-            if !res.status().is_success() {
-                return Err(format!("the daemon answered {} on /cli/read", res.status()));
-            }
-            res.json::<serde_json::Value>().await.map_err(|e| e.to_string())
-        }
-        .await;
-        return match reply {
-            Ok(v) => CachedRoot::Known(v["project_root"].as_str().map(str::to_string)),
-            Err(e) => CachedRoot::Unknown(format!("daemon: {e}")),
-        };
+        gate_verify_daemon(fetch_daemon_info().await.as_ref(), daemon::exe_fingerprint())?;
+        return Ok(CliReadStore::Daemon);
     }
-    let config = match Config::load() {
-        Ok(config) => config,
-        Err(e) => return CachedRoot::Unknown(format!("the config could not be read: {e}")),
-    };
+    let config = Config::load().map_err(|e| format!("the config could not be read: {e}"))?;
     if !config.db_path.exists() {
-        return CachedRoot::Unknown(format!("no store at {}", config.db_path.display()));
+        return Err(format!("no store at {}", config.db_path.display()));
     }
-    // The store lock is taken and held until the read below is done, as
+    // The store lock is taken and held until the read is done, as
     // `hold_store_lock_for_copy` does: a daemon that starts after a mere probe
     // could write a log between the checks below and the open. Taking it
     // creates the empty lock file when it is missing.
-    let _lock = match open_daemon_lock(&config.db_path) {
+    let lock = match open_daemon_lock(&config.db_path) {
         Ok(file) => match file.try_lock() {
             Ok(()) => file,
             Err(std::fs::TryLockError::WouldBlock) => {
-                return CachedRoot::Unknown("no daemon, store locked".to_string())
+                return Err("no daemon, store locked".to_string())
             }
             Err(std::fs::TryLockError::Error(e)) => {
-                return CachedRoot::Unknown(format!("the store lock could not be taken: {e}"))
+                return Err(format!("the store lock could not be taken: {e}"))
             }
         },
         Err(e) => {
-            return CachedRoot::Unknown(format!(
+            return Err(format!(
                 "the store lock could not be opened ({}): {e}",
                 daemon_lock_path(&config.db_path).display()
             ))
         }
     };
     if probe == DaemonProbe::Silent {
-        return CachedRoot::Unknown(
+        return Err(
             "nothing answered on 127.0.0.1:34343 within 500ms, so a daemon may be busy; not opening the store"
                 .to_string(),
         );
@@ -2382,7 +2377,7 @@ async fn root_show_cached_root(
         let mut wal = config.db_path.clone().into_os_string();
         wal.push(suffix);
         if std::fs::metadata(&wal).is_ok_and(|m| m.len() > 0) {
-            return CachedRoot::Unknown(format!(
+            return Err(format!(
                 "the store has a write-ahead log to replay ({}); opening it would write",
                 std::path::Path::new(&wal).display()
             ));
@@ -2392,26 +2387,149 @@ async fn root_show_cached_root(
     // retention count; skip the open when it would remove one.
     let keep = LadybugStore::configured_snapshot_retention_count().max(1);
     if crate::storage::snapshot::list_wal_recovery_artifacts(&config.db_path).len() > keep {
-        return CachedRoot::Unknown(
-            "opening the store would prune old write-ahead-log recovery copies".to_string(),
-        );
+        return Err("opening the store would prune old write-ahead-log recovery copies".to_string());
     }
-    let read = async {
-        let dimensions = embed::configured_dimensions().map_err(|e| e.to_string())?;
-        let store: Arc<dyn VectorStore> = Arc::new(
-            LadybugStore::new(config.db_path.to_string_lossy().to_string(), dimensions)
-                .map_err(|e| e.to_string())?,
-        );
-        let namespace = crate::server::resolve_namespace(&store, namespace).await;
-        crate::registry::cached_project_root(&store, &namespace)
+    let dimensions = embed::configured_dimensions()
+        .map_err(|e| format!("the store could not be read: {e}"))?;
+    let store = LadybugStore::new(config.db_path.to_string_lossy().to_string(), dimensions)
+        .map_err(|e| format!("the store could not be read: {e}"))?;
+    Ok(CliReadStore::Direct(Arc::new(store), lock))
+}
+
+/// One read op on the daemon's `/cli/read`.
+async fn cli_read_op(
+    body: serde_json::Value,
+    timeout: std::time::Duration,
+) -> Result<serde_json::Value, String> {
+    let res = daemon_http_client()
+        .post("http://127.0.0.1:34343/cli/read")
+        .json(&body)
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !res.status().is_success() {
+        return Err(format!("the daemon answered {} on /cli/read", res.status()));
+    }
+    res.json::<serde_json::Value>().await.map_err(|e| e.to_string())
+}
+
+/// The registry's cached root for `root show`, read from [`open_cli_read_store`].
+async fn root_show_cached_root(
+    probe: DaemonProbe,
+    namespace: &str,
+) -> crate::root_marker::CachedRoot {
+    use crate::root_marker::CachedRoot;
+    match open_cli_read_store(probe).await {
+        Err(e) => CachedRoot::Unknown(e),
+        Ok(CliReadStore::Daemon) => match cli_read_op(
+            serde_json::json!({ "op": "project_root", "namespace": namespace }),
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        {
+            Ok(v) => CachedRoot::Known(v["project_root"].as_str().map(str::to_string)),
+            Err(e) => CachedRoot::Unknown(format!("daemon: {e}")),
+        },
+        Ok(CliReadStore::Direct(store, _lock)) => {
+            let namespace = crate::server::resolve_namespace(&store, namespace).await;
+            match crate::registry::cached_project_root(&store, &namespace).await {
+                Ok(root) => CachedRoot::Known(root),
+                Err(e) => CachedRoot::Unknown(format!("the store could not be read: {e}")),
+            }
+        }
+    }
+}
+
+/// `root audit`: the root is the marker's when it names the audited
+/// namespace, else the namespace's cached root; the rows come from the daemon
+/// or the store opened read-only, as `root show` reads them. Returns the exit
+/// code.
+async fn run_root_audit(
+    dir: Option<&std::path::PathBuf>,
+    namespace: Option<&str>,
+    json: bool,
+) -> anyhow::Result<i32> {
+    let cwd = std::env::current_dir()?;
+    let dir = dir.map(|d| cwd.join(d)).unwrap_or(cwd);
+    if !dir.exists() {
+        anyhow::bail!("{} does not exist", dir.display());
+    }
+    let dir = dunce::canonicalize(&dir).unwrap_or(dir);
+    let folder = match dir.parent() {
+        Some(parent) if dir.is_file() => parent.to_path_buf(),
+        _ => dir.clone(),
+    };
+    let found = match crate::root_marker::find_root_marker(&folder) {
+        Ok(found) => found,
+        Err((path, reason)) => {
+            anyhow::bail!("the root marker {} is unreadable: {reason}", path.display())
+        }
+    };
+    let requested = match (namespace, &found) {
+        (Some(ns), _) => ns.to_string(),
+        (None, Some(found)) => found.config.namespace.clone(),
+        (None, None) => crate::task::harness_plugins::resolve_namespace(&folder)
+            .map(|resolved| resolved.namespace)
+            .map_err(|e| anyhow::anyhow!("root audit: {e}"))?,
+    };
+    let source = open_cli_read_store(probe_daemon().await)
+        .await
+        .map_err(|e| anyhow::anyhow!("root audit cannot read the store: {e}"))?;
+    // The namespace as stored (matched case-insensitively) and its cached root.
+    let (namespace, cached) = match &source {
+        CliReadStore::Daemon => {
+            let v = cli_read_op(
+                serde_json::json!({ "op": "project_root", "namespace": requested }),
+                std::time::Duration::from_secs(10),
+            )
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| anyhow::anyhow!("root audit cannot read the store: daemon: {e}"))?;
+            (
+                v["namespace"].as_str().unwrap_or(&requested).to_string(),
+                v["project_root"].as_str().map(str::to_string),
+            )
+        }
+        CliReadStore::Direct(store, _) => {
+            let ns = crate::server::resolve_namespace(store, &requested).await;
+            let cached = crate::registry::cached_project_root(store, &ns).await?;
+            (ns, cached)
+        }
+    };
+    let root = match &found {
+        Some(found) if found.config.namespace.eq_ignore_ascii_case(&namespace) => found.root.clone(),
+        _ => match cached.filter(|r| crate::paths::is_usable_root(r)) {
+            Some(root) => std::path::PathBuf::from(root),
+            None => anyhow::bail!(
+                "no root for namespace '{namespace}': no .NeuroStrata/config.json for it applies to {} \
+                 and it has no usable cached root. Run `neurostrata-mcp root show` to see what applies.",
+                folder.display()
+            ),
+        },
+    };
+    let bindings = Config::load().map(|c| c.project_contexts).unwrap_or_default();
+    let report = match source {
+        CliReadStore::Daemon => {
+            let v = cli_read_op(
+                serde_json::json!({ "op": "list", "namespace": namespace }),
+                std::time::Duration::from_secs(120),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("root audit cannot read the store: daemon: {e}"))?;
+            let rows: Vec<crate::traits::SearchResult> = serde_json::from_value(v["rows"].clone())?;
+            crate::root_audit::audit_rows(&rows, &namespace, &root, &bindings)
+        }
+        CliReadStore::Direct(store, _lock) => {
+            crate::root_audit::audit_namespace(&store, &namespace, &root, &bindings).await?
+        }
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("root: {}\nnamespace: {namespace}\n", root.display());
+        println!("{}", report.to_text());
     }
-    .await;
-    match read {
-        Ok(root) => CachedRoot::Known(root),
-        Err(e) => CachedRoot::Unknown(format!("the store could not be read: {e}")),
-    }
+    Ok(report.exit_code())
 }
 
 /// A daemon that holds the database but did not answer the probe is busy, not
@@ -4076,6 +4194,33 @@ mod tests {
         std::fs::write(&path, b"{ not json").unwrap();
         let err = root_show_bindings_from(&path).unwrap_err();
         assert!(err.contains(&path.display().to_string()), "{err}");
+    }
+
+    #[test]
+    fn root_audit_command_parses() {
+        let cli = Cli::try_parse_from(["neurostrata-mcp", "root", "audit"]).expect("parses bare");
+        match cli.command {
+            Some(Commands::Root { action }) => assert_eq!(
+                action,
+                RootCommands::Audit { dir: None, namespace: None, json: false }
+            ),
+            other => panic!("expected Root/Audit, got {:?}", other),
+        }
+        let cli = Cli::try_parse_from([
+            "neurostrata-mcp", "root", "audit", "some/dir", "--namespace", "example-project", "--json",
+        ])
+        .expect("parses with a dir, a namespace and --json");
+        match cli.command {
+            Some(Commands::Root { action }) => assert_eq!(
+                action,
+                RootCommands::Audit {
+                    dir: Some("some/dir".into()),
+                    namespace: Some("example-project".to_string()),
+                    json: true,
+                }
+            ),
+            other => panic!("expected Root/Audit, got {:?}", other),
+        }
     }
 
     #[test]
@@ -6441,6 +6586,12 @@ async fn run() -> anyhow::Result<()> {
                     "{}",
                     crate::root_marker::format_root_show(&folder, &found, &namespace, &cached, &bindings)
                 );
+            }
+            RootCommands::Audit { dir, namespace, json } => {
+                let code = run_root_audit(dir.as_ref(), namespace.as_deref(), *json).await?;
+                if code != 0 {
+                    std::process::exit(code);
+                }
             }
         }
         return Ok(());
