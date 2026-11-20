@@ -653,6 +653,25 @@ pub fn persist_active_session_file(
     golden_rules: &[SearchResult],
     active_task: Option<(&str, &MemoryPayload)>,
 ) {
+    persist_active_session_file_with_home(
+        project_root,
+        namespace,
+        golden_rules,
+        active_task,
+        dirs::home_dir().as_deref(),
+    );
+}
+
+fn persist_active_session_file_with_home(
+    project_root: &std::path::Path,
+    namespace: &str,
+    golden_rules: &[SearchResult],
+    active_task: Option<(&str, &MemoryPayload)>,
+    home: Option<&std::path::Path>,
+) {
+    if crate::formal_kernel::is_home_without_git_with(project_root, home) {
+        return;
+    }
     let ns_dir = project_root.join(".NeuroStrata");
     let session_path = ns_dir.join("active_session.json");
     let mut active: Map<String, Value> = std::fs::read_to_string(&session_path)
@@ -1544,7 +1563,9 @@ async fn record_graph_query_inner(
                 hint_path.parent()
             };
             while let Some(dir) = cur {
-                if dir.join(".git").exists() || dir.join(".NeuroStrata").exists() {
+                // `.git` only: a file under the home folder must not land its
+                // entry in `~/.NeuroStrata`.
+                if dir.join(".git").exists() {
                     project_root = Some(dir.to_string_lossy().to_string());
                     break;
                 }
@@ -1667,7 +1688,9 @@ async fn record_graph_query_inner(
         // Bare module/domain keyword: widen to directory coverage.
         format!("{}/", query_hint)
     };
-    if let Some(root) = project_root {
+    if let Some(root) = project_root
+        .filter(|r| !crate::formal_kernel::is_home_without_git(std::path::Path::new(r)))
+    {
         let ledger_path = std::path::Path::new(&root).join(".NeuroStrata/session_queries.json");
         // NOTE (spec §6 R6.2): this is the PRE-dispatch legacy path. It writes
         // only the legacy `queries[]` row + the single task stamp above; it must
@@ -2034,6 +2057,9 @@ async fn resolve_task_scope(
     if scope.worktree.is_none() {
         if let Some(ref explicit_wt) = explicit_root {
             let root_dir = resolve_session_root_dir(explicit_wt);
+            if crate::formal_kernel::is_home_without_git(&root_dir) {
+                return (chosen_root, scope);
+            }
             let canonical = root_dir
                 .canonicalize()
                 .map(|p| p.to_string_lossy().into_owned())
@@ -8044,6 +8070,39 @@ mod tests {
         .unwrap();
         assert_eq!(list["tasks"][0]["branch"], json!("feature/scope"));
         assert_eq!(list["tasks"][0]["worktree"], json!("/wt/scope"));
+    }
+
+    #[test]
+    fn home_folder_gets_no_session_file() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".NeuroStrata")).unwrap();
+        persist_active_session_file_with_home(home.path(), "example-project", &[], None, Some(home.path()));
+        assert!(!home.path().join(".NeuroStrata/active_session.json").exists());
+        let work = home.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        persist_active_session_file_with_home(&work, "example-project", &[], None, Some(home.path()));
+        assert!(work.join(".NeuroStrata/active_session.json").exists());
+    }
+
+    #[tokio::test]
+    async fn ledger_hint_walk_ignores_ancestor_neurostrata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let top = dunce::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(top.join(".NeuroStrata")).unwrap();
+        let repo = top.join("scratch");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        let file = repo.join("src").join("a.rs");
+        std::fs::write(&file, "x").unwrap();
+        let store = store_with_namespace("example-project").await;
+        let hint = file.to_string_lossy().to_string();
+
+        record_graph_query_with_root(&store, "example-project", "t", &hint, None).await;
+        assert!(!top.join(".NeuroStrata/session_queries.json").exists());
+
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        record_graph_query_with_root(&store, "example-project", "t", &hint, None).await;
+        assert!(repo.join(".NeuroStrata/session_queries.json").exists());
+        assert!(!top.join(".NeuroStrata/session_queries.json").exists());
     }
 
     #[tokio::test]

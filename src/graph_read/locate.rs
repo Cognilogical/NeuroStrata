@@ -559,6 +559,9 @@ fn record_paths_in_project_ledger(
     let Some(root) = project_root.filter(|s| !s.trim().is_empty()) else {
         return;
     };
+    if crate::formal_kernel::is_home_without_git(std::path::Path::new(root)) {
+        return;
+    }
     let ledger_path = std::path::Path::new(root).join(".NeuroStrata/session_queries.json");
     if let Some(parent) = ledger_path.parent() {
         let _ = std::fs::create_dir_all(parent);

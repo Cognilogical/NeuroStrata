@@ -3498,16 +3498,15 @@ mod tests {
         let scratch = home.path().join("work").join("scratch");
         std::fs::create_dir_all(&scratch).unwrap();
         let got = resolve_session_root_with_home(None, &scratch, Some(home.path()));
-        assert_ne!(got, home.path().to_path_buf());
         assert_eq!(got, scratch);
 
-        // Home itself without .git: the marker rule is skipped, the walk
-        // finds no .git and falls back to the start folder.
-        let got = resolve_session_root_with_home(None, home.path(), Some(home.path()));
-        assert_eq!(got, home.path().to_path_buf());
+        // Home without .git is flagged so callers skip session writes.
+        assert!(is_home_without_git_with(home.path(), Some(home.path())));
+        assert!(!is_home_without_git_with(&scratch, Some(home.path())));
 
-        // Home with .git: returned through the .git walk.
+        // Home with .git is a real repo.
         std::fs::create_dir_all(home.path().join(".git")).unwrap();
+        assert!(!is_home_without_git_with(home.path(), Some(home.path())));
         let got = resolve_session_root_with_home(None, &scratch, Some(home.path()));
         assert_eq!(got, home.path().to_path_buf());
     }
@@ -4614,7 +4613,9 @@ fn is_env_assignment(tok: &str) -> bool {
 /// current working directory. An explicit directory always wins as the
 /// starting point; otherwise `cwd` is used. The walk stops at the nearest
 /// `.git` ancestor, so an ambient `.NeuroStrata` directory outside that
-/// boundary can never capture the session.
+/// boundary can never capture the session. The user's home folder never
+/// counts as a root through its own `.NeuroStrata` (SynapticMesh keeps its
+/// node id there); callers must also skip writes for `is_home_without_git`.
 pub fn resolve_session_root(
     explicit: Option<&std::path::Path>,
     cwd: &std::path::Path,
@@ -4622,8 +4623,25 @@ pub fn resolve_session_root(
     resolve_session_root_with_home(explicit, cwd, dirs::home_dir().as_deref())
 }
 
-/// The user's home folder is never a project root by way of a `.NeuroStrata`
-/// directory (SynapticMesh keeps its node id in `~/.NeuroStrata`).
+fn is_home_dir(dir: &std::path::Path, home: Option<&std::path::Path>) -> bool {
+    let Some(h) = home.and_then(|h| dunce::canonicalize(h).ok()) else {
+        return false;
+    };
+    dunce::canonicalize(dir).is_ok_and(|d| d == h)
+}
+
+/// True when `dir` is the user's home folder and holds no `.git`. Such a
+/// folder is never a project root, so session state (`active_session.json`,
+/// `session_queries.json`) must not be written there: `~/.NeuroStrata`
+/// belongs to SynapticMesh, not to a project.
+pub fn is_home_without_git(dir: &std::path::Path) -> bool {
+    is_home_without_git_with(dir, dirs::home_dir().as_deref())
+}
+
+pub(crate) fn is_home_without_git_with(dir: &std::path::Path, home: Option<&std::path::Path>) -> bool {
+    is_home_dir(dir, home) && !dir.join(".git").exists()
+}
+
 fn resolve_session_root_with_home(
     explicit: Option<&std::path::Path>,
     cwd: &std::path::Path,
@@ -4638,14 +4656,7 @@ fn resolve_session_root_with_home(
 
     // The given directory itself is authoritative when it carries
     // .NeuroStrata (non-git project roots), matching the pre-kernel behavior.
-    let is_home = home
-        .map(|h| {
-            dunce::canonicalize(h).ok().is_some_and(|h| {
-                dunce::canonicalize(start).is_ok_and(|s| s == h)
-            })
-        })
-        .unwrap_or(false);
-    if !is_home && start.join(".NeuroStrata").exists() {
+    if !is_home_dir(start, home) && start.join(".NeuroStrata").exists() {
         return start.to_path_buf();
     }
 
