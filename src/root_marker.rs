@@ -310,19 +310,29 @@ impl FoundMarker {
         if self.via != FoundVia::MainCheckout {
             return self.root.clone();
         }
-        let mapped = checkout_top(&self.root).and_then(|top| {
-            let main = crate::paths::main_checkout_root(&top.to_string_lossy())?;
-            Some(main.join(self.root.strip_prefix(&top).ok()?))
-        });
-        mapped.unwrap_or_else(|| self.root.clone())
+        in_main_checkout(&self.root)
     }
+}
+
+/// `dir` spelled in its main checkout when it lies in a linked worktree (the
+/// main checkout's top joined with the part below the worktree's top), else
+/// `dir` itself. The registry caches a worktree's root in this spelling.
+fn in_main_checkout(dir: &Path) -> PathBuf {
+    checkout_top(dir)
+        .and_then(|top| {
+            let main = linked_main_checkout(&top)?;
+            Some(main.join(dir.strip_prefix(&top).ok()?))
+        })
+        .unwrap_or_else(|| dir.to_path_buf())
 }
 
 /// The marker that decides `path`'s project root (spec 6.1), or `None`.
 ///
-/// For a file the walk starts at its folder. A path that exists is
-/// canonicalized first, so any spelling of it (drive letter case, `/`, a
-/// junction or symlink) finds the same marker.
+/// For a file the walk starts at its folder. The path is canonicalized
+/// through its nearest existing ancestor, so any spelling of it (drive letter
+/// case, `/`, a junction or symlink) finds the same marker and the root comes
+/// back in canonical spelling. A path that is not absolute on this host (a
+/// POSIX path on Windows, say) cannot be read here and finds none.
 /// 1. Own checkout: from the start folder up to the nearest folder holding
 ///    `.git` (inclusive), never above it; the deepest marker wins.
 /// 2. Linked worktree: the start folder is mapped into the main checkout
@@ -383,18 +393,36 @@ fn decide(
     }
 }
 
-/// The absolute folder a walk starts from, canonical when it exists.
+/// The folder a walk starts from, or `None` for a path that is not
+/// absolute on this host.
 fn start_folder(path: &Path) -> Option<PathBuf> {
-    let path = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir().ok()?.join(path)
-    };
-    let path = dunce::canonicalize(&path).unwrap_or(path);
+    if !path.is_absolute() {
+        return None;
+    }
+    let path = canonical_through_existing(path);
     if path.is_file() {
         path.parent().map(Path::to_path_buf)
     } else {
         Some(path)
+    }
+}
+
+/// `path` canonicalized through its nearest existing ancestor, with the
+/// missing part appended; `path` unchanged when no ancestor resolves.
+fn canonical_through_existing(path: &Path) -> PathBuf {
+    let mut missing = Vec::new();
+    let mut existing = path;
+    loop {
+        if let Ok(canonical) = dunce::canonicalize(existing) {
+            return missing.iter().rev().fold(canonical, |p, part| p.join(part));
+        }
+        match (existing.file_name(), existing.parent()) {
+            (Some(name), Some(parent)) => {
+                missing.push(name.to_os_string());
+                existing = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
     }
 }
 
@@ -499,6 +527,8 @@ pub enum CachedRoot {
 /// The text of `neurostrata-mcp root show` for the absolute folder `dir`.
 /// `namespace` is the marker's namespace, else the one the project resolves
 /// to without a marker; `bindings` are the configured project contexts.
+/// Nested markers are listed below the marker root (below `dir` when no
+/// marker applies).
 pub fn format_root_show(
     dir: &Path,
     found: &Result<Option<FoundMarker>, (PathBuf, String)>,
@@ -538,9 +568,15 @@ pub fn format_root_show(
                 "cached root for {namespace}: {root} ({})",
                 if exists { "exists" } else { "missing" }
             ));
-            if marker_root.as_deref().is_some_and(|m| !same_folder(Path::new(root), m)) {
+            // A worktree's root is cached in the main checkout's spelling.
+            let differs = marker_root.as_deref().is_some_and(|m| {
+                !same_folder(Path::new(root), m) && !same_folder(Path::new(root), &in_main_checkout(m))
+            });
+            if differs {
                 out.push(
-                    "hint: the marker root differs from the cached root; lookups still try both"
+                    "hint: the marker root differs from the cached root; lookups do not change. \
+                     `neurostrata-mcp root set <marker root>` or `neurostrata-mcp hooks install` \
+                     updates the cached root"
                         .to_string(),
                 );
             }
@@ -548,9 +584,11 @@ pub fn format_root_show(
         CachedRoot::Known(None) => out.push(format!("cached root for {namespace}: none")),
         CachedRoot::Unknown(why) => out.push(format!("cached root: unknown ({why})")),
     }
-    let nested = nested_markers(dir);
+    let walk_root = marker_root.unwrap_or_else(|| dir.to_path_buf());
+    let nested = nested_markers(&walk_root);
     out.push(format!(
-        "nested markers below this folder (up to {NESTED_MARKER_MAX_DEPTH} levels, other checkouts not entered): {}",
+        "nested markers below {} (up to {NESTED_MARKER_MAX_DEPTH} levels, other checkouts not entered): {}",
+        walk_root.display(),
         if nested.is_empty() { "none".to_string() } else { nested.len().to_string() }
     ));
     for (path, read) in &nested {
@@ -1034,7 +1072,7 @@ mod tests {
         assert!(text.contains("source_id: example-src"), "{text}");
         assert!(text.contains("(missing)"), "{text}");
         assert!(text.contains("hint: the marker root differs"), "{text}");
-        assert!(text.contains("nested markers below this folder"), "{text}");
+        assert!(text.contains(&format!("nested markers below {} (", repo.display())), "{text}");
         assert!(text.contains("(namespace example-api)"), "{text}");
         assert!(text.contains("(unreadable:"), "{text}");
         assert!(!text.contains("example-clone"), "{text}");
@@ -1052,5 +1090,105 @@ mod tests {
         assert!(text.contains("cached root: unknown (no daemon, store locked)"), "{text}");
         assert!(text.contains("other checkouts not entered): none"), "{text}");
         assert!(text.contains("missing folders: none"), "{text}");
+    }
+
+    fn layout(base: &Path, json: &str) {
+        build_layout(base, &serde_json::from_str::<Vec<serde_json::Value>>(json).unwrap());
+    }
+
+    fn show(dir: &Path, cached: &Path) -> String {
+        format_root_show(
+            dir,
+            &find_root_marker(dir),
+            "example-project",
+            &CachedRoot::Known(Some(cached.to_string_lossy().into_owned())),
+            &std::collections::HashMap::new(),
+        )
+    }
+
+    #[test]
+    fn worktree_cached_main_top_is_not_reported_as_differing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        layout(
+            &base,
+            r#"["repo git-dir", "repo marker:example-project",
+                "repo/.git/worktrees/wt commondir:../..", "repo/.git/worktrees/own commondir:../..",
+                "repo/.claude/worktrees/wt git-file:../../../.git/worktrees/wt",
+                "own git-file:../repo/.git/worktrees/own", "own marker:example-project"]"#,
+        );
+        let repo = base.join("repo");
+        // Marker found through the main checkout, and a worktree with its own
+        // top marker: both are cached as the main checkout's top.
+        let via_main = under(&base, "repo/.claude/worktrees/wt");
+        let own = base.join("own");
+        assert_eq!(find_root_marker(&via_main).unwrap().unwrap().via, FoundVia::MainCheckout);
+        assert_eq!(find_root_marker(&own).unwrap().unwrap().via, FoundVia::OwnCheckout);
+        for dir in [&via_main, &own] {
+            let text = show(dir, &repo);
+            assert!(!text.contains("hint:"), "{text}");
+            let text = show(dir, &base.join("elsewhere"));
+            assert!(text.contains("hint: the marker root differs"), "{text}");
+            assert!(text.contains("root set") && text.contains("hooks install"), "{text}");
+        }
+        // Outside a worktree the cached root is compared as it is.
+        assert!(!show(&repo, &repo).contains("hint:"));
+    }
+
+    #[test]
+    fn non_absolute_input_finds_no_marker() {
+        assert_eq!(start_folder(Path::new("src")), None);
+        assert_eq!(find_root_marker(Path::new("src/a.rs")), Ok(None));
+        assert_eq!(find_root_marker(Path::new(".")), Ok(None));
+        // Another machine's POSIX path is not absolute on Windows.
+        #[cfg(windows)]
+        assert_eq!(find_root_marker(Path::new("/home/u/repo/a.rs")), Ok(None));
+    }
+
+    #[test]
+    fn missing_path_uses_nearest_existing_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        layout(&base, r#"["repo git-dir", "repo marker:example-project", "repo/sub marker:example-sub"]"#);
+        let found = find_root_marker(&under(&base, "repo/gone/deeper/a.rs")).unwrap().unwrap();
+        assert_eq!(found.root, base.join("repo"));
+        let found = find_root_marker(&under(&base, "repo/sub/new/b.rs")).unwrap().unwrap();
+        assert_eq!(found.root, under(&base, "repo/sub"));
+        assert_eq!(found.config.namespace, "example-sub");
+        // The root comes back in canonical spelling, whatever the input's.
+        #[cfg(windows)]
+        {
+            let raw = under(&base, "repo/gone/x").to_string_lossy().into_owned();
+            let lower = format!("{}{}", raw[..1].to_ascii_lowercase(), raw[1..].replace('\\', "/"));
+            let found = find_root_marker(Path::new(&lower)).unwrap().unwrap();
+            assert_eq!(found.root.to_string_lossy(), base.join("repo").to_string_lossy());
+        }
+    }
+
+    #[test]
+    fn nested_markers_listed_below_marker_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        layout(
+            &base,
+            r#"["repo git-dir", "repo marker:example-project", "repo/a/b",
+                "repo/c/d marker:example-d"]"#,
+        );
+        let dir = under(&base, "repo/a/b");
+        let text = show(&dir, &base.join("repo"));
+        assert!(text.contains(&format!("nested markers below {} (", base.join("repo").display())), "{text}");
+        assert!(text.contains(&format!("  {} (namespace example-d)", under(&base, "repo/c/d").display())), "{text}");
+        // With no marker, the walk is below the given folder.
+        let plain = tempfile::tempdir().unwrap();
+        let plain = dunce::canonicalize(plain.path()).unwrap();
+        std::fs::create_dir_all(plain.join("x")).unwrap();
+        let text = format_root_show(
+            &plain.join("x"),
+            &Ok(None),
+            "example-project",
+            &CachedRoot::Known(None),
+            &std::collections::HashMap::new(),
+        );
+        assert!(text.contains(&format!("nested markers below {} (", plain.join("x").display())), "{text}");
     }
 }

@@ -2280,7 +2280,11 @@ fn hold_store_lock_for_copy(db_path: &std::path::Path) -> anyhow::Result<std::fs
 /// The registry's cached root for `root show`: from a daemon that answers
 /// (after the same identity check the gate makes), else from the store opened
 /// here when no process holds it. Never starts a daemon, never writes: the
-/// store is not initialized and nothing is checkpointed.
+/// store is opened only when it has no write-ahead log to replay and no
+/// recovery copies an open would prune, is not
+/// initialized (`init` runs DDL and store-state sidecar writes), and is only
+/// read through `with_conn`, which leaves it clean, so drop does not
+/// checkpoint.
 async fn root_show_cached_root(
     probe: DaemonProbe,
     namespace: &str,
@@ -2326,6 +2330,26 @@ async fn root_show_cached_root(
     }
     if !config.db_path.exists() {
         return CachedRoot::Unknown(format!("no store at {}", config.db_path.display()));
+    }
+    // Opening a store with a write-ahead log left behind replays it, which
+    // writes; only a store closed cleanly is opened here.
+    for suffix in [".wal", ".wal.checkpoint"] {
+        let mut wal = config.db_path.clone().into_os_string();
+        wal.push(suffix);
+        if std::fs::metadata(&wal).is_ok_and(|m| m.len() > 0) {
+            return CachedRoot::Unknown(format!(
+                "the store has a write-ahead log to replay ({}); opening it would write",
+                std::path::Path::new(&wal).display()
+            ));
+        }
+    }
+    // Every open prunes old write-ahead-log recovery copies beyond the
+    // retention count; skip the open when it would remove one.
+    let keep = LadybugStore::configured_snapshot_retention_count().max(1);
+    if crate::storage::snapshot::list_wal_recovery_artifacts(&config.db_path).len() > keep {
+        return CachedRoot::Unknown(
+            "opening the store would prune old write-ahead-log recovery copies".to_string(),
+        );
     }
     let read = async {
         let dimensions = embed::configured_dimensions().map_err(|e| e.to_string())?;
@@ -6317,6 +6341,37 @@ async fn run() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Read-only: asks an answering daemon or opens a free store, never starts
+    // a daemon and never writes (so it runs before the crash breadcrumb too).
+    if let Some(Commands::Root { action }) = cli.command.as_ref() {
+        match action {
+            RootCommands::Show { dir } => {
+                let cwd = std::env::current_dir()?;
+                let dir = dir.as_ref().map(|d| cwd.join(d)).unwrap_or(cwd);
+                if !dir.exists() {
+                    anyhow::bail!("{} does not exist", dir.display());
+                }
+                let dir = dunce::canonicalize(&dir).unwrap_or(dir);
+                let folder = match dir.parent() {
+                    Some(parent) if dir.is_file() => parent.to_path_buf(),
+                    _ => dir.clone(),
+                };
+                let found = crate::root_marker::find_root_marker(&folder);
+                let namespace = match &found {
+                    Ok(Some(found)) => found.config.namespace.clone(),
+                    _ => crate::task::harness_plugins::resolve_project_namespace(&folder),
+                };
+                let cached = root_show_cached_root(probe_daemon().await, &namespace).await;
+                let bindings = Config::load().map(|c| c.project_contexts).unwrap_or_default();
+                println!(
+                    "{}",
+                    crate::root_marker::format_root_show(&folder, &found, &namespace, &cached, &bindings)
+                );
+            }
+        }
+        return Ok(());
+    }
+
     // The crash breadcrumb, installed before anything long-running so the
     // daemon and the MCP proxy are both covered. A failure here costs a
     // diagnostic, not the run: the handler is never a prerequisite, so the
@@ -6329,33 +6384,6 @@ async fn run() -> anyhow::Result<()> {
     // Check if the daemon is already running on port 34343
     let probe = probe_daemon().await;
 
-    // Read-only: asks an answering daemon or opens a free store, never starts
-    // a daemon and never writes.
-    if let Some(Commands::Root { action }) = cli.command.as_ref() {
-        match action {
-            RootCommands::Show { dir } => {
-                let cwd = std::env::current_dir()?;
-                let dir = dir.as_ref().map(|d| cwd.join(d)).unwrap_or(cwd);
-                let dir = dunce::canonicalize(&dir).unwrap_or(dir);
-                let folder = match dir.parent() {
-                    Some(parent) if dir.is_file() => parent.to_path_buf(),
-                    _ => dir.clone(),
-                };
-                let found = crate::root_marker::find_root_marker(&folder);
-                let namespace = match &found {
-                    Ok(Some(found)) => found.config.namespace.clone(),
-                    _ => crate::task::harness_plugins::resolve_project_namespace(&folder),
-                };
-                let cached = root_show_cached_root(probe, &namespace).await;
-                let bindings = Config::load().map(|c| c.project_contexts).unwrap_or_default();
-                println!(
-                    "{}",
-                    crate::root_marker::format_root_show(&folder, &found, &namespace, &cached, &bindings)
-                );
-            }
-        }
-        return Ok(());
-    }
 
     // Only a daemon that answered gets to hold the database lock as far as the
     // CLI is concerned. Treating silence as "running" would refuse every local
