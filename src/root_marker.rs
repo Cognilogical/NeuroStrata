@@ -756,8 +756,8 @@ pub enum SetupMarker {
     /// A new marker was written in this folder.
     Written(PathBuf),
     /// A marker for the namespace covers `root` (written now when `written`),
-    /// and the cached root stays `cached`: an unrelated folder that holds its
-    /// own marker for the namespace (another clone).
+    /// and the cached root stays `cached`: a usable folder outside `root`'s
+    /// tree (another clone, or an older copy). Only `root set` moves it.
     KeptCache { root: PathBuf, cached: PathBuf, written: bool },
     /// The cached root is a subfolder of the checkout top: nothing written,
     /// the caller picks one with `root set`.
@@ -814,10 +814,13 @@ impl SetupMarker {
                 root.join(ROOT_CONFIG_REL).display()
             ),
             SetupMarker::KeptCache { root, cached, written } => format!(
-                "{} {} for {namespace}. The cached root of {namespace} stays {}: that folder is                  another clone with its own marker. `neurostrata-mcp root set {} --namespace {namespace}`                  makes this clone the cached root.",
+                "{} {} for {namespace}. The cached root of {namespace} stays {}, \
+                 a folder outside this one. Run `neurostrata-mcp root set {} --namespace {namespace}` \
+                 to make {} the cached root.",
                 if *written { "Wrote" } else { "Using" },
                 root.join(ROOT_CONFIG_REL).display(),
                 cached.display(),
+                root.display(),
                 root.display()
             ),
             SetupMarker::AskRoot { top, sub } => format!(
@@ -1005,23 +1008,17 @@ async fn lost_by_change(
     }
 }
 
-/// A usable cached root outside `root`'s tree that holds its own marker for
-/// `namespace`: another clone of the project, whose cache setup must keep.
-fn sibling_clone(cached: Option<&Path>, root: &Path, namespace: &str) -> Option<PathBuf> {
+/// A usable cached root outside `root`'s tree (another clone, or an older
+/// copy), which setup and `hooks install` keep: only `root set` moves the
+/// cache to an unrelated folder.
+fn unrelated_cache(cached: Option<&Path>, root: &Path) -> Option<PathBuf> {
     let cached = cached?;
-    if same_tree(cached, root) {
-        return None;
-    }
-    match find_root_marker(cached) {
-        Ok(Some(found)) if found.config.namespace.eq_ignore_ascii_case(namespace) => {
-            Some(cached.to_path_buf())
-        }
-        _ => None,
-    }
+    (!same_tree(cached, root)).then(|| cached.to_path_buf())
 }
 
 /// Setup's cache update: nothing when the cache already is `root`, nothing
-/// when it is a sibling clone (returned), else set it.
+/// when it is an unrelated usable folder (returned), else set it (missing,
+/// unusable, or in the same tree after the root-change check).
 async fn settle_cache(
     registry: &dyn RootRegistry,
     namespace: &str,
@@ -1031,8 +1028,8 @@ async fn settle_cache(
     if cached.is_some_and(|c| same_root(c, root)) {
         return None;
     }
-    if let Some(sibling) = sibling_clone(cached, root, namespace) {
-        return Some(sibling);
+    if let Some(kept) = unrelated_cache(cached, root) {
+        return Some(kept);
     }
     if !registry.set_root(namespace, root).await {
         tracing::warn!("the cached root of '{namespace}' could not be set to {}", root.display());
@@ -2379,7 +2376,7 @@ mod tests {
         layout(
             &base,
             r#"["clone1 git-dir", "clone1 marker:example-project", "clone1/a.rs file",
-                "clone2 git-dir", "clone2/a.rs file", "moved git-dir", "old-copy/a.rs file"]"#,
+                "clone2 git-dir", "clone2/a.rs file"]"#,
         );
         let (clone1, clone2) = (base.join("clone1"), base.join("clone2"));
         let (store, emb) = mock();
@@ -2403,16 +2400,51 @@ mod tests {
         let again = ensure_marker_for_setup(&store, Some(&emb), &clone2, Some(NS)).await;
         assert_eq!(again.kind(), "reused");
         assert_eq!(cached(&store).await, Some(clone1.to_string_lossy().into_owned()));
+    }
 
-        // An unrelated cached root without a marker (an old copy): the marker
-        // is written and the cache moves, with no root-change check.
+    #[tokio::test]
+    async fn hooks_install_keeps_unrelated_cache_without_marker() {
+        // The upgrade case: the first clone was cached before markers existed,
+        // and setup or `hooks install` runs first in a second clone.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        layout(&base, r#"["clone1 git-dir", "clone1/a.rs file", "clone2 git-dir", "clone2/a.rs file"]"#);
+        let (clone1, clone2) = (base.join("clone1"), base.join("clone2"));
         let (store, emb) = mock();
-        cache_root(&store, &emb, &base.join("old-copy")).await;
+        cache_root(&store, &emb, &clone1).await;
         rule_at(&store, "rule-a", "a.rs", serde_json::json!({})).await;
-        let moved = base.join("moved");
-        let got = ensure_marker_for_setup(&store, Some(&emb), &moved, Some(NS)).await;
-        assert_eq!(got, SetupMarker::Written(moved.clone()));
-        assert_eq!(cached(&store).await, Some(moved.to_string_lossy().into_owned()));
+
+        let got = ensure_marker_for_setup(&store, Some(&emb), &clone2, Some(NS)).await;
+        assert_eq!(
+            got,
+            SetupMarker::KeptCache { root: clone2.clone(), cached: clone1.clone(), written: true }
+        );
+        assert!(has_marker(&clone2) && !has_marker(&clone1));
+        assert_eq!(cached(&store).await, Some(clone1.to_string_lossy().into_owned()));
+        assert_eq!(
+            got.message(NS, &clone2).unwrap(),
+            format!(
+                "Wrote {} for {NS}. The cached root of {NS} stays {}, a folder outside this one. \
+                 Run `neurostrata-mcp root set {} --namespace {NS}` to make {} the cached root.",
+                clone2.join(ROOT_CONFIG_REL).display(),
+                clone1.display(),
+                clone2.display(),
+                clone2.display()
+            )
+        );
+
+        // A missing cached root is replaced.
+        let (store, emb) = mock();
+        cache_root(&store, &emb, &base.join("gone")).await;
+        let got = ensure_marker_for_setup(&store, Some(&emb), &clone1, Some(NS)).await;
+        assert_eq!(got, SetupMarker::Written(clone1.clone()));
+        assert_eq!(cached(&store).await, Some(clone1.to_string_lossy().into_owned()));
+
+        // `root set` still moves the cache to an unrelated folder.
+        let (store, emb) = mock();
+        cache_root(&store, &emb, &clone1).await;
+        root_set(&store, Some(&emb), &set_args(&clone2)).await.unwrap();
+        assert_eq!(cached(&store).await, Some(clone2.to_string_lossy().into_owned()));
     }
 
     #[test]

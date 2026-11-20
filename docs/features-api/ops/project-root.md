@@ -34,10 +34,10 @@ one-line hint when the project has no marker yet.
      (correct the data first, steps 2 to 5).
    - When another namespace's marker already covers the folder, it installs
      nothing and points at `root set ... --replace`.
-   - In a second clone of a project whose cached root is the first clone
-     (which has its own marker), it writes the marker in this clone and
-     leaves the cached root on the first clone. `root set` in this clone
-     moves it.
+   - When the namespace's cached root is a folder outside this one that
+     still exists (another clone, or an older copy), it writes the marker in
+     this clone and leaves the cached root where it is, and says so.
+     `neurostrata-mcp root set <this clone> --namespace <ns>` moves it.
 2. **Before moving a project folder or changing its root, run
    `neurostrata-mcp root audit`.** Memories stored with absolute paths stop
    matching after a move, so correct them first. When the new root is inside
