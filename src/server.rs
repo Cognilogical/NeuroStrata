@@ -3779,6 +3779,11 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
                 response["resolved_path"] = serde_json::Value::String(lookup.path.clone());
                 response["resolved_from"] = serde_json::json!(lookup.source.as_str());
             }
+            if let Some(hint) =
+                crate::root_marker::root_hint(&namespace, std::path::Path::new(original_path))
+            {
+                response["root_hint"] = serde_json::Value::String(hint);
+            }
             let include_ast_edges = arguments
                 .get("include_ast_edges")
                 .and_then(|v| v.as_bool())
@@ -5193,6 +5198,7 @@ async fn handle_add_memory(
             }
         }
 
+        let hint_location = location.clone();
         let payload = MemoryPayload {
             content: content.to_string(),
             user_id: user_id.to_string(),
@@ -5339,6 +5345,12 @@ async fn handle_add_memory(
                         shape_fields.join(", ")
                     ));
                 }
+                if let Some(hint) = add_memory_hint_path(&arguments, &hint_location)
+                    .as_deref()
+                    .and_then(|p| crate::root_marker::root_hint(namespace, p))
+                {
+                    msg.push_str(&format!("\n{hint}"));
+                }
                 // TASK NUDGE: advisory when a non-task/procedure memory's content
                 // carries task-shaped markers.
                 if memory_type != "task" && memory_type != "procedure" {
@@ -5357,6 +5369,20 @@ async fn handle_add_memory(
     } else {
         "Failed to verify existing namespaces.".to_string()
     }
+}
+
+/// The folder `add_memory`'s root hint is about: `project_root`, else an
+/// absolute `location`.
+fn add_memory_hint_path(arguments: &Value, location: &str) -> Option<std::path::PathBuf> {
+    arguments
+        .get("project_root")
+        .and_then(|r| r.as_str())
+        .filter(|r| !r.trim().is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            let location = std::path::Path::new(location);
+            location.is_absolute().then(|| location.to_path_buf())
+        })
 }
 
 /// What to tell an agent when this namespace still holds ids written before
@@ -6710,9 +6736,16 @@ async fn handle_get_snapshot(
     parts.push(domain_strap.to_string());
     parts.push(body.to_string());
     let snapshot = parts.join("\n");
-
-    Ok(match migration {
+    let snapshot = match migration {
         Some(notice) => format!("{}\n\n{}", snapshot, notice),
+        None => snapshot,
+    };
+
+    Ok(match project_root
+        .as_deref()
+        .and_then(|root| crate::root_marker::root_hint(namespace, std::path::Path::new(root)))
+    {
+        Some(hint) => format!("{snapshot}\n{hint}"),
         None => snapshot,
     })
 }
@@ -6818,8 +6851,11 @@ async fn handle_ingest_directory(
             } else {
                 String::new()
             };
+            let hint = crate::root_marker::root_hint(namespace, std::path::Path::new(dir_path))
+                .map(|hint| format!("\n{hint}"))
+                .unwrap_or_default();
             format!(
-                "Successfully ingested AST from {} into namespace '{}': {} files, {} symbols{}; {} declared edges relinked.",
+                "Successfully ingested AST from {} into namespace '{}': {} files, {} symbols{}; {} declared edges relinked.{}",
                 dir_path,
                 namespace,
                 progress.files_ingested,
@@ -6828,7 +6864,8 @@ async fn handle_ingest_directory(
                 progress
                     .relinked_edges
                     .map(|n| n.to_string())
-                    .unwrap_or_else(|| "no".to_string())
+                    .unwrap_or_else(|| "no".to_string()),
+                hint
             )
         }
         Err(e) => format!("Failed to ingest directory {}: {}", dir_path, e),
@@ -16102,6 +16139,101 @@ mod tests {
         .await
         .expect("snapshot");
         assert_eq!(cached().await, Some(root), "after snapshot");
+    }
+
+    #[tokio::test]
+    async fn get_snapshot_append_log_ingest_claim_never_write_marker() {
+        let (store, _) = store_with_one_rule("ns").await;
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let base = dunce::canonicalize(tmp.path()).expect("canonical");
+        let repo = base.join("repo");
+        let sub = repo.join("sub");
+        std::fs::create_dir_all(repo.join(".git")).expect("repo .git");
+        std::fs::create_dir_all(&sub).expect("sub");
+        std::fs::write(sub.join("lib.rs"), "fn main() {}").expect("source");
+        let marker = repo.join(".NeuroStrata").join("config.json");
+        let hint = "No .NeuroStrata/config.json for ns: run `neurostrata-mcp hooks install` or neurostrata_task_setup";
+
+        let reply = crate::buffer::handle_append_log(
+            serde_json::json!({
+                "namespace": "ns",
+                "content": "a note",
+                "project_root": repo.to_string_lossy(),
+            }),
+            emb.clone(),
+            store.clone(),
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&reply).expect("append_log json");
+        assert_eq!(parsed["root_hint"], serde_json::json!(hint), "{reply}");
+        assert!(!marker.exists(), "append_log wrote a marker");
+
+        let text = handle_get_snapshot(
+            serde_json::json!({ "namespace": "ns", "project_root": repo.to_string_lossy() }),
+            store.clone(),
+        )
+        .await
+        .expect("snapshot");
+        assert!(text.ends_with(hint), "{text}");
+        assert!(!marker.exists(), "get_snapshot wrote a marker");
+
+        let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+        let text = handle_ingest_directory(
+            serde_json::json!({ "namespace": "ns", "dir_path": sub.to_string_lossy() }),
+            emb.clone(),
+            store.clone(),
+            ingests,
+            None,
+        )
+        .await;
+        assert!(text.starts_with("Successfully ingested"), "{text}");
+        assert!(text.ends_with(hint), "{text}");
+        assert!(!marker.exists(), "ingest wrote a marker");
+
+        let created: Value = serde_json::from_str(
+            &crate::task::handle_task_create(
+                serde_json::json!({ "namespace": "ns", "title": "a task" }),
+                emb.clone(),
+                store.clone(),
+            )
+            .await,
+        )
+        .expect("task_create json");
+        let id = created["id"].as_str().expect("task id").to_string();
+        let reply = crate::task::handle_task_claim(
+            serde_json::json!({
+                "id": id,
+                "namespace": "ns",
+                "session_id": "s1",
+                "assignee": "tester",
+                "project_root": repo.to_string_lossy(),
+            }),
+            store.clone(),
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&reply).expect("claim json");
+        assert_eq!(parsed["root_hint"], serde_json::json!(hint), "{reply}");
+        assert!(!marker.exists(), "claim wrote a marker");
+
+        // With a marker for the namespace, no hint and no change to it.
+        std::fs::write(&marker, br#"{"version":1,"namespace":"ns"}"#).expect("marker");
+        let reply = crate::buffer::handle_append_log(
+            serde_json::json!({
+                "namespace": "ns",
+                "content": "another note",
+                "project_root": repo.to_string_lossy(),
+            }),
+            emb.clone(),
+            store.clone(),
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&reply).expect("append_log json");
+        assert!(parsed.get("root_hint").is_none(), "{reply}");
+        assert_eq!(
+            std::fs::read(&marker).expect("marker"),
+            br#"{"version":1,"namespace":"ns"}"#.to_vec()
+        );
     }
 
     #[tokio::test]

@@ -1158,6 +1158,7 @@ pub(crate) async fn start_daemon_on(
         .route("/export-graph", post(handle_export_graph))
         .route("/tasks/import", post(handle_tasks_import))
         .route("/cli/read", post(handle_cli_read))
+        .route("/cli/root", post(handle_cli_root))
         .route("/tasks/gate", post(handle_tasks_gate))
         .route("/bus/metrics", post(handle_bus_metrics))
         .route("/sparql", post(handle_http_sparql))
@@ -1682,6 +1683,67 @@ async fn handle_cli_read(
                     "unknown read op '{}': expected 'namespaces', 'list' or 'project_root'",
                     other
                 ),
+            ))
+        }
+    };
+    Ok(value.to_string())
+}
+
+#[derive(serde::Deserialize)]
+struct RootReq {
+    op: String,
+    dir: String,
+    namespace: Option<String>,
+    source_id: Option<String>,
+    #[serde(default)]
+    replace: bool,
+    #[serde(default)]
+    force: bool,
+}
+
+/// The marker writers of `hooks install` (`setup`) and `root set` (`set`),
+/// run here so the registry change goes through the daemon that holds the
+/// store. The CLI resolves the namespace from its own environment first.
+async fn handle_cli_root(
+    State(state): State<AppState>,
+    Json(req): Json<RootReq>,
+) -> Result<String, (axum::http::StatusCode, String)> {
+    let dir = std::path::PathBuf::from(&req.dir);
+    let value = match req.op.as_str() {
+        "setup" => {
+            let outcome = crate::root_marker::ensure_marker_for_setup(
+                &state.vector_store,
+                Some(&state.embedder),
+                &dir,
+                req.namespace.as_deref(),
+            )
+            .await;
+            let ns = req.namespace.clone().unwrap_or_default();
+            outcome.to_json(&ns, &dir)
+        }
+        "set" => {
+            let Some(namespace) = req.namespace.clone() else {
+                return Err((
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "root set needs a namespace".to_string(),
+                ));
+            };
+            let args = crate::root_marker::RootSetArgs {
+                dir,
+                namespace,
+                source_id: req.source_id.clone(),
+                replace: req.replace,
+                force: req.force,
+            };
+            match crate::root_marker::root_set(&state.vector_store, Some(&state.embedder), &args).await {
+                Ok(lines) => serde_json::json!({ "ok": true, "lines": lines }),
+                Err(error) => serde_json::json!({ "ok": false, "error": error }),
+            }
+        }
+        other => {
+            return Err((
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("unknown root op '{other}': expected 'setup' or 'set'"),
             ))
         }
     };

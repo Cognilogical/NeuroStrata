@@ -390,6 +390,21 @@ pub async fn handle_append_log(
         }
     };
 
+    // The namespace the root cache and the root hint are for.
+    let cache_ns = arguments
+        .get("namespace")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| {
+            project_root
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(String::from)
+                .unwrap_or_else(|| "default".to_string())
+        });
+    let root_hint = crate::root_marker::root_hint(&cache_ns, &project_root);
+
     // Append succeeded - now run the recall if we have slugs
     // Task-intent detection must run before any early-return from the
     // recall block so `task_intent_signals` survive embedder/store
@@ -438,14 +453,14 @@ pub async fn handle_append_log(
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!("Failed to generate embedding for recall: {e}");
-                return success_response(&outcome, &tags, vec![], None, signals);
+                return success_response(&outcome, &tags, vec![], None, signals, root_hint);
             }
         };
 
         // Initialize namespace before searching
         if let Err(e) = store.init(&namespace).await {
             tracing::warn!("Failed to initialize namespace for recall: {}", e);
-            return success_response(&outcome, &tags, vec![], None, signals);
+            return success_response(&outcome, &tags, vec![], None, signals, root_hint);
         }
 
         // Run the recall search
@@ -461,7 +476,7 @@ pub async fn handle_append_log(
             Ok(o) => o,
             Err(e) => {
                 tracing::warn!("Recall search failed: {}", e);
-                return success_response(&outcome, &tags, vec![], None, signals);
+                return success_response(&outcome, &tags, vec![], None, signals, root_hint);
             }
         };
 
@@ -519,18 +534,6 @@ pub async fn handle_append_log(
 
     // Cache project_root into the registry row (best-effort) so hook hygiene
     // and doctor scheduling can resolve it later without an explicit arg.
-    let cache_ns = arguments
-        .get("namespace")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.trim().is_empty())
-        .map(String::from)
-        .unwrap_or_else(|| {
-            project_root
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(String::from)
-                .unwrap_or_else(|| "default".to_string())
-        });
     let cache_ns = crate::server::resolve_namespace(&store, &cache_ns).await;
     // Update-only here (no embedder): avoid an extra embedding on the hot
     // append path; row creation happens via ingest/setup instead.
@@ -538,7 +541,7 @@ pub async fn handle_append_log(
         .await;
 
     // Build the success response
-    success_response(&outcome, &tags, recalled, recalled_from, signals)
+    success_response(&outcome, &tags, recalled, recalled_from, signals, root_hint)
 }
 
 /// Builds the append_log success response — one shape for every successful append.
@@ -551,6 +554,7 @@ fn success_response(
     recalled: Vec<Value>,
     recalled_from: Option<&str>,
     task_intent_signals: Vec<Value>,
+    root_hint: Option<String>,
 ) -> String {
     let mut resp = json!({
         "appended": true,
@@ -563,6 +567,9 @@ fn success_response(
     });
     if let Some(mode) = recalled_from {
         resp["recalled_from"] = json!(mode);
+    }
+    if let Some(hint) = root_hint {
+        resp["root_hint"] = json!(hint);
     }
     resp.to_string()
 }

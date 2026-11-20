@@ -183,8 +183,9 @@ neurostrata-mcp task import <namespace> --from-beads <path>
 Installs `.git/hooks/pre-push` (strict task gate) and `.git/hooks/pre-commit` (graph-query ledger) plus detected agent harness plugins.
 
 ```bash
-neurostrata-mcp hooks install [--force]
+neurostrata-mcp hooks install [--force] [--namespace <ns>]
 ```
+It also writes the project marker `.NeuroStrata/config.json` at the main checkout's top, for `--namespace` or, without it, for the one namespace the harness configs, `NEUROSTRATA_NAMESPACE` and `.NeuroStrata/session_queries.json` agree on (never the folder name). When they name none or disagree, it writes no marker, still installs the hooks, and lists the candidates. When the namespace's cached root is a subfolder, or the change would stop memories matching, it writes no marker and says which `root set` to run. When another namespace's marker covers the folder, it installs nothing. See [Project root](ops/project-root.md).
 The pre-push hook gates the project's configured namespace (see `namespace resolve`) and the checkout's folder name; the pre-commit hook records against the configured namespace. The pre-push hook blocks the push when `neurostrata-mcp` is missing, when `namespace resolve` fails, or when the gate exits with anything other than 0 or 1.
 
 ### `namespace resolve`
@@ -195,11 +196,19 @@ Prints the namespace configured for a project. Order: the `namespace` of the pro
 neurostrata-mcp namespace resolve [dir]
 ```
 
-### `root show`
-Read-only. Prints the project marker `.NeuroStrata/config.json` that applies to `dir` (default: the current folder) and how it was found, its namespace and `source_id`, whether git tracks it (`unknown` when git fails), the cached root, other markers below the marker root (in a linked worktree also those only in the main checkout, labeled), and project-context bindings to missing folders (`unknown` when the user config cannot be read). It notes a `.NeuroStrata` folder spelled in another letter case, which is not a marker. It starts no daemon; with no daemon it takes the store lock and holds it while it reads the store.
+### `root show`, `root set` & `root audit`
+Read and write the project marker `.NeuroStrata/config.json` (see [Project root](ops/project-root.md)).
+
 ```bash
 neurostrata-mcp root show [dir]
+neurostrata-mcp root audit [dir] [--namespace <ns>] [--json]
+neurostrata-mcp root set <dir> --namespace <ns> [--source-id <id>] [--replace] [--force]
 ```
+
+- `root show` (read-only): the marker that applies to `dir` (default: the current folder) and how it was found, its namespace and `source_id`, whether git tracks it (`unknown` when git fails), the cached root, other markers below the marker root (in a linked worktree also those only in the main checkout, labeled), and project-context bindings to missing folders (`unknown` when the user config cannot be read). It notes a `.NeuroStrata` folder spelled in another letter case, which is not a marker. It starts no daemon; with no daemon it takes the store lock and holds it while it reads the store.
+- `root audit` (read-only): memories whose stored paths are absolute inside the root, each with the `neurostrata_supersede_memory` call that fixes it, and paths that need a decision. Exits 0 when nothing is fixable, else 1.
+- `root set`: writes the marker (in the main checkout for a linked worktree) and sets the cached root, through the running daemon or, with none, the store directly. Refuses a root change that would stop memories matching unless `--force`; refuses another namespace's marker in `<dir>` or a second marker for the namespace in the checkout unless `--replace`; binds `--source-id` only when it is unbound or bound to a missing folder.
+
 The marker is strict JSON: `version` 1, `namespace`, and optionally `source_id` (a string, not `null`); `src/schemas/root-config.schema.json` documents it. A new marker is published with a hard link, so the filesystem must support hard links (exFAT and FAT do not). The home folder, a filesystem or drive root, and a folder outside git with a checkout below it may not hold a marker; that last check looks four levels down and skips `node_modules` and `target`.
 
 ---

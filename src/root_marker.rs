@@ -743,6 +743,538 @@ fn same_folder(a: &Path, b: &Path) -> bool {
         == Some(PROBE)
 }
 
+// ── Writers (spec 6.4, 6.8) ─────────────────────────────────────────────────
+
+/// The guide for correcting data before a root changes.
+pub const ROOT_GUIDE: &str = "docs/features-api/ops/project-root.md";
+
+/// What setup, bootstrap and `hooks install` did about the marker.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SetupMarker {
+    /// A marker for this namespace already covers the project; this is its root.
+    Reused(PathBuf),
+    /// A new marker was written in this folder.
+    Written(PathBuf),
+    /// The cached root is a subfolder of the checkout top: nothing written,
+    /// the caller picks one with `root set`.
+    AskRoot { top: PathBuf, sub: PathBuf },
+    /// `hooks install` without `--namespace` and no single explicit
+    /// namespace: these are the candidates.
+    AskNamespace(Vec<String>),
+    /// A marker for this other namespace covers the project: nothing written
+    /// and nothing installed.
+    OtherNamespace(String),
+    /// Writing would move the namespace's root and these memories would stop
+    /// matching.
+    RootChangeBlocked(Vec<String>),
+    /// The folder may not hold a marker, or the write failed, for this reason.
+    Refused(&'static str),
+}
+
+impl SetupMarker {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            SetupMarker::Reused(_) => "reused",
+            SetupMarker::Written(_) => "written",
+            SetupMarker::AskRoot { .. } => "ask_root",
+            SetupMarker::AskNamespace(_) => "ask_namespace",
+            SetupMarker::OtherNamespace(_) => "other_namespace",
+            SetupMarker::RootChangeBlocked(_) => "root_change_blocked",
+            SetupMarker::Refused(_) => "refused",
+        }
+    }
+
+    /// The marker root, when a marker for the namespace now covers the project.
+    pub fn root(&self) -> Option<&Path> {
+        match self {
+            SetupMarker::Reused(root) | SetupMarker::Written(root) => Some(root),
+            _ => None,
+        }
+    }
+
+    /// Harness plugins are installed unless another namespace owns the folder.
+    pub fn installs_plugins(&self) -> bool {
+        !matches!(self, SetupMarker::OtherNamespace(_))
+    }
+
+    /// The one line a reply carries, or `None` when a marker was reused.
+    pub fn message(&self, namespace: &str, project_dir: &Path) -> Option<String> {
+        let dir = project_dir.display();
+        Some(match self {
+            SetupMarker::Reused(_) => return None,
+            SetupMarker::Written(root) => format!(
+                "Wrote {} for {namespace}.",
+                root.join(ROOT_CONFIG_REL).display()
+            ),
+            SetupMarker::AskRoot { top, sub } => format!(
+                "No .NeuroStrata/config.json written: the cached root of {namespace} is the subfolder {}. \
+                 Run `neurostrata-mcp root set {} --namespace {namespace}` to keep today's stored keys, \
+                 or `neurostrata-mcp root set {} --namespace {namespace}` after applying the corrections \
+                 `neurostrata-mcp root audit` lists ({ROOT_GUIDE}).",
+                sub.display(),
+                sub.display(),
+                top.display()
+            ),
+            SetupMarker::AskNamespace(candidates) => format!(
+                "No .NeuroStrata/config.json written: no single namespace is configured for this project \
+                 (candidates: {}). Run `neurostrata-mcp hooks install --namespace <ns>`.",
+                candidates.join(", ")
+            ),
+            SetupMarker::OtherNamespace(other) => format!(
+                "{dir} belongs to namespace {other} (.NeuroStrata/config.json), so nothing was installed \
+                 for {namespace}. To change it, run `neurostrata-mcp root set {dir} --namespace {namespace} --replace`."
+            ),
+            SetupMarker::RootChangeBlocked(ids) => format!(
+                "No .NeuroStrata/config.json written: it would move the root of {namespace}, and {} \
+                 memories would stop matching ({}). Run `neurostrata-mcp root audit` and correct them \
+                 ({ROOT_GUIDE}), or run `neurostrata-mcp root set {dir} --namespace {namespace} --force`.",
+                ids.len(),
+                ids.join(", ")
+            ),
+            SetupMarker::Refused(reason) => {
+                format!("No .NeuroStrata/config.json written: {reason}.")
+            }
+        })
+    }
+
+    /// The outcome as a reply field.
+    pub fn to_json(&self, namespace: &str, project_dir: &Path) -> serde_json::Value {
+        let mut out = serde_json::json!({ "kind": self.kind() });
+        match self {
+            SetupMarker::Reused(root) | SetupMarker::Written(root) => {
+                out["root"] = serde_json::json!(root.to_string_lossy());
+            }
+            SetupMarker::AskRoot { top, sub } => {
+                out["top"] = serde_json::json!(top.to_string_lossy());
+                out["sub"] = serde_json::json!(sub.to_string_lossy());
+            }
+            SetupMarker::AskNamespace(candidates) => out["candidates"] = serde_json::json!(candidates),
+            SetupMarker::OtherNamespace(other) => out["namespace"] = serde_json::json!(other),
+            SetupMarker::RootChangeBlocked(ids) => out["memory_ids"] = serde_json::json!(ids),
+            SetupMarker::Refused(reason) => out["reason"] = serde_json::json!(reason),
+        }
+        out["message"] = serde_json::json!(self.message(namespace, project_dir));
+        out
+    }
+}
+
+/// The hint other calls add when `path`'s project has no marker (spec 6.4):
+/// `None` when a marker covers `path` (for this namespace or another), when
+/// the marker there is unreadable (reported elsewhere), or when `path` is not
+/// an existing absolute path, the home folder or a filesystem root.
+pub fn root_hint(namespace: &str, path: &Path) -> Option<String> {
+    if namespace.trim().is_empty() || !path.is_absolute() || !path.exists() {
+        return None;
+    }
+    if !matches!(find_root_marker(path), Ok(None)) {
+        return None;
+    }
+    let folder = start_folder(path)?;
+    if folder.parent().is_none()
+        || crate::formal_kernel::is_home_dir(&folder, dirs::home_dir().as_deref())
+    {
+        return None;
+    }
+    Some(format!(
+        "No .NeuroStrata/config.json for {namespace}: run `neurostrata-mcp hooks install` or neurostrata_task_setup"
+    ))
+}
+
+/// The system temp folder (and `/tmp`): a marker there would capture every
+/// temporary project below it.
+fn is_temp_root(dir: &Path) -> bool {
+    [std::env::temp_dir(), PathBuf::from("/tmp")]
+        .iter()
+        .filter_map(|t| dunce::canonicalize(t).ok())
+        .any(|t| t == dir)
+}
+
+/// The usable cached root of `namespace`, canonicalized, or `None`.
+async fn usable_cached_root(
+    store: &std::sync::Arc<dyn crate::traits::VectorStore>,
+    namespace: &str,
+) -> Result<Option<PathBuf>, String> {
+    let cached = crate::registry::cached_project_root(store, namespace)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(cached
+        .filter(|r| crate::paths::is_usable_root(r))
+        .map(|r| dunce::canonicalize(&r).unwrap_or_else(|_| PathBuf::from(r))))
+}
+
+/// Whether `a` and `b` name the same root once both are spelled in their main
+/// checkout (a linked worktree's top is the same root as its main checkout's).
+fn same_root(a: &Path, b: &Path) -> bool {
+    same_folder(&in_main_checkout(a), &in_main_checkout(b))
+}
+
+/// The memories that would stop matching if the cached root moved from
+/// `current` to `new`; empty when the roots are the same.
+async fn lost_by_change(
+    store: &std::sync::Arc<dyn crate::traits::VectorStore>,
+    namespace: &str,
+    current: Option<&Path>,
+    new: &Path,
+) -> Result<Vec<String>, String> {
+    match current {
+        Some(current) if !same_root(current, new) => {
+            crate::root_audit::rows_lost_by_root_change(store, namespace, current, new)
+                .await
+                .map_err(|e| e.to_string())
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// Set the cached root to `root` unless it is already that root.
+async fn settle_cache(
+    store: &std::sync::Arc<dyn crate::traits::VectorStore>,
+    emb: Option<&std::sync::Arc<dyn crate::traits::Embedder>>,
+    namespace: &str,
+    cached: Option<&Path>,
+    root: &Path,
+) {
+    let current = cached.map(in_main_checkout);
+    if current.is_some_and(|c| same_folder(&c, &in_main_checkout(root))) {
+        return;
+    }
+    crate::registry::set_project_root(store, emb, namespace, root).await;
+}
+
+/// The marker step of `neurostrata_task_setup`, `neurostrata_bootstrap` and
+/// `hooks install` (spec 6.4). `namespace` is `None` only for `hooks install`
+/// without `--namespace`, which then uses
+/// [`crate::task::harness_plugins::explicit_namespace`]. Sets the cached root
+/// to the marker root when a marker for the namespace now covers the folder.
+pub async fn ensure_marker_for_setup(
+    store: &std::sync::Arc<dyn crate::traits::VectorStore>,
+    emb: Option<&std::sync::Arc<dyn crate::traits::Embedder>>,
+    project_dir: &Path,
+    namespace: Option<&str>,
+) -> SetupMarker {
+    if !project_dir.is_absolute() || !project_dir.is_dir() {
+        return SetupMarker::Refused("the project folder is not an existing absolute folder");
+    }
+    let dir = dunce::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
+    if is_temp_root(&dir) {
+        return SetupMarker::Refused("the system temp folder is not a project root");
+    }
+    let namespace = match namespace {
+        Some(ns) => ns.to_string(),
+        None => match crate::task::harness_plugins::explicit_namespace(&dir) {
+            Ok(ns) => ns,
+            Err(candidates) => return SetupMarker::AskNamespace(candidates),
+        },
+    };
+    if !is_valid_namespace(&namespace) {
+        return SetupMarker::Refused(
+            "the namespace does not fit .NeuroStrata/config.json (letters, digits, '_', '.', ':' and '-', starting with a letter or digit)",
+        );
+    }
+    let cached = match usable_cached_root(store, &namespace).await {
+        Ok(cached) => cached,
+        Err(e) => {
+            tracing::warn!("the cached root of '{namespace}' could not be read: {e}");
+            return SetupMarker::Refused("the cached root could not be read");
+        }
+    };
+    match find_root_marker(&dir) {
+        Err(_) => {
+            return SetupMarker::Refused(
+                "the .NeuroStrata/config.json that applies here is unreadable; run `neurostrata-mcp root show`",
+            )
+        }
+        Ok(Some(found)) if !found.config.namespace.eq_ignore_ascii_case(&namespace) => {
+            return SetupMarker::OtherNamespace(found.config.namespace)
+        }
+        Ok(Some(found)) => {
+            return match lost_by_change(store, &namespace, cached.as_deref(), &found.root).await {
+                Ok(ids) if !ids.is_empty() => SetupMarker::RootChangeBlocked(ids),
+                Ok(_) => {
+                    settle_cache(store, emb, &namespace, cached.as_deref(), &found.root).await;
+                    SetupMarker::Reused(found.root)
+                }
+                Err(e) => {
+                    tracing::warn!("the memories of '{namespace}' could not be listed: {e}");
+                    SetupMarker::Refused("the memories could not be listed for the root-change check")
+                }
+            };
+        }
+        Ok(None) => {}
+    }
+    let target = match crate::paths::main_checkout_root(&dir.to_string_lossy()) {
+        Some(top) => {
+            if let Some(cache) = &cached {
+                let cache = in_main_checkout(cache);
+                if !same_folder(&cache, &top) && cache.starts_with(&top) {
+                    return SetupMarker::AskRoot { top, sub: cache };
+                }
+            }
+            top
+        }
+        None => dir.clone(),
+    };
+    if let Some(reason) = refuse_root_target(&target) {
+        return SetupMarker::Refused(reason);
+    }
+    match lost_by_change(store, &namespace, cached.as_deref(), &target).await {
+        Ok(ids) if !ids.is_empty() => return SetupMarker::RootChangeBlocked(ids),
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!("the memories of '{namespace}' could not be listed: {e}");
+            return SetupMarker::Refused("the memories could not be listed for the root-change check");
+        }
+    }
+    match write_new_marker(&target, &RootConfig::new(namespace.clone())) {
+        Ok(WriteOutcome::Written) => {
+            settle_cache(store, emb, &namespace, cached.as_deref(), &target).await;
+            SetupMarker::Written(target)
+        }
+        Ok(WriteOutcome::LostRace(MarkerRead::Valid(won))) => {
+            if won.namespace.eq_ignore_ascii_case(&namespace) {
+                settle_cache(store, emb, &namespace, cached.as_deref(), &target).await;
+                SetupMarker::Reused(target)
+            } else {
+                SetupMarker::OtherNamespace(won.namespace)
+            }
+        }
+        Ok(WriteOutcome::LostRace(_)) => SetupMarker::Refused(
+            "another writer left an unreadable .NeuroStrata/config.json; run `neurostrata-mcp root show`",
+        ),
+        Err(MarkerError::Unsafe(reason)) => SetupMarker::Refused(reason),
+        Err(MarkerError::Io(e)) => {
+            tracing::warn!("writing {} failed: {e}", target.join(ROOT_CONFIG_REL).display());
+            SetupMarker::Refused("the marker file could not be written")
+        }
+    }
+}
+
+/// `root set`'s arguments.
+#[derive(Debug, Clone)]
+pub struct RootSetArgs {
+    pub dir: PathBuf,
+    pub namespace: String,
+    pub source_id: Option<String>,
+    pub replace: bool,
+    pub force: bool,
+}
+
+/// The steps of `root set --replace`, for the interruption test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RootSetStep {
+    Published,
+    RegistryUpdated,
+}
+
+/// `neurostrata-mcp root set` (spec 6.8). Returns the lines to print, or the
+/// reason it refused.
+pub async fn root_set(
+    store: &std::sync::Arc<dyn crate::traits::VectorStore>,
+    emb: Option<&std::sync::Arc<dyn crate::traits::Embedder>>,
+    args: &RootSetArgs,
+) -> Result<Vec<String>, String> {
+    root_set_until(store, emb, args, None).await
+}
+
+/// Same-namespace markers in `target`'s checkout (or, outside git, the first
+/// marker above it and those below it), other than `target`'s own.
+fn other_markers_for(target: &Path, namespace: &str) -> Vec<PathBuf> {
+    let mut found: Vec<(PathBuf, MarkerRead)> = Vec::new();
+    match crate::paths::main_checkout_root(&target.to_string_lossy()) {
+        Some(top) => {
+            found.extend(marker_at(&top));
+            found.extend(nested_markers(&top));
+        }
+        None => {
+            found.extend(target.ancestors().skip(1).find_map(marker_at));
+            found.extend(nested_markers(target));
+        }
+    }
+    found
+        .into_iter()
+        .filter(|(dir, read)| {
+            matches!(read, MarkerRead::Valid(cfg) if cfg.namespace.eq_ignore_ascii_case(namespace))
+                && !same_folder(dir, target)
+        })
+        .map(|(dir, _)| dir)
+        .collect()
+}
+
+pub(crate) async fn root_set_until(
+    store: &std::sync::Arc<dyn crate::traits::VectorStore>,
+    emb: Option<&std::sync::Arc<dyn crate::traits::Embedder>>,
+    args: &RootSetArgs,
+    stop_after: Option<RootSetStep>,
+) -> Result<Vec<String>, String> {
+    let ns = args.namespace.as_str();
+    if !args.dir.is_absolute() || !args.dir.is_dir() {
+        return Err(format!("{} is not an existing absolute folder", args.dir.display()));
+    }
+    if !is_valid_namespace(ns) {
+        return Err(format!(
+            "'{ns}' is not a valid namespace (letters, digits, '_', '.', ':' and '-', starting with a letter or digit)"
+        ));
+    }
+    let dir = dunce::canonicalize(&args.dir).unwrap_or_else(|_| args.dir.clone());
+    // A root inside a linked worktree is marked in the main checkout.
+    let target = in_main_checkout(&dir);
+    if let Some(reason) = refuse_root_target(&target) {
+        return Err(format!("refused: {} is a {reason}, which cannot be a project root", target.display()));
+    }
+    let existing = read_marker(&target);
+    match &existing {
+        MarkerRead::Valid(cfg) if !cfg.namespace.eq_ignore_ascii_case(ns) && !args.replace => {
+            return Err(format!(
+                "{} holds the marker of namespace {}; pass --replace to change it",
+                target.display(),
+                cfg.namespace
+            ))
+        }
+        MarkerRead::Unreadable { path, reason } if !args.replace => {
+            return Err(format!(
+                "{} is unreadable ({reason}); pass --replace to overwrite it",
+                path.display()
+            ))
+        }
+        _ => {}
+    }
+    let old = other_markers_for(&target, ns);
+    if !old.is_empty() && !args.replace {
+        let listed: Vec<String> = old.iter().map(|p| p.display().to_string()).collect();
+        return Err(format!(
+            "another marker for {ns} exists at {}; pass --replace to move it to {}",
+            listed.join(", "),
+            target.display()
+        ));
+    }
+
+    let cached = usable_cached_root(store, ns).await?;
+    let current = cached.clone().or_else(|| old.first().cloned());
+    let lost = lost_by_change(store, ns, current.as_deref(), &target).await?;
+    let mut lines = Vec::new();
+    if !lost.is_empty() {
+        let from = current.as_deref().map(|p| p.display().to_string()).unwrap_or_default();
+        if !args.force {
+            return Err(format!(
+                "changing the root of {ns} from {from} to {} would stop {} memories matching: {}. \
+                 Run `neurostrata-mcp root audit` and correct them first ({ROOT_GUIDE}), or pass --force.",
+                target.display(),
+                lost.len(),
+                lost.join(", ")
+            ));
+        }
+        lines.push(format!(
+            "--force: {} memories keyed to {from} will stop matching: {}",
+            lost.len(),
+            lost.join(", ")
+        ));
+    }
+
+    // 1. Publish the new marker.
+    let mut cfg = match existing {
+        MarkerRead::Valid(cfg) if cfg.namespace.eq_ignore_ascii_case(ns) => Some(cfg),
+        _ => None,
+    };
+    let wrote = match cfg.as_mut() {
+        Some(cfg) => {
+            let changed = args.source_id.is_some() && cfg.source_id != args.source_id;
+            if changed {
+                cfg.source_id = args.source_id.clone();
+                replace_marker(&target, cfg).map_err(|e| e.to_string())?;
+            }
+            changed
+        }
+        None => {
+            let mut fresh = RootConfig::new(ns);
+            fresh.source_id = args.source_id.clone();
+            if matches!(read_marker(&target), MarkerRead::Absent) {
+                match write_new_marker(&target, &fresh).map_err(|e| e.to_string())? {
+                    WriteOutcome::Written => {}
+                    WriteOutcome::LostRace(MarkerRead::Valid(won))
+                        if won.namespace.eq_ignore_ascii_case(ns) => {}
+                    WriteOutcome::LostRace(_) => {
+                        return Err(format!(
+                            "another writer published {} first; run `neurostrata-mcp root show`",
+                            target.join(ROOT_CONFIG_REL).display()
+                        ))
+                    }
+                }
+            } else {
+                replace_marker(&target, &fresh).map_err(|e| e.to_string())?;
+            }
+            true
+        }
+    };
+    let file = target.join(ROOT_CONFIG_REL);
+    lines.push(if wrote {
+        format!("Wrote {} (namespace {ns}).", file.display())
+    } else {
+        format!("Kept {} (namespace {ns}).", file.display())
+    });
+    if stop_after == Some(RootSetStep::Published) {
+        return Ok(lines);
+    }
+
+    // 2. Point the registry at it.
+    crate::registry::set_project_root(store, emb, ns, &target).await;
+    lines.push(format!("Cached root of {ns}: {}", target.display()));
+    if stop_after == Some(RootSetStep::RegistryUpdated) {
+        return Ok(lines);
+    }
+
+    // 3. Remove the old markers.
+    for old_dir in &old {
+        let old_file = old_dir.join(ROOT_CONFIG_REL);
+        match std::fs::remove_file(&old_file) {
+            Ok(()) => lines.push(format!("Removed the old marker {}.", old_file.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("could not remove the old marker {}: {e}", old_file.display())),
+        }
+    }
+
+    if let Some(source_id) = &args.source_id {
+        match crate::config::bind_project_context_if_free(source_id, &target.join(".NeuroStrata")) {
+            Ok(crate::config::BindOutcome::Bound) => {
+                lines.push(format!("Bound project context {source_id} to {}.", target.display()))
+            }
+            Ok(crate::config::BindOutcome::AlreadyBoundHere) => {}
+            Ok(crate::config::BindOutcome::LiveElsewhere(path)) => lines.push(format!(
+                "Project context {source_id} stays bound to {}; recorded in the marker only.",
+                path.display()
+            )),
+            Err(e) => lines.push(format!("Project context {source_id} was not bound: {e}")),
+        }
+    }
+    let top = crate::paths::main_checkout_root(&target.to_string_lossy());
+    if top.as_deref().is_some_and(|top| !same_folder(top, &target)) {
+        lines.push("Commit .NeuroStrata/config.json so other clones use the same root.".to_string());
+    }
+    Ok(lines)
+}
+
+/// For `hooks install` (the CLI may run git; the daemon does not): one line
+/// when the marker at `root` is neither tracked nor ignored by git.
+pub fn commit_advice(root: &Path) -> Option<String> {
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok()
+            .map(|s| s.success())
+    };
+    if git(&["ls-files", "--error-unmatch", ROOT_CONFIG_REL])? || git(&["check-ignore", "-q", ROOT_CONFIG_REL])? {
+        return None;
+    }
+    Some(
+        "Commit .NeuroStrata/config.json so other clones use the same root, or add it to .gitignore to keep it per clone."
+            .to_string(),
+    )
+}
+
 /// `yes`/`no` by `git ls-files --error-unmatch`, run in the checkout that
 /// holds the file: exit 1 is "no", any other failure (a checkout git
 /// refuses, say) is "unknown".
@@ -1490,6 +2022,448 @@ mod tests {
             let raw = repo.to_string_lossy().into_owned();
             let other = format!("{}{}", raw[..1].to_ascii_lowercase(), raw[1..].replace('\\', "/"));
             assert!(same_folder(Path::new(&other), &repo));
+        }
+    }
+
+    // ── writers ──────────────────────────────────────────────────────────
+
+    use crate::guard::testkit::{MockStore, StubEmbedder};
+    use crate::traits::{Embedder, MemoryPayload, VectorStore};
+
+    const NS: &str = "example-project";
+
+    fn mock() -> (Arc<dyn VectorStore>, Arc<dyn Embedder>) {
+        (Arc::new(MockStore::new()), Arc::new(StubEmbedder))
+    }
+
+    async fn cache_root(store: &Arc<dyn VectorStore>, emb: &Arc<dyn Embedder>, root: &Path) {
+        crate::registry::cache_project_root(store, Some(emb), NS, &root.to_string_lossy()).await;
+    }
+
+    async fn cached(store: &Arc<dyn VectorStore>) -> Option<String> {
+        crate::registry::cached_project_root(store, NS).await.unwrap()
+    }
+
+    async fn rule_at(store: &Arc<dyn VectorStore>, id: &str, location: &str, metadata: serde_json::Value) {
+        store
+            .upsert(
+                NS,
+                id,
+                vec![0.0; 4],
+                MemoryPayload {
+                    content: format!("rule {id}"),
+                    user_id: "agent".to_string(),
+                    memory_type: "rule".to_string(),
+                    agent_name: None,
+                    location: location.to_string(),
+                    location_lines: String::new(),
+                    metadata,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// A temp base folder, or `None` when the temp folder sits inside a git
+    /// checkout on this host (a non-git case cannot be built there).
+    fn base_outside_git(tmp: &tempfile::TempDir) -> Option<PathBuf> {
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        (!base.ancestors().any(|a| a.join(".git").exists())).then_some(base)
+    }
+
+    fn has_marker(dir: &Path) -> bool {
+        dir.join(ROOT_CONFIG_REL).exists()
+    }
+
+    const WORKTREE: &str = r#"["repo git-dir", "repo/src", "repo/.git/worktrees/wt commondir:../..",
+        "wt git-file:../repo/.git/worktrees/wt", "wt/src"]"#;
+
+    #[tokio::test]
+    async fn writes_at_main_checkout_top_when_cache_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        layout(&base, WORKTREE);
+        let repo = base.join("repo");
+        let (store, emb) = mock();
+        let got = ensure_marker_for_setup(&store, Some(&emb), &repo.join("src"), Some(NS)).await;
+        assert_eq!(got, SetupMarker::Written(repo.clone()));
+        assert_eq!(read_marker(&repo), MarkerRead::Valid(RootConfig::new(NS)));
+        assert_eq!(cached(&store).await, Some(repo.to_string_lossy().into_owned()));
+        assert!(got.message(NS, &repo).unwrap().starts_with("Wrote "));
+
+        // From the linked worktree: the marker goes to the main checkout's top.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        layout(&base, WORKTREE);
+        let (store, emb) = mock();
+        let got = ensure_marker_for_setup(&store, Some(&emb), &under(&base, "wt/src"), Some(NS)).await;
+        assert_eq!(got, SetupMarker::Written(base.join("repo")));
+        assert!(!has_marker(&base.join("wt")));
+        // A second setup reuses it.
+        let again = ensure_marker_for_setup(&store, Some(&emb), &base.join("wt"), Some(NS)).await;
+        assert_eq!(again.kind(), "reused");
+        assert_eq!(again.message(NS, &base), None);
+    }
+
+    #[tokio::test]
+    async fn writes_when_cache_is_top_or_its_worktree() {
+        for cache in ["repo", "wt"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let base = dunce::canonicalize(tmp.path()).unwrap();
+            layout(&base, WORKTREE);
+            let (store, emb) = mock();
+            cache_root(&store, &emb, &base.join(cache)).await;
+            let got = ensure_marker_for_setup(&store, Some(&emb), &base.join("repo"), Some(NS)).await;
+            assert_eq!(got, SetupMarker::Written(base.join("repo")), "cache {cache}");
+            assert!(has_marker(&base.join("repo")));
+        }
+    }
+
+    #[tokio::test]
+    async fn asks_when_cache_is_subfolder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        layout(&base, r#"["repo git-dir", "repo/pkg"]"#);
+        let repo = base.join("repo");
+        let (store, emb) = mock();
+        cache_root(&store, &emb, &repo.join("pkg")).await;
+        let got = ensure_marker_for_setup(&store, Some(&emb), &repo, Some(NS)).await;
+        assert_eq!(got, SetupMarker::AskRoot { top: repo.clone(), sub: repo.join("pkg") });
+        assert!(!has_marker(&repo) && !has_marker(&repo.join("pkg")));
+        let message = got.message(NS, &repo).unwrap();
+        assert!(message.contains(&format!("root set {}", repo.join("pkg").display())), "{message}");
+        assert!(message.contains(&format!("root set {}", repo.display())), "{message}");
+        assert!(message.contains("root audit"), "{message}");
+        assert_eq!(cached(&store).await, Some(repo.join("pkg").to_string_lossy().into_owned()));
+    }
+
+    #[tokio::test]
+    async fn other_namespace_marker_installs_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        layout(&base, r#"["repo git-dir", "repo marker:other-project", "repo/src"]"#);
+        let (store, emb) = mock();
+        let got = ensure_marker_for_setup(&store, Some(&emb), &under(&base, "repo/src"), Some(NS)).await;
+        assert_eq!(got, SetupMarker::OtherNamespace("other-project".to_string()));
+        assert!(!got.installs_plugins());
+        assert!(got.message(NS, &base).unwrap().contains("root set"));
+        assert_eq!(cached(&store).await, None);
+        // The marker is untouched.
+        let MarkerRead::Valid(cfg) = read_marker(&base.join("repo")) else { panic!() };
+        assert_eq!(cfg.namespace, "other-project");
+    }
+
+    #[tokio::test]
+    async fn hooks_install_without_explicit_namespace_asks_and_still_installs_hooks() {
+        let _env = crate::daemon::project_root_env_test_lock();
+        std::env::remove_var("NEUROSTRATA_NAMESPACE");
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        layout(&base, r#"["example-project git-dir"]"#);
+        let repo = base.join("example-project");
+        let (store, emb) = mock();
+
+        // Only the folder name: no marker, asks with that one candidate.
+        let got = ensure_marker_for_setup(&store, Some(&emb), &repo, None).await;
+        assert_eq!(got, SetupMarker::AskNamespace(vec!["example-project".to_string()]));
+        assert!(!has_marker(&repo));
+        // Asking does not stop the hook and plugin install.
+        assert!(got.installs_plugins());
+        assert!(got.message(NS, &repo).unwrap().contains("hooks install --namespace <ns>"));
+
+        // Harness configs that disagree: both candidates listed.
+        std::fs::create_dir_all(repo.join(".claude")).unwrap();
+        std::fs::write(
+            repo.join(".claude").join("settings.local.json"),
+            r#"{"env": {"NEUROSTRATA_NAMESPACE": "alpha"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo.join(".NeuroStrata")).unwrap();
+        std::fs::write(
+            repo.join(".NeuroStrata").join("session_queries.json"),
+            r#"{"namespace": "beta", "queries": []}"#,
+        )
+        .unwrap();
+        let got = ensure_marker_for_setup(&store, Some(&emb), &repo, None).await;
+        assert_eq!(got, SetupMarker::AskNamespace(vec!["alpha".to_string(), "beta".to_string()]));
+        assert!(!has_marker(&repo));
+        assert_eq!(cached(&store).await, None);
+    }
+
+    #[tokio::test]
+    async fn hooks_install_with_namespace_flag_writes() {
+        let _env = crate::daemon::project_root_env_test_lock();
+        std::env::remove_var("NEUROSTRATA_NAMESPACE");
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        layout(&base, r#"["example-project git-dir"]"#);
+        let repo = base.join("example-project");
+        let (store, emb) = mock();
+        let got = ensure_marker_for_setup(&store, Some(&emb), &repo, Some("team:proj")).await;
+        assert_eq!(got, SetupMarker::Written(repo.clone()));
+        let MarkerRead::Valid(cfg) = read_marker(&repo) else { panic!() };
+        assert_eq!(cfg.namespace, "team:proj");
+
+        // One explicit source is enough without the flag.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        layout(&base, r#"["example-project git-dir"]"#);
+        let repo = base.join("example-project");
+        std::fs::create_dir_all(repo.join(".claude")).unwrap();
+        std::fs::write(
+            repo.join(".claude").join("settings.local.json"),
+            r#"{"env": {"NEUROSTRATA_NAMESPACE": "alpha"}}"#,
+        )
+        .unwrap();
+        let (store, emb) = mock();
+        let got = ensure_marker_for_setup(&store, Some(&emb), &repo, None).await;
+        assert_eq!(got, SetupMarker::Written(repo.clone()));
+        let MarkerRead::Valid(cfg) = read_marker(&repo) else { panic!() };
+        assert_eq!(cfg.namespace, "alpha");
+    }
+
+    #[tokio::test]
+    async fn non_git_setup_at_parent_blocked_by_root_change_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        let Some(base) = base_outside_git(&tmp) else {
+            eprintln!("skipped: the temp folder is inside a git checkout");
+            return;
+        };
+        let proj = base.join("proj");
+        std::fs::create_dir_all(proj.join("sub")).unwrap();
+        std::fs::write(proj.join("sub").join("a.rs"), b"").unwrap();
+        let (store, emb) = mock();
+        cache_root(&store, &emb, &proj.join("sub")).await;
+        rule_at(&store, "rule-a", "a.rs", serde_json::json!({})).await;
+
+        let got = ensure_marker_for_setup(&store, Some(&emb), &proj, Some(NS)).await;
+        assert_eq!(got, SetupMarker::RootChangeBlocked(vec!["rule-a".to_string()]));
+        assert!(!has_marker(&proj));
+        assert_eq!(cached(&store).await, Some(proj.join("sub").to_string_lossy().into_owned()));
+        let message = got.message(NS, &proj).unwrap();
+        assert!(message.contains("rule-a") && message.contains("root audit"), "{message}");
+
+        // Setup at the cached root itself changes nothing and writes.
+        let got = ensure_marker_for_setup(&store, Some(&emb), &proj.join("sub"), Some(NS)).await;
+        assert_eq!(got, SetupMarker::Written(proj.join("sub")));
+    }
+
+    #[test]
+    fn racing_setups_one_wins() {
+        for round in 0..10 {
+            let tmp = tempfile::tempdir().unwrap();
+            let base = dunce::canonicalize(tmp.path()).unwrap();
+            layout(&base, r#"["repo git-dir"]"#);
+            let repo = base.join("repo");
+            let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let runs: Vec<_> = ["example-a", "example-b"]
+                .into_iter()
+                .map(|ns| {
+                    let (store, barrier, repo) = (store.clone(), barrier.clone(), repo.clone());
+                    std::thread::spawn(move || {
+                        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                        barrier.wait();
+                        rt.block_on(ensure_marker_for_setup(&store, None, &repo, Some(ns)))
+                    })
+                })
+                .collect();
+            let outcomes: Vec<SetupMarker> = runs.into_iter().map(|t| t.join().unwrap()).collect();
+            let written: Vec<_> = outcomes.iter().filter(|o| o.kind() == "written").collect();
+            assert_eq!(written.len(), 1, "round {round}: {outcomes:?}");
+            assert!(
+                outcomes.iter().any(|o| matches!(o, SetupMarker::OtherNamespace(_))),
+                "round {round}: {outcomes:?}"
+            );
+            let MarkerRead::Valid(cfg) = read_marker(&repo) else { panic!() };
+            let winner = if outcomes[0].kind() == "written" { "example-a" } else { "example-b" };
+            assert_eq!(cfg.namespace, winner, "round {round}");
+        }
+    }
+
+    #[tokio::test]
+    async fn setup_refuses_linked_neurostrata_and_temp_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        layout(&base, r#"["elsewhere", "repo git-dir", "repo neurostrata-link:elsewhere"]"#);
+        let (store, emb) = mock();
+        let got = ensure_marker_for_setup(&store, Some(&emb), &base.join("repo"), Some(NS)).await;
+        assert_eq!(got.kind(), "refused", "{got:?}");
+        assert!(!base.join("elsewhere").join("config.json").exists());
+
+        let temp = dunce::canonicalize(std::env::temp_dir()).unwrap();
+        let got = ensure_marker_for_setup(&store, Some(&emb), &temp, Some(NS)).await;
+        assert_eq!(got, SetupMarker::Refused("the system temp folder is not a project root"));
+        let got = ensure_marker_for_setup(&store, Some(&emb), Path::new("relative"), Some(NS)).await;
+        assert_eq!(got.kind(), "refused");
+    }
+
+    #[test]
+    fn root_hint_only_without_a_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        layout(
+            &base,
+            r#"["plain git-dir", "plain/src/a.rs file", "owned git-dir", "owned marker:other-project",
+                "owned/a.rs file", "ours git-dir", "ours marker:example-project"]"#,
+        );
+        let hint = root_hint(NS, &under(&base, "plain/src/a.rs")).unwrap();
+        assert_eq!(
+            hint,
+            "No .NeuroStrata/config.json for example-project: run `neurostrata-mcp hooks install` or neurostrata_task_setup"
+        );
+        assert_eq!(root_hint(NS, &under(&base, "owned/a.rs")), None);
+        assert_eq!(root_hint(NS, &base.join("ours")), None);
+        assert_eq!(root_hint(NS, Path::new("src/a.rs")), None);
+        assert_eq!(root_hint(NS, &base.join("missing")), None);
+        assert_eq!(root_hint("", &base.join("plain")), None);
+    }
+
+    fn set_args(dir: &Path) -> RootSetArgs {
+        RootSetArgs {
+            dir: dir.to_path_buf(),
+            namespace: NS.to_string(),
+            source_id: None,
+            replace: false,
+            force: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn refuses_root_change_with_affected_rows_then_force_proceeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        layout(&base, r#"["repo git-dir", "repo/sub/a.rs file"]"#);
+        let repo = base.join("repo");
+        let (store, emb) = mock();
+        cache_root(&store, &emb, &repo.join("sub")).await;
+        rule_at(&store, "rule-a", "a.rs", serde_json::json!({})).await;
+
+        let err = root_set(&store, Some(&emb), &set_args(&repo)).await.unwrap_err();
+        assert!(err.contains("rule-a") && err.contains("root audit") && err.contains(ROOT_GUIDE), "{err}");
+        assert!(!has_marker(&repo));
+        assert_eq!(cached(&store).await, Some(repo.join("sub").to_string_lossy().into_owned()));
+
+        let mut forced = set_args(&repo);
+        forced.force = true;
+        let lines = root_set(&store, Some(&emb), &forced).await.unwrap();
+        assert!(lines.iter().any(|l| l.starts_with("--force") && l.contains("rule-a")), "{lines:?}");
+        assert!(has_marker(&repo));
+        assert_eq!(cached(&store).await, Some(repo.to_string_lossy().into_owned()));
+    }
+
+    #[tokio::test]
+    async fn proceeds_after_audit_corrections() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        layout(&base, r#"["repo git-dir", "repo/sub/a.rs file"]"#);
+        let repo = base.join("repo");
+        let (store, emb) = mock();
+        cache_root(&store, &emb, &repo.join("sub")).await;
+        rule_at(&store, "rule-a", "a.rs", serde_json::json!({})).await;
+        assert!(root_set(&store, Some(&emb), &set_args(&repo)).await.is_err());
+
+        // The correction: the old row is superseded by one keyed to the new root.
+        rule_at(&store, "rule-a", "a.rs", serde_json::json!({ "superseded_by": "rule-a2" })).await;
+        rule_at(&store, "rule-a2", "sub/a.rs", serde_json::json!({ "supersedes": "rule-a" })).await;
+        let lines = root_set(&store, Some(&emb), &set_args(&repo)).await.unwrap();
+        assert!(!lines.iter().any(|l| l.starts_with("--force")), "{lines:?}");
+        assert!(has_marker(&repo));
+        assert_eq!(cached(&store).await, Some(repo.to_string_lossy().into_owned()));
+    }
+
+    #[tokio::test]
+    async fn replace_order_new_then_registry_then_remove_old() {
+        for stop in [RootSetStep::Published, RootSetStep::RegistryUpdated] {
+            let tmp = tempfile::tempdir().unwrap();
+            let base = dunce::canonicalize(tmp.path()).unwrap();
+            layout(&base, r#"["repo git-dir", "repo/old marker:example-project", "repo/new"]"#);
+            let repo = base.join("repo");
+            let (old, new) = (repo.join("old"), repo.join("new"));
+            let (store, emb) = mock();
+            cache_root(&store, &emb, &old).await;
+
+            // Another marker for the namespace in this checkout: --replace needed.
+            let err = root_set(&store, Some(&emb), &set_args(&new)).await.unwrap_err();
+            assert!(err.contains("--replace"), "{err}");
+            assert!(!has_marker(&new));
+
+            let mut args = set_args(&new);
+            args.replace = true;
+            // Interrupted after the step: both markers are there and root show
+            // lists both.
+            root_set_until(&store, Some(&emb), &args, Some(stop)).await.unwrap();
+            assert!(has_marker(&new) && has_marker(&old), "{stop:?}");
+            let shown = format_root_show(
+                &repo,
+                &find_root_marker(&repo),
+                NS,
+                &CachedRoot::Known(cached(&store).await),
+                &std::collections::HashMap::new(),
+            );
+            assert!(shown.contains(&format!("  {} (namespace {NS})", old.display())), "{shown}");
+            assert!(shown.contains(&format!("  {} (namespace {NS})", new.display())), "{shown}");
+            let expected_cache = if stop == RootSetStep::Published { &old } else { &new };
+            assert_eq!(cached(&store).await, Some(expected_cache.to_string_lossy().into_owned()));
+
+            // Rerunning the same command finishes.
+            let lines = root_set(&store, Some(&emb), &args).await.unwrap();
+            assert!(has_marker(&new) && !has_marker(&old), "{stop:?}: {lines:?}");
+            assert!(lines.iter().any(|l| l.starts_with("Removed the old marker")), "{lines:?}");
+            assert_eq!(cached(&store).await, Some(new.to_string_lossy().into_owned()));
+        }
+    }
+
+    #[tokio::test]
+    async fn split_under_other_namespace_allowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        layout(&base, r#"["repo git-dir", "repo marker:outer-project", "repo/packages/api"]"#);
+        let api = under(&base, "repo/packages/api");
+        let (store, emb) = mock();
+        let lines = root_set(&store, Some(&emb), &set_args(&api)).await.unwrap();
+        let MarkerRead::Valid(inner) = read_marker(&api) else { panic!() };
+        assert_eq!(inner.namespace, NS);
+        let MarkerRead::Valid(outer) = read_marker(&base.join("repo")) else { panic!() };
+        assert_eq!(outer.namespace, "outer-project");
+        assert!(lines.iter().any(|l| l.starts_with("Commit .NeuroStrata/config.json")), "{lines:?}");
+        assert_eq!(cached(&store).await, Some(api.to_string_lossy().into_owned()));
+    }
+
+    #[tokio::test]
+    async fn refuses_folder_with_other_namespace_without_replace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        layout(&base, r#"["repo git-dir", "repo marker:other-project"]"#);
+        let repo = base.join("repo");
+        let (store, emb) = mock();
+        let err = root_set(&store, Some(&emb), &set_args(&repo)).await.unwrap_err();
+        assert!(err.contains("other-project") && err.contains("--replace"), "{err}");
+        assert_eq!(cached(&store).await, None);
+
+        let mut args = set_args(&repo);
+        args.replace = true;
+        root_set(&store, Some(&emb), &args).await.unwrap();
+        let MarkerRead::Valid(cfg) = read_marker(&repo) else { panic!() };
+        assert_eq!(cfg.namespace, NS);
+    }
+
+    #[tokio::test]
+    async fn recommends_commit_when_not_checkout_top() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        layout(&base, r#"["repo git-dir", "repo/sub", "top git-dir"]"#);
+        let (store, emb) = mock();
+        let lines = root_set(&store, Some(&emb), &set_args(&under(&base, "repo/sub"))).await.unwrap();
+        assert!(lines.iter().any(|l| l == "Commit .NeuroStrata/config.json so other clones use the same root."), "{lines:?}");
+
+        let (store, emb) = mock();
+        let lines = root_set(&store, Some(&emb), &set_args(&base.join("top"))).await.unwrap();
+        assert!(!lines.iter().any(|l| l.starts_with("Commit")), "{lines:?}");
+        // A non-git parent of checkouts is refused.
+        if let Some(base) = base_outside_git(&tmp) {
+            let err = root_set(&store, Some(&emb), &set_args(&base)).await.unwrap_err();
+            assert!(err.contains("refused") && err.contains("git checkout"), "{err}");
         }
     }
 }

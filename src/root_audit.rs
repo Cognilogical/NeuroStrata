@@ -475,7 +475,6 @@ fn relative_keys(row: &SearchResult) -> Vec<String> {
 /// or folder under `current` but would be spelled differently relative to
 /// `new`, so moving the root from `current` to `new` would stop them matching.
 /// Absolute keys never matched by a relative key, so they are not lost.
-#[cfg_attr(not(test), allow(dead_code))]
 pub async fn rows_lost_by_root_change(
     store: &Arc<dyn VectorStore>,
     namespace: &str,

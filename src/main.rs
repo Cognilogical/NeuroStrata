@@ -946,16 +946,45 @@ pub(crate) enum RootCommands {
         #[arg(long)]
         json: bool,
     },
+    /// Make a folder the namespace's project root: write
+    /// <dir>/.NeuroStrata/config.json (in the main checkout when <dir> is in
+    /// a linked worktree) and set the cached root. Refuses a root change that
+    /// would stop memories matching unless --force; see `root audit`.
+    Set {
+        /// The folder that becomes the root
+        dir: std::path::PathBuf,
+        /// The namespace the folder belongs to
+        #[arg(long)]
+        namespace: String,
+        /// Record this project-context source id in the marker, and bind it
+        /// when it is unbound or bound to a folder that no longer exists
+        #[arg(long)]
+        source_id: Option<String>,
+        /// Replace another namespace's marker in <dir>, or move this
+        /// namespace's marker from another folder of the checkout
+        #[arg(long)]
+        replace: bool,
+        /// Change the root even when memories would stop matching
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone, PartialEq)]
 pub(crate) enum HooksCommands {
     /// Write the pre-push hook into the directory git runs hooks from
-    /// (core.hooksPath honored): the only hook the task system keeps
+    /// (core.hooksPath honored): the only hook the task system keeps. Also
+    /// writes .NeuroStrata/config.json at the checkout top when the namespace
+    /// is known, or says which root or namespace to choose.
     Install {
         /// Replace a pre-push hook NeuroStrata did not write
         #[arg(long)]
         force: bool,
+        /// The namespace to record in .NeuroStrata/config.json (default: the
+        /// one the harness configs, NEUROSTRATA_NAMESPACE or the ledger agree
+        /// on; never the folder name)
+        #[arg(long)]
+        namespace: Option<String>,
     },
 
     /// Write the pre-commit hook into the directory git runs hooks from
@@ -2079,6 +2108,9 @@ fn dispatch_project_context(
     action: &ProjectContextCommands,
     config_path: &std::path::Path,
 ) -> anyhow::Result<String> {
+    // Held across the read and the save so `root set --source-id` cannot
+    // check and write in between.
+    let _lock = crate::config::ConfigLock::acquire(config_path)?;
     let mut config = Config::load_from(config_path)?;
     let (output, changed) = match action {
         ProjectContextCommands::Bind {
@@ -2437,6 +2469,140 @@ async fn root_show_cached_root(
                 Ok(root) => CachedRoot::Known(root),
                 Err(e) => CachedRoot::Unknown(format!("the store could not be read: {e}")),
             }
+        }
+    }
+}
+
+/// Where the marker writers (`root set`, `hooks install`) send their registry
+/// change: the answering daemon, else the store opened here.
+enum CliWriteStore {
+    Daemon,
+    Direct(Arc<dyn VectorStore>, Option<Arc<dyn crate::traits::Embedder>>),
+}
+
+async fn open_cli_write_store(probe: DaemonProbe) -> Result<CliWriteStore, String> {
+    if probe == DaemonProbe::Responsive {
+        gate_verify_daemon(fetch_daemon_info().await.as_ref(), daemon::exe_fingerprint())?;
+        return Ok(CliWriteStore::Daemon);
+    }
+    let config = Config::load().map_err(|e| format!("the config could not be read: {e}"))?;
+    if daemon_holds_lock(&config.db_path) {
+        return Err("no daemon answered and the store is locked".to_string());
+    }
+    if probe == DaemonProbe::Silent {
+        return Err(
+            "nothing answered on 127.0.0.1:34343 within 500ms, so a daemon may be busy; not opening the store"
+                .to_string(),
+        );
+    }
+    let dimensions = embed::configured_dimensions()
+        .map_err(|e| format!("the store could not be opened: {e}"))?;
+    let store = LadybugStore::new(config.db_path.to_string_lossy().to_string(), dimensions)
+        .map_err(|e| format!("the store could not be opened: {e}"))?;
+    Ok(CliWriteStore::Direct(Arc::new(store), embed::build_embedder().ok()))
+}
+
+/// One op on the daemon's `/cli/root`.
+async fn cli_root_op(body: serde_json::Value) -> Result<serde_json::Value, String> {
+    let res = daemon_http_client()
+        .post("http://127.0.0.1:34343/cli/root")
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(120))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = res.status();
+    let text = res.text().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!("the daemon answered {status} on /cli/root: {text}"));
+    }
+    serde_json::from_str(&text).map_err(|e| e.to_string())
+}
+
+/// `root set`, through the daemon when one answers.
+async fn run_root_set(args: &crate::root_marker::RootSetArgs) -> Result<Vec<String>, String> {
+    match open_cli_write_store(probe_daemon().await).await? {
+        CliWriteStore::Daemon => {
+            let v = cli_root_op(serde_json::json!({
+                "op": "set",
+                "dir": args.dir.to_string_lossy(),
+                "namespace": args.namespace,
+                "source_id": args.source_id,
+                "replace": args.replace,
+                "force": args.force,
+            }))
+            .await?;
+            if v["ok"].as_bool() == Some(true) {
+                Ok(v["lines"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|l| l.as_str().map(str::to_string)).collect())
+                    .unwrap_or_default())
+            } else {
+                Err(v["error"].as_str().unwrap_or("root set failed").to_string())
+            }
+        }
+        CliWriteStore::Direct(store, emb) => {
+            let lines = crate::root_marker::root_set(&store, emb.as_ref(), args).await;
+            let _ = store.checkpoint().await;
+            lines
+        }
+    }
+}
+
+/// `hooks install`'s marker step: (kind, message, marker root). The namespace
+/// is resolved here, from this process's environment, before the daemon is
+/// asked.
+async fn hooks_install_marker(
+    root: &std::path::Path,
+    namespace: Option<&str>,
+) -> (String, Option<String>, Option<std::path::PathBuf>) {
+    let namespace = match namespace {
+        Some(ns) => ns.to_string(),
+        None => match crate::task::harness_plugins::explicit_namespace(root) {
+            Ok(ns) => ns,
+            Err(candidates) => {
+                let outcome = crate::root_marker::SetupMarker::AskNamespace(candidates);
+                return (outcome.kind().to_string(), outcome.message("", root), None);
+            }
+        },
+    };
+    let unwritten = |why: String| {
+        (
+            "refused".to_string(),
+            Some(format!("No .NeuroStrata/config.json written: {why}.")),
+            None,
+        )
+    };
+    match open_cli_write_store(probe_daemon().await).await {
+        Err(why) => unwritten(why),
+        Ok(CliWriteStore::Daemon) => match cli_root_op(serde_json::json!({
+            "op": "setup",
+            "dir": root.to_string_lossy(),
+            "namespace": namespace,
+        }))
+        .await
+        {
+            Ok(v) => (
+                v["kind"].as_str().unwrap_or("refused").to_string(),
+                v["message"].as_str().map(str::to_string),
+                v["root"].as_str().map(std::path::PathBuf::from),
+            ),
+            Err(e) => unwritten(format!("daemon: {e}")),
+        },
+        Ok(CliWriteStore::Direct(store, emb)) => {
+            let outcome = crate::root_marker::ensure_marker_for_setup(
+                &store,
+                emb.as_ref(),
+                root,
+                Some(&namespace),
+            )
+            .await;
+            let _ = store.checkpoint().await;
+            (
+                outcome.kind().to_string(),
+                outcome.message(&namespace, root),
+                outcome.root().map(std::path::Path::to_path_buf),
+            )
         }
     }
 }
@@ -4153,8 +4319,11 @@ mod tests {
             .expect("hooks install parses");
         match cli.command {
             Some(Commands::Hooks {
-                action: HooksCommands::Install { force },
-            }) => assert!(force),
+                action: HooksCommands::Install { force, namespace },
+            }) => {
+                assert!(force);
+                assert_eq!(namespace, None);
+            }
             other => panic!("expected Hooks/Install, got {:?}", other),
         }
 
@@ -4163,10 +4332,44 @@ mod tests {
             .expect("hooks install parses bare");
         match cli.command {
             Some(Commands::Hooks {
-                action: HooksCommands::Install { force },
+                action: HooksCommands::Install { force, .. },
             }) => assert!(!force),
             other => panic!("expected Hooks/Install, got {:?}", other),
         }
+
+        let cli = Cli::try_parse_from([
+            "neurostrata-mcp", "hooks", "install", "--namespace", "example-project",
+        ])
+        .expect("hooks install parses --namespace");
+        match cli.command {
+            Some(Commands::Hooks {
+                action: HooksCommands::Install { namespace, .. },
+            }) => assert_eq!(namespace.as_deref(), Some("example-project")),
+            other => panic!("expected Hooks/Install, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn root_set_command_parses() {
+        let cli = Cli::try_parse_from([
+            "neurostrata-mcp", "root", "set", "some/dir", "--namespace", "example-project",
+            "--source-id", "example-src", "--replace", "--force",
+        ])
+        .expect("parses");
+        match cli.command {
+            Some(Commands::Root { action }) => assert_eq!(
+                action,
+                RootCommands::Set {
+                    dir: "some/dir".into(),
+                    namespace: "example-project".to_string(),
+                    source_id: Some("example-src".to_string()),
+                    replace: true,
+                    force: true,
+                }
+            ),
+            other => panic!("expected Root/Set, got {:?}", other),
+        }
+        assert!(Cli::try_parse_from(["neurostrata-mcp", "root", "set", "some/dir"]).is_err());
     }
 
     #[test]
@@ -6545,8 +6748,10 @@ async fn run() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Read-only: asks an answering daemon or opens a free store, never starts
-    // a daemon and never writes (so it runs before the crash breadcrumb too).
+    // `root show` and `root audit` are read-only: they ask an answering daemon
+    // or open a free store, never start a daemon and never write (so they run
+    // before the crash breadcrumb too). `root set` writes through the daemon
+    // when one answers, else opens the store itself; it never starts one.
     if let Some(Commands::Root { action }) = cli.command.as_ref() {
         match action {
             RootCommands::Show { dir } => {
@@ -6591,6 +6796,27 @@ async fn run() -> anyhow::Result<()> {
                 let code = run_root_audit(dir.as_ref(), namespace.as_deref(), *json).await?;
                 if code != 0 {
                     std::process::exit(code);
+                }
+            }
+            RootCommands::Set { dir, namespace, source_id, replace, force } => {
+                let cwd = std::env::current_dir()?;
+                let args = crate::root_marker::RootSetArgs {
+                    dir: cwd.join(dir),
+                    namespace: namespace.clone(),
+                    source_id: source_id.clone(),
+                    replace: *replace,
+                    force: *force,
+                };
+                match run_root_set(&args).await {
+                    Ok(lines) => {
+                        for line in lines {
+                            println!("{line}");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("ERROR: {e}");
+                        std::process::exit(1);
+                    }
                 }
             }
         }
@@ -7767,7 +7993,7 @@ async fn run() -> anyhow::Result<()> {
             }
             Commands::DataConnector { .. } => { /* handled after store open */ }
             Commands::Hooks { action } => match action {
-                HooksCommands::Install { force } => {
+                HooksCommands::Install { force, namespace } => {
                     let root = match git_toplevel().or_else(|| std::env::current_dir().ok()) {
                         Some(r) => r,
                         None => {
@@ -7780,6 +8006,16 @@ async fn run() -> anyhow::Result<()> {
                             "ERROR: {:?} is not a git repository; there is nowhere to install the pre-push hook.",
                             root
                         );
+                        std::process::exit(1);
+                    }
+                    let (marker_kind, marker_message, marker_root) =
+                        hooks_install_marker(&root, namespace.as_deref()).await;
+                    if marker_kind == "other_namespace" {
+                        // Another namespace owns this folder: install nothing
+                        // that would name a different one.
+                        if let Some(message) = &marker_message {
+                            eprintln!("{message}");
+                        }
                         std::process::exit(1);
                     }
                     match install_pre_push_hook(&root, force) {
@@ -7810,6 +8046,14 @@ async fn run() -> anyhow::Result<()> {
                                 "Installed the NeuroStrata task gate at {} (plus pre-commit ledger and detected harness plugins).",
                                 target.display()
                             );
+                            if let Some(message) = &marker_message {
+                                println!("{message}");
+                            }
+                            if let Some(advice) =
+                                marker_root.as_deref().and_then(crate::root_marker::commit_advice)
+                            {
+                                println!("{advice}");
+                            }
                             return Ok(());
                         }
                         Err(e) => {

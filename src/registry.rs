@@ -890,6 +890,44 @@ pub async fn write_doctor_state(
     }
 }
 
+/// Merge `fields` into the row's `doctor_state` object (other doctor_state
+/// keys and other row fields kept), under the row lock with a fresh read.
+/// Returns the doctor_state as it was before, or `None` when there is no row
+/// (left missing) or it could not be read.
+pub async fn merge_doctor_state_fields(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    fields: serde_json::Map<String, Value>,
+) -> Option<Value> {
+    let _guard = REGISTRY_ROW_LOCK.lock().await;
+    let registry_id = registry_row_id(namespace);
+    let (vector, mut payload) = match store.get(namespace, &registry_id).await {
+        Ok(Some(found)) => found,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::warn!("registry row read failed for '{namespace}': {e}");
+            return None;
+        }
+    };
+    let previous = payload
+        .metadata
+        .get("doctor_state")
+        .cloned()
+        .unwrap_or(Value::Null);
+    if let Some(obj) = payload.metadata.as_object_mut() {
+        let mut state = match previous.clone() {
+            Value::Object(map) => map,
+            _ => serde_json::Map::new(),
+        };
+        state.extend(fields);
+        obj.insert("doctor_state".to_string(), Value::Object(state));
+    }
+    if let Err(e) = store.upsert(namespace, &registry_id, vector, payload).await {
+        tracing::warn!("failed to persist doctor_state into {namespace}::{registry_id}: {e}");
+    }
+    Some(previous)
+}
+
 /// The `project_root` cached on the namespace's registry row by
 /// [`cache_project_root`]. A missing row or field is `Ok(None)`; a failed
 /// store read is an error, so a caller can tell "no root" from "unknown".
@@ -922,7 +960,7 @@ pub async fn cached_project_root(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn write_marker(dir: &std::path::Path, ns: &str) {
@@ -1104,7 +1142,7 @@ mod tests {
         }
     }
 
-    fn yield_store() -> Arc<dyn VectorStore> {
+    pub(crate) fn yield_store() -> Arc<dyn VectorStore> {
         Arc::new(YieldStore {
             inner: crate::guard::testkit::MockStore::new(),
         })
