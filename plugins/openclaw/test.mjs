@@ -1,3 +1,4 @@
+import test from "node:test";
 import http from "node:http";
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
@@ -107,4 +108,35 @@ describe("audit W1 follow-ups on openclaw (#326)", () => {
       mod.resetState();
     }
   });
+});
+
+// The project root marker walk is a copy of the core plugin's; the shared
+// fixture is the contract every copy (and the Rust daemon) must pass.
+import {
+  findRootMarker as markerWalk,
+  resolveConfig as resolveWithMarker,
+} from "./dist/index.js";
+import { rmSync as removeTree } from "node:fs";
+import {
+  buildLayout as buildMarkerLayout,
+  canonicalTempDir as markerTempDir,
+  fixtureMismatches,
+  under as underBase,
+} from "../../tests/fixtures/root-marker-layout.mjs";
+
+test("marker fixture cases match", () => {
+  assert.deepEqual(fixtureMismatches(markerWalk), []);
+});
+
+test("resolveConfig puts marker first", () => {
+  const base = markerTempDir("ns-adapter-marker-");
+  try {
+    buildMarkerLayout(base, ["repo git-dir", "repo marker:from-marker", "repo/sub"]);
+    const sub = underBase(base, "repo/sub");
+    assert.equal(resolveWithMarker({ namespace: "cfg-ns" }, sub).namespace, "from-marker");
+    removeTree(underBase(base, "repo/.NeuroStrata/config.json"));
+    assert.equal(resolveWithMarker({ namespace: "cfg-ns" }, sub).namespace, "cfg-ns");
+  } finally {
+    removeTree(base, { recursive: true, force: true });
+  }
 });

@@ -1,6 +1,13 @@
 #!/usr/bin/env node
 import { readFileSync } from "node:fs";
-import plugin, { initialize, onTurnEnd } from "./dist/index.js";
+import plugin, {
+  initialize,
+  onTurnEnd,
+  readHarnessConfig,
+  resolveHookProjectDir
+} from "./dist/index.js";
+
+const HARNESS = "opencode";
 
 async function main() {
   // Redirect all diagnostic logging to stderr so stdout carries only the
@@ -31,7 +38,11 @@ async function main() {
   } catch {
     process.exit(0);
   }
-  await initialize({ config: { namespace: process.env.NEUROSTRATA_NAMESPACE } });
+  // The namespace comes from the harness config the installer wrote; the
+  // plugin reads NEUROSTRATA_NAMESPACE itself, after the project marker and
+  // this config (the order of `neurostrata-mcp namespace resolve`).
+  const projectDir = resolveHookProjectDir(HARNESS, event);
+  await initialize({ config: readHarnessConfig(HARNESS, projectDir), projectDir });
   // Handler chain: execute.before-style handleHookEvent takes precedence, then
   // the Claude handleClaudeHookEvent alias, falling back to the default export.
   const handler = plugin.handleHookEvent ?? plugin.handleClaudeHookEvent ?? plugin;

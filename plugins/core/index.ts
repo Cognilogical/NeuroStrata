@@ -22,13 +22,15 @@
 
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
   statSync,
   writeFileSync
 } from 'node:fs'
 import { homedir } from 'node:os'
-import { basename, dirname, join, resolve } from 'node:path'
+import { basename, dirname, join, relative, resolve } from 'node:path'
 
 // ──────────────────────────────────────────────────────────────────────
 // Configuration
@@ -103,10 +105,12 @@ export function sanitizeSubagentHeaderToken(value: string): string {
 }
 
 /**
- * Resolve `namespace` in strict priority order:
- *  1. pluginConfig.namespace (non-empty trimmed string)
- *  2. process.env.NEUROSTRATA_NAMESPACE (non-empty trimmed string)
- *  3. discoverProjectNamespace(cwd)
+ * Resolve `namespace` in strict priority order, the same order as
+ * `neurostrata-mcp namespace resolve`:
+ *  1. the project root marker (`.NeuroStrata/config.json`, findRootMarker(cwd))
+ *  2. pluginConfig.namespace (the harness config; non-empty trimmed string)
+ *  3. process.env.NEUROSTRATA_NAMESPACE (non-empty trimmed string)
+ *  4. discoverProjectNamespace(cwd)
  * Never falls back to a hardcoded "NeuroStrata".
  */
 export function resolveConfig(
@@ -122,6 +126,7 @@ export function resolveConfig(
   // Preserve the exact namespace for MCP routing; sanitization happens only
   // where the value is interpolated into a prompt header (#329 review).
   const namespace =
+    findRootMarker(resolve(cwd))?.namespace ??
     asString(input.namespace) ??
     asString(process.env.NEUROSTRATA_NAMESPACE) ??
     discoverProjectNamespace(cwd)
@@ -147,12 +152,319 @@ export function resolveConfig(
 // Bug 2: project-root / namespace discovery
 // ──────────────────────────────────────────────────────────────────────
 
+// The project root marker walk (`.NeuroStrata/config.json`). This mirrors
+// `root_marker::find_root_marker` in the Rust daemon step for step; the
+// shared cases in tests/fixtures/root-marker-cases.json are the contract both
+// must pass. Only file-system reads, no process starts (#309).
+
+/** Which walk found a project root marker. */
+export type RootMarkerVia = 'own' | 'main' | 'nogit'
+
+export interface FoundRootMarker {
+  /** The project root, in the start path's own checkout. */
+  root: string
+  namespace: string
+  via: RootMarkerVia
+}
+
+type MarkerRead = { valid: true; namespace: string } | { valid: false }
+
+const NAMESPACE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]*$/
+
 /**
- * Walk up from resolve(startDir) to the filesystem root looking for `.git`
- * (dir or file) or `.NeuroStrata`; return the directory containing it, or
- * resolve(startDir) if none found.
+ * A namespace value as written, or undefined when it is not one: empty, an
+ * unexpanded variable, or anything but `[A-Za-z0-9_.:-]` starting with a
+ * letter or digit. The Rust installer's `usable_namespace` rule.
  */
-export function findProjectRoot(startDir = process.cwd()): string {
+export function usableNamespace(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined
+  const ns = raw.trim().replace(/^["']+|["']+$/g, '')
+  return NAMESPACE_PATTERN.test(ns) ? ns : undefined
+}
+
+/** Absolute on this host: a drive or UNC path on Windows, `/` elsewhere. */
+function isHostAbsolute(p: string): boolean {
+  if (process.platform === 'win32') {
+    return /^[A-Za-z]:[\\/]/.test(p) || /^[\\/]{2}[^\\/]/.test(p)
+  }
+  return p.startsWith('/')
+}
+
+/** Absolute on any host, for paths git wrote into `.git` and `commondir`. */
+function isAbsoluteAny(p: string): boolean {
+  return p.startsWith('/') || p.startsWith('\\') || /^[A-Za-z]:[\\/]/.test(p)
+}
+
+/** The canonical spelling of an existing path, as Rust's `dunce` gives it. */
+function canonicalPath(p: string): string | null {
+  try {
+    const real = realpathSync.native(p)
+    // Drop the verbatim prefix where a plain spelling exists.
+    if (real.startsWith('\\\\?\\UNC\\')) return '\\\\' + real.slice(8)
+    if (real.startsWith('\\\\?\\')) return real.slice(4)
+    return real
+  } catch {
+    return null
+  }
+}
+
+/** `p` canonicalized through its nearest existing ancestor. */
+function canonicalThroughExisting(p: string): string {
+  const missing: string[] = []
+  let existing = p
+  while (true) {
+    const canonical = canonicalPath(existing)
+    if (canonical !== null) {
+      return missing.reduceRight((acc, part) => join(acc, part), canonical)
+    }
+    const parent = dirname(existing)
+    if (parent === existing) return p
+    missing.push(basename(existing))
+    existing = parent
+  }
+}
+
+function isDirectory(p: string): boolean {
+  try {
+    return statSync(p).isDirectory()
+  } catch {
+    return false
+  }
+}
+
+function isFile(p: string): boolean {
+  try {
+    return statSync(p).isFile()
+  } catch {
+    return false
+  }
+}
+
+function ancestorsOf(dir: string): string[] {
+  const out: string[] = []
+  let current = dir
+  while (true) {
+    out.push(current)
+    const next = dirname(current)
+    if (next === current) return out
+    current = next
+  }
+}
+
+function pathParts(rel: string): string[] {
+  return rel.split(/[\\/]/).filter((part) => part !== '' && part !== '.')
+}
+
+/** The nearest folder at or above `dir` holding `.git` (folder or file). */
+function checkoutTop(dir: string): string | null {
+  return ancestorsOf(dir).find((d) => existsSync(join(d, '.git'))) ?? null
+}
+
+/** `rel` against `base` unless it is already absolute. */
+function joinedGitPath(base: string, rel: string): string {
+  return isAbsoluteAny(rel) ? rel : join(base, rel)
+}
+
+/** The gitdir a checkout's `.git` FILE names (relative to the checkout). */
+function gitdirOfFile(checkout: string): string | null {
+  let text: string
+  try {
+    text = readFileSync(join(checkout, '.git'), 'utf8')
+  } catch {
+    return null
+  }
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim()
+    if (trimmed.startsWith('gitdir:')) {
+      return joinedGitPath(checkout, trimmed.slice('gitdir:'.length).trim())
+    }
+  }
+  return null
+}
+
+/** The common directory a linked worktree's gitdir names in `commondir`. */
+function linkedCommonDir(gitdir: string): string | null {
+  try {
+    const common = readFileSync(join(gitdir, 'commondir'), 'utf8').trim()
+    return joinedGitPath(gitdir, common)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * The main checkout when `top` is a linked worktree's top (its gitdir names
+ * a `commondir` that is a checkout's `.git`), else null. A submodule (no
+ * `commondir`) or a bare repository's worktree (common dir not `.git`) has
+ * none.
+ */
+function linkedMainCheckout(top: string): string | null {
+  if (isDirectory(join(top, '.git'))) return null
+  const gitdir = gitdirOfFile(top)
+  const common = gitdir === null ? null : linkedCommonDir(gitdir)
+  if (common === null) return null
+  const normalized = resolve(common)
+  if (basename(normalized) !== '.git') return null
+  const main = canonicalPath(dirname(normalized))
+  if (main === null) return null
+  const own = canonicalPath(top) ?? top
+  return main === own ? null : main
+}
+
+/** The marker in `dir`: valid, unreadable, or null when there is none. */
+function readRootMarker(dir: string): MarkerRead | null {
+  let text: string
+  try {
+    text = readFileSync(join(dir, '.NeuroStrata', 'config.json'), 'utf8')
+  } catch (err) {
+    return (err as { code?: string })?.code === 'ENOENT'
+      ? null
+      : { valid: false }
+  }
+  if (text.charCodeAt(0) === 0xfeff) text = text.slice(1)
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    return { valid: false }
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return { valid: false }
+  }
+  const doc = parsed as Record<string, unknown>
+  const sourceId = doc.source_id
+  if (
+    doc.version !== 1 ||
+    typeof doc.namespace !== 'string' ||
+    !NAMESPACE_PATTERN.test(doc.namespace) ||
+    (sourceId !== undefined && sourceId !== null && typeof sourceId !== 'string')
+  ) {
+    return { valid: false }
+  }
+  return { valid: true, namespace: doc.namespace }
+}
+
+/**
+ * The marker in `dir` when there is one to report. A `.NeuroStrata` that is
+ * a link pointing elsewhere, or a folder without `config.json`, is none.
+ */
+function markerAt(dir: string): MarkerRead | null {
+  const folder = join(dir, '.NeuroStrata')
+  try {
+    const st = lstatSync(folder)
+    if (st.isSymbolicLink() || !st.isDirectory()) return null
+  } catch {
+    return null
+  }
+  const realFolder = canonicalPath(folder)
+  const realDir = canonicalPath(dir)
+  if (realFolder === null || realDir === null) return null
+  if (realFolder !== join(realDir, '.NeuroStrata')) return null
+  return readRootMarker(dir)
+}
+
+function depthBelow(dir: string, top: string): number {
+  return pathParts(relative(top, dir)).length
+}
+
+/**
+ * The marker that decides `startDir`'s project root, or null. `startDir`
+ * must be absolute on this host; for a file the walk starts at its folder.
+ *  1. Own checkout: from the start folder up to its checkout top, inclusive;
+ *     the deepest marker wins.
+ *  2. Linked worktree: the start folder mapped into the main checkout,
+ *     walked from its nearest existing folder up to the main checkout's top,
+ *     never entering a folder with its own `.git`. Steps 1 and 2 both run;
+ *     the deeper marker wins, at equal depth the own checkout's.
+ *  3. Outside git: the first marker above the start folder.
+ * When the winning marker cannot be read the answer is null: the caller
+ * falls back to the other namespace sources, never to a marker further up.
+ */
+export function findRootMarker(startDir: string): FoundRootMarker | null {
+  if (typeof startDir !== 'string' || !isHostAbsolute(startDir)) return null
+  let start = canonicalThroughExisting(startDir)
+  if (isFile(start)) start = dirname(start)
+
+  const decide = (
+    root: string,
+    read: MarkerRead,
+    via: RootMarkerVia
+  ): FoundRootMarker | null =>
+    read.valid ? { root, namespace: read.namespace, via } : null
+
+  const top = checkoutTop(start)
+  if (top === null) {
+    for (const dir of ancestorsOf(start)) {
+      const read = markerAt(dir)
+      if (read) return decide(dir, read, 'nogit')
+    }
+    return null
+  }
+
+  let own: { depth: number; root: string; read: MarkerRead } | null = null
+  for (const dir of ancestorsOf(start)) {
+    const read = markerAt(dir)
+    if (read) {
+      own = { depth: depthBelow(dir, top), root: dir, read }
+      break
+    }
+    if (dir === top) break
+  }
+
+  let main: { depth: number; root: string; read: MarkerRead } | null = null
+  const mainTop = linkedMainCheckout(top)
+  if (mainTop !== null) {
+    const allowed = [mainTop]
+    let dir = mainTop
+    for (const part of pathParts(relative(top, start))) {
+      dir = join(dir, part)
+      if (!isDirectory(dir) || existsSync(join(dir, '.git'))) break
+      allowed.push(dir)
+    }
+    for (let i = allowed.length - 1; i >= 0; i--) {
+      const read = markerAt(allowed[i])
+      if (read) {
+        const below = relative(mainTop, allowed[i])
+        main = {
+          depth: depthBelow(allowed[i], mainTop),
+          root: below === '' ? top : join(top, below),
+          read
+        }
+        break
+      }
+    }
+  }
+
+  if (own && main) {
+    return main.depth > own.depth
+      ? decide(main.root, main.read, 'main')
+      : decide(own.root, own.read, 'own')
+  }
+  if (own) return decide(own.root, own.read, 'own')
+  if (main) return decide(main.root, main.read, 'main')
+  return null
+}
+
+/** Whether two folders are the same, comparing case-insensitively on Windows. */
+function sameFolder(a: string, b: string): boolean {
+  const x = resolve(a)
+  const y = resolve(b)
+  return process.platform === 'win32'
+    ? x.toLowerCase() === y.toLowerCase()
+    : x === y
+}
+
+/**
+ * Walk up from resolve(startDir) looking for `.git` (dir or file); return the
+ * directory containing it. With no `.git` above (pass 2), the nearest folder
+ * holding a valid project marker (`.NeuroStrata/config.json`), else the
+ * nearest folder holding `.NeuroStrata` other than the home folder, else
+ * resolve(startDir).
+ */
+export function findProjectRoot(
+  startDir = process.cwd(),
+  home: string = homedir()
+): string {
   // Pass 1: walk up looking for `.git` first; a `.git` anchors the project root.
   let current = resolve(startDir)
   while (true) {
@@ -163,18 +475,114 @@ export function findProjectRoot(startDir = process.cwd()): string {
     if (next === current) break
     current = next
   }
-  // Pass 2: only if no `.git` anywhere in the ancestor chain, walk up looking
-  // for `.NeuroStrata`. Otherwise fall back to resolve(startDir).
-  current = resolve(startDir)
-  while (true) {
-    if (existsSync(join(current, '.NeuroStrata'))) {
-      return current
-    }
-    const next = dirname(current)
-    if (next === current) break
-    current = next
+  // Pass 2: no `.git` anywhere in the ancestor chain.
+  const chain = ancestorsOf(resolve(startDir))
+  const marked = chain.find((dir) => markerAt(dir)?.valid === true)
+  if (marked !== undefined) return marked
+  // `~/.NeuroStrata` holds the user's own state, not a project's: a session
+  // started below home without a marker must not take home as its root.
+  const nearest = chain.find(
+    (dir) =>
+      existsSync(join(dir, '.NeuroStrata')) && !(home && sameFolder(dir, home))
+  )
+  return nearest ?? resolve(startDir)
+}
+
+/** Each harness's plugin config, relative to the project root, and the
+ * namespace's place inside it. The installer writes these files. */
+const HARNESS_CONFIG_FILES: Record<string, { file: string[]; key: string[] }> = {
+  claude: { file: ['.NeuroStrata', 'plugins', 'claude', 'neurostrata.json'], key: ['namespace'] },
+  opencode: { file: ['.opencode', 'neurostrata-plugin.json'], key: ['neurostrata', 'namespace'] },
+  codex: { file: ['.codex', 'plugins', 'neurostrata.json'], key: ['namespace'] },
+  hermes: { file: ['.hermes', 'plugins', 'neurostrata.json'], key: ['namespace'] },
+  openclaw: { file: ['.openclaw', 'plugins', 'neurostrata.json'], key: ['namespace'] },
+  'github-cli': {
+    file: ['.NeuroStrata', 'plugins', 'github-cli', 'copilot-extension.json'],
+    key: ['namespace']
   }
-  return resolve(startDir)
+}
+
+/**
+ * The namespace `harness`'s plugin config names for the project at
+ * `projectDir`, read from its checkout's top, then (for a linked worktree,
+ * whose untracked configs usually live only in the main checkout) the main
+ * checkout's; outside git from `projectDir` itself. Empty when none names a
+ * usable namespace.
+ */
+export function readHarnessConfig(
+  harness: string,
+  projectDir: string
+): { namespace?: string } {
+  const spec = HARNESS_CONFIG_FILES[harness]
+  if (!spec || typeof projectDir !== 'string' || projectDir === '') return {}
+  const start = canonicalThroughExisting(resolve(projectDir))
+  const top = checkoutTop(start)
+  const roots = top === null ? [start] : [top, linkedMainCheckout(top)]
+  for (const root of roots) {
+    if (root === null) continue
+    try {
+      let value: unknown = JSON.parse(
+        readFileSync(join(root, ...spec.file), 'utf8').replace(/^﻿/, '')
+      )
+      for (const key of spec.key) value = asRecord(value)[key]
+      const namespace = usableNamespace(value)
+      if (namespace) return { namespace }
+    } catch {
+      // missing or malformed: try the next root
+    }
+  }
+  return {}
+}
+
+/** How many SessionStart folders the Claude runner remembers. */
+const CLAUDE_SESSION_DIRS_KEEP = 20
+
+/**
+ * The project folder a CLI hook runner resolves its namespace from. Claude
+ * Code starts a new hook process per event, and the event's `cwd` follows
+ * every `cd`, so for Claude this is the session's project folder:
+ * `CLAUDE_PROJECT_DIR`, which Claude Code exports to hook processes as the
+ * project root where the session started. Without it, the folder recorded
+ * for this session at SessionStart (`claude_session_dirs` in
+ * `.NeuroStrata/active_session.json`), else the event's `cwd`. Other
+ * harnesses use the event's `cwd`, else the process's.
+ */
+export function resolveHookProjectDir(
+  harness: string,
+  event: Record<string, unknown> = {},
+  env: Record<string, string | undefined> = process.env
+): string {
+  const cwd = asString(event?.cwd) ?? process.cwd()
+  if (harness !== 'claude') return cwd
+  const fromEnv = asString(env.CLAUDE_PROJECT_DIR)
+  if (fromEnv) return fromEnv
+  const sessionId = asString(event?.session_id)
+  if (!sessionId) return cwd
+  const stateDir = join(findProjectRoot(cwd), '.NeuroStrata')
+  const sessionPath = join(stateDir, 'active_session.json')
+  let state: Record<string, unknown> = {}
+  try {
+    state = asRecord(JSON.parse(readFileSync(sessionPath, 'utf8')))
+  } catch {
+    state = {}
+  }
+  const dirs = asRecord(state.claude_session_dirs)
+  if (asString(event?.hook_event_name) === 'SessionStart') {
+    // Only where NeuroStrata state already lives; never create it here.
+    if (!isDirectory(stateDir)) return cwd
+    const kept = Object.entries(dirs).filter(([id]) => id !== sessionId)
+    kept.push([sessionId, cwd])
+    state.claude_session_dirs = Object.fromEntries(
+      kept.slice(-CLAUDE_SESSION_DIRS_KEEP)
+    )
+    try {
+      writeFileSync(sessionPath, JSON.stringify(state, null, 2))
+    } catch {
+      // best effort: later events fall back to their own cwd
+    }
+    return cwd
+  }
+  return asString(dirs[sessionId]) ?? cwd
 }
 
 /**

@@ -31,7 +31,12 @@ const CORE_PKG_JSON: &str = include_str!("../../plugins/core/package.json");
 
 const CLI_HOOK_RUNNER_MJS: &str = r#"#!/usr/bin/env node
 import { readFileSync } from "node:fs";
+import { basename, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import plugin, * as mod from "./dist/index.js";
+
+// The installer writes this runner to .NeuroStrata/plugins/<harness>/.
+const HARNESS = basename(dirname(fileURLToPath(import.meta.url)));
 
 async function main() {
   // Redirect all diagnostic logging to stderr so stdout carries only the
@@ -62,9 +67,22 @@ async function main() {
   } catch {
     process.exit(0);
   }
+  // The namespace comes from the harness config the installer wrote; the
+  // plugin reads NEUROSTRATA_NAMESPACE itself, after the project marker and
+  // this config (the order of `neurostrata-mcp namespace resolve`).
+  const projectDir =
+    typeof mod.resolveHookProjectDir === "function"
+      ? mod.resolveHookProjectDir(HARNESS, event)
+      : typeof event.cwd === "string" && event.cwd
+        ? event.cwd
+        : process.cwd();
+  const config =
+    typeof mod.readHarnessConfig === "function"
+      ? mod.readHarnessConfig(HARNESS, projectDir)
+      : {};
   const init = mod.initialize ?? plugin?.initialize ?? plugin?.setup;
   if (typeof init === "function") {
-    await init({ config: { namespace: process.env.NEUROSTRATA_NAMESPACE } });
+    await init({ config, projectDir });
   }
   const handler =
     mod.handleHookEvent ??
@@ -202,20 +220,66 @@ fn runner_is_replaceable(old_path: &str, project_root: &Path, abs_runner: &str) 
     matches!(candidate.try_exists(), Ok(false))
 }
 
-/// Rewrite only the path of an installer-generated runner command. A command
-/// shaped `NEUROSTRATA_NAMESPACE=<ns> node "<runner>"` whose runner basename
-/// matches the installer's runner, and whose runner is the installer's own or
-/// is missing, is ours to repair. A custom hook that merely carries the
-/// namespace environment variable, or runs a `cli-hook.mjs` installed
-/// elsewhere, is left untouched.
+/// Claude's plugin config, next to its bundle (as GitHub CLI's is). The Claude
+/// hook command carries no namespace; the runner reads it from here.
+const CLAUDE_CONFIG_REL: &str = ".NeuroStrata/plugins/claude/neurostrata.json";
+
+/// The namespace Claude's plugin config names at `root`: `Ok(None)` when the
+/// file is missing or names no usable one, an error when it exists but
+/// cannot be read or parsed.
+fn claude_config_namespace_checked(root: &Path) -> Result<Option<String>, UnreadableConfig> {
+    Ok(read_config(&root.join(CLAUDE_CONFIG_REL))?
+        .as_ref()
+        .and_then(|doc| doc.get("namespace"))
+        .and_then(Value::as_str)
+        .and_then(usable_namespace))
+}
+
+/// The namespace Claude's plugin config names at `root`, when usable.
+fn claude_config_namespace(root: &Path) -> Option<String> {
+    claude_config_namespace_checked(root).ok().flatten()
+}
+
+/// Writes Claude's plugin config naming `namespace` and reads it back. `false`
+/// when it cannot be written or does not read back with that namespace.
+fn write_claude_config(project_root: &Path, namespace: &str) -> bool {
+    let path = project_root.join(CLAUDE_CONFIG_REL);
+    let doc = json!({ "id": "neurostrata-claude", "namespace": namespace });
+    let Ok(text) = serde_json::to_string_pretty(&doc) else {
+        return false;
+    };
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return false;
+        }
+    }
+    let unchanged = std::fs::read_to_string(&path).is_ok_and(|existing| existing == text);
+    if !unchanged && std::fs::write(&path, &text).is_err() {
+        return false;
+    }
+    claude_config_namespace(project_root).as_deref() == Some(namespace)
+}
+
+/// Repairs a Claude hook command the installer wrote: `node "<runner>"`, or
+/// an older installer's `NEUROSTRATA_NAMESPACE=<ns> node "<runner>"`, whose
+/// runner basename matches the installer's runner and whose runner is the
+/// installer's own or is missing. The repaired command is
+/// `node "<abs_runner>"`. An older command's namespace, whatever it is, is
+/// kept: it is written to Claude's plugin config and read back before the
+/// assignment is dropped. When that fails, or the command is not ours (a
+/// custom hook that merely carries the namespace variable, or runs a
+/// `cli-hook.mjs` installed elsewhere), the answer is `None` and the old
+/// command stays.
 fn repair_installer_hook_command(
     command: &str,
-    namespace: &str,
     abs_runner: &str,
     project_root: &Path,
 ) -> Option<String> {
-    let prefix = format!("NEUROSTRATA_NAMESPACE={namespace} node \"");
-    let rest = command.strip_prefix(&prefix)?;
+    let (raw_ns, rest) = match command.strip_prefix("NEUROSTRATA_NAMESPACE=") {
+        Some(assigned) => assigned.split_once(' ')?,
+        None => ("", command),
+    };
+    let rest = rest.strip_prefix("node \"")?;
     let close = rest.find('"')?;
     let old_path = &rest[..close];
     let suffix = &rest[close + 1..];
@@ -227,7 +291,14 @@ fn repair_installer_hook_command(
     if !runner_is_replaceable(old_path, project_root, abs_runner) {
         return None;
     }
-    Some(format!("{prefix}{abs_runner}\"{suffix}"))
+    // An empty assignment (the daemon's old startup install) named nothing.
+    if !raw_ns.is_empty() {
+        let ns = usable_namespace(raw_ns)?;
+        if !write_claude_config(project_root, &ns) {
+            return None;
+        }
+    }
+    Some(format!("node \"{abs_runner}\"{suffix}"))
 }
 
 fn has_any_env(keys: &[&str]) -> bool {
@@ -418,6 +489,11 @@ fn claude_settings_namespace(root: &Path, settings: &Value) -> Option<String> {
 /// read or parsed.
 fn harness_config_namespace(root: &Path, harness: &str) -> Result<Option<String>, UnreadableConfig> {
     if harness == "claude" {
+        // Claude's plugin config first; older installs kept the namespace in
+        // the settings (the `env` block or the hook command).
+        if let Some(ns) = claude_config_namespace_checked(root)? {
+            return Ok(Some(ns));
+        }
         return Ok(read_config(&root.join(CLAUDE_SETTINGS))?
             .and_then(|settings| claude_settings_namespace(root, &settings)));
     }
@@ -1263,10 +1339,9 @@ fn wire_harness_config(
             if is_active || project_root.join(".claude").exists() {
                 let namespace = namespace.as_deref()?;
                 let cfg_path = project_root.join(".claude/settings.local.json");
-                let cmd = format!(
-                    "NEUROSTRATA_NAMESPACE={} node \"{}\"",
-                    namespace, abs_runner
-                );
+                // The namespace lives in Claude's plugin config, as it does
+                // for the other harnesses; the command carries none.
+                let cmd = format!("node \"{abs_runner}\"");
                 let mut doc: Value = json!({});
                 let mut write_doc = false;
                 if cfg_path.exists() {
@@ -1283,6 +1358,7 @@ fn wire_harness_config(
                     write_doc = true;
                 }
                 if write_doc {
+                    let mut kept_old_namespace = false;
                     if let Some(obj) = doc.as_object_mut() {
                         let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
                         if let Some(h_obj) = hooks.as_object_mut() {
@@ -1297,11 +1373,12 @@ fn wire_harness_config(
                                     "hooks": [{ "type": "command", "command": cmd.clone() }]
                                 }])
                             });
-                            // Repair commands written by an older installer that
-                            // embedded a Windows verbatim path. Only rewrite our
-                            // own hook commands; user hooks, including ones that
-                            // run a cli-hook.mjs installed elsewhere, are left
-                            // untouched.
+                            // Repair commands an older installer wrote: a
+                            // Windows verbatim or moved runner path, or the
+                            // namespace baked into the command. Only our own
+                            // hook commands are rewritten; user hooks, including
+                            // ones that run a cli-hook.mjs installed elsewhere,
+                            // are left untouched.
                             for entries in h_obj.values_mut() {
                                 if let Some(arr) = entries.as_array_mut() {
                                     for entry in arr {
@@ -1312,14 +1389,17 @@ fn wire_harness_config(
                                                 if let Some(command) =
                                                     hook.get("command").and_then(|v| v.as_str())
                                                 {
+                                                    let baked = command
+                                                        .strip_prefix("NEUROSTRATA_NAMESPACE=")
+                                                        .is_some_and(|rest| !rest.starts_with(' '));
                                                     if let Some(repaired) =
                                                         repair_installer_hook_command(
                                                             command,
-                                                            namespace,
                                                             abs_runner,
                                                             project_root,
                                                         )
                                                     {
+                                                        kept_old_namespace |= baked;
                                                         hook["command"] = Value::String(repaired);
                                                     }
                                                 }
@@ -1329,6 +1409,17 @@ fn wire_harness_config(
                                 }
                             }
                         }
+                    }
+                    // An old install's namespace was moved into the config by
+                    // the repair; otherwise the config names the namespace
+                    // being installed. Without a config that reads back, the
+                    // plain command would lose the namespace: install nothing.
+                    // An empty namespace names nothing to keep.
+                    if !kept_old_namespace
+                        && usable_namespace(namespace).is_some()
+                        && !write_claude_config(project_root, namespace)
+                    {
+                        return None;
                     }
                     return write_json_if_changed(&cfg_path, &doc);
                 }
@@ -2199,7 +2290,7 @@ mod tests {
                         hooks.iter().any(|h| {
                             h["command"]
                                 .as_str()
-                                .map(|c| c.starts_with("NEUROSTRATA_NAMESPACE=TestProj node \""))
+                                .map(|c| c.starts_with("node \""))
                                 .unwrap_or(false)
                         })
                     })
@@ -2264,17 +2355,19 @@ mod tests {
             "verbatim path survived repair: {commands:?}"
         );
         assert!(
-            commands.iter().any(
-                |c| c.starts_with("NEUROSTRATA_NAMESPACE=TestProj node \"") && c.ends_with('"')
-            ),
+            commands.iter().any(|c| c.starts_with("node \"") && c.ends_with('"')),
             "our repaired hook is present: {commands:?}"
         );
     }
 
     /// Settings whose PreToolUse, Stop and SessionStart hooks all run
-    /// `NEUROSTRATA_NAMESPACE=TestProj node "<runner>"`.
+    /// `NEUROSTRATA_NAMESPACE=TestProj node "<runner>"`, as older installers
+    /// wrote them.
     fn settings_with_runner(runner: &str) -> Value {
-        let cmd = format!("NEUROSTRATA_NAMESPACE=TestProj node \"{runner}\"");
+        settings_with_command(&format!("NEUROSTRATA_NAMESPACE=TestProj node \"{runner}\""))
+    }
+
+    fn settings_with_command(cmd: &str) -> Value {
         json!({
             "hooks": {
                 "PreToolUse": [{
@@ -2337,13 +2430,105 @@ mod tests {
         let abs_runner = report["installed_plugins"][0]["cli_hook_runner"]
             .as_str()
             .expect("cli_hook_runner");
-        let want = format!("NEUROSTRATA_NAMESPACE=TestProj node \"{abs_runner}\"");
+        let want = format!("node \"{abs_runner}\"");
         let commands = hook_commands(&cfg);
         assert_eq!(commands.len(), 3, "{commands:?}");
         assert!(
             commands.iter().all(|c| *c == want),
             "missing runner not repaired: {commands:?}"
         );
+        assert_eq!(claude_config_namespace(tmp.path()).as_deref(), Some("TestProj"));
+    }
+
+    fn claude_config(root: &Path) -> Value {
+        serde_json::from_str(&std::fs::read_to_string(root.join(CLAUDE_CONFIG_REL)).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn fresh_claude_install_writes_config_and_plain_command() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let report = auto_install_detected_plugins(tmp.path(), ConfigNamespace::Set("example-project"), Some("claude"));
+        let abs_runner = report["installed_plugins"][0]["cli_hook_runner"].as_str().unwrap();
+        assert_eq!(
+            claude_config(tmp.path()),
+            json!({"id": "neurostrata-claude", "namespace": "example-project"})
+        );
+        let commands = hook_commands(&tmp.path().join(".claude/settings.local.json"));
+        assert_eq!(commands.len(), 2, "{commands:?}");
+        let want = format!("node \"{abs_runner}\"");
+        assert!(commands.iter().all(|c| *c == want), "{commands:?}");
+        assert_eq!(configured_namespace(tmp.path()).as_deref(), Some("example-project"));
+    }
+
+    #[test]
+    fn old_claude_install_is_repaired_keeping_its_namespace() {
+        let _env = no_namespace_env();
+        let (_tmp, dir) = git_project();
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        // The marker names another namespace; the old command's is kept.
+        marker_at(&dir, "example-other");
+        let runner = dir.join(".NeuroStrata/plugins/claude/cli-hook.mjs");
+        let old = format!("NEUROSTRATA_NAMESPACE=example-project node \"{}\"", runner.display());
+        assert_eq!(
+            repair_installer_hook_command(&old, &runner.to_string_lossy(), &dir),
+            Some(format!("node \"{}\"", runner.display()))
+        );
+        assert_eq!(claude_config_namespace(&dir).as_deref(), Some("example-project"));
+
+        // Through the installer, called with the marker's namespace.
+        std::fs::remove_file(dir.join(CLAUDE_CONFIG_REL)).unwrap();
+        let cfg = dir.join(".claude/settings.local.json");
+        std::fs::write(&cfg, serde_json::to_string_pretty(&settings_with_command(&old)).unwrap()).unwrap();
+        let report = auto_install_detected_plugins(&dir, ConfigNamespace::Set("example-other"), Some("claude"));
+        let abs_runner = report["installed_plugins"][0]["cli_hook_runner"].as_str().unwrap();
+        assert_eq!(claude_config(&dir)["namespace"], "example-project");
+        let want = format!("node \"{abs_runner}\"");
+        let commands = hook_commands(&cfg);
+        assert_eq!(commands.len(), 3, "{commands:?}");
+        assert!(commands.iter().all(|c| *c == want), "{commands:?}");
+    }
+
+    #[test]
+    fn repair_keeps_old_command_when_config_write_fails() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        // A folder where the config file goes: every write of it fails, on
+        // every platform (a read-only folder does not stop writes on Windows).
+        std::fs::create_dir_all(root.join(CLAUDE_CONFIG_REL)).unwrap();
+        let runner = root.join(".NeuroStrata/plugins/claude/cli-hook.mjs");
+        let old = format!("NEUROSTRATA_NAMESPACE=example-project node \"{}\"", runner.display());
+        assert_eq!(repair_installer_hook_command(&old, &runner.to_string_lossy(), root), None);
+
+        let cfg = root.join(".claude/settings.local.json");
+        let before = serde_json::to_string_pretty(&settings_with_command(&old)).unwrap();
+        std::fs::write(&cfg, &before).unwrap();
+        let _ = auto_install_detected_plugins(root, ConfigNamespace::Set("example-project"), Some("claude"));
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), before, "old command must stay");
+
+        // A fresh install with no config to write installs no hook either.
+        std::fs::remove_file(&cfg).unwrap();
+        let _ = auto_install_detected_plugins(root, ConfigNamespace::Set("example-project"), Some("claude"));
+        assert!(!cfg.exists(), "a plain hook without a config would lose the namespace");
+    }
+
+    #[test]
+    fn configured_namespace_reads_claude_config_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        write_file(
+            &root.join(CLAUDE_CONFIG_REL),
+            r#"{"id": "neurostrata-claude", "namespace": "example-project"}"#,
+        );
+        assert_eq!(configured_namespace(root).as_deref(), Some("example-project"));
+        // The config file outranks what older installs left in the settings.
+        write_file(
+            &root.join(".claude").join("settings.local.json"),
+            r#"{"env": {"NEUROSTRATA_NAMESPACE": "from-settings"}}"#,
+        );
+        assert_eq!(configured_namespace(root).as_deref(), Some("example-project"));
+        std::fs::remove_file(root.join(CLAUDE_CONFIG_REL)).unwrap();
+        assert_eq!(configured_namespace(root).as_deref(), Some("from-settings"));
     }
 
     #[cfg(windows)]
@@ -2370,7 +2555,7 @@ mod tests {
         .expect("write settings");
 
         let _ = auto_install_detected_plugins(tmp.path(), ConfigNamespace::Set("TestProj"), Some("claude"));
-        let want = format!("NEUROSTRATA_NAMESPACE=TestProj node \"{abs_runner}\"");
+        let want = format!("node \"{abs_runner}\"");
         let commands = hook_commands(&cfg);
         assert_eq!(commands.len(), 3, "{commands:?}");
         assert!(
@@ -2409,7 +2594,7 @@ mod tests {
         .expect("write settings");
 
         let _ = auto_install_detected_plugins(&project, ConfigNamespace::Set("TestProj"), Some("claude"));
-        let want = format!("NEUROSTRATA_NAMESPACE=TestProj node \"{abs_runner}\"");
+        let want = format!("node \"{abs_runner}\"");
         let commands = hook_commands(&cfg);
         assert_eq!(commands.len(), 3, "{commands:?}");
         assert!(

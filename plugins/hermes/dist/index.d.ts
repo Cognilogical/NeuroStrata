@@ -28,6 +28,44 @@ export interface PluginConfig {
     };
 }
 export declare function resolveConfig(raw: unknown, cwd?: string): PluginConfig;
+/** Which walk found a project root marker. */
+export type RootMarkerVia = 'own' | 'main' | 'nogit';
+export interface FoundRootMarker {
+    /** The project root, in the start path's own checkout. */
+    root: string;
+    namespace: string;
+    via: RootMarkerVia;
+}
+/**
+ * A namespace value as written, or undefined when it is not one: empty, an
+ * unexpanded variable, or anything but `[A-Za-z0-9_.:-]` starting with a
+ * letter or digit. The Rust installer's `usable_namespace` rule.
+ */
+export declare function usableNamespace(raw: unknown): string | undefined;
+/**
+ * The marker that decides `startDir`'s project root, or null. `startDir`
+ * must be absolute on this host; for a file the walk starts at its folder.
+ *  1. Own checkout: from the start folder up to its checkout top, inclusive;
+ *     the deepest marker wins.
+ *  2. Linked worktree: the start folder mapped into the main checkout,
+ *     walked from its nearest existing folder up to the main checkout's top,
+ *     never entering a folder with its own `.git`. Steps 1 and 2 both run;
+ *     the deeper marker wins, at equal depth the own checkout's.
+ *  3. Outside git: the first marker above the start folder.
+ * When the winning marker cannot be read the answer is null: the caller
+ * falls back to the other namespace sources, never to a marker further up.
+ */
+export declare function findRootMarker(startDir: string): FoundRootMarker | null;
+/**
+ * The namespace `harness`'s plugin config names for the project at
+ * `projectDir`, read from its checkout's top, then (for a linked worktree,
+ * whose untracked configs usually live only in the main checkout) the main
+ * checkout's; outside git from `projectDir` itself. Empty when none names a
+ * usable namespace.
+ */
+export declare function readHarnessConfig(harness: string, projectDir: string): {
+    namespace?: string;
+};
 /**
  * Walk up from resolve(startDir) to the filesystem root looking for `.git`
  * (dir or file) or `.NeuroStrata`; return the directory containing it, or

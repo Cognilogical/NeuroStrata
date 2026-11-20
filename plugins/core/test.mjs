@@ -117,7 +117,18 @@ function hookSource() {
   ).replace(/\r\n/g, '\n')
 }
 import {
+  buildLayout,
+  canonicalTempDir,
+  fixtureMismatches,
+  insideGit,
+  under,
+  writeMarker
+} from '../../tests/fixtures/root-marker-layout.mjs'
+import {
   resolveConfig,
+  findRootMarker,
+  readHarnessConfig,
+  resolveHookProjectDir,
   resolveProjectRoot,
   findProjectRoot,
   discoverProjectNamespace,
@@ -371,18 +382,18 @@ afterEach(() => {
 
 describe('resolveConfig namespace priority (never hardcodes NeuroStrata)', () => {
   it('preserves a namespace containing spaces for MCP routing', () => {
-    assert.equal(resolveConfig({ namespace: 'My Project' }).namespace, 'My Project')
+    assert.equal(resolveConfig({ namespace: 'My Project' }, '/tmp/opencode').namespace, 'My Project')
   })
 
   it('pluginConfig.namespace wins', () => {
-    const cfg = resolveConfig({ namespace: 'cfg-ns', strictMode: false })
+    const cfg = resolveConfig({ namespace: 'cfg-ns', strictMode: false }, '/tmp/opencode')
     assert.equal(cfg.namespace, 'cfg-ns')
   })
 
   it('env NEUROSTRATA_NAMESPACE is second priority', () => {
     process.env.NEUROSTRATA_NAMESPACE = 'env-ns'
     try {
-      const cfg = resolveConfig({ strictMode: false })
+      const cfg = resolveConfig({ strictMode: false }, '/tmp/opencode')
       assert.equal(cfg.namespace, 'env-ns')
     } finally {
       delete process.env.NEUROSTRATA_NAMESPACE
@@ -439,6 +450,115 @@ describe('findProjectRoot / discoverProjectNamespace', () => {
     const dir = join(tmpRoot, 'no-ns-dir')
     mkdirSync(join(dir, '.git'), { recursive: true })
     assert.equal(discoverProjectNamespace(dir), 'no-ns-dir')
+  })
+})
+
+describe('project root marker and namespace order', () => {
+  const made = []
+  const tempDir = () => {
+    const dir = canonicalTempDir('ns-core-marker-')
+    made.push(dir)
+    return dir
+  }
+  afterEach(() => {
+    while (made.length) rmSync(made.pop(), { recursive: true, force: true })
+  })
+
+  it('marker fixture cases match', () => {
+    assert.deepEqual(fixtureMismatches(findRootMarker), [])
+  })
+
+  it('findRootMarker finds none for a relative path', () => {
+    assert.equal(findRootMarker('src'), null)
+    assert.equal(findRootMarker('.'), null)
+  })
+
+  it('resolveConfig puts marker first', () => {
+    const base = tempDir()
+    buildLayout(base, ['repo git-dir', 'repo/sub'])
+    const sub = under(base, 'repo/sub')
+    process.env.NEUROSTRATA_NAMESPACE = 'env-ns'
+    try {
+      writeMarker(under(base, 'repo'), 'from-marker')
+      assert.equal(resolveConfig({ namespace: 'cfg-ns' }, sub).namespace, 'from-marker')
+      rmSync(join(under(base, 'repo'), '.NeuroStrata', 'config.json'))
+      assert.equal(resolveConfig({ namespace: 'cfg-ns' }, sub).namespace, 'cfg-ns')
+      assert.equal(resolveConfig({}, sub).namespace, 'env-ns')
+    } finally {
+      delete process.env.NEUROSTRATA_NAMESPACE
+    }
+    assert.equal(resolveConfig({}, sub).namespace, 'repo')
+  })
+
+  it('findProjectRoot pass 2 never accepts the home folder', (t) => {
+    const base = tempDir()
+    if (insideGit(base)) return t.skip('the temp folder is inside a git checkout')
+    buildLayout(base, ['home neurostrata-dir', 'home/proj/sub'])
+    const home = under(base, 'home')
+    const found = findProjectRoot(under(base, 'home/proj/sub'), home)
+    assert.notEqual(found, home)
+    // A marker in a folder below home is still a root.
+    writeMarker(under(base, 'home/proj'), 'example-project')
+    assert.equal(findProjectRoot(under(base, 'home/proj/sub'), home), under(base, 'home/proj'))
+  })
+
+  it('findProjectRoot pass 2 keeps nearest .NeuroStrata without a marker', (t) => {
+    const base = tempDir()
+    if (insideGit(base)) return t.skip('the temp folder is inside a git checkout')
+    buildLayout(base, ['a neurostrata-dir', 'a/b neurostrata-dir', 'a/b/c'])
+    assert.equal(findProjectRoot(under(base, 'a/b/c')), under(base, 'a/b'))
+    // A valid marker further up is preferred over a nearer bare .NeuroStrata.
+    writeMarker(under(base, 'a'), 'example-project')
+    assert.equal(findProjectRoot(under(base, 'a/b/c')), under(base, 'a'))
+  })
+
+  it('readHarnessConfig reads each harness file, the main checkout last', () => {
+    const base = tempDir()
+    buildLayout(base, [
+      'repo git-dir',
+      'repo/.git/worktrees/wt commondir:../..',
+      'wt git-file:../repo/.git/worktrees/wt'
+    ])
+    const repo = under(base, 'repo')
+    mkdirSync(join(repo, '.NeuroStrata', 'plugins', 'claude'), { recursive: true })
+    writeFileSync(
+      join(repo, '.NeuroStrata', 'plugins', 'claude', 'neurostrata.json'),
+      JSON.stringify({ id: 'neurostrata-claude', namespace: 'example-project' })
+    )
+    mkdirSync(join(repo, '.opencode'), { recursive: true })
+    writeFileSync(
+      join(repo, '.opencode', 'neurostrata-plugin.json'),
+      JSON.stringify({ neurostrata: { namespace: 'from-opencode' } })
+    )
+    assert.deepEqual(readHarnessConfig('claude', repo), { namespace: 'example-project' })
+    assert.deepEqual(readHarnessConfig('opencode', join(repo, 'src')), { namespace: 'from-opencode' })
+    // A linked worktree without configs of its own uses the main checkout's.
+    assert.deepEqual(readHarnessConfig('claude', under(base, 'wt')), { namespace: 'example-project' })
+    assert.deepEqual(readHarnessConfig('codex', repo), {})
+    assert.deepEqual(readHarnessConfig('unknown', repo), {})
+    writeFileSync(
+      join(repo, '.NeuroStrata', 'plugins', 'claude', 'neurostrata.json'),
+      JSON.stringify({ namespace: '$NS' })
+    )
+    assert.deepEqual(readHarnessConfig('claude', repo), {})
+  })
+
+  it('resolveHookProjectDir: CLAUDE_PROJECT_DIR, then the SessionStart folder, then cwd', () => {
+    const base = tempDir()
+    buildLayout(base, ['repo git-dir', 'repo neurostrata-dir', 'repo/packages/api'])
+    const repo = under(base, 'repo')
+    const api = under(base, 'repo/packages/api')
+    const event = { session_id: 's1', cwd: api, hook_event_name: 'PreToolUse' }
+    assert.equal(resolveHookProjectDir('claude', event, { CLAUDE_PROJECT_DIR: repo }), repo)
+    assert.equal(resolveHookProjectDir('claude', event, {}), api)
+    assert.equal(
+      resolveHookProjectDir('claude', { ...event, cwd: repo, hook_event_name: 'SessionStart' }, {}),
+      repo
+    )
+    assert.equal(resolveHookProjectDir('claude', event, {}), repo)
+    assert.equal(resolveHookProjectDir('claude', { ...event, session_id: 's2' }, {}), api)
+    // Other harnesses follow the event's folder.
+    assert.equal(resolveHookProjectDir('codex', event, { CLAUDE_PROJECT_DIR: repo }), api)
   })
 })
 
