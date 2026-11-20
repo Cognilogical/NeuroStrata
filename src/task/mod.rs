@@ -7,6 +7,7 @@
 //! sections 1 through 3 and 6 through 8.
 
 pub mod gate;
+pub mod graph_advisories;
 pub mod harness_plugins;
 pub mod intake;
 pub mod intent;
@@ -2357,18 +2358,9 @@ pub async fn handle_task_update(
             dirty_tree_hash: binding.dirty_tree_hash,
         });
     }
-    let graph_queries_count = task
-        .payload
-        .metadata
-        .get("task")
-        .and_then(|t| t.get("graph_queries_count"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let graph_lookup_nudge = if graph_queries_count == 0 {
-        Some("Graph-First Lookup: run neurostrata_memories_for_file / neurostrata_related / neurostrata_search_memory before editing files.")
-    } else {
-        None
-    };
+    // R7.2 replaced the count-based nudge: a legacy `queries[]` stamp can no
+    // longer certify graph lookup. Applicability and compliance now come from
+    // post-dispatch receipts in `task_validate`'s non-blocking advisories.
     encode(&json!({
         "id": id,
         "namespace": namespace,
@@ -2376,8 +2368,6 @@ pub async fn handle_task_update(
         "transition": transition,
         "renamed": rename_note,
         "task": task_summary(&id, &task.payload),
-        "graph_queries_count": graph_queries_count,
-        "graph_lookup_nudge": graph_lookup_nudge,
     }))
 }
 
@@ -3169,73 +3159,132 @@ pub async fn handle_task_validate(args: Value, store: Arc<dyn VectorStore>) -> S
     if let Err(e) = check_namespace(&namespace) {
         return e;
     }
-    match gate::run(&store, &namespace).await {
-        Ok(report) => {
-            let mut json = report.validate_json();
-            // F13: dangling-edge report (warn-only, never blocks gate).
-            if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref())
-                .downcast_ref::<crate::store::LadybugStore>()
-            {
-                match ls.dangling_edges(&namespace).await {
-                    Ok(edges) => {
-                        let count = edges.len();
-                        let samples: Vec<_> = edges.into_iter().take(5).collect();
-                        if let Some(obj) = json.as_object_mut() {
-                            obj.insert(
-                                "dangling_edges".to_string(),
-                                serde_json::json!({
-                                    "total": count,
-                                    "samples": samples,
-                                }),
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("dangling_edges query failed for '{namespace}': {e}");
-                    }
-                }
-                let sw = ls.shape_warnings(&namespace).await;
-                if let Some(obj) = json.as_object_mut() {
-                    obj.insert("shape_warnings".to_string(), serde_json::Value::Array(sw));
-                }
-                let ow = ls.ontology_warnings(&namespace).await;
+    // One list scan serves both the gate and the R7 advisories: the gate
+    // stays metadata-only and the advisory inputs come from the same rows,
+    // so the two surfaces cannot disagree about which tasks are active.
+    let memories = match store.list(&namespace, None, None).await {
+        Ok(memories) => memories,
+        Err(e) => return format!("ERROR: could not evaluate the task gate: {}", e),
+    };
+    let report = gate::evaluate_scoped(&memories, chrono::Utc::now().timestamp(), None);
+    let mut json = report.validate_json();
+    // F13: dangling-edge report (warn-only, never blocks gate).
+    if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref())
+        .downcast_ref::<crate::store::LadybugStore>()
+    {
+        match ls.dangling_edges(&namespace).await {
+            Ok(edges) => {
+                let count = edges.len();
+                let samples: Vec<_> = edges.into_iter().take(5).collect();
                 if let Some(obj) = json.as_object_mut() {
                     obj.insert(
-                        "ontology_warnings".to_string(),
-                        serde_json::Value::Array(ow),
+                        "dangling_edges".to_string(),
+                        serde_json::json!({
+                            "total": count,
+                            "samples": samples,
+                        }),
                     );
                 }
-                // Enrichment state surface (F12/F14/F24), warn-first.
-                let rid = crate::registry::registry_row_id(&namespace);
-                match crate::traits::VectorStore::get(ls, &namespace, &rid).await {
-                    Ok(Some((_, reg_payload))) => {
-                        let es = crate::registry::enrichment_state(&reg_payload.metadata);
-                        if let Some(obj) = json.as_object_mut() {
-                            obj.insert("enrichment_state".to_string(), es.clone());
-                            if es.get("state").and_then(|v| v.as_str()) == Some("failed") {
-                                let warnings = obj
-                                    .entry("warnings".to_string())
-                                    .or_insert_with(|| serde_json::json!([]));
-                                if let Some(arr) = warnings.as_array_mut() {
-                                    arr.push(
-                                        serde_json::json!({"kind":"enrichment_failed","state":es}),
-                                    );
-                                }
-                            }
+            }
+            Err(e) => {
+                tracing::warn!("dangling_edges query failed for '{namespace}': {e}");
+            }
+        }
+        let sw = ls.shape_warnings(&namespace).await;
+        if let Some(obj) = json.as_object_mut() {
+            obj.insert("shape_warnings".to_string(), serde_json::Value::Array(sw));
+        }
+        let ow = ls.ontology_warnings(&namespace).await;
+        if let Some(obj) = json.as_object_mut() {
+            obj.insert(
+                "ontology_warnings".to_string(),
+                serde_json::Value::Array(ow),
+            );
+        }
+        // Enrichment state surface (F12/F14/F24), warn-first.
+        let rid = crate::registry::registry_row_id(&namespace);
+        match crate::traits::VectorStore::get(ls, &namespace, &rid).await {
+            Ok(Some((_, reg_payload))) => {
+                let es = crate::registry::enrichment_state(&reg_payload.metadata);
+                if let Some(obj) = json.as_object_mut() {
+                    obj.insert("enrichment_state".to_string(), es.clone());
+                    if es.get("state").and_then(|v| v.as_str()) == Some("failed") {
+                        let warnings = obj
+                            .entry("warnings".to_string())
+                            .or_insert_with(|| serde_json::json!([]));
+                        if let Some(arr) = warnings.as_array_mut() {
+                            arr.push(serde_json::json!({"kind":"enrichment_failed","state":es}));
                         }
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        tracing::warn!(
-                            "enrichment registry get failed for '{namespace}:{rid}': {e}"
-                        );
                     }
                 }
             }
-            encode(&json)
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("enrichment registry get failed for '{namespace}:{rid}': {e}");
+            }
         }
-        Err(e) => format!("ERROR: could not evaluate the task gate: {}", e),
     }
+    // R7: enrich the gate's zero report with local post-dispatch receipts.
+    // Ledger read is fail-soft: missing/unreadable means zero coverage, never
+    // an error and never a gate violation.
+    let active_ids = snapshot_readiness::active_task_ids(
+        &memories
+            .iter()
+            .filter(|r| gate::is_task(r))
+            .map(|r| (r.id.clone(), gate::task_status(r).as_str().to_string()))
+            .collect::<Vec<_>>(),
+    );
+    let root = crate::daemon::resolve_project_root();
+    let ledger: Value =
+        std::fs::read_to_string(root.join(".NeuroStrata").join("session_queries.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| json!({ "events": [] }));
+    let mut applicable: Vec<String> = args
+        .get("applicable_triggers")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if args.get("strategic").and_then(Value::as_bool) == Some(true) {
+        applicable.push(graph_advisories::T_STRATEGIC.to_string());
+    }
+    applicable.extend(graph_advisories::applicable_triggers_from_ledger(
+        &ledger,
+        &active_ids,
+    ));
+    let concept_rows: Vec<&SearchResult> = memories
+        .iter()
+        .filter(|r| matches!(r.payload.memory_type.as_str(), "concept" | "thesis"))
+        .collect();
+    let taxonomy_available = !concept_rows.is_empty();
+    let concept_grounding_linked = concept_rows.iter().any(|r| {
+        r.payload
+            .metadata
+            .get("extracted_from")
+            .and_then(Value::as_array)
+            .map(|ids| !ids.is_empty())
+            .unwrap_or(false)
+    });
+    let advisories = graph_advisories::compute_advisories(&graph_advisories::AdvisoryInput {
+        ledger: &ledger,
+        active_task_ids: &active_ids,
+        allowed_graph_tools: snapshot_readiness::GRAPH_TOOLS,
+        applicable_trigger_ids: &applicable,
+        taxonomy_available,
+        concept_grounding_linked,
+    });
+    if let Some(obj) = json.as_object_mut() {
+        obj.insert(
+            "advisories".to_string(),
+            json!({ "graph_ontology": advisories.to_json() }),
+        );
+    }
+    encode(&json)
 }
 
 // ── snapshot stickiness (section 6.1) ──────────────────────────────────────

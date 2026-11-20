@@ -6,6 +6,8 @@
 
 #[path = "../src/graph_read/memories_for_file.rs"]
 mod memories_for_file;
+#[path = "../src/task/graph_advisories.rs"]
+mod graph_advisories;
 #[path = "../src/task/routing.rs"]
 mod routing;
 #[path = "../src/task/snapshot_readiness.rs"]
@@ -846,4 +848,97 @@ fn append_event_bounds_manual_returned_ids() {
     tool_receipts::append_event(&mut doc, event);
     let stored = doc["events"][0]["returned_ids"].as_array().unwrap();
     assert_eq!(stored.len(), tool_receipts::MAX_RETURNED_IDS);
+}
+
+/// Spec §6 R7.2: a genuine one-hop lookup is not coverage for an applicable
+/// escalation. Only an unmet `T_HIGH_BLAST`/`T_DIFF` produces a non-blocking
+/// `W_GRAPH_NO_EXPANSION`; the old `graph_queries_count == 0` nudge is gone.
+#[test]
+fn validate_warns_only_on_unresolved_applicable_triggers() {
+    use graph_advisories::{compute_advisories, AdvisoryInput, W_GRAPH_NO_EXPANSION};
+    use std::collections::BTreeSet;
+
+    let active: BTreeSet<String> = ["t-active".to_string()].into_iter().collect();
+    let allowed = snapshot_readiness::GRAPH_TOOLS;
+    let no_triggers: Vec<String> = Vec::new();
+
+    // Genuine one-hop lookup only (plus a legacy synthetic row). No escalation
+    // is applicable, so no advisory is emitted.
+    let one_hop = serde_json::json!({
+        "events_version": 1,
+        "events": [{
+            "task_id": "t-active",
+            "tool": "neurostrata_memories_for_file",
+            "operation": "memories_for_file",
+            "trigger_id": "T_PATH",
+            "status": "success",
+            "returned_ids": ["mem-1"]
+        }],
+        "queries": [{ "tool": "pre-commit", "query": "src/task/mod.rs" }]
+    });
+    let clean = compute_advisories(&AdvisoryInput {
+        ledger: &one_hop,
+        active_task_ids: &active,
+        allowed_graph_tools: allowed,
+        applicable_trigger_ids: &no_triggers,
+        taxonomy_available: false,
+        concept_grounding_linked: false,
+    })
+    .to_json();
+    assert_eq!(clean["genuine_lookup_coverage"], true);
+    assert_eq!(clean["distinct_graph_tools"], 1);
+    assert!(
+        clean["recommendations"].as_array().unwrap().is_empty(),
+        "a genuine one-hop lookup must not warn"
+    );
+    assert!(clean["unresolved_trigger_ids"].as_array().unwrap().is_empty());
+
+    // Applicable T_HIGH_BLAST with no genuine related receipt: the prescribed
+    // action was emitted, but the escalation dispatch failed. The one-hop
+    // success and the legacy related row must NOT count as compliance.
+    let unresolved = serde_json::json!({
+        "events_version": 1,
+        "events": [
+            {
+                "task_id": "t-active",
+                "tool": "neurostrata_memories_for_file",
+                "trigger_id": "T_PATH",
+                "status": "success",
+                "prescribed_action_ids": ["T_HIGH_BLAST:abc123"]
+            },
+            {
+                "task_id": "t-active",
+                "tool": "neurostrata_related",
+                "trigger_id": "T_HIGH_BLAST",
+                "status": "failed"
+            }
+        ],
+        "queries": [{ "tool": "neurostrata_related" }]
+    });
+    let applicable = vec!["T_HIGH_BLAST".to_string()];
+    let report = compute_advisories(&AdvisoryInput {
+        ledger: &unresolved,
+        active_task_ids: &active,
+        allowed_graph_tools: allowed,
+        applicable_trigger_ids: &applicable,
+        taxonomy_available: false,
+        concept_grounding_linked: false,
+    })
+    .to_json();
+    let codes: Vec<&str> = report["recommendations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(codes, vec![W_GRAPH_NO_EXPANSION], "only the unmet escalation warns");
+    assert_eq!(report["high_blast_radius_unexplored"], true);
+    assert_eq!(
+        report["unresolved_trigger_ids"],
+        serde_json::json!(["T_HIGH_BLAST"])
+    );
+    assert!(
+        report.get("violations").is_none(),
+        "advisories never embed gate violations"
+    );
 }
