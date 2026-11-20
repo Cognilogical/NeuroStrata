@@ -6435,17 +6435,8 @@ async fn handle_get_snapshot(
         doctor_state["configured_fires_on"] =
             serde_json::json!(crate::task::wiring::VALID_FIRES_ON);
     }
-    if let (Some(vec), Some(mut payload)) = (reg_vec_opt, reg_payload_opt) {
-        if let Some(obj) = payload.metadata.as_object_mut() {
-            obj.insert("doctor_state".to_string(), doctor_state);
-        }
-        if let Err(e) = store.upsert(namespace, &rid, vec, payload).await {
-            tracing::warn!(
-                "failed to persist doctor_state into {}::{}: {e}",
-                namespace,
-                rid
-            );
-        }
+    if reg_vec_opt.is_some() && reg_payload_opt.is_some() {
+        crate::registry::write_doctor_state(&store, namespace, doctor_state).await;
     }
 
     // Communities (N) section (§5.6): partition community_summary out of all_memories,
@@ -10041,6 +10032,9 @@ async fn handle_domain_registry(
             }).to_string()
         }
         "set" => {
+            // One lock from the first read to the upsert: a concurrent writer of
+            // the same row cannot be overwritten by this stale copy.
+            let _row_guard = crate::registry::REGISTRY_ROW_LOCK.lock().await;
             let slug_raw = match arguments.get("slug").and_then(|v| v.as_str()) {
                 Some(s) => s.to_string(),
                 None => return serde_json::json!({"ok":false,"error":{"code":"INVALID_SLUG","message":"slug missing"},"warnings":[]}).to_string(),
@@ -10144,6 +10138,9 @@ async fn handle_domain_registry(
             serde_json::json!({"ok":true,"registry":{"version":version,"domains":domains},"warnings":[]}).to_string()
         }
         "remove" => {
+            // One lock from the first read to the upsert: a concurrent writer of
+            // the same row cannot be overwritten by this stale copy.
+            let _row_guard = crate::registry::REGISTRY_ROW_LOCK.lock().await;
             let slug = match arguments.get("slug").and_then(|v| v.as_str()) {
                 Some(s) => s.to_string(),
                 None => return serde_json::json!({"ok":false,"error":{"code":"INVALID_SLUG","message":"slug missing"}}).to_string(),

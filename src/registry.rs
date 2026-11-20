@@ -864,6 +864,32 @@ async fn cache_project_root_locked(
     }
 }
 
+/// Merge `doctor_state` into the registry row, re-reading the row under the
+/// row lock so a concurrent write to another field (project_root, domain
+/// slugs) is kept. A missing row is left missing.
+pub async fn write_doctor_state(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    doctor_state: Value,
+) {
+    let _guard = REGISTRY_ROW_LOCK.lock().await;
+    let registry_id = registry_row_id(namespace);
+    let (vector, mut payload) = match store.get(namespace, &registry_id).await {
+        Ok(Some(found)) => found,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!("registry row read failed for '{namespace}': {e}");
+            return;
+        }
+    };
+    if let Some(obj) = payload.metadata.as_object_mut() {
+        obj.insert("doctor_state".to_string(), doctor_state);
+    }
+    if let Err(e) = store.upsert(namespace, &registry_id, vector, payload).await {
+        tracing::warn!("failed to persist doctor_state into {namespace}::{registry_id}: {e}");
+    }
+}
+
 /// The `project_root` cached on the namespace's registry row by
 /// [`cache_project_root`]. A missing row or field is `Ok(None)`; a failed
 /// store read is an error, so a caller can tell "no root" from "unknown".
@@ -987,12 +1013,109 @@ mod tests {
         );
     }
 
+    /// A store whose `get` yields after reading, so two read-modify-write
+    /// sequences on one row interleave unless something serializes them.
+    struct YieldStore {
+        inner: crate::guard::testkit::MockStore,
+    }
+    impl crate::traits::AsAny for YieldStore {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+    #[async_trait::async_trait]
+    impl VectorStore for YieldStore {
+        async fn init(&self, ns: &str) -> anyhow::Result<()> {
+            self.inner.init(ns).await
+        }
+        async fn upsert(
+            &self,
+            ns: &str,
+            id: &str,
+            v: Vec<f32>,
+            p: MemoryPayload,
+        ) -> anyhow::Result<crate::traits::UpsertReport> {
+            self.inner.upsert(ns, id, v, p).await
+        }
+        async fn search(
+            &self,
+            ns: &str,
+            v: Vec<f32>,
+            l: usize,
+            it: bool,
+            ia: bool,
+        ) -> anyhow::Result<Vec<crate::traits::SearchResult>> {
+            self.inner.search(ns, v, l, it, ia).await
+        }
+        async fn delete(&self, ns: &str, id: &str) -> anyhow::Result<()> {
+            self.inner.delete(ns, id).await
+        }
+        async fn clear_ingested(&self, ns: &str) -> anyhow::Result<()> {
+            self.inner.clear_ingested(ns).await
+        }
+        async fn relink_edges(&self, ns: &str, sk: &str) -> anyhow::Result<usize> {
+            self.inner.relink_edges(ns, sk).await
+        }
+        async fn list(
+            &self,
+            ns: &str,
+            u: Option<&str>,
+            mt: Option<&str>,
+        ) -> anyhow::Result<Vec<crate::traits::SearchResult>> {
+            self.inner.list(ns, u, mt).await
+        }
+        async fn get(
+            &self,
+            ns: &str,
+            id: &str,
+        ) -> anyhow::Result<Option<(Vec<f32>, MemoryPayload)>> {
+            let found = self.inner.get(ns, id).await;
+            tokio::task::yield_now().await;
+            found
+        }
+        async fn relocate(
+            &self,
+            id: &str,
+            from: &str,
+            to: &str,
+        ) -> anyhow::Result<crate::traits::RelocateOutcome> {
+            self.inner.relocate(id, from, to).await
+        }
+        async fn list_namespaces(&self) -> anyhow::Result<Vec<String>> {
+            self.inner.list_namespaces().await
+        }
+        async fn export_graph(
+            &self,
+            ir: bool,
+            ia: bool,
+            pc: &std::collections::HashMap<String, std::path::PathBuf>,
+            ao: Option<&crate::source_context::ScopedAnchorOverride>,
+        ) -> anyhow::Result<serde_json::Value> {
+            self.inner.export_graph(ir, ia, pc, ao).await
+        }
+        async fn increment_access_count(&self, ns: &str, id: &str) -> anyhow::Result<()> {
+            self.inner.increment_access_count(ns, id).await
+        }
+        async fn export_database(&self, dir: &str) -> anyhow::Result<()> {
+            self.inner.export_database(dir).await
+        }
+        async fn checkpoint(&self) -> anyhow::Result<()> {
+            self.inner.checkpoint().await
+        }
+    }
+
+    fn yield_store() -> Arc<dyn VectorStore> {
+        Arc::new(YieldStore {
+            inner: crate::guard::testkit::MockStore::new(),
+        })
+    }
+
     #[tokio::test]
     async fn cache_write_and_domain_registry_write_both_survive() {
-        use crate::guard::testkit::{MockStore, StubEmbedder};
+        use crate::guard::testkit::StubEmbedder;
         let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
         for i in 0..50 {
-            let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+            let store = yield_store();
             let root = format!("/example/root-{i}");
             let domains = vec!["auth".to_string()];
             let (_, warning) = tokio::join!(
@@ -1012,6 +1135,69 @@ mod tests {
             );
         }
     }
+
+    #[tokio::test]
+    async fn doctor_state_write_keeps_concurrent_project_root() {
+        use crate::guard::testkit::StubEmbedder;
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        for i in 0..20 {
+            let store = yield_store();
+            cache_project_root(&store, Some(&emb), "example-project", "/example/old").await;
+            let root = std::path::PathBuf::from(format!("/example/new-{i}"));
+            let state = serde_json::json!({ "session_counter": i });
+            tokio::join!(
+                write_doctor_state(&store, "example-project", state),
+                set_project_root(&store, Some(&emb), "example-project", &root),
+            );
+            assert_eq!(
+                cached_project_root(&store, "example-project").await.unwrap(),
+                Some(root.to_string_lossy().into_owned()),
+                "round {i}: the root"
+            );
+            let (_, payload) = store
+                .get("example-project", &registry_row_id("example-project"))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                payload.metadata["doctor_state"]["session_counter"],
+                serde_json::json!(i),
+                "round {i}: the doctor state"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn set_project_root_maps_linked_worktree_to_main_checkout() {
+        use crate::guard::testkit::{MockStore, StubEmbedder};
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        let main = base.join("main");
+        let linked = base.join("linked");
+        std::fs::create_dir_all(&main).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .current_dir(&main)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-b", "main"]);
+        git(&["commit", "--allow-empty", "-m", "init"]);
+        git(&["worktree", "add", "-b", "feature/linked", linked.to_str().unwrap()]);
+        std::fs::create_dir_all(linked.join("pkg")).unwrap();
+
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        set_project_root(&store, Some(&emb), "example-project", &linked.join("pkg")).await;
+        assert_eq!(
+            cached_project_root(&store, "example-project").await.unwrap(),
+            Some(main.join("pkg").to_string_lossy().into_owned())
+        );
+    }
+
 
     #[test]
     fn a_registry_row_id_is_stable_and_namespaced() {
@@ -1486,6 +1672,8 @@ pub async fn enrichment_start(
     holder_id: &str,
 ) -> Result<Value, String> {
     let _guard = ENRICHMENT_MUTEX.lock().await;
+    // Lock order: enrichment first, then the row lock; never the reverse.
+    let _row_guard = REGISTRY_ROW_LOCK.lock().await;
     let registry_id = registry_row_id(namespace);
     let (vector, mut payload) = match store.get(namespace, &registry_id).await {
         Ok(Some(found)) => found,
@@ -1574,6 +1762,8 @@ pub async fn enrichment_commit(
     telemetry: Value,
 ) -> Result<(), String> {
     let _guard = ENRICHMENT_MUTEX.lock().await;
+    // Lock order: enrichment first, then the row lock; never the reverse.
+    let _row_guard = REGISTRY_ROW_LOCK.lock().await;
     let registry_id = registry_row_id(namespace);
     let (vector, mut payload) = match store.get(namespace, &registry_id).await {
         Ok(Some(found)) => found,
@@ -1620,6 +1810,8 @@ pub async fn enrichment_fail(
     error: &str,
 ) -> Result<(), String> {
     let _guard = ENRICHMENT_MUTEX.lock().await;
+    // Lock order: enrichment first, then the row lock; never the reverse.
+    let _row_guard = REGISTRY_ROW_LOCK.lock().await;
     let registry_id = registry_row_id(namespace);
     let (vector, mut payload) = match store.get(namespace, &registry_id).await {
         Ok(Some(found)) => found,
