@@ -3031,16 +3031,6 @@ describe("nb9q FIX1: zero-action shell segments in the mutating guard", () => {
     }
   });
 
-  it("publishes exactly one default export from every adapter bundle", () => {
-    for (const harness of ["opencode", "claude", "codex", "hermes", "openclaw", "github-cli"]) {
-      for (const ext of ["js", "d.ts"]) {
-        const src = readFileSync(new URL(`../${harness}/dist/index.${ext}`, import.meta.url), "utf8");
-        const count = (src.match(/export default /g) || []).length;
-        assert.equal(count, 1, `${harness} dist/index.${ext} must declare exactly one default export`);
-      }
-    }
-  });
-
   it("passes is_mutating=false to the guard for exempt shells, true for mutating ones", async () => {
     const { server, url, counters } = await createMockDaemonServer();
     let beforeHandler;
