@@ -91,7 +91,7 @@ pub const fn task_step(
         KernelGuard::None => {}
         KernelGuard::RequireReason if !has_reason => return Err(MissingReason),
         KernelGuard::ExtractionRequired if !extraction_edge_exists => {
-            return Err(KernelTaskStepError::ExtractionRequired)
+            return Err(KernelTaskStepError::ExtractionRequired);
         }
         KernelGuard::RequireReason | KernelGuard::ExtractionRequired => {}
     }
@@ -3970,4 +3970,351 @@ mod kani_proofs {
             }
         }
     }
+}
+
+// ─── Shell exemption classifier (issues #314, #315) ───
+
+/// Pure, option-aware classifier for shell payloads. Returns true when every
+/// segment of the payload is a provably read-only / verification command.
+/// Handles JSON unwrapping, lone-`&` rejection, quote stripping, short-option
+/// bundling, forced refspecs, destructive push flags, and attached `gh api`
+/// write flags. Mirrors `plugins/core/index.ts::isZeroActionExemptShellSegment`.
+pub fn evaluate_shell_exemption(payload: &str) -> bool {
+    let trimmed = payload.trim();
+    // action_type is checked by the caller; here payload may be JSON or raw.
+    // JSON unwrap.
+    let command = if trimmed.starts_with('{') {
+        // find "command" or "cmd" string value
+        extract_json_string_field(trimmed, "command")
+            .or_else(|| extract_json_string_field(trimmed, "cmd"))
+            .unwrap_or_default()
+    } else {
+        trimmed.to_string()
+    };
+    let cmd = command.trim();
+    if cmd.is_empty()
+        || cmd.contains('`')
+        || cmd.contains("$(")
+        || cmd.contains('>')
+        || cmd.contains('<')
+    {
+        return false;
+    }
+    // reject lone '&' (background operator) but allow '&&'
+    let without_andand = cmd.replace("&&", "");
+    if without_andand.contains('&') {
+        return false;
+    }
+    let segments: Vec<String> = cmd
+        .split(|c| c == ';' || c == '\n' || c == '|' || c == '&')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if segments.is_empty() {
+        return false;
+    }
+    segments.iter().all(|s| is_exempt_segment(s))
+}
+
+fn extract_json_string_field(json: &str, field: &str) -> Option<String> {
+    // naive: find "field" : "value" handling simple escapes
+    let key = format!("\"{}\"", field);
+    let idx = json.find(&key)?;
+    let rest = &json[idx + key.len()..];
+    // skip whitespace and colon
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    if !rest.starts_with('"') {
+        return None;
+    }
+    let mut i = 1usize;
+    let bytes = rest.as_bytes();
+    let mut out = String::new();
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if c == '"' {
+            return Some(out);
+        }
+        if c == '\\' && i + 1 < bytes.len() {
+            let n = bytes[i + 1] as char;
+            match n {
+                '"' => out.push('"'),
+                '\\' => out.push('\\'),
+                'n' => out.push('\n'),
+                't' => out.push('\t'),
+                'r' => out.push('\r'),
+                _ => {
+                    out.push('\\');
+                    out.push(n);
+                }
+            }
+            i += 2;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    None
+}
+
+fn strip_matching_quotes(tok: &str) -> String {
+    let t = tok.trim();
+    if t.len() >= 2 {
+        let first = t.chars().next().unwrap();
+        let last = t.chars().last().unwrap();
+        if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+            return t[1..t.len() - 1].to_string();
+        }
+    }
+    t.to_string()
+}
+
+fn is_exempt_segment(segment: &str) -> bool {
+    let mut tokens: Vec<String> = segment
+        .split_whitespace()
+        .map(strip_matching_quotes)
+        .collect();
+    // env assignment stripping
+    while !tokens.is_empty() && is_env_assignment(&tokens[0]) {
+        tokens.remove(0);
+    }
+    if tokens.is_empty() {
+        return false;
+    }
+    let bin = std::path::Path::new(&tokens[0])
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&tokens[0])
+        .to_string();
+    let args: Vec<String> = tokens[1..].to_vec();
+    let has_flag = |flags: &[&str]| -> bool {
+        args.iter().any(|arg| {
+            flags.iter().any(|flag| {
+                if *flag == arg {
+                    true
+                } else if flag.starts_with("--") {
+                    arg.starts_with(&format!("{}=", flag))
+                } else {
+                    arg.starts_with(flag)
+                }
+            })
+        })
+    };
+
+    match bin.as_str() {
+        "git" => {
+            // strip git global options
+            let mut rest: Vec<String> = args.clone();
+            loop {
+                if rest.len() >= 2
+                    && (rest[0] == "-C" || rest[0] == "--git-dir" || rest[0] == "--work-tree")
+                {
+                    rest.drain(..2);
+                } else if !rest.is_empty()
+                    && (rest[0] == "--no-pager"
+                        || rest[0] == "-P"
+                        || rest[0] == "--no-optional-locks"
+                        || rest[0].starts_with("--git-dir=")
+                        || rest[0].starts_with("--work-tree="))
+                {
+                    rest.remove(0);
+                } else {
+                    break;
+                }
+            }
+            if rest.is_empty() {
+                return false;
+            }
+            if rest[0].starts_with('-') {
+                return false;
+            }
+            let subcmd = rest[0].clone();
+            let sub_args: Vec<String> = rest[1..].to_vec();
+            // disallowed git subcommand args (from is_disallowed_git_subcommand_arg)
+            for a in &sub_args {
+                if is_disallowed_git_arg(a) {
+                    return false;
+                }
+            }
+            match subcmd.as_str() {
+                "push" => {
+                    // mutating if any push arg indicates force/delete/etc.
+                    for arg in &sub_args {
+                        let a = arg.as_str();
+                        if a.starts_with('+') {
+                            return false;
+                        }
+                        if a == "--force" || a.starts_with("--force-") {
+                            return false;
+                        }
+                        if a == "--mirror" || a == "--delete" || a == "--prune" {
+                            return false;
+                        }
+                        // unambiguous long-option prefixes (--dele* → --delete)
+                        if a.starts_with("--dele") {
+                            return false;
+                        }
+                        // short-bundle d|f only before '=' (and only for a real
+                        // short cluster, not a long option name like -oformat)
+                        if a.starts_with('-') && !a.starts_with("--") {
+                            let bundle = a.split('=').next().unwrap_or(a);
+                            let letters = &bundle[1..];
+                            if !letters.is_empty()
+                                && letters.len() <= 4
+                                && letters.chars().all(|c| c.is_ascii_alphabetic())
+                                && (letters.contains('d') || letters.contains('f'))
+                            {
+                                return false;
+                            }
+                        }
+                        // --no-verify always mutating
+                        if a == "--no-verify" {
+                            return false;
+                        }
+                        // empty-source :refspec
+                        if a.starts_with(':') && a.len() > 1 {
+                            // :refs/heads/scratch etc -> delete
+                            return false;
+                        }
+                    }
+                    // also :refspec anywhere (src:dst where src empty)
+                    // handled above by starts_with(':')
+                    true
+                }
+                "pull" | "fetch" | "status" | "log" | "diff" | "show" | "rev-parse" => {
+                    !has_flag(&[
+                        "--output",
+                        "-O",
+                        "--ext-diff",
+                        "--textconv",
+                        "--exec",
+                        "-x",
+                        "--upload-pack",
+                        "--receive-pack",
+                    ])
+                }
+                "stash" => matches!(sub_args.first().map(|s| s.as_str()), Some("list" | "show")),
+                "branch" => {
+                    sub_args.len() >= 1 // allow empty? original requires all listed; empty args -> true? original: all() on empty true but len>=2 check
+                        && sub_args.iter().all(|t| {
+                            matches!(t.as_str(), "--show-current" | "-a" | "-r" | "--list" | "-v" | "-vv")
+                        })
+                        && rest.len() >= 2
+                }
+                _ => false,
+            }
+        }
+        "neurostrata-mcp" => match args.first().map(|s| s.as_str()) {
+            Some("task" | "doc-gate") => true,
+            Some("synaptic-mesh") => matches!(args.get(1).map(|s| s.as_str()), Some("status")),
+            _ => false,
+        },
+        "cargo" => {
+            let rest: Vec<String> = if args.first().map(|s| s.starts_with('+')).unwrap_or(false) {
+                args[1..].to_vec()
+            } else {
+                args.clone()
+            };
+            matches!(
+                rest.first().map(|s| s.as_str()),
+                Some(
+                    "test"
+                        | "check"
+                        | "clippy"
+                        | "bench"
+                        | "metadata"
+                        | "tree"
+                        | "version"
+                        | "--version"
+                )
+            )
+        }
+        "gh" => {
+            match args.first().map(|s| s.as_str()) {
+                Some("pr") => matches!(
+                    args.get(1).map(|s| s.as_str()),
+                    Some("view" | "list" | "checks" | "status" | "diff")
+                ),
+                Some("issue") => matches!(
+                    args.get(1).map(|s| s.as_str()),
+                    Some("view" | "list" | "status")
+                ),
+                Some("run") => matches!(
+                    args.get(1).map(|s| s.as_str()),
+                    Some("view" | "list" | "watch")
+                ),
+                Some("api") => {
+                    // attached -X|-f|-F values count as writes
+                    let mut writes = false;
+                    for a in &args[1..] {
+                        if a == "-X"
+                            || a == "--method"
+                            || a == "-f"
+                            || a == "-F"
+                            || a == "--field"
+                            || a == "--raw-field"
+                            || a == "--input"
+                        {
+                            writes = true;
+                        } else if a.starts_with("-X") || a.starts_with("-f") || a.starts_with("-F")
+                        {
+                            // attached short flag with value, e.g. -XPOST, -fbody=hi
+                            // only count if there's more than the flag letter
+                            if a.len() > 2 {
+                                writes = true;
+                            }
+                        } else if a.starts_with("--method=")
+                            || a.starts_with("--field=")
+                            || a.starts_with("--raw-field=")
+                            || a.starts_with("--input=")
+                        {
+                            writes = true;
+                        }
+                    }
+                    !writes
+                }
+                _ => false,
+            }
+        }
+        "node" => args
+            .iter()
+            .any(|t| t == "--test" || t.ends_with("test.mjs")),
+        "gate-receipt.sh" | "check-include-str-targets.sh" => true,
+        "bash" => args
+            .first()
+            .map(|t| t.ends_with("gate-receipt.sh") || t.ends_with("check-include-str-targets.sh"))
+            .unwrap_or(false),
+        "rustc" => matches!(args.first().map(|s| s.as_str()), Some("--version" | "-V")),
+        _ => false,
+    }
+}
+
+fn is_env_assignment(tok: &str) -> bool {
+    // VAR=value at start
+    if let Some(eq) = tok.find('=') {
+        let name = &tok[..eq];
+        if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            let first = name.chars().next().unwrap();
+            if first.is_ascii_alphabetic() || first == '_' {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_disallowed_git_arg(arg: &str) -> bool {
+    arg == "--output"
+        || arg == "-O"
+        || arg.starts_with("--output=")
+        || arg == "--ext-diff"
+        || arg == "--textconv"
+        || arg == "--exec"
+        || arg.starts_with("--exec=")
+        || arg == "-x"
+        || arg == "--upload-pack"
+        || arg.starts_with("--upload-pack=")
+        || arg == "--receive-pack"
+        || arg.starts_with("--receive-pack=")
 }

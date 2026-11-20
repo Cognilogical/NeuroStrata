@@ -1,0 +1,90 @@
+{
+  "cases": [
+    {
+      "name": "push delete short -d",
+      "payload": "git push -d origin main",
+      "exempt": false
+    },
+    {
+      "name": "push delete short bundle -vd",
+      "payload": "git push -vd origin scratch",
+      "exempt": false
+    },
+    {
+      "name": "push empty-source refspec scratch",
+      "payload": "git push origin :refs/heads/scratch",
+      "exempt": false
+    },
+    {
+      "name": "push empty-source refspec main",
+      "payload": "git push origin :main",
+      "exempt": false
+    },
+    {
+      "name": "push quoted force",
+      "payload": "git push \"--force\"",
+      "exempt": false
+    },
+    {
+      "name": "push dele prefix",
+      "payload": "git push --dele origin scratch",
+      "exempt": false
+    },
+    {
+      "name": "push no-verify",
+      "payload": "git push --no-verify origin main",
+      "exempt": false
+    },
+    {
+      "name": "push -oformat false positive",
+      "payload": "git push -oformat=terse origin main",
+      "exempt": true
+    },
+    {
+      "name": "push trailing background",
+      "payload": "git push origin main &",
+      "exempt": false
+    },
+    {
+      "name": "status trailing background",
+      "payload": "git status &",
+      "exempt": false
+    },
+    {
+      "name": "gh api -XPOST",
+      "payload": "gh api -XPOST /repos/x",
+      "exempt": false
+    },
+    {
+      "name": "gh api -f attached",
+      "payload": "gh api -fbody=hi /x",
+      "exempt": false
+    },
+    {
+      "name": "gh api -F attached",
+      "payload": "gh api -Fbody=hi /x",
+      "exempt": false
+    },
+    {
+      "name": "post-task exempt push -u",
+      "payload": "git push -u origin fix/task-claim-push-scope",
+      "exempt": true
+    },
+    {
+      "name": "post-task exempt push chained",
+      "payload": "CARGO_TARGET_DIR=/tmp/target git push -u origin main && git status -s",
+      "exempt": true
+    },
+    {
+      "name": "post-task exempt pull push status",
+      "payload": "git pull --rebase && git push && git status",
+      "exempt": true
+    },
+    { "name": "basic push", "payload": "git push", "exempt": true },
+    {
+      "name": "basic push origin main",
+      "payload": "git push origin main",
+      "exempt": true
+    }
+  ]
+}

@@ -707,8 +707,22 @@ export function isCodeExecTool(name) {
  * Fail-closed recognition of a single read-only / verification shell segment.
  * Only an explicit allowlist passes; anything else is treated as mutating.
  */
+function stripMatchingQuotes(token) {
+    const t = token.trim();
+    if (t.length >= 2) {
+        const first = t[0];
+        const last = t[t.length - 1];
+        if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+            return t.slice(1, -1);
+        }
+    }
+    return t;
+}
 function isZeroActionExemptShellSegment(segment) {
-    let tokens = segment.trim().split(/\s+/).filter(Boolean);
+    const s = segment.trim();
+    if (s.replace(/&&/g, "").includes("&"))
+        return false;
+    let tokens = s.split(/\s+/).filter(Boolean).map(stripMatchingQuotes);
     while (tokens.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0])) {
         tokens = tokens.slice(1);
     }
@@ -738,15 +752,37 @@ function isZeroActionExemptShellSegment(segment) {
         const sub = rest[0];
         const subArgs = rest.slice(1);
         // Fail closed on every way to force a push: bundled short flags (-vf,
-        // -uf), forced refspecs (+main), and destructive remote operations.
-        if (sub === "push" && subArgs.some((a) => a.startsWith("+") ||
-            a === "--force" ||
-            a.startsWith("--force-") ||
-            a === "--mirror" ||
-            a === "--delete" ||
-            a === "--prune" ||
-            (a.startsWith("-") && !a.startsWith("--") && a.slice(1).includes("f")))) {
-            return false;
+        // -uf), forced refspecs (+main), destructive remote operations, --dele*,
+        // --no-verify, and empty-source :refspec. Short bundle d|f is only
+        // checked before '=' and only for a real short cluster (not -oformat).
+        if (sub === "push") {
+            const isMutatingPush = subArgs.some((a) => {
+                if (a.startsWith("+"))
+                    return true;
+                if (a === "--force" || a.startsWith("--force-"))
+                    return true;
+                if (a === "--mirror" || a === "--delete" || a === "--prune")
+                    return true;
+                if (a.startsWith("--dele"))
+                    return true;
+                if (a === "--no-verify")
+                    return true;
+                if (a.startsWith(":") && a.length > 1)
+                    return true;
+                if (a.startsWith("-") && !a.startsWith("--")) {
+                    const bundle = a.split("=")[0];
+                    const letters = bundle.slice(1);
+                    if (letters.length > 0 &&
+                        letters.length <= 4 &&
+                        /^[A-Za-z]+$/.test(letters) &&
+                        (letters.includes("d") || letters.includes("f"))) {
+                        return true;
+                    }
+                }
+                return false;
+            });
+            if (isMutatingPush)
+                return false;
         }
         if (["push", "pull", "fetch", "status", "log", "diff", "show", "rev-parse"].includes(sub)) {
             return !hasFlag(["--output", "-O", "--ext-diff", "--textconv", "--exec", "-x", "--upload-pack", "--receive-pack"]);
