@@ -773,7 +773,7 @@ export function sanitizeSubagentHeaderToken(value: string): string {
  *  out of the header's code span (issue #316: the namespace can arrive from
  *  a committed .NeuroStrata/session_queries.json). */
 function codeSpanValue(value: unknown): string {
-  return String(value ?? "").replace(/[`\r\n]+/g, " ");
+  return String(value ?? '').replace(/[`\r\n]+/g, ' ')
 }
 
 export function buildSubagentContextHeader(
@@ -828,8 +828,8 @@ function requireCtx(): OpenClawPluginContext {
 export async function initialize(
   ctx: (Partial<OpenClawPluginContext> & Record<string, unknown>) | undefined
 ): Promise<void> {
-  pluginCtx = (ctx as OpenClawPluginContext) ?? null;
-  config = resolveConfig(ctx?.config ?? ctx ?? {});
+  pluginCtx = (ctx as OpenClawPluginContext) ?? null
+  config = resolveConfig(ctx?.config ?? ctx ?? {})
 
   const token = config.bearerToken ?? loadDaemonToken(config.tokenFile)
   mcpClient = new NeuroStrataMCPClient({
@@ -850,14 +850,14 @@ export async function initialize(
   // Register file operation hook. The CLI runner calls initialize with only
   // a config object (no hooks host), so every registration is optional: the
   // runner path dispatches through handleHookEvent instead.
-  ctx?.hooks?.beforeFileOp?.(wrapFileOp);
+  ctx?.hooks?.beforeFileOp?.(wrapFileOp)
 
   // Register turn hook for intent detection
-  ctx?.hooks?.onTurnEnd?.(onTurnEnd);
+  ctx?.hooks?.onTurnEnd?.(onTurnEnd)
 
   await negotiateCapabilities()
 
-  ctx?.logger?.info?.("NeuroStrata OpenClaw plugin initialized", {
+  ctx?.logger?.info?.('NeuroStrata OpenClaw plugin initialized', {
     namespace: config.namespace,
     endpoint: config.endpoint,
     authenticated: status.authenticated,
@@ -910,23 +910,31 @@ async function negotiateCapabilities(): Promise<void> {
 // ──────────────────────────────────────────────────────────────────────
 
 type ActionGuard =
-  | { verdict: "pass" }
-  | { verdict: "reject"; reason: string; ruleIds: string[]; guardVerdict: GuardValidateResult }
-  | { verdict: "unavailable"; message: string };
+  | { verdict: 'pass' }
+  | {
+      verdict: 'reject'
+      reason: string
+      ruleIds: string[]
+      guardVerdict: GuardValidateResult
+    }
+  | { verdict: 'unavailable'; message: string }
 
 /** Run the Zero-Action Start guard for one mutating action. Never throws:
  *  wrapFileOp maps the verdict to a FileOpResult (preserving its log lines),
  *  and the CLI runner entry point maps it to a hook decision. */
-async function runActionGuard(actionType: string, payload: string): Promise<ActionGuard> {
+async function runActionGuard(
+  actionType: string,
+  payload: string
+): Promise<ActionGuard> {
   if (!config.strictMode) {
-    mutationsSinceNote++;
-    return { verdict: "pass" };
+    mutationsSinceNote++
+    return { verdict: 'pass' }
   }
-  const cwd = process.cwd();
+  const cwd = process.cwd()
   try {
-    const text = await mcpClient.callTool("neurostrata_guard_validate", {
+    const text = await mcpClient.callTool('neurostrata_guard_validate', {
       namespace: config.namespace,
-      session_id: activeSessionId ?? "unknown",
+      session_id: activeSessionId ?? 'unknown',
       active_task_id: activeTaskId,
       worktree: cwd,
       action_type: actionType,
@@ -934,60 +942,68 @@ async function runActionGuard(actionType: string, payload: string): Promise<Acti
       cwd,
       is_mutating: true,
       use_sandbox: false,
-      mutations_since_note: mutationsSinceNote,
-    });
-    const result = parseGuardValidate(text);
-    if (result.verdict === "reject") {
+      mutations_since_note: mutationsSinceNote
+    })
+    const result = parseGuardValidate(text)
+    if (result.verdict === 'reject') {
       const reason =
-        result.reasons.join("; ") ||
-        result.constraints.join("; ") ||
-        result.bucket;
-      return { verdict: "reject", reason, ruleIds: result.rule_ids, guardVerdict: result };
+        result.reasons.join('; ') ||
+        result.constraints.join('; ') ||
+        result.bucket
+      return {
+        verdict: 'reject',
+        reason,
+        ruleIds: result.rule_ids,
+        guardVerdict: result
+      }
     }
   } catch (err: unknown) {
-    return { verdict: "unavailable", message: String(err) };
+    return { verdict: 'unavailable', message: String(err) }
   }
-  mutationsSinceNote++;
-  return { verdict: "pass" };
+  mutationsSinceNote++
+  return { verdict: 'pass' }
 }
 
 /** Runner event tool names that map onto OpenClaw's native FileOperation. */
-const OPENCLAW_FILE_OP_TOOLS: Record<string, FileOperation["type"]> = {
-  write_file: "write",
-  write: "write",
-  edit: "edit",
-  patch_file: "edit",
-  delete: "delete",
-  mkdir: "mkdir",
-};
+const OPENCLAW_FILE_OP_TOOLS: Record<string, FileOperation['type']> = {
+  write_file: 'write',
+  write: 'write',
+  edit: 'edit',
+  patch_file: 'edit',
+  delete: 'delete',
+  mkdir: 'mkdir'
+}
 
 /** Runner event tool names that are mutating shells. */
-const OPENCLAW_SHELL_TOOLS = ["terminal", "bash", "shell", "command"];
+const OPENCLAW_SHELL_TOOLS = ['terminal', 'bash', 'shell', 'command']
 
 const guardToHookResponse = (guard: ActionGuard): Record<string, unknown> => {
-  if (guard.verdict === "reject") {
+  if (guard.verdict === 'reject') {
     return {
       hookSpecificOutput: {
-        hookEventName: "PreToolUse",
-        permissionDecision: "deny",
-        permissionDecisionReason: `Zero-Action Start violation: ${guard.reason}`,
-      },
-    };
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'deny',
+        permissionDecisionReason: `Zero-Action Start violation: ${guard.reason}`
+      }
+    }
   }
-  if (guard.verdict === "unavailable") {
+  if (guard.verdict === 'unavailable') {
     return {
       hookSpecificOutput: {
-        hookEventName: "PreToolUse",
-        permissionDecision: "deny",
-        permissionDecisionReason: `Guard validation unavailable (NeuroStrata core degraded): ${guard.message}`,
-      },
-    };
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'deny',
+        permissionDecisionReason: `Guard validation unavailable (NeuroStrata core degraded): ${guard.message}`
+      }
+    }
   }
   return {
     continue: true,
-    hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow" },
-  };
-};
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'allow'
+    }
+  }
+}
 
 /**
  * CLI hook runner entry point. The daemon installs hook-runner.mjs beside
@@ -1001,53 +1017,60 @@ export async function handleHookEvent(
   event: Record<string, unknown>
 ): Promise<Record<string, unknown>> {
   if (!mcpClient) {
-    config = resolveConfig({});
-    const token = loadDaemonToken(config.tokenFile);
+    config = resolveConfig({})
+    const token = loadDaemonToken(config.tokenFile)
     mcpClient = new NeuroStrataMCPClient({
       endpoint: config.endpoint,
       token,
-      timeoutMs: config.requestTimeoutMs,
-    });
+      timeoutMs: config.requestTimeoutMs
+    })
   }
   const hookEventName =
-    asString(event.hook_event_name) ?? asString(event.eventName) ?? "PreToolUse";
-  const toolName = asString(event.tool_name) ?? asString(event.toolName) ?? "";
-  const rawInput = event.tool_input ?? event.input ?? event.args ?? {};
+    asString(event.hook_event_name) ?? asString(event.eventName) ?? 'PreToolUse'
+  const toolName = asString(event.tool_name) ?? asString(event.toolName) ?? ''
+  const rawInput = event.tool_input ?? event.input ?? event.args ?? {}
   const toolInput =
-    rawInput && typeof rawInput === "object" ? (rawInput as Record<string, unknown>) : {};
+    rawInput && typeof rawInput === 'object'
+      ? (rawInput as Record<string, unknown>)
+      : {}
 
-  if (hookEventName !== "PreToolUse") {
+  if (hookEventName !== 'PreToolUse') {
     // Stop turns carry the transcript; the daemon's CLI runner dispatches
     // here before its own onTurnEnd fallback, so forward it ourselves or
     // task-intent detection never runs for runner-carried Stop events
     // (Codex review #326).
-    if (hookEventName === "Stop" && typeof event.transcript === "string") {
+    if (hookEventName === 'Stop' && typeof event.transcript === 'string') {
       try {
-        await onTurnEnd({ role: "assistant", content: event.transcript });
+        await onTurnEnd({ role: 'assistant', content: event.transcript })
       } catch {
         // turn-end handling is fail-soft for the runner
       }
     }
-    return { continue: true };
+    return { continue: true }
   }
 
-  const fileOpType = OPENCLAW_FILE_OP_TOOLS[toolName];
+  const fileOpType = OPENCLAW_FILE_OP_TOOLS[toolName]
   if (fileOpType) {
     const payload = JSON.stringify({
-      path: asString(toolInput.path) ?? asString(toolInput.filePath) ?? "",
+      path: asString(toolInput.path) ?? asString(toolInput.filePath) ?? '',
       content: asString(toolInput.content),
       oldContent: asString(toolInput.oldContent),
-      newContent: asString(toolInput.newContent),
-    });
-    return guardToHookResponse(await runActionGuard(fileOpType, payload));
+      newContent: asString(toolInput.newContent)
+    })
+    return guardToHookResponse(await runActionGuard(fileOpType, payload))
   }
   if (OPENCLAW_SHELL_TOOLS.includes(toolName)) {
-    return guardToHookResponse(await runActionGuard(toolName, JSON.stringify(toolInput)));
+    return guardToHookResponse(
+      await runActionGuard(toolName, JSON.stringify(toolInput))
+    )
   }
   return {
     continue: true,
-    hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow" },
-  };
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'allow'
+    }
+  }
 }
 
 async function wrapFileOp(op: FileOperation): Promise<FileOpResult> {
@@ -1081,40 +1104,42 @@ async function wrapFileOp(op: FileOperation): Promise<FileOpResult> {
     path: op.path,
     content: op.content,
     oldContent: op.oldContent,
-    newContent: op.newContent,
-  });
-  const guard = await runActionGuard(actionType, payload);
-  if (guard.verdict === "reject") {
-    requireCtx().logger.warn("Guard rejected file operation", {
+    newContent: op.newContent
+  })
+  const guard = await runActionGuard(actionType, payload)
+  if (guard.verdict === 'reject') {
+    requireCtx().logger.warn('Guard rejected file operation', {
       actionType,
-      session_id: activeSessionId ?? "unknown",
+      session_id: activeSessionId ?? 'unknown',
       active_task_id: activeTaskId,
       worktree: process.cwd(),
       reason: guard.reason,
-      rule_ids: guard.ruleIds,
-    });
+      rule_ids: guard.ruleIds
+    })
     return {
       allowed: false,
       reason: `Zero-Action Start violation: ${guard.reason}`,
       guardVerdict: guard.guardVerdict,
-      degraded: false,
-    };
+      degraded: false
+    }
   }
-  if (guard.verdict === "unavailable") {
-    setStatus({ state: "unavailable", lastError: guard.message });
-    requireCtx().logger.error("Guard validation failed", { error: guard.message });
+  if (guard.verdict === 'unavailable') {
+    setStatus({ state: 'unavailable', lastError: guard.message })
+    requireCtx().logger.error('Guard validation failed', {
+      error: guard.message
+    })
     // Fail closed: a guard that cannot answer is not a guard that passed.
     return {
       allowed: false,
       reason: `Guard validation unavailable (NeuroStrata core degraded): ${guard.message}`,
-      degraded: true,
-    };
+      degraded: true
+    }
   }
 
   // Allowed: the operation executes, so it counts as a mutation. The count
   // happens inside runActionGuard (shared with the runner entry point);
   // counting again here would double every strict-pass (Codex review #326).
-  return { allowed: true };
+  return { allowed: true }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1150,21 +1175,6 @@ async function onTurnEnd(turn: ConversationTurn): Promise<void> {
 // resolver, the wire helpers, the verdict parser and the adapter status are
 // the contract the adapter tests exercise.
 // ──────────────────────────────────────────────────────────────────────
-
-// The published d.ts declares a default export; keep the JS bundle in sync
-// so consumers doing `import plugin from "@neurostrata/openclaw-plugin"`
-// do not hit a link-time SyntaxError.
-export async function handleHookEvent(
-  input: Record<string, unknown> = {}
-): Promise<Record<string, unknown>> {
-  return {
-    continue: true,
-    hookSpecificOutput: {
-      hookEventName: asString(input.hook_event_name) ?? 'PreToolUse',
-      permissionDecision: 'allow'
-    }
-  }
-}
 
 export default {
   id: 'neurostrata-openclaw',

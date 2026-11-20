@@ -138,7 +138,6 @@ export declare function fetchContextPlan(opts: {
     max_bytes?: number;
     format?: 'json' | 'text';
 }): Promise<string>;
-export declare function handleHookEvent(input: any): Promise<Record<string, unknown>>;
 export declare const handleClaudeHookEvent: typeof handleHookEvent;
 declare const _default: {
     id: string;

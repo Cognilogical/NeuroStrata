@@ -402,32 +402,16 @@ export const SUBAGENT_CONTEXT_MARKER = '### NeuroStrata Task & Graph Context';
 export function sanitizeSubagentHeaderToken(value) {
     return String(value ?? '').replace(/[^A-Za-z0-9_.:-]/g, '');
 }
-// ──────────────────────────────────────────────────────────────────────
-// Subagent prompt injection (Enhancement 2 & 3)
-// ──────────────────────────────────────────────────────────────────────
-export const SUBAGENT_CONTEXT_MARKER = "### NeuroStrata Task & Graph Context";
 /** Collapse backticks and newlines so a caller-supplied value cannot break
  *  out of the header's code span (issue #316: the namespace can arrive from
  *  a committed .NeuroStrata/session_queries.json). */
 function codeSpanValue(value) {
-    return String(value ?? "").replace(/[`\r\n]+/g, " ");
+    return String(value ?? '').replace(/[`\r\n]+/g, ' ');
 }
 export function buildSubagentContextHeader(namespace, taskId) {
-    const taskLabel = taskId ?? "unclaimed (claim a task first)";
-    const extra = extraContext && extraContext.trim() ? `\n${extraContext.trim()}\n` : "";
-    let lookupRule;
-    if (isReadOnlySubagentAgent(options?.agentId)) {
-        lookupRule =
-            "- Read-Only Subagent: no NeuroStrata MCP mutation tools are available; skip the graph-lookup and task_update directives (review/edit tools only).\n";
-    }
-    else if (options?.codeMode === true) {
-        lookupRule =
-            "- Mandatory Graph-First Lookup Rule: Before editing any file, check whether its path and governing memory IDs (`mem-...`) are already listed in the auto-injected context block in your prompt. For any file you touch that is NOT listed, call `tools.neurostrata.memories_for_file` (and `tools.neurostrata.task_update` after notes) via the `execute` tool, not bare MCP tool names.\n";
-    }
-    else {
-        lookupRule =
-            "- Mandatory Graph-First Lookup Rule: Before editing any file, check whether its path and governing memory IDs (`mem-...`) are already listed in the auto-injected context block in your prompt. For any file you touch that is NOT listed in that block, call `neurostrata_memories_for_file` first (or `neurostrata_search_memory` / `neurostrata_related`).\n";
-    }
+    const taskLabel = taskId ?? 'unclaimed (claim a task first)';
+    const safeNamespace = sanitizeSubagentHeaderToken(namespace);
+    const safeTaskLabel = taskId === null ? taskLabel : sanitizeSubagentHeaderToken(taskLabel);
     return (`${SUBAGENT_CONTEXT_MARKER} (AUTO-INJECTED BY NEUROSTRATA PLUGIN)\n` +
         `- Namespace: \`${codeSpanValue(namespace)}\` | Active Task ID: \`${codeSpanValue(taskLabel)}\`\n` +
         `- Mandatory Graph-First Lookup Rule: Before blind \`grep\`/\`glob\` or editing files, query \`neurostrata_memories_for_file\`, \`neurostrata_related\`, \`neurostrata_search_memory\` (\`include_related: true\`), or \`neurostrata_sparql_query\` (or \`neurostrata-mcp\` CLI) to inspect governing rules (\`GOVERNS\`) and AST call/import edges (\`DEPENDS_ON\`, \`calls\`, \`imports\`).\n\n`);
@@ -560,15 +544,7 @@ export async function initialize(ctx) {
             }
         }
         // Guard validation on mutating Hermes Agent tools
-        const hermesMutatingTools = [
-            'write_file',
-            'write',
-            'patch_file',
-            'edit',
-            'terminal',
-            'bash'
-        ];
-        if (hermesMutatingTools.includes(toolName)) {
+        if (HERMES_MUTATING_TOOLS.includes(toolName)) {
             const call = {
                 name: toolName,
                 args: firstRecord(input?.input, input?.args),
@@ -577,56 +553,18 @@ export async function initialize(ctx) {
                     activeSessionId ??
                     undefined
             };
-            if (!config.strictMode) {
-                mutationsSinceNote++;
-                return;
+            const guard = await runMutatingToolGuard(call);
+            if (guard.verdict === 'reject') {
+                console.warn('[NeuroStrata] Guard rejected mutating tool', guard.log);
+                throw new Error(`Zero-Action Start violation: ${guard.reason}`);
             }
-            const actionType = toolName;
-            const payload = JSON.stringify(call.args);
-            const cwd = process.cwd();
-            const { session_id, active_task_id, worktree } = callState(call);
-            try {
-                const text = await mcpClient.callTool('neurostrata_guard_validate', {
-                    namespace: config.namespace,
-                    session_id,
-                    active_task_id,
-                    worktree,
-                    action_type: actionType,
-                    payload,
-                    cwd,
-                    is_mutating: true,
-                    use_sandbox: false,
-                    mutations_since_note: mutationsSinceNote
-                });
-                const result = parseGuardValidate(text);
-                if (result.verdict === 'reject') {
-                    const reason = result.reasons.join('; ') ||
-                        result.constraints.join('; ') ||
-                        result.bucket;
-                    console.warn('[NeuroStrata] Guard rejected mutating tool', {
-                        actionType,
-                        session_id,
-                        active_task_id,
-                        worktree,
-                        reason,
-                        rule_ids: result.rule_ids
-                    });
-                    throw new Error(`Zero-Action Start violation: ${reason}`);
-                }
-            }
-            catch (err) {
-                const message = String(err);
-                if (message.includes('Zero-Action Start violation:') ||
-                    message.includes('Guard rejected')) {
-                    throw err;
-                }
-                setStatus({ state: 'unavailable', lastError: message });
+            if (guard.verdict === 'unavailable') {
+                setStatus({ state: 'unavailable', lastError: guard.message });
                 console.error('[NeuroStrata] Guard validation failed', {
-                    error: message
+                    error: guard.message
                 });
-                throw new Error(`Guard validation unavailable (NeuroStrata core degraded): ${message}`);
+                throw new Error(`Guard validation unavailable (NeuroStrata core degraded): ${guard.message}`);
             }
-            mutationsSinceNote++;
         }
     }
     await ctx?.tool?.hook?.('execute.before', runBeforeTool);
@@ -647,75 +585,6 @@ export async function initialize(ctx) {
                 injectSubagentPrompt(input.input, config.namespace, activeTaskId);
             }
             if (input?.args && typeof input.args === 'object') {
-                injectSubagentPrompt(input.args, config.namespace, activeTaskId);
-            }
-        }
-    });
-    const registerHook = async (name, handler) => {
-        if (ctx?.tool?.hook && typeof ctx.tool.hook === "function") {
-            await ctx.tool.hook(name, handler);
-        }
-        else if (ctx?.hooks && typeof ctx.hooks[name] === "function") {
-            await ctx.hooks[name](handler);
-        }
-        // Session/task tracking
-        const mutationTools = [
-            "neurostrata_task_claim",
-            "neurostrata_task_update",
-            "neurostrata_task_complete",
-        ];
-        if (mutationTools.includes(toolName)) {
-            const payloadArgs = firstRecord(input?.input, input?.args);
-            const sessionId = asString(payloadArgs.session_id) ??
-                asString(input?.session_id) ??
-                asString(input?.sessionID);
-            if (sessionId)
-                activeSessionId = sessionId;
-            const taskId = asString(payloadArgs.id);
-            if (toolName === "neurostrata_task_claim" ||
-                toolName === "neurostrata_task_complete" ||
-                payloadArgs.note !== undefined) {
-                mutationsSinceNote = 0;
-            }
-            if (toolName === "neurostrata_task_complete") {
-                activeTaskId = null;
-            }
-            else if (taskId) {
-                activeTaskId = taskId;
-            }
-        }
-        // Guard validation on mutating Hermes Agent tools
-        if (HERMES_MUTATING_TOOLS.includes(toolName)) {
-            const call = {
-                name: toolName,
-                args: firstRecord(input?.input, input?.args),
-                session_id: asString(input?.session_id) ??
-                    asString(input?.sessionID) ??
-                    activeSessionId ??
-                    undefined,
-            };
-            const guard = await runMutatingToolGuard(call);
-            if (guard.verdict === "reject") {
-                console.warn("[NeuroStrata] Guard rejected mutating tool", guard.log);
-                throw new Error(`Zero-Action Start violation: ${guard.reason}`);
-            }
-            if (guard.verdict === "unavailable") {
-                setStatus({ state: "unavailable", lastError: guard.message });
-                console.error("[NeuroStrata] Guard validation failed", { error: guard.message });
-                throw new Error(`Guard validation unavailable (NeuroStrata core degraded): ${guard.message}`);
-            }
-        }
-    });
-    // Also register via ctx?.hooks?.beforeToolCall?.(function) if available
-    await ctx?.hooks?.beforeToolCall?.(async (input) => {
-        // Subagent injection via alternative hook interface
-        const subagentNames = ["delegate_task", "subagent", "Task", "task", "dispatch_agent"];
-        const toolName = input?.tool ?? input?.name ?? input?.action ?? input?.command ?? "";
-        if (subagentNames.includes(toolName)) {
-            if (input?.input && typeof input.input === "object") {
-                injectSubagentPrompt(input.input, config.namespace, activeTaskId);
-            }
-            if (input?.args && typeof input.args === "object") {
                 injectSubagentPrompt(input.args, config.namespace, activeTaskId);
             }
         }
@@ -773,21 +642,28 @@ export async function onTurnEnd(turn) {
 }
 // Hermes Agent tools that mutate state and therefore require the guard.
 // Shared by the native execute.before hook and the CLI runner entry point.
-const HERMES_MUTATING_TOOLS = ["write_file", "write", "patch_file", "edit", "terminal", "bash"];
+const HERMES_MUTATING_TOOLS = [
+    'write_file',
+    'write',
+    'patch_file',
+    'edit',
+    'terminal',
+    'bash'
+];
 /** Run the Zero-Action Start guard for a mutating tool call. Never throws:
  *  the native hook throws on the returned verdict (preserving its log lines),
  *  while the CLI runner entry point maps it to a deny decision instead. */
 async function runMutatingToolGuard(call) {
     if (!config.strictMode) {
         mutationsSinceNote++;
-        return { verdict: "pass" };
+        return { verdict: 'pass' };
     }
     const actionType = call.name;
     const payload = JSON.stringify(call.args);
     const cwd = process.cwd();
     const { session_id, active_task_id, worktree } = callState(call);
     try {
-        const text = await mcpClient.callTool("neurostrata_guard_validate", {
+        const text = await mcpClient.callTool('neurostrata_guard_validate', {
             namespace: config.namespace,
             session_id,
             active_task_id,
@@ -797,28 +673,41 @@ async function runMutatingToolGuard(call) {
             cwd,
             is_mutating: true,
             use_sandbox: false,
-            mutations_since_note: mutationsSinceNote,
+            mutations_since_note: mutationsSinceNote
         });
         const result = parseGuardValidate(text);
-        if (result.verdict === "reject") {
-            const reason = result.reasons.join("; ") || result.constraints.join("; ") || result.bucket;
+        if (result.verdict === 'reject') {
+            const reason = result.reasons.join('; ') ||
+                result.constraints.join('; ') ||
+                result.bucket;
             return {
-                verdict: "reject",
+                verdict: 'reject',
                 reason,
-                log: { actionType, session_id, active_task_id, worktree, reason, rule_ids: result.rule_ids },
+                log: {
+                    actionType,
+                    session_id,
+                    active_task_id,
+                    worktree,
+                    reason,
+                    rule_ids: result.rule_ids
+                }
             };
         }
     }
     catch (err) {
         const message = String(err);
-        if (message.includes("Zero-Action Start violation:") ||
-            message.includes("Guard rejected")) {
-            return { verdict: "reject", reason: message, log: { actionType, error: message } };
+        if (message.includes('Zero-Action Start violation:') ||
+            message.includes('Guard rejected')) {
+            return {
+                verdict: 'reject',
+                reason: message,
+                log: { actionType, error: message }
+            };
         }
-        return { verdict: "unavailable", message };
+        return { verdict: 'unavailable', message };
     }
     mutationsSinceNote++;
-    return { verdict: "pass" };
+    return { verdict: 'pass' };
 }
 /**
  * CLI hook runner entry point. The daemon installs hook-runner.mjs beside
@@ -835,20 +724,20 @@ export async function handleHookEvent(event) {
         mcpClient = new NeuroStrataMCPClient({
             endpoint: config.endpoint,
             token,
-            timeoutMs: config.requestTimeoutMs,
+            timeoutMs: config.requestTimeoutMs
         });
     }
-    const hookEventName = asString(event.hook_event_name) ?? asString(event.eventName) ?? "PreToolUse";
-    const toolName = asString(event.tool_name) ?? asString(event.toolName) ?? "";
+    const hookEventName = asString(event.hook_event_name) ?? asString(event.eventName) ?? 'PreToolUse';
+    const toolName = asString(event.tool_name) ?? asString(event.toolName) ?? '';
     const toolInput = firstRecord(event.tool_input ?? event.input ?? event.args ?? {});
-    if (hookEventName !== "PreToolUse") {
+    if (hookEventName !== 'PreToolUse') {
         // Stop turns carry the transcript; the daemon's CLI runner dispatches
         // here before its own onTurnEnd fallback, so forward it ourselves or
         // task-intent detection never runs for runner-carried Stop events
         // (Codex review #326).
-        if (hookEventName === "Stop" && typeof event.transcript === "string") {
+        if (hookEventName === 'Stop' && typeof event.transcript === 'string') {
             try {
-                await onTurnEnd({ role: "assistant", content: event.transcript });
+                await onTurnEnd({ role: 'assistant', content: event.transcript });
             }
             catch {
                 // turn-end handling is fail-soft for the runner
@@ -860,51 +749,40 @@ export async function handleHookEvent(event) {
         const call = {
             name: toolName,
             args: toolInput,
-            session_id: asString(event.session_id) ?? activeSessionId ?? undefined,
+            session_id: asString(event.session_id) ?? activeSessionId ?? undefined
         };
         const guard = await runMutatingToolGuard(call);
-        if (guard.verdict === "reject") {
+        if (guard.verdict === 'reject') {
             return {
                 hookSpecificOutput: {
-                    hookEventName: "PreToolUse",
-                    permissionDecision: "deny",
-                    permissionDecisionReason: `Zero-Action Start violation: ${guard.reason}`,
-                },
+                    hookEventName: 'PreToolUse',
+                    permissionDecision: 'deny',
+                    permissionDecisionReason: `Zero-Action Start violation: ${guard.reason}`
+                }
             };
         }
-        if (guard.verdict === "unavailable") {
+        if (guard.verdict === 'unavailable') {
             return {
                 hookSpecificOutput: {
-                    hookEventName: "PreToolUse",
-                    permissionDecision: "deny",
-                    permissionDecisionReason: `Guard validation unavailable (NeuroStrata core degraded): ${guard.message}`,
-                },
+                    hookEventName: 'PreToolUse',
+                    permissionDecision: 'deny',
+                    permissionDecisionReason: `Guard validation unavailable (NeuroStrata core degraded): ${guard.message}`
+                }
             };
         }
     }
     return {
         continue: true,
-        hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow" },
+        hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            permissionDecision: 'allow'
+        }
     };
 }
 export async function fetchContextPlan(opts) {
     if (!mcpClient)
         throw new Error('NeuroStrata MCP client not initialized');
     return await mcpClient.callTool('neurostrata_context_plan', opts);
-}
-export async function handleHookEvent(input) {
-    if (!hermesBeforeToolHandler) {
-        await initialize({
-            config: { namespace: process.env.NEUROSTRATA_NAMESPACE }
-        });
-    }
-    const normalized = {
-        ...input,
-        tool: input?.tool ?? input?.tool_name ?? input?.name,
-        input: input?.input ?? input?.tool_input ?? input?.args ?? {}
-    };
-    await hermesBeforeToolHandler(normalized);
-    return { continue: true };
 }
 export const handleClaudeHookEvent = handleHookEvent;
 export default {

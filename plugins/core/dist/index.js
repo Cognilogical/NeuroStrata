@@ -65,6 +65,10 @@ function asNumber(value) {
 function asBoolean(value) {
     return typeof value === 'boolean' ? value : undefined;
 }
+/** Allowlist namespace/task tokens before code-span interpolation (#316). */
+export function sanitizeSubagentHeaderToken(value) {
+    return String(value ?? '').replace(/[^A-Za-z0-9_.:-]/g, '');
+}
 /**
  * Resolve `namespace` in strict priority order:
  *  1. pluginConfig.namespace (non-empty trimmed string)
@@ -1486,9 +1490,6 @@ export function detectCodeMode(ctx, cfg) {
         harness.includes('code-mode') ||
         harness.includes('codemode'));
 }
-export function sanitizeSubagentHeaderToken(value) {
-    return String(value ?? '').replace(/[^A-Za-z0-9_.:-]/g, '');
-}
 /**
  * Render a value inside a markdown backtick code span without allowing a
  * breakout: backticks close the span and newlines end its line, so both are
@@ -1498,11 +1499,13 @@ export function sanitizeSubagentHeaderToken(value) {
  * here (issue #316).
  */
 export function markdownCodeSpanValue(value) {
-    return String(value ?? "").replace(/[`\r\n]+/g, " ");
+    return String(value ?? '').replace(/[`\r\n]+/g, ' ');
 }
 function buildSubagentContextHeaderInternal(namespace, taskId, extraContext, options) {
-    const taskLabel = taskId ?? "unclaimed (claim a task first)";
-    const extra = extraContext && extraContext.trim() ? `\n${extraContext.trim()}\n` : "";
+    const taskLabel = taskId ?? 'unclaimed (claim a task first)';
+    const safeNamespace = sanitizeSubagentHeaderToken(namespace);
+    const safeTaskLabel = taskId === null ? taskLabel : sanitizeSubagentHeaderToken(taskLabel);
+    const extra = extraContext && extraContext.trim() ? `\n${extraContext.trim()}\n` : '';
     let lookupRule;
     if (isReadOnlySubagentAgent(options?.agentId)) {
         lookupRule =
@@ -1946,7 +1949,7 @@ export async function sessionContextHandler(event, config) {
         const ns = asString(active.namespace) ?? config.namespace;
         const parts = [];
         if (taskId) {
-            const status = asString(active.status) ?? "";
+            const status = asString(active.status) ?? '';
             parts.push(`[NeuroStrata Active Context] Namespace: ${markdownCodeSpanValue(ns)} | Active Task: ${markdownCodeSpanValue(taskId)} [${markdownCodeSpanValue(status)}]`);
         }
         if (goldenRules.length > 0) {
@@ -2202,7 +2205,7 @@ const executeAfterHandler = async (output, secondArg) => {
     // 2. Task-intent nudge on non-NeuroStrata-native tools. Read-only
     //  inspection output is not user or assistant speech, so it never nudges
     //  either (issue #311): the reminder shares the intake gate.
-    if (toolName !== "" &&
+    if (toolName !== '' &&
         !NEUROSTRATA_NATIVE_TOOLS.has(toolName) &&
         !isReadOnlyInspectionTool(toolName) &&
         config.intentDetection.injectReminder) {

@@ -34,6 +34,8 @@ export interface PluginConfig {
 }
 /** Alias kept for readability in handler signatures (event, config: ResolvedConfig). */
 export type ResolvedConfig = PluginConfig;
+/** Allowlist namespace/task tokens before code-span interpolation (#316). */
+export declare function sanitizeSubagentHeaderToken(value: string): string;
 /**
  * Resolve `namespace` in strict priority order:
  *  1. pluginConfig.namespace (non-empty trimmed string)

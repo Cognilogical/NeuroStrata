@@ -532,32 +532,16 @@ export const SUBAGENT_CONTEXT_MARKER = '### NeuroStrata Task & Graph Context';
 export function sanitizeSubagentHeaderToken(value) {
     return String(value ?? '').replace(/[^A-Za-z0-9_.:-]/g, '');
 }
-// ──────────────────────────────────────────────────────────────────────
-// Subagent prompt injection (Enhancement 2 & 3)
-// ──────────────────────────────────────────────────────────────────────
-export const SUBAGENT_CONTEXT_MARKER = "### NeuroStrata Task & Graph Context";
 /** Collapse backticks and newlines so a caller-supplied value cannot break
  *  out of the header's code span (issue #316: the namespace can arrive from
  *  a committed .NeuroStrata/session_queries.json). */
 function codeSpanValue(value) {
-    return String(value ?? "").replace(/[`\r\n]+/g, " ");
+    return String(value ?? '').replace(/[`\r\n]+/g, ' ');
 }
 export function buildSubagentContextHeader(namespace, taskId) {
-    const taskLabel = taskId ?? "unclaimed (claim a task first)";
-    const extra = extraContext && extraContext.trim() ? `\n${extraContext.trim()}\n` : "";
-    let lookupRule;
-    if (isReadOnlySubagentAgent(options?.agentId)) {
-        lookupRule =
-            "- Read-Only Subagent: no NeuroStrata MCP mutation tools are available; skip the graph-lookup and task_update directives (review/edit tools only).\n";
-    }
-    else if (options?.codeMode === true) {
-        lookupRule =
-            "- Mandatory Graph-First Lookup Rule: Before editing any file, check whether its path and governing memory IDs (`mem-...`) are already listed in the auto-injected context block in your prompt. For any file you touch that is NOT listed, call `tools.neurostrata.memories_for_file` (and `tools.neurostrata.task_update` after notes) via the `execute` tool, not bare MCP tool names.\n";
-    }
-    else {
-        lookupRule =
-            "- Mandatory Graph-First Lookup Rule: Before editing any file, check whether its path and governing memory IDs (`mem-...`) are already listed in the auto-injected context block in your prompt. For any file you touch that is NOT listed in that block, call `neurostrata_memories_for_file` first (or `neurostrata_search_memory` / `neurostrata_related`).\n";
-    }
+    const taskLabel = taskId ?? 'unclaimed (claim a task first)';
+    const safeNamespace = sanitizeSubagentHeaderToken(namespace);
+    const safeTaskLabel = taskId === null ? taskLabel : sanitizeSubagentHeaderToken(taskLabel);
     return (`${SUBAGENT_CONTEXT_MARKER} (AUTO-INJECTED BY NEUROSTRATA PLUGIN)\n` +
         `- Namespace: \`${codeSpanValue(namespace)}\` | Active Task ID: \`${codeSpanValue(taskLabel)}\`\n` +
         `- Mandatory Graph-First Lookup Rule: Before blind \`grep\`/\`glob\` or editing files, query \`neurostrata_memories_for_file\`, \`neurostrata_related\`, \`neurostrata_search_memory\` (\`include_related: true\`), or \`neurostrata_sparql_query\` (or \`neurostrata-mcp\` CLI) to inspect governing rules (\`GOVERNS\`) and AST call/import edges (\`DEPENDS_ON\`, \`calls\`, \`imports\`).\n\n`);
@@ -612,7 +596,7 @@ export async function initialize(ctx) {
     // Register turn hook for intent detection
     ctx?.hooks?.onTurnEnd?.(onTurnEnd);
     await negotiateCapabilities();
-    ctx?.logger?.info?.("NeuroStrata OpenClaw plugin initialized", {
+    ctx?.logger?.info?.('NeuroStrata OpenClaw plugin initialized', {
         namespace: config.namespace,
         endpoint: config.endpoint,
         authenticated: status.authenticated,
@@ -655,13 +639,13 @@ async function negotiateCapabilities() {
 async function runActionGuard(actionType, payload) {
     if (!config.strictMode) {
         mutationsSinceNote++;
-        return { verdict: "pass" };
+        return { verdict: 'pass' };
     }
     const cwd = process.cwd();
     try {
-        const text = await mcpClient.callTool("neurostrata_guard_validate", {
+        const text = await mcpClient.callTool('neurostrata_guard_validate', {
             namespace: config.namespace,
-            session_id: activeSessionId ?? "unknown",
+            session_id: activeSessionId ?? 'unknown',
             active_task_id: activeTaskId,
             worktree: cwd,
             action_type: actionType,
@@ -669,55 +653,63 @@ async function runActionGuard(actionType, payload) {
             cwd,
             is_mutating: true,
             use_sandbox: false,
-            mutations_since_note: mutationsSinceNote,
+            mutations_since_note: mutationsSinceNote
         });
         const result = parseGuardValidate(text);
-        if (result.verdict === "reject") {
-            const reason = result.reasons.join("; ") ||
-                result.constraints.join("; ") ||
+        if (result.verdict === 'reject') {
+            const reason = result.reasons.join('; ') ||
+                result.constraints.join('; ') ||
                 result.bucket;
-            return { verdict: "reject", reason, ruleIds: result.rule_ids, guardVerdict: result };
+            return {
+                verdict: 'reject',
+                reason,
+                ruleIds: result.rule_ids,
+                guardVerdict: result
+            };
         }
     }
     catch (err) {
-        return { verdict: "unavailable", message: String(err) };
+        return { verdict: 'unavailable', message: String(err) };
     }
     mutationsSinceNote++;
-    return { verdict: "pass" };
+    return { verdict: 'pass' };
 }
 /** Runner event tool names that map onto OpenClaw's native FileOperation. */
 const OPENCLAW_FILE_OP_TOOLS = {
-    write_file: "write",
-    write: "write",
-    edit: "edit",
-    patch_file: "edit",
-    delete: "delete",
-    mkdir: "mkdir",
+    write_file: 'write',
+    write: 'write',
+    edit: 'edit',
+    patch_file: 'edit',
+    delete: 'delete',
+    mkdir: 'mkdir'
 };
 /** Runner event tool names that are mutating shells. */
-const OPENCLAW_SHELL_TOOLS = ["terminal", "bash", "shell", "command"];
+const OPENCLAW_SHELL_TOOLS = ['terminal', 'bash', 'shell', 'command'];
 const guardToHookResponse = (guard) => {
-    if (guard.verdict === "reject") {
+    if (guard.verdict === 'reject') {
         return {
             hookSpecificOutput: {
-                hookEventName: "PreToolUse",
-                permissionDecision: "deny",
-                permissionDecisionReason: `Zero-Action Start violation: ${guard.reason}`,
-            },
+                hookEventName: 'PreToolUse',
+                permissionDecision: 'deny',
+                permissionDecisionReason: `Zero-Action Start violation: ${guard.reason}`
+            }
         };
     }
-    if (guard.verdict === "unavailable") {
+    if (guard.verdict === 'unavailable') {
         return {
             hookSpecificOutput: {
-                hookEventName: "PreToolUse",
-                permissionDecision: "deny",
-                permissionDecisionReason: `Guard validation unavailable (NeuroStrata core degraded): ${guard.message}`,
-            },
+                hookEventName: 'PreToolUse',
+                permissionDecision: 'deny',
+                permissionDecisionReason: `Guard validation unavailable (NeuroStrata core degraded): ${guard.message}`
+            }
         };
     }
     return {
         continue: true,
-        hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow" },
+        hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            permissionDecision: 'allow'
+        }
     };
 };
 /**
@@ -735,21 +727,23 @@ export async function handleHookEvent(event) {
         mcpClient = new NeuroStrataMCPClient({
             endpoint: config.endpoint,
             token,
-            timeoutMs: config.requestTimeoutMs,
+            timeoutMs: config.requestTimeoutMs
         });
     }
-    const hookEventName = asString(event.hook_event_name) ?? asString(event.eventName) ?? "PreToolUse";
-    const toolName = asString(event.tool_name) ?? asString(event.toolName) ?? "";
+    const hookEventName = asString(event.hook_event_name) ?? asString(event.eventName) ?? 'PreToolUse';
+    const toolName = asString(event.tool_name) ?? asString(event.toolName) ?? '';
     const rawInput = event.tool_input ?? event.input ?? event.args ?? {};
-    const toolInput = rawInput && typeof rawInput === "object" ? rawInput : {};
-    if (hookEventName !== "PreToolUse") {
+    const toolInput = rawInput && typeof rawInput === 'object'
+        ? rawInput
+        : {};
+    if (hookEventName !== 'PreToolUse') {
         // Stop turns carry the transcript; the daemon's CLI runner dispatches
         // here before its own onTurnEnd fallback, so forward it ourselves or
         // task-intent detection never runs for runner-carried Stop events
         // (Codex review #326).
-        if (hookEventName === "Stop" && typeof event.transcript === "string") {
+        if (hookEventName === 'Stop' && typeof event.transcript === 'string') {
             try {
-                await onTurnEnd({ role: "assistant", content: event.transcript });
+                await onTurnEnd({ role: 'assistant', content: event.transcript });
             }
             catch {
                 // turn-end handling is fail-soft for the runner
@@ -760,10 +754,10 @@ export async function handleHookEvent(event) {
     const fileOpType = OPENCLAW_FILE_OP_TOOLS[toolName];
     if (fileOpType) {
         const payload = JSON.stringify({
-            path: asString(toolInput.path) ?? asString(toolInput.filePath) ?? "",
+            path: asString(toolInput.path) ?? asString(toolInput.filePath) ?? '',
             content: asString(toolInput.content),
             oldContent: asString(toolInput.oldContent),
-            newContent: asString(toolInput.newContent),
+            newContent: asString(toolInput.newContent)
         });
         return guardToHookResponse(await runActionGuard(fileOpType, payload));
     }
@@ -772,24 +766,27 @@ export async function handleHookEvent(event) {
     }
     return {
         continue: true,
-        hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow" },
+        hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            permissionDecision: 'allow'
+        }
     };
 }
 async function wrapFileOp(op) {
     // File-touch recall (§4.5): before guarding the operation, prefetch the
     // memories governing this file and inject them as a system message.
     // Fail-soft: file recall must never block or break the file operation.
-    if (op.path && op.path.trim() !== "") {
+    if (op.path && op.path.trim() !== '') {
         try {
             const snippets = await prefetchMemoriesForFile(config.namespace, op.path);
             if (snippets.length > 0) {
-                requireCtx().conversation.injectSystemMessage(`[NeuroStrata] Governing memories for ${op.path}:\n${snippets.join("\n")}`);
+                requireCtx().conversation.injectSystemMessage(`[NeuroStrata] Governing memories for ${op.path}:\n${snippets.join('\n')}`);
             }
         }
         catch (err) {
-            requireCtx().logger.warn("File-touch prefetch failed", {
+            requireCtx().logger?.warn('File-touch prefetch failed', {
                 path: op.path,
-                error: String(err),
+                error: String(err)
             });
         }
     }
@@ -803,33 +800,35 @@ async function wrapFileOp(op) {
         path: op.path,
         content: op.content,
         oldContent: op.oldContent,
-        newContent: op.newContent,
+        newContent: op.newContent
     });
     const guard = await runActionGuard(actionType, payload);
-    if (guard.verdict === "reject") {
-        requireCtx().logger.warn("Guard rejected file operation", {
+    if (guard.verdict === 'reject') {
+        requireCtx().logger.warn('Guard rejected file operation', {
             actionType,
-            session_id: activeSessionId ?? "unknown",
+            session_id: activeSessionId ?? 'unknown',
             active_task_id: activeTaskId,
             worktree: process.cwd(),
             reason: guard.reason,
-            rule_ids: guard.ruleIds,
+            rule_ids: guard.ruleIds
         });
         return {
             allowed: false,
             reason: `Zero-Action Start violation: ${guard.reason}`,
             guardVerdict: guard.guardVerdict,
-            degraded: false,
+            degraded: false
         };
     }
-    if (guard.verdict === "unavailable") {
-        setStatus({ state: "unavailable", lastError: guard.message });
-        requireCtx().logger.error("Guard validation failed", { error: guard.message });
+    if (guard.verdict === 'unavailable') {
+        setStatus({ state: 'unavailable', lastError: guard.message });
+        requireCtx().logger.error('Guard validation failed', {
+            error: guard.message
+        });
         // Fail closed: a guard that cannot answer is not a guard that passed.
         return {
             allowed: false,
             reason: `Guard validation unavailable (NeuroStrata core degraded): ${guard.message}`,
-            degraded: true,
+            degraded: true
         };
     }
     // Allowed: the operation executes, so it counts as a mutation. The count
@@ -869,18 +868,6 @@ async function onTurnEnd(turn) {
 // resolver, the wire helpers, the verdict parser and the adapter status are
 // the contract the adapter tests exercise.
 // ──────────────────────────────────────────────────────────────────────
-// The published d.ts declares a default export; keep the JS bundle in sync
-// so consumers doing `import plugin from "@neurostrata/openclaw-plugin"`
-// do not hit a link-time SyntaxError.
-export async function handleHookEvent(input = {}) {
-    return {
-        continue: true,
-        hookSpecificOutput: {
-            hookEventName: asString(input.hook_event_name) ?? 'PreToolUse',
-            permissionDecision: 'allow'
-        }
-    };
-}
 export default {
     id: 'neurostrata-openclaw',
     setup: initialize,

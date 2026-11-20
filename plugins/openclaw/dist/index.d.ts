@@ -233,6 +233,7 @@ export declare function parseFileMemoryHits(text: string): FileMemoryHit[];
  */
 export declare function prefetchMemoriesForFile(namespace: string, filePath: string): Promise<string[]>;
 export declare const SUBAGENT_CONTEXT_MARKER = "### NeuroStrata Task & Graph Context";
+export declare function sanitizeSubagentHeaderToken(value: string): string;
 export declare function buildSubagentContextHeader(namespace: string, taskId: string | null): string;
 export declare function injectSubagentPrompt(target: Record<string, unknown>, namespace: string, taskId: string | null): boolean;
 export declare function initialize(ctx: (Partial<OpenClawPluginContext> & Record<string, unknown>) | undefined): Promise<void>;

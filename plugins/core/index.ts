@@ -97,6 +97,11 @@ function asBoolean(value: unknown): boolean | undefined {
   return typeof value === 'boolean' ? value : undefined
 }
 
+/** Allowlist namespace/task tokens before code-span interpolation (#316). */
+export function sanitizeSubagentHeaderToken(value: string): string {
+  return String(value ?? '').replace(/[^A-Za-z0-9_.:-]/g, '')
+}
+
 /**
  * Resolve `namespace` in strict priority order:
  *  1. pluginConfig.namespace (non-empty trimmed string)
@@ -1819,7 +1824,7 @@ export interface SubagentHeaderOptions {
  * here (issue #316).
  */
 export function markdownCodeSpanValue(value: unknown): string {
-  return String(value ?? "").replace(/[`\r\n]+/g, " ");
+  return String(value ?? '').replace(/[`\r\n]+/g, ' ')
 }
 
 function buildSubagentContextHeaderInternal(
@@ -1862,9 +1867,14 @@ export function buildSubagentContextHeader(
   namespace: string,
   taskId: string | null,
   extraContext?: string,
-  options?: SubagentHeaderOptions,
+  options?: SubagentHeaderOptions
 ): string {
-  return buildSubagentContextHeaderInternal(namespace, taskId, extraContext, options);
+  return buildSubagentContextHeaderInternal(
+    namespace,
+    taskId,
+    extraContext,
+    options
+  )
 }
 
 export function injectSubagentPrompt(
@@ -2375,8 +2385,10 @@ export async function sessionContextHandler(
     const ns = asString(active.namespace) ?? config.namespace
     const parts: string[] = []
     if (taskId) {
-      const status = asString(active.status) ?? "";
-      parts.push(`[NeuroStrata Active Context] Namespace: ${markdownCodeSpanValue(ns)} | Active Task: ${markdownCodeSpanValue(taskId)} [${markdownCodeSpanValue(status)}]`);
+      const status = asString(active.status) ?? ''
+      parts.push(
+        `[NeuroStrata Active Context] Namespace: ${markdownCodeSpanValue(ns)} | Active Task: ${markdownCodeSpanValue(taskId)} [${markdownCodeSpanValue(status)}]`
+      )
     }
     if (goldenRules.length > 0) {
       parts.push(
@@ -2641,7 +2653,7 @@ const executeAfterHandler = async (
   // Resolve the tool name from BOTH arguments (issue #311): in the
   // two-argument (input, output) form Code Mode hosts carry the name on the
   // input argument, while the output argument holds the result text.
-  const toolName = extractToolName(event) || extractToolName(output);
+  const toolName = extractToolName(event) || extractToolName(output)
 
   // OpenCode V2 envelope: { name, callID, args, status, result: { content, output, metadata } }
   // Read raw tool text in priority order. OpenCode v2.2.6 delivers
@@ -2686,12 +2698,12 @@ const executeAfterHandler = async (
   //  inspection output is not user or assistant speech, so it never nudges
   //  either (issue #311): the reminder shares the intake gate.
   if (
-    toolName !== "" &&
+    toolName !== '' &&
     !NEUROSTRATA_NATIVE_TOOLS.has(toolName) &&
     !isReadOnlyInspectionTool(toolName) &&
     config.intentDetection.injectReminder
   ) {
-    const signals = detectTaskIntentsLocal(rawText);
+    const signals = detectTaskIntentsLocal(rawText)
     if (signals.length > 0) {
       const markerList = signals.map((s) => s.marker).join(', ')
       suffixParts.push(
