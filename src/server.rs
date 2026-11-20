@@ -2705,7 +2705,7 @@ async fn handle_context_plan(
                             continue;
                         }
                     };
-                    let marker = lookup_marker(&store, effective_ns, fp).await;
+                    let marker = lookup_marker_forms_only(effective_ns, fp);
                     let (lookup, forms, _) = match lookup_path_with_registry_root(
                         fp,
                         None,
@@ -3190,13 +3190,16 @@ pub async fn start_mcp_proxy(origin: DaemonOrigin) -> io::Result<()> {
 /// when the registered root cannot be read and nothing else constrains an
 /// absolute path (see [`registry_root_for_lookup`]).
 ///
-/// The third element is one line for the reply about the path's project
-/// marker, when there is something to say (see [`LookupMarker`]).
+/// `marker` is the path's project marker ([`lookup_marker`]), looked up by
+/// the caller so a failed lookup can still report its note. The third
+/// element is one line for the reply about the marker, when there is
+/// something to say (see [`LookupMarker`]).
 async fn lookup_path_for(
     store: &Arc<dyn VectorStore>,
     namespace: &str,
     path: &str,
     project_root: Option<&str>,
+    marker: &LookupMarker,
 ) -> anyhow::Result<(crate::paths::LookupPath, Vec<String>, Option<String>)> {
     let registry_root = registry_root_for_lookup(
         crate::registry::cached_project_root(store, namespace).await,
@@ -3204,13 +3207,12 @@ async fn lookup_path_for(
         path,
         project_root,
     )?;
-    let marker = lookup_marker(store, namespace, path).await;
     Ok(lookup_path_with_registry_root(
         path,
         project_root,
         registry_root.as_deref(),
         namespace,
-        &marker,
+        marker,
     )?)
 }
 
@@ -3222,8 +3224,13 @@ async fn lookup_path_for(
 struct LookupMarker {
     found: Option<crate::root_marker::FoundMarker>,
     note: Option<String>,
+    /// A marker file was found for the path, valid or not, so the
+    /// "no marker" hint does not apply.
+    exists: bool,
 }
 
+/// [`LookupMarker`] for a reply that shows its note: the marker's namespace
+/// is matched with [`resolve_namespace`]'s case rules ([`marker_owner`]).
 async fn lookup_marker(store: &Arc<dyn VectorStore>, namespace: &str, path: &str) -> LookupMarker {
     if !crate::paths::is_absolute_any(path) {
         return LookupMarker::default();
@@ -3236,11 +3243,13 @@ async fn lookup_marker(store: &Arc<dyn VectorStore>, namespace: &str, path: &str
                 "Warning: {} could not be read ({reason}); the lookup ignored it",
                 file.display()
             )),
+            exists: true,
         },
         Ok(Some(found)) => match marker_owner(store, namespace, &found.config.namespace).await {
             None => LookupMarker {
                 found: Some(found),
                 note: None,
+                exists: true,
             },
             Some(owner) => LookupMarker {
                 found: None,
@@ -3252,7 +3261,30 @@ async fn lookup_marker(store: &Arc<dyn VectorStore>, namespace: &str, path: &str
                         .join("config.json")
                         .display()
                 )),
+                exists: true,
             },
+        },
+    }
+}
+
+/// [`LookupMarker`] for a caller that only needs the lookup forms
+/// (context_plan, related): no note, and no store read. The marker's
+/// namespace is matched ignoring case, as [`crate::paths::with_root_config`]
+/// does.
+fn lookup_marker_forms_only(namespace: &str, path: &str) -> LookupMarker {
+    if !crate::paths::is_absolute_any(path) {
+        return LookupMarker::default();
+    }
+    match crate::root_marker::find_root_marker(std::path::Path::new(path)) {
+        Ok(Some(found)) if found.config.namespace.eq_ignore_ascii_case(namespace) => LookupMarker {
+            found: Some(found),
+            note: None,
+            exists: true,
+        },
+        Ok(None) => LookupMarker::default(),
+        _ => LookupMarker {
+            exists: true,
+            ..LookupMarker::default()
         },
     }
 }
@@ -3299,6 +3331,8 @@ fn lookup_path_with_registry_root(
     let Some(found) = marker.found.as_ref() else {
         return Ok((resolved.lookup, resolved.forms, marker.note.clone()));
     };
+    // `marker.found` already names this namespace; only the root is left to
+    // check, once.
     if !crate::paths::marker_root_is_cached_root(found, registry_root) {
         let note = format!(
             "The project marker root {} is not the cached root of {namespace} ({}): run `neurostrata-mcp root show` to compare them",
@@ -3307,8 +3341,7 @@ fn lookup_path_with_registry_root(
         );
         return Ok((resolved.lookup, resolved.forms, Some(note)));
     }
-    let lookup =
-        crate::paths::with_root_config(resolved.lookup, path, found, registry_root, namespace);
+    let lookup = crate::paths::with_marker_spelling(resolved.lookup, path, found);
     let mut forms = vec![lookup.path.clone()];
     forms.extend(resolved.forms);
     let mut seen = std::collections::HashSet::new();
@@ -3785,8 +3818,9 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
     // being touched. The root found here only relativizes the path -- it is
     // never used as `source`, so a worktree that was never ingested cannot pin
     // an empty generation.
+    let marker = lookup_marker(&store, &namespace, path).await;
     let (lookup, forms, marker_note) =
-        match lookup_path_for(&store, &namespace, path, project_root).await {
+        match lookup_path_for(&store, &namespace, path, project_root, &marker).await {
             Ok(found) => found,
             Err(e) => {
                 let graph_read = crate::traits::VectorStore::as_any(store.as_ref())
@@ -3807,6 +3841,9 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
                     response["resolved_path"] = serde_json::Value::String(path.to_string());
                     response["resolved_from"] =
                         serde_json::json!(crate::paths::RootSource::Outside.as_str());
+                }
+                if let Some(note) = &marker.note {
+                    response["root_hint"] = serde_json::Value::String(note.clone());
                 }
                 return response.to_string();
             }
@@ -3871,9 +3908,17 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
                 response["resolved_path"] = serde_json::Value::String(lookup.path.clone());
                 response["resolved_from"] = serde_json::json!(lookup.source.as_str());
             }
-            if let Some(hint) = marker_note.or_else(|| {
-                crate::root_marker::root_hint(&namespace, std::path::Path::new(original_path))
-            }) {
+            let no_marker_hint = || {
+                (!marker.exists)
+                    .then(|| {
+                        crate::root_marker::no_marker_hint(
+                            &namespace,
+                            std::path::Path::new(original_path),
+                        )
+                    })
+                    .flatten()
+            };
+            if let Some(hint) = marker_note.or_else(no_marker_hint) {
                 response["root_hint"] = serde_json::Value::String(hint);
             }
             let include_ast_edges = arguments
@@ -4158,7 +4203,7 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
                     .to_string();
                 }
             };
-        let marker = lookup_marker(&store_for_meta, &namespace, original_seed).await;
+        let marker = lookup_marker_forms_only(&namespace, original_seed);
         let forms = match lookup_path_with_registry_root(
             original_seed,
             project_root,
@@ -16731,12 +16776,6 @@ mod tests {
         assert!(got.is_err(), "when every spelling fails, surface the error");
     }
 
-    /// Hooks send the absolute path of the file being touched (Claude Code's
-    /// `tool_input.file_path`); stored locations are relative, and older
-    /// memories may carry an absolute `governs` path. Covers the main
-    /// checkout, a linked worktree under `.claude/worktrees/`, a relative
-    /// path, both stored spellings, a relative cached root (ignored), and a
-    /// file in another repository (must not borrow this namespace's memories).
     /// A checkout `<tmp>/repo` with `sub/a.rs`, the namespace's cached root
     /// set to `cached` (relative to the repo) before `marker` (raw file text)
     /// is written at the repo top. Returns (temp dir, repo, file, store).
@@ -16846,6 +16885,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn outside_file_under_other_namespace_marker_reply_names_owner() {
+        // The namespace has a cached root; the file is in another repository
+        // whose marker names another namespace, so it resolves Outside.
+        let (tmp, _repo, _file, store) = marked_repo("probe", Some(""), None).await;
+        let other = dunce::canonicalize(tmp.path())
+            .expect("canonical")
+            .join("other-repo");
+        std::fs::create_dir_all(other.join(".git")).expect("other .git");
+        std::fs::create_dir_all(other.join(".NeuroStrata")).expect("marker dir");
+        let marker = other.join(".NeuroStrata").join("config.json");
+        std::fs::write(&marker, br#"{"version":1,"namespace":"other"}"#).expect("marker");
+        std::fs::write(other.join("b.rs"), "fn b() {}").expect("source");
+        let file = other.join("b.rs").to_string_lossy().to_string();
+
+        let parsed = memories_for_file_reply(&store, "probe", &file, None).await;
+        assert_eq!(
+            parsed["resolved_from"],
+            serde_json::json!("outside"),
+            "{parsed}"
+        );
+        assert!(parsed.get("error").is_some(), "{parsed}");
+        let hint = parsed["root_hint"].as_str().expect("root_hint");
+        assert!(hint.contains("belongs to namespace other"), "{hint}");
+        assert_eq!(hint.lines().count(), 1, "{hint}");
+
+        // An unreadable marker there is reported on the same reply.
+        std::fs::write(&marker, b"{ not json").expect("bad marker");
+        let parsed = memories_for_file_reply(&store, "probe", &file, None).await;
+        assert_eq!(
+            parsed["resolved_from"],
+            serde_json::json!("outside"),
+            "{parsed}"
+        );
+        let warning = parsed["root_hint"].as_str().expect("root_hint");
+        assert!(warning.starts_with("Warning:"), "{warning}");
+        assert!(warning.contains("config.json"), "{warning}");
+    }
+
+    #[tokio::test]
     async fn root_show_hint_when_marker_and_cache_differ() {
         let (_tmp, repo, file, store) = marked_repo(
             "probe",
@@ -16896,6 +16974,7 @@ mod tests {
         let marked = LookupMarker {
             found: None,
             note: Some("x".into()),
+            exists: true,
         };
         let (_, with_warning, _) = lookup_path_with_registry_root(
             &file,
@@ -16916,6 +16995,12 @@ mod tests {
         assert_eq!(with_warning, today);
     }
 
+    /// Hooks send the absolute path of the file being touched (Claude Code's
+    /// `tool_input.file_path`); stored locations are relative, and older
+    /// memories may carry an absolute `governs` path. Covers the main
+    /// checkout, a linked worktree under `.claude/worktrees/`, a relative
+    /// path, both stored spellings, a relative cached root (ignored), and a
+    /// file in another repository (must not borrow this namespace's memories).
     #[tokio::test]
     async fn memories_for_file_resolves_an_absolute_path_to_the_governing_memory() {
         let (store, rule_id) = store_with_one_rule("probe").await;
@@ -24451,9 +24536,11 @@ mod context_plan_tests {
             if !missing.is_empty() {
                 use crate::traits::GraphRead;
                 for path in &missing {
-                    let (_lookup, forms, _) = lookup_path_for(&vector_store, NAMESPACE, path, None)
-                        .await
-                        .expect("benchmark diagnostic lookup_path_for");
+                    let marker = lookup_marker_forms_only(NAMESPACE, path);
+                    let (_lookup, forms, _) =
+                        lookup_path_for(&vector_store, NAMESPACE, path, None, &marker)
+                            .await
+                            .expect("benchmark diagnostic lookup_path_for");
                     for form in forms {
                         let hits = store
                             .memories_for_file(

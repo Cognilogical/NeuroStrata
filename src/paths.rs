@@ -594,10 +594,24 @@ pub fn with_root_config(
     cached_root: Option<&str>,
     call_namespace: &str,
 ) -> LookupPath {
+    if !marker.config.namespace.eq_ignore_ascii_case(call_namespace)
+        || !marker_root_is_cached_root(marker, cached_root)
+    {
+        return lookup;
+    }
+    with_marker_spelling(lookup, input, marker)
+}
+
+/// [`with_root_config`] for a caller that has already checked the marker's
+/// namespace and that its root is the cached root: puts the marker-relative
+/// spelling first unless `lookup` is `Outside` or `Relative`.
+pub fn with_marker_spelling(
+    lookup: LookupPath,
+    input: &str,
+    marker: &crate::root_marker::FoundMarker,
+) -> LookupPath {
     if matches!(lookup.source, RootSource::Outside | RootSource::Relative)
         || !is_absolute_any(input)
-        || !marker.config.namespace.eq_ignore_ascii_case(call_namespace)
-        || !marker_root_is_cached_root(marker, cached_root)
     {
         return lookup;
     }

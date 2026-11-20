@@ -889,6 +889,15 @@ pub fn root_hint(namespace: &str, path: &Path) -> Option<String> {
     if !matches!(find_root_marker(path), Ok(None)) {
         return None;
     }
+    no_marker_hint(namespace, path)
+}
+
+/// [`root_hint`] for a caller that already knows `find_root_marker(path)` is
+/// `Ok(None)`, so the marker walk is not repeated.
+pub fn no_marker_hint(namespace: &str, path: &Path) -> Option<String> {
+    if namespace.trim().is_empty() || !path.is_absolute() || !path.exists() {
+        return None;
+    }
     let folder = start_folder(path)?;
     if folder.parent().is_none()
         || crate::task::is_home_folder(&folder, dirs::home_dir().as_deref())
