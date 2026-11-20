@@ -4584,7 +4584,13 @@ mod tests {
             .expect("parses with a dir");
         match cli.command {
             Some(Commands::Namespace { action }) => {
-                assert_eq!(action, NamespaceCommands::Resolve { dir: Some("some/dir".into()), pushed: false })
+                assert_eq!(
+                    action,
+                    NamespaceCommands::Resolve {
+                        dir: Some("some/dir".into()),
+                        pushed: false
+                    }
+                )
             }
             other => panic!("expected Namespace/Resolve, got {:?}", other),
         }

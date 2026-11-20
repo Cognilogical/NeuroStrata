@@ -32,10 +32,11 @@ PUSHED_NAMESPACES=$(printf '%s\n' "$PUSH_REFS" | neurostrata-mcp namespace resol
 GATE_NAMESPACES=("$FOLDER_NAMESPACE")
 while IFS= read -r ns; do
     [ -n "$ns" ] || continue
-    case " ${GATE_NAMESPACES[*]} " in
-        *" $ns "*) ;;
-        *) GATE_NAMESPACES+=("$ns") ;;
-    esac
+    seen=0
+    for g in "${GATE_NAMESPACES[@]}"; do
+        [ "$g" = "$ns" ] && seen=1
+    done
+    [ $seen -eq 1 ] || GATE_NAMESPACES+=("$ns")
 done <<< "$PUSHED_NAMESPACES"
 
 # ── NeuroStrata gate (required) ────────────────────────────────────────────
@@ -73,4 +74,4 @@ if [ ${#PROJECT_GATES[@]} -gt 0 ]; then
 fi
 
 exit 0   # the gate passed and all project guards passed
-# neurostrata-hook-sha256: 180416ac6711b5395d614c188955e78d549bb5e921d8ea0a7e0ed2607eb988e8
+# neurostrata-hook-sha256: 038029282d646345927cf774a0d302a517f8ac9f16a61cd3bcf48b2f69d98d58

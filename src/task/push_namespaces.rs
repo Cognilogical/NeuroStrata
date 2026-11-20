@@ -106,6 +106,9 @@ fn nul_paths(bytes: Vec<u8>) -> impl Iterator<Item = String> {
 ///   `git diff-tree --root <local>`, which is `git diff <local>^ <local>` that
 ///   also answers for a root commit.
 ///
+/// `-m` lists a merge commit's paths against each parent, so a conflict fix
+/// in a merge is gated (more paths than first-parent alone, never fewer).
+///
 /// Renames are split into a deletion and an addition; a deleted path counts.
 fn changed_paths(git: &dyn GitRunner, repo: &Path, r: &PushedRef) -> Result<Vec<String>, String> {
     let local = r.local_sha.as_str();
@@ -136,6 +139,7 @@ fn changed_paths(git: &dyn GitRunner, repo: &Path, r: &PushedRef) -> Result<Vec<
             repo,
             &[
                 "diff-tree",
+                "-m",
                 "--root",
                 "-r",
                 "--no-commit-id",
@@ -151,6 +155,7 @@ fn changed_paths(git: &dyn GitRunner, repo: &Path, r: &PushedRef) -> Result<Vec<
         repo,
         &[
             "log",
+            "-m",
             "--format=",
             "--name-only",
             "--no-renames",
@@ -187,7 +192,7 @@ struct Resolver<'a> {
     /// (sha, folder) -> the committed marker in that folder of that commit.
     committed: HashMap<(String, String), Option<String>>,
     /// folder -> the deepest working-tree / main-checkout marker for it.
-    worktree: HashMap<String, Option<(String, String, bool)>>,
+    worktree: HashMap<String, Option<(String, String)>>,
 }
 
 impl Resolver<'_> {
@@ -203,11 +208,25 @@ impl Resolver<'_> {
         } else {
             format!("{folder}/{ROOT_CONFIG_REL}")
         };
-        // `git show` exits non-zero when the commit has no such file; the
-        // sha itself was just listed by git, so that is the only failure.
-        let found = match self.git.git(&self.top, &["show", &format!("{sha}:{rel}")]) {
-            Err(_) => None,
-            Ok(bytes) => {
+        // `ls-tree` needs only the commit's trees and prints nothing when the
+        // file is absent. Any failure there, or a failed `git show` of a file
+        // the tree lists (a blob missing from a partial clone, say), is an
+        // error: a marker that cannot be read must not drop its namespace.
+        let listed = self
+            .git
+            .git(&self.top, &["ls-tree", "-z", sha, "--", &rel])
+            .map_err(|e| {
+                format!("cannot look for the project marker {rel} in pushed commit {sha}: {e}")
+            })?;
+        let found = match listed.is_empty() {
+            true => None,
+            false => {
+                let bytes = self
+                    .git
+                    .git(&self.top, &["show", &format!("{sha}:{rel}")])
+                    .map_err(|e| {
+                        format!("cannot read the project marker {rel} in pushed commit {sha}: {e}")
+                    })?;
                 let shown = PathBuf::from(format!("{sha}:{rel}"));
                 match root_marker::parse_marker_bytes(&shown, &bytes) {
                     MarkerRead::Valid(cfg) => Some(cfg.namespace),
@@ -243,41 +262,51 @@ impl Resolver<'_> {
         }
     }
 
-    /// The marker `find_root_marker` gives `folder` in this checkout (own
-    /// checkout and main checkout): (marker folder relative to the top,
-    /// namespace, tracked by git).
-    fn worktree_for(&mut self, folder: &str) -> Result<Option<(String, String, bool)>, String> {
+    /// The deepest untracked marker `find_root_marker` finds for `folder` in
+    /// this checkout (own checkout and main checkout): (marker folder
+    /// relative to the top, namespace). A marker git tracks is skipped: it is
+    /// the checked-out branch's copy, while the pushed commit's tree already
+    /// says what the push holds. The search goes on above a skipped marker.
+    fn worktree_for(&mut self, folder: &str) -> Result<Option<(String, String)>, String> {
         if let Some(hit) = self.worktree.get(folder) {
             return Ok(hit.clone());
         }
-        let start = if folder.is_empty() {
+        let mut start = if folder.is_empty() {
             self.top.clone()
         } else {
             self.top.join(folder)
         };
-        let found = match root_marker::find_root_marker(&start) {
-            Err((file, reason)) => {
-                return Err(format!(
-                    "cannot read the project marker {}: {reason}",
-                    file.display()
-                ))
-            }
-            Ok(None) => None,
-            Ok(Some(marker)) => match marker.root.strip_prefix(&self.canonical_top) {
-                Err(_) => None,
-                Ok(rel) => {
-                    let rel = rel.to_string_lossy().replace('\\', "/");
-                    let tracked = self
-                        .git
-                        .git(
-                            &marker.marker_dir(),
-                            &["ls-files", "-z", "--", ROOT_CONFIG_REL],
-                        )
-                        .map(|out| !out.is_empty())
-                        .unwrap_or(false);
-                    Some((rel, marker.config.namespace, tracked))
+        let found = loop {
+            let marker = match root_marker::find_root_marker(&start) {
+                Err((file, reason)) => {
+                    return Err(format!(
+                        "cannot read the project marker {}: {reason}",
+                        file.display()
+                    ))
                 }
-            },
+                Ok(None) => break None,
+                Ok(Some(marker)) => marker,
+            };
+            let Ok(rel) = marker.root.strip_prefix(&self.canonical_top) else {
+                break None;
+            };
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            // A failed check counts as untracked, so the marker is gated.
+            let tracked = self
+                .git
+                .git(
+                    &marker.marker_dir(),
+                    &["ls-files", "-z", "--", ROOT_CONFIG_REL],
+                )
+                .map(|out| !out.is_empty())
+                .unwrap_or(false);
+            if !tracked {
+                break Some((rel, marker.config.namespace));
+            }
+            match marker.root.parent() {
+                Some(parent) if !rel.is_empty() => start = parent.to_path_buf(),
+                _ => break None,
+            }
         };
         self.worktree.insert(folder.to_string(), found.clone());
         Ok(found)
@@ -291,12 +320,10 @@ impl Resolver<'_> {
         let local = self.worktree_for(&folder)?;
         Ok(match (committed, local) {
             (None, None) => None,
-            (Some((_, ns)), None) | (None, Some((_, ns, _))) => Some(ns),
-            (Some((c_dir, c_ns)), Some((l_dir, l_ns, tracked))) => {
+            (Some((_, ns)), None) | (None, Some((_, ns))) => Some(ns),
+            (Some((c_dir, c_ns)), Some((l_dir, l_ns))) => {
                 if c_dir == l_dir {
-                    // A tracked file here is the checked-out branch's copy;
-                    // the pushed commit's copy is the one being pushed.
-                    if !tracked && !c_ns.eq_ignore_ascii_case(&l_ns) {
+                    if !c_ns.eq_ignore_ascii_case(&l_ns) {
                         let shown = if c_dir.is_empty() {
                             ".".to_string()
                         } else {
@@ -365,13 +392,29 @@ mod tests {
     const ZERO: &str = "0000000000000000000000000000000000000000";
 
     struct CountingGit {
+        lookups: Cell<usize>,
         shows: Cell<usize>,
     }
 
     impl GitRunner for CountingGit {
         fn git(&self, dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+            match args.first() {
+                Some(&"ls-tree") => self.lookups.set(self.lookups.get() + 1),
+                Some(&"show") => self.shows.set(self.shows.get() + 1),
+                _ => {}
+            }
+            SystemGit.git(dir, args)
+        }
+    }
+
+    /// Real git, except that every `git show` fails, as it does for a blob
+    /// missing from a partial clone.
+    struct ShowFailsGit;
+
+    impl GitRunner for ShowFailsGit {
+        fn git(&self, dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
             if args.first() == Some(&"show") {
-                self.shows.set(self.shows.get() + 1);
+                return Err("fatal: missing blob".to_string());
             }
             SystemGit.git(dir, args)
         }
@@ -628,17 +671,83 @@ mod tests {
         write(&dir, "a/x.rs", "x");
         write(&dir, "a/y.rs", "y");
         write(&dir, "a/b/z.rs", "z");
+        marker(&dir, "a", "a-ns");
         let sha = commit_all(&dir, "files");
         let counting = CountingGit {
+            lookups: Cell::new(0),
             shows: Cell::new(0),
         };
-        // README.md (top), a/x.rs, a/y.rs, a/b/z.rs: folders "", a, a/b.
+        // Folders: "" (README.md), a, a/b, a/.NeuroStrata (the marker).
         let got = namespaces_for_push_with(&counting, &dir, &new_branch(&sha, "main")).unwrap();
-        assert_eq!(got, set(&["proj"]));
+        assert_eq!(got, set(&["proj", "a-ns"]));
         assert_eq!(
-            counting.shows.get(),
-            3,
-            "one git show per folder of the pushed commit"
+            counting.lookups.get(),
+            4,
+            "one lookup per folder of the pushed commit"
         );
+        assert_eq!(counting.shows.get(), 1, "one git show per marker found");
+    }
+
+    #[test]
+    fn failed_show_of_a_listed_marker_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = repo(tmp.path(), "proj");
+        marker(&dir, "pkg", "pkg-ns");
+        write(&dir, "pkg/a.rs", "a");
+        let sha = commit_all(&dir, "split");
+        let err =
+            namespaces_for_push_with(&ShowFailsGit, &dir, &new_branch(&sha, "main")).unwrap_err();
+        assert!(err.contains("cannot read the project marker pkg/"), "{err}");
+    }
+
+    #[test]
+    fn merge_conflict_fix_in_split_is_gated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = repo(tmp.path(), "proj");
+        marker(&dir, "sub", "sub-ns");
+        write(&dir, "sub/f.rs", "base\n");
+        commit_all(&dir, "split");
+        let remote = tmp.path().join("remote.git");
+        git(
+            tmp.path(),
+            &["init", "-q", "--bare", remote.to_str().unwrap()],
+        );
+        git(&dir, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        git(&dir, &["checkout", "-q", "-b", "left"]);
+        write(&dir, "sub/f.rs", "left\n");
+        commit_all(&dir, "left");
+        git(&dir, &["checkout", "-q", "main"]);
+        git(&dir, &["checkout", "-q", "-b", "right"]);
+        write(&dir, "sub/f.rs", "right\n");
+        commit_all(&dir, "right");
+        git(&dir, &["push", "-q", "origin", "main", "left", "right"]);
+        git(&dir, &["checkout", "-q", "-b", "merged", "left"]);
+        // Conflicts on sub/f.rs; the fix below is the merge's only change.
+        let _ = SystemGit.git(&dir, &["merge", "-q", "right"]);
+        write(&dir, "sub/f.rs", "fixed\n");
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-q", "--no-edit"]);
+        let sha = git(&dir, &["rev-parse", "HEAD"]);
+        let got = namespaces_for_push(&dir, &new_branch(&sha, "merged")).unwrap();
+        assert_eq!(got, set(&["proj", "sub-ns"]));
+    }
+
+    #[test]
+    fn tracked_worktree_marker_missing_on_pushed_branch_is_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = repo(tmp.path(), "proj");
+        marker(&dir, "pkg", "pkg-ns");
+        write(&dir, "pkg/keep", "k");
+        commit_all(&dir, "pkg");
+        git(&dir, &["checkout", "-q", "-b", "feature"]);
+        write(&dir, "pkg/inner/f.rs", "f");
+        let sha = commit_all(&dir, "feature");
+        git(&dir, &["checkout", "-q", "main"]);
+        // The checked-out branch commits a deeper split the pushed one lacks.
+        marker(&dir, "pkg/inner", "inner-ns");
+        write(&dir, "pkg/inner/g.rs", "g");
+        commit_all(&dir, "inner split");
+        let got = namespaces_for_push(&dir, &new_branch(&sha, "feature")).unwrap();
+        assert_eq!(got, set(&["proj", "pkg-ns"]));
     }
 }
