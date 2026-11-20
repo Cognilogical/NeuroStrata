@@ -12052,7 +12052,10 @@ fn skip_git_globals(rest: &[String]) -> &[String] {
 const MUTATING_GIT_LONG: [&str; 4] = ["--force", "--mirror", "--delete", "--prune"];
 
 fn is_mutating_git_long(arg: &str) -> bool {
-    MUTATING_GIT_LONG.iter().any(|t| t.starts_with(arg) || arg.starts_with(t))
+    // The bare `--` option terminator is not a long-flag prefix
+    // (Codex 331d1a6d#r4638358109).
+    arg != "--"
+        && MUTATING_GIT_LONG.iter().any(|t| t.starts_with(arg) || arg.starts_with(t))
 }
 
 /// Args that make any git subcommand mutating in the daemon: the `+`/`:`
@@ -12067,12 +12070,22 @@ fn is_mutating_git_common_arg(arg: &str) -> bool {
 
 /// Args that make `git push` mutating.
 fn is_mutating_push_arg(arg: &str) -> bool {
-    is_mutating_git_common_arg(arg)
-        || arg == "--no-verify"
-        || (arg.starts_with('-')
-            && !arg.starts_with("--")
-            && !arg.contains('=')
-            && arg.chars().skip(1).any(|c| c == 'f' || c == 'd'))
+    if is_mutating_git_common_arg(arg) || arg == "--no-verify" {
+        return true;
+    }
+    if !arg.starts_with('-') || arg.starts_with("--") {
+        return false;
+    }
+    // Parse the short-option bundle before its attached value: Git reads
+    // `-foci.skip=true` as bundled `-f` + `-o ci.skip=true`, so a bundle
+    // starting with `f`/`d` is force/delete even though the token has `=`
+    // (Codex 331d1a6d#r4638358096); without `=`, the classic bundle rule
+    // applies (`-vf`, `-vd`, ...).
+    let bundle = arg.split('=').next().unwrap_or(arg);
+    let bundle = bundle.strip_prefix('-').unwrap_or(bundle);
+    bundle.starts_with('f')
+        || bundle.starts_with('d')
+        || (!arg.contains('=') && (bundle.contains('f') || bundle.contains('d')))
 }
 
 /// Args that make `gh api` mutating: any `-X`/`-f`/`-F` token or the

@@ -958,6 +958,9 @@ function skipGitGlobals(rest: string[]): string[] {
 }
 
 function isMutatingGitLong(arg: string): boolean {
+  // The bare `--` option terminator is not a long-flag prefix
+  // (Codex 331d1a6d#r4638358109).
+  if (arg === "--") return false;
   return MUTATING_GIT_LONG.some((t) => t.startsWith(arg) || arg.startsWith(t));
 }
 
@@ -988,13 +991,18 @@ function isMutatingGitCommonArg(arg: string): boolean {
 }
 
 function isMutatingPushArg(arg: string): boolean {
+  if (isMutatingGitCommonArg(arg) || arg === "--no-verify") return true;
+  if (!arg.startsWith("-") || arg.startsWith("--")) return false;
+  // Parse the short-option bundle before its attached value: Git reads
+  // `-foci.skip=true` as bundled `-f` + `-o ci.skip=true`, so a bundle
+  // starting with `f`/`d` is force/delete even though the token has `=`
+  // (Codex 331d1a6d#r4638358096); without `=`, the classic bundle rule
+  // applies (`-vf`, `-vd`, ...).
+  const bundle = arg.split("=")[0].slice(1);
   return (
-    isMutatingGitCommonArg(arg) ||
-    arg === "--no-verify" ||
-    (arg.startsWith("-") &&
-      !arg.startsWith("--") &&
-      !arg.includes("=") &&
-      (arg.slice(1).includes("f") || arg.slice(1).includes("d")))
+    bundle.startsWith("f") ||
+    bundle.startsWith("d") ||
+    (!arg.includes("=") && (bundle.includes("f") || bundle.includes("d")))
   );
 }
 

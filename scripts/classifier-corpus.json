@@ -24,6 +24,8 @@
     {"id": "json-fallback-cmd", "action": "bash", "payload": "{\"cmd\": \"git push +ref\"}", "exempt": false, "note": "missing command key falls back to cmd (both decoders)"},
     {"id": "json-whitespace-wrapper", "action": "bash", "payload": "﻿\u0085{\"command\": \"git push -f\"}", "exempt": false, "note": "the decoders parse as far as they do; both classify as mutating (safe): JS JSON.parse rejects the leading NEL, serde rejects the BOM/NEL form too"},
     {"id": "json-irrelevant-property", "action": "bash", "payload": "{\"command\": \"git status\", \"note\": \"not read by the classifier\"}", "exempt": true, "note": "a property no classifier reads must not flip the verdict"},
-    {"id": "cargo-test-mutating", "action": "bash", "payload": "cargo test --test lean_parity_test", "exempt": true, "note": "universal-machine exempt stays (executes build.rs); red-free anchor"}
+    {"id": "cargo-test-mutating", "action": "bash", "payload": "cargo test --test lean_parity_test", "exempt": true, "note": "universal-machine exempt stays (executes build.rs); red-free anchor"},
+    {"id": "push-force-in-attached-option", "action": "bash", "payload": "git push -foci.skip=true origin main", "exempt": false, "note": "Git parses the short-option bundle before its attached value: -foci.skip=true is bundled -f + -o ci.skip=true (Codex 331d1a6d#r4638358096); the `=` exclusion must not hide the force flag"},
+    {"id": "read-only-double-dash", "action": "bash", "payload": "git diff -- src/server.rs", "exempt": true, "note": "the bare `--` option terminator must not match as a long-flag prefix (Codex 331d1a6d#r4638358109)"}
   ]
 }
