@@ -120,6 +120,15 @@ export declare function onTurnEnd(turn: {
     role: "user" | "assistant";
     content: string;
 }): Promise<void>;
+/**
+ * CLI hook runner entry point. The daemon installs hook-runner.mjs beside
+ * dist/ and dispatches host hook events to this handler; a stateless CLI
+ * invocation may arrive before any native initialize(ctx), so a default
+ * client is built the same way core's handleHookEvent does. Mutating Hermes
+ * tools run the same guard as the native execute.before hook, but a
+ * rejection is returned as a deny decision instead of a thrown error.
+ */
+export declare function handleHookEvent(event: Record<string, unknown>): Promise<Record<string, unknown>>;
 export declare function fetchContextPlan(opts: {
     namespace: string;
     query?: string;

@@ -508,8 +508,7 @@ export async function initialize(ctx) {
             }
         }
         // Guard validation on mutating Hermes Agent tools
-        const hermesMutatingTools = ["write_file", "write", "patch_file", "edit", "terminal", "bash"];
-        if (hermesMutatingTools.includes(toolName)) {
+        if (HERMES_MUTATING_TOOLS.includes(toolName)) {
             const call = {
                 name: toolName,
                 args: firstRecord(input?.input, input?.args),
@@ -518,52 +517,16 @@ export async function initialize(ctx) {
                     activeSessionId ??
                     undefined,
             };
-            if (!config.strictMode) {
-                mutationsSinceNote++;
-                return;
+            const guard = await runMutatingToolGuard(call);
+            if (guard.verdict === "reject") {
+                console.warn("[NeuroStrata] Guard rejected mutating tool", guard.log);
+                throw new Error(`Zero-Action Start violation: ${guard.reason}`);
             }
-            const actionType = toolName;
-            const payload = JSON.stringify(call.args);
-            const cwd = process.cwd();
-            const { session_id, active_task_id, worktree } = callState(call);
-            try {
-                const text = await mcpClient.callTool("neurostrata_guard_validate", {
-                    namespace: config.namespace,
-                    session_id,
-                    active_task_id,
-                    worktree,
-                    action_type: actionType,
-                    payload,
-                    cwd,
-                    is_mutating: true,
-                    use_sandbox: false,
-                    mutations_since_note: mutationsSinceNote,
-                });
-                const result = parseGuardValidate(text);
-                if (result.verdict === "reject") {
-                    const reason = result.reasons.join("; ") || result.constraints.join("; ") || result.bucket;
-                    console.warn("[NeuroStrata] Guard rejected mutating tool", {
-                        actionType,
-                        session_id,
-                        active_task_id,
-                        worktree,
-                        reason,
-                        rule_ids: result.rule_ids,
-                    });
-                    throw new Error(`Zero-Action Start violation: ${reason}`);
-                }
+            if (guard.verdict === "unavailable") {
+                setStatus({ state: "unavailable", lastError: guard.message });
+                console.error("[NeuroStrata] Guard validation failed", { error: guard.message });
+                throw new Error(`Guard validation unavailable (NeuroStrata core degraded): ${guard.message}`);
             }
-            catch (err) {
-                const message = String(err);
-                if (message.includes("Zero-Action Start violation:") ||
-                    message.includes("Guard rejected")) {
-                    throw err;
-                }
-                setStatus({ state: "unavailable", lastError: message });
-                console.error("[NeuroStrata] Guard validation failed", { error: message });
-                throw new Error(`Guard validation unavailable (NeuroStrata core degraded): ${message}`);
-            }
-            mutationsSinceNote++;
         }
     });
     // Also register via ctx?.hooks?.beforeToolCall?.(function) if available
@@ -630,6 +593,110 @@ export async function onTurnEnd(turn) {
     const markerList = signals.map((signal) => signal.marker).join(", ");
     const nudge = `[NeuroStrata] Task intent detected (${markerList}) but no neurostrata_task_create in this turn. Consider creating a task to track this work.`;
     console.info("[NeuroStrata] " + nudge);
+}
+// Hermes Agent tools that mutate state and therefore require the guard.
+// Shared by the native execute.before hook and the CLI runner entry point.
+const HERMES_MUTATING_TOOLS = ["write_file", "write", "patch_file", "edit", "terminal", "bash"];
+/** Run the Zero-Action Start guard for a mutating tool call. Never throws:
+ *  the native hook throws on the returned verdict (preserving its log lines),
+ *  while the CLI runner entry point maps it to a deny decision instead. */
+async function runMutatingToolGuard(call) {
+    if (!config.strictMode) {
+        mutationsSinceNote++;
+        return { verdict: "pass" };
+    }
+    const actionType = call.name;
+    const payload = JSON.stringify(call.args);
+    const cwd = process.cwd();
+    const { session_id, active_task_id, worktree } = callState(call);
+    try {
+        const text = await mcpClient.callTool("neurostrata_guard_validate", {
+            namespace: config.namespace,
+            session_id,
+            active_task_id,
+            worktree,
+            action_type: actionType,
+            payload,
+            cwd,
+            is_mutating: true,
+            use_sandbox: false,
+            mutations_since_note: mutationsSinceNote,
+        });
+        const result = parseGuardValidate(text);
+        if (result.verdict === "reject") {
+            const reason = result.reasons.join("; ") || result.constraints.join("; ") || result.bucket;
+            return {
+                verdict: "reject",
+                reason,
+                log: { actionType, session_id, active_task_id, worktree, reason, rule_ids: result.rule_ids },
+            };
+        }
+    }
+    catch (err) {
+        const message = String(err);
+        if (message.includes("Zero-Action Start violation:") ||
+            message.includes("Guard rejected")) {
+            return { verdict: "reject", reason: message, log: { actionType, error: message } };
+        }
+        return { verdict: "unavailable", message };
+    }
+    mutationsSinceNote++;
+    return { verdict: "pass" };
+}
+/**
+ * CLI hook runner entry point. The daemon installs hook-runner.mjs beside
+ * dist/ and dispatches host hook events to this handler; a stateless CLI
+ * invocation may arrive before any native initialize(ctx), so a default
+ * client is built the same way core's handleHookEvent does. Mutating Hermes
+ * tools run the same guard as the native execute.before hook, but a
+ * rejection is returned as a deny decision instead of a thrown error.
+ */
+export async function handleHookEvent(event) {
+    if (!mcpClient) {
+        config = resolveConfig({});
+        const token = loadDaemonToken(config.tokenFile);
+        mcpClient = new NeuroStrataMCPClient({
+            endpoint: config.endpoint,
+            token,
+            timeoutMs: config.requestTimeoutMs,
+        });
+    }
+    const hookEventName = asString(event.hook_event_name) ?? asString(event.eventName) ?? "PreToolUse";
+    const toolName = asString(event.tool_name) ?? asString(event.toolName) ?? "";
+    const toolInput = firstRecord(event.tool_input ?? event.input ?? event.args ?? {});
+    if (hookEventName !== "PreToolUse") {
+        return { continue: true };
+    }
+    if (HERMES_MUTATING_TOOLS.includes(toolName)) {
+        const call = {
+            name: toolName,
+            args: toolInput,
+            session_id: asString(event.session_id) ?? activeSessionId ?? undefined,
+        };
+        const guard = await runMutatingToolGuard(call);
+        if (guard.verdict === "reject") {
+            return {
+                hookSpecificOutput: {
+                    hookEventName: "PreToolUse",
+                    permissionDecision: "deny",
+                    permissionDecisionReason: `Zero-Action Start violation: ${guard.reason}`,
+                },
+            };
+        }
+        if (guard.verdict === "unavailable") {
+            return {
+                hookSpecificOutput: {
+                    hookEventName: "PreToolUse",
+                    permissionDecision: "deny",
+                    permissionDecisionReason: `Guard validation unavailable (NeuroStrata core degraded): ${guard.message}`,
+                },
+            };
+        }
+    }
+    return {
+        continue: true,
+        hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow" },
+    };
 }
 export async function fetchContextPlan(opts) {
     if (!mcpClient)
