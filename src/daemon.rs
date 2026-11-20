@@ -506,18 +506,10 @@ pub async fn start_daemon(
     // Each harness config keeps its own namespace; a config naming none is
     // not written (an empty or made-up namespace is never written).
     let startup_root = resolve_project_root();
-    let _ = crate::task::harness_plugins::auto_install_detected_plugins(
-        &startup_root,
-        crate::task::harness_plugins::ConfigNamespace::Keep(None),
-        None,
-    );
+    let _ = crate::task::harness_plugins::boot_install_plugins(&startup_root);
     if let Ok(cfg) = crate::config::Config::load() {
         for dir in cfg.project_contexts.values() {
-            let _ = crate::task::harness_plugins::auto_install_detected_plugins(
-                dir,
-                crate::task::harness_plugins::ConfigNamespace::Keep(None),
-                None,
-            );
+            let _ = crate::task::harness_plugins::boot_install_plugins(dir);
         }
     }
     // The port the MCP proxy and CLI hardcode; changing it changes the wire

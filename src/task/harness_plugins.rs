@@ -767,6 +767,15 @@ pub fn detect_harnesses(
     (active, detected)
 }
 
+/// The daemon's boot-time refresh for `dir`. Bundles are always refreshed;
+/// each harness config keeps the namespace it already names, and a config
+/// naming none is left unwritten. Never the environment, the ledger or the
+/// folder name: the daemon's own environment says nothing about `dir`'s
+/// project, and a guessed name would overwrite the right one.
+pub fn boot_install_plugins(dir: &Path) -> Value {
+    auto_install_detected_plugins(dir, ConfigNamespace::Keep(None), None)
+}
+
 /// Auto-install the compiled zero-dependency plugin bundles for all detected
 /// harnesses into `<project_root>/.NeuroStrata/plugins/<harness>/` and wire
 /// harness-specific config files when the harness directory or active harness
@@ -1344,6 +1353,29 @@ mod tests {
             src_of(dir),
             ("example-project".into(), NamespaceSource::FolderName)
         );
+    }
+
+    #[test]
+    fn boot_install_keeps_existing_plugin_namespace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = dunce::canonicalize(tmp.path()).unwrap().join("example-project");
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        let cfg = dir.join(".hermes/plugins/neurostrata.json");
+        write_file(&cfg, r#"{"id": "neurostrata-hermes", "namespace": "example-project"}"#);
+        boot_install_plugins(&dir);
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(doc["namespace"], "example-project");
+    }
+
+    #[test]
+    fn boot_install_without_any_config_writes_no_namespace_config() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = dunce::canonicalize(tmp.path()).unwrap().join("example-project");
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::create_dir_all(dir.join(".hermes")).unwrap();
+        boot_install_plugins(&dir);
+        assert!(!dir.join(".hermes/plugins/neurostrata.json").exists());
+        assert!(dir.join(".NeuroStrata/plugins/hermes/dist/index.js").exists());
     }
 
     #[test]
