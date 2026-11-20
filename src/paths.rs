@@ -244,22 +244,35 @@ fn common_git_dir(checkout: &str) -> Option<String> {
     if dot_git.is_dir() {
         return Some(dot_git.to_string_lossy().to_string());
     }
-    let text = std::fs::read_to_string(&dot_git).ok()?;
+    let gitdir = gitdir_of_file(&checkout)?;
+    Some(linked_common_dir(&gitdir).unwrap_or(gitdir))
+}
+
+/// The gitdir a checkout's `.git` FILE names, made absolute against the
+/// checkout (`worktree.useRelativePaths`, git 2.48+, writes it relative).
+fn gitdir_of_file(checkout: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(checkout.join(".git")).ok()?;
     let gitdir = text
         .lines()
         .find_map(|l| l.trim().strip_prefix("gitdir:"))?
         .trim();
-    let joined = |base: &Path, rel: &str| {
-        if is_absolute_any(rel) {
-            rel.to_string()
-        } else {
-            base.join(rel).to_string_lossy().to_string()
-        }
-    };
-    let gitdir = joined(&checkout, gitdir);
-    match std::fs::read_to_string(Path::new(&gitdir).join("commondir")) {
-        Ok(common) => Some(joined(Path::new(&gitdir), common.trim())),
-        Err(_) => Some(gitdir),
+    Some(joined(checkout, gitdir))
+}
+
+/// The common directory a linked worktree's gitdir names in its `commondir`
+/// file. `None` for any other gitdir: a submodule's, including one inside a
+/// linked worktree (`<main>/.git/worktrees/<wt>/modules/<sub>`), has none.
+fn linked_common_dir(gitdir: &str) -> Option<String> {
+    let common = std::fs::read_to_string(Path::new(gitdir).join("commondir")).ok()?;
+    Some(joined(Path::new(gitdir), common.trim()))
+}
+
+/// `rel` against `base` unless it is already absolute.
+fn joined(base: &Path, rel: &str) -> String {
+    if is_absolute_any(rel) {
+        rel.to_string()
+    } else {
+        base.join(rel).to_string_lossy().to_string()
     }
 }
 
@@ -291,6 +304,43 @@ fn same_repository(a: &str, b: &str) -> bool {
 
 fn depth(rel: &str) -> usize {
     rel.split('/').count()
+}
+
+/// The git root of a DIRECTORY: `dir` itself when it holds `.git`, else its
+/// nearest ancestor that does ([`find_git_root`] looks only above its input).
+pub fn git_root_of_dir(dir: &str) -> Option<String> {
+    if host_path(dir).is_some_and(|d| d.join(".git").exists()) {
+        Some(dir.to_string())
+    } else {
+        find_git_root(dir)
+    }
+}
+
+/// The main checkout of the git repository holding `dir` (a directory): `dir`'s
+/// own `.git` root when that is a regular checkout, or, for a linked worktree,
+/// the checkout that owns it. A submodule or a worktree of a bare repository
+/// has no main checkout to borrow from and answers its own root. `None`
+/// outside git. Returned in this host's plain spelling (`dunce`).
+pub fn main_checkout_root(dir: &str) -> Option<PathBuf> {
+    let own_root = git_root_of_dir(dir)?;
+    let own = host_path(&own_root)?;
+    let dot_git = own.join(".git");
+    if dot_git.is_dir() {
+        return canonical(&own);
+    }
+    // Only a linked worktree borrows a main checkout: its gitdir names the
+    // shared directory in `commondir`, and that is a checkout's `.git`. Not a
+    // submodule (no `commondir`, wherever its gitdir lives) and not a worktree
+    // of a bare repository (the common directory is not a `.git`).
+    let main = gitdir_of_file(&own)
+        .and_then(|gitdir| linked_common_dir(&gitdir))
+        .and_then(|common| parse_absolute(&common))
+        .filter(|common| common.parts.last().is_some_and(|last| last == ".git"))
+        .map(|common| AbsPath { parts: common.parts[..common.parts.len() - 1].to_vec(), ..common });
+    match main {
+        Some(main) => canonical(&host_path(&main.to_path_string())?),
+        None => canonical(&own),
+    }
 }
 
 /// Where the root that relativized a lookup path came from.
@@ -1821,5 +1871,77 @@ mod tests {
             "{:?}",
             resolved_prefix.forms
         );
+    }
+
+    #[test]
+    fn the_main_checkout_of_a_linked_worktree_is_the_checkout_that_owns_it() {
+        let (tmp, root, worktree) = project_with_worktree();
+        assert_eq!(main_checkout_root(&s(&root)), Some(root.clone()));
+        assert_eq!(main_checkout_root(&s(&root.join("src"))), Some(root.clone()));
+        assert_eq!(main_checkout_root(&s(&worktree)), Some(root.clone()));
+        assert_eq!(main_checkout_root(&s(&worktree.join("src"))), Some(root.clone()));
+        // A submodule's gitdir is <super>/.git/modules/<name>: its own root.
+        let sub = canonical(tmp.path()).unwrap().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join(".git"), "gitdir: ../example-project/.git/modules/sub\n").unwrap();
+        assert_eq!(main_checkout_root(&s(&sub)), Some(sub.clone()));
+        // A submodule inside the linked worktree: its gitdir lives under the
+        // worktree's gitdir (`<main>/.git/worktrees/<wt>/modules/<sub>`) but
+        // has no `commondir`, so it is still its own root, not `root`.
+        let wt_gitdir = root.join(".git").join("worktrees").join("agent-1");
+        let wt_sub_gitdir = wt_gitdir.join("modules").join("lib");
+        std::fs::create_dir_all(&wt_sub_gitdir).unwrap();
+        let wt_sub = worktree.join("lib");
+        std::fs::create_dir_all(&wt_sub).unwrap();
+        std::fs::write(
+            wt_sub.join(".git"),
+            format!("gitdir: {}\n", s(&wt_sub_gitdir).replace('\\', "/")),
+        )
+        .unwrap();
+        assert_eq!(main_checkout_root(&s(&wt_sub)), Some(wt_sub.clone()));
+        // A worktree of a bare repository: the common directory is no
+        // checkout's `.git`, so the worktree answers its own root.
+        let bare = canonical(tmp.path()).unwrap().join("bare.git");
+        let bare_wt = canonical(tmp.path()).unwrap().join("bare-wt");
+        link_worktree(&bare_wt, &bare.join("worktrees").join("bare-wt"));
+        assert_eq!(main_checkout_root(&s(&bare_wt)), Some(bare_wt.clone()));
+        let outside = canonical(tmp.path()).unwrap().join("plain");
+        std::fs::create_dir_all(&outside).unwrap();
+        let above_has_git = std::iter::successors(Some(outside.as_path()), |p| p.parent())
+            .any(|p| p.join(".git").exists());
+        if !above_has_git {
+            assert_eq!(main_checkout_root(&s(&outside)), None);
+        }
+    }
+
+    #[test]
+    fn main_checkout_root_of_separate_git_dir_is_itself() {
+        // `git init --separate-git-dir`: the `.git` file names a gitdir that
+        // has no `commondir`, so the checkout is its own root.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = canonical(tmp.path()).unwrap();
+        let checkout = base.join("example-project");
+        let gitdir = base.join("elsewhere").join("example-project.git");
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::create_dir_all(&gitdir).unwrap();
+        std::fs::write(
+            checkout.join(".git"),
+            format!("gitdir: {}\n", s(&gitdir).replace('\\', "/")),
+        )
+        .unwrap();
+        assert_eq!(main_checkout_root(&s(&checkout)), Some(checkout.clone()));
+    }
+
+    #[test]
+    fn git_root_of_dir_is_the_dir_itself_or_its_nearest_checkout() {
+        let (_tmp, root, worktree) = project_with_worktree();
+        // The answer keeps the input's spelling (`find_git_root` rebuilds it
+        // with `/` on Windows), so compare with one separator.
+        let slashed = |p: Option<String>| p.map(|p| p.replace('\\', "/"));
+        let want = |p: &Path| Some(s(p).replace('\\', "/"));
+        assert_eq!(slashed(git_root_of_dir(&s(&root))), want(&root));
+        assert_eq!(slashed(git_root_of_dir(&s(&root.join("src")))), want(&root));
+        assert_eq!(slashed(git_root_of_dir(&s(&worktree))), want(&worktree));
+        assert_eq!(slashed(git_root_of_dir(&s(&worktree.join("src")))), want(&worktree));
     }
 }
