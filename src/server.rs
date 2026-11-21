@@ -2388,96 +2388,87 @@ pub(crate) async fn handle_data_connector(
 
 #[cfg(test)]
 pub(crate) mod context_plan_benchmark_instrumentation {
+    //! Counts for one measured `context_plan` request. The counters live in a
+    //! tokio task-local, so only reads made inside [`measure`]'s future are
+    //! counted: other tests running at the same time (many read the registry
+    //! root) can no longer add to them.
     use std::collections::BTreeSet;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
 
-    static ENABLED: AtomicBool = AtomicBool::new(false);
-    static REGISTRY_ROOT_READS: AtomicU64 = AtomicU64::new(0);
-    static STORE_MEMORY_MULTIFORM_OPS: AtomicU64 = AtomicU64::new(0);
-    static AST_FORM_QUERIES: AtomicU64 = AtomicU64::new(0);
-    static BRIDGE_ENRICHMENT_PASSES: AtomicU64 = AtomicU64::new(0);
-    static LOGICAL_FILES_ENRICHED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
-
-    pub(crate) struct DisableOnDrop;
-
-    impl Drop for DisableOnDrop {
-        fn drop(&mut self) {
-            ENABLED.store(false, Ordering::Relaxed);
-            reset_counts();
-        }
+    #[derive(Default)]
+    struct Counts {
+        registry_root_reads: AtomicU64,
+        store_memory_multiform_ops: AtomicU64,
+        ast_form_queries: AtomicU64,
+        bridge_enrichment_passes: AtomicU64,
+        logical_files_enriched: Mutex<BTreeSet<String>>,
     }
 
-    fn reset_counts() {
-        REGISTRY_ROOT_READS.store(0, Ordering::Relaxed);
-        STORE_MEMORY_MULTIFORM_OPS.store(0, Ordering::Relaxed);
-        AST_FORM_QUERIES.store(0, Ordering::Relaxed);
-        BRIDGE_ENRICHMENT_PASSES.store(0, Ordering::Relaxed);
-        LOGICAL_FILES_ENRICHED
+    tokio::task_local! {
+        static COUNTS: Arc<Counts>;
+    }
+
+    /// What one measured request counted.
+    pub(crate) struct Measured {
+        pub(crate) snapshot: serde_json::Value,
+        pub(crate) logical_files_enriched: BTreeSet<String>,
+    }
+
+    /// Run `fut` with fresh counters and return its output with what it
+    /// counted.
+    pub(crate) async fn measure<F: std::future::Future>(fut: F) -> (F::Output, Measured) {
+        let counts = Arc::new(Counts::default());
+        let output = COUNTS.scope(counts.clone(), fut).await;
+        let files = counts
+            .logical_files_enriched
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clear();
+            .clone();
+        let snapshot = serde_json::json!({
+            "registry_root_reads_per_request": counts.registry_root_reads.load(Ordering::Relaxed),
+            "store_memory_multiform_ops_per_request": counts.store_memory_multiform_ops.load(Ordering::Relaxed),
+            "ast_form_queries_per_request": counts.ast_form_queries.load(Ordering::Relaxed),
+            "bridge_enrichment_passes_per_request": counts.bridge_enrichment_passes.load(Ordering::Relaxed),
+            "logical_files_enriched_per_request": files.len(),
+        });
+        (
+            output,
+            Measured {
+                snapshot,
+                logical_files_enriched: files,
+            },
+        )
     }
 
-    pub(crate) fn enable() -> DisableOnDrop {
-        reset_counts();
-        ENABLED.store(true, Ordering::Relaxed);
-        DisableOnDrop
-    }
-
-    pub(crate) fn begin_request() {
-        reset_counts();
+    fn bump(pick: impl FnOnce(&Counts) -> &AtomicU64) {
+        let _ = COUNTS.try_with(|counts| pick(counts).fetch_add(1, Ordering::Relaxed));
     }
 
     pub(crate) fn record_registry_root_read() {
-        if ENABLED.load(Ordering::Relaxed) {
-            REGISTRY_ROOT_READS.fetch_add(1, Ordering::Relaxed);
-        }
+        bump(|c| &c.registry_root_reads);
     }
 
     pub(crate) fn record_store_memory_multiform_op() {
-        if ENABLED.load(Ordering::Relaxed) {
-            STORE_MEMORY_MULTIFORM_OPS.fetch_add(1, Ordering::Relaxed);
-        }
+        bump(|c| &c.store_memory_multiform_ops);
     }
 
     pub(crate) fn record_ast_form_query() {
-        if ENABLED.load(Ordering::Relaxed) {
-            AST_FORM_QUERIES.fetch_add(1, Ordering::Relaxed);
-        }
+        bump(|c| &c.ast_form_queries);
     }
 
     pub(crate) fn record_bridge_enrichment_pass() {
-        if ENABLED.load(Ordering::Relaxed) {
-            BRIDGE_ENRICHMENT_PASSES.fetch_add(1, Ordering::Relaxed);
-        }
+        bump(|c| &c.bridge_enrichment_passes);
     }
 
     pub(crate) fn record_logical_file_enriched(path: &str) {
-        if ENABLED.load(Ordering::Relaxed) {
-            LOGICAL_FILES_ENRICHED
+        let _ = COUNTS.try_with(|counts| {
+            counts
+                .logical_files_enriched
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(crate::parser::ingest::normalize_node_path(path));
-        }
-    }
-
-    pub(crate) fn logical_files_enriched() -> BTreeSet<String> {
-        LOGICAL_FILES_ENRICHED
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-    }
-
-    pub(crate) fn snapshot() -> serde_json::Value {
-        let logical_files_enriched = logical_files_enriched().len();
-        serde_json::json!({
-            "registry_root_reads_per_request": REGISTRY_ROOT_READS.load(Ordering::Relaxed),
-            "store_memory_multiform_ops_per_request": STORE_MEMORY_MULTIFORM_OPS.load(Ordering::Relaxed),
-            "ast_form_queries_per_request": AST_FORM_QUERIES.load(Ordering::Relaxed),
-            "bridge_enrichment_passes_per_request": BRIDGE_ENRICHMENT_PASSES.load(Ordering::Relaxed),
-            "logical_files_enriched_per_request": logical_files_enriched,
-        })
+        });
     }
 }
 
@@ -23883,20 +23874,20 @@ mod context_plan_tests {
                 .expect("upsert governing rule");
         }
 
-        let _instrumentation = super::context_plan_benchmark_instrumentation::enable();
-        super::context_plan_benchmark_instrumentation::begin_request();
-        let result = handle_context_plan(
-            &serde_json::json!({
-                "namespace": "ns",
-                "query": "rule",
-                "files": ["src/one.rs", abs1, "src/two.rs", abs2],
-                "max_items": 20,
-            }),
-            embedder.clone(),
-            store.clone(),
+        let (result, measured) = super::context_plan_benchmark_instrumentation::measure(
+            handle_context_plan(
+                &serde_json::json!({
+                    "namespace": "ns",
+                    "query": "rule",
+                    "files": ["src/one.rs", abs1, "src/two.rs", abs2],
+                    "max_items": 20,
+                }),
+                embedder.clone(),
+                store.clone(),
+            ),
         )
         .await;
-        let snap = super::context_plan_benchmark_instrumentation::snapshot();
+        let snap = measured.snapshot;
         let plan: serde_json::Value = serde_json::from_str(&result).expect("plan json");
 
         // Registry root is read once per request, not once per requested file.
@@ -24156,19 +24147,19 @@ mod context_plan_tests {
             })
         );
 
-        let _instrumentation = super::context_plan_benchmark_instrumentation::enable();
         let mut measured_ms = Vec::with_capacity(MEASURED_ITERATIONS);
         let mut expected_counts: Option<serde_json::Value> = None;
         for iteration in 0..(WARMUP_ITERATIONS + MEASURED_ITERATIONS) {
-            super::context_plan_benchmark_instrumentation::begin_request();
             let started = Instant::now();
-            let result =
-                handle_context_plan(&arguments, embedder.clone(), vector_store.clone()).await;
+            let (result, measured) = super::context_plan_benchmark_instrumentation::measure(
+                handle_context_plan(&arguments, embedder.clone(), vector_store.clone()),
+            )
+            .await;
             let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
-            let counts = super::context_plan_benchmark_instrumentation::snapshot();
+            let counts = measured.snapshot;
             let plan: serde_json::Value = serde_json::from_str(&result).expect("plan JSON");
             assert!(plan["items"].is_array(), "context plan must contain items");
-            let enriched = super::context_plan_benchmark_instrumentation::logical_files_enriched();
+            let enriched = measured.logical_files_enriched;
             let missing: Vec<&String> = logical_files
                 .iter()
                 .filter(|path| !enriched.contains(*path))
