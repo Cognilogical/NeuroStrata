@@ -287,7 +287,8 @@ pub fn derive_status(result_text: &str, is_error: bool) -> ReceiptStatus {
     }
     // Text guards for non-JSON responses. Placed after the existing Empty
     // patterns so a genuine "no results" text is not reclassified as failed.
-    if lower.starts_with("error")
+    if lower.starts_with("missing ")
+        || lower.starts_with("error")
         || lower.contains("error [")
         || lower.contains("error:")
         || lower.contains("\"status\":\"failed\"")
@@ -299,23 +300,93 @@ pub fn derive_status(result_text: &str, is_error: bool) -> ReceiptStatus {
     ReceiptStatus::Success
 }
 
+/// JSON array keys that carry real result rows across graph/ontology handlers.
+const RESULT_KEYS: &[&str] = &[
+    "memories",
+    "results",
+    "symbols",
+    "concepts",
+    "related_memories",
+    "hits",
+    "rows",
+    "locations",
+    "recommendations",
+    "gaps",
+];
+
+/// Legacy key recognized only by empty-detection (kept for behavior parity).
+const EMPTY_ONLY_RESULT_KEYS: &[&str] = &["nodes"];
+
+/// An ASK query returns one boolean verdict even though `solution_count` is 0.
+fn is_ask_verdict(v: &Value) -> bool {
+    v.get("query_form").and_then(Value::as_str) == Some("ask")
+        && v.get("results")
+            .and_then(Value::as_object)
+            .and_then(|o| o.get("boolean"))
+            .map(Value::is_boolean)
+            .unwrap_or(false)
+}
+
+/// Append a non-empty id, bounded to [`MAX_RETURNED_IDS`]. No raw text is kept.
+fn push_bounded(ids: &mut Vec<String>, id: Option<&str>) {
+    if let Some(id) = id.map(str::trim).filter(|s| !s.is_empty()) {
+        if ids.len() < MAX_RETURNED_IDS {
+            ids.push(id.to_string());
+        }
+    }
+}
+
+/// Bounded governing-rule ids from a top-level `governing_rules` array.
+fn push_rule_ids(v: &Value, ids: &mut Vec<String>) {
+    if let Some(rules) = v.get("governing_rules").and_then(Value::as_array) {
+        for rule in rules {
+            push_bounded(ids, rule.get("id").and_then(Value::as_str));
+        }
+    }
+}
+
+/// Total items across diff-tour stops.
+fn diff_tour_item_count(v: &Value) -> usize {
+    v.get("stops")
+        .and_then(Value::as_array)
+        .map(|stops| {
+            stops
+                .iter()
+                .map(|stop| {
+                    stop.get("items")
+                        .and_then(Value::as_array)
+                        .map(Vec::len)
+                        .unwrap_or(0)
+                })
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
 /// True when a JSON response carries only empty result collections.
 fn is_empty_result(v: &Value) -> bool {
-    const RESULT_KEYS: &[&str] = &[
-        "memories",
-        "results",
-        "symbols",
-        "concepts",
-        "related_memories",
-        "hits",
-        "rows",
-        "nodes",
-    ];
+    // A real verdict (ASK boolean) or an object view is always one result.
+    if is_ask_verdict(v) || v.get("object_view").map(Value::is_object).unwrap_or(false) {
+        return false;
+    }
+    if v.get("solution_count").and_then(Value::as_u64) == Some(0) {
+        return true;
+    }
+    if let Some(stops) = v.get("stops").and_then(Value::as_array) {
+        return stops.is_empty() || diff_tour_item_count(v) == 0;
+    }
     let arrays: Vec<&Vec<Value>> = RESULT_KEYS
         .iter()
+        .chain(EMPTY_ONLY_RESULT_KEYS.iter())
         .filter_map(|k| v.get(k).and_then(Value::as_array))
         .collect();
-    !arrays.is_empty() && arrays.iter().all(|a| a.is_empty())
+    let has_single_id = ["concept_id", "thesis_id"].iter().any(|k| {
+        v.get(k)
+            .and_then(Value::as_str)
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+    });
+    !arrays.is_empty() && arrays.iter().all(|a| a.is_empty()) && !has_single_id
 }
 
 /// Marker emitted by `format_memory` for every rendered search result.
@@ -348,29 +419,56 @@ pub fn extract_returned_ids(result_text: &str) -> Vec<String> {
         return text_memory_ids(result_text);
     };
     let mut ids = Vec::new();
-    const RESULT_KEYS: &[&str] = &[
-        "memories",
-        "results",
-        "symbols",
-        "concepts",
-        "related_memories",
-        "hits",
-        "rows",
-    ];
     for key in RESULT_KEYS {
         if let Some(arr) = v.get(*key).and_then(Value::as_array) {
             for item in arr {
-                if let Some(id) = item.get("id").and_then(Value::as_str) {
-                    if !id.is_empty() {
-                        ids.push(id.to_string());
-                        if ids.len() >= MAX_RETURNED_IDS {
-                            return ids;
+                if *key == "locations" {
+                    // locate items carry scip_symbol/symbol/path, not always id.
+                    let id = ["id", "scip_symbol", "symbol", "path"]
+                        .iter()
+                        .find_map(|k| item.get(k).and_then(Value::as_str));
+                    push_bounded(&mut ids, id);
+                    if let Some(rules) = item.get("governing_rules").and_then(Value::as_array) {
+                        for rule in rules {
+                            push_bounded(&mut ids, rule.get("id").and_then(Value::as_str));
                         }
                     }
+                } else {
+                    push_bounded(&mut ids, item.get("id").and_then(Value::as_str));
+                }
+                if ids.len() >= MAX_RETURNED_IDS {
+                    return ids;
                 }
             }
         }
     }
+    // Single-object view: the viewed id is the one bounded id.
+    if let Some(view) = v.get("object_view").filter(|view| view.is_object()) {
+        push_bounded(&mut ids, view.get("id").and_then(Value::as_str));
+    }
+    // Diff tour: one bounded id per stop item (symbol, else path, else id).
+    if let Some(stops) = v.get("stops").and_then(Value::as_array) {
+        for stop in stops {
+            if let Some(items) = stop.get("items").and_then(Value::as_array) {
+                for item in items {
+                    let id = ["symbol", "path", "id"]
+                        .iter()
+                        .find_map(|k| item.get(k).and_then(Value::as_str));
+                    push_bounded(&mut ids, id);
+                }
+            }
+            if let Some(rules) = stop.get("governing_rules").and_then(Value::as_array) {
+                for rule in rules {
+                    push_bounded(&mut ids, rule.get("id").and_then(Value::as_str));
+                }
+            }
+        }
+    }
+    // Top-level governing rules (locate / diff_tour emit these at the root).
+    push_rule_ids(&v, &mut ids);
+    // Single-id fallbacks (taxonomy upsert_concept / set_thesis).
+    push_bounded(&mut ids, v.get("concept_id").and_then(Value::as_str));
+    push_bounded(&mut ids, v.get("thesis_id").and_then(Value::as_str));
     ids
 }
 
@@ -381,28 +479,45 @@ pub fn result_count(result_text: &str) -> usize {
     let Ok(v) = serde_json::from_str::<Value>(result_text) else {
         return text_memory_ids(result_text).len();
     };
+    // ASK is one boolean verdict regardless of its zero solution_count.
+    if is_ask_verdict(&v) {
+        return 1;
+    }
     if let Some(n) = v
         .get("result_count")
         .and_then(Value::as_u64)
         .or_else(|| v.get("count").and_then(Value::as_u64))
         .or_else(|| v.get("total").and_then(Value::as_u64))
+        .or_else(|| v.get("solution_count").and_then(Value::as_u64))
     {
         return n as usize;
     }
-    const RESULT_KEYS: &[&str] = &[
-        "memories",
-        "results",
-        "symbols",
-        "concepts",
-        "related_memories",
-        "hits",
-        "rows",
-    ];
-    RESULT_KEYS
+    // A single-object view is one result.
+    if v.get("object_view").map(Value::is_object).unwrap_or(false) {
+        return 1;
+    }
+    // Diff tour: sum stop items, or the declared total when stops is absent.
+    if v.get("stops").and_then(Value::as_array).is_some() {
+        return diff_tour_item_count(&v);
+    }
+    if let Some(n) = v.get("total_symbols_touched").and_then(Value::as_u64) {
+        return n as usize;
+    }
+    let mut count: usize = RESULT_KEYS
         .iter()
         .filter_map(|k| v.get(k).and_then(Value::as_array))
-        .map(|a| a.len())
-        .sum()
+        .map(Vec::len)
+        .sum();
+    for key in ["concept_id", "thesis_id"] {
+        if v.get(key)
+            .and_then(Value::as_str)
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+        {
+            count += 1;
+        }
+    }
+    count
 }
 
 /// Coarse route class for a tool name, derived locally so receipt builders
@@ -436,7 +551,18 @@ pub fn build_dispatch_receipt(
     let status = derive_status(result_text, is_error);
     let returned_ids = extract_returned_ids(result_text);
     let count = result_count(result_text);
-    let operation = tool.trim_start_matches("neurostrata_").to_string();
+    // The handler's real `operation` (e.g. taxonomy `advise`) outranks the
+    // tool-derived name; a response without one falls back to the tool name.
+    let operation = serde_json::from_str::<Value>(result_text)
+        .ok()
+        .and_then(|v| {
+            v.get("operation")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| tool.trim_start_matches("neurostrata_").to_string());
     let schema_valid = !is_error && serde_json::from_str::<Value>(result_text).is_ok();
     ReceiptFields::new(
         event_id,
@@ -458,6 +584,27 @@ pub fn build_dispatch_receipt(
         query_raw,
         result_text,
     )
+}
+
+/// For `neurostrata_taxonomy` dispatch only: recover the requested operation
+/// from call args when the handler response carried no top-level `operation`
+/// (e.g. an error path). Never stores raw args — only the bounded op string.
+pub fn taxonomy_operation_fallback(
+    operation: &str,
+    is_taxonomy: bool,
+    args: Option<&Value>,
+) -> String {
+    if is_taxonomy && operation == "taxonomy" {
+        if let Some(op) = args
+            .and_then(|a| a.get("operation"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return op.to_string();
+        }
+    }
+    operation.to_string()
 }
 
 /// Read §5 action objects from the REAL handler response text. `next_actions`
@@ -570,5 +717,139 @@ mod tests {
             .collect::<String>();
         assert_eq!(extract_returned_ids(&many).len(), MAX_RETURNED_IDS);
         assert_eq!(result_count(&many), MAX_RETURNED_IDS);
+    }
+
+    // ---- Task 11 Fix 1: missing-query search classified success (c2) ----
+    #[test]
+    fn receipt_status_missing_query_search_is_failed() {
+        let text = "Missing 'query' parameter.\n\n[search_contract] query=* top_k=5";
+        assert_eq!(derive_status(text, false), ReceiptStatus::Failed);
+        // Genuine empty search outcomes still classify as Empty, not Failed.
+        assert_eq!(derive_status(r#"{"memories":[]}"#, false), ReceiptStatus::Empty);
+        assert_eq!(
+            derive_status("no relevant memories found.", false),
+            ReceiptStatus::Empty
+        );
+    }
+
+    // ---- Task 11 Fix 2a/2c: taxonomy receipt operation = handler op ----
+    #[test]
+    fn receipt_operation_comes_from_handler_result() {
+        let mk = |tool: &str, text: &str| {
+            build_dispatch_receipt(
+                "evt-op".to_string(),
+                1,
+                "ses".to_string(),
+                "ns".to_string(),
+                tool.to_string(),
+                "q",
+                text,
+                false,
+                1,
+            )
+        };
+        assert_eq!(
+            mk("neurostrata_taxonomy", r#"{"operation":"advise","recommendations":[]}"#).operation,
+            "advise"
+        );
+        assert_eq!(
+            mk("neurostrata_taxonomy", r#"{"operation":"briefing"}"#).operation,
+            "briefing"
+        );
+        // Non-taxonomy tool with no top-level operation is unchanged.
+        assert_eq!(
+            mk("neurostrata_related", r#"{"memories":[]}"#).operation,
+            "related"
+        );
+    }
+
+    // ---- Task 11 Fix 2b: failed taxonomy call operation from args ----
+    #[test]
+    fn taxonomy_failed_call_operation_from_args() {
+        let args = serde_json::json!({"operation":"advise"});
+        assert_eq!(
+            taxonomy_operation_fallback("taxonomy", true, Some(&args)),
+            "advise"
+        );
+        assert_eq!(
+            taxonomy_operation_fallback("related", false, Some(&args)),
+            "related"
+        );
+        let no_op = serde_json::json!({"namespace":"NeuroStrata"});
+        assert_eq!(
+            taxonomy_operation_fallback("taxonomy", true, Some(&no_op)),
+            "taxonomy"
+        );
+        assert_eq!(
+            taxonomy_operation_fallback("advise", true, Some(&args)),
+            "advise"
+        );
+        assert_eq!(taxonomy_operation_fallback("taxonomy", true, None), "taxonomy");
+    }
+
+    // ---- Task 11 Fix 3: honest count/ids for remaining graph tools ----
+    #[test]
+    fn receipt_count_and_ids_sparql() {
+        let select = r#"{"query_form":"select","solution_count":3,"results":[]}"#;
+        assert_eq!(result_count(select), 3);
+        assert!(extract_returned_ids(select).is_empty());
+
+        // ASK returns one boolean verdict even though solution_count is 0.
+        let ask = r#"{"query_form":"ask","solution_count":0,"results":{"boolean":true}}"#;
+        assert_eq!(result_count(ask), 1);
+        assert_eq!(derive_status(ask, false), ReceiptStatus::Success);
+
+        let empty = r#"{"query_form":"select","solution_count":0,"results":[]}"#;
+        assert_eq!(result_count(empty), 0);
+        assert_eq!(derive_status(empty, false), ReceiptStatus::Empty);
+    }
+
+    #[test]
+    fn receipt_count_and_ids_locate() {
+        let text = r#"{"locations":[{"path":"src/a.rs","scip_symbol":"foo"},{"id":"mem-2","symbol":"bar"}],"governing_rules":[{"id":"rule-1"}]}"#;
+        assert_eq!(result_count(text), 2);
+        assert_eq!(
+            extract_returned_ids(text),
+            vec!["foo", "mem-2", "rule-1"]
+        );
+        let empty = r#"{"locations":[],"governing_rules":[]}"#;
+        assert_eq!(result_count(empty), 0);
+        assert_eq!(derive_status(empty, false), ReceiptStatus::Empty);
+    }
+
+    #[test]
+    fn receipt_count_and_ids_object_view() {
+        let text = r#"{"object_view":{"id":"mem-x","location":"src/lib.rs"}}"#;
+        assert_eq!(result_count(text), 1);
+        assert_eq!(extract_returned_ids(text), vec!["mem-x"]);
+        assert_eq!(derive_status(text, false), ReceiptStatus::Success);
+    }
+
+    #[test]
+    fn receipt_count_and_ids_diff_tour() {
+        let text = r#"{"total_symbols_touched":2,"stops":[{"items":[{"symbol":"s1","path":"src/a.rs"},{"path":"src/b.rs"}]}],"governing_rules":[{"id":"rule-2"}]}"#;
+        assert_eq!(result_count(text), 2);
+        assert_eq!(
+            extract_returned_ids(text),
+            vec!["s1", "src/b.rs", "rule-2"]
+        );
+        // Fallback when stops is absent.
+        assert_eq!(result_count(r#"{"total_symbols_touched":5}"#), 5);
+        let empty = r#"{"stops":[]}"#;
+        assert_eq!(result_count(empty), 0);
+        assert_eq!(derive_status(empty, false), ReceiptStatus::Empty);
+    }
+
+    #[test]
+    fn receipt_count_and_ids_taxonomy() {
+        let text = r#"{"operation":"advise","recommendations":[{"id":"rec-1"}],"gaps":[{"id":"gap-1"}]}"#;
+        assert_eq!(result_count(text), 2);
+        assert_eq!(extract_returned_ids(text), vec!["rec-1", "gap-1"]);
+        let single = r#"{"operation":"briefing","concept_id":"concept-1"}"#;
+        assert_eq!(result_count(single), 1);
+        assert_eq!(extract_returned_ids(single), vec!["concept-1"]);
+        let empty = r#"{"recommendations":[],"gaps":[]}"#;
+        assert_eq!(result_count(empty), 0);
+        assert_eq!(derive_status(empty, false), ReceiptStatus::Empty);
     }
 }

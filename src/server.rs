@@ -2033,6 +2033,15 @@ pub async fn process_mcp_request(
                                 ),
                                 &result_text,
                             );
+                            // Task 11 Fix 2b: a failed taxonomy call carries no
+                            // handler `operation`, so recover the requested op
+                            // from args (bounded string only; no raw args stored).
+                            fields.operation =
+                                crate::task::tool_receipts::taxonomy_operation_fallback(
+                                    &fields.operation,
+                                    name == "neurostrata_taxonomy",
+                                    args_ref,
+                                );
                             // R7 proof: the ledger is digest-only, so a follow-up
                             // `neurostrata_related` call must prove at dispatch that
                             // it matched the prescription (concrete seed, >=2 hops).

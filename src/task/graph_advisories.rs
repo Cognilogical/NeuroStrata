@@ -340,4 +340,58 @@ mod tests {
         let r = report(&l);
         assert!(r.high_blast_radius_unexplored);
     }
+
+    // Task 11 Fix 2d: a genuine taxonomy `advise` receipt clears the strategic
+    // miss; a `tree`/`briefing` receipt must NOT (predicate stays strict).
+    #[test]
+    fn advisory_strategic_taxonomy_advise_resolves_tree_does_not() {
+        let active = active();
+        let applicable = vec![T_STRATEGIC.to_string()];
+        let allowed = vec![TAXONOMY_TOOL];
+        let mk = |op: &str| {
+            json!({
+                "events": [{
+                    "task_id": "t-active",
+                    "tool": TAXONOMY_TOOL,
+                    "operation": op,
+                    "status": "success"
+                }]
+            })
+        };
+        let report_for = |le: &Value| {
+            compute_advisories(&AdvisoryInput {
+                ledger: le,
+                active_task_ids: &active,
+                allowed_graph_tools: &allowed,
+                applicable_trigger_ids: &applicable,
+                taxonomy_available: true,
+                concept_grounding_linked: false,
+            })
+            .to_json()
+        };
+
+        let advise = report_for(&mk("advise"));
+        assert!(advise["recommendations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|w| w != W_ONTOLOGY_STRATEGIC_MISS));
+        assert!(advise["unresolved_trigger_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t != T_STRATEGIC));
+
+        let tree = report_for(&mk("tree"));
+        assert!(tree["recommendations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w == W_ONTOLOGY_STRATEGIC_MISS));
+        assert!(tree["unresolved_trigger_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t == T_STRATEGIC));
+    }
 }
