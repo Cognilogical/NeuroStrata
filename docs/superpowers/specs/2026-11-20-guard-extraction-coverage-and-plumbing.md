@@ -77,11 +77,16 @@ any added `#!` line, so documentation examples cause false denials.
    deterministic rules the hook configuration relies on.
 2. A shebang is attributed only to a real script target, never to a quoted
    example in a documentation patch.
+3. Extraction never fails open through truncation: recognized top-level
+   targets are captured before the nested walk, and a payload that exhausts
+   the depth/node budget is treated as a match (fail closed) rather than as
+   having no targets.
 
 ### Behavior specification
 
-1. **Bounded recursive extraction.** On a JSON object, walk values to a
-   bounded depth (≤3) and node budget (≤256), collecting:
+1. **Bounded recursive extraction.** On a JSON object, first collect
+   top-level recognized values, then walk values to a bounded depth (≤3) and
+   node budget (4096), collecting:
    - path-like values under `path`/`file_path`/`filePath`/`filepath`/
      `target_file`/`targetFile`/`filename`/`notebook_path`/`notebookPath`,
      at any nesting level;
@@ -132,6 +137,11 @@ Rust (`src/guard/validator.rs` tests):
   - a complete Codex patch (`*** Begin Patch` … `*** End Patch`), a unified
     diff (`--- a/...` / `+++ b/...`), and both forms under JSON `input` yield
     their target; the doc-like exclusion still holds inside an envelope.
+- `extraction_budget_exhaustion_fails_closed`
+  - 254 edit objects followed by a top-level `file_path` still yield the
+    `.py` target;
+  - a payload beyond the node budget with no visible target fires the rule
+    (fail closed) instead of silently passing.
 
 JS (`plugins/core/test.mjs`, mock daemon records `guardArgs`):
 - `apply_patch raw hook input reaches guard_validate as the patch, not "{}"`

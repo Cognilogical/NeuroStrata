@@ -70,7 +70,10 @@ const DOC_LIKE_EXTENSIONS: &[&str] = &[
 ];
 
 const MUTATION_WALK_MAX_DEPTH: usize = 3;
-const MUTATION_WALK_MAX_NODES: usize = 256;
+/// Node budget for the bounded extraction walks. Large legitimate MultiEdit
+/// payloads fit; anything beyond it is reported as incomplete and fails
+/// closed rather than silently truncating (d7b8d2ee#r4650162580).
+const MUTATION_WALK_MAX_NODES: usize = 4096;
 
 pub struct GuardValidator {
     semantic: SemanticEvaluator,
@@ -310,14 +313,24 @@ impl GuardValidator {
         }
 
         if Self::is_file_mutation_action(&action_lower) {
-            let (paths, shebangs) = Self::extract_file_mutation_targets_and_shebangs(payload);
+            let (paths, shebangs, complete) =
+                Self::extract_file_mutation_targets_and_shebangs(payload);
+            if !complete {
+                // Fail closed: an oversized payload must not hide a target
+                // beyond the extraction budget (Codex
+                // d7b8d2ee#r4650162580).
+                return true;
+            }
             return branches
                 .iter()
                 .any(|b| Self::file_mutation_matches_branch(b, &paths, &shebangs));
         }
 
         if Self::is_shell_action(&action_lower) {
-            let commands = Self::extract_shell_commands(payload);
+            let (commands, complete) = Self::extract_shell_commands(payload);
+            if !complete {
+                return true;
+            }
             return commands.iter().any(|cmd| {
                 let surfaces = Self::unquoted_command_surfaces(cmd);
                 branches
@@ -462,44 +475,60 @@ impl GuardValidator {
         }
     }
 
+    fn collect_mutation_string(
+        key: &str,
+        value: &str,
+        paths: &mut Vec<String>,
+        shebangs: &mut Vec<String>,
+    ) {
+        if MUTATION_PATH_KEYS
+            .iter()
+            .any(|k| k.eq_ignore_ascii_case(key))
+            && !value.trim().is_empty()
+        {
+            paths.push(value.trim().to_lowercase());
+        }
+        if MUTATION_CONTENT_KEYS
+            .iter()
+            .any(|k| k.eq_ignore_ascii_case(key))
+        {
+            Self::collect_shebang_from_content(value, shebangs);
+        }
+        if Self::should_scan_patch(key, value) {
+            Self::extract_patch_targets_and_shebangs(value, paths, shebangs);
+        }
+    }
+
+    /// Returns `false` when the walk was truncated by the depth or node
+    /// budget. Truncation is fail-closed: the caller treats an incomplete
+    /// extraction as a match instead of allowing a hidden target.
     fn walk_mutation_json(
         value: &serde_json::Value,
         depth: usize,
         budget: &mut usize,
         paths: &mut Vec<String>,
         shebangs: &mut Vec<String>,
-    ) {
+    ) -> bool {
         if depth > MUTATION_WALK_MAX_DEPTH || *budget == 0 {
-            return;
+            return false;
         }
         *budget -= 1;
+        let mut complete = true;
         match value {
             serde_json::Value::Object(map) => {
                 for (key, val) in map {
                     if *budget == 0 {
+                        complete = false;
                         break;
                     }
                     match val {
                         serde_json::Value::String(s) => {
-                            if MUTATION_PATH_KEYS
-                                .iter()
-                                .any(|k| k.eq_ignore_ascii_case(key))
-                                && !s.trim().is_empty()
-                            {
-                                paths.push(s.trim().to_lowercase());
-                            }
-                            if MUTATION_CONTENT_KEYS
-                                .iter()
-                                .any(|k| k.eq_ignore_ascii_case(key))
-                            {
-                                Self::collect_shebang_from_content(s, shebangs);
-                            }
-                            if Self::should_scan_patch(key, s) {
-                                Self::extract_patch_targets_and_shebangs(s, paths, shebangs);
-                            }
+                            Self::collect_mutation_string(key, s, paths, shebangs);
                         }
                         serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
-                            Self::walk_mutation_json(val, depth + 1, budget, paths, shebangs);
+                            if !Self::walk_mutation_json(val, depth + 1, budget, paths, shebangs) {
+                                complete = false;
+                            }
                         }
                         _ => {}
                     }
@@ -508,16 +537,22 @@ impl GuardValidator {
             serde_json::Value::Array(items) => {
                 for item in items {
                     if *budget == 0 {
+                        complete = false;
                         break;
                     }
-                    Self::walk_mutation_json(item, depth + 1, budget, paths, shebangs);
+                    if !Self::walk_mutation_json(item, depth + 1, budget, paths, shebangs) {
+                        complete = false;
+                    }
                 }
             }
             _ => {}
         }
+        complete
     }
 
-    fn extract_file_mutation_targets_and_shebangs(payload: &str) -> (Vec<String>, Vec<String>) {
+    fn extract_file_mutation_targets_and_shebangs(
+        payload: &str,
+    ) -> (Vec<String>, Vec<String>, bool) {
         let mut paths = Vec::new();
         let mut shebangs = Vec::new();
 
@@ -530,27 +565,40 @@ impl GuardValidator {
             // surface their targets. Patch-shaped string values are decoded
             // by `serde_json` before the scan, so `input` bodies have real
             // newlines (#333/B2 exec bridge).
+            //
+            // Top-level recognized targets are captured before the walk so a
+            // large nested array cannot starve them (Codex
+            // d7b8d2ee#r4650162580).
+            for (key, val) in &map {
+                if let serde_json::Value::String(s) = val {
+                    Self::collect_mutation_string(key, s, &mut paths, &mut shebangs);
+                }
+            }
             let mut budget = MUTATION_WALK_MAX_NODES;
-            Self::walk_mutation_json(
+            let complete = Self::walk_mutation_json(
                 &serde_json::Value::Object(map),
                 0,
                 &mut budget,
                 &mut paths,
                 &mut shebangs,
             );
-            return (paths, shebangs);
+            paths.sort();
+            paths.dedup();
+            shebangs.sort();
+            shebangs.dedup();
+            return (paths, shebangs, complete);
         }
 
         if Self::contains_patch_marker(payload) {
             Self::extract_patch_targets_and_shebangs(payload, &mut paths, &mut shebangs);
-            return (paths, shebangs);
+            return (paths, shebangs, true);
         }
 
         Self::collect_shebang_from_content(payload, &mut shebangs);
         if !payload.contains('\n') && !payload.trim().is_empty() {
             paths.push(payload.trim().to_lowercase());
         }
-        (paths, shebangs)
+        (paths, shebangs, true)
     }
 
     fn file_mutation_matches_branch(
@@ -587,11 +635,12 @@ impl GuardValidator {
         depth: usize,
         budget: &mut usize,
         out: &mut Vec<String>,
-    ) {
+    ) -> bool {
         if depth > MUTATION_WALK_MAX_DEPTH || *budget == 0 {
-            return;
+            return false;
         }
         *budget -= 1;
+        let mut complete = true;
         match value {
             serde_json::Value::String(s) => {
                 let trimmed = s.trim();
@@ -602,24 +651,31 @@ impl GuardValidator {
             serde_json::Value::Array(items) => {
                 for item in items {
                     if *budget == 0 {
+                        complete = false;
                         break;
                     }
-                    Self::collect_shell_command_strings(item, depth + 1, budget, out);
+                    if !Self::collect_shell_command_strings(item, depth + 1, budget, out) {
+                        complete = false;
+                    }
                 }
             }
             serde_json::Value::Object(map) => {
                 for val in map.values() {
                     if *budget == 0 {
+                        complete = false;
                         break;
                     }
-                    Self::collect_shell_command_strings(val, depth + 1, budget, out);
+                    if !Self::collect_shell_command_strings(val, depth + 1, budget, out) {
+                        complete = false;
+                    }
                 }
             }
             _ => {}
         }
+        complete
     }
 
-    fn extract_shell_commands(payload: &str) -> Vec<String> {
+    fn extract_shell_commands(payload: &str) -> (Vec<String>, bool) {
         if let Ok(serde_json::Value::Object(map)) =
             serde_json::from_str::<serde_json::Value>(payload)
         {
@@ -647,16 +703,17 @@ impl GuardValidator {
                 // a command nested under an unlisted key.
                 cmds.push(payload.to_string());
                 let mut budget = MUTATION_WALK_MAX_NODES;
-                Self::collect_shell_command_strings(
+                let complete = Self::collect_shell_command_strings(
                     &serde_json::Value::Object(map),
                     0,
                     &mut budget,
                     &mut cmds,
                 );
+                return (cmds, complete);
             }
-            return cmds;
+            return (cmds, true);
         }
-        vec![payload.to_string()]
+        (vec![payload.to_string()], true)
     }
 
     fn split_shell_segments(cmd: &str) -> Vec<String> {
@@ -1962,9 +2019,8 @@ mod tests {
         ));
 
         // Beyond any budget with no visible target: fail closed, not open.
-        let operations: Vec<serde_json::Value> = (0..5000)
-            .map(|i| serde_json::json!({ "n": i }))
-            .collect();
+        let operations: Vec<serde_json::Value> =
+            (0..5000).map(|i| serde_json::json!({ "n": i })).collect();
         let huge = serde_json::json!({ "operations": operations }).to_string();
         let (v_huge, f_huge) = validator
             .validate("write", &huge, "/workspace", false)
