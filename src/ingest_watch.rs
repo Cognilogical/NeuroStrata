@@ -1071,38 +1071,50 @@ impl IngestWatchService {
     /// Earliest wake-up instant for the run loop: next flush deadline,
     /// next backoff retry, or a far-future bound when nothing is pending.
     fn next_deadline(&self) -> tokio::time::Instant {
-        let now = tokio::time::Instant::now();
-        let mut earliest = now + MAX_WINDOW + QUIET_PERIOD;
-        // Snapshot the burst map before touching retries: never nest locks.
+        self.next_deadline_from(tokio::time::Instant::now())
+    }
+
+    fn next_deadline_from(&self, now: tokio::time::Instant) -> tokio::time::Instant {
+        let far_future = now + MAX_WINDOW + QUIET_PERIOD;
+        // Snapshot each map in turn — never hold two guards at once.
+        let active = match self.active.lock() {
+            Ok(active) => active,
+            Err(_) => return far_future,
+        };
         let snapshots: Vec<(RootKey, tokio::time::Instant, tokio::time::Instant)> =
             match self.bursts.lock() {
                 Ok(bursts) => bursts
                     .iter()
                     .map(|(key, burst)| (key.clone(), burst.first, burst.last))
                     .collect(),
-                Err(_) => return now,
+                Err(_) => return far_future,
             };
         let retries = match self.retry_at.lock() {
             Ok(retries) => retries,
-            Err(_) => return now,
+            Err(_) => return far_future,
         };
+        let mut earliest = far_future;
         for (key, first, last) in snapshots {
-            let retry = retries.get(&key).copied().unwrap_or(first);
-            let candidates = [last + QUIET_PERIOD, first + MAX_WINDOW, retry];
-            for candidate in candidates {
-                // Clamp to `now`: an already-elapsed retry must not make
-                // sleep_until spin on a past deadline.
-                let candidate = if candidate < now { now } else { candidate };
-                if candidate < earliest {
+            // An in-flight root is driven by its firing task, not by a timer.
+            if active.contains(&key) {
+                continue;
+            }
+            // Only future deadlines wake the loop. An elapsed retry paired
+            // with a fresh burst must defer to the burst's real deadline;
+            // returning `now` here would spin sleep_until until the quiet
+            // window expires.
+            for candidate in [last + QUIET_PERIOD, first + MAX_WINDOW] {
+                if candidate > now && candidate < earliest {
                     earliest = candidate;
                 }
             }
+            if let Some(retry) = retries.get(&key) {
+                if *retry > now && *retry < earliest {
+                    earliest = *retry;
+                }
+            }
         }
-        if earliest < now {
-            now
-        } else {
-            earliest
-        }
+        earliest
     }
 
     /// Fire one due root. Marks it active for the trigger duration so runs
@@ -1994,5 +2006,31 @@ mod tests {
         };
         handle.await.unwrap().unwrap();
         assert_eq!(std::fs::read(&registry_path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn loop_next_deadline_ignores_elapsed_retry_and_never_spins() {
+        let dir = tempfile::tempdir().unwrap();
+        let (service, canonical) = service_with(&dir, Arc::new(RecordingTrigger::default()));
+        service.register("NeuroStrata", &canonical).unwrap();
+        let key = root_key(&canonical);
+        let t0 = tokio::time::Instant::now();
+        service.bursts.lock().unwrap().insert(
+            key.clone(),
+            BurstState {
+                first: t0 - Duration::from_millis(500),
+                last: t0 - Duration::from_millis(100),
+            },
+        );
+        service
+            .retry_at
+            .lock()
+            .unwrap()
+            .insert(key, t0 - Duration::from_secs(1));
+        // Retry is a second elapsed; burst is only 100 ms old and 500 ms into
+        // its window, so this is exactly the no-due / would-spin case.
+        assert!(service.due_keys(t0).is_empty());
+        let expected = t0 - Duration::from_millis(100) + QUIET_PERIOD;
+        assert_eq!(service.next_deadline_from(t0), expected);
     }
 }
