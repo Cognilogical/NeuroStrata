@@ -264,12 +264,20 @@ impl WatchRegistrationStore for JsonFileRegistrationStore {
         let content = fs::read_to_string(&self.path)
             .with_context(|| format!("Could not read watch registry at {}", self.path.display()))?;
         let doc: serde_json::Value = serde_json::from_str(&content).map_err(|err| {
+            tracing::warn!(
+                "watch registry at {} is not valid strict JSON: {err}",
+                self.path.display()
+            );
             anyhow::anyhow!(
                 "watch registry at {} is not valid strict JSON: {err}",
                 self.path.display()
             )
         })?;
         let obj = doc.as_object().ok_or_else(|| {
+            tracing::warn!(
+                "watch registry at {} must be a JSON object",
+                self.path.display()
+            );
             anyhow::anyhow!(
                 "watch registry at {} must be a JSON object",
                 self.path.display()
@@ -279,6 +287,10 @@ impl WatchRegistrationStore for JsonFileRegistrationStore {
             || !obj.contains_key("schema_version")
             || !obj.contains_key("registrations")
         {
+            tracing::warn!(
+                "watch registry at {} must contain exactly schema_version and registrations",
+                self.path.display()
+            );
             return Err(anyhow::anyhow!(
                 "watch registry at {} must contain exactly schema_version and registrations",
                 self.path.display()
@@ -288,12 +300,21 @@ impl WatchRegistrationStore for JsonFileRegistrationStore {
             .get("schema_version")
             .and_then(|value| value.as_u64())
             .ok_or_else(|| {
+                tracing::warn!(
+                    "watch registry at {} must carry an integer schema_version",
+                    self.path.display()
+                );
                 anyhow::anyhow!(
                     "watch registry at {} must carry an integer schema_version",
                     self.path.display()
                 )
             })?;
         if schema_version != 1 {
+            tracing::warn!(
+                "watch registry at {} has unsupported schema_version {}",
+                self.path.display(),
+                schema_version
+            );
             return Err(anyhow::anyhow!(
                 "watch registry at {} has unsupported schema_version {}",
                 self.path.display(),
@@ -304,6 +325,10 @@ impl WatchRegistrationStore for JsonFileRegistrationStore {
             .get("registrations")
             .and_then(|value| value.as_array())
             .ok_or_else(|| {
+                tracing::warn!(
+                    "watch registry at {} must carry a registrations array",
+                    self.path.display()
+                );
                 anyhow::anyhow!(
                     "watch registry at {} must carry a registrations array",
                     self.path.display()
@@ -569,13 +594,21 @@ impl IngestWatchService {
         };
         {
             let mut state = self.lock_state()?;
-            for reg in regs {
+            for mut reg in regs {
                 let canonical = match crate::daemon::check_caller_path(
                     &reg.canonical_path,
                     &self.startup_root,
                     &self.allowed_external_dirs,
                 ) {
-                    Ok(canonical) => canonical,
+                    Ok(canonical) => {
+                        reg.canonical_path = canonical.clone();
+                        tracing::warn!(
+                            "watch registry entry J6-canonicalized at load: {} -> {}",
+                            reg.canonical_path.display(),
+                            canonical.display()
+                        );
+                        canonical
+                    }
                     Err(err) => {
                         tracing::warn!(
                             "watch registry entry refused at load (J6): {} -> {err}",
@@ -784,7 +817,7 @@ mod tests {
             self.unwatched
                 .lock()
                 .map_err(|_| "watch mutex poisoned".to_string())?
-                .retain(|path| path != root);
+                .push(root.to_path_buf());
             Ok(())
         }
     }
@@ -966,5 +999,29 @@ mod tests {
         let service = service_for(&dir, dir.path().to_path_buf());
         service.start().await.unwrap();
         assert!(service.status(None).roots.is_empty());
+    }
+
+    #[tokio::test]
+    async fn start_canonicalizes_persisted_registration_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("watch_registrations.json");
+        let in_root = dir.path().join("src");
+        std::fs::create_dir_all(&in_root).unwrap();
+        let resolved = in_root.canonicalize().unwrap();
+        let raw = format!("{}/./src", dir.path().display());
+        let doc = format!(
+            r#"{{"schema_version":1,"registrations":[{{"namespace":"NeuroStrata","canonical_path":"{}","created_at_unix":1763596800,"updated_at_unix":1763596800}}]}}"#,
+            raw
+        );
+        std::fs::write(&path, doc).unwrap();
+        let service = service_for(&dir, dir.path().to_path_buf());
+        service.start().await.unwrap();
+        let report = service.status(None);
+        assert_eq!(report.roots.len(), 1);
+        assert_eq!(report.roots[0].canonical_path, resolved);
+        let loaded = service.store.load().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].canonical_path, resolved);
+        assert_eq!(service.store.load().unwrap()[0].canonical_path, resolved);
     }
 }
