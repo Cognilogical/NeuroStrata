@@ -3904,8 +3904,9 @@ pub(crate) fn is_current_hook(content: &str) -> bool {
     content.contains(&marker)
 }
 
-/// The scaffolded `pre-commit` hook: records the module-query ledger and
-/// stamps `graph_queried` on the active task before any commit lands.
+/// The scaffolded `pre-commit` hook: reads the module-query ledger and warns
+/// on staged files with no lookup. It never stamps `graph_queried`; that is
+/// written by `record_graph_query_with_root` after a real lookup.
 pub(crate) const SCAFFOLDED_PRE_COMMIT_HOOK: &str = r#"#!/bin/bash
 # NeuroStrata pre-commit hook — scaffolded by neurostrata-bootstrap.
 #
@@ -4199,6 +4200,97 @@ echo "Verify: neurostrata_task_setup should report verified.hook_installed: true
 pub(crate) const SCAFFOLDED_TASK_COVERAGE_GATE: &str =
     include_str!("../../scripts/task-coverage-gate.sh");
 
+/// SHA-256 of the scaffolded task-coverage guard body (excluding the trailing
+/// hash-marker line). Lets hygiene tell a current gate from a stale one that
+/// an older binary seeded, without touching locally authored guards.
+pub(crate) fn task_coverage_gate_sha256() -> String {
+    use sha2::{Digest, Sha256};
+    let marker = "# neurostrata-gate-sha256:";
+    let body = match SCAFFOLDED_TASK_COVERAGE_GATE.rfind(marker) {
+        Some(idx) => &SCAFFOLDED_TASK_COVERAGE_GATE[..idx],
+        None => SCAFFOLDED_TASK_COVERAGE_GATE,
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(body.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// True when `content` is the scaffolded guard whose embedded hash matches
+/// the current canonical script. A stale marked copy is refreshed by hygiene.
+pub(crate) fn is_current_task_coverage_gate(content: &str) -> bool {
+    let marker = format!("# neurostrata-gate-sha256: {}", task_coverage_gate_sha256());
+    content.contains(&marker)
+}
+
+/// Live (non-comment, non-empty) entries in a hook's PROJECT_GATES array.
+fn hook_project_gates(content: &str) -> Vec<String> {
+    const OPEN: &str = "PROJECT_GATES=(";
+    let start = match content.find(OPEN) {
+        Some(i) => i + OPEN.len(),
+        None => return Vec::new(),
+    };
+    let block = match content[start..].find(')') {
+        Some(i) => &content[start..start + i],
+        None => return Vec::new(),
+    };
+    block
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Canonical pre-push bytes plus any project-added PROJECT_GATES entries
+/// found in `stale`, merged in (dedup, original order). The canonical hash
+/// marker is retained so hygiene does not rewrite the hook again next run.
+fn refreshed_pre_push_preserving_gates(stale: &str) -> String {
+    let defaults = hook_project_gates(SCAFFOLDED_PRE_PUSH_HOOK);
+    let mut added: Vec<String> = Vec::new();
+    for gate in hook_project_gates(stale) {
+        if !defaults.contains(&gate) && !added.contains(&gate) {
+            added.push(gate);
+        }
+    }
+    if added.is_empty() {
+        return SCAFFOLDED_PRE_PUSH_HOOK.to_string();
+    }
+    const OPEN: &str = "PROJECT_GATES=(";
+    let start = SCAFFOLDED_PRE_PUSH_HOOK
+        .find(OPEN)
+        .expect("PROJECT_GATES in canonical pre-push")
+        + OPEN.len();
+    let end = start
+        + SCAFFOLDED_PRE_PUSH_HOOK[start..]
+            .find(')')
+            .expect("closing paren of PROJECT_GATES");
+    let mut out = String::with_capacity(SCAFFOLDED_PRE_PUSH_HOOK.len() + 128);
+    out.push_str(&SCAFFOLDED_PRE_PUSH_HOOK[..end]);
+    for gate in added {
+        out.push_str("    ");
+        out.push_str(&gate);
+        out.push('\n');
+    }
+    out.push_str(&SCAFFOLDED_PRE_PUSH_HOOK[end..]);
+    out
+}
+
+/// Content version marker for the scaffolded pre-commit hook. The canonical
+/// hook is byte-identity guarded, so it cannot carry a literal hash-marker
+/// line like pre-push/task-coverage-gate. This header block was introduced
+/// when the hook stopped stamping `graph_queried`; its presence proves the
+/// current version already landed. Local checks a project appends leave the
+/// marker intact, so "current + local edits" is distinct from "stale V1".
+pub(crate) const PRE_COMMIT_VERSION_MARKER: &str =
+    "# Warns when a staged file has no recorded NeuroStrata graph/memory lookup and";
+
+/// True when `content` carries the current pre-commit version marker. Such a
+/// hook is preserved even when local edits make it differ from the canonical
+/// bytes; only hooks missing the marker (older versions) are refreshed.
+pub(crate) fn is_current_pre_commit_hook(content: &str) -> bool {
+    content.contains(PRE_COMMIT_VERSION_MARKER)
+}
+
 /// The directory git actually runs hooks from, resolved the way git resolves
 /// it: `core.hooksPath` at the highest-priority config level that sets it,
 /// else `$GIT_DIR/hooks`.
@@ -4259,6 +4351,7 @@ pub(crate) fn hook_hygiene(root: &std::path::Path) -> String {
     } else if let Ok(pc_content) = std::fs::read_to_string(&pre_commit_target) {
         if pc_content.contains("NeuroStrata pre-commit hook")
             && pc_content != SCAFFOLDED_PRE_COMMIT_HOOK
+            && !is_current_pre_commit_hook(&pc_content)
             && std::fs::copy(&pre_commit_target, hooks_dir.join("pre-commit.bak")).is_ok()
             && std::fs::write(&pre_commit_target, SCAFFOLDED_PRE_COMMIT_HOOK).is_ok()
         {
@@ -4267,12 +4360,15 @@ pub(crate) fn hook_hygiene(root: &std::path::Path) -> String {
     }
     // Tracked hook artifacts live in scripts/. Create the tree explicitly so
     // a fresh project without scripts/ gets the whole set a live hook needs.
-    // Seed only when absent: an older binary must never clobber a newer
-    // checked-in hook or local edits. Git-hook auto-heal above is untouched.
+    // Seed when absent; refresh a copy we authored that is stale, so a later
+    // `bash scripts/install-hooks.sh` cannot copy fabrication machinery back
+    // over the .git/hooks copy hygiene just healed. Files with no NeuroStrata
+    // marker are foreign/local and are never touched.
     let scripts_dir = root.join("scripts");
     if let Err(e) = std::fs::create_dir_all(scripts_dir.join("hooks")) {
         tracing::warn!("failed to create scripts/hooks dir: {e}");
     }
+    let mut notes: Vec<String> = Vec::new();
     for (rel, content) in [
         ("hooks/pre-push", SCAFFOLDED_PRE_PUSH_HOOK),
         ("hooks/pre-commit", SCAFFOLDED_PRE_COMMIT_HOOK),
@@ -4280,43 +4376,89 @@ pub(crate) fn hook_hygiene(root: &std::path::Path) -> String {
         ("task-coverage-gate.sh", SCAFFOLDED_TASK_COVERAGE_GATE),
     ] {
         let path = scripts_dir.join(rel);
-        if !path.exists() && std::fs::write(&path, content).is_ok() {
+        if !path.exists() {
+            if std::fs::write(&path, content).is_ok() {
+                set_executable(&path);
+            }
+            continue;
+        }
+        let on_disk = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if on_disk == content {
+            continue;
+        }
+        let stale_ours = match rel {
+            "hooks/pre-push" => is_ours_hook(&on_disk) && !is_current_hook(&on_disk),
+            "hooks/pre-commit" => {
+                on_disk.contains("NeuroStrata pre-commit hook")
+                    && !is_current_pre_commit_hook(&on_disk)
+            }
+            "install-hooks.sh" => {
+                on_disk.contains("Install scripts/hooks/pre-push as the hook git runs")
+            }
+            "task-coverage-gate.sh" => {
+                on_disk.contains("# scripts/task-coverage-gate.sh")
+                    && !is_current_task_coverage_gate(&on_disk)
+            }
+            _ => false,
+        };
+        if !stale_ours {
+            continue;
+        }
+        let backup = format!("{}.bak", path.display());
+        if let Err(e) = std::fs::copy(&path, &backup) {
+            tracing::warn!("failed to back up stale tracked {rel}: {e}");
+            continue;
+        }
+        let refreshed = if rel == "hooks/pre-push" {
+            refreshed_pre_push_preserving_gates(&on_disk)
+        } else {
+            content.to_string()
+        };
+        if std::fs::write(&path, &refreshed).is_ok() {
             set_executable(&path);
+            notes.push(format!("HOOKS: refreshed stale tracked {rel}"));
         }
     }
     let target = hooks_dir.join("pre-push");
     let version = env!("CARGO_PKG_VERSION");
-    if !target.exists() {
+    let git_status = if !target.exists() {
         if std::fs::write(&target, SCAFFOLDED_PRE_PUSH_HOOK).is_ok() {
             set_executable(&target);
-            return format!("HOOKS: auto-installed pre-push (v{})", version);
+            format!("HOOKS: auto-installed pre-push (v{version})")
+        } else {
+            String::new()
         }
-        return String::new();
-    }
-    let content = match std::fs::read_to_string(&target) {
-        Ok(c) => c,
-        Err(_) => return String::new(),
+    } else {
+        let content = match std::fs::read_to_string(&target) {
+            Ok(c) => c,
+            Err(_) => return notes.join("; "),
+        };
+        if is_ours_hook(&content) {
+            if is_current_hook(&content) {
+                String::new()
+            } else if let Err(e) = std::fs::copy(&target, hooks_dir.join("pre-push.bak")) {
+                tracing::warn!("failed to back up foreign pre-push hook: {e}");
+                String::new()
+            } else if std::fs::write(&target, refreshed_pre_push_preserving_gates(&content)).is_ok() {
+                set_executable(&target);
+                format!("HOOKS: updated pre-push (stale -> v{version})")
+            } else {
+                String::new()
+            }
+        } else {
+            format!(
+                "HOOKS WARNING: foreign pre-push hook at {}; inspect or run 'neurostrata-mcp hooks install --force'",
+                target.display()
+            )
+        }
     };
-    if is_ours_hook(&content) {
-        if is_current_hook(&content) {
-            return String::new();
-        }
-        // stale: back up + rewrite. A failed backup must not destroy the
-        // hook content -- rewriting without the .bak loses the only copy.
-        if let Err(e) = std::fs::copy(&target, hooks_dir.join("pre-push.bak")) {
-            tracing::warn!("failed to back up foreign pre-push hook: {e}");
-            return String::new();
-        }
-        if std::fs::write(&target, SCAFFOLDED_PRE_PUSH_HOOK).is_ok() {
-            set_executable(&target);
-            return format!("HOOKS: updated pre-push (stale -> v{})", version);
-        }
-        return String::new();
+    if !git_status.is_empty() {
+        notes.push(git_status);
     }
-    format!(
-        "HOOKS WARNING: foreign pre-push hook at {}; inspect or run 'neurostrata-mcp hooks install --force'",
-        target.display()
-    )
+    notes.join("; ")
 }
 
 #[cfg(unix)]
@@ -4601,7 +4743,7 @@ fn wiring_panel(root: &std::path::Path, namespace: &str) -> (Value, Value, Value
                 { "path": "scripts/hooks/pre-commit",
                   "content": SCAFFOLDED_PRE_COMMIT_HOOK,
                   "executable": true,
-                  "note": "records the graph-query ledger before each commit" },
+                  "note": "reads the graph-query ledger and warns on unrecorded staged files" },
                 { "path": "scripts/install-hooks.sh",
                   "content": SCAFFOLDED_INSTALL_HOOKS,
                   "executable": true,
@@ -5625,16 +5767,224 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// C21: a stale tracked hook carries fabrication machinery. If the
+    /// installer re-copies it over a hygiene-healed `.git/hooks` copy, that
+    /// machinery comes back. Hygiene must refresh copies it authored, keeping
+    /// a `.bak` for review.
+    #[cfg(unix)]
+    #[test]
+    fn hook_hygiene_refreshes_stale_tracked_pre_push() {
+        let root = std::env::temp_dir()
+            .join(format!("ns-hygiene-stale-push-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
+        std::fs::create_dir_all(root.join("scripts").join("hooks")).unwrap();
+        let stale = SCAFFOLDED_PRE_PUSH_HOOK.replace(
+            &format!("# neurostrata-hook-sha256: {}", hook_sha256()),
+            "# fabricated graph_queried stamp\n",
+        );
+        assert!(stale.contains("fabricated"), "stale fixture must carry the marker");
+        let tracked = root.join("scripts/hooks/pre-push");
+        std::fs::write(&tracked, &stale).unwrap();
+        let status = hook_hygiene(&root);
+        assert!(
+            status.contains("stale tracked"),
+            "hygiene must report the stale tracked hook: {status}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&tracked).unwrap(),
+            SCAFFOLDED_PRE_PUSH_HOOK,
+            "tracked pre-push must be refreshed to canonical bytes"
+        );
+        let backup = root.join("scripts/hooks/pre-push.bak");
+        assert!(
+            backup.is_file()
+                && std::fs::read_to_string(&backup)
+                    .unwrap()
+                    .contains("fabricated"),
+            "stale tracked hook must be backed up before rewrite"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Codex 4653560567: refreshing a stale tracked pre-push hook must keep
+    /// project-added PROJECT_GATES entries instead of dropping them with the
+    /// canonical rewrite. The original (with the guard) is still backed up.
+    #[cfg(unix)]
+    #[test]
+    fn hook_hygiene_refresh_preserves_project_added_prepush_gates() {
+        let root =
+            std::env::temp_dir().join(format!("ns-hygiene-custom-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
+        std::fs::create_dir_all(root.join("scripts").join("hooks")).unwrap();
+        let custom_gate = "./scripts/local-audit.sh";
+        let stale = SCAFFOLDED_PRE_PUSH_HOOK
+            .replace(
+                &format!("# neurostrata-hook-sha256: {}", hook_sha256()),
+                "# old pre-push marker (stale)\n",
+            )
+            .replace(
+                "    # ./scripts/rules-gate.sh\n",
+                &format!("    # ./scripts/rules-gate.sh\n    {custom_gate}\n"),
+            );
+        assert!(
+            stale.contains(custom_gate),
+            "fixture must carry custom gate"
+        );
+        let tracked = root.join("scripts/hooks/pre-push");
+        std::fs::write(&tracked, &stale).unwrap();
+        let status = hook_hygiene(&root);
+        let refreshed = std::fs::read_to_string(&tracked).unwrap();
+        assert!(
+            refreshed.contains(&format!("# neurostrata-hook-sha256: {}", hook_sha256())),
+            "stale hook must be refreshed to a current marker: {status}"
+        );
+        assert!(
+            refreshed.contains(custom_gate),
+            "project-added PROJECT_GATES entry must survive refresh: {refreshed}"
+        );
+        let backup = root.join("scripts/hooks/pre-push.bak");
+        assert!(
+            backup.is_file()
+                && std::fs::read_to_string(&backup)
+                    .unwrap()
+                    .contains(custom_gate),
+            ".bak must retain the original hook with its custom guard"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Codex 4653560575: a current-version pre-commit hook with local edits
+    /// must survive hygiene; the old code overwrote any marked hook that
+    /// differed from the embedded script, destroying local checks.
+    #[cfg(unix)]
+    #[test]
+    fn hook_hygiene_preserves_local_edits_in_current_pre_commit() {
+        let root = std::env::temp_dir().join(format!("ns-hygiene-local-pc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
+        std::fs::create_dir_all(root.join("scripts").join("hooks")).unwrap();
+        let anchor = "\nexit 0\n";
+        let pos = SCAFFOLDED_PRE_COMMIT_HOOK
+            .rfind(anchor)
+            .expect("canonical pre-commit hook ends with exit 0");
+        let mut local = String::new();
+        local.push_str(&SCAFFOLDED_PRE_COMMIT_HOOK[..pos]);
+        local.push_str("\necho 'local project check'\n");
+        local.push_str(&SCAFFOLDED_PRE_COMMIT_HOOK[pos..]);
+        let tracked = root.join("scripts/hooks/pre-commit");
+        std::fs::write(&tracked, &local).unwrap();
+        let status = hook_hygiene(&root);
+        let after = std::fs::read_to_string(&tracked).unwrap();
+        assert!(
+            after.contains("local project check"),
+            "local edits to a current pre-commit hook must be preserved: {status}"
+        );
+        assert!(
+            !root.join("scripts/hooks/pre-commit.bak").exists(),
+            "a preserved current hook needs no backup: {status}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Codex 4653560575: a stale (old-version) pre-commit hook is still
+    /// refreshed to canonical bytes with a `.bak`, so the version check does
+    /// not make hygiene stop healing genuinely superseded hooks.
+    #[cfg(unix)]
+    #[test]
+    fn hook_hygiene_refreshes_stale_pre_commit_with_old_marker() {
+        let root = std::env::temp_dir().join(format!("ns-hygiene-stale-pc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
+        std::fs::create_dir_all(root.join("scripts").join("hooks")).unwrap();
+        let stale = "#!/bin/bash\n# NeuroStrata pre-commit hook — scaffolded by neurostrata-bootstrap.\n# STALE V1 fabrication machinery\nexit 0\n";
+        let tracked = root.join("scripts/hooks/pre-commit");
+        std::fs::write(&tracked, stale).unwrap();
+        let status = hook_hygiene(&root);
+        assert!(
+            status.contains("stale tracked"),
+            "hygiene must report the stale pre-commit hook: {status}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&tracked).unwrap(),
+            SCAFFOLDED_PRE_COMMIT_HOOK,
+            "stale pre-commit hook must be refreshed to canonical bytes"
+        );
+        let backup = root.join("scripts/hooks/pre-commit.bak");
+        assert!(
+            backup.is_file()
+                && std::fs::read_to_string(&backup)
+                    .unwrap()
+                    .contains("STALE V1"),
+            "stale pre-commit hook must be backed up before rewrite"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// C45: a scaffolded task-coverage gate seeded by an older binary drifts
+    /// forever because hygiene only seeds absent files. A marked stale copy
+    /// must be refreshed (with `.bak`) so the live hook never points at it.
+    #[cfg(unix)]
+    #[test]
+    fn hook_hygiene_refreshes_stale_scaffolded_gate() {
+        let root = std::env::temp_dir()
+            .join(format!("ns-hygiene-stale-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
+        std::fs::create_dir_all(root.join("scripts")).unwrap();
+        let path = root.join("scripts/task-coverage-gate.sh");
+        std::fs::write(
+            &path,
+            "#!/bin/bash\n# scripts/task-coverage-gate.sh\n# fabricated gate\nexit 0\n",
+        )
+        .unwrap();
+        let status = hook_hygiene(&root);
+        assert!(
+            status.contains("stale tracked"),
+            "hygiene must report the stale gate: {status}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            SCAFFOLDED_TASK_COVERAGE_GATE,
+            "scaffolded gate must be refreshed to canonical bytes"
+        );
+        let backup = root.join("scripts/task-coverage-gate.sh.bak");
+        assert!(
+            backup.is_file()
+                && std::fs::read_to_string(&backup)
+                    .unwrap()
+                    .contains("fabricated"),
+            "stale scaffolded gate must be backed up before rewrite"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The scaffolded guard must be the canonical script, not an empty stub.
     #[test]
     fn scaffolded_task_coverage_gate_is_valid_bash() {
         if which_bash().is_none() {
             return;
         }
-        assert_eq!(
-            SCAFFOLDED_TASK_COVERAGE_GATE,
-            include_str!("../../scripts/task-coverage-gate.sh"),
-            "the guard must be single-sourced from the canonical script"
+        // Real content/hash check: the embedded guard must carry a SHA-256
+        // marker matching its own body. Editing the script without refreshing
+        // the marker fails here instead of drifting forever.
+        use sha2::Digest;
+        let marker = "# neurostrata-gate-sha256:";
+        let marker_at = SCAFFOLDED_TASK_COVERAGE_GATE
+            .find(marker)
+            .expect("canonical gate must carry a SHA-256 marker");
+        let body = &SCAFFOLDED_TASK_COVERAGE_GATE[..marker_at];
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(body.as_bytes());
+        let digest = hex::encode(hasher.finalize());
+        assert!(
+            SCAFFOLDED_TASK_COVERAGE_GATE[marker_at..].contains(&digest),
+            "gate hash marker must match the canonical guard body"
+        );
+        assert!(
+            SCAFFOLDED_TASK_COVERAGE_GATE.contains("BASH_VERSINFO"),
+            "guard must keep its fail-closed Bash version check"
         );
         assert!(
             SCAFFOLDED_TASK_COVERAGE_GATE.contains("untracked work items"),
@@ -6026,6 +6376,24 @@ mod tests {
         assert!(
             checked_in.contains("scripts/check-staged-quality.sh"),
             "the pre-commit hook must delegate to the project's staged-quality runner"
+        );
+    }
+
+    /// C23: `scripts/install-hooks.sh` is authored twice — the checked-in
+    /// installer and the bytes embedded for fresh projects. Drift would make
+    /// one install path run a different installer than the one reviewed.
+    #[test]
+    fn install_hooks_script_sources_stay_byte_identical() {
+        let checked_in = include_str!("../../scripts/install-hooks.sh");
+        assert_eq!(
+            SCAFFOLDED_INSTALL_HOOKS, checked_in,
+            "embedded install-hooks.sh ({} bytes) differs from scripts/install-hooks.sh ({} bytes)",
+            SCAFFOLDED_INSTALL_HOOKS.len(),
+            checked_in.len()
+        );
+        assert!(
+            checked_in.contains("core.hooksPath"),
+            "installer must honor the hooks dir git actually runs"
         );
     }
 

@@ -121,3 +121,4 @@ fi
 
 echo "task-coverage-gate: no untracked work items found"
 exit 0
+# neurostrata-gate-sha256: e46c4eeb26f05f064b9bd5abb7e7db3ff18fbb8a3f2a753c32566b37e72431d6
