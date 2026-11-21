@@ -972,44 +972,55 @@ impl IngestWatchService {
     /// deterministic without real-time sleeps.
     pub fn ingest_event(&self, ev: WatchEvent, now: tokio::time::Instant) -> anyhow::Result<()> {
         let effects = normalize_event(ev.clone());
-        let mut state = self.lock_state()?;
-        let keys: Vec<RootKey> = state.roots.keys().cloned().collect();
-        let mut matched = false;
-        for key in keys {
-            let canonical = &key.1;
-            let paths: Vec<PathBuf> = effects.iter().map(|e| e.path.clone()).collect();
-            let eligible = paths
-                .iter()
-                .any(|path| crate::parser::ingest::is_ingest_eligible_path(path, canonical));
-            if !eligible {
-                continue;
-            }
-            matched = true;
-            if let Some(runtime) = state.roots.get_mut(&key) {
-                for effect in &effects {
-                    runtime.pending.insert(effect.path.clone());
+        let mut matched_keys: Vec<RootKey> = Vec::new();
+        {
+            // Hold only `state` here; burst state is updated after releasing
+            // it so no two locks are ever nested (deadlock-free ordering).
+            let mut state = self.lock_state()?;
+            let keys: Vec<RootKey> = state.roots.keys().cloned().collect();
+            for key in keys {
+                let canonical = &key.1;
+                let eligible_effects: Vec<&PathEffect> = effects
+                    .iter()
+                    .filter(|effect| {
+                        crate::parser::ingest::is_ingest_eligible_path(&effect.path, canonical)
+                    })
+                    .collect();
+                if eligible_effects.is_empty() {
+                    continue;
                 }
-                runtime.dirty = true;
-                runtime.last_event_unix = Some(unix_now_secs());
+                matched_keys.push(key.clone());
+                if let Some(runtime) = state.roots.get_mut(&key) {
+                    for effect in eligible_effects {
+                        runtime.pending.insert(effect.path.clone());
+                    }
+                    runtime.dirty = true;
+                    runtime.last_event_unix = Some(unix_now_secs());
+                }
             }
+        }
+        let no_match = matched_keys.is_empty();
+        {
             let mut bursts = self
                 .bursts
                 .lock()
                 .map_err(|_| anyhow::anyhow!("burst mutex poisoned"))?;
-            match bursts.get_mut(&key) {
-                Some(burst) => burst.last = now,
-                None => {
-                    bursts.insert(
-                        key,
-                        BurstState {
-                            first: now,
-                            last: now,
-                        },
-                    );
+            for key in matched_keys {
+                match bursts.get_mut(&key) {
+                    Some(burst) => burst.last = now,
+                    None => {
+                        bursts.insert(
+                            key,
+                            BurstState {
+                                first: now,
+                                last: now,
+                            },
+                        );
+                    }
                 }
             }
         }
-        if !matched {
+        if no_match {
             tracing::debug!("watch event filtered as ineligible: {}", ev.path.display());
         }
         Ok(())
@@ -1062,18 +1073,36 @@ impl IngestWatchService {
     fn next_deadline(&self) -> tokio::time::Instant {
         let now = tokio::time::Instant::now();
         let mut earliest = now + MAX_WINDOW + QUIET_PERIOD;
-        if let (Ok(bursts), Ok(retries)) = (self.bursts.lock(), self.retry_at.lock()) {
-            for (key, burst) in bursts.iter() {
-                let retry = retries.get(key).copied().unwrap_or(burst.first);
-                let candidates = [burst.last + QUIET_PERIOD, burst.first + MAX_WINDOW, retry];
-                for candidate in candidates {
-                    if candidate < earliest {
-                        earliest = candidate;
-                    }
+        // Snapshot the burst map before touching retries: never nest locks.
+        let snapshots: Vec<(RootKey, tokio::time::Instant, tokio::time::Instant)> =
+            match self.bursts.lock() {
+                Ok(bursts) => bursts
+                    .iter()
+                    .map(|(key, burst)| (key.clone(), burst.first, burst.last))
+                    .collect(),
+                Err(_) => return now,
+            };
+        let retries = match self.retry_at.lock() {
+            Ok(retries) => retries,
+            Err(_) => return now,
+        };
+        for (key, first, last) in snapshots {
+            let retry = retries.get(&key).copied().unwrap_or(first);
+            let candidates = [last + QUIET_PERIOD, first + MAX_WINDOW, retry];
+            for candidate in candidates {
+                // Clamp to `now`: an already-elapsed retry must not make
+                // sleep_until spin on a past deadline.
+                let candidate = if candidate < now { now } else { candidate };
+                if candidate < earliest {
+                    earliest = candidate;
                 }
             }
         }
-        earliest
+        if earliest < now {
+            now
+        } else {
+            earliest
+        }
     }
 
     /// Fire one due root. Marks it active for the trigger duration so runs
@@ -1107,7 +1136,10 @@ impl IngestWatchService {
             },
         };
         let finished = tokio::time::Instant::now();
+        let mut retry_at: Option<tokio::time::Instant> = None;
         {
+            // One lock at a time throughout: no nested guards means no
+            // possible inversion with `ingest_event`'s state-then-burst path.
             let mut state = self.lock_state()?;
             if let Some(runtime) = state.roots.get_mut(key) {
                 runtime.last_trigger_unix = Some(unix_now_secs());
@@ -1121,13 +1153,16 @@ impl IngestWatchService {
                     let delay = next_backoff(runtime.backoff_attempt);
                     runtime.backoff_attempt += 1;
                     runtime.next_retry_unix = Some(unix_now_secs() + delay.as_secs());
-                    let mut retries = self
-                        .retry_at
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("retry mutex poisoned"))?;
-                    retries.insert(key.clone(), started + delay);
+                    retry_at = Some(started + delay);
                 }
             }
+        }
+        if let Some(at) = retry_at {
+            let mut retries = self
+                .retry_at
+                .lock()
+                .map_err(|_| anyhow::anyhow!("retry mutex poisoned"))?;
+            retries.insert(key.clone(), at);
         }
         {
             let mut active = self
@@ -1136,34 +1171,39 @@ impl IngestWatchService {
                 .map_err(|_| anyhow::anyhow!("active mutex poisoned"))?;
             active.remove(key);
         }
-        let mut bursts = self
-            .bursts
-            .lock()
-            .map_err(|_| anyhow::anyhow!("burst mutex poisoned"))?;
-        let events_during_run = bursts
-            .get(key)
-            .map(|burst| burst.last >= started)
-            .unwrap_or(false);
-        if outcome.state == TriggerState::Finished && !events_during_run {
-            bursts.remove(key);
-            let mut state = self.lock_state()?;
-            if let Some(runtime) = state.roots.get_mut(key) {
-                runtime.dirty = false;
-                runtime.pending.clear();
+        let events_during_run = {
+            let bursts = self
+                .bursts
+                .lock()
+                .map_err(|_| anyhow::anyhow!("burst mutex poisoned"))?;
+            let during = bursts
+                .get(key)
+                .map(|burst| burst.last >= started)
+                .unwrap_or(false);
+            drop(bursts);
+            let mut bursts = self
+                .bursts
+                .lock()
+                .map_err(|_| anyhow::anyhow!("burst mutex poisoned"))?;
+            if outcome.state == TriggerState::Finished && !during {
+                bursts.remove(key);
+            } else {
+                // One follow-up burst, armed from completion time. More
+                // events coalesce into it; no second follow-up is scheduled.
+                bursts.insert(
+                    key.clone(),
+                    BurstState {
+                        first: finished,
+                        last: finished,
+                    },
+                );
             }
-        } else {
-            // One follow-up burst, armed from completion time. More events
-            // coalesce into it; no second follow-up is scheduled separately.
-            bursts.insert(
-                key.clone(),
-                BurstState {
-                    first: finished,
-                    last: finished,
-                },
-            );
+            during
+        };
+        {
             let mut state = self.lock_state()?;
             if let Some(runtime) = state.roots.get_mut(key) {
-                runtime.dirty = true;
+                runtime.dirty = outcome.state == TriggerState::Failed || events_during_run;
                 runtime.pending.clear();
             }
         }
@@ -1782,6 +1822,33 @@ mod tests {
         }
         assert_eq!(service.status(None).roots[0].pending_paths_count, 0);
         assert!(service.due_keys(t0 + QUIET_PERIOD).is_empty());
+    }
+
+    #[tokio::test]
+    async fn loop_c_mixed_rename_filters_each_effect_path_individually() {
+        let dir = tempfile::tempdir().unwrap();
+        let (service, canonical) = service_with(&dir, Arc::new(RecordingTrigger::default()));
+        service.register("NeuroStrata", &canonical).unwrap();
+        let eligible = canonical.join("old.rs");
+        let ineligible = canonical.join("dest.db");
+        // normalize_event emits Remove(old.rs) + Upsert(dest.db); only the
+        // eligible side may enter pending even though both share one event.
+        service
+            .ingest_event(
+                WatchEvent {
+                    root: canonical.clone(),
+                    path: eligible.clone(),
+                    kind: WatchEventKind::Rename,
+                    new_path: Some(ineligible.clone()),
+                },
+                tokio::time::Instant::now(),
+            )
+            .unwrap();
+        let runtime = service.lock_state().unwrap();
+        let pending = &runtime.roots[&root_key(&canonical)].pending;
+        assert!(pending.contains(&eligible));
+        assert!(!pending.contains(&ineligible));
+        assert_eq!(pending.len(), 1);
     }
 
     #[tokio::test]
