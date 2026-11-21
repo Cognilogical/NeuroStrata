@@ -3498,7 +3498,12 @@ pub async fn revert_action(
                 }
             }
             "transition_task" => {
-                let Some((_v, current_task)) = store
+                // Repeated transitions of one task land here in reverse: the
+                // persisted row already carries the chain's final status, so
+                // the comparison head is the before-image staged by the newer
+                // delta. The persisted row still anchors the commit CAS.
+                let staged_task = staged_rows.get(&delta.after_id).cloned();
+                let Some((_v, persisted_task)) = store
                     .get(&invocation.namespace, &delta.after_id)
                     .await
                     .map_err(|e| ActionError::Storage(e.to_string()))?
@@ -3508,6 +3513,7 @@ pub async fn revert_action(
                         superseded_by: "missing_task".to_string(),
                     });
                 };
+                let current_task = staged_task.unwrap_or_else(|| persisted_task.clone());
 
                 check_target_auth(&current_task, &delta.after_id)?;
                 if let Some(ref before_p) = delta.before_payload {
@@ -3555,7 +3561,7 @@ pub async fn revert_action(
                     &mut expected_heads,
                     &mut seen_expected_rows,
                     &delta.after_id,
-                    &current_task,
+                    &persisted_task,
                 );
 
                 let before_payload = delta.before_payload.as_ref().ok_or_else(|| {
@@ -7690,6 +7696,239 @@ mod tests {
         assert_eq!(
             active_after_revert.1.metadata["twin"]["variables"]["pressure"],
             json!(100.0)
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn revert_multi_effect_transition_task_on_same_task_chains_through_staged_state() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ns-action-multi-task-revert-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = crate::store::ladybug::LadybugStore::for_testing(&tmp, 4).expect("store");
+        let ns = "ns-multi-task-rev";
+        store.init(ns).await.unwrap();
+
+        store
+            .upsert(
+                ns,
+                "task-1",
+                vec![0.1; 4],
+                MemoryPayload {
+                    content: "Task 1".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "task".to_string(),
+                    agent_name: None,
+                    location: "".to_string(),
+                    location_lines: "".to_string(),
+                    metadata: json!({
+                        "task": {
+                            "title": "Task 1",
+                            "status": "open",
+                            "priority": 1,
+                            "created_at": 1700000000,
+                            "updated_at": 1700000000,
+                            "history": []
+                        }
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+
+        store
+            .upsert(
+                ns,
+                "act-two-step-task",
+                vec![0.1; 4],
+                MemoryPayload {
+                    content: "Action: two-step-task".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "action_type".to_string(),
+                    agent_name: None,
+                    location: "".to_string(),
+                    location_lines: "".to_string(),
+                    metadata: json!({
+                        "action_type": {
+                            "slug": "two-step-task",
+                            "title": "Two Step Task",
+                            "description": "Applies two TransitionTask effects to the same task in one action",
+                            "required_role": "editor",
+                            "parameters": {
+                                "task_id": { "param_type": "memory_id", "required": true, "target_memory_type": "task" },
+                                "reason": { "param_type": "string", "required": true }
+                            },
+                            "submission_criteria": [],
+                            "effects": [
+                                {
+                                    "op": "transition_task",
+                                    "target_param": "task_id",
+                                    "new_status": "in_progress",
+                                    "note_template": "Claimed by two-step-task"
+                                },
+                                {
+                                    "op": "transition_task",
+                                    "target_param": "task_id",
+                                    "new_status": "blocked",
+                                    "note_template": "Blocked on {{reason}}"
+                                }
+                            ]
+                        }
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+
+        let params = BTreeMap::from([
+            ("task_id".to_string(), json!("task-1")),
+            ("reason".to_string(), json!("upstream valve")),
+        ]);
+        let apply_out = apply_action(
+            &store,
+            &ActionInvocation {
+                namespace: ns.to_string(),
+                slug: "two-step-task".to_string(),
+                security: ActionSecurityContext {
+                    authenticated_principal: "alice".to_string(),
+                    requested_principal: None,
+                },
+                params: params.clone(),
+            },
+            &DummyActionEmbedder,
+        )
+        .await
+        .expect("apply two-step-task");
+        let (receipt_id, receipt) = match apply_out {
+            ActionApplyOutcome::Applied {
+                receipt_id,
+                receipt,
+            } => (receipt_id, receipt),
+            other => panic!("expected Applied, got {other:?}"),
+        };
+        assert_eq!(
+            receipt
+                .row_deltas
+                .iter()
+                .filter(|d| d.kind == "transition_task")
+                .count(),
+            2
+        );
+        assert_eq!(receipt.task_deltas.len(), 2);
+
+        let (_, applied_task) = store.get(ns, "task-1").await.unwrap().unwrap();
+        assert_eq!(applied_task.metadata["task"]["status"], json!("blocked"));
+
+        let rev_out = revert_action(
+            &store,
+            &RevertInvocation {
+                namespace: ns.to_string(),
+                receipt_id: receipt_id.clone(),
+                security: ActionSecurityContext {
+                    authenticated_principal: "alice".to_string(),
+                    requested_principal: None,
+                },
+                force: false,
+            },
+            &DummyActionEmbedder,
+        )
+        .await
+        .expect("non-forced revert of a two-transition task action must succeed (#349)");
+
+        assert!(!rev_out.forced);
+        assert_eq!(rev_out.revert_receipt.task_deltas.len(), 2);
+        let statuses: Vec<(&str, &str)> = rev_out
+            .revert_receipt
+            .task_deltas
+            .iter()
+            .map(|d| (d.before_status.as_str(), d.after_status.as_str()))
+            .collect();
+        assert_eq!(statuses, vec![("blocked", "in_progress"), ("in_progress", "open")]);
+
+        let (_, reverted_task) = store.get(ns, "task-1").await.unwrap().unwrap();
+        assert_eq!(reverted_task.metadata["task"]["status"], json!("open"));
+
+        // A stale revert must still be refused and must write nothing.
+        let apply_again = apply_action(
+            &store,
+            &ActionInvocation {
+                namespace: ns.to_string(),
+                slug: "two-step-task".to_string(),
+                security: ActionSecurityContext {
+                    authenticated_principal: "alice".to_string(),
+                    requested_principal: None,
+                },
+                params,
+            },
+            &DummyActionEmbedder,
+        )
+        .await
+        .expect("re-apply two-step-task");
+        let stale_receipt_id = apply_again.receipt_id().expect("applied receipt").to_string();
+
+        store
+            .upsert(
+                ns,
+                "task-1",
+                vec![0.1; 4],
+                MemoryPayload {
+                    content: "Task 1".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "task".to_string(),
+                    agent_name: None,
+                    location: "".to_string(),
+                    location_lines: "".to_string(),
+                    metadata: json!({
+                        "task": {
+                            "title": "Task 1",
+                            "status": "blocked",
+                            "priority": 1,
+                            "created_at": 1700000000,
+                            "updated_at": 1700009999,
+                            "history": []
+                        }
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        let receipts_before = store
+            .list(ns, None, Some("action_receipt"))
+            .await
+            .unwrap()
+            .len();
+
+        let stale_rev = revert_action(
+            &store,
+            &RevertInvocation {
+                namespace: ns.to_string(),
+                receipt_id: stale_receipt_id,
+                security: ActionSecurityContext {
+                    authenticated_principal: "alice".to_string(),
+                    requested_principal: None,
+                },
+                force: false,
+            },
+            &DummyActionEmbedder,
+        )
+        .await;
+        assert!(
+            matches!(stale_rev, Err(ActionError::ConflictWithNewerVersion { .. })),
+            "expected ConflictWithNewerVersion on external write, got {stale_rev:?}"
+        );
+        let receipts_after = store
+            .list(ns, None, Some("action_receipt"))
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(receipts_before, receipts_after);
+        let (_, untouched_task) = store.get(ns, "task-1").await.unwrap().unwrap();
+        assert_eq!(untouched_task.metadata["task"]["status"], json!("blocked"));
+        assert_eq!(
+            untouched_task.metadata["task"]["updated_at"],
+            json!(1700009999)
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }

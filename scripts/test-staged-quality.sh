@@ -1041,6 +1041,59 @@ SC_EOF
         rm -rf "$tmpdir"
     done
 }
+# Test 23: the shell gate lints the release-reference scripts themselves (#338)
+test_release_reference_scripts_pass_shell_gate() {
+    local tmpdir repo bindir exit_code real_shellcheck
+    tmpdir=$(mktemp -d)
+    repo="$tmpdir/repo"
+    bindir="$tmpdir/bin"
+    export FAKE_TOOL_LOG="$tmpdir/tool.log"
+    setup_fake_tools "$bindir"
+    real_shellcheck=$(command -v shellcheck || true)
+    if [ -z "$real_shellcheck" ]; then
+        echo "shellcheck is required by the staged-quality gate but was not found" >&2
+        rm -rf "$tmpdir"
+        return 1
+    fi
+    # A fake exit 0 would hide real findings; delegate to the real binary so
+    # this exercises the gate's own invocation, and log it so the test proves
+    # both files were linted rather than skipped.
+    cat > "$bindir/shellcheck" <<SC_EOF
+#!/usr/bin/env bash
+echo "shellcheck \$*" >> "\$FAKE_TOOL_LOG"
+exec "$real_shellcheck" "\$@"
+SC_EOF
+    chmod +x "$bindir/shellcheck"
+    mkdir -p "$repo/scripts"
+    cp "$REPO_ROOT/scripts/check-release-references.sh" "$repo/scripts/"
+    cp "$REPO_ROOT/scripts/check-release-references.test.sh" "$repo/scripts/"
+    cd "$repo"
+    git init -q
+    git config user.email "test@test.com"
+    git config user.name "Test"
+    git add scripts/check-release-references.sh scripts/check-release-references.test.sh
+
+    PATH="$bindir:$PATH" bash "$SCRIPT_PATH" > "$tmpdir/out.log" 2>&1
+    exit_code=$?
+    cd - >/dev/null
+    if [ $exit_code -ne 0 ]; then
+        echo "Staged release-reference scripts failed the shell gate" >&2
+        cat "$tmpdir/out.log" >&2
+        rm -rf "$tmpdir"
+        return 1
+    fi
+    local file
+    for file in check-release-references.sh check-release-references.test.sh; do
+        if ! grep -q "scripts/$file" "$FAKE_TOOL_LOG"; then
+            echo "ShellCheck never saw scripts/$file" >&2
+            cat "$tmpdir/out.log" >&2
+            rm -rf "$tmpdir"
+            return 1
+        fi
+    done
+    rm -rf "$tmpdir"
+}
+
 # Test 21: staged Rust with no Cargo dep-info is not silently skipped
 test_unbuilt_staged_rust_fails() {
     local tmpdir repo bindir exit_code
@@ -1292,6 +1345,7 @@ run_test "Good staged Rust passes despite bad worktree" test_good_staged_rust_pa
 run_test "Extensionless Bash hook is checked" test_extensionless_bash_hook_is_checked
 run_test "Direct /usr/bin shebangs are checked" test_direct_usr_bin_shebang_is_checked
 run_test "Unbuilt staged Rust fails" test_unbuilt_staged_rust_fails
+run_test "Release-reference scripts pass the shell gate" test_release_reference_scripts_pass_shell_gate
 run_test "Quality suites are wired into CI" test_quality_suites_are_wired_into_ci
 run_test "Local Rustfmt survives snapshot cwd" test_local_rustfmt_survives_snapshot_cwd
 run_test "Type-change is checked" test_type_change_is_checked
