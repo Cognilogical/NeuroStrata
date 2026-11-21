@@ -2805,4 +2805,349 @@ mod tests {
             "a failed effect's receipt must not make a later retry a no-op: {resolved}"
         );
     }
+
+    /// Review 9227e20f#r4650419233: a write-back must not restore the stale
+    /// schema of a pool that another request changed to read-only.
+    #[tokio::test]
+    async fn write_back_does_not_restore_a_schema_that_became_read_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_impl =
+            Arc::new(LadybugStore::for_testing(dir.path().join("db"), 4).expect("store init"));
+        let store: Arc<dyn VectorStore> = store_impl.clone();
+        let ns = "ns_pool_schema_race";
+        store.init(ns).await.expect("init ns");
+        let bus = Arc::new(ThalamicBus::new(64));
+        let now = now_epoch();
+
+        let kernel1 = AgentKernel::new(store.clone(), bus.clone(), dir.path().to_path_buf());
+        kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "register_pool",
+                    "schema": {
+                        "connector_id": "memory_pool",
+                        "pool_id": "schema_race",
+                        "access_mode": "read_write",
+                        "entity_types": ["item"],
+                        "max_slice_rows": 25,
+                        "max_slice_bytes": 2048,
+                        "description": "Schema race pool"
+                    },
+                    "records": {"mem://items": [{"v": 1}]}
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("register pool");
+        kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "register_pointer",
+                    "record": {
+                        "pointer_id": "ptr_schema_race",
+                        "connector_id": "memory_pool",
+                        "pool_id": "schema_race",
+                        "pointer_uri": "mem://items",
+                        "entity_type": "item",
+                        "expected_source_sha256": null,
+                        "captured_at_secs": now,
+                        "max_staleness_secs": 3600
+                    }
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("register pointer");
+        seed_receipt(
+            &store_impl,
+            ns,
+            "rcpt_schema_race",
+            "ptr_schema_race",
+            "schema_race",
+            false,
+        )
+        .await;
+
+        // Kernel #1 hydrates the read-write schema before the admin change.
+        kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "resolve_pointer",
+                    "req": {"pointer_id": "ptr_schema_race", "offset": 0, "limit": 10, "max_bytes": 1024},
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("kernel1 hydrates");
+
+        let kernel2 = AgentKernel::new(store.clone(), bus.clone(), dir.path().to_path_buf());
+        kernel2
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "upsert_pool",
+                    "schema": {
+                        "connector_id": "memory_pool",
+                        "pool_id": "schema_race",
+                        "access_mode": "read_only",
+                        "entity_types": ["item"],
+                        "max_slice_rows": 25,
+                        "max_slice_bytes": 2048,
+                        "description": "Now read-only"
+                    }
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("schema-only read-only update");
+
+        let result = kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "apply_effect",
+                    "req": {
+                        "pointer_id": "ptr_schema_race",
+                        "operation": "append",
+                        "payload": {"v": 2},
+                        "action_receipt_id": "rcpt_schema_race",
+                        "idempotency_key": "idem-schema-race"
+                    },
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "the write-back must revalidate the stored read-only schema: {result:?}"
+        );
+
+        let kernel3 = AgentKernel::new(store.clone(), bus.clone(), dir.path().to_path_buf());
+        let described = kernel3
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "describe_pool",
+                    "connector_id": "memory_pool",
+                    "pool_id": "schema_race"
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("describe after rejected write-back");
+        assert_eq!(
+            described["access_mode"], "read_only",
+            "the administrative change must not be undone: {described}"
+        );
+    }
+
+    /// Review 9227e20f#r4650419237: a stale kernel must not resurrect a
+    /// pointer whose records were removed by a newer pool replacement.
+    #[tokio::test]
+    async fn stale_kernel_cannot_resurrect_a_removed_pointer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_impl =
+            Arc::new(LadybugStore::for_testing(dir.path().join("db"), 4).expect("store init"));
+        let store: Arc<dyn VectorStore> = store_impl.clone();
+        let ns = "ns_pool_removed_pointer";
+        store.init(ns).await.expect("init ns");
+        let bus = Arc::new(ThalamicBus::new(64));
+        let now = now_epoch();
+
+        let kernel1 = AgentKernel::new(store.clone(), bus.clone(), dir.path().to_path_buf());
+        kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "register_pool",
+                    "schema": {
+                        "connector_id": "memory_pool",
+                        "pool_id": "removed_pool",
+                        "access_mode": "read_write",
+                        "entity_types": ["item"],
+                        "max_slice_rows": 25,
+                        "max_slice_bytes": 2048,
+                        "description": "Removal pool"
+                    },
+                    "records": {
+                        "mem://a": [{"v": 0}],
+                        "mem://b": [{"v": 0}]
+                    }
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("register pool");
+        kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "register_pointer",
+                    "record": {
+                        "pointer_id": "ptr_removed_a",
+                        "connector_id": "memory_pool",
+                        "pool_id": "removed_pool",
+                        "pointer_uri": "mem://a",
+                        "entity_type": "item",
+                        "expected_source_sha256": null,
+                        "captured_at_secs": now,
+                        "max_staleness_secs": 3600
+                    }
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("register pointer");
+        seed_receipt(
+            &store_impl,
+            ns,
+            "rcpt_removed",
+            "ptr_removed_a",
+            "removed_pool",
+            false,
+        )
+        .await;
+
+        kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "resolve_pointer",
+                    "req": {"pointer_id": "ptr_removed_a", "offset": 0, "limit": 10, "max_bytes": 1024},
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("kernel1 hydrates mem://a");
+
+        let kernel2 = AgentKernel::new(store.clone(), bus.clone(), dir.path().to_path_buf());
+        kernel2
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "upsert_pool",
+                    "schema": {
+                        "connector_id": "memory_pool",
+                        "pool_id": "removed_pool",
+                        "access_mode": "read_write",
+                        "entity_types": ["item"],
+                        "max_slice_rows": 25,
+                        "max_slice_bytes": 2048,
+                        "description": "Replaced records"
+                    },
+                    "records": {"mem://b": [{"v": 9}]}
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("record replacement omitting mem://a");
+
+        let result = kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "apply_effect",
+                    "req": {
+                        "pointer_id": "ptr_removed_a",
+                        "operation": "append",
+                        "payload": {"v": 2},
+                        "action_receipt_id": "rcpt_removed",
+                        "idempotency_key": "idem-removed"
+                    },
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "a removed pointer must be a conflict, not an insert: {result:?}"
+        );
+
+        let kernel3 = AgentKernel::new(store.clone(), bus.clone(), dir.path().to_path_buf());
+        let resolved = kernel3
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "resolve_pointer",
+                    "req": {"pointer_id": "ptr_removed_a", "offset": 0, "limit": 10, "max_bytes": 1024},
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await;
+        assert!(
+            resolved.is_err(),
+            "the removed pointer must stay removed: {resolved:?}"
+        );
+    }
+
+    /// Review 9227e20f#r4650419233 (deterministic port-level form): a stale
+    /// read-write commit that lands after a read-only schema update must be
+    /// rejected and must not restore the stale schema.
+    #[tokio::test]
+    async fn write_back_revalidates_the_persisted_schema() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_impl =
+            Arc::new(LadybugStore::for_testing(dir.path().join("db"), 4).expect("store init"));
+        let store: Arc<dyn VectorStore> = store_impl.clone();
+        let ns = "ns_port_schema";
+        store.init(ns).await.expect("init ns");
+        let port = LadybugMemoryPort::new(store.clone());
+
+        let read_write = DataPoolSchema {
+            connector_id: "memory_pool".to_string(),
+            pool_id: "race".to_string(),
+            access_mode: DataPoolAccessMode::ReadWrite,
+            entity_types: vec!["item".to_string()],
+            max_slice_rows: 25,
+            max_slice_bytes: 2048,
+            description: "read-write".to_string(),
+        };
+        let mut records = HashMap::new();
+        records.insert("mem://a".to_string(), vec![json!({"v": 0})]);
+        port.register_data_pool(ns, &read_write, Some(&records), Some(ns))
+            .await
+            .expect("register read-write pool");
+
+        let mut read_only = read_write.clone();
+        read_only.access_mode = DataPoolAccessMode::ReadOnly;
+        port.register_data_pool(ns, &read_only, None, Some(ns))
+            .await
+            .expect("schema-only read-only update");
+
+        // A writer that hydrated the old schema commits a snapshot now.
+        let snapshot = crate::connectors::WriteBackSnapshot {
+            prior_records: vec![json!({"v": 0})],
+            pointer_records: vec![json!({"v": 0}), json!({"v": 1})],
+            idempotency: HashMap::new(),
+        };
+        let result = port
+            .register_pool_writeback(ns, &read_write, "mem://a", &snapshot, Some(ns))
+            .await;
+        assert!(
+            result.is_err(),
+            "a stale read-write commit must be rejected"
+        );
+
+        let persisted = port
+            .list_data_pools(ns, Some("memory_pool"), Some(ns))
+            .await
+            .expect("list pools");
+        let (schema, _) = persisted
+            .into_iter()
+            .find(|(schema, _)| schema.pool_id == "race")
+            .expect("pool row");
+        assert_eq!(
+            schema.access_mode,
+            DataPoolAccessMode::ReadOnly,
+            "the stale commit must not restore the read-write schema"
+        );
+    }
 }
