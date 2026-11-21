@@ -70,8 +70,9 @@ export declare function usableNamespace(raw: unknown): string | undefined;
  *     never entering a folder with its own `.git`. Steps 1 and 2 both run;
  *     the deeper marker wins, at equal depth the own checkout's.
  *  3. Outside git: the first marker above the start folder.
- * When the winning marker cannot be read the answer is null: the caller
- * falls back to the other namespace sources, never to a marker further up.
+ * When the winning marker cannot be read the answer is null, with one
+ * warning line naming the file: the caller falls back to the other namespace
+ * sources, never to a marker further up.
  */
 export declare function findRootMarker(startDir: string): FoundRootMarker | null;
 /**
@@ -104,10 +105,28 @@ export declare function readHarnessConfig(harness: string, projectDir: string, r
  * project root where the session started. Without it, the folder recorded
  * for this session at SessionStart (`claude_session_dirs` in
  * `.NeuroStrata/active_session.json`; never the home folder's), else the
- * event's `cwd`. Other
- * harnesses use the event's `cwd`, else the process's.
+ * event's `cwd`. Other harnesses use the event's `cwd`, else the process's.
+ *
+ * SessionStart also fires on resume, clear and compact, when the event's
+ * `cwd` may have moved: a folder already recorded for the session is kept.
+ * The file is replaced whole (temp + rename), and never when it exists but
+ * cannot be parsed, so the other fields it holds are not lost.
  */
 export declare function resolveHookProjectDir(harness: string, event?: Record<string, unknown>, env?: Record<string, string | undefined>, home?: string): string;
+/**
+ * Whether `toolName` is one of [SESSION_SCOPED_TOOLS], bare or as a harness
+ * spells an MCP tool (`mcp__<server>__neurostrata_task_claim`,
+ * `<server>_neurostrata_task_claim`, `<server>.neurostrata_task_claim`).
+ */
+export declare function isSessionScopedTool(toolName: string): boolean;
+/**
+ * Claim scope from a linked worktree (design 6.5): `neurostrata_task_claim`
+ * and `neurostrata_get_snapshot` without `worktree`, `project_root` or `cwd`
+ * are scoped by the daemon to the namespace's registry root, the main
+ * checkout when a marker applies. This passes the session's project folder
+ * as `worktree` instead. Changes `args` in place; true when it did.
+ */
+export declare function addSessionWorktree(toolName: string, args: Record<string, unknown>, projectDir: string | undefined): boolean;
 /**
  * 1. Walk up to findProjectRoot(startDir) checking <dir>/.NeuroStrata/session_queries.json;
  *    if it parses as JSON with a non-empty string .namespace, return it trimmed.

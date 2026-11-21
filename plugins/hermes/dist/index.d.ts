@@ -52,8 +52,9 @@ export declare function usableNamespace(raw: unknown): string | undefined;
  *     never entering a folder with its own `.git`. Steps 1 and 2 both run;
  *     the deeper marker wins, at equal depth the own checkout's.
  *  3. Outside git: the first marker above the start folder.
- * When the winning marker cannot be read the answer is null: the caller
- * falls back to the other namespace sources, never to a marker further up.
+ * When the winning marker cannot be read the answer is null, with one
+ * warning line naming the file: the caller falls back to the other namespace
+ * sources, never to a marker further up.
  */
 export declare function findRootMarker(startDir: string): FoundRootMarker | null;
 /**
@@ -170,6 +171,22 @@ export declare function sanitizeSubagentHeaderToken(value: string): string;
 export declare function buildSubagentContextHeader(namespace: string, taskId: string | null): string;
 export declare function injectSubagentPrompt(target: Record<string, unknown>, namespace: string, taskId: string | null): boolean;
 export declare function resetClientForTesting(): void;
+/**
+ * Whether `toolName` is one of SESSION_SCOPED_TOOLS, bare or as a host
+ * spells an MCP tool (`mcp__<server>__neurostrata_task_claim`,
+ * `<server>_neurostrata_task_claim`, `<server>.neurostrata_task_claim`).
+ * A copy of core's `isSessionScopedTool`.
+ */
+export declare function isSessionScopedTool(toolName: string): boolean;
+/**
+ * Claim scope from a linked worktree (design 6.5): passes the session's
+ * project folder as `worktree` on `neurostrata_task_claim` and
+ * `neurostrata_get_snapshot` calls that carry no `worktree`, `project_root`
+ * or `cwd`, which the daemon would otherwise scope to the namespace's
+ * registry root (the main checkout when a marker applies). Changes `args`
+ * in place; true when it did. A copy of core's `addSessionWorktree`.
+ */
+export declare function addSessionWorktree(toolName: string, args: Record<string, unknown>, projectDir: string | undefined): boolean;
 export declare function initialize(ctx: any): Promise<void>;
 export declare function onTurnEnd(turn: {
     role: 'user' | 'assistant';
