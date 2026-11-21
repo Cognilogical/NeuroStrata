@@ -665,9 +665,10 @@ fn exact_note_target(
     declared: &str,
     known: &std::collections::BTreeSet<String>,
 ) -> Option<String> {
-    crate::parser::ingest::exact_target_spellings(namespace, declared)
-        .find(|candidate| known.contains(*candidate))
-        .map(str::to_string)
+    crate::parser::ingest::exact_target_match(namespace, declared, |candidate| {
+        known.contains(candidate)
+    })
+    .map(str::to_string)
 }
 
 /// Store-backed half of the same rule: try each spelling in order and return
@@ -698,29 +699,50 @@ async fn exact_stored_target(
 }
 
 /// The edge ids a head's declarations will actually bind, matching the store's
-/// exact-mode lookup. An unresolved declaration keeps its declared spelling so
-/// a later replay binds the same target the vault named.
+/// exact-mode lookup. Both id sources are consulted per spelling so the keep
+/// set cannot pick an alias the upsert would not have bound; an unresolved
+/// declaration keeps its declared spelling so a later replay binds the same
+/// target the vault named.
 async fn exact_keep_targets(
     store: &Arc<dyn VectorStore>,
     namespace: &str,
     declared: &[String],
     known: &std::collections::BTreeSet<String>,
-    cache: &mut std::collections::HashMap<String, Option<(String, crate::traits::MemoryPayload)>>,
 ) -> Vec<String> {
     let mut keep = Vec::with_capacity(declared.len());
     for target in declared {
-        if let Some(found) = exact_note_target(namespace, target, known) {
-            keep.push(found);
-            continue;
-        }
-        match exact_stored_target(store, namespace, target, cache).await {
-            Ok(Some((id, _))) => keep.push(id),
-            Ok(None) => keep.push(target.clone()),
-            Err(e) => {
-                warn!("Could not resolve exact edge target {}: {}", target, e);
-                keep.push(target.clone());
+        // Find the first spelling present in either source. Vault membership is
+        // free; the store is queried only until one spelling resolves.
+        let mut store_hit = None;
+        let mut failure = None;
+        for candidate in crate::parser::ingest::exact_target_spellings(namespace, target) {
+            if known.contains(candidate) {
+                break;
+            }
+            match store.get(namespace, candidate).await {
+                Ok(Some(_)) => {
+                    store_hit = Some(candidate.to_string());
+                    break;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    failure = Some(e.to_string());
+                    break;
+                }
             }
         }
+        if let Some(e) = failure {
+            warn!("Could not resolve exact edge target {}: {}", target, e);
+            keep.push(target.clone());
+            continue;
+        }
+        keep.push(
+            crate::parser::ingest::exact_target_match(namespace, target, |candidate| {
+                known.contains(candidate) || store_hit.as_deref() == Some(candidate)
+            })
+            .unwrap_or(target.as_str())
+            .to_string(),
+        );
     }
     keep
 }
@@ -1245,14 +1267,7 @@ pub async fn import_vault_with_limits(
             .and_then(Value::as_array)
             .is_some_and(|targets| !targets.is_empty())
             .then(|| (payload.clone(), item.vector.clone()));
-        let keep = exact_keep_targets(
-            &store,
-            &config.namespace,
-            &item.related,
-            &known_notes,
-            &mut exact_cache,
-        )
-        .await;
+        let keep = exact_keep_targets(&store, &config.namespace, &item.related, &known_notes).await;
 
         // Materialise the new head before retiring the old head's edges.
         // Reconciliation deletes edges the current head still relies on, so
@@ -1311,14 +1326,7 @@ pub async fn import_vault_with_limits(
                     .collect()
             })
             .unwrap_or_default();
-        let keep = exact_keep_targets(
-            &store,
-            &config.namespace,
-            &declared,
-            &known_notes,
-            &mut exact_cache,
-        )
-        .await;
+        let keep = exact_keep_targets(&store, &config.namespace, &declared, &known_notes).await;
         if let Err(e) = store.upsert(&config.namespace, &id, vector, payload).await {
             errors.push(format!("Failed to relink edges for {}: {}", id, e));
         } else if let Err(e) = store
@@ -4241,6 +4249,130 @@ mod tests {
                 .metadata["canonical_sha256"],
             prior_sha,
             "the linker fingerprint must not churn"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// PR #363: keep resolution must consult stored ids and vault ids per
+    /// spelling. A stored verbatim `<ns>::z` outranks the vault-known alias
+    /// `z`; otherwise reconciliation deletes the edge the upsert just wrote
+    /// and an unchanged reimport can never repair it.
+    #[tokio::test]
+    async fn stored_verbatim_target_outranks_vault_alias_during_reconciliation() {
+        let root =
+            std::env::temp_dir().join(format!("ns-vault-dual-set-keep-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "ns";
+        store.init(ns).await.expect("init");
+        let config = vault_config(&root, &vault, ns);
+
+        let stored_id = format!("{ns}::z");
+        store
+            .upsert(
+                ns,
+                &stored_id,
+                vec![0.0; 4],
+                crate::traits::MemoryPayload {
+                    content: "memory stored under its verbatim id".to_string(),
+                    memory_type: "note".to_string(),
+                    location: "".to_string(),
+                    user_id: "default".to_string(),
+                    agent_name: Some("auto-ingestor".to_string()),
+                    location_lines: "".to_string(),
+                    metadata: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("seed stored verbatim target");
+
+        // Partial vault: only the bare `z` file and a linker naming `ns::z`.
+        let mut linker = note("linker", &[stored_id.as_str()]);
+        linker.content = "links the stored verbatim memory".to_string();
+        linker.canonical_sha256 = linker.fingerprint();
+        let mut target = note("z", &[]);
+        target.content = "partial vault body for z".to_string();
+        target.canonical_sha256 = target.fingerprint();
+        std::fs::write(vault.join("linker.md"), linker.to_markdown()).expect("write linker");
+        std::fs::write(vault.join("z.md"), target.to_markdown()).expect("write z");
+
+        let result = import_vault(
+            config.clone(),
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("import");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(result.success, "{result:?}");
+
+        let linked = |edges: &[(String, String, String, Option<crate::rdf::EdgeProvenance>)]| {
+            edges
+                .iter()
+                .filter(|(from, rel, _, _)| from == "linker" && rel == "RELATES_TO")
+                .map(|(_, _, to, _)| to.clone())
+                .collect::<Vec<_>>()
+        };
+        let edges = store.list_edges(ns).await.expect("list edges");
+        assert_eq!(
+            linked(&edges),
+            vec![stored_id.clone()],
+            "reconciliation must keep the id materialization bound: {:?}",
+            edges
+        );
+        assert!(
+            !edges.iter().any(|(_, _, to, _)| to == "z"),
+            "no edge may bind the alias: {:?}",
+            edges
+        );
+        let (_, bare) = store
+            .get(ns, "z")
+            .await
+            .expect("get bare note")
+            .expect("the partial vault note exists");
+        assert_eq!(
+            bare.metadata.get("stub").and_then(Value::as_bool),
+            Some(false),
+            "the vault note itself must not become an alias stub"
+        );
+
+        let mut export_config = config.clone();
+        export_config.vault_path = root.join("exported");
+        export_config.output_dir = root.join("exported");
+        export_vault(export_config, store.clone())
+            .await
+            .expect("export");
+        let markdown =
+            std::fs::read_to_string(root.join("exported").join("linker.md")).expect("read export");
+        assert_eq!(
+            markdown.matches(&format!("[[{stored_id}]]")).count(),
+            1,
+            "{markdown}"
+        );
+        assert!(!markdown.contains("[[z]]"), "{markdown}");
+
+        let again = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("reimport");
+        assert!(again.errors.is_empty(), "{:?}", again.errors);
+        assert_eq!(
+            again.notes_imported, 0,
+            "an unchanged reimport must be a no-op: {:?}",
+            again.errors
+        );
+        let edges = store
+            .list_edges(ns)
+            .await
+            .expect("list edges after reimport");
+        assert_eq!(
+            linked(&edges),
+            vec![stored_id],
+            "an unchanged reimport must not churn the reconciled edge set: {:?}",
+            edges
         );
         let _ = std::fs::remove_dir_all(&root);
     }

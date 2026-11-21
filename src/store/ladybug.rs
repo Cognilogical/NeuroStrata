@@ -10718,41 +10718,16 @@ impl VectorStore for LadybugStore {
                     // The verbatim id is a real note id too (`<ns>::7::path`
                     // is exported as-is), so it is tried before the namespace
                     // prefix is read as an alias for a bare id.
-                    let mut found = None;
-                    let mut failure = None;
-                    for candidate in crate::parser::ingest::exact_target_spellings(
+                    match crate::parser::ingest::exact_target_match_fallible(
                         &namespace,
                         &edge.target_id,
+                        |candidate| {
+                            exact_target_in_namespace_exists(conn, &namespace, candidate)
+                                .map_err(|e| e.to_string())
+                        },
                     ) {
-                        match exact_target_in_namespace_exists(conn, &namespace, candidate) {
-                            Ok(true) => {
-                                found = Some(candidate.to_string());
-                                break;
-                            }
-                            Ok(false) => {}
-                            Err(e) => {
-                                failure = Some(e.to_string());
-                                break;
-                            }
-                        }
-                    }
-                    match (found, failure) {
-                        (Some(found), _) => found,
-                        (None, Some(e)) => {
-                            deferred_edges.push(crate::traits::EdgeResolutionStatus {
-                                rel_type: edge.rel_type.to_string(),
-                                declared_target: edge.target_id.clone(),
-                                declaration_index: edge.declaration_index,
-                                resolution: crate::traits::TargetResolution::Failed(e),
-                            });
-                            emit_write_shape_warning(&namespace, &id, &WriteShapeWarning {
-                                field: format!("metadata.{}", edge.rel_type.to_lowercase()),
-                                why: "exact target lookup failed".to_string(),
-                                skipped: "this edge materialization".to_string(),
-                            });
-                            continue;
-                        }
-                        (None, None) => {
+                        Ok(Some(found)) => found.to_string(),
+                        Ok(None) => {
                             deferred_edges.push(crate::traits::EdgeResolutionStatus {
                                 rel_type: edge.rel_type.to_string(),
                                 declared_target: edge.target_id.clone(),
@@ -10762,6 +10737,20 @@ impl VectorStore for LadybugStore {
                             emit_write_shape_warning(&namespace, &id, &WriteShapeWarning {
                                 field: format!("metadata.{}", edge.rel_type.to_lowercase()),
                                 why: "exact target does not exist yet".to_string(),
+                                skipped: "this edge materialization".to_string(),
+                            });
+                            continue;
+                        }
+                        Err(e) => {
+                            deferred_edges.push(crate::traits::EdgeResolutionStatus {
+                                rel_type: edge.rel_type.to_string(),
+                                declared_target: edge.target_id.clone(),
+                                declaration_index: edge.declaration_index,
+                                resolution: crate::traits::TargetResolution::Failed(e),
+                            });
+                            emit_write_shape_warning(&namespace, &id, &WriteShapeWarning {
+                                field: format!("metadata.{}", edge.rel_type.to_lowercase()),
+                                why: "exact target lookup failed".to_string(),
                                 skipped: "this edge materialization".to_string(),
                             });
                             continue;
@@ -11921,9 +11910,11 @@ impl VectorStore for LadybugStore {
                 .unwrap_or(false);
             for edge in edge_specs(&memory.payload.metadata) {
                 let target = if exact_edge_targets {
-                    match crate::parser::ingest::exact_target_spellings(namespace, &edge.target_id)
-                        .find(|candidate| namespace_ids.contains(*candidate))
-                    {
+                    match crate::parser::ingest::exact_target_match(
+                        namespace,
+                        &edge.target_id,
+                        |candidate| namespace_ids.contains(candidate),
+                    ) {
                         Some(found) => found.to_string(),
                         None => continue,
                     }

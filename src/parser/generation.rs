@@ -117,6 +117,34 @@ pub fn exact_target_spellings<'a>(
     std::iter::once(declared).chain(stripped)
 }
 
+/// The first [`exact_target_spellings`] candidate that `exists` accepts.
+///
+/// Every caller resolving an exact target must use this one ordering. A caller
+/// holding more than one id source (vault-known ids and stored ids) must fold
+/// both into the predicate, so neither source can outrank the other by kind:
+/// a stored verbatim id always beats a vault-known alias, and vice versa.
+pub fn exact_target_match<'a>(
+    namespace: &str,
+    declared: &'a str,
+    mut exists: impl FnMut(&str) -> bool,
+) -> Option<&'a str> {
+    exact_target_spellings(namespace, declared).find(|candidate| exists(candidate))
+}
+
+/// Fallible [`exact_target_match`] for callers whose existence check can fail.
+pub fn exact_target_match_fallible<'a, E>(
+    namespace: &str,
+    declared: &'a str,
+    mut exists: impl FnMut(&str) -> Result<bool, E>,
+) -> Result<Option<&'a str>, E> {
+    for candidate in exact_target_spellings(namespace, declared) {
+        if exists(candidate)? {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
 /// The lowercase hex SHA-256 of `bytes`, used for `file_sha256` and
 /// `span_sha256` capture.
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -193,6 +221,26 @@ mod tests {
             exact_target_spellings("ns", "other::z").collect::<Vec<_>>(),
             vec!["other::z"]
         );
+    }
+
+    #[test]
+    fn exact_target_match_prefers_a_stored_verbatim_id_over_a_vault_alias() {
+        // The two sources are folded into one predicate so neither can win by
+        // kind: `<ns>::z` is stored and `z` is only vault-known.
+        let stored = ["ns::z"];
+        let vault = ["z"];
+        assert_eq!(
+            exact_target_match("ns", "ns::z", |candidate| {
+                stored.contains(&candidate) || vault.contains(&candidate)
+            }),
+            Some("ns::z")
+        );
+        // The alias still resolves when the verbatim spelling is absent.
+        assert_eq!(
+            exact_target_match("ns", "ns::z", |candidate| vault.contains(&candidate)),
+            Some("z")
+        );
+        assert_eq!(exact_target_match("ns", "ns::missing", |_| false), None);
     }
 
     #[test]

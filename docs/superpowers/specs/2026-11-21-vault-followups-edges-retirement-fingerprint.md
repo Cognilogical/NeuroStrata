@@ -250,10 +250,10 @@ detection and reconciliation share the verbatim-first candidate order (§3e).
   is absent is the importer's own namespace prefix stripped and the alias
   retried (§3e). Missing defers, and the earlier qualified branch keeps its
   inference for ordinary memories only.
-- `unresolved_wiki_targets` and the reconciliation keep-set in the importer
-  apply the same candidate order (`exact_note_target`, `exact_stored_target`),
-  so a qualified spelling neither mints a bogus alias stub nor deletes the
-  edge it just bound.
+- `unresolved_wiki_targets` applies the same candidate order within the vault,
+  while the reconciliation keep-set resolves each spelling against both the
+  vault-known ids and the stored ids (§3e), so a qualified spelling neither
+  mints a bogus alias stub nor deletes the edge it just bound.
 
 #### Eval (failed on `c14f5de0`)
 
@@ -342,10 +342,21 @@ governs all four exact-mode paths:
 
 The candidate order is centralised in
 `parser::generation::exact_target_spellings`: verbatim first, then the
-own-namespace-stripped alias, never the reverse. Unresolved declarations keep
-the declared spelling.
+own-namespace-stripped alias, never the reverse. Precedence selection is
+centralised in `exact_target_match` (and its fallible form) so materialisation,
+replay, and reconciliation cannot drift.
 
-#### Eval (failed on `c209c4ad`)
+**Dual-set precedence.** The importer holds two id sources: the vault-known
+note ids and the stored ids. Reconciliation must resolve against *both sets per
+spelling*, never one set to exhaustion before the other. If the store holds
+`<ns>::z` and a partial vault holds only the note `z`, the first candidate
+`<ns>::z` exists in the store, so it wins before the vault-known alias `z` is
+considered — the same id the upsert materialises. A vault-first short-circuit
+would keep `z` and the delete-only reconciler would remove the freshly written
+edge, with no retry and no repair on an unchanged reimport. Unresolved
+declarations keep the declared spelling.
+
+#### Evals (failed on `c209c4ad` and `6f132a49`)
 
 - `qualified_note_id_binds_verbatim_before_alias_stripping`
   - Import vault notes `linker` → `<ns>::7::path` and the note whose `@id`
@@ -357,13 +368,26 @@ the declared spelling.
   - On `c209c4ad` normalization rewrote the link to `7::path` before the
     known-note check: the import minted a `7::path` stub (which then failed
     its Turtle subject validation) and the real note received no edge.
+- `stored_verbatim_target_outranks_vault_alias_during_reconciliation`
+  - Store a memory at `<ns>::z`; import a partial vault containing only the
+    note `z` and a `linker` note linking `<ns>::z`.
+  - Assert the import succeeds with no errors, the only `linker` `RELATES_TO`
+    edge ends at `<ns>::z` (not the alias `z`), the vault note `z` is not a
+    stub, export renders exactly one `[[<ns>::z]]` and no `[[z]]`, and an
+    unchanged reimport imports `0` notes while leaving the edge intact.
+  - On `6f132a49` the vault-only keep resolution chose `z`; the upsert still
+    materialised `linker → <ns>::z`, and reconciliation deleted it
+    (`reconciliation must keep the id materialization bound: []`). Import
+    reported success, so no retry was scheduled and reimport could not repair
+    the edge.
 
 #### Residual risk
 
-- The store-backed resolution performs one keyed read per candidate spelling
-  for a declaration that is not already a vault note. The result is cached
-  for the import turn; the added reads are bounded by distinct unresolved
-  or store-only targets, not by edge count.
+- Stub discovery still caches one store-backed resolution per distinct
+  declaration for the import turn. Reconciliation no longer reuses that cache:
+  it checks the store per candidate spelling so a kept verbatim id cannot be
+  masked by an earlier alias-only answer. The added reads are bounded by
+  distinct declared targets, not by edge count.
 - If an intermediate import fails after binding a verbatim edge, a later
   alias-only spelling resolving to a different row can still retire that edge
   through reconciliation, as with any changed declaration. The keep-set
@@ -473,10 +497,11 @@ note whose *real* type changed is versioned.
 - `src/store/ladybug.rs` — `extractor = 'upsert'` RELATES_TO reconciler,
   `exact_edge_targets` opt-out from `KnownIds` rewriting, from
   path-inferring edge materialisation, and from `relink_edges` declaration
-  replay (§3d), both using verbatim-first candidate order (§3e).
-- `src/parser/generation.rs` — `exact_target_spellings`, the single
-  verbatim-first alias rule shared by the vault importer and the store
-  (§3e), re-exported through `parser::ingest`.
+  replay (§3d), both using the shared verbatim-first match (§3e).
+- `src/parser/generation.rs` — `exact_target_spellings`, `exact_target_match`,
+  and `exact_target_match_fallible`: the single verbatim-first alias rule and
+  precedence selector shared by the vault importer and the store (§3e),
+  re-exported through `parser::ingest`.
 - `src/parser/ingest.rs` — re-export only; no parser behaviour change.
 
 ## 7. Risk
