@@ -58,6 +58,34 @@ pub const MAX_VAULT_FILES: usize = 10_000;
 pub const MAX_VAULT_FILE_BYTES: u64 = 4 * 1024 * 1024;
 pub const MAX_VAULT_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Metadata keys the import owns on the replacement head. Everything else on
+/// a prior head (notably `task`) is preserved across a reimport: #335 showed
+/// that copying a fixed field list drops the next structured field silently.
+const IMPORT_OWNED_METADATA_KEYS: [&str; 17] = [
+    // Import-owned values, overlaid after the prior head is copied.
+    "vault_source",
+    "stub",
+    "canonical_sha256",
+    "related",
+    "valid_from",
+    "supersedes",
+    // Edge renderings. The vault note's parsed link set is authoritative;
+    // keeping alternate keys would resurrect links deleted from the vault,
+    // because VaultNote::from_payload unions all four fields on export.
+    "related_to",
+    "relates_to",
+    "governs",
+    "depends_on",
+    // Store-derived and retirement bookkeeping must not be re-headered.
+    "facets",
+    "facets_bitemporal",
+    "concept_iri",
+    "topology_original",
+    "valid_to",
+    "superseded_by",
+    "archived_by_vault_import",
+];
+
 /// Resource caps for a vault import/export. The default entry points use the
 /// published constants; tests tighten them to exercise fail-closed paths.
 #[derive(Debug, Clone)]
@@ -786,7 +814,17 @@ pub async fn import_vault_with_limits(
     let mut preloaded: Vec<(PathBuf, String)> = Vec::new();
     let mut total_bytes: u64 = 0;
     for path in &paths {
-        let metadata = match std::fs::metadata(path) {
+        // #337: authorize each candidate's RESOLVED path, then read that same
+        // path. Checking only the vault root let a `.md` symlink import a file
+        // from outside the project root / allowed_external_dirs.
+        let resolved = match crate::daemon::check_caller_path(path, &project_root, &allowed) {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                errors.push(format!("Refusing vault file {}: {}", path.display(), e));
+                continue;
+            }
+        };
+        let metadata = match std::fs::metadata(&resolved) {
             Ok(metadata) => metadata,
             Err(e) => {
                 errors.push(format!(
@@ -806,7 +844,7 @@ pub async fn import_vault_with_limits(
             ));
             continue;
         }
-        let content = match std::fs::read_to_string(path) {
+        let content = match std::fs::read_to_string(&resolved) {
             Ok(content) => content,
             Err(e) => {
                 errors.push(format!(
@@ -866,8 +904,39 @@ pub async fn import_vault_with_limits(
     }
 
     // Mint queryable stubs for unresolved WikiLinks; each is gated again.
-    let mut stub_ids = std::collections::BTreeSet::new();
+    // #336: a target is unresolved only when the vault AND the store lack it.
+    // In a partial vault a linked memory's file is absent by definition; a
+    // placeholder must not replace the live head that still exists.
+    let mut mintable = Vec::new();
     for target in unresolved_wiki_targets(&notes) {
+        match store.get(&config.namespace, &target).await {
+            Ok(Some((_, payload))) => {
+                // An existing stub is exactly the state this loop would
+                // produce, so re-import is a silent no-op. A non-stub head
+                // is live knowledge whose file is simply absent from a
+                // partial vault — that is the #336 refusal.
+                let prior_is_stub = payload
+                    .metadata
+                    .get("stub")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if !prior_is_stub {
+                    errors.push(format!(
+                        "Skipping WikiLink stub for '{}': the memory exists in the store \
+                         and its file is absent from the vault",
+                        target
+                    ));
+                }
+            }
+            Ok(None) => mintable.push(target),
+            Err(e) => errors.push(format!(
+                "Skipping WikiLink stub for '{}': could not check the store: {}",
+                target, e
+            )),
+        }
+    }
+    let mut stub_ids = std::collections::BTreeSet::new();
+    for target in mintable {
         let stub = stub_note(&target);
         let turtle = match note_to_turtle(&stub) {
             Ok(turtle) => turtle,
@@ -922,15 +991,35 @@ pub async fn import_vault_with_limits(
             }
         };
 
+        // #336 backstop: a stub is additive only. If a prior head exists for
+        // a stub id (a write landed between resolution and planning), refuse
+        // rather than replace live content with placeholder text.
+        if is_stub && prior_payload.is_some() {
+            errors.push(format!(
+                "Refusing to replace existing memory '{}' with a WikiLink stub",
+                note.id
+            ));
+            continue;
+        }
+
         if let Some(ref prior) = prior_payload {
             // Byte-identical re-import is a no-op before any sovereignty
             // question: a protected row we do not touch is not overwritten.
             // The hash always comes from parsed content/edges, never frontmatter.
+            // Task rows have no stored hash, so derive the same identity the
+            // export path would render for the prior payload (#335).
             let prior_hash = prior
                 .metadata
                 .get("canonical_sha256")
                 .and_then(|v| v.as_str());
-            if prior_hash == Some(note.canonical_sha256.as_str()) {
+            let unchanged = match prior_hash {
+                Some(hash) => hash == note.canonical_sha256,
+                None => {
+                    VaultNote::from_payload(&note.id, prior).canonical_sha256
+                        == note.canonical_sha256
+                }
+            };
+            if unchanged {
                 continue;
             }
             if let Err(e) = writable_prior(principal, prior) {
@@ -949,13 +1038,25 @@ pub async fn import_vault_with_limits(
             }
         };
 
-        let mut metadata = serde_json::json!({
-            "vault_source": true,
-            "stub": is_stub,
-            "canonical_sha256": note.canonical_sha256,
-            "related": note.related,
-            "valid_from": now,
-        });
+        // #335: start from the prior head's structured metadata so a reimport
+        // cannot silently drop fields the import does not own (`task`, and any
+        // future structured state). Import-owned and store-derived keys are
+        // removed here and overlaid below.
+        let mut metadata = match prior_payload.as_ref().and_then(|p| p.metadata.as_object()) {
+            Some(prior_obj) => {
+                let mut preserved = prior_obj.clone();
+                for key in IMPORT_OWNED_METADATA_KEYS {
+                    preserved.remove(key);
+                }
+                serde_json::Value::Object(preserved)
+            }
+            None => serde_json::json!({}),
+        };
+        metadata["vault_source"] = serde_json::json!(true);
+        metadata["stub"] = serde_json::json!(is_stub);
+        metadata["canonical_sha256"] = serde_json::json!(note.canonical_sha256);
+        metadata["related"] = serde_json::json!(note.related);
+        metadata["valid_from"] = serde_json::json!(now);
 
         let mut history = None;
         if let (Some(hv), Some(mut prior)) = (prior_vector, prior_payload) {
@@ -966,14 +1067,8 @@ pub async fn import_vault_with_limits(
                 ));
                 continue;
             }
-            if let Some(prior_obj) = prior.metadata.as_object() {
-                if let Some(visible_to) = prior_obj.get("visible_to") {
-                    metadata["visible_to"] = visible_to.clone();
-                }
-                if let Some(eligibility) = prior_obj.get("eligibility") {
-                    metadata["eligibility"] = eligibility.clone();
-                }
-            }
+            // `visible_to` / `eligibility` (and any future structured field)
+            // already came across in the wholesale copy above.
             let history_id = format!("{}.vault-history.{}", note.id, uuid::Uuid::new_v4());
             retire_metadata(&mut prior.metadata, &note.id, now);
             metadata["supersedes"] = serde_json::json!(history_id);
@@ -2816,6 +2911,403 @@ mod tests {
             "symlink target must be untouched"
         );
 
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// #335: task rows carry no `canonical_sha256`, so the unchanged check
+    /// must derive identity from the prior payload. An unchanged round-trip
+    /// must neither replace the head nor drop `metadata.task`.
+    #[tokio::test]
+    async fn import_unchanged_task_roundtrip_is_a_noop_and_keeps_task_state() {
+        let root = std::env::temp_dir().join(format!("ns-task-noop-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_task_noop";
+        store.init(ns).await.expect("init");
+        let task_meta = serde_json::json!({
+            "status": "done",
+            "session_id": "sess-1",
+            "assignee": "agent-a",
+            "blocked_by": ["other-task"],
+            "history": [{"at": 1, "note": "claimed"}],
+            "created_at": 1,
+            "updated_at": 2
+        });
+        store
+            .upsert(
+                ns,
+                "task-1",
+                vec![0.0; 4],
+                crate::traits::MemoryPayload {
+                    content: "Ship the vault fix".to_string(),
+                    user_id: "default".to_string(),
+                    memory_type: "task".to_string(),
+                    agent_name: Some("agent-a".to_string()),
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({ "task": task_meta.clone() }),
+                },
+            )
+            .await
+            .expect("seed task head");
+
+        let mut exported = note("task-1", &[]);
+        exported.rdf_type = "yaml:task".to_string();
+        exported.epistemic_tier = "task".to_string();
+        exported.content = "Ship the vault fix".to_string();
+        exported.canonical_sha256 = exported.fingerprint();
+        std::fs::write(vault.join("task-1.md"), exported.to_markdown()).expect("write task note");
+
+        let config = VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.clone()),
+            allowed_external_dirs: None,
+        };
+        let result = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("import");
+        assert_eq!(
+            result.notes_imported, 0,
+            "unchanged task round-trip must be a no-op: {:?}",
+            result.errors
+        );
+        let (_, head) = store.get(ns, "task-1").await.unwrap().unwrap();
+        assert_eq!(head.content, "Ship the vault fix");
+        assert_eq!(head.memory_type, "task");
+        assert_eq!(head.metadata["task"], task_meta);
+        assert!(
+            head.metadata.get("supersedes").is_none(),
+            "unchanged import must not retire the head"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #335: an edited task reimport must keep the prior head's structured
+    /// task state (status, claim, blockers, history) on the new live head.
+    #[tokio::test]
+    async fn import_task_edit_preserves_task_state() {
+        let root = std::env::temp_dir().join(format!("ns-task-edit-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_task_edit";
+        store.init(ns).await.expect("init");
+        let task_meta = serde_json::json!({
+            "status": "in_progress",
+            "session_id": "sess-1",
+            "assignee": "agent-a",
+            "blocked_by": ["other-task"],
+            "history": [{"at": 1, "note": "claimed"}]
+        });
+        store
+            .upsert(
+                ns,
+                "task-2",
+                vec![0.0; 4],
+                crate::traits::MemoryPayload {
+                    content: "Original task body".to_string(),
+                    user_id: "default".to_string(),
+                    memory_type: "task".to_string(),
+                    agent_name: Some("agent-a".to_string()),
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({ "task": task_meta.clone() }),
+                },
+            )
+            .await
+            .expect("seed task head");
+
+        let mut edited = note("task-2", &[]);
+        edited.rdf_type = "yaml:task".to_string();
+        edited.epistemic_tier = "task".to_string();
+        edited.content = "Edited task body".to_string();
+        edited.canonical_sha256 = edited.fingerprint();
+        std::fs::write(vault.join("task-2.md"), edited.to_markdown()).expect("write task note");
+
+        let config = VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.clone()),
+            allowed_external_dirs: None,
+        };
+        let result = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("import");
+        assert_eq!(result.notes_imported, 1, "{:?}", result.errors);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let (_, head) = store.get(ns, "task-2").await.unwrap().unwrap();
+        assert_eq!(head.content, "Edited task body");
+        assert_eq!(head.memory_type, "task");
+        assert_eq!(
+            head.metadata["task"], task_meta,
+            "task state must survive an edited reimport"
+        );
+        let history_id = head.metadata["supersedes"].as_str().expect("supersedes");
+        let (_, history) = store.get(ns, history_id).await.unwrap().unwrap();
+        assert_eq!(history.content, "Original task body");
+        assert_eq!(history.metadata["task"], task_meta);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Codex review 7b8f8fb4#r4649890196: preserving the prior head's
+    /// alternate edge keys (`related_to`/`governs`/`depends_on`) must not
+    /// resurrect links the edited vault note removed — `from_payload` unions
+    /// all four fields, so the next export would restore them.
+    #[tokio::test]
+    async fn import_reconciles_preserved_edge_fields_with_edited_links() {
+        let root = std::env::temp_dir().join(format!("ns-edge-reconcile-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_edge_reconcile";
+        store.init(ns).await.expect("init");
+
+        // The prior head carries typed edge renderings plus unrelated state.
+        store
+            .upsert(
+                ns,
+                "edge-reconcile",
+                vec![0.0; 4],
+                crate::traits::MemoryPayload {
+                    content: "Original body".to_string(),
+                    user_id: "default".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({
+                        "canonical_sha256": "seed-hash",
+                        "related": ["kept-edge", "deleted-edge"],
+                        "related_to": ["deleted-related-to"],
+                        "governs": ["deleted-governs"],
+                        "depends_on": ["deleted-depends"],
+                        "custom_state": {"stage": "kept"}
+                    }),
+                },
+            )
+            .await
+            .expect("seed edge head");
+        // The kept target is in the vault unchanged, so it is a no-op and
+        // the import has nothing to stub.
+        let mut kept = note("kept-edge", &[]);
+        kept.content = "kept target".to_string();
+        kept.canonical_sha256 = kept.fingerprint();
+        store
+            .upsert(
+                ns,
+                "kept-edge",
+                vec![0.0; 4],
+                crate::traits::MemoryPayload {
+                    content: kept.content.clone(),
+                    user_id: "default".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({
+                        "canonical_sha256": kept.canonical_sha256
+                    }),
+                },
+            )
+            .await
+            .expect("seed kept edge target");
+        std::fs::write(vault.join("kept-edge.md"), kept.to_markdown())
+            .expect("write kept target note");
+
+        // The edited vault note keeps only one link.
+        let mut edited = note("edge-reconcile", &["kept-edge"]);
+        edited.content = "Edited body".to_string();
+        edited.canonical_sha256 = edited.fingerprint();
+        std::fs::write(vault.join("edge-reconcile.md"), edited.to_markdown())
+            .expect("write edited note");
+
+        let config = VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.clone()),
+            allowed_external_dirs: None,
+        };
+        let result = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("import");
+        assert_eq!(result.notes_imported, 1, "{:?}", result.errors);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+
+        let (_, head) = store.get(ns, "edge-reconcile").await.unwrap().unwrap();
+        assert_eq!(head.metadata["related"], serde_json::json!(["kept-edge"]));
+        for key in ["related_to", "governs", "depends_on"] {
+            assert!(
+                head.metadata.get(key).is_none(),
+                "stale edge field {key} must be reconciled away: {:?}",
+                head.metadata
+            );
+        }
+        assert_eq!(
+            head.metadata["custom_state"]["stage"],
+            serde_json::json!("kept"),
+            "unrelated structured state must survive"
+        );
+        let exported = VaultNote::from_payload("edge-reconcile", &head);
+        assert_eq!(
+            exported.related,
+            vec!["kept-edge".to_string()],
+            "the next export must not resurrect deleted links"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #336: a WikiLink target that exists in the store but whose file is
+    /// absent from the vault must not be replaced by a stub.
+    #[tokio::test]
+    async fn import_does_not_stub_over_existing_head_absent_from_vault() {
+        let root = std::env::temp_dir().join(format!("ns-stub-over-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_stub_over";
+        store.init(ns).await.expect("init");
+        store
+            .upsert(
+                ns,
+                "existing-target",
+                vec![0.0; 4],
+                crate::traits::MemoryPayload {
+                    content: "Real knowledge".to_string(),
+                    user_id: "default".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({
+                        "canonical_sha256": "seed-hash",
+                        "visible_to": ["default"]
+                    }),
+                },
+            )
+            .await
+            .expect("seed existing target");
+
+        // Only the linker is in the vault; the target's own file is absent.
+        std::fs::write(
+            vault.join("linker.md"),
+            note("linker", &["existing-target"]).to_markdown(),
+        )
+        .expect("write linker note");
+
+        let config = VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.clone()),
+            allowed_external_dirs: None,
+        };
+        let result = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("import");
+        assert_eq!(result.notes_imported, 1, "{:?}", result.errors);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.contains("existing-target") && e.to_lowercase().contains("stub")),
+            "the unresolved-but-present target must be reported: {:?}",
+            result.errors
+        );
+        let (_, head) = store
+            .get(ns, "existing-target")
+            .await
+            .unwrap()
+            .expect("existing target must remain");
+        assert_eq!(head.content, "Real knowledge");
+        assert_eq!(head.memory_type, "fact");
+        assert!(
+            head.metadata.get("stub").is_none()
+                || head.metadata["stub"] == serde_json::json!(false),
+            "existing head must not be marked as a stub: {:?}",
+            head.metadata
+        );
+        assert!(
+            head.metadata.get("supersedes").is_none(),
+            "existing head must not be retired by a stub"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #337: a `.md` symlink inside an authorized vault that resolves outside
+    /// the project root (and allowlist) must be refused, not imported.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn import_refuses_md_symlink_outside_authorized_roots() {
+        let root = std::env::temp_dir().join(format!("ns-symlink-{}", uuid::Uuid::new_v4()));
+        let outside = std::env::temp_dir().join(format!("ns-symlink-out-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        std::fs::create_dir_all(&outside).expect("create outside");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_symlink";
+        store.init(ns).await.expect("init");
+
+        std::fs::write(vault.join("good.md"), note("good", &[]).to_markdown())
+            .expect("write good note");
+        let escaped = outside.join("escape-note.md");
+        std::fs::write(&escaped, note("escape-note", &[]).to_markdown())
+            .expect("write outside note");
+        std::os::unix::fs::symlink(&escaped, vault.join("escape.md")).expect("symlink escape");
+
+        let config = VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.clone()),
+            allowed_external_dirs: None,
+        };
+        let result = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("import");
+        assert_eq!(
+            result.notes_imported, 1,
+            "only the in-bound note may import: {:?}",
+            result.errors
+        );
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.contains("escape.md") && e.to_lowercase().contains("refus")),
+            "the escaping symlink must be refused by name: {:?}",
+            result.errors
+        );
+        assert!(
+            store.get(ns, "escape-note").await.unwrap().is_none(),
+            "content outside the authority boundary must not enter the store"
+        );
+        assert!(store.get(ns, "good").await.unwrap().is_some());
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&outside);
     }
