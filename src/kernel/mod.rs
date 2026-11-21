@@ -3164,4 +3164,183 @@ mod tests {
             "the stale commit must not restore the read-write schema"
         );
     }
+
+    /// Review 0fce913e#r4650457715: a pool archived after hydration must not
+    /// be revived by a write-back commit.
+    #[tokio::test]
+    async fn write_back_rejects_a_pool_that_became_retired() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_impl =
+            Arc::new(LadybugStore::for_testing(dir.path().join("db"), 4).expect("store init"));
+        let store: Arc<dyn VectorStore> = store_impl.clone();
+        let ns = "ns_pool_retired";
+        store.init(ns).await.expect("init ns");
+        let bus = Arc::new(ThalamicBus::new(64));
+        let now = now_epoch();
+
+        let kernel1 = AgentKernel::new(store.clone(), bus.clone(), dir.path().to_path_buf());
+        kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "register_pool",
+                    "schema": {
+                        "connector_id": "memory_pool",
+                        "pool_id": "retired_pool",
+                        "access_mode": "read_write",
+                        "entity_types": ["item"],
+                        "max_slice_rows": 25,
+                        "max_slice_bytes": 2048,
+                        "description": "Retirement pool"
+                    },
+                    "records": {"mem://items": [{"v": 1}]}
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("register pool");
+        kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "register_pointer",
+                    "record": {
+                        "pointer_id": "ptr_retired",
+                        "connector_id": "memory_pool",
+                        "pool_id": "retired_pool",
+                        "pointer_uri": "mem://items",
+                        "entity_type": "item",
+                        "expected_source_sha256": null,
+                        "captured_at_secs": now,
+                        "max_staleness_secs": 3600
+                    }
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("register pointer");
+        seed_receipt(&store_impl, ns, "rcpt_retired", "ptr_retired", "retired_pool", false).await;
+
+        kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "resolve_pointer",
+                    "req": {"pointer_id": "ptr_retired", "offset": 0, "limit": 10, "max_bytes": 1024},
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("kernel1 hydrates");
+
+        // Archive the pool row between hydration and persistence.
+        let row_id = format!("__data_pool__:{}:memory_pool:retired_pool", ns);
+        let (vector, mut payload) = store_impl
+            .get(ns, &row_id)
+            .await
+            .expect("read pool row")
+            .expect("pool row exists");
+        if let Some(obj) = payload.metadata.as_object_mut() {
+            obj.insert("archived".to_string(), json!(true));
+        }
+        store_impl
+            .upsert(ns, &row_id, vector, payload)
+            .await
+            .expect("archive pool row");
+
+        let result = kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "apply_effect",
+                    "req": {
+                        "pointer_id": "ptr_retired",
+                        "operation": "append",
+                        "payload": {"v": 2},
+                        "action_receipt_id": "rcpt_retired",
+                        "idempotency_key": "idem-retired"
+                    },
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "a write-back must not revive an archived pool: {result:?}"
+        );
+
+        let kernel2 = AgentKernel::new(store.clone(), bus.clone(), dir.path().to_path_buf());
+        let resolved = kernel2
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "resolve_pointer",
+                    "req": {"pointer_id": "ptr_retired", "offset": 0, "limit": 10, "max_bytes": 1024},
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await;
+        assert!(
+            resolved.is_err(),
+            "the archived pool must stay unavailable: {resolved:?}"
+        );
+    }
+
+    /// Review 0fce913e#r4650457715 (commit-time form): a write-back that
+    /// lands after the pool row was archived must be rejected, not revive it.
+    #[tokio::test]
+    async fn write_back_rejects_a_retired_pool_at_commit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_impl =
+            Arc::new(LadybugStore::for_testing(dir.path().join("db"), 4).expect("store init"));
+        let store: Arc<dyn VectorStore> = store_impl.clone();
+        let ns = "ns_port_retired";
+        store.init(ns).await.expect("init ns");
+        let port = LadybugMemoryPort::new(store.clone());
+
+        let schema = DataPoolSchema {
+            connector_id: "memory_pool".to_string(),
+            pool_id: "retired_at_commit".to_string(),
+            access_mode: DataPoolAccessMode::ReadWrite,
+            entity_types: vec!["item".to_string()],
+            max_slice_rows: 25,
+            max_slice_bytes: 2048,
+            description: "retire race".to_string(),
+        };
+        let mut records = HashMap::new();
+        records.insert("mem://a".to_string(), vec![json!({"v": 0})]);
+        port.register_data_pool(ns, &schema, Some(&records), Some(ns))
+            .await
+            .expect("register pool");
+
+        let row_id = format!("__data_pool__:{}:memory_pool:retired_at_commit", ns);
+        let (vector, mut payload) = store_impl
+            .get(ns, &row_id)
+            .await
+            .expect("read pool row")
+            .expect("pool row exists");
+        if let Some(obj) = payload.metadata.as_object_mut() {
+            obj.insert("archived".to_string(), json!(true));
+        }
+        store_impl
+            .upsert(ns, &row_id, vector, payload)
+            .await
+            .expect("archive pool row");
+
+        let snapshot = crate::connectors::WriteBackSnapshot {
+            prior_records: vec![json!({"v": 0})],
+            pointer_records: vec![json!({"v": 0}), json!({"v": 1})],
+            idempotency: HashMap::new(),
+        };
+        let result = port
+            .register_pool_writeback(ns, &schema, "mem://a", &snapshot, Some(ns))
+            .await;
+        assert!(
+            result.is_err(),
+            "a commit against an archived pool must be rejected: {result:?}"
+        );
+    }
 }
