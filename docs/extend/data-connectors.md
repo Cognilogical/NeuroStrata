@@ -64,6 +64,8 @@ pub trait DataConnector: Send + Sync {
 ## Write-Back Receipts
 
 - `ExternalEffectRequest` / `ExternalEffectReceipt`; idempotency key; active target-bound `action_receipt` (`ActiveBound`). Write-back requires CAS + idempotency key.
+- Target binding comes from the production receipt payload (`metadata.action_receipt`), not from editable row metadata: the nested `receipt_id` must equal the requested receipt and the stamped `target_pointer_id`/`target_pool_id` (or the pre-stamp nested `pointer_id`/`pool_id` parameter pair) must equal the write-back pointer and pool. A receipt whose action never declared that pair is unbound and denied.
+- The kinetic action writer stamps `target_pointer_id`/`target_pool_id` in the nested receipt when the action declares both reserved parameters; receipt rows keep no top-level `pointer_id`/`pool_id`.
 
 ## Write-Back Durability
 

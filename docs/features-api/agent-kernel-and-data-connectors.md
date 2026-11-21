@@ -18,7 +18,7 @@ Central Agentic Kernel (`AgentKernel`) unifies workflow lifecycle, cognitive rec
 
 - `MemoryPort` (`LadybugMemoryPort`): `get_visible_memory`, `register_data_pointer`, `get_data_pointer`, `list_data_pointers`, `register_data_pool`, `list_data_pools`.
 - `ExecutivePort` (`LadybugExecutivePort`): `list_tasks`, `get_task`, `verify_task_extraction_count`, `evaluate_workflow_transition`.
-- `OntologyPort` (`LadybugOntologyPort`): `list_ontology_entities`, `get_ontology_entity`, `verify_active_action_receipt`.
+- `OntologyPort` (`LadybugOntologyPort`): `list_ontology_entities`, `get_ontology_entity`, `verify_active_action_receipt`. Receipt verification reads the production shape: the receipt is parsed from the nested `metadata.action_receipt`, its `receipt_id` must equal the requested id, and its stamped `target_pointer_id`/`target_pool_id` (or, for receipts written before the stamp, the same reserved `pointer_id`/`pool_id` parameter pair) must equal the pointer and pool being written. Top-level row metadata is never a binding source, and an active receipt with no binding is denied.
 
 ## Central AgentKernel
 

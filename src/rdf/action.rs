@@ -692,6 +692,13 @@ pub struct ActionReceiptPayload {
     pub executed_at: i64,
     #[serde(default)]
     pub params: BTreeMap<String, serde_json::Value>,
+    /// Connector write-back target stamped from the action's declared
+    /// `pointer_id` / `pool_id` pair. Kept inside the immutable nested
+    /// receipt so a verifier never has to trust editable row metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_pointer_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_pool_id: Option<String>,
     #[serde(default)]
     pub superseded_pairs: Vec<SupersededPair>,
     #[serde(default)]
@@ -748,6 +755,26 @@ impl ActionReceiptPayload {
             });
         }
         out
+    }
+}
+
+/// Connector write-back targets are recorded through the reserved
+/// `pointer_id` / `pool_id` parameter pair. Stamp both or neither: a partial
+/// pair must not produce a binding that can never match a real pointer.
+fn connector_target_binding(
+    params: &BTreeMap<String, serde_json::Value>,
+) -> (Option<String>, Option<String>) {
+    let string_param = |name: &str| {
+        params
+            .get(name)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    match (string_param("pointer_id"), string_param("pool_id")) {
+        (Some(pointer), Some(pool)) => (Some(pointer), Some(pool)),
+        _ => (None, None),
     }
 }
 
@@ -2433,12 +2460,15 @@ pub async fn stage_action(
         });
     }
 
+    let (target_pointer_id, target_pool_id) = connector_target_binding(&eval.bound_params);
     let receipt = ActionReceiptPayload {
         receipt_id: receipt_id.clone(),
         action_slug: eval.definition.slug.clone(),
         principal: eval.effective_principal.clone(),
         executed_at: now_ts,
         params: eval.bound_params.clone(),
+        target_pointer_id,
+        target_pool_id,
         superseded_pairs,
         created_ids,
         twin_deltas,
@@ -3622,6 +3652,8 @@ pub async fn revert_action(
         principal: effective_principal.clone(),
         executed_at: now_ts,
         params: BTreeMap::new(),
+        target_pointer_id: None,
+        target_pool_id: None,
         superseded_pairs: revert_superseded_pairs,
         created_ids: revert_created_ids,
         twin_deltas: revert_twin_deltas,
@@ -4352,6 +4384,103 @@ mod tests {
             .collect();
         assert!(codes2.contains(&"out_of_bounds"));
         assert!(codes2.contains(&"invalid_parameter_type"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// #352: the production writer must stamp the connector target inside the
+    /// nested receipt so the kernel verifier never depends on editable row
+    /// metadata or on an untyped parameter bag being re-read.
+    #[tokio::test]
+    async fn apply_stamps_connector_target_binding_in_nested_receipt() {
+        let tmp = std::env::temp_dir().join(format!("ns-action-binding-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = crate::store::ladybug::LadybugStore::for_testing(&tmp, 4).expect("store");
+        let ns = "ns-bind";
+        store.init(ns).await.unwrap();
+
+        store
+            .upsert(
+                ns,
+                "act-write-back",
+                vec![0.1; 4],
+                MemoryPayload {
+                    content: "Action definition: connector-write-back".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "action_type".to_string(),
+                    agent_name: None,
+                    location: "".to_string(),
+                    location_lines: "".to_string(),
+                    metadata: json!({
+                        "action_type": {
+                            "slug": "connector-write-back",
+                            "title": "Connector Write Back",
+                            "description": "Authorize one connector write-back target",
+                            "required_role": "editor",
+                            "parameters": {
+                                "pointer_id": { "param_type": "string", "required": true },
+                                "pool_id": { "param_type": "string", "required": true }
+                            },
+                            "submission_criteria": [],
+                            "effects": [
+                                {
+                                    "op": "upsert_memory",
+                                    "memory_type": "fact",
+                                    "content_template": "Approved write-back for {{pointer_id}}",
+                                    "metadata_template": {"domain": "ops"}
+                                }
+                            ]
+                        }
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+
+        let apply_out = apply_action(
+            &store,
+            &ActionInvocation {
+                namespace: ns.to_string(),
+                slug: "connector-write-back".to_string(),
+                security: ActionSecurityContext {
+                    authenticated_principal: "alice".to_string(),
+                    requested_principal: None,
+                },
+                params: BTreeMap::from([
+                    ("pointer_id".to_string(), json!("ptr-bound")),
+                    ("pool_id".to_string(), json!("default")),
+                ]),
+            },
+            &DummyActionEmbedder,
+        )
+        .await
+        .expect("apply connector-write-back");
+        let (receipt_id, receipt) = match apply_out {
+            ActionApplyOutcome::Applied {
+                receipt_id,
+                receipt,
+            } => (receipt_id, receipt),
+            other => panic!("expected Applied, got {other:?}"),
+        };
+        assert_eq!(receipt.target_pointer_id.as_deref(), Some("ptr-bound"));
+        assert_eq!(receipt.target_pool_id.as_deref(), Some("default"));
+
+        let row = store
+            .get(ns, &receipt_id)
+            .await
+            .unwrap()
+            .expect("receipt row");
+        assert_eq!(
+            row.1.metadata["action_receipt"]["target_pointer_id"],
+            json!("ptr-bound")
+        );
+        assert_eq!(
+            row.1.metadata["action_receipt"]["target_pool_id"],
+            json!("default")
+        );
+        assert!(
+            row.1.metadata.get("pointer_id").is_none(),
+            "the target must live inside the receipt, not in row metadata"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

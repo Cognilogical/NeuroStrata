@@ -18,6 +18,7 @@ use crate::connectors::{
     DataPointerRecord, DataPoolAccessMode, DataPoolSchema, ExternalEffectReceipt, WriteBackSnapshot,
 };
 use crate::formal_kernel::KernelActionReceiptState;
+use crate::rdf::action::ActionReceiptPayload;
 use crate::rebac::can_read_memory;
 use crate::traits::{MemoryPayload, OntologyStore, TaskStore, TaskSummaryRow, VectorStore};
 use crate::workflow::machine::WorkflowStage;
@@ -866,6 +867,13 @@ impl OntologyPort for LadybugOntologyPort {
         if payload.memory_type != "action_receipt" {
             return Ok(KernelActionReceiptState::MissingOrNotFound);
         }
+        // #352: the production writer nests the receipt under
+        // `metadata.action_receipt`. Bind from that immutable payload, never
+        // from editable top-level row metadata and never from "any active
+        // receipt".
+        let Ok(receipt) = ActionReceiptPayload::from_payload(&payload) else {
+            return Ok(KernelActionReceiptState::TargetMismatch);
+        };
         if payload
             .metadata
             .get("reverted_at")
@@ -875,31 +883,33 @@ impl OntologyPort for LadybugOntologyPort {
                 .get("valid_to")
                 .is_some_and(|v| !v.is_null())
             || payload.metadata.get("tx_to").is_some_and(|v| !v.is_null())
+            || receipt.reverted_at.is_some()
         {
             return Ok(KernelActionReceiptState::RevertedOrSuperseded);
         }
-        let (metadata_pointer_id, metadata_pool_id) = match (
-            payload.metadata.get("pointer_id").and_then(|v| v.as_str()),
-            payload.metadata.get("pool_id").and_then(|v| v.as_str()),
-        ) {
-            (Some(pid), Some(p)) => (pid, p),
-            _ => return Ok(KernelActionReceiptState::TargetMismatch),
+        if receipt.receipt_id != receipt_id {
+            return Ok(KernelActionReceiptState::TargetMismatch);
+        }
+        let explicit = match (&receipt.target_pointer_id, &receipt.target_pool_id) {
+            (Some(p), Some(pool)) => Some((p.as_str(), pool.as_str())),
+            _ => None,
         };
-        if metadata_pointer_id == pointer_id && metadata_pool_id == pool_id {
-            return Ok(KernelActionReceiptState::ActiveBound);
-        }
-        if let Some(target_pointer) = payload
-            .metadata
-            .get("target_pointer_id")
-            .and_then(|v| v.as_str())
-        {
-            if let Some(target_receipt) = payload.metadata.get("receipt").and_then(|v| v.as_str()) {
-                if target_pointer == pointer_id && target_receipt == receipt_id {
-                    return Ok(KernelActionReceiptState::ActiveBound);
-                }
+        // Transitional binding for receipts written before the target was
+        // stamped: the same reserved parameter pair is still nested in the
+        // receipt, not in editable row metadata.
+        let bound = explicit.or_else(|| {
+            let pointer = receipt.params.get("pointer_id")?.as_str()?;
+            let pool = receipt.params.get("pool_id")?.as_str()?;
+            Some((pointer, pool))
+        });
+        match bound {
+            Some((bound_pointer, bound_pool))
+                if bound_pointer == pointer_id && bound_pool == pool_id =>
+            {
+                Ok(KernelActionReceiptState::ActiveBound)
             }
+            _ => Ok(KernelActionReceiptState::TargetMismatch),
         }
-        Ok(KernelActionReceiptState::TargetMismatch)
     }
 
     async fn plan_ontology_diff(

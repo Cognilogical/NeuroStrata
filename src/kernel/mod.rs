@@ -997,9 +997,69 @@ mod tests {
         pool_id: &str,
         reverted: bool,
     ) {
-        let mut metadata = json!({"pointer_id": pointer_id, "pool_id": pool_id});
+        seed_receipt_with_binding(
+            store, namespace, receipt_id, pointer_id, pool_id, reverted, true,
+        )
+        .await;
+    }
+
+    /// Mirrors a receipt written before the target was stamped: the same
+    /// reserved parameter pair is nested in the receipt, no explicit fields.
+    async fn seed_in_flight_receipt(
+        store: &LadybugStore,
+        namespace: &str,
+        receipt_id: &str,
+        pointer_id: &str,
+        pool_id: &str,
+    ) {
+        seed_receipt_with_binding(
+            store, namespace, receipt_id, pointer_id, pool_id, false, false,
+        )
+        .await;
+    }
+
+    /// Reproduces the production writer's metadata shape
+    /// (`src/rdf/action.rs`): the receipt is nested under
+    /// `metadata.action_receipt`, never at the top level.
+    async fn seed_receipt_with_binding(
+        store: &LadybugStore,
+        namespace: &str,
+        receipt_id: &str,
+        pointer_id: &str,
+        pool_id: &str,
+        reverted: bool,
+        stamped: bool,
+    ) {
+        let mut receipt = json!({
+            "receipt_id": receipt_id,
+            "action_slug": "connector-write-back",
+            "principal": "alice",
+            "executed_at": 1000,
+            "params": {"pointer_id": pointer_id, "pool_id": pool_id},
+            "superseded_pairs": [],
+            "created_ids": [],
+            "twin_deltas": [],
+            "edge_deltas": [],
+            "row_deltas": [],
+            "task_deltas": [],
+            "reverted_at": null,
+            "reverted_by_receipt_id": null,
+            "reverts_receipt_id": null,
+            "forced_by": null,
+            "forced_at": null
+        });
+        if stamped {
+            receipt["target_pointer_id"] = json!(pointer_id);
+            receipt["target_pool_id"] = json!(pool_id);
+        }
+        let mut metadata = json!({
+            "eligibility": "private",
+            "valid_from": 1000,
+            "action_receipt": receipt
+        });
         if reverted {
-            metadata["reverted_at"] = json!("2026-01-01T00:00:00Z");
+            // The production revert writer retires the row with `valid_to`.
+            metadata["valid_to"] = json!(1001);
         }
         let payload = MemoryPayload {
             content: "receipt".to_string(),
@@ -1014,6 +1074,100 @@ mod tests {
             .put_scoped_memory(namespace, receipt_id, &payload)
             .await
             .expect("seed receipt");
+    }
+
+    /// #352: the receipt shape the production writer emits must authorize its
+    /// own target, and the same shape bound elsewhere must still deny before
+    /// connector I/O.
+    #[tokio::test]
+    async fn production_receipt_binds_its_write_back_target() {
+        let ns = "ns352";
+        let spy = Arc::new(SpyConnector::new(
+            "spy",
+            DataPoolAccessMode::ReadWrite,
+            10,
+            1024,
+        ));
+        let (kernel, store, _dir) = build_kernel(spy.clone());
+        store.init(ns).await.expect("init");
+        kernel
+            .register_pointer(ns, &pointer_record("ptr_bound", "spy", 1000, 100), Some(ns))
+            .await
+            .expect("register");
+        seed_receipt(&store, ns, "rcpt_bound", "ptr_bound", "pool1", false).await;
+
+        let receipt = kernel
+            .apply_external_effect(
+                ns,
+                &writeback_request("ptr_bound", "rcpt_bound"),
+                1000,
+                Some(ns),
+            )
+            .await
+            .expect("a production-shaped receipt must authorize its target");
+        assert!(receipt.applied);
+        assert_eq!(spy.apply_calls.load(Ordering::SeqCst), 1);
+
+        seed_receipt(
+            &store,
+            ns,
+            "rcpt_elsewhere",
+            "some_other_pointer",
+            "other_pool",
+            false,
+        )
+        .await;
+        let err = kernel
+            .apply_external_effect(
+                ns,
+                &writeback_request("ptr_bound", "rcpt_elsewhere"),
+                1000,
+                Some(ns),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Pre-gate"), "unexpected: {err}");
+        assert_eq!(
+            spy.apply_calls.load(Ordering::SeqCst),
+            1,
+            "a wrong-target receipt must deny before connector I/O"
+        );
+    }
+
+    /// #352: receipts already written before the stamp existed remain usable
+    /// through the reserved parameter pair nested in the same payload.
+    #[tokio::test]
+    async fn in_flight_receipt_binds_via_nested_params() {
+        let ns = "ns352_inflight";
+        let spy = Arc::new(SpyConnector::new(
+            "spy",
+            DataPoolAccessMode::ReadWrite,
+            10,
+            1024,
+        ));
+        let (kernel, store, _dir) = build_kernel(spy.clone());
+        store.init(ns).await.expect("init");
+        kernel
+            .register_pointer(
+                ns,
+                &pointer_record("ptr_inflight", "spy", 1000, 100),
+                Some(ns),
+            )
+            .await
+            .expect("register");
+        seed_in_flight_receipt(&store, ns, "rcpt_inflight", "ptr_inflight", "pool1").await;
+
+        let receipt = kernel
+            .apply_external_effect(
+                ns,
+                &writeback_request("ptr_inflight", "rcpt_inflight"),
+                1000,
+                Some(ns),
+            )
+            .await
+            .expect("an in-flight receipt must bind through nested params");
+        assert!(receipt.applied);
+        assert_eq!(spy.apply_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
