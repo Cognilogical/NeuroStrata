@@ -308,9 +308,10 @@ fn depth(rel: &str) -> usize {
 
 /// The git root of a DIRECTORY: `dir` itself when it holds `.git`, else its
 /// nearest ancestor that does ([`find_git_root`] looks only above its input).
+/// Returned in the same normalized spelling as [`find_git_root`] either way.
 pub fn git_root_of_dir(dir: &str) -> Option<String> {
     if host_path(dir).is_some_and(|d| d.join(".git").exists()) {
-        Some(dir.to_string())
+        Some(parse_absolute(dir)?.to_path_string())
     } else {
         find_git_root(dir)
     }
@@ -318,29 +319,102 @@ pub fn git_root_of_dir(dir: &str) -> Option<String> {
 
 /// The main checkout of the git repository holding `dir` (a directory): `dir`'s
 /// own `.git` root when that is a regular checkout, or, for a linked worktree,
-/// the checkout that owns it. A submodule or a worktree of a bare repository
-/// has no main checkout to borrow from and answers its own root. `None`
-/// outside git. Returned in this host's plain spelling (`dunce`).
+/// the checkout that owns it. A submodule, a worktree of a bare repository,
+/// and any worktree whose main checkout can't be found answer their own root.
+/// `None` outside git. Returned in this host's plain spelling (`dunce`).
 pub fn main_checkout_root(dir: &str) -> Option<PathBuf> {
-    let own_root = git_root_of_dir(dir)?;
+    // Resolve links first: a relative gitdir read against a linked spelling
+    // lands somewhere else, and a link can cross a checkout boundary.
+    let dir = host_path(dir)
+        .and_then(|d| canonical(&d))
+        .map(|d| d.to_string_lossy().to_string())
+        .unwrap_or_else(|| dir.to_string());
+    let own_root = git_root_of_dir(&dir)?;
     let own = host_path(&own_root)?;
-    let dot_git = own.join(".git");
-    if dot_git.is_dir() {
-        return canonical(&own);
+    let own = canonical(&own).unwrap_or(own);
+    if own.join(".git").is_dir() {
+        return Some(own);
     }
     // Only a linked worktree borrows a main checkout: its gitdir names the
-    // shared directory in `commondir`, and that is a checkout's `.git`. Not a
-    // submodule (no `commondir`, wherever its gitdir lives) and not a worktree
-    // of a bare repository (the common directory is not a `.git`).
+    // shared directory in `commondir`. Not a submodule (no `commondir`,
+    // wherever its gitdir lives).
     let main = gitdir_of_file(&own)
         .and_then(|gitdir| linked_common_dir(&gitdir))
-        .and_then(|common| parse_absolute(&common))
-        .filter(|common| common.parts.last().is_some_and(|last| last == ".git"))
-        .map(|common| AbsPath { parts: common.parts[..common.parts.len() - 1].to_vec(), ..common });
-    match main {
-        Some(main) => canonical(&host_path(&main.to_path_string())?),
-        None => canonical(&own),
+        .and_then(|common| canonical(Path::new(&common)))
+        .and_then(|common| main_checkout_of_common(&common));
+    Some(main.unwrap_or(own))
+}
+
+/// The main checkout that owns the common git directory `common` (canonical):
+/// `core.worktree` when set, else the parent of a common directory named
+/// `.git`. `None` for a bare repository (`core.bare`, whatever the folder is
+/// called), and when the parent holds nothing but that `.git`: that is how
+/// `git init --separate-git-dir <dir>/.git <checkout>` leaves it, and git
+/// records the real checkout nowhere in the common directory (git itself
+/// then lists `<dir>` as the main worktree). A parent with only `.git` has
+/// nothing for a worktree to borrow either way.
+fn main_checkout_of_common(common: &Path) -> Option<PathBuf> {
+    let core = core_config(common);
+    if core.bare {
+        return None;
     }
+    if let Some(worktree) = core.worktree {
+        // Relative to the git directory, as git reads it.
+        let path = PathBuf::from(joined(common, &worktree));
+        return canonical(&path).filter(|p| p.is_dir());
+    }
+    if common.file_name()? != ".git" {
+        return None;
+    }
+    let parent = common.parent()?;
+    let holds_more_than_git = std::fs::read_dir(parent)
+        .ok()?
+        .filter_map(Result::ok)
+        .any(|entry| entry.file_name() != ".git");
+    holds_more_than_git.then(|| parent.to_path_buf())
+}
+
+/// The `[core]` settings [`main_checkout_of_common`] reads.
+#[derive(Default)]
+struct CoreConfig {
+    bare: bool,
+    worktree: Option<String>,
+}
+
+/// `core.bare` and `core.worktree` from `<common>/config` (an unreadable
+/// config reads as neither). Keys are case-insensitive; a key with no value
+/// is boolean true, as git reads it.
+fn core_config(common: &Path) -> CoreConfig {
+    let mut out = CoreConfig::default();
+    let Ok(text) = std::fs::read_to_string(common.join("config")) else {
+        return out;
+    };
+    let mut in_core = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(section) = line.strip_prefix('[') {
+            let name = section.split(']').next().unwrap_or("").trim();
+            in_core = name.eq_ignore_ascii_case("core");
+            continue;
+        }
+        if !in_core || line.starts_with(['#', ';']) {
+            continue;
+        }
+        let (key, value) = match line.split_once('=') {
+            Some((k, v)) => (k.trim(), Some(v.trim().trim_matches('"'))),
+            None => (line, None),
+        };
+        if key.eq_ignore_ascii_case("bare") {
+            out.bare = value.is_none_or(|v| {
+                ["true", "yes", "on", "1"]
+                    .iter()
+                    .any(|t| v.eq_ignore_ascii_case(t))
+            });
+        } else if key.eq_ignore_ascii_case("worktree") {
+            out.worktree = value.filter(|v| !v.is_empty()).map(str::to_string);
+        }
+    }
+    out
 }
 
 /// Where the root that relativized a lookup path came from.
@@ -1877,13 +1951,23 @@ mod tests {
     fn the_main_checkout_of_a_linked_worktree_is_the_checkout_that_owns_it() {
         let (tmp, root, worktree) = project_with_worktree();
         assert_eq!(main_checkout_root(&s(&root)), Some(root.clone()));
-        assert_eq!(main_checkout_root(&s(&root.join("src"))), Some(root.clone()));
+        assert_eq!(
+            main_checkout_root(&s(&root.join("src"))),
+            Some(root.clone())
+        );
         assert_eq!(main_checkout_root(&s(&worktree)), Some(root.clone()));
-        assert_eq!(main_checkout_root(&s(&worktree.join("src"))), Some(root.clone()));
+        assert_eq!(
+            main_checkout_root(&s(&worktree.join("src"))),
+            Some(root.clone())
+        );
         // A submodule's gitdir is <super>/.git/modules/<name>: its own root.
         let sub = canonical(tmp.path()).unwrap().join("sub");
         std::fs::create_dir_all(&sub).unwrap();
-        std::fs::write(sub.join(".git"), "gitdir: ../example-project/.git/modules/sub\n").unwrap();
+        std::fs::write(
+            sub.join(".git"),
+            "gitdir: ../example-project/.git/modules/sub\n",
+        )
+        .unwrap();
         assert_eq!(main_checkout_root(&s(&sub)), Some(sub.clone()));
         // A submodule inside the linked worktree: its gitdir lives under the
         // worktree's gitdir (`<main>/.git/worktrees/<wt>/modules/<sub>`) but
@@ -1935,13 +2019,131 @@ mod tests {
     #[test]
     fn git_root_of_dir_is_the_dir_itself_or_its_nearest_checkout() {
         let (_tmp, root, worktree) = project_with_worktree();
-        // The answer keeps the input's spelling (`find_git_root` rebuilds it
-        // with `/` on Windows), so compare with one separator.
-        let slashed = |p: Option<String>| p.map(|p| p.replace('\\', "/"));
-        let want = |p: &Path| Some(s(p).replace('\\', "/"));
-        assert_eq!(slashed(git_root_of_dir(&s(&root))), want(&root));
-        assert_eq!(slashed(git_root_of_dir(&s(&root.join("src")))), want(&root));
-        assert_eq!(slashed(git_root_of_dir(&s(&worktree))), want(&worktree));
-        assert_eq!(slashed(git_root_of_dir(&s(&worktree.join("src")))), want(&worktree));
+        // One spelling whether `dir` is the checkout top or below it.
+        let want = |p: &Path| parse_absolute(&s(p)).map(|p| p.to_path_string());
+        assert_eq!(git_root_of_dir(&s(&root)), want(&root));
+        assert_eq!(git_root_of_dir(&s(&root.join("src"))), want(&root));
+        assert_eq!(git_root_of_dir(&s(&worktree)), want(&worktree));
+        assert_eq!(git_root_of_dir(&s(&worktree.join("src"))), want(&worktree));
+        let trailing = format!("{}{}", s(&root), std::path::MAIN_SEPARATOR);
+        assert_eq!(git_root_of_dir(&trailing), want(&root));
+        let dotted = format!("{}/src/..", s(&root));
+        assert_eq!(git_root_of_dir(&dotted), want(&root));
+    }
+
+    /// `git clone --bare <url> <dir>/.git` + `git worktree add`: the common
+    /// directory is named `.git` but its config says `core.bare = true`.
+    #[test]
+    fn worktree_of_a_bare_repo_named_dot_git_is_its_own_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = canonical(tmp.path()).unwrap().join("example-project");
+        let common = project.join(".git");
+        let wt = project.join("main");
+        link_worktree(&wt, &common.join("worktrees").join("main"));
+        std::fs::write(common.join("config"), "[core]\n\tBare = TRUE\n").unwrap();
+        assert_eq!(main_checkout_root(&s(&wt)), Some(wt.clone()));
+        assert_eq!(main_checkout_root(&s(&wt.join("src"))), Some(wt.clone()));
+        // The same layout with `bare = false` and the parent holding that
+        // `.git` is an ordinary main checkout.
+        std::fs::write(common.join("config"), "[core]\n\tbare = false\n").unwrap();
+        assert_eq!(main_checkout_root(&s(&wt)), Some(project.clone()));
+    }
+
+    /// `git init --separate-git-dir data/proj/.git sep` + `git worktree add`:
+    /// the common directory is `data/proj/.git`, but `data/proj` is no
+    /// checkout. The real main checkout `sep` is named nowhere git keeps
+    /// (no `core.worktree`), so the worktree answers its own root; with
+    /// `core.worktree` set, that folder is the main checkout.
+    #[test]
+    fn worktree_of_a_separate_git_dir_named_dot_git_is_not_owned_by_its_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = canonical(tmp.path()).unwrap();
+        let common = base.join("data").join("proj").join(".git");
+        let sep = base.join("sep");
+        std::fs::create_dir_all(&common).unwrap();
+        std::fs::create_dir_all(&sep).unwrap();
+        std::fs::write(
+            sep.join(".git"),
+            format!("gitdir: {}\n", s(&common).replace('\\', "/")),
+        )
+        .unwrap();
+        std::fs::write(common.join("config"), "[core]\n\tbare = false\n").unwrap();
+        let wt = base.join("wt");
+        link_worktree(&wt, &common.join("worktrees").join("wt"));
+        assert_eq!(main_checkout_root(&s(&wt)), Some(wt.clone()));
+        assert_eq!(main_checkout_root(&s(&sep)), Some(sep.clone()));
+        std::fs::write(
+            common.join("config"),
+            format!(
+                "[core]\n\tbare = false\n\tworktree = {}\n",
+                s(&sep).replace('\\', "/")
+            ),
+        )
+        .unwrap();
+        assert_eq!(main_checkout_root(&s(&wt)), Some(sep.clone()));
+    }
+
+    /// Every way the main checkout can't be found answers the worktree's own
+    /// root: an unreadable gitdir, and a `commondir` naming a missing folder.
+    #[test]
+    fn main_checkout_root_failures_answer_the_worktrees_own_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = canonical(tmp.path()).unwrap();
+        let wt = base.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: ../missing/.git/worktrees/wt\n").unwrap();
+        assert_eq!(main_checkout_root(&s(&wt)), Some(wt.clone()));
+        let gone = base.join("gone").join(".git");
+        let wt2 = base.join("wt2");
+        link_worktree(&wt2, &base.join("gitdir2"));
+        std::fs::write(
+            base.join("gitdir2").join("commondir"),
+            format!("{}\n", s(&gone).replace('\\', "/")),
+        )
+        .unwrap();
+        assert_eq!(main_checkout_root(&s(&wt2)), Some(wt2.clone()));
+    }
+
+    /// A directory link (symlink, or a junction on Windows) to `target` at
+    /// `link`; `false` when this host or user can't make one.
+    fn dir_link(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_dir(target, link).is_ok()
+                || std::process::Command::new("cmd")
+                    .args(["/C", "mklink", "/J"])
+                    .arg(link)
+                    .arg(target)
+                    .output()
+                    .is_ok_and(|o| o.status.success())
+        }
+    }
+
+    /// A worktree reached through a directory link, with a relative gitdir
+    /// (`worktree.useRelativePaths`): the link is resolved first, so the
+    /// relative gitdir is read against the real folder.
+    #[test]
+    fn main_checkout_root_resolves_a_linked_spelling_first() {
+        let (tmp, root, worktree) = project_with_worktree();
+        std::fs::write(
+            worktree.join(".git"),
+            "gitdir: ../../../.git/worktrees/agent-1\n",
+        )
+        .unwrap();
+        assert_eq!(main_checkout_root(&s(&worktree)), Some(root.clone()));
+        let link = canonical(tmp.path()).unwrap().join("wt-link");
+        if !dir_link(&worktree, &link) {
+            eprintln!("skipped: no directory links on this host");
+            return;
+        }
+        assert_eq!(main_checkout_root(&s(&link)), Some(root.clone()));
+        assert_eq!(
+            main_checkout_root(&s(&link.join("src"))),
+            Some(root.clone())
+        );
     }
 }
