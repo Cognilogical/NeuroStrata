@@ -230,12 +230,64 @@ mod tests {
             .collect()
     }
 
+    /// CPU-allocation-scoped pressure classification (Codex P2 fix).
+    /// `/proc/loadavg` is host-wide: inside a cgroup/cpuset its runnable count
+    /// can come from sibling work outside this test's allocation, so dividing
+    /// it by process-visible parallelism falsely reports pressure and lets AC5
+    /// regressions up to 4x pass. Decision below:
+    ///   - cgroup v2 `cpu.pressure` readable -> PSI `some avg10` (pressure in
+    ///     the same allocation); relax only above `PSI_AVG10_THRESHOLD`.
+    ///   - cgroup CPU quota present without PSI -> strict; host load is
+    ///     out of scope, never a relaxation trigger.
+    ///   - no cgroup limit -> whole host visible; host load normalized by
+    ///     available parallelism is same-scope and may relax.
+    ///   - any read/parse failure -> strict; never relax on unknown load.
+    #[derive(Debug, Clone, Copy)]
+    enum CgroupScope {
+        /// PSI `some avg10` for this cgroup (same CPU allocation).
+        Psi(f64),
+        /// cgroup CPU quota present; host-wide load is out of scope.
+        QuotaLimited,
+        /// No cgroup CPU limit; process sees the whole host.
+        NoLimit,
+        /// Unreadable/unparseable signal: strict path.
+        Unknown,
+    }
+
+    /// PSI `some avg10` from `/sys/fs/cgroup/cpu.pressure` (percent of the
+    /// last 10s with at least one CPU-stalled task). Only the `some` line
+    /// counts; `full`, unparseable, and non-finite values yield `None`.
+    fn psi_some_avg10(raw: &str) -> Option<f64> {
+        let line = raw.lines().find(|l| l.trim_start().starts_with("some "))?;
+        let token = line.split_whitespace().find(|t| t.starts_with("avg10="))?;
+        let value: f64 = token.strip_prefix("avg10=")?.parse().ok()?;
+        value.is_finite().then_some(value)
+    }
+
+    /// Read the cgroup CPU scope. Absent `cpu.pressure` and `cpu.max` means no
+    /// cgroup v2 limit (whole host visible); a non-`max` quota means a limited
+    /// allocation where host-wide load cannot justify relaxation.
+    fn cgroup_scope() -> CgroupScope {
+        match std::fs::read_to_string("/sys/fs/cgroup/cpu.pressure") {
+            Ok(raw) => return psi_some_avg10(&raw).map_or(CgroupScope::Unknown, CgroupScope::Psi),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return CgroupScope::Unknown,
+        }
+        match std::fs::read_to_string("/sys/fs/cgroup/cpu.max") {
+            Ok(raw) => match raw.split_whitespace().next().unwrap_or("") {
+                "max" => CgroupScope::NoLimit,
+                quota if quota.parse::<u64>().is_ok() => CgroupScope::QuotaLimited,
+                _ => CgroupScope::Unknown,
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => CgroupScope::NoLimit,
+            Err(_) => CgroupScope::Unknown,
+        }
+    }
+
     /// Linux load normalized by available parallelism. Takes the max of the
     /// 1-minute average and the *instantaneous* runnable count (`/proc/loadavg`
-    /// field 4): the average alone lags a sudden burst of competing work,
-    /// which is exactly how a loaded run can slip into the strict assertion.
-    /// `None` on hosts without the signal (e.g. macOS) — those keep the strict
-    /// 100ms contract, never relax it on an unknown load.
+    /// field 4): the average alone lags a sudden burst of competing work.
+    /// Consulted only in the `NoLimit` scope, where it is same-scope.
     fn host_load_per_cpu() -> Option<f64> {
         let raw = std::fs::read_to_string("/proc/loadavg").ok()?;
         let fields: Vec<&str> = raw.split_whitespace().collect();
@@ -252,6 +304,22 @@ mod tests {
     /// strict assertion runs only when it can actually be trusted.
     const HIGH_LOAD_PER_CPU: f64 = 0.75;
 
+    /// PSI avg10 threshold: calibrated idle `some avg10` ~0.00 vs ~44.86 under
+    /// 32 synthetic busy loops on this 16-CPU host; 10.0 separates real
+    /// allocation-scoped contention from noise.
+    const PSI_AVG10_THRESHOLD: f64 = 10.0;
+
+    /// Pure decision seam: only pressure scoped to this CPU allocation may
+    /// relax the strict assertion. Host load is consulted exclusively when no
+    /// cgroup limit exists (the process then sees the whole host).
+    fn scoped_pressure_relaxes(scope: CgroupScope, host_load_per_cpu: Option<f64>) -> bool {
+        match scope {
+            CgroupScope::Psi(avg10) => avg10 >= PSI_AVG10_THRESHOLD,
+            CgroupScope::QuotaLimited | CgroupScope::Unknown => false,
+            CgroupScope::NoLimit => host_load_per_cpu.is_some_and(|load| load >= HIGH_LOAD_PER_CPU),
+        }
+    }
+
     /// Load-aware ceiling; explicitly NOT a verification of the 100ms AC5
     /// production contract. It only keeps the measurement meaningful when the
     /// host is too contended to assert that contract. Calibrated against a
@@ -261,9 +329,10 @@ mod tests {
 
     /// The real p95 both budgets must be under 100ms: actual plan calls over a
     /// populated candidate set, and actual AC3-canonicalizing upserts. The
-    /// upsert leg is warmed up on the same AC3 path; only when the host is too
-    /// loaded for absolute timing is the strict assertion replaced by the
-    /// clearly labelled load-aware ceiling above.
+    /// upsert leg is warmed up on the same AC3 path; the strict assertion is
+    /// relaxed only under pressure scoped to this allocation (cgroup PSI, or
+    /// host load when no cgroup limit exists), never on host-wide load inside
+    /// a quota-limited cgroup.
     #[tokio::test]
     async fn ac5_real_context_plan_and_upsert_p95_under_100ms() {
         // -- ContextService::plan_with_items over 10 real items, 100 runs --
@@ -334,9 +403,11 @@ mod tests {
         // Absolute wall-clock p95 is the AC5 production signal: no reference
         // subtraction (a cheap `get` is not a variance-matched proxy for the
         // guard/metrics/AC3/WAL work in upsert, so A-B would add variance and
-        // mask a shared-infra regression). Host load is handled by the explicit
-        // gate below, never by transforming the measurement.
+        // mask a shared-infra regression). Allocation-scoped pressure is
+        // handled by the explicit gate below, never by transforming the
+        // measurement.
         const MEASURED: usize = 20;
+        let scope_before = cgroup_scope();
         let load_before = host_load_per_cpu();
         let mut upsert_samples = Vec::<f64>::with_capacity(MEASURED);
         for i in 0..MEASURED {
@@ -369,26 +440,34 @@ mod tests {
         // Functional assertions run on every host, independent of load.
         assert_eq!(upsert_samples_count, MEASURED);
 
+        let scope_after = cgroup_scope();
         let load_after = host_load_per_cpu();
         let load_per_cpu = match (load_before, load_after) {
             (Some(a), Some(b)) => Some(a.max(b)),
             (Some(a), None) | (None, Some(a)) => Some(a),
             (None, None) => None,
         };
+        eprintln!(
+            "AC5 scoped pressure before={:?} load={:?} after={:?} load={:?} (PSI avg10>{:.1}; host>{:.2} only with no cgroup limit)",
+            scope_before, load_before, scope_after, load_after,
+            PSI_AVG10_THRESHOLD, HIGH_LOAD_PER_CPU
+        );
         match load_per_cpu {
             Some(load) => eprintln!(
-                "AC5 host load before={:?} after={:?} max={load:.3} runnable/CPU (threshold {:.2})",
-                load_before, load_after, HIGH_LOAD_PER_CPU
+                "AC5 host load before={:?} after={:?} max={load:.3} runnable/CPU (informational only)",
+                load_before, load_after
             ),
-            None => eprintln!("AC5 host load unavailable: asserting strict 100ms contract"),
+            None => eprintln!("AC5 host load unavailable"),
         }
         eprintln!("AC5 absolute p95: plan={p95_plan_ms:.3}ms upsert={p95_upsert_ms:.3}ms");
 
         std::fs::remove_dir_all(&dir).ok();
 
-        if load_per_cpu.is_some_and(|load| load >= HIGH_LOAD_PER_CPU) {
+        let relax = scoped_pressure_relaxes(scope_before, load_before)
+            || scoped_pressure_relaxes(scope_after, load_after);
+        if relax {
             eprintln!(
-                "AC5 host contended: asserting {:.0}ms load-aware ceiling, NOT the 100ms production contract",
+                "AC5 scoped CPU pressure detected: asserting {:.0}ms load-aware ceiling, NOT the 100ms production contract",
                 LOADED_BUDGET_MS
             );
             assert!(
@@ -530,5 +609,66 @@ mod tests {
             dirty_tree_hash: expected_dirty,
         });
         assert!(receipt_is_retained(&store, "s", "t", "e2"));
+    }
+
+    /// CPU-allocation-scoped pressure classification. Host-wide
+    /// `/proc/loadavg` is out of scope inside a cgroup/cpuset: only a signal
+    /// from the same CPU allocation may relax the strict assertion.
+    #[test]
+    fn scoped_pressure_psi_high_relaxes() {
+        assert!(PSI_AVG10_THRESHOLD > 0.0);
+        assert!(scoped_pressure_relaxes(
+            CgroupScope::Psi(PSI_AVG10_THRESHOLD + 5.0),
+            Some(0.0) // host idle — relaxation must come from scoped PSI
+        ));
+        assert!(!scoped_pressure_relaxes(
+            CgroupScope::Psi(PSI_AVG10_THRESHOLD / 2.0),
+            Some(3.0)
+        ));
+    }
+
+    #[test]
+    fn scoped_pressure_quota_with_host_load_stays_strict() {
+        // Cgroup CPU quota present, no cgroup pressure: host load is
+        // out of scope and must not relax the strict assertion.
+        assert!(!scoped_pressure_relaxes(
+            CgroupScope::QuotaLimited,
+            Some(2.0)
+        ));
+    }
+
+    #[test]
+    fn scoped_pressure_no_cgroup_host_load_relaxes() {
+        // No cgroup limit: the process sees the whole host, so host load
+        // normalized by available parallelism is the same-scope signal.
+        assert!(scoped_pressure_relaxes(
+            CgroupScope::NoLimit,
+            Some(HIGH_LOAD_PER_CPU + 0.5)
+        ));
+        assert!(!scoped_pressure_relaxes(CgroupScope::NoLimit, Some(0.0)));
+    }
+
+    #[test]
+    fn scoped_pressure_unreadable_stays_strict() {
+        // Unknown/unreadable scope never relaxes, even under high host load.
+        assert!(!scoped_pressure_relaxes(CgroupScope::Unknown, Some(5.0)));
+        assert!(!scoped_pressure_relaxes(CgroupScope::Unknown, None));
+    }
+
+    #[test]
+    fn psi_some_avg10_parses_some_line() {
+        let raw = concat!(
+            "some avg10=44.86 avg60=11.17 avg300=5.45 total=1268869085\n",
+            "full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
+        );
+        assert_eq!(psi_some_avg10(raw), Some(44.86));
+        assert_eq!(
+            psi_some_avg10("full avg10=9.00 avg60=0.00 avg300=0.00 total=0\n"),
+            None
+        );
+        assert_eq!(
+            psi_some_avg10("some avg10=nan avg60=0.00 avg300=0.00 total=0\n"),
+            None
+        );
     }
 }
