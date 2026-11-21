@@ -1274,12 +1274,13 @@ pub async fn execute_locate(
         }
         seen.into_iter().collect()
     };
-    if returned_paths.is_empty() {
-        crate::task::record_graph_query(store, &namespace, "neurostrata_locate", &query).await;
-    } else {
-        for p in &returned_paths {
-            crate::task::record_graph_query(store, &namespace, "neurostrata_locate", p).await;
-        }
+    // Panel C14: one locate dispatch is ONE graph-first lookup. Count it once,
+    // attributed by the recorder to the dispatching task. The per-path rows
+    // below remain as legacy `queries[]` history but never touch task counters.
+    crate::task::record_graph_query(store, &namespace, "neurostrata_locate", &query).await;
+    for p in &returned_paths {
+        crate::task::record_legacy_query_path(store, &namespace, "neurostrata_locate", p, None)
+            .await;
     }
     record_paths_in_project_ledger(
         request.project_root.as_deref(),
@@ -1532,6 +1533,102 @@ mod tests {
             bytes.len() <= 1024,
             "serialized size {} exceeded 1024",
             bytes.len()
+        );
+    }
+
+    /// panel C14: one dispatch returning several distinct paths must still
+    /// increment the dispatching task's counter exactly once.
+    #[tokio::test]
+    async fn locate_counts_one_dispatch_across_multiple_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store: Arc<dyn VectorStore> =
+            Arc::new(LadybugStore::new(dir.path().join("db"), 384).expect("store init"));
+        let ns = "LocateMultiPath";
+        store.init(ns).await.unwrap();
+
+        store
+            .upsert(
+                ns,
+                "task-locate-multi",
+                vec![0.0; 384],
+                MemoryPayload {
+                    content: "Verify locate multi-path".to_string(),
+                    location: "global".to_string(),
+                    location_lines: String::new(),
+                    memory_type: "task".to_string(),
+                    metadata: json!({
+                        "task": {
+                            "id": "task-locate-multi",
+                            "title": "Verify locate multi-path",
+                            "status": "in_progress",
+                            "graph_queries_count": 0
+                        }
+                    }),
+                    user_id: "test".to_string(),
+                    agent_name: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        for (i, path) in ["src/a.rs", "src/b.rs", "src/c.rs"].iter().enumerate() {
+            store
+                .upsert(
+                    ns,
+                    &format!("sym-multi-{i}"),
+                    vec![0.2; 384],
+                    MemoryPayload {
+                        content: format!(
+                            "functions check_multi in {path}\nlines 1-9\n\nfn check_multi() {{}}"
+                        ),
+                        location: path.to_string(),
+                        location_lines: "1-9".to_string(),
+                        memory_type: "code_ast".to_string(),
+                        metadata: json!({
+                            "domain": "code_ast",
+                            "symbol": "check_multi",
+                            "symbol_kind": "functions",
+                        }),
+                        user_id: "test".to_string(),
+                        agent_name: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let project_dir = tempfile::tempdir().expect("project_dir");
+        let req = LocateRequest {
+            namespace: ns.to_string(),
+            query: "check_multi".to_string(),
+            path_prefix: None,
+            symbols_only: None,
+            max_locations: Some(8),
+            max_bytes: Some(6144),
+            project_root: Some(project_dir.path().to_string_lossy().to_string()),
+            principal: Some("admin".to_string()),
+        };
+        let resp = execute_locate(&store, None, &req, Some("admin"))
+            .await
+            .expect("locate");
+        let paths: BTreeSet<String> = resp.locations.iter().map(|l| l.path.clone()).collect();
+        assert!(
+            paths.len() >= 2,
+            "expected multiple returned paths, got {paths:?}"
+        );
+        let (_, task) = store
+            .get(ns, "task-locate-multi")
+            .await
+            .unwrap()
+            .expect("task exists");
+        let count = task.metadata["task"]["graph_queries_count"]
+            .as_i64()
+            .unwrap_or(0);
+        assert_eq!(
+            count,
+            1,
+            "one dispatch across {} paths must count once, got {count}",
+            paths.len()
         );
     }
 }
