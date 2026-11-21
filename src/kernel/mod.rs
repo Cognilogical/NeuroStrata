@@ -3350,4 +3350,162 @@ mod tests {
             "a commit against an archived pool must be rejected: {result:?}"
         );
     }
+
+    /// Review 700fdbe0#r4650486569: a persistence conflict must restore the
+    /// connector's pre-effect state so the rejected mutation cannot leak from
+    /// a reused kernel.
+    #[tokio::test]
+    async fn rejected_write_back_restores_connector_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_impl =
+            Arc::new(LadybugStore::for_testing(dir.path().join("db"), 4).expect("store init"));
+        let store: Arc<dyn VectorStore> = store_impl.clone();
+        let ns = "ns_pool_rollback";
+        store.init(ns).await.expect("init ns");
+        let bus = Arc::new(ThalamicBus::new(64));
+        let now = now_epoch();
+
+        let kernel1 = AgentKernel::new(store.clone(), bus.clone(), dir.path().to_path_buf());
+        kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "register_pool",
+                    "schema": {
+                        "connector_id": "memory_pool",
+                        "pool_id": "rollback_mem",
+                        "access_mode": "read_write",
+                        "entity_types": ["item"],
+                        "max_slice_rows": 25,
+                        "max_slice_bytes": 2048,
+                        "description": "Rollback pool"
+                    },
+                    "records": {"mem://a": [{"v": 0}]}
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("register pool");
+        kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "register_pointer",
+                    "record": {
+                        "pointer_id": "ptr_rollback",
+                        "connector_id": "memory_pool",
+                        "pool_id": "rollback_mem",
+                        "pointer_uri": "mem://a",
+                        "entity_type": "item",
+                        "expected_source_sha256": null,
+                        "captured_at_secs": now,
+                        "max_staleness_secs": 3600
+                    }
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("register pointer");
+        seed_receipt(&store_impl, ns, "rcpt_r1", "ptr_rollback", "rollback_mem", false).await;
+        seed_receipt(&store_impl, ns, "rcpt_r2", "ptr_rollback", "rollback_mem", false).await;
+
+        let kernel2 = AgentKernel::new(store.clone(), bus.clone(), dir.path().to_path_buf());
+        kernel2
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "resolve_pointer",
+                    "req": {"pointer_id": "ptr_rollback", "offset": 0, "limit": 10, "max_bytes": 1024},
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("kernel2 hydrates before the first write");
+
+        kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "apply_effect",
+                    "req": {
+                        "pointer_id": "ptr_rollback",
+                        "operation": "append",
+                        "payload": {"k1": 1},
+                        "action_receipt_id": "rcpt_r1",
+                        "idempotency_key": "idem-r1"
+                    },
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("kernel1 write persists");
+        let conflict = kernel2
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "apply_effect",
+                    "req": {
+                        "pointer_id": "ptr_rollback",
+                        "operation": "append",
+                        "payload": {"k2": 1},
+                        "action_receipt_id": "rcpt_r2",
+                        "idempotency_key": "idem-r2"
+                    },
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await;
+        assert!(
+            conflict.is_err(),
+            "the stale write must conflict: {conflict:?}"
+        );
+
+        // The rejected mutation and its receipt must be gone from the reused
+        // kernel; a resolve shows the pre-effect state, not the leaked append.
+        let resolved = kernel2
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "resolve_pointer",
+                    "req": {"pointer_id": "ptr_rollback", "offset": 0, "limit": 10, "max_bytes": 1024},
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("resolve after rejected write-back");
+        let records = resolved["records"].as_array().unwrap();
+        assert_eq!(
+            records.len(),
+            1,
+            "the rejected append must be rolled back: {resolved}"
+        );
+        assert_eq!(records[0], json!({"v": 0}));
+
+        // Retrying the same key must not replay a rejected receipt.
+        let retry = kernel2
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "apply_effect",
+                    "req": {
+                        "pointer_id": "ptr_rollback",
+                        "operation": "append",
+                        "payload": {"k2": 1},
+                        "action_receipt_id": "rcpt_r2",
+                        "idempotency_key": "idem-r2"
+                    },
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await;
+        assert!(
+            retry.is_err(),
+            "a rejected receipt must not replay as success: {retry:?}"
+        );
+    }
 }
