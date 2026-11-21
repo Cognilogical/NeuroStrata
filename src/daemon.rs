@@ -509,7 +509,7 @@ pub async fn start_daemon(
     let _ = crate::task::harness_plugins::boot_install_plugins(&startup_root);
     if let Ok(cfg) = crate::config::Config::load() {
         for dir in cfg.project_contexts.values() {
-            let _ = crate::task::harness_plugins::boot_install_plugins(dir);
+            let _ = crate::task::harness_plugins::boot_install_project_context(dir);
         }
     }
     // The port the MCP proxy and CLI hardcode; changing it changes the wire

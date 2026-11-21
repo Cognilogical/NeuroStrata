@@ -639,6 +639,10 @@ pub enum ConfigNamespace<'a> {
     /// none gets this one when given, else is left unwritten (plugin files
     /// only). A config that cannot be read is left as it is.
     Keep(Option<&'a str>),
+    /// The daemon's boot refresh: each harness gets the namespace listed for
+    /// it ([`boot_namespaces_for`]); a harness not listed, or whose config
+    /// cannot be read, is left unwritten.
+    Each(&'a [(String, String)]),
 }
 
 impl ConfigNamespace<'_> {
@@ -651,6 +655,10 @@ impl ConfigNamespace<'_> {
                 Ok(Some(own)) => Some(own),
                 Ok(None) => fallback.and_then(usable_namespace),
                 Err(_) => None,
+            },
+            ConfigNamespace::Each(listed) => match harness_config_namespace(root, harness) {
+                Err(_) => None,
+                Ok(_) => listed.iter().find(|(h, _)| h == harness).map(|(_, ns)| ns.clone()),
             },
         }
     }
@@ -767,13 +775,62 @@ pub fn detect_harnesses(
     (active, detected)
 }
 
-/// The daemon's boot-time refresh for `dir`. Bundles are always refreshed;
-/// each harness config keeps the namespace it already names, and a config
-/// naming none is left unwritten. Never the environment, the ledger or the
-/// folder name: the daemon's own environment says nothing about `dir`'s
+/// The namespaces the daemon's boot refresh may write into harness configs
+/// for `dir`, as `(harness, namespace)`: each harness keeps the one its own
+/// config already names. A harness's config is looked for in `dir` itself
+/// first, then in `dir`'s checkout, its main checkout (for a linked
+/// worktree), or, outside git, `dir`; the first place that has one wins, and
+/// a config that cannot be read ends the search for that harness. A harness
+/// with no config anywhere is left out. Never the environment, the ledger or
+/// the folder name: the daemon's own environment says nothing about `dir`'s
 /// project, and a guessed name would overwrite the right one.
+pub fn boot_namespaces_for(dir: &Path) -> Vec<(String, String)> {
+    let Ok(roots) = NamespaceRoots::of(dir) else {
+        return Vec::new();
+    };
+    let mut places: Vec<&PathBuf> = vec![&roots.dir];
+    for root in roots.config_order() {
+        if !places.contains(&root) {
+            places.push(root);
+        }
+    }
+    let harnesses =
+        std::iter::once("claude").chain(PLUGIN_NAMESPACE_CONFIGS.iter().map(|(h, _, _)| *h));
+    let mut found = Vec::new();
+    for harness in harnesses {
+        for place in &places {
+            match harness_config_namespace(place, harness) {
+                Ok(Some(ns)) => {
+                    found.push((harness.to_string(), ns));
+                    break;
+                }
+                Ok(None) => {}
+                Err(_) => break,
+            }
+        }
+    }
+    found
+}
+
+/// The daemon's boot-time refresh for `dir`. Bundles are always refreshed;
+/// each harness config is rewritten only with the namespace
+/// [`boot_namespaces_for`] keeps for that harness, so configs that disagree
+/// stay as they are and a harness without one is never given one.
 pub fn boot_install_plugins(dir: &Path) -> Value {
-    auto_install_detected_plugins(dir, ConfigNamespace::Keep(None), None)
+    let namespaces = boot_namespaces_for(dir);
+    auto_install_detected_plugins(dir, ConfigNamespace::Each(&namespaces), None)
+}
+
+/// The daemon's boot-time refresh for a configured project. The config
+/// stores each project as its `.NeuroStrata` folder; the refresh runs on the
+/// project folder that holds it. Any other path is refreshed as given.
+pub fn boot_install_project_context(context: &Path) -> Value {
+    let context = dunce::simplified(context);
+    let project = match (context.file_name(), context.parent()) {
+        (Some(name), Some(parent)) if name == ".NeuroStrata" => parent,
+        _ => context,
+    };
+    boot_install_plugins(project)
 }
 
 /// Auto-install the compiled zero-dependency plugin bundles for all detected
@@ -1363,8 +1420,7 @@ mod tests {
         let cfg = dir.join(".hermes/plugins/neurostrata.json");
         write_file(&cfg, r#"{"id": "neurostrata-hermes", "namespace": "example-project"}"#);
         boot_install_plugins(&dir);
-        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
-        assert_eq!(doc["namespace"], "example-project");
+        assert_eq!(namespace_in(&cfg), "example-project");
     }
 
     #[test]
@@ -1373,9 +1429,68 @@ mod tests {
         let dir = dunce::canonicalize(tmp.path()).unwrap().join("example-project");
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         std::fs::create_dir_all(dir.join(".hermes")).unwrap();
+        assert!(boot_namespaces_for(&dir).is_empty());
         boot_install_plugins(&dir);
         assert!(!dir.join(".hermes/plugins/neurostrata.json").exists());
         assert!(dir.join(".NeuroStrata/plugins/hermes/dist/index.js").exists());
+    }
+
+    fn namespace_in(cfg: &Path) -> Value {
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(cfg).unwrap()).unwrap();
+        doc["namespace"].clone()
+    }
+
+    /// Configs that disagree each keep their own namespace at boot, and a
+    /// harness with no config gets plugin files only, not a config.
+    #[test]
+    fn boot_install_keeps_each_harness_namespace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = dunce::canonicalize(tmp.path()).unwrap().join("example-project");
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        let codex = dir.join(".codex/plugins/neurostrata.json");
+        let hermes = dir.join(".hermes/plugins/neurostrata.json");
+        write_file(&codex, r#"{"id": "neurostrata-codex", "namespace": "alpha"}"#);
+        write_file(&hermes, r#"{"id": "neurostrata-hermes", "namespace": "beta"}"#);
+        std::fs::create_dir_all(dir.join(".openclaw")).unwrap();
+        boot_install_plugins(&dir);
+        assert_eq!(namespace_in(&codex), "alpha");
+        assert_eq!(namespace_in(&hermes), "beta");
+        assert!(!dir.join(".openclaw/plugins/neurostrata.json").exists());
+        assert!(dir.join(".NeuroStrata/plugins/openclaw/dist/index.js").exists());
+    }
+
+    /// A folder below the checkout top with its own harness config keeps
+    /// that config's namespace; the checkout top's config is not copied in.
+    #[test]
+    fn boot_install_in_subfolder_reads_the_folder_itself_first() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let top = dunce::canonicalize(tmp.path()).unwrap().join("example-project");
+        std::fs::create_dir_all(top.join(".git")).unwrap();
+        let top_cfg = top.join(".hermes/plugins/neurostrata.json");
+        write_file(&top_cfg, r#"{"id": "neurostrata-hermes", "namespace": "outer"}"#);
+        let sub = top.join("packages").join("api");
+        let sub_cfg = sub.join(".hermes/plugins/neurostrata.json");
+        write_file(&sub_cfg, r#"{"id": "neurostrata-hermes", "namespace": "api"}"#);
+        boot_install_plugins(&sub);
+        assert_eq!(namespace_in(&sub_cfg), "api");
+        assert_eq!(namespace_in(&top_cfg), "outer");
+    }
+
+    /// A configured project is stored as its `.NeuroStrata` folder; the boot
+    /// refresh installs into the project folder that holds it, never into
+    /// `<project>/.NeuroStrata/.NeuroStrata`.
+    #[test]
+    fn boot_install_for_configured_project_uses_the_project_folder() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = dunce::canonicalize(tmp.path()).unwrap().join("example-project");
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::create_dir_all(dir.join(".NeuroStrata")).unwrap();
+        let hermes = dir.join(".hermes/plugins/neurostrata.json");
+        write_file(&hermes, r#"{"id": "neurostrata-hermes", "namespace": "example-project"}"#);
+        boot_install_project_context(&dir.join(".NeuroStrata"));
+        assert!(dir.join(".NeuroStrata/plugins/hermes/dist/index.js").exists());
+        assert!(!dir.join(".NeuroStrata/.NeuroStrata").exists());
+        assert_eq!(namespace_in(&hermes), "example-project");
     }
 
     #[test]
