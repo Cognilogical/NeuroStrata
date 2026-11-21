@@ -430,7 +430,7 @@ pub enum RootSource {
     Marker,
     /// The root of the project marker (`.NeuroStrata/config.json`) for the
     /// call's namespace, when it is also the namespace's cached root
-    /// ([`with_root_config`]).
+    /// ([`with_marker_spelling`]).
     RootConfig,
     /// Absolute, but under no root this namespace knows: left unchanged.
     Outside,
@@ -577,16 +577,11 @@ pub fn marker_root_is_cached_root(
     canonical(&mapped).unwrap_or(mapped) == cached
 }
 
-/// Add the project marker's spelling to a file lookup of absolute `input`
-/// (spec 6.2). Only when `marker` names `call_namespace` (ignoring case, as
-/// `server::resolve_namespace` does; the caller has already told apart two
-/// stored namespaces differing only in case), its root is the cached root
-/// ([`marker_root_is_cached_root`]), and `lookup` is not `Outside` or
-/// `Relative`: the path below the marker root, in its on-disk spelling,
-/// becomes `path`, and today's `path` and `alternates` follow in order. The
-/// marker root is the cached root, so this is a key today's resolution could
-/// already produce for the file; it only stops depending on the caller's
-/// `project_root`. In every other case `lookup` comes back unchanged.
+/// [`with_marker_spelling`] after checking that `marker` names
+/// `call_namespace` (ignoring case) and that its root is the cached root
+/// ([`marker_root_is_cached_root`]); in every other case `lookup` comes back
+/// unchanged. Tests use it to state those rules in one call.
+#[cfg(test)]
 pub fn with_root_config(
     lookup: LookupPath,
     input: &str,
@@ -602,9 +597,16 @@ pub fn with_root_config(
     with_marker_spelling(lookup, input, marker)
 }
 
-/// [`with_root_config`] for a caller that has already checked the marker's
-/// namespace and that its root is the cached root: puts the marker-relative
-/// spelling first unless `lookup` is `Outside` or `Relative`.
+/// Add the project marker's spelling to a file lookup of absolute `input`
+/// (spec 6.2), for a caller that has already checked that `marker` names
+/// the call's namespace (ignoring case, as `server::resolve_namespace` does)
+/// and that its root is the cached root ([`marker_root_is_cached_root`]).
+/// Unless `lookup` is `Outside` or `Relative`, the path below the marker
+/// root, in its on-disk spelling, becomes `path`, and today's `path` and
+/// `alternates` follow in order. The
+/// marker root is the cached root, so this is a key today's resolution could
+/// already produce for the file; it only stops depending on the caller's
+/// `project_root`. In every other case `lookup` comes back unchanged.
 pub fn with_marker_spelling(
     lookup: LookupPath,
     input: &str,
