@@ -103,10 +103,11 @@ export declare function readHarnessConfig(harness: string, projectDir: string, r
  * `CLAUDE_PROJECT_DIR`, which Claude Code exports to hook processes as the
  * project root where the session started. Without it, the folder recorded
  * for this session at SessionStart (`claude_session_dirs` in
- * `.NeuroStrata/active_session.json`), else the event's `cwd`. Other
+ * `.NeuroStrata/active_session.json`; never the home folder's), else the
+ * event's `cwd`. Other
  * harnesses use the event's `cwd`, else the process's.
  */
-export declare function resolveHookProjectDir(harness: string, event?: Record<string, unknown>, env?: Record<string, string | undefined>): string;
+export declare function resolveHookProjectDir(harness: string, event?: Record<string, unknown>, env?: Record<string, string | undefined>, home?: string): string;
 /**
  * 1. Walk up to findProjectRoot(startDir) checking <dir>/.NeuroStrata/session_queries.json;
  *    if it parses as JSON with a non-empty string .namespace, return it trimmed.

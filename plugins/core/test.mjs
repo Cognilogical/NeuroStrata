@@ -574,6 +574,16 @@ describe('project root marker and namespace order', () => {
     // Other harnesses follow the event's folder.
     assert.equal(resolveHookProjectDir('codex', event, { CLAUDE_PROJECT_DIR: repo }), api)
   })
+
+  it('resolveHookProjectDir: a session in the home folder writes no session file there', () => {
+    const home = tempDir()
+    mkdirSync(join(home, '.NeuroStrata'), { recursive: true })
+    const start = { session_id: 's1', cwd: home, hook_event_name: 'SessionStart' }
+    assert.equal(resolveHookProjectDir('claude', start, {}, home), home)
+    assert.equal(existsSync(join(home, '.NeuroStrata', 'active_session.json')), false)
+    const later = { ...start, hook_event_name: 'PreToolUse' }
+    assert.equal(resolveHookProjectDir('claude', later, {}, home), home)
+  })
 })
 
 // ──────────────────────────────────────────────────────────────────────

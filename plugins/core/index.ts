@@ -563,13 +563,15 @@ const CLAUDE_SESSION_DIRS_KEEP = 20
  * `CLAUDE_PROJECT_DIR`, which Claude Code exports to hook processes as the
  * project root where the session started. Without it, the folder recorded
  * for this session at SessionStart (`claude_session_dirs` in
- * `.NeuroStrata/active_session.json`), else the event's `cwd`. Other
+ * `.NeuroStrata/active_session.json`; never the home folder's), else the
+ * event's `cwd`. Other
  * harnesses use the event's `cwd`, else the process's.
  */
 export function resolveHookProjectDir(
   harness: string,
   event: Record<string, unknown> = {},
-  env: Record<string, string | undefined> = process.env
+  env: Record<string, string | undefined> = process.env,
+  home: string = homedir()
 ): string {
   const cwd = asString(event?.cwd) ?? process.cwd()
   if (harness !== 'claude') return cwd
@@ -577,7 +579,11 @@ export function resolveHookProjectDir(
   if (fromEnv) return fromEnv
   const sessionId = asString(event?.session_id)
   if (!sessionId) return cwd
-  const stateDir = join(findProjectRoot(cwd), '.NeuroStrata')
+  const root = findProjectRoot(cwd, home)
+  // `~/.NeuroStrata` is the user's own state, not a project's: a session
+  // whose root falls back to the home folder records nothing there.
+  if (home && sameFolder(root, home)) return cwd
+  const stateDir = join(root, '.NeuroStrata')
   const sessionPath = join(stateDir, 'active_session.json')
   let state: Record<string, unknown> = {}
   try {
