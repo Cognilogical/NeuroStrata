@@ -64,10 +64,7 @@ async function main() {
   }
   const init = mod.initialize ?? plugin?.initialize ?? plugin?.setup;
   if (typeof init === "function") {
-    // The namespace comes from the environment (Claude Code hooks) or the
-    // first argument (Codex hooks, which run through PowerShell on Windows).
-    const namespace = process.env.NEUROSTRATA_NAMESPACE || process.argv[2];
-    await init({ config: { namespace } });
+    await init({ config: { namespace: process.env.NEUROSTRATA_NAMESPACE } });
   }
   const handler =
     mod.handleHookEvent ??
@@ -237,39 +234,53 @@ fn repair_installer_hook_command(
 /// Codex's shell tool (on every platform, including PowerShell on Windows).
 const CODEX_PRE_TOOL_USE_MATCHER: &str = "apply_patch|Bash";
 
-/// The installer's Codex hook command. Codex runs hook commands through the
-/// platform shell (PowerShell on Windows), so the namespace is an argument,
-/// not a `NAME=value` prefix that only POSIX shells understand.
-fn codex_hook_command(abs_runner: &str, namespace: &str) -> String {
-    if namespace.is_empty() {
-        // No namespace known (daemon boot): the runner discovers it.
-        format!("node \"{abs_runner}\"")
+/// Quote `value` as one literal word for the shell Codex runs hook commands
+/// in: PowerShell on Windows, `sh` elsewhere. Inside single quotes neither
+/// expands `$`, backticks or `$(...)`; only an embedded single quote is
+/// written differently (`''` in PowerShell, `'\''` in `sh`).
+fn shell_literal(value: &str) -> String {
+    if cfg!(windows) {
+        format!("'{}'", value.replace('\'', "''"))
     } else {
-        format!("node \"{abs_runner}\" \"{namespace}\"")
+        format!("'{}'", value.replace('\'', r"'\''"))
     }
 }
 
-/// Split a command shaped like `codex_hook_command` into its runner path and
-/// namespace argument (empty when there is none).
-fn parse_codex_hook_command(command: &str) -> Option<(&str, &str)> {
-    let rest = command.strip_prefix("node \"")?;
-    let close = rest.find('"')?;
-    let (path, tail) = (&rest[..close], rest[close + 1..].trim());
-    if tail.is_empty() {
-        return Some((path, ""));
+/// Read back a word written by `shell_literal`; `None` when `text` does not
+/// start with one. Returns the value and the text after it.
+fn shell_literal_value(text: &str) -> Option<(String, &str)> {
+    let mut rest = text.strip_prefix('\'')?;
+    let mut value = String::new();
+    // After a closing quote, this continues the same word with a quote.
+    let escaped = if cfg!(windows) { "'" } else { r"\''" };
+    loop {
+        let close = rest.find('\'')?;
+        value.push_str(&rest[..close]);
+        rest = &rest[close + 1..];
+        match rest.strip_prefix(escaped) {
+            Some(after) => {
+                value.push('\'');
+                rest = after;
+            }
+            None => return Some((value, rest)),
+        }
     }
-    let ns = tail.strip_prefix('"')?.strip_suffix('"')?;
-    Some((path, ns))
+}
+
+/// The installer's Codex hook command. It carries no namespace: the callers
+/// that refresh it (`hook_hygiene` from `get_snapshot`, `hooks install`,
+/// daemon boot) only have a folder-name guess or nothing, so the runner
+/// discovers the namespace itself, as it does with no configured value.
+fn codex_hook_command(abs_runner: &str) -> String {
+    format!("node {}", shell_literal(abs_runner))
 }
 
 /// Add the NeuroStrata PreToolUse and Stop hooks to `.codex/hooks.json`,
 /// keeping every other entry. An installer-written command is recognized by
-/// its runner, whatever namespace argument it carries: it keeps that
-/// namespace (automatic refreshes such as `hook_hygiene` and daemon boot pass
-/// a folder-name guess or nothing) and is only pointed at the current runner
-/// if the runner moved. A hooks.json that cannot be read or is not a JSON
-/// object is left untouched.
-fn wire_codex_hooks(project_root: &Path, namespace: &str, abs_runner: &str) -> Option<String> {
+/// its runner and rewritten to the current form, so a moved runner is
+/// repointed and nothing is added twice. A hooks.json that cannot be read or
+/// is not a JSON object is left untouched.
+fn wire_codex_hooks(project_root: &Path, abs_runner: &str) -> Option<String> {
     let hooks_path = project_root.join(".codex/hooks.json");
     let mut doc: Value = match std::fs::read_to_string(&hooks_path) {
         Ok(raw) => match serde_json::from_str::<Value>(&raw) {
@@ -279,7 +290,7 @@ fn wire_codex_hooks(project_root: &Path, namespace: &str, abs_runner: &str) -> O
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
         Err(_) => return None,
     };
-    let cmd = codex_hook_command(abs_runner, namespace);
+    let cmd = codex_hook_command(abs_runner);
     let obj = doc.as_object_mut()?;
     let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
     let h_obj = hooks.as_object_mut()?;
@@ -300,15 +311,17 @@ fn wire_codex_hooks(project_root: &Path, namespace: &str, abs_runner: &str) -> O
                 let Some(command) = hook.get("command").and_then(|v| v.as_str()) else {
                     continue;
                 };
-                let Some((old_path, old_ns)) = parse_codex_hook_command(command) else {
+                let Some((old_path, _)) = command
+                    .strip_prefix("node ")
+                    .and_then(shell_literal_value)
+                else {
                     continue;
                 };
-                if path_basename(old_path) == path_basename(abs_runner)
-                    && runner_is_replaceable(old_path, project_root, abs_runner)
+                if path_basename(&old_path) == path_basename(abs_runner)
+                    && runner_is_replaceable(&old_path, project_root, abs_runner)
                 {
-                    let repointed = codex_hook_command(abs_runner, old_ns);
-                    if repointed != command {
-                        hook["command"] = Value::String(repointed);
+                    if command != cmd {
+                        hook["command"] = Value::String(cmd.clone());
                     }
                     present = true;
                 }
@@ -894,7 +907,7 @@ fn wire_harness_config(
                 // Codex CLI never reads the file above: it runs hooks from
                 // `.codex/hooks.json` (or `[hooks]` in config.toml). Without
                 // this entry no NeuroStrata hook ran in Codex at all (#333).
-                return wire_codex_hooks(project_root, namespace, abs_runner).or(cfg_written);
+                return wire_codex_hooks(project_root, abs_runner).or(cfg_written);
             }
             None
         }
@@ -1515,7 +1528,7 @@ mod tests {
             .as_str()
             .expect("cli_hook_runner")
             .to_string();
-        let expected = format!("node \"{runner}\" \"TestProj\"");
+        let expected = format!("node {}", shell_literal(&runner));
 
         let doc = read_codex_hooks(tmp.path());
         let pre = doc["hooks"]["PreToolUse"].as_array().expect("PreToolUse");
@@ -1524,15 +1537,10 @@ mod tests {
         assert_eq!(pre[0]["hooks"][0]["type"], json!("command"));
         assert_eq!(codex_commands(&doc, "PreToolUse"), vec![expected.clone()]);
         assert_eq!(codex_commands(&doc, "Stop"), vec![expected.clone()]);
-        assert!(
-            !expected.contains("NEUROSTRATA_NAMESPACE="),
-            "PowerShell cannot run a NAME=value prefix: {expected}"
-        );
+        // No namespace in the command: the callers that refresh it only have
+        // a folder-name guess, and PowerShell cannot run a NAME=value prefix.
+        assert!(!expected.contains("TestProj") && !expected.contains("NEUROSTRATA_NAMESPACE="));
         assert!(tmp.path().join(".codex/plugins/neurostrata.json").exists());
-
-        // The runner must accept the namespace as its first argument.
-        let runner_src = std::fs::read_to_string(&runner).expect("read runner");
-        assert!(runner_src.contains("process.argv[2]"));
 
         // A second run adds nothing.
         let _ = auto_install_detected_plugins(tmp.path(), "TestProj", Some("codex"));
@@ -1548,11 +1556,11 @@ mod tests {
             .as_str()
             .expect("cli_hook_runner")
             .to_string();
-        let expected = format!("node \"{runner}\" \"TestProj\"");
+        let expected = format!("node {}", shell_literal(&runner));
         let gone = tmp
             .path()
             .join("moved-away/.NeuroStrata/plugins/codex/cli-hook.mjs");
-        let stale = format!("node \"{}\" \"TestProj\"", gone.to_string_lossy());
+        let stale = format!("node {}", shell_literal(&gone.to_string_lossy()));
 
         let user = json!({
             "hooks": {
@@ -1590,47 +1598,50 @@ mod tests {
         assert_eq!(std::fs::read(&path).expect("read"), utf16);
     }
 
-    /// Automatic refreshes call the installer with another namespace:
-    /// `hook_hygiene` passes the checkout folder name and daemon boot passes
-    /// none. They must recognize the installer's own hooks, keep the
-    /// configured namespace and add nothing (Codex review on #368).
+    /// Refreshes call the installer with other namespaces: `hook_hygiene`
+    /// (get_snapshot, hooks install) passes the checkout folder name and
+    /// daemon boot passes none. None of them may change the hooks or pin a
+    /// guessed namespace (Codex review on #368).
     #[test]
-    fn codex_refresh_with_another_namespace_keeps_the_configured_hooks() {
+    fn codex_hooks_do_not_depend_on_the_callers_namespace() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(tmp.path().join(".codex")).expect("create .codex");
-        let report = auto_install_detected_plugins(tmp.path(), "TestProj", Some("codex"));
-        let runner = report["installed_plugins"][0]["cli_hook_runner"]
-            .as_str()
-            .expect("cli_hook_runner")
-            .to_string();
-        let configured = format!("node \"{runner}\" \"TestProj\"");
+        let _ = auto_install_detected_plugins(tmp.path(), "folder-name", Some("codex"));
         let before = read_codex_hooks(tmp.path());
-
-        for other in ["folder-name", ""] {
+        for other in ["TestProj", "", "folder-name"] {
             let _ = auto_install_detected_plugins(tmp.path(), other, Some("codex"));
-            let doc = read_codex_hooks(tmp.path());
-            assert_eq!(doc, before, "refresh with {other:?} must change nothing");
-            assert_eq!(codex_commands(&doc, "PreToolUse"), vec![configured.clone()]);
-            assert_eq!(codex_commands(&doc, "Stop"), vec![configured.clone()]);
+            assert_eq!(
+                read_codex_hooks(tmp.path()),
+                before,
+                "install with {other:?} must change nothing"
+            );
         }
+        for command in codex_commands(&before, "PreToolUse") {
+            assert!(!command.contains("folder-name"), "guess pinned: {command}");
+        }
+    }
 
-        // A first install without a namespace leaves the argument off, and
-        // the runner discovers the namespace itself.
-        let fresh = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(fresh.path().join(".codex")).expect("create .codex");
-        let report = auto_install_detected_plugins(fresh.path(), "", Some("codex"));
-        let runner = report["installed_plugins"][0]["cli_hook_runner"]
-            .as_str()
-            .expect("cli_hook_runner")
-            .to_string();
-        let doc = read_codex_hooks(fresh.path());
-        assert_eq!(
-            codex_commands(&doc, "PreToolUse"),
-            vec![format!("node \"{runner}\"")]
-        );
-        // A later install with a namespace keeps that entry instead of
-        // adding a second one.
-        let _ = auto_install_detected_plugins(fresh.path(), "TestProj", Some("codex"));
-        assert_eq!(read_codex_hooks(fresh.path()), doc);
+    /// The runner path is quoted as one literal word: `$`, backticks and
+    /// `$(...)` in a checkout path must not expand in sh or PowerShell, and an
+    /// embedded single quote must round-trip (Codex review on #368).
+    #[test]
+    fn codex_hook_command_quotes_the_runner_path_literally() {
+        for path in [
+            "/home/u/Team$QA/.NeuroStrata/plugins/codex/cli-hook.mjs",
+            "/home/u/R$(printf injected)/`id`/cli-hook.mjs",
+            r"C:\Users\o'brien\proj dir\.NeuroStrata\plugins\codex\cli-hook.mjs",
+        ] {
+            let command = codex_hook_command(path);
+            let word = command.strip_prefix("node ").expect("node prefix");
+            assert!(word.starts_with('\'') && word.ends_with('\''), "{command}");
+            let (back, rest) = shell_literal_value(word).expect("parse back");
+            assert_eq!(back, path);
+            assert_eq!(rest, "");
+        }
+        if cfg!(windows) {
+            assert_eq!(shell_literal("a'b"), "'a''b'");
+        } else {
+            assert_eq!(shell_literal("a'b"), r"'a'\''b'");
+        }
     }
 }
