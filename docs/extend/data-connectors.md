@@ -65,6 +65,12 @@ pub trait DataConnector: Send + Sync {
 
 - `ExternalEffectRequest` / `ExternalEffectReceipt`; idempotency key; active target-bound `action_receipt` (`ActiveBound`). Write-back requires CAS + idempotency key.
 
+## Write-Back Durability
+
+- `DataConnector::snapshot_pool_records(pool_id)` defaults to `Ok(None)`; `None` means the connector already persists its own state.
+- `InMemoryPoolConnector` returns its full per-pointer record map. After a successful effect and post-gate, the kernel persists that snapshot through `register_data_pool` before returning the receipt, so the next kernel/request hydrates the post-write records and source SHA.
+- `JsonFilePoolConnector` returns `None` (file-backed) and is not rewritten. A snapshot or persistence failure rejects the effect rather than returning an unobservable success receipt.
+
 ## Transport Parity
 
 - MCP tool: `neurostrata_data_connector`

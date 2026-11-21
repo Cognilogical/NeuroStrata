@@ -508,6 +508,16 @@ impl AgentKernel {
         if post_verdict != KernelConnectorPostVerdict::AllowPostOutput {
             anyhow::bail!("Post-gate denied write-back: {:?}", post_verdict);
         }
+        // #331: a success receipt must describe state a later request can
+        // observe. Connectors whose records live only in memory snapshot the
+        // full pool here, and the kernel persists it through the same
+        // registry row the next request hydrates from. Connectors that
+        // already persist (json_file) return None and are left alone.
+        if let Some(records) = connector.snapshot_pool_records(&connector_pool_id).await? {
+            self.memory
+                .register_data_pool(namespace, &schema, Some(&records), principal)
+                .await?;
+        }
         let mut receipt = receipt;
         receipt.pointer_id = pointer.pointer_id.clone();
         receipt.pool_id = pointer.pool_id.clone();
@@ -2086,7 +2096,7 @@ mod tests {
     async fn memory_pool_write_back_survives_a_fresh_kernel() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store_impl =
-            Arc::new(LadybugStore::new(dir.path().join("db"), 4).expect("store init"));
+            Arc::new(LadybugStore::for_testing(dir.path().join("db"), 4).expect("store init"));
         let store: Arc<dyn VectorStore> = store_impl.clone();
         let ns = "ns_pool_durability";
         store.init(ns).await.expect("init ns");

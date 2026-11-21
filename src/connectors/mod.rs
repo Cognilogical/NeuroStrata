@@ -115,6 +115,17 @@ pub trait DataConnector: Send + Sync {
         pointer_uri: &str,
         req: &ExternalEffectRequest,
     ) -> Result<ExternalEffectReceipt>;
+
+    /// Full record snapshot for connectors whose records are not otherwise
+    /// durable. `None` means the connector already persists its own state
+    /// (for example a file-backed connector) and needs no write-through.
+    async fn snapshot_pool_records(
+        &self,
+        pool_id: &str,
+    ) -> Result<Option<HashMap<String, Vec<Value>>>> {
+        let _ = pool_id;
+        Ok(None)
+    }
 }
 
 pub struct DataConnectorRegistry {
@@ -447,6 +458,16 @@ impl DataConnector for InMemoryPoolConnector {
         };
         pool.idempotency.insert(idempotency_key, receipt.clone());
         Ok(receipt)
+    }
+
+    /// #331: the pool's records live only in this connector's map. Return a
+    /// full snapshot so the kernel can persist it for the next request.
+    async fn snapshot_pool_records(
+        &self,
+        pool_id: &str,
+    ) -> Result<Option<HashMap<String, Vec<Value>>>> {
+        let pools = self.pools.read().unwrap();
+        Ok(pools.get(pool_id).map(|entry| entry.records.clone()))
     }
 }
 
