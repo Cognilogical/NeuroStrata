@@ -1716,26 +1716,51 @@ pub async fn record_tool_receipt(
     // handler-internal recorders, and bumping them here double-counts a dispatch.
     //
     // Panel C15: a non-empty `fields.task_id` is the caller's real task context
-    // and always wins. The generic MCP dispatch forwards no task id, so when it
-    // is genuinely unavailable the fallback picks the lowest-id active
-    // in-progress task. First-match is the safe default here because receipt
-    // attribution is telemetry only (never a gate/quota): a wrong attribution
-    // cannot force work open, and a stable id ordering avoids a random,
-    // per-process-varying assignment rather than silently preferring whichever
-    // row `store.list` returned first.
+    // and always wins. The generic MCP dispatch forwards no task id, but it does
+    // carry a session id and a caller root. When no id is supplied, attribute the
+    // receipt to the task that actually made the call, mirroring the specificity
+    // order of `handle_guard_validate` in src/server.rs:
+    // session+worktree > session > worktree > lowest-id. Within each tier the
+    // lowest id wins, so attribution stays deterministic regardless of the order
+    // `store.list` returned. Receipt attribution is telemetry only (never a
+    // gate/quota), so this sharpens accuracy without opening any work.
     if fields.task_id.is_empty() {
         let now = chrono::Utc::now().timestamp();
         if let Ok(rows) = store.list(&ns, None, Some("task")).await {
-            if let Some(r) = rows
-                .iter()
-                .filter(|r| {
-                    gate::is_task(r)
-                        && !gate::is_retired(&r.payload.metadata, now)
-                        && gate::task_status(r) == Status::InProgress
+            let is_active = |r: &SearchResult| {
+                gate::is_task(r)
+                    && !gate::is_retired(&r.payload.metadata, now)
+                    && gate::task_status(r) == Status::InProgress
+            };
+            fn task_meta<'a>(r: &'a SearchResult, key: &str) -> Option<&'a str> {
+                r.payload
+                    .metadata
+                    .get("task")
+                    .and_then(|t| t.get(key))
+                    .and_then(|v| v.as_str())
+            }
+            let pick = |matches: &dyn Fn(&SearchResult) -> bool| {
+                rows.iter()
+                    .filter(|r| is_active(r) && matches(r))
+                    .min_by(|a, b| a.id.cmp(&b.id))
+                    .map(|r| r.id.clone())
+            };
+            let session = fields.session_id.trim();
+            let session = (!session.is_empty()).then_some(session);
+            let worktree = caller_root.map(str::trim).filter(|w| !w.is_empty());
+            let attributed = match (session, worktree) {
+                (Some(s), Some(w)) => pick(&|r| {
+                    task_meta(r, "session_id") == Some(s) && task_meta(r, "worktree") == Some(w)
                 })
-                .min_by(|a, b| a.id.cmp(&b.id))
-            {
-                fields.task_id = r.id.clone();
+                .or_else(|| pick(&|r| task_meta(r, "session_id") == Some(s)))
+                .or_else(|| pick(&|r| task_meta(r, "worktree") == Some(w))),
+                (Some(s), None) => pick(&|r| task_meta(r, "session_id") == Some(s)),
+                (None, Some(w)) => pick(&|r| task_meta(r, "worktree") == Some(w)),
+                (None, None) => None,
+            }
+            .or_else(|| pick(&|_| true));
+            if let Some(id) = attributed {
+                fields.task_id = id;
             }
         }
     }
@@ -6309,6 +6334,223 @@ mod tests {
             ledger["events"][0]["task_id"].as_str(),
             Some("a-task"),
             "fallback must be deterministic (lowest task id), not first insertion"
+        );
+    }
+
+    /// Seed an in-progress task carrying the optional claim context that a
+    /// real `neurostrata_task_claim` writes under `metadata["task"]`.
+    async fn seed_attributed_task(
+        store: &Arc<dyn VectorStore>,
+        ns: &str,
+        id: &str,
+        session_id: Option<&str>,
+        worktree: Option<&str>,
+    ) {
+        let vector = StubEmbedder.embed("seed").await.unwrap();
+        let mut task = json!({ "status": "in_progress", "title": id });
+        if let Some(s) = session_id {
+            task["session_id"] = json!(s);
+        }
+        if let Some(w) = worktree {
+            task["worktree"] = json!(w);
+        }
+        store
+            .upsert(
+                ns,
+                id,
+                vector,
+                MemoryPayload {
+                    content: "task".to_string(),
+                    user_id: "kenton".to_string(),
+                    memory_type: "task".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({ "task": task }),
+                },
+            )
+            .await
+            .expect("seed task");
+    }
+
+    /// Read the task id attributed on the first `events[]` receipt.
+    fn receipt_attributed_task(tmp: &tempfile::TempDir) -> Option<String> {
+        let ledger: Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.path().join(".NeuroStrata/session_queries.json"))
+                .expect("ledger written"),
+        )
+        .expect("valid ledger");
+        ledger["events"][0]["task_id"].as_str().map(str::to_string)
+    }
+
+    /// C15 follow-up (Codex P2): two in-progress tasks in one namespace with
+    /// different session ids — the receipt must go to the caller's session,
+    /// not the lexicographically smaller task.
+    #[tokio::test]
+    async fn receipt_fallback_attributes_by_session() {
+        use crate::guard::testkit::MockStore;
+        use crate::task::tool_receipts::build_dispatch_receipt;
+
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        let ns = "C15SessionAttribution";
+        seed_attributed_task(&store, ns, "a-task", Some("session-alpha"), None).await;
+        seed_attributed_task(&store, ns, "b-task", Some("session-beta"), None).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".NeuroStrata")).unwrap();
+        let caller_root = tmp.path().to_str().unwrap().to_string();
+        let fields = build_dispatch_receipt(
+            "evt-c15-session".to_string(),
+            1,
+            "session-beta".to_string(),
+            ns.to_string(),
+            "neurostrata_locate".to_string(),
+            "q",
+            &json!({"memories": [{"id": "m1"}]}).to_string(),
+            false,
+            1,
+        );
+        assert!(fields.task_id.is_empty());
+        record_tool_receipt(&store, fields, Some(&caller_root)).await;
+
+        assert_eq!(
+            receipt_attributed_task(&tmp).as_deref(),
+            Some("b-task"),
+            "receipt must follow fields.session_id, not the lowest id"
+        );
+    }
+
+    /// A session match beats a lexicographically smaller id, and the combined
+    /// session+worktree tier outranks either single-context tier.
+    #[tokio::test]
+    async fn receipt_session_match_beats_smaller_id_and_worktree() {
+        use crate::guard::testkit::MockStore;
+        use crate::task::tool_receipts::build_dispatch_receipt;
+
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        let ns = "C15SessionWorktreeAttribution";
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".NeuroStrata")).unwrap();
+        let caller_root = tmp.path().to_str().unwrap().to_string();
+        // Smaller id: only the session matches.
+        seed_attributed_task(
+            &store,
+            ns,
+            "a-task",
+            Some("session-beta"),
+            Some("other-root"),
+        )
+        .await;
+        // Larger id: both session and worktree match the caller.
+        seed_attributed_task(
+            &store,
+            ns,
+            "z-task",
+            Some("session-beta"),
+            Some(caller_root.as_str()),
+        )
+        .await;
+        let fields = build_dispatch_receipt(
+            "evt-c15-both".to_string(),
+            1,
+            "session-beta".to_string(),
+            ns.to_string(),
+            "neurostrata_locate".to_string(),
+            "q",
+            &json!({"memories": [{"id": "m1"}]}).to_string(),
+            false,
+            1,
+        );
+        record_tool_receipt(&store, fields, Some(&caller_root)).await;
+
+        assert_eq!(
+            receipt_attributed_task(&tmp).as_deref(),
+            Some("z-task"),
+            "session+worktree match must beat the smaller id and session-only match"
+        );
+    }
+
+    /// With no session match, a worktree-only match still wins over the
+    /// lowest-id fallback.
+    #[tokio::test]
+    async fn receipt_fallback_attributes_by_worktree() {
+        use crate::guard::testkit::MockStore;
+        use crate::task::tool_receipts::build_dispatch_receipt;
+
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        let ns = "C15WorktreeAttribution";
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".NeuroStrata")).unwrap();
+        let caller_root = tmp.path().to_str().unwrap().to_string();
+        seed_attributed_task(
+            &store,
+            ns,
+            "a-task",
+            Some("session-alpha"),
+            Some("other-root"),
+        )
+        .await;
+        seed_attributed_task(
+            &store,
+            ns,
+            "b-task",
+            Some("session-beta"),
+            Some(caller_root.as_str()),
+        )
+        .await;
+        let fields = build_dispatch_receipt(
+            "evt-c15-worktree".to_string(),
+            1,
+            "session-unmatched".to_string(),
+            ns.to_string(),
+            "neurostrata_locate".to_string(),
+            "q",
+            &json!({"memories": [{"id": "m1"}]}).to_string(),
+            false,
+            1,
+        );
+        record_tool_receipt(&store, fields, Some(&caller_root)).await;
+
+        assert_eq!(
+            receipt_attributed_task(&tmp).as_deref(),
+            Some("b-task"),
+            "worktree-only match must beat the lowest-id fallback"
+        );
+    }
+
+    /// Caller truth always wins: an explicit non-empty task id is never
+    /// overwritten by any session/worktree fallback.
+    #[tokio::test]
+    async fn receipt_explicit_task_id_wins_over_fallback() {
+        use crate::guard::testkit::MockStore;
+        use crate::task::tool_receipts::build_dispatch_receipt;
+
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        let ns = "C15ExplicitTaskId";
+        seed_attributed_task(&store, ns, "a-task", Some("session-beta"), None).await;
+        seed_attributed_task(&store, ns, "explicit-task", None, None).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".NeuroStrata")).unwrap();
+        let caller_root = tmp.path().to_str().unwrap().to_string();
+        let mut fields = build_dispatch_receipt(
+            "evt-c15-explicit".to_string(),
+            1,
+            "session-beta".to_string(),
+            ns.to_string(),
+            "neurostrata_locate".to_string(),
+            "q",
+            &json!({"memories": [{"id": "m1"}]}).to_string(),
+            false,
+            1,
+        );
+        fields.task_id = "explicit-task".to_string();
+        record_tool_receipt(&store, fields, Some(&caller_root)).await;
+
+        assert_eq!(
+            receipt_attributed_task(&tmp).as_deref(),
+            Some("explicit-task"),
+            "explicit fields.task_id must outrank any fallback"
         );
     }
 
