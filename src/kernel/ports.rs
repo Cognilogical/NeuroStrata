@@ -14,7 +14,9 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::connectors::{DataPointerRecord, DataPoolSchema};
+use crate::connectors::{
+    DataPointerRecord, DataPoolSchema, ExternalEffectReceipt, WriteBackSnapshot,
+};
 use crate::formal_kernel::KernelActionReceiptState;
 use crate::rebac::can_read_memory;
 use crate::traits::{MemoryPayload, OntologyStore, TaskStore, TaskSummaryRow, VectorStore};
@@ -74,6 +76,31 @@ pub trait MemoryPort: Send + Sync {
     ) -> Result<DataPoolSchema> {
         let _ = (namespace, records, principal);
         Ok(schema.clone())
+    }
+
+    /// Merge a connector write-back snapshot into the persisted pool state.
+    /// The snapshot carries the written pointer's prior/post records, so a
+    /// stored row that no longer matches is a concurrent-write conflict.
+    async fn register_pool_writeback(
+        &self,
+        namespace: &str,
+        schema: &DataPoolSchema,
+        pointer_uri: &str,
+        snapshot: &WriteBackSnapshot,
+        principal: Option<&str>,
+    ) -> Result<()> {
+        let _ = (namespace, schema, pointer_uri, snapshot, principal);
+        Ok(())
+    }
+
+    /// Persisted idempotency receipts for a pool (empty when none).
+    async fn pool_idempotency(
+        &self,
+        namespace: &str,
+        schema: &DataPoolSchema,
+    ) -> Result<HashMap<String, ExternalEffectReceipt>> {
+        let _ = (namespace, schema);
+        Ok(HashMap::new())
     }
 
     /// List persisted `DataPoolSchema` entries in the namespace, optionally filtered by `connector_id`.
@@ -425,6 +452,107 @@ impl MemoryPort for LadybugMemoryPort {
         };
         lb.put_scoped_memory(namespace, &row_id, &payload).await?;
         Ok(schema.clone())
+    }
+
+    async fn register_pool_writeback(
+        &self,
+        namespace: &str,
+        schema: &DataPoolSchema,
+        pointer_uri: &str,
+        snapshot: &WriteBackSnapshot,
+        principal: Option<&str>,
+    ) -> Result<()> {
+        let lb = self.ladybug_store();
+        if !crate::rebac::can_write_namespace(lb, namespace, principal) {
+            anyhow::bail!("write denied for namespace '{}'", namespace);
+        }
+        let row_id = format!(
+            "__data_pool__:{}:{}:{}",
+            namespace, schema.connector_id, schema.pool_id
+        );
+        let now = chrono::Utc::now().timestamp();
+        let existing = self
+            .trusted_get_memory(namespace, &row_id)
+            .await?
+            .filter(|p| !is_retired_data_metadata(&p.metadata, now));
+        let mut records: HashMap<String, Vec<Value>> = existing
+            .as_ref()
+            .and_then(|p| p.metadata.get("pool_records"))
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        let mut stored_idempotency: HashMap<String, ExternalEffectReceipt> = existing
+            .as_ref()
+            .and_then(|p| p.metadata.get("pool_idempotency"))
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+
+        // Compare only the pointer this write-back touched: other pointers
+        // are merged, so concurrent kernels writing different pointers both
+        // survive. A same-pointer concurrent write is a conflict, not a last-
+        // writer-wins overwrite.
+        if let Some(current) = records.get(pointer_uri) {
+            if current.as_slice() != snapshot.prior_records.as_slice() {
+                anyhow::bail!(
+                    "concurrent pool write conflict for pointer '{}'",
+                    pointer_uri
+                );
+            }
+        }
+        records.insert(pointer_uri.to_string(), snapshot.pointer_records.clone());
+        stored_idempotency.extend(
+            snapshot
+                .idempotency
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone())),
+        );
+
+        let metadata = serde_json::json!({
+            "eligibility": "private",
+            "pool_schema": serde_json::to_value(schema)?,
+            "pool_records": serde_json::to_value(&records)?,
+            "pool_idempotency": serde_json::to_value(&stored_idempotency)?,
+            "source": {
+                "kind": "data_connector_pool",
+                "ref": format!("{}:{}", schema.connector_id, schema.pool_id)
+            }
+        });
+        let payload = MemoryPayload {
+            content: format!(
+                "data pool {}:{} ({})",
+                schema.connector_id, schema.pool_id, schema.description
+            ),
+            user_id: principal.unwrap_or("").to_string(),
+            memory_type: "data_pointer".to_string(),
+            agent_name: None,
+            location: format!("{}:{}", schema.connector_id, schema.pool_id),
+            location_lines: String::new(),
+            metadata,
+        };
+        lb.put_scoped_memory(namespace, &row_id, &payload).await?;
+        Ok(())
+    }
+
+    async fn pool_idempotency(
+        &self,
+        namespace: &str,
+        schema: &DataPoolSchema,
+    ) -> Result<HashMap<String, ExternalEffectReceipt>> {
+        let row_id = format!(
+            "__data_pool__:{}:{}:{}",
+            namespace, schema.connector_id, schema.pool_id
+        );
+        let now = chrono::Utc::now().timestamp();
+        let Some(row) = self.trusted_get_memory(namespace, &row_id).await? else {
+            return Ok(HashMap::new());
+        };
+        if is_retired_data_metadata(&row.metadata, now) {
+            return Ok(HashMap::new());
+        }
+        Ok(row
+            .metadata
+            .get("pool_idempotency")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default())
     }
 
     async fn list_data_pools(

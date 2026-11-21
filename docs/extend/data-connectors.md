@@ -67,8 +67,10 @@ pub trait DataConnector: Send + Sync {
 
 ## Write-Back Durability
 
-- `DataConnector::snapshot_pool_records(pool_id)` defaults to `Ok(None)`; `None` means the connector already persists its own state.
-- `InMemoryPoolConnector` returns its full per-pointer record map. After a successful effect and post-gate, the kernel persists that snapshot through `register_data_pool` before returning the receipt, so the next kernel/request hydrates the post-write records and source SHA.
+- `DataConnector::snapshot_write_back(pool_id, pointer_uri)` defaults to `Ok(None)`; `None` means the connector already persists its own state.
+- `InMemoryPoolConnector` returns the written pointer's post-effect records, its prior records, and the pool's idempotency receipts. After a successful effect and post-gate, the kernel merges that delta into the pool registry row under a process-wide turn before returning the receipt.
+- Merging is per-pointer: concurrent kernels writing different pointers both survive; a same-pointer write whose stored records no longer match `prior_records` is a conflict, not a last-writer-wins overwrite.
+- `pool_idempotency` is persisted with the records and restored during hydration, so a retry through a fresh kernel returns the original receipt and cannot append twice.
 - `JsonFilePoolConnector` returns `None` (file-backed) and is not rewritten. A snapshot or persistence failure rejects the effect rather than returning an unobservable success receipt.
 
 ## Transport Parity

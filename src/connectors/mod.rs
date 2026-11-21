@@ -81,6 +81,18 @@ pub struct ExternalEffectReceipt {
     pub details: String,
 }
 
+/// Post-effect state the kernel persists for a connector whose records are
+/// not already durable. `prior_records` is the pointer's state before this
+/// effect; the persistence layer compares it with the stored row so a
+/// concurrent same-pointer write is a conflict instead of a lost update.
+#[derive(Debug, Clone)]
+pub struct WriteBackSnapshot {
+    pub prior_records: Vec<Value>,
+    pub pointer_records: Vec<Value>,
+    /// Receipts to retain, keyed by the connector's idempotency key.
+    pub idempotency: HashMap<String, ExternalEffectReceipt>,
+}
+
 #[async_trait]
 pub trait DataConnector: Send + Sync {
     fn connector_id(&self) -> &str;
@@ -119,12 +131,27 @@ pub trait DataConnector: Send + Sync {
     /// Full record snapshot for connectors whose records are not otherwise
     /// durable. `None` means the connector already persists its own state
     /// (for example a file-backed connector) and needs no write-through.
-    async fn snapshot_pool_records(
+    ///
+    /// The snapshot is per written pointer plus the receipts to retain, so
+    /// concurrent kernels writing different pointers do not overwrite each
+    /// other's records.
+    async fn snapshot_write_back(
         &self,
         pool_id: &str,
-    ) -> Result<Option<HashMap<String, Vec<Value>>>> {
-        let _ = pool_id;
+        pointer_uri: &str,
+    ) -> Result<Option<WriteBackSnapshot>> {
+        let _ = (pool_id, pointer_uri);
         Ok(None)
+    }
+
+    /// Restore persisted idempotency receipts during pool hydration.
+    async fn hydrate_idempotency(
+        &self,
+        pool_id: &str,
+        receipts: &HashMap<String, ExternalEffectReceipt>,
+    ) -> Result<()> {
+        let _ = (pool_id, receipts);
+        Ok(())
     }
 }
 
@@ -237,6 +264,9 @@ struct InMemoryPoolEntry {
     schema: DataPoolSchema,
     records: HashMap<String, Vec<Value>>,
     idempotency: HashMap<String, ExternalEffectReceipt>,
+    /// Pointer records before the most recent effect, used by the kernel to
+    /// detect a concurrent same-pointer write at persistence time.
+    prior_records: HashMap<String, Vec<Value>>,
 }
 
 pub struct InMemoryPoolConnector {
@@ -264,6 +294,7 @@ impl InMemoryPoolConnector {
                     schema,
                     records: HashMap::new(),
                     idempotency: HashMap::new(),
+                    prior_records: HashMap::new(),
                 },
             );
         }
@@ -404,8 +435,12 @@ impl DataConnector for InMemoryPoolConnector {
         if pool.schema.access_mode == DataPoolAccessMode::ReadOnly {
             return Err(anyhow!("pool '{}' is read-only", pool_id));
         }
-        if let Some(receipt) = pool.idempotency.get(&idempotency_key) {
-            return Ok(receipt.clone());
+        if let Some(receipt) = pool.idempotency.get(&idempotency_key).cloned() {
+            // A replay changes nothing; record the current state as "prior"
+            // so persistence does not report a self-conflict.
+            let current = pool.records.get(pointer_uri).cloned().unwrap_or_default();
+            pool.prior_records.insert(pointer_uri.to_string(), current);
+            return Ok(receipt);
         }
         let all_records = pool.records.get_mut(pointer_uri).ok_or_else(|| {
             anyhow!(
@@ -414,6 +449,7 @@ impl DataConnector for InMemoryPoolConnector {
                 pool_id
             )
         })?;
+        let prior_records = all_records.clone();
         let current_source_sha = InMemoryPoolConnector::compute_source_sha256(all_records);
         if let Some(expected) = &req.expected_source_sha256 {
             if *expected != current_source_sha {
@@ -445,6 +481,8 @@ impl DataConnector for InMemoryPoolConnector {
             }
         }
         let new_source_sha = InMemoryPoolConnector::compute_source_sha256(all_records);
+        pool.prior_records
+            .insert(pointer_uri.to_string(), prior_records);
         let receipt = ExternalEffectReceipt {
             pointer_id: pointer_uri.to_string(),
             connector_id: self.connector_id().to_string(),
@@ -460,14 +498,42 @@ impl DataConnector for InMemoryPoolConnector {
         Ok(receipt)
     }
 
-    /// #331: the pool's records live only in this connector's map. Return a
-    /// full snapshot so the kernel can persist it for the next request.
-    async fn snapshot_pool_records(
+    /// #331: records live only in this connector's map. Return the written
+    /// pointer's post-effect records plus the receipts to retain; the kernel
+    /// merges them into the persisted pool state.
+    async fn snapshot_write_back(
         &self,
         pool_id: &str,
-    ) -> Result<Option<HashMap<String, Vec<Value>>>> {
+        pointer_uri: &str,
+    ) -> Result<Option<WriteBackSnapshot>> {
         let pools = self.pools.read().unwrap();
-        Ok(pools.get(pool_id).map(|entry| entry.records.clone()))
+        let Some(entry) = pools.get(pool_id) else {
+            return Ok(None);
+        };
+        let pointer_records = entry.records.get(pointer_uri).cloned().unwrap_or_default();
+        let prior_records = entry
+            .prior_records
+            .get(pointer_uri)
+            .cloned()
+            .unwrap_or_else(|| pointer_records.clone());
+        Ok(Some(WriteBackSnapshot {
+            prior_records,
+            pointer_records,
+            idempotency: entry.idempotency.clone(),
+        }))
+    }
+
+    async fn hydrate_idempotency(
+        &self,
+        pool_id: &str,
+        receipts: &HashMap<String, ExternalEffectReceipt>,
+    ) -> Result<()> {
+        if let Some(entry) = self.pools.write().unwrap().get_mut(pool_id) {
+            entry
+                .idempotency
+                .extend(receipts.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+        Ok(())
     }
 }
 

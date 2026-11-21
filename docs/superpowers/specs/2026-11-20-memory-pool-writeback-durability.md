@@ -41,18 +41,23 @@ post-write records with that same source SHA.
    durable (e.g. `json_file`) opts out and is not rewritten.
    `InMemoryPoolConnector` implements it by cloning its complete per-pointer
    record map (not a capped slice).
-3. **Persist the snapshot.** When a snapshot is returned, the kernel writes
-   it through `MemoryPort::register_data_pool` with the same (unscoped)
-   schema the pointer resolves against, so the next kernel's
-   `describe_pool_with_hydration` seeds the post-write records.
-4. **No false receipt.** If the snapshot or persistence fails, the effect
+3. **Persist a delta, not a full replacement.** The snapshot carries the
+   written pointer's post-effect records plus the pool's idempotency
+   receipts. The persistence port merges that pointer into the stored
+   `pool_records` (other pointers are left intact) and merges receipts by
+   key. Persistence is serialized across kernels by a process-level turn.
+4. **Same-pointer concurrency is a conflict.** The snapshot also carries the
+   pointer's `prior_records` (or the current records on an idempotent
+   replay). If the stored row no longer matches, the effect returns a
+   conflict error instead of overwriting a concurrent write.
+5. **Idempotency is durable.** `pool_idempotency` is persisted with the
+   records and restored during hydration, so a retry through a fresh kernel
+   returns the original receipt and never appends twice.
+6. **No false receipt.** If the snapshot or persistence fails, the effect
    returns an error instead of a success receipt that cannot be observed.
-5. **Same-kernel visibility is unchanged**: the in-memory effect is visible
+7. **Same-kernel visibility is unchanged**: the in-memory effect is visible
    immediately, and the persist step does not mutate the request-local
    connector again.
-6. Full-pool snapshot semantics: every pointer's records in that pool are
-   preserved, including pointers other than the one written (the persistence
-   call replaces the registry row's `pool_records`).
 
 ---
 
@@ -71,6 +76,17 @@ post-write records with that same source SHA.
 
 Baseline result: kernel #2 returns 1 record and the pre-write SHA — the
 write vanished despite the success receipt.
+
+Additional evals:
+
+- `concurrent_pool_write_backs_preserve_other_pointers` — two kernels hydrate
+  the same pool, each writes a different pointer, and a third kernel sees
+  both post-write records. Baseline: the second full-pool persist erases the
+  first write.
+- `idempotent_write_back_replay_through_fresh_kernel_does_not_duplicate` —
+  replaying the same idempotency key through a fresh kernel returns the
+  original receipt and leaves exactly two records. Baseline: hydration omits
+  the receipt and the payload is appended twice.
 
 Negative control (existing coverage): `json_file` registration/resolution
 across kernels continues to pass; its connector returns no snapshot so the

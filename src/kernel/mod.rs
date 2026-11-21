@@ -26,6 +26,13 @@ use crate::traits::VectorStore;
 use crate::workflow::connector::{GitWorkflowConnector, WorkflowConnector};
 use crate::workflow::machine::WorkflowStage;
 
+/// Serializes pool write-back persistence across kernels in this process.
+/// The port performs a read-merge-write of the registry row; without this
+/// turn two requests that hydrated the same pool could interleave their
+/// reads and erase each other's pointer updates.
+static POOL_WRITEBACK_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+
 pub mod ports;
 
 /// Registry of pluggable workflow connectors keyed by `connector_id`.
@@ -263,6 +270,16 @@ impl AgentKernel {
                     for (uri, values) in recs {
                         let _ = connector.seed_records(&scoped_id, &uri, values).await;
                     }
+                }
+                // Review 14c61663#r4650345073: retries through a fresh kernel
+                // must see the persisted receipts, not re-apply the effect.
+                let receipts = self
+                    .memory
+                    .pool_idempotency(namespace, &schema)
+                    .await
+                    .unwrap_or_default();
+                if !receipts.is_empty() {
+                    let _ = connector.hydrate_idempotency(&scoped_id, &receipts).await;
                 }
             }
             if schema.pool_id == pool_id {
@@ -510,12 +527,26 @@ impl AgentKernel {
         }
         // #331: a success receipt must describe state a later request can
         // observe. Connectors whose records live only in memory snapshot the
-        // full pool here, and the kernel persists it through the same
-        // registry row the next request hydrates from. Connectors that
-        // already persist (json_file) return None and are left alone.
-        if let Some(records) = connector.snapshot_pool_records(&connector_pool_id).await? {
+        // written pointer plus their receipts here, and the kernel merges
+        // that delta into the registry row the next request hydrates from.
+        // Connectors that already persist (json_file) return None and are
+        // left alone.
+        if let Some(snapshot) = connector
+            .snapshot_write_back(&connector_pool_id, &pointer.pointer_uri)
+            .await?
+        {
+            let _persist = POOL_WRITEBACK_LOCK
+                .get_or_init(|| tokio::sync::Mutex::new(()))
+                .lock()
+                .await;
             self.memory
-                .register_data_pool(namespace, &schema, Some(&records), principal)
+                .register_pool_writeback(
+                    namespace,
+                    &schema,
+                    &pointer.pointer_uri,
+                    &snapshot,
+                    principal,
+                )
                 .await?;
         }
         let mut receipt = receipt;
