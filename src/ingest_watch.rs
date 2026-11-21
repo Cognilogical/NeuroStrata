@@ -1817,7 +1817,7 @@ mod tests {
             loop {
                 let ev = tokio::time::timeout(std::time::Duration::from_secs(2), source.recv())
                     .await
-                    .expect("event timeout")
+                    .unwrap_or_else(|_| panic!("event timeout waiting for {want:?}"))
                     .expect("event");
                 if ev.kind == want {
                     return ev;
