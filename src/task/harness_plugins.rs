@@ -747,15 +747,21 @@ fn resolve_namespace_from(
     let roots = NamespaceRoots::of(dir)?;
     let marker = crate::root_marker::find_root_marker(&roots.dir)
         .map_err(|(path, reason)| ResolveError::UnreadableMarker(UnreadableConfig { path, reason }))?;
+    if let Some(found) = marker {
+        // The marker decides alone: a harness config that cannot be read
+        // does not change the answer, and is not listed.
+        return Ok(ResolvedNamespace {
+            namespace: found.config.namespace,
+            source: NamespaceSource::Marker,
+            configs: roots.harness_namespaces().unwrap_or_default(),
+        });
+    }
     let configs = roots.harness_namespaces().map_err(ResolveError::UnreadableConfigs)?;
     let resolved = |namespace: String, source: NamespaceSource| ResolvedNamespace {
         namespace,
         source,
         configs: configs.clone(),
     };
-    if let Some(found) = marker {
-        return Ok(resolved(found.config.namespace, NamespaceSource::Marker));
-    }
     if let Some((_, ns)) = configs.first() {
         return Ok(resolved(ns.clone(), NamespaceSource::HarnessConfig));
     }
@@ -789,7 +795,8 @@ fn resolve_namespace_from(
 }
 
 /// The namespace a project's git hooks, `hooks install` and
-/// `neurostrata-mcp namespace resolve` use for `dir`: harness config, then
+/// `neurostrata-mcp namespace resolve` use for `dir`: the project marker
+/// (`.NeuroStrata/config.json`), then the harness config, then
 /// `NEUROSTRATA_NAMESPACE` from this process's environment, then the ledger,
 /// then the folder name.
 pub fn resolve_namespace(dir: &Path) -> Result<ResolvedNamespace, ResolveError> {

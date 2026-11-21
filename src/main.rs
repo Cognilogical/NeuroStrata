@@ -901,15 +901,17 @@ pub(crate) enum TaskCommands {
 
 #[derive(Subcommand, Debug, Clone, PartialEq)]
 pub(crate) enum NamespaceCommands {
-    /// Print the namespace configured for a project: the harness settings
-    /// the installer wrote (.claude/settings.local.json, the opencode, codex,
-    /// hermes, openclaw or GitHub CLI plugin config) in the checkout or its
-    /// main checkout, else NEUROSTRATA_NAMESPACE, else the namespace in
+    /// Print the namespace configured for a project: the project marker
+    /// (.NeuroStrata/config.json), else the harness settings the installer
+    /// wrote (.claude/settings.local.json, the opencode, codex, hermes,
+    /// openclaw or GitHub CLI plugin config) in the checkout or its main
+    /// checkout, else NEUROSTRATA_NAMESPACE, else the namespace in
     /// .NeuroStrata/session_queries.json, else the main checkout's folder
-    /// name. Configs that disagree are reported on stderr; the first in that
-    /// order wins. Exits non-zero, naming the cause, when the directory does
-    /// not exist, a harness config cannot be read, or no usable namespace is
-    /// found. The git hooks call this.
+    /// name. Harness configs that disagree are reported on stderr unless the
+    /// marker decides; the first in that order wins. Exits non-zero, naming
+    /// the cause, when the directory does not exist, the marker or a harness
+    /// config cannot be read, or no usable namespace is found. The git hooks
+    /// call this.
     Resolve {
         /// Directory inside the project (default: the current directory)
         dir: Option<std::path::PathBuf>,
@@ -6369,8 +6371,7 @@ async fn run() -> anyhow::Result<()> {
                 };
                 // Fail closed: a missing directory, a project marker or a
                 // harness config that cannot be read, or no usable namespace
-                // exits non-zero, and
-                // the pre-push hook blocks the push.
+                // exits non-zero, and the pre-push hook blocks the push.
                 let resolved = match crate::task::harness_plugins::resolve_namespace(&dir) {
                     Ok(resolved) => resolved,
                     Err(e) => {
@@ -6378,8 +6379,12 @@ async fn run() -> anyhow::Result<()> {
                         std::process::exit(1);
                     }
                 };
+                // A marker decides the namespace on its own; the harness
+                // configs' disagreement does not change the answer then.
                 let configs = &resolved.configs;
-                if configs.iter().any(|(_, ns)| *ns != configs[0].1) {
+                if resolved.source != crate::task::harness_plugins::NamespaceSource::Marker
+                    && configs.iter().any(|(_, ns)| *ns != configs[0].1)
+                {
                     let listed: Vec<String> =
                         configs.iter().map(|(harness, ns)| format!("{harness}={ns}")).collect();
                     eprintln!(
