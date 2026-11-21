@@ -787,13 +787,15 @@ pub async fn cache_project_root(
 /// Like [`cache_project_root`], but a namespace whose root a marker names is
 /// left alone: only the marker's writers change that root. An unreadable
 /// marker is no reason to overwrite a root that may be right, so it is a
-/// no-op too (one warning).
+/// no-op too (one warning). The checks run under the row lock, so a marker
+/// writer that sets the cached root between them and the write is seen.
 pub async fn cache_project_root_unless_marked(
     store: &Arc<dyn VectorStore>,
     emb: Option<&Arc<dyn Embedder>>,
     namespace: &str,
     project_root: &str,
 ) {
+    let _guard = REGISTRY_ROW_LOCK.lock().await;
     match crate::root_marker::find_root_marker(std::path::Path::new(project_root)) {
         Ok(Some(found)) if found.config.namespace.eq_ignore_ascii_case(namespace) => return,
         Err((path, reason)) => {
@@ -824,7 +826,7 @@ pub async fn cache_project_root_unless_marked(
             return;
         }
     }
-    cache_project_root(store, emb, namespace, project_root).await;
+    cache_project_root_locked(store, emb, namespace, project_root).await;
 }
 
 /// Set the namespace's cached root to `root` (for the marker's writers). A
@@ -1041,6 +1043,47 @@ pub(crate) mod tests {
         assert_eq!(
             cached_project_root(&store, "example-project").await.unwrap(),
             Some(root)
+        );
+    }
+
+    /// A caller that started before a marker writer pinned the root sees the
+    /// pin: its checks run under the row lock, not before it.
+    #[tokio::test]
+    async fn unmarked_caller_waiting_on_the_lock_keeps_a_root_pinned_meanwhile() {
+        use crate::guard::testkit::{MockStore, StubEmbedder};
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        let old = base.join("old");
+        let pinned = base.join("pinned");
+        let caller = base.join("caller");
+        for dir in [&old, &pinned, &caller] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        cache_project_root(&store, Some(&emb), "example-project", &old.to_string_lossy()).await;
+
+        let held = REGISTRY_ROW_LOCK.lock().await;
+        let task = {
+            let (store, emb) = (store.clone(), emb.clone());
+            let caller = caller.to_string_lossy().into_owned();
+            tokio::spawn(async move {
+                cache_project_root_unless_marked(&store, Some(&emb), "example-project", &caller).await
+            })
+        };
+        // Let the caller run up to the lock.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // A marker writer pins the root while the caller waits.
+        write_marker(&pinned, "example-project");
+        assert!(
+            cache_project_root_locked(&store, Some(&emb), "example-project", &pinned.to_string_lossy())
+                .await
+        );
+        drop(held);
+        task.await.unwrap();
+        assert_eq!(
+            cached_project_root(&store, "example-project").await.unwrap(),
+            Some(pinned.to_string_lossy().into_owned())
         );
     }
 

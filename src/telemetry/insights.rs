@@ -103,8 +103,6 @@ pub struct InsightsResponse {
     pub removed: Option<bool>,
 }
 
-static INSIGHT_REGISTRY_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 fn normalize_insight_slug(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim().to_ascii_lowercase();
     if trimmed.is_empty() {
@@ -183,7 +181,9 @@ pub async fn save_custom_insight(
     namespace: &str,
     mut def: InsightDefinition,
 ) -> Result<InsightDefinition, String> {
-    let _guard = INSIGHT_REGISTRY_MUTEX.lock().await;
+    // The registry row's one lock: a cached-root or domain write between
+    // this read and the upsert below would otherwise be reverted.
+    let _guard = crate::registry::REGISTRY_ROW_LOCK.lock().await;
     def.name = normalize_insight_slug(&def.name)?;
     if def.title.trim().is_empty() {
         def.title = def.name.clone();
@@ -286,7 +286,9 @@ pub async fn remove_custom_insight(
     namespace: &str,
     raw_name: &str,
 ) -> Result<bool, String> {
-    let _guard = INSIGHT_REGISTRY_MUTEX.lock().await;
+    // The registry row's one lock: a cached-root or domain write between
+    // this read and the upsert below would otherwise be reverted.
+    let _guard = crate::registry::REGISTRY_ROW_LOCK.lock().await;
     let slug = normalize_insight_slug(raw_name)?;
     if is_builtin_insight_slug(&slug) {
         return Err(format!("built-in insight '{slug}' cannot be removed"));
@@ -1694,5 +1696,38 @@ mod tests {
             .points
             .iter()
             .any(|p| p.generation == Some(7)));
+    }
+
+    /// Custom-insight writers read, change and upsert the registry row, so
+    /// they wait for the row lock every other registry-row writer takes; a
+    /// cached-root write in between would otherwise be reverted.
+    #[tokio::test]
+    async fn custom_insight_writers_wait_for_the_registry_row_lock() {
+        let store: Arc<dyn VectorStore> = Arc::new(crate::guard::testkit::MockStore::new());
+        let ns = "example-project";
+        let def = InsightDefinition {
+            name: "lock-probe".to_string(),
+            title: "Lock probe".to_string(),
+            query_kind: InsightQueryKind::Lexical,
+            query: "fn".to_string(),
+            path_prefix: None,
+            created_at: 100,
+        };
+        let held = crate::registry::REGISTRY_ROW_LOCK.lock().await;
+        let save = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            save_custom_insight(&store, ns, def.clone()),
+        )
+        .await;
+        assert!(save.is_err(), "save_custom_insight ran while the row lock was held");
+        let remove = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            remove_custom_insight(&store, ns, "lock-probe"),
+        )
+        .await;
+        assert!(remove.is_err(), "remove_custom_insight ran while the row lock was held");
+        drop(held);
+        save_custom_insight(&store, ns, def).await.expect("saves once the lock is free");
+        assert_eq!(remove_custom_insight(&store, ns, "lock-probe").await, Ok(true));
     }
 }
