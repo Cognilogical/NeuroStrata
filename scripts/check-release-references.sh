@@ -67,6 +67,10 @@ bounds="$(awk '
 read -r SECTION_START SECTION_END <<<"$bounds"
 
 NOTES="docs/releases/changelog/${VERSION}.md"
+# check_line reports this path; the loop below feeds the same file on stdin,
+# and passing that path as a command argument makes linters read the loop as a
+# self-overwriting pipeline (SC2094) even though nothing writes it.
+NOTES_LABEL="$NOTES"
 
 echo "release reference check: release ${VERSION} (CHANGELOG.md lines ${SECTION_START}-${SECTION_END}, ${NOTES})"
 
@@ -105,6 +109,7 @@ ROUTES="$(
 # CLI subcommands: the top-level `Commands` enum. Clap derives a kebab-case
 # name for a variant that carries no explicit `name = ".."` attribute, so the
 # derived names are part of the registry too.
+# shellcheck disable=SC2016  # awk program: $0/$1 are awk fields, not shell expansions
 CLI_AWK='
 function kebab(s,   out, i, c, p) {
   out = ""; p = ""
@@ -232,7 +237,7 @@ if [ -f "$NOTES" ]; then
   lineno=0
   while IFS= read -r line; do
     lineno=$((lineno + 1))
-    check_line "$NOTES" "$lineno" "$line"
+    check_line "$NOTES_LABEL" "$lineno" "$line"
   done <"$NOTES"
 else
   echo "::warning::no release note at ${NOTES}; only the CHANGELOG section was checked" >&2

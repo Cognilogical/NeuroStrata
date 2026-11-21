@@ -92,8 +92,13 @@ $out"
 
 # --- 1. a valid narrative resolves ------------------------------------------
 
+# The fixture narratives below must carry literal backtick-quoted names, so
+# they stay single-quoted on purpose: nothing here is ever expanded. Each site
+# carries its own targeted disable so the harness code stays checked.
+
 TREE="$WORK/valid"
 make_tree "$TREE"
+# shellcheck disable=SC2016  # literal fixture: backtick names never expand
 write_narrative "$TREE" 'Fixture names `neurostrata_add_memory`, `neurostrata_synaptic_mesh_init`, `POST /diff-tour`, `neurostrata-mcp synaptic-mesh`, `neurostrata-mcp mesh`, `Cargo.toml`, `Cargo.lock` and `src/server.rs`.'
 expect_exit "valid narrative resolves" "$TREE" 0 "every reference"
 
@@ -101,21 +106,25 @@ expect_exit "valid narrative resolves" "$TREE" 0 "every reference"
 
 TREE="$WORK/tool"
 make_tree "$TREE"
+# shellcheck disable=SC2016  # literal fixture: backtick names never expand
 write_narrative "$TREE" 'Fixture names `neurostrata_add_memory`.'
 expect_exit "known MCP tool resolves" "$TREE" 0 "every reference"
 
 TREE="$WORK/tool-bad"
 make_tree "$TREE"
+# shellcheck disable=SC2016  # literal fixture: backtick names never expand
 write_narrative "$TREE" 'Fixture names `neurostrata_definitely_not_a_tool`.'
 expect_exit "unknown MCP tool fails" "$TREE" 1 "unresolved MCP tool reference: neurostrata_definitely_not_a_tool"
 
 TREE="$WORK/tool-mesh"
 make_tree "$TREE"
+# shellcheck disable=SC2016  # literal fixture: backtick names never expand
 write_narrative "$TREE" 'Fixture names `neurostrata_synaptic_mesh_init`.'
 expect_exit "runtime mesh tool resolves" "$TREE" 0 "every reference"
 
 TREE="$WORK/tool-mesh-bad"
 make_tree "$TREE"
+# shellcheck disable=SC2016  # literal fixture: backtick names never expand
 write_narrative "$TREE" 'Fixture names `neurostrata_synaptic_mesh_not_a_tool`.'
 expect_exit "unknown mesh tool fails" "$TREE" 1 "unresolved MCP tool reference: neurostrata_synaptic_mesh_not_a_tool"
 
@@ -123,16 +132,19 @@ expect_exit "unknown mesh tool fails" "$TREE" 1 "unresolved MCP tool reference: 
 
 TREE="$WORK/route"
 make_tree "$TREE"
+# shellcheck disable=SC2016  # literal fixture: backtick names never expand
 write_narrative "$TREE" 'Fixture names `POST /diff-tour`.'
 expect_exit "shipped route resolves" "$TREE" 0 "every reference"
 
 TREE="$WORK/route-testonly"
 make_tree "$TREE"
+# shellcheck disable=SC2016  # literal fixture: backtick names never expand
 write_narrative "$TREE" 'Fixture names `POST /dummy`.'
 expect_exit "test-only route fails" "$TREE" 1 "unresolved daemon route reference: POST /dummy"
 
 TREE="$WORK/route-bad"
 make_tree "$TREE"
+# shellcheck disable=SC2016  # literal fixture: backtick names never expand
 write_narrative "$TREE" 'Fixture names `POST /not-a-shipped-route`.'
 expect_exit "unknown route fails" "$TREE" 1 "unresolved daemon route reference: POST /not-a-shipped-route"
 
@@ -140,16 +152,19 @@ expect_exit "unknown route fails" "$TREE" 1 "unresolved daemon route reference: 
 
 TREE="$WORK/cli"
 make_tree "$TREE"
+# shellcheck disable=SC2016  # literal fixture: backtick names never expand
 write_narrative "$TREE" 'Fixture names `neurostrata-mcp synaptic-mesh`.'
 expect_exit "command with trailing attributes resolves" "$TREE" 0 "every reference"
 
 TREE="$WORK/cli-alias"
 make_tree "$TREE"
+# shellcheck disable=SC2016  # literal fixture: backtick names never expand
 write_narrative "$TREE" 'Fixture names `neurostrata-mcp mesh`.'
 expect_exit "command alias resolves" "$TREE" 0 "every reference"
 
 TREE="$WORK/cli-bad"
 make_tree "$TREE"
+# shellcheck disable=SC2016  # literal fixture: backtick names never expand
 write_narrative "$TREE" 'Fixture names `neurostrata-mcp definitely-not-a-command`.'
 expect_exit "unknown CLI command fails" "$TREE" 1 "unresolved CLI command reference: neurostrata-mcp definitely-not-a-command"
 
@@ -157,29 +172,34 @@ expect_exit "unknown CLI command fails" "$TREE" 1 "unresolved CLI command refere
 
 TREE="$WORK/path"
 make_tree "$TREE"
+# shellcheck disable=SC2016  # literal fixture: backtick names never expand
 write_narrative "$TREE" 'Fixture names `src/server.rs` and `Cargo.toml`.'
 expect_exit "tree paths resolve" "$TREE" 0 "every reference"
 
 TREE="$WORK/path-bad"
 make_tree "$TREE"
+# shellcheck disable=SC2016  # literal fixture: backtick names never expand
 write_narrative "$TREE" 'Fixture names `src/parser/not_a_real_file.rs`.'
 expect_exit "missing tree path fails" "$TREE" 1 "unresolved path reference: src/parser/not_a_real_file.rs"
 
 TREE="$WORK/manifest-missing"
 make_tree "$TREE"
 rm -f "$TREE/Cargo.toml"
+# shellcheck disable=SC2016  # literal fixture: backtick names never expand
 write_narrative "$TREE" 'Fixture names `Cargo.toml`.'
 expect_exit "missing root manifest fails" "$TREE" 1 "unresolved path reference: Cargo.toml"
 
 TREE="$WORK/manifest-renamed"
 make_tree "$TREE"
 mv "$TREE/Cargo.toml" "$TREE/Cargo.toml.renamed"
+# shellcheck disable=SC2016  # literal fixture: backtick names never expand
 write_narrative "$TREE" 'Fixture names `Cargo.toml`.'
 expect_exit "renamed root manifest fails" "$TREE" 1 "unresolved path reference: Cargo.toml"
 
 TREE="$WORK/manifest-lock-missing"
 make_tree "$TREE"
 rm -f "$TREE/Cargo.lock"
+# shellcheck disable=SC2016  # literal fixture: backtick names never expand
 write_narrative "$TREE" 'Fixture names `Cargo.lock`.'
 expect_exit "missing root lockfile fails" "$TREE" 1 "unresolved path reference: Cargo.lock"
 
@@ -193,6 +213,7 @@ else
   bad "changelog taxonomy synopsis lists tree" "the 1.18.0 synopsis does not name the shipped \`tree\` operation"
 fi
 
+# shellcheck disable=SC2016  # literal fixture: backtick names never expand
 if grep -qF '(`tree`)' "$REPO/docs/releases/changelog/1.18.0.md"; then
   ok "release note names the tree operation"
 else
