@@ -35,6 +35,104 @@ pub const QUIET_PERIOD: Duration = Duration::from_millis(300);
 pub const MAX_WINDOW: Duration = Duration::from_secs(2);
 pub const BACKOFF_STEPS_SECS: &[u64] = &[1, 2, 4, 8, 16, 30];
 pub const MAX_RENAME_COOKIES: usize = 1024;
+// Native events are staged in a bounded channel. Duplicate paths still in
+// flight are coalesced, so a burst of writes to one file cannot fill it.
+pub const MAX_QUEUED_EVENTS: usize = 4096;
+
+fn event_queue_key(event: &WatchEvent) -> PathBuf {
+    event.new_path.clone().unwrap_or_else(|| event.path.clone())
+}
+
+/// Stage one native event for the core. Events whose path is already queued
+/// are coalesced; a full channel drops the event (safe because ingest is
+/// per-root and the next event re-ingests the whole root).
+fn enqueue_coalesced(
+    tx: &tokio::sync::mpsc::Sender<WatchEvent>,
+    queued: &Mutex<HashSet<PathBuf>>,
+    event: WatchEvent,
+) {
+    let key = event_queue_key(&event);
+    let mut queued = match queued.lock() {
+        Ok(queued) => queued,
+        Err(_) => return,
+    };
+    if !queued.insert(key.clone()) {
+        return;
+    }
+    if tx.try_send(event).is_err() {
+        queued.remove(&key);
+    }
+}
+
+/// Translate one native notification into the normalized core event. Returns
+/// `None` for read-side notifications: ingesting a root reads its files, and
+/// re-enqueuing those reads would make a watched root re-ingest itself forever.
+fn translate_native_event(
+    event: &Event,
+    pending_renames: &Mutex<HashMap<usize, (PathBuf, tokio::time::Instant)>>,
+) -> Option<WatchEvent> {
+    let path = event.paths.first().cloned().unwrap_or_default();
+    let (kind, new_path) = match &event.kind {
+        EventKind::Access(_) => return None,
+        EventKind::Modify(ModifyKind::Metadata(notify::event::MetadataKind::AccessTime)) => {
+            return None
+        }
+        EventKind::Create(_) => (WatchEventKind::Create, None),
+        EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => {
+            if event.paths.len() >= 2 {
+                // paths[0] is the old path, paths[1] the destination.
+                (WatchEventKind::Rename, Some(event.paths[1].clone()))
+            } else {
+                (WatchEventKind::Modify, None)
+            }
+        }
+        EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
+            if let Some(cookie) = event.tracker() {
+                if let Ok(mut pending) = pending_renames.lock() {
+                    if pending.len() >= MAX_RENAME_COOKIES {
+                        // Evict the least recently inserted cookie, not an
+                        // arbitrary HashMap slot.
+                        if let Some(old_key) = pending
+                            .iter()
+                            .min_by_key(|(_, (_, at))| *at)
+                            .map(|(key, _)| *key)
+                        {
+                            pending.remove(&old_key);
+                        }
+                    }
+                    pending.insert(cookie, (path.clone(), tokio::time::Instant::now()));
+                }
+            }
+            (WatchEventKind::Remove, None)
+        }
+        EventKind::Modify(ModifyKind::Name(RenameMode::To)) => {
+            let resolved_new = path.clone();
+            let paired = match pending_renames.lock() {
+                Ok(mut pending) => event.tracker().and_then(|cookie| pending.remove(&cookie)),
+                Err(_) => None,
+            };
+            if let Some((old, _)) = paired {
+                return Some(WatchEvent {
+                    root: PathBuf::from("/"),
+                    path: old,
+                    kind: WatchEventKind::Rename,
+                    new_path: Some(resolved_new),
+                });
+            }
+            // Unpaired `To` without `From`: treat as upsert at this path.
+            (WatchEventKind::Create, None)
+        }
+        EventKind::Modify(_) => (WatchEventKind::Modify, None),
+        EventKind::Remove(_) => (WatchEventKind::Remove, None),
+        EventKind::Any | EventKind::Other => (WatchEventKind::Modify, None),
+    };
+    Some(WatchEvent {
+        root: PathBuf::from("/"),
+        path,
+        kind,
+        new_path,
+    })
+}
 
 // Test-only fake source; shared by this module's tests and the MCP shim tests.
 #[cfg(test)]
@@ -217,8 +315,9 @@ pub struct NotifyEventSource {
     watcher: Mutex<RecommendedWatcher>,
     // Retained so the callback's sender stays alive for the source's lifetime.
     #[allow(dead_code)]
-    tx: tokio::sync::mpsc::UnboundedSender<WatchEvent>,
-    rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<WatchEvent>>,
+    tx: tokio::sync::mpsc::Sender<WatchEvent>,
+    rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<WatchEvent>>,
+    queued_paths: Arc<Mutex<HashSet<PathBuf>>>,
     watched_roots: Mutex<HashSet<PathBuf>>,
     // Shared with the notify callback; the field itself is never re-read here.
     #[allow(dead_code)]
@@ -229,77 +328,17 @@ impl NotifyEventSource {
     /// Create a new `NotifyEventSource`. Starts the underlying `notify`
     /// watcher with a background task that forwards events into the channel.
     pub fn new() -> anyhow::Result<Self> {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::channel(MAX_QUEUED_EVENTS);
         let pending_renames: Arc<Mutex<HashMap<usize, (PathBuf, tokio::time::Instant)>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let queued_paths: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
         let pending_renames_clone = Arc::clone(&pending_renames);
+        let queued_paths_clone = Arc::clone(&queued_paths);
         let tx_clone = tx.clone();
         let watcher = notify::recommended_watcher(move |res: Result<Event, Error>| {
             if let Ok(ev) = res {
-                let path = ev.paths.first().cloned().unwrap_or_default();
-                let (kind, new_path, skip_direct_send) = match &ev.kind {
-                    EventKind::Create(_) => (WatchEventKind::Create, None, false),
-                    EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => {
-                        if ev.paths.len() >= 2 {
-                            let _old = ev.paths[0].clone();
-                            let new = ev.paths[1].clone();
-                            // A single both-paths rename must be emitted; the
-                            // old path is `paths[0]`, destination is `paths[1]`.
-                            (WatchEventKind::Rename, Some(new), false)
-                        } else {
-                            (WatchEventKind::Modify, None, false)
-                        }
-                    }
-                    EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
-                        if let Some(cookie) = ev.tracker() {
-                            if let Ok(mut pending) = pending_renames_clone.lock() {
-                                if pending.len() >= MAX_RENAME_COOKIES {
-                                    // Evict the least recently inserted cookie,
-                                    // not an arbitrary HashMap slot.
-                                    if let Some(old_key) = pending
-                                        .iter()
-                                        .min_by_key(|(_, (_, at))| *at)
-                                        .map(|(key, _)| *key)
-                                    {
-                                        pending.remove(&old_key);
-                                    }
-                                }
-                                pending.insert(cookie, (path.clone(), tokio::time::Instant::now()));
-                            }
-                        }
-                        (WatchEventKind::Remove, None, false)
-                    }
-                    EventKind::Modify(ModifyKind::Name(RenameMode::To)) => {
-                        let resolved_new = path.clone();
-                        if let Some(cookie) = ev.tracker() {
-                            if let Ok(mut pending) = pending_renames_clone.lock() {
-                                if let Some((old, _)) = pending.remove(&cookie) {
-                                    let watch_event = WatchEvent {
-                                        root: PathBuf::from("/"),
-                                        path: old,
-                                        kind: WatchEventKind::Rename,
-                                        new_path: Some(resolved_new),
-                                    };
-                                    let _ = tx_clone.send(watch_event);
-                                    return;
-                                }
-                            }
-                        }
-                        // Unpaired `To` without `From`: treat as upsert at this path.
-                        (WatchEventKind::Create, None, false)
-                    }
-                    EventKind::Modify(_) => (WatchEventKind::Modify, None, false),
-                    EventKind::Remove(_) => (WatchEventKind::Remove, None, false),
-                    _ => (WatchEventKind::Modify, None, false),
-                };
-                let watch_event = WatchEvent {
-                    root: PathBuf::from("/"),
-                    path,
-                    kind,
-                    new_path,
-                };
-                if !skip_direct_send {
-                    let _ = tx_clone.send(watch_event);
+                if let Some(watch_event) = translate_native_event(&ev, &pending_renames_clone) {
+                    enqueue_coalesced(&tx_clone, &queued_paths_clone, watch_event);
                 }
             }
         })?;
@@ -307,6 +346,7 @@ impl NotifyEventSource {
             watcher: Mutex::new(watcher),
             tx,
             rx: tokio::sync::Mutex::new(rx),
+            queued_paths,
             watched_roots: Mutex::new(HashSet::new()),
             pending_renames,
         })
@@ -316,7 +356,12 @@ impl NotifyEventSource {
 #[async_trait]
 impl WatchEventSource for NotifyEventSource {
     async fn recv(&self) -> Option<WatchEvent> {
-        self.rx.lock().await.recv().await
+        let event = self.rx.lock().await.recv().await?;
+        let key = event_queue_key(&event);
+        if let Ok(mut queued) = self.queued_paths.lock() {
+            queued.remove(&key);
+        }
+        Some(event)
     }
 
     fn watch_root(&self, root: &Path) -> Result<(), String> {
@@ -882,6 +927,22 @@ impl IngestWatchService {
         if !removed {
             return Ok(false);
         }
+        // Clear all pending scheduling for the key so an elapsed debounce or
+        // backoff deadline cannot re-arm a root that is no longer registered.
+        {
+            let mut bursts = self
+                .bursts
+                .lock()
+                .map_err(|_| anyhow::anyhow!("burst mutex poisoned"))?;
+            bursts.remove(&key);
+        }
+        {
+            let mut retries = self
+                .retry_at
+                .lock()
+                .map_err(|_| anyhow::anyhow!("retry mutex poisoned"))?;
+            retries.remove(&key);
+        }
         self.persist_state()?;
         if !still_referenced {
             self.deactivate(&canonical)?;
@@ -955,8 +1016,20 @@ impl IngestWatchService {
                 .collect()
         };
         for (namespace, path) in keys {
-            self.activate(&path)?;
-            self.mark_watch_active(&(namespace.clone(), path.clone()), true)?;
+            let key = (namespace.clone(), path.clone());
+            match self.activate(&path) {
+                Ok(()) => self.mark_watch_active(&key, true)?,
+                Err(err) => {
+                    // A stale/unavailable persisted root must not abort daemon
+                    // startup. Retain it as an inactive entry; reconcile/skip
+                    // handles it until the registration is repaired.
+                    tracing::warn!(
+                        "watch activation failed for {} ({}), leaving root inactive: {err}",
+                        path.display(),
+                        namespace
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -1203,10 +1276,13 @@ impl IngestWatchService {
         };
         let finished = tokio::time::Instant::now();
         let mut retry_at: Option<tokio::time::Instant> = None;
-        {
+        // A root may be unregistered while the trigger is in flight. If so,
+        // do not re-arm any debounce/backoff scheduling below.
+        let root_exists = {
             // One lock at a time throughout: no nested guards means no
             // possible inversion with `ingest_event`'s state-then-burst path.
             let mut state = self.lock_state()?;
+            let root_exists = state.roots.contains_key(key);
             if let Some(runtime) = state.roots.get_mut(key) {
                 runtime.last_trigger_unix = Some(unix_now_secs());
                 runtime.last_outcome = Some(outcome.clone());
@@ -1222,13 +1298,16 @@ impl IngestWatchService {
                     retry_at = Some(started + delay);
                 }
             }
-        }
-        if let Some(at) = retry_at {
-            let mut retries = self
-                .retry_at
-                .lock()
-                .map_err(|_| anyhow::anyhow!("retry mutex poisoned"))?;
-            retries.insert(key.clone(), at);
+            root_exists
+        };
+        if root_exists {
+            if let Some(at) = retry_at {
+                let mut retries = self
+                    .retry_at
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("retry mutex poisoned"))?;
+                retries.insert(key.clone(), at);
+            }
         }
         {
             let mut active = self
@@ -1251,7 +1330,7 @@ impl IngestWatchService {
                 .bursts
                 .lock()
                 .map_err(|_| anyhow::anyhow!("burst mutex poisoned"))?;
-            if outcome.state == TriggerState::Finished && !during {
+            if !root_exists || (outcome.state == TriggerState::Finished && !during) {
                 bursts.remove(key);
             } else {
                 // One follow-up burst, armed from completion time. More
@@ -1397,6 +1476,41 @@ mod tests {
     }
 
     #[test]
+    fn ingest_read_events_are_not_translated_into_watch_events() {
+        let pending = Mutex::new(HashMap::new());
+        let path = PathBuf::from("/tmp/fresh-root/src/lib.rs");
+        let ignored = [
+            EventKind::Access(notify::event::AccessKind::Read),
+            EventKind::Access(notify::event::AccessKind::Open(
+                notify::event::AccessMode::Read,
+            )),
+            EventKind::Access(notify::event::AccessKind::Close(
+                notify::event::AccessMode::Write,
+            )),
+            EventKind::Modify(ModifyKind::Metadata(
+                notify::event::MetadataKind::AccessTime,
+            )),
+        ];
+        for kind in ignored {
+            let ev = Event {
+                kind,
+                paths: vec![path.clone()],
+                attrs: Default::default(),
+            };
+            assert!(
+                translate_native_event(&ev, &pending).is_none(),
+                "read-side native event must not re-trigger ingest: {kind:?}"
+            );
+        }
+        let write = Event {
+            kind: EventKind::Any,
+            paths: vec![path],
+            attrs: Default::default(),
+        };
+        assert!(translate_native_event(&write, &pending).is_some());
+    }
+
+    #[test]
     fn normalize_event_create_and_modify_upsert_the_path() {
         for kind in [WatchEventKind::Create, WatchEventKind::Modify] {
             let effects = normalize_event(watch_event(kind));
@@ -1481,6 +1595,29 @@ mod tests {
                 state: TriggerState::Finished,
                 error: None,
             })
+        }
+    }
+
+    // Source whose activation fails for one path, modelling a persisted root
+    // that was deleted/moved since registration.
+    struct RefusingWatchSource {
+        inner: TestEventSource,
+        refuse: PathBuf,
+    }
+
+    #[async_trait]
+    impl WatchEventSource for RefusingWatchSource {
+        async fn recv(&self) -> Option<WatchEvent> {
+            self.inner.recv().await
+        }
+        fn watch_root(&self, root: &Path) -> Result<(), String> {
+            if root == self.refuse {
+                return Err("stale root unavailable".to_string());
+            }
+            self.inner.watch_root(root)
+        }
+        fn unwatch_root(&self, root: &Path) -> Result<(), String> {
+            self.inner.unwatch_root(root)
         }
     }
 
@@ -1798,6 +1935,32 @@ mod tests {
             Ok(TriggerOutcome {
                 state: TriggerState::Finished,
                 error: None,
+            })
+        }
+    }
+
+    // Trigger that blocks inside trigger() and always reports failure, so a
+    // test can unregister a root while a fire is in flight.
+    struct GatedFailTrigger {
+        entered: Arc<tokio::sync::Notify>,
+        gate: Mutex<Option<oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait]
+    impl IngestTrigger for GatedFailTrigger {
+        async fn trigger(
+            &self,
+            _namespace: &str,
+            _canonical_path: &str,
+        ) -> anyhow::Result<TriggerOutcome> {
+            self.entered.notify_one();
+            let gate = self.gate.lock().unwrap().take();
+            if let Some(rx) = gate {
+                let _ = rx.await;
+            }
+            Ok(TriggerOutcome {
+                state: TriggerState::Failed,
+                error: Some("injected failure".to_string()),
             })
         }
     }
@@ -2141,5 +2304,140 @@ mod tests {
         assert!(service.due_keys(t0).is_empty());
         let expected = t0 - Duration::from_millis(100) + QUIET_PERIOD;
         assert_eq!(service.next_deadline_from(t0), expected);
+    }
+
+    #[tokio::test]
+    async fn start_continues_when_a_persisted_root_cannot_be_activated() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = dir.path().join("watch_registrations.json");
+        let good = dir.path().join("good");
+        let stale = dir.path().join("stale");
+        let doc = format!(
+            r#"{{"schema_version":1,"registrations":[{{"namespace":"NeuroStrata","canonical_path":"{}","created_at_unix":1763596800,"updated_at_unix":1763596800}},{{"namespace":"NeuroStrata","canonical_path":"{}","created_at_unix":1763596800,"updated_at_unix":1763596800}}]}}"#,
+            good.display(),
+            stale.display()
+        );
+        std::fs::write(&registry, doc).unwrap();
+        let store: Arc<dyn WatchRegistrationStore> =
+            Arc::new(JsonFileRegistrationStore::new(registry));
+        let service = IngestWatchService::new(
+            Box::new(RefusingWatchSource {
+                inner: TestEventSource::channel(),
+                refuse: stale.clone(),
+            }),
+            store,
+            Arc::new(NoopTrigger),
+            dir.path().to_path_buf(),
+            Vec::new(),
+        );
+        service
+            .start()
+            .await
+            .expect("one stale root must not abort start");
+        let report = service.status(None);
+        assert_eq!(report.roots.len(), 2);
+        let good_status = report
+            .roots
+            .iter()
+            .find(|r| r.canonical_path == good)
+            .expect("good root loaded");
+        assert!(good_status.watch_active);
+        let stale_status = report
+            .roots
+            .iter()
+            .find(|r| r.canonical_path == stale)
+            .expect("stale root retained as inactive");
+        assert!(!stale_status.watch_active);
+    }
+
+    #[tokio::test]
+    async fn unregister_clears_pending_burst_and_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (service, canonical) = service_with(&dir, Arc::new(NoopTrigger));
+        service.register("NeuroStrata", &canonical).unwrap();
+        let key = root_key(&canonical);
+        let now = tokio::time::Instant::now();
+        service
+            .ingest_event(
+                source_event(
+                    &canonical,
+                    canonical.join("src/lib.rs"),
+                    WatchEventKind::Modify,
+                ),
+                now,
+            )
+            .unwrap();
+        assert!(service.bursts.lock().unwrap().contains_key(&key));
+        service
+            .retry_at
+            .lock()
+            .unwrap()
+            .insert(key.clone(), now + Duration::from_secs(30));
+        assert!(service
+            .unregister("NeuroStrata", &canonical)
+            .expect("unregister succeeds"));
+        assert!(!service.bursts.lock().unwrap().contains_key(&key));
+        assert!(!service.retry_at.lock().unwrap().contains_key(&key));
+        assert!(service.due_keys(now + Duration::from_secs(60)).is_empty());
+    }
+
+    #[tokio::test]
+    async fn fire_does_not_rearm_a_root_unregistered_during_trigger() {
+        let dir = tempfile::tempdir().unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let (gate_tx, gate_rx) = oneshot::channel();
+        let trigger = GatedFailTrigger {
+            entered: Arc::clone(&entered),
+            gate: Mutex::new(Some(gate_rx)),
+        };
+        let (service, canonical) = service_with(&dir, Arc::new(trigger));
+        service.register("NeuroStrata", &canonical).unwrap();
+        let key = root_key(&canonical);
+        service
+            .ingest_event(
+                source_event(
+                    &canonical,
+                    canonical.join("src/lib.rs"),
+                    WatchEventKind::Modify,
+                ),
+                tokio::time::Instant::now(),
+            )
+            .unwrap();
+        let fire_service = Arc::new(service);
+        let handle = {
+            let service = Arc::clone(&fire_service);
+            let key = key.clone();
+            tokio::spawn(async move { service.fire(&key).await })
+        };
+        entered.notified().await;
+        assert!(fire_service
+            .unregister("NeuroStrata", &canonical)
+            .expect("unregister while fire in flight"));
+        let _ = gate_tx.send(());
+        handle.await.unwrap().expect("fire completes");
+        assert!(!fire_service.bursts.lock().unwrap().contains_key(&key));
+        assert!(!fire_service.retry_at.lock().unwrap().contains_key(&key));
+        assert!(fire_service
+            .due_keys(tokio::time::Instant::now() + Duration::from_secs(60))
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn native_event_queue_is_bounded_and_coalesces_duplicate_paths() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let queued = Mutex::new(HashSet::new());
+        let ev = |path: &str| WatchEvent {
+            root: PathBuf::from("/tmp/fresh-root"),
+            path: PathBuf::from(path),
+            kind: WatchEventKind::Modify,
+            new_path: None,
+        };
+        enqueue_coalesced(&tx, &queued, ev("/tmp/fresh-root/src/a.rs"));
+        enqueue_coalesced(&tx, &queued, ev("/tmp/fresh-root/src/a.rs"));
+        assert_eq!(rx.len(), 1, "duplicate path coalesced");
+        for i in 0..32 {
+            enqueue_coalesced(&tx, &queued, ev(&format!("/tmp/fresh-root/src/{i}.rs")));
+        }
+        assert!(rx.len() <= 4, "native event queue is bounded");
     }
 }
