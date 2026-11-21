@@ -406,7 +406,12 @@ fn snapshot_readiness_excludes_restricted_taxonomy() {
 /// R5.2: zero thesis/concept rows emit exactly the prescribed hint line.
 #[test]
 fn snapshot_readiness_zero_concept_hint_is_exact() {
-    use snapshot_readiness::{render_readiness_section, ReadinessInput, ZERO_CONCEPT_HINT};
+    use snapshot_readiness::{render_readiness_section, ReadinessInput};
+
+    // Spec §6 R5.2 literal, NOT the producer's own ZERO_CONCEPT_HINT constant:
+    // asserting the constant against itself cannot detect a drifted hint.
+    const SPEC_ZERO_CONCEPT_HINT: &str =
+        "Taxonomy (0 concepts): run neurostrata_taxonomy(operation:'set_thesis') to anchor domain concepts.";
 
     let empty = ReadinessInput {
         concepts: vec![],
@@ -415,8 +420,8 @@ fn snapshot_readiness_zero_concept_hint_is_exact() {
     };
     let section = render_readiness_section(&empty);
     assert!(
-        section.lines().any(|line| line == ZERO_CONCEPT_HINT),
-        "zero-concept hint must appear verbatim as its own line; got:\n{section}"
+        section.lines().any(|line| line == SPEC_ZERO_CONCEPT_HINT),
+        "zero-concept hint must match the R5.2 spec literal; got:\n{section}"
     );
     assert!(section.contains("taxonomy_concepts_count: 0"));
 
@@ -427,7 +432,7 @@ fn snapshot_readiness_zero_concept_hint_is_exact() {
         graph_tool_names: vec![],
         has_thesis: true,
     };
-    assert!(!render_readiness_section(&thesis_only).contains(ZERO_CONCEPT_HINT));
+    assert!(!render_readiness_section(&thesis_only).contains(SPEC_ZERO_CONCEPT_HINT));
 }
 
 /// R5.1: graph tool diversity is distinct-count, and recommended_reads is
@@ -721,15 +726,29 @@ fn receipt_events_are_versioned_and_bounded() {
 /// quotas or nudges are introduced by the receipt recorder.
 #[test]
 fn receipt_tool_invocations_are_additive_only() {
-    let mut doc = serde_json::json!({});
-    tool_receipts::bump_tool_invocation(&mut doc, "neurostrata_related");
-    tool_receipts::bump_tool_invocation(&mut doc, "neurostrata_related");
-    tool_receipts::bump_tool_invocation(&mut doc, "neurostrata_taxonomy");
-    assert_eq!(doc["tool_invocations"]["neurostrata_related"].as_u64(), Some(2));
-    assert_eq!(doc["tool_invocations"]["neurostrata_taxonomy"].as_u64(), Some(1));
-    assert!(doc.get("quota").is_none());
-    assert!(doc.get("gate").is_none());
-    assert!(doc.get("nudge").is_none());
+    // Assert on the REAL persisted ledger path, not on a bare document that
+    // the counter helper never had a chance to pollute.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join(".NeuroStrata/session_queries.json");
+    tool_receipts::mutate_session_ledger(&path, "NeuroStrata", |doc| {
+        tool_receipts::bump_tool_invocation(doc, "neurostrata_related");
+        tool_receipts::bump_tool_invocation(doc, "neurostrata_related");
+        tool_receipts::bump_tool_invocation(doc, "neurostrata_taxonomy");
+        tool_receipts::append_event(doc, sample_receipt("q", "c").to_value());
+    });
+    let saved: Value = serde_json::from_str(
+        &std::fs::read_to_string(&path).expect("ledger was persisted by the real write path"),
+    )
+    .expect("persisted ledger is strict JSON");
+    assert_eq!(saved["tool_invocations"]["neurostrata_related"].as_u64(), Some(2));
+    assert_eq!(saved["tool_invocations"]["neurostrata_taxonomy"].as_u64(), Some(1));
+    assert_eq!(saved["events"].as_array().unwrap().len(), 1);
+    for forbidden in ["quota", "gate", "nudge"] {
+        assert!(
+            saved.get(forbidden).is_none(),
+            "real dispatch path added a {forbidden} surface"
+        );
+    }
 }
 
 /// Spec §6 R6.4: receipts are private/local JSON events, never memory rows,
@@ -810,24 +829,55 @@ fn every_graph_tool_has_post_dispatch_receipt_path() {
     use std::collections::BTreeSet;
     use tool_receipts::{build_dispatch_receipt, route_class, RECEIPT_FIELD_NAMES};
 
-    let response = serde_json::json!({ "memories": [ { "id": "m1" } ] }).to_string();
+    // The dispatcher in src/server.rs gates on GRAPH_TOOLS and calls the ONE
+    // post-dispatch recorder for every match. Pin that literal wiring here; a
+    // builder-only fixture cannot detect a dispatcher that forgot the call.
+    let dispatcher = include_str!("../src/server.rs");
+    assert!(
+        dispatcher.contains("GRAPH_TOOLS.contains(&name)"),
+        "MCP dispatcher no longer gates receipts on GRAPH_TOOLS"
+    );
+    assert!(
+        dispatcher.contains("record_tool_receipt(&store, fields, caller_root).await"),
+        "MCP dispatcher no longer records a post-dispatch receipt"
+    );
+
+    // Outcome-diverse fixtures: a single success payload for all eight tools
+    // cannot prove the builder reads the real handler response.
+    let outcomes = [
+        (
+            serde_json::json!({ "memories": [ { "id": "m1" } ] }).to_string(),
+            "success",
+        ),
+        (serde_json::json!({ "memories": [] }).to_string(), "empty"),
+        (
+            serde_json::json!({ "status": "failed", "error": "boom" }).to_string(),
+            "failed",
+        ),
+    ];
     let mut covered = BTreeSet::new();
     for tool in snapshot_readiness::GRAPH_TOOLS {
-        let receipt = build_dispatch_receipt(
-            "evt-coverage".to_string(),
-            1,
-            "ses".to_string(),
-            "ns".to_string(),
-            (*tool).to_string(),
-            "q",
-            &response,
-            false,
-            3,
-        )
-        .to_value();
-        assert_eq!(receipt["tool"].as_str(), Some(*tool));
-        assert_eq!(receipt["status"].as_str(), Some("success"));
-        assert_eq!(receipt.as_object().unwrap().len(), RECEIPT_FIELD_NAMES.len());
+        for (response, expected_status) in &outcomes {
+            let receipt = build_dispatch_receipt(
+                "evt-coverage".to_string(),
+                1,
+                "ses".to_string(),
+                "ns".to_string(),
+                (*tool).to_string(),
+                "q",
+                response,
+                false,
+                3,
+            )
+            .to_value();
+            assert_eq!(receipt["tool"].as_str(), Some(*tool));
+            assert_eq!(
+                receipt["status"].as_str(),
+                Some(*expected_status),
+                "{tool} receipt must reflect the real outcome, not a hardcoded success"
+            );
+            assert_eq!(receipt.as_object().unwrap().len(), RECEIPT_FIELD_NAMES.len());
+        }
         assert!(!route_class(tool).is_empty());
         covered.insert(*tool);
     }
@@ -975,6 +1025,96 @@ fn load_evaluation_contract() -> Value {
     serde_json::from_str(&text).expect("evaluation contract must be strict JSON")
 }
 
+/// C37: read the semantic receipt through the path the contract itself declares.
+fn load_semantic_receipt(contract: &Value) -> Value {
+    let rel = contract["semantic_lift_gate"]["receipt"]
+        .as_str()
+        .expect("contract must declare its semantic receipt path");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("missing semantic receipt {}: {e}", path.display()));
+    serde_json::from_str(&text).expect("semantic receipt must be strict JSON")
+}
+
+/// C37: mechanically extract `(lift, threshold, baseline, candidate)` from the
+/// receipt's subset-lift violation detail instead of hand-copying those values.
+fn receipt_subset_lift_numbers(receipt: &Value) -> (f64, f64, f64, f64) {
+    let detail = receipt["gate"]["violations"]
+        .as_array()
+        .and_then(|rows| {
+            rows.iter()
+                .find(|row| row["code"] == "insufficient_ontology_subset_lift")
+        })
+        .and_then(|row| row["detail"].as_str())
+        .expect("receipt must carry the subset-lift violation detail");
+    let number_after = |marker: &str| -> f64 {
+        detail
+            .split(marker)
+            .nth(1)
+            .and_then(|tail| tail.split_whitespace().next())
+            .map(|token| {
+                token.trim_end_matches(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')
+            })
+            .and_then(|token| token.parse().ok())
+            .unwrap_or_else(|| panic!("detail has no number after '{marker}': {detail}"))
+    };
+    (
+        number_after("subset lift "),
+        number_after("< "),
+        number_after("baseline "),
+        number_after("candidate "),
+    )
+}
+
+/// C37: the eval-honesty chain must be one mechanical path from the receipt to
+/// the contract and the recomputed verdict — never a hand-mirrored constant.
+#[test]
+fn eval_honesty_chain_is_mechanically_linked_to_receipt() {
+    let contract = load_evaluation_contract();
+    let receipt = load_semantic_receipt(&contract);
+    let (measured, threshold, baseline, candidate) = receipt_subset_lift_numbers(&receipt);
+    let gate = &contract["semantic_lift_gate"];
+
+    assert_eq!(
+        measured,
+        gate["measured_alias_hierarchy_recall_at_5_lift"]
+            .as_f64()
+            .unwrap(),
+        "contract measured lift drifted from the receipt"
+    );
+    assert_eq!(
+        baseline,
+        gate["measured_baseline_subset_recall_at_5"]
+            .as_f64()
+            .unwrap()
+    );
+    assert_eq!(
+        candidate,
+        gate["measured_candidate_subset_recall_at_5"]
+            .as_f64()
+            .unwrap()
+    );
+    assert_eq!(threshold, gate["threshold"].as_f64().unwrap());
+    assert_eq!(
+        threshold,
+        contract["thresholds"]["ontology_lift"].as_f64().unwrap()
+    );
+
+    let expected = if measured < threshold { "FAIL" } else { "PASS" };
+    assert_eq!(gate["verdict"].as_str(), Some(expected));
+    assert_eq!(receipt["verdict"].as_str(), Some(expected));
+
+    // No hand-copied mirror of the receipt numbers may survive in the metrics
+    // test source; it must derive them from the same artifact.
+    let metrics_src = include_str!("semantic_eval_metrics_test.rs");
+    for hand_copied in ["0.042857", "0.661905", "0.704762"] {
+        assert!(
+            !metrics_src.contains(hand_copied),
+            "hand-copied receipt value {hand_copied} in semantic_eval_metrics_test.rs"
+        );
+    }
+}
+
 /// Spec §6 R8.3: pin every acceptance threshold to its exact declared value,
 /// and assert the owner-labeled task sets are a declaration only.
 #[test]
@@ -1041,8 +1181,14 @@ fn semantic_lift_gate_remains_honest() {
         measured < 0.10,
         "measured lift {measured} must remain below the 0.10 floor"
     );
-    assert_eq!(gate["verdict"].as_str(), Some("FAIL"));
-    assert_ne!(gate["verdict"].as_str(), Some("PASS"));
+    // C25/C37: recompute the FAIL from the eval receipt; never hard-code it.
+    let receipt = load_semantic_receipt(&contract);
+    let (receipt_measured, receipt_threshold, _, _) = receipt_subset_lift_numbers(&receipt);
+    assert_eq!(measured, receipt_measured, "gate lift must come from the receipt");
+    assert_eq!(threshold, receipt_threshold);
+    let expected_verdict = if measured < threshold { "FAIL" } else { "PASS" };
+    assert_eq!(gate["verdict"].as_str(), Some(expected_verdict));
+    assert_eq!(receipt["verdict"].as_str(), Some(expected_verdict));
     assert_eq!(gate["production_claim"].as_bool(), Some(false));
     assert_eq!(gate["default_ranking_roi_claimed"].as_bool(), Some(false));
 }

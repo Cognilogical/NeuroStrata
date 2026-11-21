@@ -402,34 +402,67 @@ fn per_query_p95_medians_still_use_three_iteration_medians() {
     assert!((medians[1] - 20.0).abs() < 1e-12);
 }
 
+/// C37: read the mixed-subset figures from the checked-in receipt instead of
+/// hand-mirroring them. One mechanical chain: receipt -> this test -> gate.
+fn recorded_subset_lift_numbers() -> (f64, f64, f64) {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("eval/semantic/retrieval-receipt.json");
+    let text = std::fs::read_to_string(&path).expect("read semantic receipt");
+    let receipt: serde_json::Value = serde_json::from_str(&text).expect("strict JSON receipt");
+    let detail = receipt["gate"]["violations"]
+        .as_array()
+        .and_then(|rows| {
+            rows.iter()
+                .find(|row| row["code"] == "insufficient_ontology_subset_lift")
+        })
+        .and_then(|row| row["detail"].as_str())
+        .expect("receipt must carry the subset-lift violation detail");
+    let number_after = |marker: &str| -> f64 {
+        detail
+            .split(marker)
+            .nth(1)
+            .and_then(|tail| tail.split_whitespace().next())
+            .map(|token| {
+                token.trim_end_matches(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')
+            })
+            .and_then(|token| token.parse().ok())
+            .unwrap_or_else(|| panic!("detail has no number after '{marker}': {detail}"))
+    };
+    (
+        number_after("subset lift "),
+        number_after("baseline "),
+        number_after("candidate "),
+    )
+}
+
 /// R8.1 honesty guard (additive): the recorded mixed alias+hierarchy subset
-/// lift (0.042857 in eval/semantic/retrieval-receipt.json) is below the 0.10
-/// floor, so the accepted gate must still fail closed with the subset-lift
-/// violation. Mirrors the receipt; never weakens the existing gate tests.
+/// lift is below the 0.10 floor, so the accepted gate must still fail closed
+/// with the subset-lift violation. Never weakens the existing gate tests.
 #[test]
 fn recorded_mixed_subset_lift_gate_fails_honestly() {
+    let (lift, baseline, candidate) = recorded_subset_lift_numbers();
     let arm3 = ArmMetrics {
         arm: RetrievalArm::FlatAliases,
         ndcg_at_10: 0.55,
-        recall_at_5: 0.661905,
+        recall_at_5: baseline,
         precision_at_5: 0.62,
         ontology_recall_at_5: 0.45,
         p95_ms: 100.0,
         queries: vec![
-            query("q-alias", QueryCategory::Alias, 0.55, 0.661905, 0.60),
-            query("q-hier", QueryCategory::Hierarchy, 0.55, 0.661905, 0.60),
+            query("q-alias", QueryCategory::Alias, 0.55, baseline, 0.60),
+            query("q-hier", QueryCategory::Hierarchy, 0.55, baseline, 0.60),
         ],
     };
     let arm4 = ArmMetrics {
         arm: RetrievalArm::Ontology,
         ndcg_at_10: 0.56,
-        recall_at_5: 0.704762,
+        recall_at_5: candidate,
         precision_at_5: 0.61,
         ontology_recall_at_5: 0.46,
         p95_ms: 105.0,
         queries: vec![
-            query("q-alias", QueryCategory::Alias, 0.56, 0.704762, 0.60),
-            query("q-hier", QueryCategory::Hierarchy, 0.56, 0.704762, 0.60),
+            query("q-alias", QueryCategory::Alias, 0.56, candidate, 0.60),
+            query("q-hier", QueryCategory::Hierarchy, 0.56, candidate, 0.60),
         ],
     };
     let report = gate_ok(&arm3, &arm4);
@@ -440,7 +473,7 @@ fn recorded_mixed_subset_lift_gate_fails_honestly() {
         .find(|v| v.code == "insufficient_ontology_subset_lift")
         .expect("subset-lift violation must remain enforced");
     assert!(
-        violation.detail.contains("0.042857"),
+        violation.detail.contains(&format!("{lift:.6}")),
         "unexpected measured lift: {}",
         violation.detail
     );

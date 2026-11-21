@@ -3471,25 +3471,15 @@ pub async fn handle_task_validate(args: Value, store: Arc<dyn VectorStore>) -> S
         &ledger,
         &active_ids,
     ));
-    // ReBAC: restricted concept/thesis rows are neither counted nor exposed.
-    // Reuse the same public-access policy the taxonomy view applies, so an
-    // advisory cannot leak the existence of a private row through a boolean.
-    let concept_rows: Vec<&SearchResult> = memories
-        .iter()
-        .filter(|r| {
-            matches!(r.payload.memory_type.as_str(), "concept" | "thesis")
-                && crate::rdf::taxonomy::is_public_access_policy(&r.payload.metadata)
-        })
-        .collect();
-    let taxonomy_available = !concept_rows.is_empty();
-    let concept_grounding_linked = concept_rows.iter().any(|r| {
-        r.payload
-            .metadata
-            .get("extracted_from")
-            .and_then(Value::as_array)
-            .map(|ids| !ids.is_empty())
-            .unwrap_or(false)
-    });
+    // C30: derive the ontology advisories from the SAME active, ReBAC-visible
+    // row pipeline the snapshot readiness view uses. A raw `memories` filter
+    // would count expired/superseded/private concepts as live taxonomy.
+    let (taxonomy_available, concept_grounding_linked) =
+        if let Some(lb) = VectorStore::as_any(&*store).downcast_ref::<LadybugStore>() {
+            crate::rdf::taxonomy::taxonomy_advisory_signal(lb, &namespace).await
+        } else {
+            (false, false)
+        };
     let advisories = graph_advisories::compute_advisories(&graph_advisories::AdvisoryInput {
         ledger: &ledger,
         active_task_ids: &active_ids,
@@ -9991,6 +9981,49 @@ mod tests {
         assert_eq!(parsed["violations"][0]["kind"], json!("in_progress"));
         assert!(parsed.get("stale").is_some());
         assert!(parsed.get("unextracted_done").is_some());
+    }
+
+    /// C30: task_validate's taxonomy signal must come from the same active-row
+    /// pipeline as the snapshot readiness view. A public but expired concept is
+    /// visible to a raw `store.list`, yet the snapshot reports zero concepts.
+    #[tokio::test]
+    async fn task_validate_taxonomy_availability_uses_active_rows_only() {
+        let ns = "TaxValidateNs";
+        let store = store_with_namespace(ns).await;
+        let id = uuid::Uuid::new_v4().to_string();
+        let vector = StubEmbedder.embed("stale concept").await.unwrap();
+        store
+            .upsert(
+                ns,
+                &id,
+                vector,
+                MemoryPayload {
+                    content: "stale concept".to_string(),
+                    user_id: "kenton".to_string(),
+                    memory_type: "concept".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({
+                        "concept": {
+                            "slug": "stale-concept",
+                            "pref_label": "Stale",
+                            "definition": "expired concept"
+                        },
+                        "valid_to": 1
+                    }),
+                },
+            )
+            .await
+            .expect("seed expired public concept");
+
+        let reply = handle_task_validate(json!({ "namespace": ns }), store.clone()).await;
+        let parsed: Value = serde_json::from_str(&reply).expect("json reply");
+        assert_eq!(
+            parsed["advisories"]["graph_ontology"]["taxonomy_available"],
+            json!(false),
+            "expired concept must not set taxonomy_available: {reply}"
+        );
     }
 
     /// R7 fix round 1: a REAL `memories_for_file` response carrying a
