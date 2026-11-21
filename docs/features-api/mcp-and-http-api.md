@@ -11,7 +11,9 @@
 - `neurostrata_diff_tour` — diff tour between versions (separates caller-facing display paths from internal multi-form lookup paths and records canonical project-relative paths in the Graph-First session ledger).
 - `neurostrata_locate` — locate structural code symbols and governing rules (resolves `path_prefix` against optional `project_root` and the namespace's cached `registry_root` across relative and absolute stored spellings, failing closed on unresolvable absolute prefixes).
 - `neurostrata_insights` — evaluate and track architectural insights (accepts optional `project_root`; resolves `path_prefix` dynamically at `snapshot`/`series` time for `lexical` and `ast_calls` insights across relative and absolute stored spellings, failing closed on unresolvable absolute prefixes).
-- `neurostrata_ingest_directory` — ingest a directory into the property graph.
+- `neurostrata_ingest_directory` — ingest a directory into the property graph. On success the resolved directory is auto-registered as a watched root, so subsequent filesystem changes are re-ingested incrementally by the daemon watcher through the same generation ingest path; a failed ingest registers nothing.
+- `neurostrata_watch_status` — read-only report of registered watch roots. Optional `namespace` filters the report. Returns a JSON report (no state mutation). Available over MCP and as `GET /ingest/watch/status` on the daemon.
+- `neurostrata_unwatch` — stop watching a registered root. Requires `namespace` and `dir_path`. The path is resolved through the daemon's J6 caller-path policy (startup root + `allowed_external_dirs`); a path outside those bounds is refused. Returns `{"removed": bool, "namespace": string, "canonical_path": string}`, matching `POST /ingest/watch/unwatch`. The `canonical_path` echo is produced by the core's J6 resolver, so it matches the path actually unregistered even when the caller supplied a relative path or one with a non-existent tail.
 - `neurostrata_ingest_bounded` — ontology-scoped bounded RDF classification + ingest (Capability F). Inputs: `namespace`, `domain`, `candidates` (all required), optional `principal`, `user_id`, `reason`. Each candidate carries `subject`, `class`, `predicate` and an `object` that is either `{"iri": "<absolute-iri>"}` or `{"literal": {"value": "...", "datatype"?: "<iri>", "language"?: "<tag>"}}`. The requested `domain` is normalized before the governed class/predicate closure is selected under a fixed finite query budget; `governs_class` is exact-match only, so invented IRIs that collapse onto a slug are rejected. Finite caps apply to candidate count (256), IRI length (2048 bytes) and literal length (65536 bytes). The emitted Turtle and the `MemoryPayload` are SHACL-validated before any write; any violation, unknown/empty domain, budget exhaustion, ungoverned class/predicate, malformed term or cap breach fails closed with `{"ok": false, "error": ...}` and zero writes. A successful call commits exactly one idempotent batch memory (`bounded-ingest-<sha256>`) and returns `{"ok": true, "id", "namespace", "domain", "triple_count", "turtle"}`. A ReBAC namespace write gate (`can_write_namespace` on the resolved principal) protects the write; there is no permissive opt-out and no CLI/daemon surface for this tool.
 - `neurostrata_append_log` — append conversational transcript log entries.
 - `neurostrata_bootstrap` — initialize a new project namespace.
@@ -66,20 +68,22 @@ Active-task resolution is session/worktree scoped: when the daemon returns sever
 
 ## HTTP Daemon Endpoints
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/mcp` | Root MCP server entry point |
-| POST | `/ingest` | Ingest files/directories into the property graph |
-| POST | `/backup` | Backup current state to archive |
-| POST | `/export-graph` | Export the full knowledge graph (RDF/SPARQL) |
-| POST | `/tasks/gate` | Run documentation gate checks |
-| GET | `/twin` | Digital twin state retrieval |
-| POST | `/scenario` | Create a counterfactual scenario |
-| POST | `/action` | Apply a kinetic action (state machine mutation) |
-| POST | `/data-connector` | Execute a DataConnector command (list/describe/register-pointer/resolve/apply-effect/mediate) |
-| POST | `/vault-sync` | Bidirectional Vault-LD Markdown sync (export/import); `vault_path`/`output_dir` validated against the daemon startup root + `allowed_external_dirs` before any filesystem access |
-| GET | `/taxonomy` | Query SKOS concept graph |
-| POST | `/graphql` | Execute GraphQL queries over the ontology |
+| Method | Path                    | Description                                                                                                                                                                      |
+| ------ | ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| GET    | `/mcp`                  | Root MCP server entry point                                                                                                                                                      |
+| POST   | `/ingest`               | Ingest files/directories into the property graph                                                                                                                                 |
+| GET    | `/ingest/watch/status`  | Read-only report of registered watch roots (optional `namespace` query parameter)                                                                                                |
+| POST   | `/ingest/watch/unwatch` | Stop watching a registered root; returns `{removed, namespace, canonical_path}`; J6 path policy applies                                                                          |
+| POST   | `/backup`               | Backup current state to archive                                                                                                                                                  |
+| POST   | `/export-graph`         | Export the full knowledge graph (RDF/SPARQL)                                                                                                                                     |
+| POST   | `/tasks/gate`           | Run documentation gate checks                                                                                                                                                    |
+| GET    | `/twin`                 | Digital twin state retrieval                                                                                                                                                     |
+| POST   | `/scenario`             | Create a counterfactual scenario                                                                                                                                                 |
+| POST   | `/action`               | Apply a kinetic action (state machine mutation)                                                                                                                                  |
+| POST   | `/data-connector`       | Execute a DataConnector command (list/describe/register-pointer/resolve/apply-effect/mediate)                                                                                    |
+| POST   | `/vault-sync`           | Bidirectional Vault-LD Markdown sync (export/import); `vault_path`/`output_dir` validated against the daemon startup root + `allowed_external_dirs` before any filesystem access |
+| GET    | `/taxonomy`             | Query SKOS concept graph                                                                                                                                                         |
+| POST   | `/graphql`              | Execute GraphQL queries over the ontology                                                                                                                                        |
 
 All endpoints are served by the **neurostrata-mcp daemon** on `127.0.0.1:34343`. Tauri acts as a lightweight HTTP client; Cursor MCP integration proxies stdio JSON-RPC requests.
 
@@ -87,4 +91,4 @@ All endpoints are served by the **neurostrata-mcp daemon** on `127.0.0.1:34343`.
 
 ## Storage Status Surfaces
 
-`storage status` has two provenance layers since #212. The path-only (no-open) surface — used by the CLI's dispatch and by callers that must not open the store — reports filesystem and store-state sidecar facts: `wal_bytes`, `wal_age_secs` (age of the active WAL, regular files only), `checkpoint_failures`, and the persisted `last_recovery { at, kind, wal_bytes }` history. The live-handle surface additionally owns `opened_via_recovery` and its kind *exclusively*: a verified live store never reports recovery because the sidecar holds a `last_recovery` entry. Identity writes (`has_data`, descriptor) and health writes (checkpoint health) are split (`write_store_state_identity` vs. the health writers), and a fresh process still reports the last real checkpoint because `record_checkpoint_outcome` persists to the sidecar (best effort, never propagated).
+`storage status` has two provenance layers since #212. The path-only (no-open) surface — used by the CLI's dispatch and by callers that must not open the store — reports filesystem and store-state sidecar facts: `wal_bytes`, `wal_age_secs` (age of the active WAL, regular files only), `checkpoint_failures`, and the persisted `last_recovery { at, kind, wal_bytes }` history. The live-handle surface additionally owns `opened_via_recovery` and its kind _exclusively_: a verified live store never reports recovery because the sidecar holds a `last_recovery` entry. Identity writes (`has_data`, descriptor) and health writes (checkpoint health) are split (`write_store_state_identity` vs. the health writers), and a fresh process still reports the last real checkpoint because `record_checkpoint_outcome` persists to the sidecar (best effort, never propagated).
