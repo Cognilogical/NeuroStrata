@@ -195,6 +195,13 @@ Prints the namespace configured for a project. Order: `NEUROSTRATA_NAMESPACE` in
 neurostrata-mcp namespace resolve [dir]
 ```
 
+### `root show`
+Read-only. Prints the project marker `.NeuroStrata/config.json` that applies to `dir` (default: the current folder) and how it was found, its namespace and `source_id`, whether git tracks it (`unknown` when git fails), the cached root, other markers below the marker root (in a linked worktree also those only in the main checkout, labeled), and project-context bindings to missing folders (`unknown` when the user config cannot be read). It notes a `.NeuroStrata` folder spelled in another letter case, which is not a marker. It starts no daemon; with no daemon it takes the store lock and holds it while it reads the store.
+```bash
+neurostrata-mcp root show [dir]
+```
+The marker is strict JSON: `version` 1, `namespace`, and optionally `source_id` (a string, not `null`); `src/schemas/root-config.schema.json` documents it. A new marker is published with a hard link, so the filesystem must support hard links (exFAT and FAT do not). The home folder, a filesystem or drive root, and a folder outside git with a checkout below it may not hold a marker; that last check looks four levels down and skips `node_modules` and `target`.
+
 ---
 
 ## 5. SynapticMesh (Git Team Memory Sync)

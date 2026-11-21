@@ -38,11 +38,23 @@ const NESTED_GIT_SKIP: &[&str] = &["node_modules", "target", ".git"];
 pub struct RootConfig {
     pub version: u32,
     pub namespace: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// When present it must be a string: `null` is refused, as the schema
+    /// refuses it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_string"
+    )]
     pub source_id: Option<String>,
     /// Fields this build does not know; kept so a rewrite does not drop them.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Called only for a field that is present, so `null` is an error rather
+/// than `None`.
+fn present_string<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Option<String>, D::Error> {
+    String::deserialize(de).map(Some)
 }
 
 impl RootConfig {
@@ -463,12 +475,21 @@ fn linked_main_checkout(top: &Path) -> Option<PathBuf> {
 /// Step 2's walk in the main checkout `main` for the worktree-relative `rel`.
 fn main_checkout_walk(main: &Path, rel: &Path) -> Option<(PathBuf, MarkerRead)> {
     // Built top down so the walk stops before a folder that holds its own
-    // `.git`, and at the first folder missing from `main`.
+    // `.git`, at the first folder missing from `main`, and at a symlink or
+    // junction or any folder whose canonical form leaves `main`: a link in
+    // the main checkout may point into another repository, whose markers
+    // are not this worktree's.
+    let main_canonical = dunce::canonicalize(main).unwrap_or_else(|_| main.to_path_buf());
     let mut allowed = vec![main.to_path_buf()];
     let mut dir = main.to_path_buf();
     for part in rel.components() {
         dir.push(part);
-        if !dir.is_dir() || dir.join(".git").exists() {
+        let real_dir = std::fs::symlink_metadata(&dir)
+            .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink());
+        if !real_dir
+            || dir.join(".git").exists()
+            || !dunce::canonicalize(&dir).is_ok_and(|c| c.starts_with(&main_canonical))
+        {
             break;
         }
         allowed.push(dir.clone());
@@ -478,12 +499,30 @@ fn main_checkout_walk(main: &Path, rel: &Path) -> Option<(PathBuf, MarkerRead)> 
 
 /// The marker in `dir` when there is one to report, valid or unreadable. A
 /// `.NeuroStrata` that is a link pointing elsewhere, or a folder without
-/// `config.json`, is none.
+/// `config.json`, is none. Only a missing `.NeuroStrata` is absent: one that
+/// cannot be inspected (no permission, say) is `Unreadable`, so the walk
+/// does not silently pass it for a marker further up.
 fn marker_at(dir: &Path) -> Option<(PathBuf, MarkerRead)> {
     let folder = dir.join(".NeuroStrata");
-    if std::fs::symlink_metadata(&folder).is_err()
-        || !crate::source_context::is_valid_marker_directory(&folder)
-    {
+    match std::fs::symlink_metadata(&folder) {
+        Ok(_) => {}
+        // NotADirectory: a step of a missing path that is a file.
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return None
+        }
+        Err(err) => {
+            return Some((
+                dir.to_path_buf(),
+                MarkerRead::Unreadable { path: folder, reason: err.to_string() },
+            ))
+        }
+    }
+    if !crate::source_context::is_valid_marker_directory(&folder) {
         return None;
     }
     match read_marker(dir) {
@@ -546,15 +585,17 @@ pub enum CachedRoot {
 
 /// The text of `neurostrata-mcp root show` for the absolute folder `dir`.
 /// `namespace` is the marker's namespace, else the one the project resolves
-/// to without a marker; `bindings` are the configured project contexts.
-/// Nested markers are listed below the marker root (below `dir` when no
-/// marker applies).
+/// to without a marker; `bindings` are the configured project contexts, or
+/// why the user config could not be read. Nested markers are listed below
+/// the marker root (below `dir` when no marker applies); in a linked
+/// worktree, also those that exist only in the main checkout, since they
+/// apply to the worktree too.
 pub fn format_root_show(
     dir: &Path,
     found: &Result<Option<FoundMarker>, (PathBuf, String)>,
     namespace: &str,
     cached: &CachedRoot,
-    bindings: &std::collections::HashMap<String, PathBuf>,
+    bindings: &Result<std::collections::HashMap<String, PathBuf>, String>,
 ) -> String {
     let mut out = vec![format!("folder: {}", dir.display())];
     let mut marker_root = None;
@@ -581,6 +622,12 @@ pub fn format_root_show(
             out.push(format!("namespace without a marker: {namespace}"));
         }
     }
+    for folder in miscased_marker_folders(dir) {
+        out.push(format!(
+            "note: {} is not spelled .NeuroStrata, so it is not a marker",
+            folder.display()
+        ));
+    }
     match cached {
         CachedRoot::Known(Some(root)) => {
             let exists = Path::new(root).is_dir();
@@ -606,43 +653,99 @@ pub fn format_root_show(
     }
     let walk_root = marker_root.unwrap_or_else(|| dir.to_path_buf());
     let nested = nested_markers(&walk_root);
+    // A split marker kept only in the main checkout (uncommitted, say) still
+    // decides paths in this worktree; one the worktree has itself wins.
+    let main_root = in_main_checkout(&walk_root);
+    let main_only: Vec<_> = if main_root == walk_root {
+        Vec::new()
+    } else {
+        nested_markers(&main_root)
+            .into_iter()
+            .filter(|(path, _)| {
+                let rel = path.strip_prefix(&main_root).ok();
+                !nested.iter().any(|(own, _)| own.strip_prefix(&walk_root).ok() == rel)
+            })
+            .collect()
+    };
+    let count = nested.len() + main_only.len();
     out.push(format!(
         "nested markers below {} (up to {NESTED_MARKER_MAX_DEPTH} levels, other checkouts not entered): {}",
         walk_root.display(),
-        if nested.is_empty() { "none".to_string() } else { nested.len().to_string() }
+        if count == 0 { "none".to_string() } else { count.to_string() }
     ));
-    for (path, read) in &nested {
+    let labeled = nested
+        .iter()
+        .map(|hit| (hit, ""))
+        .chain(main_only.iter().map(|hit| (hit, ", only in the main checkout")));
+    for ((path, read), label) in labeled {
         match read {
             MarkerRead::Valid(cfg) => {
-                out.push(format!("  {} (namespace {})", path.display(), cfg.namespace))
+                out.push(format!("  {} (namespace {}{label})", path.display(), cfg.namespace))
             }
             MarkerRead::Unreadable { reason, .. } => {
-                out.push(format!("  {} (unreadable: {reason})", path.display()))
+                out.push(format!("  {} (unreadable: {reason}{label})", path.display()))
             }
             MarkerRead::Absent => {}
         }
     }
-    let mut missing: Vec<_> = bindings.iter().filter(|(_, path)| !path.exists()).collect();
-    missing.sort();
-    out.push(format!(
-        "project-context bindings to missing folders: {}",
-        if missing.is_empty() { "none".to_string() } else { missing.len().to_string() }
-    ));
-    for (source_id, path) in missing {
-        out.push(format!("  {source_id} -> {}", path.display()));
+    match bindings {
+        Ok(bindings) => {
+            let mut missing: Vec<_> = bindings.iter().filter(|(_, path)| !path.exists()).collect();
+            missing.sort();
+            out.push(format!(
+                "project-context bindings to missing folders: {}",
+                if missing.is_empty() { "none".to_string() } else { missing.len().to_string() }
+            ));
+            for (source_id, path) in missing {
+                out.push(format!("  {source_id} -> {}", path.display()));
+            }
+        }
+        Err(why) => out.push(format!(
+            "project-context bindings to missing folders: unknown (config could not be read: {why})"
+        )),
     }
     out.join("\n")
 }
 
-fn same_folder(a: &Path, b: &Path) -> bool {
-    match (dunce::canonicalize(a), dunce::canonicalize(b)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => a == b,
+/// Folders named `.NeuroStrata` in another letter case in `dir` or the
+/// folders above it that a marker walk visits (up to the checkout top, or
+/// every ancestor outside git). Such a folder is not a marker, also where
+/// the filesystem ignores case.
+fn miscased_marker_folders(dir: &Path) -> Vec<PathBuf> {
+    let top = checkout_top(dir);
+    let mut found = Vec::new();
+    for folder in dir.ancestors() {
+        if top.as_deref().is_some_and(|top| !folder.starts_with(top)) {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(folder) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name != ".NeuroStrata" && name.eq_ignore_ascii_case(".NeuroStrata") {
+                found.push(entry.path());
+            }
+        }
     }
+    found
+}
+
+/// Whether `a` and `b` name one folder: by spelling, else on disk (through
+/// links and the nearest existing ancestor), by the rule the path lookups
+/// use. `relative_to_on_disk` answers only for a path strictly below the
+/// root, so a child name that does not exist is compared.
+fn same_folder(a: &Path, b: &Path) -> bool {
+    const PROBE: &str = ".neurostrata-same-folder-probe";
+    let probe = a.join(PROBE);
+    crate::paths::relative_to_on_disk(&probe.to_string_lossy(), &b.to_string_lossy()).as_deref()
+        == Some(PROBE)
 }
 
 /// `yes`/`no` by `git ls-files --error-unmatch`, run in the checkout that
-/// holds the file.
+/// holds the file: exit 1 is "no", any other failure (a checkout git
+/// refuses, say) is "unknown".
 fn git_tracks_marker(marker_dir: &Path, via: FoundVia) -> String {
     if via == FoundVia::NoGit {
         return "no (not in a git checkout)".to_string();
@@ -656,7 +759,11 @@ fn git_tracks_marker(marker_dir: &Path, via: FoundVia) -> String {
         .status()
     {
         Ok(status) if status.success() => "yes".to_string(),
-        Ok(_) => "no".to_string(),
+        Ok(status) if status.code() == Some(1) => "no".to_string(),
+        Ok(status) => match status.code() {
+            Some(code) => format!("unknown (git exit {code})"),
+            None => "unknown (git was stopped by a signal)".to_string(),
+        },
         Err(err) => format!("unknown (git could not run: {err})"),
     }
 }
@@ -1085,7 +1192,7 @@ mod tests {
             &found,
             "example-project",
             &CachedRoot::Known(Some(base.join("old").to_string_lossy().into_owned())),
-            &bindings,
+            &Ok(bindings.clone()),
         );
         assert!(text.contains(&format!("marker root: {}", repo.display())), "{text}");
         assert!(text.contains("found via: own_checkout"), "{text}");
@@ -1105,7 +1212,7 @@ mod tests {
             &Ok(None),
             "example-project",
             &CachedRoot::Unknown("no daemon, store locked".into()),
-            &std::collections::HashMap::new(),
+            &Ok(std::collections::HashMap::new()),
         );
         assert!(text.contains("cached root: unknown (no daemon, store locked)"), "{text}");
         assert!(text.contains("other checkouts not entered): none"), "{text}");
@@ -1122,7 +1229,7 @@ mod tests {
             &find_root_marker(dir),
             "example-project",
             &CachedRoot::Known(Some(cached.to_string_lossy().into_owned())),
-            &std::collections::HashMap::new(),
+            &Ok(std::collections::HashMap::new()),
         )
     }
 
@@ -1207,8 +1314,170 @@ mod tests {
             &Ok(None),
             "example-project",
             &CachedRoot::Known(None),
-            &std::collections::HashMap::new(),
+            &Ok(std::collections::HashMap::new()),
         );
         assert!(text.contains(&format!("nested markers below {} (", plain.join("x").display())), "{text}");
+    }
+
+    #[test]
+    fn null_source_id_is_unreadable() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_raw(tmp.path(), br#"{"version":1,"namespace":"example-project","source_id":null}"#);
+        assert!(matches!(read_marker(tmp.path()), MarkerRead::Unreadable { .. }));
+        write_raw(tmp.path(), br#"{"version":1,"namespace":"example-project","source_id":7}"#);
+        assert!(matches!(read_marker(tmp.path()), MarkerRead::Unreadable { .. }));
+        // Left out is still fine.
+        write_raw(tmp.path(), br#"{"version":1,"namespace":"example-project"}"#);
+        assert!(matches!(read_marker(tmp.path()), MarkerRead::Valid(_)));
+    }
+
+    #[test]
+    fn main_checkout_walk_stops_at_a_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        layout(
+            &base,
+            r#"["repo git-dir", "repo marker:example-project",
+                "repo/.git/worktrees/wt commondir:../..", "wt/pkg/x",
+                "wt git-file:../repo/.git/worktrees/wt",
+                "other git-dir", "other/sub marker:example-other", "other/sub/x"]"#,
+        );
+        // The main checkout's `pkg` is a link into another repository.
+        assert!(link_dir(&under(&base, "other/sub"), &under(&base, "repo/pkg")), "could not create a link");
+        let found = find_root_marker(&under(&base, "wt/pkg/x")).unwrap().unwrap();
+        assert_eq!(found.config.namespace, "example-project");
+        assert_eq!(found.root, base.join("wt"));
+        assert_eq!(found.via, FoundVia::MainCheckout);
+    }
+
+    #[test]
+    fn uninspectable_neurostrata_is_unreadable_not_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A name the OS refuses: inspecting `.NeuroStrata` under it fails
+        // with an error other than "not found".
+        let dir = tmp.path().join("bad\0name");
+        match marker_at(&dir) {
+            Some((at, MarkerRead::Unreadable { path, reason })) => {
+                assert_eq!(at, dir);
+                assert_eq!(path, dir.join(".NeuroStrata"));
+                assert!(!reason.is_empty());
+            }
+            other => panic!("expected an unreadable marker, got {other:?}"),
+        }
+        // A missing folder, or a missing path below a file, is absent.
+        assert_eq!(marker_at(&tmp.path().join("missing")), None);
+        std::fs::write(tmp.path().join("file"), b"").unwrap();
+        assert_eq!(marker_at(&tmp.path().join("file").join("x")), None);
+    }
+
+    #[test]
+    fn git_failure_is_unknown_not_untracked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        // A `.git` file pointing nowhere: git refuses the checkout (exit 128).
+        let broken = base.join("broken");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(broken.join(".git"), "gitdir: does-not-exist\n").unwrap();
+        write_raw(&broken, br#"{"version":1,"namespace":"example-project"}"#);
+        let answer = git_tracks_marker(&broken, FoundVia::OwnCheckout);
+        assert!(answer.starts_with("unknown (git exit "), "{answer}");
+
+        // A real checkout with the marker untracked: exit 1, "no".
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let init = std::process::Command::new("git").arg("-C").arg(&repo).args(["init", "-q"]).status();
+        if !init.is_ok_and(|s| s.success()) {
+            eprintln!("skipped the untracked half: git init failed");
+            return;
+        }
+        write_raw(&repo, br#"{"version":1,"namespace":"example-project"}"#);
+        assert_eq!(git_tracks_marker(&repo, FoundVia::OwnCheckout), "no");
+    }
+
+    #[test]
+    fn root_show_in_worktree_lists_main_only_split_markers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        layout(
+            &base,
+            r#"["repo git-dir", "repo marker:example-project",
+                "repo/packages/api marker:example-api", "repo/packages/web marker:example-web",
+                "repo/.git/worktrees/wt commondir:../..", "wt/packages/web marker:example-web",
+                "wt git-file:../repo/.git/worktrees/wt"]"#,
+        );
+        let wt = base.join("wt");
+        let text = show(&wt, &base.join("repo"));
+        assert!(text.contains("found via: main_checkout"), "{text}");
+        assert!(text.contains(": 2\n"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "  {} (namespace example-api, only in the main checkout)",
+                under(&base, "repo/packages/api").display()
+            )),
+            "{text}"
+        );
+        // The worktree's own copy is listed once, without the label.
+        assert!(
+            text.contains(&format!("  {} (namespace example-web)", under(&base, "wt/packages/web").display())),
+            "{text}"
+        );
+        assert!(!text.contains(&under(&base, "repo/packages/web").display().to_string()), "{text}");
+        // The marker it lists is the one find_root_marker answers there.
+        let found = find_root_marker(&under(&base, "wt/packages/api")).unwrap().unwrap();
+        assert_eq!(found.config.namespace, "example-api");
+    }
+
+    #[test]
+    fn root_show_reports_unreadable_config_and_miscased_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        let repo = base.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join(".neurostrata")).unwrap();
+        std::fs::write(repo.join(".neurostrata/config.json"), br#"{"version":1,"namespace":"example-project"}"#)
+            .unwrap();
+        let text = format_root_show(
+            &repo,
+            &find_root_marker(&repo),
+            "example-project",
+            &CachedRoot::Known(None),
+            &Err("config.json: expected value at line 1 column 1".to_string()),
+        );
+        assert!(text.contains("marker root: none"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "note: {} is not spelled .NeuroStrata, so it is not a marker",
+                repo.join(".neurostrata").display()
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "project-context bindings to missing folders: unknown (config could not be read: config.json: expected value"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn same_folder_compares_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        assert!(same_folder(&repo, &repo));
+        assert!(!same_folder(&base, &repo));
+        assert!(!same_folder(&repo.join("gone"), &repo));
+        // A link to the folder is the same folder.
+        let alias = base.join("alias");
+        assert!(link_dir(&repo, &alias), "could not create a link");
+        assert!(same_folder(&alias, &repo));
+        // Another spelling of the same path.
+        #[cfg(windows)]
+        {
+            let raw = repo.to_string_lossy().into_owned();
+            let other = format!("{}{}", raw[..1].to_ascii_lowercase(), raw[1..].replace('\\', "/"));
+            assert!(same_folder(Path::new(&other), &repo));
+        }
     }
 }

@@ -2277,9 +2277,33 @@ fn hold_store_lock_for_copy(db_path: &std::path::Path) -> anyhow::Result<std::fs
     }
 }
 
+/// The configured project contexts for `root show`. No user config file
+/// means no bindings; a file that exists but cannot be read or parsed is
+/// reported, not shown as "none".
+fn root_show_bindings() -> Result<std::collections::HashMap<String, std::path::PathBuf>, String> {
+    let path = Config::default_path().map_err(|e| format!("{e:#}"))?;
+    root_show_bindings_from(&path)
+}
+
+fn root_show_bindings_from(
+    path: &std::path::Path,
+) -> Result<std::collections::HashMap<String, std::path::PathBuf>, String> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(std::collections::HashMap::new())
+        }
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+        Ok(_) => {}
+    }
+    Config::load_from(path)
+        .map(|c| c.project_contexts)
+        .map_err(|e| format!("{}: {e:#}", path.display()))
+}
+
 /// The registry's cached root for `root show`: from a daemon that answers
 /// (after the same identity check the gate makes), else from the store opened
-/// here when no process holds it. Never starts a daemon, never writes: the
+/// here while this process holds the store lock. Never starts a daemon and
+/// never writes the store (it may create the empty lock file): the
 /// store is opened only when it has no write-ahead log to replay and no
 /// recovery copies an open would prune, is not
 /// initialized (`init` runs DDL and store-state sidecar writes), and is only
@@ -2319,17 +2343,35 @@ async fn root_show_cached_root(
         Ok(config) => config,
         Err(e) => return CachedRoot::Unknown(format!("the config could not be read: {e}")),
     };
-    if daemon_holds_lock(&config.db_path) {
-        return CachedRoot::Unknown("no daemon, store locked".to_string());
+    if !config.db_path.exists() {
+        return CachedRoot::Unknown(format!("no store at {}", config.db_path.display()));
     }
+    // The store lock is taken and held until the read below is done, as
+    // `hold_store_lock_for_copy` does: a daemon that starts after a mere probe
+    // could write a log between the checks below and the open. Taking it
+    // creates the empty lock file when it is missing.
+    let _lock = match open_daemon_lock(&config.db_path) {
+        Ok(file) => match file.try_lock() {
+            Ok(()) => file,
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return CachedRoot::Unknown("no daemon, store locked".to_string())
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                return CachedRoot::Unknown(format!("the store lock could not be taken: {e}"))
+            }
+        },
+        Err(e) => {
+            return CachedRoot::Unknown(format!(
+                "the store lock could not be opened ({}): {e}",
+                daemon_lock_path(&config.db_path).display()
+            ))
+        }
+    };
     if probe == DaemonProbe::Silent {
         return CachedRoot::Unknown(
             "nothing answered on 127.0.0.1:34343 within 500ms, so a daemon may be busy; not opening the store"
                 .to_string(),
         );
-    }
-    if !config.db_path.exists() {
-        return CachedRoot::Unknown(format!("no store at {}", config.db_path.display()));
     }
     // Opening a store with a write-ahead log left behind replays it, which
     // writes; only a store closed cleanly is opened here.
@@ -4021,6 +4063,16 @@ mod tests {
             }
             other => panic!("expected Root/Show, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn root_show_bindings_missing_config_is_none_unreadable_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+        assert_eq!(root_show_bindings_from(&path), Ok(std::collections::HashMap::new()));
+        std::fs::write(&path, b"{ not json").unwrap();
+        let err = root_show_bindings_from(&path).unwrap_err();
+        assert!(err.contains(&path.display().to_string()), "{err}");
     }
 
     #[test]
@@ -6362,7 +6414,7 @@ async fn run() -> anyhow::Result<()> {
                     _ => crate::task::harness_plugins::resolve_project_namespace(&folder),
                 };
                 let cached = root_show_cached_root(probe_daemon().await, &namespace).await;
-                let bindings = Config::load().map(|c| c.project_contexts).unwrap_or_default();
+                let bindings = root_show_bindings();
                 println!(
                     "{}",
                     crate::root_marker::format_root_show(&folder, &found, &namespace, &cached, &bindings)
