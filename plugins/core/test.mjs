@@ -2793,6 +2793,72 @@ describe('round-8: Codex apply_patch extraction, decoded ledger matching, and ba
     }
   })
 
+  it('apply_patch raw hook input reaches guard_validate as the patch, not "{}"', async () => {
+    const { server, url, counters } = await createMockDaemonServer()
+    try {
+      await initialize({
+        config: {
+          namespace: 'r8-ns',
+          endpoint: url,
+          bearerToken: 'tok',
+          strictMode: true,
+          requestTimeoutMs: 500
+        },
+        tool: { hook: async () => {} },
+        hooks: {}
+      })
+      const patch = '*** Update File: src/codex.rs\n@@\n-a\n+b\n'
+      await handleHookEvent({
+        hook_event_name: 'PreToolUse',
+        tool_name: 'apply_patch',
+        input: patch
+      })
+      assert.equal(counters.guardValidate, 1)
+      const payload = counters.guardArgs[0].payload
+      assert.ok(
+        typeof payload === 'string' && payload.includes('*** Update File:'),
+        `the raw patch must reach guard_validate, got ${payload}`
+      )
+      assert.notEqual(payload, '{}')
+    } finally {
+      server.close()
+      resetModuleState()
+    }
+  })
+
+  it('beforeToolExec forwards a raw apply_patch string to guard_validate', async () => {
+    const { server, url, counters } = await createMockDaemonServer()
+    try {
+      let beforeExecFn = null
+      await initialize({
+        config: {
+          namespace: 'r8-ns',
+          endpoint: url,
+          bearerToken: 'tok',
+          strictMode: true,
+          requestTimeoutMs: 500
+        },
+        hooks: {
+          beforeToolExec: async (fn) => {
+            beforeExecFn = fn
+          }
+        }
+      })
+      const patch = '*** Update File: src/codex.rs\n@@\n-a\n+b\n'
+      await beforeExecFn({ tool: 'apply_patch', input: patch })
+      assert.equal(counters.guardValidate, 1)
+      const payload = counters.guardArgs[0].payload
+      assert.ok(
+        typeof payload === 'string' && payload.includes('*** Update File:'),
+        `the raw patch must reach guard_validate, got ${payload}`
+      )
+      assert.notEqual(payload, '{}')
+    } finally {
+      server.close()
+      resetModuleState()
+    }
+  })
+
   // A file name containing a double quote cannot exist on Windows.
   it(
     'pre-commit matches JSON-escaped unicode/quote paths and appends missing files in one write',
