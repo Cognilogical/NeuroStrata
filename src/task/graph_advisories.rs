@@ -159,10 +159,11 @@ pub struct DispatchProof {
 }
 
 /// Which trigger a tool call actually follows. An explicit hint (the
-/// `next_action` the caller is dispatching) wins, otherwise the tool's single
-/// canonical trigger applies. `related` serves both `T_HIGH_BLAST` and
-/// `T_SEED_EXPAND`, so only the hint can honestly tell them apart (C32). A hint
-/// incompatible with the tool is ignored, never trusted.
+/// `next_action` the caller is dispatching) wins. `related` serves both
+/// `T_HIGH_BLAST` and `T_SEED_EXPAND` with byte-identical args, so with no
+/// hint it MUST abstain — a default mint would falsely resolve the other
+/// trigger (C32). `diff_tour` and taxonomy `advise` map to a single trigger
+/// and keep a safe default. A hint incompatible with the tool is ignored.
 pub fn proof_trigger_for_tool(
     tool: &str,
     operation: Option<&str>,
@@ -179,20 +180,20 @@ pub fn proof_trigger_for_tool(
             return Some(h.to_string());
         }
     }
-    let default = match (tool, operation) {
-        (HIGH_BLAST_TOOL, _) => T_HIGH_BLAST,
-        (DIFF_TOOL, _) => T_DIFF,
-        (TAXONOMY_TOOL, Some("advise")) => T_STRATEGIC,
-        _ => return None,
-    };
-    Some(default.to_string())
+    // Deliberately no `HIGH_BLAST_TOOL` default: only a hint can de-alias it.
+    match (tool, operation) {
+        (DIFF_TOOL, _) => Some(T_DIFF.to_string()),
+        (TAXONOMY_TOOL, Some("advise")) => Some(T_STRATEGIC.to_string()),
+        _ => None,
+    }
 }
 
 /// Pure proof plan for a real tool call. Abstains (`None`) when the call cannot
 /// honestly prove a prescription: no usable seed, fewer than the prescribed
-/// two hops, empty diff text, or a non-`advise` taxonomy operation. `related`
-/// with hops >= 2 is normalized to the canonical two-hop args so a superset
-/// (e.g. three hops) reproduces the prescribed digest (C10).
+/// two hops, empty diff text, a non-`advise` taxonomy operation, or — for
+/// `related` — no trigger hint (C32). `related` with hops >= 2 is normalized to
+/// the canonical two-hop args so a superset (e.g. three hops) reproduces the
+/// prescribed digest (C10).
 pub fn dispatch_proof(
     tool: &str,
     operation: Option<&str>,
@@ -213,8 +214,16 @@ pub fn dispatch_proof(
                 return None;
             }
             Some(DispatchProof {
-                trigger,
-                args: json!({ "namespace": namespace, "id": seed, "max_hops": 2 }),
+                trigger: trigger.clone(),
+                // The hint is part of the prescribed args, so include it in
+                // the canonical digest: a hinted prescription and its real
+                // dispatch must reproduce the exact same action id (C32).
+                args: json!({
+                    "namespace": namespace,
+                    "id": seed,
+                    "max_hops": 2,
+                    "followed_trigger_id": &trigger,
+                }),
                 ids: vec![seed.to_string()],
             })
         }
@@ -712,7 +721,8 @@ mod tests {
     fn advisory_proof_trigger_for_tool_hint_and_default() {
         assert_eq!(
             proof_trigger_for_tool(HIGH_BLAST_TOOL, None, None).as_deref(),
-            Some(T_HIGH_BLAST)
+            None,
+            "related without a hint cannot de-alias its two triggers"
         );
         assert_eq!(
             proof_trigger_for_tool(HIGH_BLAST_TOOL, None, Some(T_SEED_EXPAND)).as_deref(),
@@ -739,6 +749,39 @@ mod tests {
         );
     }
 
+    // oy5c C32 RED: `related` serves two triggers, so without the hint it
+    // cannot mint an honest proof — defaulting to T_HIGH_BLAST falsely
+    // resolves a T_HIGH_BLAST advisory when the agent followed seed expansion.
+    #[test]
+    fn advisory_related_without_hint_abstains() {
+        assert_eq!(
+            proof_trigger_for_tool(HIGH_BLAST_TOOL, None, None).as_deref(),
+            None,
+            "no hint => no honest trigger for related"
+        );
+        assert!(dispatch_proof(
+            HIGH_BLAST_TOOL,
+            Some("related"),
+            Some(&json!({ "namespace": "NS", "id": "seed", "max_hops": 2 })),
+            None,
+            "NS"
+        )
+        .is_none(), "a hint-less related call must abstain");
+        // A compatibility-checked hint de-aliases seed expansion.
+        assert_eq!(
+            dispatch_proof(
+                HIGH_BLAST_TOOL,
+                Some("related"),
+                Some(&json!({ "namespace": "NS", "id": "seed", "max_hops": 2 })),
+                Some(T_SEED_EXPAND),
+                "NS"
+            )
+            .map(|p| p.trigger)
+            .as_deref(),
+            Some(T_SEED_EXPAND)
+        );
+    }
+
     // oy5c C10/C12/C16: proof minting normalizes hops and abstains on an empty
     // diff. The digest is recomputed from canonical args only.
     #[test]
@@ -747,14 +790,17 @@ mod tests {
             HIGH_BLAST_TOOL,
             Some("related"),
             Some(&json!({ "namespace": "NS", "id": " seed ", "max_hops": 3 })),
-            None,
+            Some(T_HIGH_BLAST),
             "NS",
         )
         .expect("a genuine related call has a proof plan");
         assert_eq!(related.trigger, T_HIGH_BLAST);
         assert_eq!(
             related.args,
-            json!({ "namespace": "NS", "id": "seed", "max_hops": 2 }),
+            json!({
+                "namespace": "NS", "id": "seed", "max_hops": 2,
+                "followed_trigger_id": T_HIGH_BLAST
+            }),
             "hops >= 2 must normalize to the prescribed two-hop args"
         );
         assert_eq!(related.ids, vec!["seed".to_string()]);
@@ -762,7 +808,7 @@ mod tests {
             HIGH_BLAST_TOOL,
             Some("related"),
             Some(&json!({ "namespace": "NS", "id": "seed", "max_hops": 1 })),
-            None,
+            Some(T_HIGH_BLAST),
             "NS"
         )
         .is_none());

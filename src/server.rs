@@ -2047,35 +2047,29 @@ pub async fn process_mcp_request(
                                     name == "neurostrata_taxonomy",
                                     args_ref,
                                 );
-                            // R7 proof: mint a digest-only proof id under the
-                            // trigger actually followed. The optional
-                            // `followed_trigger_id` hint is the `next_action`
-                            // trigger the caller is dispatching; the pure
-                            // planner de-aliases `related` (T_HIGH_BLAST vs
-                            // T_SEED_EXPAND), normalizes hops >= 2, and abstains
-                            // on an empty diff. Reuse `followed_action_ids`;
-                            // no new receipt field, no raw text stored.
+                            // R7 proof: mint a digest-only proof under the
+                            // trigger actually followed. `related` serves two
+                            // triggers with identical args, so only an
+                            // explicit `followed_trigger_id` (copied from the
+                            // prescribed `next_action.args`) can bind it; no
+                            // hint => abstain, never default. Reuse the
+                            // existing `followed_action_ids` field; no raw
+                            // args are written into the ledger.
                             let followed_hint = args_ref
-                                .and_then(|a| {
-                                    a.get("followed_trigger_id")
-                                        .or_else(|| a.get("trigger_id"))
-                                })
+                                .and_then(|a| a.get("followed_trigger_id"))
                                 .and_then(Value::as_str);
-                            if let Some(plan) =
-                                crate::task::graph_advisories::dispatch_proof(
+                            if let Some((proof_id, followed_trigger)) =
+                                mint_followed_action_id(
                                     name,
-                                    Some(fields.operation.as_str()),
+                                    fields.operation.as_str(),
                                     args_ref,
                                     followed_hint,
                                     &ns,
                                 )
                             {
-                                fields.followed_action_ids =
-                                    vec![crate::task::routing::action_id(
-                                        &plan.trigger, &plan.args, &plan.ids,
-                                    )];
+                                fields.followed_action_ids = vec![proof_id];
                                 if fields.trigger_id.trim().is_empty() {
-                                    fields.trigger_id = plan.trigger;
+                                    fields.trigger_id = followed_trigger;
                                 }
                             }
                             crate::task::record_tool_receipt(&store, fields, caller_root).await;
@@ -12757,11 +12751,128 @@ mod migration_notice_tests {
     }
 }
 
+/// Mint a digest-only follow-through proof for an MCP `tools/call` dispatch.
+/// Returns `(action_id, followed_trigger)`, or `None` when the call cannot
+/// honestly prove a prescription. Single source of truth shared by the live
+/// dispatcher and its C32 regression test.
+fn mint_followed_action_id(
+    tool: &str,
+    operation: &str,
+    args: Option<&Value>,
+    hint: Option<&str>,
+    namespace: &str,
+) -> Option<(String, String)> {
+    let plan = crate::task::graph_advisories::dispatch_proof(
+        tool,
+        Some(operation),
+        args,
+        hint,
+        namespace,
+    )?;
+    let action_id = crate::task::routing::action_id(&plan.trigger, &plan.args, &plan.ids);
+    Some((action_id, plan.trigger))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::events::{RecursionToken, ThalamicBus, ThalamicPulse};
     use crate::guard::testkit::MockStore;
+
+    /// oy5c C32 regression: drive the SAME mint step the MCP dispatcher uses.
+    /// A real T_SEED_EXPAND next_action (hint included in its args) mints a
+    /// seed-expansion proof that cannot resolve a T_HIGH_BLAST advisory; a
+    /// hint-less related call mints nothing.
+    #[test]
+    fn c32_related_proof_mint_dealiases_and_abstains_without_hint() {
+        use crate::task::graph_advisories::{compute_advisories, AdvisoryInput, HIGH_BLAST_TOOL};
+        use crate::task::routing::{next_action, RouteTrigger};
+        use serde_json::json;
+        use std::collections::BTreeSet;
+
+        let ns = "NeuroStrata";
+        let seed = "mem-seed-42";
+        let make = |trigger: &'static str| {
+            let t = RouteTrigger {
+                id: trigger,
+                tool: HIGH_BLAST_TOOL,
+                args: json!({
+                    "namespace": ns,
+                    "id": seed,
+                    "max_hops": 2,
+                    "followed_trigger_id": trigger,
+                }),
+                reason: String::new(),
+            };
+            next_action(&t, &[seed.to_string()])
+        };
+        let seed_expand = make("T_SEED_EXPAND");
+        let high_blast = make("T_HIGH_BLAST");
+        let (proof, _) = super::mint_followed_action_id(
+            HIGH_BLAST_TOOL,
+            "related",
+            Some(&seed_expand["args"]),
+            seed_expand["args"]["followed_trigger_id"].as_str(),
+            ns,
+        )
+        .expect("hinted related call has a proof");
+        assert!(proof.starts_with("T_SEED_EXPAND:"), "actual: {proof}");
+        assert_eq!(
+            proof,
+            seed_expand["action_id"].as_str().unwrap(),
+            "proof must bind to the prescribed seed-expansion action"
+        );
+        assert_ne!(
+            proof,
+            high_blast["action_id"].as_str().unwrap(),
+            "seed-expansion proof must differ from the high-blast prescription"
+        );
+
+        let active: BTreeSet<String> = ["t-active".to_string()].into_iter().collect();
+        let ledger = json!({
+            "events": [
+                {
+                    "task_id": "t-active",
+                    "tool": "neurostrata_memories_for_file",
+                    "status": "success",
+                    "ts": 10,
+                    "prescribed_action_ids": [high_blast["action_id"]]
+                },
+                {
+                    "task_id": "t-active",
+                    "tool": HIGH_BLAST_TOOL,
+                    "status": "success",
+                    "ts": 11,
+                    "returned_ids": ["mem-x"],
+                    "followed_action_ids": [proof]
+                }
+            ]
+        });
+        let r = compute_advisories(&AdvisoryInput {
+            ledger: &ledger,
+            active_task_ids: &active,
+            allowed_graph_tools: &["neurostrata_memories_for_file", HIGH_BLAST_TOOL],
+            applicable_trigger_ids: &["T_HIGH_BLAST".to_string()],
+            taxonomy_available: false,
+            concept_grounding_linked: false,
+        });
+        assert!(
+            r.high_blast_radius_unexplored,
+            "a seed-expansion follow must not resolve T_HIGH_BLAST"
+        );
+
+        assert!(
+            super::mint_followed_action_id(
+                HIGH_BLAST_TOOL,
+                "related",
+                Some(&json!({ "namespace": ns, "id": seed, "max_hops": 2 })),
+                None,
+                ns,
+            )
+            .is_none(),
+            "a hint-less related call cannot distinguish the triggers; abstain"
+        );
+    }
 
     #[test]
     fn inject_proxy_caller_cwd_stamps_cwd_and_preserves_explicit_roots() {

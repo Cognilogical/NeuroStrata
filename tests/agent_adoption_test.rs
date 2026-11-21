@@ -966,6 +966,27 @@ fn validate_warns_only_on_unresolved_applicable_triggers() {
     );
 }
 
+/// oy5c C32 RED: `related` serves both T_HIGH_BLAST and T_SEED_EXPAND. Without
+/// the trigger hint no honest proof can be minted (a default mint would
+/// falsely resolve a high-blast advisory on a seed-expansion follow).
+#[test]
+fn c32_hintless_related_proof_abstains() {
+    use graph_advisories::{dispatch_proof, HIGH_BLAST_TOOL};
+    assert!(
+        dispatch_proof(
+            HIGH_BLAST_TOOL,
+            Some("related"),
+            Some(&serde_json::json!({
+                "namespace": "NeuroStrata", "id": "mem-1", "max_hops": 2
+            })),
+            None,
+            "NeuroStrata",
+        )
+        .is_none(),
+        "no trigger hint => no proof"
+    );
+}
+
 /// oy5c C10: a hops=3 `related` call proves the canonical two-hop prescription
 /// through a normalized digest; a hops=1 call is not even minted.
 #[test]
@@ -975,14 +996,17 @@ fn dispatch_proof_hops_superset_matches_prescription_digest() {
     let seed = "mem-seed-42";
     let prescribed = routing::action_id(
         "T_HIGH_BLAST",
-        &serde_json::json!({ "namespace": ns, "id": seed, "max_hops": 2 }),
+        &serde_json::json!({
+            "namespace": ns, "id": seed, "max_hops": 2,
+            "followed_trigger_id": "T_HIGH_BLAST"
+        }),
         &[seed.to_string()],
     );
     let plan = dispatch_proof(
         HIGH_BLAST_TOOL,
         Some("related"),
         Some(&serde_json::json!({ "namespace": ns, "id": seed, "max_hops": 3 })),
-        None,
+        Some("T_HIGH_BLAST"),
         ns,
     )
     .expect("a genuine related call has a proof plan");

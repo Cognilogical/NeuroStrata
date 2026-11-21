@@ -362,7 +362,12 @@ fn recommended_next_actions_inner(
             // `routing::next_action` likewise refuses an empty seed id: a
             // related call with args.id == "" is schema-invalid, so abstain.
             if let Some(id) = seed_id.filter(|id| !id.trim().is_empty()) {
-                let args = json!({ "namespace": namespace, "id": id, "max_hops": 2 });
+                let args = json!({
+                    "namespace": namespace,
+                    "id": id,
+                    "max_hops": 2,
+                    "followed_trigger_id": "T_HIGH_BLAST"
+                });
                 actions.push(next_action(
                     "T_HIGH_BLAST",
                     "neurostrata_related",
