@@ -196,7 +196,7 @@ Prints the namespace configured for a project. Order: the `namespace` of the pro
 neurostrata-mcp namespace resolve [dir]
 neurostrata-mcp namespace resolve --pushed [dir]
 ```
-With `--pushed` it reads the pre-push hook's stdin (`<local ref> <local sha> <remote ref> <remote sha>` lines) and prints, one per line, every namespace the push must pass the task gate for: the checkout's folder name, the resolved namespace, and the namespace of the marker over each path the pushed commits change, read from the pushed commit. It exits 1 on an unreadable marker on a pushed path, or when a committed and an untracked marker disagree.
+With `--pushed` it reads the pre-push hook's stdin (`<local ref> <local sha> <remote ref> <remote sha>` lines) and prints, one per line, every namespace the push must pass the task gate for: the checkout's folder name, the resolved namespace, the namespace of the marker over each path the pushed commits change, read from the pushed commit, and the namespace a marker the push deletes or changes named at the remote tip. It exits 1 on an unreadable marker on a pushed path, on a stdin line it cannot read, or when a committed and an untracked marker disagree.
 
 ### `root show`, `root set` & `root audit`
 Read and write the project marker `.NeuroStrata/config.json` (see [Project root](ops/project-root.md)).

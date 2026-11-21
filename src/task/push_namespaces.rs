@@ -6,13 +6,15 @@
 //! 2. the resolved namespace of the checkout top (`namespace resolve`),
 //! 3. the namespace of every path the push changes, read from the pushed
 //!    commits rather than the working tree, then from untracked markers in
-//!    the working tree and the main checkout (`find_root_marker`).
+//!    the working tree and the main checkout,
+//! 4. the namespace a marker the push deletes or changes named at the remote
+//!    tip, when the remote tip is known.
 //!
 //! Nothing here is stored: a split committed on another branch, a nested
 //! split, a split committed in another clone and a hand-added marker are all
 //! found from the push itself.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use crate::root_marker::{self, MarkerRead, ROOT_CONFIG_REL};
@@ -26,21 +28,45 @@ pub struct PushedRef {
     pub remote_sha: String,
 }
 
-/// Parses `<local ref> <local sha> <remote ref> <remote sha>` lines. Blank
-/// or malformed lines are skipped.
-pub fn parse_pre_push_stdin(text: &str) -> Vec<PushedRef> {
-    text.lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let r = PushedRef {
-                local_ref: fields.next()?.to_string(),
-                local_sha: fields.next()?.to_string(),
-                remote_ref: fields.next()?.to_string(),
-                remote_sha: fields.next()?.to_string(),
-            };
-            fields.next().is_none().then_some(r)
-        })
-        .collect()
+fn is_object_name(sha: &str) -> bool {
+    matches!(sha.len(), 40 | 64) && sha.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Parses `<local ref> SP <local sha> SP <remote ref> SP <remote sha>`
+/// lines, splitting from the right on ASCII space only: the local ref is
+/// what the user typed (`HEAD@{1 second ago}` holds spaces), while the other
+/// three fields never hold an ASCII space. Other whitespace, such as U+00A0
+/// in a branch name, stays part of the ref. Blank lines are skipped; any
+/// other line that does not parse is an error, so the hook blocks the push
+/// rather than gate it without that ref.
+pub fn parse_pre_push_stdin(text: &str) -> Result<Vec<PushedRef>, String> {
+    let mut refs = Vec::new();
+    for line in text.lines() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut fields = line.rsplitn(4, ' ');
+        let (Some(remote_sha), Some(remote_ref), Some(local_sha), Some(local_ref)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return Err(format!("cannot read the pre-push line {line:?}"));
+        };
+        if local_ref.is_empty()
+            || remote_ref.is_empty()
+            || !is_object_name(local_sha)
+            || !is_object_name(remote_sha)
+        {
+            return Err(format!("cannot read the pre-push line {line:?}"));
+        }
+        refs.push(PushedRef {
+            local_ref: local_ref.to_string(),
+            local_sha: local_sha.to_string(),
+            remote_ref: remote_ref.to_string(),
+            remote_sha: remote_sha.to_string(),
+        });
+    }
+    Ok(refs)
 }
 
 /// Runs git; injected so tests can count calls.
@@ -52,9 +78,25 @@ pub trait GitRunner {
 /// The `git` on PATH.
 pub struct SystemGit;
 
+/// Variables git sets for a hook. Git runs pre-push in a linked worktree with
+/// `GIT_DIR` naming that worktree's git directory; inherited, it makes every
+/// child git answer for that worktree whatever its `current_dir` (the main
+/// checkout's `HEAD` would be the worktree's).
+const HOOK_GIT_ENV: [&str; 5] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_PREFIX",
+    "GIT_COMMON_DIR",
+];
+
 impl GitRunner for SystemGit {
     fn git(&self, dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-        let out = std::process::Command::new("git")
+        let mut cmd = std::process::Command::new("git");
+        for var in HOOK_GIT_ENV {
+            cmd.env_remove(var);
+        }
+        let out = cmd
             .current_dir(dir)
             .args(args)
             .output()
@@ -95,6 +137,13 @@ fn nul_paths(bytes: Vec<u8>) -> impl Iterator<Item = String> {
         .into_iter()
 }
 
+/// The paths one pushed ref changes, and the remote tip they were compared
+/// with when git has it.
+struct Changes {
+    paths: Vec<String>,
+    remote_base: Option<String>,
+}
+
 /// The repository-relative paths one pushed ref changes.
 ///
 /// - Remote tip present locally: `git diff --name-only <remote> <local>`.
@@ -104,13 +153,14 @@ fn nul_paths(bytes: Vec<u8>) -> impl Iterator<Item = String> {
 /// - When that lists no commit (everything pushed is already on some remote,
 ///   say a branch pushed under a second name), the tip commit's own paths:
 ///   `git diff-tree --root <local>`, which is `git diff <local>^ <local>` that
-///   also answers for a root commit.
+///   also answers for a root commit. This is deliberately stricter than the
+///   empty commit selection (spec 6.7): a new ref is gated for its tip.
 ///
 /// `-m` lists a merge commit's paths against each parent, so a conflict fix
 /// in a merge is gated (more paths than first-parent alone, never fewer).
 ///
 /// Renames are split into a deletion and an addition; a deleted path counts.
-fn changed_paths(git: &dyn GitRunner, repo: &Path, r: &PushedRef) -> Result<Vec<String>, String> {
+fn changed_paths(git: &dyn GitRunner, repo: &Path, r: &PushedRef) -> Result<Changes, String> {
     let local = r.local_sha.as_str();
     let remote_known = !is_zero_sha(&r.remote_sha)
         && git
@@ -131,28 +181,25 @@ fn changed_paths(git: &dyn GitRunner, repo: &Path, r: &PushedRef) -> Result<Vec<
                 local,
             ],
         )?;
-        return Ok(nul_paths(out).collect());
+        return Ok(Changes {
+            paths: nul_paths(out).collect(),
+            remote_base: Some(r.remote_sha.clone()),
+        });
     }
     let commits = text(git.git(repo, &["rev-list", local, "--not", "--remotes"])?);
-    if commits.trim().is_empty() {
-        let out = git.git(
-            repo,
-            &[
-                "diff-tree",
-                "-m",
-                "--root",
-                "-r",
-                "--no-commit-id",
-                "--name-only",
-                "--no-renames",
-                "-z",
-                local,
-            ],
-        )?;
-        return Ok(nul_paths(out).collect());
-    }
-    let out = git.git(
-        repo,
+    let args: &[&str] = if commits.trim().is_empty() {
+        &[
+            "diff-tree",
+            "-m",
+            "--root",
+            "-r",
+            "--no-commit-id",
+            "--name-only",
+            "--no-renames",
+            "-z",
+            local,
+        ]
+    } else {
         &[
             "log",
             "-m",
@@ -163,9 +210,12 @@ fn changed_paths(git: &dyn GitRunner, repo: &Path, r: &PushedRef) -> Result<Vec<
             local,
             "--not",
             "--remotes",
-        ],
-    )?;
-    Ok(nul_paths(out).collect())
+        ]
+    };
+    Ok(Changes {
+        paths: nul_paths(git.git(repo, args)?).collect(),
+        remote_base: None,
+    })
 }
 
 /// `a/b/c.rs` -> `a/b`; a top-level file -> `` (the checkout top).
@@ -175,48 +225,167 @@ fn parent_folder(path: &str) -> String {
         .unwrap_or_default()
 }
 
-fn depth(rel: &str) -> usize {
-    if rel.is_empty() {
-        0
+fn marker_rel(folder: &str) -> String {
+    if folder.is_empty() {
+        ROOT_CONFIG_REL.to_string()
     } else {
-        rel.split('/').count()
+        format!("{folder}/{ROOT_CONFIG_REL}")
     }
 }
 
-/// Reads markers for one push: each pushed commit's tree is listed once, and
-/// each (commit, folder) and each working-tree folder is read at most once.
+/// The folder whose marker a tree path is, or lies under (a tree that holds
+/// a folder where the marker file belongs): `(folder, is the file itself)`.
+fn marker_entry(path: &str) -> Option<(String, bool)> {
+    if path == ROOT_CONFIG_REL {
+        return Some((String::new(), true));
+    }
+    if let Some(folder) = path.strip_suffix(&format!("/{ROOT_CONFIG_REL}")) {
+        return Some((folder.to_string(), true));
+    }
+    let below = format!("{ROOT_CONFIG_REL}/");
+    path.match_indices(&below)
+        .find(|(at, _)| *at == 0 || path.as_bytes()[at - 1] == b'/')
+        .map(|(at, _)| (path[..at.saturating_sub(1)].to_string(), false))
+}
+
+/// `git ls-tree -r` of `treeish` (it needs only the trees, not the blobs):
+/// folder -> whether its marker path is a file (`false`: a folder sits where
+/// the marker file belongs).
+fn marker_entries(
+    git: &dyn GitRunner,
+    dir: &Path,
+    treeish: &str,
+) -> Result<HashMap<String, bool>, String> {
+    let listed = git.git(dir, &["ls-tree", "-r", "-z", "--name-only", treeish])?;
+    let mut entries = HashMap::new();
+    for (folder, is_file) in nul_paths(listed).filter_map(|p| marker_entry(&p)) {
+        let slot = entries.entry(folder).or_insert(is_file);
+        *slot &= is_file;
+    }
+    Ok(entries)
+}
+
+/// A folder of the working tree that may hold a marker for a pushed path.
+struct Level {
+    /// Relative to the checkout top, `/`-separated; `` for the top.
+    rel: String,
+    dir: PathBuf,
+}
+
+/// The folders from `top` down to `top/<folder>` that belong to the checkout
+/// at `top`, top first. The list stops before a folder that is missing, a
+/// link or junction, holds its own `.git` (a submodule or nested clone,
+/// whose markers are not this checkout's) or resolves outside `top`.
+fn levels(top: &Path, folder: &str) -> Vec<Level> {
+    let mut out = vec![Level {
+        rel: String::new(),
+        dir: top.to_path_buf(),
+    }];
+    if folder.is_empty() {
+        return out;
+    }
+    let mut dir = top.to_path_buf();
+    let mut rel = String::new();
+    for part in folder.split('/') {
+        dir.push(part);
+        let real_dir = std::fs::symlink_metadata(&dir)
+            .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink());
+        if !real_dir
+            || dir.join(".git").exists()
+            || !dunce::canonicalize(&dir).is_ok_and(|c| c.starts_with(top))
+        {
+            break;
+        }
+        if !rel.is_empty() {
+            rel.push('/');
+        }
+        rel.push_str(part);
+        out.push(Level {
+            rel: rel.clone(),
+            dir: dir.clone(),
+        });
+    }
+    out
+}
+
+/// The marker in working-tree folder `dir`, valid or unreadable; `None`
+/// when there is none. The rules of `find_root_marker`: a `.NeuroStrata`
+/// that is a link is none, one that cannot be inspected is unreadable.
+fn working_tree_marker(dir: &Path) -> Option<MarkerRead> {
+    let folder = dir.join(".NeuroStrata");
+    match std::fs::symlink_metadata(&folder) {
+        Ok(_) => {}
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return None
+        }
+        Err(err) => {
+            return Some(MarkerRead::Unreadable {
+                path: folder,
+                reason: err.to_string(),
+            })
+        }
+    }
+    if !crate::source_context::is_valid_marker_directory(&folder) {
+        return None;
+    }
+    match root_marker::read_marker(dir) {
+        MarkerRead::Absent => None,
+        read => Some(read),
+    }
+}
+
+/// Reads markers for one push: each pushed commit's tree and each
+/// checkout's `HEAD` tree is listed once, and each (commit, folder) and each
+/// working-tree folder is read at most once.
 struct Resolver<'a> {
     git: &'a dyn GitRunner,
     top: PathBuf,
-    canonical_top: PathBuf,
-    /// (sha, folder) -> the committed marker in that folder of that commit.
-    committed: HashMap<(String, String), Option<String>>,
-    /// sha -> the folders of that commit's tree that hold a marker file.
-    marker_folders: HashMap<String, HashSet<String>>,
-    /// folder -> the deepest working-tree / main-checkout marker for it.
+    /// The checkout's top canonicalized, and the main checkout's when this
+    /// is a linked worktree.
+    own_top: PathBuf,
+    main_top: Option<PathBuf>,
+    /// (sha, folder) -> the committed marker in that folder of that commit:
+    /// its namespace, or why it cannot be read.
+    committed: HashMap<(String, String), Option<Result<String, String>>>,
+    /// sha -> the marker entries of that commit's tree.
+    marker_folders: HashMap<String, HashMap<String, bool>>,
+    /// checkout top -> the marker folders its `HEAD` tracks.
+    tracked: HashMap<PathBuf, HashMap<String, bool>>,
+    /// folder -> the deepest untracked working-tree / main-checkout marker.
     worktree: HashMap<String, Option<(String, String)>>,
 }
 
 impl Resolver<'_> {
-    /// The committed marker exactly in `folder` of commit `sha`. A missing
-    /// file (or folder) answers `None`; an invalid one is an error.
-    fn committed_at(&mut self, sha: &str, folder: &str) -> Result<Option<String>, String> {
+    /// The committed marker exactly in `folder` of commit `sha`: `None` when
+    /// missing, `Some(Err(reason))` when it cannot be parsed. A failed tree
+    /// listing, or a failed `git show` of a file the tree lists (a blob
+    /// missing from a partial clone, say), is the outer error: a marker that
+    /// cannot be read must not drop its namespace.
+    fn committed_marker(
+        &mut self,
+        sha: &str,
+        folder: &str,
+    ) -> Result<Option<Result<String, String>>, String> {
         let key = (sha.to_string(), folder.to_string());
         if let Some(hit) = self.committed.get(&key) {
             return Ok(hit.clone());
         }
-        let rel = if folder.is_empty() {
-            ROOT_CONFIG_REL.to_string()
-        } else {
-            format!("{folder}/{ROOT_CONFIG_REL}")
-        };
-        // A failed tree listing, or a failed `git show` of a file the tree
-        // lists (a blob missing from a partial clone, say), is an error: a
-        // marker that cannot be read must not drop its namespace.
-        let listed = self.marker_folders_of(sha, &rel)?.contains(folder);
-        let found = match listed {
-            false => None,
-            true => {
+        let rel = marker_rel(folder);
+        if !self.marker_folders.contains_key(sha) {
+            let entries = marker_entries(self.git, &self.top, sha).map_err(|e| {
+                format!("cannot look for the project marker {rel} in pushed commit {sha}: {e}")
+            })?;
+            self.marker_folders.insert(sha.to_string(), entries);
+        }
+        let found = match self.marker_folders[sha].get(folder) {
+            None => None,
+            Some(false) => Some(Err("it is a folder, not a file".to_string())),
+            Some(true) => {
                 let bytes = self
                     .git
                     .git(&self.top, &["show", &format!("{sha}:{rel}")])
@@ -225,13 +394,9 @@ impl Resolver<'_> {
                     })?;
                 let shown = PathBuf::from(format!("{sha}:{rel}"));
                 match root_marker::parse_marker_bytes(&shown, &bytes) {
-                    MarkerRead::Valid(cfg) => Some(cfg.namespace),
+                    MarkerRead::Valid(cfg) => Some(Ok(cfg.namespace)),
                     MarkerRead::Absent => None,
-                    MarkerRead::Unreadable { reason, .. } => {
-                        return Err(format!(
-                            "cannot read the project marker {rel} in pushed commit {sha}: {reason}"
-                        ))
-                    }
+                    MarkerRead::Unreadable { reason, .. } => Some(Err(reason)),
                 }
             }
         };
@@ -239,30 +404,17 @@ impl Resolver<'_> {
         Ok(found)
     }
 
-    /// The folders of commit `sha` that hold a marker file, from one
-    /// `git ls-tree -r` of the commit (it needs only the commit's trees, not
-    /// its blobs). `rel` names the file asked for, for the error.
-    fn marker_folders_of(&mut self, sha: &str, rel: &str) -> Result<&HashSet<String>, String> {
-        if !self.marker_folders.contains_key(sha) {
-            let listed = self
-                .git
-                .git(&self.top, &["ls-tree", "-r", "-z", "--name-only", sha])
-                .map_err(|e| {
-                    format!("cannot look for the project marker {rel} in pushed commit {sha}: {e}")
-                })?;
-            let suffix = format!("/{ROOT_CONFIG_REL}");
-            let folders = nul_paths(listed)
-                .filter_map(|path| {
-                    if path == ROOT_CONFIG_REL {
-                        Some(String::new())
-                    } else {
-                        path.strip_suffix(&suffix).map(str::to_string)
-                    }
-                })
-                .collect();
-            self.marker_folders.insert(sha.to_string(), folders);
+    /// The committed marker exactly in `folder` of commit `sha`; one that
+    /// cannot be read is an error.
+    fn committed_at(&mut self, sha: &str, folder: &str) -> Result<Option<String>, String> {
+        match self.committed_marker(sha, folder)? {
+            None => Ok(None),
+            Some(Ok(ns)) => Ok(Some(ns)),
+            Some(Err(reason)) => Err(format!(
+                "cannot read the project marker {} in pushed commit {sha}: {reason}",
+                marker_rel(folder)
+            )),
         }
-        Ok(&self.marker_folders[sha])
     }
 
     /// The deepest committed marker at or above `folder` in commit `sha`:
@@ -284,52 +436,68 @@ impl Resolver<'_> {
         }
     }
 
-    /// The deepest untracked marker `find_root_marker` finds for `folder` in
-    /// this checkout (own checkout and main checkout): (marker folder
-    /// relative to the top, namespace). A marker git tracks is skipped: it is
-    /// the checked-out branch's copy, while the pushed commit's tree already
-    /// says what the push holds. The search goes on above a skipped marker.
+    /// Whether the `HEAD` of the checkout at `checkout` tracks the marker of
+    /// `rel` (as a file, or with a folder in its place). One `git ls-tree`
+    /// per checkout. A failed listing (an unborn `HEAD`, say) tracks
+    /// nothing, so the marker is gated.
+    fn tracked_in_head(&mut self, checkout: &Path, rel: &str) -> bool {
+        if !self.tracked.contains_key(checkout) {
+            let entries = marker_entries(self.git, checkout, "HEAD").unwrap_or_default();
+            self.tracked.insert(checkout.to_path_buf(), entries);
+        }
+        self.tracked[checkout].contains_key(rel)
+    }
+
+    /// The deepest untracked marker in this checkout or its main checkout
+    /// for `folder`: (marker folder relative to the top, namespace).
+    ///
+    /// Folder by folder from `folder` up to the top, the own checkout's
+    /// marker first, then the main checkout's at the same folder. A marker
+    /// the checkout's `HEAD` tracks is skipped, valid or not: it is the
+    /// checked-out branch's copy, while the pushed commit's tree already says
+    /// what the push holds. An untracked marker that cannot be read is an
+    /// error. The walk does not enter a nested checkout.
     fn worktree_for(&mut self, folder: &str) -> Result<Option<(String, String)>, String> {
         if let Some(hit) = self.worktree.get(folder) {
             return Ok(hit.clone());
         }
-        let mut start = if folder.is_empty() {
-            self.top.clone()
-        } else {
-            self.top.join(folder)
-        };
-        let found = loop {
-            let marker = match root_marker::find_root_marker(&start) {
-                Err((file, reason)) => {
-                    return Err(format!(
-                        "cannot read the project marker {}: {reason}",
-                        file.display()
-                    ))
+        let own = levels(&self.own_top, folder);
+        let main = self
+            .main_top
+            .as_deref()
+            .map(|m| levels(m, folder))
+            .unwrap_or_default();
+        let main_top = self.main_top.clone().unwrap_or_default();
+        let mut found = None;
+        'walk: for depth in (0..own.len().max(main.len())).rev() {
+            // At equal depth the own checkout's marker is asked first.
+            let candidates = [
+                (self.own_top.clone(), own.get(depth)),
+                (main_top.clone(), main.get(depth)),
+            ];
+            for (checkout, level) in candidates {
+                let Some(level) = level else { continue };
+                let Some(read) = working_tree_marker(&level.dir) else {
+                    continue;
+                };
+                if self.tracked_in_head(&checkout, &level.rel) {
+                    continue;
                 }
-                Ok(None) => break None,
-                Ok(Some(marker)) => marker,
-            };
-            let Ok(rel) = marker.root.strip_prefix(&self.canonical_top) else {
-                break None;
-            };
-            let rel = rel.to_string_lossy().replace('\\', "/");
-            // A failed check counts as untracked, so the marker is gated.
-            let tracked = self
-                .git
-                .git(
-                    &marker.marker_dir(),
-                    &["ls-files", "-z", "--", ROOT_CONFIG_REL],
-                )
-                .map(|out| !out.is_empty())
-                .unwrap_or(false);
-            if !tracked {
-                break Some((rel, marker.config.namespace));
+                match read {
+                    MarkerRead::Valid(cfg) => {
+                        found = Some((level.rel.clone(), cfg.namespace));
+                        break 'walk;
+                    }
+                    MarkerRead::Unreadable { path, reason } => {
+                        return Err(format!(
+                            "cannot read the project marker {}: {reason}",
+                            path.display()
+                        ))
+                    }
+                    MarkerRead::Absent => {}
+                }
             }
-            match marker.root.parent() {
-                Some(parent) if !rel.is_empty() => start = parent.to_path_buf(),
-                _ => break None,
-            }
-        };
+        }
         self.worktree.insert(folder.to_string(), found.clone());
         Ok(found)
     }
@@ -367,6 +535,14 @@ impl Resolver<'_> {
     }
 }
 
+fn depth(rel: &str) -> usize {
+    if rel.is_empty() {
+        0
+    } else {
+        rel.split('/').count()
+    }
+}
+
 /// [`namespaces_for_push`] with an injected git.
 pub fn namespaces_for_push_with(
     git: &dyn GitRunner,
@@ -378,7 +554,9 @@ pub fn namespaces_for_push_with(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .ok_or_else(|| format!("the checkout top {} has no folder name", top.display()))?;
-    let canonical_top = dunce::canonicalize(&top).unwrap_or_else(|_| top.clone());
+    let own_top = dunce::canonicalize(&top).unwrap_or_else(|_| top.clone());
+    let main_top = crate::paths::main_checkout_root(&own_top.to_string_lossy())
+        .filter(|main| *main != own_top);
 
     let mut out = BTreeSet::new();
     out.insert(folder_namespace.clone());
@@ -389,9 +567,11 @@ pub fn namespaces_for_push_with(
     let mut resolver = Resolver {
         git,
         top,
-        canonical_top,
+        own_top,
+        main_top,
         committed: HashMap::new(),
         marker_folders: HashMap::new(),
+        tracked: HashMap::new(),
         worktree: HashMap::new(),
     };
     for r in refs {
@@ -399,9 +579,19 @@ pub fn namespaces_for_push_with(
         if is_zero_sha(&r.local_sha) {
             continue;
         }
-        for path in changed_paths(git, &resolver.top.clone(), r)? {
-            let ns = resolver.namespace_for(&r.local_sha, &path)?;
+        let changes = changed_paths(git, &resolver.top.clone(), r)?;
+        for path in &changes.paths {
+            let ns = resolver.namespace_for(&r.local_sha, path)?;
             out.insert(ns.unwrap_or_else(|| folder_namespace.clone()));
+            // A marker the push deletes or changes: the namespace it named
+            // at the remote tip is gated too, so a push cannot drop a split
+            // from the gate by removing its marker. One that was not valid
+            // there named no namespace.
+            if let (Some(base), Some((folder, _))) = (&changes.remote_base, marker_entry(path)) {
+                if let Some(Ok(ns)) = resolver.committed_marker(base, &folder)? {
+                    out.insert(ns);
+                }
+            }
         }
     }
     Ok(out)
@@ -414,14 +604,21 @@ mod tests {
 
     const ZERO: &str = "0000000000000000000000000000000000000000";
 
+    #[derive(Default)]
     struct CountingGit {
+        /// `git ls-tree` of a pushed commit.
         lookups: Cell<usize>,
+        /// `git ls-tree` of a checkout's `HEAD` (is a marker tracked?).
+        heads: Cell<usize>,
         shows: Cell<usize>,
     }
 
     impl GitRunner for CountingGit {
         fn git(&self, dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
             match args.first() {
+                Some(&"ls-tree") if args.last() == Some(&"HEAD") => {
+                    self.heads.set(self.heads.get() + 1)
+                }
                 Some(&"ls-tree") => self.lookups.set(self.lookups.get() + 1),
                 Some(&"show") => self.shows.set(self.shows.get() + 1),
                 _ => {}
@@ -498,17 +695,47 @@ mod tests {
         parse_pre_push_stdin(&format!(
             "refs/heads/{branch} {local_sha} refs/heads/{branch} {ZERO}\n"
         ))
+        .unwrap()
     }
 
     fn set(items: &[&str]) -> BTreeSet<String> {
         items.iter().map(|s| s.to_string()).collect()
     }
 
+    const SHA: &str = "1234567890abcdef1234567890abcdef12345678";
+
     #[test]
-    fn parse_skips_malformed_lines() {
-        let refs = parse_pre_push_stdin("a 1 b 2\n\nbad line\na 1 b 2 extra\n");
+    fn parse_reads_from_the_right_and_rejects_malformed_lines() {
+        let refs =
+            parse_pre_push_stdin(&format!("refs/heads/a {SHA} refs/heads/b {ZERO}\n\n")).unwrap();
         assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].remote_sha, "2");
+        assert_eq!(refs[0].remote_sha, ZERO);
+
+        // The local ref is what the user typed and may hold spaces.
+        let refs = parse_pre_push_stdin(&format!(
+            "HEAD@{{1 second ago}} {SHA} refs/heads/x {ZERO}\n"
+        ))
+        .unwrap();
+        assert_eq!(refs[0].local_ref, "HEAD@{1 second ago}");
+        assert_eq!(refs[0].local_sha, SHA);
+        assert_eq!(refs[0].remote_ref, "refs/heads/x");
+
+        // U+00A0 is valid in a ref name and is not a field separator.
+        let refs = parse_pre_push_stdin(&format!(
+            "refs/heads/a\u{a0}b {SHA} refs/heads/a\u{a0}b {ZERO}\n"
+        ))
+        .unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].remote_ref, "refs/heads/a\u{a0}b");
+
+        for bad in [
+            "bad line\n".to_string(),
+            "a 1 b 2\n".to_string(),
+            format!("refs/heads/a {SHA} refs/heads/b\n"),
+            format!("refs/heads/a {SHA} refs/heads/b {ZERO} extra\n"),
+        ] {
+            assert!(parse_pre_push_stdin(&bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
@@ -531,7 +758,8 @@ mod tests {
             "the folder name stays gated next to the marker's namespace"
         );
         // A branch deletion pushes nothing; the two top namespaces remain.
-        let deletion = parse_pre_push_stdin(&format!("(delete) {ZERO} refs/heads/gone {sha}\n"));
+        let deletion =
+            parse_pre_push_stdin(&format!("(delete) {ZERO} refs/heads/gone {sha}\n")).unwrap();
         assert_eq!(
             namespaces_for_push(&dir, &deletion).unwrap(),
             set(&["marked-proj", "top-ns"])
@@ -563,7 +791,8 @@ mod tests {
         let after = commit_all(&dir, "delete");
         let refs = parse_pre_push_stdin(&format!(
             "refs/heads/main {after} refs/heads/main {before}\n"
-        ));
+        ))
+        .unwrap();
         assert_eq!(
             namespaces_for_push(&dir, &refs).unwrap(),
             set(&["proj", "pkg-ns"])
@@ -591,7 +820,8 @@ mod tests {
         let never_fetched = "1234567890123456789012345678901234567890";
         let refs = parse_pre_push_stdin(&format!(
             "refs/heads/main {sha} refs/heads/main {never_fetched}\n"
-        ));
+        ))
+        .unwrap();
         assert_eq!(
             namespaces_for_push(&dir, &refs).unwrap(),
             set(&["proj", "new-ns"]),
@@ -600,7 +830,8 @@ mod tests {
         // Everything already on a remote: the tip commit's own paths.
         let refs = parse_pre_push_stdin(&format!(
             "refs/heads/main {pushed} refs/heads/other {ZERO}\n"
-        ));
+        ))
+        .unwrap();
         assert_eq!(
             namespaces_for_push(&dir, &refs).unwrap(),
             set(&["proj", "old-ns"])
@@ -696,29 +927,37 @@ mod tests {
         write(&dir, "a/b/z.rs", "z");
         marker(&dir, "a", "a-ns");
         let sha = commit_all(&dir, "files");
-        let counting = CountingGit {
-            lookups: Cell::new(0),
-            shows: Cell::new(0),
-        };
+        let counting = CountingGit::default();
         // Folders: "" (README.md), a, a/b, a/.NeuroStrata (the marker).
         let got = namespaces_for_push_with(&counting, &dir, &new_branch(&sha, "main")).unwrap();
         assert_eq!(got, set(&["proj", "a-ns"]));
-        assert_eq!(counting.lookups.get(), 1, "one tree listing per pushed commit");
+        assert_eq!(
+            counting.lookups.get(),
+            1,
+            "one tree listing per pushed commit"
+        );
         assert_eq!(counting.shows.get(), 1, "one git show per marker found");
+        assert_eq!(
+            counting.heads.get(),
+            1,
+            "one HEAD listing however many folders ask whether the marker is tracked"
+        );
 
         // Two pushed refs at different commits: one listing each, however
         // many folders.
         write(&dir, "c/d/w.rs", "w");
         let second = commit_all(&dir, "more");
-        let counting = CountingGit {
-            lookups: Cell::new(0),
-            shows: Cell::new(0),
-        };
+        let counting = CountingGit::default();
         let mut refs = new_branch(&sha, "main");
         refs.extend(new_branch(&second, "other"));
         let got = namespaces_for_push_with(&counting, &dir, &refs).unwrap();
         assert_eq!(got, set(&["proj", "a-ns"]));
-        assert_eq!(counting.lookups.get(), 2, "one tree listing per pushed commit");
+        assert_eq!(
+            counting.lookups.get(),
+            2,
+            "one tree listing per pushed commit"
+        );
+        assert_eq!(counting.heads.get(), 1, "one HEAD listing per checkout");
     }
 
     /// Real git, except that every `git ls-tree` fails.
@@ -806,5 +1045,168 @@ mod tests {
         commit_all(&dir, "inner split");
         let got = namespaces_for_push(&dir, &new_branch(&sha, "feature")).unwrap();
         assert_eq!(got, set(&["proj", "pkg-ns"]));
+    }
+
+    #[test]
+    fn marker_folder_in_pushed_commit_is_unreadable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = repo(tmp.path(), "proj");
+        write(&dir, &format!("pkg/{ROOT_CONFIG_REL}/placeholder"), "x");
+        write(&dir, "pkg/a.rs", "a");
+        let sha = commit_all(&dir, "folder where the marker belongs");
+        let err = namespaces_for_push(&dir, &new_branch(&sha, "main")).unwrap_err();
+        assert!(
+            err.contains("cannot read the project marker pkg/") && err.contains("not a file"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn untracked_marker_in_nested_checkout_is_not_used() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = repo(tmp.path(), "proj");
+        git(&dir, &["checkout", "-q", "-b", "feature"]);
+        write(&dir, "pkg/a.rs", "a");
+        let sha = commit_all(&dir, "pkg");
+        git(&dir, &["checkout", "-q", "main"]);
+        // The checked-out branch leaves `pkg` free for a nested clone.
+        let nested = dir.join("pkg");
+        std::fs::create_dir_all(&nested).unwrap();
+        git(&nested, &["init", "-q"]);
+        marker(&nested, "", "nested-ns");
+        let got = namespaces_for_push(&dir, &new_branch(&sha, "feature")).unwrap();
+        assert_eq!(got, set(&["proj"]));
+    }
+
+    #[test]
+    fn staged_marker_not_in_head_is_gated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = repo(tmp.path(), "proj");
+        write(&dir, "h/f.rs", "f");
+        let sha = commit_all(&dir, "h");
+        marker(&dir, "h", "h-ns");
+        git(&dir, &["add", "-A"]);
+        let got = namespaces_for_push(&dir, &new_branch(&sha, "main")).unwrap();
+        assert_eq!(got, set(&["proj", "h-ns"]));
+    }
+
+    #[test]
+    fn broken_tracked_marker_of_checked_out_branch_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = repo(tmp.path(), "proj");
+        git(&dir, &["checkout", "-q", "-b", "feature"]);
+        marker(&dir, "pkg", "pkg-ns");
+        write(&dir, "pkg/a.rs", "a");
+        let sha = commit_all(&dir, "split");
+        git(&dir, &["checkout", "-q", "main"]);
+        write(&dir, &format!("pkg/{ROOT_CONFIG_REL}"), "{not json");
+        commit_all(&dir, "broken marker on main");
+        let got = namespaces_for_push(&dir, &new_branch(&sha, "feature")).unwrap();
+        assert_eq!(got, set(&["proj", "pkg-ns"]));
+    }
+
+    #[test]
+    fn marker_changed_or_deleted_by_push_gates_its_old_namespace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = repo(tmp.path(), "proj");
+        marker(&dir, "pkg", "old-ns");
+        write(&dir, "pkg/a.rs", "a");
+        let first = commit_all(&dir, "split");
+        marker(&dir, "pkg", "new-ns");
+        let renamed = commit_all(&dir, "renamed");
+        let refs = parse_pre_push_stdin(&format!(
+            "refs/heads/main {renamed} refs/heads/main {first}\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            namespaces_for_push(&dir, &refs).unwrap(),
+            set(&["proj", "old-ns", "new-ns"])
+        );
+
+        std::fs::remove_dir_all(dir.join("pkg").join(".NeuroStrata")).unwrap();
+        let deleted = commit_all(&dir, "deleted");
+        let refs = parse_pre_push_stdin(&format!(
+            "refs/heads/main {deleted} refs/heads/main {renamed}\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            namespaces_for_push(&dir, &refs).unwrap(),
+            set(&["proj", "new-ns"])
+        );
+    }
+
+    /// A linked worktree `proj-wt` on branch `wtb`, which commits a marker
+    /// in `pkg`; the main checkout `proj` holds an untracked marker in `pkg`;
+    /// branch `feature` changes `pkg/f.rs` with no marker. Returns
+    /// (worktree, feature tip).
+    fn tracked_worktree_marker_over_main_marker(tmp: &Path) -> (PathBuf, String) {
+        let main = repo(tmp, "proj");
+        write(&main, "pkg/keep", "k");
+        commit_all(&main, "pkg");
+        let wt = tmp.join("proj-wt");
+        git(
+            &main,
+            &["worktree", "add", "-q", "-b", "wtb", wt.to_str().unwrap()],
+        );
+        marker(&wt, "pkg", "wt-ns");
+        commit_all(&wt, "worktree split");
+        git(&main, &["checkout", "-q", "-b", "feature"]);
+        write(&main, "pkg/f.rs", "f");
+        let sha = commit_all(&main, "feature");
+        git(&main, &["checkout", "-q", "main"]);
+        marker(&main, "pkg", "main-ns");
+        (wt, sha)
+    }
+
+    #[test]
+    fn tracked_worktree_marker_does_not_hide_main_checkout_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (wt, sha) = tracked_worktree_marker_over_main_marker(tmp.path());
+        let got = namespaces_for_push(&wt, &new_branch(&sha, "feature")).unwrap();
+        assert_eq!(got, set(&["proj", "proj-wt", "main-ns"]));
+    }
+
+    const HOOK_CHILD_ENV: &str = "NEUROSTRATA_TEST_PUSH_HOOK_CHILD";
+
+    /// Runs [`hook_env_child`] in a child process with the environment git
+    /// gives a pre-push hook in a linked worktree: `GIT_DIR` set to the
+    /// worktree's absolute git directory, no `GIT_WORK_TREE`, the worktree
+    /// top as the current folder.
+    #[test]
+    fn linked_worktree_push_under_hook_environment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (wt, sha) = tracked_worktree_marker_over_main_marker(tmp.path());
+        let git_dir = git(&wt, &["rev-parse", "--absolute-git-dir"]);
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "task::push_namespaces::tests::hook_env_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .current_dir(&wt)
+            .env(HOOK_CHILD_ENV, &sha)
+            .env("GIT_DIR", &git_dir)
+            .env_remove("GIT_WORK_TREE")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// The child of [`linked_worktree_push_under_hook_environment`]; passes
+    /// at once when run on its own.
+    #[test]
+    fn hook_env_child() {
+        let Ok(sha) = std::env::var(HOOK_CHILD_ENV) else {
+            return;
+        };
+        let wt = std::env::current_dir().unwrap();
+        let got = namespaces_for_push(&wt, &new_branch(&sha, "feature")).unwrap();
+        assert_eq!(got, set(&["proj", "proj-wt", "main-ns"]));
     }
 }

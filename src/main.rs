@@ -921,8 +921,10 @@ pub(crate) enum NamespaceCommands {
         /// ref> <remote sha>` lines) and print, one per line, every namespace
         /// the push must pass the task gate for: the checkout's folder name,
         /// the resolved namespace, and the namespace of each path the pushed
-        /// commits change. Exits 1 on an unreadable marker on a pushed path,
-        /// or when a committed and an untracked marker disagree.
+        /// commits change, and the namespace a marker the push deletes or
+        /// changes named at the remote tip. Exits 1 on an unreadable marker
+        /// on a pushed path, on a stdin line it cannot read, or when a
+        /// committed and an untracked marker disagree.
         #[arg(long)]
         pushed: bool,
     },
@@ -7103,8 +7105,13 @@ async fn run() -> anyhow::Result<()> {
                     use std::io::Read as _;
                     let mut stdin = String::new();
                     std::io::stdin().read_to_string(&mut stdin)?;
-                    let refs = crate::task::push_namespaces::parse_pre_push_stdin(&stdin);
-                    match crate::task::push_namespaces::namespaces_for_push(&dir, &refs) {
+                    // An unparseable stdin line exits 1 like an unreadable
+                    // marker: the hook blocks rather than gate without a ref.
+                    let namespaces = crate::task::push_namespaces::parse_pre_push_stdin(&stdin)
+                        .and_then(|refs| {
+                            crate::task::push_namespaces::namespaces_for_push(&dir, &refs)
+                        });
+                    match namespaces {
                         Ok(namespaces) => {
                             for namespace in namespaces {
                                 println!("{namespace}");
