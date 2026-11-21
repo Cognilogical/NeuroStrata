@@ -14,7 +14,9 @@ use tracing::warn;
 use crate::rebac;
 use crate::secrets::SecretScanner;
 use crate::traits::{Embedder, SearchResult, VectorStore};
-use crate::vault_ld::{CanvasDocument, CanvasNode, VaultNote, VAULT_LD_SHAPES_V1, YAML_LD_CONTEXT};
+use crate::vault_ld::{
+    CanvasDocument, CanvasNode, VaultNote, FINGERPRINT_VERSION, VAULT_LD_SHAPES_V1, YAML_LD_CONTEXT,
+};
 
 /// Configuration for a vault sync operation
 #[derive(Debug, Clone)]
@@ -61,11 +63,12 @@ pub const MAX_VAULT_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 /// Metadata keys the import owns on the replacement head. Everything else on
 /// a prior head (notably `task`) is preserved across a reimport: #335 showed
 /// that copying a fixed field list drops the next structured field silently.
-const IMPORT_OWNED_METADATA_KEYS: [&str; 17] = [
+const IMPORT_OWNED_METADATA_KEYS: [&str; 18] = [
     // Import-owned values, overlaid after the prior head is copied.
     "vault_source",
     "stub",
     "canonical_sha256",
+    "fingerprint_version",
     "related",
     "valid_from",
     "supersedes",
@@ -506,11 +509,20 @@ pub async fn export_vault_with_limits(
         .await
         .map_err(|e| format!("Failed to list memories: {}", e))?;
 
-    // Filter by ReBAC can_read_memory
+    // Filter by ReBAC can_read_memory, then drop retired rows: an export is
+    // the current-knowledge surface, and `list` is generation-scoped only.
     let principal = config.principal.as_deref().unwrap_or("default");
+    let now = chrono::Utc::now().timestamp();
     let filtered: Vec<SearchResult> = memories
         .into_iter()
         .filter(|m| rebac::can_read_memory(principal, &m.payload.user_id, &m.payload.metadata))
+        .filter(|m| {
+            let metadata = &m.payload.metadata;
+            !crate::store::ladybug::is_retired_at(metadata, now)
+                && metadata
+                    .get("superseded_by")
+                    .map_or(true, serde_json::Value::is_null)
+        })
         .collect();
 
     // Convert to VaultNotes
@@ -872,6 +884,12 @@ pub async fn import_vault_with_limits(
         }
 
         let note = match VaultNote::from_markdown(&content) {
+            Ok(note) if note.id.contains(".vault-history.") => {
+                // History copies are importer projections, never vault-authored
+                // knowledge. Old exports may still carry them; ignoring the id
+                // keeps a stale vault from resurrecting one.
+                continue;
+            }
             Ok(mut note) => {
                 // Frontmatter hash is informational and may be stale. Derive
                 // bitemporal identity from content, tier and edges (finding 3).
@@ -1002,22 +1020,43 @@ pub async fn import_vault_with_limits(
             continue;
         }
 
+        let declared_type = note.rdf_type.strip_prefix("yaml:").unwrap_or("symbol");
         if let Some(ref prior) = prior_payload {
             // Byte-identical re-import is a no-op before any sovereignty
             // question: a protected row we do not touch is not overwritten.
-            // The hash always comes from parsed content/edges, never frontmatter.
-            // Task rows have no stored hash, so derive the same identity the
-            // export path would render for the prior payload (#335).
+            // The hash always comes from parsed content/edges/type, never
+            // frontmatter. Task rows have no stored hash, so derive the same
+            // identity the export path would render for the prior payload
+            // (#335).
             let prior_hash = prior
                 .metadata
                 .get("canonical_sha256")
                 .and_then(|v| v.as_str());
-            let unchanged = match prior_hash {
-                Some(hash) => hash == note.canonical_sha256,
-                None => {
-                    VaultNote::from_payload(&note.id, prior).canonical_sha256
-                        == note.canonical_sha256
+            let prior_version = prior
+                .metadata
+                .get("fingerprint_version")
+                .and_then(Value::as_u64);
+            let unchanged = if prior_version.is_some_and(|v| v >= FINGERPRINT_VERSION) {
+                match prior_hash {
+                    Some(hash) => hash == note.canonical_sha256,
+                    None => {
+                        VaultNote::from_payload(&note.id, prior).canonical_sha256
+                            == note.canonical_sha256
+                    }
                 }
+            } else {
+                // v1 head: keep its no-op round-trip, but require the declared
+                // type to match so a type-only edit still versions.
+                prior.memory_type == declared_type
+                    && match prior_hash {
+                        Some(hash) => {
+                            hash == note.fingerprint_legacy() || hash == note.canonical_sha256
+                        }
+                        None => {
+                            VaultNote::from_payload(&note.id, prior).fingerprint_legacy()
+                                == note.fingerprint_legacy()
+                        }
+                    }
             };
             if unchanged {
                 continue;
@@ -1055,7 +1094,11 @@ pub async fn import_vault_with_limits(
         metadata["vault_source"] = serde_json::json!(true);
         metadata["stub"] = serde_json::json!(is_stub);
         metadata["canonical_sha256"] = serde_json::json!(note.canonical_sha256);
+        metadata["fingerprint_version"] = serde_json::json!(FINGERPRINT_VERSION);
+        // `related` is the vault render; `related_to` is the parser-recognised
+        // relation key that materialises the RELATES_TO edge (#343).
         metadata["related"] = serde_json::json!(note.related);
+        metadata["related_to"] = serde_json::json!(note.related);
         metadata["valid_from"] = serde_json::json!(now);
 
         let mut history = None;
@@ -1080,17 +1123,14 @@ pub async fn import_vault_with_limits(
             vector,
             metadata,
             content: note.content,
-            memory_type: note
-                .rdf_type
-                .strip_prefix("yaml:")
-                .unwrap_or("symbol")
-                .to_string(),
+            memory_type: declared_type.to_string(),
             history,
         });
     }
 
     // ---- Phase 2: writes ----
     let mut imported = 0;
+    let mut deferred_retry: Vec<(String, Vec<f32>, crate::traits::MemoryPayload)> = Vec::new();
     for item in planned {
         let cleanup_id = item.history.as_ref().map(|(id, _, _)| id.clone());
         if let Some((history_id, history_vector, history_payload)) = item.history {
@@ -1118,11 +1158,27 @@ pub async fn import_vault_with_limits(
             metadata: item.metadata,
         };
 
+        let retry = payload
+            .metadata
+            .get("related_to")
+            .and_then(Value::as_array)
+            .is_some_and(|targets| !targets.is_empty())
+            .then(|| (payload.clone(), item.vector.clone()));
+
         match store
             .upsert(&config.namespace, &item.id, item.vector, payload)
             .await
         {
-            Ok(_) => imported += 1,
+            Ok(report) => {
+                imported += 1;
+                // A declarer may precede its target in id order. The edge is
+                // not lost: retry once after every head exists.
+                if !report.deferred_edges.is_empty() {
+                    if let Some((payload, vector)) = retry {
+                        deferred_retry.push((item.id.clone(), vector, payload));
+                    }
+                }
+            }
             Err(e) => {
                 // Never leave a head-without-history outcome: roll back the
                 // history row staged for this note.
@@ -1135,6 +1191,14 @@ pub async fn import_vault_with_limits(
                 }
                 errors.push(format!("Failed to upsert {}: {}", item.id, e));
             }
+        }
+    }
+
+    // Every row (and stub) now exists, so a forward reference resolves. A
+    // target absent from both the vault and the store stays deferred.
+    for (id, vector, payload) in deferred_retry {
+        if let Err(e) = store.upsert(&config.namespace, &id, vector, payload).await {
+            errors.push(format!("Failed to relink edges for {}: {}", id, e));
         }
     }
 
@@ -3153,7 +3217,14 @@ mod tests {
 
         let (_, head) = store.get(ns, "edge-reconcile").await.unwrap().unwrap();
         assert_eq!(head.metadata["related"], serde_json::json!(["kept-edge"]));
-        for key in ["related_to", "governs", "depends_on"] {
+        // #343: `related_to` is now the parser-recognised head key and must
+        // carry exactly the parsed set, not the stale preserved one.
+        assert_eq!(
+            head.metadata["related_to"],
+            serde_json::json!(["kept-edge"]),
+            "the head must declare the parsed link set for edge materialisation"
+        );
+        for key in ["governs", "depends_on"] {
             assert!(
                 head.metadata.get(key).is_none(),
                 "stale edge field {key} must be reconciled away: {:?}",
@@ -3470,7 +3541,11 @@ mod tests {
         assert_eq!(exported.notes_exported, 2, "{:?}", exported.errors);
         assert!(vault.join("live-rule.md").exists());
         assert!(vault.join("future-rule.md").exists());
-        for id in ["expired-rule", "superseded-rule", "live-rule.vault-history.0000"] {
+        for id in [
+            "expired-rule",
+            "superseded-rule",
+            "live-rule.vault-history.0000",
+        ] {
             assert!(
                 !vault.join(format!("{id}.md")).exists(),
                 "retired row {id} must not be exported"
@@ -3575,8 +3650,15 @@ mod tests {
         let mut before = note("type-note", &[]);
         before.content = "same body".to_string();
         before.canonical_sha256 = legacy_fingerprint(&before);
-        seed_legacy_head(&store, ns, "type-note", "same body", "fact", &before.canonical_sha256)
-            .await;
+        seed_legacy_head(
+            &store,
+            ns,
+            "type-note",
+            "same body",
+            "fact",
+            &before.canonical_sha256,
+        )
+        .await;
 
         let mut after = before.clone();
         after.rdf_type = "yaml:rule".to_string();
@@ -3631,8 +3713,7 @@ mod tests {
             &unchanged.canonical_sha256,
         )
         .await;
-        std::fs::write(vault.join("legacy-note.md"), unchanged.to_markdown())
-            .expect("write note");
+        std::fs::write(vault.join("legacy-note.md"), unchanged.to_markdown()).expect("write note");
 
         let result = import_vault(
             vault_config(&root, &vault, ns),
