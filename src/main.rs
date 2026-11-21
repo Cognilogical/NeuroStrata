@@ -896,8 +896,10 @@ pub(crate) enum HooksCommands {
     },
 
     /// Write the pre-commit hook into the directory git runs hooks from
-    /// (core.hooksPath honored): stamps session_queries.json and task.graph_queried
-    /// when committing files in governed modules. Optional — only run on git repos.
+    /// (core.hooksPath honored): it reads session_queries.json and warns on
+    /// unrecorded staged files. It never stamps task.graph_queried — that is
+    /// written by record_graph_query_with_root after a real lookup. Optional —
+    /// only run on git repos.
     InstallPreCommit,
 }
 
