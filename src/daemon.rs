@@ -1724,6 +1724,22 @@ async fn cli_root_value(
                 ));
             }
             let ns = crate::server::resolve_namespace(store, &req.namespace).await;
+            // Only a folder the CLI already marked for this namespace: any
+            // other caller path would move the cache away from the marker.
+            let marked = crate::root_marker::in_main_checkout(root);
+            match crate::root_marker::read_marker(&marked) {
+                crate::root_marker::MarkerRead::Valid(cfg)
+                    if cfg.namespace.eq_ignore_ascii_case(&ns) => {}
+                _ => {
+                    return Err((
+                        axum::http::StatusCode::BAD_REQUEST,
+                        format!(
+                            "{} holds no project marker for '{ns}'; write the marker first (`neurostrata-mcp root set` or `hooks install`)",
+                            marked.display()
+                        ),
+                    ))
+                }
+            }
             let ok = crate::registry::set_project_root(store, Some(emb), &ns, root).await;
             Ok(serde_json::json!({ "ok": ok, "namespace": ns }))
         }
@@ -2518,6 +2534,21 @@ mod tests {
             root: root.to_string(),
         };
 
+        // No marker, or one for another namespace: the caller path is refused.
+        let err = super::cli_root_value(&store, &emb, &req("cache_root", &root.to_string_lossy()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST, "{}", err.1);
+        let other = crate::root_marker::RootConfig::new("other-project");
+        crate::root_marker::write_new_marker(&root, &other).unwrap();
+        let err = super::cli_root_value(&store, &emb, &req("cache_root", &root.to_string_lossy()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST, "{}", err.1);
+        assert_eq!(crate::registry::cached_project_root(&store, "example-project").await.unwrap(), None);
+
+        let cfg = crate::root_marker::RootConfig::new("example-project");
+        crate::root_marker::replace_marker(&root, &cfg).unwrap();
         let v = super::cli_root_value(&store, &emb, &req("cache_root", &root.to_string_lossy()))
             .await
             .unwrap();
@@ -2527,8 +2558,9 @@ mod tests {
             crate::registry::cached_project_root(&store, "example-project").await.unwrap(),
             Some(root.to_string_lossy().into_owned())
         );
-        // The daemon writes no file in the folder.
-        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        // The daemon writes no file in the folder: only the test's marker.
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(root.join(".NeuroStrata")).unwrap().count(), 1);
 
         // The removed writer ops and a relative root are refused.
         for op in ["setup", "set"] {
