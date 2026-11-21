@@ -1820,15 +1820,22 @@ describe('native task tool tracking + hook registration + pre-commit awk fallbac
   })
 
   it(
-    'pre-commit awk fallback handles filenames with spaces and & and produces valid comma-separated JSON',
+    'pre-commit warns for unrecorded paths with spaces and & without writing ledger rows',
     { skip: winHookSkip() },
     async () => {
       const { execFileSync } = await import('node:child_process')
-      const { mkdtempSync, symlinkSync, copyFileSync, chmodSync } =
-        await import('node:fs')
+      const {
+        mkdtempSync,
+        symlinkSync,
+        copyFileSync,
+        chmodSync,
+        openSync,
+        closeSync
+      } = await import('node:fs')
       const { tmpdir } = await import('node:os')
       const repoDir = mkdtempSync(join(tmpdir(), 'ns-precommit-awk-'))
       const binDir = mkdtempSync(join(tmpdir(), 'ns-precommit-bin-'))
+      const stderrPath = join(repoDir, 'hook-stderr.log')
       try {
         for (const cmd of [
           'bash',
@@ -1875,51 +1882,72 @@ describe('native task tool tracking + hook registration + pre-commit awk fallbac
         writeFileSync(hookPath, hookSource())
         chmodSync(hookPath, 0o755)
 
-        // Run 1: populates empty queries array with "src/file one.rs"
-        runHook(hookPath, {
-          cwd: repoDir,
-          env: { PATH: binDir, HOME: repoDir }
-        })
-
+        // Restricted PATH keeps node/python off the hook's PATH; the real
+        // shell + git still run. Capture stderr so warnings stay assertable.
+        const runWithStderr = () => {
+          const fd = openSync(stderrPath, 'w')
+          try {
+            runHook(hookPath, {
+              cwd: repoDir,
+              env: { PATH: binDir, HOME: repoDir },
+              stdio: ['ignore', 'pipe', fd]
+            })
+          } finally {
+            closeSync(fd)
+          }
+          return readFileSync(stderrPath, 'utf8')
+        }
         const ledgerPath = join(repoDir, '.NeuroStrata', 'session_queries.json')
-        const doc1 = JSON.parse(readFileSync(ledgerPath, 'utf8'))
-        assert.equal(doc1.queries.length, 1)
-        assert.equal(doc1.queries[0].query, 'src/file one.rs')
 
-        // Run 2: stages second file with '&' and appends to populated queries array
+        // Run 1: no ledger yet → warn, then create an empty queries array.
+        assert.equal(existsSync(ledgerPath), false)
+        let stderr = runWithStderr()
+        assert.ok(
+          stderr.includes("warning: file 'src/file one.rs'"),
+          `unrecorded path must warn: ${stderr}`
+        )
+        assert.ok(existsSync(ledgerPath), 'ledger file must be created')
+        const doc1 = JSON.parse(readFileSync(ledgerPath, 'utf8'))
+        assert.equal(doc1.queries.length, 0, 'hook must not fabricate rows')
+
+        // Run 2: stage a second file with '&' → warn for both, still no rows.
         writeFileSync(join(repoDir, 'src', 'a&b.rs'), 'fn b() {}\n')
         execFileSync('git', ['add', 'src/a&b.rs'], { cwd: repoDir })
-        runHook(hookPath, {
-          cwd: repoDir,
-          env: { PATH: binDir, HOME: repoDir }
-        })
-
+        stderr = runWithStderr()
+        assert.ok(
+          stderr.includes("warning: file 'src/a&b.rs'"),
+          `ampersand path must warn verbatim: ${stderr}`
+        )
+        assert.ok(
+          stderr.includes("warning: file 'src/file one.rs'"),
+          `spaced path must warn verbatim: ${stderr}`
+        )
         const doc2 = JSON.parse(readFileSync(ledgerPath, 'utf8'))
-        assert.equal(doc2.queries.length, 2)
-        const queries = doc2.queries.map((q) => q.query).sort()
-        assert.deepEqual(queries, ['src/a&b.rs', 'src/file one.rs'])
+        assert.equal(doc2.queries.length, 0, 'hook must not fabricate rows')
 
-        // Run 3: legacy compact single-line empty-array ledger `{"namespace":"app","queries":[]}`
-        writeFileSync(ledgerPath, '{"namespace":"app","queries":[]}')
-        runHook(hookPath, {
-          cwd: repoDir,
-          env: { PATH: binDir, HOME: repoDir }
-        })
-        const doc3 = JSON.parse(readFileSync(ledgerPath, 'utf8'))
-        assert.equal(doc3.namespace, 'app')
-        assert.equal(doc3.queries.length, 2)
+        // Run 3: legacy compact empty-array ledger is left byte-identical.
+        const compactLedger = '{"namespace":"app","queries":[]}'
+        writeFileSync(ledgerPath, compactLedger)
+        stderr = runWithStderr()
+        assert.ok(stderr.includes("warning: file 'src/file one.rs'"))
+        assert.ok(stderr.includes("warning: file 'src/a&b.rs'"))
+        assert.equal(
+          readFileSync(ledgerPath, 'utf8'),
+          compactLedger,
+          'legacy compact ledger must not be mutated'
+        )
 
-        // Run 4: legacy top-level array ledger `[{"ts":1,"tool":"legacy","query":"old.rs"}]`
-        writeFileSync(ledgerPath, '[{"ts":1,"tool":"legacy","query":"old.rs"}]')
-        runHook(hookPath, {
-          cwd: repoDir,
-          env: { PATH: binDir, HOME: repoDir }
-        })
-        const doc4 = JSON.parse(readFileSync(ledgerPath, 'utf8'))
-        assert.equal(typeof doc4.namespace, 'string')
-        assert.ok(Array.isArray(doc4.queries))
-        assert.equal(doc4.queries.length, 3)
-        assert.ok(doc4.queries.some((q) => q.query === 'old.rs'))
+        // Run 4: legacy top-level array ledger is left byte-identical.
+        const arrayLedger = '[{"ts":1,"tool":"legacy","query":"old.rs"}]'
+        writeFileSync(ledgerPath, arrayLedger)
+        stderr = runWithStderr()
+        assert.ok(stderr.includes("warning: file 'src/file one.rs'"))
+        assert.ok(stderr.includes("warning: file 'src/a&b.rs'"))
+        assert.equal(
+          readFileSync(ledgerPath, 'utf8'),
+          arrayLedger,
+          'legacy array ledger must not be mutated'
+        )
       } finally {
         rmSync(repoDir, { recursive: true, force: true })
         rmSync(binDir, { recursive: true, force: true })
@@ -2611,8 +2639,14 @@ describe('round-6: task_update title invalidation, AST summary formatting, dev s
     { skip: winHookSkip() },
     async () => {
       const { execFileSync } = await import('node:child_process')
-      const { mkdtempSync, symlinkSync, copyFileSync, chmodSync } =
-        await import('node:fs')
+      const {
+        mkdtempSync,
+        symlinkSync,
+        copyFileSync,
+        chmodSync,
+        openSync,
+        closeSync
+      } = await import('node:fs')
       const { tmpdir } = await import('node:os')
       const repoDir = mkdtempSync(join(tmpdir(), 'ns-precommit-r6-'))
       const binDir = mkdtempSync(join(tmpdir(), 'ns-precommit-bin-'))
@@ -2660,51 +2694,63 @@ describe('round-6: task_update title invalidation, AST summary formatting, dev s
         writeFileSync(hookPath, hookSource())
         chmodSync(hookPath, 0o755)
 
-        // Run 1: populate ledger with bare path
-        runHook(hookPath, {
-          cwd: repoDir,
-          env: { PATH: binDir, HOME: repoDir }
-        })
+        // Pre-seed all three recorded path forms: bare, ./<path> and
+        // $ROOT/<path> (the hook's ROOT, expanded to this temp repo).
+        const paths = ['src/test.rs', './src/test.rs', `${repoDir}/src/test.rs`]
+        const originalLedger = JSON.stringify(
+          {
+            namespace: 'r6',
+            queries: paths.map((query, i) => ({
+              ts: i + 1,
+              tool: 'graph-query',
+              query,
+              domains: [query],
+              returned_ids: [],
+              governed_prefixes: [query]
+            }))
+          },
+          null,
+          2
+        )
+        mkdirSync(join(repoDir, '.NeuroStrata'), { recursive: true })
+        const ledgerPath = join(repoDir, '.NeuroStrata', 'session_queries.json')
+        writeFileSync(ledgerPath, originalLedger)
 
-        let ledgerPath = join(repoDir, '.NeuroStrata', 'session_queries.json')
-        let ledger = JSON.parse(readFileSync(ledgerPath, 'utf8'))
-        assert.equal(ledger.queries.length, 1)
-        assert.equal(ledger.queries[0].query, 'src/test.rs')
-
-        // Run 2: manually inject $ROOT/path and ./path into ledger, then verify no warning on next run
-        // We simulate a ledger that already has entries with different path formats
-        ledger.queries.push({
-          ts: Date.now(),
-          tool: 'pre-commit',
-          query: './src/test.rs',
-          domains: ['./src/test.rs'],
-          returned_ids: [],
-          governed_prefixes: ['./src/test.rs']
-        })
-        ledger.queries.push({
-          ts: Date.now(),
-          tool: 'pre-commit',
-          query: '$ROOT/src/test.rs',
-          domains: ['$ROOT/src/test.rs'],
-          returned_ids: [],
-          governed_prefixes: ['$ROOT/src/test.rs']
-        })
-        writeFileSync(ledgerPath, JSON.stringify(ledger, null, 2))
-
-        // Stage another file and run - should not warn about src/test.rs (already in ledger in any format)
+        // Stage an unrecorded file: only it warns; src/test.rs matches in
+        // every recorded form and the hook never writes fabricated rows.
         writeFileSync(join(repoDir, 'src', 'another.rs'), 'fn b() {}\n')
         execFileSync('git', ['add', 'src/another.rs'], { cwd: repoDir })
-        runHook(hookPath, {
-          cwd: repoDir,
-          env: { PATH: binDir, HOME: repoDir }
-        })
-
-        // Should not have warning for src/test.rs
-        ledger = JSON.parse(readFileSync(ledgerPath, 'utf8'))
+        const stderrPath = join(repoDir, 'hook-stderr.log')
+        const fd = openSync(stderrPath, 'w')
+        try {
+          runHook(hookPath, {
+            cwd: repoDir,
+            env: { PATH: binDir, HOME: repoDir },
+            stdio: ['ignore', 'pipe', fd]
+          })
+        } finally {
+          closeSync(fd)
+        }
+        const stderr = readFileSync(stderrPath, 'utf8')
         assert.equal(
-          ledger.queries.length,
-          4,
-          'should have 4 queries total (src/test.rs once, ./src/test.rs, $ROOT/src/test.rs, src/another.rs)'
+          stderr.includes("warning: file 'src/test.rs'"),
+          false,
+          `pre-seeded path must not warn: ${stderr}`
+        )
+        assert.ok(
+          stderr.includes("warning: file 'src/another.rs'"),
+          `unrecorded path must warn: ${stderr}`
+        )
+        assert.equal(
+          readFileSync(ledgerPath, 'utf8'),
+          originalLedger,
+          'ledger must not gain fabricated rows'
+        )
+        const ledger = JSON.parse(readFileSync(ledgerPath, 'utf8'))
+        assert.equal(ledger.queries.length, 3)
+        assert.deepEqual(
+          ledger.queries.map((q) => q.query),
+          paths
         )
       } finally {
         const { rmSync } = await import('node:fs')
@@ -2795,7 +2841,7 @@ describe('round-8: Codex apply_patch extraction, decoded ledger matching, and ba
 
   // A file name containing a double quote cannot exist on Windows.
   it(
-    'pre-commit matches JSON-escaped unicode/quote paths and appends missing files in one write',
+    'pre-commit matches JSON-escaped unicode/quote paths and warns for unrecorded files without writing rows',
     {
       skip:
         winHookSkip() ||
@@ -2853,10 +2899,8 @@ describe('round-8: Codex apply_patch extraction, decoded ledger matching, and ba
         )
         // Force unicode escapes like python json.dump(ensure_ascii=True)
         const escaped = JSON.parse(readFileSync(ledgerPath, 'utf8'))
-        writeFileSync(
-          ledgerPath,
-          JSON.stringify(escaped).replace(/é/g, '\\u00e9')
-        )
+        const escapedLedger = JSON.stringify(escaped).replace(/é/g, '\\u00e9')
+        writeFileSync(ledgerPath, escapedLedger)
 
         const { spawnSync } = await import('node:child_process')
         const ran = spawnSync(hookPath, [], { cwd: repoDir, encoding: 'utf8' })
@@ -2877,10 +2921,36 @@ describe('round-8: Codex apply_patch extraction, decoded ledger matching, and ba
           `decoded quoted path must not warn: ${stderr}`
         )
 
+        assert.ok(
+          stderr.includes("warning: file 'src/a.rs'"),
+          `unrecorded a.rs must warn: ${stderr}`
+        )
+        assert.ok(
+          stderr.includes("warning: file 'src/b.rs'"),
+          `unrecorded b.rs must warn: ${stderr}`
+        )
+        assert.equal(
+          readFileSync(ledgerPath, 'utf8'),
+          escapedLedger,
+          'ledger must not gain fabricated rows'
+        )
         const ledger = JSON.parse(readFileSync(ledgerPath, 'utf8'))
         const queries = ledger.queries.map((q) => q.query).sort()
-        assert.ok(queries.includes('src/a.rs'))
-        assert.ok(queries.includes('src/b.rs'))
+        assert.equal(
+          queries.includes('src/a.rs'),
+          false,
+          'no fabricated row for a.rs'
+        )
+        assert.equal(
+          queries.includes('src/b.rs'),
+          false,
+          'no fabricated row for b.rs'
+        )
+        assert.equal(
+          ledger.queries.length,
+          2,
+          'ledger keeps only the 2 seeded rows'
+        )
         assert.equal(
           queries.filter(
             (q) => q === 'src/café.rs' || q === 'src/quote"file.rs'
