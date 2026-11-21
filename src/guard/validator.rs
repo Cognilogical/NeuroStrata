@@ -1924,4 +1924,59 @@ mod tests {
             ValidateVerdict::SandboxPassHighFidelity { .. }
         ));
     }
+
+    /// Codex review d7b8d2ee#r4650162580: a payload that exhausts the walk
+    /// budget must not hide a target behind truncation, and recognized
+    /// top-level targets must survive a large nested array.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn extraction_budget_exhaustion_fails_closed() {
+        let (_store, validator) = validator_with(vec![rule(
+            "global-no-python",
+            &no_py_trigger(),
+            "Never use Python code",
+            "active",
+        )])
+        .await;
+
+        // 254 edit objects exhaust a 256-node budget before the top-level
+        // file_path is visited (serde_json sorts keys).
+        let edits: Vec<serde_json::Value> = (0..254)
+            .map(|i| serde_json::json!({"path": format!("/workspace/src/f{i}.rs")}))
+            .collect();
+        let multi_edit = serde_json::json!({
+            "edits": edits,
+            "file_path": "/workspace/target.py"
+        })
+        .to_string();
+        let (v_multi, f_multi) = validator
+            .validate("MultiEdit", &multi_edit, "/workspace", false)
+            .await;
+        assert_eq!(
+            f_multi,
+            vec!["global-no-python".to_string()],
+            "a top-level target must survive a large edit list"
+        );
+        assert!(matches!(
+            v_multi,
+            ValidateVerdict::DeterministicReject { .. }
+        ));
+
+        // Beyond any budget with no visible target: fail closed, not open.
+        let operations: Vec<serde_json::Value> = (0..5000)
+            .map(|i| serde_json::json!({ "n": i }))
+            .collect();
+        let huge = serde_json::json!({ "operations": operations }).to_string();
+        let (v_huge, f_huge) = validator
+            .validate("write", &huge, "/workspace", false)
+            .await;
+        assert_eq!(
+            f_huge,
+            vec!["global-no-python".to_string()],
+            "truncated extraction must reject rather than silently allow"
+        );
+        assert!(matches!(
+            v_huge,
+            ValidateVerdict::DeterministicReject { .. }
+        ));
+    }
 }
