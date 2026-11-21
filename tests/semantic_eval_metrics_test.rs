@@ -401,3 +401,48 @@ fn per_query_p95_medians_still_use_three_iteration_medians() {
     assert!((medians[0] - 12.0).abs() < 1e-12);
     assert!((medians[1] - 20.0).abs() < 1e-12);
 }
+
+/// R8.1 honesty guard (additive): the recorded mixed alias+hierarchy subset
+/// lift (0.042857 in eval/semantic/retrieval-receipt.json) is below the 0.10
+/// floor, so the accepted gate must still fail closed with the subset-lift
+/// violation. Mirrors the receipt; never weakens the existing gate tests.
+#[test]
+fn recorded_mixed_subset_lift_gate_fails_honestly() {
+    let arm3 = ArmMetrics {
+        arm: RetrievalArm::FlatAliases,
+        ndcg_at_10: 0.55,
+        recall_at_5: 0.661905,
+        precision_at_5: 0.62,
+        ontology_recall_at_5: 0.45,
+        p95_ms: 100.0,
+        queries: vec![
+            query("q-alias", QueryCategory::Alias, 0.55, 0.661905, 0.60),
+            query("q-hier", QueryCategory::Hierarchy, 0.55, 0.661905, 0.60),
+        ],
+    };
+    let arm4 = ArmMetrics {
+        arm: RetrievalArm::Ontology,
+        ndcg_at_10: 0.56,
+        recall_at_5: 0.704762,
+        precision_at_5: 0.61,
+        ontology_recall_at_5: 0.46,
+        p95_ms: 105.0,
+        queries: vec![
+            query("q-alias", QueryCategory::Alias, 0.56, 0.704762, 0.60),
+            query("q-hier", QueryCategory::Hierarchy, 0.56, 0.704762, 0.60),
+        ],
+    };
+    let report = gate_ok(&arm3, &arm4);
+    assert_eq!(report.verdict, GateVerdict::Fail);
+    let violation = report
+        .violations
+        .iter()
+        .find(|v| v.code == "insufficient_ontology_subset_lift")
+        .expect("subset-lift violation must remain enforced");
+    assert!(
+        violation.detail.contains("0.042857"),
+        "unexpected measured lift: {}",
+        violation.detail
+    );
+    assert!(violation.detail.contains("< 0.10"));
+}

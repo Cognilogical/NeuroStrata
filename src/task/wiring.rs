@@ -180,7 +180,7 @@ pub const REMINDER_WIRES: &[Reminder] = &[
     Reminder {
         id: "graph-first-lookup",
         fires_on: "during-work",
-        text: "before blind grep/glob or file edits, query neurostrata_memories_for_file, neurostrata_related, neurostrata_search_memory (include_related: true), or neurostrata_sparql_query for GOVERNS/DEPENDS_ON/calls/imports edges",
+        text: "before blind grep/glob or file edits, query neurostrata_memories_for_file, neurostrata_related, neurostrata_search_memory (mode hybrid default, include_references true), or neurostrata_sparql_query for GOVERNS/DEPENDS_ON/calls/imports edges",
     },
     Reminder {
         id: "subagent-context-propagation",

@@ -137,6 +137,12 @@ impl GateReport {
             "stale_memories": stale_memories,
             "unextracted_done": self.unextracted_done.iter().map(Violation::to_json).collect::<Vec<_>>(),
             "counts": self.counts.to_json(),
+            // R7: always present, always advisory. The gate engine is
+            // metadata-only, so it emits the zero report; handle_task_validate
+            // enriches it from local receipts. No advisory reaches `violations`.
+            "advisories": json!({
+                "graph_ontology": crate::task::graph_advisories::AdvisoryReport::default().to_json(),
+            }),
         })
     }
 }
@@ -891,6 +897,37 @@ mod tests {
             &format!("work for {}", id),
             json!({ "task": task_meta }),
         )
+    }
+
+    /// R7.1/R7.3: `validate_json` always carries the exact advisory field set
+    /// and no advisory code can enter `violations`. `ok()` stays byte-bound to
+    /// `violations` alone.
+    #[test]
+    fn gate_validate_json_keeps_advisories_out_of_violations() {
+        let report = GateReport::default();
+        let body = report.validate_json();
+        assert!(body["violations"].as_array().unwrap().is_empty());
+        assert_eq!(body["advisories"].as_object().unwrap().len(), 1);
+        let advisory = &body["advisories"]["graph_ontology"];
+        for field in [
+            "genuine_lookup_coverage",
+            "distinct_graph_tools",
+            "high_blast_radius_unexplored",
+            "diff_tour_recommended",
+            "taxonomy_available",
+            "strategic_context_detected",
+            "concept_grounding_linked",
+            "recommendations",
+            "unresolved_trigger_ids",
+        ] {
+            assert!(
+                advisory.get(field).is_some(),
+                "advisories.graph_ontology missing {field}"
+            );
+        }
+        assert_eq!(advisory.as_object().unwrap().len(), 9);
+        assert!(advisory["recommendations"].as_array().unwrap().is_empty());
+        assert!(report.ok());
     }
 
     /// FEATURE-4: a rule is an assertion until it says where it came from.

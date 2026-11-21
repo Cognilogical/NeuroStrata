@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "contract_id": "agent-adoption-evaluation-v1",
+  "spec": "docs/superpowers/specs/2026-11-20-agent-graph-ontology-adoption-design.md#R8",
+  "production_roi_claimed": false,
+  "evidence_boundary": "thresholds_and_task_sets_declared_not_measured",
+  "thresholds": {
+    "route_coverage": 0.95,
+    "follow_through": 0.80,
+    "routing_precision": 0.90,
+    "unnecessary_ontology_routing": 0.05,
+    "blind_accuracy_lift": 0.10,
+    "regression_floor": -0.02,
+    "response_p95_bytes": 32768,
+    "routing_p95_ms": 750,
+    "ontology_lift": 0.10
+  },
+  "task_sets": {
+    "label_source": "owner",
+    "total_tasks": 120,
+    "status": "declared_not_materialized",
+    "owner_labeled_suite_task": "neurostrata-pqhb",
+    "sets": [
+      {
+        "id": "routine_edits",
+        "count": 40,
+        "label_source": "owner"
+      },
+      {
+        "id": "cross_file_impact",
+        "count": 40,
+        "label_source": "owner"
+      },
+      {
+        "id": "ontology_relevant",
+        "count": 40,
+        "label_source": "owner"
+      }
+    ]
+  },
+  "semantic_lift_gate": {
+    "gate_source": "src/semantic_eval/metrics.rs:evaluate_thresholds",
+    "receipt": "eval/semantic/retrieval-receipt.json",
+    "measured_alias_hierarchy_recall_at_5_lift": 0.042857,
+    "measured_baseline_subset_recall_at_5": 0.661905,
+    "measured_candidate_subset_recall_at_5": 0.704762,
+    "threshold": 0.10,
+    "verdict": "FAIL",
+    "production_claim": false,
+    "default_ranking_roi_claimed": false,
+    "note": "Gate stays FAILING: mixed alias+hierarchy Recall@5 subset lift 0.042857 < 0.10. No threshold, ranking default, or evaluate_thresholds behavior is changed to force a pass."
+  }
+}
