@@ -3055,6 +3055,121 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Codex review 7b8f8fb4#r4649890196: preserving the prior head's
+    /// alternate edge keys (`related_to`/`governs`/`depends_on`) must not
+    /// resurrect links the edited vault note removed — `from_payload` unions
+    /// all four fields, so the next export would restore them.
+    #[tokio::test]
+    async fn import_reconciles_preserved_edge_fields_with_edited_links() {
+        let root = std::env::temp_dir().join(format!("ns-edge-reconcile-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_edge_reconcile";
+        store.init(ns).await.expect("init");
+
+        // The prior head carries typed edge renderings plus unrelated state.
+        store
+            .upsert(
+                ns,
+                "edge-reconcile",
+                vec![0.0; 4],
+                crate::traits::MemoryPayload {
+                    content: "Original body".to_string(),
+                    user_id: "default".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({
+                        "canonical_sha256": "seed-hash",
+                        "related": ["kept-edge", "deleted-edge"],
+                        "related_to": ["deleted-related-to"],
+                        "governs": ["deleted-governs"],
+                        "depends_on": ["deleted-depends"],
+                        "custom_state": {"stage": "kept"}
+                    }),
+                },
+            )
+            .await
+            .expect("seed edge head");
+        // The kept target is in the vault unchanged, so it is a no-op and
+        // the import has nothing to stub.
+        let mut kept = note("kept-edge", &[]);
+        kept.content = "kept target".to_string();
+        kept.canonical_sha256 = kept.fingerprint();
+        store
+            .upsert(
+                ns,
+                "kept-edge",
+                vec![0.0; 4],
+                crate::traits::MemoryPayload {
+                    content: kept.content.clone(),
+                    user_id: "default".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({
+                        "canonical_sha256": kept.canonical_sha256
+                    }),
+                },
+            )
+            .await
+            .expect("seed kept edge target");
+        std::fs::write(vault.join("kept-edge.md"), kept.to_markdown())
+            .expect("write kept target note");
+
+        // The edited vault note keeps only one link.
+        let mut edited = note("edge-reconcile", &["kept-edge"]);
+        edited.content = "Edited body".to_string();
+        edited.canonical_sha256 = edited.fingerprint();
+        std::fs::write(
+            vault.join("edge-reconcile.md"),
+            edited.to_markdown(),
+        )
+        .expect("write edited note");
+
+        let config = VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.clone()),
+            allowed_external_dirs: None,
+        };
+        let result = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("import");
+        assert_eq!(result.notes_imported, 1, "{:?}", result.errors);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+
+        let (_, head) = store.get(ns, "edge-reconcile").await.unwrap().unwrap();
+        assert_eq!(head.metadata["related"], serde_json::json!(["kept-edge"]));
+        for key in ["related_to", "governs", "depends_on"] {
+            assert!(
+                head.metadata.get(key).is_none(),
+                "stale edge field {key} must be reconciled away: {:?}",
+                head.metadata
+            );
+        }
+        assert_eq!(
+            head.metadata["custom_state"]["stage"],
+            serde_json::json!("kept"),
+            "unrelated structured state must survive"
+        );
+        let exported = VaultNote::from_payload("edge-reconcile", &head);
+        assert_eq!(
+            exported.related,
+            vec!["kept-edge".to_string()],
+            "the next export must not resurrect deleted links"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// #336: a WikiLink target that exists in the store but whose file is
     /// absent from the vault must not be replaced by a stub.
     #[tokio::test]
