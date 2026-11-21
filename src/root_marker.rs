@@ -336,10 +336,12 @@ pub(crate) fn in_main_checkout(dir: &Path) -> PathBuf {
 
 /// The marker that decides `path`'s project root (spec 6.1), or `None`.
 ///
-/// For a file the walk starts at its folder. The path is canonicalized
+/// For a file the walk starts at its folder. That folder is canonicalized
 /// through its nearest existing ancestor, so any spelling of it (drive letter
 /// case, `/`, a junction or symlink) finds the same marker and the root comes
-/// back in canonical spelling. A path that is not absolute on this host (a
+/// back in canonical spelling. A file symlink itself is not followed: the
+/// link's own folder decides, so a link into another checkout does not
+/// carry that checkout's marker. A path that is not absolute on this host (a
 /// POSIX path on Windows, say) cannot be read here and finds none.
 /// 1. Own checkout: from the start folder up to the nearest folder holding
 ///    `.git` (inclusive), never above it; the deepest marker wins.
@@ -402,17 +404,17 @@ fn decide(
 }
 
 /// The folder a walk starts from, or `None` for a path that is not
-/// absolute on this host.
+/// absolute on this host. For a file it is the file's folder, canonicalized
+/// itself: a file symlink is not followed, so a link to a file in another
+/// checkout does not take that checkout's marker.
 fn start_folder(path: &Path) -> Option<PathBuf> {
     if !path.is_absolute() {
         return None;
     }
-    let path = canonical_through_existing(path);
     if path.is_file() {
-        path.parent().map(Path::to_path_buf)
-    } else {
-        Some(path)
+        return path.parent().map(canonical_through_existing);
     }
+    Some(canonical_through_existing(path))
 }
 
 /// `path` canonicalized through its nearest existing ancestor, with the
@@ -1635,6 +1637,46 @@ mod tests {
                     .output()
                     .is_ok_and(|o| o.status.success())
         }
+    }
+
+    /// Links `link` to the file `target`; false when this session may not
+    /// create file symlinks (Windows without the privilege).
+    fn link_file(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(target, link).is_ok()
+        }
+    }
+
+    #[test]
+    fn file_symlink_into_another_checkout_does_not_take_its_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        let outer = base.join("outer");
+        std::fs::create_dir_all(outer.join(".git")).unwrap();
+        std::fs::create_dir_all(outer.join("src")).unwrap();
+        std::fs::write(outer.join("src").join("a.rs"), "").unwrap();
+        write_raw(&outer, br#"{"version":1,"namespace":"outer"}"#);
+        let inner = base.join("inner");
+        std::fs::create_dir_all(inner.join(".git")).unwrap();
+        let link = inner.join("link.rs");
+        if !link_file(&outer.join("src").join("a.rs"), &link) {
+            eprintln!("skipped: file symlinks are not available here");
+            return;
+        }
+        assert_eq!(find_root_marker(&link), Ok(None));
+        // The target itself still finds its own marker.
+        let found = find_root_marker(&outer.join("src").join("a.rs")).unwrap().unwrap();
+        assert_eq!(found.root, outer);
+        // A marker in the link's own checkout decides for the link.
+        write_raw(&inner, br#"{"version":1,"namespace":"inner"}"#);
+        let found = find_root_marker(&link).unwrap().unwrap();
+        assert_eq!(found.root, inner);
+        assert_eq!(found.config.namespace, "inner");
     }
 
     #[test]
