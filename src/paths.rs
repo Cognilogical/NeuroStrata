@@ -562,10 +562,10 @@ pub fn to_project_relative(
 }
 
 /// Whether `marker`'s root is `cached_root`, the namespace's cached registry
-/// root. A worktree's root is compared in its main checkout's spelling (the
-/// registry caches it that way), and both sides canonically, so an alias of
-/// the same folder matches. No cached root, or one missing here, never
-/// matches.
+/// root. A worktree's root matches in its main checkout's spelling (the
+/// registry caches it that way) or as itself (a root cached at the
+/// worktree), both sides compared canonically, so an alias of the same
+/// folder matches. No cached root, or one missing here, never matches.
 pub fn marker_root_is_cached_root(
     marker: &crate::root_marker::FoundMarker,
     cached_root: Option<&str>,
@@ -574,7 +574,9 @@ pub fn marker_root_is_cached_root(
         return false;
     };
     let mapped = crate::root_marker::in_main_checkout(&marker.root);
-    canonical(&mapped).unwrap_or(mapped) == cached
+    [mapped, marker.root.clone()]
+        .into_iter()
+        .any(|root| canonical(&root).unwrap_or(root) == cached)
 }
 
 /// [`with_marker_spelling`] after checking that `marker` names
@@ -599,7 +601,7 @@ pub fn with_root_config(
 
 /// Add the project marker's spelling to a file lookup of absolute `input`
 /// (spec 6.2), for a caller that has already checked that `marker` names
-/// the call's namespace (ignoring case, as `server::resolve_namespace` does)
+/// the call's namespace (under `server::resolve_namespace`'s case rules)
 /// and that its root is the cached root ([`marker_root_is_cached_root`]).
 /// Unless `lookup` is `Outside` or `Relative`, the path below the marker
 /// root, in its on-disk spelling, becomes `path`, and today's `path` and
@@ -2388,6 +2390,8 @@ mod tests {
             ..found_marker(&wt, "ns")
         };
         assert!(marker_root_is_cached_root(&marker, Some(&repo_s)));
+        // A root cached at the worktree itself matches too.
+        assert!(marker_root_is_cached_root(&marker, Some(&s(&wt))));
         let today = to_project_relative(&file, None, Some(&repo_s));
         let got = with_root_config(today, &file, &marker, Some(&repo_s), "ns");
         assert_eq!(got.source, RootSource::RootConfig);
