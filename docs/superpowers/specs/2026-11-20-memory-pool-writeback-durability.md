@@ -70,7 +70,10 @@ post-write records with that same source SHA.
    `pool_idempotency` error: silently proceeding without receipts would let a
    retried effect duplicate.
 9. **No false receipt.** If the snapshot or persistence fails, the effect
-   returns an error instead of a success receipt that cannot be observed.
+   returns an error instead of a success receipt that cannot be observed. A
+   rejected persistence also restores the request-local connector to
+   `prior_records` and drops the uncommitted receipt, so a reused kernel
+   cannot serve or replay the failed effect.
 10. **Same-kernel visibility is unchanged**: the in-memory effect is visible
     immediately, and the persist step does not mutate the request-local
     connector again.
@@ -122,6 +125,9 @@ Additional evals:
   `write_back_rejects_a_pool_that_became_retired` covers the early path).
 - Receipt-load failure propagation is enforced by `?` in hydration; the
   kernel path fails the request instead of hydrating without receipts.
+- `rejected_write_back_restores_connector_state` — after a persistence
+  conflict, the reused kernel resolves the pre-effect records and the same
+  idempotency key no longer replays as success.
 
 Negative control (existing coverage): `json_file` registration/resolution
 across kernels continues to pass; its connector returns no snapshot so the

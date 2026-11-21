@@ -544,7 +544,8 @@ impl AgentKernel {
                 .get_or_init(|| tokio::sync::Mutex::new(()))
                 .lock()
                 .await;
-            self.memory
+            if let Err(e) = self
+                .memory
                 .register_pool_writeback(
                     namespace,
                     &schema,
@@ -552,7 +553,22 @@ impl AgentKernel {
                     &snapshot,
                     principal,
                 )
-                .await?;
+                .await
+            {
+                // Review 700fdbe0#r4650486569: the effect mutated this
+                // kernel's connector, but it is not durable. Restore the
+                // pre-effect state so a reused kernel cannot leak the
+                // rejected write or replay its receipt.
+                let _ = connector
+                    .rollback_write_back(
+                        &connector_pool_id,
+                        &pointer.pointer_uri,
+                        &snapshot.prior_records,
+                        &snapshot.idempotency,
+                    )
+                    .await;
+                return Err(e);
+            }
         }
         let mut receipt = receipt;
         receipt.pointer_id = pointer.pointer_id.clone();
@@ -3406,8 +3422,24 @@ mod tests {
             )
             .await
             .expect("register pointer");
-        seed_receipt(&store_impl, ns, "rcpt_r1", "ptr_rollback", "rollback_mem", false).await;
-        seed_receipt(&store_impl, ns, "rcpt_r2", "ptr_rollback", "rollback_mem", false).await;
+        seed_receipt(
+            &store_impl,
+            ns,
+            "rcpt_r1",
+            "ptr_rollback",
+            "rollback_mem",
+            false,
+        )
+        .await;
+        seed_receipt(
+            &store_impl,
+            ns,
+            "rcpt_r2",
+            "ptr_rollback",
+            "rollback_mem",
+            false,
+        )
+        .await;
 
         let kernel2 = AgentKernel::new(store.clone(), bus.clone(), dir.path().to_path_buf());
         kernel2

@@ -154,6 +154,20 @@ pub trait DataConnector: Send + Sync {
         let _ = (pool_id, receipts);
         Ok(())
     }
+
+    /// Roll back an in-memory effect whose persistence was rejected, so a
+    /// reused kernel does not expose an uncommitted mutation or replay its
+    /// receipt.
+    async fn rollback_write_back(
+        &self,
+        pool_id: &str,
+        pointer_uri: &str,
+        prior_records: &[Value],
+        idempotency: &HashMap<String, ExternalEffectReceipt>,
+    ) -> Result<()> {
+        let _ = (pool_id, pointer_uri, prior_records, idempotency);
+        Ok(())
+    }
 }
 
 pub struct DataConnectorRegistry {
@@ -553,6 +567,39 @@ impl DataConnector for InMemoryPoolConnector {
                 .idempotency
                 .extend(receipts.iter().map(|(k, v)| (k.clone(), v.clone())));
         }
+        Ok(())
+    }
+
+    /// Review 700fdbe0#r4650486569: a rejected persistence restores the
+    /// pointer's pre-effect records and drops the uncommitted receipt. A
+    /// replay (records already equal to prior) is left untouched.
+    async fn rollback_write_back(
+        &self,
+        pool_id: &str,
+        pointer_uri: &str,
+        prior_records: &[Value],
+        idempotency: &HashMap<String, ExternalEffectReceipt>,
+    ) -> Result<()> {
+        let mut pools = self.pools.write().unwrap();
+        let Some(entry) = pools.get_mut(pool_id) else {
+            return Ok(());
+        };
+        let changed = entry
+            .records
+            .get(pointer_uri)
+            .map(|records| records.as_slice())
+            != Some(prior_records);
+        if !changed {
+            return Ok(());
+        }
+        entry
+            .records
+            .insert(pointer_uri.to_string(), prior_records.to_vec());
+        for key in idempotency.keys() {
+            entry.idempotency.remove(key);
+        }
+        entry.prior_records.remove(pointer_uri);
+        entry.last_receipt_keys.remove(pointer_uri);
         Ok(())
     }
 }

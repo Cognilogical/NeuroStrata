@@ -74,6 +74,7 @@ pub trait DataConnector: Send + Sync {
 - The persisted `pool_schema` is preserved and its access mode revalidated at commit: a pool changed to read-only after hydration rejects the write-back instead of restoring the stale read-write schema. Pool registration and write-back share one persistence turn.
 - A pool archived after hydration is rejected at commit; a write-back must never revive a retired row.
 - Receipt-load failures during hydration fail the request instead of silently omitting receipts and allowing a retried effect to duplicate.
+- A rejected persistence rolls the request-local connector back to `prior_records`, drops the uncommitted receipt, and then returns the error: a reused kernel cannot serve the failed mutation or replay it as success.
 - `pool_idempotency` is persisted with the records and restored during hydration, so a retry through a fresh kernel returns the original receipt and cannot append twice.
 - A schema-only `upsert_pool` (no `records`) preserves `pool_idempotency` alongside the retained `pool_records`; it must not orphan receipts from their records.
 - A snapshot carries only the receipt produced by the written pointer's latest effect. A receipt whose persistence was rejected is never promoted by a later write to another pointer, so it cannot replay as `applied: true` without durable records.
