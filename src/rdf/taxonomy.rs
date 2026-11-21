@@ -2089,17 +2089,24 @@ fn build_tree_node(
     slug: &str,
     concepts: &BTreeMap<String, HydratedConcept>,
     allowed_set: &BTreeSet<String>,
-    visited: &mut BTreeSet<String>,
+    visited: &mut BTreeMap<String, usize>,
     remaining_hops: Option<usize>,
 ) -> Option<TaxonomyTreeNode> {
-    if !visited.insert(slug.to_string()) {
-        return None;
+    // Track the greatest remaining budget seen per node, not a boolean:
+    // a DAG node first reached by a longer path must be revisited when a
+    // shorter path leaves more hops for its descendants (#334/C2 follow-up).
+    let budget = remaining_hops.unwrap_or(usize::MAX);
+    if let Some(best) = visited.get(slug) {
+        if *best >= budget {
+            return None;
+        }
     }
+    visited.insert(slug.to_string(), budget);
     let c = concepts.get(slug)?;
     let mut children = Vec::new();
     if remaining_hops != Some(0) {
         for child_slug in &c.narrower {
-            if allowed_set.contains(child_slug) && !visited.contains(child_slug) {
+            if allowed_set.contains(child_slug) {
                 if let Some(child_node) = build_tree_node(
                     child_slug,
                     concepts,
@@ -2190,7 +2197,7 @@ async fn execute_tree(
             .collect()
     };
 
-    let mut visited = BTreeSet::new();
+    let mut visited = BTreeMap::new();
     let max_hops = req.max_hops.map(|hops| hops.clamp(1, MAX_TREE_HOPS));
     let mut roots = Vec::new();
     for r_slug in root_slugs {
@@ -5826,9 +5833,8 @@ mod tests {
                     pref_label: Some(slug.to_string()),
                     definition: Some("shared DAG fixture".to_string()),
                     domain: Some("testing".to_string()),
-                    broader: broader.map(|list| {
-                        list.into_iter().map(|item| item.to_string()).collect()
-                    }),
+                    broader: broader
+                        .map(|list| list.into_iter().map(|item| item.to_string()).collect()),
                     ..Default::default()
                 },
                 &sec("alice"),

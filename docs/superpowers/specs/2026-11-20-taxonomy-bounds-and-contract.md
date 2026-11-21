@@ -51,7 +51,10 @@ aliases and MCP routing keys make strict rejection risky).
 ### C2 — tree controls
 
 - `max_hops` caps the tree depth below each root: `Some(n)` is clamped to
-  `1..=4`; `None` keeps the current unlimited behavior.
+  `1..=4`; `None` keeps the current unlimited behavior. Shared DAG nodes are
+  revisited when a shorter path leaves a larger remaining budget, so a
+  depth-limited tree does not lose descendants reachable by that path (the
+  node may appear under both parents).
 - `limit` caps the number of returned root nodes: `Some(n)` is clamped to
   `1..=50`; `None` returns all roots.
 - Both are backward-compatible: omitted parameters produce today's full
@@ -81,6 +84,9 @@ Red on baseline:
   level of children. Baseline returns the full chain.
 - `tree_honours_limit` — two top-level roots with `limit=1` return one root.
   Baseline returns both.
+- `tree_revisits_shared_nodes_with_a_larger_budget` — in a DAG with a
+  shorter direct path, `max_hops` still expands the descendants reachable
+  through it.
 
 Added with the fix (helper did not exist to compile against):
 
