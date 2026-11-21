@@ -166,6 +166,19 @@ pub fn should_flush(quiet_elapsed: Duration, window_elapsed: Duration) -> bool {
     quiet_elapsed >= QUIET_PERIOD || window_elapsed >= MAX_WINDOW
 }
 
+/// Deadline decision for one burst: flush after the quiet period since the
+/// latest event, or at the max window since the first event (event storms).
+/// Uses monotonic `Instant`s so it can be tested with synthetic clocks.
+pub fn flush_due(
+    first: tokio::time::Instant,
+    last: tokio::time::Instant,
+    now: tokio::time::Instant,
+) -> bool {
+    let quiet_elapsed = now.saturating_duration_since(last);
+    let window_elapsed = now.saturating_duration_since(first);
+    should_flush(quiet_elapsed, window_elapsed)
+}
+
 /// Next backoff delay for a failed trigger attempt, progressing through the
 /// backoff ladder and capping at the last step.
 pub fn next_backoff(attempt: usize) -> Duration {
@@ -207,7 +220,9 @@ impl NotifyEventSource {
                         if ev.paths.len() >= 2 {
                             let _old = ev.paths[0].clone();
                             let new = ev.paths[1].clone();
-                            (WatchEventKind::Rename, Some(new), true)
+                            // A single both-paths rename must be emitted; the
+                            // old path is `paths[0]`, destination is `paths[1]`.
+                            (WatchEventKind::Rename, Some(new), false)
                         } else {
                             (WatchEventKind::Modify, None, false)
                         }
@@ -277,12 +292,11 @@ impl WatchEventSource for NotifyEventSource {
     }
 
     fn watch_root(&mut self, root: &Path) -> Result<(), String> {
-        // Delegate to the underlying notify::RecommendedWatcher so OS
-        // events are actually delivered for this root. The daemon layer
-        // re‑initialises the watcher when roots change.
-        let _ = self
-            .watcher
-            .watch(root, notify::RecursiveMode::NonRecursive);
+        // Fail closed: a root we cannot actually watch must not be recorded
+        // as active. Recursive mode covers nested source files.
+        self.watcher
+            .watch(root, notify::RecursiveMode::Recursive)
+            .map_err(|err| format!("could not watch {}: {err}", root.display()))?;
         let mut roots = self
             .watched_roots
             .lock()
@@ -292,13 +306,16 @@ impl WatchEventSource for NotifyEventSource {
     }
 
     fn unwatch_root(&mut self, root: &Path) -> Result<(), String> {
-        // Delegate to the underlying notify::RecommendedWatcher so OS
-        // events are torn down for this root.
-        let _ = self.watcher.unwatch(root);
         let mut roots = self
             .watched_roots
             .lock()
             .map_err(|_| "watch roots mutex poisoned".to_string())?;
+        if !roots.contains(root) {
+            return Ok(());
+        }
+        self.watcher
+            .unwatch(root)
+            .map_err(|err| format!("could not unwatch {}: {err}", root.display()))?;
         roots.remove(root);
         Ok(())
     }
@@ -643,6 +660,16 @@ pub struct WatchStatusReport {
     pub roots: Vec<RootStatus>,
 }
 
+type RootKey = (String, PathBuf);
+
+/// Timing of one in-flight event burst. Monotonic instants avoid the
+/// whole-second truncation that made the previous debounce ineffective.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BurstState {
+    first: tokio::time::Instant,
+    last: tokio::time::Instant,
+}
+
 /// Client-agnostic watcher core: owns registrations, runtime state, and
 /// status behind the event source / store / trigger ports. Concrete adapters
 /// are wired only at the composition root.
@@ -653,6 +680,9 @@ pub struct IngestWatchService {
     startup_root: PathBuf,
     allowed_external_dirs: Vec<PathBuf>,
     state: Mutex<CoreState>,
+    bursts: Mutex<HashMap<RootKey, BurstState>>,
+    active: Mutex<HashSet<RootKey>>,
+    retry_at: Mutex<HashMap<RootKey, tokio::time::Instant>>,
 }
 
 fn unix_now_secs() -> u64 {
@@ -677,6 +707,9 @@ impl IngestWatchService {
             startup_root,
             allowed_external_dirs,
             state: Mutex::new(CoreState::default()),
+            bursts: Mutex::new(HashMap::new()),
+            active: Mutex::new(HashSet::new()),
+            retry_at: Mutex::new(HashMap::new()),
         }
     }
 
@@ -934,102 +967,238 @@ impl IngestWatchService {
     /// Event loop for the daemon: receives watch events, coalesces them
     /// per‑root, debounces per the pure `should_flush`, triggers ingest via
     /// the `IngestTrigger` port, updates runtime/status, and honours shutdown.
-    pub async fn run(self: Arc<Self>, mut shutdown: oneshot::Receiver<()>) -> anyhow::Result<()> {
-        // Initial reconciliation: one full skip-fast trigger per active root.
-        self.reconcile().await?;
+    /// Fold one normalized watch event into every active root it touches.
+    /// Testable seam: callers supply a monotonic `now` so debounce timing is
+    /// deterministic without real-time sleeps.
+    pub fn ingest_event(&self, ev: WatchEvent, now: tokio::time::Instant) -> anyhow::Result<()> {
+        let effects = normalize_event(ev.clone());
+        let mut state = self.lock_state()?;
+        let keys: Vec<RootKey> = state.roots.keys().cloned().collect();
+        let mut matched = false;
+        for key in keys {
+            let canonical = &key.1;
+            let paths: Vec<PathBuf> = effects.iter().map(|e| e.path.clone()).collect();
+            let eligible = paths
+                .iter()
+                .any(|path| crate::parser::ingest::is_ingest_eligible_path(path, canonical));
+            if !eligible {
+                continue;
+            }
+            matched = true;
+            if let Some(runtime) = state.roots.get_mut(&key) {
+                for effect in &effects {
+                    runtime.pending.insert(effect.path.clone());
+                }
+                runtime.dirty = true;
+                runtime.last_event_unix = Some(unix_now_secs());
+            }
+            let mut bursts = self
+                .bursts
+                .lock()
+                .map_err(|_| anyhow::anyhow!("burst mutex poisoned"))?;
+            match bursts.get_mut(&key) {
+                Some(burst) => burst.last = now,
+                None => {
+                    bursts.insert(
+                        key,
+                        BurstState {
+                            first: now,
+                            last: now,
+                        },
+                    );
+                }
+            }
+        }
+        if !matched {
+            tracing::debug!("watch event filtered as ineligible: {}", ev.path.display());
+        }
+        Ok(())
+    }
 
+    /// Roots whose debounce window or backoff retry is ready to fire.
+    /// A root with an in-flight trigger is never returned (no overlap).
+    pub fn due_keys(&self, now: tokio::time::Instant) -> Vec<RootKey> {
+        let active = match self.active.lock() {
+            Ok(a) => a,
+            Err(_) => return Vec::new(),
+        };
+        let bursts = match self.bursts.lock() {
+            Ok(b) => b,
+            Err(_) => return Vec::new(),
+        };
+        let retries = match self.retry_at.lock() {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        let mut due: Vec<RootKey> = Vec::new();
+        for (key, burst) in bursts.iter() {
+            if active.contains(key) {
+                continue;
+            }
+            if retries.get(key).map(|at| now < *at).unwrap_or(false) {
+                continue;
+            }
+            if flush_due(burst.first, burst.last, now) {
+                due.push(key.clone());
+            }
+        }
+        for (key, at) in retries.iter() {
+            if active.contains(key) || now < *at || due.contains(key) {
+                continue;
+            }
+            if let Some(burst) = bursts.get(key) {
+                if !flush_due(burst.first, burst.last, now) {
+                    continue;
+                }
+            }
+            due.push(key.clone());
+        }
+        due.sort();
+        due
+    }
+
+    /// Earliest wake-up instant for the run loop: next flush deadline,
+    /// next backoff retry, or a far-future bound when nothing is pending.
+    fn next_deadline(&self) -> tokio::time::Instant {
+        let now = tokio::time::Instant::now();
+        let mut earliest = now + MAX_WINDOW + QUIET_PERIOD;
+        if let (Ok(bursts), Ok(retries)) = (self.bursts.lock(), self.retry_at.lock()) {
+            for (key, burst) in bursts.iter() {
+                let retry = retries.get(key).copied().unwrap_or(burst.first);
+                let candidates = [burst.last + QUIET_PERIOD, burst.first + MAX_WINDOW, retry];
+                for candidate in candidates {
+                    if candidate < earliest {
+                        earliest = candidate;
+                    }
+                }
+            }
+        }
+        earliest
+    }
+
+    /// Fire one due root. Marks it active for the trigger duration so runs
+    /// never overlap, then reconciles dirty state: a clean success clears
+    /// dirty; events arriving during the run re-arm exactly one follow-up.
+    pub async fn fire(&self, key: &RootKey) -> anyhow::Result<()> {
+        {
+            let mut active = self
+                .active
+                .lock()
+                .map_err(|_| anyhow::anyhow!("active mutex poisoned"))?;
+            if !active.insert(key.clone()) {
+                return Ok(());
+            }
+        }
+        let started = tokio::time::Instant::now();
+        {
+            let mut retries = self
+                .retry_at
+                .lock()
+                .map_err(|_| anyhow::anyhow!("retry mutex poisoned"))?;
+            retries.remove(key);
+        }
+        let (namespace, canonical) = (key.0.clone(), key.1.clone());
+        let path_str = canonical.to_string_lossy().to_string();
+        let outcome = match self.trigger.trigger(&namespace, &path_str).await {
+            Ok(outcome) => outcome,
+            Err(err) => TriggerOutcome {
+                state: TriggerState::Failed,
+                error: Some(err.to_string()),
+            },
+        };
+        let finished = tokio::time::Instant::now();
+        {
+            let mut state = self.lock_state()?;
+            if let Some(runtime) = state.roots.get_mut(key) {
+                runtime.last_trigger_unix = Some(unix_now_secs());
+                runtime.last_outcome = Some(outcome.clone());
+                if outcome.state == TriggerState::Finished {
+                    runtime.backoff_attempt = 0;
+                    runtime.next_retry_unix = None;
+                } else {
+                    // Derive the delay from the pre-increment attempt: the
+                    // first failure waits 1 s (BACKOFF_STEPS_SECS[0]).
+                    let delay = next_backoff(runtime.backoff_attempt);
+                    runtime.backoff_attempt += 1;
+                    runtime.next_retry_unix = Some(unix_now_secs() + delay.as_secs());
+                    let mut retries = self
+                        .retry_at
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("retry mutex poisoned"))?;
+                    retries.insert(key.clone(), started + delay);
+                }
+            }
+        }
+        {
+            let mut active = self
+                .active
+                .lock()
+                .map_err(|_| anyhow::anyhow!("active mutex poisoned"))?;
+            active.remove(key);
+        }
+        let mut bursts = self
+            .bursts
+            .lock()
+            .map_err(|_| anyhow::anyhow!("burst mutex poisoned"))?;
+        let events_during_run = bursts
+            .get(key)
+            .map(|burst| burst.last >= started)
+            .unwrap_or(false);
+        if outcome.state == TriggerState::Finished && !events_during_run {
+            bursts.remove(key);
+            let mut state = self.lock_state()?;
+            if let Some(runtime) = state.roots.get_mut(key) {
+                runtime.dirty = false;
+                runtime.pending.clear();
+            }
+        } else {
+            // One follow-up burst, armed from completion time. More events
+            // coalesce into it; no second follow-up is scheduled separately.
+            bursts.insert(
+                key.clone(),
+                BurstState {
+                    first: finished,
+                    last: finished,
+                },
+            );
+            let mut state = self.lock_state()?;
+            if let Some(runtime) = state.roots.get_mut(key) {
+                runtime.dirty = true;
+                runtime.pending.clear();
+            }
+        }
+        Ok(())
+    }
+
+    /// Daemon event loop: receive events, fold them into bursts, fire due
+    /// roots, honor backoff deadlines, and stop promptly on shutdown.
+    pub async fn run(self: Arc<Self>, mut shutdown: oneshot::Receiver<()>) -> anyhow::Result<()> {
+        self.reconcile().await?;
         loop {
-            // Receive next event from the watch source, or shut down.
-            let maybe_event = {
-                let mut events = self.events.lock().await;
-                tokio::select! {
-                    ev = events.recv() => ev,
-                    _ = &mut shutdown => {
-                        tracing::debug!("watch service shutting down");
+            let due = self.due_keys(tokio::time::Instant::now());
+            for key in due {
+                self.fire(&key).await?;
+            }
+            let deadline = self.next_deadline();
+            let mut events = self.events.lock().await;
+            tokio::select! {
+                ev = events.recv() => {
+                    drop(events);
+                    if let Some(ev) = ev {
+                        self.ingest_event(ev, tokio::time::Instant::now())?;
+                    } else {
                         return Ok(());
                     }
                 }
-            };
-            if let Some(ev) = maybe_event {
-                // Filter and coalesce into per-root pending sets.
-                let mut to_trigger: Vec<(String, PathBuf)> = Vec::new();
-                {
-                    let mut state = self.lock_state()?;
-                    let now = unix_now_secs();
-                    for ((namespace, canonical), runtime) in state.roots.iter_mut() {
-                        if !crate::parser::ingest::is_ingest_eligible_path(&ev.path, canonical) {
-                            continue;
-                        }
-                        // Coalesce pending paths: for Rename emit both old and new.
-                        let mut paths_to_insert = vec![ev.path.clone()];
-                        if let Some(ref new_path) = ev.new_path {
-                            paths_to_insert.push(new_path.clone());
-                        }
-                        for path in paths_to_insert {
-                            runtime.pending.insert(path);
-                        }
-                        runtime.dirty = true;
-                        runtime.last_event_unix = Some(now);
-                        // Compute debounce timing.
-                        let last_event = runtime.last_event_unix.unwrap_or(now);
-                        let last_trigger = runtime.last_trigger_unix.unwrap_or(0);
-                        let quiet_elapsed =
-                            std::time::Duration::from_secs(now.saturating_sub(last_event));
-                        let window_elapsed =
-                            std::time::Duration::from_secs(now.saturating_sub(last_trigger));
-                        let backoff_active =
-                            runtime.next_retry_unix.map(|t| now < t).unwrap_or(false);
-                        if should_flush(quiet_elapsed, window_elapsed) && !backoff_active {
-                            to_trigger.push((namespace.clone(), canonical.clone()));
-                        }
-                    }
-                }
-                // Trigger for eligible roots (no overlap; IngestJobs handles
-                // attachment to running walks).
-                for (ns, canonical) in to_trigger {
-                    let path_str = canonical.to_string_lossy().to_string();
-                    match self.trigger.trigger(&ns, &path_str).await {
-                        Ok(outcome) => {
-                            let now = unix_now_secs();
-                            let mut state = self.lock_state()?;
-                            if let Some(rt) = state.roots.get_mut(&(ns.clone(), canonical.clone()))
-                            {
-                                rt.last_trigger_unix = Some(now);
-                                rt.last_outcome = Some(outcome.clone());
-                                if outcome.state == TriggerState::Finished {
-                                    rt.backoff_attempt = 0;
-                                    rt.next_retry_unix = None;
-                                    rt.pending.clear();
-                                    // dirty may remain true if events arrived during run; follow‑up will handle
-                                } else {
-                                    rt.dirty = true;
-                                    rt.backoff_attempt += 1;
-                                    rt.next_retry_unix =
-                                        Some(now + next_backoff(rt.backoff_attempt).as_secs());
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            tracing::error!("watch trigger failed for {}: {}", path_str, err);
-                            // Treat as failed outcome.
-                            let now = unix_now_secs();
-                            let mut state = self.lock_state()?;
-                            if let Some(rt) = state.roots.get_mut(&(ns.clone(), canonical.clone()))
-                            {
-                                rt.dirty = true;
-                                rt.backoff_attempt += 1;
-                                rt.next_retry_unix =
-                                    Some(now + next_backoff(rt.backoff_attempt).as_secs());
-                            }
-                        }
-                    }
+                _ = tokio::time::sleep_until(deadline) => { drop(events); }
+                _ = &mut shutdown => {
+                    tracing::debug!("watch service shutting down");
+                    return Ok(());
                 }
             }
         }
     }
 
-    /// Perform one full skip‑fast trigger per active root (reconciliation for
-    /// missed events while the daemon was down).
     pub async fn reconcile(&self) -> anyhow::Result<()> {
         let keys: Vec<(String, PathBuf)> = {
             let state = self.lock_state()?;
@@ -1055,9 +1224,9 @@ impl IngestWatchService {
                             rt.pending.clear();
                         } else {
                             rt.dirty = true;
+                            let delay = next_backoff(rt.backoff_attempt);
                             rt.backoff_attempt += 1;
-                            rt.next_retry_unix =
-                                Some(now + next_backoff(rt.backoff_attempt).as_secs());
+                            rt.next_retry_unix = Some(now + delay.as_secs());
                         }
                     }
                 }
@@ -1067,8 +1236,9 @@ impl IngestWatchService {
                     let mut state = self.lock_state()?;
                     if let Some(rt) = state.roots.get_mut(&(namespace.clone(), canonical.clone())) {
                         rt.dirty = true;
+                        let delay = next_backoff(rt.backoff_attempt);
                         rt.backoff_attempt += 1;
-                        rt.next_retry_unix = Some(now + next_backoff(rt.backoff_attempt).as_secs());
+                        rt.next_retry_unix = Some(now + delay.as_secs());
                     }
                 }
             }
@@ -1429,5 +1599,333 @@ mod tests {
         // Verify new file exists with content
         let content = std::fs::read_to_string(&new).unwrap();
         assert_eq!(content, "old");
+    }
+
+    /// Scriptable trigger stub: records calls and pops canned outcomes.
+    #[derive(Default)]
+    struct RecordingTrigger {
+        calls: Mutex<Vec<(String, String)>>,
+        outcomes: Mutex<std::collections::VecDeque<anyhow::Result<TriggerOutcome>>>,
+    }
+
+    impl RecordingTrigger {
+        fn with_outcomes(outcomes: Vec<anyhow::Result<TriggerOutcome>>) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                outcomes: Mutex::new(outcomes.into()),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.lock().unwrap().len()
+        }
+    }
+
+    #[async_trait]
+    impl IngestTrigger for RecordingTrigger {
+        async fn trigger(
+            &self,
+            namespace: &str,
+            canonical_path: &str,
+        ) -> anyhow::Result<TriggerOutcome> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((namespace.to_string(), canonical_path.to_string()));
+            match self.outcomes.lock().unwrap().pop_front() {
+                Some(result) => result,
+                None => Ok(TriggerOutcome {
+                    state: TriggerState::Finished,
+                    error: None,
+                }),
+            }
+        }
+    }
+
+    /// Trigger that blocks until released, so a test can inject an event
+    /// while a run is in flight and prove there is no overlap.
+    struct GatedTrigger {
+        entered: Arc<tokio::sync::Notify>,
+        gate: Mutex<Option<oneshot::Receiver<()>>>,
+        calls: Mutex<usize>,
+    }
+
+    #[async_trait]
+    impl IngestTrigger for GatedTrigger {
+        async fn trigger(
+            &self,
+            _namespace: &str,
+            _canonical_path: &str,
+        ) -> anyhow::Result<TriggerOutcome> {
+            *self.calls.lock().unwrap() += 1;
+            self.entered.notify_one();
+            let gate = self.gate.lock().unwrap().take();
+            if let Some(rx) = gate {
+                let _ = rx.await;
+            }
+            Ok(TriggerOutcome {
+                state: TriggerState::Finished,
+                error: None,
+            })
+        }
+    }
+
+    fn service_with(
+        dir: &tempfile::TempDir,
+        trigger: Arc<dyn IngestTrigger>,
+    ) -> (IngestWatchService, PathBuf) {
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let canonical = root.canonicalize().unwrap();
+        let store: Arc<dyn WatchRegistrationStore> = Arc::new(JsonFileRegistrationStore::new(
+            dir.path().join("watch_registrations.json"),
+        ));
+        let service = IngestWatchService::new(
+            Box::new(TestEventSource::channel()),
+            store,
+            trigger,
+            canonical.clone(),
+            Vec::new(),
+        );
+        (service, canonical)
+    }
+
+    fn root_key(canonical: &Path) -> RootKey {
+        ("NeuroStrata".to_string(), canonical.to_path_buf())
+    }
+
+    fn source_event(canonical: &Path, path: PathBuf, kind: WatchEventKind) -> WatchEvent {
+        WatchEvent {
+            root: canonical.to_path_buf(),
+            path,
+            kind,
+            new_path: None,
+        }
+    }
+
+    fn failed_outcome(error: &str) -> anyhow::Result<TriggerOutcome> {
+        Ok(TriggerOutcome {
+            state: TriggerState::Failed,
+            error: Some(error.to_string()),
+        })
+    }
+
+    #[tokio::test]
+    async fn loop_a_two_events_coalesce_into_one_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let (service, canonical) = service_with(&dir, Arc::new(RecordingTrigger::default()));
+        service.register("NeuroStrata", &canonical).unwrap();
+        let t0 = tokio::time::Instant::now();
+        service
+            .ingest_event(
+                source_event(&canonical, canonical.join("a.rs"), WatchEventKind::Create),
+                t0,
+            )
+            .unwrap();
+        service
+            .ingest_event(
+                source_event(&canonical, canonical.join("b.rs"), WatchEventKind::Modify),
+                t0 + Duration::from_millis(100),
+            )
+            .unwrap();
+        assert!(service.due_keys(t0 + Duration::from_millis(100)).is_empty());
+        assert_eq!(service.status(None).roots[0].pending_paths_count, 2);
+        assert_eq!(
+            service.due_keys(t0 + Duration::from_millis(400)),
+            vec![root_key(&canonical)]
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_b_continuous_events_force_flush_at_max_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let (service, canonical) = service_with(&dir, Arc::new(RecordingTrigger::default()));
+        service.register("NeuroStrata", &canonical).unwrap();
+        let t0 = tokio::time::Instant::now();
+        for i in 0..25 {
+            service
+                .ingest_event(
+                    source_event(
+                        &canonical,
+                        canonical.join(format!("{i}.rs")),
+                        WatchEventKind::Modify,
+                    ),
+                    t0 + Duration::from_millis(i * 100),
+                )
+                .unwrap();
+        }
+        // The most recent event is only ~200 ms old, but the burst started
+        // 2.1 s ago, so the max window must force a flush.
+        assert_eq!(
+            service.due_keys(t0 + Duration::from_millis(2100)),
+            vec![root_key(&canonical)]
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_c_ineligible_paths_never_enter_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let (service, canonical) = service_with(&dir, Arc::new(RecordingTrigger::default()));
+        service.register("NeuroStrata", &canonical).unwrap();
+        let t0 = tokio::time::Instant::now();
+        let ineligible = [
+            canonical.join(".git/config"),
+            canonical.join("target/debug/x.rs"),
+            canonical.join("data.db"),
+            canonical.join("data.db.wal"),
+            canonical.join(".lock"),
+        ];
+        for path in ineligible {
+            service
+                .ingest_event(source_event(&canonical, path, WatchEventKind::Create), t0)
+                .unwrap();
+        }
+        assert_eq!(service.status(None).roots[0].pending_paths_count, 0);
+        assert!(service.due_keys(t0 + QUIET_PERIOD).is_empty());
+    }
+
+    #[tokio::test]
+    async fn loop_d_rename_contributes_remove_and_upsert_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let (service, canonical) = service_with(&dir, Arc::new(RecordingTrigger::default()));
+        service.register("NeuroStrata", &canonical).unwrap();
+        let old = canonical.join("old.rs");
+        let new = canonical.join("new.rs");
+        service
+            .ingest_event(
+                WatchEvent {
+                    root: canonical.clone(),
+                    path: old.clone(),
+                    kind: WatchEventKind::Rename,
+                    new_path: Some(new.clone()),
+                },
+                tokio::time::Instant::now(),
+            )
+            .unwrap();
+        let runtime = service.lock_state().unwrap();
+        let pending = &runtime.roots[&root_key(&canonical)].pending;
+        assert!(pending.contains(&old));
+        assert!(pending.contains(&new));
+        assert_eq!(pending.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn loop_e_backoff_advances_then_resets_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let trigger = Arc::new(RecordingTrigger::with_outcomes(vec![
+            failed_outcome("first"),
+            failed_outcome("second"),
+            Ok(TriggerOutcome {
+                state: TriggerState::Finished,
+                error: None,
+            }),
+        ]));
+        let (service, canonical) = service_with(&dir, trigger.clone());
+        service.register("NeuroStrata", &canonical).unwrap();
+        let key = root_key(&canonical);
+        let t0 = tokio::time::Instant::now();
+        service
+            .ingest_event(
+                source_event(&canonical, canonical.join("a.rs"), WatchEventKind::Create),
+                t0,
+            )
+            .unwrap();
+
+        service.fire(&key).await.unwrap();
+        assert_eq!(service.status(None).roots[0].backoff_attempt, 1);
+        assert!(service.due_keys(t0 + Duration::from_millis(500)).is_empty());
+        assert_eq!(
+            service.due_keys(t0 + Duration::from_secs(1) + Duration::from_millis(50)),
+            vec![key.clone()]
+        );
+
+        service.fire(&key).await.unwrap();
+        assert_eq!(service.status(None).roots[0].backoff_attempt, 2);
+        service.fire(&key).await.unwrap();
+        assert_eq!(service.status(None).roots[0].backoff_attempt, 0);
+        assert_eq!(trigger.call_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn loop_f_event_during_run_schedules_exactly_one_follow_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = oneshot::channel();
+        let trigger = Arc::new(GatedTrigger {
+            entered: entered.clone(),
+            gate: Mutex::new(Some(release_rx)),
+            calls: Mutex::new(0),
+        });
+        let (service, canonical) = service_with(&dir, trigger.clone());
+        service.register("NeuroStrata", &canonical).unwrap();
+        let key = root_key(&canonical);
+        service
+            .ingest_event(
+                source_event(&canonical, canonical.join("a.rs"), WatchEventKind::Create),
+                tokio::time::Instant::now(),
+            )
+            .unwrap();
+        let service = Arc::new(service);
+
+        let fired = {
+            let service = Arc::clone(&service);
+            let key = key.clone();
+            tokio::spawn(async move { service.fire(&key).await })
+        };
+        entered.notified().await;
+        service
+            .ingest_event(
+                source_event(&canonical, canonical.join("b.rs"), WatchEventKind::Modify),
+                tokio::time::Instant::now(),
+            )
+            .unwrap();
+        release_tx.send(()).unwrap();
+        fired.await.unwrap().unwrap();
+
+        assert!(service.active.lock().unwrap().is_empty());
+        assert_eq!(
+            service.due_keys(tokio::time::Instant::now() + QUIET_PERIOD),
+            vec![key]
+        );
+        assert_eq!(trigger.calls.lock().unwrap().clone(), 1);
+    }
+
+    #[tokio::test]
+    async fn loop_g_reconcile_triggers_once_per_active_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let trigger = Arc::new(RecordingTrigger::default());
+        let (service, canonical) = service_with(&dir, trigger.clone());
+        let first = canonical.clone();
+        let second = canonical.join("other");
+        std::fs::create_dir_all(&second).unwrap();
+        let second = second.canonicalize().unwrap();
+        service.register("NsA", &first).unwrap();
+        service.register("NsB", &second).unwrap();
+        service.reconcile().await.unwrap();
+        assert_eq!(trigger.call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn loop_h_shutdown_with_pending_events_leaves_registry_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let (service, canonical) = service_with(&dir, Arc::new(RecordingTrigger::default()));
+        service.register("NeuroStrata", &canonical).unwrap();
+        service
+            .ingest_event(
+                source_event(&canonical, canonical.join("a.rs"), WatchEventKind::Create),
+                tokio::time::Instant::now(),
+            )
+            .unwrap();
+        let registry_path = dir.path().join("watch_registrations.json");
+        let before = std::fs::read(&registry_path).unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        shutdown_tx.send(()).unwrap();
+        let service = Arc::new(service);
+        let handle = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move { service.run(shutdown_rx).await })
+        };
+        handle.await.unwrap().unwrap();
+        assert_eq!(std::fs::read(&registry_path).unwrap(), before);
     }
 }
