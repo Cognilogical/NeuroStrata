@@ -1,10 +1,9 @@
+use oxrdf::Dataset;
 /// RDF projection types for NeuroStrata's semantic layer using oxrdf.
-/// 
+///
 /// Phase 2: Replacing hand-written Quad/QuadObject/Tier types with oxrdf types
 /// as specified in task neurostrata-c2jd (OxiRS adoption: migrate hand-written RDF to oxrdf/oxttl).
-
-use oxrdf::{Literal, NamedNode, NamedOrBlankNode, GraphName, Quad};
-use oxrdf::Dataset;
+use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Quad};
 
 /// A NeuroStrata RDF Quad built on top of oxrdf::Quad.
 /// This provides oxrdf-backed RDF quads that can be serialized with oxttl
@@ -79,7 +78,11 @@ impl OxRdfBridge {
             crate::rdf::types::QuadObject::Iri(iri) => {
                 oxrdf::Term::NamedNode(NamedNode::new_unchecked(iri.clone()))
             }
-            crate::rdf::types::QuadObject::Literal { value, datatype, language } => {
+            crate::rdf::types::QuadObject::Literal {
+                value,
+                datatype,
+                language,
+            } => {
                 if let Some(dt) = datatype {
                     let datatype_nn = NamedNode::new(dt.clone())?;
                     match language {
@@ -152,14 +155,19 @@ impl OxRdfBridge {
                     t.predicate
                 );
                 QuadObject::Iri("urn:neurostrata:triple".to_string())
-            },
+            }
         };
         let graph = match &quad.inner.graph_name {
             GraphName::NamedNode(gn) => Some(gn.as_str().to_string()),
             GraphName::BlankNode(bg) => Some(format!("_:{}", bg)),
             GraphName::DefaultGraph => None,
         };
-        NSQuad { subject, predicate, object, graph }
+        NSQuad {
+            subject,
+            predicate,
+            object,
+            graph,
+        }
     }
 
     /// Convert NeuroStrata's Tier + namespace + generation to an oxrdf GraphName.
@@ -168,7 +176,12 @@ impl OxRdfBridge {
         namespace: &str,
         generation: u64,
     ) -> GraphName {
-        let iri = format!("urn:neurostrata:graph:{}:{}:gen:{}", namespace, tier.as_str(), generation);
+        let iri = format!(
+            "urn:neurostrata:graph:{}:{}:gen:{}",
+            namespace,
+            tier.as_str(),
+            generation
+        );
         GraphName::NamedNode(NamedNode::new_unchecked(iri))
     }
 }
@@ -219,11 +232,8 @@ mod tests {
 
     #[test]
     fn tier_to_graph_name_produces_valid_graph() {
-        let graph_name = OxRdfBridge::tier_to_graph_name(
-            &crate::rdf::types::Tier::Domain,
-            "test_ns",
-            1,
-        );
+        let graph_name =
+            OxRdfBridge::tier_to_graph_name(&crate::rdf::types::Tier::Domain, "test_ns", 1);
         let s = graph_name.to_string();
         assert!(s.contains("urn:neurostrata:graph:test_ns:domain:gen:1"));
     }

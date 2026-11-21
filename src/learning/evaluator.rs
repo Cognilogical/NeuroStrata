@@ -121,7 +121,11 @@ mod tests {
         assert!((r.precision - 0.0).abs() < 1e-9);
         assert!((r.recall - 0.0).abs() < 1e-9);
         assert!((r.f1 - 0.0).abs() < 1e-9);
-        assert!(r.nll > 1.0, "high NLL for inverted predictions, got {}", r.nll);
+        assert!(
+            r.nll > 1.0,
+            "high NLL for inverted predictions, got {}",
+            r.nll
+        );
     }
 
     #[test]
@@ -130,7 +134,12 @@ mod tests {
         // toward 0.5 => higher Brier against extreme pseudo-labels.
         let cold = evaluate_pairs(&[(0.99, false)], 0.1);
         let warm = evaluate_pairs(&[(0.99, false)], 10.0);
-        assert!(cold.nll > warm.nll, "cold nll={} warm nll={}", cold.nll, warm.nll);
+        assert!(
+            cold.nll > warm.nll,
+            "cold nll={} warm nll={}",
+            cold.nll,
+            warm.nll
+        );
         assert_eq!(cold.temperature, 0.1);
         assert_eq!(warm.temperature, 10.0);
     }
@@ -139,6 +148,10 @@ mod tests {
     fn brier_matches_manual_computation() {
         // p=0.5 => pred 0.5 regardless of T; y=1 => brier (0.5-1)^2 = 0.25.
         let r = evaluate_pairs(&[(0.5, true)], 1.0);
-        assert!((r.brier_score - 0.25).abs() < 1e-9, "brier={}", r.brier_score);
+        assert!(
+            (r.brier_score - 0.25).abs() < 1e-9,
+            "brier={}",
+            r.brier_score
+        );
     }
 }

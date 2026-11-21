@@ -1,10 +1,12 @@
 use crate::domain;
-use crate::registry;
-use crate::rdf::shacl::ShaclViolation;
-use ontobug::validate::extract_shacl_shapes;
 use crate::rdf::action::validate_sparql_ask_syntax_and_budget;
-use crate::rdf::reasoning::{nt_triple, DerivationStep, MaterializationCertificate, ReasoningAdapter, ReasoningProfile};
+use crate::rdf::reasoning::{
+    nt_triple, DerivationStep, MaterializationCertificate, ReasoningAdapter, ReasoningProfile,
+};
+use crate::rdf::shacl::ShaclViolation;
+use crate::registry;
 use crate::traits::MemoryPayload;
+use ontobug::validate::extract_shacl_shapes;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
@@ -20,7 +22,6 @@ pub struct ClosureResult {
     pub results: Vec<String>,
     pub evidence: Vec<crate::traits::SearchEvidence>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DomainEntry {
@@ -115,7 +116,6 @@ impl DomainVocabulary {
     pub fn governs_predicate(&self, term: &str) -> bool {
         self.predicates.contains(term)
     }
-
 }
 
 /// Errors that can occur when selecting a domain vocabulary.
@@ -266,7 +266,8 @@ impl OntologyIndex {
             return;
         }
         for alias in &entry.aliases {
-            self.alias_map.insert(alias.to_lowercase(), entry.slug.clone());
+            self.alias_map
+                .insert(alias.to_lowercase(), entry.slug.clone());
             self.add_alt_label(&entry.slug, alias);
         }
         self.alias_map
@@ -334,10 +335,7 @@ impl OntologyIndex {
                 }
             }
         }
-        if let Some(arr) = vocab
-            .get("equivalent_properties")
-            .and_then(Value::as_array)
-        {
+        if let Some(arr) = vocab.get("equivalent_properties").and_then(Value::as_array) {
             for pair in arr {
                 if let Some((a, b)) = vocabulary_pair(pair) {
                     self.add_equivalent_property(a, b);
@@ -351,20 +349,14 @@ impl OntologyIndex {
                 }
             }
         }
-        if let Some(arr) = vocab
-            .get("transitive_properties")
-            .and_then(Value::as_array)
-        {
+        if let Some(arr) = vocab.get("transitive_properties").and_then(Value::as_array) {
             for p in arr {
                 if let Some(s) = p.as_str() {
                     self.add_transitive_property(s);
                 }
             }
         }
-        if let Some(arr) = vocab
-            .get("symmetric_properties")
-            .and_then(Value::as_array)
-        {
+        if let Some(arr) = vocab.get("symmetric_properties").and_then(Value::as_array) {
             for p in arr {
                 if let Some(s) = p.as_str() {
                     self.add_symmetric_property(s);
@@ -407,9 +399,9 @@ impl OntologyIndex {
         // that normalizes to nothing is rejected (fail closed).
         let normalized = domain::normalize_domain_slug(domain)
             .ok_or_else(|| VocabularySelectionError::UnknownDomain(domain.to_string()))?;
-        let domain_entry = self.domain(&normalized).ok_or_else(|| {
-            VocabularySelectionError::UnknownDomain(domain.to_string())
-        })?;
+        let domain_entry = self
+            .domain(&normalized)
+            .ok_or_else(|| VocabularySelectionError::UnknownDomain(domain.to_string()))?;
 
         // 2. Budget tracking.
         let mut visited = 0usize;
@@ -425,9 +417,7 @@ impl OntologyIndex {
                     max_nodes: budget.max_nodes,
                 });
             }
-            if budget.max_ms == 0
-                || start_time.elapsed().as_millis() as u64 >= budget.max_ms
-            {
+            if budget.max_ms == 0 || start_time.elapsed().as_millis() as u64 >= budget.max_ms {
                 return Err(VocabularySelectionError::BudgetExhausted {
                     visited,
                     max_nodes: budget.max_nodes,
@@ -441,7 +431,10 @@ impl OntologyIndex {
         let mut predicate_closure: BTreeSet<String> = BTreeSet::new();
         let mut queue = VecDeque::new();
 
-        let push_class = |set: &mut BTreeSet<String>, term: String, visited: &mut usize| -> Result<(), VocabularySelectionError> {
+        let push_class = |set: &mut BTreeSet<String>,
+                          term: String,
+                          visited: &mut usize|
+         -> Result<(), VocabularySelectionError> {
             if !set.contains(&term) {
                 *visited += 1;
                 check_budget(*visited)?;
@@ -835,12 +828,16 @@ impl OntologyIndex {
         let mut out = BTreeSet::new();
         if let Some(slug) = self.canonical_slug(symbol) {
             if let Some(alt) = self.alt_labels.get(&slug) {
-                for a in alt { out.insert(a.clone()); }
+                for a in alt {
+                    out.insert(a.clone());
+                }
             }
         }
         // Direct lookup for symbols not yet registered as domain slugs
         if let Some(alt) = self.alt_labels.get(symbol) {
-            for a in alt { out.insert(a.clone()); }
+            for a in alt {
+                out.insert(a.clone());
+            }
         }
         out
     }
@@ -895,10 +892,10 @@ impl OntologyIndex {
         let mut out = BTreeSet::new();
         let mut queue = VecDeque::new();
         let mut visited = BTreeSet::new();
-        
+
         queue.push_back(slug.to_string());
         visited.insert(slug.to_string());
-        
+
         while let Some(cur) = queue.pop_front() {
             if let Some(broader) = self.broader.get(&cur) {
                 for b in broader {
@@ -910,7 +907,7 @@ impl OntologyIndex {
                 }
             }
         }
-        
+
         out
     }
 
@@ -919,10 +916,10 @@ impl OntologyIndex {
         let mut out = BTreeSet::new();
         let mut queue = VecDeque::new();
         let mut visited = BTreeSet::new();
-        
+
         queue.push_back(slug.to_string());
         visited.insert(slug.to_string());
-        
+
         while let Some(cur) = queue.pop_front() {
             if let Some(narrower) = self.narrower.get(&cur) {
                 for n in narrower {
@@ -934,7 +931,7 @@ impl OntologyIndex {
                 }
             }
         }
-        
+
         out
     }
 
@@ -1096,7 +1093,11 @@ impl OntologyIndex {
                 continue;
             };
             let Some(slug) = domain::normalize_domain_slug(raw_slug) else {
-                tracing::warn!("skipping concept row '{}' with invalid slug '{}'", id, raw_slug);
+                tracing::warn!(
+                    "skipping concept row '{}' with invalid slug '{}'",
+                    id,
+                    raw_slug
+                );
                 continue;
             };
             deduped_by_slug.insert(slug, (id, payload));
@@ -1129,7 +1130,9 @@ impl OntologyIndex {
             if let Some(arr) = c_obj.get("broader").and_then(|v| v.as_array()) {
                 for item in arr {
                     let Some(raw_p) = item.as_str() else { continue };
-                    let Some(p_slug) = domain::normalize_domain_slug(raw_p) else { continue };
+                    let Some(p_slug) = domain::normalize_domain_slug(raw_p) else {
+                        continue;
+                    };
                     let v = intern_slug(&p_slug);
                     let mut candidate = accepted_broader_pairs.clone();
                     candidate.push((u, v));
@@ -1173,7 +1176,9 @@ impl OntologyIndex {
             if let Some(arr) = c_obj.get("related").and_then(|v| v.as_array()) {
                 for item in arr {
                     let Some(raw_r) = item.as_str() else { continue };
-                    let Some(r_slug) = domain::normalize_domain_slug(raw_r) else { continue };
+                    let Some(r_slug) = domain::normalize_domain_slug(raw_r) else {
+                        continue;
+                    };
                     let v = intern_slug(&r_slug);
                     if crate::formal_kernel::validate_skos_disjointness(
                         &accepted_broader_pairs,
@@ -1197,7 +1202,9 @@ impl OntologyIndex {
             if let Some(arr) = c_obj.get("contrasts_with").and_then(|v| v.as_array()) {
                 for item in arr {
                     let Some(raw_c) = item.as_str() else { continue };
-                    let Some(c_slug) = domain::normalize_domain_slug(raw_c) else { continue };
+                    let Some(c_slug) = domain::normalize_domain_slug(raw_c) else {
+                        continue;
+                    };
                     let v = intern_slug(&c_slug);
                     if crate::formal_kernel::validate_skos_disjointness(
                         &accepted_broader_pairs,
@@ -1365,7 +1372,12 @@ impl OntologyIndex {
         result
     }
 
-    pub fn closure_governs(&self, root: &str, edges: &[String], budget: &QueryBudget) -> ClosureResult {
+    pub fn closure_governs(
+        &self,
+        root: &str,
+        edges: &[String],
+        budget: &QueryBudget,
+    ) -> ClosureResult {
         let mut result = ClosureResult::default();
         let mut visited: BTreeSet<String> = BTreeSet::new();
         let mut frontier: VecDeque<String> = VecDeque::new();
@@ -1417,78 +1429,81 @@ impl OntologyIndex {
         result
     }
 
-pub fn load_shacl_shapes(&mut self, ttl: &str) -> anyhow::Result<usize> {
-    self.shapes_ttl = Some(ttl.to_string());
-    let extracted = extract_shacl_shapes(ttl)
-        .map_err(|e| anyhow::anyhow!("load_shacl_shapes: {}", e))?;
-    let mut total = 0usize;
+    pub fn load_shacl_shapes(&mut self, ttl: &str) -> anyhow::Result<usize> {
+        self.shapes_ttl = Some(ttl.to_string());
+        let extracted =
+            extract_shacl_shapes(ttl).map_err(|e| anyhow::anyhow!("load_shacl_shapes: {}", e))?;
+        let mut total = 0usize;
 
-    for shape in extracted {
-        let mut min_counts = BTreeMap::new();
-        let mut max_counts = BTreeMap::new();
-        let mut datatypes = BTreeMap::new();
-        let mut node_kinds = BTreeMap::new();
-        let mut in_values = BTreeMap::new();
-        let mut messages = BTreeMap::new();
-        let mut property_constraints = Vec::new();
+        for shape in extracted {
+            let mut min_counts = BTreeMap::new();
+            let mut max_counts = BTreeMap::new();
+            let mut datatypes = BTreeMap::new();
+            let mut node_kinds = BTreeMap::new();
+            let mut in_values = BTreeMap::new();
+            let mut messages = BTreeMap::new();
+            let mut property_constraints = Vec::new();
 
-        for prop in &shape.property_constraints {
-            let path = prop.path.clone();
-            property_constraints.push((path.clone(), None));
-            min_counts.insert(path.clone(), prop.min_count.unwrap_or(0).max(0) as u32);
-            max_counts.insert(path.clone(), prop.max_count.unwrap_or(u32::MAX as i64).max(0) as u32);
-            if let Some(dt) = &prop.datatype {
-                datatypes.insert(path.clone(), dt.clone());
+            for prop in &shape.property_constraints {
+                let path = prop.path.clone();
+                property_constraints.push((path.clone(), None));
+                min_counts.insert(path.clone(), prop.min_count.unwrap_or(0).max(0) as u32);
+                max_counts.insert(
+                    path.clone(),
+                    prop.max_count.unwrap_or(u32::MAX as i64).max(0) as u32,
+                );
+                if let Some(dt) = &prop.datatype {
+                    datatypes.insert(path.clone(), dt.clone());
+                }
+                if let Some(nk) = &prop.node_kind {
+                    node_kinds.insert(path.clone(), nk.clone());
+                }
+                if !prop.in_values.is_empty() {
+                    in_values.insert(path.clone(), prop.in_values.clone());
+                }
+                if let Some(msg) = &prop.message {
+                    messages.insert(path.clone(), msg.clone());
+                }
             }
-            if let Some(nk) = &prop.node_kind {
-                node_kinds.insert(path.clone(), nk.clone());
-            }
-            if !prop.in_values.is_empty() {
-                in_values.insert(path.clone(), prop.in_values.clone());
-            }
-            if let Some(msg) = &prop.message {
-                messages.insert(path.clone(), msg.clone());
-            }
+
+            self.shacl_shapes.push(ShaclShapeDef {
+                shape_iri: shape.shape_iri,
+                target_class: shape.target_class,
+                property_constraints,
+                min_counts,
+                max_counts,
+                datatypes,
+                in_values,
+                node_kinds,
+                messages,
+            });
+            total += 1;
         }
 
-        self.shacl_shapes.push(ShaclShapeDef {
-            shape_iri: shape.shape_iri,
-            target_class: shape.target_class,
-            property_constraints,
-            min_counts,
-            max_counts,
-            datatypes,
-            in_values,
-            node_kinds,
-            messages,
-        });
-        total += 1;
+        Ok(total)
     }
 
-    Ok(total)
-}
+    /// Drop loaded SHACL shapes (used when a registry row stops shipping shapes).
+    /// Both the parsed shapes and the raw TTL must go: `validate_rdf_graph` reads
+    /// `shapes_ttl`, so leaving it behind keeps validating against stale shapes.
+    pub fn clear_shacl_shapes(&mut self) {
+        self.shacl_shapes.clear();
+        self.shapes_ttl = None;
+    }
 
-/// Drop loaded SHACL shapes (used when a registry row stops shipping shapes).
-/// Both the parsed shapes and the raw TTL must go: `validate_rdf_graph` reads
-/// `shapes_ttl`, so leaving it behind keeps validating against stale shapes.
-pub fn clear_shacl_shapes(&mut self) {
-    self.shacl_shapes.clear();
-    self.shapes_ttl = None;
-}
+    /// Validate RDF data against loaded SHACL shapes using ontobug/rudof.
+    ///
+    /// Uses the shapes TTL captured at load time; returns SHACL violations.
+    pub fn validate_rdf_graph(&self, data_ttl: &str) -> anyhow::Result<Vec<ShaclViolation>> {
+        let Some(shapes_ttl) = self.shapes_ttl.clone() else {
+            return Ok(Vec::new());
+        };
+        crate::rdf::shacl::validate_rdf_with_ontobug(data_ttl, &shapes_ttl)
+    }
 
-/// Validate RDF data against loaded SHACL shapes using ontobug/rudof.
-///
-/// Uses the shapes TTL captured at load time; returns SHACL violations.
-pub fn validate_rdf_graph(&self, data_ttl: &str) -> anyhow::Result<Vec<ShaclViolation>> {
-    let Some(shapes_ttl) = self.shapes_ttl.clone() else {
-        return Ok(Vec::new());
-    };
-    crate::rdf::shacl::validate_rdf_with_ontobug(data_ttl, &shapes_ttl)
-}
-
-/// Validate a memory payload against loaded SHACL shapes.
-/// Returns violations extracted from matching shapes; falls back to
-/// hardcoded `crate::rdf::shacl::validate_memory` if no shapes are loaded.
+    /// Validate a memory payload against loaded SHACL shapes.
+    /// Returns violations extracted from matching shapes; falls back to
+    /// hardcoded `crate::rdf::shacl::validate_memory` if no shapes are loaded.
     pub fn shacl_validate(&self, payload: &MemoryPayload) -> Vec<ShaclViolation> {
         if self.shacl_shapes.is_empty() {
             return crate::rdf::shacl::validate_memory(payload);
@@ -1501,7 +1516,10 @@ pub fn validate_rdf_graph(&self, data_ttl: &str) -> anyhow::Result<Vec<ShaclViol
         for shape in &self.shacl_shapes {
             // Match shape to memory_type via targetClass (ns:Rule, ns:Procedure, ns:Task, etc.)
             let shape_match = shape.target_class.as_deref().map_or(false, |tc| {
-                let tail = tc.rsplit(|c| c == '/' || c == '#' || c == ':').next().unwrap_or(tc);
+                let tail = tc
+                    .rsplit(|c| c == '/' || c == '#' || c == ':')
+                    .next()
+                    .unwrap_or(tc);
                 memory_type == tail || memory_type.eq_ignore_ascii_case(tail)
             });
 
@@ -1510,7 +1528,12 @@ pub fn validate_rdf_graph(&self, data_ttl: &str) -> anyhow::Result<Vec<ShaclViol
             }
 
             // Evaluate Memory target shapes (Memory) and matching type shapes
-            if shape.target_class.as_deref().map_or(false, |tc| tc.ends_with("Memory")) || shape_match {
+            if shape
+                .target_class
+                .as_deref()
+                .map_or(false, |tc| tc.ends_with("Memory"))
+                || shape_match
+            {
                 for (path, _) in &shape.property_constraints {
                     let path_violations = self.validate_path(payload, path, shape);
                     violations.extend(path_violations);
@@ -1539,14 +1562,23 @@ pub fn validate_rdf_graph(&self, data_ttl: &str) -> anyhow::Result<Vec<ShaclViol
         violations
     }
 
-    fn validate_path(&self, payload: &MemoryPayload, path: &str, shape: &ShaclShapeDef) -> Vec<ShaclViolation> {
+    fn validate_path(
+        &self,
+        payload: &MemoryPayload,
+        path: &str,
+        shape: &ShaclShapeDef,
+    ) -> Vec<ShaclViolation> {
         let mut out = Vec::new();
         let meta_key = path
             .trim_start_matches("urn:neurostrata:ns#")
             .trim_start_matches("http://neurostrata.io/ns#")
             .trim_start_matches("https://neurostrata.io/ns#")
             .trim_start_matches("ns:");
-        let value = match payload.metadata.get(meta_key).or_else(|| payload.metadata.get(path)) {
+        let value = match payload
+            .metadata
+            .get(meta_key)
+            .or_else(|| payload.metadata.get(path))
+        {
             Some(v) => v.clone(),
             None => {
                 // Check min_count
@@ -1601,7 +1633,9 @@ pub fn validate_rdf_graph(&self, data_ttl: &str) -> anyhow::Result<Vec<ShaclViol
                         });
                     }
                 }
-                serde_json::Value::Object(_) if dt.contains("BlankNodeOrIRI") || dt.contains("BlankNode") => {
+                serde_json::Value::Object(_)
+                    if dt.contains("BlankNodeOrIRI") || dt.contains("BlankNode") =>
+                {
                     // ok
                 }
                 serde_json::Value::Null => {
@@ -1633,7 +1667,10 @@ pub fn validate_rdf_graph(&self, data_ttl: &str) -> anyhow::Result<Vec<ShaclViol
                         if !allowed.iter().any(|a| a == item_s) {
                             out.push(ShaclViolation {
                                 field: path.to_string(),
-                                why: format!("{} value '{}' not in allowed values {:?}", path, item_s, allowed),
+                                why: format!(
+                                    "{} value '{}' not in allowed values {:?}",
+                                    path, item_s, allowed
+                                ),
                             });
                         }
                     }
@@ -1756,7 +1793,9 @@ fn parse_nquads_triples(s: &str) -> Result<Vec<oxrdf::Triple>, OntologyPlanError
 }
 
 fn parse_add_triples(add: Option<&str>) -> Result<Vec<oxrdf::Triple>, OntologyPlanError> {
-    let Some(s) = add else { return Ok(Vec::new()); };
+    let Some(s) = add else {
+        return Ok(Vec::new());
+    };
     match parse_turtle_triples(s) {
         Ok(v) if !v.is_empty() => Ok(v),
         _ => parse_nquads_triples(s),
@@ -1830,9 +1869,9 @@ fn triples_to_dataset(triples: &[oxrdf::Triple]) -> oxrdf::Dataset {
     // graph and ASK criteria run with the default graph set as the union of all
     // named graphs. Putting these triples in the default graph would make them
     // invisible once that union is selected.
-    let graph = oxrdf::GraphName::NamedNode(
-        oxrdf::NamedNode::new_unchecked("urn:neurostrata:graph:ontology-plan:sandbox"),
-    );
+    let graph = oxrdf::GraphName::NamedNode(oxrdf::NamedNode::new_unchecked(
+        "urn:neurostrata:graph:ontology-plan:sandbox",
+    ));
     let mut ds = oxrdf::Dataset::new();
     for t in triples {
         ds.insert(&oxrdf::Quad::new(
@@ -1914,7 +1953,9 @@ fn hierarchy_cycles(triples: &[oxrdf::Triple]) -> Vec<String> {
         path: &mut Vec<String>,
         found: &mut BTreeSet<String>,
     ) {
-        let Some(nexts) = adj.get(node) else { return; };
+        let Some(nexts) = adj.get(node) else {
+            return;
+        };
         for next in nexts {
             if let Some(pos) = path.iter().position(|n| n == next) {
                 let mut cycle = path[pos..].to_vec();
@@ -2123,7 +2164,13 @@ impl OntologyIndex {
                 let (_, pre_v) = shacl_summaries(&pre_turtle, sh)?;
                 let (post_ok, post_v) = shacl_summaries(&post_turtle, sh)?;
                 let pre_set: HashSet<ShaclViolationSummary> = pre_v.into_iter().collect();
-                (post_ok, post_v.into_iter().filter(|v| !pre_set.contains(v)).collect())
+                (
+                    post_ok,
+                    post_v
+                        .into_iter()
+                        .filter(|v| !pre_set.contains(v))
+                        .collect(),
+                )
             }
             None => (true, Vec::new()),
         };
@@ -2151,7 +2198,8 @@ impl OntologyIndex {
 
         let pre_dataset = triples_to_dataset(&base);
         let post_dataset = triples_to_dataset(&post);
-        let impacted_action_slugs = ask_flips(&input.visible_action_asks, &pre_dataset, &post_dataset)?;
+        let impacted_action_slugs =
+            ask_flips(&input.visible_action_asks, &pre_dataset, &post_dataset)?;
         let (mut impacted_memories, mut impacted_files) =
             governance_impact(adds.iter().chain(rets.iter()), input);
         for nt in added_entailments
@@ -2216,24 +2264,36 @@ mod tests {
                 .into_iter()
                 .collect(),
         };
-        assert!(classes_only.is_empty(), "classes without predicates fail closed");
-        assert!(predicates_only.is_empty(), "predicates without classes fail closed");
+        assert!(
+            classes_only.is_empty(),
+            "classes without predicates fail closed"
+        );
+        assert!(
+            predicates_only.is_empty(),
+            "predicates without classes fail closed"
+        );
         assert!(DomainVocabulary::default().is_empty());
     }
 
     #[test]
     fn governs_class_accepts_only_exact_terms() {
         let vocab = DomainVocabulary {
-            classes: ["memory".to_string(), "urn:neurostrata:ns#Memory".to_string()]
-                .into_iter()
-                .collect(),
+            classes: [
+                "memory".to_string(),
+                "urn:neurostrata:ns#Memory".to_string(),
+            ]
+            .into_iter()
+            .collect(),
             predicates: BTreeSet::new(),
         };
         assert!(vocab.governs_class("memory"));
         assert!(vocab.governs_class("urn:neurostrata:ns#Memory"));
         // A normalized-slug fallback would let an invented absolute IRI
         // such as `memory:` collapse to the governed slug `memory`.
-        assert!(!vocab.governs_class("memory:"), "invented IRI must not match slug");
+        assert!(
+            !vocab.governs_class("memory:"),
+            "invented IRI must not match slug"
+        );
         assert!(!vocab.governs_class("Memory"));
         assert!(!vocab.governs_class("memory:Invented"));
     }
@@ -2252,9 +2312,13 @@ mod tests {
         assert!(idx.shapes_ttl.is_some(), "load must retain raw shapes TTL");
         idx.clear_shacl_shapes();
         assert!(idx.shacl_shapes.is_empty());
-        assert!(idx.shapes_ttl.is_none(), "clear must not leave stale shapes TTL");
         assert!(
-            idx.validate_rdf_graph("<s> <p> <o> .").expect("graph validation")
+            idx.shapes_ttl.is_none(),
+            "clear must not leave stale shapes TTL"
+        );
+        assert!(
+            idx.validate_rdf_graph("<s> <p> <o> .")
+                .expect("graph validation")
                 .is_empty(),
             "no shapes means no graph-level violations (stale TTL would still fire)"
         );
@@ -2278,10 +2342,20 @@ mod tests {
 "#,
         )
         .expect("shapes load");
-        let budget = QueryBudget { max_ms: 10_000, max_nodes: 10_000 };
-        let lower = idx.select_domain_vocabulary("memory", &budget).expect("plain slug");
-        let upper = idx.select_domain_vocabulary("  Memory  ", &budget).expect("case + whitespace");
-        assert_eq!(lower, upper, "domain variants must resolve to the same vocabulary");
+        let budget = QueryBudget {
+            max_ms: 10_000,
+            max_nodes: 10_000,
+        };
+        let lower = idx
+            .select_domain_vocabulary("memory", &budget)
+            .expect("plain slug");
+        let upper = idx
+            .select_domain_vocabulary("  Memory  ", &budget)
+            .expect("case + whitespace");
+        assert_eq!(
+            lower, upper,
+            "domain variants must resolve to the same vocabulary"
+        );
         assert!(
             idx.select_domain_vocabulary("!!!", &budget).is_err(),
             "a domain that normalizes to nothing must be rejected"
@@ -2297,8 +2371,16 @@ mod tests {
         idx.add_sub_class("auth/mtls", "auth/tls");
 
         let subs = idx.subclasses_of("auth");
-        assert!(subs.contains("auth/tls"), "direct child missing: {:?}", subs);
-        assert!(subs.contains("auth/mtls"), "transitive child missing: {:?}", subs);
+        assert!(
+            subs.contains("auth/tls"),
+            "direct child missing: {:?}",
+            subs
+        );
+        assert!(
+            subs.contains("auth/mtls"),
+            "transitive child missing: {:?}",
+            subs
+        );
         assert!(
             !subs.contains("auth") && !subs.contains("security"),
             "subclasses_of must not return the class itself or its ancestors: {:?}",
@@ -2306,8 +2388,16 @@ mod tests {
         );
 
         let supers = idx.superclasses_of("auth/mtls");
-        assert!(supers.contains("auth/tls"), "direct parent missing: {:?}", supers);
-        assert!(supers.contains("auth"), "transitive ancestor missing: {:?}", supers);
+        assert!(
+            supers.contains("auth/tls"),
+            "direct parent missing: {:?}",
+            supers
+        );
+        assert!(
+            supers.contains("auth"),
+            "transitive ancestor missing: {:?}",
+            supers
+        );
         assert!(
             !supers.contains("auth/mtls"),
             "superclasses_of must not return the class itself: {:?}",
@@ -2344,18 +2434,30 @@ mod tests {
     fn add_related_sets_symmetric_relationships() {
         let mut idx = OntologyIndex::from_entries(Vec::new());
         idx.add_related("concept-a", "concept-b");
-        
-        assert_eq!(idx.related.get("concept-a"), Some(&BTreeSet::from(["concept-b".to_string()])));
-        assert_eq!(idx.related.get("concept-b"), Some(&BTreeSet::from(["concept-a".to_string()])));
+
+        assert_eq!(
+            idx.related.get("concept-a"),
+            Some(&BTreeSet::from(["concept-b".to_string()]))
+        );
+        assert_eq!(
+            idx.related.get("concept-b"),
+            Some(&BTreeSet::from(["concept-a".to_string()]))
+        );
     }
 
     #[test]
     fn add_contrasts_with_sets_symmetric_relationships() {
         let mut idx = OntologyIndex::from_entries(Vec::new());
         idx.add_contrasts_with("concept-a", "concept-b");
-        
-        assert_eq!(idx.contrasts_with.get("concept-a"), Some(&BTreeSet::from(["concept-b".to_string()])));
-        assert_eq!(idx.contrasts_with.get("concept-b"), Some(&BTreeSet::from(["concept-a".to_string()])));
+
+        assert_eq!(
+            idx.contrasts_with.get("concept-a"),
+            Some(&BTreeSet::from(["concept-b".to_string()]))
+        );
+        assert_eq!(
+            idx.contrasts_with.get("concept-b"),
+            Some(&BTreeSet::from(["concept-a".to_string()]))
+        );
     }
 
     #[test]
@@ -2363,7 +2465,7 @@ mod tests {
         let mut idx = OntologyIndex::from_entries(Vec::new());
         idx.add_broader("child", "parent");
         idx.add_broader("grandchild", "child");
-        
+
         let broader = idx.concept_broader_of("grandchild");
         assert!(broader.contains("child"));
         assert!(broader.contains("parent"));
@@ -2375,7 +2477,7 @@ mod tests {
         let mut idx = OntologyIndex::from_entries(Vec::new());
         idx.add_broader("child", "parent");
         idx.add_broader("grandchild", "child");
-        
+
         let narrower = idx.concept_narrower_of("parent");
         assert!(narrower.contains("child"));
         assert!(narrower.contains("grandchild"));
@@ -2399,7 +2501,7 @@ mod tests {
             realization_status: "unknown".to_string(),
         };
         idx.concepts.insert("concept-a".to_string(), entry);
-        
+
         let expanded = idx.expand_concept_query_terms("concept-a");
         assert!(expanded.contains("concept-a"));
         assert!(expanded.contains("Concept Alpha"));
@@ -2439,7 +2541,7 @@ mod tests {
         idx.concepts.insert("concept-a".to_string(), entry1);
         idx.concepts.insert("concept-b".to_string(), entry2);
         idx.add_related("concept-a", "concept-b");
-        
+
         let expanded = idx.expand_concept_query_terms("concept-a");
         assert!(expanded.contains("concept-b"));
         assert!(expanded.contains("Concept Beta"));
@@ -2463,10 +2565,10 @@ mod tests {
                 }),
             },
         )];
-        
+
         let mut idx = OntologyIndex::from_entries(Vec::new());
         idx.load_concept_rows(&rows, 1730000000);
-        
+
         assert!(idx.concepts.is_empty());
     }
 
@@ -2487,10 +2589,10 @@ mod tests {
                 }),
             },
         )];
-        
+
         let mut idx = OntologyIndex::from_entries(Vec::new());
         idx.load_concept_rows(&rows, 1730000000);
-        
+
         assert!(idx.concepts.is_empty());
     }
 
@@ -2510,10 +2612,10 @@ mod tests {
                 }),
             },
         )];
-        
+
         let mut idx = OntologyIndex::from_entries(Vec::new());
         idx.load_concept_rows(&rows, 1730000000);
-        
+
         // Concept with self-loop broader should not be loaded
         assert!(idx.concepts.is_empty());
     }
@@ -2603,15 +2705,13 @@ mod tests {
         assert!(idx.subclasses_of("consensus").is_empty());
 
         // SKOS S27 disjointness: related edge between raft-consensus and its ancestor consensus is rejected
-        assert!(
-            idx.related
-                .get("raft-consensus")
-                .map(|s| !s.contains("consensus"))
-                .unwrap_or(true)
-        );
+        assert!(idx
+            .related
+            .get("raft-consensus")
+            .map(|s| !s.contains("consensus"))
+            .unwrap_or(true));
     }
 }
-
 
 /// Extract an `(a, b)` pair from a vocabulary entry that is either a
 /// two-element `[a, b]` array or an object with `"child"`/`"parent"` (and
@@ -2686,7 +2786,11 @@ mod plan_tests {
             .added_entailments
             .iter()
             .any(|s| s.conclusion.contains(&format!("<{EX}B>")));
-        assert!(found, "new subClassOf entailment must be reported: {:?}", report.added_entailments);
+        assert!(
+            found,
+            "new subClassOf entailment must be reported: {:?}",
+            report.added_entailments
+        );
         // Zero mutation: neither the index nor the caller input changed.
         assert_eq!(base_before, inp.base_turtle);
         assert_eq!(idx_before, format!("{idx:?}"));
@@ -2699,9 +2803,8 @@ mod plan_tests {
              <{EX}A> rdfs:subClassOf <{EX}B> .\n\
              <{EX}x> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{EX}A> ."
         );
-        let retract = format!(
-            "<{EX}x> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{EX}A> ."
-        );
+        let retract =
+            format!("<{EX}x> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{EX}A> .");
         let inp = input(&base);
         let idx = OntologyIndex::empty();
 
@@ -2710,7 +2813,10 @@ mod plan_tests {
             .expect("plan must succeed");
 
         assert!(
-            report.removed_entailments.iter().any(|s| s.contains(&format!("<{EX}B>"))),
+            report
+                .removed_entailments
+                .iter()
+                .any(|s| s.contains(&format!("<{EX}B>"))),
             "lost subClassOf entailment must be reported: {:?}",
             report.removed_entailments
         );
@@ -2735,13 +2841,20 @@ mod plan_tests {
             .expect("plan must succeed");
 
         assert!(!report.validation_conforms, "post-image must not conform");
-        assert!(!report.new_shacl_violations.is_empty(), "new SHACL violation expected");
-        assert!(report.new_shacl_violations.iter().any(|v| v.focus.contains("x")));
+        assert!(
+            !report.new_shacl_violations.is_empty(),
+            "new SHACL violation expected"
+        );
+        assert!(report
+            .new_shacl_violations
+            .iter()
+            .any(|v| v.focus.contains("x")));
     }
 
     #[test]
     fn plan_produces_real_schema_ddl_diff_via_ontobug() {
-        let base = "@prefix owl: <http://www.w3.org/2002/07/owl#> .\n<urn:test:ex#Employee> a owl:Class .";
+        let base =
+            "@prefix owl: <http://www.w3.org/2002/07/owl#> .\n<urn:test:ex#Employee> a owl:Class .";
         let add = "@prefix owl: <http://www.w3.org/2002/07/owl#> .\n\
                    @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n\
                    <urn:test:ex#Manager> a owl:Class ; rdfs:subClassOf <urn:test:ex#Employee> .";
@@ -2751,9 +2864,18 @@ mod plan_tests {
             .plan_mutation_diff(&req(Some(add), &[]), &input(base))
             .expect("plan must succeed");
 
-        assert!(!report.schema_ddl_diff.is_empty(), "ontobug must produce real DDL");
-        assert!(report.schema_ddl_diff.iter().any(|s| s.contains("OntologyClass")),
-            "DDL must reference OntologyClass statements: {:?}", report.schema_ddl_diff);
+        assert!(
+            !report.schema_ddl_diff.is_empty(),
+            "ontobug must produce real DDL"
+        );
+        assert!(
+            report
+                .schema_ddl_diff
+                .iter()
+                .any(|s| s.contains("OntologyClass")),
+            "DDL must reference OntologyClass statements: {:?}",
+            report.schema_ddl_diff
+        );
     }
 
     #[test]
@@ -2764,17 +2886,21 @@ mod plan_tests {
             "check-employee".to_string(),
             vec![format!("PREFIX ex: <{EX}> ASK {{ ex:x a ex:Employee }}")],
         ));
-        let retract = format!(
-            "<{EX}x> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{EX}Employee> ."
-        );
+        let retract =
+            format!("<{EX}x> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{EX}Employee> .");
         let idx = OntologyIndex::empty();
 
         let report = idx
             .plan_mutation_diff(&req(None, &[&retract]), &inp)
             .expect("plan must succeed");
 
-        assert!(report.impacted_action_slugs.contains(&"check-employee".to_string()),
-            "ASK flip must mark slug impacted: {:?}", report.impacted_action_slugs);
+        assert!(
+            report
+                .impacted_action_slugs
+                .contains(&"check-employee".to_string()),
+            "ASK flip must mark slug impacted: {:?}",
+            report.impacted_action_slugs
+        );
     }
 
     // --- Capability B independent-review regressions (RED-first) ----------
@@ -2789,8 +2915,14 @@ mod plan_tests {
         let inp = input(&base);
         let base_before = inp.base_turtle.clone();
         let result = OntologyIndex::empty().plan_mutation_diff(&req(None, &[&two]), &inp);
-        assert!(result.is_err(), "two quads in one retract entry must be rejected: {result:?}");
-        assert_eq!(base_before, inp.base_turtle, "plan must not mutate caller input");
+        assert!(
+            result.is_err(),
+            "two quads in one retract entry must be rejected: {result:?}"
+        );
+        assert_eq!(
+            base_before, inp.base_turtle,
+            "plan must not mutate caller input"
+        );
     }
 
     #[test]
@@ -2801,16 +2933,18 @@ mod plan_tests {
         );
         let inp = input(&base);
         let result = OntologyIndex::empty().plan_mutation_diff(&req(None, &[&bad]), &inp);
-        assert!(result.is_err(), "trailing malformed content must be rejected: {result:?}");
+        assert!(
+            result.is_err(),
+            "trailing malformed content must be rejected: {result:?}"
+        );
     }
 
     #[test]
     fn plan_impacted_action_slugs_are_sorted_unique_deterministic() {
         let base = format!("<{EX}x> a <{EX}Employee> .");
         let ask = format!("PREFIX ex: <{EX}> ASK {{ ex:x a ex:Employee }}");
-        let retract = format!(
-            "<{EX}x> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{EX}Employee> ."
-        );
+        let retract =
+            format!("<{EX}x> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{EX}Employee> .");
         let mut a = input(&base);
         a.visible_action_asks = vec![
             ("zeta".into(), vec![ask.clone()]),
@@ -2823,8 +2957,12 @@ mod plan_tests {
             ("zeta".into(), vec![ask]),
         ];
         let idx = OntologyIndex::empty();
-        let ra = idx.plan_mutation_diff(&req(None, &[&retract]), &a).expect("plan a");
-        let rb = idx.plan_mutation_diff(&req(None, &[&retract]), &b).expect("plan b");
+        let ra = idx
+            .plan_mutation_diff(&req(None, &[&retract]), &a)
+            .expect("plan a");
+        let rb = idx
+            .plan_mutation_diff(&req(None, &[&retract]), &b)
+            .expect("plan b");
         assert_eq!(
             serde_json::to_string(&ra.impacted_action_slugs).unwrap(),
             serde_json::to_string(&rb.impacted_action_slugs).unwrap(),
@@ -2833,7 +2971,8 @@ mod plan_tests {
         assert_eq!(
             ra.impacted_action_slugs,
             vec!["alpha".to_string(), "zeta".to_string()],
-            "slug list must be sorted and unique: {:?}", ra.impacted_action_slugs
+            "slug list must be sorted and unique: {:?}",
+            ra.impacted_action_slugs
         );
     }
 
@@ -2846,15 +2985,21 @@ mod plan_tests {
         inp.visible_memory_ids = vec!["mem-a".to_string()];
         let idx = OntologyIndex::empty();
 
-        let false_report = idx.plan_mutation_diff(&req(Some(&add_false), &[]), &inp).expect("plan false");
+        let false_report = idx
+            .plan_mutation_diff(&req(Some(&add_false), &[]), &inp)
+            .expect("plan false");
         assert!(
             !false_report.impacted_memories.iter().any(|m| m == "mem-a"),
-            "mem-a must not false-positive on mem-ab: {:?}", false_report.impacted_memories
+            "mem-a must not false-positive on mem-ab: {:?}",
+            false_report.impacted_memories
         );
-        let true_report = idx.plan_mutation_diff(&req(Some(&add_true), &[]), &inp).expect("plan true");
+        let true_report = idx
+            .plan_mutation_diff(&req(Some(&add_true), &[]), &inp)
+            .expect("plan true");
         assert!(
             true_report.impacted_memories.iter().any(|m| m == "mem-a"),
-            "exact memory IRI must impact: {:?}", true_report.impacted_memories
+            "exact memory IRI must impact: {:?}",
+            true_report.impacted_memories
         );
     }
 
@@ -2868,20 +3013,29 @@ mod plan_tests {
         inp.visible_file_paths = vec!["foo.rs".to_string()];
         let idx = OntologyIndex::empty();
 
-        let false_report = idx.plan_mutation_diff(&req(Some(&add_false), &[]), &inp).expect("plan false");
+        let false_report = idx
+            .plan_mutation_diff(&req(Some(&add_false), &[]), &inp)
+            .expect("plan false");
         assert!(
             !false_report.impacted_files.iter().any(|p| p == "foo.rs"),
-            "foo.rs must not false-positive on foo.rs.bak: {:?}", false_report.impacted_files
+            "foo.rs must not false-positive on foo.rs.bak: {:?}",
+            false_report.impacted_files
         );
-        let true_report = idx.plan_mutation_diff(&req(Some(&add_true), &[]), &inp).expect("plan true");
+        let true_report = idx
+            .plan_mutation_diff(&req(Some(&add_true), &[]), &inp)
+            .expect("plan true");
         assert!(
             true_report.impacted_files.iter().any(|p| p == "foo.rs"),
-            "exact file path must impact: {:?}", true_report.impacted_files
+            "exact file path must impact: {:?}",
+            true_report.impacted_files
         );
-        let iri_report = idx.plan_mutation_diff(&req(Some(&add_iri), &[]), &inp).expect("plan iri");
+        let iri_report = idx
+            .plan_mutation_diff(&req(Some(&add_iri), &[]), &inp)
+            .expect("plan iri");
         assert!(
             iri_report.impacted_files.iter().any(|p| p == "foo.rs"),
-            "file path at a legitimate IRI boundary must impact: {:?}", iri_report.impacted_files
+            "file path at a legitimate IRI boundary must impact: {:?}",
+            iri_report.impacted_files
         );
     }
 
@@ -2938,15 +3092,25 @@ mod plan_tests {
         deterministic_report_order(&mut a);
         deterministic_report_order(&mut b);
 
-        let conclusions: Vec<&str> = a.added_entailments.iter().map(|s| s.conclusion.as_str()).collect();
+        let conclusions: Vec<&str> = a
+            .added_entailments
+            .iter()
+            .map(|s| s.conclusion.as_str())
+            .collect();
         assert_eq!(conclusions, vec!["<urn:a>", "<urn:m>", "<urn:z>"]);
-        let foci: Vec<(&str, &str)> = a.new_shacl_violations.iter()
-            .map(|v| (v.focus.as_str(), v.component.as_str())).collect();
-        assert_eq!(foci, vec![
-            ("<urn:a>", "ClassConstraintComponent"),
-            ("<urn:a>", "DatatypeConstraintComponent"),
-            ("<urn:z>", "MinCountConstraintComponent"),
-        ]);
+        let foci: Vec<(&str, &str)> = a
+            .new_shacl_violations
+            .iter()
+            .map(|v| (v.focus.as_str(), v.component.as_str()))
+            .collect();
+        assert_eq!(
+            foci,
+            vec![
+                ("<urn:a>", "ClassConstraintComponent"),
+                ("<urn:a>", "DatatypeConstraintComponent"),
+                ("<urn:z>", "MinCountConstraintComponent"),
+            ]
+        );
         assert_eq!(
             serde_json::to_string(&a).unwrap(),
             serde_json::to_string(&b).unwrap(),

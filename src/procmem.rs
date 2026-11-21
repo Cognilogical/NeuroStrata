@@ -110,10 +110,19 @@ pub fn sample() -> Sample {
         status
             .lines()
             .find_map(|l| l.strip_prefix(key))
-            .and_then(|rest| rest.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+            .and_then(|rest| {
+                rest.trim()
+                    .trim_end_matches("kB")
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+            })
             .map(|v| v * 1024)
     };
-    Sample { rss_bytes: kb("VmRSS:"), peak_bytes: kb("VmHWM:") }
+    Sample {
+        rss_bytes: kb("VmRSS:"),
+        peak_bytes: kb("VmHWM:"),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -230,30 +239,32 @@ pub fn enable_profile() {
 /// an IDE starts. The resident figure in `storage_status` stays on: it is one
 /// syscall and has nothing to switch.
 fn profile_enabled() -> bool {
-    PROFILE.load(Ordering::Relaxed)
-        || {
-            #[cfg(not(test))]
-            {
-                // `CallGuard::enter` runs on every tool call; a disabled
-                // profile must cost one relaxed load, not an `env::var`
-                // syscall. The value cannot change mid-process in a way that
-                // matters: `--profile` sets `PROFILE` above, and an operator
-                // flipping the variable after start has no contract to honor.
-                *PROFILE_ENV.get_or_init(env_says_profile)
-            }
-            #[cfg(test)]
-            {
-                // Tests toggle the variable at runtime, so they keep the
-                // uncached read.
-                env_says_profile()
-            }
+    PROFILE.load(Ordering::Relaxed) || {
+        #[cfg(not(test))]
+        {
+            // `CallGuard::enter` runs on every tool call; a disabled
+            // profile must cost one relaxed load, not an `env::var`
+            // syscall. The value cannot change mid-process in a way that
+            // matters: `--profile` sets `PROFILE` above, and an operator
+            // flipping the variable after start has no contract to honor.
+            *PROFILE_ENV.get_or_init(env_says_profile)
         }
+        #[cfg(test)]
+        {
+            // Tests toggle the variable at runtime, so they keep the
+            // uncached read.
+            env_says_profile()
+        }
+    }
 }
 
 /// The `NEUROSTRATA_PROFILE` lookup the release build caches once.
 fn env_says_profile() -> bool {
     matches!(
-        std::env::var("NEUROSTRATA_PROFILE").ok().as_deref().map(str::trim),
+        std::env::var("NEUROSTRATA_PROFILE")
+            .ok()
+            .as_deref()
+            .map(str::trim),
         Some("1") | Some("true") | Some("on")
     )
 }
@@ -324,7 +335,9 @@ fn threshold_mb() -> u64 {
 
 fn log_path() -> PathBuf {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    home.join(".config").join("neurostrata").join("memory-growth.log")
+    home.join(".config")
+        .join("neurostrata")
+        .join("memory-growth.log")
 }
 
 /// The growth log's file name, never its path: `/status` is operator-facing
@@ -346,9 +359,7 @@ fn grew(before: Option<u64>, after: Option<u64>, threshold_mb: u64) -> bool {
         return false;
     }
     match (before, after) {
-        (Some(b), Some(a)) => {
-            a.saturating_sub(b) >= threshold_mb.saturating_mul(MB)
-        }
+        (Some(b), Some(a)) => a.saturating_sub(b) >= threshold_mb.saturating_mul(MB),
         _ => false,
     }
 }
@@ -761,8 +772,14 @@ mod tests {
     fn growth_needs_both_figures_and_the_threshold() {
         assert!(grew(Some(100 * MB), Some(150 * MB), 50));
         assert!(!grew(Some(100 * MB), Some(149 * MB), 50));
-        assert!(!grew(Some(150 * MB), Some(100 * MB), 50), "shrinking is not growth");
-        assert!(!grew(None, Some(900 * MB), 50), "an unknown start is not a measurement");
+        assert!(
+            !grew(Some(150 * MB), Some(100 * MB), 50),
+            "shrinking is not growth"
+        );
+        assert!(
+            !grew(None, Some(900 * MB), 50),
+            "an unknown start is not a measurement"
+        );
         assert!(!grew(Some(100 * MB), None, 50));
     }
 
@@ -858,7 +875,10 @@ mod tests {
         let s = sample();
         #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
         {
-            assert!(s.rss_bytes.unwrap_or(0) > 0, "no resident set reported: {s:?}");
+            assert!(
+                s.rss_bytes.unwrap_or(0) > 0,
+                "no resident set reported: {s:?}"
+            );
             assert!(s.peak_bytes.unwrap_or(0) >= s.rss_bytes.unwrap_or(0));
         }
         let _ = s;
@@ -866,10 +886,23 @@ mod tests {
 
     #[test]
     fn a_log_line_is_strict_json_naming_the_call() {
-        let before = Sample { rss_bytes: Some(1000 * MB), peak_bytes: Some(1000 * MB) };
-        let after = Sample { rss_bytes: Some(1300 * MB), peak_bytes: Some(1300 * MB) };
-        let v: serde_json::Value =
-            serde_json::from_str(&line("neurostrata_search_memory", Some("example-project"), before, after, 2, false)).unwrap();
+        let before = Sample {
+            rss_bytes: Some(1000 * MB),
+            peak_bytes: Some(1000 * MB),
+        };
+        let after = Sample {
+            rss_bytes: Some(1300 * MB),
+            peak_bytes: Some(1300 * MB),
+        };
+        let v: serde_json::Value = serde_json::from_str(&line(
+            "neurostrata_search_memory",
+            Some("example-project"),
+            before,
+            after,
+            2,
+            false,
+        ))
+        .unwrap();
         assert_eq!(v["tool"], "neurostrata_search_memory");
         assert_eq!(v["namespace"], "example-project");
         assert_eq!(v["delta_mb"], 300);
@@ -920,8 +953,15 @@ mod tests {
 
     #[test]
     fn unknown_figures_are_null_not_zero() {
-        let v: serde_json::Value =
-            serde_json::from_str(&line("t", None, Sample::default(), Sample::default(), 1, false)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line(
+            "t",
+            None,
+            Sample::default(),
+            Sample::default(),
+            1,
+            false,
+        ))
+        .unwrap();
         assert!(v["rss_after_mb"].is_null());
         assert!(v["delta_mb"].is_null());
         assert!(v["namespace"].is_null());
@@ -934,7 +974,10 @@ mod tests {
         let path = dir.join("memory-growth.log");
         std::fs::write(&path, vec![b'x'; (MAX_LOG_BYTES + 1) as usize]).unwrap();
         append(&path, "{\"fresh\":true}").expect("append");
-        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), "{\"fresh\":true}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().trim(),
+            "{\"fresh\":true}"
+        );
         assert!(dir.join("memory-growth.log.1").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -947,7 +990,10 @@ mod tests {
         assert_eq!(v["snapshots"], 3);
         let p = &v["process"];
         assert!(p.get("rss_mb").is_some() && p.get("peak_rss_mb").is_some());
-        assert!(p.get("rss_available").is_some(), "callers can tell whether rss is live");
+        assert!(
+            p.get("rss_available").is_some(),
+            "callers can tell whether rss is live"
+        );
         assert_eq!(p["growth_log"].as_str().unwrap(), "memory-growth.log");
         assert!(p["growth_log_threshold_mb"].as_u64().unwrap() > 0);
     }
@@ -986,21 +1032,33 @@ mod tests {
         assert_eq!(rows[0]["rss_mb"], 180);
         assert_eq!(rows[0]["delta_mb"], 80);
         // No second row when the process does not grow again.
-        assert!(!sample_once_with(|| Some(190 * MB), &mut prev, 50 * MB, &path));
+        assert!(!sample_once_with(
+            || Some(190 * MB),
+            &mut prev,
+            50 * MB,
+            &path
+        ));
         assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_sample_row_is_strict_json_with_the_call_count() {
-        let s = Sample { rss_bytes: Some(1800 * MB), peak_bytes: Some(2100 * MB) };
+        let s = Sample {
+            rss_bytes: Some(1800 * MB),
+            peak_bytes: Some(2100 * MB),
+        };
         let v: serde_json::Value = serde_json::from_str(&sample_line(s, 7, 1)).unwrap();
         assert_eq!(v["kind"], "sample");
         assert_eq!(v["rss_mb"], 1800);
         assert_eq!(v["peak_rss_mb"], 2100);
         assert_eq!(v["calls_since_last"], 7);
-        let none: serde_json::Value = serde_json::from_str(&sample_line(Sample::default(), 0, 0)).unwrap();
-        assert!(none["rss_mb"].is_null(), "an unknown figure is null, not zero");
+        let none: serde_json::Value =
+            serde_json::from_str(&sample_line(Sample::default(), 0, 0)).unwrap();
+        assert!(
+            none["rss_mb"].is_null(),
+            "an unknown figure is null, not zero"
+        );
     }
 
     #[tokio::test]
@@ -1010,7 +1068,11 @@ mod tests {
         let path = dir.join("memory-growth.log");
         let _ = std::fs::remove_file(&path);
         let (tx, rx) = tokio::sync::watch::channel(false);
-        let handle = tokio::spawn(run_sampler(path.clone(), std::time::Duration::from_millis(40), rx));
+        let handle = tokio::spawn(run_sampler(
+            path.clone(),
+            std::time::Duration::from_millis(40),
+            rx,
+        ));
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         tx.send(true).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), handle)
@@ -1018,9 +1080,15 @@ mod tests {
             .expect("the sampler stops promptly")
             .unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        let rows: Vec<serde_json::Value> =
-            text.lines().map(|l| serde_json::from_str(l).expect("strict JSON")).collect();
-        assert!(rows.len() >= 3, "a row at once and one per interval, got {}", rows.len());
+        let rows: Vec<serde_json::Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("strict JSON"))
+            .collect();
+        assert!(
+            rows.len() >= 3,
+            "a row at once and one per interval, got {}",
+            rows.len()
+        );
         assert!(rows.iter().all(|r| r["kind"] == "sample"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1074,7 +1142,10 @@ mod tests {
             serde_json::from_str(&line("t", None, before, after, 1, false)).unwrap();
         assert_eq!(v["rss_before_mb"], 100);
         assert_eq!(v["rss_after_mb"], 101);
-        assert_eq!(v["delta_mb"], 1, "delta_mb must equal rss_after_mb - rss_before_mb");
+        assert_eq!(
+            v["delta_mb"], 1,
+            "delta_mb must equal rss_after_mb - rss_before_mb"
+        );
 
         let dir = std::env::temp_dir().join(format!(
             "procmem-delta-floor-{}-{}",

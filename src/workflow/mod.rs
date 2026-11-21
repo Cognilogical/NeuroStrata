@@ -7,10 +7,10 @@ pub mod connector;
 pub mod machine;
 
 pub use connector::{
-    GitWorkflowConnector, ManifestWorkflowConnector, TriggerInstallReport,
-    WorkflowConnector, resolve_workflow_connector,
+    resolve_workflow_connector, GitWorkflowConnector, ManifestWorkflowConnector,
+    TriggerInstallReport, WorkflowConnector,
 };
 pub use machine::{
-    WorkflowEdgeSpec, WorkflowEvent, WorkflowStage, WorkflowTransitionOutcome, WORKFLOW_TABLE,
-    evaluate_workflow_transition,
+    evaluate_workflow_transition, WorkflowEdgeSpec, WorkflowEvent, WorkflowStage,
+    WorkflowTransitionOutcome, WORKFLOW_TABLE,
 };

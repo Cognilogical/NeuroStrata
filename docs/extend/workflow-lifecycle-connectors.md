@@ -4,18 +4,19 @@
 
 The workflow lifecycle is a finite state machine with 8 stages and 23 legal edges:
 
-| Stage | Description |
-|-------|-------------|
-| `Unpreflighted` | Session has not loaded project snapshot/context |
-| `ContextLoaded` | Snapshot/memory preflight satisfied; ready to claim a task |
-| `Claimed` | Active task claimed in a valid workspace scope; ready to mutate |
-| `Mutating` | Executing mutations within the Breath budget |
-| `BreathRequired` | Mutation budget reached; requires a breath note to return to `Mutating` |
-| `PreCheckpoint` | Checkpoint trigger fired; validates ledger and receipt binding |
-| `PrePublish` | Publish trigger fired; evaluates task + documentation gates |
-| `Completed` | Task closed via `neurostrata_task_complete` with extraction and clean targets |
+| Stage            | Description                                                                   |
+| ---------------- | ----------------------------------------------------------------------------- |
+| `Unpreflighted`  | Session has not loaded project snapshot/context                               |
+| `ContextLoaded`  | Snapshot/memory preflight satisfied; ready to claim a task                    |
+| `Claimed`        | Active task claimed in a valid workspace scope; ready to mutate               |
+| `Mutating`       | Executing mutations within the Breath budget                                  |
+| `BreathRequired` | Mutation budget reached; requires a breath note to return to `Mutating`       |
+| `PreCheckpoint`  | Checkpoint trigger fired; validates ledger and receipt binding                |
+| `PrePublish`     | Publish trigger fired; evaluates task + documentation gates                   |
+| `Completed`      | Task closed via `neurostrata_task_complete` with extraction and clean targets |
 
 `WorkflowEvent` triggers transitions with named guards:
+
 - `claim_task` → `claimed` requires `has_valid_scope`
 - `mutate` → `mutating` requires `mutations_since_note_after < breath_limit`
 - `mutate` → `breath_required` requires `mutations_since_note_after >= breath_limit`
@@ -45,6 +46,7 @@ A `WorkflowConnector` is a pluggable implementation that knows how to:
 4. **Install triggers** — wire up hooks (pre-commit, pre-push, etc.) for the workspace
 
 The shipped implementations are:
+
 - **`GitWorkflowConnector`** — the default, preserving the pre-existing hardwired behavior
 - **`ManifestWorkflowConnector`** — a non-git connector that reads `.NeuroStrata/workflow-connector.json`
 
@@ -68,6 +70,7 @@ Non-git workspaces declare their connector in `.NeuroStrata/workflow-connector.j
 ```
 
 `WorkflowConnectorManifest` accepts:
+
 - `connector_id` (or alias `connector`, default `"manifest"`)
 - `stream` + `workspace` (or `scope: { "branch": "...", "worktree": "..." }`)
 - `revision_id` and `dirty_state_hash` (optional overrides for deterministic state digests)
@@ -93,3 +96,5 @@ impl WorkflowConnector for MyCustomConnector {
 ```
 
 `resolve_workflow_connector` inspects `.NeuroStrata/workflow-connector.json` (or falls back to `git`), constructs the appropriate connector, and returns it for non-trust uses such as `workflow status` display. The connector is **not** used by the workflow state machine: `src/workflow/machine.rs` and `src/workflow/connector.rs` never reference each other, and the machine is evaluated only through `evaluate_workflow_transition` (for example by the `workflow transitions` CLI sample). Trust-bearing consumers — receipt binding (`compute_worktree_state`), retention re-verification, gate scope (`GateScope::capture`), and the documentation gate's changed set — use `GitWorkflowConnector` directly, so a manifest connector cannot attest the state those consumers bind to.
+
+Source of truth: `src/workflow/connector.rs` and `src/workflow/machine.rs`.

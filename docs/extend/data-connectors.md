@@ -65,6 +65,21 @@ pub trait DataConnector: Send + Sync {
 
 - `ExternalEffectRequest` / `ExternalEffectReceipt`; idempotency key; active target-bound `action_receipt` (`ActiveBound`). Write-back requires CAS + idempotency key.
 
+## Write-Back Durability
+
+- `DataConnector::snapshot_write_back(pool_id, pointer_uri)` defaults to `Ok(None)`; `None` means the connector already persists its own state.
+- `InMemoryPoolConnector` returns the written pointer's post-effect records, its prior records, and the pool's idempotency receipts. After a successful effect and post-gate, the kernel merges that delta into the pool registry row under a process-wide turn before returning the receipt.
+- Merging is per-pointer: concurrent kernels writing different pointers both survive; a same-pointer write whose stored records no longer match `prior_records` is a conflict, not a last-writer-wins overwrite.
+- A pointer missing from an existing row is a removal by a newer replacement, not an invitation to resurrect it; the commit is rejected when the snapshot has prior records.
+- The persisted `pool_schema` is preserved and its access mode revalidated at commit: a pool changed to read-only after hydration rejects the write-back instead of restoring the stale read-write schema. Pool registration and write-back share one persistence turn.
+- A pool archived after hydration is rejected at commit; a write-back must never revive a retired row.
+- Receipt-load failures during hydration fail the request instead of silently omitting receipts and allowing a retried effect to duplicate.
+- A rejected persistence rolls the request-local connector back to `prior_records`, drops the uncommitted receipt, and then returns the error: a reused kernel cannot serve the failed mutation or replay it as success.
+- `pool_idempotency` is persisted with the records and restored during hydration, so a retry through a fresh kernel returns the original receipt and cannot append twice.
+- A schema-only `upsert_pool` (no `records`) preserves `pool_idempotency` alongside the retained `pool_records`; it must not orphan receipts from their records.
+- A snapshot carries only the receipt produced by the written pointer's latest effect. A receipt whose persistence was rejected is never promoted by a later write to another pointer, so it cannot replay as `applied: true` without durable records.
+- `JsonFilePoolConnector` returns `None` (file-backed) and is not rewritten. A snapshot or persistence failure rejects the effect rather than returning an unobservable success receipt.
+
 ## Transport Parity
 
 - MCP tool: `neurostrata_data_connector`

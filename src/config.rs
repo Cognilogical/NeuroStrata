@@ -41,17 +41,35 @@ pub struct DeduplicationConfig {
     pub cb_backoff_max_seconds: u64,
 }
 
-fn default_timeout() -> u64 { 5 }
-fn default_similarity_threshold() -> f32 { 0.85 }
-fn default_confidence_threshold() -> f32 { 0.8 }
-fn default_laya_bundle_path() -> String { "artifacts/laya-bundle".to_string() }
-fn default_max_candidates() -> usize { 5 }
-fn default_cb_failure_threshold() -> u32 { 3 }
-fn default_cb_backoff_initial() -> u64 { 30 }
-fn default_cb_backoff_max() -> u64 { 3600 }
+fn default_timeout() -> u64 {
+    5
+}
+fn default_similarity_threshold() -> f32 {
+    0.85
+}
+fn default_confidence_threshold() -> f32 {
+    0.8
+}
+fn default_laya_bundle_path() -> String {
+    "artifacts/laya-bundle".to_string()
+}
+fn default_max_candidates() -> usize {
+    5
+}
+fn default_cb_failure_threshold() -> u32 {
+    3
+}
+fn default_cb_backoff_initial() -> u64 {
+    30
+}
+fn default_cb_backoff_max() -> u64 {
+    3600
+}
 
 impl Default for DedupProviderMode {
-    fn default() -> Self { Self::Auto }
+    fn default() -> Self {
+        Self::Auto
+    }
 }
 
 impl Default for DeduplicationConfig {
@@ -265,7 +283,10 @@ impl Config {
             file.write_all(b"\n")?;
             if let Some(permissions) = existing_permissions {
                 file.set_permissions(permissions).with_context(|| {
-                    format!("Could not preserve config permissions at {}", path.display())
+                    format!(
+                        "Could not preserve config permissions at {}",
+                        path.display()
+                    )
                 })?;
             }
             file.sync_all()?;
@@ -574,10 +595,9 @@ mod tests {
     #[test]
     fn dedup_provider_config_jev_without_key_does_not_failover() {
         std::env::remove_var("TYPESAFE_API_KEY");
-        let config: Config = serde_json::from_str(
-            r#"{"db_path":"test.db","deduplication":{"provider":"jev"}}"#,
-        )
-        .unwrap();
+        let config: Config =
+            serde_json::from_str(r#"{"db_path":"test.db","deduplication":{"provider":"jev"}}"#)
+                .unwrap();
         assert_eq!(config.deduplication.provider, DedupProviderMode::Jev);
         assert!(config.deduplication.judgment_api_key.is_none());
         assert!(config.deduplication.judgment_api_key_env.is_none());
@@ -586,10 +606,9 @@ mod tests {
     /// `none` disables dedup learning entirely.
     #[test]
     fn dedup_provider_config_none_disables_dedup_learning() {
-        let config: Config = serde_json::from_str(
-            r#"{"db_path":"test.db","deduplication":{"provider":"none"}}"#,
-        )
-        .unwrap();
+        let config: Config =
+            serde_json::from_str(r#"{"db_path":"test.db","deduplication":{"provider":"none"}}"#)
+                .unwrap();
         assert_eq!(config.deduplication.provider, DedupProviderMode::None);
     }
 

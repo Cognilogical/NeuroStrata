@@ -367,14 +367,13 @@ pub async fn hydrate_object_view(
                                 .get("valid_from")
                                 .and_then(|v| v.as_i64())
                                 .unwrap_or(0);
-                            if best_concept_or_thesis.as_ref().map_or(
-                                true,
-                                |(bv, bvf, brid, _)| {
+                            if best_concept_or_thesis
+                                .as_ref()
+                                .map_or(true, |(bv, bvf, brid, _)| {
                                     (ver, vf, rid.as_str()) > (*bv, *bvf, brid.as_str())
-                                },
-                            ) {
-                                best_concept_or_thesis =
-                                    Some((ver, vf, rid.clone(), pl.clone()));
+                                })
+                            {
+                                best_concept_or_thesis = Some((ver, vf, rid.clone(), pl.clone()));
                             }
                         }
                     }
@@ -389,9 +388,12 @@ pub async fn hydrate_object_view(
                         .get("valid_from")
                         .and_then(|v| v.as_i64())
                         .unwrap_or(0);
-                    if best_concept_or_thesis.as_ref().map_or(true, |(bv, bvf, brid, _)| {
-                        (ver, vf, rid.as_str()) > (*bv, *bvf, brid.as_str())
-                    }) {
+                    if best_concept_or_thesis
+                        .as_ref()
+                        .map_or(true, |(bv, bvf, brid, _)| {
+                            (ver, vf, rid.as_str()) > (*bv, *bvf, brid.as_str())
+                        })
+                    {
                         best_concept_or_thesis = Some((ver, vf, rid.clone(), pl.clone()));
                     }
                 }

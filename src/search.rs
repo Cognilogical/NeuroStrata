@@ -260,6 +260,71 @@ pub fn passes_filters(
     true
 }
 
+/// Exact warning emitted when the removed `include_related` alias is used.
+/// `"include_references"` is provenance-only; the alias used to be a silent
+/// no-op, so the correction has to be loud and byte-stable.
+pub const INCLUDE_RELATED_DEPRECATION_WARNING: &str =
+    "'include_related' is deprecated; use 'include_references'";
+
+/// Pure resolution of the `search_memory` argument contract.
+///
+/// Kept independent of the store and embedder so the alias/default rules can
+/// be pinned by a focused test. `graph_expanded_ids` is supplied by the caller:
+/// the IDs come from hybrid graph expansion, never from ranking changes here.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SearchMemoryContract {
+    pub mode: String,
+    pub include_references: bool,
+    pub warnings: Vec<String>,
+    pub graph_expanded_ids: Vec<String>,
+}
+
+impl SearchMemoryContract {
+    pub fn from_arguments(arguments: &Value, graph_expanded_ids: Vec<String>) -> Self {
+        let mode = arguments
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("hybrid")
+            .to_string();
+        let include_related = arguments.get("include_related").and_then(|v| v.as_bool());
+        let include_references = arguments
+            .get("include_references")
+            .and_then(|v| v.as_bool());
+        let mut warnings = Vec::new();
+        if arguments.get("include_related").is_some() {
+            warnings.push(INCLUDE_RELATED_DEPRECATION_WARNING.to_string());
+        }
+        // Explicit `include_references` wins when both keys are present;
+        // the deprecated alias only fills in an otherwise absent value.
+        let include_references = include_references.or(include_related).unwrap_or(false);
+        Self {
+            mode,
+            include_references,
+            warnings,
+            graph_expanded_ids,
+        }
+    }
+}
+
+/// Append the additive `search_contract` line to any report, including the
+/// plain strings returned on hard-error paths (missing params, bad mode, init
+/// or embed failure, search failure). Error paths pass no graph-expanded ids,
+/// but the rule set is identical to the success path: `hybrid` default,
+/// `include_related` deprecation warning, and an always-present id array.
+/// Kept crate-free so `upgraded_search_test` can pin the error rendering.
+pub fn append_search_contract_line(
+    mut report: String,
+    arguments: &Value,
+    graph_expanded_ids: Vec<String>,
+) -> String {
+    let contract = SearchMemoryContract::from_arguments(arguments, graph_expanded_ids);
+    report.push_str(&format!(
+        "\n\nsearch_contract: {}",
+        serde_json::to_string(&contract).unwrap_or_default()
+    ));
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

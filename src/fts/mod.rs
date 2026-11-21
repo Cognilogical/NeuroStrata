@@ -43,7 +43,13 @@ impl Field {
     }
 }
 
-pub const ALL_FIELDS: [Field; 5] = [Field::Content, Field::Symbol, Field::Location, Field::Namespace, Field::MemoryType];
+pub const ALL_FIELDS: [Field; 5] = [
+    Field::Content,
+    Field::Symbol,
+    Field::Location,
+    Field::Namespace,
+    Field::MemoryType,
+];
 pub const DEFAULT_FIELD_WEIGHTS: [f64; 5] = [1.0, 2.0, 1.5, 3.0, 0.5];
 const K1: f64 = 1.2;
 const B: f64 = 0.75;
@@ -124,7 +130,10 @@ impl LexicalDoc {
             (Field::Symbol, Field::Symbol.tokenize(&self.symbol)),
             (Field::Location, Field::Location.tokenize(&self.location)),
             (Field::Namespace, Field::Namespace.tokenize(&self.namespace)),
-            (Field::MemoryType, Field::MemoryType.tokenize(&self.memory_type)),
+            (
+                Field::MemoryType,
+                Field::MemoryType.tokenize(&self.memory_type),
+            ),
         ]
     }
 
@@ -287,7 +296,10 @@ impl LexicalIndex {
         // Non-recall material never enters the index (§5.6 indexing filter);
         // say so at debug level so a silent skip is diagnosable.
         if doc.structural || doc.registry || doc.conflicting {
-            tracing::debug!("skipping non-indexable doc {} in LexicalIndex::upsert", doc.id);
+            tracing::debug!(
+                "skipping non-indexable doc {} in LexicalIndex::upsert",
+                doc.id
+            );
             return false;
         }
         let key = doc.key();
@@ -519,7 +531,11 @@ fn push_token(groups: &mut Vec<Vec<Clause>>, raw: &str, fuzzy_max: usize) {
         return;
     }
     if token.eq_ignore_ascii_case("OR") {
-        if groups.last().map(|group| !group.is_empty()).unwrap_or(false) {
+        if groups
+            .last()
+            .map(|group| !group.is_empty())
+            .unwrap_or(false)
+        {
             groups.push(Vec::new());
         }
         return;
@@ -657,15 +673,15 @@ fn retirement_visible(doc: &LexicalDoc, now: i64, as_of: Option<i64>) -> bool {
     // filter and the per-hit veto cannot disagree and starve a page slot.
     match as_of {
         None => doc.valid_to.map_or(true, |v| v > now),
-        Some(ts) => {
-            doc.valid_from.unwrap_or(0) <= ts
-                && doc.valid_to.map_or(true, |v| ts < v)
-        }
+        Some(ts) => doc.valid_from.unwrap_or(0) <= ts && doc.valid_to.map_or(true, |v| ts < v),
     }
 }
 
 fn domain_matches(doc: &LexicalDoc, domains: &[String]) -> bool {
-    domains.is_empty() || domains.iter().any(|d| doc.domains.iter().any(|own| own == d))
+    domains.is_empty()
+        || domains
+            .iter()
+            .any(|d| doc.domains.iter().any(|own| own == d))
 }
 
 #[derive(Debug)]
@@ -900,10 +916,7 @@ fn finalize(mut scored: Vec<ScoredDoc>, limit: usize) -> Vec<ScoredDoc> {
     if scored.is_empty() {
         return Vec::new();
     }
-    let max_score = scored
-        .iter()
-        .map(|hit| hit.score)
-        .fold(0.0_f32, f32::max);
+    let max_score = scored.iter().map(|hit| hit.score).fold(0.0_f32, f32::max);
     if max_score > 0.0 {
         for hit in &mut scored {
             hit.score = (1.0 - hit.score / max_score).clamp(0.0, 1.0);
@@ -913,11 +926,7 @@ fn finalize(mut scored: Vec<ScoredDoc>, limit: usize) -> Vec<ScoredDoc> {
             hit.score = 0.0;
         }
     }
-    scored.sort_by(|a, b| {
-        a.score
-            .total_cmp(&b.score)
-            .then_with(|| a.id.cmp(&b.id))
-    });
+    scored.sort_by(|a, b| a.score.total_cmp(&b.score).then_with(|| a.id.cmp(&b.id)));
     let limit = limit.max(1);
     scored.truncate(limit);
     scored

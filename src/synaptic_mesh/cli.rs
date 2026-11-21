@@ -374,15 +374,10 @@ async fn start_active_mesh_node(
     conflicts_dir: PathBuf,
 ) -> Result<std::sync::Arc<ActiveMeshNode>, String> {
     use super::transport::MeshTransport;
-    let transport = super::p2p::P2pMeshTransport::bind(
-        bind,
-        mesh_id.clone(),
-        epoch,
-        psk,
-        outbox.clone(),
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+    let transport =
+        super::p2p::P2pMeshTransport::bind(bind, mesh_id.clone(), epoch, psk, outbox.clone())
+            .await
+            .map_err(|e| e.to_string())?;
     let bind_addr = transport.local_addr();
     let mut rx = transport.subscribe().await.map_err(|e| e.to_string())?;
     let reactor = std::sync::Arc::new(super::reactor::MeshReactor::new(

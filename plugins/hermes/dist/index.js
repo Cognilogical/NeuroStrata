@@ -5,50 +5,61 @@
  * Provides Zero-Action Start guard, file-touch recall, and subagent
  * prompt auto-injection without requiring @opencode/plugin import.
  */
-import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { existsSync, readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { basename, dirname, join, resolve } from 'node:path';
 // ──────────────────────────────────────────────────────────────────────
 // Configuration
 // ──────────────────────────────────────────────────────────────────────
 /** Where the daemon serves MCP. The setup default is 34343, not 8080. */
-export const DEFAULT_ENDPOINT = "http://127.0.0.1:34343/mcp";
+export const DEFAULT_ENDPOINT = 'http://127.0.0.1:34343/mcp';
 /** The daemon's bearer token, as the daemon itself lays it down. */
-export const DEFAULT_TOKEN_FILE = "daemon.token";
+export const DEFAULT_TOKEN_FILE = 'daemon.token';
 /** The tools this shim needs from the core to do its job. */
 export const REQUIRED_TOOLS = [
-    "neurostrata_guard_validate",
-    "neurostrata_task_create",
+    'neurostrata_guard_validate',
+    'neurostrata_task_create'
 ];
 const DEFAULT_CONFIG = {
-    namespace: "NeuroStrata",
+    namespace: 'NeuroStrata',
     endpoint: DEFAULT_ENDPOINT,
     bearerToken: null,
     tokenFile: null,
     strictMode: true,
     requestTimeoutMs: 5000,
-    intentDetection: { enabled: true, injectReminder: true },
+    intentDetection: { enabled: true, injectReminder: true }
 };
 function asRecord(value) {
-    return typeof value === "object" && value !== null ? value : {};
+    return typeof value === 'object' && value !== null
+        ? value
+        : {};
 }
 function asString(value) {
-    return typeof value === "string" && value.trim() !== "" ? value.trim() : undefined;
+    return typeof value === 'string' && value.trim() !== ''
+        ? value.trim()
+        : undefined;
 }
 function asNumber(value) {
-    return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+    return typeof value === 'number' && Number.isFinite(value) && value > 0
+        ? value
+        : undefined;
 }
 function asBoolean(value) {
-    return typeof value === "boolean" ? value : undefined;
+    return typeof value === 'boolean' ? value : undefined;
 }
-export function resolveConfig(raw) {
+export function resolveConfig(raw, cwd = process.cwd()) {
     const input = asRecord(raw);
     const intent = asRecord(input.intentDetection);
     const endpoint = asString(input.endpoint) ??
         asString(input.guardEndpoint) ??
         DEFAULT_CONFIG.endpoint;
+    // Preserve the exact namespace for MCP routing; sanitization happens only
+    // where the value is interpolated into a prompt header (#329 review).
+    const namespace = asString(input.namespace) ??
+        asString(process.env.NEUROSTRATA_NAMESPACE) ??
+        discoverProjectNamespace(cwd);
     return {
-        namespace: asString(input.namespace) ?? DEFAULT_CONFIG.namespace,
+        namespace,
         endpoint,
         bearerToken: asString(input.bearerToken) ?? null,
         tokenFile: asString(input.tokenFile) ?? null,
@@ -56,21 +67,87 @@ export function resolveConfig(raw) {
         requestTimeoutMs: asNumber(input.requestTimeoutMs) ?? DEFAULT_CONFIG.requestTimeoutMs,
         intentDetection: {
             enabled: asBoolean(intent.enabled) ?? DEFAULT_CONFIG.intentDetection.enabled,
-            injectReminder: asBoolean(intent.injectReminder) ?? DEFAULT_CONFIG.intentDetection.injectReminder,
-        },
+            injectReminder: asBoolean(intent.injectReminder) ??
+                DEFAULT_CONFIG.intentDetection.injectReminder
+        }
     };
+}
+/**
+ * Walk up from resolve(startDir) to the filesystem root looking for `.git`
+ * (dir or file) or `.NeuroStrata`; return the directory containing it, or
+ * resolve(startDir) if none found.
+ */
+export function findProjectRoot(startDir = process.cwd()) {
+    // Pass 1: walk up looking for `.git` first; a `.git` anchors the project root.
+    let current = resolve(startDir);
+    while (true) {
+        if (existsSync(join(current, '.git'))) {
+            return current;
+        }
+        const next = dirname(current);
+        if (next === current)
+            break;
+        current = next;
+    }
+    // Pass 2: only if no `.git` anywhere in the ancestor chain, walk up looking
+    // for `.NeuroStrata`. Otherwise fall back to resolve(startDir).
+    current = resolve(startDir);
+    while (true) {
+        if (existsSync(join(current, '.NeuroStrata'))) {
+            return current;
+        }
+        const next = dirname(current);
+        if (next === current)
+            break;
+        current = next;
+    }
+    return resolve(startDir);
+}
+/**
+ * 1. Walk up to findProjectRoot(startDir) checking <dir>/.NeuroStrata/session_queries.json;
+ *    if it parses as JSON with a non-empty string .namespace, return it trimmed.
+ * 2. Otherwise return basename(findProjectRoot(startDir)) || "default".
+ */
+export function discoverProjectNamespace(startDir = process.cwd()) {
+    const root = findProjectRoot(startDir);
+    let current = resolve(startDir);
+    while (true) {
+        const sessionQueriesPath = join(current, '.NeuroStrata', 'session_queries.json');
+        try {
+            if (existsSync(sessionQueriesPath)) {
+                const content = readFileSync(sessionQueriesPath, 'utf8');
+                const parsed = JSON.parse(content);
+                if (parsed !== null &&
+                    typeof parsed === 'object' &&
+                    typeof parsed.namespace === 'string' &&
+                    parsed.namespace.trim() !== '') {
+                    return parsed.namespace.trim();
+                }
+            }
+        }
+        catch {
+            // fall through to next ancestor
+        }
+        if (current === root)
+            break;
+        const next = dirname(current);
+        if (next === current)
+            break;
+        current = next;
+    }
+    return basename(root) || 'default';
 }
 // ──────────────────────────────────────────────────────────────────────
 // Credential
 // ──────────────────────────────────────────────────────────────────────
 export function daemonTokenPath(tokenFile) {
-    if (tokenFile && tokenFile.trim() !== "")
+    if (tokenFile && tokenFile.trim() !== '')
         return tokenFile.trim();
-    return join(homedir(), ".config", "neurostrata", DEFAULT_TOKEN_FILE);
+    return join(homedir(), '.config', 'neurostrata', DEFAULT_TOKEN_FILE);
 }
 export function loadDaemonToken(tokenFile) {
     try {
-        const raw = readFileSync(daemonTokenPath(tokenFile), "utf8").trim();
+        const raw = readFileSync(daemonTokenPath(tokenFile), 'utf8').trim();
         return raw.length > 0 ? raw : null;
     }
     catch {
@@ -78,43 +155,44 @@ export function loadDaemonToken(tokenFile) {
     }
 }
 export function buildHeaders(token) {
-    const headers = { "Content-Type": "application/json" };
+    const headers = { 'Content-Type': 'application/json' };
     if (token)
         headers.Authorization = `Bearer ${token}`;
     return headers;
 }
 export function buildToolCallRequest(id, name, args) {
     return {
-        jsonrpc: "2.0",
+        jsonrpc: '2.0',
         id,
-        method: "tools/call",
-        params: { name, arguments: args },
+        method: 'tools/call',
+        params: { name, arguments: args }
     };
 }
 export function buildToolsListRequest(id) {
-    return { jsonrpc: "2.0", id, method: "tools/list", params: {} };
+    return { jsonrpc: '2.0', id, method: 'tools/list', params: {} };
 }
 export function extractToolText(result) {
     const content = result?.content;
     if (!Array.isArray(content)) {
-        throw new Error("tool result carried no content array");
+        throw new Error('tool result carried no content array');
     }
     const text = content
-        .map((part) => (typeof part?.text === "string" ? part.text : ""))
+        .map((part) => (typeof part?.text === 'string' ? part.text : ''))
         .filter((part) => part.length > 0)
-        .join("\n");
+        .join('\n');
     if (text.length === 0) {
-        throw new Error("tool result carried no text content");
+        throw new Error('tool result carried no text content');
     }
     return text;
 }
 export function extractToolNames(result) {
-    const tools = result?.tools;
+    const tools = result
+        ?.tools;
     if (!Array.isArray(tools)) {
-        throw new Error("tools/list returned no tools array");
+        throw new Error('tools/list returned no tools array');
     }
     return tools
-        .map((tool) => (typeof tool?.name === "string" ? tool.name : ""))
+        .map((tool) => (typeof tool?.name === 'string' ? tool.name : ''))
         .filter((name) => name.length > 0);
 }
 // ──────────────────────────────────────────────────────────────────────
@@ -134,7 +212,7 @@ export class NeuroStrataMCPClient {
         const id = ++this.requestId;
         const response = await this.post(buildToolCallRequest(id, name, args));
         if (response.error) {
-            throw new Error(`[${response.error.code ?? "?"}] ${response.error.message ?? "tool call failed"}`);
+            throw new Error(`[${response.error.code ?? '?'}] ${response.error.message ?? 'tool call failed'}`);
         }
         if (response.result === undefined || response.result === null) {
             throw new Error(`${name} returned no result`);
@@ -150,7 +228,7 @@ export class NeuroStrataMCPClient {
         const id = ++this.requestId;
         const response = await this.post(buildToolsListRequest(id));
         if (response.error) {
-            throw new Error(`[${response.error.code ?? "?"}] ${response.error.message ?? "tools/list failed"}`);
+            throw new Error(`[${response.error.code ?? '?'}] ${response.error.message ?? 'tools/list failed'}`);
         }
         return extractToolNames(response.result);
     }
@@ -159,10 +237,10 @@ export class NeuroStrataMCPClient {
         const timer = setTimeout(() => controller.abort(), this.timeoutMs);
         try {
             const response = await fetch(this.endpoint, {
-                method: "POST",
+                method: 'POST',
                 headers: buildHeaders(this.token),
                 body: JSON.stringify(body),
-                signal: controller.signal,
+                signal: controller.signal
             });
             if (!response.ok) {
                 throw new Error(`HTTP ${response.status} ${response.statusText}`);
@@ -170,7 +248,7 @@ export class NeuroStrataMCPClient {
             return (await response.json());
         }
         catch (err) {
-            if (err instanceof Error && err.name === "AbortError") {
+            if (err instanceof Error && err.name === 'AbortError') {
                 throw new Error(`request timed out after ${this.timeoutMs}ms`);
             }
             throw err;
@@ -181,8 +259,8 @@ export class NeuroStrataMCPClient {
     }
 }
 export function parseGuardValidate(text) {
-    const start = text.indexOf("{");
-    const end = text.lastIndexOf("}");
+    const start = text.indexOf('{');
+    const end = text.lastIndexOf('}');
     if (start === -1 || end <= start) {
         throw new Error(`guard_validate returned no JSON body: ${text.slice(0, 200)}`);
     }
@@ -194,7 +272,7 @@ export function parseGuardValidate(text) {
         throw new Error(`guard_validate returned an unreadable body: ${String(err)}`);
     }
     const verdict = asRecord(body.verdict);
-    const bucket = asString(verdict.bucket) ?? "Unknown";
+    const bucket = asString(verdict.bucket) ?? 'Unknown';
     const reasons = Array.isArray(verdict.reasons)
         ? verdict.reasons.map((reason) => String(reason))
         : [];
@@ -207,24 +285,24 @@ export function parseGuardValidate(text) {
     const rule_ids = Array.isArray(body.rule_ids_triggered)
         ? body.rule_ids_triggered.map((id) => String(id))
         : [];
-    const rejecting = bucket === "DeterministicReject" || bucket === "SandboxReject";
+    const rejecting = bucket === 'DeterministicReject' || bucket === 'SandboxReject';
     return {
-        verdict: rejecting ? "reject" : "pass",
+        verdict: rejecting ? 'reject' : 'pass',
         bucket,
         reasons,
         constraints,
         notes,
-        rule_ids,
+        rule_ids
     };
 }
 function initialStatus() {
     return {
-        state: "uninitialized",
+        state: 'uninitialized',
         endpoint: DEFAULT_ENDPOINT,
-        namespace: "NeuroStrata",
+        namespace: 'NeuroStrata',
         authenticated: false,
         missingTools: [],
-        updatedAt: new Date(0).toISOString(),
+        updatedAt: new Date(0).toISOString()
     };
 }
 let status = initialStatus();
@@ -243,23 +321,23 @@ function setStatus(patch) {
     status = { ...status, ...patch, updatedAt: new Date().toISOString() };
 }
 export const MARKERS = [
-    ["todo:", "todo:"],
-    ["fixme:", "fixme:"],
-    ["follow-up:", "follow-up:"],
-    ["followup:", "followup:"],
-    ["next step:", "next step:"],
-    ["action item:", "action item:"],
-    ["remaining work:", "remaining work:"],
-    ["we should also ", "we should also"],
-    ["later we need to ", "later we need to"],
-    ["need to follow up ", "need to follow up"],
-    ["still need to ", "still need to"],
-    ["must also fix ", "must also fix"],
-    ["filed follow-up ", "filed follow-up"],
-    ["defer ", "defer"],
-    ["deferred ", "deferred"],
+    ['todo:', 'todo:'],
+    ['fixme:', 'fixme:'],
+    ['follow-up:', 'follow-up:'],
+    ['followup:', 'followup:'],
+    ['next step:', 'next step:'],
+    ['action item:', 'action item:'],
+    ['remaining work:', 'remaining work:'],
+    ['we should also ', 'we should also'],
+    ['later we need to ', 'later we need to'],
+    ['need to follow up ', 'need to follow up'],
+    ['still need to ', 'still need to'],
+    ['must also fix ', 'must also fix'],
+    ['filed follow-up ', 'filed follow-up'],
+    ['defer ', 'defer'],
+    ['deferred ', 'deferred']
 ];
-export const NEGATION_PREFIXES = ["never ", "do not ", "don't ", "do not, "];
+export const NEGATION_PREFIXES = ['never ', 'do not ', "don't ", 'do not, '];
 export function detectTaskIntentsLocal(text) {
     const lower = text.toLowerCase();
     const out = [];
@@ -270,9 +348,9 @@ export function detectTaskIntentsLocal(text) {
             continue;
         if (seen.has(canonical))
             continue;
-        const clauseStart = text.slice(0, idx).lastIndexOf("\n") + 1;
+        const clauseStart = text.slice(0, idx).lastIndexOf('\n') + 1;
         let start = clauseStart;
-        const sentPos = text.slice(0, idx).lastIndexOf(". ");
+        const sentPos = text.slice(0, idx).lastIndexOf('. ');
         if (sentPos !== -1 && sentPos + 2 > start)
             start = sentPos + 2;
         const clausePrefix = text.slice(start, idx).trimStart().toLowerCase();
@@ -280,7 +358,7 @@ export function detectTaskIntentsLocal(text) {
             continue;
         const from = idx;
         const rest = text.slice(from);
-        const end = Math.min(rest.indexOf("\n") === -1 ? rest.length : rest.indexOf("\n"), 160);
+        const end = Math.min(rest.indexOf('\n') === -1 ? rest.length : rest.indexOf('\n'), 160);
         let excerpt = rest.slice(0, end).trimEnd();
         if (excerpt.length > 160)
             excerpt = excerpt.slice(0, 160);
@@ -309,8 +387,8 @@ function touchPrefetchedPath(key) {
     recordPrefetchedPath(key);
 }
 export function parseFileMemoryHits(text) {
-    const start = text.indexOf("{");
-    const end = text.lastIndexOf("}");
+    const start = text.indexOf('{');
+    const end = text.lastIndexOf('}');
     if (start === -1 || end <= start) {
         throw new Error(`memories_for_file returned no JSON body: ${text.slice(0, 200)}`);
     }
@@ -328,27 +406,27 @@ export function parseFileMemoryHits(text) {
             : [];
     const out = [];
     for (const item of raw) {
-        if (typeof item !== "object" || item === null)
+        if (typeof item !== 'object' || item === null)
             continue;
         const hit = item;
         const id = asString(hit.id) ?? asString(hit.memory_id);
-        const valid_from = asString(hit.valid_from) ?? "";
+        const valid_from = asString(hit.valid_from) ?? '';
         if (!id)
             continue;
         out.push({
             id,
             valid_from,
-            memory_type: asString(hit.memory_type) ?? asString(hit.type) ?? "memory",
+            memory_type: asString(hit.memory_type) ?? asString(hit.type) ?? 'memory',
             content: asString(hit.content) ??
                 asString(hit.text) ??
                 asString(hit.summary) ??
-                "",
+                ''
         });
     }
     return out;
 }
 function formatFileMemorySnippet(hit) {
-    const where = hit.valid_from ? ` (valid_from ${hit.valid_from})` : "";
+    const where = hit.valid_from ? ` (valid_from ${hit.valid_from})` : '';
     return `[NeuroStrata ${hit.memory_type} ${hit.id}${where}] ${hit.content}`;
 }
 function capSnippets(snippets) {
@@ -365,7 +443,7 @@ function capSnippets(snippets) {
 }
 export async function prefetchMemoriesForFile(namespace, filePath) {
     const path = filePath.trim();
-    if (path === "")
+    if (path === '')
         return [];
     const key = `${namespace}:${path}`;
     if (prefetchedPaths.has(key)) {
@@ -374,10 +452,10 @@ export async function prefetchMemoriesForFile(namespace, filePath) {
     }
     if (!mcpClient)
         return [];
-    const text = await mcpClient.callTool("neurostrata_memories_for_file", {
+    const text = await mcpClient.callTool('neurostrata_memories_for_file', {
         namespace,
         path,
-        limit: 5,
+        limit: 5
     });
     recordPrefetchedPath(key);
     const out = [];
@@ -390,15 +468,26 @@ export async function prefetchMemoriesForFile(namespace, filePath) {
     }
     return capSnippets(out);
 }
-export const SUBAGENT_CONTEXT_MARKER = "### NeuroStrata Task & Graph Context";
+export const SUBAGENT_CONTEXT_MARKER = '### NeuroStrata Task & Graph Context';
+export function sanitizeSubagentHeaderToken(value) {
+    return String(value ?? '').replace(/[^A-Za-z0-9_.:-]/g, '');
+}
+/** Collapse backticks and newlines so a caller-supplied value cannot break
+ *  out of the header's code span (issue #316: the namespace can arrive from
+ *  a committed .NeuroStrata/session_queries.json). */
+function codeSpanValue(value) {
+    return String(value ?? '').replace(/[`\r\n\u2028\u2029]+/g, ' ');
+}
 export function buildSubagentContextHeader(namespace, taskId) {
-    const taskLabel = taskId ?? "unclaimed (claim a task first)";
+    const taskLabel = taskId ?? 'unclaimed (claim a task first)';
+    const safeNamespace = sanitizeSubagentHeaderToken(namespace);
+    const safeTaskLabel = taskId === null ? taskLabel : sanitizeSubagentHeaderToken(taskLabel);
     return (`${SUBAGENT_CONTEXT_MARKER} (AUTO-INJECTED BY NEUROSTRATA PLUGIN)\n` +
-        `- Namespace: \`${namespace}\` | Active Task ID: \`${taskLabel}\`\n` +
+        `- Namespace: \`${codeSpanValue(namespace)}\` | Active Task ID: \`${codeSpanValue(taskLabel)}\`\n` +
         `- Mandatory Graph-First Lookup Rule: Before blind \`grep\`/\`glob\` or editing files, query \`neurostrata_memories_for_file\`, \`neurostrata_related\`, \`neurostrata_search_memory\` (\`include_related: true\`), or \`neurostrata_sparql_query\` (or \`neurostrata-mcp\` CLI) to inspect governing rules (\`GOVERNS\`) and AST call/import edges (\`DEPENDS_ON\`, \`calls\`, \`imports\`).\n\n`);
 }
 export function injectSubagentPrompt(target, namespace, taskId) {
-    const raw = typeof target.prompt === "string" ? target.prompt : null;
+    const raw = typeof target.prompt === 'string' ? target.prompt : null;
     if (raw === null || raw.includes(SUBAGENT_CONTEXT_MARKER))
         return false;
     target.prompt = buildSubagentContextHeader(namespace, taskId) + raw;
@@ -414,15 +503,16 @@ export function resetClientForTesting() {
     resetState();
 }
 let pluginCtx = null;
+let hermesBeforeToolHandler = null;
 function requireCtx() {
     if (!pluginCtx) {
-        throw new Error("NeuroStrata plugin used before initialize()");
+        throw new Error('NeuroStrata plugin used before initialize()');
     }
     return pluginCtx;
 }
 function firstRecord(...candidates) {
     for (const candidate of candidates) {
-        if (typeof candidate === "object" && candidate !== null) {
+        if (typeof candidate === 'object' && candidate !== null) {
             return candidate;
         }
     }
@@ -435,22 +525,29 @@ export async function initialize(ctx) {
     mcpClient = new NeuroStrataMCPClient({
         endpoint: config.endpoint,
         token,
-        timeoutMs: config.requestTimeoutMs,
+        timeoutMs: config.requestTimeoutMs
     });
     setStatus({
-        state: "uninitialized",
+        state: 'uninitialized',
         endpoint: config.endpoint,
         namespace: config.namespace,
         authenticated: token !== null,
         missingTools: [],
-        lastError: undefined,
+        lastError: undefined
     });
     // Hermes Agent tool names support (without @opencode/plugin import)
     // Register via ctx?.tool?.hook?.("execute.before", ...) for pre-tool hook
-    await ctx?.tool?.hook?.("execute.before", async (input) => {
+    async function runBeforeTool(input) {
         const toolName = input?.tool;
         // File-touch recall (§4.5): on read/write/edit touching a file
-        const hermesFileTools = ["read_file", "read", "write_file", "write", "patch_file", "edit"];
+        const hermesFileTools = [
+            'read_file',
+            'read',
+            'write_file',
+            'write',
+            'patch_file',
+            'edit'
+        ];
         if (hermesFileTools.includes(toolName)) {
             const args = asRecord(input?.input);
             const altArgs = asRecord(input?.args);
@@ -462,30 +559,39 @@ export async function initialize(ctx) {
                 try {
                     const snippets = await prefetchMemoriesForFile(config.namespace, filePath);
                     if (snippets.length > 0) {
-                        console.info(`[NeuroStrata] File-touch recall for ${filePath}\n${snippets.join("\n")}`);
+                        console.info(`[NeuroStrata] File-touch recall for ${filePath}\n${snippets.join('\n')}`);
                     }
                 }
                 catch (err) {
-                    setStatus({ state: "degraded", lastError: String(err) });
-                    console.warn("[NeuroStrata] File-touch prefetch failed", { file: filePath, error: String(err) });
+                    setStatus({ state: 'degraded', lastError: String(err) });
+                    console.warn('[NeuroStrata] File-touch prefetch failed', {
+                        file: filePath,
+                        error: String(err)
+                    });
                 }
             }
         }
         // Subagent prompt auto-injection for delegate_task/subagent/Task
-        const subagentNames = ["delegate_task", "subagent", "Task", "task", "dispatch_agent"];
+        const subagentNames = [
+            'delegate_task',
+            'subagent',
+            'Task',
+            'task',
+            'dispatch_agent'
+        ];
         if (subagentNames.includes(toolName)) {
-            if (input?.input && typeof input.input === "object") {
+            if (input?.input && typeof input.input === 'object') {
                 injectSubagentPrompt(input.input, config.namespace, activeTaskId);
             }
-            if (input?.args && typeof input.args === "object") {
+            if (input?.args && typeof input.args === 'object') {
                 injectSubagentPrompt(input.args, config.namespace, activeTaskId);
             }
         }
         // Session/task tracking
         const mutationTools = [
-            "neurostrata_task_claim",
-            "neurostrata_task_update",
-            "neurostrata_task_complete",
+            'neurostrata_task_claim',
+            'neurostrata_task_update',
+            'neurostrata_task_complete'
         ];
         if (mutationTools.includes(toolName)) {
             const payloadArgs = firstRecord(input?.input, input?.args);
@@ -495,12 +601,12 @@ export async function initialize(ctx) {
             if (sessionId)
                 activeSessionId = sessionId;
             const taskId = asString(payloadArgs.id);
-            if (toolName === "neurostrata_task_claim" ||
-                toolName === "neurostrata_task_complete" ||
+            if (toolName === 'neurostrata_task_claim' ||
+                toolName === 'neurostrata_task_complete' ||
                 payloadArgs.note !== undefined) {
                 mutationsSinceNote = 0;
             }
-            if (toolName === "neurostrata_task_complete") {
+            if (toolName === 'neurostrata_task_complete') {
                 activeTaskId = null;
             }
             else if (taskId) {
@@ -508,74 +614,47 @@ export async function initialize(ctx) {
             }
         }
         // Guard validation on mutating Hermes Agent tools
-        const hermesMutatingTools = ["write_file", "write", "patch_file", "edit", "terminal", "bash"];
-        if (hermesMutatingTools.includes(toolName)) {
+        if (HERMES_MUTATING_TOOLS.includes(toolName)) {
             const call = {
                 name: toolName,
                 args: firstRecord(input?.input, input?.args),
                 session_id: asString(input?.session_id) ??
                     asString(input?.sessionID) ??
                     activeSessionId ??
-                    undefined,
+                    undefined
             };
-            if (!config.strictMode) {
-                mutationsSinceNote++;
-                return;
+            const guard = await runMutatingToolGuard(call);
+            if (guard.verdict === 'reject') {
+                console.warn('[NeuroStrata] Guard rejected mutating tool', guard.log);
+                throw new Error(`Zero-Action Start violation: ${guard.reason}`);
             }
-            const actionType = toolName;
-            const payload = JSON.stringify(call.args);
-            const cwd = process.cwd();
-            const { session_id, active_task_id, worktree } = callState(call);
-            try {
-                const text = await mcpClient.callTool("neurostrata_guard_validate", {
-                    namespace: config.namespace,
-                    session_id,
-                    active_task_id,
-                    worktree,
-                    action_type: actionType,
-                    payload,
-                    cwd,
-                    is_mutating: true,
-                    use_sandbox: false,
-                    mutations_since_note: mutationsSinceNote,
+            if (guard.verdict === 'unavailable') {
+                setStatus({ state: 'unavailable', lastError: guard.message });
+                console.error('[NeuroStrata] Guard validation failed', {
+                    error: guard.message
                 });
-                const result = parseGuardValidate(text);
-                if (result.verdict === "reject") {
-                    const reason = result.reasons.join("; ") || result.constraints.join("; ") || result.bucket;
-                    console.warn("[NeuroStrata] Guard rejected mutating tool", {
-                        actionType,
-                        session_id,
-                        active_task_id,
-                        worktree,
-                        reason,
-                        rule_ids: result.rule_ids,
-                    });
-                    throw new Error(`Zero-Action Start violation: ${reason}`);
-                }
+                throw new Error(`Guard validation unavailable (NeuroStrata core degraded): ${guard.message}`);
             }
-            catch (err) {
-                const message = String(err);
-                if (message.includes("Zero-Action Start violation:") ||
-                    message.includes("Guard rejected")) {
-                    throw err;
-                }
-                setStatus({ state: "unavailable", lastError: message });
-                console.error("[NeuroStrata] Guard validation failed", { error: message });
-                throw new Error(`Guard validation unavailable (NeuroStrata core degraded): ${message}`);
-            }
-            mutationsSinceNote++;
         }
-    });
+    }
+    await ctx?.tool?.hook?.('execute.before', runBeforeTool);
+    hermesBeforeToolHandler = runBeforeTool;
     // Also register via ctx?.hooks?.beforeToolCall?.(function) if available
     await ctx?.hooks?.beforeToolCall?.(async (input) => {
         // Subagent injection via alternative hook interface
-        const subagentNames = ["delegate_task", "subagent", "Task", "task", "dispatch_agent"];
-        const toolName = input?.tool ?? input?.name ?? input?.action ?? input?.command ?? "";
+        const subagentNames = [
+            'delegate_task',
+            'subagent',
+            'Task',
+            'task',
+            'dispatch_agent'
+        ];
+        const toolName = input?.tool ?? input?.name ?? input?.action ?? input?.command ?? '';
         if (subagentNames.includes(toolName)) {
-            if (input?.input && typeof input.input === "object") {
+            if (input?.input && typeof input.input === 'object') {
                 injectSubagentPrompt(input.input, config.namespace, activeTaskId);
             }
-            if (input?.args && typeof input.args === "object") {
+            if (input?.args && typeof input.args === 'object') {
                 injectSubagentPrompt(input.args, config.namespace, activeTaskId);
             }
         }
@@ -583,12 +662,12 @@ export async function initialize(ctx) {
     // Register onTurnEnd hook via ctx?.hooks?.onTurnEnd?.(onTurnEnd)
     await ctx?.hooks?.onTurnEnd?.(onTurnEnd);
     await negotiateCapabilities();
-    console.info("[NeuroStrata] Hermes plugin initialized", {
+    console.info('[NeuroStrata] Hermes plugin initialized', {
         namespace: config.namespace,
         endpoint: config.endpoint,
         authenticated: status.authenticated,
         state: status.state,
-        missingTools: status.missingTools,
+        missingTools: status.missingTools
     });
 }
 async function negotiateCapabilities() {
@@ -596,13 +675,13 @@ async function negotiateCapabilities() {
         const available = new Set(await mcpClient.listToolNames());
         const missing = REQUIRED_TOOLS.filter((tool) => !available.has(tool));
         setStatus({
-            state: missing.length > 0 ? "degraded" : "ready",
+            state: missing.length > 0 ? 'degraded' : 'ready',
             missingTools: missing,
-            lastError: undefined,
+            lastError: undefined
         });
     }
     catch (err) {
-        setStatus({ state: "unavailable", lastError: String(err) });
+        setStatus({ state: 'unavailable', lastError: String(err) });
     }
 }
 function callState(call) {
@@ -611,34 +690,176 @@ function callState(call) {
         session_id: asString(call.session_id) ??
             asString(args.session_id) ??
             activeSessionId ??
-            "unknown",
+            'unknown',
         active_task_id: asString(args.active_task_id) ?? activeTaskId,
-        worktree: asString(args.worktree) ?? process.cwd(),
+        worktree: asString(args.worktree) ?? process.cwd()
     };
 }
 export async function onTurnEnd(turn) {
     if (!config.intentDetection.enabled)
         return;
     const text = turn.content;
-    if (text.includes("neurostrata_task_create"))
+    if (text.includes('neurostrata_task_create'))
         return;
     const signals = detectTaskIntentsLocal(text);
     if (signals.length === 0)
         return;
     if (!config.intentDetection.injectReminder)
         return;
-    const markerList = signals.map((signal) => signal.marker).join(", ");
+    const markerList = signals.map((signal) => signal.marker).join(', ');
     const nudge = `[NeuroStrata] Task intent detected (${markerList}) but no neurostrata_task_create in this turn. Consider creating a task to track this work.`;
-    console.info("[NeuroStrata] " + nudge);
+    console.info('[NeuroStrata] ' + nudge);
+}
+// Hermes Agent tools that mutate state and therefore require the guard.
+// Shared by the native execute.before hook and the CLI runner entry point.
+const HERMES_MUTATING_TOOLS = [
+    'write_file',
+    'write',
+    'patch_file',
+    'edit',
+    'terminal',
+    'bash'
+];
+/** Run the Zero-Action Start guard for a mutating tool call. Never throws:
+ *  the native hook throws on the returned verdict (preserving its log lines),
+ *  while the CLI runner entry point maps it to a deny decision instead. */
+async function runMutatingToolGuard(call) {
+    if (!config.strictMode) {
+        mutationsSinceNote++;
+        return { verdict: 'pass' };
+    }
+    const actionType = call.name;
+    const payload = JSON.stringify(call.args);
+    const cwd = process.cwd();
+    const { session_id, active_task_id, worktree } = callState(call);
+    try {
+        const text = await mcpClient.callTool('neurostrata_guard_validate', {
+            namespace: config.namespace,
+            session_id,
+            active_task_id,
+            worktree,
+            action_type: actionType,
+            payload,
+            cwd,
+            is_mutating: true,
+            use_sandbox: false,
+            mutations_since_note: mutationsSinceNote
+        });
+        const result = parseGuardValidate(text);
+        if (result.verdict === 'reject') {
+            const reason = result.reasons.join('; ') ||
+                result.constraints.join('; ') ||
+                result.bucket;
+            return {
+                verdict: 'reject',
+                reason,
+                log: {
+                    actionType,
+                    session_id,
+                    active_task_id,
+                    worktree,
+                    reason,
+                    rule_ids: result.rule_ids
+                }
+            };
+        }
+    }
+    catch (err) {
+        const message = String(err);
+        if (message.includes('Zero-Action Start violation:') ||
+            message.includes('Guard rejected')) {
+            return {
+                verdict: 'reject',
+                reason: message,
+                log: { actionType, error: message }
+            };
+        }
+        return { verdict: 'unavailable', message };
+    }
+    mutationsSinceNote++;
+    return { verdict: 'pass' };
+}
+/**
+ * CLI hook runner entry point. The daemon installs hook-runner.mjs beside
+ * dist/ and dispatches host hook events to this handler; a stateless CLI
+ * invocation may arrive before any native initialize(ctx), so a default
+ * client is built the same way core's handleHookEvent does. Mutating Hermes
+ * tools run the same guard as the native execute.before hook, but a
+ * rejection is returned as a deny decision instead of a thrown error.
+ */
+export async function handleHookEvent(event) {
+    if (!mcpClient) {
+        config = resolveConfig({});
+        const token = loadDaemonToken(config.tokenFile);
+        mcpClient = new NeuroStrataMCPClient({
+            endpoint: config.endpoint,
+            token,
+            timeoutMs: config.requestTimeoutMs
+        });
+    }
+    const hookEventName = asString(event.hook_event_name) ?? asString(event.eventName) ?? 'PreToolUse';
+    const toolName = asString(event.tool_name) ?? asString(event.toolName) ?? '';
+    const toolInput = firstRecord(event.tool_input ?? event.input ?? event.args ?? {});
+    if (hookEventName !== 'PreToolUse') {
+        // Stop turns carry the transcript; the daemon's CLI runner dispatches
+        // here before its own onTurnEnd fallback, so forward it ourselves or
+        // task-intent detection never runs for runner-carried Stop events
+        // (Codex review #326).
+        if (hookEventName === 'Stop' && typeof event.transcript === 'string') {
+            try {
+                await onTurnEnd({ role: 'assistant', content: event.transcript });
+            }
+            catch {
+                // turn-end handling is fail-soft for the runner
+            }
+        }
+        return { continue: true };
+    }
+    if (HERMES_MUTATING_TOOLS.includes(toolName)) {
+        const call = {
+            name: toolName,
+            args: toolInput,
+            session_id: asString(event.session_id) ?? activeSessionId ?? undefined
+        };
+        const guard = await runMutatingToolGuard(call);
+        if (guard.verdict === 'reject') {
+            return {
+                hookSpecificOutput: {
+                    hookEventName: 'PreToolUse',
+                    permissionDecision: 'deny',
+                    permissionDecisionReason: `Zero-Action Start violation: ${guard.reason}`
+                }
+            };
+        }
+        if (guard.verdict === 'unavailable') {
+            return {
+                hookSpecificOutput: {
+                    hookEventName: 'PreToolUse',
+                    permissionDecision: 'deny',
+                    permissionDecisionReason: `Guard validation unavailable (NeuroStrata core degraded): ${guard.message}`
+                }
+            };
+        }
+    }
+    return {
+        continue: true,
+        hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            permissionDecision: 'allow'
+        }
+    };
 }
 export async function fetchContextPlan(opts) {
     if (!mcpClient)
-        throw new Error("NeuroStrata MCP client not initialized");
-    return await mcpClient.callTool("neurostrata_context_plan", opts);
+        throw new Error('NeuroStrata MCP client not initialized');
+    return await mcpClient.callTool('neurostrata_context_plan', opts);
 }
+export const handleClaudeHookEvent = handleHookEvent;
 export default {
-    id: "neurostrata-hermes",
+    id: 'neurostrata-hermes',
     setup: initialize,
     initialize,
+    handleHookEvent,
+    handleClaudeHookEvent
 };
 //# sourceMappingURL=index.js.map

@@ -86,10 +86,8 @@ mod tests {
 
     #[test]
     fn non_empty_allowlist_is_exhaustive() {
-        let policy = CrossNamespacePolicy::new(
-            true,
-            vec!["allowed".to_string(), "also".to_string()],
-        );
+        let policy =
+            CrossNamespacePolicy::new(true, vec!["allowed".to_string(), "also".to_string()]);
         assert!(policy.is_allowed("probe", "allowed"));
         assert!(policy.is_allowed("probe", "also"));
         assert!(!policy.is_allowed("probe", "other"));

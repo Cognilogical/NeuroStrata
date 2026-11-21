@@ -128,13 +128,10 @@ impl EpisodicPointerEcho {
     /// stays on the construction root, exactly where a single-project daemon
     /// always wrote.
     fn root_for(&self, namespace: &str) -> PathBuf {
-        self.anchors
-            .get(namespace)
-            .cloned()
-            .unwrap_or_else(|| {
-                resolve_anchor_for_namespace(namespace, &self.project_root)
-                    .unwrap_or_else(|| self.project_root.clone())
-            })
+        self.anchors.get(namespace).cloned().unwrap_or_else(|| {
+            resolve_anchor_for_namespace(namespace, &self.project_root)
+                .unwrap_or_else(|| self.project_root.clone())
+        })
     }
 }
 
@@ -744,8 +741,11 @@ mod tests {
                 "a path-like namespace stays on the construction root: {hostile:?}"
             );
         }
-        assert_eq!(echo.root_for("AnchoredSecondProject"), project,
-            "no sibling and no anchor: construction root");
+        assert_eq!(
+            echo.root_for("AnchoredSecondProject"),
+            project,
+            "no sibling and no anchor: construction root"
+        );
     }
 
     /// The production constructor, checked against the machine it runs on. The

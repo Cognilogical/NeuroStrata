@@ -98,8 +98,8 @@ impl InviteToken {
         if parsed.mesh_id.trim().is_empty() {
             return Err("empty mesh_id".to_string());
         }
-        let psk = hex::decode(&parsed.mesh_psk_hex)
-            .map_err(|e| format!("invalid mesh_psk_hex: {e}"))?;
+        let psk =
+            hex::decode(&parsed.mesh_psk_hex).map_err(|e| format!("invalid mesh_psk_hex: {e}"))?;
         if psk.len() != 32 {
             return Err(format!("expected 32-byte mesh_psk, got {}", psk.len()));
         }
@@ -115,8 +115,8 @@ impl InviteToken {
 
     /// Decode the 32-byte pre-shared key carried in this token.
     pub fn psk_bytes(&self) -> Result<[u8; 32], String> {
-        let decoded = hex::decode(&self.mesh_psk_hex)
-            .map_err(|e| format!("invalid mesh_psk_hex: {e}"))?;
+        let decoded =
+            hex::decode(&self.mesh_psk_hex).map_err(|e| format!("invalid mesh_psk_hex: {e}"))?;
         decoded
             .try_into()
             .map_err(|_| "mesh_psk_hex is not 32 bytes".to_string())
@@ -261,12 +261,20 @@ impl std::fmt::Display for SovereigntyGateError {
             Self::MeshMismatch {
                 expected_mesh,
                 got_mesh,
-            } => write!(f, "mesh_id mismatch: expected {expected_mesh}, got {got_mesh}"),
+            } => write!(
+                f,
+                "mesh_id mismatch: expected {expected_mesh}, got {got_mesh}"
+            ),
             Self::EpochMismatch {
                 expected_epoch,
                 got_epoch,
-            } => write!(f, "epoch mismatch: expected {expected_epoch}, got {got_epoch}"),
-            Self::FrameTooLarge(n) => write!(f, "frame size {n} exceeds limit {MAX_MESH_FRAME_BYTES}"),
+            } => write!(
+                f,
+                "epoch mismatch: expected {expected_epoch}, got {got_epoch}"
+            ),
+            Self::FrameTooLarge(n) => {
+                write!(f, "frame size {n} exceeds limit {MAX_MESH_FRAME_BYTES}")
+            }
             Self::UnauthorizedRecipient(d) => write!(f, "local node {d} not in visible_to"),
         }
     }
@@ -307,12 +315,12 @@ pub fn validate_egress_candidate(
     let is_shareable = eligibility == "shareable";
     match evaluate_sovereignty_gate(permitted_memory_type, is_shareable, false, true, true) {
         KernelSovereigntyDecision::Allow => Ok(()),
-        KernelSovereigntyDecision::ForbiddenMemoryType => Err(SovereigntyGateError::ForbiddenMemoryType(
-            memory_type.to_string(),
+        KernelSovereigntyDecision::ForbiddenMemoryType => Err(
+            SovereigntyGateError::ForbiddenMemoryType(memory_type.to_string()),
+        ),
+        KernelSovereigntyDecision::NotShareable => Err(SovereigntyGateError::NotShareable(
+            format!("eligibility is '{eligibility}', required 'shareable'"),
         )),
-        KernelSovereigntyDecision::NotShareable => Err(SovereigntyGateError::NotShareable(format!(
-            "eligibility is '{eligibility}', required 'shareable'"
-        ))),
         _ => Ok(()),
     }
 }

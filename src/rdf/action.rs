@@ -924,8 +924,14 @@ async fn resolve_namespace_target_row(
     is_twin_lookup: bool,
 ) -> Result<Option<(String, MemoryPayload)>, ActionError> {
     let empty_staged = BTreeMap::new();
-    resolve_namespace_target_row_with_staged(store, namespace, raw_id, is_twin_lookup, &empty_staged)
-        .await
+    resolve_namespace_target_row_with_staged(
+        store,
+        namespace,
+        raw_id,
+        is_twin_lookup,
+        &empty_staged,
+    )
+    .await
 }
 
 async fn resolve_namespace_target_row_with_staged(
@@ -3022,10 +3028,7 @@ pub async fn revert_action(
                                 })
                                 .and_then(|v| v.as_u64())
                                 .unwrap_or(0);
-                            let sup_by = p
-                                .metadata
-                                .get("superseded_by")
-                                .and_then(|v| v.as_str());
+                            let sup_by = p.metadata.get("superseded_by").and_then(|v| v.as_str());
                             ver == expected_after_ver
                                 && sup_by == Some(chain.superseded_by_after_id.as_str())
                         });
@@ -7346,10 +7349,8 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_define_action_same_slug_rejects_duplicate_atomically() {
-        let tmp = std::env::temp_dir().join(format!(
-            "ns-action-concurrent-slug-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("ns-action-concurrent-slug-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let store = std::sync::Arc::new(
             crate::store::ladybug::LadybugStore::for_testing(&tmp, 4).expect("store"),
@@ -7566,10 +7567,8 @@ mod tests {
 
     #[tokio::test]
     async fn revert_first_of_two_identical_upserts_is_refused_without_retiring_newer_payload() {
-        let tmp = std::env::temp_dir().join(format!(
-            "ns-action-upsert-rev-guard-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("ns-action-upsert-rev-guard-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let store = crate::store::ladybug::LadybugStore::for_testing(&tmp, 4).expect("store");
         let ns = "ns-upsert-rev-guard";
@@ -7669,8 +7668,7 @@ mod tests {
             "newer upsert payload must remain active"
         );
         assert_eq!(
-            payload_after_failed_revert.metadata,
-            payload_after_apply2.metadata,
+            payload_after_failed_revert.metadata, payload_after_apply2.metadata,
             "newer upsert metadata (including valid_from) must be untouched"
         );
 
@@ -7884,8 +7882,8 @@ mod tests {
             .await
             .unwrap()
             .expect("receipt row");
-        receipt_payload.metadata["action_receipt"]["row_deltas"][0]["after_payload"]
-            ["metadata"]["topology"] = raw_topology;
+        receipt_payload.metadata["action_receipt"]["row_deltas"][0]["after_payload"]["metadata"]
+            ["topology"] = raw_topology;
         store
             .upsert(ns, &receipt_id, receipt_vec, receipt_payload)
             .await

@@ -19,19 +19,25 @@ impl BlobStore {
     }
 
     pub fn put(&self, payload: &MemoryPayload) -> Result<PayloadHash> {
-        
         // SHA-256 of the content string
         let mut hasher = sha2::Sha256::default();
         hasher.update(payload.content.as_bytes());
         let result = hasher.finalize();
         let id = PayloadHash(format!("sha256:{}", hex::encode(result)));
-        self.cache.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), payload.content.as_bytes().to_vec());
+        self.cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.clone(), payload.content.as_bytes().to_vec());
         Ok(id)
     }
 
     /// Returns the cached payload bytes for a previously stored hash.
     pub fn get(&self, hash: &PayloadHash) -> Option<Vec<u8>> {
-        self.cache.lock().unwrap_or_else(|e| e.into_inner()).get(hash).cloned()
+        self.cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(hash)
+            .cloned()
     }
 }
 

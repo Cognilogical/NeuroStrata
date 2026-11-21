@@ -18,43 +18,56 @@
 // ──────────────────────────────────────────────────────────────────────
 // Node built-ins only (ESM). Zero require(), zero external runtime deps.
 // ──────────────────────────────────────────────────────────────────────
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { basename, dirname, join, resolve } from 'node:path';
 // ──────────────────────────────────────────────────────────────────────
 // Configuration
 // ──────────────────────────────────────────────────────────────────────
-export const DEFAULT_ENDPOINT = "http://127.0.0.1:34343/mcp";
-export const DEFAULT_TOKEN_FILE = "daemon.token";
-export const REQUIRED_TOOLS = ["neurostrata_guard_validate", "neurostrata_task_create"];
+export const DEFAULT_ENDPOINT = 'http://127.0.0.1:34343/mcp';
+export const DEFAULT_TOKEN_FILE = 'daemon.token';
+export const REQUIRED_TOOLS = [
+    'neurostrata_guard_validate',
+    'neurostrata_task_create'
+];
 const DEFAULT_CONFIG = {
-    namespace: "NeuroStrata",
+    namespace: 'NeuroStrata',
     endpoint: DEFAULT_ENDPOINT,
     bearerToken: null,
     tokenFile: null,
     strictMode: true,
     requestTimeoutMs: 5000,
-    intentDetection: { enabled: true, injectReminder: true },
+    intentDetection: { enabled: true, injectReminder: true }
 };
 function asRecord(value) {
-    return typeof value === "object" && value !== null ? value : {};
+    return typeof value === 'object' && value !== null
+        ? value
+        : {};
 }
 function firstRecord(...candidates) {
     for (const candidate of candidates) {
-        if (typeof candidate === "object" && candidate !== null) {
+        if (typeof candidate === 'object' && candidate !== null) {
             return candidate;
         }
     }
     return {};
 }
 function asString(value) {
-    return typeof value === "string" && value.trim() !== "" ? value.trim() : undefined;
+    return typeof value === 'string' && value.trim() !== ''
+        ? value.trim()
+        : undefined;
 }
 function asNumber(value) {
-    return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+    return typeof value === 'number' && Number.isFinite(value) && value > 0
+        ? value
+        : undefined;
 }
 function asBoolean(value) {
-    return typeof value === "boolean" ? value : undefined;
+    return typeof value === 'boolean' ? value : undefined;
+}
+/** Allowlist namespace/task tokens before code-span interpolation (#316). */
+export function sanitizeSubagentHeaderToken(value) {
+    return String(value ?? '').replace(/[^A-Za-z0-9_.:-]/g, '');
 }
 /**
  * Resolve `namespace` in strict priority order:
@@ -66,7 +79,11 @@ function asBoolean(value) {
 export function resolveConfig(pluginConfig = {}, cwd = process.cwd()) {
     const input = asRecord(pluginConfig);
     const intent = asRecord(input.intentDetection);
-    const endpoint = asString(input.endpoint) ?? asString(input.guardEndpoint) ?? DEFAULT_CONFIG.endpoint;
+    const endpoint = asString(input.endpoint) ??
+        asString(input.guardEndpoint) ??
+        DEFAULT_CONFIG.endpoint;
+    // Preserve the exact namespace for MCP routing; sanitization happens only
+    // where the value is interpolated into a prompt header (#329 review).
     const namespace = asString(input.namespace) ??
         asString(process.env.NEUROSTRATA_NAMESPACE) ??
         discoverProjectNamespace(cwd);
@@ -79,8 +96,9 @@ export function resolveConfig(pluginConfig = {}, cwd = process.cwd()) {
         requestTimeoutMs: asNumber(input.requestTimeoutMs) ?? DEFAULT_CONFIG.requestTimeoutMs,
         intentDetection: {
             enabled: asBoolean(intent.enabled) ?? DEFAULT_CONFIG.intentDetection.enabled,
-            injectReminder: asBoolean(intent.injectReminder) ?? DEFAULT_CONFIG.intentDetection.injectReminder,
-        },
+            injectReminder: asBoolean(intent.injectReminder) ??
+                DEFAULT_CONFIG.intentDetection.injectReminder
+        }
     };
 }
 // ──────────────────────────────────────────────────────────────────────
@@ -95,7 +113,7 @@ export function findProjectRoot(startDir = process.cwd()) {
     // Pass 1: walk up looking for `.git` first; a `.git` anchors the project root.
     let current = resolve(startDir);
     while (true) {
-        if (existsSync(join(current, ".git"))) {
+        if (existsSync(join(current, '.git'))) {
             return current;
         }
         const next = dirname(current);
@@ -107,7 +125,7 @@ export function findProjectRoot(startDir = process.cwd()) {
     // for `.NeuroStrata`. Otherwise fall back to resolve(startDir).
     current = resolve(startDir);
     while (true) {
-        if (existsSync(join(current, ".NeuroStrata"))) {
+        if (existsSync(join(current, '.NeuroStrata'))) {
             return current;
         }
         const next = dirname(current);
@@ -126,15 +144,15 @@ export function discoverProjectNamespace(startDir = process.cwd()) {
     const root = findProjectRoot(startDir);
     let current = resolve(startDir);
     while (true) {
-        const sessionQueriesPath = join(current, ".NeuroStrata", "session_queries.json");
+        const sessionQueriesPath = join(current, '.NeuroStrata', 'session_queries.json');
         try {
             if (existsSync(sessionQueriesPath)) {
-                const content = readFileSync(sessionQueriesPath, "utf8");
+                const content = readFileSync(sessionQueriesPath, 'utf8');
                 const parsed = JSON.parse(content);
                 if (parsed !== null &&
-                    typeof parsed === "object" &&
-                    typeof parsed.namespace === "string" &&
-                    parsed.namespace.trim() !== "") {
+                    typeof parsed === 'object' &&
+                    typeof parsed.namespace === 'string' &&
+                    parsed.namespace.trim() !== '') {
                     return parsed.namespace.trim();
                 }
             }
@@ -149,7 +167,7 @@ export function discoverProjectNamespace(startDir = process.cwd()) {
             break;
         current = next;
     }
-    return basename(root) || "default";
+    return basename(root) || 'default';
 }
 // ──────────────────────────────────────────────────────────────────────
 // OpenCode V2 project-root & namespace resolution
@@ -181,11 +199,11 @@ export function resolveProjectRoot(ctx) {
  * files are a no-op; the host-supplied ctx.config always wins the merge.
  */
 function loadPluginConfigFromDisk(projectRoot) {
-    for (const file of ["neurostrata-plugin.json", "PluginConfig.json"]) {
-        const p = join(projectRoot, ".NeuroStrata", file);
+    for (const file of ['neurostrata-plugin.json', 'PluginConfig.json']) {
+        const p = join(projectRoot, '.NeuroStrata', file);
         if (existsSync(p)) {
             try {
-                return asRecord(JSON.parse(readFileSync(p, "utf8")));
+                return asRecord(JSON.parse(readFileSync(p, 'utf8')));
             }
             catch {
                 // ignore malformed / unreadable config files
@@ -209,9 +227,9 @@ function pathRelativeToProjectRoot(filePath, config) {
         // Resolve a relative filePath against the project root (not process.cwd())
         // so the startsWith check below is meaningful when cwd != projectRoot.
         const resolved = resolve(root, filePath);
-        const rootWithSep = root.endsWith("/") ? root : root + "/";
+        const rootWithSep = root.endsWith('/') ? root : root + '/';
         if (resolved === root || resolved.startsWith(rootWithSep)) {
-            return resolved.slice(root.length).replace(/^\/+/, "");
+            return resolved.slice(root.length).replace(/^\/+/, '');
         }
     }
     catch {
@@ -223,18 +241,20 @@ function pathRelativeToProjectRoot(filePath, config) {
 // Credential
 // ──────────────────────────────────────────────────────────────────────
 export function daemonTokenPath(tokenFile) {
-    if (tokenFile && tokenFile.trim() !== "") {
+    if (tokenFile && tokenFile.trim() !== '') {
         return tokenFile.trim();
     }
-    const envTokenDir = (typeof process !== "undefined" && process.env?.NEUROSTRATA_TOKEN_DIR?.trim()) ?? "";
+    const envTokenDir = (typeof process !== 'undefined' &&
+        process.env?.NEUROSTRATA_TOKEN_DIR?.trim()) ??
+        '';
     if (envTokenDir) {
         return envTokenDir;
     }
-    return join(homedir(), ".config", "neurostrata", DEFAULT_TOKEN_FILE);
+    return join(homedir(), '.config', 'neurostrata', DEFAULT_TOKEN_FILE);
 }
 export function loadDaemonToken(tokenFile) {
     try {
-        const raw = readFileSync(daemonTokenPath(tokenFile), "utf8").trim();
+        const raw = readFileSync(daemonTokenPath(tokenFile), 'utf8').trim();
         return raw.length > 0 ? raw : null;
     }
     catch {
@@ -242,35 +262,41 @@ export function loadDaemonToken(tokenFile) {
     }
 }
 export function buildHeaders(token) {
-    const headers = { "Content-Type": "application/json" };
+    const headers = { 'Content-Type': 'application/json' };
     if (token)
         headers.Authorization = `Bearer ${token}`;
     return headers;
 }
 export function buildToolCallRequest(id, name, args) {
-    return { jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } };
+    return {
+        jsonrpc: '2.0',
+        id,
+        method: 'tools/call',
+        params: { name, arguments: args }
+    };
 }
 export function buildToolsListRequest(id) {
-    return { jsonrpc: "2.0", id, method: "tools/list", params: {} };
+    return { jsonrpc: '2.0', id, method: 'tools/list', params: {} };
 }
 export function extractToolText(result) {
     const content = result?.content;
     if (!Array.isArray(content))
-        throw new Error("tool result carried no content array");
+        throw new Error('tool result carried no content array');
     const text = content
-        .map((part) => (typeof part?.text === "string" ? part.text : ""))
+        .map((part) => (typeof part?.text === 'string' ? part.text : ''))
         .filter((part) => part.length > 0)
-        .join("\n");
+        .join('\n');
     if (text.length === 0)
-        throw new Error("tool result carried no text content");
+        throw new Error('tool result carried no text content');
     return text;
 }
 export function extractToolNames(result) {
-    const tools = result?.tools;
+    const tools = result
+        ?.tools;
     if (!Array.isArray(tools))
-        throw new Error("tools/list returned no tools array");
+        throw new Error('tools/list returned no tools array');
     return tools
-        .map((tool) => (typeof tool?.name === "string" ? tool.name : ""))
+        .map((tool) => (typeof tool?.name === 'string' ? tool.name : ''))
         .filter((name) => name.length > 0);
 }
 // ──────────────────────────────────────────────────────────────────────
@@ -303,18 +329,18 @@ export class NeuroStrataMCPClient {
         // throws on, and the daemon's advisory marker lives on the error
         // channel, so only that channel is scanned (never normal tool output).
         const text = response.result === undefined || response.result === null
-            ? ""
+            ? ''
             : (() => {
                 try {
                     return extractToolText(response.result);
                 }
                 catch {
-                    return "";
+                    return '';
                 }
             })();
         if (response.error) {
-            this.pendingDaemonAdvisory = extractDaemonMemoryAdvisory(typeof response.error.message === "string" ? response.error.message : "");
-            throw new Error(`[${response.error.code ?? "?"}] ${response.error.message ?? "tool call failed"}`);
+            this.pendingDaemonAdvisory = extractDaemonMemoryAdvisory(typeof response.error.message === 'string' ? response.error.message : '');
+            throw new Error(`[${response.error.code ?? '?'}] ${response.error.message ?? 'tool call failed'}`);
         }
         if (response.result === undefined || response.result === null) {
             this.pendingDaemonAdvisory = null;
@@ -331,7 +357,7 @@ export class NeuroStrataMCPClient {
         const id = ++this.requestId;
         const response = await this.post(buildToolsListRequest(id));
         if (response.error)
-            throw new Error(`[${response.error.code ?? "?"}] ${response.error.message ?? "tools/list failed"}`);
+            throw new Error(`[${response.error.code ?? '?'}] ${response.error.message ?? 'tools/list failed'}`);
         return extractToolNames(response.result);
     }
     async post(body) {
@@ -339,17 +365,17 @@ export class NeuroStrataMCPClient {
         const timer = setTimeout(() => controller.abort(), this.timeoutMs);
         try {
             const response = await fetch(this.endpoint, {
-                method: "POST",
+                method: 'POST',
                 headers: buildHeaders(this.token),
                 body: JSON.stringify(body),
-                signal: controller.signal,
+                signal: controller.signal
             });
             if (!response.ok)
                 throw new Error(`HTTP ${response.status} ${response.statusText}`);
             return (await response.json());
         }
         catch (err) {
-            if (err instanceof Error && err.name === "AbortError")
+            if (err instanceof Error && err.name === 'AbortError')
                 throw new Error(`request timed out after ${this.timeoutMs}ms`);
             throw err;
         }
@@ -359,8 +385,8 @@ export class NeuroStrataMCPClient {
     }
 }
 export function parseGuardValidate(text) {
-    const start = text.indexOf("{");
-    const end = text.lastIndexOf("}");
+    const start = text.indexOf('{');
+    const end = text.lastIndexOf('}');
     if (start === -1 || end <= start)
         throw new Error(`guard_validate returned no JSON body: ${text.slice(0, 200)}`);
     let body;
@@ -371,22 +397,37 @@ export function parseGuardValidate(text) {
         throw new Error(`guard_validate returned an unreadable body: ${String(err)}`);
     }
     const verdict = asRecord(body.verdict);
-    const bucket = asString(verdict.bucket) ?? "Unknown";
-    const reasons = Array.isArray(verdict.reasons) ? verdict.reasons.map((r) => String(r)) : [];
-    const constraints = Array.isArray(verdict.constraints) ? verdict.constraints.map((c) => String(c)) : [];
-    const notes = Array.isArray(verdict.notes) ? verdict.notes.map((n) => String(n)) : [];
-    const rule_ids = Array.isArray(body.rule_ids_triggered) ? body.rule_ids_triggered.map((id) => String(id)) : [];
-    const rejecting = bucket === "DeterministicReject" || bucket === "SandboxReject";
-    return { verdict: rejecting ? "reject" : "pass", bucket, reasons, constraints, notes, rule_ids };
+    const bucket = asString(verdict.bucket) ?? 'Unknown';
+    const reasons = Array.isArray(verdict.reasons)
+        ? verdict.reasons.map((r) => String(r))
+        : [];
+    const constraints = Array.isArray(verdict.constraints)
+        ? verdict.constraints.map((c) => String(c))
+        : [];
+    const notes = Array.isArray(verdict.notes)
+        ? verdict.notes.map((n) => String(n))
+        : [];
+    const rule_ids = Array.isArray(body.rule_ids_triggered)
+        ? body.rule_ids_triggered.map((id) => String(id))
+        : [];
+    const rejecting = bucket === 'DeterministicReject' || bucket === 'SandboxReject';
+    return {
+        verdict: rejecting ? 'reject' : 'pass',
+        bucket,
+        reasons,
+        constraints,
+        notes,
+        rule_ids
+    };
 }
 function initialStatus() {
     return {
-        state: "uninitialized",
+        state: 'uninitialized',
         endpoint: DEFAULT_ENDPOINT,
-        namespace: "NeuroStrata",
+        namespace: 'NeuroStrata',
         authenticated: false,
         missingTools: [],
-        updatedAt: new Date(0).toISOString(),
+        updatedAt: new Date(0).toISOString()
     };
 }
 let status = initialStatus();
@@ -397,23 +438,23 @@ function setStatus(patch) {
     status = { ...status, ...patch, updatedAt: new Date().toISOString() };
 }
 export const MARKERS = [
-    ["todo:", "todo:"],
-    ["fixme:", "fixme:"],
-    ["follow-up:", "follow-up:"],
-    ["followup:", "followup:"],
-    ["next step:", "next step:"],
-    ["action item:", "action item:"],
-    ["remaining work:", "remaining work:"],
-    ["we should also ", "we should also"],
-    ["later we need to ", "later we need to"],
-    ["need to follow up ", "need to follow up"],
-    ["still need to ", "still need to"],
-    ["must also fix ", "must also fix"],
-    ["filed follow-up ", "filed follow-up"],
-    ["defer ", "defer"],
-    ["deferred ", "deferred"],
+    ['todo:', 'todo:'],
+    ['fixme:', 'fixme:'],
+    ['follow-up:', 'follow-up:'],
+    ['followup:', 'followup:'],
+    ['next step:', 'next step:'],
+    ['action item:', 'action item:'],
+    ['remaining work:', 'remaining work:'],
+    ['we should also ', 'we should also'],
+    ['later we need to ', 'later we need to'],
+    ['need to follow up ', 'need to follow up'],
+    ['still need to ', 'still need to'],
+    ['must also fix ', 'must also fix'],
+    ['filed follow-up ', 'filed follow-up'],
+    ['defer ', 'defer'],
+    ['deferred ', 'deferred']
 ];
-export const NEGATION_PREFIXES = ["never ", "do not ", "don't ", "do not, "];
+export const NEGATION_PREFIXES = ['never ', 'do not ', "don't ", 'do not, '];
 export function detectTaskIntentsLocal(text) {
     const lower = text.toLowerCase();
     const out = [];
@@ -424,16 +465,16 @@ export function detectTaskIntentsLocal(text) {
             continue;
         if (seen.has(canonical))
             continue;
-        const clauseStart = text.slice(0, idx).lastIndexOf("\n") + 1;
+        const clauseStart = text.slice(0, idx).lastIndexOf('\n') + 1;
         let start = clauseStart;
-        const sentPos = text.slice(0, idx).lastIndexOf(". ");
+        const sentPos = text.slice(0, idx).lastIndexOf('. ');
         if (sentPos !== -1 && sentPos + 2 > start)
             start = sentPos + 2;
         const clausePrefix = text.slice(start, idx).trimStart().toLowerCase();
         if (NEGATION_PREFIXES.some((p) => clausePrefix.startsWith(p)))
             continue;
         const rest = text.slice(idx);
-        const end = Math.min(rest.indexOf("\n") === -1 ? rest.length : rest.indexOf("\n"), 160);
+        const end = Math.min(rest.indexOf('\n') === -1 ? rest.length : rest.indexOf('\n'), 160);
         let excerpt = rest.slice(0, end).trimEnd();
         if (excerpt.length > 160)
             excerpt = excerpt.slice(0, 160);
@@ -465,7 +506,7 @@ export function extractTurnCandidates(turn) {
         const start = idx === -1 ? 0 : idx;
         const end = Math.min(content.length, start + signal.excerpt.length);
         out.push({
-            kind: "task_obligation",
+            kind: 'task_obligation',
             title: signal.excerpt,
             confidence: 0.9,
             auto_commit: false,
@@ -478,8 +519,8 @@ export function extractTurnCandidates(turn) {
                 quote: signal.excerpt,
                 char_range: [start, end],
                 parent_task_id,
-                confidence: 0.9,
-            },
+                confidence: 0.9
+            }
         });
     }
     // Decision / fact markers: explicit DECISION:/FACT:/Architectural decision:/
@@ -487,19 +528,19 @@ export function extractTurnCandidates(turn) {
     // ProvenanceSpan so the intake Lock 2 gate can see them.
     const DF_MARKERS = /\b(?:DECISION|FACT|Architectural decision|We decided to)\s*:\s*([^\n.]{8,200})/gi;
     for (const m of content.matchAll(DF_MARKERS)) {
-        const marker = m[0].split(":")[0].trim();
+        const marker = m[0].split(':')[0].trim();
         const category = /^(?:DECISION|Architectural decision|We decided to)$/i.test(marker)
-            ? "decision"
-            : "fact";
+            ? 'decision'
+            : 'fact';
         const excerpt = m[1];
         const start = m.index + m[0].indexOf(excerpt);
         const end = start + excerpt.length;
         out.push({
-            kind: "memory_candidate",
+            kind: 'memory_candidate',
             category,
             title: excerpt,
             confidence: 0.9,
-            auto_commit: role === "user" || role === "checker",
+            auto_commit: role === 'user' || role === 'checker',
             provenance: {
                 turn_id,
                 role,
@@ -509,8 +550,8 @@ export function extractTurnCandidates(turn) {
                 quote: excerpt,
                 char_range: [start, end],
                 parent_task_id,
-                confidence: 0.9,
-            },
+                confidence: 0.9
+            }
         });
     }
     return out;
@@ -526,9 +567,9 @@ export async function postTurnCandidates(candidates, namespace) {
         return;
     for (const cand of candidates) {
         try {
-            await mcpClient.callTool("neurostrata_task_candidates", {
+            await mcpClient.callTool('neurostrata_task_candidates', {
                 namespace,
-                action: "record",
+                action: 'record',
                 kind: cand.kind,
                 category: cand.category,
                 confidence: cand.confidence,
@@ -536,7 +577,7 @@ export async function postTurnCandidates(candidates, namespace) {
                 description: cand.description,
                 auto_commit: cand.auto_commit,
                 task_id: cand.provenance?.parent_task_id ?? activeTaskId,
-                provenance: cand.provenance,
+                provenance: cand.provenance
             });
         }
         catch {
@@ -553,14 +594,14 @@ export function extractConceptualBridges(hits) {
     const out = [];
     const seen = new Set();
     for (const hit of hits) {
-        if (typeof hit !== "object" || hit === null)
+        if (typeof hit !== 'object' || hit === null)
             continue;
         const rec = hit;
         const cbs = rec.conceptual_bridges;
         if (!Array.isArray(cbs))
             continue;
         for (const cb of cbs) {
-            if (typeof cb !== "object" || cb === null)
+            if (typeof cb !== 'object' || cb === null)
                 continue;
             const b = cb;
             const path = asString(b.path);
@@ -574,7 +615,7 @@ export function extractConceptualBridges(hits) {
                 target_domain: asString(b.target_domain),
                 target_type: asString(b.target_type),
                 target_summary: asString(b.target_summary),
-                path,
+                path
             });
         }
     }
@@ -586,12 +627,12 @@ export function extractConceptualBridges(hits) {
  * `sessionContextHandler` can inject them as `[NeuroStrata Conceptual Bridges]`.
  */
 export function persistConceptualBridges(projectRoot, bridges) {
-    const nsDir = join(projectRoot, ".NeuroStrata");
-    const sessionPath = join(nsDir, "active_session.json");
+    const nsDir = join(projectRoot, '.NeuroStrata');
+    const sessionPath = join(nsDir, 'active_session.json');
     let active = {};
     if (existsSync(sessionPath)) {
         try {
-            active = asRecord(JSON.parse(readFileSync(sessionPath, "utf8")));
+            active = asRecord(JSON.parse(readFileSync(sessionPath, 'utf8')));
         }
         catch {
             active = {};
@@ -620,64 +661,64 @@ export function persistConceptualBridges(projectRoot, bridges) {
 // Bug 3: canonical tool classification
 // ──────────────────────────────────────────────────────────────────────
 export const READ_FILE_TOOLS = new Set([
-    "read",
-    "Read",
-    "read_file",
-    "grep",
-    "Grep",
-    "glob",
-    "Glob",
-    "mcp_glob",
-    "view",
-    "cat",
+    'read',
+    'Read',
+    'read_file',
+    'grep',
+    'Grep',
+    'glob',
+    'Glob',
+    'mcp_glob',
+    'view',
+    'cat'
 ]);
 export const MUTATING_FILE_TOOLS = new Set([
-    "write",
-    "Write",
-    "write_file",
-    "create_file",
-    "create",
-    "edit",
-    "Edit",
-    "MultiEdit",
-    "edit_file",
-    "str_replace_editor",
-    "patch",
-    "patch_file",
-    "apply_patch",
-    "replace_string_in_file",
-    "insert_edit_into_file",
+    'write',
+    'Write',
+    'write_file',
+    'create_file',
+    'create',
+    'edit',
+    'Edit',
+    'MultiEdit',
+    'edit_file',
+    'str_replace_editor',
+    'patch',
+    'patch_file',
+    'apply_patch',
+    'replace_string_in_file',
+    'insert_edit_into_file'
 ]);
 export const SHELL_TOOLS = new Set([
-    "bash",
-    "Bash",
-    "shell",
-    "local_shell",
-    "exec_command",
-    "run_shell_command",
-    "run_command",
-    "execute_command",
-    "terminal",
-    "gh_exec",
+    'bash',
+    'Bash',
+    'shell',
+    'local_shell',
+    'exec_command',
+    'run_shell_command',
+    'run_command',
+    'execute_command',
+    'terminal',
+    'gh_exec'
 ]);
 export const MUTATING_TOOLS = new Set([...MUTATING_FILE_TOOLS, ...SHELL_TOOLS]);
 export const SUBAGENT_TOOLS = new Set([
-    "subagent",
-    "Task",
-    "task",
-    "dispatch_agent",
-    "spawn_agent",
-    "agent",
-    "delegate_task",
+    'subagent',
+    'Task',
+    'task',
+    'dispatch_agent',
+    'spawn_agent',
+    'agent',
+    'delegate_task'
 ]);
-export const CODE_EXEC_TOOLS = new Set(["execute", "mcp_execute"]);
+export const CODE_EXEC_TOOLS = new Set(['execute', 'mcp_execute']);
 export const TOOL_CLASSIFICATION = {
     READ_FILE_TOOLS,
     MUTATING_FILE_TOOLS,
     SHELL_TOOLS,
     MUTATING_TOOLS,
     SUBAGENT_TOOLS,
-    CODE_EXEC_TOOLS,
+    CODE_EXEC_TOOLS
 };
 export function isFileTouchTool(name) {
     return READ_FILE_TOOLS.has(name) || MUTATING_FILE_TOOLS.has(name);
@@ -689,8 +730,21 @@ export function isMutatingTool(name) {
 // markers such as TODO:/defer found there are code or log noise, not a task
 // obligation. Never post intake candidates from read-only inspection tools.
 const READ_ONLY_INSPECTION_TOOLS = new Set([
-    "read", "read_file", "shell", "bash", "local_shell", "exec_command", "run_shell_command",
-    "run_command", "execute_command", "terminal", "gh_exec", "grep", "glob", "view", "cat",
+    'read',
+    'read_file',
+    'shell',
+    'bash',
+    'local_shell',
+    'exec_command',
+    'run_shell_command',
+    'run_command',
+    'execute_command',
+    'terminal',
+    'gh_exec',
+    'grep',
+    'glob',
+    'view',
+    'cat'
 ]);
 export function isReadOnlyInspectionTool(name) {
     const lower = String(name).toLowerCase();
@@ -707,28 +761,45 @@ export function isCodeExecTool(name) {
  * Fail-closed recognition of a single read-only / verification shell segment.
  * Only an explicit allowlist passes; anything else is treated as mutating.
  */
+function stripMatchingQuotes(token) {
+    const t = token.trim();
+    if (t.length >= 2) {
+        const first = t[0];
+        const last = t[t.length - 1];
+        if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+            return t.slice(1, -1);
+        }
+    }
+    return t;
+}
 function isZeroActionExemptShellSegment(segment) {
-    let tokens = segment.trim().split(/\s+/).filter(Boolean);
+    const s = segment.trim();
+    if (s.replace(/&&/g, '').includes('&'))
+        return false;
+    let tokens = s.split(/\s+/).filter(Boolean).map(stripMatchingQuotes);
     while (tokens.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0])) {
         tokens = tokens.slice(1);
     }
     if (tokens.length === 0)
         return false;
-    const bin = tokens[0].replace(/\\/g, "/").split("/").pop() ?? "";
+    const bin = tokens[0].replace(/\\/g, '/').split('/').pop() ?? '';
     const args = tokens.slice(1);
-    const hasFlag = (flags) => args.some((arg) => flags.some((flag) => arg === flag || (flag.startsWith("--") ? arg.startsWith(`${flag}=`) : arg.startsWith(flag))));
-    if (bin === "git") {
+    const hasFlag = (flags) => args.some((arg) => flags.some((flag) => arg === flag ||
+        (flag.startsWith('--')
+            ? arg.startsWith(`${flag}=`)
+            : arg.startsWith(flag))));
+    if (bin === 'git') {
         let rest = args;
         while (rest.length > 0) {
             const head = rest[0];
-            if (head === "-C" || head === "--git-dir" || head === "--work-tree") {
+            if (head === '-C' || head === '--git-dir' || head === '--work-tree') {
                 rest = rest.slice(2);
             }
-            else if (head === "--no-pager" ||
-                head === "-P" ||
-                head === "--no-optional-locks" ||
-                head.startsWith("--git-dir=") ||
-                head.startsWith("--work-tree=")) {
+            else if (head === '--no-pager' ||
+                head === '-P' ||
+                head === '--no-optional-locks' ||
+                head.startsWith('--git-dir=') ||
+                head.startsWith('--work-tree=')) {
                 rest = rest.slice(1);
             }
             else {
@@ -738,58 +809,132 @@ function isZeroActionExemptShellSegment(segment) {
         const sub = rest[0];
         const subArgs = rest.slice(1);
         // Fail closed on every way to force a push: bundled short flags (-vf,
-        // -uf), forced refspecs (+main), and destructive remote operations.
-        if (sub === "push" && subArgs.some((a) => a.startsWith("+") ||
-            a === "--force" ||
-            a.startsWith("--force-") ||
-            a === "--mirror" ||
-            a === "--delete" ||
-            a === "--prune" ||
-            (a.startsWith("-") && !a.startsWith("--") && a.slice(1).includes("f")))) {
-            return false;
+        // -uf), forced refspecs (+main), destructive remote operations, --dele*,
+        // --no-verify, and empty-source :refspec. Short bundle d|f is only
+        // checked before '=' and only for a real short cluster (not -oformat).
+        if (sub === 'push') {
+            const isMutatingPush = subArgs.some((a) => {
+                if (a.startsWith('+'))
+                    return true;
+                if (a.startsWith('--force'))
+                    return true;
+                if (a === '--mirror' || a === '--delete' || a === '--prune')
+                    return true;
+                if (a.startsWith('--dele'))
+                    return true;
+                if (a === '--no-verify')
+                    return true;
+                if (a.startsWith(':') && a.length > 1)
+                    return true;
+                if (a.startsWith('-') && !a.startsWith('--')) {
+                    const bundle = a.split('=')[0];
+                    const letters = bundle.slice(1);
+                    // Parse the short-option cluster left-to-right: `-o` (--push-option)
+                    // consumes the rest as its attached value, so only flags appearing
+                    // before it decide mutability (`-fometa` = `-f -o meta`).
+                    for (const ch of letters) {
+                        if (!/[A-Za-z]/.test(ch))
+                            break;
+                        if (ch === 'f' || ch === 'd')
+                            return true;
+                        if (ch === 'o')
+                            break;
+                    }
+                }
+                return false;
+            });
+            if (isMutatingPush)
+                return false;
         }
-        if (["push", "pull", "fetch", "status", "log", "diff", "show", "rev-parse"].includes(sub)) {
-            return !hasFlag(["--output", "-O", "--ext-diff", "--textconv", "--exec", "-x", "--upload-pack", "--receive-pack"]);
+        if ([
+            'push',
+            'pull',
+            'fetch',
+            'status',
+            'log',
+            'diff',
+            'show',
+            'rev-parse'
+        ].includes(sub)) {
+            return !hasFlag([
+                '--output',
+                '-O',
+                '--ext-diff',
+                '--textconv',
+                '--exec',
+                '-x',
+                '--upload-pack',
+                '--receive-pack'
+            ]);
         }
-        if (sub === "stash")
-            return subArgs[0] === "list" || subArgs[0] === "show";
-        if (sub === "branch") {
-            return subArgs.every((arg) => ["--show-current", "-a", "-r", "--list", "-v", "-vv"].includes(arg));
+        if (sub === 'stash')
+            return ((subArgs[0] === 'list' || subArgs[0] === 'show') &&
+                !hasFlag([
+                    '--output',
+                    '-O',
+                    '--ext-diff',
+                    '--textconv',
+                    '--exec',
+                    '-x',
+                    '--upload-pack',
+                    '--receive-pack'
+                ]));
+        if (sub === 'branch') {
+            return (subArgs.length > 0 &&
+                subArgs.every((arg) => ['--show-current', '-a', '-r', '--list', '-v', '-vv'].includes(arg)));
         }
         return false;
     }
-    if (bin === "neurostrata-mcp") {
-        if (args[0] === "task" || args[0] === "doc-gate")
+    if (bin === 'neurostrata-mcp') {
+        if (args[0] === 'task' || args[0] === 'doc-gate')
             return true;
-        return args[0] === "synaptic-mesh" && args[1] === "status";
+        return args[0] === 'synaptic-mesh' && args[1] === 'status';
     }
-    if (bin === "cargo") {
-        const rest = args[0]?.startsWith("+") ? args.slice(1) : args;
-        return ["test", "check", "clippy", "bench", "metadata", "tree", "version", "--version"].includes(rest[0]);
+    if (bin === 'cargo') {
+        const rest = args[0]?.startsWith('+') ? args.slice(1) : args;
+        return [
+            'test',
+            'check',
+            'clippy',
+            'bench',
+            'metadata',
+            'tree',
+            'version',
+            '--version'
+        ].includes(rest[0]);
     }
-    if (bin === "gh") {
-        if (args[0] === "pr")
-            return ["view", "list", "checks", "status", "diff"].includes(args[1]);
-        if (args[0] === "issue")
-            return ["view", "list", "status"].includes(args[1]);
-        if (args[0] === "run")
-            return ["view", "list", "watch"].includes(args[1]);
-        if (args[0] === "api") {
-            return !hasFlag(["-X", "--method", "-f", "-F", "--field", "--raw-field", "--input"]);
+    if (bin === 'gh') {
+        if (args[0] === 'pr')
+            return ['view', 'list', 'checks', 'status', 'diff'].includes(args[1]);
+        if (args[0] === 'issue')
+            return ['view', 'list', 'status'].includes(args[1]);
+        if (args[0] === 'run')
+            return ['view', 'list', 'watch'].includes(args[1]);
+        if (args[0] === 'api') {
+            return !hasFlag([
+                '-X',
+                '--method',
+                '-f',
+                '-F',
+                '--field',
+                '--raw-field',
+                '--input'
+            ]);
         }
         return false;
     }
-    if (bin === "node") {
-        return args.some((arg) => arg === "--test" || arg.endsWith("test.mjs"));
+    if (bin === 'node') {
+        return args.some((arg) => arg === '--test' || arg.endsWith('test.mjs'));
     }
-    if (bin === "gate-receipt.sh" || bin === "check-include-str-targets.sh")
+    if (bin === 'gate-receipt.sh' || bin === 'check-include-str-targets.sh')
         return true;
-    if (bin === "bash") {
-        const next = args[0] ?? "";
-        return next.endsWith("gate-receipt.sh") || next.endsWith("check-include-str-targets.sh");
+    if (bin === 'bash') {
+        const next = args[0] ?? '';
+        return (next.endsWith('gate-receipt.sh') ||
+            next.endsWith('check-include-str-targets.sh'));
     }
-    if (bin === "rustc")
-        return args[0] === "--version" || args[0] === "-V";
+    if (bin === 'rustc')
+        return args[0] === '--version' || args[0] === '-V';
     return false;
 }
 /**
@@ -798,11 +943,11 @@ function isZeroActionExemptShellSegment(segment) {
  * and chains containing any mutating segment fail closed.
  */
 export function isZeroActionExemptShellPayload(actionType, payloadOrCommand) {
-    if (!["bash", "shell", "command", "exec"].includes(String(actionType).toLowerCase()))
+    if (!['bash', 'shell', 'command', 'exec'].includes(String(actionType).toLowerCase()))
         return false;
     let command = payloadOrCommand;
     const trimmed = payloadOrCommand.trim();
-    if (trimmed.startsWith("{")) {
+    if (trimmed.startsWith('{')) {
         let parsed;
         try {
             parsed = asRecord(JSON.parse(trimmed));
@@ -810,15 +955,22 @@ export function isZeroActionExemptShellPayload(actionType, payloadOrCommand) {
         catch {
             return false;
         }
-        command = asString(parsed.command) ?? asString(parsed.cmd) ?? "";
+        command = asString(parsed.command) ?? asString(parsed.cmd) ?? '';
     }
     const cmd = command.trim();
-    if (!cmd || cmd.includes("`") || cmd.includes("$(") || cmd.includes(">") || cmd.includes("<"))
+    if (!cmd ||
+        cmd.includes('`') ||
+        cmd.includes('$(') ||
+        cmd.includes('>') ||
+        cmd.includes('<'))
         return false;
     // A lone '&' backgrounds the command; splitting on it would hide the operator.
-    if (cmd.replace(/&&/g, "").includes("&"))
+    if (cmd.replace(/&&/g, '').includes('&'))
         return false;
-    const segments = cmd.split(/[;\n|&]+/).map((segment) => segment.trim()).filter(Boolean);
+    const segments = cmd
+        .split(/[;\n|&]+/)
+        .map((segment) => segment.trim())
+        .filter(Boolean);
     return segments.length > 0 && segments.every(isZeroActionExemptShellSegment);
 }
 function extractBalancedCallArgs(code, startAfterOpenParen) {
@@ -828,7 +980,7 @@ function extractBalancedCallArgs(code, startAfterOpenParen) {
     while (i < code.length && depth > 0) {
         const ch = code[i];
         if (quote) {
-            if (ch === "\\") {
+            if (ch === '\\') {
                 i += 2;
                 continue;
             }
@@ -837,13 +989,13 @@ function extractBalancedCallArgs(code, startAfterOpenParen) {
             i++;
             continue;
         }
-        if (ch === '"' || ch === "'" || ch === "`") {
+        if (ch === '"' || ch === "'" || ch === '`') {
             quote = ch;
         }
-        else if (ch === "(") {
+        else if (ch === '(') {
             depth++;
         }
-        else if (ch === ")") {
+        else if (ch === ')') {
             depth--;
             if (depth === 0)
                 break;
@@ -879,7 +1031,7 @@ export function inspectCodeModeExecution(code) {
         const hasIdKey = /(?:^|[^\w$])["']?id["']?\s*:\s*(?!undefined\b|null\b)\S/.test(argSlice);
         const hasSessionKey = /(?:^|[^\w$])["']?session_id["']?\s*:\s*(?!undefined\b|null\b)\S/.test(argSlice);
         const hasNoteKey = /(?:^|[^\w$])["']?note["']?\s*:\s*(?!undefined\b|null\b)\S/.test(argSlice);
-        if (tool === "neurostrata_task_claim") {
+        if (tool === 'neurostrata_task_claim') {
             if (idMatch)
                 result.id = idMatch[1];
             if (sessionMatch)
@@ -889,7 +1041,7 @@ export function inspectCodeModeExecution(code) {
                 result.taskCompleted = false;
             }
         }
-        else if (tool === "neurostrata_task_update") {
+        else if (tool === 'neurostrata_task_update') {
             result.taskUpdated = true;
             if (idMatch)
                 result.id = idMatch[1];
@@ -898,16 +1050,20 @@ export function inspectCodeModeExecution(code) {
             if (noteMatch)
                 result.note = noteMatch[1];
             else if (hasNoteKey)
-                result.note = "";
+                result.note = '';
         }
-        else if (tool === "neurostrata_task_complete") {
+        else if (tool === 'neurostrata_task_complete') {
             result.taskCompleted = true;
         }
-        else if (tool === "neurostrata_memories_for_file" || tool === "neurostrata_locate") {
+        else if (tool === 'neurostrata_memories_for_file' ||
+            tool === 'neurostrata_locate') {
             if (pathMatch)
                 result.queriedFiles.push(pathMatch[1]);
         }
-        else if (tool === "neurostrata_archive_memory" || tool === "neurostrata_add_memory" || tool === "neurostrata_supersede_memory" || tool === "neurostrata_update_memory") {
+        else if (tool === 'neurostrata_archive_memory' ||
+            tool === 'neurostrata_add_memory' ||
+            tool === 'neurostrata_supersede_memory' ||
+            tool === 'neurostrata_update_memory') {
             result.memoryMutated = true;
         }
     }
@@ -940,8 +1096,8 @@ function touchPrefetchedPath(key) {
     recordPrefetchedPath(key);
 }
 export function parseFileMemoryHits(text) {
-    const start = text.indexOf("{");
-    const end = text.lastIndexOf("}");
+    const start = text.indexOf('{');
+    const end = text.lastIndexOf('}');
     if (start === -1 || end <= start)
         throw new Error(`memories_for_file returned no JSON body: ${text.slice(0, 200)}`);
     let body;
@@ -951,27 +1107,34 @@ export function parseFileMemoryHits(text) {
     catch (err) {
         throw new Error(`memories_for_file returned an unreadable body: ${String(err)}`);
     }
-    const raw = Array.isArray(body.hits) ? body.hits : Array.isArray(body.memories) ? body.memories : [];
+    const raw = Array.isArray(body.hits)
+        ? body.hits
+        : Array.isArray(body.memories)
+            ? body.memories
+            : [];
     const out = [];
     for (const item of raw) {
-        if (typeof item !== "object" || item === null)
+        if (typeof item !== 'object' || item === null)
             continue;
         const hit = item;
         const id = asString(hit.id) ?? asString(hit.memory_id);
-        const valid_from = asString(hit.valid_from) ?? "";
+        const valid_from = asString(hit.valid_from) ?? '';
         if (!id)
             continue;
         out.push({
             id,
             valid_from,
-            memory_type: asString(hit.memory_type) ?? asString(hit.type) ?? "memory",
-            content: asString(hit.content) ?? asString(hit.text) ?? asString(hit.summary) ?? "",
+            memory_type: asString(hit.memory_type) ?? asString(hit.type) ?? 'memory',
+            content: asString(hit.content) ??
+                asString(hit.text) ??
+                asString(hit.summary) ??
+                ''
         });
     }
     return out;
 }
 function formatFileMemorySnippet(hit) {
-    const where = hit.valid_from ? ` (valid_from ${hit.valid_from})` : "";
+    const where = hit.valid_from ? ` (valid_from ${hit.valid_from})` : '';
     return `[NeuroStrata ${hit.memory_type} ${hit.id}${where}] ${hit.content}`;
 }
 function capSnippets(snippets) {
@@ -992,19 +1155,28 @@ function capSnippets(snippets) {
  * exists on disk, so unit tests do not dirty random directories unless requested.
  */
 function recordLocalSessionQuery(namespace, tool, query, recordLedgerDir) {
-    const rootDir = recordLedgerDir ? findProjectRoot(recordLedgerDir) : findProjectRoot();
-    const shouldRecord = recordLedgerDir !== undefined || existsSync(join(rootDir, ".NeuroStrata"));
+    const rootDir = recordLedgerDir
+        ? findProjectRoot(recordLedgerDir)
+        : findProjectRoot();
+    const shouldRecord = recordLedgerDir !== undefined || existsSync(join(rootDir, '.NeuroStrata'));
     if (!shouldRecord)
         return;
     // The governed prefix is the queried path itself. Widening it to the first
     // path component would claim coverage of every sibling file under that
     // directory, so the pre-commit hook would silence warnings for files that
     // were never looked up.
-    const entry = { ts: Math.floor(Date.now() / 1000), tool, query, governed_prefixes: [query] };
-    const ledgerPath = join(rootDir, ".NeuroStrata", "session_queries.json");
+    const entry = {
+        ts: Math.floor(Date.now() / 1000),
+        tool,
+        query,
+        governed_prefixes: [query]
+    };
+    const ledgerPath = join(rootDir, '.NeuroStrata', 'session_queries.json');
     let parsed;
     try {
-        parsed = existsSync(ledgerPath) ? JSON.parse(readFileSync(ledgerPath, "utf8")) : undefined;
+        parsed = existsSync(ledgerPath)
+            ? JSON.parse(readFileSync(ledgerPath, 'utf8'))
+            : undefined;
     }
     catch {
         parsed = undefined;
@@ -1014,9 +1186,15 @@ function recordLocalSessionQuery(namespace, tool, query, recordLedgerDir) {
         // Legacy top-level array: wrap it into the object form.
         out = { namespace, queries: [...parsed, entry] };
     }
-    else if (parsed !== null && typeof parsed === "object" && Array.isArray(parsed.queries)) {
+    else if (parsed !== null &&
+        typeof parsed === 'object' &&
+        Array.isArray(parsed.queries)) {
         const obj = parsed;
-        out = { ...obj, namespace: obj.namespace || namespace, queries: [...obj.queries, entry] };
+        out = {
+            ...obj,
+            namespace: obj.namespace || namespace,
+            queries: [...obj.queries, entry]
+        };
     }
     else {
         out = { namespace, queries: [entry] };
@@ -1041,11 +1219,11 @@ function cacheSubagentFileRecall(key, entries) {
 }
 function formatAstEntryList(val, maxItems = 5) {
     if (!Array.isArray(val))
-        return "[]";
+        return '[]';
     const arr = val.map((item) => {
-        if (typeof item === "string")
+        if (typeof item === 'string')
             return item;
-        if (typeof item === "object" && item !== null) {
+        if (typeof item === 'object' && item !== null) {
             const rec = item;
             const symbol_name = asString(rec.symbol_name);
             const name = asString(rec.name);
@@ -1058,8 +1236,8 @@ function formatAstEntryList(val, maxItems = 5) {
         return String(item);
     });
     const capped = arr.slice(0, maxItems);
-    const suffix = arr.length > maxItems ? `,+${arr.length - maxItems}` : "";
-    return `[${capped.join(",")}${suffix}]`;
+    const suffix = arr.length > maxItems ? `,+${arr.length - maxItems}` : '';
+    return `[${capped.join(',')}${suffix}]`;
 }
 function parseRawFileRecallEntries(text, normalized) {
     const entries = [];
@@ -1073,28 +1251,36 @@ function parseRawFileRecallEntries(text, normalized) {
     for (const hit of parseFileMemoryHits(text)) {
         entries.push({
             dedupKey: `${hit.id}:${hit.valid_from}`,
-            snippet: formatFileMemorySnippet(hit),
+            snippet: formatFileMemorySnippet(hit)
         });
     }
-    let astDetail = "";
-    if (Array.isArray(body.related_memories) && body.related_memories.length > 0) {
+    let astDetail = '';
+    if (Array.isArray(body.related_memories) &&
+        body.related_memories.length > 0) {
         astDetail = `related_memories=${body.related_memories.length}(${formatAstEntryList(body.related_memories, 5)})`;
     }
-    if (body.ast_summary && typeof body.ast_summary === "object") {
+    if (body.ast_summary && typeof body.ast_summary === 'object') {
         const ast = body.ast_summary;
         const parts = [];
-        if (typeof ast.blast_radius_count === "number") {
+        if (typeof ast.blast_radius_count === 'number') {
             parts.push(`blast_radius_count=${ast.blast_radius_count}`);
         }
         if (ast.blast_radius !== undefined) {
             if (Array.isArray(ast.blast_radius)) {
                 parts.push(`blast_radius=${formatAstEntryList(ast.blast_radius, 5)}`);
             }
-            else if (typeof ast.blast_radius === "number" || typeof ast.blast_radius === "string") {
+            else if (typeof ast.blast_radius === 'number' ||
+                typeof ast.blast_radius === 'string') {
                 parts.push(`blast_radius=${String(ast.blast_radius)}`);
             }
         }
-        for (const key of ["symbols", "callers", "callees", "imports", "importers"]) {
+        for (const key of [
+            'symbols',
+            'callers',
+            'callees',
+            'imports',
+            'importers'
+        ]) {
             const val = ast[key];
             if (Array.isArray(val) && val.length > 0) {
                 parts.push(`${key}=${formatAstEntryList(val, 5)}`);
@@ -1104,7 +1290,9 @@ function parseRawFileRecallEntries(text, normalized) {
             }
         }
         if (parts.length > 0) {
-            astDetail += astDetail ? ` | ast_summary={${parts.join(", ")}}` : `ast_summary={${parts.join(", ")}}`;
+            astDetail += astDetail
+                ? ` | ast_summary={${parts.join(', ')}}`
+                : `ast_summary={${parts.join(', ')}}`;
         }
     }
     if (astDetail) {
@@ -1118,7 +1306,7 @@ function parseRawFileRecallEntries(text, normalized) {
  */
 export async function prefetchMemoriesForFile(namespace, filePath, opts) {
     const normalized = filePath.trim();
-    if (normalized === "")
+    if (normalized === '')
         return [];
     const key = `${namespace}:${normalized}`;
     if (prefetchedPaths.has(key)) {
@@ -1128,10 +1316,10 @@ export async function prefetchMemoriesForFile(namespace, filePath, opts) {
     if (!mcpClient)
         return [];
     try {
-        const text = await mcpClient.callTool("neurostrata_memories_for_file", {
+        const text = await mcpClient.callTool('neurostrata_memories_for_file', {
             namespace,
             path: normalized,
-            limit: 5,
+            limit: 5
         });
         recordPrefetchedPath(key);
         // Persist conceptual bridges from the hits into active_session.json so
@@ -1143,7 +1331,9 @@ export async function prefetchMemoriesForFile(namespace, filePath, opts) {
                 let topBridges = [];
                 try {
                     const body = JSON.parse(text);
-                    hits = Array.isArray(body.memories ?? body.hits) ? (body.memories ?? body.hits) : [];
+                    hits = Array.isArray(body.memories ?? body.hits)
+                        ? (body.memories ?? body.hits)
+                        : [];
                     if (Array.isArray(body.conceptual_bridges)) {
                         topBridges = body.conceptual_bridges;
                     }
@@ -1151,7 +1341,10 @@ export async function prefetchMemoriesForFile(namespace, filePath, opts) {
                 catch {
                     hits = [];
                 }
-                const bridges = [...extractConceptualBridges(hits), ...topBridges];
+                const bridges = [
+                    ...extractConceptualBridges(hits),
+                    ...topBridges
+                ];
                 if (bridges.length > 0) {
                     persistConceptualBridges(projectRoot, bridges);
                 }
@@ -1161,7 +1354,7 @@ export async function prefetchMemoriesForFile(namespace, filePath, opts) {
             }
         }
         try {
-            recordLocalSessionQuery(namespace, "neurostrata_memories_for_file", normalized, opts?.recordLedgerDir);
+            recordLocalSessionQuery(namespace, 'neurostrata_memories_for_file', normalized, opts?.recordLedgerDir);
         }
         catch {
             // ledger is best-effort
@@ -1220,7 +1413,7 @@ export function restorePrefetchDelivery(namespace, filePath) {
 }
 async function recallMemoriesForSubagentFile(namespace, filePath, seenInPrompt) {
     const normalized = filePath.trim();
-    if (normalized === "")
+    if (normalized === '')
         return [];
     const key = `${namespace}:${normalized}`;
     let entries = subagentFileRecallCache.get(key);
@@ -1228,13 +1421,13 @@ async function recallMemoriesForSubagentFile(namespace, filePath, seenInPrompt) 
         if (!mcpClient)
             return [];
         try {
-            const text = await mcpClient.callTool("neurostrata_memories_for_file", {
+            const text = await mcpClient.callTool('neurostrata_memories_for_file', {
                 namespace,
                 path: normalized,
-                limit: 5,
+                limit: 5
             });
             try {
-                recordLocalSessionQuery(namespace, "neurostrata_memories_for_file", normalized);
+                recordLocalSessionQuery(namespace, 'neurostrata_memories_for_file', normalized);
             }
             catch {
                 // ledger is best-effort
@@ -1261,22 +1454,28 @@ async function recallMemoriesForSubagentFile(namespace, filePath, seenInPrompt) 
     return capSnippets(out);
 }
 export function formatFileTouchRecallBlock(filePath, snippets) {
-    return `[NeuroStrata Governing Memories for ${filePath}]\n${snippets.join("\n")}`;
+    return `[NeuroStrata Governing Memories for ${filePath}]\n${snippets.join('\n')}`;
 }
 // ──────────────────────────────────────────────────────────────────────
 // Subagent prompt injection (Enhancement 2 & 3)
 // ──────────────────────────────────────────────────────────────────────
-export const SUBAGENT_CONTEXT_MARKER = "### NeuroStrata Task & Graph Context";
+export const SUBAGENT_CONTEXT_MARKER = '### NeuroStrata Task & Graph Context';
 // Read-only subagents (review / check / explore) have no NeuroStrata MCP tools
 // available. Telling them to call task_update/memories_for_file produces
 // InvalidToolCallsError churn, so their header omits the tool-call directive.
 const READ_ONLY_SUBAGENT_AGENTS = new Set([
-    "reviewer", "checker", "checker-free", "explore",
+    'reviewer',
+    'checker',
+    'checker-free',
+    'explore'
 ]);
 export function isReadOnlySubagentAgent(agentId) {
     if (!agentId)
         return false;
-    const normalized = String(agentId).trim().toLowerCase().replace(/^.*[/:]/, "");
+    const normalized = String(agentId)
+        .trim()
+        .toLowerCase()
+        .replace(/^.*[/:]/, '');
     return READ_ONLY_SUBAGENT_AGENTS.has(normalized);
 }
 /** Resolve the subagent agent id from the fields harnesses use to name it. */
@@ -1295,39 +1494,66 @@ export function resolveSubagentAgentId(target) {
 }
 /** Code-Mode harnesses (OpenCode V2) expose MCP via `execute` + tools.neurostrata.*. */
 export function detectCodeMode(ctx, cfg) {
-    if (ctx?.codeMode === true || ctx?.tool?.codeMode === true || cfg?.codeMode === true) {
+    if (ctx?.codeMode === true ||
+        ctx?.tool?.codeMode === true ||
+        cfg?.codeMode === true) {
         return true;
     }
-    const harness = (asString(ctx?.harness ?? ctx?.harnessName ?? ctx?.adapter?.name ?? ctx?.tool?.name ?? activeHarnessName) ?? "").toLowerCase();
-    return harness.includes("opencode") || harness.includes("code-mode") || harness.includes("codemode");
+    const harness = (asString(ctx?.harness ??
+        ctx?.harnessName ??
+        ctx?.adapter?.name ??
+        ctx?.tool?.name ??
+        activeHarnessName) ?? '').toLowerCase();
+    return (harness.includes('opencode') ||
+        harness.includes('code-mode') ||
+        harness.includes('codemode'));
 }
-export function buildSubagentContextHeader(namespace, taskId, extraContext, options) {
-    const taskLabel = taskId ?? "unclaimed (claim a task first)";
-    const extra = extraContext && extraContext.trim() ? `\n${extraContext.trim()}\n` : "";
+/**
+ * Render a value inside a markdown backtick code span without allowing a
+ * breakout: backticks close the span and newlines end its line, so both are
+ * collapsed to single spaces. The namespace is not privileged input — it can
+ * arrive from a committed `.NeuroStrata/session_queries.json`, plugin config,
+ * or an environment variable — so every header interpolation goes through
+ * here (issue #316).
+ */
+export function markdownCodeSpanValue(value) {
+    return String(value ?? '').replace(/[`\r\n\u2028\u2029]+/g, ' ');
+}
+function buildSubagentContextHeaderInternal(namespace, taskId, extraContext, options) {
+    const taskLabel = taskId ?? 'unclaimed (claim a task first)';
+    const extra = extraContext && extraContext.trim() ? `\n${extraContext.trim()}\n` : '';
     let lookupRule;
     if (isReadOnlySubagentAgent(options?.agentId)) {
         lookupRule =
-            "- Read-Only Subagent: no NeuroStrata MCP mutation tools are available; skip the graph-lookup and task_update directives (review/edit tools only).\n";
+            '- Read-Only Subagent: no NeuroStrata MCP mutation tools are available; skip the graph-lookup and task_update directives (review/edit tools only).\n';
     }
     else if (options?.codeMode === true) {
         lookupRule =
-            "- Mandatory Graph-First Lookup Rule: Before editing any file, check whether its path and governing memory IDs (`mem-...`) are already listed in the auto-injected context block in your prompt. For any file you touch that is NOT listed, call `tools.neurostrata.memories_for_file` (and `tools.neurostrata.task_update` after notes) via the `execute` tool, not bare MCP tool names.\n";
+            '- Mandatory Graph-First Lookup Rule: Before editing any file, check whether its path and governing memory IDs (`mem-...`) are already listed in the auto-injected context block in your prompt. For any file you touch that is NOT listed, call `tools.neurostrata.memories_for_file` (and `tools.neurostrata.task_update` after notes) via the `execute` tool, not bare MCP tool names.\n';
     }
     else {
         lookupRule =
-            "- Mandatory Graph-First Lookup Rule: Before editing any file, check whether its path and governing memory IDs (`mem-...`) are already listed in the auto-injected context block in your prompt. For any file you touch that is NOT listed in that block, call `neurostrata_memories_for_file` first (or `neurostrata_search_memory` / `neurostrata_related`).\n";
+            '- Mandatory Graph-First Lookup Rule: Before editing any file, check whether its path and governing memory IDs (`mem-...`) are already listed in the auto-injected context block in your prompt. For any file you touch that is NOT listed in that block, call `neurostrata_memories_for_file` first (or `neurostrata_search_memory` / `neurostrata_related`).\n';
     }
     return (`${SUBAGENT_CONTEXT_MARKER} (AUTO-INJECTED BY NEUROSTRATA PLUGIN)\n` +
-        `- Namespace: \`${namespace}\` | Active Task ID: \`${taskLabel}\`\n` +
+        `- Namespace: \`${markdownCodeSpanValue(namespace)}\` | Active Task ID: \`${markdownCodeSpanValue(taskLabel)}\`\n` +
         lookupRule +
         extra +
         `\n`);
 }
+/**
+ * Public header builder: sanitizes the two caller-supplied values before
+ * rendering (issue #316).
+ */
+export function buildSubagentContextHeader(namespace, taskId, extraContext, options) {
+    return buildSubagentContextHeaderInternal(namespace, taskId, extraContext, options);
+}
 export function injectSubagentPrompt(target, namespace, taskId, extraContext, options) {
-    const raw = typeof target.prompt === "string" ? target.prompt : null;
+    const raw = typeof target.prompt === 'string' ? target.prompt : null;
     if (raw === null || raw.includes(SUBAGENT_CONTEXT_MARKER))
         return false;
-    target.prompt = buildSubagentContextHeader(namespace, taskId, extraContext, options) + raw;
+    target.prompt =
+        buildSubagentContextHeader(namespace, taskId, extraContext, options) + raw;
     return true;
 }
 export function extractRepoFilePaths(promptText) {
@@ -1342,17 +1568,17 @@ export function extractRepoFilePaths(promptText) {
         const raw = match[0];
         let start = match.index;
         // Skip runs immediately preceded by "://" (URL bodies).
-        if (start >= 3 && promptText.slice(start - 3, start) === "://")
+        if (start >= 3 && promptText.slice(start - 3, start) === '://')
             continue;
         let token = raw;
         // Trim leading "./" or "/".
         for (;;) {
-            if (token.startsWith("./")) {
+            if (token.startsWith('./')) {
                 token = token.slice(2);
                 start += 2;
                 continue;
             }
-            if (token.startsWith("/")) {
+            if (token.startsWith('/')) {
                 token = token.slice(1);
                 start += 1;
                 continue;
@@ -1361,7 +1587,7 @@ export function extractRepoFilePaths(promptText) {
         }
         // Trim trailing "." or "/".
         for (;;) {
-            if (token.endsWith(".") || token.endsWith("/")) {
+            if (token.endsWith('.') || token.endsWith('/')) {
                 token = token.slice(0, -1);
                 continue;
             }
@@ -1369,12 +1595,12 @@ export function extractRepoFilePaths(promptText) {
         }
         // A run such as "//example.com/foo/bar.ts" trimmed past its slashes now
         // begins right after "://", so re-check with the adjusted offset.
-        if (start >= 3 && promptText.slice(start - 3, start) === "://")
+        if (start >= 3 && promptText.slice(start - 3, start) === '://')
             continue;
-        if (!token.includes("/"))
+        if (!token.includes('/'))
             continue;
-        const segments = token.split("/");
-        if (segments.some((seg) => seg.length === 0 || seg === "." || seg === ".."))
+        const segments = token.split('/');
+        if (segments.some((seg) => seg.length === 0 || seg === '.' || seg === '..'))
             continue;
         const finalSegment = segments[segments.length - 1];
         const extMatch = /\.[A-Za-z0-9]{1,8}$/.exec(finalSegment);
@@ -1402,10 +1628,17 @@ export const cachedSubagentPromptByTask = cachedTaskInjection;
  */
 export async function resolveActiveTaskFromDaemon(namespace, preferredTaskId) {
     if (!mcpClient) {
-        return { taskId: activeTaskId, sessionId: activeSessionId, promptInjection: null };
+        return {
+            taskId: activeTaskId,
+            sessionId: activeSessionId,
+            promptInjection: null
+        };
     }
     try {
-        const text = await mcpClient.callTool("neurostrata_task_list", { namespace, status: "in_progress" });
+        const text = await mcpClient.callTool('neurostrata_task_list', {
+            namespace,
+            status: 'in_progress'
+        });
         let body = {};
         try {
             body = asRecord(JSON.parse(text));
@@ -1413,20 +1646,24 @@ export async function resolveActiveTaskFromDaemon(namespace, preferredTaskId) {
         catch {
             body = {};
         }
-        const tasks = Array.isArray(body.tasks) ? body.tasks : Array.isArray(body.items) ? body.items : [];
+        const tasks = Array.isArray(body.tasks)
+            ? body.tasks
+            : Array.isArray(body.items)
+                ? body.items
+                : [];
         const projectRoot = effectiveProjectRoot(config);
         let target = null;
         let targetRank = -1;
         let firstInProgress = null;
         for (const item of tasks) {
-            if (typeof item !== "object" || item === null)
+            if (typeof item !== 'object' || item === null)
                 continue;
             const rec = item;
             const recId = asString(rec.id);
             if (recId) {
                 cachedTaskInjection.set(recId, asString(rec.subagent_prompt_injection) ?? null);
             }
-            if (asString(rec.status) !== "in_progress")
+            if (asString(rec.status) !== 'in_progress')
                 continue;
             if (!firstInProgress)
                 firstInProgress = rec;
@@ -1439,7 +1676,10 @@ export async function resolveActiveTaskFromDaemon(namespace, preferredTaskId) {
             let rank = 1;
             if (preferredTaskId && recId === preferredTaskId)
                 rank = 5;
-            else if (activeSessionId && recSession === activeSessionId && recWorktree && recWorktree === projectRoot)
+            else if (activeSessionId &&
+                recSession === activeSessionId &&
+                recWorktree &&
+                recWorktree === projectRoot)
                 rank = 4;
             else if (activeSessionId && recSession === activeSessionId)
                 rank = 3;
@@ -1452,7 +1692,10 @@ export async function resolveActiveTaskFromDaemon(namespace, preferredTaskId) {
         }
         if (!target)
             target = firstInProgress;
-        if (!target && tasks.length > 0 && typeof tasks[0] === "object" && tasks[0] !== null) {
+        if (!target &&
+            tasks.length > 0 &&
+            typeof tasks[0] === 'object' &&
+            tasks[0] !== null) {
             target = tasks[0];
         }
         if (target) {
@@ -1463,7 +1706,9 @@ export async function resolveActiveTaskFromDaemon(namespace, preferredTaskId) {
             if (taskId) {
                 if (!preferredTaskId || taskId === preferredTaskId) {
                     activeTaskId = taskId;
-                    if (!activeSessionId || sessionId === activeSessionId || preferredTaskId) {
+                    if (!activeSessionId ||
+                        sessionId === activeSessionId ||
+                        preferredTaskId) {
                         activeSessionId = sessionId;
                     }
                 }
@@ -1475,7 +1720,9 @@ export async function resolveActiveTaskFromDaemon(namespace, preferredTaskId) {
             return {
                 taskId: preferredTaskId ?? taskId ?? null,
                 sessionId: sessionId ?? activeSessionId,
-                promptInjection: preferredTaskId ? (cachedTaskInjection.get(preferredTaskId) ?? promptInjection) : promptInjection,
+                promptInjection: preferredTaskId
+                    ? (cachedTaskInjection.get(preferredTaskId) ?? promptInjection)
+                    : promptInjection
             };
         }
         if (preferredTaskId && !cachedTaskInjection.has(preferredTaskId)) {
@@ -1485,7 +1732,11 @@ export async function resolveActiveTaskFromDaemon(namespace, preferredTaskId) {
     catch {
         // fail-soft: daemon unreachable or "Unknown tool"
     }
-    return { taskId: activeTaskId, sessionId: activeSessionId, promptInjection: null };
+    return {
+        taskId: activeTaskId,
+        sessionId: activeSessionId,
+        promptInjection: null
+    };
 }
 /**
  * Prefetch governing memories for repo file paths mentioned in a subagent prompt and
@@ -1493,7 +1744,8 @@ export async function resolveActiveTaskFromDaemon(namespace, preferredTaskId) {
  * target prompt. Idempotent.
  */
 export async function enrichAndInjectSubagentPrompt(target, namespace, taskId) {
-    if (typeof target.prompt !== "string" || target.prompt.includes(SUBAGENT_CONTEXT_MARKER)) {
+    if (typeof target.prompt !== 'string' ||
+        target.prompt.includes(SUBAGENT_CONTEXT_MARKER)) {
         return false;
     }
     let effectiveTaskId = taskId ?? null;
@@ -1505,14 +1757,17 @@ export async function enrichAndInjectSubagentPrompt(target, namespace, taskId) {
     }
     else if (!cachedTaskInjection.has(effectiveTaskId)) {
         const resolved = await resolveActiveTaskFromDaemon(namespace, effectiveTaskId);
-        injection = cachedTaskInjection.get(effectiveTaskId) ?? resolved.promptInjection ?? null;
+        injection =
+            cachedTaskInjection.get(effectiveTaskId) ??
+                resolved.promptInjection ??
+                null;
     }
     else {
         injection = cachedTaskInjection.get(effectiveTaskId) ?? null;
     }
     const headerOptions = {
         agentId: resolveSubagentAgentId(target),
-        codeMode: detectCodeMode(pluginCtx, config),
+        codeMode: detectCodeMode(pluginCtx, config)
     };
     const extraLines = [];
     if (injection)
@@ -1528,7 +1783,7 @@ export async function enrichAndInjectSubagentPrompt(target, namespace, taskId) {
             // prefetch failures never block subagent injection
         }
     }
-    return injectSubagentPrompt(target, namespace, effectiveTaskId, extraLines.join("\n"), headerOptions);
+    return injectSubagentPrompt(target, namespace, effectiveTaskId, extraLines.join('\n'), headerOptions);
 }
 // ──────────────────────────────────────────────────────────────────────
 // Session / task tracking state
@@ -1540,18 +1795,19 @@ let activeHarnessName = null;
 let mcpClient = undefined;
 let pluginCtx = null;
 const TASK_MUTATION_TOOLS = new Set([
-    "neurostrata_task_claim",
-    "neurostrata_task_update",
-    "neurostrata_task_complete",
+    'neurostrata_task_claim',
+    'neurostrata_task_update',
+    'neurostrata_task_complete'
 ]);
 const MEMORY_MUTATION_TOOLS = new Set([
-    "neurostrata_archive_memory",
-    "neurostrata_add_memory",
-    "neurostrata_supersede_memory",
-    "neurostrata_update_memory",
+    'neurostrata_archive_memory',
+    'neurostrata_add_memory',
+    'neurostrata_supersede_memory',
+    'neurostrata_update_memory'
 ]);
 function trackNativeTaskToolCall(toolName, payloadArgs, outerInput) {
-    if (!TASK_MUTATION_TOOLS.has(toolName) && !MEMORY_MUTATION_TOOLS.has(toolName))
+    if (!TASK_MUTATION_TOOLS.has(toolName) &&
+        !MEMORY_MUTATION_TOOLS.has(toolName))
         return;
     const sessionId = asString(payloadArgs.session_id) ??
         asString(outerInput?.session_id) ??
@@ -1559,8 +1815,8 @@ function trackNativeTaskToolCall(toolName, payloadArgs, outerInput) {
     if (sessionId)
         activeSessionId = sessionId;
     const taskId = asString(payloadArgs.id);
-    if (toolName === "neurostrata_task_claim" ||
-        toolName === "neurostrata_task_complete" ||
+    if (toolName === 'neurostrata_task_claim' ||
+        toolName === 'neurostrata_task_complete' ||
         payloadArgs.note !== undefined) {
         mutationsSinceNote = 0;
     }
@@ -1571,14 +1827,14 @@ function trackNativeTaskToolCall(toolName, payloadArgs, outerInput) {
         subagentFileRecallCache.clear();
         return;
     }
-    if (toolName === "neurostrata_task_complete") {
+    if (toolName === 'neurostrata_task_complete') {
         if (activeTaskId)
             cachedTaskInjection.delete(activeTaskId);
         activeTaskId = null;
     }
     else if (taskId) {
-        if (toolName === "neurostrata_task_claim" ||
-            toolName === "neurostrata_task_update" ||
+        if (toolName === 'neurostrata_task_claim' ||
+            toolName === 'neurostrata_task_update' ||
             payloadArgs.title !== undefined) {
             cachedTaskInjection.delete(taskId);
             if (activeTaskId)
@@ -1614,7 +1870,7 @@ export function getTrackingState() {
 /** Structured marker the daemon writes on its error/diagnostic channel when
  *  it reports buffer-pool / RSS pressure. Memory payloads and tool-result
  *  rows never carry it, so matching it can never misfire on user content. */
-export const DAEMON_MEMORY_ADVICE_MARKER = "NEUROSTRATA_ADVICE[daemon_memory]";
+export const DAEMON_MEMORY_ADVICE_MARKER = 'NEUROSTRATA_ADVICE[daemon_memory]';
 /** One advisory per session per window: repeated pressure is one message,
  *  not one per errored request. */
 const ADVISORY_THROTTLE_MS = 10 * 60 * 1000;
@@ -1633,22 +1889,24 @@ export function flushPendingDaemonAdvisory() {
  * guidance string once per 10-minute window, or `null` when already shown
  * or absent. */
 export function extractDaemonMemoryAdvisory(errorChannelText, nowMs = Date.now()) {
-    if (!errorChannelText || !errorChannelText.includes(DAEMON_MEMORY_ADVICE_MARKER)) {
+    if (!errorChannelText ||
+        !errorChannelText.includes(DAEMON_MEMORY_ADVICE_MARKER)) {
         return null;
     }
-    if (advisoryLastShown > 0 && nowMs - advisoryLastShown < ADVISORY_THROTTLE_MS) {
+    if (advisoryLastShown > 0 &&
+        nowMs - advisoryLastShown < ADVISORY_THROTTLE_MS) {
         return null;
     }
     advisoryLastShown = nowMs;
     return [
-        "[NeuroStrata — DAEMON MEMORY ADVISORY]",
-        "The daemon reports buffer-pool or RSS pressure.",
-        "Raise NEUROSTRATA_BUFFER_POOL_MB (or the daemon's configured buffer pool) and restart the daemon; repeated advisories are suppressed for 10 minutes.",
-    ].join(" ");
+        '[NeuroStrata — DAEMON MEMORY ADVISORY]',
+        'The daemon reports buffer-pool or RSS pressure.',
+        "Raise NEUROSTRATA_BUFFER_POOL_MB (or the daemon's configured buffer pool) and restart the daemon; repeated advisories are suppressed for 10 minutes."
+    ].join(' ');
 }
 const sessionEpochs = new Map();
 function sessionEpochState(sessionId) {
-    const sid = sessionId ?? "__default__";
+    const sid = sessionId ?? '__default__';
     let state = sessionEpochs.get(sid);
     if (!state) {
         state = { epoch: 0, baselineInjectedEpoch: -1, seenFiles: new Set() };
@@ -1671,7 +1929,7 @@ export function sessionSeenFiles(sessionId) {
     return sessionEpochState(sessionId).seenFiles;
 }
 export function resetSessionEpoch(sessionId) {
-    sessionEpochs.delete(sessionId ?? "__default__");
+    sessionEpochs.delete(sessionId ?? '__default__');
 }
 export function resetAllSessionEpochs() {
     sessionEpochs.clear();
@@ -1687,10 +1945,10 @@ export async function sessionContextHandler(event, config) {
     const st = sessionEpochState(sessionId);
     const projectRoot = effectiveProjectRoot(config);
     let active = null;
-    const sessionPath = join(projectRoot, ".NeuroStrata", "active_session.json");
+    const sessionPath = join(projectRoot, '.NeuroStrata', 'active_session.json');
     if (existsSync(sessionPath)) {
         try {
-            active = asRecord(JSON.parse(readFileSync(sessionPath, "utf8")));
+            active = asRecord(JSON.parse(readFileSync(sessionPath, 'utf8')));
         }
         catch {
             active = null;
@@ -1698,7 +1956,7 @@ export async function sessionContextHandler(event, config) {
     }
     const taskId = asString(active?.task_id);
     const goldenRules = Array.isArray(active?.golden_rules)
-        ? active.golden_rules.filter((g) => typeof g === "string" && g.trim() !== "")
+        ? active.golden_rules.filter((g) => typeof g === 'string' && g.trim() !== '')
         : [];
     if (!active || (!taskId && goldenRules.length === 0))
         return; // nothing to baseline-inject
@@ -1707,13 +1965,13 @@ export async function sessionContextHandler(event, config) {
         const ns = asString(active.namespace) ?? config.namespace;
         const parts = [];
         if (taskId) {
-            const status = asString(active.status) ?? "";
-            parts.push(`[NeuroStrata Active Context] Namespace: ${ns} | Active Task: ${taskId} [${status}]`);
+            const status = asString(active.status) ?? '';
+            parts.push(`[NeuroStrata Active Context] Namespace: ${markdownCodeSpanValue(ns)} | Active Task: ${markdownCodeSpanValue(taskId)} [${markdownCodeSpanValue(status)}]`);
         }
         if (goldenRules.length > 0) {
-            parts.push(`[NeuroStrata Golden Rules — ALWAYS ENFORCED]\n${goldenRules.map((g) => `  - ${g}`).join("\n")}`);
+            parts.push(`[NeuroStrata Golden Rules — ALWAYS ENFORCED]\n${goldenRules.map((g) => `  - ${g}`).join('\n')}`);
         }
-        let extra = "";
+        let extra = '';
         const injection = asString(active.subagent_prompt_injection);
         if (injection)
             extra += `\n${injection.trim()}`;
@@ -1721,20 +1979,20 @@ export async function sessionContextHandler(event, config) {
         if (bridges !== undefined && bridges !== null && Array.isArray(bridges)) {
             const formatted = bridges
                 .map((b) => {
-                if (typeof b === "string")
+                if (typeof b === 'string')
                     return b;
                 const bridge = b;
-                const type = bridge.memory_type ?? bridge.target_type ?? "memory";
+                const type = bridge.memory_type ?? bridge.target_type ?? 'memory';
                 const id = bridge.id ?? bridge.target_id;
-                const content = bridge.content ?? bridge.target_summary ?? "";
-                const why = bridge.why_connected ?? bridge.path ?? "";
+                const content = bridge.content ?? bridge.target_summary ?? '';
+                const why = bridge.why_connected ?? bridge.path ?? '';
                 return `[${type}] ${id}: ${content} (${why})`;
             })
-                .join("; ");
+                .join('; ');
             extra += `\n[NeuroStrata Conceptual Bridges] ${formatted}`;
         }
-        const full = parts.join("\n") + extra;
-        if (typeof event.additionalContext === "string") {
+        const full = parts.join('\n') + extra;
+        if (typeof event.additionalContext === 'string') {
             event.additionalContext += `\n${full}`;
         }
         else {
@@ -1845,7 +2103,7 @@ function consumePendingRecall(meta, target) {
     return shifted;
 }
 function extractPatchPath(raw) {
-    if (typeof raw !== "string")
+    if (typeof raw !== 'string')
         return undefined;
     const m = raw.match(/(?:^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*|^---\s+a\/|^\+\+\+\s+b\/)([^\r\n]+)/m);
     return m?.[1]?.trim();
@@ -1875,20 +2133,20 @@ export function extractToolName(event) {
         asString(event?.tool_name) ??
         asString(event?.action) ??
         asString(event?.command) ??
-        "");
+        '');
 }
 /** Native NeuroStrata control-plane tools: never nudge on these. */
 const NEUROSTRATA_NATIVE_TOOLS = new Set([
-    "neurostrata_task_claim",
-    "neurostrata_task_update",
-    "neurostrata_task_complete",
-    "neurostrata_add_memory",
-    "neurostrata_archive_memory",
-    "neurostrata_supersede_memory",
-    "neurostrata_update_memory",
-    "neurostrata_guard_validate",
-    "neurostrata_memories_for_file",
-    "neurostrata_locate",
+    'neurostrata_task_claim',
+    'neurostrata_task_update',
+    'neurostrata_task_complete',
+    'neurostrata_add_memory',
+    'neurostrata_archive_memory',
+    'neurostrata_supersede_memory',
+    'neurostrata_update_memory',
+    'neurostrata_guard_validate',
+    'neurostrata_memories_for_file',
+    'neurostrata_locate'
 ]);
 /**
  * Read the active task_id from `.NeuroStrata/active_session.json` so the
@@ -1896,11 +2154,11 @@ const NEUROSTRATA_NATIVE_TOOLS = new Set([
  * the server-side auto-commit gate (task_id.is_some()) from the live hook.
  */
 function readActiveTaskId(projectRoot) {
-    const sessionPath = join(projectRoot, ".NeuroStrata", "active_session.json");
+    const sessionPath = join(projectRoot, '.NeuroStrata', 'active_session.json');
     if (!existsSync(sessionPath))
         return null;
     try {
-        const active = asRecord(JSON.parse(readFileSync(sessionPath, "utf8")));
+        const active = asRecord(JSON.parse(readFileSync(sessionPath, 'utf8')));
         return asString(active?.task_id ?? active?.active_task_id) || null;
     }
     catch {
@@ -1910,55 +2168,71 @@ function readActiveTaskId(projectRoot) {
 const executeAfterHandler = async (output, secondArg) => {
     // The host may pass (input, output) or a single `output`/`event` argument
     // whose `.output` holds the real output. Resolve metadata and target object.
-    const hasSecondObject = secondArg !== undefined && secondArg !== null && typeof secondArg === "object";
+    const hasSecondObject = secondArg !== undefined &&
+        secondArg !== null &&
+        typeof secondArg === 'object';
     const meta = asRecord(output);
     let target = hasSecondObject ? secondArg : output;
-    if (!hasSecondObject && target && typeof target === "object" && target.output !== undefined && typeof target.output === "object") {
+    if (!hasSecondObject &&
+        target &&
+        typeof target === 'object' &&
+        target.output !== undefined &&
+        typeof target.output === 'object') {
         target = target.output;
     }
     const targetRec = asRecord(target);
     const event = target;
-    const toolName = extractToolName(event);
+    // Resolve the tool name from BOTH arguments (issue #311): in the
+    // two-argument (input, output) form Code Mode hosts carry the name on the
+    // input argument, while the output argument holds the result text.
+    const toolName = extractToolName(event) || extractToolName(output);
     // OpenCode V2 envelope: { name, callID, args, status, result: { content, output, metadata } }
     // Read raw tool text in priority order. OpenCode v2.2.6 delivers
     // `event.result.content` as an array of content parts `[{ type: "text", text: ... }]`.
-    const rawText = typeof event?.result?.content === "string"
+    const rawText = typeof event?.result?.content === 'string'
         ? event.result.content
         : Array.isArray(event?.result?.content)
             ? event.result.content
-                .filter((p) => p && p.type === "text" && typeof p.text === "string")
+                .filter((p) => p && p.type === 'text' && typeof p.text === 'string')
                 .map((p) => p.text)
-                .join("\n")
-            : typeof event?.result?.output === "string"
+                .join('\n')
+            : typeof event?.result?.output === 'string'
                 ? event.result.output
-                : typeof event?.output === "string"
+                : typeof event?.output === 'string'
                     ? event.output
-                    : typeof event?.result === "string"
+                    : typeof event?.result === 'string'
                         ? event.result
-                        : typeof event?.response === "string"
+                        : typeof event?.response === 'string'
                             ? event.response
-                            : typeof event?.content === "string"
+                            : typeof event?.content === 'string'
                                 ? event.content
-                                : "";
+                                : '';
     const sessionId = asString(event?.sessionID ?? event?.session_id);
     const epoch = currentSessionEpoch(sessionId);
     const suffixParts = [];
     // 1. Pending recall block delivered by execute.before (legacy V1 / Claude / Hermes).
     const pendingBlock = consumePendingRecall(meta, targetRec) ??
-        (targetRec ? targetRec.neurostrataContext : undefined) ??
+        (targetRec
+            ? targetRec.neurostrataContext
+            : undefined) ??
         (meta ? meta.neurostrataContext : undefined);
     if (pendingBlock)
         suffixParts.push(pendingBlock);
-    // 2. Task-intent nudge on non-NeuroStrata-native tools.
-    if (toolName !== "" && !NEUROSTRATA_NATIVE_TOOLS.has(toolName) && config.intentDetection.injectReminder) {
+    // 2. Task-intent nudge on non-NeuroStrata-native tools. Read-only
+    //  inspection output is not user or assistant speech, so it never nudges
+    //  either (issue #311): the reminder shares the intake gate.
+    if (toolName !== '' &&
+        !NEUROSTRATA_NATIVE_TOOLS.has(toolName) &&
+        !isReadOnlyInspectionTool(toolName) &&
+        config.intentDetection.injectReminder) {
         const signals = detectTaskIntentsLocal(rawText);
         if (signals.length > 0) {
-            const markerList = signals.map((s) => s.marker).join(", ");
+            const markerList = signals.map((s) => s.marker).join(', ');
             suffixParts.push(`[NeuroStrata Plugin — TASK INTENT DETECTED]\nDetected intent markers: ${markerList} — consider creating a task to track this work.`);
         }
     }
     // 3. JIT file-touch recall (deduplicated per sessionId:epoch:normalizedPath).
-    if (toolName !== "" && isFileTouchTool(toolName)) {
+    if (toolName !== '' && isFileTouchTool(toolName)) {
         const filePath = event?.args?.path ??
             event?.args?.filePath ??
             event?.input?.path ??
@@ -1966,13 +2240,13 @@ const executeAfterHandler = async (output, secondArg) => {
         if (filePath) {
             const fp = String(filePath);
             const normalizedPath = pathRelativeToProjectRoot(fp, config);
-            const dedupKey = `${sessionId ?? "__no_session__"}:${epoch}:${normalizedPath}`;
+            const dedupKey = `${sessionId ?? '__no_session__'}:${epoch}:${normalizedPath}`;
             const seen = sessionSeenFiles(sessionId);
             if (!seen.has(dedupKey)) {
                 let snippets = [];
                 try {
                     snippets = await prefetchMemoriesForFile(config.namespace, fp, {
-                        recordLedgerDir: config.projectRoot,
+                        recordLedgerDir: config.projectRoot
                     });
                     // Only mark the path as seen once the prefetch has actually run;
                     // a failed/empty prefetch leaves the path unmarked so a retry
@@ -1984,64 +2258,66 @@ const executeAfterHandler = async (output, secondArg) => {
                 }
                 if (snippets.length > 0) {
                     confirmPrefetchDelivery(config.namespace, fp);
-                    suffixParts.push(`[NeuroStrata File Context — ${normalizedPath}]\n${snippets.slice(0, 2).join("\n")}`);
+                    suffixParts.push(`[NeuroStrata File Context — ${normalizedPath}]\n${snippets.slice(0, 2).join('\n')}`);
                 }
             }
         }
     }
-    const legacyPrefix = pendingBlock ? `${pendingBlock}\n\n` : "";
-    const newSuffix = suffixParts.slice(pendingBlock ? 1 : 0).join("\n\n");
+    const legacyPrefix = pendingBlock ? `${pendingBlock}\n\n` : '';
+    const newSuffix = suffixParts.slice(pendingBlock ? 1 : 0).join('\n\n');
     const combined = rawText
-        ? `${legacyPrefix}${rawText}${newSuffix ? "\n\n" + newSuffix : ""}`
+        ? `${legacyPrefix}${rawText}${newSuffix ? '\n\n' + newSuffix : ''}`
         : `${legacyPrefix}${newSuffix}`;
     // Only mutate the event when there is actually something to prepend or
     // append; otherwise leave event.result.content / output / content untouched
     // (preserving the tool's original output, including V2 content arrays).
-    const hasAnything = !!pendingBlock || newSuffix !== "";
-    if (hasAnything && event && typeof event === "object") {
+    const hasAnything = !!pendingBlock || newSuffix !== '';
+    if (hasAnything && event && typeof event === 'object') {
         // OpenCode V2: mutate event.result.content in-place (and result.output).
-        if (event.result && typeof event.result === "object") {
+        if (event.result && typeof event.result === 'object') {
             if (Array.isArray(event.result.content)) {
-                const nonText = event.result.content.filter((p) => p && p.type !== "text");
-                event.result.content = [...nonText, { type: "text", text: combined }];
+                const nonText = event.result.content.filter((p) => p && p.type !== 'text');
+                event.result.content = [...nonText, { type: 'text', text: combined }];
             }
             else {
                 event.result.content = combined;
             }
-            if (typeof event.result.output === "string")
+            if (typeof event.result.output === 'string')
                 event.result.output = combined;
         }
         // Preserve legacy top-level fields for V1 / Claude / Hermes harnesses.
-        if (newSuffix !== "") {
-            if (typeof event.additionalContext === "string") {
+        if (newSuffix !== '') {
+            if (typeof event.additionalContext === 'string') {
                 event.additionalContext +=
-                    (event.additionalContext.length ? "\n" : "") + newSuffix;
+                    (event.additionalContext.length ? '\n' : '') + newSuffix;
                 if (pendingBlock && !event.additionalContext.includes(pendingBlock)) {
                     event.additionalContext = `${pendingBlock}\n\n${event.additionalContext}`;
                 }
             }
             else {
-                event.additionalContext = suffixParts.join("\n\n");
+                event.additionalContext = suffixParts.join('\n\n');
             }
         }
-        else if (pendingBlock && typeof event.additionalContext === "string") {
+        else if (pendingBlock && typeof event.additionalContext === 'string') {
             event.additionalContext = pendingBlock;
         }
-        if (typeof event.output === "string")
+        if (typeof event.output === 'string')
             event.output = combined;
-        if (typeof event.content === "string")
+        if (typeof event.content === 'string')
             event.content = combined;
     }
     // Wave 4: extract task-intent obligations from the tool output text and
     // post them fail-soft to the intake ledger (never blocks the tool output).
-    if (config.intentDetection.enabled && rawText && !isReadOnlyInspectionTool(toolName)) {
+    if (config.intentDetection.enabled &&
+        rawText &&
+        !isReadOnlyInspectionTool(toolName)) {
         const activeTaskId = readActiveTaskId(effectiveProjectRoot(config));
         const candidates = extractTurnCandidates({
-            role: "assistant",
+            role: 'assistant',
             content: rawText,
             turn_id: sessionId ?? undefined,
             source_tool: toolName || undefined,
-            parent_task_id: activeTaskId ?? undefined,
+            parent_task_id: activeTaskId ?? undefined
         });
         if (candidates.length > 0) {
             await postTurnCandidates(candidates, config.namespace);
@@ -2050,12 +2326,17 @@ const executeAfterHandler = async (output, secondArg) => {
     return target ?? output;
 };
 const executeBeforeHandler = async (input) => {
-    const toolName = input?.tool ?? input?.tool_name ?? input?.name ?? input?.action ?? input?.command ?? "";
+    const toolName = input?.tool ??
+        input?.tool_name ??
+        input?.name ??
+        input?.action ??
+        input?.command ??
+        '';
     const args = firstRecord(input?.input, input?.args, input);
     const altArgs = asRecord(input?.args);
     // Bug 3: OpenCode V2 Code Mode execution inspection.
     if (isCodeExecTool(toolName)) {
-        const code = String(input?.input?.code ?? input?.args?.code ?? input?.code ?? "");
+        const code = String(input?.input?.code ?? input?.args?.code ?? input?.code ?? '');
         const inspection = inspectCodeModeExecution(code);
         if (inspection.id) {
             cachedTaskInjection.delete(inspection.id);
@@ -2068,7 +2349,9 @@ const executeBeforeHandler = async (input) => {
             // stale id so the next check re-resolves it via activeSessionId.
             activeTaskId = null;
         }
-        if (inspection.taskClaimed || inspection.taskCompleted || inspection.note !== undefined) {
+        if (inspection.taskClaimed ||
+            inspection.taskCompleted ||
+            inspection.note !== undefined) {
             mutationsSinceNote = 0;
         }
         if (inspection.taskCompleted) {
@@ -2112,13 +2395,13 @@ const executeBeforeHandler = async (input) => {
     // Enhancement 2 & 3: subagent tool prompt enrichment.
     if (isSubagentTool(toolName)) {
         const targets = [];
-        if (input?.input && typeof input.input === "object") {
+        if (input?.input && typeof input.input === 'object') {
             targets.push(input.input);
         }
-        if (input?.args && typeof input.args === "object") {
+        if (input?.args && typeof input.args === 'object') {
             targets.push(input.args);
         }
-        if (targets.length === 0 && input && typeof input === "object") {
+        if (targets.length === 0 && input && typeof input === 'object') {
             targets.push(input);
         }
         for (const target of targets) {
@@ -2128,7 +2411,7 @@ const executeBeforeHandler = async (input) => {
             catch {
                 injectSubagentPrompt(target, config.namespace, activeTaskId, undefined, {
                     agentId: resolveSubagentAgentId(target),
-                    codeMode: detectCodeMode(pluginCtx, config),
+                    codeMode: detectCodeMode(pluginCtx, config)
                 });
             }
         }
@@ -2167,12 +2450,21 @@ const executeBeforeHandler = async (input) => {
     // demanding an active task for `git push` would be an unbreakable Catch-22).
     if (isMutatingTool(toolName)) {
         const payload = JSON.stringify(args);
+        // Same forwarding rule as the hook path: a raw patch string under
+        // `input` is the analysable surface (#333/B2 exec bridge).
+        const rawStringInput = typeof input?.input === 'string' && input.input.trim() !== ''
+            ? input.input
+            : null;
+        const guardPayload = rawStringInput ?? payload;
         const shellExempt = isZeroActionExemptShellPayload(toolName, payload);
         if (config.strictMode) {
             const call = {
                 name: toolName,
                 args,
-                session_id: asString(input?.session_id) ?? asString(input?.sessionID) ?? activeSessionId ?? undefined,
+                session_id: asString(input?.session_id) ??
+                    asString(input?.sessionID) ??
+                    activeSessionId ??
+                    undefined
             };
             const projectRoot = effectiveProjectRoot(config);
             const cwd = asString(args.cwd) ?? asString(args.workdir) ?? projectRoot;
@@ -2183,21 +2475,23 @@ const executeBeforeHandler = async (input) => {
                 throw new Error(`Guard validation unavailable (NeuroStrata core degraded): no MCP client`);
             }
             try {
-                const text = await mcpClient.callTool("neurostrata_guard_validate", {
+                const text = await mcpClient.callTool('neurostrata_guard_validate', {
                     namespace: config.namespace,
                     session_id,
                     active_task_id,
                     worktree,
                     action_type: toolName,
-                    payload,
+                    payload: guardPayload,
                     cwd,
                     is_mutating: !shellExempt,
                     use_sandbox: false,
-                    mutations_since_note: mutationsSinceNote,
+                    mutations_since_note: mutationsSinceNote
                 });
                 const result = parseGuardValidate(text);
-                if (result.verdict === "reject") {
-                    const reason = result.reasons.join("; ") || result.constraints.join("; ") || result.bucket;
+                if (result.verdict === 'reject') {
+                    const reason = result.reasons.join('; ') ||
+                        result.constraints.join('; ') ||
+                        result.bucket;
                     throw new Error(`Zero-Action Start violation: ${reason}`);
                 }
             }
@@ -2208,7 +2502,8 @@ const executeBeforeHandler = async (input) => {
                 // see the governing rules.
                 if (filePath)
                     restorePrefetchDelivery(config.namespace, filePath);
-                if (message.includes("Zero-Action Start violation:") || message.includes("Guard rejected"))
+                if (message.includes('Zero-Action Start violation:') ||
+                    message.includes('Guard rejected'))
                     throw err;
                 throw new Error(`Guard validation unavailable (NeuroStrata core degraded): ${message}`);
             }
@@ -2237,60 +2532,67 @@ export async function initialize(ctx) {
     config = resolveConfig({ ...diskConfig, ...inputConfig }, projectRoot);
     config.projectRoot = projectRoot;
     const token = config.bearerToken ?? loadDaemonToken(config.tokenFile);
-    mcpClient = new NeuroStrataMCPClient({ endpoint: config.endpoint, token, timeoutMs: config.requestTimeoutMs });
+    mcpClient = new NeuroStrataMCPClient({
+        endpoint: config.endpoint,
+        token,
+        timeoutMs: config.requestTimeoutMs
+    });
     cachedTaskInjection.clear();
     subagentFileRecallCache.clear();
     setStatus({
-        state: "uninitialized",
+        state: 'uninitialized',
         endpoint: config.endpoint,
         namespace: config.namespace,
         authenticated: token !== null,
         missingTools: [],
-        lastError: undefined,
+        lastError: undefined
     });
     const registerHook = async (name, handler) => {
-        if (ctx?.tool?.hook && typeof ctx.tool.hook === "function") {
+        if (ctx?.tool?.hook && typeof ctx.tool.hook === 'function') {
             await ctx.tool.hook(name, handler);
         }
-        else if (ctx?.hooks && typeof ctx.hooks[name] === "function") {
+        else if (ctx?.hooks && typeof ctx.hooks[name] === 'function') {
             await ctx.hooks[name](handler);
         }
     };
     // Register execute.after FIRST, execute.before SECOND (tests overwrite registeredHook
     // on each ctx.tool.hook call and expect execute.before as the last registered hook).
-    await registerHook("execute.after", executeAfterHandler);
-    await registerHook("execute.before", executeBeforeHandler);
+    await registerHook('execute.after', executeAfterHandler);
+    await registerHook('execute.before', executeBeforeHandler);
     // OpenCode V2 session hooks: context injects the active-task baseline once per
     // epoch; compaction bumps the epoch so the next context hook re-injects it.
-    if (typeof ctx?.session?.hook === "function") {
-        ctx.session.hook("context", (event) => sessionContextHandler(event, config));
-        ctx.session.hook("compaction", (event) => sessionCompactionHandler(event, config));
+    if (typeof ctx?.session?.hook === 'function') {
+        ctx.session.hook('context', (event) => sessionContextHandler(event, config));
+        ctx.session.hook('compaction', (event) => sessionCompactionHandler(event, config));
     }
     // Claude Code style hook events.
-    if (ctx?.hooks?.PreToolUse && typeof ctx.hooks.PreToolUse === "function") {
+    if (ctx?.hooks?.PreToolUse && typeof ctx.hooks.PreToolUse === 'function') {
         await ctx.hooks.PreToolUse(async (event) => handleHookEvent(event));
     }
     // Fix 2: Register beforeToolExec, beforeToolCall, beforeCommand, and onTurnEnd hooks
     // (used by Codex / GitHub CLI hosts that route tool calls through these hook names).
-    if (ctx?.hooks?.beforeToolExec && typeof ctx.hooks.beforeToolExec === "function") {
+    if (ctx?.hooks?.beforeToolExec &&
+        typeof ctx.hooks.beforeToolExec === 'function') {
         await ctx.hooks.beforeToolExec(executeBeforeHandler);
     }
-    if (ctx?.hooks?.beforeToolCall && typeof ctx.hooks.beforeToolCall === "function") {
+    if (ctx?.hooks?.beforeToolCall &&
+        typeof ctx.hooks.beforeToolCall === 'function') {
         await ctx.hooks.beforeToolCall(executeBeforeHandler);
     }
-    if (ctx?.hooks?.beforeCommand && typeof ctx.hooks.beforeCommand === "function") {
+    if (ctx?.hooks?.beforeCommand &&
+        typeof ctx.hooks.beforeCommand === 'function') {
         await ctx.hooks.beforeCommand(executeBeforeHandler);
     }
-    if (ctx?.hooks?.onTurnEnd && typeof ctx.hooks.onTurnEnd === "function") {
+    if (ctx?.hooks?.onTurnEnd && typeof ctx.hooks.onTurnEnd === 'function') {
         await ctx.hooks.onTurnEnd(onTurnEnd);
     }
     await negotiateCapabilities();
-    console.error("[NeuroStrata] plugin initialized", {
+    console.error('[NeuroStrata] plugin initialized', {
         namespace: config.namespace,
         endpoint: config.endpoint,
         authenticated: status.authenticated,
         state: status.state,
-        missingTools: status.missingTools,
+        missingTools: status.missingTools
     });
 }
 async function negotiateCapabilities() {
@@ -2299,14 +2601,20 @@ async function negotiateCapabilities() {
     try {
         const available = new Set(await mcpClient.listToolNames());
         const missing = REQUIRED_TOOLS.filter((t) => !available.has(t));
-        setStatus({ state: missing.length > 0 ? "degraded" : "ready", missingTools: missing, lastError: undefined });
+        setStatus({
+            state: missing.length > 0 ? 'degraded' : 'ready',
+            missingTools: missing,
+            lastError: undefined
+        });
         if (missing.length > 0) {
-            console.error("NeuroStrata core does not expose the tools this shim needs", { missing });
+            console.error('NeuroStrata core does not expose the tools this shim needs', { missing });
         }
     }
     catch (err) {
-        setStatus({ state: "unavailable", lastError: String(err) });
-        console.error("NeuroStrata core is unreachable; the shim is degraded", { error: String(err) });
+        setStatus({ state: 'unavailable', lastError: String(err) });
+        console.error('NeuroStrata core is unreachable; the shim is degraded', {
+            error: String(err)
+        });
     }
 }
 // ──────────────────────────────────────────────────────────────────────
@@ -2318,18 +2626,22 @@ export async function handleHookEvent(event) {
     if (!mcpClient) {
         config = resolveConfig({});
         const token = loadDaemonToken(config.tokenFile);
-        mcpClient = new NeuroStrataMCPClient({ endpoint: config.endpoint, token, timeoutMs: config.requestTimeoutMs });
+        mcpClient = new NeuroStrataMCPClient({
+            endpoint: config.endpoint,
+            token,
+            timeoutMs: config.requestTimeoutMs
+        });
     }
-    const hookEventName = asString(event.hook_event_name) ?? asString(event.eventName) ?? "PreToolUse";
-    const toolNameRaw = asString(event.tool_name) ?? asString(event.toolName) ?? "";
+    const hookEventName = asString(event.hook_event_name) ?? asString(event.eventName) ?? 'PreToolUse';
+    const toolNameRaw = asString(event.tool_name) ?? asString(event.toolName) ?? '';
     const toolInputRaw = event.tool_input ?? event.input ?? event.args ?? {};
     const toolInput = firstRecord(toolInputRaw);
-    if (hookEventName === "PreToolUse") {
+    if (hookEventName === 'PreToolUse') {
         // Track native task mutation tools (claim/update/complete) for state bookkeeping.
         trackNativeTaskToolCall(toolNameRaw, firstRecord(toolInput), asRecord(event));
         // Code execution: inspect OpenCode V2 Code Mode to update task/session state.
         if (isCodeExecTool(toolNameRaw)) {
-            const code = String(toolInput.code ?? asRecord(toolInput.input)?.code ?? "");
+            const code = String(toolInput.code ?? asRecord(toolInput.input)?.code ?? '');
             const inspection = inspectCodeModeExecution(code);
             if (inspection.id) {
                 cachedTaskInjection.delete(inspection.id);
@@ -2341,7 +2653,9 @@ export async function handleHookEvent(event) {
                 // Variable id: let the next check re-resolve from activeSessionId.
                 activeTaskId = null;
             }
-            if (inspection.taskClaimed || inspection.taskCompleted || inspection.note !== undefined) {
+            if (inspection.taskClaimed ||
+                inspection.taskCompleted ||
+                inspection.note !== undefined) {
                 mutationsSinceNote = 0;
             }
             if (inspection.taskCompleted) {
@@ -2370,10 +2684,10 @@ export async function handleHookEvent(event) {
             return {
                 continue: true,
                 hookSpecificOutput: {
-                    hookEventName: "PreToolUse",
-                    permissionDecision: "allow",
-                    updatedInput: toolInput,
-                },
+                    hookEventName: 'PreToolUse',
+                    permissionDecision: 'allow',
+                    updatedInput: toolInput
+                }
             };
         }
         // File-touch tools: prefetch governing memories, build recall block.
@@ -2403,11 +2717,11 @@ export async function handleHookEvent(event) {
             return {
                 ...(recallBlock ? { systemMessage: recallBlock } : {}),
                 hookSpecificOutput: {
-                    hookEventName: "PreToolUse",
-                    permissionDecision: "deny",
+                    hookEventName: 'PreToolUse',
+                    permissionDecision: 'deny',
                     permissionDecisionReason: reason,
-                    ...(recallBlock ? { additionalContext: recallBlock } : {}),
-                },
+                    ...(recallBlock ? { additionalContext: recallBlock } : {})
+                }
             };
         };
         // Mutating tools: resolve active task from daemon if unset, run guard_validate,
@@ -2423,38 +2737,49 @@ export async function handleHookEvent(event) {
             }
             const callArgs = firstRecord(toolInput);
             const payload = JSON.stringify(callArgs);
+            // A raw-string tool input (Codex apply_patch) is discarded by
+            // firstRecord; forward the text itself so the daemon can scan the
+            // patch body instead of receiving "{}" (#333/B2).
+            const guardPayload = typeof toolInputRaw === 'string' && toolInputRaw.trim() !== ''
+                ? toolInputRaw
+                : payload;
             const shellExempt = isZeroActionExemptShellPayload(toolNameRaw, payload);
             if (config.strictMode) {
                 const projectRoot = effectiveProjectRoot(config);
                 const cwd = asString(callArgs.cwd) ?? asString(callArgs.workdir) ?? projectRoot;
-                const session_id = asString(callArgs.session_id) ?? asString(event.session_id) ?? activeSessionId ?? undefined;
+                const session_id = asString(callArgs.session_id) ??
+                    asString(event.session_id) ??
+                    activeSessionId ??
+                    undefined;
                 const active_task_id = asString(callArgs.active_task_id) ?? activeTaskId;
                 const worktree = asString(callArgs.worktree) ?? cwd;
                 try {
                     if (!mcpClient)
-                        throw new Error("no MCP client");
-                    const text = await mcpClient.callTool("neurostrata_guard_validate", {
+                        throw new Error('no MCP client');
+                    const text = await mcpClient.callTool('neurostrata_guard_validate', {
                         namespace: config.namespace,
                         session_id,
                         active_task_id,
                         worktree,
                         action_type: toolNameRaw,
-                        payload,
+                        payload: guardPayload,
                         cwd,
                         is_mutating: !shellExempt,
                         use_sandbox: false,
-                        mutations_since_note: mutationsSinceNote,
+                        mutations_since_note: mutationsSinceNote
                     });
                     const result = parseGuardValidate(text);
-                    if (result.verdict === "reject") {
-                        const reason = result.reasons.join("; ") || result.constraints.join("; ") || result.bucket;
+                    if (result.verdict === 'reject') {
+                        const reason = result.reasons.join('; ') ||
+                            result.constraints.join('; ') ||
+                            result.bucket;
                         return denyWithRecall(reason);
                     }
                 }
                 catch (err) {
                     const message = String(err);
-                    if (message.includes("Zero-Action Start violation:") ||
-                        message.includes("Guard rejected")) {
+                    if (message.includes('Zero-Action Start violation:') ||
+                        message.includes('Guard rejected')) {
                         return denyWithRecall(message);
                     }
                     return denyWithRecall(`Guard unavailable: ${message}`);
@@ -2469,23 +2794,25 @@ export async function handleHookEvent(event) {
             continue: true,
             ...(recallBlock ? { systemMessage: recallBlock } : {}),
             hookSpecificOutput: {
-                hookEventName: "PreToolUse",
-                permissionDecision: "allow",
+                hookEventName: 'PreToolUse',
+                permissionDecision: 'allow',
                 updatedInput: toolInput,
-                ...(recallBlock ? { additionalContext: recallBlock } : {}),
-            },
+                ...(recallBlock ? { additionalContext: recallBlock } : {})
+            }
         };
     }
-    if (["Stop", "SubagentStop"].includes(hookEventName)) {
+    if (['Stop', 'SubagentStop'].includes(hookEventName)) {
         const transcript = asString(event.transcript) ??
             asString(event.content) ??
             asString(event.last_assistant_message);
-        if (hookEventName === "Stop" && transcript) {
-            await onTurnEnd({ role: "assistant", content: transcript });
+        if (hookEventName === 'Stop' && transcript) {
+            await onTurnEnd({ role: 'assistant', content: transcript });
         }
-        return { hookSpecificOutput: { hookEventName, permissionDecision: "allow" } };
+        return {
+            hookSpecificOutput: { hookEventName, permissionDecision: 'allow' }
+        };
     }
-    return { hookSpecificOutput: { hookEventName, permissionDecision: "allow" } };
+    return { hookSpecificOutput: { hookEventName, permissionDecision: 'allow' } };
 }
 export const handleClaudeHookEvent = handleHookEvent;
 // ──────────────────────────────────────────────────────────────────────
@@ -2495,25 +2822,25 @@ export async function onTurnEnd(turn) {
     if (!config.intentDetection.enabled)
         return;
     const text = turn.content;
-    if (text.includes("neurostrata_task_create"))
+    if (text.includes('neurostrata_task_create'))
         return;
     const signals = detectTaskIntentsLocal(text);
     if (signals.length === 0)
         return;
     if (!config.intentDetection.injectReminder)
         return;
-    const markerList = signals.map((s) => s.marker).join(", ");
+    const markerList = signals.map((s) => s.marker).join(', ');
     console.error(`[NeuroStrata] Task intent detected (${markerList}) but no neurostrata_task_create in this turn. Consider creating a task to track this work.`);
 }
 export async function fetchContextPlan(opts) {
     if (!mcpClient)
-        throw new Error("NeuroStrata MCP client not initialized");
-    return await mcpClient.callTool("neurostrata_context_plan", opts);
+        throw new Error('NeuroStrata MCP client not initialized');
+    return await mcpClient.callTool('neurostrata_context_plan', opts);
 }
 // ──────────────────────────────────────────────────────────────────────
 // Adapter factory
 // ──────────────────────────────────────────────────────────────────────
-export function createHarnessPlugin(pluginId = "neurostrata", harnessName = "OpenCode") {
+export function createHarnessPlugin(pluginId = 'neurostrata', harnessName = 'OpenCode') {
     activeHarnessName = harnessName;
     return {
         id: pluginId,
@@ -2524,7 +2851,7 @@ export function createHarnessPlugin(pluginId = "neurostrata", harnessName = "Ope
         handleClaudeHookEvent,
         onTurnEnd,
         fetchContextPlan,
-        adapterStatus,
+        adapterStatus
     };
 }
 export const plugin = createHarnessPlugin("neurostrata", "OpenCode");

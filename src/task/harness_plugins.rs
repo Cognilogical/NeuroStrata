@@ -95,7 +95,7 @@ const EMBEDDED_NEUROSTRATA_SKILL_MD: &str =
 const EMBEDDED_NEUROSTRATA_TASK_AGENT_MD: &str =
     include_str!("../../.agents/agents/NeuroStrata-Task.md");
 const SUBAGENT_RULE_MARKER: &str = "subagent_prompt_injection";
-const SUBAGENT_GRAPH_FIRST_RULE_SNIPPET: &str = "\n- **NEUROSTRATA GRAPH-FIRST & SUBAGENT CONTEXT RULE:** Honor the `### NeuroStrata Task & Graph Context` (`subagent_prompt_injection`) block in your prompt — every `[rule]` entry is a binding architectural constraint. Before editing any file, check whether its path and governing memory IDs (`mem-...`) are already listed under `### NeuroStrata Task & Graph Context` in your prompt. For any file you touch that is NOT listed in that block, call `neurostrata_memories_for_file` first (or `neurostrata_related` / `neurostrata_search_memory` with `include_related: true` / `neurostrata_sparql_query`). Never leave `TODO`, `FIXME`, `stub`, or `phase-2` deferrals.\n";
+const SUBAGENT_GRAPH_FIRST_RULE_SNIPPET: &str = "\n- **NEUROSTRATA GRAPH-FIRST & SUBAGENT CONTEXT RULE:** Honor the `### NeuroStrata Task & Graph Context` (`subagent_prompt_injection`) block in your prompt — every `[rule]` entry is a binding architectural constraint. Before editing any file, check whether its path and governing memory IDs (`mem-...`) are already listed under `### NeuroStrata Task & Graph Context` in your prompt. For any file you touch that is NOT listed in that block, call `neurostrata_memories_for_file` first (or `neurostrata_related` / `neurostrata_search_memory` with `mode`: `hybrid` (default) + `include_references`: true / `neurostrata_sparql_query`). Never leave `TODO`, `FIXME`, `stub`, or `phase-2` deferrals.\n";
 
 const KNOWN_HARNESSES: &[&str] = &[
     "opencode",
@@ -247,9 +247,19 @@ pub fn detect_harnesses(
 ) -> (Option<&'static str>, Vec<&'static str>) {
     let explicit = explicit_harness.and_then(normalize_harness_name);
 
-    let env_active = if has_any_env(&["OPENCODE", "OPENCODE_PID", "OPENCODE_SESSION", "OPENCODE_CONFIG"]) {
+    let env_active = if has_any_env(&[
+        "OPENCODE",
+        "OPENCODE_PID",
+        "OPENCODE_SESSION",
+        "OPENCODE_CONFIG",
+    ]) {
         Some("opencode")
-    } else if has_any_env(&["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_PROJECT_DIR", "ANTHROPIC_CLAUDE_CODE"]) {
+    } else if has_any_env(&[
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_PROJECT_DIR",
+        "ANTHROPIC_CLAUDE_CODE",
+    ]) {
         Some("claude")
     } else if has_any_env(&["HERMES_AGENT", "HERMES_HOME", "HERMES_SESSION_ID"]) {
         Some("hermes")
@@ -279,32 +289,52 @@ pub fn detect_harnesses(
     if project_root.join(".opencode").exists()
         || project_root.join(".NeuroStrata/plugins/opencode").exists()
         || project_root.join("opencode.json").exists()
-        || home.as_ref().map(|h| h.join(".config/opencode").exists() || h.join(".local/share/opencode").exists()).unwrap_or(false)
+        || home
+            .as_ref()
+            .map(|h| {
+                h.join(".config/opencode").exists() || h.join(".local/share/opencode").exists()
+            })
+            .unwrap_or(false)
     {
         push_unique("opencode");
     }
     if project_root.join(".openclaw").exists()
-        || home.as_ref().map(|h| h.join(".openclaw").exists()).unwrap_or(false)
+        || home
+            .as_ref()
+            .map(|h| h.join(".openclaw").exists())
+            .unwrap_or(false)
     {
         push_unique("openclaw");
     }
     if project_root.join(".claude").exists()
-        || home.as_ref().map(|h| h.join(".claude").exists()).unwrap_or(false)
+        || home
+            .as_ref()
+            .map(|h| h.join(".claude").exists())
+            .unwrap_or(false)
     {
         push_unique("claude");
     }
     if project_root.join(".hermes").exists()
-        || home.as_ref().map(|h| h.join(".hermes").exists()).unwrap_or(false)
+        || home
+            .as_ref()
+            .map(|h| h.join(".hermes").exists())
+            .unwrap_or(false)
     {
         push_unique("hermes");
     }
     if project_root.join(".codex").exists()
-        || home.as_ref().map(|h| h.join(".codex").exists()).unwrap_or(false)
+        || home
+            .as_ref()
+            .map(|h| h.join(".codex").exists())
+            .unwrap_or(false)
     {
         push_unique("codex");
     }
     if project_root.join(".github/copilot").exists()
-        || home.as_ref().map(|h| h.join(".config/gh").exists() || h.join(".config/github-copilot").exists()).unwrap_or(false)
+        || home
+            .as_ref()
+            .map(|h| h.join(".config/gh").exists() || h.join(".config/github-copilot").exists())
+            .unwrap_or(false)
     {
         push_unique("github-cli");
     }
@@ -532,9 +562,17 @@ fn sync_skills_and_agent_rules(
                     })
                     .collect::<Vec<&str>>()
                     .join("\n");
-                if replaced != content { Some(replaced) } else { None }
+                if replaced != content {
+                    Some(replaced)
+                } else {
+                    None
+                }
             } else if !content.contains(SUBAGENT_RULE_MARKER) && !content.contains("tools: false") {
-                Some(format!("{}{}", content.trim_end(), SUBAGENT_GRAPH_FIRST_RULE_SNIPPET))
+                Some(format!(
+                    "{}{}",
+                    content.trim_end(),
+                    SUBAGENT_GRAPH_FIRST_RULE_SNIPPET
+                ))
             } else {
                 None
             };
@@ -573,7 +611,10 @@ fn wire_harness_config(
 
     match harness {
         "opencode" => {
-            if is_active || project_root.join(".opencode").exists() || project_root.join("opencode.json").exists() {
+            if is_active
+                || project_root.join(".opencode").exists()
+                || project_root.join("opencode.json").exists()
+            {
                 // 1. Write the thin OpenCode loader at .opencode/plugins/neurostrata.js
                 //    (creating .opencode/plugins/ if needed). The relative import
                 //    resolves from the loader file's location back to the bundled core.
@@ -649,7 +690,10 @@ fn wire_harness_config(
         "claude" => {
             if is_active || project_root.join(".claude").exists() {
                 let cfg_path = project_root.join(".claude/settings.local.json");
-                let cmd = format!("NEUROSTRATA_NAMESPACE={} node \"{}\"", namespace, abs_runner);
+                let cmd = format!(
+                    "NEUROSTRATA_NAMESPACE={} node \"{}\"",
+                    namespace, abs_runner
+                );
                 let mut doc: Value = json!({});
                 let mut write_doc = false;
                 if cfg_path.exists() {
@@ -688,9 +732,8 @@ fn wire_harness_config(
                             for entries in h_obj.values_mut() {
                                 if let Some(arr) = entries.as_array_mut() {
                                     for entry in arr {
-                                        if let Some(hooks) = entry
-                                            .get_mut("hooks")
-                                            .and_then(|v| v.as_array_mut())
+                                        if let Some(hooks) =
+                                            entry.get_mut("hooks").and_then(|v| v.as_array_mut())
                                         {
                                             for hook in hooks {
                                                 if let Some(command) =
@@ -704,8 +747,7 @@ fn wire_harness_config(
                                                             project_root,
                                                         )
                                                     {
-                                                        hook["command"] =
-                                                            Value::String(repaired);
+                                                        hook["command"] = Value::String(repaired);
                                                     }
                                                 }
                                             }
@@ -760,7 +802,8 @@ fn wire_harness_config(
         }
         "github-cli" => {
             if is_active || project_root.join(".github").exists() {
-                let cfg_path = project_root.join(".NeuroStrata/plugins/github-cli/copilot-extension.json");
+                let cfg_path =
+                    project_root.join(".NeuroStrata/plugins/github-cli/copilot-extension.json");
                 let doc = json!({
                     "id": "neurostrata-github-cli",
                     "namespace": namespace,
@@ -785,20 +828,41 @@ mod tests {
         let custom_agent_dir = tmp.path().join(".claude/agents");
         std::fs::create_dir_all(&custom_agent_dir).expect("create .claude/agents");
         let custom_agent_md = custom_agent_dir.join("custom-worker.md");
-        std::fs::write(&custom_agent_md, "# Custom Worker\n\n- Run assigned tasks.\n")
-            .expect("write custom-worker.md");
+        std::fs::write(
+            &custom_agent_md,
+            "# Custom Worker\n\n- Run assigned tasks.\n",
+        )
+        .expect("write custom-worker.md");
 
         let report = auto_install_detected_plugins(tmp.path(), "TestProj", Some("claude"));
         assert_eq!(report["active_harness"], json!("claude"));
-        let installed = report["installed_plugins"].as_array().expect("installed array");
+        let installed = report["installed_plugins"]
+            .as_array()
+            .expect("installed array");
         assert!(!installed.is_empty());
-        assert!(tmp.path().join(".NeuroStrata/plugins/claude/dist/index.js").exists());
+        assert!(tmp
+            .path()
+            .join(".NeuroStrata/plugins/claude/dist/index.js")
+            .exists());
         assert!(tmp.path().join(".claude/settings.local.json").exists());
-        assert!(tmp.path().join(".agents/skills/neurostrata/SKILL.md").exists());
-        assert!(tmp.path().join(".agents/agents/NeuroStrata-Task.md").exists());
-        assert!(tmp.path().join(".claude/skills/neurostrata/SKILL.md").exists());
-        assert!(tmp.path().join(".claude/agents/NeuroStrata-Task.md").exists());
-        let patched = std::fs::read_to_string(&custom_agent_md).expect("read patched custom-worker.md");
+        assert!(tmp
+            .path()
+            .join(".agents/skills/neurostrata/SKILL.md")
+            .exists());
+        assert!(tmp
+            .path()
+            .join(".agents/agents/NeuroStrata-Task.md")
+            .exists());
+        assert!(tmp
+            .path()
+            .join(".claude/skills/neurostrata/SKILL.md")
+            .exists());
+        assert!(tmp
+            .path()
+            .join(".claude/agents/NeuroStrata-Task.md")
+            .exists());
+        let patched =
+            std::fs::read_to_string(&custom_agent_md).expect("read patched custom-worker.md");
         assert!(patched.contains("subagent_prompt_injection"));
     }
 
@@ -809,10 +873,16 @@ mod tests {
         let runner = report["installed_plugins"][0]["cli_hook_runner"]
             .as_str()
             .expect("cli_hook_runner");
-        assert!(!runner.starts_with(r"\\?\"), "verbatim path leaked: {runner}");
+        assert!(
+            !runner.starts_with(r"\\?\"),
+            "verbatim path leaked: {runner}"
+        );
         let settings = std::fs::read_to_string(tmp.path().join(".claude/settings.local.json"))
             .expect("settings.local.json");
-        assert!(!settings.contains(r"\\\\?\\"), "verbatim path in hook command");
+        assert!(
+            !settings.contains(r"\\\\?\\"),
+            "verbatim path in hook command"
+        );
     }
 
     #[test]
@@ -823,14 +893,24 @@ mod tests {
             ("hermes", ".hermes/plugins/neurostrata.json"),
             ("codex", ".codex/plugins/neurostrata.json"),
             ("openclaw", ".openclaw/plugins/neurostrata.json"),
-            ("github-cli", ".NeuroStrata/plugins/github-cli/copilot-extension.json"),
+            (
+                "github-cli",
+                ".NeuroStrata/plugins/github-cli/copilot-extension.json",
+            ),
         ];
         for (harness, cfg_rel) in cases {
             let tmp = tempfile::tempdir().expect("tempdir");
             let report = auto_install_detected_plugins(tmp.path(), "TestProj", Some(harness));
-            assert!(report["ok"].as_bool().unwrap_or(true), "{harness} install report");
+            assert!(
+                report["ok"].as_bool().unwrap_or(true),
+                "{harness} install report"
+            );
             let cfg = tmp.path().join(cfg_rel);
-            assert!(cfg.exists(), "{harness} config missing at {}", cfg.display());
+            assert!(
+                cfg.exists(),
+                "{harness} config missing at {}",
+                cfg.display()
+            );
             let raw = std::fs::read_to_string(&cfg).expect("read harness config");
             assert!(
                 !raw.contains(r"\\?\") && !raw.contains(r"\\\\?\\"),
@@ -842,7 +922,10 @@ mod tests {
                 .and_then(|p| p.get("cli_hook_runner"))
                 .and_then(|v| v.as_str());
             if let Some(runner) = runner {
-                assert!(!runner.starts_with(r"\\?\"), "{harness} runner is verbatim: {runner}");
+                assert!(
+                    !runner.starts_with(r"\\?\"),
+                    "{harness} runner is verbatim: {runner}"
+                );
             }
         }
     }
@@ -933,10 +1016,9 @@ mod tests {
             "verbatim path survived repair: {commands:?}"
         );
         assert!(
-            commands
-                .iter()
-                .any(|c| c.starts_with("NEUROSTRATA_NAMESPACE=TestProj node \"")
-                    && c.ends_with('"')),
+            commands.iter().any(
+                |c| c.starts_with("NEUROSTRATA_NAMESPACE=TestProj node \"") && c.ends_with('"')
+            ),
             "our repaired hook is present: {commands:?}"
         );
     }
@@ -1010,7 +1092,10 @@ mod tests {
         let want = format!("NEUROSTRATA_NAMESPACE=TestProj node \"{abs_runner}\"");
         let commands = hook_commands(&cfg);
         assert_eq!(commands.len(), 3, "{commands:?}");
-        assert!(commands.iter().all(|c| *c == want), "missing runner not repaired: {commands:?}");
+        assert!(
+            commands.iter().all(|c| *c == want),
+            "missing runner not repaired: {commands:?}"
+        );
     }
 
     #[cfg(windows)]
@@ -1024,7 +1109,10 @@ mod tests {
             .as_str()
             .expect("cli_hook_runner")
             .to_string();
-        assert!(Path::new(&abs_runner).exists(), "runner written: {abs_runner}");
+        assert!(
+            Path::new(&abs_runner).exists(),
+            "runner written: {abs_runner}"
+        );
         let cfg = tmp.path().join(".claude/settings.local.json");
         let verbatim = format!(r"\\?\{abs_runner}");
         std::fs::write(
@@ -1037,7 +1125,10 @@ mod tests {
         let want = format!("NEUROSTRATA_NAMESPACE=TestProj node \"{abs_runner}\"");
         let commands = hook_commands(&cfg);
         assert_eq!(commands.len(), 3, "{commands:?}");
-        assert!(commands.iter().all(|c| *c == want), "own verbatim runner not repaired: {commands:?}");
+        assert!(
+            commands.iter().all(|c| *c == want),
+            "own verbatim runner not repaired: {commands:?}"
+        );
     }
 
     #[cfg(windows)]
@@ -1051,11 +1142,17 @@ mod tests {
             .as_str()
             .expect("cli_hook_runner")
             .to_string();
-        assert!(abs_runner.contains("Pröj"), "runner under the project: {abs_runner}");
+        assert!(
+            abs_runner.contains("Pröj"),
+            "runner under the project: {abs_runner}"
+        );
         // Same file on a case-insensitive volume, but not equal after ASCII
         // case folding.
         let other_case = format!(r"\\?\{}", abs_runner.replace("Pröj", "PRÖJ"));
-        assert!(Path::new(&other_case).exists(), "volume is case-insensitive: {other_case}");
+        assert!(
+            Path::new(&other_case).exists(),
+            "volume is case-insensitive: {other_case}"
+        );
         let cfg = project.join(".claude/settings.local.json");
         std::fs::write(
             &cfg,
@@ -1067,7 +1164,10 @@ mod tests {
         let want = format!("NEUROSTRATA_NAMESPACE=TestProj node \"{abs_runner}\"");
         let commands = hook_commands(&cfg);
         assert_eq!(commands.len(), 3, "{commands:?}");
-        assert!(commands.iter().all(|c| *c == want), "own runner in other case not repaired: {commands:?}");
+        assert!(
+            commands.iter().all(|c| *c == want),
+            "own runner in other case not repaired: {commands:?}"
+        );
     }
 
     #[test]
@@ -1092,7 +1192,9 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let custom = tmp.path().join("cli-hook.mjs");
         std::fs::write(&custom, "").expect("write custom runner");
-        let own_here = tmp.path().join("project/.NeuroStrata/plugins/claude/cli-hook.mjs");
+        let own_here = tmp
+            .path()
+            .join("project/.NeuroStrata/plugins/claude/cli-hook.mjs");
         assert!(!runner_is_replaceable(
             &custom.to_string_lossy(),
             &tmp.path().join("project"),
@@ -1104,7 +1206,10 @@ mod tests {
             "%USERPROFILE%/hooks/cli-hook.mjs",
             "~/hooks/cli-hook.mjs",
         ] {
-            assert!(!runner_is_replaceable(expanded, tmp.path(), &own_here.to_string_lossy()), "{expanded}");
+            assert!(
+                !runner_is_replaceable(expanded, tmp.path(), &own_here.to_string_lossy()),
+                "{expanded}"
+            );
         }
     }
 
@@ -1118,7 +1223,10 @@ mod tests {
         let root_cfg = tmp.path().join("opencode.json");
         std::fs::write(
             &root_cfg,
-            serde_json::to_string_pretty(&json!({ "plugins": ["./other.js"], "otherKey": "preserve" })).unwrap(),
+            serde_json::to_string_pretty(
+                &json!({ "plugins": ["./other.js"], "otherKey": "preserve" }),
+            )
+            .unwrap(),
         )
         .expect("write root opencode.json");
 
@@ -1126,22 +1234,37 @@ mod tests {
         assert_eq!(report["active_harness"], json!("opencode"));
 
         // Core plugin-core bundle must be present so relative imports resolve.
-        assert!(tmp.path().join(".NeuroStrata/plugins/core/dist/index.js").exists());
-        assert!(tmp.path().join(".NeuroStrata/plugins/core/package.json").exists());
+        assert!(tmp
+            .path()
+            .join(".NeuroStrata/plugins/core/dist/index.js")
+            .exists());
+        assert!(tmp
+            .path()
+            .join(".NeuroStrata/plugins/core/package.json")
+            .exists());
         // Opencode bundle + hook runner.
-        assert!(tmp.path().join(".NeuroStrata/plugins/opencode/dist/index.js").exists());
-        assert!(tmp.path().join(".NeuroStrata/plugins/opencode/cli-hook.mjs").exists());
+        assert!(tmp
+            .path()
+            .join(".NeuroStrata/plugins/opencode/dist/index.js")
+            .exists());
+        assert!(tmp
+            .path()
+            .join(".NeuroStrata/plugins/opencode/cli-hook.mjs")
+            .exists());
 
         // Thin loader wired into OpenCode.
         let loader = tmp.path().join(".opencode/plugins/neurostrata.js");
         assert!(loader.exists());
         let loader_src = std::fs::read_to_string(&loader).expect("read loader");
         assert!(
-            loader_src.contains("export { default } from \"../../.NeuroStrata/plugins/opencode/dist/index.js\";"),
+            loader_src.contains(
+                "export { default } from \"../../.NeuroStrata/plugins/opencode/dist/index.js\";"
+            ),
             "loader re-exports default"
         );
         assert!(
-            loader_src.contains("export * from \"../../.NeuroStrata/plugins/opencode/dist/index.js\";"),
+            loader_src
+                .contains("export * from \"../../.NeuroStrata/plugins/opencode/dist/index.js\";"),
             "loader re-exports all"
         );
 
@@ -1157,8 +1280,7 @@ mod tests {
                     .and_then(|p| p.as_array())
                     .map(|arr| {
                         !arr.iter().any(|v| {
-                            v.as_str()
-                                == Some("./.NeuroStrata/plugins/opencode/dist/index.js")
+                            v.as_str() == Some("./.NeuroStrata/plugins/opencode/dist/index.js")
                         })
                     })
                     .unwrap_or(true),
@@ -1167,16 +1289,32 @@ mod tests {
         } else {
             true
         };
-        assert!(oc_untouched, ".opencode/opencode.json must not contain the loader path");
+        assert!(
+            oc_untouched,
+            ".opencode/opencode.json must not contain the loader path"
+        );
 
         // Root opencode.json is never written: existing entries preserved, loader path never inserted.
-        let root_doc: Value = serde_json::from_str(&std::fs::read_to_string(root_cfg).expect("read opencode.json"))
-            .expect("parse opencode.json");
-        let root_plugins = root_doc.get("plugins").and_then(|v| v.as_array()).expect("plugins array");
-        assert_eq!(root_plugins.len(), 1, "root opencode.json plugins: {root_plugins:?}");
+        let root_doc: Value =
+            serde_json::from_str(&std::fs::read_to_string(root_cfg).expect("read opencode.json"))
+                .expect("parse opencode.json");
+        let root_plugins = root_doc
+            .get("plugins")
+            .and_then(|v| v.as_array())
+            .expect("plugins array");
+        assert_eq!(
+            root_plugins.len(),
+            1,
+            "root opencode.json plugins: {root_plugins:?}"
+        );
         assert_eq!(root_plugins[0].as_str(), Some("./other.js"));
-        assert!(!root_plugins.iter().any(|v| v.as_str() == Some("./.NeuroStrata/plugins/opencode/dist/index.js")));
-        assert_eq!(root_doc.get("otherKey").and_then(|v| v.as_str()), Some("preserve"));
+        assert!(!root_plugins
+            .iter()
+            .any(|v| v.as_str() == Some("./.NeuroStrata/plugins/opencode/dist/index.js")));
+        assert_eq!(
+            root_doc.get("otherKey").and_then(|v| v.as_str()),
+            Some("preserve")
+        );
     }
 
     #[test]
@@ -1211,7 +1349,8 @@ mod tests {
         );
 
         let parsed: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(opencode_dir.join("opencode.json")).expect("read opencode.json"),
+            &std::fs::read_to_string(opencode_dir.join("opencode.json"))
+                .expect("read opencode.json"),
         )
         .expect("valid json");
         // Invalid file-path entry stripped; valid entry preserved.

@@ -137,6 +137,12 @@ impl GateReport {
             "stale_memories": stale_memories,
             "unextracted_done": self.unextracted_done.iter().map(Violation::to_json).collect::<Vec<_>>(),
             "counts": self.counts.to_json(),
+            // R7: always present, always advisory. The gate engine is
+            // metadata-only, so it emits the zero report; handle_task_validate
+            // enriches it from local receipts. No advisory reaches `violations`.
+            "advisories": json!({
+                "graph_ontology": crate::task::graph_advisories::AdvisoryReport::default().to_json(),
+            }),
         })
     }
 }
@@ -204,10 +210,7 @@ pub fn stale_memory_violations(memories: &[SearchResult], now: i64) -> Vec<Viola
 /// refuses to forgive. A row the gate still judges is at least still
 /// visible in `task_list`.
 pub(crate) fn is_retired(metadata: &Value, now: i64) -> bool {
-    crate::formal_kernel::is_retired_at(
-        metadata.get("valid_to").and_then(Value::as_i64),
-        now,
-    )
+    crate::formal_kernel::is_retired_at(metadata.get("valid_to").and_then(Value::as_i64), now)
 }
 
 /// The chain bound: a namespace is written by many hands, so a loop in the
@@ -894,6 +897,37 @@ mod tests {
             &format!("work for {}", id),
             json!({ "task": task_meta }),
         )
+    }
+
+    /// R7.1/R7.3: `validate_json` always carries the exact advisory field set
+    /// and no advisory code can enter `violations`. `ok()` stays byte-bound to
+    /// `violations` alone.
+    #[test]
+    fn gate_validate_json_keeps_advisories_out_of_violations() {
+        let report = GateReport::default();
+        let body = report.validate_json();
+        assert!(body["violations"].as_array().unwrap().is_empty());
+        assert_eq!(body["advisories"].as_object().unwrap().len(), 1);
+        let advisory = &body["advisories"]["graph_ontology"];
+        for field in [
+            "genuine_lookup_coverage",
+            "distinct_graph_tools",
+            "high_blast_radius_unexplored",
+            "diff_tour_recommended",
+            "taxonomy_available",
+            "strategic_context_detected",
+            "concept_grounding_linked",
+            "recommendations",
+            "unresolved_trigger_ids",
+        ] {
+            assert!(
+                advisory.get(field).is_some(),
+                "advisories.graph_ontology missing {field}"
+            );
+        }
+        assert_eq!(advisory.as_object().unwrap().len(), 9);
+        assert!(advisory["recommendations"].as_array().unwrap().is_empty());
+        assert!(report.ok());
     }
 
     /// FEATURE-4: a rule is an assertion until it says where it came from.
@@ -1609,7 +1643,13 @@ mod tests {
         let scope = GateScope::capture(&subdirectory);
         assert_eq!(
             scope.worktree,
-            Some(dir.path().canonicalize().unwrap().to_string_lossy().into_owned())
+            Some(
+                dir.path()
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            )
         );
     }
 
@@ -1681,10 +1721,7 @@ mod tests {
             }),
         )];
         let report = evaluate_scoped(&memories, NOW, Some(&GateScope::default()));
-        assert!(report
-            .violations
-            .iter()
-            .any(|v| v.kind == "in_progress"));
+        assert!(report.violations.iter().any(|v| v.kind == "in_progress"));
     }
 
     #[test]
@@ -2109,7 +2146,15 @@ mod tests {
             .map(|v| v.id.as_str())
             .collect();
         stale.sort();
-        assert_eq!(stale, vec!["blocked-stale", "done-stale", "in_progress-stale", "open-stale"]);
+        assert_eq!(
+            stale,
+            vec![
+                "blocked-stale",
+                "done-stale",
+                "in_progress-stale",
+                "open-stale"
+            ]
+        );
     }
 
     /// Capability C: epoch seconds stale_after is parsed correctly.
@@ -2118,8 +2163,14 @@ mod tests {
         let epoch_past = (NOW - DAY).to_string();
         let epoch_future = (NOW + DAY).to_string();
         let memories = vec![
-            task("epoch-past", json!({ "status": "open", "stale_after": epoch_past })),
-            task("epoch-future", json!({ "status": "open", "stale_after": epoch_future })),
+            task(
+                "epoch-past",
+                json!({ "status": "open", "stale_after": epoch_past }),
+            ),
+            task(
+                "epoch-future",
+                json!({ "status": "open", "stale_after": epoch_future }),
+            ),
         ];
         let report = evaluate(&memories, NOW);
         let stale: Vec<&str> = report
@@ -2185,7 +2236,10 @@ mod tests {
             .iter()
             .find(|v| v.id == "numeric")
             .expect("numeric epoch must produce an advisory");
-        assert!(violation.detail.contains(&value.to_string()), "{violation:?}");
+        assert!(
+            violation.detail.contains(&value.to_string()),
+            "{violation:?}"
+        );
         assert!(!violation.detail.contains("malformed"), "{violation:?}");
     }
 
@@ -2201,10 +2255,7 @@ mod tests {
                 "bad-array",
                 json!({ "status": "open", "stale_after": [1, 2] }),
             ),
-            task(
-                "negative",
-                json!({ "status": "open", "stale_after": -1 }),
-            ),
+            task("negative", json!({ "status": "open", "stale_after": -1 })),
             task("epoch-zero", json!({ "status": "open", "stale_after": 0 })),
         ];
         let report = evaluate(&memories, NOW);
@@ -2279,7 +2330,9 @@ mod tests {
         );
         let report = evaluate(&[stale_fact], now);
         let json = report.validate_json();
-        let alias = json.get("stale_memories").expect("stale_memories alias present");
+        let alias = json
+            .get("stale_memories")
+            .expect("stale_memories alias present");
         let items = alias.as_array().expect("stale_memories is a list");
         assert_eq!(items.len(), 1);
         let rendered = items[0].to_string();

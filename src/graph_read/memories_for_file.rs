@@ -12,7 +12,7 @@
 //! `GraphRead` implementation call, so the two cannot drift.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 /// The default `memory_types` a `memories_for_file` query asks for.
 pub const DEFAULT_MEMORY_TYPES: [&str; 3] = ["rule", "fact", "procedure"];
@@ -114,11 +114,7 @@ pub struct ConceptualBridge {
 pub fn memory_type_priority(memory_type: &str, metadata: &Value) -> u8 {
     match memory_type {
         "rule" => {
-            if metadata
-                .get("enforcement")
-                .and_then(|v| v.as_str())
-                == Some("ENFORCED")
-            {
+            if metadata.get("enforcement").and_then(|v| v.as_str()) == Some("ENFORCED") {
                 0
             } else {
                 1
@@ -176,7 +172,10 @@ fn is_direct(kind: GraphMatchKind) -> bool {
 }
 
 fn valid_from(metadata: &Value) -> i64 {
-    metadata.get("valid_from").and_then(|v| v.as_i64()).unwrap_or(0)
+    metadata
+        .get("valid_from")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
 }
 
 /// Sort hits by the spec's ranking: match kind, then memory-type priority,
@@ -207,4 +206,186 @@ pub fn rank_hits(hits: &mut [MemoryHit]) {
             })
             .then_with(|| a.id.cmp(&b.id))
     });
+}
+
+// --- Conditional escalation (Task 4) ---------------------------------------
+//
+// These thresholds and expected-decision strings mirror `crate::task::routing`
+// on purpose. This module stays crate-free (serde_json + std only) so the
+// integration test can compile it from its real path; hence the duplication.
+
+/// R4: an AST blast radius at or above this value needs a two-hop expansion.
+/// `pub` so `tests/agent_adoption_test.rs` can pin it against `routing`.
+pub const HIGH_BLAST_THRESHOLD: usize = 15;
+/// R4: at least this many staged files (or a PR review scope) needs a diff tour.
+pub const DIFF_STAGED_FILE_THRESHOLD: usize = 3;
+/// §5: no response may recommend more than three follow-up actions.
+pub const MAX_NEXT_ACTIONS: usize = 3;
+
+pub const EXPECTED_AMBIGUOUS: &str = "Pick a localized symbol/path, then re-run the path lookup.";
+pub const EXPECTED_HIGH_BLAST: &str =
+    "Expand two hops; re-plan edits around unchanged callers before proceeding.";
+pub const EXPECTED_SEED_EDGE: &str =
+    "Use the result to decide the next step; abstain when it adds no evidence.";
+pub const EXPECTED_DIFF: &str =
+    "Review by dependency stop; audit unchanged callers and governing rules.";
+
+/// FNV-1a over the emitted args plus relevant ids. Stable across runs so an
+/// `action_id` can be correlated with the call it produced (mirrors routing).
+fn stable_digest(args: &Value, ids: &[String]) -> String {
+    let mut payload = args.to_string();
+    for id in ids {
+        payload.push('\u{1f}');
+        payload.push_str(id);
+    }
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in payload.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// Materialize one additive §5 `next_action`:
+/// `{action_id, trigger_id, tool, args, reason, expected_decision}`.
+fn next_action(
+    trigger_id: &str,
+    tool: &str,
+    args: &Value,
+    digest_ids: &[String],
+    reason: &str,
+    expected_decision: &str,
+) -> Value {
+    json!({
+        "action_id": format!("{}:{}", trigger_id, stable_digest(args, digest_ids)),
+        "trigger_id": trigger_id,
+        "tool": tool,
+        "args": args,
+        "reason": reason,
+        "expected_decision": expected_decision,
+    })
+}
+
+/// Pure escalation decision for `memories_for_file`, shared with the HTTP
+/// handler in `src/server.rs`. Returns `{status, next_actions,
+/// suppressed_reason?}` with only additive fields.
+///
+/// - `empty` -> `status:"empty"` + `T_AMBIGUOUS` to `neurostrata_locate`.
+///   An empty lookup is NOT "no governance" and is never described as such.
+/// - `blast_radius_count >= 15` **and a usable seed id** -> `T_HIGH_BLAST` to
+///   `neurostrata_related` with `max_hops:2`. An empty/whitespace seed is never
+///   emitted as `args.id`; with no seed the trigger is skipped.
+/// - a non-empty conceptual bridge -> `T_SEED_EDGE` to `neurostrata_object_view`.
+/// - `staged_file_count >= 3` -> `T_DIFF` to `neurostrata_diff_tour` with
+///   only the schema-valid `{namespace, diff_text}` args (`git_ref`, if any,
+///   belongs in `reason` only -- `diff_tour` declares no such argument).
+///
+/// At most three actions are emitted. An ordinary single-file edit (no
+/// triggers) emits an empty `next_actions` plus a `suppressed_reason`.
+pub fn recommended_next_actions(
+    blast_radius_count: usize,
+    bridge_ids: &[String],
+    staged_file_count: usize,
+    empty: bool,
+    namespace: &str,
+    seed_id: Option<&str>,
+) -> Value {
+    let status = if empty { "empty" } else { "success" };
+    let mut actions: Vec<Value> = Vec::new();
+
+    if empty {
+        // An empty lookup prescribes T_AMBIGUOUS only when there is a usable
+        // seed to narrow. With no seed there is no schema-valid `query` arg,
+        // so abstain (suppressed_reason is set when next_actions is empty).
+        if let Some(seed) = seed_id.filter(|id| !id.trim().is_empty()) {
+            let args = json!({ "namespace": namespace, "query": seed });
+            actions.push(next_action(
+                "T_AMBIGUOUS",
+                "neurostrata_locate",
+                &args,
+                &[],
+                "Empty lookup: narrow to a concrete symbol/path and re-run the path lookup.",
+                EXPECTED_AMBIGUOUS,
+            ));
+        }
+    } else {
+        if blast_radius_count >= HIGH_BLAST_THRESHOLD {
+            // `routing::next_action` likewise refuses an empty seed id: a
+            // related call with args.id == "" is schema-invalid, so abstain.
+            if let Some(id) = seed_id.filter(|id| !id.trim().is_empty()) {
+                let args = json!({ "namespace": namespace, "id": id, "max_hops": 2 });
+                actions.push(next_action(
+                    "T_HIGH_BLAST",
+                    "neurostrata_related",
+                    &args,
+                    &[id.to_string()],
+                    &format!(
+                        "Blast radius {blast_radius_count} >= 15: expand two hops before editing."
+                    ),
+                    EXPECTED_HIGH_BLAST,
+                ));
+            }
+        }
+        if let Some(bridge_id) = bridge_ids.iter().find(|id| !id.trim().is_empty()) {
+            let args = json!({ "namespace": namespace, "id": bridge_id });
+            actions.push(next_action(
+                "T_SEED_EDGE",
+                "neurostrata_object_view",
+                &args,
+                &[bridge_id.clone()],
+                "Cross-domain conceptual bridge: inspect the target before editing.",
+                EXPECTED_SEED_EDGE,
+            ));
+        }
+    }
+
+    if staged_file_count >= DIFF_STAGED_FILE_THRESHOLD {
+        // `diff_tour` declares no `git_ref` arg; the caller fills `diff_text`.
+        let args = json!({ "namespace": namespace, "diff_text": "" });
+        actions.push(next_action(
+            "T_DIFF",
+            "neurostrata_diff_tour",
+            &args,
+            &[],
+            "Scope has >=3 staged files; supply diff_text (e.g. from HEAD) and review by dependency stop.",
+            EXPECTED_DIFF,
+        ));
+    }
+
+    actions.truncate(MAX_NEXT_ACTIONS);
+    let mut response = json!({ "status": status, "next_actions": actions });
+    if response["next_actions"]
+        .as_array()
+        .is_some_and(Vec::is_empty)
+    {
+        // State the *conditions* for escalation, not the observed values: a
+        // high-radius lookup with no usable seed, or an empty lookup with no
+        // seed to narrow, also lands here.
+        let reason = if empty {
+            "Empty lookup with no usable symbol/path seed: no schema-valid graph action to prescribe; narrow the query and re-run the path lookup."
+        } else {
+            "Single-file lookup already carries 1-hop related memories; no trigger fired (high-blast needs radius >= 15 and a usable seed, no conceptual bridge, staged scope < 3)."
+        };
+        response["suppressed_reason"] = Value::String(reason.to_string());
+    }
+    response
+}
+
+/// Additive fail-soft shape for a `memories_for_file` query failure.
+///
+/// The legacy fields (`memories`, `unsupported`, `path`, `error`) keep their
+/// exact values; the §5 receipt fields are added so a failed lookup is never
+/// misread as "no governing memory". `next_actions` is empty and a
+/// `suppressed_reason` is always present, matching the abstention rule in
+/// `recommended_next_actions` (empty actions must say why none fired).
+pub fn query_failure_response(path: &str, error: &str) -> Value {
+    json!({
+        "memories": [],
+        "unsupported": false,
+        "path": path,
+        "error": error,
+        "status": "failed",
+        "next_actions": [],
+        "suppressed_reason": "Query failed; no escalation actions were emitted because the lookup did not complete. A failed lookup is not evidence of no governing memory.",
+    })
 }

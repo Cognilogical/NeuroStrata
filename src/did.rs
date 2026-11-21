@@ -1,4 +1,4 @@
-use openssl::pkey::{PKey, Id, Private};
+use openssl::pkey::{Id, PKey, Private};
 use openssl::sign::{Signer, Verifier};
 use serde_json;
 use std::fs;
@@ -102,7 +102,11 @@ pub fn encode_base58btc(bytes: &[u8]) -> String {
     // Reverse the digits produced (they come out LSB first)
     let chars: Vec<char> = out.chars().collect();
     let prefix_len = zeros;
-    let reversed = chars[prefix_len..].iter().rev().cloned().collect::<String>();
+    let reversed = chars[prefix_len..]
+        .iter()
+        .rev()
+        .cloned()
+        .collect::<String>();
     out = chars[..prefix_len].iter().cloned().collect();
     out.push_str(&reversed);
     out
@@ -119,7 +123,10 @@ pub fn decode_base58btc(input: &str) -> Result<Vec<u8>, String> {
     // Little-endian temporary (index 0 = LSB) for arithmetic
     let mut le = Vec::new();
     for ch in input.bytes().skip(leading_zeros) {
-        let digit = B58.iter().position(|&b| b == ch).ok_or_else(|| format!("invalid base58 char: {}", ch as char))? as u32;
+        let digit =
+            B58.iter()
+                .position(|&b| b == ch)
+                .ok_or_else(|| format!("invalid base58 char: {}", ch as char))? as u32;
         let mut carry = digit;
         for b in le.iter_mut() {
             let v = (*b as u32) * 58 + carry;
@@ -163,7 +170,10 @@ pub fn public_key_from_did(did: &str) -> Result<Vec<u8>, String> {
     }
     let pubkey = decoded[ED25519_MULTICODEC_PREFIX.len()..].to_vec();
     if pubkey.len() != 32 {
-        return Err(format!("expected 32-byte ed25519 pubkey, got {}", pubkey.len()));
+        return Err(format!(
+            "expected 32-byte ed25519 pubkey, got {}",
+            pubkey.len()
+        ));
     }
     Ok(pubkey)
 }
@@ -174,20 +184,26 @@ pub fn public_key_from_did(did: &str) -> Result<Vec<u8>, String> {
 
 pub fn generate_keypair() -> Result<(PKey<Private>, String, Vec<u8>), String> {
     let pkey = PKey::generate_ed25519().map_err(|e| format!("generate_ed25519: {}", e))?;
-    let pubkey = pkey.raw_public_key().map_err(|e| format!("raw_public_key: {}", e))?;
+    let pubkey = pkey
+        .raw_public_key()
+        .map_err(|e| format!("raw_public_key: {}", e))?;
     let did = signer_did(&pubkey);
     Ok((pkey, did, pubkey))
 }
 
 pub fn keypair_from_private_pem(pem: &[u8]) -> Result<(PKey<Private>, String, Vec<u8>), String> {
-    let pkey = PKey::private_key_from_pem(pem).map_err(|e| format!("private_key_from_pem: {}", e))?;
-    let pubkey = pkey.raw_public_key().map_err(|e| format!("raw_public_key: {}", e))?;
+    let pkey =
+        PKey::private_key_from_pem(pem).map_err(|e| format!("private_key_from_pem: {}", e))?;
+    let pubkey = pkey
+        .raw_public_key()
+        .map_err(|e| format!("raw_public_key: {}", e))?;
     let did = signer_did(&pubkey);
     Ok((pkey, did, pubkey))
 }
 
 pub fn keypair_to_private_pem(pkey: &PKey<Private>) -> Result<Vec<u8>, String> {
-    pkey.private_key_to_pem_pkcs8().map_err(|e| format!("private_key_to_pem: {}", e))
+    pkey.private_key_to_pem_pkcs8()
+        .map_err(|e| format!("private_key_to_pem: {}", e))
 }
 
 pub fn load_or_generate_keypair(path: &Path) -> Result<(PKey<Private>, String, Vec<u8>), String> {
@@ -206,7 +222,9 @@ pub fn load_or_generate_keypair(path: &Path) -> Result<(PKey<Private>, String, V
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perm = fs::metadata(path).map_err(|e| format!("metadata: {}", e))?.permissions();
+        let mut perm = fs::metadata(path)
+            .map_err(|e| format!("metadata: {}", e))?
+            .permissions();
         perm.set_mode(0o600);
         fs::set_permissions(path, perm).map_err(|e| format!("set_permissions: {}", e))?;
     }
@@ -218,8 +236,11 @@ pub fn load_or_generate_keypair(path: &Path) -> Result<(PKey<Private>, String, V
 // ============================================================
 
 pub fn sign(payload: &[u8], privkey: &PKey<Private>) -> Result<Vec<u8>, String> {
-    let mut signer = Signer::new_without_digest(privkey).map_err(|e| format!("Signer::new: {}", e))?;
-    signer.sign_oneshot_to_vec(payload).map_err(|e| format!("sign_oneshot: {}", e))
+    let mut signer =
+        Signer::new_without_digest(privkey).map_err(|e| format!("Signer::new: {}", e))?;
+    signer
+        .sign_oneshot_to_vec(payload)
+        .map_err(|e| format!("sign_oneshot: {}", e))
 }
 
 pub fn verify(payload: &[u8], pubkey: &[u8], sig: &[u8]) -> bool {

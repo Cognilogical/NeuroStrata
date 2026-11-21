@@ -109,16 +109,15 @@ pub struct KgeModel {
 
 impl KgeModel {
     /// Load artifact from `model_path` and `meta_path` (spec §5.5).
-    pub fn load(
-        model_path: &PathBuf,
-        meta_path: &PathBuf,
-    ) -> anyhow::Result<Self> {
+    pub fn load(model_path: &PathBuf, meta_path: &PathBuf) -> anyhow::Result<Self> {
         use std::io::Read;
 
         let meta_buf = std::fs::read_to_string(meta_path)?;
         let meta_json: serde_json::Value = serde_json::from_str(&meta_buf)?;
 
-        let epochs = meta_json["epochs"].as_u64().unwrap_or(DEFAULT_EPOCHS as u64) as u32;
+        let epochs = meta_json["epochs"]
+            .as_u64()
+            .unwrap_or(DEFAULT_EPOCHS as u64) as u32;
         let node_count = meta_json["entity_count"]
             .as_u64()
             .or_else(|| meta_json["node_count"].as_u64())
@@ -133,11 +132,19 @@ impl KgeModel {
             .to_string();
         let entity_ids: Vec<String> = meta_json["entity_ids"]
             .as_array()
-            .map(|arr| arr.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect())
+            .map(|arr| {
+                arr.iter()
+                    .map(|v| v.as_str().unwrap_or("").to_string())
+                    .collect()
+            })
             .unwrap_or_default();
         let relation_types: Vec<String> = meta_json["relation_types"]
             .as_array()
-            .map(|arr| arr.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect())
+            .map(|arr| {
+                arr.iter()
+                    .map(|v| v.as_str().unwrap_or("").to_string())
+                    .collect()
+            })
             .unwrap_or_else(|| {
                 vec![
                     "GOVERNS".to_string(),
@@ -170,7 +177,8 @@ impl KgeModel {
             anyhow::bail!("Invalid KGE model magic header");
         }
 
-        let version_u32 = u32::from_le_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]);
+        let version_u32 =
+            u32::from_le_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]);
         // The metadata carries a semantic version string ("1.0"); compare its
         // major numeric against the binary header (save() writes 1u32).
         let meta_version: u32 = version
@@ -186,9 +194,14 @@ impl KgeModel {
             );
         }
         let entity_count_stored =
-            u32::from_le_bytes([header_buf[8], header_buf[9], header_buf[10], header_buf[11]]) as usize;
-        let relation_count_stored =
-            u32::from_le_bytes([header_buf[12], header_buf[13], header_buf[14], header_buf[15]]) as usize;
+            u32::from_le_bytes([header_buf[8], header_buf[9], header_buf[10], header_buf[11]])
+                as usize;
+        let relation_count_stored = u32::from_le_bytes([
+            header_buf[12],
+            header_buf[13],
+            header_buf[14],
+            header_buf[15],
+        ]) as usize;
         let model_dim = u32::from_le_bytes([
             header_buf[16],
             header_buf[17],
@@ -334,12 +347,10 @@ impl KgeModel {
         let n_rel = num_relations;
         let bound = 6.0 / (dim.max(1) as f32).sqrt();
 
-        let mut entity_embeddings: Vec<f32> = (0..(n_ent * dim))
-            .map(|_| next_unit() * bound)
-            .collect();
-        let mut relation_embeddings: Vec<f32> = (0..(n_rel * dim))
-            .map(|_| next_unit() * bound)
-            .collect();
+        let mut entity_embeddings: Vec<f32> =
+            (0..(n_ent * dim)).map(|_| next_unit() * bound).collect();
+        let mut relation_embeddings: Vec<f32> =
+            (0..(n_rel * dim)).map(|_| next_unit() * bound).collect();
 
         let indexed_edges: Vec<(usize, usize, usize)> = edges
             .iter()
@@ -365,9 +376,7 @@ impl KgeModel {
                     for &(h, r, t) in batch {
                         // Advance the RNG state so negative sampling draws a
                         // fresh entity per triple/epoch (AH-2).
-                        state = state
-                            .wrapping_mul(6364136223846793005)
-                            .wrapping_add(1);
+                        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
                         let mut neg_t = ((state >> 32) as usize) % n_ent;
                         if neg_t == t {
                             neg_t = (t + 1) % n_ent;
@@ -424,8 +433,7 @@ impl KgeModel {
                 for j in (i + 1)..cap {
                     let mut sq = 0.0f32;
                     for k in 0..dim {
-                        let dd = entity_embeddings[i * dim + k]
-                            - entity_embeddings[j * dim + k];
+                        let dd = entity_embeddings[i * dim + k] - entity_embeddings[j * dim + k];
                         sq += dd * dd;
                     }
                     distances.push(sq.sqrt());
@@ -490,8 +498,8 @@ impl KgeModel {
         let d = self.dim as usize;
         let mut sum_sq = 0.0f32;
         for k in 0..d {
-            let diff = self.entity_embeddings[row_a * d + k]
-                - self.entity_embeddings[row_b * d + k];
+            let diff =
+                self.entity_embeddings[row_a * d + k] - self.entity_embeddings[row_b * d + k];
             sum_sq += diff * diff;
         }
         sum_sq.sqrt()
@@ -527,23 +535,14 @@ impl KgeModel {
 
     /// Normalized structural distance (spec §5.6):
     /// `min(1.0, distance / STRUCTURAL_SCALE)` guarded by `scale.max(1e-6)`.
-    pub fn normalized_structural_distance(
-        &self,
-        a: &str,
-        b: &str,
-    ) -> f32 {
+    pub fn normalized_structural_distance(&self, a: &str, b: &str) -> f32 {
         let scale = self.structural_scale.max(1e-6);
         ((self.structural_distance(a, b) / scale).min(1.0)).clamp(0.0, 1.0)
     }
 
     /// Duplicate-candidate scoring: 0.5 text_sim + 0.5 (1 - normalized_struct_dist)
     /// (spec §5.7). Higher = more likely duplicate.
-    pub fn duplicate_score(
-        &self,
-        text_similarity: f32,
-        a: &str,
-        b: &str,
-    ) -> f32 {
+    pub fn duplicate_score(&self, text_similarity: f32, a: &str, b: &str) -> f32 {
         let text_sim = text_similarity.clamp(0.0, 1.0);
         let norm_struct = self.normalized_structural_distance(a, b);
         0.5 * text_sim + 0.5 * (1.0 - norm_struct)
@@ -554,7 +553,13 @@ impl KgeModel {
 /// `neurostrata-mcp kge train [--namespace <ns>|--all] [--epochs N] [--dim D]`.
 /// Extracts triples from `.NeuroStrata/graph/graph.json` (current working dir) if present,
 /// else falls back to dummy entities so CLI tests work in temp dirs without a graph.
-pub fn cli_train(namespace: Option<&str>, all: bool, epochs: Option<u32>, dim: Option<u32>, kge_weight: Option<f32>) -> anyhow::Result<()> {
+pub fn cli_train(
+    namespace: Option<&str>,
+    all: bool,
+    epochs: Option<u32>,
+    dim: Option<u32>,
+    kge_weight: Option<f32>,
+) -> anyhow::Result<()> {
     // Validate arguments: require either namespace.is_some() or all == true (bail if neither or both)
     if namespace.is_some() == all {
         anyhow::bail!("Specify either --namespace <ns> or --all, not both or neither");
@@ -589,7 +594,11 @@ pub fn cli_train(namespace: Option<&str>, all: bool, epochs: Option<u32>, dim: O
     if graph_path.exists() {
         let content = std::fs::read_to_string(&graph_path)?;
         let json: serde_json::Value = serde_json::from_str(&content)?;
-        let nodes_arr = json.get("nodes").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let nodes_arr = json
+            .get("nodes")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
         let mut collected: std::collections::HashSet<String> = std::collections::HashSet::new();
         for node in &nodes_arr {
             let id_val = node.get("id").and_then(|v| v.as_str()).map(String::from);
@@ -610,17 +619,38 @@ pub fn cli_train(namespace: Option<&str>, all: bool, epochs: Option<u32>, dim: O
         entity_ids.sort();
         entity_ids.dedup();
 
-        let edge_arr = json.get("edges").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-        let links_arr = json.get("links").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-        let combined_edges: Vec<&serde_json::Value> = edge_arr.iter().chain(links_arr.iter()).collect();
+        let edge_arr = json
+            .get("edges")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let links_arr = json
+            .get("links")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let combined_edges: Vec<&serde_json::Value> =
+            edge_arr.iter().chain(links_arr.iter()).collect();
         for e in combined_edges {
             let src = e.get("source").and_then(|v| v.as_str()).map(String::from);
             let tgt = e.get("target").and_then(|v| v.as_str()).map(String::from);
-            let rel_str = e.get("rel_type").or_else(|| e.get("relation")).or_else(|| e.get("type")).and_then(|v| v.as_str()).map(String::from);
+            let rel_str = e
+                .get("rel_type")
+                .or_else(|| e.get("relation"))
+                .or_else(|| e.get("type"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
             if let (Some(s), Some(t), Some(rel)) = (src, tgt, rel_str) {
                 if collected.contains(&s) && collected.contains(&t) {
                     if let Ok(et) = rel.parse::<EdgeType>() {
-                        if matches!(et, EdgeType::Governs | EdgeType::Contains | EdgeType::RelatesTo | EdgeType::DependsOn | EdgeType::ExtractedFrom) {
+                        if matches!(
+                            et,
+                            EdgeType::Governs
+                                | EdgeType::Contains
+                                | EdgeType::RelatesTo
+                                | EdgeType::DependsOn
+                                | EdgeType::ExtractedFrom
+                        ) {
                             edges.push((s.clone(), et, t.clone()));
                         }
                     }
@@ -633,7 +663,9 @@ pub fn cli_train(namespace: Option<&str>, all: bool, epochs: Option<u32>, dim: O
             final_set.insert(s.clone());
             final_set.insert(t.clone());
         }
-        for id in &entity_ids { final_set.insert(id.clone()); }
+        for id in &entity_ids {
+            final_set.insert(id.clone());
+        }
         entity_ids = final_set.into_iter().collect();
         entity_ids.sort();
         entity_ids.dedup();
@@ -662,23 +694,42 @@ pub fn cli_train(namespace: Option<&str>, all: bool, epochs: Option<u32>, dim: O
     // Save artifacts to scope_dir (.NeuroStrata/kge/<scope> or NEUROSTRATA_KGE_DIR)
     let model_path = scope_dir.join("model.bin");
     let meta_path = scope_dir.join("meta.json");
-    model.save(&model_path, &meta_path, epochs, edges.len(), model.final_loss, Some(effective_weight))?;
+    model.save(
+        &model_path,
+        &meta_path,
+        epochs,
+        edges.len(),
+        model.final_loss,
+        Some(effective_weight),
+    )?;
 
     // Also mirror to <db_path_parent>/kge/<scope>/ (spec §5.9) when NEUROSTRATA_KGE_DIR is not overridden,
     // so the background daemon (whose cwd may differ from the project directory) loads the trained artifact.
     if std::env::var("NEUROSTRATA_KGE_DIR").is_err() {
         if let Ok(cfg) = crate::config::Config::from_default_path() {
-            let (db_model_path, db_meta_path) = artifact_paths(std::path::Path::new(&cfg.db_path), scope);
+            let (db_model_path, db_meta_path) =
+                artifact_paths(std::path::Path::new(&cfg.db_path), scope);
             if db_model_path != model_path {
-                if let Err(e) = model.save(&db_model_path, &db_meta_path, epochs, edges.len(), model.final_loss, Some(effective_weight)) {
-                    tracing::warn!("Failed to mirror KGE model artifact to {}: {e}", db_model_path.display());
+                if let Err(e) = model.save(
+                    &db_model_path,
+                    &db_meta_path,
+                    epochs,
+                    edges.len(),
+                    model.final_loss,
+                    Some(effective_weight),
+                ) {
+                    tracing::warn!(
+                        "Failed to mirror KGE model artifact to {}: {e}",
+                        db_model_path.display()
+                    );
                 }
             }
         }
     }
 
     // Print summary
-    println!("Trained KGE model for '{}': entities={}, edges={}, dim={}, epochs={}, loss={}",
+    println!(
+        "Trained KGE model for '{}': entities={}, edges={}, dim={}, epochs={}, loss={}",
         scope,
         entity_ids.len(),
         edges.len(),
@@ -701,13 +752,13 @@ pub fn kge_weight_from_env() -> f32 {
 
 /// Artifact path helper (spec §5.3, §5.9): `<db_path_parent>/kge/<scope>/`.
 /// Returns `(model.bin, meta.json)` paths.
-pub fn artifact_paths(db_path: &std::path::Path, scope: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+pub fn artifact_paths(
+    db_path: &std::path::Path,
+    scope: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
     let parent = db_path.parent().unwrap_or(db_path);
     let dir = parent.join("kge").join(scope);
-    (
-        dir.join("model.bin"),
-        dir.join("meta.json"),
-    )
+    (dir.join("model.bin"), dir.join("meta.json"))
 }
 
 /// Load the trained KGE artifact for a scope, preferring the database-layout
@@ -793,12 +844,18 @@ mod tests {
         let entities = vec!["n1".to_string(), "n2".to_string(), "n3".to_string()];
         let edges = vec![("n1".to_string(), EdgeType::Governs, "n2".to_string())];
         let trained = KgeModel::train(&edges, &entities, 8, 5, 0.01, 1.0, 42).unwrap();
-        trained.save(&model_path, &meta_path, 5, edges.len(), 0.25, Some(0.15)).unwrap();
+        trained
+            .save(&model_path, &meta_path, 5, edges.len(), 0.25, Some(0.15))
+            .unwrap();
 
         let loaded = KgeModel::load(&model_path, &meta_path).unwrap();
         assert_eq!(loaded.dim, 8);
         assert_eq!(loaded.entity_ids, entities);
-        assert!((loaded.structural_distance("n1", "n2") - trained.structural_distance("n1", "n2")).abs() < 1e-6);
+        assert!(
+            (loaded.structural_distance("n1", "n2") - trained.structural_distance("n1", "n2"))
+                .abs()
+                < 1e-6
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -813,7 +870,9 @@ mod tests {
         let entities = vec!["n1".to_string(), "n2".to_string()];
         let edges = vec![("n1".to_string(), EdgeType::Governs, "n2".to_string())];
         let trained = KgeModel::train(&edges, &entities, 8, 2, 0.01, 1.0, 42).unwrap();
-        trained.save(&model_path, &meta_path, 5, edges.len(), 0.25, Some(0.15)).unwrap();
+        trained
+            .save(&model_path, &meta_path, 5, edges.len(), 0.25, Some(0.15))
+            .unwrap();
 
         // Overwrite the metadata version so it disagrees with the binary header.
         let meta_buf = std::fs::read_to_string(&meta_path).unwrap();
@@ -842,7 +901,8 @@ mod tests {
         std::env::remove_var("NEUROSTRATA_KGE_WEIGHT");
         assert!(kge_weight_from_env() - DEFAULT_KGE_WEIGHT < 1e-6);
 
-        let (model_path, meta_path) = artifact_paths(std::path::Path::new("/tmp/db/ladybug.db"), "ns");
+        let (model_path, meta_path) =
+            artifact_paths(std::path::Path::new("/tmp/db/ladybug.db"), "ns");
         assert!(model_path.ends_with("kge/ns/model.bin"));
         assert!(meta_path.ends_with("kge/ns/meta.json"));
     }
@@ -850,7 +910,14 @@ mod tests {
     #[test]
     fn cli_train_extracts_from_graph_json_and_saves_model() {
         let tmp_dir = tempfile::tempdir().unwrap();
-        std::env::set_var("NEUROSTRATA_KGE_DIR", tmp_dir.path().join(".NeuroStrata/kge").to_string_lossy().to_string());
+        std::env::set_var(
+            "NEUROSTRATA_KGE_DIR",
+            tmp_dir
+                .path()
+                .join(".NeuroStrata/kge")
+                .to_string_lossy()
+                .to_string(),
+        );
         let graph_dir = tmp_dir.path().join(".NeuroStrata/graph");
         std::fs::create_dir_all(&graph_dir).unwrap();
         let graph_json = serde_json::json!({
@@ -868,12 +935,28 @@ mod tests {
         // The graph source is overridable by env, so this test never needs to
         // chdir the whole test process into a self-deleting TempDir — that
         // used to orphan every other test thread's working directory.
-        std::env::set_var("NEUROSTRATA_KGE_GRAPH_DIR", graph_dir.to_string_lossy().to_string());
-        std::env::set_var("NEUROSTRATA_KGE_DIR", tmp_dir.path().join(".NeuroStrata/kge").to_string_lossy().to_string());
+        std::env::set_var(
+            "NEUROSTRATA_KGE_GRAPH_DIR",
+            graph_dir.to_string_lossy().to_string(),
+        );
+        std::env::set_var(
+            "NEUROSTRATA_KGE_DIR",
+            tmp_dir
+                .path()
+                .join(".NeuroStrata/kge")
+                .to_string_lossy()
+                .to_string(),
+        );
         cli_train(Some("NeuroStrata"), false, Some(2), Some(8), None).unwrap();
         let scope_dir = tmp_dir.path().join(".NeuroStrata/kge/NeuroStrata");
-        assert!(scope_dir.join("model.bin").exists(), "model.bin should exist");
-        assert!(scope_dir.join("meta.json").exists(), "meta.json should exist");
+        assert!(
+            scope_dir.join("model.bin").exists(),
+            "model.bin should exist"
+        );
+        assert!(
+            scope_dir.join("meta.json").exists(),
+            "meta.json should exist"
+        );
         std::env::remove_var("NEUROSTRATA_KGE_DIR");
         std::env::remove_var("NEUROSTRATA_KGE_GRAPH_DIR");
     }

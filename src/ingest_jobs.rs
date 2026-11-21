@@ -265,8 +265,13 @@ impl IngestJobs {
     /// and exited mid-walk, and the runtime dropped the walk after it had
     /// cleared the namespace but before it had rebuilt or relinked it.
     pub async fn wait_idle(&self, limit: std::time::Duration) -> bool {
-        let receivers: Vec<watch::Receiver<IngestProgress>> =
-            self.jobs.lock().unwrap_or_else(|e| e.into_inner()).values().cloned().collect();
+        let receivers: Vec<watch::Receiver<IngestProgress>> = self
+            .jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
 
         let all_finished = async move {
             for mut rx in receivers {

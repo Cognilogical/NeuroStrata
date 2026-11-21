@@ -814,7 +814,7 @@ LEDGER
     return 0
 }
 
-# Test 9: absent project quality script leaves generic ledger hook operational
+# Test 9: absent quality script warns honestly and writes no fabricated ledger row
 test_pre_commit_hook_delegation_absent_quality_script() {
     local tmpdir
     tmpdir=$(mktemp -d)
@@ -859,19 +859,32 @@ RF_EOF
         return 1
     fi
 
-    # Expect generic ledger operations (the hook should still write a ledger entry)
+    # Spec §6 R6.1: the hook must not fabricate `tool:"pre-commit"` rows for
+    # staged files with no real graph lookup. It may create an empty ledger and
+    # emit an honest warning — nothing more.
     local ledger="$repo/.NeuroStrata/session_queries.json"
     if [ ! -f "$ledger" ]; then
-        echo "pre-commit delegation without quality script should still write ledger" >&2
+        echo "pre-commit delegation without quality script should still create ledger" >&2
         rm -rf "$tmpdir"
         return 1
     fi
 
-    # Verify it has at least one entry
     local queries_count
     queries_count=$(jq -r '.queries | length' "$ledger")
-    if [ "$queries_count" -lt 1 ]; then
-        echo "ledger should have at least one query after hook run" >&2
+    if [ "$queries_count" -ne 0 ]; then
+        echo "hook must not fabricate ledger rows (found $queries_count)" >&2
+        cat "$ledger" >&2
+        rm -rf "$tmpdir"
+        return 1
+    fi
+    if jq -e '.queries[] | select(.tool == "pre-commit")' "$ledger" >/dev/null 2>&1; then
+        echo "hook wrote a synthetic tool:pre-commit row" >&2
+        rm -rf "$tmpdir"
+        return 1
+    fi
+    if ! grep -q "no recorded NeuroStrata graph/memory lookup" "$tmpdir/out.log"; then
+        echo "hook should emit an honest missing-lookup warning" >&2
+        cat "$tmpdir/out.log" >&2
         rm -rf "$tmpdir"
         return 1
     fi
@@ -978,6 +991,55 @@ SC_EOF
     grep -q "hooks/pre-commit" "$FAKE_TOOL_LOG" || { echo "Hook was not passed to ShellCheck" >&2; cd - >/dev/null; return 1; }
     cd - >/dev/null
     rm -rf "$tmpdir"
+}
+
+# Direct /usr/bin interpreter paths must stay in the ShellCheck scan (#330).
+test_direct_usr_bin_shebang_is_checked() {
+    local shebang tmpdir repo bindir exit_code
+    for shebang in '#!/usr/bin/bash' '#!/usr/bin/sh'; do
+        tmpdir=$(mktemp -d)
+        repo="$tmpdir/repo"
+        bindir="$tmpdir/bin"
+        export FAKE_TOOL_LOG="$tmpdir/tool.log"
+        setup_fake_tools "$bindir"
+        cat > "$bindir/shellcheck" <<'SC_EOF'
+#!/usr/bin/env bash
+echo "shellcheck $*" >> "$FAKE_TOOL_LOG"
+for file; do
+    if [ -f "$file" ] && grep -q 'echo $unquoted' "$file"; then
+        echo "SC2086: quote staged hook expansion" >&2
+        exit 1
+    fi
+done
+exit 0
+SC_EOF
+        chmod +x "$bindir/shellcheck"
+        mkdir -p "$repo/hooks"
+        # shellcheck disable=SC2016  # fixture intentionally contains an unquoted expansion
+        printf '%s\necho $unquoted\n' "$shebang" > "$repo/hooks/pre-commit"
+        chmod +x "$repo/hooks/pre-commit"
+        cd "$repo"
+        git init -q
+        git config user.email "test@test.com"
+        git config user.name "Test"
+        git add hooks/pre-commit
+        PATH="$bindir:$PATH" bash "$SCRIPT_PATH" > "$tmpdir/out.log" 2>&1
+        exit_code=$?
+        [ "$exit_code" -ne 0 ] || {
+            echo "Direct /usr/bin shebang skipped ShellCheck: $shebang" >&2
+            cd - >/dev/null
+            rm -rf "$tmpdir"
+            return 1
+        }
+        grep -q "hooks/pre-commit" "$FAKE_TOOL_LOG" || {
+            echo "Hook was not passed to ShellCheck: $shebang" >&2
+            cd - >/dev/null
+            rm -rf "$tmpdir"
+            return 1
+        }
+        cd - >/dev/null
+        rm -rf "$tmpdir"
+    done
 }
 # Test 21: staged Rust with no Cargo dep-info is not silently skipped
 test_unbuilt_staged_rust_fails() {
@@ -1119,7 +1181,7 @@ CARGO_EOF
     git commit -q -m "initial"
 
     # Unstaged working-tree edition bump; staged Rust is still edition 2021.
-    sed -i 's/edition = "2021"/edition = "2024"/' Cargo.toml
+    sed 's/edition = "2021"/edition = "2024"/' Cargo.toml > Cargo.toml.new && mv Cargo.toml.new Cargo.toml
     echo '// staged change' >> src/main.rs
     git add src/main.rs
 
@@ -1163,9 +1225,9 @@ CARGO_EOF
     git add Cargo.toml src/main.rs
     git commit -q -m "initial"
 
-    sed -i 's/edition = "2021"/edition = "2024"/' Cargo.toml
+    sed 's/edition = "2021"/edition = "2024"/' Cargo.toml > Cargo.toml.new && mv Cargo.toml.new Cargo.toml
     git add Cargo.toml
-    sed -i 's/edition = "2024"/edition = "2021"/' Cargo.toml
+    sed 's/edition = "2024"/edition = "2021"/' Cargo.toml > Cargo.toml.new && mv Cargo.toml.new Cargo.toml
     echo '// staged change' >> src/main.rs
     git add src/main.rs
 
@@ -1224,10 +1286,11 @@ run_test "Local ESLint mandatory over PATH" test_local_eslint_mandatory
 run_test "ESLint cwd and web-ui-relative args" test_eslint_cwd_and_args
 run_test "Pre-commit delegation quality failure nonzero, ledger unchanged" test_pre_commit_hook_delegation_quality_failure_propagates_nonzero_ledger_unchanged
 run_test "Pre-commit delegation quality success preserves ledger" test_pre_commit_hook_delegation_quality_success_preserves_ledger
-run_test "Pre-commit delegation absent quality script generic ledger" test_pre_commit_hook_delegation_absent_quality_script
+run_test "Pre-commit delegation absent quality script no fabrication" test_pre_commit_hook_delegation_absent_quality_script
 run_test "Bad staged Rust fails despite formatted worktree" test_bad_staged_rust_fails_despite_formatted_worktree
 run_test "Good staged Rust passes despite bad worktree" test_good_staged_rust_passes_despite_bad_worktree
 run_test "Extensionless Bash hook is checked" test_extensionless_bash_hook_is_checked
+run_test "Direct /usr/bin shebangs are checked" test_direct_usr_bin_shebang_is_checked
 run_test "Unbuilt staged Rust fails" test_unbuilt_staged_rust_fails
 run_test "Quality suites are wired into CI" test_quality_suites_are_wired_into_ci
 run_test "Local Rustfmt survives snapshot cwd" test_local_rustfmt_survives_snapshot_cwd

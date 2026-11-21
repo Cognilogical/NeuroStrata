@@ -110,20 +110,10 @@ pub const OP_CREATED: &str = "created";
 pub const OP_SUPERSEDED: &str = "superseded";
 pub const OP_ARCHIVED: &str = "archived";
 
-/// The memory types that may be shared over the mesh (spec §"Sharing
-/// boundary": `rule`, `fact`, `procedure`, and opt-in `action_type`
-/// definitions). Everything else — `action_receipt`, tasks,
-/// structural/source-ingestion rows, embeddings, the bus's own
-/// sentinel/audit rows — is strictly local.
-const SHAREABLE_MEMORY_TYPES: &[&str] = &["rule", "fact", "procedure", "action_type", "thesis", "concept"];
-
-/// Whether `memory_type` is a type the mesh may carry. Used by both the
-/// subscriber (to decide what to capture) and the worker (to decide what to
-/// export). The worker also re-checks it defensively, because a captured
-/// entry's type is not the worker's only filter.
-pub fn is_shareable_memory_type(memory_type: &str) -> bool {
-    SHAREABLE_MEMORY_TYPES.contains(&memory_type)
-}
+/// Whether `memory_type` is a type the mesh may carry. The predicate lives in
+/// the crate-free `shareable` module so the privacy egress test exercises this
+/// exact production function rather than a drifting copy of the allowlist.
+pub use super::shareable::is_shareable_memory_type;
 
 /// One pending mesh operation, as it sits in the WAL. Self-contained on
 /// purpose: the worker builds the mesh record from this alone and never reads

@@ -2,9 +2,17 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 pub const DEFAULT_ALLOWED_MIMES: [&str; 11] = [
-    "text/plain", "text/markdown", "text/csv",
-    "image/png", "image/jpeg", "image/gif", "image/webp",
-    "audio/wav", "audio/mpeg", "audio/ogg", "application/pdf",
+    "text/plain",
+    "text/markdown",
+    "text/csv",
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+    "audio/wav",
+    "audio/mpeg",
+    "audio/ogg",
+    "application/pdf",
 ];
 
 pub const IMAGE_MIMES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
@@ -48,14 +56,29 @@ pub struct MultimodalConfig {
     pub share_attachments: bool,
 }
 
-fn default_false() -> bool { false }
-fn default_true() -> bool { true }
-fn default_10mb() -> usize { 10 * 1024 * 1024 }
-fn default_50mb() -> usize { 50 * 1024 * 1024 }
-fn default_20() -> usize { 20 }
-fn default_8192() -> u32 { 8192 }
+fn default_false() -> bool {
+    false
+}
+fn default_true() -> bool {
+    true
+}
+fn default_10mb() -> usize {
+    10 * 1024 * 1024
+}
+fn default_50mb() -> usize {
+    50 * 1024 * 1024
+}
+fn default_20() -> usize {
+    20
+}
+fn default_8192() -> u32 {
+    8192
+}
 fn default_allowed_mimes() -> Vec<String> {
-    DEFAULT_ALLOWED_MIMES.iter().map(|s| s.to_string()).collect()
+    DEFAULT_ALLOWED_MIMES
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 impl Default for MultimodalConfig {
@@ -79,37 +102,89 @@ impl Default for MultimodalConfig {
 pub enum MultimodalWarning {
     EmptyId,
     EmptyUri,
-    UnsupportedMime { mime: String },
-    SizeExceeded { size: usize, cap: usize },
+    UnsupportedMime {
+        mime: String,
+    },
+    SizeExceeded {
+        size: usize,
+        cap: usize,
+    },
     SizeZero,
-    TotalSizeExceeded { total: usize, cap: usize },
-    CountExceeded { count: usize, cap: usize },
-    DigestMalformed { digest: String },
-    DigestMismatch { expected: String, actual: String },
-    DigestUnverifiable { uri: String },
-    DimensionsMissing { mime: String },
-    DimensionsUnparseable { mime: String },
-    DimensionsExceeded { width: u32, height: u32, max_width: u32, max_height: u32 },
-    DimensionsMismatch { declared: (u32, u32), parsed: (u32, u32) },
-    AltTextTooLong { len: usize, cap: usize },
-    DuplicateId { id: String },
+    TotalSizeExceeded {
+        total: usize,
+        cap: usize,
+    },
+    CountExceeded {
+        count: usize,
+        cap: usize,
+    },
+    DigestMalformed {
+        digest: String,
+    },
+    DigestMismatch {
+        expected: String,
+        actual: String,
+    },
+    DigestUnverifiable {
+        uri: String,
+    },
+    DimensionsMissing {
+        mime: String,
+    },
+    DimensionsUnparseable {
+        mime: String,
+    },
+    DimensionsExceeded {
+        width: u32,
+        height: u32,
+        max_width: u32,
+        max_height: u32,
+    },
+    DimensionsMismatch {
+        declared: (u32, u32),
+        parsed: (u32, u32),
+    },
+    AltTextTooLong {
+        len: usize,
+        cap: usize,
+    },
+    DuplicateId {
+        id: String,
+    },
     AttachmentsNotArray,
-    ByteLengthMismatch { declared: usize, actual: usize },
+    ByteLengthMismatch {
+        declared: usize,
+        actual: usize,
+    },
     /// An element of the `attachments` array did not deserialize into
     /// [`Attachment`] (missing/ill-typed required fields). Detection is not
     /// optional: silently skipping would validate a smaller set than declared.
-    AttachmentUnparseable { index: usize, error: String },
+    AttachmentUnparseable {
+        index: usize,
+        error: String,
+    },
 }
 
 impl MultimodalWarning {
     pub fn is_strict_failure(&self, require_dimensions: bool) -> bool {
         use MultimodalWarning::*;
         match self {
-            EmptyId | EmptyUri | UnsupportedMime { .. } | SizeExceeded { .. } | SizeZero
-            | TotalSizeExceeded { .. } | CountExceeded { .. } | DigestMalformed { .. }
-            | DigestMismatch { .. } | DimensionsExceeded { .. } | DimensionsMismatch { .. }
-            | AltTextTooLong { .. } | DuplicateId { .. } | AttachmentsNotArray
-            | AttachmentUnparseable { .. } | ByteLengthMismatch { .. } => true,
+            EmptyId
+            | EmptyUri
+            | UnsupportedMime { .. }
+            | SizeExceeded { .. }
+            | SizeZero
+            | TotalSizeExceeded { .. }
+            | CountExceeded { .. }
+            | DigestMalformed { .. }
+            | DigestMismatch { .. }
+            | DimensionsExceeded { .. }
+            | DimensionsMismatch { .. }
+            | AltTextTooLong { .. }
+            | DuplicateId { .. }
+            | AttachmentsNotArray
+            | AttachmentUnparseable { .. }
+            | ByteLengthMismatch { .. } => true,
             DigestUnverifiable { .. } => false,
             DimensionsMissing { .. } => require_dimensions,
             DimensionsUnparseable { .. } => require_dimensions,
@@ -123,22 +198,61 @@ impl fmt::Display for MultimodalWarning {
             MultimodalWarning::EmptyId => write!(f, "EmptyId"),
             MultimodalWarning::EmptyUri => write!(f, "EmptyUri"),
             MultimodalWarning::UnsupportedMime { mime } => write!(f, "UnsupportedMime({})", mime),
-            MultimodalWarning::SizeExceeded { size, cap } => write!(f, "SizeExceeded({} > {})", size, cap),
+            MultimodalWarning::SizeExceeded { size, cap } => {
+                write!(f, "SizeExceeded({} > {})", size, cap)
+            }
             MultimodalWarning::SizeZero => write!(f, "SizeZero"),
-            MultimodalWarning::TotalSizeExceeded { total, cap } => write!(f, "TotalSizeExceeded({} > {})", total, cap),
-            MultimodalWarning::CountExceeded { count, cap } => write!(f, "CountExceeded({} > {})", count, cap),
-            MultimodalWarning::DigestMalformed { digest } => write!(f, "DigestMalformed({})", digest),
-            MultimodalWarning::DigestMismatch { expected, actual } => write!(f, "DigestMismatch(expected={}, actual={})", expected, actual),
-            MultimodalWarning::DigestUnverifiable { uri } => write!(f, "DigestUnverifiable({})", uri),
-            MultimodalWarning::DimensionsMissing { mime } => write!(f, "DimensionsMissing({})", mime),
-            MultimodalWarning::DimensionsUnparseable { mime } => write!(f, "DimensionsUnparseable({})", mime),
-            MultimodalWarning::DimensionsExceeded { width, height, max_width, max_height } => write!(f, "DimensionsExceeded({}x{} > {}x{})", width, height, max_width, max_height),
-            MultimodalWarning::DimensionsMismatch { declared, parsed } => write!(f, "DimensionsMismatch(declared=({}x{}), parsed=({}x{}))", declared.0, declared.1, parsed.0, parsed.1),
-            MultimodalWarning::AltTextTooLong { len, cap } => write!(f, "AltTextTooLong({} > {})", len, cap),
+            MultimodalWarning::TotalSizeExceeded { total, cap } => {
+                write!(f, "TotalSizeExceeded({} > {})", total, cap)
+            }
+            MultimodalWarning::CountExceeded { count, cap } => {
+                write!(f, "CountExceeded({} > {})", count, cap)
+            }
+            MultimodalWarning::DigestMalformed { digest } => {
+                write!(f, "DigestMalformed({})", digest)
+            }
+            MultimodalWarning::DigestMismatch { expected, actual } => write!(
+                f,
+                "DigestMismatch(expected={}, actual={})",
+                expected, actual
+            ),
+            MultimodalWarning::DigestUnverifiable { uri } => {
+                write!(f, "DigestUnverifiable({})", uri)
+            }
+            MultimodalWarning::DimensionsMissing { mime } => {
+                write!(f, "DimensionsMissing({})", mime)
+            }
+            MultimodalWarning::DimensionsUnparseable { mime } => {
+                write!(f, "DimensionsUnparseable({})", mime)
+            }
+            MultimodalWarning::DimensionsExceeded {
+                width,
+                height,
+                max_width,
+                max_height,
+            } => write!(
+                f,
+                "DimensionsExceeded({}x{} > {}x{})",
+                width, height, max_width, max_height
+            ),
+            MultimodalWarning::DimensionsMismatch { declared, parsed } => write!(
+                f,
+                "DimensionsMismatch(declared=({}x{}), parsed=({}x{}))",
+                declared.0, declared.1, parsed.0, parsed.1
+            ),
+            MultimodalWarning::AltTextTooLong { len, cap } => {
+                write!(f, "AltTextTooLong({} > {})", len, cap)
+            }
             MultimodalWarning::DuplicateId { id } => write!(f, "DuplicateId({})", id),
             MultimodalWarning::AttachmentsNotArray => write!(f, "AttachmentsNotArray"),
-            MultimodalWarning::ByteLengthMismatch { declared, actual } => write!(f, "ByteLengthMismatch(declared={}, actual={})", declared, actual),
-            MultimodalWarning::AttachmentUnparseable { index, error } => write!(f, "AttachmentUnparseable(index={}, error={})", index, error),
+            MultimodalWarning::ByteLengthMismatch { declared, actual } => write!(
+                f,
+                "ByteLengthMismatch(declared={}, actual={})",
+                declared, actual
+            ),
+            MultimodalWarning::AttachmentUnparseable { index, error } => {
+                write!(f, "AttachmentUnparseable(index={}, error={})", index, error)
+            }
         }
     }
 }
@@ -152,7 +266,7 @@ pub fn is_valid_digest_format(digest: &str) -> bool {
 }
 
 pub fn compute_sha256_digest(bytes: &[u8]) -> String {
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     let result = hasher.finalize();
@@ -188,8 +302,18 @@ fn parse_png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     } else {
         return None;
     };
-    let width = u32::from_be_bytes([bytes[w_off], bytes[w_off + 1], bytes[w_off + 2], bytes[w_off + 3]]);
-    let height = u32::from_be_bytes([bytes[h_off], bytes[h_off + 1], bytes[h_off + 2], bytes[h_off + 3]]);
+    let width = u32::from_be_bytes([
+        bytes[w_off],
+        bytes[w_off + 1],
+        bytes[w_off + 2],
+        bytes[w_off + 3],
+    ]);
+    let height = u32::from_be_bytes([
+        bytes[h_off],
+        bytes[h_off + 1],
+        bytes[h_off + 2],
+        bytes[h_off + 3],
+    ]);
     if width == 0 || height == 0 {
         return None;
     }
@@ -239,8 +363,8 @@ fn parse_jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
         // SOF markers
         if (0xC0..=0xCF).contains(&marker) && ![0xC4, 0xC8, 0xCC].contains(&marker) {
             if i + 8 < bytes.len() {
-                let height = (bytes[i + 5] as u32) << 8 | (bytes[i + 6] as u32) ;
-                let width = (bytes[i + 7] as u32) << 8 | (bytes[i + 8] as u32) ;
+                let height = (bytes[i + 5] as u32) << 8 | (bytes[i + 6] as u32);
+                let width = (bytes[i + 7] as u32) << 8 | (bytes[i + 8] as u32);
                 if height > 0 && width > 0 {
                     return Some((width, height));
                 }
@@ -335,8 +459,12 @@ fn parse_vp8x_extended(bytes: &[u8]) -> Option<(u32, u32)> {
     if bytes.len() < 30 {
         return None;
     }
-    let width_raw = (*bytes.get(24)? as u32) | ((*bytes.get(25)? as u32) << 8) | ((*bytes.get(26)? as u32) << 16);
-    let height_raw = (*bytes.get(27)? as u32) | ((*bytes.get(28)? as u32) << 8) | ((*bytes.get(29)? as u32) << 16);
+    let width_raw = (*bytes.get(24)? as u32)
+        | ((*bytes.get(25)? as u32) << 8)
+        | ((*bytes.get(26)? as u32) << 16);
+    let height_raw = (*bytes.get(27)? as u32)
+        | ((*bytes.get(28)? as u32) << 8)
+        | ((*bytes.get(29)? as u32) << 16);
     let width = width_raw + 1;
     let height = height_raw + 1;
     if width == 0 || height == 0 {
@@ -345,7 +473,11 @@ fn parse_vp8x_extended(bytes: &[u8]) -> Option<(u32, u32)> {
     Some((width, height))
 }
 
-pub fn validate_attachment(att: &Attachment, config: &MultimodalConfig, bytes: Option<&[u8]>) -> Vec<MultimodalWarning> {
+pub fn validate_attachment(
+    att: &Attachment,
+    config: &MultimodalConfig,
+    bytes: Option<&[u8]>,
+) -> Vec<MultimodalWarning> {
     let mut warnings = Vec::new();
     if att.id.trim().is_empty() {
         warnings.push(MultimodalWarning::EmptyId);
@@ -354,26 +486,39 @@ pub fn validate_attachment(att: &Attachment, config: &MultimodalConfig, bytes: O
         warnings.push(MultimodalWarning::EmptyUri);
     }
     if !config.allowed_mimes.contains(&att.mime) {
-        warnings.push(MultimodalWarning::UnsupportedMime { mime: att.mime.clone() });
+        warnings.push(MultimodalWarning::UnsupportedMime {
+            mime: att.mime.clone(),
+        });
     }
     if att.size_bytes == 0 {
         warnings.push(MultimodalWarning::SizeZero);
     } else if att.size_bytes > config.max_attachment_bytes {
-        warnings.push(MultimodalWarning::SizeExceeded { size: att.size_bytes, cap: config.max_attachment_bytes });
+        warnings.push(MultimodalWarning::SizeExceeded {
+            size: att.size_bytes,
+            cap: config.max_attachment_bytes,
+        });
     }
     if !is_valid_digest_format(&att.digest) {
-        warnings.push(MultimodalWarning::DigestMalformed { digest: att.digest.clone() });
+        warnings.push(MultimodalWarning::DigestMalformed {
+            digest: att.digest.clone(),
+        });
     } else if config.verify_digests {
         if let Some(b) = bytes {
             let actual_digest = compute_sha256_digest(b);
             if actual_digest != att.digest {
-                warnings.push(MultimodalWarning::DigestMismatch { expected: att.digest.clone(), actual: actual_digest });
+                warnings.push(MultimodalWarning::DigestMismatch {
+                    expected: att.digest.clone(),
+                    actual: actual_digest,
+                });
             }
         }
     }
     if let Some(b) = bytes {
         if b.len() != att.size_bytes {
-            warnings.push(MultimodalWarning::ByteLengthMismatch { declared: att.size_bytes, actual: b.len() });
+            warnings.push(MultimodalWarning::ByteLengthMismatch {
+                declared: att.size_bytes,
+                actual: b.len(),
+            });
         }
     }
     if let Some(ref alt) = att.alt_text {
@@ -387,29 +532,47 @@ pub fn validate_attachment(att: &Attachment, config: &MultimodalConfig, bytes: O
             match parse_dimensions(&att.mime, b) {
                 Some((w, h)) => {
                     if w > config.max_width || h > config.max_height {
-                        warnings.push(MultimodalWarning::DimensionsExceeded { width: w, height: h, max_width: config.max_width, max_height: config.max_height });
+                        warnings.push(MultimodalWarning::DimensionsExceeded {
+                            width: w,
+                            height: h,
+                            max_width: config.max_width,
+                            max_height: config.max_height,
+                        });
                     }
                     if let (Some(dw), Some(dh)) = (att.width, att.height) {
                         if w != dw || h != dh {
-                            warnings.push(MultimodalWarning::DimensionsMismatch { declared: (dw, dh), parsed: (w, h) });
+                            warnings.push(MultimodalWarning::DimensionsMismatch {
+                                declared: (dw, dh),
+                                parsed: (w, h),
+                            });
                         }
                     }
                 }
                 None => {
-                    warnings.push(MultimodalWarning::DimensionsUnparseable { mime: att.mime.clone() });
+                    warnings.push(MultimodalWarning::DimensionsUnparseable {
+                        mime: att.mime.clone(),
+                    });
                     if config.require_dimensions {
-                        warnings.push(MultimodalWarning::DimensionsMissing { mime: att.mime.clone() });
+                        warnings.push(MultimodalWarning::DimensionsMissing {
+                            mime: att.mime.clone(),
+                        });
                     }
                 }
             }
         } else if config.require_dimensions && (att.width.is_none() || att.height.is_none()) {
-            warnings.push(MultimodalWarning::DimensionsMissing { mime: att.mime.clone() });
+            warnings.push(MultimodalWarning::DimensionsMissing {
+                mime: att.mime.clone(),
+            });
         }
     }
     warnings
 }
 
-pub fn validate_attachments(atts: &[Attachment], config: &MultimodalConfig, bytes_resolver: Option<&dyn Fn(&str) -> Option<Vec<u8>>>) -> Vec<MultimodalWarning> {
+pub fn validate_attachments(
+    atts: &[Attachment],
+    config: &MultimodalConfig,
+    bytes_resolver: Option<&dyn Fn(&str) -> Option<Vec<u8>>>,
+) -> Vec<MultimodalWarning> {
     let mut warnings = Vec::new();
 
     if atts.len() > config.max_attachments {
@@ -477,7 +640,9 @@ fn verify_inline_attachments(metadata: &serde_json::Value) -> Vec<MultimodalWarn
             .and_then(|v| v.as_str())
             .or_else(|| item.get("content").and_then(|v| v.as_str()));
         let Some(inline) = inline else { continue };
-        let Some(declared) = item.get("sha256").and_then(|v| v.as_str()) else { continue };
+        let Some(declared) = item.get("sha256").and_then(|v| v.as_str()) else {
+            continue;
+        };
         let expected = normalize_declared_sha256(declared);
         if !verify_digest(inline.as_bytes(), &expected) {
             warnings.push(MultimodalWarning::DigestMismatch {
@@ -489,7 +654,11 @@ fn verify_inline_attachments(metadata: &serde_json::Value) -> Vec<MultimodalWarn
     warnings
 }
 
-pub fn validate_metadata_attachments(metadata: &serde_json::Value, config: &MultimodalConfig, bytes_resolver: Option<&dyn Fn(&str) -> Option<Vec<u8>>>) -> Vec<MultimodalWarning> {
+pub fn validate_metadata_attachments(
+    metadata: &serde_json::Value,
+    config: &MultimodalConfig,
+    bytes_resolver: Option<&dyn Fn(&str) -> Option<Vec<u8>>>,
+) -> Vec<MultimodalWarning> {
     match metadata.get("attachments") {
         None | Some(serde_json::Value::Null) => Vec::new(),
         Some(serde_json::Value::Array(_)) => {
@@ -530,21 +699,63 @@ mod tests {
     fn mime_allowlist() {
         let c = test_config();
         assert!(c.allowed_mimes.contains(&"image/png".to_string()));
-        let att = Attachment { id: "a".into(), mime: "image/png".into(), size_bytes: 1, digest: "sha256:".to_string() + &"a".repeat(64), uri: "x".into(), width: None, height: None, alt_text: None };
+        let att = Attachment {
+            id: "a".into(),
+            mime: "image/png".into(),
+            size_bytes: 1,
+            digest: "sha256:".to_string() + &"a".repeat(64),
+            uri: "x".into(),
+            width: None,
+            height: None,
+            alt_text: None,
+        };
         assert!(validate_attachment(&att, &c, None).is_empty());
-        let bad = Attachment { id: "b".into(), mime: "bad/type".into(), size_bytes: 1, digest: "sha256:".to_string() + &"a".repeat(64), uri: "x".into(), width: None, height: None, alt_text: None };
+        let bad = Attachment {
+            id: "b".into(),
+            mime: "bad/type".into(),
+            size_bytes: 1,
+            digest: "sha256:".to_string() + &"a".repeat(64),
+            uri: "x".into(),
+            width: None,
+            height: None,
+            alt_text: None,
+        };
         let w = validate_attachment(&bad, &c, None);
-        assert!(w.iter().any(|x| matches!(x, MultimodalWarning::UnsupportedMime { mime } if mime == "bad/type")));
+        assert!(w.iter().any(
+            |x| matches!(x, MultimodalWarning::UnsupportedMime { mime } if mime == "bad/type")
+        ));
     }
 
     #[test]
     fn size_caps() {
         let mut c = test_config();
         c.max_attachment_bytes = 100;
-        let att = Attachment { id: "s".into(), mime: "text/plain".into(), size_bytes: 0, digest: "sha256:".to_string() + &"a".repeat(64), uri: "x".into(), width: None, height: None, alt_text: None };
-        assert!(validate_attachment(&att, &c, None).iter().any(|x| matches!(x, MultimodalWarning::SizeZero)));
-        let big = Attachment { id: "b".into(), mime: "text/plain".into(), size_bytes: 200, digest: "sha256:".to_string() + &"a".repeat(64), uri: "x".into(), width: None, height: None, alt_text: None };
-        assert!(validate_attachment(&big, &c, None).iter().any(|x| matches!(x, MultimodalWarning::SizeExceeded { .. })));
+        let att = Attachment {
+            id: "s".into(),
+            mime: "text/plain".into(),
+            size_bytes: 0,
+            digest: "sha256:".to_string() + &"a".repeat(64),
+            uri: "x".into(),
+            width: None,
+            height: None,
+            alt_text: None,
+        };
+        assert!(validate_attachment(&att, &c, None)
+            .iter()
+            .any(|x| matches!(x, MultimodalWarning::SizeZero)));
+        let big = Attachment {
+            id: "b".into(),
+            mime: "text/plain".into(),
+            size_bytes: 200,
+            digest: "sha256:".to_string() + &"a".repeat(64),
+            uri: "x".into(),
+            width: None,
+            height: None,
+            alt_text: None,
+        };
+        assert!(validate_attachment(&big, &c, None)
+            .iter()
+            .any(|x| matches!(x, MultimodalWarning::SizeExceeded { .. })));
     }
 
     #[test]
@@ -555,10 +766,30 @@ mod tests {
         assert!(verify_digest(bytes, &digest));
         assert!(!verify_digest(bytes, "sha256:bad"));
         assert!(!is_valid_digest_format("bad"));
-        let att = Attachment { id: "d".into(), mime: "text/plain".into(), size_bytes: 5, digest: digest.clone(), uri: "x".into(), width: None, height: None, alt_text: None };
+        let att = Attachment {
+            id: "d".into(),
+            mime: "text/plain".into(),
+            size_bytes: 5,
+            digest: digest.clone(),
+            uri: "x".into(),
+            width: None,
+            height: None,
+            alt_text: None,
+        };
         assert!(validate_attachment(&att, &c, Some(bytes)).is_empty());
-        let bad_digest = Attachment { id: "dd".into(), mime: "text/plain".into(), size_bytes: 5, digest: "sha256:".to_string() + &"b".repeat(64), uri: "x".into(), width: None, height: None, alt_text: None };
-        assert!(validate_attachment(&bad_digest, &c, Some(bytes)).iter().any(|x| matches!(x, MultimodalWarning::DigestMismatch { .. })));
+        let bad_digest = Attachment {
+            id: "dd".into(),
+            mime: "text/plain".into(),
+            size_bytes: 5,
+            digest: "sha256:".to_string() + &"b".repeat(64),
+            uri: "x".into(),
+            width: None,
+            height: None,
+            alt_text: None,
+        };
+        assert!(validate_attachment(&bad_digest, &c, Some(bytes))
+            .iter()
+            .any(|x| matches!(x, MultimodalWarning::DigestMismatch { .. })));
     }
 
     #[test]
@@ -574,12 +805,12 @@ mod tests {
         png.extend_from_slice(&(0u32.to_be_bytes())); // compression
         png.extend_from_slice(&(0u32.to_be_bytes())); // filter
         png.extend_from_slice(&(0u32.to_be_bytes())); // interlace
-        // Add CRC (4 bytes dummy)
-        png.extend_from_slice(&[0,0,0,0]);
+                                                      // Add CRC (4 bytes dummy)
+        png.extend_from_slice(&[0, 0, 0, 0]);
         // IEND chunk
         png.extend_from_slice(b"IEND");
         png.extend_from_slice(&(0u32.to_be_bytes()));
-        png.extend_from_slice(&[0,0,0,0]);
+        png.extend_from_slice(&[0, 0, 0, 0]);
         let dims = parse_dimensions("image/png", &png);
         assert_eq!(dims, Some((100, 200)));
     }
@@ -617,8 +848,8 @@ mod tests {
         webp.extend_from_slice(b"WEBP");
         webp.extend_from_slice(b"VP8 ");
         webp.extend_from_slice(&(10u32.to_le_bytes())); // chunk size
-        // VP8 frame: frame tag (3 bytes) at 20..23, keyframe sync code
-        // 0x9D 0x01 0x2A at 23..26, then 14-bit LE width/height at 26..30.
+                                                        // VP8 frame: frame tag (3 bytes) at 20..23, keyframe sync code
+                                                        // 0x9D 0x01 0x2A at 23..26, then 14-bit LE width/height at 26..30.
         webp.extend_from_slice(&[0x00, 0x00, 0x00]);
         webp.extend_from_slice(&[0x9D, 0x01, 0x2A, 0x01]);
         webp.resize(30, 0);
@@ -645,21 +876,40 @@ mod tests {
             ]
         });
         let w = validate_metadata_attachments(&meta, &c, None);
-        assert!(w.iter().any(|x| matches!(
-            x,
-            MultimodalWarning::AttachmentUnparseable { index: 1, .. }
-        )));
+        assert!(w
+            .iter()
+            .any(|x| matches!(x, MultimodalWarning::AttachmentUnparseable { index: 1, .. })));
     }
 
     #[test]
     fn duplicate_id() {
         let c = test_config();
         let atts = vec![
-            Attachment { id: "dup".into(), mime: "text/plain".into(), size_bytes: 1, digest: "sha256:".to_string() + &"a".repeat(64), uri: "x".into(), width: None, height: None, alt_text: None },
-            Attachment { id: "dup".into(), mime: "text/plain".into(), size_bytes: 1, digest: "sha256:".to_string() + &"a".repeat(64), uri: "y".into(), width: None, height: None, alt_text: None },
+            Attachment {
+                id: "dup".into(),
+                mime: "text/plain".into(),
+                size_bytes: 1,
+                digest: "sha256:".to_string() + &"a".repeat(64),
+                uri: "x".into(),
+                width: None,
+                height: None,
+                alt_text: None,
+            },
+            Attachment {
+                id: "dup".into(),
+                mime: "text/plain".into(),
+                size_bytes: 1,
+                digest: "sha256:".to_string() + &"a".repeat(64),
+                uri: "y".into(),
+                width: None,
+                height: None,
+                alt_text: None,
+            },
         ];
         let w = validate_attachments(&atts, &c, None);
-        assert!(w.iter().any(|x| matches!(x, MultimodalWarning::DuplicateId { id } if id == "dup")));
+        assert!(w
+            .iter()
+            .any(|x| matches!(x, MultimodalWarning::DuplicateId { id } if id == "dup")));
     }
 
     #[test]
@@ -685,6 +935,8 @@ mod tests {
             }]
         });
         let w = validate_metadata_attachments(&bad, &c, None);
-        assert!(w.iter().any(|x| matches!(x, MultimodalWarning::DigestMismatch { .. })));
+        assert!(w
+            .iter()
+            .any(|x| matches!(x, MultimodalWarning::DigestMismatch { .. })));
     }
 }

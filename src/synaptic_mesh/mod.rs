@@ -23,6 +23,7 @@ pub mod outbox;
 pub mod p2p;
 pub mod reactor;
 pub mod record;
+pub mod shareable;
 pub mod storage;
 pub mod storage_api;
 pub mod tools;

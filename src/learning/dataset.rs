@@ -4,11 +4,11 @@
 //! ledger, with labeled tiers, component-disjoint splitting, and gold-standard
 //! partitions. Exported as `build_dedup_dataset` (Task 6 Step 5).
 
+use crate::learning::labels::{derive_labels, LabelRule, LabelTier};
+use crate::learning::observation::{DecisionObservation, LearningOutcome, LearningOutcomeKind};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use crate::learning::labels::{derive_labels, LabelRule, LabelTier};
-use crate::learning::observation::{DecisionObservation, LearningOutcome, LearningOutcomeKind};
 
 /// Measured raw-distance bands per embedder for the dedup policy.
 /// Left empty until a Gold-calibrated Laya candidate exists.
@@ -43,20 +43,27 @@ impl DistancePolicy {
     /// Load from `datasets/dedup/distance_policy.json`, or return `missing()`
     /// if the file is absent (Task 3 must treat missing as no hint band).
     pub fn load_from(root: &Path) -> Self {
-        let path = root.join("datasets").join("dedup").join("distance_policy.json");
+        let path = root
+            .join("datasets")
+            .join("dedup")
+            .join("distance_policy.json");
         if path.exists() {
             match std::fs::read_to_string(&path) {
-                Ok(content) => {
-                    match serde_json::from_str::<Self>(&content) {
-                        Ok(policy) => return policy,
-                        Err(e) => {
-                            tracing::warn!("failed to parse distance_policy.json at {}: {e}", path.display());
-                            return Self::missing();
-                        }
+                Ok(content) => match serde_json::from_str::<Self>(&content) {
+                    Ok(policy) => return policy,
+                    Err(e) => {
+                        tracing::warn!(
+                            "failed to parse distance_policy.json at {}: {e}",
+                            path.display()
+                        );
+                        return Self::missing();
                     }
-                }
+                },
                 Err(e) => {
-                    tracing::warn!("failed to read distance_policy.json at {}: {e}", path.display());
+                    tracing::warn!(
+                        "failed to read distance_policy.json at {}: {e}",
+                        path.display()
+                    );
                     return Self::missing();
                 }
             }
@@ -120,7 +127,13 @@ pub async fn build_dedup_dataset(
 
     if learning_root.exists() && learning_root.is_dir() {
         let mut obs_files: Vec<_> = std::fs::read_dir(learning_root)?
-            .filter_map(|res| match res { Ok(e) => Some(e), Err(e) => { tracing::warn!("failed to read dataset directory entry: {e}"); None } })
+            .filter_map(|res| match res {
+                Ok(e) => Some(e),
+                Err(e) => {
+                    tracing::warn!("failed to read dataset directory entry: {e}");
+                    None
+                }
+            })
             .map(|e| e.path())
             .filter(|p| {
                 let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -130,7 +143,13 @@ pub async fn build_dedup_dataset(
         obs_files.sort();
 
         let mut out_files: Vec<_> = std::fs::read_dir(learning_root)?
-            .filter_map(|res| match res { Ok(e) => Some(e), Err(e) => { tracing::warn!("failed to read dataset directory entry: {e}"); None } })
+            .filter_map(|res| match res {
+                Ok(e) => Some(e),
+                Err(e) => {
+                    tracing::warn!("failed to read dataset directory entry: {e}");
+                    None
+                }
+            })
             .map(|e| e.path())
             .filter(|p| {
                 let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -190,19 +209,35 @@ pub async fn build_dedup_dataset(
     }
 
     // 4. Derive labels / build observation_ids and rules
-    let observation_ids: Vec<String> = observations.iter().map(|o| o.observation_id.clone()).collect();
+    let observation_ids: Vec<String> = observations
+        .iter()
+        .map(|o| o.observation_id.clone())
+        .collect();
 
     let mut rules = Vec::new();
     for obs in &observations {
         let has_blocked = matches!(obs.decision, crate::judgment::DedupDecision::BlockedExact);
         let result_mem = obs.result_memory_id.as_deref();
-        let mem_outcomes: Vec<&LearningOutcome> = outcomes.iter()
-            .filter(|o| result_mem.map(|m| o.target_ids.contains(&m.to_string())).unwrap_or(false))
+        let mem_outcomes: Vec<&LearningOutcome> = outcomes
+            .iter()
+            .filter(|o| {
+                result_mem
+                    .map(|m| o.target_ids.contains(&m.to_string()))
+                    .unwrap_or(false)
+            })
             .collect();
-        let has_superseded = mem_outcomes.iter().any(|o| matches!(o.kind, LearningOutcomeKind::MemorySuperseded));
-        let has_archived = mem_outcomes.iter().any(|o| matches!(o.kind, LearningOutcomeKind::MemoryArchived));
-        let has_task_completed = mem_outcomes.iter().any(|o| matches!(o.kind, LearningOutcomeKind::TaskCompleted));
-        let has_inspected = mem_outcomes.iter().any(|o| matches!(o.kind, LearningOutcomeKind::MemoryInspected));
+        let has_superseded = mem_outcomes
+            .iter()
+            .any(|o| matches!(o.kind, LearningOutcomeKind::MemorySuperseded));
+        let has_archived = mem_outcomes
+            .iter()
+            .any(|o| matches!(o.kind, LearningOutcomeKind::MemoryArchived));
+        let has_task_completed = mem_outcomes
+            .iter()
+            .any(|o| matches!(o.kind, LearningOutcomeKind::TaskCompleted));
+        let has_inspected = mem_outcomes
+            .iter()
+            .any(|o| matches!(o.kind, LearningOutcomeKind::MemoryInspected));
 
         if has_blocked || has_superseded || has_archived {
             rules.push(LabelRule {
@@ -220,7 +255,10 @@ pub async fn build_dedup_dataset(
             });
         } else {
             // Weak proxy if candidates provide confidence / distance signals
-            let weak = obs.candidates.iter().any(|c| c.provider_confidence.is_some() || c.raw_distance.is_some());
+            let weak = obs
+                .candidates
+                .iter()
+                .any(|c| c.provider_confidence.is_some() || c.raw_distance.is_some());
             if weak {
                 rules.push(LabelRule {
                     id: format!("rule-{}", obs.observation_id),
@@ -243,33 +281,41 @@ pub async fn build_dedup_dataset(
     );
 
     // 5. Component-disjoint split
-    let memory_ids: Vec<std::collections::HashSet<String>> = observations.iter().map(|o| {
-        let mut s = std::collections::HashSet::new();
-        if let Some(mid) = &o.result_memory_id {
-            s.insert(mid.clone());
-        }
-        for c in &o.candidates {
-            s.insert(c.candidate_id.clone());
-        }
-        s
-    }).collect();
+    let memory_ids: Vec<std::collections::HashSet<String>> = observations
+        .iter()
+        .map(|o| {
+            let mut s = std::collections::HashSet::new();
+            if let Some(mid) = &o.result_memory_id {
+                s.insert(mid.clone());
+            }
+            for c in &o.candidates {
+                s.insert(c.candidate_id.clone());
+            }
+            s
+        })
+        .collect();
 
-    let payload_hashes: Vec<std::collections::HashSet<String>> = observations.iter().map(|o| {
-        let mut s = std::collections::HashSet::new();
-        s.insert(o.input_payload_hash.0.clone());
-        s
-    }).collect();
+    let payload_hashes: Vec<std::collections::HashSet<String>> = observations
+        .iter()
+        .map(|o| {
+            let mut s = std::collections::HashSet::new();
+            s.insert(o.input_payload_hash.0.clone());
+            s
+        })
+        .collect();
 
     // Supersession lineage: consecutive decisions on the same memory share
     // `result_memory_id` (the "new memory" identity), so they must never
     // straddle train/calibration/eval boundaries.
-    let supersession_lineages: Vec<Option<String>> = observations.iter()
+    let supersession_lineages: Vec<Option<String>> = observations
+        .iter()
         .map(|o| o.result_memory_id.clone())
         .collect();
     // Governance target: decisions made under the same active task are one
     // governance unit (namespace would collapse every same-namespace
     // observation into a single component and degenerate the split).
-    let governance_targets: Vec<Option<String>> = observations.iter()
+    let governance_targets: Vec<Option<String>> = observations
+        .iter()
         .map(|o| o.context.active_task_id.clone())
         .collect();
     let time_windows: Vec<i64> = observations.iter().map(|o| o.occurred_at).collect();
@@ -284,12 +330,14 @@ pub async fn build_dedup_dataset(
     )?;
 
     // 6. Exclude SingleSignalWeakProxy from calibration / eval
-    let weak_obs_ids: std::collections::HashSet<String> = rules.iter()
+    let weak_obs_ids: std::collections::HashSet<String> = rules
+        .iter()
         .filter(|r| r.tier == LabelTier::SingleSignalWeakProxy)
         .filter_map(|r| r.id.strip_prefix("rule-").map(|s| s.to_string()))
         .collect();
 
-    let non_weak_train_ids: std::collections::HashSet<String> = observations.iter()
+    let non_weak_train_ids: std::collections::HashSet<String> = observations
+        .iter()
         .filter(|o| !weak_obs_ids.contains(&o.observation_id))
         .map(|o| o.observation_id.clone())
         .collect();
@@ -307,10 +355,12 @@ pub async fn build_dedup_dataset(
     // Write train: observations assigned to the train split, excluding weak
     // proxies when doing so would not empty the training set (tiny test sets
     // may only contain weak proxies — keep them so small tests still work).
-    let train_assigned: Vec<&DecisionObservation> = observations.iter()
+    let train_assigned: Vec<&DecisionObservation> = observations
+        .iter()
         .filter(|o| splits.train.contains(&o.observation_id))
         .collect();
-    let train_non_weak: Vec<&DecisionObservation> = train_assigned.iter()
+    let train_non_weak: Vec<&DecisionObservation> = train_assigned
+        .iter()
         .copied()
         .filter(|o| non_weak_train_ids.contains(&o.observation_id))
         .collect();
@@ -319,53 +369,99 @@ pub async fn build_dedup_dataset(
     } else {
         train_assigned
     };
-    write_jsonl(&out_dir.join("train.jsonl"), &train_obs.iter().map(|o| (*o).clone()).collect::<Vec<_>>())?;
+    write_jsonl(
+        &out_dir.join("train.jsonl"),
+        &train_obs.iter().map(|o| (*o).clone()).collect::<Vec<_>>(),
+    )?;
     let train_rows = train_obs.len();
 
     // Calibration / eval only from non-weak, assigned to those splits
-    let calib_obs: Vec<&DecisionObservation> = observations.iter()
+    let calib_obs: Vec<&DecisionObservation> = observations
+        .iter()
         .filter(|o| {
             splits.calibration.contains(&o.observation_id)
                 && !weak_obs_ids.contains(&o.observation_id)
         })
         .collect();
-    let eval_obs: Vec<&DecisionObservation> = observations.iter()
+    let eval_obs: Vec<&DecisionObservation> = observations
+        .iter()
         .filter(|o| {
-            splits.eval.contains(&o.observation_id)
-                && !weak_obs_ids.contains(&o.observation_id)
+            splits.eval.contains(&o.observation_id) && !weak_obs_ids.contains(&o.observation_id)
         })
         .collect();
 
     // Separate gold (ShippedAnchorGold) from proxy calibration/eval
-    let gold_calib_obs: Vec<&DecisionObservation> = calib_obs.iter()
-        .filter(|o| rules.iter().any(|r| r.tier == LabelTier::ShippedAnchorGold && (r.id == format!("rule-{}", o.observation_id) || r.id == o.observation_id)))
+    let gold_calib_obs: Vec<&DecisionObservation> = calib_obs
+        .iter()
+        .filter(|o| {
+            rules.iter().any(|r| {
+                r.tier == LabelTier::ShippedAnchorGold
+                    && (r.id == format!("rule-{}", o.observation_id) || r.id == o.observation_id)
+            })
+        })
         .copied()
         .collect();
-    let gold_eval_obs: Vec<&DecisionObservation> = eval_obs.iter()
-        .filter(|o| rules.iter().any(|r| r.tier == LabelTier::ShippedAnchorGold && (r.id == format!("rule-{}", o.observation_id) || r.id == o.observation_id)))
+    let gold_eval_obs: Vec<&DecisionObservation> = eval_obs
+        .iter()
+        .filter(|o| {
+            rules.iter().any(|r| {
+                r.tier == LabelTier::ShippedAnchorGold
+                    && (r.id == format!("rule-{}", o.observation_id) || r.id == o.observation_id)
+            })
+        })
         .copied()
         .collect();
 
     // Use observation_id comparison for filtering
-    let gold_calib_ids: std::collections::HashSet<String> = gold_calib_obs.iter()
-        .map(|o| o.observation_id.clone()).collect();
-    let gold_eval_ids: std::collections::HashSet<String> = gold_eval_obs.iter()
-        .map(|o| o.observation_id.clone()).collect();
+    let gold_calib_ids: std::collections::HashSet<String> = gold_calib_obs
+        .iter()
+        .map(|o| o.observation_id.clone())
+        .collect();
+    let gold_eval_ids: std::collections::HashSet<String> = gold_eval_obs
+        .iter()
+        .map(|o| o.observation_id.clone())
+        .collect();
 
-    let proxy_calib_obs: Vec<&DecisionObservation> = calib_obs.iter()
+    let proxy_calib_obs: Vec<&DecisionObservation> = calib_obs
+        .iter()
         .filter(|o| !gold_calib_ids.contains(&o.observation_id))
         .copied()
         .collect();
 
-    let proxy_eval_obs: Vec<&DecisionObservation> = eval_obs.iter()
+    let proxy_eval_obs: Vec<&DecisionObservation> = eval_obs
+        .iter()
         .filter(|o| !gold_eval_ids.contains(&o.observation_id))
         .copied()
         .collect();
 
-    write_jsonl(&out_dir.join("calibration.jsonl"), &proxy_calib_obs.iter().map(|o| (*o).clone()).collect::<Vec<_>>())?;
-    write_jsonl(&out_dir.join("eval.jsonl"), &proxy_eval_obs.iter().map(|o| (*o).clone()).collect::<Vec<_>>())?;
-    write_jsonl(&out_dir.join("gold_calibration.jsonl"), &gold_calib_obs.iter().map(|o| (*o).clone()).collect::<Vec<_>>())?;
-    write_jsonl(&out_dir.join("gold_eval.jsonl"), &gold_eval_obs.iter().map(|o| (*o).clone()).collect::<Vec<_>>())?;
+    write_jsonl(
+        &out_dir.join("calibration.jsonl"),
+        &proxy_calib_obs
+            .iter()
+            .map(|o| (*o).clone())
+            .collect::<Vec<_>>(),
+    )?;
+    write_jsonl(
+        &out_dir.join("eval.jsonl"),
+        &proxy_eval_obs
+            .iter()
+            .map(|o| (*o).clone())
+            .collect::<Vec<_>>(),
+    )?;
+    write_jsonl(
+        &out_dir.join("gold_calibration.jsonl"),
+        &gold_calib_obs
+            .iter()
+            .map(|o| (*o).clone())
+            .collect::<Vec<_>>(),
+    )?;
+    write_jsonl(
+        &out_dir.join("gold_eval.jsonl"),
+        &gold_eval_obs
+            .iter()
+            .map(|o| (*o).clone())
+            .collect::<Vec<_>>(),
+    )?;
 
     let proxy_calib_rows = proxy_calib_obs.len();
     let proxy_eval_rows = proxy_eval_obs.len();
@@ -380,7 +476,10 @@ pub async fn build_dedup_dataset(
         label_rule_versions: rules.iter().map(|r| (r.id.clone(), r.version)).collect(),
         derived_label_count,
     };
-    std::fs::write(out_dir.join("manifest.json"), serde_json::to_string_pretty(&manifest)?)?;
+    std::fs::write(
+        out_dir.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest)?,
+    )?;
 
     Ok(DatasetBuildReport {
         train_rows,
@@ -394,7 +493,6 @@ pub async fn build_dedup_dataset(
 #[cfg(test)]
 mod tests {
     use super::*;
-    
 
     #[test]
     fn failing_build_dedup_dataset_empty_root() {
@@ -404,8 +502,8 @@ mod tests {
         use futures::executor::block_on;
         let tmpdir = std::env::temp_dir().join("ns_learn_test");
         let _ = std::fs::remove_dir_all(&tmpdir);
-        let report = block_on(build_dedup_dataset(&tmpdir, &tmpdir.join("out")))
-            .expect("build dataset");
+        let report =
+            block_on(build_dedup_dataset(&tmpdir, &tmpdir.join("out"))).expect("build dataset");
         assert_eq!(report.train_rows, 0);
         assert_eq!(report.gold_calib_rows, 0);
         assert_eq!(report.gold_eval_rows, 0);
@@ -425,7 +523,10 @@ mod tests {
         let deserialized: DatasetManifest = serde_json::from_str(&serialized).unwrap();
         assert_eq!(manifest.dataset_version, deserialized.dataset_version);
         assert_eq!(manifest.split_seed, deserialized.split_seed);
-        assert_eq!(manifest.derived_label_count, deserialized.derived_label_count);
+        assert_eq!(
+            manifest.derived_label_count,
+            deserialized.derived_label_count
+        );
     }
 
     #[test]
@@ -445,28 +546,35 @@ mod tests {
                         .unwrap_or_else(|e| panic!("invalid JSONL in {}: {e}", path.display()));
                     row["observation_id"]
                         .as_str()
-                        .unwrap_or_else(|| panic!("missing observation_id in {}: {line}", path.display()))
+                        .unwrap_or_else(|| {
+                            panic!("missing observation_id in {}: {line}", path.display())
+                        })
                         .to_string()
                 })
                 .collect()
         };
         let calib_ids = read_ids("tests/fixtures/learning/dedup_gold_calib.jsonl");
         let eval_ids = read_ids("tests/fixtures/learning/dedup_gold_eval.jsonl");
-        assert!(!calib_ids.is_empty(), "gold calib fixture must not be empty");
+        assert!(
+            !calib_ids.is_empty(),
+            "gold calib fixture must not be empty"
+        );
         assert!(!eval_ids.is_empty(), "gold eval fixture must not be empty");
-        assert!(calib_ids.is_disjoint(&eval_ids),
+        assert!(
+            calib_ids.is_disjoint(&eval_ids),
             "gold calib and eval must not overlap: {:?}",
-            calib_ids.intersection(&eval_ids).collect::<Vec<_>>());
+            calib_ids.intersection(&eval_ids).collect::<Vec<_>>()
+        );
     }
 
     #[test]
     fn build_dedup_dataset_populates_splits_and_excludes_weak_proxy_from_calib() {
-        use futures::executor::block_on;
+        use crate::judgment::policy::DedupDecision;
         use crate::learning::observation::{
             CandidateSource, DecisionObservation, LearningContext, LearningOutcome,
             LearningOutcomeKind, ObservedCandidate, PayloadHash,
         };
-        use crate::judgment::policy::DedupDecision;
+        use futures::executor::block_on;
 
         let tmpdir = std::env::temp_dir().join("ns_learn_dataset_test");
         let _ = std::fs::remove_dir_all(&tmpdir);
@@ -538,7 +646,11 @@ mod tests {
             serde_json::to_string(&obs2).unwrap(),
             serde_json::to_string(&obs3).unwrap()
         );
-        std::fs::write(tmpdir.join("observations-202610.jsonl"), obs_lines.as_bytes()).unwrap();
+        std::fs::write(
+            tmpdir.join("observations-202610.jsonl"),
+            obs_lines.as_bytes(),
+        )
+        .unwrap();
 
         let out1 = LearningOutcome {
             outcome_id: "o1".to_string(),
@@ -568,10 +680,19 @@ mod tests {
         let out_dir = tmpdir.join("out");
         let report = block_on(build_dedup_dataset(&tmpdir, &out_dir)).expect("build");
         assert!(report.train_rows > 0, "train should be non-zero");
-        assert_eq!(report.proxy_calib_rows, 0, "weak proxy obs-2 must be excluded from calibration");
-        assert_eq!(report.gold_eval_rows, 1, "ShippedAnchorGold obs-3 must enter gold_eval");
+        assert_eq!(
+            report.proxy_calib_rows, 0,
+            "weak proxy obs-2 must be excluded from calibration"
+        );
+        assert_eq!(
+            report.gold_eval_rows, 1,
+            "ShippedAnchorGold obs-3 must enter gold_eval"
+        );
 
-        assert!(out_dir.join("manifest.json").exists(), "manifest.json must exist");
+        assert!(
+            out_dir.join("manifest.json").exists(),
+            "manifest.json must exist"
+        );
         let train_path = out_dir.join("train.jsonl");
         assert!(train_path.exists(), "train.jsonl must exist");
     }

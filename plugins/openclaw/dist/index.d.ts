@@ -24,7 +24,7 @@ export interface GuardValidateParams {
     use_sandbox?: boolean;
 }
 export interface GuardValidateResult {
-    verdict: "pass" | "reject";
+    verdict: 'pass' | 'reject';
     /** The core's own verdict bucket, kept so nothing is flattened away. */
     bucket: string;
     reasons: string[];
@@ -63,7 +63,7 @@ export interface OpenClawPluginContext {
 export type FileOpHandler = (op: FileOperation) => Promise<FileOpResult>;
 export type TurnEndHandler = (turn: ConversationTurn) => Promise<void>;
 export interface FileOperation {
-    type: "write" | "edit" | "delete" | "mkdir";
+    type: 'write' | 'edit' | 'delete' | 'mkdir';
     path: string;
     content?: string;
     oldContent?: string;
@@ -77,7 +77,7 @@ export interface FileOpResult {
     degraded?: boolean;
 }
 export interface ConversationTurn {
-    role: "user" | "assistant" | "system";
+    role: 'user' | 'assistant' | 'system';
     content: string;
 }
 /** Where the daemon serves MCP. The setup default is 34343, not 8080. */
@@ -101,6 +101,8 @@ export interface PluginConfig {
         enabled: boolean;
         injectReminder: boolean;
     };
+    /** Resolved project root directory (set in initialize from ctx.location / cwd). */
+    projectRoot?: string;
 }
 /**
  * Merge the host config over the defaults.
@@ -108,7 +110,19 @@ export interface PluginConfig {
  * `guardEndpoint` is still honored: it is what older installs wrote, and
  * silently ignoring it would point the shim at the wrong port.
  */
-export declare function resolveConfig(raw: unknown): PluginConfig;
+export declare function resolveConfig(raw: unknown, cwd?: string): PluginConfig;
+/**
+ * Walk up from resolve(startDir) to the filesystem root looking for `.git`
+ * (dir or file) or `.NeuroStrata`; return the directory containing it, or
+ * resolve(startDir) if none found.
+ */
+export declare function findProjectRoot(startDir?: string): string;
+/**
+ * 1. Walk up to findProjectRoot(startDir) checking <dir>/.NeuroStrata/session_queries.json;
+ *    if it parses as JSON with a non-empty string .namespace, return it trimmed.
+ * 2. Otherwise return basename(findProjectRoot(startDir)) || "default".
+ */
+export declare function discoverProjectNamespace(startDir?: string): string;
 /** The absolute path of the daemon token file. */
 export declare function daemonTokenPath(tokenFile?: string | null): string;
 /**
@@ -123,7 +137,7 @@ export declare function loadDaemonToken(tokenFile?: string | null): string | nul
 /** The request headers, with the bearer attached when there is one. */
 export declare function buildHeaders(token: string | null): Record<string, string>;
 export interface JsonRpcRequest {
-    jsonrpc: "2.0";
+    jsonrpc: '2.0';
     id: number;
     method: string;
     params?: unknown;
@@ -182,7 +196,7 @@ export declare class NeuroStrataMCPClient {
  * is tagged with `bucket`, not `type`.
  */
 export declare function parseGuardValidate(text: string): GuardValidateResult;
-export type AdapterState = "uninitialized" | "ready" | "degraded" | "unavailable";
+export type AdapterState = 'uninitialized' | 'ready' | 'degraded' | 'unavailable';
 export interface AdapterStatus {
     state: AdapterState;
     endpoint: string;
@@ -233,13 +247,24 @@ export declare function parseFileMemoryHits(text: string): FileMemoryHit[];
  */
 export declare function prefetchMemoriesForFile(namespace: string, filePath: string): Promise<string[]>;
 export declare const SUBAGENT_CONTEXT_MARKER = "### NeuroStrata Task & Graph Context";
+export declare function sanitizeSubagentHeaderToken(value: string): string;
 export declare function buildSubagentContextHeader(namespace: string, taskId: string | null): string;
 export declare function injectSubagentPrompt(target: Record<string, unknown>, namespace: string, taskId: string | null): boolean;
-export declare function initialize(ctx: OpenClawPluginContext): Promise<void>;
+export declare function initialize(ctx: (Partial<OpenClawPluginContext> & Record<string, unknown>) | undefined): Promise<void>;
+/**
+ * CLI hook runner entry point. The daemon installs hook-runner.mjs beside
+ * dist/ and dispatches host hook events here; initialize may have been
+ * called with only a config object (no hooks host), so a default client is
+ * built the same way core's handleHookEvent does. File-op and shell events
+ * run the same guard as the native beforeFileOp hook, with a rejection
+ * returned as a deny decision instead of a failed FileOpResult.
+ */
+export declare function handleHookEvent(event: Record<string, unknown>): Promise<Record<string, unknown>>;
 declare const _default: {
     id: string;
     setup: typeof initialize;
     initialize: typeof initialize;
+    handleHookEvent: typeof handleHookEvent;
 };
 export default _default;
 //# sourceMappingURL=index.d.ts.map

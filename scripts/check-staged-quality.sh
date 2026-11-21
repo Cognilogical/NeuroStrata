@@ -15,20 +15,51 @@ cd "$ROOT"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLIPPY_FILTER="$SCRIPT_DIR/clippy-staged-diagnostics.mjs"
 
+classify_shebang() {
+    local line="${1%$'\r'}"
+    if [[ "$line" =~ ^#!/(bin|usr/bin)/bash([[:space:]]|$) ]]; then
+        printf 'bash'
+        return 0
+    fi
+    if [[ "$line" =~ ^#!/usr/bin/env[[:space:]]+(-S[[:space:]]+)?bash([[:space:]]|$) ]]; then
+        printf 'bash'
+        return 0
+    fi
+    if [[ "$line" =~ ^#!/(bin|usr/bin)/sh([[:space:]]|$) ]]; then
+        printf 'sh'
+        return 0
+    fi
+    if [[ "$line" =~ ^#!/usr/bin/env[[:space:]]+(-S[[:space:]]+)?sh([[:space:]]|$) ]]; then
+        printf 'sh'
+        return 0
+    fi
+    printf ''
+}
+
 # ── Staged paths (NUL-delimited; exclude .NeuroStrata/, deleted, unstaged-only) ─
+STAGED_LIST="$(mktemp "${TMPDIR:-/tmp}/staged-quality-list.XXXXXX")"
+# shellcheck disable=SC2154  # rc is assigned by the trap trigger ($?)
+trap 'rc=$?; rm -f "$STAGED_LIST"; exit "$rc"' EXIT
+if ! git diff --cached --name-only --diff-filter=ACMRT -z >"$STAGED_LIST" 2>"$STAGED_LIST.err"; then
+    echo "error: could not enumerate staged files" >&2
+    cat "$STAGED_LIST.err" >&2 || true
+    rm -f "$STAGED_LIST"
+    exit 1
+fi
+
 StagedFiles=()
 while IFS= read -r -d '' file; do
     case "$file" in
         .NeuroStrata/*|"") continue ;;
     esac
     StagedFiles+=("$file")
-done < <(git diff --cached --name-only --diff-filter=ACMRT -z 2>/dev/null)
+done < "$STAGED_LIST"
 
 CHECK_ROOT="$ROOT"
 if [ ${#StagedFiles[@]} -gt 0 ]; then
     tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/staged-quality.XXXXXX")
     # shellcheck disable=SC2154  # rc is assigned inside the trap itself
-    trap 'rc=$?; trap - EXIT; rm -rf "$tmpdir"; exit "$rc"' EXIT
+    trap 'rc=$?; trap - EXIT; rm -f "$STAGED_LIST"; rm -rf "$tmpdir"; exit "$rc"' EXIT
     CHECK_ROOT="$tmpdir/tree"
     mkdir -p "$CHECK_ROOT"
     if ! git checkout-index --all --prefix="$CHECK_ROOT/"; then
@@ -56,11 +87,10 @@ for file in ${StagedFiles[@]+"${StagedFiles[@]}"}; do
         *)
             if [ -f "$CHECK_ROOT/$file" ] && [ ! -L "$CHECK_ROOT/$file" ]; then
                 IFS= read -r first_line < "$CHECK_ROOT/$file" || true
-                case "$first_line" in
-                    '#!/bin/bash'|'#!/usr/bin/bash'|'#!/usr/bin/env bash')
-                        ShellFiles+=("$file"); BashFiles+=("$file") ;;
-                    '#!/bin/sh'|'#!/usr/bin/sh'|'#!/usr/bin/env sh')
-                        ShellFiles+=("$file") ;;
+                shebang_kind="$(classify_shebang "$first_line")"
+                case "$shebang_kind" in
+                    bash) ShellFiles+=("$file"); BashFiles+=("$file") ;;
+                    sh) ShellFiles+=("$file") ;;
                 esac
             fi
             ;;
@@ -208,6 +238,9 @@ done
 if [ ${#WEB_UI_FILES[@]} -gt 0 ]; then
     if [ ! -x "$ROOT/web-ui/node_modules/.bin/eslint" ]; then
         missing_tool eslint "npm --prefix web-ui ci"
+    fi
+    if [ -d "$ROOT/web-ui/node_modules" ] && [ ! -e "$CHECK_ROOT/web-ui/node_modules" ]; then
+        ln -s "$ROOT/web-ui/node_modules" "$CHECK_ROOT/web-ui/node_modules"
     fi
     ( cd "$CHECK_ROOT/web-ui" && "$ROOT/web-ui/node_modules/.bin/eslint" "${WEB_UI_FILES[@]}" ) || {
         echo "error: eslint check failed" >&2

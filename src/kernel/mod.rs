@@ -26,6 +26,13 @@ use crate::traits::VectorStore;
 use crate::workflow::connector::{GitWorkflowConnector, WorkflowConnector};
 use crate::workflow::machine::WorkflowStage;
 
+/// Serializes pool write-back persistence across kernels in this process.
+/// The port performs a read-merge-write of the registry row; without this
+/// turn two requests that hydrated the same pool could interleave their
+/// reads and erase each other's pointer updates.
+static POOL_WRITEBACK_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+
 pub mod ports;
 
 /// Registry of pluggable workflow connectors keyed by `connector_id`.
@@ -227,6 +234,12 @@ impl AgentKernel {
                 registered.pool_id.clone(),
             ));
         }
+        // Schema updates and write-back persistence share one turn, so a
+        // read-only change cannot interleave with a stale write-back commit.
+        let _persist = POOL_WRITEBACK_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
         self.memory
             .register_data_pool(namespace, &registered, records, principal)
             .await
@@ -263,6 +276,15 @@ impl AgentKernel {
                     for (uri, values) in recs {
                         let _ = connector.seed_records(&scoped_id, &uri, values).await;
                     }
+                }
+                // Review 14c61663#r4650345073: retries through a fresh kernel
+                // must see the persisted receipts, not re-apply the effect.
+                // Review 0fce913e#r4650457720: a receipt-load failure must
+                // fail the request, not silently hydrate without receipts
+                // and let a retry duplicate the effect.
+                let receipts = self.memory.pool_idempotency(namespace, &schema).await?;
+                if !receipts.is_empty() {
+                    let _ = connector.hydrate_idempotency(&scoped_id, &receipts).await;
                 }
             }
             if schema.pool_id == pool_id {
@@ -507,6 +529,46 @@ impl AgentKernel {
         ));
         if post_verdict != KernelConnectorPostVerdict::AllowPostOutput {
             anyhow::bail!("Post-gate denied write-back: {:?}", post_verdict);
+        }
+        // #331: a success receipt must describe state a later request can
+        // observe. Connectors whose records live only in memory snapshot the
+        // written pointer plus their receipts here, and the kernel merges
+        // that delta into the registry row the next request hydrates from.
+        // Connectors that already persist (json_file) return None and are
+        // left alone.
+        if let Some(snapshot) = connector
+            .snapshot_write_back(&connector_pool_id, &pointer.pointer_uri)
+            .await?
+        {
+            let _persist = POOL_WRITEBACK_LOCK
+                .get_or_init(|| tokio::sync::Mutex::new(()))
+                .lock()
+                .await;
+            if let Err(e) = self
+                .memory
+                .register_pool_writeback(
+                    namespace,
+                    &schema,
+                    &pointer.pointer_uri,
+                    &snapshot,
+                    principal,
+                )
+                .await
+            {
+                // Review 700fdbe0#r4650486569: the effect mutated this
+                // kernel's connector, but it is not durable. Restore the
+                // pre-effect state so a reused kernel cannot leak the
+                // rejected write or replay its receipt.
+                let _ = connector
+                    .rollback_write_back(
+                        &connector_pool_id,
+                        &pointer.pointer_uri,
+                        &snapshot.prior_records,
+                        &snapshot.idempotency,
+                    )
+                    .await;
+                return Err(e);
+            }
         }
         let mut receipt = receipt;
         receipt.pointer_id = pointer.pointer_id.clone();
@@ -1454,7 +1516,12 @@ mod tests {
     async fn list_pointers_excludes_retired_rows_and_keeps_active_visible() {
         let now = now_epoch();
         let ns = "ns1";
-        let spy = Arc::new(SpyConnector::new("spy", DataPoolAccessMode::ReadWrite, 10, 1024));
+        let spy = Arc::new(SpyConnector::new(
+            "spy",
+            DataPoolAccessMode::ReadWrite,
+            10,
+            1024,
+        ));
         let (kernel, store, _dir) = build_kernel(spy.clone());
         store.init(ns).await.expect("init");
 
@@ -1465,10 +1532,16 @@ mod tests {
         let active = pointer_record("ptr_active", "spy", now, 3600);
         seed_pointer(&store, ns, &active, "alice", None).await;
         let retired_cases = [
-            ("ptr_retired_valid_to", json!({"valid_to": now.saturating_sub(1)})),
+            (
+                "ptr_retired_valid_to",
+                json!({"valid_to": now.saturating_sub(1)}),
+            ),
             ("ptr_retired_archived", json!({"archived": true})),
             ("ptr_retired_flag", json!({"retired": true})),
-            ("ptr_retired_superseded", json!({"superseded_by": "ptr_active"})),
+            (
+                "ptr_retired_superseded",
+                json!({"superseded_by": "ptr_active"}),
+            ),
         ];
         for (pid, marker) in &retired_cases {
             let rec = pointer_record(pid, "spy", now, 3600);
@@ -1866,7 +1939,7 @@ mod tests {
                         "pointer_id": "ptr_default_json",
                         "offset": 0,
                         "limit": 10,
-                        "max_bytes": 4096
+                        "max_bytes": 1024
                     },
                     "now_secs": now
                 }),
@@ -2067,5 +2140,1404 @@ mod tests {
             .expect("describe_pool built-in default in untouched namespace");
         assert_eq!(other_ns_default["access_mode"], "read_write");
         assert_eq!(other_ns_default["max_slice_rows"], 1000);
+    }
+
+    /// #331: a successful `memory_pool` write-back must be durable across the
+    /// per-request kernel boundary, not only in the request-local connector.
+    #[tokio::test]
+    async fn memory_pool_write_back_survives_a_fresh_kernel() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_impl =
+            Arc::new(LadybugStore::for_testing(dir.path().join("db"), 4).expect("store init"));
+        let store: Arc<dyn VectorStore> = store_impl.clone();
+        let ns = "ns_pool_durability";
+        store.init(ns).await.expect("init ns");
+        let bus = Arc::new(ThalamicBus::new(64));
+        let now = now_epoch();
+
+        let kernel1 = AgentKernel::new(store.clone(), bus.clone(), dir.path().to_path_buf());
+        kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "register_pool",
+                    "schema": {
+                        "connector_id": "memory_pool",
+                        "pool_id": "durable_mem",
+                        "access_mode": "read_write",
+                        "entity_types": ["item"],
+                        "max_slice_rows": 25,
+                        "max_slice_bytes": 2048,
+                        "description": "Write-back durability"
+                    },
+                    "records": {
+                        "mem://items": [{"v": 1}]
+                    }
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("register pool");
+
+        kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "register_pointer",
+                    "record": {
+                        "pointer_id": "ptr_durable",
+                        "connector_id": "memory_pool",
+                        "pool_id": "durable_mem",
+                        "pointer_uri": "mem://items",
+                        "entity_type": "item",
+                        "expected_source_sha256": null,
+                        "captured_at_secs": now,
+                        "max_staleness_secs": 3600
+                    }
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("register pointer");
+        seed_receipt(
+            &store_impl,
+            ns,
+            "rcpt_durable",
+            "ptr_durable",
+            "durable_mem",
+            false,
+        )
+        .await;
+
+        let receipt = kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "apply_effect",
+                    "req": {
+                        "pointer_id": "ptr_durable",
+                        "operation": "append",
+                        "payload": {"v": 2},
+                        "action_receipt_id": "rcpt_durable",
+                        "idempotency_key": "idem-durable"
+                    },
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("apply effect");
+        assert_eq!(receipt["applied"], true);
+        let new_source_sha = receipt["new_source_sha256"]
+            .as_str()
+            .expect("new source sha")
+            .to_string();
+
+        // The request-local kernel sees the write immediately.
+        let same_kernel = kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "resolve_pointer",
+                    "req": {
+                        "pointer_id": "ptr_durable",
+                        "offset": 0,
+                        "limit": 10,
+                        "max_bytes": 1024
+                    },
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("same-kernel resolve");
+        assert_eq!(same_kernel["records"].as_array().unwrap().len(), 2);
+
+        // A fresh kernel is the production serving shape (one kernel per
+        // data-connector request). The receipt promised this state.
+        let kernel2 = AgentKernel::new(store.clone(), bus.clone(), dir.path().to_path_buf());
+        let fresh = kernel2
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "resolve_pointer",
+                    "req": {
+                        "pointer_id": "ptr_durable",
+                        "offset": 0,
+                        "limit": 10,
+                        "max_bytes": 1024
+                    },
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("fresh-kernel resolve");
+        let fresh_records = fresh["records"].as_array().expect("records");
+        assert_eq!(
+            fresh_records.len(),
+            2,
+            "the write-back must survive the request boundary: {fresh}"
+        );
+        assert_eq!(
+            fresh["source_sha256"],
+            json!(new_source_sha),
+            "a fresh read must match the receipt's new source SHA"
+        );
+    }
+
+    /// Review 14c61663#r4650345071: two kernels that hydrated the same pool
+    /// before either wrote must not clobber each other's pointers.
+    #[tokio::test]
+    async fn concurrent_pool_write_backs_preserve_other_pointers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_impl =
+            Arc::new(LadybugStore::for_testing(dir.path().join("db"), 4).expect("store init"));
+        let store: Arc<dyn VectorStore> = store_impl.clone();
+        let ns = "ns_pool_concurrent";
+        store.init(ns).await.expect("init ns");
+        let bus = Arc::new(ThalamicBus::new(64));
+        let now = now_epoch();
+
+        let kernel1 = AgentKernel::new(store.clone(), bus.clone(), dir.path().to_path_buf());
+        kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "register_pool",
+                    "schema": {
+                        "connector_id": "memory_pool",
+                        "pool_id": "shared_mem",
+                        "access_mode": "read_write",
+                        "entity_types": ["item"],
+                        "max_slice_rows": 25,
+                        "max_slice_bytes": 2048,
+                        "description": "Shared pool"
+                    },
+                    "records": {
+                        "mem://a": [{"v": 0}],
+                        "mem://b": [{"v": 0}]
+                    }
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("register pool");
+        for (pointer_id, pointer_uri) in [("ptr_a", "mem://a"), ("ptr_b", "mem://b")] {
+            kernel1
+                .execute_connector_command(
+                    ns,
+                    &json!({
+                        "operation": "register_pointer",
+                        "record": {
+                            "pointer_id": pointer_id,
+                            "connector_id": "memory_pool",
+                            "pool_id": "shared_mem",
+                            "pointer_uri": pointer_uri,
+                            "entity_type": "item",
+                            "expected_source_sha256": null,
+                            "captured_at_secs": now,
+                            "max_staleness_secs": 3600
+                        }
+                    }),
+                    Some(ns),
+                )
+                .await
+                .expect("register pointer");
+        }
+        seed_receipt(&store_impl, ns, "rcpt_a", "ptr_a", "shared_mem", false).await;
+        seed_receipt(&store_impl, ns, "rcpt_b", "ptr_b", "shared_mem", false).await;
+
+        // Kernel #2 hydrates the persisted pool before either write lands.
+        let kernel2 = AgentKernel::new(store.clone(), bus.clone(), dir.path().to_path_buf());
+        kernel2
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "resolve_pointer",
+                    "req": {"pointer_id": "ptr_b", "offset": 0, "limit": 10, "max_bytes": 1024},
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("kernel2 hydrates the shared pool");
+
+        kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "apply_effect",
+                    "req": {
+                        "pointer_id": "ptr_a",
+                        "operation": "append",
+                        "payload": {"a": 1},
+                        "action_receipt_id": "rcpt_a",
+                        "idempotency_key": "idem-a"
+                    },
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("kernel1 writes pointer a");
+        kernel2
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "apply_effect",
+                    "req": {
+                        "pointer_id": "ptr_b",
+                        "operation": "append",
+                        "payload": {"b": 1},
+                        "action_receipt_id": "rcpt_b",
+                        "idempotency_key": "idem-b"
+                    },
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("kernel2 writes pointer b");
+
+        let kernel3 = AgentKernel::new(store.clone(), bus.clone(), dir.path().to_path_buf());
+        for pointer_id in ["ptr_a", "ptr_b"] {
+            let resolved = kernel3
+                .execute_connector_command(
+                    ns,
+                    &json!({
+                        "operation": "resolve_pointer",
+                        "req": {"pointer_id": pointer_id, "offset": 0, "limit": 10, "max_bytes": 1024},
+                        "now_secs": now
+                    }),
+                    Some(ns),
+                )
+                .await
+                .expect("fresh resolve after concurrent write-backs");
+            assert_eq!(
+                resolved["records"].as_array().unwrap().len(),
+                2,
+                "concurrent write-backs must both survive for {pointer_id}: {resolved}"
+            );
+        }
+    }
+
+    /// Review 14c61663#r4650345073: an idempotent replay through a fresh
+    /// kernel must return the original receipt, not append again.
+    #[tokio::test]
+    async fn idempotent_write_back_replay_through_fresh_kernel_does_not_duplicate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_impl =
+            Arc::new(LadybugStore::for_testing(dir.path().join("db"), 4).expect("store init"));
+        let store: Arc<dyn VectorStore> = store_impl.clone();
+        let ns = "ns_pool_idempotent";
+        store.init(ns).await.expect("init ns");
+        let bus = Arc::new(ThalamicBus::new(64));
+        let now = now_epoch();
+
+        let kernel1 = AgentKernel::new(store.clone(), bus.clone(), dir.path().to_path_buf());
+        kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "register_pool",
+                    "schema": {
+                        "connector_id": "memory_pool",
+                        "pool_id": "idem_mem",
+                        "access_mode": "read_write",
+                        "entity_types": ["item"],
+                        "max_slice_rows": 25,
+                        "max_slice_bytes": 2048,
+                        "description": "Idempotent pool"
+                    },
+                    "records": {"mem://items": [{"v": 1}]}
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("register pool");
+        kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "register_pointer",
+                    "record": {
+                        "pointer_id": "ptr_idem",
+                        "connector_id": "memory_pool",
+                        "pool_id": "idem_mem",
+                        "pointer_uri": "mem://items",
+                        "entity_type": "item",
+                        "expected_source_sha256": null,
+                        "captured_at_secs": now,
+                        "max_staleness_secs": 3600
+                    }
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("register pointer");
+        seed_receipt(&store_impl, ns, "rcpt_idem", "ptr_idem", "idem_mem", false).await;
+
+        let request = json!({
+            "operation": "apply_effect",
+            "req": {
+                "pointer_id": "ptr_idem",
+                "operation": "append",
+                "payload": {"v": 2},
+                "action_receipt_id": "rcpt_idem",
+                "idempotency_key": "idem-retry"
+            },
+            "now_secs": now
+        });
+        let first = kernel1
+            .execute_connector_command(ns, &request, Some(ns))
+            .await
+            .expect("first apply");
+        assert_eq!(first["applied"], true);
+
+        let kernel2 = AgentKernel::new(store.clone(), bus.clone(), dir.path().to_path_buf());
+        let replay = kernel2
+            .execute_connector_command(ns, &request, Some(ns))
+            .await
+            .expect("replay through a fresh kernel");
+        assert_eq!(replay["applied"], true);
+        assert_eq!(
+            replay["new_source_sha256"], first["new_source_sha256"],
+            "a replay must return the original receipt"
+        );
+
+        let resolved = kernel2
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "resolve_pointer",
+                    "req": {"pointer_id": "ptr_idem", "offset": 0, "limit": 10, "max_bytes": 1024},
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("fresh resolve after replay");
+        assert_eq!(
+            resolved["records"].as_array().unwrap().len(),
+            2,
+            "a replay must not duplicate the append: {resolved}"
+        );
+    }
+
+    /// Review 490f0340#r4650391606: a schema-only `upsert_pool` must keep the
+    /// durable idempotency receipts alongside the retained records.
+    #[tokio::test]
+    async fn schema_only_upsert_preserves_idempotency_receipts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_impl =
+            Arc::new(LadybugStore::for_testing(dir.path().join("db"), 4).expect("store init"));
+        let store: Arc<dyn VectorStore> = store_impl.clone();
+        let ns = "ns_pool_schema_idem";
+        store.init(ns).await.expect("init ns");
+        let bus = Arc::new(ThalamicBus::new(64));
+        let now = now_epoch();
+
+        let kernel1 = AgentKernel::new(store.clone(), bus.clone(), dir.path().to_path_buf());
+        kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "register_pool",
+                    "schema": {
+                        "connector_id": "memory_pool",
+                        "pool_id": "schema_idem",
+                        "access_mode": "read_write",
+                        "entity_types": ["item"],
+                        "max_slice_rows": 25,
+                        "max_slice_bytes": 2048,
+                        "description": "Schema update pool"
+                    },
+                    "records": {"mem://items": [{"v": 1}]}
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("register pool");
+        kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "register_pointer",
+                    "record": {
+                        "pointer_id": "ptr_schema",
+                        "connector_id": "memory_pool",
+                        "pool_id": "schema_idem",
+                        "pointer_uri": "mem://items",
+                        "entity_type": "item",
+                        "expected_source_sha256": null,
+                        "captured_at_secs": now,
+                        "max_staleness_secs": 3600
+                    }
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("register pointer");
+        seed_receipt(
+            &store_impl,
+            ns,
+            "rcpt_schema",
+            "ptr_schema",
+            "schema_idem",
+            false,
+        )
+        .await;
+
+        let request = json!({
+            "operation": "apply_effect",
+            "req": {
+                "pointer_id": "ptr_schema",
+                "operation": "append",
+                "payload": {"v": 2},
+                "action_receipt_id": "rcpt_schema",
+                "idempotency_key": "idem-schema"
+            },
+            "now_secs": now
+        });
+        let first = kernel1
+            .execute_connector_command(ns, &request, Some(ns))
+            .await
+            .expect("first apply");
+        assert_eq!(first["applied"], true);
+
+        // Schema-only update: no `records`, so records and receipts must both
+        // survive the row rewrite.
+        kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "upsert_pool",
+                    "schema": {
+                        "connector_id": "memory_pool",
+                        "pool_id": "schema_idem",
+                        "access_mode": "read_write",
+                        "entity_types": ["item"],
+                        "max_slice_rows": 30,
+                        "max_slice_bytes": 2048,
+                        "description": "Updated schema only"
+                    }
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("schema-only upsert");
+
+        let kernel2 = AgentKernel::new(store.clone(), bus.clone(), dir.path().to_path_buf());
+        let replay = kernel2
+            .execute_connector_command(ns, &request, Some(ns))
+            .await
+            .expect("replay after schema-only upsert");
+        assert_eq!(replay["applied"], true);
+        assert_eq!(
+            replay["new_source_sha256"], first["new_source_sha256"],
+            "the original receipt must survive the schema update"
+        );
+        let resolved = kernel2
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "resolve_pointer",
+                    "req": {"pointer_id": "ptr_schema", "offset": 0, "limit": 10, "max_bytes": 1024},
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("resolve after schema update");
+        assert_eq!(
+            resolved["records"].as_array().unwrap().len(),
+            2,
+            "the replay must not append after a schema-only update: {resolved}"
+        );
+    }
+
+    /// Review 490f0340#r4650391609: a receipt from a same-pointer persistence
+    /// conflict must not be made durable by a later write to another pointer.
+    #[tokio::test]
+    async fn failed_pointer_receipt_is_not_persisted_by_another_pointer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_impl =
+            Arc::new(LadybugStore::for_testing(dir.path().join("db"), 4).expect("store init"));
+        let store: Arc<dyn VectorStore> = store_impl.clone();
+        let ns = "ns_pool_failed_receipt";
+        store.init(ns).await.expect("init ns");
+        let bus = Arc::new(ThalamicBus::new(64));
+        let now = now_epoch();
+
+        let kernel1 = AgentKernel::new(store.clone(), bus.clone(), dir.path().to_path_buf());
+        kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "register_pool",
+                    "schema": {
+                        "connector_id": "memory_pool",
+                        "pool_id": "conflict_mem",
+                        "access_mode": "read_write",
+                        "entity_types": ["item"],
+                        "max_slice_rows": 25,
+                        "max_slice_bytes": 2048,
+                        "description": "Conflict pool"
+                    },
+                    "records": {
+                        "mem://a": [{"v": 0}],
+                        "mem://b": [{"v": 0}]
+                    }
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("register pool");
+        for (pointer_id, pointer_uri) in [("ptr_a", "mem://a"), ("ptr_b", "mem://b")] {
+            kernel1
+                .execute_connector_command(
+                    ns,
+                    &json!({
+                        "operation": "register_pointer",
+                        "record": {
+                            "pointer_id": pointer_id,
+                            "connector_id": "memory_pool",
+                            "pool_id": "conflict_mem",
+                            "pointer_uri": pointer_uri,
+                            "entity_type": "item",
+                            "expected_source_sha256": null,
+                            "captured_at_secs": now,
+                            "max_staleness_secs": 3600
+                        }
+                    }),
+                    Some(ns),
+                )
+                .await
+                .expect("register pointer");
+        }
+        seed_receipt(&store_impl, ns, "rcpt_a1", "ptr_a", "conflict_mem", false).await;
+        seed_receipt(&store_impl, ns, "rcpt_a2", "ptr_a", "conflict_mem", false).await;
+        seed_receipt(&store_impl, ns, "rcpt_b", "ptr_b", "conflict_mem", false).await;
+
+        let kernel2 = AgentKernel::new(store.clone(), bus.clone(), dir.path().to_path_buf());
+        kernel2
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "resolve_pointer",
+                    "req": {"pointer_id": "ptr_b", "offset": 0, "limit": 10, "max_bytes": 1024},
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("kernel2 hydrates before the first write");
+
+        kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "apply_effect",
+                    "req": {
+                        "pointer_id": "ptr_a",
+                        "operation": "append",
+                        "payload": {"k1": 1},
+                        "action_receipt_id": "rcpt_a1",
+                        "idempotency_key": "idem-a1"
+                    },
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("kernel1 writes pointer a");
+        let conflict = kernel2
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "apply_effect",
+                    "req": {
+                        "pointer_id": "ptr_a",
+                        "operation": "append",
+                        "payload": {"k2": 1},
+                        "action_receipt_id": "rcpt_a2",
+                        "idempotency_key": "idem-a2"
+                    },
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await;
+        assert!(
+            conflict.is_err(),
+            "same-pointer stale write must conflict: {conflict:?}"
+        );
+
+        // A later, successful write to another pointer must not persist the
+        // failed operation's receipt.
+        kernel2
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "apply_effect",
+                    "req": {
+                        "pointer_id": "ptr_b",
+                        "operation": "append",
+                        "payload": {"b": 1},
+                        "action_receipt_id": "rcpt_b",
+                        "idempotency_key": "idem-b"
+                    },
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("kernel2 writes pointer b");
+
+        let kernel3 = AgentKernel::new(store.clone(), bus.clone(), dir.path().to_path_buf());
+        let replay = kernel3
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "apply_effect",
+                    "req": {
+                        "pointer_id": "ptr_a",
+                        "operation": "append",
+                        "payload": {"k2": 1},
+                        "action_receipt_id": "rcpt_a2",
+                        "idempotency_key": "idem-a2"
+                    },
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("retry of the failed effect through a fresh kernel");
+        assert_eq!(replay["applied"], true);
+
+        let resolved = kernel3
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "resolve_pointer",
+                    "req": {"pointer_id": "ptr_a", "offset": 0, "limit": 10, "max_bytes": 1024},
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("resolve pointer a after retry");
+        assert_eq!(
+            resolved["records"].as_array().unwrap().len(),
+            3,
+            "a failed effect's receipt must not make a later retry a no-op: {resolved}"
+        );
+    }
+
+    /// Review 9227e20f#r4650419233: a write-back must not restore the stale
+    /// schema of a pool that another request changed to read-only.
+    #[tokio::test]
+    async fn write_back_does_not_restore_a_schema_that_became_read_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_impl =
+            Arc::new(LadybugStore::for_testing(dir.path().join("db"), 4).expect("store init"));
+        let store: Arc<dyn VectorStore> = store_impl.clone();
+        let ns = "ns_pool_schema_race";
+        store.init(ns).await.expect("init ns");
+        let bus = Arc::new(ThalamicBus::new(64));
+        let now = now_epoch();
+
+        let kernel1 = AgentKernel::new(store.clone(), bus.clone(), dir.path().to_path_buf());
+        kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "register_pool",
+                    "schema": {
+                        "connector_id": "memory_pool",
+                        "pool_id": "schema_race",
+                        "access_mode": "read_write",
+                        "entity_types": ["item"],
+                        "max_slice_rows": 25,
+                        "max_slice_bytes": 2048,
+                        "description": "Schema race pool"
+                    },
+                    "records": {"mem://items": [{"v": 1}]}
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("register pool");
+        kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "register_pointer",
+                    "record": {
+                        "pointer_id": "ptr_schema_race",
+                        "connector_id": "memory_pool",
+                        "pool_id": "schema_race",
+                        "pointer_uri": "mem://items",
+                        "entity_type": "item",
+                        "expected_source_sha256": null,
+                        "captured_at_secs": now,
+                        "max_staleness_secs": 3600
+                    }
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("register pointer");
+        seed_receipt(
+            &store_impl,
+            ns,
+            "rcpt_schema_race",
+            "ptr_schema_race",
+            "schema_race",
+            false,
+        )
+        .await;
+
+        // Kernel #1 hydrates the read-write schema before the admin change.
+        kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "resolve_pointer",
+                    "req": {"pointer_id": "ptr_schema_race", "offset": 0, "limit": 10, "max_bytes": 1024},
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("kernel1 hydrates");
+
+        let kernel2 = AgentKernel::new(store.clone(), bus.clone(), dir.path().to_path_buf());
+        kernel2
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "upsert_pool",
+                    "schema": {
+                        "connector_id": "memory_pool",
+                        "pool_id": "schema_race",
+                        "access_mode": "read_only",
+                        "entity_types": ["item"],
+                        "max_slice_rows": 25,
+                        "max_slice_bytes": 2048,
+                        "description": "Now read-only"
+                    }
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("schema-only read-only update");
+
+        let result = kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "apply_effect",
+                    "req": {
+                        "pointer_id": "ptr_schema_race",
+                        "operation": "append",
+                        "payload": {"v": 2},
+                        "action_receipt_id": "rcpt_schema_race",
+                        "idempotency_key": "idem-schema-race"
+                    },
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "the write-back must revalidate the stored read-only schema: {result:?}"
+        );
+
+        let kernel3 = AgentKernel::new(store.clone(), bus.clone(), dir.path().to_path_buf());
+        let described = kernel3
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "describe_pool",
+                    "connector_id": "memory_pool",
+                    "pool_id": "schema_race"
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("describe after rejected write-back");
+        assert_eq!(
+            described["access_mode"], "read_only",
+            "the administrative change must not be undone: {described}"
+        );
+    }
+
+    /// Review 9227e20f#r4650419237: a stale kernel must not resurrect a
+    /// pointer whose records were removed by a newer pool replacement.
+    #[tokio::test]
+    async fn stale_kernel_cannot_resurrect_a_removed_pointer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_impl =
+            Arc::new(LadybugStore::for_testing(dir.path().join("db"), 4).expect("store init"));
+        let store: Arc<dyn VectorStore> = store_impl.clone();
+        let ns = "ns_pool_removed_pointer";
+        store.init(ns).await.expect("init ns");
+        let bus = Arc::new(ThalamicBus::new(64));
+        let now = now_epoch();
+
+        let kernel1 = AgentKernel::new(store.clone(), bus.clone(), dir.path().to_path_buf());
+        kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "register_pool",
+                    "schema": {
+                        "connector_id": "memory_pool",
+                        "pool_id": "removed_pool",
+                        "access_mode": "read_write",
+                        "entity_types": ["item"],
+                        "max_slice_rows": 25,
+                        "max_slice_bytes": 2048,
+                        "description": "Removal pool"
+                    },
+                    "records": {
+                        "mem://a": [{"v": 0}],
+                        "mem://b": [{"v": 0}]
+                    }
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("register pool");
+        kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "register_pointer",
+                    "record": {
+                        "pointer_id": "ptr_removed_a",
+                        "connector_id": "memory_pool",
+                        "pool_id": "removed_pool",
+                        "pointer_uri": "mem://a",
+                        "entity_type": "item",
+                        "expected_source_sha256": null,
+                        "captured_at_secs": now,
+                        "max_staleness_secs": 3600
+                    }
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("register pointer");
+        seed_receipt(
+            &store_impl,
+            ns,
+            "rcpt_removed",
+            "ptr_removed_a",
+            "removed_pool",
+            false,
+        )
+        .await;
+
+        kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "resolve_pointer",
+                    "req": {"pointer_id": "ptr_removed_a", "offset": 0, "limit": 10, "max_bytes": 1024},
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("kernel1 hydrates mem://a");
+
+        let kernel2 = AgentKernel::new(store.clone(), bus.clone(), dir.path().to_path_buf());
+        kernel2
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "upsert_pool",
+                    "schema": {
+                        "connector_id": "memory_pool",
+                        "pool_id": "removed_pool",
+                        "access_mode": "read_write",
+                        "entity_types": ["item"],
+                        "max_slice_rows": 25,
+                        "max_slice_bytes": 2048,
+                        "description": "Replaced records"
+                    },
+                    "records": {"mem://b": [{"v": 9}]}
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("record replacement omitting mem://a");
+
+        let result = kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "apply_effect",
+                    "req": {
+                        "pointer_id": "ptr_removed_a",
+                        "operation": "append",
+                        "payload": {"v": 2},
+                        "action_receipt_id": "rcpt_removed",
+                        "idempotency_key": "idem-removed"
+                    },
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "a removed pointer must be a conflict, not an insert: {result:?}"
+        );
+
+        let kernel3 = AgentKernel::new(store.clone(), bus.clone(), dir.path().to_path_buf());
+        let resolved = kernel3
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "resolve_pointer",
+                    "req": {"pointer_id": "ptr_removed_a", "offset": 0, "limit": 10, "max_bytes": 1024},
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await;
+        assert!(
+            resolved.is_err(),
+            "the removed pointer must stay removed: {resolved:?}"
+        );
+    }
+
+    /// Review 9227e20f#r4650419233 (deterministic port-level form): a stale
+    /// read-write commit that lands after a read-only schema update must be
+    /// rejected and must not restore the stale schema.
+    #[tokio::test]
+    async fn write_back_revalidates_the_persisted_schema() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_impl =
+            Arc::new(LadybugStore::for_testing(dir.path().join("db"), 4).expect("store init"));
+        let store: Arc<dyn VectorStore> = store_impl.clone();
+        let ns = "ns_port_schema";
+        store.init(ns).await.expect("init ns");
+        let port = LadybugMemoryPort::new(store.clone());
+
+        let read_write = DataPoolSchema {
+            connector_id: "memory_pool".to_string(),
+            pool_id: "race".to_string(),
+            access_mode: DataPoolAccessMode::ReadWrite,
+            entity_types: vec!["item".to_string()],
+            max_slice_rows: 25,
+            max_slice_bytes: 2048,
+            description: "read-write".to_string(),
+        };
+        let mut records = HashMap::new();
+        records.insert("mem://a".to_string(), vec![json!({"v": 0})]);
+        port.register_data_pool(ns, &read_write, Some(&records), Some(ns))
+            .await
+            .expect("register read-write pool");
+
+        let mut read_only = read_write.clone();
+        read_only.access_mode = DataPoolAccessMode::ReadOnly;
+        port.register_data_pool(ns, &read_only, None, Some(ns))
+            .await
+            .expect("schema-only read-only update");
+
+        // A writer that hydrated the old schema commits a snapshot now.
+        let snapshot = crate::connectors::WriteBackSnapshot {
+            prior_records: vec![json!({"v": 0})],
+            pointer_records: vec![json!({"v": 0}), json!({"v": 1})],
+            idempotency: HashMap::new(),
+        };
+        let result = port
+            .register_pool_writeback(ns, &read_write, "mem://a", &snapshot, Some(ns))
+            .await;
+        assert!(
+            result.is_err(),
+            "a stale read-write commit must be rejected"
+        );
+
+        let persisted = port
+            .list_data_pools(ns, Some("memory_pool"), Some(ns))
+            .await
+            .expect("list pools");
+        let (schema, _) = persisted
+            .into_iter()
+            .find(|(schema, _)| schema.pool_id == "race")
+            .expect("pool row");
+        assert_eq!(
+            schema.access_mode,
+            DataPoolAccessMode::ReadOnly,
+            "the stale commit must not restore the read-write schema"
+        );
+    }
+
+    /// Review 0fce913e#r4650457715: a pool archived after hydration must not
+    /// be revived by a write-back commit.
+    #[tokio::test]
+    async fn write_back_rejects_a_pool_that_became_retired() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_impl =
+            Arc::new(LadybugStore::for_testing(dir.path().join("db"), 4).expect("store init"));
+        let store: Arc<dyn VectorStore> = store_impl.clone();
+        let ns = "ns_pool_retired";
+        store.init(ns).await.expect("init ns");
+        let bus = Arc::new(ThalamicBus::new(64));
+        let now = now_epoch();
+
+        let kernel1 = AgentKernel::new(store.clone(), bus.clone(), dir.path().to_path_buf());
+        kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "register_pool",
+                    "schema": {
+                        "connector_id": "memory_pool",
+                        "pool_id": "retired_pool",
+                        "access_mode": "read_write",
+                        "entity_types": ["item"],
+                        "max_slice_rows": 25,
+                        "max_slice_bytes": 2048,
+                        "description": "Retirement pool"
+                    },
+                    "records": {"mem://items": [{"v": 1}]}
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("register pool");
+        kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "register_pointer",
+                    "record": {
+                        "pointer_id": "ptr_retired",
+                        "connector_id": "memory_pool",
+                        "pool_id": "retired_pool",
+                        "pointer_uri": "mem://items",
+                        "entity_type": "item",
+                        "expected_source_sha256": null,
+                        "captured_at_secs": now,
+                        "max_staleness_secs": 3600
+                    }
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("register pointer");
+        seed_receipt(
+            &store_impl,
+            ns,
+            "rcpt_retired",
+            "ptr_retired",
+            "retired_pool",
+            false,
+        )
+        .await;
+
+        kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "resolve_pointer",
+                    "req": {"pointer_id": "ptr_retired", "offset": 0, "limit": 10, "max_bytes": 1024},
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("kernel1 hydrates");
+
+        // Archive the pool row between hydration and persistence.
+        let row_id = format!("__data_pool__:{}:memory_pool:retired_pool", ns);
+        let (vector, mut payload) = store_impl
+            .get(ns, &row_id)
+            .await
+            .expect("read pool row")
+            .expect("pool row exists");
+        if let Some(obj) = payload.metadata.as_object_mut() {
+            obj.insert("archived".to_string(), json!(true));
+        }
+        store_impl
+            .upsert(ns, &row_id, vector, payload)
+            .await
+            .expect("archive pool row");
+
+        let result = kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "apply_effect",
+                    "req": {
+                        "pointer_id": "ptr_retired",
+                        "operation": "append",
+                        "payload": {"v": 2},
+                        "action_receipt_id": "rcpt_retired",
+                        "idempotency_key": "idem-retired"
+                    },
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "a write-back must not revive an archived pool: {result:?}"
+        );
+
+        let kernel2 = AgentKernel::new(store.clone(), bus.clone(), dir.path().to_path_buf());
+        let resolved = kernel2
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "resolve_pointer",
+                    "req": {"pointer_id": "ptr_retired", "offset": 0, "limit": 10, "max_bytes": 1024},
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await;
+        assert!(
+            resolved.is_err(),
+            "the archived pool must stay unavailable: {resolved:?}"
+        );
+    }
+
+    /// Review 0fce913e#r4650457715 (commit-time form): a write-back that
+    /// lands after the pool row was archived must be rejected, not revive it.
+    #[tokio::test]
+    async fn write_back_rejects_a_retired_pool_at_commit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_impl =
+            Arc::new(LadybugStore::for_testing(dir.path().join("db"), 4).expect("store init"));
+        let store: Arc<dyn VectorStore> = store_impl.clone();
+        let ns = "ns_port_retired";
+        store.init(ns).await.expect("init ns");
+        let port = LadybugMemoryPort::new(store.clone());
+
+        let schema = DataPoolSchema {
+            connector_id: "memory_pool".to_string(),
+            pool_id: "retired_at_commit".to_string(),
+            access_mode: DataPoolAccessMode::ReadWrite,
+            entity_types: vec!["item".to_string()],
+            max_slice_rows: 25,
+            max_slice_bytes: 2048,
+            description: "retire race".to_string(),
+        };
+        let mut records = HashMap::new();
+        records.insert("mem://a".to_string(), vec![json!({"v": 0})]);
+        port.register_data_pool(ns, &schema, Some(&records), Some(ns))
+            .await
+            .expect("register pool");
+
+        let row_id = format!("__data_pool__:{}:memory_pool:retired_at_commit", ns);
+        let (vector, mut payload) = store_impl
+            .get(ns, &row_id)
+            .await
+            .expect("read pool row")
+            .expect("pool row exists");
+        if let Some(obj) = payload.metadata.as_object_mut() {
+            obj.insert("archived".to_string(), json!(true));
+        }
+        store_impl
+            .upsert(ns, &row_id, vector, payload)
+            .await
+            .expect("archive pool row");
+
+        let snapshot = crate::connectors::WriteBackSnapshot {
+            prior_records: vec![json!({"v": 0})],
+            pointer_records: vec![json!({"v": 0}), json!({"v": 1})],
+            idempotency: HashMap::new(),
+        };
+        let result = port
+            .register_pool_writeback(ns, &schema, "mem://a", &snapshot, Some(ns))
+            .await;
+        assert!(
+            result.is_err(),
+            "a commit against an archived pool must be rejected: {result:?}"
+        );
+    }
+
+    /// Review 700fdbe0#r4650486569: a persistence conflict must restore the
+    /// connector's pre-effect state so the rejected mutation cannot leak from
+    /// a reused kernel.
+    #[tokio::test]
+    async fn rejected_write_back_restores_connector_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_impl =
+            Arc::new(LadybugStore::for_testing(dir.path().join("db"), 4).expect("store init"));
+        let store: Arc<dyn VectorStore> = store_impl.clone();
+        let ns = "ns_pool_rollback";
+        store.init(ns).await.expect("init ns");
+        let bus = Arc::new(ThalamicBus::new(64));
+        let now = now_epoch();
+
+        let kernel1 = AgentKernel::new(store.clone(), bus.clone(), dir.path().to_path_buf());
+        kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "register_pool",
+                    "schema": {
+                        "connector_id": "memory_pool",
+                        "pool_id": "rollback_mem",
+                        "access_mode": "read_write",
+                        "entity_types": ["item"],
+                        "max_slice_rows": 25,
+                        "max_slice_bytes": 2048,
+                        "description": "Rollback pool"
+                    },
+                    "records": {"mem://a": [{"v": 0}]}
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("register pool");
+        kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "register_pointer",
+                    "record": {
+                        "pointer_id": "ptr_rollback",
+                        "connector_id": "memory_pool",
+                        "pool_id": "rollback_mem",
+                        "pointer_uri": "mem://a",
+                        "entity_type": "item",
+                        "expected_source_sha256": null,
+                        "captured_at_secs": now,
+                        "max_staleness_secs": 3600
+                    }
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("register pointer");
+        seed_receipt(
+            &store_impl,
+            ns,
+            "rcpt_r1",
+            "ptr_rollback",
+            "rollback_mem",
+            false,
+        )
+        .await;
+        seed_receipt(
+            &store_impl,
+            ns,
+            "rcpt_r2",
+            "ptr_rollback",
+            "rollback_mem",
+            false,
+        )
+        .await;
+
+        let kernel2 = AgentKernel::new(store.clone(), bus.clone(), dir.path().to_path_buf());
+        kernel2
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "resolve_pointer",
+                    "req": {"pointer_id": "ptr_rollback", "offset": 0, "limit": 10, "max_bytes": 1024},
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("kernel2 hydrates before the first write");
+
+        kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "apply_effect",
+                    "req": {
+                        "pointer_id": "ptr_rollback",
+                        "operation": "append",
+                        "payload": {"k1": 1},
+                        "action_receipt_id": "rcpt_r1",
+                        "idempotency_key": "idem-r1"
+                    },
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("kernel1 write persists");
+        let conflict = kernel2
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "apply_effect",
+                    "req": {
+                        "pointer_id": "ptr_rollback",
+                        "operation": "append",
+                        "payload": {"k2": 1},
+                        "action_receipt_id": "rcpt_r2",
+                        "idempotency_key": "idem-r2"
+                    },
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await;
+        assert!(
+            conflict.is_err(),
+            "the stale write must conflict: {conflict:?}"
+        );
+
+        // The rejected mutation and its receipt must be gone from the reused
+        // kernel; a resolve shows the pre-effect state, not the leaked append.
+        let resolved = kernel2
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "resolve_pointer",
+                    "req": {"pointer_id": "ptr_rollback", "offset": 0, "limit": 10, "max_bytes": 1024},
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("resolve after rejected write-back");
+        let records = resolved["records"].as_array().unwrap();
+        assert_eq!(
+            records.len(),
+            1,
+            "the rejected append must be rolled back: {resolved}"
+        );
+        assert_eq!(records[0], json!({"v": 0}));
+
+        // Retrying the same key must not replay a rejected receipt.
+        let retry = kernel2
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "apply_effect",
+                    "req": {
+                        "pointer_id": "ptr_rollback",
+                        "operation": "append",
+                        "payload": {"k2": 1},
+                        "action_receipt_id": "rcpt_r2",
+                        "idempotency_key": "idem-r2"
+                    },
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await;
+        assert!(
+            retry.is_err(),
+            "a rejected receipt must not replay as success: {retry:?}"
+        );
     }
 }

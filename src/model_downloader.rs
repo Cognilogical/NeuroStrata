@@ -42,16 +42,13 @@ impl ModelRegistry {
             std::fs::write(&registry_path, DEFAULT_REGISTRY)
                 .context("Failed to write default registry")?;
         }
-        let text = std::fs::read_to_string(&registry_path)
-            .context("Cannot read registry.json")?;
+        let text = std::fs::read_to_string(&registry_path).context("Cannot read registry.json")?;
         serde_json::from_str(&text).context("Malformed registry.json")
     }
 
     /// Look up a model entry by name substring match.
     pub fn find(&self, model_id: &str) -> Option<&ModelEntry> {
-        self.models
-            .iter()
-            .find(|m| m.name.contains(model_id))
+        self.models.iter().find(|m| m.name.contains(model_id))
     }
 
     /// Write the registry file back out (pretty-printed).
@@ -66,11 +63,7 @@ impl ModelRegistry {
 /// Download, verify, and persist a model file.
 /// Supply-chain safe: returns Err on ANY checksum mismatch.
 /// Uses blocking I/O wrapped in spawn_blocking for async compatibility.
-pub fn fetch_model(
-    url: &str,
-    target_sha256: &str,
-    out_path: &Path,
-) -> Result<std::path::PathBuf> {
+pub fn fetch_model(url: &str, target_sha256: &str, out_path: &Path) -> Result<std::path::PathBuf> {
     if target_sha256.trim().is_empty() {
         return Err(anyhow!("target SHA-256 must not be empty"));
     }
@@ -81,8 +74,7 @@ pub fn fetch_model(
 
     // Ensure output dir exists
     if let Some(parent) = out_path.parent() {
-        std::fs::create_dir_all(parent)
-            .context("Failed to create model directory")?;
+        std::fs::create_dir_all(parent).context("Failed to create model directory")?;
     }
 
     // Download bytes: support file:// for local, testable fetches.
@@ -97,7 +89,10 @@ pub fn fetch_model(
         if !response.status().is_success() {
             return Err(anyhow!("HTTP {} for {}", response.status(), url));
         }
-        response.bytes().context("Failed to read response body")?.to_vec()
+        response
+            .bytes()
+            .context("Failed to read response body")?
+            .to_vec()
     };
 
     // Compute SHA-256
@@ -109,14 +104,18 @@ pub fn fetch_model(
         let _ = std::fs::remove_file(out_path);
         return Err(anyhow!(
             "SHA-256 mismatch! Expected {}, got {}",
-            target_sha256, actual_sha
+            target_sha256,
+            actual_sha
         ));
     }
 
-    std::fs::write(out_path, &bytes)
-        .context("Failed to write model file")?;
+    std::fs::write(out_path, &bytes).context("Failed to write model file")?;
 
-    println!("Model downloaded and verified (SHA-256: {}) to '{}'", actual_sha, out_path.display());
+    println!(
+        "Model downloaded and verified (SHA-256: {}) to '{}'",
+        actual_sha,
+        out_path.display()
+    );
     Ok(out_path.to_path_buf())
 }
 
@@ -155,10 +154,7 @@ fn is_cached(out_path: &Path, target_sha256: &str, expected_size: Option<u64>) -
 /// SHA-256 is verified over the archive bytes before extraction; extracted
 /// members are written under `registry_dir`. `entry.files`, when present, is
 /// used to verify that the expected artifacts exist after extraction.
-pub fn fetch_from_registry(
-    model_id: &str,
-    registry_dir: &Path,
-) -> Result<std::path::PathBuf> {
+pub fn fetch_from_registry(model_id: &str, registry_dir: &Path) -> Result<std::path::PathBuf> {
     let registry = ModelRegistry::load_or_create(registry_dir)?;
     let entry = registry
         .find(model_id)
@@ -183,11 +179,17 @@ pub fn fetch_from_registry(
                 .timeout(std::time::Duration::from_secs(300))
                 .build()
                 .context("HTTP client build failed")?;
-            let response = client.get(&entry.url).send().context("Download request failed")?;
+            let response = client
+                .get(&entry.url)
+                .send()
+                .context("Download request failed")?;
             if !response.status().is_success() {
                 return Err(anyhow!("HTTP {} for {}", response.status(), entry.url));
             }
-            response.bytes().context("Failed to read response body")?.to_vec()
+            response
+                .bytes()
+                .context("Failed to read response body")?
+                .to_vec()
         };
 
         let mut hasher = Sha256::new();
@@ -247,7 +249,10 @@ pub fn fetch_from_registry(
         if let Some(files) = &entry.files {
             for file in files {
                 if !registry_dir.join(file).exists() {
-                    return Err(anyhow!("Downloaded bundle missing expected file '{}'", file));
+                    return Err(anyhow!(
+                        "Downloaded bundle missing expected file '{}'",
+                        file
+                    ));
                 }
             }
         }
@@ -270,15 +275,24 @@ pub fn extract_tar_gz(archive_bytes: &[u8], registry_dir: &Path) -> Result<()> {
         if entry_type.is_symlink() || entry_type.is_hard_link() {
             return Err(anyhow!("Unsafe link entry in archive"));
         }
-        let path = member.path().context("Failed to read member path")?.into_owned();
-        if path.is_absolute() || path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        let path = member
+            .path()
+            .context("Failed to read member path")?
+            .into_owned();
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
             return Err(anyhow!("Unsafe path in archive: {}", path.display()));
         }
         let dest = registry_dir.join(&path);
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).context("Failed to create extraction directory")?;
         }
-        member.unpack(&dest).context("Failed to extract archive member")?;
+        member
+            .unpack(&dest)
+            .context("Failed to extract archive member")?;
     }
     Ok(())
 }
@@ -333,7 +347,12 @@ mod tests {
         std::fs::write(&src, b"model-bytes").unwrap();
         let out = tmp.join("out.bin");
         let url = format!("file://{}", src.display());
-        assert!(fetch_model(&url, "0000000000000000000000000000000000000000000000000000000000000000", &out).is_err());
+        assert!(fetch_model(
+            &url,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            &out
+        )
+        .is_err());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -370,7 +389,9 @@ mod tests {
             header.set_size(data.len() as u64);
             header.set_mode(0o644);
             header.set_cksum();
-            builder.append_data(&mut header, "model.onnx", &data[..]).unwrap();
+            builder
+                .append_data(&mut header, "model.onnx", &data[..])
+                .unwrap();
             builder.finish().unwrap();
         }
         let archive = encoder.finish().unwrap();
@@ -403,7 +424,7 @@ mod tests {
     fn extract_tar_gz_writes_member() {
         use flate2::write::GzEncoder;
         use flate2::Compression;
-        
+
         use tar::Builder;
 
         let tmp = std::env::temp_dir().join("ns-tar-test");
@@ -418,7 +439,9 @@ mod tests {
             header.set_size(data.len() as u64);
             header.set_mode(0o644);
             header.set_cksum();
-            builder.append_data(&mut header, "model.onnx", &data[..]).unwrap();
+            builder
+                .append_data(&mut header, "model.onnx", &data[..])
+                .unwrap();
             builder.finish().unwrap();
         }
         let archive = encoder.finish().unwrap();
@@ -442,11 +465,9 @@ mod tests {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         {
             let mut builder = Builder::new(&mut encoder);
-            builder.append_link(
-                &mut tar::Header::new_gnu(),
-                "escape.link",
-                "/etc/passwd",
-            ).unwrap();
+            builder
+                .append_link(&mut tar::Header::new_gnu(), "escape.link", "/etc/passwd")
+                .unwrap();
             builder.finish().unwrap();
         }
         let archive = encoder.finish().unwrap();

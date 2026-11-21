@@ -30,11 +30,9 @@ pub async fn tee_taxonomy_pulse_to_project_outbox(
     };
     let outbox_dir = crate::synaptic_mesh::outbox::outbox_dir_for(&mesh_dir);
     let wake = Arc::new(tokio::sync::Notify::new());
-    let Ok(sub) = crate::events::subscribers::MeshOutbox::new(
-        outbox_dir,
-        wake,
-        mesh.manifest().epoch,
-    ) else {
+    let Ok(sub) =
+        crate::events::subscribers::MeshOutbox::new(outbox_dir, wake, mesh.manifest().epoch)
+    else {
         return;
     };
     let ctx = SubscriberContext {
@@ -108,6 +106,15 @@ pub async fn handle_taxonomy_with_auth_and_bus(
             "error": "operation required ('set_thesis', 'upsert_concept', 'tree', 'briefing', 'compare', 'gaps', or 'advise')"
         })
         .to_string();
+    }
+    let unknown_fields = crate::rdf::taxonomy::unknown_taxonomy_request_fields(arguments);
+    if !unknown_fields.is_empty() {
+        tracing::debug!(
+            operation = %req.operation,
+            namespace = %namespace,
+            unknown_fields = ?unknown_fields,
+            "taxonomy request contains unrecognised fields (ignored)"
+        );
     }
 
     let requested_principal = req.principal.clone().or_else(|| {

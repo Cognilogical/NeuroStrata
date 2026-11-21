@@ -18,7 +18,13 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 /// The five relations the traversal may follow (vocabulary v7).
-pub const DEFAULT_RELATIONS: [&str; 5] = ["GOVERNS", "CONTAINS", "RELATES_TO", "EXTRACTED_FROM", "DEPENDS_ON"];
+pub const DEFAULT_RELATIONS: [&str; 5] = [
+    "GOVERNS",
+    "CONTAINS",
+    "RELATES_TO",
+    "EXTRACTED_FROM",
+    "DEPENDS_ON",
+];
 
 /// The default and maximum hop counts (spec §4.2: default 1, max 2).
 pub const DEFAULT_MAX_HOPS: usize = 1;
@@ -97,7 +103,10 @@ pub fn parse_direction(raw: Option<&str>) -> Direction {
         Some("incoming") => Direction::Incoming,
         Some("both" | "") | None => Direction::Both,
         Some(other) => {
-            tracing::warn!("unknown graph_read direction '{}'; defaulting to Both", other);
+            tracing::warn!(
+                "unknown graph_read direction '{}'; defaulting to Both",
+                other
+            );
             Direction::Both
         }
     }
@@ -303,10 +312,10 @@ pub fn graph_read_related(
         if !allowed.contains(edge.relation.as_str()) {
             continue;
         }
-        let follow_out =
-            is_undirected(&edge.relation) || matches!(direction, Direction::Outgoing | Direction::Both);
-        let follow_in =
-            is_undirected(&edge.relation) || matches!(direction, Direction::Incoming | Direction::Both);
+        let follow_out = is_undirected(&edge.relation)
+            || matches!(direction, Direction::Outgoing | Direction::Both);
+        let follow_in = is_undirected(&edge.relation)
+            || matches!(direction, Direction::Incoming | Direction::Both);
         if follow_out {
             adj.entry(edge.source.as_str())
                 .or_default()
@@ -333,7 +342,9 @@ pub fn graph_read_related(
     visited.insert(seed);
 
     while let Some((id, depth)) = queue.pop_front() {
-        let Some(&node) = node_map.get(id) else { continue };
+        let Some(&node) = node_map.get(id) else {
+            continue;
+        };
         if !node.visible {
             continue;
         }
@@ -368,16 +379,24 @@ pub fn graph_read_related(
         // Deterministic order: neighbour id, then relation, then the stored
         // edge endpoints -- so the same graph always pages identically.
         neighbors.sort_by(|a, b| {
-            (a.0, a.1.relation.as_str(), a.1.source.as_str(), a.1.target.as_str()).cmp(&(
-                b.0,
-                b.1.relation.as_str(),
-                b.1.source.as_str(),
-                b.1.target.as_str(),
-            ))
+            (
+                a.0,
+                a.1.relation.as_str(),
+                a.1.source.as_str(),
+                a.1.target.as_str(),
+            )
+                .cmp(&(
+                    b.0,
+                    b.1.relation.as_str(),
+                    b.1.source.as_str(),
+                    b.1.target.as_str(),
+                ))
         });
 
         for (neighbor, es) in neighbors {
-            let Some(&nnode) = node_map.get(neighbor) else { continue };
+            let Some(&nnode) = node_map.get(neighbor) else {
+                continue;
+            };
             // Privacy/retirement hard stop: an invisible neighbour is neither
             // returned nor crossed.
             if !nnode.visible {
@@ -518,9 +537,18 @@ mod tests {
 
     #[test]
     fn fingerprint_is_stable_and_distinguishes_queries() {
-        assert_eq!(query_fingerprint(&["a", "b"]), query_fingerprint(&["a", "b"]));
-        assert_ne!(query_fingerprint(&["a", "b"]), query_fingerprint(&["a", "c"]));
-        assert_ne!(query_fingerprint(&["a", "bc"]), query_fingerprint(&["ab", "c"]));
+        assert_eq!(
+            query_fingerprint(&["a", "b"]),
+            query_fingerprint(&["a", "b"])
+        );
+        assert_ne!(
+            query_fingerprint(&["a", "b"]),
+            query_fingerprint(&["a", "c"])
+        );
+        assert_ne!(
+            query_fingerprint(&["a", "bc"]),
+            query_fingerprint(&["ab", "c"])
+        );
     }
 
     #[test]
@@ -564,7 +592,11 @@ pub struct ClosureResult<T> {
     pub budget_exceeded: Option<BudgetExceeded>,
 }
 
-pub fn closure_governs(root: &str, edges: &[EdgeSpec], budget: &QueryBudget) -> ClosureResult<String> {
+pub fn closure_governs(
+    root: &str,
+    edges: &[EdgeSpec],
+    budget: &QueryBudget,
+) -> ClosureResult<String> {
     let mut items: Vec<String> = Vec::new();
     let mut visited: HashSet<String> = HashSet::new();
     let mut queue: VecDeque<(String, usize)> = VecDeque::new();
@@ -586,7 +618,14 @@ pub fn closure_governs(root: &str, edges: &[EdgeSpec], budget: &QueryBudget) -> 
         if Instant::now() >= budget.deadline {
             truncated = true;
             let len = items.len();
-            return build_result(items, truncated, budget, true, "closure_governs".to_string(), len);
+            return build_result(
+                items,
+                truncated,
+                budget,
+                true,
+                "closure_governs".to_string(),
+                len,
+            );
         }
         // Gather outgoing GOVERNS neighbors sorted lexicographically. Every
         // matched edge counts against the edge budget here -- in the edge loop
@@ -598,7 +637,14 @@ pub fn closure_governs(root: &str, edges: &[EdgeSpec], budget: &QueryBudget) -> 
                 if edge_crossed > budget.max_edges {
                     truncated = true;
                     let len = items.len();
-                    return build_result(items, truncated, budget, true, "closure_governs".to_string(), len);
+                    return build_result(
+                        items,
+                        truncated,
+                        budget,
+                        true,
+                        "closure_governs".to_string(),
+                        len,
+                    );
                 }
                 neighbors.push(edge.target.clone());
             }
@@ -620,7 +666,14 @@ pub fn closure_governs(root: &str, edges: &[EdgeSpec], budget: &QueryBudget) -> 
                 truncated = true;
                 // Stop expanding further.
                 let len = items.len();
-                return build_result(items, truncated, budget, true, "closure_governs".to_string(), len);
+                return build_result(
+                    items,
+                    truncated,
+                    budget,
+                    true,
+                    "closure_governs".to_string(),
+                    len,
+                );
             }
             visited.insert(neighbor.clone());
             items.push(neighbor.clone());
@@ -629,7 +682,14 @@ pub fn closure_governs(root: &str, edges: &[EdgeSpec], budget: &QueryBudget) -> 
     }
 
     let len = items.len();
-    build_result(items, truncated, budget, false, "closure_governs".to_string(), len)
+    build_result(
+        items,
+        truncated,
+        budget,
+        false,
+        "closure_governs".to_string(),
+        len,
+    )
 }
 
 fn build_result(
@@ -647,7 +707,10 @@ fn build_result(
             stage: stage.clone(),
             visited,
             truncated: true,
-            deadline_remaining_ms: budget.deadline.saturating_duration_since(Instant::now()).as_millis() as u64,
+            deadline_remaining_ms: budget
+                .deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis() as u64,
         });
     }
     // Deadline advisory: if past deadline and no budget exceeded yet, set advisory.
@@ -673,8 +736,20 @@ mod closure_tests {
     #[test]
     fn chain_closure() {
         let edges = vec![
-            EdgeSpec { source: "A".to_string(), relation: "GOVERNS".to_string(), target: "B".to_string(), valid_from: 0, valid_to: 0 },
-            EdgeSpec { source: "B".to_string(), relation: "GOVERNS".to_string(), target: "C".to_string(), valid_from: 0, valid_to: 0 },
+            EdgeSpec {
+                source: "A".to_string(),
+                relation: "GOVERNS".to_string(),
+                target: "B".to_string(),
+                valid_from: 0,
+                valid_to: 0,
+            },
+            EdgeSpec {
+                source: "B".to_string(),
+                relation: "GOVERNS".to_string(),
+                target: "C".to_string(),
+                valid_from: 0,
+                valid_to: 0,
+            },
         ];
         let budget = QueryBudget::default();
         let result = closure_governs("A", &edges, &budget);
@@ -685,9 +760,13 @@ mod closure_tests {
 
     #[test]
     fn cycle_guard_self_loop() {
-        let edges = vec![
-            EdgeSpec { source: "A".to_string(), relation: "GOVERNS".to_string(), target: "A".to_string(), valid_from: 0, valid_to: 0 },
-        ];
+        let edges = vec![EdgeSpec {
+            source: "A".to_string(),
+            relation: "GOVERNS".to_string(),
+            target: "A".to_string(),
+            valid_from: 0,
+            valid_to: 0,
+        }];
         let budget = QueryBudget::default();
         let result = closure_governs("A", &edges, &budget);
         assert!(!result.truncated);
@@ -697,9 +776,27 @@ mod closure_tests {
     #[test]
     fn max_hops_truncation_and_budget_exceeded() {
         let edges = vec![
-            EdgeSpec { source: "A".to_string(), relation: "GOVERNS".to_string(), target: "B".to_string(), valid_from: 0, valid_to: 0 },
-            EdgeSpec { source: "B".to_string(), relation: "GOVERNS".to_string(), target: "C".to_string(), valid_from: 0, valid_to: 0 },
-            EdgeSpec { source: "C".to_string(), relation: "GOVERNS".to_string(), target: "D".to_string(), valid_from: 0, valid_to: 0 },
+            EdgeSpec {
+                source: "A".to_string(),
+                relation: "GOVERNS".to_string(),
+                target: "B".to_string(),
+                valid_from: 0,
+                valid_to: 0,
+            },
+            EdgeSpec {
+                source: "B".to_string(),
+                relation: "GOVERNS".to_string(),
+                target: "C".to_string(),
+                valid_from: 0,
+                valid_to: 0,
+            },
+            EdgeSpec {
+                source: "C".to_string(),
+                relation: "GOVERNS".to_string(),
+                target: "D".to_string(),
+                valid_from: 0,
+                valid_to: 0,
+            },
         ];
         let mut budget = QueryBudget::default();
         budget.max_hops = 1;
@@ -722,4 +819,3 @@ mod closure_tests {
         assert!(result.budget_exceeded.is_none());
     }
 }
-

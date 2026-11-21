@@ -18,85 +18,85 @@
  *   masked by a silent local fallback.
  */
 
-import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { existsSync, readFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { basename, dirname, join, resolve } from 'node:path'
 
 // ──────────────────────────────────────────────────────────────────────
 // Types (mirror MCP tool signatures & OpenClaw plugin API)
 // ──────────────────────────────────────────────────────────────────────
 
 export interface GuardValidateParams {
-  action_type: string;
-  payload: string;
-  cwd: string;
-  use_sandbox?: boolean;
+  action_type: string
+  payload: string
+  cwd: string
+  use_sandbox?: boolean
 }
 
 export interface GuardValidateResult {
-  verdict: "pass" | "reject";
+  verdict: 'pass' | 'reject'
   /** The core's own verdict bucket, kept so nothing is flattened away. */
-  bucket: string;
-  reasons: string[];
-  constraints: string[];
-  notes: string[];
-  rule_ids: string[];
+  bucket: string
+  reasons: string[]
+  constraints: string[]
+  notes: string[]
+  rule_ids: string[]
 }
 
 export interface TaskIntentSignal {
-  marker: string;
-  excerpt: string;
+  marker: string
+  excerpt: string
 }
 
 export interface TaskCreateParams {
-  namespace: string;
-  title: string;
-  description?: string;
-  priority?: number;
-  labels?: string[];
-  blocked_by?: string[];
-  parent_id?: string;
+  namespace: string
+  title: string
+  description?: string
+  priority?: number
+  labels?: string[]
+  blocked_by?: string[]
+  parent_id?: string
 }
 
 // OpenClaw plugin context
 export interface OpenClawPluginContext {
-  config: Record<string, unknown>;
+  config: Record<string, unknown>
   logger: {
-    info: (msg: string, meta?: Record<string, unknown>) => void;
-    warn: (msg: string, meta?: Record<string, unknown>) => void;
-    error: (msg: string, meta?: Record<string, unknown>) => void;
-  };
+    info: (msg: string, meta?: Record<string, unknown>) => void
+    warn: (msg: string, meta?: Record<string, unknown>) => void
+    error: (msg: string, meta?: Record<string, unknown>) => void
+  }
   hooks: {
-    beforeFileOp: (handler: FileOpHandler) => void;
-    onTurnEnd: (handler: TurnEndHandler) => void;
-  };
+    beforeFileOp: (handler: FileOpHandler) => void
+    onTurnEnd: (handler: TurnEndHandler) => void
+  }
   conversation: {
-    injectSystemMessage: (message: string) => void;
-  };
+    injectSystemMessage: (message: string) => void
+  }
 }
 
-export type FileOpHandler = (op: FileOperation) => Promise<FileOpResult>;
-export type TurnEndHandler = (turn: ConversationTurn) => Promise<void>;
+export type FileOpHandler = (op: FileOperation) => Promise<FileOpResult>
+export type TurnEndHandler = (turn: ConversationTurn) => Promise<void>
 
 export interface FileOperation {
-  type: "write" | "edit" | "delete" | "mkdir";
-  path: string;
-  content?: string;
-  oldContent?: string;
-  newContent?: string;
+  type: 'write' | 'edit' | 'delete' | 'mkdir'
+  path: string
+  content?: string
+  oldContent?: string
+  newContent?: string
 }
 
 export interface FileOpResult {
-  allowed: boolean;
-  reason?: string;
-  guardVerdict?: GuardValidateResult;
+  allowed: boolean
+  reason?: string
+  guardVerdict?: GuardValidateResult
   /** True when the core could not answer and the shim is running degraded. */
-  degraded?: boolean;
+  degraded?: boolean
 }
 
 export interface ConversationTurn {
-  role: "user" | "assistant" | "system";
-  content: string;
+  role: 'user' | 'assistant' | 'system'
+  content: string
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -104,62 +104,66 @@ export interface ConversationTurn {
 // ──────────────────────────────────────────────────────────────────────
 
 /** Where the daemon serves MCP. The setup default is 34343, not 8080. */
-export const DEFAULT_ENDPOINT = "http://127.0.0.1:34343/mcp";
+export const DEFAULT_ENDPOINT = 'http://127.0.0.1:34343/mcp'
 
 /** The daemon's bearer token, as the daemon itself lays it down. */
-export const DEFAULT_TOKEN_FILE = "daemon.token";
+export const DEFAULT_TOKEN_FILE = 'daemon.token'
 
 /** The tools this shim needs from the core to do its job. */
 export const REQUIRED_TOOLS = [
-  "neurostrata_guard_validate",
-  "neurostrata_task_create",
-];
+  'neurostrata_guard_validate',
+  'neurostrata_task_create'
+]
 
 export interface PluginConfig {
-  namespace: string;
+  namespace: string
   /** The daemon's `/mcp` endpoint. */
-  endpoint: string;
+  endpoint: string
   /** The bearer token, when the host config carries one explicitly. */
-  bearerToken: string | null;
+  bearerToken: string | null
   /** Where to read the daemon token from when the config carries none. */
-  tokenFile: string | null;
-  strictMode: boolean;
+  tokenFile: string | null
+  strictMode: boolean
   /** Upper bound on one MCP round trip. */
-  requestTimeoutMs: number;
+  requestTimeoutMs: number
   intentDetection: {
-    enabled: boolean;
-    injectReminder: boolean;
-  };
+    enabled: boolean
+    injectReminder: boolean
+  }
+  /** Resolved project root directory (set in initialize from ctx.location / cwd). */
+  projectRoot?: string
 }
 
 const DEFAULT_CONFIG: PluginConfig = {
-  namespace: "NeuroStrata",
+  namespace: 'NeuroStrata',
   endpoint: DEFAULT_ENDPOINT,
   bearerToken: null,
   tokenFile: null,
   strictMode: true,
   requestTimeoutMs: 5000,
-  intentDetection: { enabled: true, injectReminder: true },
-};
+  intentDetection: { enabled: true, injectReminder: true }
+}
 
 function asRecord(value: unknown): Record<string, unknown> {
-  return typeof value === "object" && value !== null
+  return typeof value === 'object' && value !== null
     ? (value as Record<string, unknown>)
-    : {};
+    : {}
 }
 
 function asString(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim() !== "" ? value.trim() : undefined;
+  return typeof value === 'string' && value.trim() !== ''
+    ? value.trim()
+    : undefined
 }
 
 function asNumber(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isFinite(value) && value > 0
+  return typeof value === 'number' && Number.isFinite(value) && value > 0
     ? value
-    : undefined;
+    : undefined
 }
 
 function asBoolean(value: unknown): boolean | undefined {
-  return typeof value === "boolean" ? value : undefined;
+  return typeof value === 'boolean' ? value : undefined
 }
 
 /**
@@ -168,16 +172,21 @@ function asBoolean(value: unknown): boolean | undefined {
  * `guardEndpoint` is still honored: it is what older installs wrote, and
  * silently ignoring it would point the shim at the wrong port.
  */
-export function resolveConfig(raw: unknown): PluginConfig {
-  const input = asRecord(raw);
-  const intent = asRecord(input.intentDetection);
+export function resolveConfig(raw: unknown, cwd = process.cwd()): PluginConfig {
+  const input = asRecord(raw)
+  const intent = asRecord(input.intentDetection)
   const endpoint =
     asString(input.endpoint) ??
     asString(input.guardEndpoint) ??
-    DEFAULT_CONFIG.endpoint;
-
+    DEFAULT_CONFIG.endpoint
+  // Preserve the exact namespace for MCP routing; sanitization happens only
+  // where the value is interpolated into a prompt header (#329 review).
+  const namespace =
+    asString(input.namespace) ??
+    asString(process.env.NEUROSTRATA_NAMESPACE) ??
+    discoverProjectNamespace(cwd)
   return {
-    namespace: asString(input.namespace) ?? DEFAULT_CONFIG.namespace,
+    namespace,
     endpoint,
     bearerToken: asString(input.bearerToken) ?? null,
     tokenFile: asString(input.tokenFile) ?? null,
@@ -185,12 +194,81 @@ export function resolveConfig(raw: unknown): PluginConfig {
     requestTimeoutMs:
       asNumber(input.requestTimeoutMs) ?? DEFAULT_CONFIG.requestTimeoutMs,
     intentDetection: {
-      enabled: asBoolean(intent.enabled) ?? DEFAULT_CONFIG.intentDetection.enabled,
+      enabled:
+        asBoolean(intent.enabled) ?? DEFAULT_CONFIG.intentDetection.enabled,
       injectReminder:
         asBoolean(intent.injectReminder) ??
-        DEFAULT_CONFIG.intentDetection.injectReminder,
-    },
-  };
+        DEFAULT_CONFIG.intentDetection.injectReminder
+    }
+  }
+}
+
+/**
+ * Walk up from resolve(startDir) to the filesystem root looking for `.git`
+ * (dir or file) or `.NeuroStrata`; return the directory containing it, or
+ * resolve(startDir) if none found.
+ */
+export function findProjectRoot(startDir = process.cwd()): string {
+  // Pass 1: walk up looking for `.git` first; a `.git` anchors the project root.
+  let current = resolve(startDir)
+  while (true) {
+    if (existsSync(join(current, '.git'))) {
+      return current
+    }
+    const next = dirname(current)
+    if (next === current) break
+    current = next
+  }
+  // Pass 2: only if no `.git` anywhere in the ancestor chain, walk up looking
+  // for `.NeuroStrata`. Otherwise fall back to resolve(startDir).
+  current = resolve(startDir)
+  while (true) {
+    if (existsSync(join(current, '.NeuroStrata'))) {
+      return current
+    }
+    const next = dirname(current)
+    if (next === current) break
+    current = next
+  }
+  return resolve(startDir)
+}
+
+/**
+ * 1. Walk up to findProjectRoot(startDir) checking <dir>/.NeuroStrata/session_queries.json;
+ *    if it parses as JSON with a non-empty string .namespace, return it trimmed.
+ * 2. Otherwise return basename(findProjectRoot(startDir)) || "default".
+ */
+export function discoverProjectNamespace(startDir = process.cwd()): string {
+  const root = findProjectRoot(startDir)
+  let current = resolve(startDir)
+  while (true) {
+    const sessionQueriesPath = join(
+      current,
+      '.NeuroStrata',
+      'session_queries.json'
+    )
+    try {
+      if (existsSync(sessionQueriesPath)) {
+        const content = readFileSync(sessionQueriesPath, 'utf8')
+        const parsed = JSON.parse(content)
+        if (
+          parsed !== null &&
+          typeof parsed === 'object' &&
+          typeof parsed.namespace === 'string' &&
+          parsed.namespace.trim() !== ''
+        ) {
+          return parsed.namespace.trim()
+        }
+      }
+    } catch {
+      // fall through to next ancestor
+    }
+    if (current === root) break
+    const next = dirname(current)
+    if (next === current) break
+    current = next
+  }
+  return basename(root) || 'default'
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -199,8 +277,8 @@ export function resolveConfig(raw: unknown): PluginConfig {
 
 /** The absolute path of the daemon token file. */
 export function daemonTokenPath(tokenFile?: string | null): string {
-  if (tokenFile && tokenFile.trim() !== "") return tokenFile.trim();
-  return join(homedir(), ".config", "neurostrata", DEFAULT_TOKEN_FILE);
+  if (tokenFile && tokenFile.trim() !== '') return tokenFile.trim()
+  return join(homedir(), '.config', 'neurostrata', DEFAULT_TOKEN_FILE)
 }
 
 /**
@@ -213,18 +291,18 @@ export function daemonTokenPath(tokenFile?: string | null): string {
  */
 export function loadDaemonToken(tokenFile?: string | null): string | null {
   try {
-    const raw = readFileSync(daemonTokenPath(tokenFile), "utf8").trim();
-    return raw.length > 0 ? raw : null;
+    const raw = readFileSync(daemonTokenPath(tokenFile), 'utf8').trim()
+    return raw.length > 0 ? raw : null
   } catch {
-    return null;
+    return null
   }
 }
 
 /** The request headers, with the bearer attached when there is one. */
 export function buildHeaders(token: string | null): Record<string, string> {
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (token) headers.Authorization = `Bearer ${token}`;
-  return headers;
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+  if (token) headers.Authorization = `Bearer ${token}`
+  return headers
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -232,41 +310,41 @@ export function buildHeaders(token: string | null): Record<string, string> {
 // ──────────────────────────────────────────────────────────────────────
 
 export interface JsonRpcRequest {
-  jsonrpc: "2.0";
-  id: number;
-  method: string;
-  params?: unknown;
+  jsonrpc: '2.0'
+  id: number
+  method: string
+  params?: unknown
 }
 
 export interface JsonRpcResponse {
-  jsonrpc?: string;
-  id?: number | string | null;
-  result?: unknown;
-  error?: { code?: number; message?: string };
+  jsonrpc?: string
+  id?: number | string | null
+  result?: unknown
+  error?: { code?: number; message?: string }
 }
 
 export interface McpToolResult {
-  content?: Array<{ type?: string; text?: string }>;
-  isError?: boolean;
+  content?: Array<{ type?: string; text?: string }>
+  isError?: boolean
 }
 
 /** Build the `tools/call` request the core actually answers. */
 export function buildToolCallRequest(
   id: number,
   name: string,
-  args: unknown,
+  args: unknown
 ): JsonRpcRequest {
   return {
-    jsonrpc: "2.0",
+    jsonrpc: '2.0',
     id,
-    method: "tools/call",
-    params: { name, arguments: args },
-  };
+    method: 'tools/call',
+    params: { name, arguments: args }
+  }
 }
 
 /** Build the `tools/list` request used for capability negotiation. */
 export function buildToolsListRequest(id: number): JsonRpcRequest {
-  return { jsonrpc: "2.0", id, method: "tools/list", params: {} };
+  return { jsonrpc: '2.0', id, method: 'tools/list', params: {} }
 }
 
 /**
@@ -277,29 +355,30 @@ export function buildToolsListRequest(id: number): JsonRpcRequest {
  * it is reported, never treated as an empty success.
  */
 export function extractToolText(result: unknown): string {
-  const content = (result as McpToolResult | undefined)?.content;
+  const content = (result as McpToolResult | undefined)?.content
   if (!Array.isArray(content)) {
-    throw new Error("tool result carried no content array");
+    throw new Error('tool result carried no content array')
   }
   const text = content
-    .map((part) => (typeof part?.text === "string" ? part.text : ""))
+    .map((part) => (typeof part?.text === 'string' ? part.text : ''))
     .filter((part) => part.length > 0)
-    .join("\n");
+    .join('\n')
   if (text.length === 0) {
-    throw new Error("tool result carried no text content");
+    throw new Error('tool result carried no text content')
   }
-  return text;
+  return text
 }
 
 /** The tool names from a `tools/list` answer. */
 export function extractToolNames(result: unknown): string[] {
-  const tools = (result as { tools?: Array<{ name?: string }> } | undefined)?.tools;
+  const tools = (result as { tools?: Array<{ name?: string }> } | undefined)
+    ?.tools
   if (!Array.isArray(tools)) {
-    throw new Error("tools/list returned no tools array");
+    throw new Error('tools/list returned no tools array')
   }
   return tools
-    .map((tool) => (typeof tool?.name === "string" ? tool.name : ""))
-    .filter((name) => name.length > 0);
+    .map((tool) => (typeof tool?.name === 'string' ? tool.name : ''))
+    .filter((name) => name.length > 0)
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -307,74 +386,74 @@ export function extractToolNames(result: unknown): string[] {
 // ──────────────────────────────────────────────────────────────────────
 
 export class NeuroStrataMCPClient {
-  private readonly endpoint: string;
-  private readonly token: string | null;
-  private readonly timeoutMs: number;
-  private requestId = 0;
+  private readonly endpoint: string
+  private readonly token: string | null
+  private readonly timeoutMs: number
+  private requestId = 0
 
   constructor(options: {
-    endpoint: string;
-    token: string | null;
-    timeoutMs: number;
+    endpoint: string
+    token: string | null
+    timeoutMs: number
   }) {
-    this.endpoint = options.endpoint;
-    this.token = options.token;
-    this.timeoutMs = options.timeoutMs;
+    this.endpoint = options.endpoint
+    this.token = options.token
+    this.timeoutMs = options.timeoutMs
   }
 
   /** Call one tool and return its text content. */
   async callTool(name: string, args: unknown): Promise<string> {
-    const id = ++this.requestId;
-    const response = await this.post(buildToolCallRequest(id, name, args));
+    const id = ++this.requestId
+    const response = await this.post(buildToolCallRequest(id, name, args))
     if (response.error) {
       throw new Error(
-        `[${response.error.code ?? "?"}] ${response.error.message ?? "tool call failed"}`,
-      );
+        `[${response.error.code ?? '?'}] ${response.error.message ?? 'tool call failed'}`
+      )
     }
     if (response.result === undefined || response.result === null) {
-      throw new Error(`${name} returned no result`);
+      throw new Error(`${name} returned no result`)
     }
-    const text = extractToolText(response.result);
-    const isError = (response.result as McpToolResult).isError;
+    const text = extractToolText(response.result)
+    const isError = (response.result as McpToolResult).isError
     if (isError) {
-      throw new Error(`${name} failed: ${text}`);
+      throw new Error(`${name} failed: ${text}`)
     }
-    return text;
+    return text
   }
 
   /** The names of the tools the core exposes. */
   async listToolNames(): Promise<string[]> {
-    const id = ++this.requestId;
-    const response = await this.post(buildToolsListRequest(id));
+    const id = ++this.requestId
+    const response = await this.post(buildToolsListRequest(id))
     if (response.error) {
       throw new Error(
-        `[${response.error.code ?? "?"}] ${response.error.message ?? "tools/list failed"}`,
-      );
+        `[${response.error.code ?? '?'}] ${response.error.message ?? 'tools/list failed'}`
+      )
     }
-    return extractToolNames(response.result);
+    return extractToolNames(response.result)
   }
 
   private async post(body: JsonRpcRequest): Promise<JsonRpcResponse> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs)
     try {
       const response = await fetch(this.endpoint, {
-        method: "POST",
+        method: 'POST',
         headers: buildHeaders(this.token),
         body: JSON.stringify(body),
-        signal: controller.signal,
-      });
+        signal: controller.signal
+      })
       if (!response.ok) {
-        throw new Error(`HTTP ${response.status} ${response.statusText}`);
+        throw new Error(`HTTP ${response.status} ${response.statusText}`)
       }
-      return (await response.json()) as JsonRpcResponse;
+      return (await response.json()) as JsonRpcResponse
     } catch (err) {
-      if (err instanceof Error && err.name === "AbortError") {
-        throw new Error(`request timed out after ${this.timeoutMs}ms`);
+      if (err instanceof Error && err.name === 'AbortError') {
+        throw new Error(`request timed out after ${this.timeoutMs}ms`)
       }
-      throw err;
+      throw err
     } finally {
-      clearTimeout(timer);
+      clearTimeout(timer)
     }
   }
 }
@@ -391,47 +470,49 @@ export class NeuroStrataMCPClient {
  * is tagged with `bucket`, not `type`.
  */
 export function parseGuardValidate(text: string): GuardValidateResult {
-  const start = text.indexOf("{");
-  const end = text.lastIndexOf("}");
+  const start = text.indexOf('{')
+  const end = text.lastIndexOf('}')
   if (start === -1 || end <= start) {
     throw new Error(
-      `guard_validate returned no JSON body: ${text.slice(0, 200)}`,
-    );
+      `guard_validate returned no JSON body: ${text.slice(0, 200)}`
+    )
   }
 
-  let body: Record<string, unknown>;
+  let body: Record<string, unknown>
   try {
-    body = JSON.parse(text.slice(start, end + 1)) as Record<string, unknown>;
+    body = JSON.parse(text.slice(start, end + 1)) as Record<string, unknown>
   } catch (err) {
-    throw new Error(`guard_validate returned an unreadable body: ${String(err)}`);
+    throw new Error(
+      `guard_validate returned an unreadable body: ${String(err)}`
+    )
   }
 
-  const verdict = asRecord(body.verdict);
-  const bucket = asString(verdict.bucket) ?? "Unknown";
+  const verdict = asRecord(body.verdict)
+  const bucket = asString(verdict.bucket) ?? 'Unknown'
   const reasons = Array.isArray(verdict.reasons)
     ? verdict.reasons.map((reason) => String(reason))
-    : [];
+    : []
   const constraints = Array.isArray(verdict.constraints)
     ? verdict.constraints.map((constraint) => String(constraint))
-    : [];
+    : []
   const notes = Array.isArray(verdict.notes)
     ? verdict.notes.map((note) => String(note))
-    : [];
+    : []
   const rule_ids = Array.isArray(body.rule_ids_triggered)
     ? body.rule_ids_triggered.map((id) => String(id))
-    : [];
+    : []
 
   const rejecting =
-    bucket === "DeterministicReject" || bucket === "SandboxReject";
+    bucket === 'DeterministicReject' || bucket === 'SandboxReject'
 
   return {
-    verdict: rejecting ? "reject" : "pass",
+    verdict: rejecting ? 'reject' : 'pass',
     bucket,
     reasons,
     constraints,
     notes,
-    rule_ids,
-  };
+    rule_ids
+  }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -439,35 +520,35 @@ export function parseGuardValidate(text: string): GuardValidateResult {
 // ──────────────────────────────────────────────────────────────────────
 
 export type AdapterState =
-  | "uninitialized"
-  | "ready"
-  | "degraded"
-  | "unavailable";
+  | 'uninitialized'
+  | 'ready'
+  | 'degraded'
+  | 'unavailable'
 
 export interface AdapterStatus {
-  state: AdapterState;
-  endpoint: string;
-  namespace: string;
+  state: AdapterState
+  endpoint: string
+  namespace: string
   /** Whether a bearer token was found and attached. */
-  authenticated: boolean;
+  authenticated: boolean
   /** Tools this shim needs that the core does not expose. */
-  missingTools: string[];
-  lastError?: string;
-  updatedAt: string;
+  missingTools: string[]
+  lastError?: string
+  updatedAt: string
 }
 
 function initialStatus(): AdapterStatus {
   return {
-    state: "uninitialized",
+    state: 'uninitialized',
     endpoint: DEFAULT_ENDPOINT,
-    namespace: "NeuroStrata",
+    namespace: 'NeuroStrata',
     authenticated: false,
     missingTools: [],
-    updatedAt: new Date(0).toISOString(),
-  };
+    updatedAt: new Date(0).toISOString()
+  }
 }
 
-let status: AdapterStatus = initialStatus();
+let status: AdapterStatus = initialStatus()
 
 /**
  * Session/task tracking between turn content and guard validation.
@@ -477,8 +558,8 @@ let status: AdapterStatus = initialStatus();
  * `neurostrata_task_update` or `neurostrata_task_complete`, with the
  * `id` / `session_id` parameters the payload carries.
  */
-let activeSessionId: string | null = null;
-let activeTaskId: string | null = null;
+let activeSessionId: string | null = null
+let activeTaskId: string | null = null
 
 /**
  * Mutations since the heavyweight channels were last touched (a note on the
@@ -486,13 +567,13 @@ let activeTaskId: string | null = null;
  * `neurostrata_guard_validate`'s `mutations_since_note` argument to pin the
  * Breath prompt.
  */
-let mutationsSinceNote = 0;
+let mutationsSinceNote = 0
 
 /** Reset the tracked session/task state (test hook). */
 export function resetState(): void {
-  activeSessionId = null;
-  activeTaskId = null;
-  mutationsSinceNote = 0;
+  activeSessionId = null
+  activeTaskId = null
+  mutationsSinceNote = 0
 }
 
 /**
@@ -501,50 +582,51 @@ export function resetState(): void {
  * spellings; both `session_id` and camelCase `sessionID` are accepted.
  */
 function extractTrackingFromText(text: string): {
-  taskId: string | undefined;
-  sessionId: string | undefined;
+  taskId: string | undefined
+  sessionId: string | undefined
 } {
-  const id = /(?<![\w-])id["'\s]*[:=]\s*["']([^"']+)["']/.exec(text)?.[1];
+  const id = /(?<![\w-])id["'\s]*[:=]\s*["']([^"']+)["']/.exec(text)?.[1]
   const sessionId =
-    /session[_\s-]?id["'\s]*[:=]\s*["']([^"']+)["']/i.exec(text)?.[1] ?? undefined;
-  return { taskId: id, sessionId };
+    /session[_\s-]?id["'\s]*[:=]\s*["']([^"']+)["']/i.exec(text)?.[1] ??
+    undefined
+  return { taskId: id, sessionId }
 }
 
 /** Update the tracked session/task state from a turn, best-effort. */
 function trackFromTurn(turn: ConversationTurn): void {
-  const lower = turn.content.toLowerCase();
+  const lower = turn.content.toLowerCase()
   const isClaimOrComplete =
-    lower.includes("neurostrata_task_claim") ||
-    lower.includes("neurostrata_task_update") ||
-    lower.includes("neurostrata_task_complete");
-  if (!isClaimOrComplete) return;
+    lower.includes('neurostrata_task_claim') ||
+    lower.includes('neurostrata_task_update') ||
+    lower.includes('neurostrata_task_complete')
+  if (!isClaimOrComplete) return
 
-  const { taskId, sessionId } = extractTrackingFromText(turn.content);
-  if (sessionId) activeSessionId = sessionId;
+  const { taskId, sessionId } = extractTrackingFromText(turn.content)
+  if (sessionId) activeSessionId = sessionId
   // Heavyweight turn: a note, claim, or completion satisfies the Breath
   // prompt, so the mutation counter starts over. Best-effort: the turn text
   // is the only source openclaw exposes, so a bare "note" mention counts.
   if (
-    lower.includes("neurostrata_task_claim") ||
-    lower.includes("neurostrata_task_complete") ||
-    (lower.includes("neurostrata_task_update") && lower.includes("note"))
+    lower.includes('neurostrata_task_claim') ||
+    lower.includes('neurostrata_task_complete') ||
+    (lower.includes('neurostrata_task_update') && lower.includes('note'))
   ) {
-    mutationsSinceNote = 0;
+    mutationsSinceNote = 0
   }
-  if (lower.includes("neurostrata_task_complete")) {
-    activeTaskId = null;
+  if (lower.includes('neurostrata_task_complete')) {
+    activeTaskId = null
   } else if (taskId) {
-    activeTaskId = taskId;
+    activeTaskId = taskId
   }
 }
 
 /** The adapter's current state. A degraded core is visible here. */
 export function adapterStatus(): AdapterStatus {
-  return { ...status, missingTools: [...status.missingTools] };
+  return { ...status, missingTools: [...status.missingTools] }
 }
 
 function setStatus(patch: Partial<AdapterStatus>): void {
-  status = { ...status, ...patch, updatedAt: new Date().toISOString() };
+  status = { ...status, ...patch, updatedAt: new Date().toISOString() }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -552,57 +634,57 @@ function setStatus(patch: Partial<AdapterStatus>): void {
 // ──────────────────────────────────────────────────────────────────────
 
 export const MARKERS: readonly [string, string][] = [
-  ["todo:", "todo:"],
-  ["fixme:", "fixme:"],
-  ["follow-up:", "follow-up:"],
-  ["followup:", "followup:"],
-  ["next step:", "next step:"],
-  ["action item:", "action item:"],
-  ["remaining work:", "remaining work:"],
-  ["we should also ", "we should also"],
-  ["later we need to ", "later we need to"],
-  ["need to follow up", "need to follow up"],
-  ["still need to ", "still need to"],
-  ["must also fix ", "must also fix"],
-  ["filed follow-up", "filed follow-up"],
-  ["defer ", "defer"],
-  ["deferred ", "deferred"],
-];
+  ['todo:', 'todo:'],
+  ['fixme:', 'fixme:'],
+  ['follow-up:', 'follow-up:'],
+  ['followup:', 'followup:'],
+  ['next step:', 'next step:'],
+  ['action item:', 'action item:'],
+  ['remaining work:', 'remaining work:'],
+  ['we should also ', 'we should also'],
+  ['later we need to ', 'later we need to'],
+  ['need to follow up', 'need to follow up'],
+  ['still need to ', 'still need to'],
+  ['must also fix ', 'must also fix'],
+  ['filed follow-up', 'filed follow-up'],
+  ['defer ', 'defer'],
+  ['deferred ', 'deferred']
+]
 
-export const NEGATION_PREFIXES = ["never ", "do not ", "don't ", "do not, "];
+export const NEGATION_PREFIXES = ['never ', 'do not ', "don't ", 'do not, ']
 
 export function detectTaskIntentsLocal(text: string): TaskIntentSignal[] {
-  const lower = text.toLowerCase();
-  const out: TaskIntentSignal[] = [];
-  const seen = new Set<string>();
+  const lower = text.toLowerCase()
+  const out: TaskIntentSignal[] = []
+  const seen = new Set<string>()
 
   for (const [matchStr, canonical] of MARKERS) {
-    const idx = lower.indexOf(matchStr);
-    if (idx === -1) continue;
-    if (seen.has(canonical)) continue;
+    const idx = lower.indexOf(matchStr)
+    if (idx === -1) continue
+    if (seen.has(canonical)) continue
 
     // negation guard
-    const clauseStart = text.slice(0, idx).lastIndexOf("\n") + 1;
-    let start = clauseStart;
-    const sentPos = text.slice(0, idx).lastIndexOf(". ");
-    if (sentPos !== -1 && sentPos + 2 > start) start = sentPos + 2;
-    const clausePrefix = text.slice(start, idx).trimStart().toLowerCase();
-    if (NEGATION_PREFIXES.some((p) => clausePrefix.startsWith(p))) continue;
+    const clauseStart = text.slice(0, idx).lastIndexOf('\n') + 1
+    let start = clauseStart
+    const sentPos = text.slice(0, idx).lastIndexOf('. ')
+    if (sentPos !== -1 && sentPos + 2 > start) start = sentPos + 2
+    const clausePrefix = text.slice(start, idx).trimStart().toLowerCase()
+    if (NEGATION_PREFIXES.some((p) => clausePrefix.startsWith(p))) continue
 
     // excerpt
-    const from = idx;
-    const rest = text.slice(from);
+    const from = idx
+    const rest = text.slice(from)
     const end = Math.min(
-      rest.indexOf("\n") === -1 ? rest.length : rest.indexOf("\n"),
-      160,
-    );
-    let excerpt = rest.slice(0, end).trimEnd();
-    if (excerpt.length > 160) excerpt = excerpt.slice(0, 160);
+      rest.indexOf('\n') === -1 ? rest.length : rest.indexOf('\n'),
+      160
+    )
+    let excerpt = rest.slice(0, end).trimEnd()
+    if (excerpt.length > 160) excerpt = excerpt.slice(0, 160)
 
-    seen.add(canonical);
-    out.push({ marker: canonical, excerpt });
+    seen.add(canonical)
+    out.push({ marker: canonical, excerpt })
   }
-  return out;
+  return out
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -610,39 +692,39 @@ export function detectTaskIntentsLocal(text: string): TaskIntentSignal[] {
 // ──────────────────────────────────────────────────────────────────────
 
 /** LRU cap: how many recently touched (`namespace:path`) keys are kept. */
-export const PREFETCH_LRU_CAP = 128;
+export const PREFETCH_LRU_CAP = 128
 
 /** Output budget: one file-touch recall injects at most this many chars. */
-export const PREFETCH_MAX_CHARS = 2048;
+export const PREFETCH_MAX_CHARS = 2048
 
 /**
  * Recently touched file paths, keyed `namespace:path`, in LRU order
  * (oldest first). Bounded so a long session cannot grow without bound.
  */
-export const prefetchedPaths = new Map<string, number>();
+export const prefetchedPaths = new Map<string, number>()
 
 /** `(memory_id:valid_from)` keys already injected this session. */
-export const injectedMemoryIds = new Set<string>();
+export const injectedMemoryIds = new Set<string>()
 
 function recordPrefetchedPath(key: string): void {
-  prefetchedPaths.set(key, Date.now());
+  prefetchedPaths.set(key, Date.now())
   if (prefetchedPaths.size > PREFETCH_LRU_CAP) {
-    const oldest = prefetchedPaths.keys().next().value;
-    if (oldest !== undefined) prefetchedPaths.delete(oldest);
+    const oldest = prefetchedPaths.keys().next().value
+    if (oldest !== undefined) prefetchedPaths.delete(oldest)
   }
 }
 
 function touchPrefetchedPath(key: string): void {
-  prefetchedPaths.delete(key);
-  recordPrefetchedPath(key);
+  prefetchedPaths.delete(key)
+  recordPrefetchedPath(key)
 }
 
 /** One governing memory as `memories_for_file` returns it. */
 export interface FileMemoryHit {
-  id: string;
-  valid_from: string;
-  memory_type: string;
-  content: string;
+  id: string
+  valid_from: string
+  memory_type: string
+  content: string
 }
 
 /**
@@ -650,66 +732,66 @@ export interface FileMemoryHit {
  * `memories` between the first `{` and the last `}` of the content text.
  */
 export function parseFileMemoryHits(text: string): FileMemoryHit[] {
-  const start = text.indexOf("{");
-  const end = text.lastIndexOf("}");
+  const start = text.indexOf('{')
+  const end = text.lastIndexOf('}')
   if (start === -1 || end <= start) {
     throw new Error(
-      `memories_for_file returned no JSON body: ${text.slice(0, 200)}`,
-    );
+      `memories_for_file returned no JSON body: ${text.slice(0, 200)}`
+    )
   }
 
-  let body: Record<string, unknown>;
+  let body: Record<string, unknown>
   try {
-    body = JSON.parse(text.slice(start, end + 1)) as Record<string, unknown>;
+    body = JSON.parse(text.slice(start, end + 1)) as Record<string, unknown>
   } catch (err) {
     throw new Error(
-      `memories_for_file returned an unreadable body: ${String(err)}`,
-    );
+      `memories_for_file returned an unreadable body: ${String(err)}`
+    )
   }
 
   const raw = Array.isArray(body.hits)
     ? body.hits
     : Array.isArray(body.memories)
       ? body.memories
-      : [];
+      : []
 
-  const out: FileMemoryHit[] = [];
+  const out: FileMemoryHit[] = []
   for (const item of raw) {
-    if (typeof item !== "object" || item === null) continue;
-    const hit = item as Record<string, unknown>;
-    const id = asString(hit.id) ?? asString(hit.memory_id);
-    const valid_from = asString(hit.valid_from) ?? "";
-    if (!id) continue; // a hit without an id cannot be deduped — never inject
+    if (typeof item !== 'object' || item === null) continue
+    const hit = item as Record<string, unknown>
+    const id = asString(hit.id) ?? asString(hit.memory_id)
+    const valid_from = asString(hit.valid_from) ?? ''
+    if (!id) continue // a hit without an id cannot be deduped — never inject
     out.push({
       id,
       valid_from,
-      memory_type: asString(hit.memory_type) ?? asString(hit.type) ?? "memory",
+      memory_type: asString(hit.memory_type) ?? asString(hit.type) ?? 'memory',
       content:
         asString(hit.content) ??
         asString(hit.text) ??
         asString(hit.summary) ??
-        "",
-    });
+        ''
+    })
   }
-  return out;
+  return out
 }
 
 function formatFileMemorySnippet(hit: FileMemoryHit): string {
-  const where = hit.valid_from ? ` (valid_from ${hit.valid_from})` : "";
-  return `[NeuroStrata ${hit.memory_type} ${hit.id}${where}] ${hit.content}`;
+  const where = hit.valid_from ? ` (valid_from ${hit.valid_from})` : ''
+  return `[NeuroStrata ${hit.memory_type} ${hit.id}${where}] ${hit.content}`
 }
 
 /** Cap the recalled snippets so one file touch can never flood context. */
 function capSnippets(snippets: string[]): string[] {
-  let total = 0;
-  const out: string[] = [];
+  let total = 0
+  const out: string[] = []
   for (const snippet of snippets) {
-    if (total >= PREFETCH_MAX_CHARS) break;
-    const room = PREFETCH_MAX_CHARS - total;
-    out.push(snippet.length > room ? snippet.slice(0, room) : snippet);
-    total += Math.min(snippet.length, room) + 1; // + join newline
+    if (total >= PREFETCH_MAX_CHARS) break
+    const room = PREFETCH_MAX_CHARS - total
+    out.push(snippet.length > room ? snippet.slice(0, room) : snippet)
+    total += Math.min(snippet.length, room) + 1 // + join newline
   }
-  return out;
+  return out
 }
 
 /**
@@ -721,70 +803,84 @@ function capSnippets(snippets: string[]): string[] {
  */
 export async function prefetchMemoriesForFile(
   namespace: string,
-  filePath: string,
+  filePath: string
 ): Promise<string[]> {
-  const path = filePath.trim();
-  if (path === "") return [];
+  const path = filePath.trim()
+  if (path === '') return []
 
-  const key = `${namespace}:${path}`;
+  const key = `${namespace}:${path}`
   if (prefetchedPaths.has(key)) {
-    touchPrefetchedPath(key);
-    return [];
+    touchPrefetchedPath(key)
+    return []
   }
 
   // Record the LRU entry only after the recall actually succeeded: a
   // disconnected or failed call must never permanently suppress prefetch
   // for this file within the LRU window.
-  if (!mcpClient) return [];
+  if (!mcpClient) return []
 
-  const text = await mcpClient.callTool("neurostrata_memories_for_file", {
+  const text = await mcpClient.callTool('neurostrata_memories_for_file', {
     namespace,
     path,
-    limit: 5,
-  });
-  recordPrefetchedPath(key);
+    limit: 5
+  })
+  recordPrefetchedPath(key)
 
-  const out: string[] = [];
+  const out: string[] = []
   for (const hit of parseFileMemoryHits(text)) {
-    const dedupKey = `${hit.id}:${hit.valid_from}`;
-    if (injectedMemoryIds.has(dedupKey)) continue;
-    injectedMemoryIds.add(dedupKey);
-    out.push(formatFileMemorySnippet(hit));
+    const dedupKey = `${hit.id}:${hit.valid_from}`
+    if (injectedMemoryIds.has(dedupKey)) continue
+    injectedMemoryIds.add(dedupKey)
+    out.push(formatFileMemorySnippet(hit))
   }
-  return capSnippets(out);
+  return capSnippets(out)
 }
 
-export const SUBAGENT_CONTEXT_MARKER = "### NeuroStrata Task & Graph Context";
+export const SUBAGENT_CONTEXT_MARKER = '### NeuroStrata Task & Graph Context'
+
+export function sanitizeSubagentHeaderToken(value: string): string {
+  return String(value ?? '').replace(/[^A-Za-z0-9_.:-]/g, '')
+}
+
+/** Collapse backticks and newlines so a caller-supplied value cannot break
+ *  out of the header's code span (issue #316: the namespace can arrive from
+ *  a committed .NeuroStrata/session_queries.json). */
+function codeSpanValue(value: unknown): string {
+  return String(value ?? '').replace(/[`\r\n\u2028\u2029]+/g, ' ')
+}
 
 export function buildSubagentContextHeader(
   namespace: string,
-  taskId: string | null,
+  taskId: string | null
 ): string {
-  const taskLabel = taskId ?? "unclaimed (claim a task first)";
+  const taskLabel = taskId ?? 'unclaimed (claim a task first)'
+  const safeNamespace = sanitizeSubagentHeaderToken(namespace)
+  const safeTaskLabel =
+    taskId === null ? taskLabel : sanitizeSubagentHeaderToken(taskLabel)
   return (
     `${SUBAGENT_CONTEXT_MARKER} (AUTO-INJECTED BY NEUROSTRATA PLUGIN)\n` +
-    `- Namespace: \`${namespace}\` | Active Task ID: \`${taskLabel}\`\n` +
+    `- Namespace: \`${codeSpanValue(namespace)}\` | Active Task ID: \`${codeSpanValue(taskLabel)}\`\n` +
     `- Mandatory Graph-First Lookup Rule: Before blind \`grep\`/\`glob\` or editing files, query \`neurostrata_memories_for_file\`, \`neurostrata_related\`, \`neurostrata_search_memory\` (\`include_related: true\`), or \`neurostrata_sparql_query\` (or \`neurostrata-mcp\` CLI) to inspect governing rules (\`GOVERNS\`) and AST call/import edges (\`DEPENDS_ON\`, \`calls\`, \`imports\`).\n\n`
-  );
+  )
 }
 
 export function injectSubagentPrompt(
   target: Record<string, unknown>,
   namespace: string,
-  taskId: string | null,
+  taskId: string | null
 ): boolean {
-  const raw = typeof target.prompt === "string" ? target.prompt : null;
-  if (raw === null || raw.includes(SUBAGENT_CONTEXT_MARKER)) return false;
-  target.prompt = buildSubagentContextHeader(namespace, taskId) + raw;
-  return true;
+  const raw = typeof target.prompt === 'string' ? target.prompt : null
+  if (raw === null || raw.includes(SUBAGENT_CONTEXT_MARKER)) return false
+  target.prompt = buildSubagentContextHeader(namespace, taskId) + raw
+  return true
 }
 
 // ──────────────────────────────────────────────────────────────────────
 // Plugin Entry Point
 // ──────────────────────────────────────────────────────────────────────
 
-let config: PluginConfig = DEFAULT_CONFIG;
-let mcpClient!: NeuroStrataMCPClient;
+let config: PluginConfig = DEFAULT_CONFIG
+let mcpClient!: NeuroStrataMCPClient
 
 /**
  * The plugin context, captured on initialize.
@@ -793,50 +889,54 @@ let mcpClient!: NeuroStrataMCPClient;
  * `initialize`'s parameter. Capturing it here is what makes `ctx` reachable
  * from them at all.
  */
-let pluginCtx: OpenClawPluginContext | null = null;
+let pluginCtx: OpenClawPluginContext | null = null
 
 function requireCtx(): OpenClawPluginContext {
   if (!pluginCtx) {
-    throw new Error("NeuroStrata plugin used before initialize()");
+    throw new Error('NeuroStrata plugin used before initialize()')
   }
-  return pluginCtx;
+  return pluginCtx
 }
 
-export async function initialize(ctx: OpenClawPluginContext): Promise<void> {
-  pluginCtx = ctx;
-  config = resolveConfig(ctx.config);
+export async function initialize(
+  ctx: (Partial<OpenClawPluginContext> & Record<string, unknown>) | undefined
+): Promise<void> {
+  pluginCtx = (ctx as OpenClawPluginContext) ?? null
+  config = resolveConfig(ctx?.config ?? ctx ?? {})
 
-  const token = config.bearerToken ?? loadDaemonToken(config.tokenFile);
+  const token = config.bearerToken ?? loadDaemonToken(config.tokenFile)
   mcpClient = new NeuroStrataMCPClient({
     endpoint: config.endpoint,
     token,
-    timeoutMs: config.requestTimeoutMs,
-  });
+    timeoutMs: config.requestTimeoutMs
+  })
 
   setStatus({
-    state: "uninitialized",
+    state: 'uninitialized',
     endpoint: config.endpoint,
     namespace: config.namespace,
     authenticated: token !== null,
     missingTools: [],
-    lastError: undefined,
-  });
+    lastError: undefined
+  })
 
-  // Register file operation hook
-  ctx.hooks.beforeFileOp(wrapFileOp);
+  // Register file operation hook. The CLI runner calls initialize with only
+  // a config object (no hooks host), so every registration is optional: the
+  // runner path dispatches through handleHookEvent instead.
+  ctx?.hooks?.beforeFileOp?.(wrapFileOp)
 
   // Register turn hook for intent detection
-  ctx.hooks.onTurnEnd(onTurnEnd);
+  ctx?.hooks?.onTurnEnd?.(onTurnEnd)
 
-  await negotiateCapabilities();
+  await negotiateCapabilities()
 
-  ctx.logger.info("NeuroStrata OpenClaw plugin initialized", {
+  ctx?.logger?.info?.('NeuroStrata OpenClaw plugin initialized', {
     namespace: config.namespace,
     endpoint: config.endpoint,
     authenticated: status.authenticated,
     state: status.state,
-    missingTools: status.missingTools,
-  });
+    missingTools: status.missingTools
+  })
 }
 
 /**
@@ -849,28 +949,28 @@ export async function initialize(ctx: OpenClawPluginContext): Promise<void> {
  */
 async function negotiateCapabilities(): Promise<void> {
   try {
-    const available = new Set(await mcpClient.listToolNames());
-    const missing = REQUIRED_TOOLS.filter((tool) => !available.has(tool));
+    const available = new Set(await mcpClient.listToolNames())
+    const missing = REQUIRED_TOOLS.filter((tool) => !available.has(tool))
     setStatus({
-      state: missing.length > 0 ? "degraded" : "ready",
+      state: missing.length > 0 ? 'degraded' : 'ready',
       missingTools: missing,
-      lastError: undefined,
-    });
+      lastError: undefined
+    })
     if (missing.length > 0) {
-      requireCtx().logger.warn(
-        "NeuroStrata core does not expose the tools this shim needs",
-        { missing },
-      );
+      requireCtx().logger?.warn(
+        'NeuroStrata core does not expose the tools this shim needs',
+        { missing }
+      )
     }
   } catch (err) {
     setStatus({
-      state: "unavailable",
-      lastError: String(err),
-    });
-    requireCtx().logger.warn(
-      "NeuroStrata core is unreachable; the shim is degraded",
-      { error: String(err) },
-    );
+      state: 'unavailable',
+      lastError: String(err)
+    })
+    requireCtx().logger?.warn(
+      'NeuroStrata core is unreachable; the shim is degraded',
+      { error: String(err) }
+    )
   }
 }
 
@@ -878,45 +978,36 @@ async function negotiateCapabilities(): Promise<void> {
 // File Op Hook: guard_validate before write/edit/delete
 // ──────────────────────────────────────────────────────────────────────
 
-async function wrapFileOp(op: FileOperation): Promise<FileOpResult> {
-  // File-touch recall (§4.5): before guarding the operation, prefetch the
-  // memories governing this file and inject them as a system message.
-  // Fail-soft: file recall must never block or break the file operation.
-  if (op.path && op.path.trim() !== "") {
-    try {
-      const snippets = await prefetchMemoriesForFile(config.namespace, op.path);
-      if (snippets.length > 0) {
-        requireCtx().conversation.injectSystemMessage(
-          `[NeuroStrata] Governing memories for ${op.path}:\n${snippets.join("\n")}`,
-        );
-      }
-    } catch (err) {
-      requireCtx().logger.warn("File-touch prefetch failed", {
-        path: op.path,
-        error: String(err),
-      });
+// ──────────────────────────────────────────────────────────────────────
+// Shared guard core + CLI hook runner entry point (#310)
+// ──────────────────────────────────────────────────────────────────────
+
+type ActionGuard =
+  | { verdict: 'pass' }
+  | {
+      verdict: 'reject'
+      reason: string
+      ruleIds: string[]
+      guardVerdict: GuardValidateResult
     }
-  }
+  | { verdict: 'unavailable'; message: string }
 
+/** Run the Zero-Action Start guard for one mutating action. Never throws:
+ *  wrapFileOp maps the verdict to a FileOpResult (preserving its log lines),
+ *  and the CLI runner entry point maps it to a hook decision. */
+async function runActionGuard(
+  actionType: string,
+  payload: string
+): Promise<ActionGuard> {
   if (!config.strictMode) {
-    // Executed without validation: it is still a mutation.
-    mutationsSinceNote++;
-    return { allowed: true };
+    mutationsSinceNote++
+    return { verdict: 'pass' }
   }
-
-  const actionType = op.type; // "write" | "edit" | "delete" | "mkdir"
-  const payload = JSON.stringify({
-    path: op.path,
-    content: op.content,
-    oldContent: op.oldContent,
-    newContent: op.newContent,
-  });
-  const cwd = process.cwd();
-
+  const cwd = process.cwd()
   try {
-    const text = await mcpClient.callTool("neurostrata_guard_validate", {
+    const text = await mcpClient.callTool('neurostrata_guard_validate', {
       namespace: config.namespace,
-      session_id: activeSessionId ?? "unknown",
+      session_id: activeSessionId ?? 'unknown',
       active_task_id: activeTaskId,
       worktree: cwd,
       action_type: actionType,
@@ -924,45 +1015,204 @@ async function wrapFileOp(op: FileOperation): Promise<FileOpResult> {
       cwd,
       is_mutating: true,
       use_sandbox: false,
-      mutations_since_note: mutationsSinceNote,
-    });
-
-    const result = parseGuardValidate(text);
-    if (result.verdict === "reject") {
+      mutations_since_note: mutationsSinceNote
+    })
+    const result = parseGuardValidate(text)
+    if (result.verdict === 'reject') {
       const reason =
-        result.reasons.join("; ") ||
-        result.constraints.join("; ") ||
-        result.bucket;
-      requireCtx().logger.warn("Guard rejected file operation", {
-        actionType,
-        session_id: activeSessionId ?? "unknown",
-        active_task_id: activeTaskId,
-        worktree: cwd,
-        reason,
-        rule_ids: result.rule_ids,
-      });
+        result.reasons.join('; ') ||
+        result.constraints.join('; ') ||
+        result.bucket
       return {
-        allowed: false,
-        reason: `Zero-Action Start violation: ${reason}`,
-        guardVerdict: result,
-        degraded: false,
-      };
+        verdict: 'reject',
+        reason,
+        ruleIds: result.rule_ids,
+        guardVerdict: result
+      }
     }
-  } catch (err) {
-    const message = String(err);
-    setStatus({ state: "unavailable", lastError: message });
-    requireCtx().logger.error("Guard validation failed", { error: message });
+  } catch (err: unknown) {
+    return { verdict: 'unavailable', message: String(err) }
+  }
+  mutationsSinceNote++
+  return { verdict: 'pass' }
+}
+
+/** Runner event tool names that map onto OpenClaw's native FileOperation. */
+const OPENCLAW_FILE_OP_TOOLS: Record<string, FileOperation['type']> = {
+  write_file: 'write',
+  write: 'write',
+  edit: 'edit',
+  patch_file: 'edit',
+  delete: 'delete',
+  mkdir: 'mkdir'
+}
+
+/** Runner event tool names that are mutating shells. */
+const OPENCLAW_SHELL_TOOLS = ['terminal', 'bash', 'shell', 'command']
+
+const guardToHookResponse = (guard: ActionGuard): Record<string, unknown> => {
+  if (guard.verdict === 'reject') {
+    return {
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'deny',
+        permissionDecisionReason: `Zero-Action Start violation: ${guard.reason}`
+      }
+    }
+  }
+  if (guard.verdict === 'unavailable') {
+    return {
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'deny',
+        permissionDecisionReason: `Guard validation unavailable (NeuroStrata core degraded): ${guard.message}`
+      }
+    }
+  }
+  return {
+    continue: true,
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'allow'
+    }
+  }
+}
+
+/**
+ * CLI hook runner entry point. The daemon installs hook-runner.mjs beside
+ * dist/ and dispatches host hook events here; initialize may have been
+ * called with only a config object (no hooks host), so a default client is
+ * built the same way core's handleHookEvent does. File-op and shell events
+ * run the same guard as the native beforeFileOp hook, with a rejection
+ * returned as a deny decision instead of a failed FileOpResult.
+ */
+export async function handleHookEvent(
+  event: Record<string, unknown>
+): Promise<Record<string, unknown>> {
+  if (!mcpClient) {
+    config = resolveConfig({})
+    const token = loadDaemonToken(config.tokenFile)
+    mcpClient = new NeuroStrataMCPClient({
+      endpoint: config.endpoint,
+      token,
+      timeoutMs: config.requestTimeoutMs
+    })
+  }
+  const hookEventName =
+    asString(event.hook_event_name) ?? asString(event.eventName) ?? 'PreToolUse'
+  const toolName = asString(event.tool_name) ?? asString(event.toolName) ?? ''
+  const rawInput = event.tool_input ?? event.input ?? event.args ?? {}
+  const toolInput =
+    rawInput && typeof rawInput === 'object'
+      ? (rawInput as Record<string, unknown>)
+      : {}
+
+  if (hookEventName !== 'PreToolUse') {
+    // Stop turns carry the transcript; the daemon's CLI runner dispatches
+    // here before its own onTurnEnd fallback, so forward it ourselves or
+    // task-intent detection never runs for runner-carried Stop events
+    // (Codex review #326).
+    if (hookEventName === 'Stop' && typeof event.transcript === 'string') {
+      try {
+        await onTurnEnd({ role: 'assistant', content: event.transcript })
+      } catch {
+        // turn-end handling is fail-soft for the runner
+      }
+    }
+    return { continue: true }
+  }
+
+  const fileOpType = OPENCLAW_FILE_OP_TOOLS[toolName]
+  if (fileOpType) {
+    const payload = JSON.stringify({
+      path: asString(toolInput.path) ?? asString(toolInput.filePath) ?? '',
+      content: asString(toolInput.content),
+      oldContent: asString(toolInput.oldContent),
+      newContent: asString(toolInput.newContent)
+    })
+    return guardToHookResponse(await runActionGuard(fileOpType, payload))
+  }
+  if (OPENCLAW_SHELL_TOOLS.includes(toolName)) {
+    return guardToHookResponse(
+      await runActionGuard(toolName, JSON.stringify(toolInput))
+    )
+  }
+  return {
+    continue: true,
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'allow'
+    }
+  }
+}
+
+async function wrapFileOp(op: FileOperation): Promise<FileOpResult> {
+  // File-touch recall (§4.5): before guarding the operation, prefetch the
+  // memories governing this file and inject them as a system message.
+  // Fail-soft: file recall must never block or break the file operation.
+  if (op.path && op.path.trim() !== '') {
+    try {
+      const snippets = await prefetchMemoriesForFile(config.namespace, op.path)
+      if (snippets.length > 0) {
+        requireCtx().conversation.injectSystemMessage(
+          `[NeuroStrata] Governing memories for ${op.path}:\n${snippets.join('\n')}`
+        )
+      }
+    } catch (err) {
+      requireCtx().logger?.warn('File-touch prefetch failed', {
+        path: op.path,
+        error: String(err)
+      })
+    }
+  }
+
+  if (!config.strictMode) {
+    // Executed without validation: it is still a mutation.
+    mutationsSinceNote++
+    return { allowed: true }
+  }
+
+  const actionType = op.type // "write" | "edit" | "delete" | "mkdir"
+  const payload = JSON.stringify({
+    path: op.path,
+    content: op.content,
+    oldContent: op.oldContent,
+    newContent: op.newContent
+  })
+  const guard = await runActionGuard(actionType, payload)
+  if (guard.verdict === 'reject') {
+    requireCtx().logger.warn('Guard rejected file operation', {
+      actionType,
+      session_id: activeSessionId ?? 'unknown',
+      active_task_id: activeTaskId,
+      worktree: process.cwd(),
+      reason: guard.reason,
+      rule_ids: guard.ruleIds
+    })
+    return {
+      allowed: false,
+      reason: `Zero-Action Start violation: ${guard.reason}`,
+      guardVerdict: guard.guardVerdict,
+      degraded: false
+    }
+  }
+  if (guard.verdict === 'unavailable') {
+    setStatus({ state: 'unavailable', lastError: guard.message })
+    requireCtx().logger.error('Guard validation failed', {
+      error: guard.message
+    })
     // Fail closed: a guard that cannot answer is not a guard that passed.
     return {
       allowed: false,
-      reason: `Guard validation unavailable (NeuroStrata core degraded): ${message}`,
-      degraded: true,
-    };
+      reason: `Guard validation unavailable (NeuroStrata core degraded): ${guard.message}`,
+      degraded: true
+    }
   }
 
-  // Allowed: the operation executes, so it counts as a mutation.
-  mutationsSinceNote++;
-  return { allowed: true };
+  // Allowed: the operation executes, so it counts as a mutation. The count
+  // happens inside runActionGuard (shared with the runner entry point);
+  // counting again here would double every strict-pass (Codex review #326).
+  return { allowed: true }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -972,25 +1222,25 @@ async function wrapFileOp(op: FileOperation): Promise<FileOpResult> {
 async function onTurnEnd(turn: ConversationTurn): Promise<void> {
   // Session/task tracking for guard validation (F15): runs before intent
   // detection so a rejected turn still updates the tracked state.
-  trackFromTurn(turn);
+  trackFromTurn(turn)
 
-  if (!config.intentDetection.enabled) return;
-  if (turn.role === "system") return; // don't re-process our own nudges
+  if (!config.intentDetection.enabled) return
+  if (turn.role === 'system') return // don't re-process our own nudges
 
-  const text = turn.content;
-  if (text.includes("neurostrata_task_create")) return;
+  const text = turn.content
+  if (text.includes('neurostrata_task_create')) return
 
   // The core exposes no intent-detection tool: the earlier
   // `neurostrata_detect_task_intents` call was a phantom the core answered
   // with "Unknown tool". The lexical detector runs here instead, and
   // Phase 0 writes nothing — a detected intent is a nudge, never a task.
-  const signals = detectTaskIntentsLocal(text);
-  if (signals.length === 0) return;
-  if (!config.intentDetection.injectReminder) return;
+  const signals = detectTaskIntentsLocal(text)
+  if (signals.length === 0) return
+  if (!config.intentDetection.injectReminder) return
 
-  const markerList = signals.map((signal) => signal.marker).join(", ");
-  const nudge = `[NeuroStrata] Task intent detected (${markerList}) but no neurostrata_task_create in this turn. Consider creating a task to track this work.`;
-  requireCtx().conversation.injectSystemMessage(nudge);
+  const markerList = signals.map((signal) => signal.marker).join(', ')
+  const nudge = `[NeuroStrata] Task intent detected (${markerList}) but no neurostrata_task_create in this turn. Consider creating a task to track this work.`
+  requireCtx().conversation.injectSystemMessage(nudge)
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -999,11 +1249,9 @@ async function onTurnEnd(turn: ConversationTurn): Promise<void> {
 // the contract the adapter tests exercise.
 // ──────────────────────────────────────────────────────────────────────
 
-// The published d.ts declares a default export; keep the JS bundle in sync
-// so consumers doing `import plugin from "@neurostrata/openclaw-plugin"`
-// do not hit a link-time SyntaxError.
 export default {
-  id: "neurostrata-openclaw",
+  id: 'neurostrata-openclaw',
   setup: initialize,
   initialize,
-};
+  handleHookEvent
+}

@@ -126,10 +126,7 @@ impl ConceptSpec {
         let obj = payload.metadata.get("concept")?;
         let mut spec: Self = serde_json::from_value(obj.clone()).ok()?;
         if spec.not_definition.is_none() {
-            spec.not_definition = obj
-                .get("not_definition")
-                .filter(|v| !v.is_null())
-                .cloned();
+            spec.not_definition = obj.get("not_definition").filter(|v| !v.is_null()).cloned();
         }
         if spec.deprecation.is_none() {
             spec.deprecation = obj.get("deprecation").filter(|v| v.is_object()).cloned();
@@ -386,8 +383,39 @@ pub struct TaxonomyRequest {
     pub top_k: Option<usize>,
 }
 
+/// Keys accepted by `TaxonomyRequest`, for unknown-field visibility (#334/C3).
+/// Derived from a default serialization so new struct fields are picked up
+/// automatically, plus the serde aliases that are accepted but not emitted.
+pub fn unknown_taxonomy_request_fields(value: &Value) -> Vec<String> {
+    let mut known: BTreeSet<String> = BTreeSet::new();
+    if let Ok(Value::Object(defaults)) = serde_json::to_value(TaxonomyRequest::default()) {
+        known.extend(defaults.keys().cloned());
+    }
+    for alias in ["action", "alt_labels", "related"] {
+        known.insert(alias.to_string());
+    }
+    let Some(obj) = value.as_object() else {
+        return Vec::new();
+    };
+    let mut unknown: Vec<String> = obj
+        .keys()
+        .filter(|key| !known.contains(*key))
+        .cloned()
+        .collect();
+    unknown.sort();
+    unknown
+}
+
 /// Typed response wrapper for `neurostrata_taxonomy`.
 pub type TaxonomyResponse = Value;
+
+/// Hard caps for `compare`: caller-controlled collections must not drive
+/// pairwise/ancestor work without a bound (#334/C1).
+pub const MAX_COMPARE_SLUGS: usize = 64;
+pub const MAX_COMPARE_AXES: usize = 32;
+/// Tree query controls (#334/C2).
+pub const MAX_TREE_HOPS: usize = 4;
+pub const MAX_TREE_ROOTS: usize = 50;
 
 fn normalize_slug_vec(raw: &[String]) -> Vec<String> {
     let mut set = BTreeSet::new();
@@ -749,10 +777,8 @@ pub fn build_principal_taxonomy_view(
                     .get(&spec.slug)
                     .map_or(true, |(old_vf, old_id, _, _)| (vf, id) >= (*old_vf, old_id));
                 if replace {
-                    visible_concepts_raw.insert(
-                        spec.slug.clone(),
-                        (vf, id.clone(), payload.clone(), spec),
-                    );
+                    visible_concepts_raw
+                        .insert(spec.slug.clone(), (vf, id.clone(), payload.clone(), spec));
                 }
             }
         }
@@ -961,10 +987,8 @@ pub fn build_principal_taxonomy_view(
             .filter(|a| active_actions.contains(*a))
             .count();
 
-        let grounding_count = verified_grounding_ids.len()
-            + valid_iface_count
-            + valid_action_count
-            + locations.len();
+        let grounding_count =
+            verified_grounding_ids.len() + valid_iface_count + valid_action_count + locations.len();
 
         let is_core_pillar_root = thesis.as_ref().map_or(false, |t| {
             t.core_pillars.contains(slug)
@@ -993,7 +1017,8 @@ pub fn build_principal_taxonomy_view(
             has_empirical_grounding,
         );
 
-        let axis_alignment_bps = compute_axis_alignment_bps(&spec.evaluation_scores, thesis.as_ref());
+        let axis_alignment_bps =
+            compute_axis_alignment_bps(&spec.evaluation_scores, thesis.as_ref());
         let realization_gap_bps = realization_status_gap_bps(&spec.realization_status);
         let has_frontier_or_limitation =
             !spec.frontier_opportunities.is_empty() || !spec.current_limitations.is_empty();
@@ -1064,10 +1089,7 @@ pub fn build_principal_taxonomy_view(
     }
 }
 
-fn compute_axis_alignment_bps(
-    scores: &BTreeMap<String, u32>,
-    thesis: Option<&ThesisSpec>,
-) -> u32 {
+fn compute_axis_alignment_bps(scores: &BTreeMap<String, u32>, thesis: Option<&ThesisSpec>) -> u32 {
     if scores.is_empty() {
         return 5000;
     }
@@ -1099,7 +1121,8 @@ struct TestTaxonomyProbeState {
 }
 
 #[cfg(test)]
-fn test_taxonomy_probe_map() -> &'static std::sync::Mutex<BTreeMap<String, TestTaxonomyProbeState>> {
+fn test_taxonomy_probe_map() -> &'static std::sync::Mutex<BTreeMap<String, TestTaxonomyProbeState>>
+{
     static MAP: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, TestTaxonomyProbeState>>> =
         std::sync::OnceLock::new();
     MAP.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
@@ -1110,7 +1133,9 @@ fn set_test_probe_fail_for_namespace(namespace: &str, fail: bool) {
     let mut map = test_taxonomy_probe_map()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    map.entry(namespace.to_string()).or_default().fail_probe_list = fail;
+    map.entry(namespace.to_string())
+        .or_default()
+        .fail_probe_list = fail;
 }
 
 #[cfg(test)]
@@ -1366,13 +1391,12 @@ async fn execute_set_thesis(
     let mut expected_heads: Vec<ExpectedHead> = Vec::new();
     let mut writes: Vec<StagedMemoryWrite> = Vec::new();
 
-    let (next_ver, superseded_id) = if let Some((last_ver, _vf, last_id, _last_pl)) =
-        active_theses.last()
-    {
-        (last_ver + 1, Some(last_id.clone()))
-    } else {
-        (1u64, None)
-    };
+    let (next_ver, superseded_id) =
+        if let Some((last_ver, _vf, last_id, _last_pl)) = active_theses.last() {
+            (last_ver + 1, Some(last_id.clone()))
+        } else {
+            (1u64, None)
+        };
     let new_id = thesis_row_id(namespace, next_ver);
     expected_heads.push(ExpectedHead::AbsentOrInactive {
         row_id: new_id.clone(),
@@ -1575,10 +1599,14 @@ async fn execute_upsert_concept(
         .ok_or_else(|| "definition is required for upsert_concept".to_string())?
         .to_string();
 
-    let domain_slug = match req.domain.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    let domain_slug = match req
+        .domain
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         Some(d) => Some(
-            domain::normalize_domain_slug(d)
-                .ok_or_else(|| format!("invalid domain slug '{d}'"))?,
+            domain::normalize_domain_slug(d).ok_or_else(|| format!("invalid domain slug '{d}'"))?,
         ),
         None => None,
     };
@@ -1806,13 +1834,12 @@ async fn execute_upsert_concept(
     validate_concept_forest(&candidate_forest)?;
 
     existing_for_slug.sort_by(|a, b| (a.0, a.1, &a.2).cmp(&(b.0, b.1, &b.2)));
-    let (next_ver, superseded_id) = if let Some((last_ver, _vf, last_id, _pl)) =
-        existing_for_slug.last()
-    {
-        (last_ver + 1, Some(last_id.clone()))
-    } else {
-        (1u64, None)
-    };
+    let (next_ver, superseded_id) =
+        if let Some((last_ver, _vf, last_id, _pl)) = existing_for_slug.last() {
+            (last_ver + 1, Some(last_id.clone()))
+        } else {
+            (1u64, None)
+        };
     let new_id = concept_row_id(namespace, &slug, next_ver);
 
     let mut expected_heads: Vec<ExpectedHead> = vec![ExpectedHead::AbsentOrInactive {
@@ -2039,7 +2066,9 @@ async fn execute_upsert_concept(
     let (post_rows, post_edges) = load_active_rows_and_edges(store, namespace, now_ts).await?;
     let view = build_principal_taxonomy_view(&post_rows, &post_edges, principal);
     let hydrated = view.concepts.get(&slug).cloned().ok_or_else(|| {
-        format!("concept '{slug}' was written but could not be hydrated for principal '{principal}'")
+        format!(
+            "concept '{slug}' was written but could not be hydrated for principal '{principal}'"
+        )
     })?;
 
     Ok(json!({
@@ -2060,19 +2089,33 @@ fn build_tree_node(
     slug: &str,
     concepts: &BTreeMap<String, HydratedConcept>,
     allowed_set: &BTreeSet<String>,
-    visited: &mut BTreeSet<String>,
+    visited: &mut BTreeMap<String, usize>,
+    remaining_hops: Option<usize>,
 ) -> Option<TaxonomyTreeNode> {
-    if !visited.insert(slug.to_string()) {
-        return None;
+    // Track the greatest remaining budget seen per node, not a boolean:
+    // a DAG node first reached by a longer path must be revisited when a
+    // shorter path leaves more hops for its descendants (#334/C2 follow-up).
+    let budget = remaining_hops.unwrap_or(usize::MAX);
+    if let Some(best) = visited.get(slug) {
+        if *best >= budget {
+            return None;
+        }
     }
+    visited.insert(slug.to_string(), budget);
     let c = concepts.get(slug)?;
     let mut children = Vec::new();
-    for child_slug in &c.narrower {
-        if allowed_set.contains(child_slug) && !visited.contains(child_slug) {
-            if let Some(child_node) =
-                build_tree_node(child_slug, concepts, allowed_set, visited)
-            {
-                children.push(child_node);
+    if remaining_hops != Some(0) {
+        for child_slug in &c.narrower {
+            if allowed_set.contains(child_slug) {
+                if let Some(child_node) = build_tree_node(
+                    child_slug,
+                    concepts,
+                    allowed_set,
+                    visited,
+                    remaining_hops.map(|hops| hops.saturating_sub(1)),
+                ) {
+                    children.push(child_node);
+                }
             }
         }
     }
@@ -2147,22 +2190,29 @@ async fn execute_tree(
             .iter()
             .filter(|slug| {
                 view.concepts.get(*slug).map_or(false, |c| {
-                    c.broader.is_empty()
-                        || !c.broader.iter().any(|p| allowed_slugs.contains(p))
+                    c.broader.is_empty() || !c.broader.iter().any(|p| allowed_slugs.contains(p))
                 })
             })
             .cloned()
             .collect()
     };
 
-    let mut visited = BTreeSet::new();
+    let mut visited = BTreeMap::new();
+    let max_hops = req.max_hops.map(|hops| hops.clamp(1, MAX_TREE_HOPS));
     let mut roots = Vec::new();
     for r_slug in root_slugs {
-        if let Some(node) =
-            build_tree_node(&r_slug, &view.concepts, &allowed_slugs, &mut visited)
-        {
+        if let Some(node) = build_tree_node(
+            &r_slug,
+            &view.concepts,
+            &allowed_slugs,
+            &mut visited,
+            max_hops,
+        ) {
             roots.push(node);
         }
+    }
+    if let Some(limit) = req.limit.map(|limit| limit.clamp(1, MAX_TREE_ROOTS)) {
+        roots.truncate(limit);
     }
 
     Ok(json!({
@@ -2559,6 +2609,12 @@ async fn execute_compare(
     if slugs.len() < 2 {
         return Err("compare requires at least 2 distinct concept slugs".to_string());
     }
+    if slugs.len() > MAX_COMPARE_SLUGS {
+        return Err(format!(
+            "compare supports at most {MAX_COMPARE_SLUGS} concept slugs (got {})",
+            slugs.len()
+        ));
+    }
 
     let now_ts = chrono::Utc::now().timestamp();
     let (active_rows, active_edges) = load_active_rows_and_edges(store, namespace, now_ts).await?;
@@ -2658,6 +2714,12 @@ async fn execute_compare(
         }
         union_axes.into_iter().collect()
     };
+    if axes.len() > MAX_COMPARE_AXES {
+        return Err(format!(
+            "compare supports at most {MAX_COMPARE_AXES} evaluation axes (got {})",
+            axes.len()
+        ));
+    }
 
     let mut axis_matrix: BTreeMap<String, Vec<Value>> = BTreeMap::new();
     for axis in &axes {
@@ -3166,8 +3228,7 @@ async fn execute_advise(
         }
         let has_frontier_or_limitation =
             !c.frontier_opportunities.is_empty() || !c.current_limitations.is_empty();
-        let has_citations =
-            !c.references.is_empty() || !c.comparable_implementations.is_empty();
+        let has_citations = !c.references.is_empty() || !c.comparable_implementations.is_empty();
 
         if c.frontier_leverage_bps > 0 && has_frontier_or_limitation && has_citations {
             actionable.push(c);
@@ -3436,8 +3497,9 @@ async fn load_autobriefing_taxonomy_view(
             build_principal_taxonomy_view(&thesis_rows, &[], "admin")
         }
         TaxonomyProbeOutcome::NeedsFullRead => {
-            let (active_rows, active_edges) =
-                load_active_rows_and_edges(store, namespace, now_ts).await.ok()?;
+            let (active_rows, active_edges) = load_active_rows_and_edges(store, namespace, now_ts)
+                .await
+                .ok()?;
             let unrestricted_rows: Vec<(String, MemoryPayload)> = active_rows
                 .into_iter()
                 .filter(|(_id, pl)| is_public_access_policy(&pl.metadata))
@@ -3500,7 +3562,12 @@ pub async fn render_snapshot_taxonomy_section(store: &LadybugStore, namespace: &
         if !t.core_pillars.is_empty() {
             lines.push(format!(
                 "  - Core Pillars: {}",
-                t.core_pillars.iter().take(6).cloned().collect::<Vec<_>>().join(", ")
+                t.core_pillars
+                    .iter()
+                    .take(6)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
     } else {
@@ -3524,8 +3591,7 @@ pub async fn render_snapshot_taxonomy_section(store: &LadybugStore, namespace: &
         }
     }
     for (slug, c) in &view.concepts {
-        if (c.epistemic_status == "seed" || c.epistemic_status == "defined")
-            && gap_items.len() < 4
+        if (c.epistemic_status == "seed" || c.epistemic_status == "defined") && gap_items.len() < 4
         {
             gap_items.push(format!("shallow:{slug}({})", c.epistemic_status));
         }
@@ -3553,7 +3619,10 @@ pub async fn render_snapshot_taxonomy_section(store: &LadybugStore, namespace: &
             })
             .collect();
         if !summary.is_empty() {
-            lines.push(format!("  - Deprecated / Bounded Concepts: {}", summary.join("; ")));
+            lines.push(format!(
+                "  - Deprecated / Bounded Concepts: {}",
+                summary.join("; ")
+            ));
         }
     }
 
@@ -3565,6 +3634,33 @@ pub async fn render_snapshot_taxonomy_section(store: &LadybugStore, namespace: &
     } else {
         out
     }
+}
+
+/// R5 readiness view: whether an unrestricted thesis is visible plus one
+/// `(slug, read-time epistemic_status)` pair per visible concept. Reuses the
+/// same filtered view helpers as `render_snapshot_taxonomy_section`, so the
+/// snapshot readiness totals cannot diverge from the taxonomy section or leak
+/// a ReBAC-restricted row. Fail-soft: an unreadable store yields an empty view.
+pub async fn snapshot_taxonomy_readiness_view(
+    store: &LadybugStore,
+    namespace: &str,
+) -> (bool, Vec<(String, String)>) {
+    let now_ts = chrono::Utc::now().timestamp();
+    let Ok((active_rows, active_edges)) = load_active_rows_and_edges(store, namespace, now_ts).await
+    else {
+        return (false, Vec::new());
+    };
+    let unrestricted_rows: Vec<(String, MemoryPayload)> = active_rows
+        .into_iter()
+        .filter(|(_id, pl)| is_public_access_policy(&pl.metadata))
+        .collect();
+    let view = build_principal_taxonomy_view(&unrestricted_rows, &active_edges, "admin");
+    let concepts = view
+        .concepts
+        .values()
+        .map(|c| (c.slug.clone(), c.epistemic_status.clone()))
+        .collect();
+    (view.thesis.is_some(), concepts)
 }
 
 /// Build context-budgeted (`<= 1200` chars) unrestricted Project Thesis and up to 3 matched
@@ -3590,7 +3686,12 @@ pub async fn build_task_taxonomy_context(
         .iter()
         .map(|(slug, c)| {
             let score = score_concept_match(c, task_text, &tokens);
-            (score, c.epistemic_weight_bps, c.grounding_count, slug.clone())
+            (
+                score,
+                c.epistemic_weight_bps,
+                c.grounding_count,
+                slug.clone(),
+            )
         })
         .collect();
     ranked.sort_by(|a, b| {
@@ -3627,11 +3728,7 @@ pub async fn build_task_taxonomy_context(
             let def_snip: String = c.definition.replace('\n', " ").chars().take(160).collect();
             lines.push(format!(
                 "  - [concept:{} | {}] `{}` ({}): {}",
-                c.epistemic_status,
-                c.realization_status,
-                c.slug,
-                c.pref_label,
-                def_snip
+                c.epistemic_status, c.realization_status, c.slug, c.pref_label, def_snip
             ));
         }
     }
@@ -3692,7 +3789,10 @@ mod tests {
                 primary_domain: Some("cognitive-memory".to_string()),
                 mission: Some("Initial mission".to_string()),
                 direction: Some("Initial direction".to_string()),
-                core_pillars: Some(vec!["graph-memory".to_string(), "formal-verification".to_string()]),
+                core_pillars: Some(vec![
+                    "graph-memory".to_string(),
+                    "formal-verification".to_string(),
+                ]),
                 evaluation_axes: Some(vec!["determinism".to_string(), "auditability".to_string()]),
                 non_goals: Some(vec!["cloud-only lock-in".to_string()]),
                 ..Default::default()
@@ -3714,7 +3814,10 @@ mod tests {
                 primary_domain: Some("cognitive-memory".to_string()),
                 mission: Some("Refined mission v2".to_string()),
                 direction: Some("Refined direction v2".to_string()),
-                core_pillars: Some(vec!["graph-memory".to_string(), "formal-verification".to_string()]),
+                core_pillars: Some(vec![
+                    "graph-memory".to_string(),
+                    "formal-verification".to_string(),
+                ]),
                 evaluation_axes: Some(vec!["determinism".to_string(), "auditability".to_string()]),
                 non_goals: Some(vec!["cloud-only lock-in".to_string()]),
                 ..Default::default()
@@ -3727,11 +3830,7 @@ mod tests {
         assert_eq!(r2["superseded_id"], thesis_row_id(ns, 1));
 
         // Verify thesis v1 has superseded_by = thesis v2
-        let (_v1_vec, v1_pl) = store
-            .get(ns, &thesis_row_id(ns, 1))
-            .await
-            .unwrap()
-            .unwrap();
+        let (_v1_vec, v1_pl) = store.get(ns, &thesis_row_id(ns, 1)).await.unwrap().unwrap();
         assert_eq!(v1_pl.metadata["superseded_by"], thesis_row_id(ns, 2));
 
         // 3. Upsert concept twice with same slug -> v1 superseded by v2
@@ -3751,10 +3850,7 @@ mod tests {
         )
         .await
         .expect("upsert_concept v1");
-        assert_eq!(
-            c1["concept_id"],
-            concept_row_id(ns, "bitemporal-graph", 1)
-        );
+        assert_eq!(c1["concept_id"], concept_row_id(ns, "bitemporal-graph", 1));
         assert!(c1["superseded_id"].is_null());
 
         let c2 = execute_taxonomy(
@@ -3773,10 +3869,7 @@ mod tests {
         )
         .await
         .expect("upsert_concept v2");
-        assert_eq!(
-            c2["concept_id"],
-            concept_row_id(ns, "bitemporal-graph", 2)
-        );
+        assert_eq!(c2["concept_id"], concept_row_id(ns, "bitemporal-graph", 2));
         assert_eq!(
             c2["superseded_id"],
             concept_row_id(ns, "bitemporal-graph", 1)
@@ -3828,10 +3921,7 @@ mod tests {
         );
         assert_ne!(c_ns2["concept_id"], c1["concept_id"]);
         // Adversarial delimiter boundary: ("a-b", "c") vs ("a", "b-c") must remain distinct.
-        assert_ne!(
-            concept_row_id("a-b", "c", 1),
-            concept_row_id("a", "b-c", 1)
-        );
+        assert_ne!(concept_row_id("a-b", "c", 1), concept_row_id("a", "b-c", 1));
     }
 
     #[tokio::test]
@@ -3910,7 +4000,10 @@ mod tests {
         )
         .await
         .expect_err("must reject DAG cycle");
-        assert!(cycle_err.contains("DAG cycle"), "unexpected error: {cycle_err}");
+        assert!(
+            cycle_err.contains("DAG cycle"),
+            "unexpected error: {cycle_err}"
+        );
 
         // 2. Reject transitive SKOS S27 related_concepts between grand-child and root-concept
         let s27_err = execute_taxonomy(
@@ -3930,10 +4023,7 @@ mod tests {
         )
         .await
         .expect_err("must reject transitive S27 related violation");
-        assert!(
-            s27_err.contains("SKOS S27"),
-            "unexpected error: {s27_err}"
-        );
+        assert!(s27_err.contains("SKOS S27"), "unexpected error: {s27_err}");
 
         // 3. Reject transitive contrast violation between grand-child and root-concept
         let contrast_err = execute_taxonomy(
@@ -4165,8 +4255,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn briefing_forward_expand_backward_prune_removes_ungrounded_outer_leaves_but_keeps_bridges()
-    {
+    async fn briefing_forward_expand_backward_prune_removes_ungrounded_outer_leaves_but_keeps_bridges(
+    ) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
         let embedder = DummyEmbedder(4);
@@ -4178,11 +4268,23 @@ mod tests {
         // Outer hop-2 ungrounded leaf: dead-end-leaf (related only to mid-node, 0 rules) -> MUST BE PRUNED
         // Outer hop-1/2 bridge node: bridge-node (connected to both seed-a and seed-b) -> MUST BE RETAINED
         for (slug, label, rels) in [
-            ("seed-alpha", "Alpha Retrieval", vec!["mid-hop", "bridge-concept"]),
+            (
+                "seed-alpha",
+                "Alpha Retrieval",
+                vec!["mid-hop", "bridge-concept"],
+            ),
             ("seed-beta", "Beta Retrieval", vec!["bridge-concept"]),
-            ("mid-hop", "Intermediate Hop", vec!["seed-alpha", "dead-end-leaf"]),
+            (
+                "mid-hop",
+                "Intermediate Hop",
+                vec!["seed-alpha", "dead-end-leaf"],
+            ),
             ("dead-end-leaf", "Ungrounded Outer Leaf", vec!["mid-hop"]),
-            ("bridge-concept", "Bridging Concept", vec!["seed-alpha", "seed-beta"]),
+            (
+                "bridge-concept",
+                "Bridging Concept",
+                vec!["seed-alpha", "seed-beta"],
+            ),
         ] {
             execute_taxonomy(
                 &store,
@@ -4303,7 +4405,9 @@ mod tests {
                 domain: Some("retrieval".to_string()),
                 broader: Some(vec!["retrieval".to_string()]),
                 contrasts_with: Some(vec!["distributed-cluster-index".to_string()]),
-                tradeoffs: Some(vec!["Higher indexing latency vs superior recall".to_string()]),
+                tradeoffs: Some(vec![
+                    "Higher indexing latency vs superior recall".to_string()
+                ]),
                 references: Some(vec!["Formal et al. (2021) SPLADE SIGIR".to_string()]),
                 comparable_implementations: Some(vec![ComparableImplementation {
                     name: "tantivy".to_string(),
@@ -4346,7 +4450,7 @@ mod tests {
                 realization_status: Some("partial".to_string()),
                 current_limitations: Some(vec!["Single-node writer".to_string()]),
                 frontier_opportunities: Some(vec![
-                    "Add distributed consensus cluster orchestration".to_string()
+                    "Add distributed consensus cluster orchestration".to_string(),
                 ]),
                 evaluation_scores: Some(BTreeMap::from([
                     ("determinism".to_string(), 6000),
@@ -4431,15 +4535,20 @@ mod tests {
         store.init(ns).await.expect("init");
         for i in 0..3 {
             store
-                .upsert(ns, &format!("rule-{i}"), vec![0.1; 4], MemoryPayload {
-                    content: format!("An ordinary rule {i} about retrieval."),
-                    user_id: "kenton".to_string(),
-                    memory_type: "rule".to_string(),
-                    agent_name: None,
-                    location: String::new(),
-                    location_lines: String::new(),
-                    metadata: json!({}),
-                })
+                .upsert(
+                    ns,
+                    &format!("rule-{i}"),
+                    vec![0.1; 4],
+                    MemoryPayload {
+                        content: format!("An ordinary rule {i} about retrieval."),
+                        user_id: "kenton".to_string(),
+                        memory_type: "rule".to_string(),
+                        agent_name: None,
+                        location: String::new(),
+                        location_lines: String::new(),
+                        metadata: json!({}),
+                    },
+                )
                 .await
                 .expect("seed rule");
         }
@@ -4468,7 +4577,9 @@ mod tests {
         .await
         .expect("concept without a thesis");
         assert!(namespace_has_taxonomy_rows(&store, ns).await);
-        assert!(render_snapshot_taxonomy_section(&store, ns).await.contains("1 unrestricted concepts"));
+        assert!(render_snapshot_taxonomy_section(&store, ns)
+            .await
+            .contains("1 unrestricted concepts"));
     }
 
     #[tokio::test]
@@ -4664,7 +4775,10 @@ mod tests {
             !namespace_has_taxonomy_rows(&store, ns_hidden).await,
             "namespace with only restricted/retired/conflicting taxonomy rows must report false"
         );
-        assert_eq!(render_snapshot_taxonomy_section(&store, ns_hidden).await, "");
+        assert_eq!(
+            render_snapshot_taxonomy_section(&store, ns_hidden).await,
+            ""
+        );
         let (h_thesis, h_concepts, h_prompt) =
             build_task_taxonomy_context(&store, ns_hidden, "stealth").await;
         assert!(h_thesis.is_null());
@@ -4793,7 +4907,9 @@ mod tests {
                 namespace: ns.to_string(),
                 slug: Some("public-rrf-fusion".to_string()),
                 pref_label: Some("Public RRF Fusion".to_string()),
-                definition: Some("Unrestricted public concept for reciprocal rank fusion.".to_string()),
+                definition: Some(
+                    "Unrestricted public concept for reciprocal rank fusion.".to_string(),
+                ),
                 domain: Some("retrieval".to_string()),
                 ..Default::default()
             },
@@ -5134,8 +5250,12 @@ mod tests {
     async fn shacl_mesh_uuid_and_thalamic_bus_pulse_integration_for_thesis_and_concept() {
         assert!(crate::synaptic_mesh::frame::PERMITTED_MESH_MEMORY_TYPES.contains(&"thesis"));
         assert!(crate::synaptic_mesh::frame::PERMITTED_MESH_MEMORY_TYPES.contains(&"concept"));
-        assert!(crate::synaptic_mesh::outbox::is_shareable_memory_type("thesis"));
-        assert!(crate::synaptic_mesh::outbox::is_shareable_memory_type("concept"));
+        assert!(crate::synaptic_mesh::outbox::is_shareable_memory_type(
+            "thesis"
+        ));
+        assert!(crate::synaptic_mesh::outbox::is_shareable_memory_type(
+            "concept"
+        ));
 
         // Deterministic UUIDv5 mapping for non-UUID taxonomy row IDs
         let u1 = crate::synaptic_mesh::worker::parse_or_derive_mesh_uuid(
@@ -5219,7 +5339,10 @@ mod tests {
             Some(bus.clone()),
         )
         .await;
-        assert!(thesis_out.contains("\"ok\": true"), "thesis_out: {thesis_out}");
+        assert!(
+            thesis_out.contains("\"ok\": true"),
+            "thesis_out: {thesis_out}"
+        );
 
         // 2. Write shareable concept via handle_taxonomy + tee_taxonomy_pulse_to_project_outbox (CLI fallback path)
         let concept_out = crate::handlers::taxonomy::handle_taxonomy_with_bus(
@@ -5239,7 +5362,10 @@ mod tests {
             None,
         )
         .await;
-        assert!(concept_out.contains("\"ok\": true"), "concept_out: {concept_out}");
+        assert!(
+            concept_out.contains("\"ok\": true"),
+            "concept_out: {concept_out}"
+        );
         crate::handlers::taxonomy::tee_taxonomy_pulse_to_project_outbox(
             &project_root,
             src_store.as_ref(),
@@ -5296,7 +5422,9 @@ mod tests {
             Some("Shared mission across mesh")
         );
         assert_eq!(
-            peer_briefing["matched_concepts"].as_array().map(|a| a.len()),
+            peer_briefing["matched_concepts"]
+                .as_array()
+                .map(|a| a.len()),
             Some(1)
         );
         assert_eq!(
@@ -5335,9 +5463,8 @@ mod tests {
             2,
             "single Superseded pulse must queue exactly 2 outbox entries (OP_SUPERSEDED + OP_CREATED)"
         );
-        let drain_rep_v2 =
-            crate::synaptic_mesh::worker::drain_once(&outbox, &mesh, "node-author")
-                .expect("drain v2");
+        let drain_rep_v2 = crate::synaptic_mesh::worker::drain_once(&outbox, &mesh, "node-author")
+            .expect("drain v2");
         assert_eq!(drain_rep_v2.applied, 2, "drain_rep_v2: {drain_rep_v2:?}");
         let import_rep_v2 = crate::synaptic_mesh::import::apply_changed(
             &mesh,
@@ -5453,7 +5580,12 @@ mod tests {
             );
         }
         store
-            .upsert(ns, &concept_id, embedder.embed("legacy concept").await.unwrap(), pl)
+            .upsert(
+                ns,
+                &concept_id,
+                embedder.embed("legacy concept").await.unwrap(),
+                pl,
+            )
             .await
             .expect("write annotated concept");
 
@@ -5473,7 +5605,10 @@ mod tests {
         .await
         .expect("briefing");
         let matched = briefing["matched_concepts"][0].clone();
-        assert_eq!(matched["not_definition"], json!("not a replacement for live concepts"));
+        assert_eq!(
+            matched["not_definition"],
+            json!("not a replacement for live concepts")
+        );
         assert_eq!(matched["deprecation_banner"], json!(banner));
 
         let compare = execute_taxonomy(
@@ -5482,7 +5617,10 @@ mod tests {
             TaxonomyRequest {
                 operation: "compare".to_string(),
                 namespace: ns.to_string(),
-                slugs: Some(vec!["legacy-concept".to_string(), "new-concept".to_string()]),
+                slugs: Some(vec![
+                    "legacy-concept".to_string(),
+                    "new-concept".to_string(),
+                ]),
                 ..Default::default()
             },
             &sec("alice"),
@@ -5490,7 +5628,10 @@ mod tests {
         .await
         .expect("compare");
         let compared = compare["concepts"][0].clone();
-        assert_eq!(compared["not_definition"], json!("not a replacement for live concepts"));
+        assert_eq!(
+            compared["not_definition"],
+            json!("not a replacement for live concepts")
+        );
         assert_eq!(compared["deprecation_banner"], json!(banner));
 
         let gaps = execute_taxonomy(
@@ -5506,8 +5647,14 @@ mod tests {
         .await
         .expect("gaps");
         let gap_str = gaps.to_string();
-        assert!(gap_str.contains("not a replacement for live concepts"), "gaps must expose boundary: {gap_str}");
-        assert!(gap_str.contains(banner), "gaps must expose banner: {gap_str}");
+        assert!(
+            gap_str.contains("not a replacement for live concepts"),
+            "gaps must expose boundary: {gap_str}"
+        );
+        assert!(
+            gap_str.contains(banner),
+            "gaps must expose banner: {gap_str}"
+        );
 
         let advise = execute_taxonomy(
             &store,
@@ -5523,13 +5670,289 @@ mod tests {
         .await
         .expect("advise");
         let advise_str = advise.to_string();
-        assert!(advise_str.contains("not a replacement for live concepts"), "advise must expose boundary: {advise_str}");
-        assert!(advise_str.contains(banner), "advise must expose banner: {advise_str}");
+        assert!(
+            advise_str.contains("not a replacement for live concepts"),
+            "advise must expose boundary: {advise_str}"
+        );
+        assert!(
+            advise_str.contains(banner),
+            "advise must expose banner: {advise_str}"
+        );
 
         let snap = render_snapshot_taxonomy_section(&store, ns).await;
         assert!(
             snap.contains("DEPRECATED") || snap.contains("not_definition"),
             "snapshot taxonomy must expose the annotation: {snap}"
         );
+    }
+
+    /// #334/C1: compare must reject more than 64 slugs before any pair work.
+    #[tokio::test]
+    async fn compare_rejects_slugs_beyond_cap() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::for_testing(tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-cap-slugs";
+        store.init(ns).await.expect("init");
+
+        let slugs: Vec<String> = (0..65).map(|i| format!("slug-{i}")).collect();
+        let err = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "compare".to_string(),
+                namespace: ns.to_string(),
+                slugs: Some(slugs),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect_err("65 slugs must be rejected");
+        assert!(
+            err.contains("at most 64"),
+            "expected the slug cap error, got: {err}"
+        );
+    }
+
+    /// #334/C1: compare must reject more than 32 evaluation axes.
+    #[tokio::test]
+    async fn compare_rejects_axes_beyond_cap() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::for_testing(tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-cap-axes";
+        store.init(ns).await.expect("init");
+
+        for slug in ["axis-a", "axis-b"] {
+            execute_taxonomy(
+                &store,
+                &embedder,
+                TaxonomyRequest {
+                    operation: "upsert_concept".to_string(),
+                    namespace: ns.to_string(),
+                    slug: Some(slug.to_string()),
+                    pref_label: Some(slug.to_string()),
+                    definition: Some("cap fixture".to_string()),
+                    domain: Some("testing".to_string()),
+                    ..Default::default()
+                },
+                &sec("alice"),
+            )
+            .await
+            .expect("seed concept");
+        }
+
+        let axes: Vec<String> = (0..33).map(|i| format!("axis-{i}")).collect();
+        let err = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "compare".to_string(),
+                namespace: ns.to_string(),
+                slugs: Some(vec!["axis-a".to_string(), "axis-b".to_string()]),
+                axes: Some(axes),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect_err("33 axes must be rejected");
+        assert!(
+            err.contains("at most 32"),
+            "expected the axis cap error, got: {err}"
+        );
+    }
+
+    /// #334/C2: `max_hops` must cap tree depth.
+    #[tokio::test]
+    async fn tree_honours_max_hops() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::for_testing(tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-tree-hops";
+        store.init(ns).await.expect("init");
+
+        for (slug, broader) in [
+            ("alpha", None),
+            ("beta", Some("alpha")),
+            ("gamma", Some("beta")),
+        ] {
+            execute_taxonomy(
+                &store,
+                &embedder,
+                TaxonomyRequest {
+                    operation: "upsert_concept".to_string(),
+                    namespace: ns.to_string(),
+                    slug: Some(slug.to_string()),
+                    pref_label: Some(slug.to_string()),
+                    definition: Some("tree fixture".to_string()),
+                    domain: Some("testing".to_string()),
+                    broader: broader.map(|b| vec![b.to_string()]),
+                    ..Default::default()
+                },
+                &sec("alice"),
+            )
+            .await
+            .expect("seed tree");
+        }
+
+        let tree = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "tree".to_string(),
+                namespace: ns.to_string(),
+                root_slug: Some("alpha".to_string()),
+                max_hops: Some(1),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("tree with max_hops");
+
+        let root = &tree["roots"][0];
+        assert_eq!(root["slug"], "alpha");
+        let children = root["children"].as_array().expect("children");
+        assert_eq!(children.len(), 1, "one hop must expose only beta: {root}");
+        assert_eq!(children[0]["slug"], "beta");
+        assert_eq!(
+            children[0]["children"].as_array().unwrap().len(),
+            0,
+            "gamma is beyond max_hops=1: {root}"
+        );
+    }
+
+    /// #334/C2 review follow-up (4650591458): a shorter path to a shared DAG
+    /// node must be allowed to expand even after a longer path marked it.
+    #[tokio::test]
+    async fn tree_revisits_shared_nodes_with_a_larger_budget() {
+        fn contains_slug(node: &Value, slug: &str) -> bool {
+            if node.get("slug").and_then(Value::as_str) == Some(slug) {
+                return true;
+            }
+            node.get("children")
+                .and_then(Value::as_array)
+                .map(|children| children.iter().any(|child| contains_slug(child, slug)))
+                .unwrap_or(false)
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::for_testing(tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-tree-shared";
+        store.init(ns).await.expect("init");
+
+        for (slug, broader) in [
+            ("alpha", None),
+            ("beta", Some(vec!["alpha"])),
+            ("charlie", Some(vec!["beta", "alpha"])),
+            ("delta", Some(vec!["charlie"])),
+        ] {
+            execute_taxonomy(
+                &store,
+                &embedder,
+                TaxonomyRequest {
+                    operation: "upsert_concept".to_string(),
+                    namespace: ns.to_string(),
+                    slug: Some(slug.to_string()),
+                    pref_label: Some(slug.to_string()),
+                    definition: Some("shared DAG fixture".to_string()),
+                    domain: Some("testing".to_string()),
+                    broader: broader
+                        .map(|list| list.into_iter().map(|item| item.to_string()).collect()),
+                    ..Default::default()
+                },
+                &sec("alice"),
+            )
+            .await
+            .expect("seed shared DAG");
+        }
+
+        let tree = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "tree".to_string(),
+                namespace: ns.to_string(),
+                root_slug: Some("alpha".to_string()),
+                max_hops: Some(2),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("tree over a shared DAG");
+        assert!(
+            contains_slug(&tree["roots"][0], "delta"),
+            "delta is two hops from alpha via the direct alpha→charlie edge: {tree}"
+        );
+    }
+
+    /// #334/C2: `limit` must cap the number of returned roots.
+    #[tokio::test]
+    async fn tree_honours_limit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::for_testing(tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-tree-limit";
+        store.init(ns).await.expect("init");
+
+        for slug in ["alpha", "delta"] {
+            execute_taxonomy(
+                &store,
+                &embedder,
+                TaxonomyRequest {
+                    operation: "upsert_concept".to_string(),
+                    namespace: ns.to_string(),
+                    slug: Some(slug.to_string()),
+                    pref_label: Some(slug.to_string()),
+                    definition: Some("root fixture".to_string()),
+                    domain: Some("testing".to_string()),
+                    ..Default::default()
+                },
+                &sec("alice"),
+            )
+            .await
+            .expect("seed root");
+        }
+
+        let tree = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "tree".to_string(),
+                namespace: ns.to_string(),
+                limit: Some(1),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("tree with limit");
+        assert_eq!(
+            tree["roots"].as_array().unwrap().len(),
+            1,
+            "limit=1 must return one root: {tree}"
+        );
+    }
+
+    /// #334/C3: unknown request keys are reported; aliases are recognised.
+    #[test]
+    fn unknown_taxonomy_request_fields_reports_only_unrecognised_keys() {
+        let value = json!({
+            "operation": "tree",
+            "namespace": "ns",
+            "limit": 1,
+            "typo_field": true,
+            "action": "tree",
+            "related": []
+        });
+        assert_eq!(
+            unknown_taxonomy_request_fields(&value),
+            vec!["typo_field".to_string()]
+        );
+        assert!(unknown_taxonomy_request_fields(&json!({})).is_empty());
     }
 }

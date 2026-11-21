@@ -22,7 +22,11 @@ const DEFAULT_RETENTION_DAYS: u64 = 30;
 /// must never interleave partial lines nor race the rollover rename against
 /// another append, so every mutating operation takes the per-root guard and
 /// holds it until its pending/commit sequence is complete.
-static BUFFER_WRITE_LOCKS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, std::sync::Arc<std::sync::Mutex<()>>>>> = std::sync::OnceLock::new();
+static BUFFER_WRITE_LOCKS: std::sync::OnceLock<
+    std::sync::Mutex<
+        std::collections::HashMap<std::path::PathBuf, std::sync::Arc<std::sync::Mutex<()>>>,
+    >,
+> = std::sync::OnceLock::new();
 
 fn root_lock(project_root: &Path) -> Arc<std::sync::Mutex<()>> {
     // Canonicalize so `/x/./y` and `/x/y` (same project, different spelling)
@@ -30,8 +34,8 @@ fn root_lock(project_root: &Path) -> Arc<std::sync::Mutex<()>> {
     // yet nothing is racing anything, so the literal path is a fine key; the
     // file checks and creation inside `append_entry` judge the real root.
     let key = std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
-    let map = BUFFER_WRITE_LOCKS
-        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let map =
+        BUFFER_WRITE_LOCKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     // A mutex poisoned by a panic in another writer must not brick the
     // buffer for the rest of the process: resume like a scheduler would.
     let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
@@ -123,7 +127,10 @@ fn judged_resolution(path: &Path) -> Option<PathBuf> {
             }
             return Some(resolved);
         }
-        match (cursor.file_name().map(|n| n.to_os_string()), cursor.parent()) {
+        match (
+            cursor.file_name().map(|n| n.to_os_string()),
+            cursor.parent(),
+        ) {
             (Some(name), Some(parent)) => {
                 remainder.push(name);
                 cursor = parent.to_path_buf();
@@ -276,7 +283,10 @@ fn prune_rolled(sessions: &Path, retention_days: u64) -> std::io::Result<()> {
     let dir_entries = match std::fs::read_dir(sessions) {
         Ok(entries) => entries,
         Err(e) => {
-            tracing::warn!("prune_rolled read_dir failed for {}: {e}", sessions.display());
+            tracing::warn!(
+                "prune_rolled read_dir failed for {}: {e}",
+                sessions.display()
+            );
             return Ok(());
         }
     };
@@ -289,7 +299,10 @@ fn prune_rolled(sessions: &Path, retention_days: u64) -> std::io::Result<()> {
         let modified = match entry.metadata().and_then(|m| m.modified()) {
             Ok(t) => t,
             Err(e) => {
-                tracing::warn!("prune_rolled failed to read mtime for {}: {e}", entry.path().display());
+                tracing::warn!(
+                    "prune_rolled failed to read mtime for {}: {e}",
+                    entry.path().display()
+                );
                 continue;
             }
         };
@@ -438,14 +451,10 @@ pub async fn handle_append_log(
         // Run the recall search
         let search_outcome = match store
             .search_with_domain(
-                &namespace,
-                vec,
-                3,              // limit = 3
-                false,          // include_tasks = false
-                false,          // include_archived = false
-                &slugs,
-                None,
-                true,
+                &namespace, vec, 3,     // limit = 3
+                false, // include_tasks = false
+                false, // include_archived = false
+                &slugs, None, true,
             )
             .await
         {
@@ -458,8 +467,7 @@ pub async fn handle_append_log(
 
         // Domain-filter counters: this search carried a filter (slugs non-empty).
         let mode = search_outcome.mode;
-        let single_domain =
-            crate::registry::registry_domain_count(&store, &namespace).await <= 1;
+        let single_domain = crate::registry::registry_domain_count(&store, &namespace).await <= 1;
         crate::recall_metrics::record_domain_query(
             mode == crate::traits::DomainMatchMode::Domain,
             mode == crate::traits::DomainMatchMode::Vector,
@@ -526,7 +534,8 @@ pub async fn handle_append_log(
     let cache_ns = crate::server::resolve_namespace(&store, &cache_ns).await;
     // Update-only here (no embedder): avoid an extra embedding on the hot
     // append path; row creation happens via ingest/setup instead.
-    crate::registry::cache_project_root(&store, None, &cache_ns, &project_root.to_string_lossy()).await;
+    crate::registry::cache_project_root(&store, None, &cache_ns, &project_root.to_string_lossy())
+        .await;
 
     // Build the success response
     success_response(&outcome, &tags, recalled, recalled_from, signals)
@@ -563,8 +572,8 @@ mod tests {
     use super::*;
     use crate::guard::testkit::{MockStore, StubEmbedder};
     use crate::traits::Embedder;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     fn scratch(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -706,14 +715,16 @@ mod tests {
         append_entry(&root, "first entry", &[], 500 * 1024, 30).unwrap();
         let outcome = append_entry(&root, "second entry", &[], 500 * 1024, 30).unwrap();
         let text = std::fs::read_to_string(&outcome.file).unwrap();
-        assert!(text.contains("first entry"), "the first entry persists: {text}");
+        assert!(
+            text.contains("first entry"),
+            "the first entry persists: {text}"
+        );
         assert!(
             text.contains("second entry"),
             "the second entry appends: {text}"
         );
         assert!(
-            std::path::Path::new(&outcome.file)
-                .starts_with(std::fs::canonicalize(&root).unwrap()),
+            std::path::Path::new(&outcome.file).starts_with(std::fs::canonicalize(&root).unwrap()),
             "the buffer file lives under the project root: {}",
             outcome.file
         );
@@ -783,13 +794,29 @@ mod tests {
         .await;
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert!(parsed.get("appended").and_then(|v| v.as_bool()).unwrap_or(false));
-        let recalled = parsed.get("recalled").expect("recalled field must be present");
+        assert!(parsed
+            .get("appended")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false));
+        let recalled = parsed
+            .get("recalled")
+            .expect("recalled field must be present");
         assert!(recalled.is_array());
         let recalled_arr = recalled.as_array().unwrap();
-        assert_eq!(recalled_arr.len(), 1, "exactly one fact recalled: {}", result);
-        assert_eq!(recalled_arr[0].get("id").and_then(|v| v.as_str()), Some(fact_id));
-        assert_eq!(parsed.get("recalled_from").and_then(|v| v.as_str()), Some("domain"));
+        assert_eq!(
+            recalled_arr.len(),
+            1,
+            "exactly one fact recalled: {}",
+            result
+        );
+        assert_eq!(
+            recalled_arr[0].get("id").and_then(|v| v.as_str()),
+            Some(fact_id)
+        );
+        assert_eq!(
+            parsed.get("recalled_from").and_then(|v| v.as_str()),
+            Some("domain")
+        );
     }
 
     #[tokio::test]
@@ -831,9 +858,15 @@ mod tests {
         .await;
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        let recalled = parsed.get("recalled").expect("recalled field must be present");
+        let recalled = parsed
+            .get("recalled")
+            .expect("recalled field must be present");
         let recalled_arr = recalled.as_array().unwrap();
-        assert!(recalled_arr.len() <= 3, "at most 3 entries recalled, got {}", recalled_arr.len());
+        assert!(
+            recalled_arr.len() <= 3,
+            "at most 3 entries recalled, got {}",
+            recalled_arr.len()
+        );
         for entry in recalled_arr {
             let snippet = entry.get("snippet").and_then(|v| v.as_str()).unwrap_or("");
             assert!(
@@ -850,7 +883,9 @@ mod tests {
         let root = scratch("recall-untagged");
         let store = Arc::new(MockStore::new());
         let calls = Arc::new(AtomicUsize::new(0));
-        let emb = Arc::new(CountingEmbedder { calls: calls.clone() });
+        let emb = Arc::new(CountingEmbedder {
+            calls: calls.clone(),
+        });
         store.init("probe").await.unwrap();
 
         // Store a fact
@@ -882,9 +917,18 @@ mod tests {
         .await;
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert!(parsed.get("appended").and_then(|v| v.as_bool()).unwrap_or(false));
-        let recalled = parsed.get("recalled").expect("recalled field must be present");
-        assert_eq!(recalled.as_array().unwrap().len(), 0, "recalled must be empty array");
+        assert!(parsed
+            .get("appended")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false));
+        let recalled = parsed
+            .get("recalled")
+            .expect("recalled field must be present");
+        assert_eq!(
+            recalled.as_array().unwrap().len(),
+            0,
+            "recalled must be empty array"
+        );
         // No recalled_from key at all when no search ran
         assert!(
             parsed.get("recalled_from").is_none(),
@@ -892,7 +936,11 @@ mod tests {
             result
         );
         // Zero embed calls for untagged turn
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "untagged turn must not call embed");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "untagged turn must not call embed"
+        );
     }
 
     #[tokio::test]
@@ -932,8 +980,14 @@ mod tests {
         .await;
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        let recalled = parsed.get("recalled").expect("recalled field must be present");
-        assert_eq!(recalled.as_array().unwrap().len(), 0, "recalled must be empty array");
+        let recalled = parsed
+            .get("recalled")
+            .expect("recalled field must be present");
+        assert_eq!(
+            recalled.as_array().unwrap().len(),
+            0,
+            "recalled must be empty array"
+        );
         assert!(
             parsed.get("recalled_from").is_none(),
             "recalled_from must be absent when tags normalize to nothing: {}",
@@ -980,13 +1034,17 @@ mod tests {
 
         let final_increments = store.incremented_ids().len();
         assert_eq!(
-            final_increments, initial_increments,
+            final_increments,
+            initial_increments,
             "increment_access_count must not be called during recall; got {} new increments",
             final_increments - initial_increments
         );
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert!(parsed.get("appended").and_then(|v| v.as_bool()).unwrap_or(false));
+        assert!(parsed
+            .get("appended")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false));
     }
 
     #[tokio::test]
@@ -1011,9 +1069,18 @@ mod tests {
         .await;
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert!(parsed.get("appended").and_then(|v| v.as_bool()).unwrap_or(false));
-        let recalled = parsed.get("recalled").expect("recalled field must be present");
-        assert_eq!(recalled.as_array().unwrap().len(), 0, "recalled must be empty array on error");
+        assert!(parsed
+            .get("appended")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false));
+        let recalled = parsed
+            .get("recalled")
+            .expect("recalled field must be present");
+        assert_eq!(
+            recalled.as_array().unwrap().len(),
+            0,
+            "recalled must be empty array on error"
+        );
         assert!(
             parsed.get("recalled_from").is_none(),
             "recalled_from must be absent when search failed: {}",
@@ -1067,8 +1134,13 @@ mod tests {
         .await;
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert!(parsed.get("appended").and_then(|v| v.as_bool()).unwrap_or(false));
-        let recalled = parsed.get("recalled").expect("recalled field must be present");
+        assert!(parsed
+            .get("appended")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false));
+        let recalled = parsed
+            .get("recalled")
+            .expect("recalled field must be present");
         assert!(recalled.is_array());
         let recalled_arr = recalled.as_array().unwrap();
         // The row seeded in the fallback namespace is the one that must come back.
@@ -1088,7 +1160,10 @@ mod tests {
             "recalled_from must be present when search ran (even against empty namespace): {}",
             result
         );
-        assert_eq!(parsed.get("recalled_from").and_then(|v| v.as_str()), Some("domain"));
+        assert_eq!(
+            parsed.get("recalled_from").and_then(|v| v.as_str()),
+            Some("domain")
+        );
     }
 
     #[tokio::test]
@@ -1096,7 +1171,9 @@ mod tests {
         let root = scratch("recall-one-embed");
         let store = Arc::new(MockStore::new());
         let calls = Arc::new(AtomicUsize::new(0));
-        let emb = Arc::new(CountingEmbedder { calls: calls.clone() });
+        let emb = Arc::new(CountingEmbedder {
+            calls: calls.clone(),
+        });
         store.init("probe").await.unwrap();
 
         // Store a fact
@@ -1128,9 +1205,16 @@ mod tests {
         .await;
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert!(parsed.get("appended").and_then(|v| v.as_bool()).unwrap_or(false));
+        assert!(parsed
+            .get("appended")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false));
         // Exactly one embed call for a tagged turn
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one embed call for tagged turn");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "exactly one embed call for tagged turn"
+        );
     }
 
     #[tokio::test]
@@ -1166,19 +1250,35 @@ mod tests {
         } else {
             let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
             // F1: appended must be false
-            assert_eq!(parsed.get("appended").and_then(|v| v.as_bool()), Some(false));
+            assert_eq!(
+                parsed.get("appended").and_then(|v| v.as_bool()),
+                Some(false)
+            );
             // F1: error field with old wording
             let error = parsed.get("error").and_then(|v| v.as_str()).unwrap_or("");
-            assert!(error.contains("could not append to the Episodic Buffer"), "error missing or wrong: {}", error);
+            assert!(
+                error.contains("could not append to the Episodic Buffer"),
+                "error missing or wrong: {}",
+                error
+            );
             // F1: other keys present with empty/zero values
             assert_eq!(parsed.get("file").and_then(|v| v.as_str()), Some(""));
             assert_eq!(parsed.get("size_bytes").and_then(|v| v.as_u64()), Some(0));
             assert_eq!(parsed.get("rolled").and_then(|v| v.as_bool()), Some(false));
             // F1: recalled present (empty because search didn't run - append failed first)
             assert!(parsed.get("recalled").is_some());
-            assert!(parsed.get("recalled").unwrap().as_array().unwrap().is_empty());
+            assert!(parsed
+                .get("recalled")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .is_empty());
             // F1: no recalled_from because search didn't run
-            assert!(parsed.get("recalled_from").is_none(), "recalled_from must be absent when no search ran: {}", result);
+            assert!(
+                parsed.get("recalled_from").is_none(),
+                "recalled_from must be absent when no search ran: {}",
+                result
+            );
         }
     }
 
@@ -1364,7 +1464,10 @@ mod tests {
                     let marker = format!("ENTRY-{}-{}", w, i);
                     let outcome =
                         append_entry(&root, &marker, &[], 500 * 1024, 30).expect("append");
-                    assert!(!outcome.rolled, "200-byte entries must not roll a 500KB buffer");
+                    assert!(
+                        !outcome.rolled,
+                        "200-byte entries must not roll a 500KB buffer"
+                    );
                 }
             }));
         }
@@ -1372,9 +1475,12 @@ mod tests {
             join.join().unwrap();
         }
 
-        let text =
-            std::fs::read_to_string(root.join(".NeuroStrata").join("sessions").join("current.md"))
-                .unwrap();
+        let text = std::fs::read_to_string(
+            root.join(".NeuroStrata")
+                .join("sessions")
+                .join("current.md"),
+        )
+        .unwrap();
         assert!(text.ends_with('\n'), "every entry commits as a whole line");
         for w in 0..writers {
             for i in 0..per_writer {

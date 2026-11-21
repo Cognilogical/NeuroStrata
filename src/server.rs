@@ -102,8 +102,7 @@ pub(crate) fn annotate_daemon_memory_error(msg: &str) -> String {
         || lower.contains("out of memory")
         || lower.contains("cannot allocate memory")
     {
-        let advice =
-            " [NEUROSTRATA_ADVICE[daemon_memory]: raise NEUROSTRATA_BUFFER_POOL_MB or storage_hygiene.buffer_pool_mb and restart the daemon]";
+        let advice = " [NEUROSTRATA_ADVICE[daemon_memory]: raise NEUROSTRATA_BUFFER_POOL_MB or storage_hygiene.buffer_pool_mb and restart the daemon]";
         if !msg.contains("NEUROSTRATA_ADVICE[daemon_memory]") {
             return format!("{msg}{advice}");
         }
@@ -381,7 +380,8 @@ async fn _with_watch(
                                 "exclude_stale": { "type": "boolean", "default": false, "description": "Exclude memories marked stale." },
                                 "include_code_ast": { "type": "boolean", "default": true, "description": "Include structural code AST memories even when memory_type is not explicitly set to structural." },
                                 "include_archived": { "type": "boolean", "description": "When true, include archived memories in search results." },
-                                "include_references": { "type": "boolean", "description": "When true, append edge_sources provenance citations for each returned memory. Defaults to false." }
+                                "include_references": { "type": "boolean", "description": "When true, append edge_sources provenance citations for each returned memory. Defaults to false." },
+                                "include_related": { "type": "boolean", "description": "DEPRECATED alias for include_references. Emits a warning; do not use in new prompts." }
                             },
                             "required": ["query", "namespace"]
                         }
@@ -445,7 +445,8 @@ async fn _with_watch(
                                 "memory_types": { "type": "array", "items": { "type": "string" }, "description": "Memory types to return. Default [\"rule\",\"fact\",\"procedure\"]." },
                                 "exclude_ids": { "type": "array", "items": { "type": "string" }, "description": "Optional ids to exclude from the results." },
                                 "limit": { "type": "integer", "description": "Max results. Default 5, max 20." },
-                                "include_ast_edges": { "type": "boolean", "description": "Also bundle 1-hop related memories (DEPENDS_ON/SUPERSEDES/RELATES_TO) and a compact AST neighborhood summary (symbols/callers/callees/imports/importers/blast_radius_count). Default true." }
+                                "include_ast_edges": { "type": "boolean", "description": "Also bundle 1-hop related memories (DEPENDS_ON/SUPERSEDES/RELATES_TO) and a compact AST neighborhood summary (symbols/callers/callees/imports/importers/blast_radius_count). Default true." },
+                                "staged_file_count": { "type": "integer", "minimum": 0, "default": 0, "description": "Optional count of files in the current edit scope. At 3 or more, adds a T_DIFF recommendation to neurostrata_diff_tour. Absent means no diff-tour trigger." }
                             },
                             "required": ["namespace", "path"]
                         }
@@ -1610,6 +1611,9 @@ async fn _with_watch(
             // and the error must surface as a -32603, not as a success
             // payload containing an error string.
             let mut error_response: Option<Value> = None;
+            // Spec §6 R6.2: latency is measured around the real dispatch and
+            // read only AFTER the handler returns.
+            let dispatch_started = std::time::Instant::now();
             if let Some(params) = &request.params {
                 if let Some(name) = params.get("name").and_then(|n| n.as_str()) {
                     let arguments = params
@@ -2114,22 +2118,121 @@ async fn _with_watch(
                         }
                     }
 
-                    if matches!(
+                    // Spec §6 R6: record ONE post-dispatch receipt for every
+                    // in-scope graph/ontology tool, derived from the REAL
+                    // outcome the handler just returned — never a hardcoded
+                    // success/0/[]. GRAPH_TOOLS is the single source of truth,
+                    // so all eight tools get identical coverage.
+                    if crate::task::snapshot_readiness::GRAPH_TOOLS.contains(&name) {
+                        // `arguments` was moved into the handler; read the
+                        // original params value instead.
+                        let args_ref = params.get("arguments");
+                        {
+                            // P1-7: a failed MCP tools/call with no namespace
+                            // still records a receipt under "global" — MCP
+                            // post-dispatch receipt completeness is 100%.
+                            // Daemon REST/CLI are out of scope (spec §2).
+                            let ns_arg = args_ref
+                                .and_then(|a| a.get("namespace"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("global");
+                            let query_raw = args_ref
+                                .and_then(|a| {
+                                    a.get("query")
+                                        .or_else(|| a.get("path"))
+                                        .or_else(|| a.get("file_path"))
+                                        .or_else(|| a.get("id"))
+                                        .or_else(|| a.get("memory_id"))
+                                        .or_else(|| a.get("question"))
+                                        .or_else(|| a.get("goal"))
+                                })
+                                .and_then(Value::as_str)
+                                .unwrap_or(name);
+                            let caller_root = args_ref
+                                .and_then(|a| {
+                                    a.get("project_root")
+                                        .or_else(|| a.get("worktree"))
+                                        .or_else(|| a.get("cwd"))
+                                })
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty());
+                            let ns = resolve_namespace(&store, ns_arg).await;
+                            // R7: the real handler response carries §5
+                            // next_actions/next_hop_calls with trigger ids and
+                            // action ids. Thread them into the receipt so task
+                            // validation can find applicable escalations with
+                            // no caller-supplied signals.
+                            let mut fields = crate::task::tool_receipts::attach_trigger_context(
+                                crate::task::tool_receipts::build_dispatch_receipt(
+                                    uuid::Uuid::new_v4().to_string(),
+                                    chrono::Utc::now().timestamp(),
+                                    crate::task::current_session_id(),
+                                    ns.clone(),
+                                    name.to_string(),
+                                    query_raw,
+                                    &result_text,
+                                    error_response.is_some(),
+                                    dispatch_started.elapsed().as_millis() as u64,
+                                ),
+                                &result_text,
+                            );
+                            // Task 11 Fix 2b: a failed taxonomy call carries no
+                            // handler `operation`, so recover the requested op
+                            // from args (bounded string only; no raw args stored).
+                            fields.operation =
+                                crate::task::tool_receipts::taxonomy_operation_fallback(
+                                    &fields.operation,
+                                    name == "neurostrata_taxonomy",
+                                    args_ref,
+                                );
+                            // R7 proof: the ledger is digest-only, so a follow-up
+                            // `neurostrata_related` call must prove at dispatch that
+                            // it matched the prescription (concrete seed, >=2 hops).
+                            // Reuse the existing `followed_action_ids` field; no new
+                            // receipt field, no raw args/hops text stored.
+                            if name == "neurostrata_related" {
+                                let seed = args_ref
+                                    .and_then(|a| a.get("id"))
+                                    .and_then(Value::as_str)
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty());
+                                let hops = args_ref
+                                    .and_then(|a| a.get("max_hops"))
+                                    .and_then(Value::as_u64)
+                                    .unwrap_or(0);
+                                if let (Some(seed), true) = (seed, hops >= 2) {
+                                    let proof_args = serde_json::json!({
+                                        "namespace": ns.as_str(),
+                                        "id": seed,
+                                        "max_hops": hops,
+                                    });
+                                    fields.followed_action_ids =
+                                        vec![crate::task::routing::action_id(
+                                            crate::task::graph_advisories::T_HIGH_BLAST,
+                                            &proof_args,
+                                            &[seed.to_string()],
+                                        )];
+                                }
+                            }
+                            crate::task::record_tool_receipt(&store, fields, caller_root).await;
+                        }
+                    } else if matches!(
                         name,
-                        "neurostrata_search_memory"
-                            | "neurostrata_related"
-                            | "neurostrata_sparql_query"
-                            | "neurostrata_graphql_query"
+                        "neurostrata_graphql_query"
                             | "neurostrata_chat_ask"
                             | "neurostrata_context_plan"
                             | "neurostrata_provenance_for"
                     ) {
-                        if let Some(ns) = params
-                            .get("arguments")
+                        // Legacy `queries[]` compatibility for tools that used
+                        // to be recorded here but are outside GRAPH_TOOLS.
+                        // `record_graph_query_with_root` is now legacy-only —
+                        // it cannot fabricate an `events[]` outcome receipt.
+                        let args_ref = params.get("arguments");
+                        if let Some(ns) = args_ref
                             .and_then(|a| a.get("namespace"))
-                            .and_then(|v| v.as_str())
+                            .and_then(Value::as_str)
                         {
-                            let args_ref = params.get("arguments");
                             let hint = args_ref
                                 .and_then(|a| {
                                     a.get("query")
@@ -2140,7 +2243,7 @@ async fn _with_watch(
                                         .or_else(|| a.get("question"))
                                         .or_else(|| a.get("goal"))
                                 })
-                                .and_then(|v| v.as_str())
+                                .and_then(Value::as_str)
                                 .unwrap_or(name);
                             let caller_root = args_ref
                                 .and_then(|a| {
@@ -2148,15 +2251,11 @@ async fn _with_watch(
                                         .or_else(|| a.get("worktree"))
                                         .or_else(|| a.get("cwd"))
                                 })
-                                .and_then(|v| v.as_str())
+                                .and_then(Value::as_str)
                                 .map(str::trim)
                                 .filter(|s| !s.is_empty());
                             crate::task::record_graph_query_with_root(
-                                &store,
-                                ns,
-                                name,
-                                hint,
-                                caller_root,
+                                &store, ns, name, hint, caller_root,
                             )
                             .await;
                         }
@@ -3526,24 +3625,9 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
     };
     let namespace = resolve_namespace(&store, namespace).await;
 
-    // Direct invocations of handle_memories_for_file also record the
-    // touched file path in `.NeuroStrata/session_queries.json` and bump
-    // `graph_queries_count` on the active in_progress task.
-    let caller_root = arguments
-        .get("project_root")
-        .or_else(|| arguments.get("worktree"))
-        .or_else(|| arguments.get("cwd"))
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let _ = crate::task::record_graph_query_with_root(
-        &store,
-        &namespace,
-        "neurostrata_memories_for_file",
-        path,
-        caller_root,
-    )
-    .await;
+    // Spec §6 R6.2: no pre-dispatch ledger write here. Receipts for this tool
+    // are written post-dispatch at the MCP tools/call boundary with the REAL
+    // result (success/empty/unsupported/failed), latency and returned ids.
 
     let symbol = arguments.get("symbol").and_then(|s| s.as_str());
     let include_ancestors = arguments
@@ -3596,6 +3680,9 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
                 "unsupported": !graph_read,
                 "path": path,
                 "error": format!("{e:#}"),
+                "status": "failed",
+                "next_actions": [],
+                "suppressed_reason": "Path resolution failed; no graph lookup ran, so no escalation is prescribed.",
             });
             if e.downcast_ref::<crate::paths::UnresolvablePathError>()
                 .is_some()
@@ -3619,6 +3706,9 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
             "memories": [],
             "unsupported": true,
             "path": original_path,
+            "status": "unsupported",
+            "next_actions": [],
+            "suppressed_reason": "Graph-read backend unavailable; no lookup ran, so no escalation is prescribed.",
         })
         .to_string();
     };
@@ -3724,30 +3814,86 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
                     }
                 }
             }
+
+            // Task 4: conditional escalation decided by a crate-free pure
+            // function so the decision itself is testable without a store.
+            // All fields here are additive; existing fields stay byte-stable.
+            let blast_radius_count = response
+                .get("ast_summary")
+                .and_then(|v| v.get("blast_radius_count"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
+            let bridge_ids: Vec<String> = hits
+                .iter()
+                .flat_map(|h| h.conceptual_bridges.iter())
+                .map(|b| b.target_id.clone())
+                .collect();
+            let staged_file_count = arguments
+                .get("staged_file_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
+            // Prefer a returned symbol id, then a returned memory id, then the
+            // queried path (all valid `related` seeds; an empty lookup supplies
+            // the path as the `locate` query).
+            let seed_id = response
+                .get("ast_summary")
+                .and_then(|v| v.get("symbols"))
+                .and_then(serde_json::Value::as_array)
+                .and_then(|a| a.first())
+                .and_then(|s| s.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| hit_ids.first().map(String::as_str))
+                .unwrap_or(original_path);
+            let escalation = crate::graph_read::memories_for_file::recommended_next_actions(
+                blast_radius_count,
+                &bridge_ids,
+                staged_file_count,
+                hits.is_empty(),
+                &namespace,
+                Some(seed_id),
+            );
+            if let Some(status) = escalation.get("status").and_then(serde_json::Value::as_str) {
+                response["status"] = serde_json::Value::String(status.to_string());
+            }
+            if let Some(actions) = escalation.get("next_actions") {
+                response["next_actions"] = actions.clone();
+            }
+            if let Some(reason) = escalation.get("suppressed_reason") {
+                response["suppressed_reason"] = reason.clone();
+            }
             response.to_string()
         }
-        Err(e) => serde_json::json!({
-            "memories": [],
-            "unsupported": false,
-            "path": original_path,
-            "error": e.to_string(),
-        })
+        Err(e) => crate::graph_read::memories_for_file::query_failure_response(
+            original_path,
+            &e.to_string(),
+        )
         .to_string(),
     }
 }
 
 #[cfg(test)]
-static RELATED_TRAVERSAL_COUNTER: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+std::thread_local! {
+    static RELATED_TRAVERSAL_COUNTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 #[cfg(test)]
 pub(crate) fn reset_related_traversal_counter_for_tests() {
-    RELATED_TRAVERSAL_COUNTER.store(0, std::sync::atomic::Ordering::SeqCst);
+    RELATED_TRAVERSAL_COUNTER.with(|c| c.set(0));
 }
 
 #[cfg(test)]
 pub(crate) fn related_traversal_counter_for_tests() -> usize {
-    RELATED_TRAVERSAL_COUNTER.load(std::sync::atomic::Ordering::SeqCst)
+    RELATED_TRAVERSAL_COUNTER.with(|c| c.get())
+}
+
+#[cfg(test)]
+static RELATED_TRAVERSAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn related_traversal_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    RELATED_TRAVERSAL_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
 }
 
 /// Whether a `related` seed names a file path (and so needs canonical
@@ -3945,7 +4091,7 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
     }
 
     #[cfg(test)]
-    RELATED_TRAVERSAL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    RELATED_TRAVERSAL_COUNTER.with(|c| c.set(c.get() + 1));
 
     match store
         .related(
@@ -4750,7 +4896,10 @@ async fn handle_add_memory(
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
                 if !create_new_namespace {
-                    return format!("ERROR: No .NeuroStrata directory found at {}. This indicates the project does not have a designated context/namespace yet. Do NOT guess the namespace. Ask the user if they want to initialize this directory as a new context, and if so, call this tool again with create_new_namespace=true.", project_root);
+                    return format!(
+                        "ERROR: No .NeuroStrata directory found at {}. This indicates the project does not have a designated context/namespace yet. Do NOT guess the namespace. Ask the user if they want to initialize this directory as a new context, and if so, call this tool again with create_new_namespace=true.",
+                        project_root
+                    );
                 } else {
                     if let Err(e) = tokio::fs::create_dir_all(&ns_dir).await {
                         return format!("ERROR: Failed to create .NeuroStrata directory: {}", e);
@@ -5093,7 +5242,10 @@ async fn handle_add_memory(
                     return match decision {
                         DedupDecision::LinkedExisting => {
                             let id = linked_id.unwrap_or_default();
-                            format!("Reused existing memory for namespace: {}\nMemory ID: {}", namespace, id)
+                            format!(
+                                "Reused existing memory for namespace: {}\nMemory ID: {}",
+                                namespace, id
+                            )
                         }
                         DedupDecision::BlockedExact => format!(
                             "Potential duplicate detected: Memory is similar to an existing memory. Use neurostrata_supersede_memory to update the existing memory instead, or neurostrata_archive_memory to archive it."
@@ -5248,7 +5400,7 @@ pub async fn handle_task_candidates(
         Some("resolve") => "resolve",
         Some("dismiss") => "dismiss",
         Some(a) => {
-            return format!("ERROR: unknown action '{a}' (expected record|list|resolve|dismiss).")
+            return format!("ERROR: unknown action '{a}' (expected record|list|resolve|dismiss).");
         }
     };
 
@@ -5604,6 +5756,24 @@ fn apply_doctor_version(state: &mut Value, version: &str, allowed: bool) {
     if allowed {
         state["last_run_version"] = serde_json::json!(version);
     }
+}
+
+/// Read the session ledger fail-soft and count only attributed post-dispatch
+/// graph tools from active tasks. A missing/unreadable ledger yields 0. Legacy
+/// `queries[]` rows are excluded from this metric by design (spec R6), so the
+/// thin wrapper delegates to the pure helper after parsing.
+fn active_task_graph_tool_names(
+    root: &std::path::Path,
+    active_task_ids: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    let path = root.join(".NeuroStrata/session_queries.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(doc) = serde_json::from_str::<Value>(&text) else {
+        return Vec::new();
+    };
+    crate::task::snapshot_readiness::graph_tools_from_ledger(&doc, active_task_ids)
 }
 
 async fn handle_get_snapshot(
@@ -6438,6 +6608,53 @@ async fn handle_get_snapshot(
         None => String::new(),
     };
 
+    // R5: graph/ontology readiness. Concept data comes from the same ReBAC-
+    // filtered taxonomy view the section above renders, so restricted rows are
+    // never counted or named. Tool diversity is read fail-soft from the session
+    // ledger; no ledger means an honest 0, never a fabricated count.
+    let (has_thesis, concept_statuses) = match crate::traits::VectorStore::as_any(store.as_ref())
+        .downcast_ref::<crate::store::ladybug::LadybugStore>()
+    {
+        Some(ls) => crate::rdf::taxonomy::snapshot_taxonomy_readiness_view(ls, namespace).await,
+        None => (false, Vec::new()),
+    };
+    let readiness_concepts: Vec<crate::task::snapshot_readiness::ReadinessConcept> =
+        concept_statuses
+            .into_iter()
+            .map(|(slug, epistemic_status)| crate::task::snapshot_readiness::ReadinessConcept {
+                slug,
+                restricted: false,
+                epistemic_status,
+            })
+            .collect();
+    // Only work in flight may attract tool receipts; done/retired tasks must
+    // not inflate diversity. Status mapping is the gate's own enum -> string.
+    let active_task_status_rows: Vec<(String, String)> = all_memories
+        .iter()
+        .filter(|r| crate::task::gate::is_task(r))
+        .filter(|r| !crate::task::gate::is_retired(&r.payload.metadata, now))
+        .map(|r| {
+            (
+                r.id.clone(),
+                crate::task::gate::task_status(r).as_str().to_string(),
+            )
+        })
+        .collect();
+    let active_task_ids =
+        crate::task::snapshot_readiness::active_task_ids(&active_task_status_rows);
+    // P1-8: snapshot readiness must read the SAME root the recorder writes.
+    // Route the hint through the shared receipt_ledger_root policy (validated
+    // worktree marker -> registry -> directory rows -> daemon CWD).
+    let ledger_root =
+        crate::task::receipt_ledger_root(inferred_root.as_deref(), &store, namespace).await;
+    let readiness_input = crate::task::snapshot_readiness::ReadinessInput {
+        concepts: readiness_concepts,
+        graph_tool_names: active_task_graph_tool_names(&ledger_root, &active_task_ids),
+        has_thesis,
+    };
+    let readiness_section =
+        crate::task::snapshot_readiness::render_readiness_section(&readiness_input);
+
     let mut parts: Vec<String> = vec![task_head.to_string()];
     if !hooks_line.is_empty() {
         parts.push(hooks_line.clone());
@@ -6448,6 +6665,7 @@ async fn handle_get_snapshot(
     if !taxonomy_section.is_empty() {
         parts.push(taxonomy_section);
     }
+    parts.push(readiness_section);
     if !stale_section.is_empty() {
         parts.push(stale_section);
     }
@@ -6868,7 +7086,7 @@ async fn handle_export_canonical_rdf(arguments: &Value, store: Arc<dyn VectorSto
             Ok(u) => u.to_string(),
             Err(e) => {
                 return serde_json::json!({"ok":false,"error":format!("invalid memory_id: {e}")})
-                    .to_string()
+                    .to_string();
             }
         }],
         None => match store.list(namespace_str, None, None).await {
@@ -7161,14 +7379,14 @@ async fn handle_validate_canonical_rdf(arguments: &Value, store: Arc<dyn VectorS
         Some(n) => n.to_string(),
         None => {
             return serde_json::json!({"ok":false,"valid":false,"violations":["namespace missing"]})
-                .to_string()
+                .to_string();
         }
     };
     let memory_id = match arguments.get("memory_id").and_then(|v| v.as_str()) {
         Some(i) => i.to_string(),
         None => {
             return serde_json::json!({"ok":false,"valid":false,"violations":["memory_id missing"]})
-                .to_string()
+                .to_string();
         }
     };
 
@@ -7199,7 +7417,7 @@ async fn handle_validate_canonical_rdf(arguments: &Value, store: Arc<dyn VectorS
                             "valid":false,
                             "violations":[format!("invalid lifecycle_state: {lifecycle_state}")]
                         })
-                        .to_string()
+                        .to_string();
                     }
                 };
             // created_at is required for deterministic canonical RDF (fail closed).
@@ -7217,7 +7435,7 @@ async fn handle_validate_canonical_rdf(arguments: &Value, store: Arc<dyn VectorS
                         "valid":false,
                         "violations":[format!("invalid created_at (not RFC3339): {e}")]
                     })
-                    .to_string()
+                    .to_string();
                 }
             };
             let created_by = &payload.user_id;
@@ -7395,7 +7613,7 @@ pub(crate) async fn handle_sparql_query(arguments: &Value, store: Arc<dyn Vector
     let query = match arguments.get("query").and_then(|v| v.as_str()) {
         Some(q) => q.to_string(),
         None => {
-            return serde_json::json!({"ok":false,"error":"query parameter required"}).to_string()
+            return serde_json::json!({"ok":false,"error":"query parameter required"}).to_string();
         }
     };
 
@@ -7755,7 +7973,7 @@ pub(crate) async fn handle_twin_set(
                         "ok": false,
                         "error": format!("invalid attributes object: {}", e)
                     })
-                    .to_string()
+                    .to_string();
                 }
             };
         if let Err(e) = crate::digital_twin::set_attributes(&mut base_payload, &attrs, merge) {
@@ -9964,13 +10182,13 @@ async fn handle_supersede_memory(
     let id = match arguments.get("id").and_then(|v| v.as_str()) {
         Some(i) => i,
         None => {
-            return "Missing 'id' parameter: supersede needs the memory it replaces.".to_string()
+            return "Missing 'id' parameter: supersede needs the memory it replaces.".to_string();
         }
     };
     let content = match arguments.get("content").and_then(|c| c.as_str()) {
         Some(c) => c,
         None => {
-            return "Missing 'content' parameter: supersede needs the corrected text.".to_string()
+            return "Missing 'content' parameter: supersede needs the corrected text.".to_string();
         }
     };
     let namespace = match arguments.get("namespace").and_then(|n| n.as_str()) {
@@ -10209,7 +10427,7 @@ async fn handle_supersede_memory(
             return format!(
                 "Failed to embed the new content, nothing was changed: {}",
                 e
-            )
+            );
         }
     };
 
@@ -10222,7 +10440,7 @@ async fn handle_supersede_memory(
             return format!(
                 "Failed to store the replacement, nothing was changed: {}",
                 e
-            )
+            );
         }
     };
 
@@ -10873,6 +11091,34 @@ fn token_set_tokens(content: &str) -> std::collections::HashSet<String> {
         .collect()
 }
 
+/// IDs surfaced only through graph expansion, never direct semantic hits.
+/// Evidence kind is the discriminator: `DirectMatch` is a direct hit; every
+/// other kind was discovered by traversing a graph edge.
+fn graph_expanded_ids_from_results(results: &[SearchResult]) -> Vec<String> {
+    let mut ids = Vec::new();
+    for result in results {
+        let expanded = result.evidence.as_ref().is_some_and(|evs| {
+            evs.iter()
+                .any(|ev| ev.kind != crate::traits::EvidenceKind::DirectMatch)
+        });
+        if expanded && !ids.contains(&result.id) {
+            ids.push(result.id.clone());
+        }
+    }
+    ids
+}
+
+/// Append the response contract as one additive JSON line. Older report
+/// fields stay byte-identical; parsers that ignore unknown lines are unaffected.
+fn finalize_search_report(
+    report: String,
+    arguments: &Value,
+    results: &[SearchResult],
+) -> String {
+    let ids = graph_expanded_ids_from_results(results);
+    crate::search::append_search_contract_line(report, arguments, ids)
+}
+
 async fn handle_search_memory(
     arguments: Value,
     emb: Arc<dyn Embedder>,
@@ -10880,11 +11126,19 @@ async fn handle_search_memory(
 ) -> String {
     let query = match arguments.get("query").and_then(|q| q.as_str()) {
         Some(q) => q,
-        None => return "Missing 'query' parameter.".to_string(),
+        None => {
+            return finalize_search_report("Missing 'query' parameter.".to_string(), &arguments, &[])
+        }
     };
     let namespace = match arguments.get("namespace").and_then(|n| n.as_str()) {
         Some(n) => n,
-        None => return "ERROR [NAMESPACE]: 'namespace' is missing. You MUST explicitly provide the specific project namespace to search in.".to_string(),
+        None => {
+            return finalize_search_report(
+                "ERROR [NAMESPACE]: 'namespace' is missing. You MUST explicitly provide the specific project namespace to search in.".to_string(),
+                &arguments,
+                &[],
+            )
+        }
     };
     let namespace = resolve_namespace(&store, namespace).await;
     let namespace = namespace.as_str();
@@ -10917,9 +11171,13 @@ async fn handle_search_memory(
         && search_mode != "lexical"
         && search_mode != "lexical-inhouse"
     {
-        return format!(
-            "ERROR [MODE]: unknown search mode '{}'. Use 'hybrid' (default), 'vector', 'lexical', or 'lexical-inhouse'.",
-            search_mode
+        return finalize_search_report(
+            format!(
+                "ERROR [MODE]: unknown search mode '{}'. Use 'hybrid' (default), 'vector', 'lexical', or 'lexical-inhouse'.",
+                search_mode
+            ),
+            &arguments,
+            &[],
         );
     }
     // No authenticated principal context exists on this local MCP surface yet;
@@ -10969,10 +11227,12 @@ async fn handle_search_memory(
         .get("domain_expansion")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
-    let include_references = arguments
-        .get("include_references")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    // `include_related` never existed in this schema: it was silently ignored.
+    // Resolve it here as a deprecated alias so the caller gets both the provenance
+    // behaviour and an explicit warning in the response contract.
+    let search_contract =
+        crate::search::SearchMemoryContract::from_arguments(&arguments, Vec::new());
+    let include_references = search_contract.include_references;
 
     // Upgraded SearchFilters (src/search.rs). Optional: defaults preserve
     // existing search behavior (include_code_ast defaults to true so searches
@@ -11015,9 +11275,13 @@ async fn handle_search_memory(
         let registry_root = match crate::registry::cached_project_root(&store, namespace).await {
             Ok(root) => root,
             Err(e) => {
-                return format!(
-                    "ERROR [PATH_PREFIX]: failed to read namespace registry root for '{namespace}': {e}"
-                )
+                return crate::search::append_search_contract_line(
+                    format!(
+                        "ERROR [PATH_PREFIX]: failed to read namespace registry root for '{namespace}': {e}"
+                    ),
+                    &arguments,
+                    vec![],
+                );
             }
         };
         let prefix_forms = match crate::paths::prefix_lookup_forms(
@@ -11026,7 +11290,13 @@ async fn handle_search_memory(
             registry_root.as_deref(),
         ) {
             Ok(forms) => forms,
-            Err(e) => return format!("ERROR [PATH_PREFIX]: {e}"),
+            Err(e) => {
+                return crate::search::append_search_contract_line(
+                    format!("ERROR [PATH_PREFIX]: {e}"),
+                    &arguments,
+                    vec![],
+                )
+            }
         };
         search_filters.path_prefix_forms = prefix_forms;
     }
@@ -11118,7 +11388,11 @@ async fn handle_search_memory(
         let outcome = match outcome_res {
             Ok(outcome) => outcome,
             Err(error) => {
-                return format!("Failed to search the lexical index: {error}");
+                return crate::search::append_search_contract_line(
+                    format!("Failed to search the lexical index: {error}"),
+                    &arguments,
+                    vec![],
+                );
             }
         };
 
@@ -11180,7 +11454,11 @@ async fn handle_search_memory(
         results.truncate(DEFAULT_LIMIT);
 
         if results.is_empty() {
-            return "No relevant memories found.".to_string();
+            return finalize_search_report(
+                "No relevant memories found.".to_string(),
+                &arguments,
+                &results,
+            );
         }
 
         for res in &results {
@@ -11233,7 +11511,7 @@ async fn handle_search_memory(
             ));
         }
         if !domain_requested {
-            return report;
+            return finalize_search_report(report, &arguments, &results);
         }
         let mode_line = if slugs.is_empty() {
             "domain filter: skipped — the domain did not normalize; the results are unfiltered (lexical)"
@@ -11242,18 +11520,30 @@ async fn handle_search_memory(
         } else {
             "domain filter: skipped — no row matched the domain; the results are unfiltered (lexical)"
         };
-        return format!("{}\n\n{}", mode_line, report);
+        return format!(
+            "{}\n\n{}",
+            mode_line,
+            finalize_search_report(report, &arguments, &results)
+        );
     }
 
     if let Err(e) = store.init(namespace).await {
         tracing::warn!("search_memory init failed for '{namespace}': {e}");
-        return format!("Failed to initialize namespace table.: {e}");
+        return finalize_search_report(
+            format!("Failed to initialize namespace table.: {e}"),
+            &arguments,
+            &[],
+        );
     }
     let vec = match emb.embed(&query).await {
         Ok(vec) => vec,
         Err(e) => {
             tracing::warn!("search_memory embedding failed for '{namespace}': {e}");
-            return format!("Failed to generate embedding for search.: {e}");
+            return finalize_search_report(
+                format!("Failed to generate embedding for search.: {e}"),
+                &arguments,
+                &[],
+            );
         }
     };
     let is_ladybug_store = crate::traits::VectorStore::as_any(store.as_ref())
@@ -11488,7 +11778,11 @@ async fn handle_search_memory(
             );
         }
         if results.is_empty() {
-            "No relevant memories found.".to_string()
+            finalize_search_report(
+                "No relevant memories found.".to_string(),
+                &arguments,
+                &results,
+            )
         } else {
             // Increment access_count ONLY for direct hits (EvidenceKind::DirectMatch)
             for res in &results {
@@ -11542,7 +11836,7 @@ async fn handle_search_memory(
                 ));
             }
             if !domain_requested {
-                report
+                finalize_search_report(report, &arguments, &results)
             } else {
                 // A filter that was skipped is a substitution the caller
                 // has to be told about: a wrong domain must never blind
@@ -11554,19 +11848,21 @@ async fn handle_search_memory(
                     "domain filter: skipped — the domain did not normalize; the results are unfiltered (vector)"
                 } else {
                     match mode {
-                                crate::traits::DomainMatchMode::Domain => {
-                                    "domain filter: applied (domain)"
-                                }
-                                crate::traits::DomainMatchMode::Vector => {
-                                    "domain filter: skipped — no row matched the domain; the results are unfiltered (vector)"
-                                }
-                            }
+                        crate::traits::DomainMatchMode::Domain => "domain filter: applied (domain)",
+                        crate::traits::DomainMatchMode::Vector => {
+                            "domain filter: skipped — no row matched the domain; the results are unfiltered (vector)"
+                        }
+                    }
                 };
-                format!("{}\n\n{}", mode_line, report)
+                format!(
+                    "{}\n\n{}",
+                    mode_line,
+                    finalize_search_report(report, &arguments, &results)
+                )
             }
         }
     } else {
-        "Failed to search database.".to_string()
+        finalize_search_report("Failed to search database.".to_string(), &arguments, &[])
     }
 }
 
@@ -11978,7 +12274,10 @@ fn render_evidence_suffix(result: &SearchResult, remaining_bytes: usize) -> Opti
                     continue;
                 }
                 let rendered_path = render_path(ev, orig);
-                format!("\nPath [governs_2hop]: {}\nWhy: This memory governs a node one hop from a direct match.", rendered_path)
+                format!(
+                    "\nPath [governs_2hop]: {}\nWhy: This memory governs a node one hop from a direct match.",
+                    rendered_path
+                )
             }
             crate::traits::EvidenceKind::EpisodeSibling => {
                 // Two hops: primary -(EXTRACTED_FROM)-> task <-EXTRACTED_FROM- sibling (result)
@@ -12001,7 +12300,10 @@ fn render_evidence_suffix(result: &SearchResult, remaining_bytes: usize) -> Opti
                     continue;
                 }
                 let rendered_path = render_path(ev, orig);
-                format!("\nPath [episode_sibling]: {}\nWhy: This memory and a direct match were both extracted from the same task.", rendered_path)
+                format!(
+                    "\nPath [episode_sibling]: {}\nWhy: This memory and a direct match were both extracted from the same task.",
+                    rendered_path
+                )
             }
         };
 
@@ -12091,157 +12393,6 @@ async fn build_guard_validator(
     Ok((validator, namespace.to_string()))
 }
 
-fn is_env_assignment_token(tok: &str) -> bool {
-    let Some((name, _)) = tok.split_once('=') else {
-        return false;
-    };
-    !name.is_empty()
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        && !name.chars().next().unwrap().is_ascii_digit()
-}
-
-fn is_disallowed_git_subcommand_arg(arg: &str) -> bool {
-    arg == "--output"
-        || arg.starts_with("--output=")
-        || arg.starts_with("-O")
-        || arg == "--ext-diff"
-        || arg == "--textconv"
-        || arg == "--exec"
-        || arg.starts_with("--exec=")
-        || arg == "-x"
-        || arg == "--upload-pack"
-        || arg.starts_with("--upload-pack=")
-        || arg == "--receive-pack"
-        || arg.starts_with("--receive-pack=")
-}
-
-fn is_zero_action_exempt_shell_segment(segment: &str) -> bool {
-    let mut tokens = segment
-        .split_whitespace()
-        .skip_while(|t| is_env_assignment_token(t));
-    let Some(first) = tokens.next() else {
-        return false;
-    };
-    let bin = std::path::Path::new(first)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(first);
-    match bin {
-        "git" => {
-            let mut rest: Vec<&str> = tokens.collect();
-            loop {
-                if rest.len() >= 2 && matches!(rest[0], "-C" | "--git-dir" | "--work-tree") {
-                    rest.drain(..2);
-                } else if !rest.is_empty()
-                    && (matches!(rest[0], "--no-pager" | "-P" | "--no-optional-locks")
-                        || rest[0].starts_with("--git-dir=")
-                        || rest[0].starts_with("--work-tree="))
-                {
-                    rest.remove(0);
-                } else {
-                    break;
-                }
-            }
-            if rest.first().is_some_and(|t| t.starts_with('-')) {
-                return false;
-            }
-            let Some(&subcmd) = rest.first() else {
-                return false;
-            };
-            if rest[1..]
-                .iter()
-                .any(|arg| is_disallowed_git_subcommand_arg(arg))
-            {
-                return false;
-            }
-            match subcmd {
-                // Force-push rewrites remote history: never exempt it from the
-                // active-task gate. Mirror the plugin's flag detection here.
-                // Inspect the whole argument list: bundled short flags
-                // (-vf/-uf), forced refspecs (+main) and destructive remote
-                // operations must all stay mutating, in parity with the plugin.
-                "push" => !rest[1..].iter().copied().any(|arg| {
-                    arg.starts_with('+')
-                        || arg == "--force"
-                        || arg.starts_with("--force-")
-                        || matches!(arg, "--mirror" | "--delete" | "--prune")
-                        || (arg.starts_with('-')
-                            && !arg.starts_with("--")
-                            && arg[1..].contains('f'))
-                }),
-                "pull" | "fetch" | "status" | "log" | "diff" | "show" | "rev-parse" => true,
-                "stash" => matches!(rest.get(1).copied(), Some("list" | "show")),
-                "branch" => {
-                    rest.len() >= 2
-                        && rest[1..].iter().all(|t| {
-                            matches!(*t, "--show-current" | "-a" | "-r" | "--list" | "-v" | "-vv")
-                        })
-                }
-                _ => false,
-            }
-        }
-        "neurostrata-mcp" => {
-            let rest: Vec<&str> = tokens.collect();
-            match rest.first().copied() {
-                Some("task" | "doc-gate") => true,
-                Some("synaptic-mesh") => matches!(rest.get(1).copied(), Some("status")),
-                _ => false,
-            }
-        }
-        "cargo" => {
-            let mut rest: Vec<&str> = tokens.collect();
-            if rest.first().is_some_and(|t| t.starts_with('+')) {
-                rest.remove(0);
-            }
-            matches!(
-                rest.first().copied(),
-                Some(
-                    "test"
-                        | "check"
-                        | "clippy"
-                        | "bench"
-                        | "metadata"
-                        | "tree"
-                        | "version"
-                        | "--version"
-                )
-            )
-        }
-        "gh" => {
-            let rest: Vec<&str> = tokens.collect();
-            match rest.first().copied() {
-                Some("pr") => matches!(
-                    rest.get(1).copied(),
-                    Some("view" | "list" | "checks" | "status" | "diff")
-                ),
-                Some("issue") => matches!(rest.get(1).copied(), Some("view" | "list" | "status")),
-                Some("run") => matches!(rest.get(1).copied(), Some("view" | "list" | "watch")),
-                Some("api") => !rest[1..].iter().any(|arg| {
-                    matches!(
-                        *arg,
-                        "-X" | "--method" | "-f" | "-F" | "--field" | "--raw-field" | "--input"
-                    ) || arg.starts_with("--method=")
-                        || arg.starts_with("--field=")
-                        || arg.starts_with("--raw-field=")
-                        || arg.starts_with("--input=")
-                }),
-                _ => false,
-            }
-        }
-        "node" => {
-            let rest: Vec<&str> = tokens.collect();
-            rest.iter()
-                .any(|t| *t == "--test" || t.ends_with("test.mjs"))
-        }
-        "gate-receipt.sh" | "check-include-str-targets.sh" => true,
-        "bash" => tokens.next().is_some_and(|t| {
-            t.ends_with("gate-receipt.sh") || t.ends_with("check-include-str-targets.sh")
-        }),
-        "rustc" => matches!(tokens.next(), Some("--version" | "-V")),
-        _ => false,
-    }
-}
-
 pub(crate) fn is_zero_action_exempt_shell_payload(action_type: &str, payload: &str) -> bool {
     if !matches!(
         action_type.to_lowercase().as_str(),
@@ -12249,46 +12400,7 @@ pub(crate) fn is_zero_action_exempt_shell_payload(action_type: &str, payload: &s
     ) {
         return false;
     }
-    // Harness plugins send payload = JSON.stringify(call.args), e.g.
-    // {"command":"git status --short"}. Unwrap the command before segmenting;
-    // a JSON object with no string command is never exempt.
-    let parsed: Option<serde_json::Value> = if payload.trim_start().starts_with('{') {
-        match serde_json::from_str(payload) {
-            Ok(value @ serde_json::Value::Object(_)) => Some(value),
-            _ => return false,
-        }
-    } else {
-        None
-    };
-    let command = match &parsed {
-        Some(serde_json::Value::Object(obj)) => match obj
-            .get("command")
-            .or_else(|| obj.get("cmd"))
-            .and_then(|v| v.as_str())
-        {
-            Some(s) => s,
-            None => return false,
-        },
-        _ => payload,
-    };
-    let trimmed = command.trim();
-    if trimmed.is_empty()
-        || trimmed.contains('`')
-        || trimmed.contains("$(")
-        || trimmed.contains('>')
-        || trimmed.contains('<')
-    {
-        return false;
-    }
-    let segments: Vec<&str> = trimmed
-        .split(|c| c == ';' || c == '\n' || c == '|' || c == '&')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
-    !segments.is_empty()
-        && segments
-            .into_iter()
-            .all(is_zero_action_exempt_shell_segment)
+    crate::formal_kernel::evaluate_shell_exemption(payload)
 }
 
 /// Validate an action against stored behavioral rules and (optionally) the
@@ -12597,7 +12709,12 @@ async fn handle_guard_learn(
     };
     let rule: BehavioralRule = match serde_json::from_value(rule_value) {
         Ok(r) => r,
-        Err(e) => return format!("ERROR [RULE SHAPE]: {}; required: id, version, rule_class, trigger_pattern, constraint_text, hit_count, status", e),
+        Err(e) => {
+            return format!(
+                "ERROR [RULE SHAPE]: {}; required: id, version, rule_class, trigger_pattern, constraint_text, hit_count, status",
+                e
+            );
+        }
     };
     let (validator, namespace) =
         match build_guard_validator(&arguments, store, embedder, "learn").await {
@@ -13159,6 +13276,26 @@ mod tests {
             "bash",
             r#"{"cmd":42}"#
         ));
+    }
+
+    #[test]
+    fn shell_exemption_corpus_agrees() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/shell-exemption-verdicts.json"
+        );
+        let raw = std::fs::read_to_string(path).expect("read corpus");
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("parse corpus");
+        for case in v["cases"].as_array().expect("cases") {
+            let name = case["name"].as_str().unwrap_or("");
+            let payload = case["payload"].as_str().expect("payload");
+            let expected = case["exempt"].as_bool().expect("exempt");
+            let got = is_zero_action_exempt_shell_payload("bash", payload);
+            assert_eq!(
+                got, expected,
+                "corpus case mismatch: {name} payload={payload} got={got} expected={expected}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -15185,6 +15322,45 @@ mod tests {
         );
     }
 
+    /// The lexical empty-results path must still emit the additive response
+    /// contract, otherwise `include_related` is a silent no-op and
+    /// `graph_expanded_ids` disappears on exactly the path callers hit most.
+    #[tokio::test]
+    async fn lexical_empty_results_report_include_related_warning_and_graph_contract() {
+        let dir = std::env::temp_dir().join(format!("ns-lex-empty-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database"),
+        );
+        store.init("probe").await.expect("init the schema");
+        let text = handle_search_memory(
+            serde_json::json!({
+                "namespace": "probe",
+                "query": "no such memory exists here",
+                "mode": "lexical-inhouse",
+                "include_related": true
+            }),
+            Arc::new(StubEmbedder),
+            store,
+        )
+        .await;
+        assert!(
+            text.contains("No relevant memories found."),
+            "empty-result message preserved: {text}"
+        );
+        assert!(
+            text.contains(crate::search::INCLUDE_RELATED_DEPRECATION_WARNING),
+            "deprecation warning must appear on the empty lexical path: {text}"
+        );
+        assert!(
+            text.contains("graph_expanded_ids"),
+            "graph contract line must appear on the empty lexical path: {text}"
+        );
+        assert!(
+            text.contains("search_contract"),
+            "additive contract line must be present: {text}"
+        );
+    }
+
     /// A store holding two rules in two different domains, so a domain filter
     /// has something to choose between.
     async fn store_with_two_domains(namespace: &str) -> (Arc<dyn VectorStore>, String, String) {
@@ -15581,6 +15757,7 @@ mod tests {
 
     #[tokio::test]
     async fn related_surface_emits_deprecation_presentation() {
+        let _related_guard = crate::server::related_traversal_test_lock();
         let (store, rule_id) = store_with_deprecated_rule("probe").await;
         let lb = crate::traits::VectorStore::as_any(store.as_ref())
             .downcast_ref::<crate::store::LadybugStore>()
@@ -15620,9 +15797,10 @@ mod tests {
 
     #[tokio::test]
     async fn related_resolves_file_seed_across_absolute_and_relative_spellings() {
+        let _related_guard = crate::server::related_traversal_test_lock();
         let tmp = tempfile::tempdir().expect("temp dir");
         let store: Arc<dyn VectorStore> = Arc::new(
-            crate::store::ladybug::LadybugStore::for_testing(&tmp.path().join("db"), 4)
+            crate::store::ladybug::LadybugStore::for_testing(tmp.path().join("db"), 4)
                 .expect("open temp database"),
         );
         store.init("ns").await.expect("init namespace");
@@ -15687,9 +15865,10 @@ mod tests {
 
     #[tokio::test]
     async fn related_unresolvable_absolute_file_seed_returns_explicit_error() {
+        let _related_guard = crate::server::related_traversal_test_lock();
         let tmp = tempfile::tempdir().expect("temp dir");
         let store: Arc<dyn VectorStore> = Arc::new(
-            crate::store::ladybug::LadybugStore::for_testing(&tmp.path().join("db"), 4)
+            crate::store::ladybug::LadybugStore::for_testing(tmp.path().join("db"), 4)
                 .expect("open temp database"),
         );
         store.init("ns").await.expect("init namespace");
@@ -16318,7 +16497,7 @@ mod tests {
     async fn memories_for_file_absolute_and_relative_spellings_resolve_identically() {
         let tmp = tempfile::tempdir().expect("temp dir");
         let store: Arc<dyn VectorStore> = Arc::new(
-            crate::store::ladybug::LadybugStore::for_testing(&tmp.path().join("db"), 4)
+            crate::store::ladybug::LadybugStore::for_testing(tmp.path().join("db"), 4)
                 .expect("open temp database"),
         );
         store.init("ns").await.expect("init namespace");
@@ -16405,7 +16584,7 @@ mod tests {
     async fn memories_for_file_and_context_plan_reject_unresolvable_outside_path_even_if_stored() {
         let tmp = tempfile::tempdir().expect("temp dir");
         let store: Arc<dyn VectorStore> = Arc::new(
-            crate::store::ladybug::LadybugStore::for_testing(&tmp.path().join("db"), 4)
+            crate::store::ladybug::LadybugStore::for_testing(tmp.path().join("db"), 4)
                 .expect("open temp database"),
         );
         store.init("ns").await.expect("init namespace");
@@ -16493,7 +16672,7 @@ mod tests {
     async fn memories_for_file_unions_ast_neighborhood_across_equivalent_spellings() {
         let tmp = tempfile::tempdir().expect("temp dir");
         let store: Arc<dyn VectorStore> = Arc::new(
-            crate::store::ladybug::LadybugStore::for_testing(&tmp.path().join("db"), 4)
+            crate::store::ladybug::LadybugStore::for_testing(tmp.path().join("db"), 4)
                 .expect("open temp database"),
         );
         store.init("ns").await.expect("init namespace");
@@ -19093,6 +19272,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
+    /// The T_DIFF escalation trigger is fed by a caller-supplied scope count,
+    /// so `staged_file_count` must be a declared (optional) schema property.
+    #[tokio::test]
+    async fn memories_for_file_schema_declares_optional_staged_file_count() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: "tools/list".to_string(),
+            params: Some(serde_json::json!({})),
+        };
+        let (bus, _seen) = recording_bus();
+        let response =
+            process_mcp_request(request, Arc::new(StubEmbedder), store, ingests, None, bus).await;
+        let tools = response["result"]["tools"]
+            .as_array()
+            .expect("tools/list returns an array");
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == "neurostrata_memories_for_file")
+            .expect("memories_for_file tool must be listed");
+        let schema = &tool["inputSchema"];
+        assert_eq!(schema["properties"]["staged_file_count"]["type"], "integer");
+        let required = schema["required"].as_array().expect("required array");
+        assert!(
+            !required
+                .iter()
+                .any(|v| v.as_str() == Some("staged_file_count")),
+            "staged_file_count must stay optional (absent = no diff-tour trigger)"
+        );
+    }
+
     /// Every tool the surface exposes, in the order tools/list returns them.
     /// Clients pin this list; a silent rename orphans their wiring.
     /// Keep in sync with the entries in `process_mcp_request` -> `"tools/list"`.
@@ -20992,6 +21204,45 @@ mod tests {
             !required_names.contains(&"namespace"),
             "namespace must not be in required: {:?}",
             required_names
+        );
+    }
+
+    /// Task 13 P1-7: a failed MCP tools/call with no `namespace` still writes a
+    /// post-dispatch receipt (under "global") — MCP completeness is 100%.
+    #[tokio::test]
+    async fn tools_call_without_namespace_still_records_receipt() {
+        let root = std::env::temp_dir().join(format!("ns-mcp-no-ns-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join(".git")).expect("worktree marker");
+        let store = Arc::new(MockStore::new());
+        let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "name": "neurostrata_search_memory",
+                "arguments": { "project_root": root.display().to_string() }
+            })),
+        };
+        let (bus, _seen) = recording_bus();
+        let _ = process_mcp_request(
+            request,
+            Arc::new(StubEmbedder),
+            store,
+            ingests,
+            None,
+            bus,
+        )
+        .await;
+        let ledger = root.join(".NeuroStrata").join("session_queries.json");
+        let text = std::fs::read_to_string(&ledger)
+            .unwrap_or_else(|e| panic!("no receipt ledger at {}: {e}", ledger.display()));
+        let doc: serde_json::Value = serde_json::from_str(&text).expect("ledger json");
+        let events = doc["events"].as_array().expect("events");
+        assert!(
+            events.iter().any(|e| e["tool"] == "neurostrata_search_memory"
+                && e["namespace"] == "global"),
+            "missing-namespace call must still record a receipt: {events:?}"
         );
     }
 
@@ -22912,7 +23163,7 @@ mod context_plan_tests {
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let store: Arc<dyn VectorStore> = Arc::new(
-            crate::store::LadybugStore::for_testing(&tmp.path().join("db"), 4).expect("open"),
+            crate::store::LadybugStore::for_testing(tmp.path().join("db"), 4).expect("open"),
         );
         store.init("ns").await.expect("init ns");
 
@@ -23335,7 +23586,7 @@ mod context_plan_tests {
             serde_json::json!({"namespace":"test","max_items":2,"format":"json","query":"test"});
         let embedder = Arc::new(LocalStubEmbedder);
         let store: Arc<dyn crate::traits::VectorStore> = Arc::new(
-            crate::store::LadybugStore::for_testing(&std::env::temp_dir().join("plan-test"), 4)
+            crate::store::LadybugStore::for_testing(std::env::temp_dir().join("plan-test"), 4)
                 .expect("open"),
         );
         store.init("test").await.unwrap();
@@ -23376,7 +23627,7 @@ mod context_plan_tests {
         let embedder = Arc::new(LocalStubEmbedder);
         let store: Arc<dyn crate::traits::VectorStore> = Arc::new(
             crate::store::LadybugStore::for_testing(
-                &std::env::temp_dir().join("plan-alias-test"),
+                std::env::temp_dir().join("plan-alias-test"),
                 4,
             )
             .expect("open"),
@@ -23453,9 +23704,8 @@ mod context_plan_tests {
         use crate::traits::MemoryPayload;
         let tmp_dir = std::env::temp_dir().join(format!("ns-golden-snap-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
-        let store: Arc<dyn crate::traits::VectorStore> = Arc::new(
-            crate::store::LadybugStore::for_testing(&tmp_dir.join("db"), 4).expect("open"),
-        );
+        let store: Arc<dyn crate::traits::VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(tmp_dir.join("db"), 4).expect("open"));
         store.init("global").await.unwrap();
         store.init("probe").await.unwrap();
 
@@ -23569,7 +23819,7 @@ mod context_plan_tests {
     async fn scenario_plan_ontology_diff_dispatches_zero_mutation_report() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let store: Arc<dyn crate::traits::VectorStore> = Arc::new(
-            crate::store::LadybugStore::for_testing(&tmp.path().join("db"), 4)
+            crate::store::LadybugStore::for_testing(tmp.path().join("db"), 4)
                 .expect("open temp database"),
         );
         store.init("probe-plan").await.expect("init namespace");

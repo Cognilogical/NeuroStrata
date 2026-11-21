@@ -1,5 +1,5 @@
-use async_trait::async_trait;
 use anyhow::{anyhow, Result};
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -81,6 +81,19 @@ pub struct ExternalEffectReceipt {
     pub details: String,
 }
 
+/// Post-effect state the kernel persists for a connector whose records are
+/// not already durable. `prior_records` is the pointer's state before this
+/// effect; the persistence layer compares it with the stored row so a
+/// concurrent same-pointer write is a conflict instead of a lost update.
+#[derive(Debug, Clone)]
+pub struct WriteBackSnapshot {
+    pub prior_records: Vec<Value>,
+    pub pointer_records: Vec<Value>,
+    /// The receipt produced by the written pointer's latest effect, keyed by
+    /// the connector's idempotency key.
+    pub idempotency: HashMap<String, ExternalEffectReceipt>,
+}
+
 #[async_trait]
 pub trait DataConnector: Send + Sync {
     fn connector_id(&self) -> &str;
@@ -115,6 +128,46 @@ pub trait DataConnector: Send + Sync {
         pointer_uri: &str,
         req: &ExternalEffectRequest,
     ) -> Result<ExternalEffectReceipt>;
+
+    /// Full record snapshot for connectors whose records are not otherwise
+    /// durable. `None` means the connector already persists its own state
+    /// (for example a file-backed connector) and needs no write-through.
+    ///
+    /// The snapshot is per written pointer plus the receipts to retain, so
+    /// concurrent kernels writing different pointers do not overwrite each
+    /// other's records.
+    async fn snapshot_write_back(
+        &self,
+        pool_id: &str,
+        pointer_uri: &str,
+    ) -> Result<Option<WriteBackSnapshot>> {
+        let _ = (pool_id, pointer_uri);
+        Ok(None)
+    }
+
+    /// Restore persisted idempotency receipts during pool hydration.
+    async fn hydrate_idempotency(
+        &self,
+        pool_id: &str,
+        receipts: &HashMap<String, ExternalEffectReceipt>,
+    ) -> Result<()> {
+        let _ = (pool_id, receipts);
+        Ok(())
+    }
+
+    /// Roll back an in-memory effect whose persistence was rejected, so a
+    /// reused kernel does not expose an uncommitted mutation or replay its
+    /// receipt.
+    async fn rollback_write_back(
+        &self,
+        pool_id: &str,
+        pointer_uri: &str,
+        prior_records: &[Value],
+        idempotency: &HashMap<String, ExternalEffectReceipt>,
+    ) -> Result<()> {
+        let _ = (pool_id, pointer_uri, prior_records, idempotency);
+        Ok(())
+    }
 }
 
 pub struct DataConnectorRegistry {
@@ -152,7 +205,9 @@ impl DataConnectorRegistry {
     }
 
     fn load_configured_pool_schemas(workspace_root: &Path) -> Vec<DataPoolSchema> {
-        let config_path = workspace_root.join(".NeuroStrata").join("connector_pools.json");
+        let config_path = workspace_root
+            .join(".NeuroStrata")
+            .join("connector_pools.json");
         let Ok(raw) = std::fs::read_to_string(&config_path) else {
             return Vec::new();
         };
@@ -224,6 +279,13 @@ struct InMemoryPoolEntry {
     schema: DataPoolSchema,
     records: HashMap<String, Vec<Value>>,
     idempotency: HashMap<String, ExternalEffectReceipt>,
+    /// Pointer records before the most recent effect, used by the kernel to
+    /// detect a concurrent same-pointer write at persistence time.
+    prior_records: HashMap<String, Vec<Value>>,
+    /// Idempotency key produced by the pointer's most recent effect. Only
+    /// that receipt is snapshotted for persistence, so a receipt from a
+    /// rejected write is never made durable by a later write elsewhere.
+    last_receipt_keys: HashMap<String, String>,
 }
 
 pub struct InMemoryPoolConnector {
@@ -245,11 +307,16 @@ impl InMemoryPoolConnector {
         if let Some(entry) = pools.get_mut(&pool_id) {
             entry.schema = schema;
         } else {
-            pools.insert(pool_id, InMemoryPoolEntry {
-                schema,
-                records: HashMap::new(),
-                idempotency: HashMap::new(),
-            });
+            pools.insert(
+                pool_id,
+                InMemoryPoolEntry {
+                    schema,
+                    records: HashMap::new(),
+                    idempotency: HashMap::new(),
+                    prior_records: HashMap::new(),
+                    last_receipt_keys: HashMap::new(),
+                },
+            );
         }
     }
 
@@ -338,7 +405,9 @@ impl DataConnector for InMemoryPoolConnector {
         max_bytes: u32,
     ) -> Result<DataSlicePayload> {
         let pools = self.pools.read().unwrap();
-        let pool = pools.get(pool_id).ok_or_else(|| anyhow!("pool '{}' not found", pool_id))?;
+        let pool = pools
+            .get(pool_id)
+            .ok_or_else(|| anyhow!("pool '{}' not found", pool_id))?;
         let all_records = pool.records.get(pointer_uri).ok_or_else(|| {
             anyhow!(
                 "pointer_uri '{}' not found in pool '{}'",
@@ -379,13 +448,21 @@ impl DataConnector for InMemoryPoolConnector {
         req: &ExternalEffectRequest,
     ) -> Result<ExternalEffectReceipt> {
         let mut pools = self.pools.write().unwrap();
-        let pool = pools.get_mut(pool_id).ok_or_else(|| anyhow!("pool '{}' not found", pool_id))?;
+        let pool = pools
+            .get_mut(pool_id)
+            .ok_or_else(|| anyhow!("pool '{}' not found", pool_id))?;
         let idempotency_key = format!("{}:{}:{}", pool_id, pointer_uri, req.idempotency_key);
         if pool.schema.access_mode == DataPoolAccessMode::ReadOnly {
             return Err(anyhow!("pool '{}' is read-only", pool_id));
         }
-        if let Some(receipt) = pool.idempotency.get(&idempotency_key) {
-            return Ok(receipt.clone());
+        if let Some(receipt) = pool.idempotency.get(&idempotency_key).cloned() {
+            // A replay changes nothing; record the current state as "prior"
+            // so persistence does not report a self-conflict.
+            let current = pool.records.get(pointer_uri).cloned().unwrap_or_default();
+            pool.prior_records.insert(pointer_uri.to_string(), current);
+            pool.last_receipt_keys
+                .insert(pointer_uri.to_string(), idempotency_key.clone());
+            return Ok(receipt);
         }
         let all_records = pool.records.get_mut(pointer_uri).ok_or_else(|| {
             anyhow!(
@@ -394,6 +471,7 @@ impl DataConnector for InMemoryPoolConnector {
                 pool_id
             )
         })?;
+        let prior_records = all_records.clone();
         let current_source_sha = InMemoryPoolConnector::compute_source_sha256(all_records);
         if let Some(expected) = &req.expected_source_sha256 {
             if *expected != current_source_sha {
@@ -425,6 +503,10 @@ impl DataConnector for InMemoryPoolConnector {
             }
         }
         let new_source_sha = InMemoryPoolConnector::compute_source_sha256(all_records);
+        pool.prior_records
+            .insert(pointer_uri.to_string(), prior_records);
+        pool.last_receipt_keys
+            .insert(pointer_uri.to_string(), idempotency_key.clone());
         let receipt = ExternalEffectReceipt {
             pointer_id: pointer_uri.to_string(),
             connector_id: self.connector_id().to_string(),
@@ -438,6 +520,87 @@ impl DataConnector for InMemoryPoolConnector {
         };
         pool.idempotency.insert(idempotency_key, receipt.clone());
         Ok(receipt)
+    }
+
+    /// #331: records live only in this connector's map. Return the written
+    /// pointer's post-effect records plus the receipts to retain; the kernel
+    /// merges them into the persisted pool state.
+    async fn snapshot_write_back(
+        &self,
+        pool_id: &str,
+        pointer_uri: &str,
+    ) -> Result<Option<WriteBackSnapshot>> {
+        let pools = self.pools.read().unwrap();
+        let Some(entry) = pools.get(pool_id) else {
+            return Ok(None);
+        };
+        let pointer_records = entry.records.get(pointer_uri).cloned().unwrap_or_default();
+        let prior_records = entry
+            .prior_records
+            .get(pointer_uri)
+            .cloned()
+            .unwrap_or_else(|| pointer_records.clone());
+        // Review 490f0340#r4650391609: snapshot only the receipt produced by
+        // this pointer's latest effect. A receipt whose persistence was
+        // rejected stays out of later snapshots (and therefore out of the
+        // durable row).
+        let mut idempotency = HashMap::new();
+        if let Some(key) = entry.last_receipt_keys.get(pointer_uri) {
+            if let Some(receipt) = entry.idempotency.get(key) {
+                idempotency.insert(key.clone(), receipt.clone());
+            }
+        }
+        Ok(Some(WriteBackSnapshot {
+            prior_records,
+            pointer_records,
+            idempotency,
+        }))
+    }
+
+    async fn hydrate_idempotency(
+        &self,
+        pool_id: &str,
+        receipts: &HashMap<String, ExternalEffectReceipt>,
+    ) -> Result<()> {
+        if let Some(entry) = self.pools.write().unwrap().get_mut(pool_id) {
+            entry
+                .idempotency
+                .extend(receipts.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+        Ok(())
+    }
+
+    /// Review 700fdbe0#r4650486569: a rejected persistence restores the
+    /// pointer's pre-effect records and drops the uncommitted receipt. A
+    /// replay (records already equal to prior) is left untouched.
+    async fn rollback_write_back(
+        &self,
+        pool_id: &str,
+        pointer_uri: &str,
+        prior_records: &[Value],
+        idempotency: &HashMap<String, ExternalEffectReceipt>,
+    ) -> Result<()> {
+        let mut pools = self.pools.write().unwrap();
+        let Some(entry) = pools.get_mut(pool_id) else {
+            return Ok(());
+        };
+        let changed = entry
+            .records
+            .get(pointer_uri)
+            .map(|records| records.as_slice())
+            != Some(prior_records);
+        if !changed {
+            return Ok(());
+        }
+        entry
+            .records
+            .insert(pointer_uri.to_string(), prior_records.to_vec());
+        for key in idempotency.keys() {
+            entry.idempotency.remove(key);
+        }
+        entry.prior_records.remove(pointer_uri);
+        entry.last_receipt_keys.remove(pointer_uri);
+        Ok(())
     }
 }
 
@@ -474,13 +637,22 @@ impl JsonFilePoolConnector {
             match comp {
                 std::path::Component::Normal(_) | std::path::Component::CurDir => {}
                 std::path::Component::ParentDir => {
-                    return Err(anyhow!("pointer_uri '{}' must not contain '..'", pointer_uri));
+                    return Err(anyhow!(
+                        "pointer_uri '{}' must not contain '..'",
+                        pointer_uri
+                    ));
                 }
                 std::path::Component::RootDir => {
-                    return Err(anyhow!("pointer_uri '{}' must be relative to workspace root", pointer_uri));
+                    return Err(anyhow!(
+                        "pointer_uri '{}' must be relative to workspace root",
+                        pointer_uri
+                    ));
                 }
                 std::path::Component::Prefix(_) => {
-                    return Err(anyhow!("pointer_uri '{}' must not contain a prefix component", pointer_uri));
+                    return Err(anyhow!(
+                        "pointer_uri '{}' must not contain a prefix component",
+                        pointer_uri
+                    ));
                 }
             }
         }
@@ -489,14 +661,21 @@ impl JsonFilePoolConnector {
         } else {
             self.workspace_root.join(&p)
         };
-        let root_canonical = self.workspace_root.canonicalize().unwrap_or_else(|_| self.workspace_root.clone());
+        let root_canonical = self
+            .workspace_root
+            .canonicalize()
+            .unwrap_or_else(|_| self.workspace_root.clone());
         let canonical = match abs.canonicalize() {
             Ok(c) => c,
             Err(_) => {
                 // If pointer does not exist yet (e.g. for append), resolve the parent and join file name
                 let parent = abs.parent().unwrap_or_else(|| Path::new("."));
-                let file_name = abs.file_name().ok_or_else(|| anyhow!("invalid pointer path '{}'", pointer_uri))?;
-                let parent_canonical = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
+                let file_name = abs
+                    .file_name()
+                    .ok_or_else(|| anyhow!("invalid pointer path '{}'", pointer_uri))?;
+                let parent_canonical = parent
+                    .canonicalize()
+                    .unwrap_or_else(|_| parent.to_path_buf());
                 let canonical = parent_canonical.join(file_name);
                 canonical
             }
@@ -526,12 +705,16 @@ impl JsonFilePoolConnector {
             if line.is_empty() {
                 continue;
             }
-            let value: Value = serde_json::from_str(line)
-                .map_err(|e| anyhow!("invalid JSON line in {}: {} -> {}", path.display(), line, e))?;
+            let value: Value = serde_json::from_str(line).map_err(|e| {
+                anyhow!("invalid JSON line in {}: {} -> {}", path.display(), line, e)
+            })?;
             records.push(value);
         }
         if records.is_empty() {
-            return Err(anyhow!("file {} is empty or not valid JSON/JSONL", path.display()));
+            return Err(anyhow!(
+                "file {} is empty or not valid JSON/JSONL",
+                path.display()
+            ));
         }
         Ok(records)
     }
@@ -757,7 +940,9 @@ mod tests {
         });
         c.seed_records("p", "uri", vec![json!(1), json!(2), json!(3)]);
         let rt = rt();
-        let payload = rt.block_on(c.resolve_slice("p", "uri", 1, 1, 1024)).unwrap();
+        let payload = rt
+            .block_on(c.resolve_slice("p", "uri", 1, 1, 1024))
+            .unwrap();
         assert_eq!(payload.records.len(), 1);
         assert_eq!(payload.records[0], json!(2));
         // source hash = hash of full vec, slice hash = hash of slice
@@ -792,12 +977,16 @@ mod tests {
             expected_source_sha256: None,
             idempotency_key: "key1".into(),
         };
-        let receipt = rt.block_on(c.apply_external_effect("p", "uri", &req)).unwrap();
+        let receipt = rt
+            .block_on(c.apply_external_effect("p", "uri", &req))
+            .unwrap();
         assert!(receipt.applied);
         // prior and new should differ after append
         assert_ne!(receipt.prior_source_sha256, receipt.new_source_sha256);
         // Replay idempotency
-        let receipt2 = rt.block_on(c.apply_external_effect("p", "uri", &req)).unwrap();
+        let receipt2 = rt
+            .block_on(c.apply_external_effect("p", "uri", &req))
+            .unwrap();
         assert_eq!(receipt2.new_source_sha256, receipt.new_source_sha256);
         // CAS conflict
         let bad_req = ExternalEffectRequest {
@@ -808,7 +997,9 @@ mod tests {
             expected_source_sha256: Some("0000".into()),
             idempotency_key: "key2".into(),
         };
-        let err = rt.block_on(c.apply_external_effect("p", "uri", &bad_req)).unwrap_err();
+        let err = rt
+            .block_on(c.apply_external_effect("p", "uri", &bad_req))
+            .unwrap_err();
         assert!(err.to_string().contains("CAS conflict"));
     }
 
@@ -834,7 +1025,9 @@ mod tests {
             expected_source_sha256: None,
             idempotency_key: "key1".into(),
         };
-        let err = rt.block_on(c.apply_external_effect("ro", "uri", &req)).unwrap_err();
+        let err = rt
+            .block_on(c.apply_external_effect("ro", "uri", &req))
+            .unwrap_err();
         assert!(err.to_string().contains("read-only"));
     }
 
@@ -857,11 +1050,15 @@ mod tests {
             description: "test".into(),
         });
         let rt = rt();
-        let payload = rt.block_on(c.resolve_slice("jp", "data.json", 0, 10, 1024)).unwrap();
+        let payload = rt
+            .block_on(c.resolve_slice("jp", "data.json", 0, 10, 1024))
+            .unwrap();
         assert_eq!(payload.records.len(), 2);
         assert_eq!(payload.source_sha256, payload.slice_sha256);
         // Path traversal
-        let err = rt.block_on(c.resolve_slice("jp", "../outside.json", 0, 10, 1024)).unwrap_err();
+        let err = rt
+            .block_on(c.resolve_slice("jp", "../outside.json", 0, 10, 1024))
+            .unwrap_err();
         assert!(err.to_string().contains("must not contain '..'"));
         // Write-back
         let req = ExternalEffectRequest {
@@ -872,7 +1069,9 @@ mod tests {
             expected_source_sha256: None,
             idempotency_key: "k1".into(),
         };
-        let receipt = rt.block_on(c.apply_external_effect("jp", "data.json", &req)).unwrap();
+        let receipt = rt
+            .block_on(c.apply_external_effect("jp", "data.json", &req))
+            .unwrap();
         assert!(receipt.applied);
         // Check file
         let new_content = std::fs::read_to_string(&file_path).unwrap();
@@ -900,10 +1099,16 @@ mod tests {
             description: "test".into(),
         });
         let rt = rt();
-        let err = rt.block_on(c.resolve_slice("jp", "nonexistent_dir/../../outside.json", 0, 10, 1024)).unwrap_err();
+        let err = rt
+            .block_on(c.resolve_slice("jp", "nonexistent_dir/../../outside.json", 0, 10, 1024))
+            .unwrap_err();
         assert!(err.to_string().contains("must not contain '..'"));
-        let err = rt.block_on(c.resolve_slice("jp", "/etc/passwd", 0, 10, 1024)).unwrap_err();
-        assert!(err.to_string().contains("must be relative to workspace root"));
+        let err = rt
+            .block_on(c.resolve_slice("jp", "/etc/passwd", 0, 10, 1024))
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("must be relative to workspace root"));
         let req = ExternalEffectRequest {
             pointer_id: "../outside.json".into(),
             operation: "append".into(),
@@ -912,7 +1117,9 @@ mod tests {
             expected_source_sha256: None,
             idempotency_key: "k1".into(),
         };
-        let err = rt.block_on(c.apply_external_effect("jp", "../outside.json", &req)).unwrap_err();
+        let err = rt
+            .block_on(c.apply_external_effect("jp", "../outside.json", &req))
+            .unwrap_err();
         assert!(err.to_string().contains("must not contain '..'"));
         std::fs::remove_dir_all(&root).unwrap();
     }

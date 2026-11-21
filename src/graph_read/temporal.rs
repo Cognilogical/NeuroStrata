@@ -50,11 +50,12 @@ pub fn parse_temporal(raw: &str) -> Option<i64> {
     }
     // Date-only ISO-8601 ("2026-10-27") is the other shape ingest writes.
     if let Ok(date) = chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
-        return date
-            .and_hms_opt(0, 0, 0)
-            .map(|dt| dt.and_utc().timestamp());
+        return date.and_hms_opt(0, 0, 0).map(|dt| dt.and_utc().timestamp());
     }
-    tracing::warn!("unparseable temporal timestamp '{}'; treating bound as absent", raw);
+    tracing::warn!(
+        "unparseable temporal timestamp '{}'; treating bound as absent",
+        raw
+    );
     None
 }
 
@@ -67,7 +68,9 @@ pub fn extract_query_timestamp(query: &str) -> Option<i64> {
         if tok.len() == 10 && tok.as_bytes()[4] == b'-' && tok.as_bytes()[7] == b'-' {
             if let Ok(date) = chrono::NaiveDate::parse_from_str(tok, "%Y-%m-%d") {
                 return Some(
-                    date.and_hms_opt(0, 0, 0).map(|dt| dt.and_utc().timestamp()).unwrap_or(0),
+                    date.and_hms_opt(0, 0, 0)
+                        .map(|dt| dt.and_utc().timestamp())
+                        .unwrap_or(0),
                 );
             }
         } else if tok.contains('T') && tok.len() >= 19 {
@@ -88,19 +91,35 @@ pub fn extract_query_timestamp(query: &str) -> Option<i64> {
 pub fn temporal_proximity_boost(query_ts: i64, metadata: &serde_json::Value) -> f32 {
     let ts = if let Some(v) = metadata.get("valid_from").and_then(|v| v.as_str()) {
         parse_temporal(v).filter(|&t| t > 0)
-    } else if let Some(v) = metadata.get("valid_from").and_then(|v| v.as_i64()).filter(|&n| n > 0) {
+    } else if let Some(v) = metadata
+        .get("valid_from")
+        .and_then(|v| v.as_i64())
+        .filter(|&n| n > 0)
+    {
         Some(v)
     } else if let Some(v) = metadata.get("created_at").and_then(|v| v.as_str()) {
         parse_temporal(v).filter(|&t| t > 0)
-    } else if let Some(v) = metadata.get("created_at").and_then(|v| v.as_i64()).filter(|&n| n > 0) {
+    } else if let Some(v) = metadata
+        .get("created_at")
+        .and_then(|v| v.as_i64())
+        .filter(|&n| n > 0)
+    {
         Some(v)
     } else if let Some(v) = metadata.get("timestamp").and_then(|v| v.as_str()) {
         parse_temporal(v).filter(|&t| t > 0)
-    } else if let Some(v) = metadata.get("timestamp").and_then(|v| v.as_i64()).filter(|&n| n > 0) {
+    } else if let Some(v) = metadata
+        .get("timestamp")
+        .and_then(|v| v.as_i64())
+        .filter(|&n| n > 0)
+    {
         Some(v)
     } else if let Some(v) = metadata.get("date").and_then(|v| v.as_str()) {
         parse_temporal(v).filter(|&t| t > 0)
-    } else if let Some(v) = metadata.get("date").and_then(|v| v.as_i64()).filter(|&n| n > 0) {
+    } else if let Some(v) = metadata
+        .get("date")
+        .and_then(|v| v.as_i64())
+        .filter(|&n| n > 0)
+    {
         Some(v)
     } else {
         None
@@ -132,7 +151,10 @@ fn item_window(
     if edge_valid_to > 0 {
         hi = hi.min(edge_valid_to);
     }
-    if let Some(from) = payload_valid_from.and_then(parse_temporal).filter(|&v| v > 0) {
+    if let Some(from) = payload_valid_from
+        .and_then(parse_temporal)
+        .filter(|&v| v > 0)
+    {
         lo = lo.max(from);
     }
     if let Some(to) = payload_valid_to.and_then(parse_temporal).filter(|&v| v > 0) {
@@ -194,8 +216,20 @@ mod tests {
 
     #[test]
     fn zero_edge_bounds_are_unbounded() {
-        assert!(is_temporally_active(0, 0, None, None, &filter(Some(1), None, None)));
-        assert!(is_temporally_active(0, 0, None, None, &filter(None, Some(-10), Some(10))));
+        assert!(is_temporally_active(
+            0,
+            0,
+            None,
+            None,
+            &filter(Some(1), None, None)
+        ));
+        assert!(is_temporally_active(
+            0,
+            0,
+            None,
+            None,
+            &filter(None, Some(-10), Some(10))
+        ));
     }
 
     #[test]
@@ -245,12 +279,24 @@ mod tests {
             &filter(None, Some(10), Some(5)),
         ));
         // Edge lower bound after the upper bound is an empty interval.
-        assert!(!is_temporally_active(100, 50, None, None, &filter(Some(75), None, None)));
+        assert!(!is_temporally_active(
+            100,
+            50,
+            None,
+            None,
+            &filter(Some(75), None, None)
+        ));
     }
 
     #[test]
     fn unbounded_filter_accepts_any_consistent_window() {
-        assert!(is_temporally_active(1, 2, None, None, &TemporalFilter::default()));
+        assert!(is_temporally_active(
+            1,
+            2,
+            None,
+            None,
+            &TemporalFilter::default()
+        ));
         assert!(TemporalFilter::default().is_unbounded());
         assert!(!filter(Some(1), None, None).is_unbounded());
     }
@@ -265,17 +311,26 @@ mod tests {
 
     #[test]
     fn extract_query_timestamp_finds_iso_date() {
-        assert_eq!(extract_query_timestamp("hello world 2026-10-27 test"), Some(1_793_059_200));
+        assert_eq!(
+            extract_query_timestamp("hello world 2026-10-27 test"),
+            Some(1_793_059_200)
+        );
     }
 
     #[test]
     fn extract_query_timestamp_finds_rfc3339() {
-        assert_eq!(extract_query_timestamp("query 2026-10-27T12:00:00Z more text"), Some(1_793_102_400));
+        assert_eq!(
+            extract_query_timestamp("query 2026-10-27T12:00:00Z more text"),
+            Some(1_793_102_400)
+        );
     }
 
     #[test]
     fn extract_query_timestamp_skips_ordinary_words() {
-        assert_eq!(extract_query_timestamp("the quick brown fox jumps over the lazy dog"), None);
+        assert_eq!(
+            extract_query_timestamp("the quick brown fox jumps over the lazy dog"),
+            None
+        );
     }
 
     #[test]
@@ -285,7 +340,10 @@ mod tests {
 
     #[test]
     fn extract_query_timestamp_handles_punctuation_around_dates() {
-        assert_eq!(extract_query_timestamp("(\"2026-10-27\") and [2026-11-15] data"), Some(1_793_059_200));
+        assert_eq!(
+            extract_query_timestamp("(\"2026-10-27\") and [2026-11-15] data"),
+            Some(1_793_059_200)
+        );
     }
 
     #[test]
@@ -303,7 +361,10 @@ mod tests {
 
     #[test]
     fn temporal_proximity_boost_missing_metadata_returns_zero() {
-        assert_eq!(temporal_proximity_boost(1_000_000, &serde_json::Value::Null), 0.0);
+        assert_eq!(
+            temporal_proximity_boost(1_000_000, &serde_json::Value::Null),
+            0.0
+        );
     }
 
     #[test]

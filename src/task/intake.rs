@@ -305,7 +305,6 @@ pub struct ResolveCandidateResult {
     pub task_id: Option<String>,
 }
 
-
 /// Generate a deterministic ID for a receipt.
 /// Uses SHA-256 (not `DefaultHasher`, which is toolchain-unstable) so the
 /// persisted MERGE keys survive Rust version changes.
@@ -316,7 +315,10 @@ pub fn generate_receipt_id(namespace: &str, source_digest: &str) -> String {
     hasher.update([0u8]);
     hasher.update(source_digest.as_bytes());
     let digest = hasher.finalize();
-    format!("rcpt-{:016x}", u64::from_be_bytes(digest[..8].try_into().unwrap()))
+    format!(
+        "rcpt-{:016x}",
+        u64::from_be_bytes(digest[..8].try_into().unwrap())
+    )
 }
 
 /// Generate a deterministic ID for a candidate (SHA-256, toolchain-stable).
@@ -329,7 +331,10 @@ fn generate_candidate_id(namespace: &str, receipt_id: &str, index: usize) -> Str
     hasher.update([0u8]);
     hasher.update(index.to_le_bytes());
     let digest = hasher.finalize();
-    format!("cand-{:016x}", u64::from_be_bytes(digest[..8].try_into().unwrap()))
+    format!(
+        "cand-{:016x}",
+        u64::from_be_bytes(digest[..8].try_into().unwrap())
+    )
 }
 
 /// Extract title from text using heuristics.
@@ -355,11 +360,21 @@ pub fn create_candidates_from_intents(
     if let Some(title) = request.title.clone() {
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
         let candidate_kind = request.candidate_kind.clone().unwrap_or_else(|| {
-            if title.starts_with("[rule_candidate]") { "rule".to_string() } else { "task".to_string() }
+            if title.starts_with("[rule_candidate]") {
+                "rule".to_string()
+            } else {
+                "task".to_string()
+            }
         });
-        let kind = request.kind.clone().unwrap_or_else(|| "task_obligation".to_string());
+        let kind = request
+            .kind
+            .clone()
+            .unwrap_or_else(|| "task_obligation".to_string());
         let provenance = request.provenance.clone().or_else(|| {
-            request.source_span.as_ref().and_then(|v| ProvenanceSpan::from_value(v.clone()))
+            request
+                .source_span
+                .as_ref()
+                .and_then(|v| ProvenanceSpan::from_value(v.clone()))
         });
         return vec![IntakeCandidate {
             id: generate_candidate_id(namespace, receipt_id, 0),
@@ -378,9 +393,10 @@ pub fn create_candidates_from_intents(
             category: request.category.clone(),
             payload: request.payload.clone().unwrap_or(serde_json::Value::Null),
             confidence: request.confidence,
-            source_span: request.source_span.clone().or_else(|| {
-                Some(serde_json::json!({"start": 0, "end": request.text.len()}))
-            }),
+            source_span: request
+                .source_span
+                .clone()
+                .or_else(|| Some(serde_json::json!({"start": 0, "end": request.text.len()}))),
             provenance,
             extractor_fingerprint: request
                 .extractor_fingerprint
@@ -394,7 +410,10 @@ pub fn create_candidates_from_intents(
     if intents.is_empty() {
         // No intents detected - create a single candidate from the raw text
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        let title = request.title.clone().unwrap_or_else(|| extract_title(&request.text));
+        let title = request
+            .title
+            .clone()
+            .unwrap_or_else(|| extract_title(&request.text));
         let description = request.description.clone().or_else(|| {
             if request.text.len() > title.len() {
                 Some(request.text.clone())
@@ -402,9 +421,15 @@ pub fn create_candidates_from_intents(
                 None
             }
         });
-        let kind = request.kind.clone().unwrap_or_else(|| "task_obligation".to_string());
+        let kind = request
+            .kind
+            .clone()
+            .unwrap_or_else(|| "task_obligation".to_string());
         let provenance = request.provenance.clone().or_else(|| {
-            request.source_span.as_ref().and_then(|v| ProvenanceSpan::from_value(v.clone()))
+            request
+                .source_span
+                .as_ref()
+                .and_then(|v| ProvenanceSpan::from_value(v.clone()))
         });
         candidates.push(IntakeCandidate {
             id: generate_candidate_id(namespace, receipt_id, 0),
@@ -418,14 +443,18 @@ pub fn create_candidates_from_intents(
             cas_version: 1,
             created_at: now.clone(),
             updated_at: now,
-            candidate_kind: request.candidate_kind.clone().unwrap_or_else(|| "task".to_string()),
+            candidate_kind: request
+                .candidate_kind
+                .clone()
+                .unwrap_or_else(|| "task".to_string()),
             kind,
             category: request.category.clone(),
             payload: request.payload.clone().unwrap_or(serde_json::Value::Null),
             confidence: request.confidence,
-            source_span: request.source_span.clone().or_else(|| {
-                Some(serde_json::json!({"start": 0, "end": request.text.len()}))
-            }),
+            source_span: request
+                .source_span
+                .clone()
+                .or_else(|| Some(serde_json::json!({"start": 0, "end": request.text.len()}))),
             provenance,
             extractor_fingerprint: request
                 .extractor_fingerprint
@@ -436,7 +465,11 @@ pub fn create_candidates_from_intents(
         // Create one candidate per distinct intent
         for (i, intent) in intents.into_iter().enumerate() {
             let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-            let title = format!("[{}] {}", intent.marker, intent.excerpt.chars().take(80).collect::<String>());
+            let title = format!(
+                "[{}] {}",
+                intent.marker,
+                intent.excerpt.chars().take(80).collect::<String>()
+            );
             let span = request.source_span.clone().or_else(|| {
                 request
                     .text
@@ -448,9 +481,13 @@ pub fn create_candidates_from_intents(
                 .extractor_fingerprint
                 .clone()
                 .or_else(|| Some(format!("lexical-intent:{}", intent.marker)));
-            let kind = request.kind.clone().unwrap_or_else(|| "task_obligation".to_string());
+            let kind = request
+                .kind
+                .clone()
+                .unwrap_or_else(|| "task_obligation".to_string());
             let provenance = request.provenance.clone().or_else(|| {
-                span.as_ref().and_then(|v| ProvenanceSpan::from_value(v.clone()))
+                span.as_ref()
+                    .and_then(|v| ProvenanceSpan::from_value(v.clone()))
             });
             candidates.push(IntakeCandidate {
                 id: generate_candidate_id(namespace, receipt_id, i),
@@ -464,7 +501,10 @@ pub fn create_candidates_from_intents(
                 cas_version: 1,
                 created_at: now.clone(),
                 updated_at: now,
-                candidate_kind: request.candidate_kind.clone().unwrap_or_else(|| "task".to_string()),
+                candidate_kind: request
+                    .candidate_kind
+                    .clone()
+                    .unwrap_or_else(|| "task".to_string()),
                 kind,
                 category: request.category.clone(),
                 payload: request.payload.clone().unwrap_or(serde_json::Value::Null),
@@ -517,12 +557,8 @@ pub async fn undisposed_high_confidence_obligations(
         .filter(|c| c.kind == "task_obligation")
         .filter(|c| {
             c.confidence.unwrap_or(0.0) >= 0.85
-                || c
-                    .provenance
-                    .as_ref()
-                    .is_some_and(|p| p.confidence >= 0.85)
-                || c
-                    .source_span
+                || c.provenance.as_ref().is_some_and(|p| p.confidence >= 0.85)
+                || c.source_span
                     .as_ref()
                     .and_then(|s| s.get("confidence"))
                     .and_then(|v| v.as_f64())
@@ -640,8 +676,14 @@ mod tests {
             extractor_fingerprint: None,
         };
         let intents = vec![
-            DetectedIntent { marker: "todo:".to_string(), excerpt: "TODO: fix bug".to_string() },
-            DetectedIntent { marker: "later we need to".to_string(), excerpt: "Later we need to refactor".to_string() },
+            DetectedIntent {
+                marker: "todo:".to_string(),
+                excerpt: "TODO: fix bug".to_string(),
+            },
+            DetectedIntent {
+                marker: "later we need to".to_string(),
+                excerpt: "Later we need to refactor".to_string(),
+            },
         ];
         let candidates = create_candidates_from_intents("test", "rcpt-1", &request, intents);
         assert_eq!(candidates.len(), 2);
@@ -672,17 +714,32 @@ mod tests {
     #[test]
     fn test_provenance_span_from_value_invalid() {
         assert!(ProvenanceSpan::from_value(serde_json::json!(42)).is_none());
-        assert!(ProvenanceSpan::from_value(serde_json::json!(["a","b"])).is_none());
+        assert!(ProvenanceSpan::from_value(serde_json::json!(["a", "b"])).is_none());
     }
 
     #[test]
     fn test_category_to_kind() {
-        assert_eq!(category_to_kind(&Some("fact".to_string())), CandidateKind::Fact);
-        assert_eq!(category_to_kind(&Some("decision".to_string())), CandidateKind::Decision);
-        assert_eq!(category_to_kind(&Some("rule_candidate".to_string())), CandidateKind::Rule);
-        assert_eq!(category_to_kind(&Some("rule".to_string())), CandidateKind::Rule);
+        assert_eq!(
+            category_to_kind(&Some("fact".to_string())),
+            CandidateKind::Fact
+        );
+        assert_eq!(
+            category_to_kind(&Some("decision".to_string())),
+            CandidateKind::Decision
+        );
+        assert_eq!(
+            category_to_kind(&Some("rule_candidate".to_string())),
+            CandidateKind::Rule
+        );
+        assert_eq!(
+            category_to_kind(&Some("rule".to_string())),
+            CandidateKind::Rule
+        );
         assert_eq!(category_to_kind(&None), CandidateKind::Task);
-        assert_eq!(category_to_kind(&Some("weird".to_string())), CandidateKind::Task);
+        assert_eq!(
+            category_to_kind(&Some("weird".to_string())),
+            CandidateKind::Task
+        );
     }
 
     #[tokio::test]
@@ -699,46 +756,87 @@ mod tests {
         store.init("obl-ns").await.expect("create schema");
         let intake = store.as_intake_store().expect("intake store");
         let ns = "obl-ns";
-        let prov = json!({"turn_id": "t1", "role": "user", "evidence_quote": "fix it", "confidence": 0.9});
+        let prov =
+            json!({"turn_id": "t1", "role": "user", "evidence_quote": "fix it", "confidence": 0.9});
 
         // high-conf user obligation -> should be returned
-        intake.create_receipt(crate::task::intake::CreateReceiptRequest {
-            namespace: ns.to_string(), source_kind: SourceKind::Tool,
-            source_revision: "r1".to_string(), source_digest: "d1".to_string(),
-            text: "obligation one".to_string(), title: Some("Fix login".to_string()),
-            description: None, candidate_kind: None, kind: Some("task_obligation".to_string()),
-            category: None, payload: None, confidence: Some(0.9),
-            source_span: None, provenance: Some(serde_json::from_value::<ProvenanceSpan>(prov.clone()).unwrap()),
-            extractor_fingerprint: None,
-        }).await.expect("create receipt 1");
+        intake
+            .create_receipt(crate::task::intake::CreateReceiptRequest {
+                namespace: ns.to_string(),
+                source_kind: SourceKind::Tool,
+                source_revision: "r1".to_string(),
+                source_digest: "d1".to_string(),
+                text: "obligation one".to_string(),
+                title: Some("Fix login".to_string()),
+                description: None,
+                candidate_kind: None,
+                kind: Some("task_obligation".to_string()),
+                category: None,
+                payload: None,
+                confidence: Some(0.9),
+                source_span: None,
+                provenance: Some(serde_json::from_value::<ProvenanceSpan>(prov.clone()).unwrap()),
+                extractor_fingerprint: None,
+            })
+            .await
+            .expect("create receipt 1");
 
         // low confidence -> excluded
-        let low_prov = json!({"turn_id": "t2", "role": "user", "evidence_quote": "meh", "confidence": 0.5});
-        intake.create_receipt(crate::task::intake::CreateReceiptRequest {
-            namespace: ns.to_string(), source_kind: SourceKind::Tool,
-            source_revision: "r2".to_string(), source_digest: "d2".to_string(),
-            text: "obligation two".to_string(), title: Some("Low conf".to_string()),
-            description: None, candidate_kind: None, kind: Some("task_obligation".to_string()),
-            category: None, payload: None, confidence: Some(0.5),
-            source_span: None, provenance: Some(serde_json::from_value::<ProvenanceSpan>(low_prov).unwrap()),
-            extractor_fingerprint: None,
-        }).await.expect("create receipt 2");
+        let low_prov =
+            json!({"turn_id": "t2", "role": "user", "evidence_quote": "meh", "confidence": 0.5});
+        intake
+            .create_receipt(crate::task::intake::CreateReceiptRequest {
+                namespace: ns.to_string(),
+                source_kind: SourceKind::Tool,
+                source_revision: "r2".to_string(),
+                source_digest: "d2".to_string(),
+                text: "obligation two".to_string(),
+                title: Some("Low conf".to_string()),
+                description: None,
+                candidate_kind: None,
+                kind: Some("task_obligation".to_string()),
+                category: None,
+                payload: None,
+                confidence: Some(0.5),
+                source_span: None,
+                provenance: Some(serde_json::from_value::<ProvenanceSpan>(low_prov).unwrap()),
+                extractor_fingerprint: None,
+            })
+            .await
+            .expect("create receipt 2");
 
         // different role (assistant) -> excluded
         let asst_prov = json!({"turn_id": "t3", "role": "assistant", "evidence_quote": "no", "confidence": 0.99});
-        intake.create_receipt(crate::task::intake::CreateReceiptRequest {
-            namespace: ns.to_string(), source_kind: SourceKind::Tool,
-            source_revision: "r3".to_string(), source_digest: "d3".to_string(),
-            text: "obligation three".to_string(), title: Some("Assistant".to_string()),
-            description: None, candidate_kind: None, kind: Some("task_obligation".to_string()),
-            category: None, payload: None, confidence: Some(0.99),
-            source_span: None, provenance: Some(serde_json::from_value::<ProvenanceSpan>(asst_prov).unwrap()),
-            extractor_fingerprint: None,
-        }).await.expect("create receipt 3");
+        intake
+            .create_receipt(crate::task::intake::CreateReceiptRequest {
+                namespace: ns.to_string(),
+                source_kind: SourceKind::Tool,
+                source_revision: "r3".to_string(),
+                source_digest: "d3".to_string(),
+                text: "obligation three".to_string(),
+                title: Some("Assistant".to_string()),
+                description: None,
+                candidate_kind: None,
+                kind: Some("task_obligation".to_string()),
+                category: None,
+                payload: None,
+                confidence: Some(0.99),
+                source_span: None,
+                provenance: Some(serde_json::from_value::<ProvenanceSpan>(asst_prov).unwrap()),
+                extractor_fingerprint: None,
+            })
+            .await
+            .expect("create receipt 3");
 
         let got = undisposed_high_confidence_obligations(&*intake, ns, None, None)
-            .await.expect("query obligations");
-        assert_eq!(got.len(), 1, "only the high-conf user obligation: {:?}", got);
+            .await
+            .expect("query obligations");
+        assert_eq!(
+            got.len(),
+            1,
+            "only the high-conf user obligation: {:?}",
+            got
+        );
         assert_eq!(got[0].title, "Fix login");
     }
 
@@ -783,11 +881,8 @@ mod tests {
         }
 
         // Receipts: unpaged
-        let out = handle_intake_list(
-            json!({"namespace": ns, "mode": "receipts"}),
-            store.clone(),
-        )
-        .await;
+        let out =
+            handle_intake_list(json!({"namespace": ns, "mode": "receipts"}), store.clone()).await;
         assert!(
             !out.contains("ERROR") && !out.contains("parser exception"),
             "unpaged receipts list broke: {}",
@@ -805,14 +900,22 @@ mod tests {
 
         // Receipts: paged pages reassemble the full listing
         let pages: [Vec<String>; 2] = [
-            page_of(handle_intake_list(
-                json!({"namespace": ns, "mode": "receipts", "limit": 1, "offset": 0}),
-                store.clone(),
-            ).await, "receipts"),
-            page_of(handle_intake_list(
-                json!({"namespace": ns, "mode": "receipts", "limit": 1, "offset": 1}),
-                store.clone(),
-            ).await, "receipts"),
+            page_of(
+                handle_intake_list(
+                    json!({"namespace": ns, "mode": "receipts", "limit": 1, "offset": 0}),
+                    store.clone(),
+                )
+                .await,
+                "receipts",
+            ),
+            page_of(
+                handle_intake_list(
+                    json!({"namespace": ns, "mode": "receipts", "limit": 1, "offset": 1}),
+                    store.clone(),
+                )
+                .await,
+                "receipts",
+            ),
         ];
         assert_eq!(pages[0].len(), 1, "receipt page at offset 0: {:?}", pages);
         assert_eq!(pages[1].len(), 1, "receipt page at offset 1: {:?}", pages);
@@ -845,14 +948,22 @@ mod tests {
             .collect();
 
         // Candidates: paged pages reassemble the full listing
-        let page0 = page_of(handle_intake_list(
-            json!({"namespace": ns, "mode": "candidates", "limit": 1, "offset": 0}),
-            store.clone(),
-        ).await, "candidates");
-        let page1 = page_of(handle_intake_list(
-            json!({"namespace": ns, "mode": "candidates", "limit": 1, "offset": 1}),
-            store.clone(),
-        ).await, "candidates");
+        let page0 = page_of(
+            handle_intake_list(
+                json!({"namespace": ns, "mode": "candidates", "limit": 1, "offset": 0}),
+                store.clone(),
+            )
+            .await,
+            "candidates",
+        );
+        let page1 = page_of(
+            handle_intake_list(
+                json!({"namespace": ns, "mode": "candidates", "limit": 1, "offset": 1}),
+                store.clone(),
+            )
+            .await,
+            "candidates",
+        );
         assert_eq!(page0.len(), 1, "candidate page at offset 0");
         assert_eq!(page1.len(), 1, "candidate page at offset 1");
         assert_ne!(page0[0], page1[0], "offset must move to the next candidate");
@@ -860,7 +971,10 @@ mod tests {
         combined.sort();
         let mut sorted_all = all_candidate_ids.clone();
         sorted_all.sort();
-        assert_eq!(combined, sorted_all, "paged pages must cover every candidate");
+        assert_eq!(
+            combined, sorted_all,
+            "paged pages must cover every candidate"
+        );
 
         // Resolve one candidate (dismissed keeps the resolve path free of
         // task creation side effects).
@@ -906,8 +1020,7 @@ mod tests {
             key,
             raw
         );
-        let value: Value =
-            serde_json::from_str(&raw).expect("page must be valid JSON");
+        let value: Value = serde_json::from_str(&raw).expect("page must be valid JSON");
         value[key]
             .as_array()
             .expect("page array")
@@ -918,10 +1031,7 @@ mod tests {
 }
 
 /// Handler for neurostrata_task_intake tool.
-pub async fn handle_intake(
-    args: Value,
-    store: Arc<dyn crate::traits::VectorStore>,
-) -> String {
+pub async fn handle_intake(args: Value, store: Arc<dyn crate::traits::VectorStore>) -> String {
     // Parse arguments
     let namespace = match args.get("namespace").and_then(|v| v.as_str()) {
         Some(n) if !n.trim().is_empty() => n.to_string(),
@@ -953,19 +1063,42 @@ pub async fn handle_intake(
         _ => return "ERROR: 'text' is required and cannot be empty.".to_string(),
     };
 
-    let title = args.get("title").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let description = args.get("description").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let candidate_kind =
-        args.get("candidate_kind").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let kind = args.get("kind").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let category = args.get("category").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let title = args
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let description = args
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let candidate_kind = args
+        .get("candidate_kind")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let kind = args
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let category = args
+        .get("category")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let payload = args.get("payload").cloned();
     let confidence = args.get("confidence").and_then(|v| v.as_f64());
     let source_span = args.get("source_span").cloned();
-    let provenance = args.get("provenance").cloned()
+    let provenance = args
+        .get("provenance")
+        .cloned()
         .and_then(|v| serde_json::from_value::<ProvenanceSpan>(v).ok())
-        .or_else(|| source_span.as_ref().and_then(|v| ProvenanceSpan::from_value(v.clone())));
-    let extractor_fingerprint = args.get("extractor_fingerprint").and_then(|v| v.as_str()).map(|s| s.to_string());
+        .or_else(|| {
+            source_span
+                .as_ref()
+                .and_then(|v| ProvenanceSpan::from_value(v.clone()))
+        });
+    let extractor_fingerprint = args
+        .get("extractor_fingerprint")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     // Downcast to IntakeStore
     let intake_store = store.as_intake_store();
@@ -1012,16 +1145,16 @@ pub async fn handle_intake(
 }
 
 /// Handler for neurostrata_task_intake_list tool.
-pub async fn handle_intake_list(
-    args: Value,
-    store: Arc<dyn crate::traits::VectorStore>,
-) -> String {
+pub async fn handle_intake_list(args: Value, store: Arc<dyn crate::traits::VectorStore>) -> String {
     let namespace = match args.get("namespace").and_then(|v| v.as_str()) {
         Some(n) if !n.trim().is_empty() => n.to_string(),
         _ => return "ERROR: 'namespace' is required and cannot be empty.".to_string(),
     };
 
-    let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("candidates");
+    let mode = args
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("candidates");
 
     let intake_store = store.as_intake_store();
     let intake_store = match intake_store {
@@ -1031,8 +1164,14 @@ pub async fn handle_intake_list(
 
     match mode {
         "receipts" => {
-            let limit = args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
-            let offset = args.get("offset").and_then(|v| v.as_u64()).map(|v| v as usize);
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
+            let offset = args
+                .get("offset")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
 
             let request = ListReceiptsRequest {
                 namespace: namespace.clone(),
@@ -1050,7 +1189,8 @@ pub async fn handle_intake_list(
                         "limit": response.limit,
                         "receipts": response.items,
                     });
-                    serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("ERROR: {}", e))
+                    serde_json::to_string_pretty(&result)
+                        .unwrap_or_else(|e| format!("ERROR: {}", e))
                 }
                 Err(e) => {
                     if e.starts_with("ERROR:") {
@@ -1062,8 +1202,14 @@ pub async fn handle_intake_list(
             }
         }
         "candidates" => {
-            let limit = args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
-            let offset = args.get("offset").and_then(|v| v.as_u64()).map(|v| v as usize);
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
+            let offset = args
+                .get("offset")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
 
             let review_state = match args.get("review_state").and_then(|v| v.as_str()) {
                 Some(s) if !s.is_empty() => match s {
@@ -1105,7 +1251,8 @@ pub async fn handle_intake_list(
                         "limit": response.limit,
                         "candidates": response.items,
                     });
-                    serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("ERROR: {}", e))
+                    serde_json::to_string_pretty(&result)
+                        .unwrap_or_else(|e| format!("ERROR: {}", e))
                 }
                 Err(e) => {
                     if e.starts_with("ERROR:") {
@@ -1139,14 +1286,24 @@ pub async fn handle_intake_resolve(
         Some("created") => Disposition::Created,
         Some("linked") => Disposition::Linked,
         Some("dismissed") => Disposition::Dismissed,
-        _ => return "ERROR: 'disposition' must be 'created', 'linked', or 'dismissed'.".to_string(),
+        _ => {
+            return "ERROR: 'disposition' must be 'created', 'linked', or 'dismissed'.".to_string()
+        }
     };
 
-    let task_id = args.get("task_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let task_id = args
+        .get("task_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     // Validate task_id is provided for created/linked dispositions
-    if (disposition == Disposition::Created || disposition == Disposition::Linked) && task_id.is_none() {
-        return format!("ERROR: 'task_id' is required when disposition is '{}'.", disposition);
+    if (disposition == Disposition::Created || disposition == Disposition::Linked)
+        && task_id.is_none()
+    {
+        return format!(
+            "ERROR: 'task_id' is required when disposition is '{}'.",
+            disposition
+        );
     }
 
     let cas_version = match args.get("cas_version").and_then(|v| v.as_u64()) {

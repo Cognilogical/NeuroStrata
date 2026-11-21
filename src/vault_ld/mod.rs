@@ -61,9 +61,11 @@ impl VaultNote {
         hex::encode(Sha256::digest(canonical.as_bytes()))
     }
 
-    /// Create a VaultNote from a SearchResult (ladybug payload)
-    pub fn from_search_result(result: &SearchResult) -> Result<Self, String> {
-        let payload = &result.payload;
+    /// Create a VaultNote from a stored payload. Used by export and by the
+    /// import unchanged-round-trip check for rows that carry no
+    /// `canonical_sha256` in metadata (task rows are written as `{task: …}`
+    /// without it, so a hash-only comparison can never match them).
+    pub fn from_payload(id: &str, payload: &crate::traits::MemoryPayload) -> Self {
         let memory_type = payload.memory_type.clone();
 
         let epistemic_tier = match memory_type.as_str() {
@@ -92,7 +94,7 @@ impl VaultNote {
         related.dedup();
 
         let mut note = VaultNote {
-            id: result.id.clone(),
+            id: id.to_string(),
             rdf_type: format!("yaml:{memory_type}"),
             context: YAML_LD_CONTEXT.to_string(),
             epistemic_tier,
@@ -103,7 +105,12 @@ impl VaultNote {
             content: payload.content.trim().to_string(),
         };
         note.canonical_sha256 = note.fingerprint();
-        Ok(note)
+        note
+    }
+
+    /// Create a VaultNote from a SearchResult (ladybug payload)
+    pub fn from_search_result(result: &SearchResult) -> Result<Self, String> {
+        Ok(Self::from_payload(&result.id, &result.payload))
     }
 
     /// Render to YAML-LD 1.0 Markdown with frontmatter

@@ -185,8 +185,8 @@ fn source_statement_prefix(text: &str, key_start: usize) -> bool {
     let line_start = text[..key_start].rfind('\n').map(|i| i + 1).unwrap_or(0);
     let prefix = text[line_start..key_start].trim_start();
     [
-        "let ", "const ", "var ", "return ", "if ", "match ", "for ", "while ",
-        "pub ", "fn ", "struct ", "enum ", "impl ", "type ",
+        "let ", "const ", "var ", "return ", "if ", "match ", "for ", "while ", "pub ", "fn ",
+        "struct ", "enum ", "impl ", "type ",
     ]
     .iter()
     .any(|p| prefix.starts_with(p))
@@ -218,9 +218,31 @@ fn looks_like_member_chain(value: &str) -> bool {
 /// (`api_key: String`, `token: Option<PathBuf>`) rather than a credential.
 fn is_known_type_name(value: &str) -> bool {
     const TYPES: &[&str] = &[
-        "String", "str", "bool", "usize", "u64", "u32", "u16", "u8", "i64", "i32",
-        "i16", "i8", "f64", "f32", "PathBuf", "Path", "Option", "Result", "Vec",
-        "Arc", "Rc", "Box", "Mutex", "RwLock", "SecretString",
+        "String",
+        "str",
+        "bool",
+        "usize",
+        "u64",
+        "u32",
+        "u16",
+        "u8",
+        "i64",
+        "i32",
+        "i16",
+        "i8",
+        "f64",
+        "f32",
+        "PathBuf",
+        "Path",
+        "Option",
+        "Result",
+        "Vec",
+        "Arc",
+        "Rc",
+        "Box",
+        "Mutex",
+        "RwLock",
+        "SecretString",
     ];
     TYPES.iter().any(|ty| {
         value == *ty
@@ -454,9 +476,10 @@ impl SecretScanner {
             // The capture stops at `;`, so a quoted value containing `;` has no
             // closing quote at `m.end()`; the opening quote is the reliable
             // marker that this is a literal.
-            let quoted = cap.get(2).map(|m| {
-                matches!(text[..m.start()].chars().last(), Some('"') | Some('\''))
-            }).unwrap_or(false);
+            let quoted = cap
+                .get(2)
+                .map(|m| matches!(text[..m.start()].chars().last(), Some('"') | Some('\'')))
+                .unwrap_or(false);
             // Type annotations use `:`. A config value after `=` (for example
             // `password=&hunter2!`) is never a type annotation, even if it
             // starts with a reference sigil.
@@ -472,8 +495,8 @@ impl SecretScanner {
                 .get(1)
                 .map(|key| source_statement_prefix(text, key.start()))
                 .unwrap_or(false);
-            let literal_keyword = matches!(value, "None" | "true" | "false")
-                || value.starts_with("&self.");
+            let literal_keyword =
+                matches!(value, "None" | "true" | "false") || value.starts_with("&self.");
             if !quoted
                 && (literal_keyword
                     || looks_like_code_expression(value)
@@ -1053,18 +1076,20 @@ mod tests {
     #[test]
     fn high_entropy_low_entropy_value_falls_back_to_password() {
         // >=24 chars but (almost) all the same character → entropy below 4.2.
-        let r = SecretScanner::scan_str("api_key = aaaaaaaaaaaaaaaaaaaaaaaaaab1", "content")
-            .unwrap();
+        let r =
+            SecretScanner::scan_str("api_key = aaaaaaaaaaaaaaaaaaaaaaaaaab1", "content").unwrap();
         assert_eq!(r.category, "password");
     }
 
     #[test]
     fn short_value_not_high_entropy_detected() {
         // 20 chars, below the 24-char threshold.
-        assert!(SecretScanner::scan_str("api_key = aB3xZ9kQ7wE2rT8uI1oP", "content").is_none()
-            || SecretScanner::scan_str("api_key = aB3xZ9kQ7wE2rT8uI1oP", "content")
-                .map(|r| r.category == "password")
-                .unwrap_or(false));
+        assert!(
+            SecretScanner::scan_str("api_key = aB3xZ9kQ7wE2rT8uI1oP", "content").is_none()
+                || SecretScanner::scan_str("api_key = aB3xZ9kQ7wE2rT8uI1oP", "content")
+                    .map(|r| r.category == "password")
+                    .unwrap_or(false)
+        );
     }
 
     #[test]
@@ -1108,7 +1133,11 @@ mod tests {
         );
         let r = SecretScanner::scan_value(&Value::Object(map), "metadata").unwrap();
         assert_eq!(r.category, "github_pat");
-        assert!(r.location.contains("<key>"), "the location names the key: {}", r.location);
+        assert!(
+            r.location.contains("<key>"),
+            "the location names the key: {}",
+            r.location
+        );
         assert!(
             !r.to_string().contains("ghp_"),
             "the rejection must not echo the credential-bearing key: {r}"
@@ -1133,7 +1162,10 @@ mod tests {
     fn single_line_token_straddling_a_chunk_boundary_is_detected() {
         let header = base64_encode(br#"{"alg":"HS256","typ":"JWT"}"#);
         let payload = base64_encode(br#"{"sub":"1234567890","name":"John"}"#);
-        let jwt = format!("{}.{}.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c", header, payload);
+        let jwt = format!(
+            "{}.{}.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+            header, payload
+        );
         let mut text = "a".repeat(MAX_SCAN_BYTES - 10);
         text.push_str(&jwt);
         assert!(
@@ -1205,7 +1237,10 @@ mod tests {
         // A document that starts with `${` likewise.
         let xml = r#"<config>api_key = "sk-live-1234567890abcdefghijklmnop"</config>"#;
         let r = SecretScanner::scan_str(xml, "content");
-        assert!(r.is_some(), "secret inside <config> document must be rejected");
+        assert!(
+            r.is_some(),
+            "secret inside <config> document must be rejected"
+        );
         assert!(
             matches!(
                 r.as_ref().map(|r| r.category),

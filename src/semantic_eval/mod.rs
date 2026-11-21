@@ -42,21 +42,39 @@ pub async fn run_semantic_eval(
         }
     };
 
-    let competency_pass = competency.as_ref().map(|r| r.verdict == "PASS").unwrap_or(false);
-    let retrieval_pass = retrieval.as_ref().map(|r| r.verdict == "PASS").unwrap_or(false);
+    let competency_pass = competency
+        .as_ref()
+        .map(|r| r.verdict == "PASS")
+        .unwrap_or(false);
+    let retrieval_pass = retrieval
+        .as_ref()
+        .map(|r| r.verdict == "PASS")
+        .unwrap_or(false);
     let passed = errors.is_empty() && competency_pass && retrieval_pass;
 
     let competency_value = match &competency {
-        Some(r) => serde_json::to_value(r).unwrap_or_else(|e| json!({"serialization_error": e.to_string()})),
-        None => json!({"error": errors.iter().find(|e| e.starts_with("competency:")).cloned().unwrap_or_default()}),
+        Some(r) => serde_json::to_value(r)
+            .unwrap_or_else(|e| json!({"serialization_error": e.to_string()})),
+        None => {
+            json!({"error": errors.iter().find(|e| e.starts_with("competency:")).cloned().unwrap_or_default()})
+        }
     };
     let retrieval_value = match &retrieval {
-        Some(r) => serde_json::to_value(r).unwrap_or_else(|e| json!({"serialization_error": e.to_string()})),
-        None => json!({"error": errors.iter().find(|e| e.starts_with("retrieval:")).cloned().unwrap_or_default()}),
+        Some(r) => serde_json::to_value(r)
+            .unwrap_or_else(|e| json!({"serialization_error": e.to_string()})),
+        None => {
+            json!({"error": errors.iter().find(|e| e.starts_with("retrieval:")).cloned().unwrap_or_default()})
+        }
     };
     let gate_violations: Vec<Value> = retrieval
         .as_ref()
-        .map(|r| r.gate.violations.iter().map(|v| json!({"code": v.code, "detail": v.detail})).collect())
+        .map(|r| {
+            r.gate
+                .violations
+                .iter()
+                .map(|v| json!({"code": v.code, "detail": v.detail}))
+                .collect()
+        })
         .unwrap_or_default();
     let not_evaluated: Vec<&str> = ablation::NOT_EVALUATED.to_vec();
 

@@ -356,9 +356,8 @@ impl MeshStorage {
             text.push_str(entry);
             text.push('\n');
         }
-        std::fs::write(&path, text).with_context(|| {
-            format!(".gitignore could not be written to {}", path.display())
-        })?;
+        std::fs::write(&path, text)
+            .with_context(|| format!(".gitignore could not be written to {}", path.display()))?;
         Ok(())
     }
 
@@ -682,7 +681,9 @@ mod tests {
         let memories = mesh.root().join("stripe-api").join("memories");
         std::fs::create_dir_all(&memories).unwrap();
         std::fs::write(memories.join("m1.json"), r#"{"id":"m1"}"#).unwrap();
-        assert!(mesh.commit_all("first record with a local key", "node-key").unwrap());
+        assert!(mesh
+            .commit_all("first record with a local key", "node-key")
+            .unwrap());
 
         let gitignore = std::fs::read_to_string(mesh.root().join(".gitignore")).unwrap();
         assert!(
@@ -695,7 +696,10 @@ mod tests {
             "the signing key must never be staged or committed"
         );
         assert_eq!(
-            git_out(mesh.root(), &["check-ignore", "--quiet", ".neurostrata-mesh/signing.key"]),
+            git_out(
+                mesh.root(),
+                &["check-ignore", "--quiet", ".neurostrata-mesh/signing.key"]
+            ),
             "",
             "check-ignore must flag the signing key"
         );
@@ -703,7 +707,10 @@ mod tests {
         // Idempotent: a second pass never duplicates or rewrites the rules.
         let before = gitignore.clone();
         mesh.ensure_signing_key_ignored().unwrap();
-        assert_eq!(std::fs::read_to_string(mesh.root().join(".gitignore")).unwrap(), before);
+        assert_eq!(
+            std::fs::read_to_string(mesh.root().join(".gitignore")).unwrap(),
+            before
+        );
     }
 
     #[test]
@@ -726,11 +733,16 @@ mod tests {
 
         let gitignore = std::fs::read_to_string(mesh.root().join(".gitignore")).unwrap();
         assert!(
-            gitignore.lines().any(|l| l.trim() == "/bundles/*.bundle.zst"),
+            gitignore
+                .lines()
+                .any(|l| l.trim() == "/bundles/*.bundle.zst"),
             ".gitignore must carry the /bundles/*.bundle.zst pattern, got: {gitignore:?}"
         );
         assert_eq!(
-            git_out(mesh.root(), &["check-ignore", "--quiet", "bundles/drain-1.bundle.zst"]),
+            git_out(
+                mesh.root(),
+                &["check-ignore", "--quiet", "bundles/drain-1.bundle.zst"]
+            ),
             "",
             "check-ignore must flag a drain bundle artifact"
         );

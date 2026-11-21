@@ -29,3 +29,5 @@ v1.19.0 wires deterministic trajectory mining and outcome-verified reflection in
 - **ReBAC / privacy / SHACL** — every write goes through `LadybugStore::commit_action_batch` (single-writer turn, expected-head CAS, privacy-aware staged writes). Inert action-type candidates pass `ActionTypeDefinition::validate_definition` and `OntologyIndex::validate_strict_post_image` before any write; `learner_writable` adds a foreign-owner ACL check because ReBAC admin bypass cannot express it. Failures are collected in a report, never reported as reflection success.
 
 No online training, no autonomous self-modification, and no unimplemented triggers: mined procedure and action-type candidates stay inert until defined and applied through the existing gated mechanisms.
+
+Source of truth: `src/rdf/action.rs`.

@@ -7,4 +7,3 @@
 //! worktree state it captured is still current.
 
 pub mod store;
-
