@@ -322,6 +322,15 @@ fn stable_digest(args: &Value, ids: &[String]) -> String {
     format!("{hash:016x}")
 }
 
+/// Pure action-id formula, shared with dispatch-time proof generation.
+///
+/// The ledger stores digests only, so depth/seed of a prescribed call cannot be
+/// recovered from a receipt. A follow-up dispatch recomputes this id from the
+/// same arg shape + ids as the prescription; their equality is the proof.
+pub fn action_id(trigger_id: &str, args: &Value, ids: &[String]) -> String {
+    format!("{trigger_id}:{}", stable_digest(args, ids))
+}
+
 /// Resolve the single-source expected-decision constant for a trigger ID.
 pub fn expected_decision(trigger_id: &str) -> &'static str {
     match trigger_id {
@@ -355,7 +364,7 @@ pub fn next_action(trigger: &RouteTrigger, ids: &[String]) -> Value {
             }
         }
     }
-    let action_id = format!("{}:{}", trigger.id, stable_digest(&args, ids));
+    let action_id = action_id(trigger.id, &args, ids);
     json!({
         "action_id": action_id,
         "trigger_id": trigger.id,
@@ -364,4 +373,42 @@ pub fn next_action(trigger: &RouteTrigger, ids: &[String]) -> Value {
         "reason": &trigger.reason,
         "expected_decision": expected_decision(trigger.id)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn routing_action_id_matches_prescription_shape() {
+        let ns = "NeuroStrata";
+        let seed = "mem-seed-42";
+        let trigger = RouteTrigger {
+            id: "T_HIGH_BLAST",
+            tool: "neurostrata_related",
+            args: json!({ "namespace": ns, "id": seed, "max_hops": 2 }),
+            reason: String::new(),
+        };
+        let prescribed = next_action(&trigger, &[seed.to_string()]);
+        let proof_args = json!({ "namespace": ns, "id": seed, "max_hops": 2 });
+        assert_eq!(
+            prescribed["action_id"],
+            action_id("T_HIGH_BLAST", &proof_args, &[seed.to_string()]),
+            "dispatch proof must equal the prescribed action id byte-for-byte"
+        );
+        assert_ne!(
+            prescribed["action_id"],
+            action_id(
+                "T_HIGH_BLAST",
+                &json!({ "namespace": ns, "id": seed, "max_hops": 1 }),
+                &[seed.to_string()]
+            ),
+            "a one-hop call must not reproduce the prescribed proof"
+        );
+        assert_ne!(
+            prescribed["action_id"],
+            action_id("T_HIGH_BLAST", &proof_args, &["other-seed".to_string()]),
+            "a different seed must not reproduce the prescribed proof"
+        );
+    }
 }

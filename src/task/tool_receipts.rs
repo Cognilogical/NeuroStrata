@@ -264,6 +264,17 @@ pub fn derive_status(result_text: &str, is_error: bool) -> ReceiptStatus {
         {
             return ReceiptStatus::Unsupported;
         }
+        // A failed lookup still carries an empty result array (`query_failure_response`
+        // emits `{status:"failed", memories:[]}`). Failure outranks emptiness:
+        // counting it as genuine coverage would inflate coverage/diversity.
+        if v.get("status").and_then(Value::as_str) == Some("failed")
+            || v.get("error")
+                .and_then(Value::as_str)
+                .map(|e| !e.trim().is_empty())
+                .unwrap_or(false)
+        {
+            return ReceiptStatus::Failed;
+        }
         if is_empty_result(&v) {
             return ReceiptStatus::Empty;
         }
@@ -274,9 +285,14 @@ pub fn derive_status(result_text: &str, is_error: bool) -> ReceiptStatus {
     {
         return ReceiptStatus::Empty;
     }
+    // Text guards for non-JSON responses. Placed after the existing Empty
+    // patterns so a genuine "no results" text is not reclassified as failed.
     if lower.starts_with("error")
         || lower.contains("error [")
         || lower.contains("error:")
+        || lower.contains("\"status\":\"failed\"")
+        || lower.contains("\"status\": \"failed\"")
+        || lower.contains("\"error\":")
     {
         return ReceiptStatus::Failed;
     }
@@ -302,10 +318,34 @@ fn is_empty_result(v: &Value) -> bool {
     !arrays.is_empty() && arrays.iter().all(|a| a.is_empty())
 }
 
-/// Bounded result ids extracted from a REAL JSON response.
+/// Marker emitted by `format_memory` for every rendered search result.
+const MEMORY_ID_PREFIX: &str = "--- Memory ID: ";
+
+/// Bounded ids from the human-readable `render_search_results` report. Only
+/// the ids survive — surrounding rendered text is never retained.
+fn text_memory_ids(text: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut rest = text;
+    while let Some(pos) = rest.find(MEMORY_ID_PREFIX) {
+        let after = &rest[pos + MEMORY_ID_PREFIX.len()..];
+        let line_end = after.find('\n').unwrap_or(after.len());
+        let line = &after[..line_end];
+        let id = line.split(" ---").next().unwrap_or(line).trim();
+        if !id.is_empty() {
+            ids.push(id.to_string());
+            if ids.len() >= MAX_RETURNED_IDS {
+                break;
+            }
+        }
+        rest = &after[line_end..];
+    }
+    ids
+}
+
+/// Bounded result ids extracted from a REAL response (JSON or search text).
 pub fn extract_returned_ids(result_text: &str) -> Vec<String> {
     let Ok(v) = serde_json::from_str::<Value>(result_text) else {
-        return Vec::new();
+        return text_memory_ids(result_text);
     };
     let mut ids = Vec::new();
     const RESULT_KEYS: &[&str] = &[
@@ -334,11 +374,12 @@ pub fn extract_returned_ids(result_text: &str) -> Vec<String> {
     ids
 }
 
-/// Result count from a REAL JSON response (explicit count field or the sum of
-/// known result-array lengths). Never invented.
+/// Result count from a REAL response: an explicit JSON count field, the sum of
+/// known JSON result arrays, or the bounded `--- Memory ID:` markers of a text
+/// report. Never invented.
 pub fn result_count(result_text: &str) -> usize {
     let Ok(v) = serde_json::from_str::<Value>(result_text) else {
-        return 0;
+        return text_memory_ids(result_text).len();
     };
     if let Some(n) = v
         .get("result_count")
@@ -464,4 +505,70 @@ pub fn attach_trigger_context(mut fields: ReceiptFields, result_text: &str) -> R
         fields.prescribed_action_ids = action_ids;
     }
     fields
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn receipt_status_explicit_failed_precedes_empty() {
+        // A failed lookup carries an empty result array, but failure is the
+        // honest status and must win over empty-array detection.
+        assert_eq!(
+            derive_status(r#"{"status":"failed","memories":[]}"#, false),
+            ReceiptStatus::Failed
+        );
+        assert_eq!(
+            derive_status(r#"{"error":"query backend down","memories":[]}"#, false),
+            ReceiptStatus::Failed
+        );
+        // Malformed (non-JSON) responses still carry an explicit failed status.
+        assert_eq!(
+            derive_status(r#"{"status": "failed", "memories": []"#, false),
+            ReceiptStatus::Failed
+        );
+    }
+
+    #[test]
+    fn receipt_status_genuine_empty_unchanged() {
+        assert_eq!(
+            derive_status(r#"{"status":"empty","memories":[]}"#, false),
+            ReceiptStatus::Empty
+        );
+        assert_eq!(
+            derive_status("no relevant memories found.", false),
+            ReceiptStatus::Empty
+        );
+    }
+
+    #[test]
+    fn receipt_text_report_ids_and_count_bounded() {
+        // `handle_search_memory` returns render_search_results text, not JSON.
+        let report = concat!(
+            "--- Memory ID: mem-alpha ---\nType: rule\nContent: a\n\n",
+            "--- Memory ID: mem-beta --- (score 0.91)\nType: fact\nContent: b\n\n",
+            "--- Memory ID: mem-gamma ---\nType: fact\nContent: c\n"
+        );
+        assert_eq!(
+            extract_returned_ids(report),
+            vec!["mem-alpha", "mem-beta", "mem-gamma"]
+        );
+        assert_eq!(result_count(report), 3);
+
+        assert!(extract_returned_ids("no relevant memories found.").is_empty());
+        assert_eq!(result_count("no relevant memories found."), 0);
+
+        // JSON responses keep their existing behaviour.
+        let json_text = r#"{"memories":[{"id":"mem-json"}]}"#;
+        assert_eq!(extract_returned_ids(json_text), vec!["mem-json"]);
+        assert_eq!(result_count(json_text), 1);
+
+        // Both ids and count respect the same bound.
+        let many = (0..(MAX_RETURNED_IDS + 5))
+            .map(|i| format!("--- Memory ID: mem-{i} ---\n"))
+            .collect::<String>();
+        assert_eq!(extract_returned_ids(&many).len(), MAX_RETURNED_IDS);
+        assert_eq!(result_count(&many), MAX_RETURNED_IDS);
+    }
 }

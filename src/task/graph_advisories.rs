@@ -128,7 +128,11 @@ pub fn applicable_triggers_from_ledger(
 /// entry with an allowlisted tool and a `success`/`empty` status. Legacy
 /// `queries[]` rows and `tool:"pre-commit"` are never read: only `events[]`
 /// reaches this function. An escalated trigger is resolved by its OWN tool
-/// receipt; a genuine one-hop lookup cannot stand in for it.
+/// receipt: `T_HIGH_BLAST` needs a genuine `neurostrata_related` receipt whose
+/// `followed_action_ids` exactly matches the prescribed action id emitted by
+/// the `T_HIGH_BLAST`-triggering receipt. A default one-hop lookup, a different
+/// seed or a different hop count cannot stand in for it. With no expected
+/// proof the advisory stays unresolved (honest abstention).
 pub fn compute_advisories(input: &AdvisoryInput<'_>) -> AdvisoryReport {
     let mut applicable: BTreeSet<String> = input
         .applicable_trigger_ids
@@ -138,6 +142,26 @@ pub fn compute_advisories(input: &AdvisoryInput<'_>) -> AdvisoryReport {
         .collect();
     for id in applicable_triggers_from_ledger(input.ledger, input.active_task_ids) {
         applicable.insert(id);
+    }
+
+    // Exact proof of the prescribed two-hop expansion: the action ids emitted
+    // by an attributed T_HIGH_BLAST-triggering receipt. The ledger is
+    // digest-only, so depth/seed cannot be parsed back out of a receipt; only
+    // the action-id digest can prove the prescribed call actually ran.
+    let mut expected_action_ids: BTreeSet<&str> = BTreeSet::new();
+    for event in events(input.ledger) {
+        if !attributed(event, input.active_task_ids)
+            || event.get("trigger_id").and_then(Value::as_str) != Some(T_HIGH_BLAST)
+        {
+            continue;
+        }
+        if let Some(ids) = event.get("prescribed_action_ids").and_then(Value::as_array) {
+            for value in ids {
+                if let Some(id) = value.as_str().filter(|s| !s.trim().is_empty()) {
+                    expected_action_ids.insert(id);
+                }
+            }
+        }
     }
 
     let mut distinct_tools = BTreeSet::new();
@@ -162,12 +186,29 @@ pub fn compute_advisories(input: &AdvisoryInput<'_>) -> AdvisoryReport {
         }
         distinct_tools.insert(tool.to_string());
         if let Some(id) = event.get("trigger_id").and_then(Value::as_str) {
-            resolved.insert(id);
+            // A T_HIGH_BLAST trigger id on a receipt marks the prescription
+            // (e.g. memories_for_file), not the expansion itself. Only exact
+            // followed-proof may resolve it.
+            if id != T_HIGH_BLAST {
+                resolved.insert(id);
+            }
         }
         match tool {
             HIGH_BLAST_TOOL => {
-                high_blast_resolved = true;
-                resolved.insert(T_HIGH_BLAST);
+                let proved = !expected_action_ids.is_empty()
+                    && event
+                        .get("followed_action_ids")
+                        .and_then(Value::as_array)
+                        .map(|ids| {
+                            ids.iter()
+                                .filter_map(Value::as_str)
+                                .any(|id| expected_action_ids.contains(id))
+                        })
+                        .unwrap_or(false);
+                if proved {
+                    high_blast_resolved = true;
+                    resolved.insert(T_HIGH_BLAST);
+                }
             }
             DIFF_TOOL => {
                 diff_resolved = true;
@@ -212,5 +253,91 @@ pub fn compute_advisories(input: &AdvisoryInput<'_>) -> AdvisoryReport {
         concept_grounding_linked: input.concept_grounding_linked,
         recommendations,
         unresolved_trigger_ids,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn active() -> BTreeSet<String> {
+        ["t-active".to_string()].into_iter().collect()
+    }
+
+    fn allowed() -> Vec<&'static str> {
+        vec!["neurostrata_memories_for_file", HIGH_BLAST_TOOL]
+    }
+
+    /// A prescribing `memories_for_file` receipt plus one `related` receipt
+    /// carrying the given followed-proof ids (empty = a default one-hop call).
+    fn ledger(proof: Vec<&str>) -> Value {
+        json!({
+            "events": [
+                {
+                    "task_id": "t-active",
+                    "tool": "neurostrata_memories_for_file",
+                    "operation": "memories_for_file",
+                    "status": "success",
+                    "trigger_id": T_HIGH_BLAST,
+                    "prescribed_action_ids": ["T_HIGH_BLAST:proof-hops2-seed"]
+                },
+                {
+                    "task_id": "t-active",
+                    "tool": HIGH_BLAST_TOOL,
+                    "operation": "related",
+                    "status": "success",
+                    "followed_action_ids": proof
+                }
+            ]
+        })
+    }
+
+    fn report(ledger: &Value) -> AdvisoryReport {
+        let active = active();
+        let applicable = vec![T_HIGH_BLAST.to_string()];
+        compute_advisories(&AdvisoryInput {
+            ledger,
+            active_task_ids: &active,
+            allowed_graph_tools: &allowed(),
+            applicable_trigger_ids: &applicable,
+            taxonomy_available: false,
+            concept_grounding_linked: false,
+        })
+    }
+
+    #[test]
+    fn advisory_high_blast_one_hop_without_proof_unresolved() {
+        let r = report(&ledger(vec![]));
+        assert!(r.high_blast_radius_unexplored);
+        assert!(r.recommendations.iter().any(|w| w == W_GRAPH_NO_EXPANSION));
+        assert!(r.unresolved_trigger_ids.iter().any(|t| t == T_HIGH_BLAST));
+    }
+
+    #[test]
+    fn advisory_high_blast_exact_proof_resolves() {
+        let r = report(&ledger(vec!["T_HIGH_BLAST:proof-hops2-seed"]));
+        assert!(!r.high_blast_radius_unexplored);
+        assert!(!r.recommendations.iter().any(|w| w == W_GRAPH_NO_EXPANSION));
+        assert!(r.unresolved_trigger_ids.iter().all(|t| t != T_HIGH_BLAST));
+    }
+
+    #[test]
+    fn advisory_high_blast_wrong_seed_or_hops_stays_unresolved() {
+        let r = report(&ledger(vec!["T_HIGH_BLAST:wrong-seed-hops1"]));
+        assert!(r.high_blast_radius_unexplored);
+        assert!(r.recommendations.iter().any(|w| w == W_GRAPH_NO_EXPANSION));
+        assert!(r.unresolved_trigger_ids.iter().any(|t| t == T_HIGH_BLAST));
+    }
+
+    #[test]
+    fn advisory_high_blast_absent_expected_proof_abstains() {
+        let mut l = ledger(vec!["T_HIGH_BLAST:proof-hops2-seed"]);
+        l["events"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("prescribed_action_ids");
+        let r = report(&l);
+        assert!(r.high_blast_radius_unexplored);
     }
 }

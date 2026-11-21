@@ -2020,7 +2020,7 @@ pub async fn process_mcp_request(
                             // action ids. Thread them into the receipt so task
                             // validation can find applicable escalations with
                             // no caller-supplied signals.
-                            let fields = crate::task::tool_receipts::attach_trigger_context(
+                            let mut fields = crate::task::tool_receipts::attach_trigger_context(
                                 crate::task::tool_receipts::build_dispatch_receipt(
                                     uuid::Uuid::new_v4().to_string(),
                                     chrono::Utc::now().timestamp(),
@@ -2034,6 +2034,35 @@ pub async fn process_mcp_request(
                                 ),
                                 &result_text,
                             );
+                            // R7 proof: the ledger is digest-only, so a follow-up
+                            // `neurostrata_related` call must prove at dispatch that
+                            // it matched the prescription (concrete seed, >=2 hops).
+                            // Reuse the existing `followed_action_ids` field; no new
+                            // receipt field, no raw args/hops text stored.
+                            if name == "neurostrata_related" {
+                                let seed = args_ref
+                                    .and_then(|a| a.get("id"))
+                                    .and_then(Value::as_str)
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty());
+                                let hops = args_ref
+                                    .and_then(|a| a.get("max_hops"))
+                                    .and_then(Value::as_u64)
+                                    .unwrap_or(0);
+                                if let (Some(seed), true) = (seed, hops >= 2) {
+                                    let proof_args = serde_json::json!({
+                                        "namespace": ns.as_str(),
+                                        "id": seed,
+                                        "max_hops": hops,
+                                    });
+                                    fields.followed_action_ids =
+                                        vec![crate::task::routing::action_id(
+                                            crate::task::graph_advisories::T_HIGH_BLAST,
+                                            &proof_args,
+                                            &[seed.to_string()],
+                                        )];
+                                }
+                            }
                             crate::task::record_tool_receipt(&store, fields, caller_root).await;
                         }
                     } else if matches!(

@@ -1278,14 +1278,8 @@ pub fn resolve_session_root_dir(dir: &std::path::Path) -> std::path::PathBuf {
     dir.to_path_buf()
 }
 
-/// The single ledger-root policy shared by the receipt recorder and by
-/// `task_validate`: honour a caller worktree hint, then walk up to the
-/// enclosing worktree marker. Without this, a receipt written from a
-/// worktree can be invisible to the very validation that reads it.
-fn receipt_ledger_root(caller_root: Option<&str>) -> std::path::PathBuf {
-    let mut root = caller_root
-        .map(|s| resolve_session_root_dir(std::path::Path::new(s)))
-        .unwrap_or_else(|| crate::daemon::resolve_project_root());
+/// Walk a candidate root up to the enclosing `.git`/`.NeuroStrata` marker.
+fn walk_to_worktree_marker(mut root: std::path::PathBuf) -> std::path::PathBuf {
     while !root.as_os_str().is_empty()
         && !root.join(".git").exists()
         && !root.join(".NeuroStrata").exists()
@@ -1296,6 +1290,57 @@ fn receipt_ledger_root(caller_root: Option<&str>) -> std::path::PathBuf {
         }
     }
     root
+}
+
+fn has_worktree_marker(root: &std::path::Path) -> bool {
+    root.join(".git").exists() || root.join(".NeuroStrata").exists()
+}
+
+/// The single ledger-root policy shared by the receipt recorder and by
+/// `task_validate`: an explicit caller worktree hint wins; otherwise prefer
+/// the namespace registry's `project_root` then registered directory rows, and
+/// only fall back to the daemon CWD last. Mirrors `record_graph_query_with_root`
+/// so a daemon running outside the checkout writes and reads the same ledger.
+async fn receipt_ledger_root(
+    caller_root: Option<&str>,
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+) -> std::path::PathBuf {
+    if let Some(hint) = caller_root.map(str::trim).filter(|s| !s.is_empty()) {
+        return walk_to_worktree_marker(resolve_session_root_dir(std::path::Path::new(hint)));
+    }
+    let ns = crate::server::resolve_namespace(store, namespace).await;
+    if let Ok(Some((_, registry))) = store.get(&ns, &crate::registry::registry_row_id(&ns)).await {
+        if crate::registry::is_registry_row(&registry.metadata) {
+            if let Some(p) = registry
+                .metadata
+                .get("project_root")
+                .and_then(Value::as_str)
+                .filter(|p| !p.trim().is_empty())
+            {
+                let candidate = walk_to_worktree_marker(std::path::PathBuf::from(p));
+                if has_worktree_marker(&candidate) {
+                    return candidate;
+                }
+            }
+        }
+    }
+    if let Ok(dirs) = store.list(&ns, None, Some("directory")).await {
+        for d in &dirs {
+            if let Some(p) = d
+                .payload
+                .metadata
+                .get("absolute_path")
+                .and_then(Value::as_str)
+            {
+                let candidate = walk_to_worktree_marker(std::path::PathBuf::from(p));
+                if has_worktree_marker(&candidate) {
+                    return candidate;
+                }
+            }
+        }
+    }
+    walk_to_worktree_marker(crate::daemon::resolve_project_root())
 }
 
 /// Record a graph or memory lookup against any active `in_progress` task in
@@ -1544,12 +1589,13 @@ pub async fn record_tool_receipt(
         }
     }
 
-    // Resolve the ledger root: explicit caller root, then cwd walked up to a
-    // worktree marker. Review fix round 2: this recorder writes ONLY the
+    // Resolve the ledger root: explicit caller root, then the namespace
+    // registry/directory roots, then cwd walked up to a worktree marker.
+    // Review fix round 2: this recorder writes ONLY the
     // versioned `events[]` receipt and the additive `tool_invocations`
     // counter. Legacy `queries[]` rows belong exclusively to the handler-
     // internal ledger recorders, so none are written here.
-    let root = receipt_ledger_root(caller_root);
+    let root = receipt_ledger_root(caller_root, store, &ns).await;
     if root.as_os_str().is_empty() {
         return;
     }
@@ -3253,11 +3299,12 @@ pub async fn handle_task_validate(args: Value, store: Arc<dyn VectorStore>) -> S
             .collect::<Vec<_>>(),
     );
     // Same ledger-root policy as the receipt recorder: a caller worktree hint
-    // wins, so a receipt written from a worktree is visible to validation.
+    // wins, then registry roots, so a receipt written from a worktree is
+    // visible to validation even when the daemon runs outside that checkout.
     let caller_hint = arg_str(&args, "worktree")
         .or_else(|| arg_str(&args, "project_root"))
         .or_else(|| arg_str(&args, "cwd"));
-    let root = receipt_ledger_root(caller_hint);
+    let root = receipt_ledger_root(caller_hint, &store, &namespace).await;
     let ledger: Value =
         std::fs::read_to_string(root.join(".NeuroStrata").join("session_queries.json"))
             .ok()
@@ -5546,6 +5593,72 @@ mod tests {
 
     fn emb() -> Arc<dyn Embedder> {
         Arc::new(StubEmbedder)
+    }
+
+    /// Finding 3: with no caller root, a receipt must land under the namespace
+    /// registry's `project_root` (which may sit outside the daemon CWD), not in
+    /// the daemon's own ledger. Validation reads that same root.
+    #[tokio::test]
+    async fn ledger_root_registry_fallback_writes_receipt_under_registry_root() {
+        let store = temp_store().await;
+        let ns = "RegRootNs";
+        store.init(ns).await.expect("init namespace schema");
+        let worktree = std::env::temp_dir().join(format!(
+            "ns-ledger-registry-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(worktree.join(".git")).unwrap();
+        crate::registry::cache_project_root(
+            &store,
+            Some(&emb()),
+            ns,
+            worktree.to_str().unwrap(),
+        )
+        .await;
+        assert_eq!(
+            crate::registry::cached_project_root(&store, ns)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(worktree.to_str().unwrap()),
+            "registry must carry the temp worktree root"
+        );
+
+        let fields = tool_receipts::ReceiptFields::new(
+            "evt-registry".to_string(),
+            0,
+            "sess-registry".to_string(),
+            String::new(),
+            ns.to_string(),
+            "neurostrata_related".to_string(),
+            "related".to_string(),
+            String::new(),
+            "graph_read".to_string(),
+            true,
+            tool_receipts::ReceiptStatus::Success,
+            0,
+            1,
+            vec!["mem-1".to_string()],
+            Vec::new(),
+            Vec::new(),
+            "q",
+            "r",
+        );
+        record_tool_receipt(&store, fields, None).await;
+
+        let ledger = worktree.join(".NeuroStrata").join("session_queries.json");
+        assert!(
+            ledger.exists(),
+            "receipt must be written under the registry project_root, not daemon CWD"
+        );
+        let doc: Value =
+            serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
+        assert_eq!(doc["events"][0]["event_id"], "evt-registry");
+        assert_eq!(
+            receipt_ledger_root(None, &store, ns).await,
+            worktree,
+            "validation reads the same root the recorder wrote"
+        );
     }
 
     /// Git's own bash: on Windows `bash` on PATH may be WSL's launcher, which
@@ -9267,7 +9380,8 @@ mod tests {
             json!(true)
         );
 
-        // A genuine `related` receipt for the same trigger resolves it.
+        // A genuine `related` receipt WITHOUT exact proof must NOT resolve:
+        // a default one-hop lookup cannot stand in for the prescribed call.
         let related = serde_json::json!({
             "task_id": id,
             "tool": "neurostrata_related",
@@ -9276,11 +9390,11 @@ mod tests {
             "status": "success",
             "returned_ids": ["mem-x"]
         });
-        let resolved = serde_json::json!({
+        let unproven = serde_json::json!({
             "events_version": 1,
-            "events": [event, related]
+            "events": [event.clone(), related.clone()]
         });
-        std::fs::write(&ledger_path, resolved.to_string()).unwrap();
+        std::fs::write(&ledger_path, unproven.to_string()).unwrap();
         let reply2 = handle_task_validate(
             serde_json::json!({ "namespace": "MyProj", "worktree": worktree }),
             store.clone(),
@@ -9294,9 +9408,36 @@ mod tests {
             .map(|v| v.as_str().unwrap())
             .collect();
         assert!(
-            !codes2.contains(&"W_GRAPH_NO_EXPANSION"),
-            "genuine related receipt must resolve: {:?}",
+            codes2.contains(&"W_GRAPH_NO_EXPANSION"),
+            "a related receipt without followed-proof must not resolve: {:?}",
             codes2
+        );
+
+        // Exact followed-proof of the prescribed action id resolves it.
+        let mut proven_related = related;
+        proven_related["followed_action_ids"] =
+            serde_json::json!(["T_HIGH_BLAST:abc123"]);
+        let resolved = serde_json::json!({
+            "events_version": 1,
+            "events": [event, proven_related]
+        });
+        std::fs::write(&ledger_path, resolved.to_string()).unwrap();
+        let reply3 = handle_task_validate(
+            serde_json::json!({ "namespace": "MyProj", "worktree": worktree }),
+            store.clone(),
+        )
+        .await;
+        let parsed3: Value = serde_json::from_str(&reply3).expect("json reply");
+        let codes3: Vec<&str> = parsed3["advisories"]["graph_ontology"]["recommendations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(
+            !codes3.contains(&"W_GRAPH_NO_EXPANSION"),
+            "exact followed-proof must resolve: {:?}",
+            codes3
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
