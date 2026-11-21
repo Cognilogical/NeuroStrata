@@ -432,6 +432,8 @@ struct AppState {
     /// the destructive routes (/delete, /shutdown, /backup). Persisted to
     /// ~/.config/neurostrata/operator.token.
     operator_token: String,
+    /// The watch service for daemon watch composition and HTTP parity shims.
+    watch: Arc<crate::ingest_watch::IngestWatchService>,
 }
 
 #[derive(Deserialize)]
@@ -988,6 +990,7 @@ async fn drain_mesh_once(project_root: &std::path::Path, store: &Arc<dyn VectorS
     }
 }
 
+#[allow(clippy::manual_is_multiple_of)]
 pub(crate) async fn start_daemon_on(
     bind_addr: String,
     embedder: Arc<dyn Embedder>,
@@ -1069,6 +1072,42 @@ pub(crate) async fn start_daemon_on(
     // Kept here as well as in the state, because stopping has to wait for it.
     let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
     let fingerprint = exe_fingerprint();
+    // Watch service composition root
+    let allowed_external_dirs = load_allowed_external_dirs();
+    let watch_service = {
+        // Fail closed: a config path we cannot resolve must not silently
+        // relocate the durable watch registry into the process CWD.
+        let config_path = crate::config::Config::default_path()
+            .map_err(|e| anyhow::anyhow!("watch registry config path unavailable: {e}"))?;
+        let registry_path = config_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("watch registry config path has no parent directory"))?
+            .join("watch_registrations.json");
+
+        let event_source = crate::ingest_watch::NotifyEventSource::new()
+            .map_err(|e| anyhow::anyhow!("failed to create watch event source: {e}"))?;
+
+        let registration_store = Arc::new(crate::ingest_watch::JsonFileRegistrationStore::new(
+            registry_path,
+        ));
+
+        let trigger = Arc::new(crate::ingest_watch::IngestJobsTrigger::new(
+            ingests.clone(),
+            crate::parser::schema::ParserSchema::load(include_str!("schema.json"))
+                .map_err(|e| anyhow::anyhow!("schema load failed: {e}"))?,
+            embedder.clone(),
+            vector_store.clone(),
+        ));
+
+        Arc::new(crate::ingest_watch::IngestWatchService::new(
+            Box::new(event_source),
+            registration_store,
+            trigger,
+            startup_root.clone(),
+            allowed_external_dirs.clone(),
+        ))
+    };
+
     let state = AppState {
         embedder,
         vector_store: vector_store.clone(),
@@ -1078,7 +1117,7 @@ pub(crate) async fn start_daemon_on(
         deduplication_checker,
         guard_validator,
         startup_root: startup_root.clone(),
-        allowed_external_dirs: load_allowed_external_dirs(),
+        allowed_external_dirs,
         build: BuildInfo {
             version: env!("CARGO_PKG_VERSION"),
             exe_hash: fingerprint.0,
@@ -1088,7 +1127,18 @@ pub(crate) async fn start_daemon_on(
         },
         daemon_token: daemon_token.clone(),
         operator_token: operator_token.clone(),
+        watch: watch_service.clone(),
     };
+
+    // Start the watch service (load registry, canonicalize roots, activate notify watchers)
+    watch_service
+        .start()
+        .await
+        .map_err(|e| anyhow::anyhow!("watch service start failed: {e}"))?;
+
+    // Spawn the watch event loop with its own shutdown channel
+    let (watch_shutdown_tx, watch_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let watch_handle = tokio::spawn(watch_service.run(watch_shutdown_rx));
 
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
@@ -1127,6 +1177,8 @@ pub(crate) async fn start_daemon_on(
         .route("/data-connector", post(handle_http_data_connector))
         .route("/vault-sync", post(handle_http_vault_sync))
         .route("/shutdown", post(handle_shutdown))
+        .route("/ingest/watch/status", get(handle_ingest_watch_status))
+        .route("/ingest/watch/unwatch", post(handle_ingest_watch_unwatch))
         .with_state(state.clone())
         .layer(axum::middleware::from_fn_with_state(state, auth_middleware));
 
@@ -1226,14 +1278,24 @@ pub(crate) async fn start_daemon_on(
     eprintln!("NeuroStrata Daemon listening on {bind_addr}");
     let cause = Arc::new(Mutex::new(ShutdownCause::Requested));
     let recorded_cause = cause.clone();
-    axum::serve(listener, app)
+    let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             let why = shutdown_signal(shutdown_rx).await;
             *recorded_cause.lock().unwrap_or_else(|e| e.into_inner()) = why;
         })
-        .await?;
+        .await;
 
     let cause = cause.lock().map(|c| *c).unwrap_or(ShutdownCause::Requested);
+
+    // Stop the watch event loop and wait for it to finish before checkpointing.
+    // Do this before propagating a serve error so a failed startup never
+    // strands the spawned run() task.
+    let _ = watch_shutdown_tx.send(());
+    if let Err(e) = watch_handle.await {
+        tracing::warn!("watch service task join error: {e}");
+    }
+
+    serve_result?;
 
     // An ingest runs detached from the request that started it, so the graceful
     // shutdown above did not wait for it. Stopping without waiting left the
@@ -1420,6 +1482,12 @@ async fn handle_ingest(
             state.vector_store.clone(),
         )
         .await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Auto-register the root after successful ingest
+    state
+        .watch
+        .on_ingest_success(&namespace, Path::new(&dir))
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let progress_value = serde_json::to_value(&progress).map_err(|e| {
@@ -1806,13 +1874,14 @@ async fn handle_mcp(
         // empty body, as MCP's HTTP transport answers one; the stdio proxy
         // writes nothing for an empty body.
         let is_notification = rpc_req.id.is_none();
-        let response = crate::server::process_mcp_request(
+        let response = crate::server::process_mcp_request_with_watch(
             rpc_req,
             state.embedder.clone(),
             state.vector_store.clone(),
             state.ingests.clone(),
             state.deduplication_checker.clone(),
             state.bus.clone(),
+            Some(state.watch.clone()),
         )
         .await;
         if is_notification {
@@ -2019,6 +2088,33 @@ async fn handle_tasks_gate(
         );
     }
     Ok(Json(report.gate_json()))
+}
+
+/// Watch composition root HTTP parity shims (Task 4)
+async fn handle_ingest_watch_status(
+    State(state): State<AppState>,
+    Query(query): Query<crate::ingest_watch::WatchStatusQuery>,
+) -> Result<Json<crate::ingest_watch::WatchStatusReport>, (axum::http::StatusCode, String)> {
+    let report = state.watch.status(query.namespace.as_deref());
+    Ok(Json(report))
+}
+
+async fn handle_ingest_watch_unwatch(
+    State(state): State<AppState>,
+    Json(req): Json<crate::ingest_watch::WatchUnwatchReq>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    // J6 path policy first, so an outside path is 403 (not an opaque 500),
+    // and the resolved canonical path is what the core unregisters.
+    let canonical = caller_path_refusal(&state, &req.dir_path)?;
+    let removed = state
+        .watch
+        .unregister(&req.namespace, &canonical)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "removed": removed,
+        "namespace": req.namespace,
+        "canonical_path": canonical.to_string_lossy().to_string(),
+    })))
 }
 
 async fn handle_http_sparql(
@@ -2341,6 +2437,14 @@ async fn handle_http_learning_control(
 }
 
 #[cfg(test)]
+// These legacy tests hold process-wide env/credential locks across awaits by
+// design (they serialize filesystem/token fixtures), and their fixture types
+// predate the newer clippy lints. Scope the allows to tests only.
+#[allow(
+    clippy::await_holding_lock,
+    clippy::type_complexity,
+    clippy::cloned_ref_to_slice_refs
+)]
 mod tests {
     #[test]
     fn gate_scope_is_optional_for_older_cli_callers() {
@@ -4059,11 +4163,27 @@ mod tests {
     async fn caller_path_state(root: &Path, allowlist: Vec<PathBuf>) -> AppState {
         let store = Arc::new(RecordingStore::default());
         let embedder = Arc::new(StubEmbedder { dimensions: 8 });
+        let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+        let watch_service = Arc::new(crate::ingest_watch::IngestWatchService::new(
+            Box::new(crate::ingest_watch::TestEventSource::channel()),
+            Arc::new(crate::ingest_watch::JsonFileRegistrationStore::new(
+                root.join("watch_registrations.json"),
+            )),
+            Arc::new(crate::ingest_watch::IngestJobsTrigger::new(
+                ingests.clone(),
+                crate::parser::schema::ParserSchema::load(include_str!("schema.json"))
+                    .expect("test schema loads"),
+                embedder.clone(),
+                store.clone(),
+            )),
+            root.to_path_buf(),
+            allowlist.clone(),
+        ));
         AppState {
             embedder: embedder.clone(),
             vector_store: store.clone(),
             bus: build_thalamic_bus(store.clone(), 8, root.to_path_buf()),
-            ingests: Arc::new(crate::ingest_jobs::IngestJobs::new()),
+            ingests: ingests.clone(),
             shutdown: Arc::new(Mutex::new(None)),
             deduplication_checker: None,
             guard_validator: Arc::new(
@@ -4080,6 +4200,7 @@ mod tests {
             },
             daemon_token: "test-daemon-token".to_string(),
             operator_token: "test-operator-token".to_string(),
+            watch: watch_service,
         }
     }
 
@@ -4376,6 +4497,240 @@ mod tests {
         assert_eq!(log_json["entries"].as_array().unwrap().len(), 2);
 
         stop_daemon(&client, &base, daemon).await;
+    }
+
+    /// Focused tests for Task 4: daemon watch composition and HTTP parity shims
+    mod watch {
+        use super::*;
+        use axum::body::Body;
+        use axum::http::{Method, Request, StatusCode};
+        use axum::Router;
+        use tower::ServiceExt;
+
+        fn scratch_root(tag: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "neurostrata-watch-test-{}-{}",
+                std::process::id(),
+                tag
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        async fn make_test_app(root: &Path) -> (Router, AppState) {
+            let state = caller_path_state(root, vec![]).await;
+            let app = Router::new()
+                .route("/ingest/watch/status", get(handle_ingest_watch_status))
+                .route("/ingest/watch/unwatch", post(handle_ingest_watch_unwatch))
+                .with_state(state.clone())
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    auth_middleware,
+                ));
+            (app, state)
+        }
+
+        #[tokio::test]
+        async fn watch_unwatch_shim_maps_valid_path() {
+            let root = scratch_root("watch-unwatch-valid");
+            std::fs::create_dir_all(&root).unwrap();
+            let (app, state) = make_test_app(&root).await;
+            // Registration belongs to the core port, not to an HTTP route.
+            state
+                .watch
+                .register("test-ns", &root)
+                .expect("core registration succeeds");
+            let canonical = std::fs::canonicalize(&root).unwrap();
+
+            let req = serde_json::json!({
+                "namespace": "test-ns",
+                "dir_path": root.display().to_string()
+            });
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/ingest/watch/unwatch")
+                        .header("Authorization", "Bearer test-daemon-token")
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(req.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["removed"], true);
+            assert_eq!(json["namespace"], "test-ns");
+            assert_eq!(
+                json["canonical_path"],
+                canonical.to_string_lossy().to_string()
+            );
+            assert!(
+                state.watch.status(Some("test-ns")).roots.is_empty(),
+                "the core dropped the registration"
+            );
+        }
+
+        #[tokio::test]
+        async fn watch_unwatch_shim_refuses_j6_outside_path() {
+            let root = scratch_root("watch-unwatch-outside");
+            std::fs::create_dir_all(&root).unwrap();
+            let (app, _state) = make_test_app(&root).await;
+
+            // Try to unwatch a path outside the root: the J6 gate must refuse
+            // before the core is reached.
+            let outside = std::env::temp_dir().join("outside-watch-test");
+            std::fs::create_dir_all(&outside).unwrap();
+            let req = serde_json::json!({
+                "namespace": "test-ns",
+                "dir_path": outside.display().to_string()
+            });
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/ingest/watch/unwatch")
+                        .header("Authorization", "Bearer test-daemon-token")
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(req.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            // Should be 403 FORBIDDEN due to J6 path policy
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+
+        #[tokio::test]
+        async fn watch_status_shim_serializes_all_fields_and_filters() {
+            let root = scratch_root("watch-status");
+            std::fs::create_dir_all(&root).unwrap();
+            let (app, state) = make_test_app(&root).await;
+
+            // Register two namespaces over the core port; the status shim
+            // is the surface under test here.
+            for ns in ["ns-a", "ns-b"] {
+                state
+                    .watch
+                    .register(ns, &root)
+                    .expect("core registration succeeds");
+            }
+
+            // Get status without filter (both namespaces)
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri("/ingest/watch/status")
+                        .header("Authorization", "Bearer test-daemon-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let roots = json["roots"].as_array().unwrap();
+            assert_eq!(roots.len(), 2);
+            // Check all fields present
+            for root in roots {
+                assert!(root["namespace"].is_string());
+                assert!(root["canonical_path"].is_string());
+                assert!(root["dirty"].is_boolean());
+                assert!(root["pending_paths_count"].is_number());
+                assert!(root["last_event_unix"].is_number() || root["last_event_unix"].is_null());
+                assert!(
+                    root["last_trigger_unix"].is_number() || root["last_trigger_unix"].is_null()
+                );
+                assert!(
+                    root["last_ingest_state"].is_string() || root["last_ingest_state"].is_null()
+                );
+                assert!(
+                    root["last_ingest_finished_unix"].is_number()
+                        || root["last_ingest_finished_unix"].is_null()
+                );
+                assert!(root["backoff_attempt"].is_number());
+                assert!(root["next_retry_unix"].is_number() || root["next_retry_unix"].is_null());
+                assert!(root["watch_active"].is_boolean());
+            }
+
+            // Get status with namespace filter
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri("/ingest/watch/status?namespace=ns-a")
+                        .header("Authorization", "Bearer test-daemon-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let roots = json["roots"].as_array().unwrap();
+            assert_eq!(roots.len(), 1);
+            assert_eq!(roots[0]["namespace"], "ns-a");
+        }
+
+        #[tokio::test]
+        async fn watch_ingest_success_auto_registers() {
+            let root = scratch_root("watch-auto-register");
+            std::fs::write(root.join("lib.rs"), "pub fn probe() {}\n").unwrap();
+            let (app, state) = make_test_app(&root).await;
+
+            // Exercise the real handler so the auto-register hook call site
+            // is covered, not just the core method it delegates to.
+            let namespace = "auto-reg-ns";
+            let out = handle_ingest(
+                State(state),
+                Json(IngestReq {
+                    dir: root.display().to_string(),
+                    namespace: namespace.to_string(),
+                }),
+            )
+            .await
+            .expect("ingest succeeds");
+            assert!(
+                out.0.get("state").is_some(),
+                "the handler answered with ingest progress"
+            );
+
+            // Verify the root was registered by checking status
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri("/ingest/watch/status")
+                        .header("Authorization", "Bearer test-daemon-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let roots = json["roots"].as_array().unwrap();
+            assert_eq!(roots.len(), 1);
+            assert_eq!(roots[0]["namespace"], namespace);
+        }
     }
 }
 

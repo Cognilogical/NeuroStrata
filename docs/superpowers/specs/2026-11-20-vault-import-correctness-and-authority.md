@@ -1,9 +1,7 @@
 # 2026-11-20 — Vault Import Correctness & Path Authority (W-A)
 
-> **Baseline**: `cognilogical/main` @ `216e9d56`
-> **Issues**: #335, #336 (P1), #337 (P2/security)
-> **Branch**: `fix/wa-vault-import-correctness`
-> **Workflow**: spec → red evals → minimal fix → green evals → regression suites
+> **Baseline**: `cognilogical/main` @ `216e9d56` > **Issues**: #335, #336 (P1), #337 (P2/security)
+> **Branch**: `fix/wa-vault-import-correctness` > **Workflow**: spec → red evals → minimal fix → green evals → regression suites
 
 ---
 
@@ -68,8 +66,8 @@ blockers, priority, labels, or history on the live head.
 
 - `import_unchanged_task_roundtrip_is_a_noop_and_keeps_task_state`
   - Seed a `memory_type: "task"` head with `{task: {status:"done",
-    session_id:"sess-1", assignee:"agent-a", blocked_by:["other"],
-    history:[...]}}`, no `canonical_sha256`.
+session_id:"sess-1", assignee:"agent-a", blocked_by:["other"],
+history:[...]}}`, no `canonical_sha256`.
   - Write its exported form unchanged into the vault, import.
   - Assert `notes_imported == 0`, head content/type unchanged, and
     `metadata.task` equal to the seeded value (status done, session intact).
@@ -167,7 +165,7 @@ read is the resolved path that was authorized.
 - `import_refuses_md_symlink_outside_authorized_roots`
   - Vault inside the project root; a valid note written outside the root and
     symlinked into the vault as `escape.md`.
-  - Assert: the outside note is not in the store, the remaining in-vault note
+  - Assert: the outside note is not in the store, the subsequent in-vault note
     still imports, and the result records a refusal naming the escaping file.
 - Existing `import_continues_past_unreadable_file` stays green (broken
   symlink yields the same single unreadable-file error, not a boundary error).

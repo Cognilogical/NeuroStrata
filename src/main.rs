@@ -26,6 +26,7 @@ mod graphql;
 mod guard;
 mod handlers;
 mod ingest_jobs;
+mod ingest_watch;
 mod judgment;
 mod kernel;
 mod kge;
