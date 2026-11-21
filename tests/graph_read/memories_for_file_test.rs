@@ -11,7 +11,7 @@ mod memories_for_file;
 use memories_for_file::{
     fan_out_bucket, freshness_priority, memory_type_priority, query_failure_response, rank_hits,
     recommended_next_actions, GraphMatchKind, MemoryHit, DEFAULT_LIMIT, DEFAULT_MEMORY_TYPES,
-    MAX_LIMIT,
+    MAX_LIMIT, MAX_NEXT_ACTIONS,
 };
 use serde_json::{json, Value};
 
@@ -269,6 +269,23 @@ fn high_blast_radius_escalates_to_two_hop() {
 }
 
 #[test]
+fn high_blast_threshold_boundary_is_14_to_15() {
+    // R4 floor is >= 15. A `>` off-by-one would silently flip either side.
+    let below = recommended_next_actions(14, &[], 0, false, "NeuroStrata", Some("sym::x"));
+    assert_eq!(below["status"], "success");
+    assert!(
+        below["next_actions"].as_array().unwrap().is_empty(),
+        "blast 14 must not escalate: {below}"
+    );
+
+    let at = recommended_next_actions(15, &[], 0, false, "NeuroStrata", Some("sym::x"));
+    let actions = at["next_actions"].as_array().unwrap();
+    assert_eq!(actions.len(), 1, "blast 15 must escalate: {at}");
+    assert_eq!(actions[0]["trigger_id"], "T_HIGH_BLAST");
+    assert_eq!(actions[0]["args"]["max_hops"], 2);
+}
+
+#[test]
 fn empty_lookup_routes_to_locate() {
     // An empty lookup is T_AMBIGUOUS -> neurostrata_locate. Empty is NOT
     // "no governance": no response field may claim governance absence.
@@ -352,6 +369,22 @@ fn staged_diff_scope_emits_schema_valid_args_only() {
 }
 
 #[test]
+fn staged_diff_threshold_boundary_is_2_to_3() {
+    // R4 floor is >= 3 staged files. A `>` off-by-one would flip either side.
+    let below = recommended_next_actions(3, &[], 2, false, "NeuroStrata", Some("sym::x"));
+    assert!(
+        below["next_actions"].as_array().unwrap().is_empty(),
+        "2 staged files must not escalate: {below}"
+    );
+
+    let at = recommended_next_actions(3, &[], 3, false, "NeuroStrata", Some("sym::x"));
+    let actions = at["next_actions"].as_array().unwrap();
+    assert_eq!(actions.len(), 1, "3 staged files must escalate: {at}");
+    assert_eq!(actions[0]["trigger_id"], "T_DIFF");
+    assert_eq!(actions[0]["tool"], "neurostrata_diff_tour");
+}
+
+#[test]
 fn high_blast_without_seed_emits_no_related_action() {
     // A high blast radius with no usable seed must NOT emit a schema-invalid
     // related action with args.id == "".
@@ -366,10 +399,19 @@ fn high_blast_without_seed_emits_no_related_action() {
 }
 
 #[test]
-fn next_actions_are_capped_at_three() {
+fn next_actions_are_capped_at_three_by_construction() {
+    // §5's cap is structural: one high-blast, one seed-edge, one diff. Extra
+    // bridges select the first non-blank one, so no runtime truncation is
+    // needed (and no action is silently dropped).
     let bridges: Vec<String> = (0..5).map(|i| format!("bridge-{i}")).collect();
     let resp = recommended_next_actions(16, &bridges, 3, false, "NeuroStrata", Some("sym::x"));
-    assert_eq!(resp["next_actions"].as_array().unwrap().len(), 3);
+    let actions = resp["next_actions"].as_array().unwrap();
+    assert_eq!(actions.len(), MAX_NEXT_ACTIONS);
+    let triggers: Vec<&str> = actions
+        .iter()
+        .map(|a| a["trigger_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(triggers, vec!["T_HIGH_BLAST", "T_SEED_EDGE", "T_DIFF"]);
 }
 
 #[test]
