@@ -97,6 +97,8 @@ Active-task resolution is session/worktree scoped: when the daemon returns sever
 
 `POST /vault-sync` is the Vault-LD Markdown sync route; `vault_path` and `output_dir` are resolved against the daemon startup root or an explicit allowed external directory before any filesystem access.
 
+`POST /cli/root` is how `hooks install` and `root set` set a namespace's cached root through a running daemon (`{"op": "cache_root", "namespace", "root"}`). The `root` is a caller path: it must resolve inside the daemon startup root or an `allowed_external_dirs` entry (refused with `403` otherwise, the same rule as `/ingest`), and it must hold a project marker for the namespace. The route only writes the registry row.
+
 All endpoints are served by the **neurostrata-mcp daemon** on `127.0.0.1:34343`. Tauri acts as a lightweight HTTP client; Cursor MCP integration proxies stdio JSON-RPC requests.
 
 At startup the daemon refreshes the harness plugin files in its startup root and in every configured project (the folder that holds the project's `.NeuroStrata` folder). Each harness keeps the namespace its own config already names, looked up in the folder itself first, then in its checkout and the main checkout; configs that disagree are left as they are. A harness with no config, or whose config cannot be read, gets its plugin files only, so the daemon never writes an empty or made-up namespace into a harness config (see `namespace resolve` in the CLI reference).

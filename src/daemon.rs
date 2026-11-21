@@ -1699,11 +1699,17 @@ struct RootReq {
 /// The one registry change `hooks install` and `root set` need from the
 /// daemon: set the namespace's cached root. Every file change (the marker,
 /// old markers, the user config) stays in the CLI process, which checked the
-/// folder before asking; this route only writes the registry row.
+/// folder before asking; this route only writes the registry row. The root
+/// is a caller path, so it passes the same policy as `/ingest` (startup root
+/// or `allowed_external_dirs`) and is used in its canonical form.
 async fn handle_cli_root(
     State(state): State<AppState>,
-    Json(req): Json<RootReq>,
+    Json(mut req): Json<RootReq>,
 ) -> Result<String, (axum::http::StatusCode, String)> {
+    if std::path::Path::new(&req.root).is_absolute() {
+        let root = caller_path_refusal(&state, &req.root)?;
+        req.root = dunce::simplified(&root).to_string_lossy().into_owned();
+    }
     cli_root_value(&state.vector_store, &state.embedder, &req)
         .await
         .map(|v| v.to_string())
@@ -2520,6 +2526,43 @@ async fn handle_http_learning_control(
     clippy::cloned_ref_to_slice_refs
 )]
 mod tests {
+    /// `/cli/root` takes a caller path, so it is held to the same policy as
+    /// `/ingest`: a root outside the startup root and the allowlist is
+    /// refused before the registry is touched.
+    #[tokio::test]
+    async fn cli_root_refuses_a_root_outside_the_caller_path_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        let served = base.join("served");
+        let outside = base.join("outside");
+        for dir in [&served, &outside] {
+            std::fs::create_dir_all(dir).unwrap();
+            crate::root_marker::write_new_marker(dir, &crate::root_marker::RootConfig::new("example-project"))
+                .unwrap();
+        }
+        let state = caller_path_state(&served, vec![]).await;
+        let req = |root: &Path| RootReq {
+            op: "cache_root".to_string(),
+            namespace: "example-project".to_string(),
+            root: root.to_string_lossy().into_owned(),
+        };
+        let err = handle_cli_root(State(state.clone()), Json(req(&outside))).await.unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::FORBIDDEN, "{}", err.1);
+        assert!(err.1.contains("allowed_external_dirs"), "{}", err.1);
+        let inside = handle_cli_root(State(state.clone()), Json(req(&served))).await;
+        assert!(
+            !matches!(&inside, Err((code, _)) if *code == axum::http::StatusCode::FORBIDDEN),
+            "{inside:?}"
+        );
+        // The allowlist admits it.
+        let allowed = caller_path_state(&served, vec![outside.clone()]).await;
+        let listed = handle_cli_root(State(allowed), Json(req(&outside))).await;
+        assert!(
+            !matches!(&listed, Err((code, _)) if *code == axum::http::StatusCode::FORBIDDEN),
+            "{listed:?}"
+        );
+    }
+
     #[tokio::test]
     async fn cli_root_cache_root_op_sets_only_the_cache() {
         use crate::guard::testkit::{MockStore, StubEmbedder};
