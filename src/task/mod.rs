@@ -3980,6 +3980,12 @@ fi
 echo "Verify: neurostrata_task_setup should report verified.hook_installed: true"
 "#;
 
+/// Single source for the task-coverage guard: the scaffolded file and the
+/// repository script are the same bytes, so the hook's live PROJECT_GATES
+/// entry can never point at a guard the installer forgot to create.
+pub(crate) const SCAFFOLDED_TASK_COVERAGE_GATE: &str =
+    include_str!("../../scripts/task-coverage-gate.sh");
+
 /// The directory git actually runs hooks from, resolved the way git resolves
 /// it: `core.hooksPath` at the highest-priority config level that sets it,
 /// else `$GIT_DIR/hooks`.
@@ -4046,13 +4052,23 @@ pub(crate) fn hook_hygiene(root: &std::path::Path) -> String {
             set_executable(&pre_commit_target);
         }
     }
-    let repo_scripts_hooks = root.join("scripts/hooks");
-    if repo_scripts_hooks.is_dir() {
-        let repo_pc = repo_scripts_hooks.join("pre-commit");
-        // The repo-side hook is tracked. Only seed it when absent: an older
-        // binary must never clobber a newer checked-in hook or local edits.
-        if !repo_pc.exists() && std::fs::write(&repo_pc, SCAFFOLDED_PRE_COMMIT_HOOK).is_ok() {
-            set_executable(&repo_pc);
+    // Tracked hook artifacts live in scripts/. Create the tree explicitly so
+    // a fresh project without scripts/ gets the whole set a live hook needs.
+    // Seed only when absent: an older binary must never clobber a newer
+    // checked-in hook or local edits. Git-hook auto-heal above is untouched.
+    let scripts_dir = root.join("scripts");
+    if let Err(e) = std::fs::create_dir_all(scripts_dir.join("hooks")) {
+        tracing::warn!("failed to create scripts/hooks dir: {e}");
+    }
+    for (rel, content) in [
+        ("hooks/pre-push", SCAFFOLDED_PRE_PUSH_HOOK),
+        ("hooks/pre-commit", SCAFFOLDED_PRE_COMMIT_HOOK),
+        ("install-hooks.sh", SCAFFOLDED_INSTALL_HOOKS),
+        ("task-coverage-gate.sh", SCAFFOLDED_TASK_COVERAGE_GATE),
+    ] {
+        let path = scripts_dir.join(rel);
+        if !path.exists() && std::fs::write(&path, content).is_ok() {
+            set_executable(&path);
         }
     }
     let target = hooks_dir.join("pre-push");
@@ -4340,7 +4356,7 @@ fn wiring_panel(root: &std::path::Path, namespace: &str) -> (Value, Value, Value
         if hook_installed {
             "Git detected -- still the default and recommended instance, because a git hook is the one chokepoint that works on EVERY git project -- and the NeuroStrata pre-push hook is already installed at the path git runs -- so the task gate runs on every push; nothing to install, and the scaffolded files are omitted from this instruction rather than written over a working hook. What is left is the project-pipeline gates above: `verified.hook_project_guards` lists the ones the installed hook already runs, and the rest are not yet enforced on a bare `git push`. Extend the installed `pre-push` hook's `PROJECT_GATES` with them -- a guard in the hook runs on every host and needs no CI. CI is optional and vendor-specific: if this project already has GitHub Actions, GitLab CI or similar, re-run the project-pipeline gates there as a defense-in-depth second check; a git project with no CI needs nothing beyond the hook."
         } else {
-            "Git detected -- the default and recommended instance, because a git hook is the one chokepoint that works on EVERY git project: run `neurostrata-mcp hooks install` to put the task gate on pre-push (the gate does not move until that hook is installed and runs `task gate --strict`). The `files` field of this instruction carries a runnable `scripts/hooks/pre-push` and `scripts/install-hooks.sh`; write them, install the hook, then extend that hook with the project-pipeline gates above -- they belong in the hook, not in a workflow. CI is optional and vendor-specific: if this project already has GitHub Actions, GitLab CI or similar, re-run the project-pipeline gates there as a defense-in-depth second check; a git project with no CI needs nothing beyond the hook. Verify with the `verified` block in this payload."
+            "Git detected -- the default and recommended instance, because a git hook is the one chokepoint that works on EVERY git project: run `neurostrata-mcp hooks install` to put the task gate on pre-push (the gate does not move until that hook is installed and runs `task gate --strict`). The `files` field of this instruction carries a runnable `scripts/hooks/pre-push`, `scripts/hooks/pre-commit`, `scripts/install-hooks.sh` and `scripts/task-coverage-gate.sh` (the guard the hook's PROJECT_GATES already names); write them, install the hook, then extend that hook with the project-pipeline gates above -- they belong in the hook, not in a workflow. CI is optional and vendor-specific: if this project already has GitHub Actions, GitLab CI or similar, re-run the project-pipeline gates there as a defense-in-depth second check; a git project with no CI needs nothing beyond the hook. Verify with the `verified` block in this payload."
         }
     } else {
         "No git detected. Identify the ONE step every unit of work must pass to leave this project -- a CMS publish action, a render-farm submission, a publish script, a review-approval step. Wire `neurostrata-mcp task gate NAMESPACE --strict` (exit 1 = blocked) and the project-pipeline gates above into that step so nothing ships past an unresolved gate. Record the chosen step: neurostrata_add_memory with memory_type: rule, content naming the gate point -- the next session must not have to re-derive it."
@@ -4359,9 +4375,9 @@ fn wiring_panel(root: &std::path::Path, namespace: &str) -> (Value, Value, Value
             gate_ids.join(", "),
             resolve_clause.replace("NAMESPACE", namespace)
         ),
-        // Scaffolded for git projects that have no hook yet: a runnable hook
-        // and its installer are the path of least resistance, which is the
-        // point. A hooked project gets nothing — writing these files would
+        // Scaffolded for git projects that have no hook yet: every artifact a
+        // live PROJECT_GATES entry needs, plus both hook copies and their
+        // installer. A hooked project gets nothing — writing these files would
         // overwrite a working gate and tell it to install a second one.
         "files": if git && !hook_installed {
             json!([
@@ -4369,10 +4385,18 @@ fn wiring_panel(root: &std::path::Path, namespace: &str) -> (Value, Value, Value
                   "content": SCAFFOLDED_PRE_PUSH_HOOK,
                   "executable": true,
                   "note": "extend PROJECT_GATES with the project's own guards" },
+                { "path": "scripts/hooks/pre-commit",
+                  "content": SCAFFOLDED_PRE_COMMIT_HOOK,
+                  "executable": true,
+                  "note": "records the graph-query ledger before each commit" },
                 { "path": "scripts/install-hooks.sh",
                   "content": SCAFFOLDED_INSTALL_HOOKS,
                   "executable": true,
                   "note": "run: bash scripts/install-hooks.sh" },
+                { "path": "scripts/task-coverage-gate.sh",
+                  "content": SCAFFOLDED_TASK_COVERAGE_GATE,
+                  "executable": true,
+                  "note": "project gate: blocks docs with untracked work items" },
             ])
         } else {
             json!([])
@@ -5277,6 +5301,148 @@ mod tests {
         assert!(!is_current_hook("#!/bin/bash\necho hi\n"));
     }
 
+    /// Install-hook audit: every live PROJECT_GATES entry in the scaffolded
+    /// pre-push hook must have a matching bootstrap file, so a fresh project
+    /// never silently skips a guard the hook claims to run.
+    #[test]
+    fn bootstrap_scaffolds_every_prepush_project_gate() {
+        let root =
+            std::env::temp_dir().join(format!("ns-scaffold-gates-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
+        std::fs::write(root.join(".git").join("config"), "[core]\n").unwrap();
+
+        let (_, _, wire_instruction) = wiring_panel(&root, "MyProj");
+        let files = wire_instruction["files"]
+            .as_array()
+            .expect("fresh git project gets scaffolded files");
+        let paths: Vec<&str> = files
+            .iter()
+            .map(|f| f["path"].as_str().expect("file path"))
+            .collect();
+        for expected in [
+            "scripts/hooks/pre-push",
+            "scripts/hooks/pre-commit",
+            "scripts/install-hooks.sh",
+            "scripts/task-coverage-gate.sh",
+        ] {
+            assert!(
+                paths.contains(&expected),
+                "bootstrap must scaffold {expected}; got {paths:?}"
+            );
+        }
+        assert!(
+            files
+                .iter()
+                .all(|f| f["executable"].as_bool().unwrap_or(false)),
+            "every scaffolded hook artifact must be executable: {files:?}"
+        );
+
+        // Comments and blank lines are not gates; only live array entries are.
+        let open = "PROJECT_GATES=(";
+        let start = SCAFFOLDED_PRE_PUSH_HOOK
+            .find(open)
+            .expect("PROJECT_GATES block in the scaffolded hook")
+            + open.len();
+        let block = &SCAFFOLDED_PRE_PUSH_HOOK[start..];
+        let end = block.find(')').expect("closing paren of PROJECT_GATES");
+        let live_gates: Vec<&str> = block[..end]
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect();
+        assert!(
+            !live_gates.is_empty(),
+            "the hook must declare at least one live project gate"
+        );
+        for gate in live_gates {
+            let normalized = gate.trim_start_matches("./");
+            assert!(
+                paths.contains(&normalized),
+                "live gate {gate} has no scaffolded file; paths={paths:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Install-hook audit: hook_hygiene seeds every tracked artifact on a
+    /// fresh project and keeps an existing one byte-identical on re-run.
+    #[cfg(unix)]
+    #[test]
+    fn hook_hygiene_seeds_all_tracked_hook_artifacts_on_fresh_project() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("ns-hygiene-seed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
+
+        let _ = hook_hygiene(&root);
+        for (rel, content) in [
+            ("scripts/hooks/pre-push", SCAFFOLDED_PRE_PUSH_HOOK),
+            ("scripts/hooks/pre-commit", SCAFFOLDED_PRE_COMMIT_HOOK),
+            ("scripts/install-hooks.sh", SCAFFOLDED_INSTALL_HOOKS),
+            (
+                "scripts/task-coverage-gate.sh",
+                SCAFFOLDED_TASK_COVERAGE_GATE,
+            ),
+        ] {
+            let path = root.join(rel);
+            assert!(path.is_file(), "missing scaffolded artifact {rel}");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                content,
+                "{rel} content drifted"
+            );
+            assert!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o111 != 0,
+                "{rel} must be executable"
+            );
+        }
+
+        // Seed-only: a pre-existing tracked artifact (even foreign) is kept.
+        let sentinel = root.join("scripts/task-coverage-gate.sh");
+        std::fs::write(&sentinel, "#!/bin/bash\n# local sentinel\nexit 0\n").unwrap();
+        let _ = hook_hygiene(&root);
+        assert!(
+            std::fs::read_to_string(&sentinel)
+                .unwrap()
+                .contains("local sentinel"),
+            "hook_hygiene must not overwrite an existing tracked artifact"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The scaffolded guard must be the canonical script, not an empty stub.
+    #[test]
+    fn scaffolded_task_coverage_gate_is_valid_bash() {
+        if which_bash().is_none() {
+            return;
+        }
+        assert_eq!(
+            SCAFFOLDED_TASK_COVERAGE_GATE,
+            include_str!("../../scripts/task-coverage-gate.sh"),
+            "the guard must be single-sourced from the canonical script"
+        );
+        assert!(
+            SCAFFOLDED_TASK_COVERAGE_GATE.contains("untracked work items"),
+            "the guard must carry the task-ID gate marker"
+        );
+        let path =
+            std::env::temp_dir().join(format!("ns-gate-scaffold-{}.sh", std::process::id()));
+        std::fs::write(&path, SCAFFOLDED_TASK_COVERAGE_GATE).unwrap();
+        let syntax = std::process::Command::new("bash")
+            .arg("-n")
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(
+            syntax.status.success(),
+            "scaffolded guard must be valid bash: {}",
+            String::from_utf8_lossy(&syntax.stderr)
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     // ── the bus, as the completion path sees it ────────────────────────────────
 
     /// Records every pulse the dispatcher hands it, so a test can assert on
@@ -5775,7 +5941,12 @@ mod tests {
         let paths: Vec<&str> = files.iter().map(|f| f["path"].as_str().unwrap()).collect();
         assert_eq!(
             paths,
-            vec!["scripts/hooks/pre-push", "scripts/install-hooks.sh"]
+            vec![
+                "scripts/hooks/pre-push",
+                "scripts/hooks/pre-commit",
+                "scripts/install-hooks.sh",
+                "scripts/task-coverage-gate.sh",
+            ]
         );
         let hook = files[0]["content"].as_str().unwrap();
         assert!(
