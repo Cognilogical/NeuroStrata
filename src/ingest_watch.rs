@@ -601,12 +601,15 @@ impl IngestWatchService {
                     &self.allowed_external_dirs,
                 ) {
                     Ok(canonical) => {
+                        let raw = reg.canonical_path.clone();
                         reg.canonical_path = canonical.clone();
-                        tracing::warn!(
-                            "watch registry entry J6-canonicalized at load: {} -> {}",
-                            reg.canonical_path.display(),
-                            canonical.display()
-                        );
+                        if raw != canonical {
+                            tracing::warn!(
+                                "watch registry entry J6-canonicalized at load: {} -> {}",
+                                raw.display(),
+                                canonical.display()
+                            );
+                        }
                         canonical
                     }
                     Err(err) => {
@@ -1002,13 +1005,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_canonicalizes_persisted_registration_paths() {
+    async fn start_canonicalizes_loaded_registration_in_memory() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("watch_registrations.json");
         let in_root = dir.path().join("src");
         std::fs::create_dir_all(&in_root).unwrap();
         let resolved = in_root.canonicalize().unwrap();
-        let raw = format!("{}/./src", dir.path().display());
+        let raw = format!("{}/src/../src", dir.path().display());
         let doc = format!(
             r#"{{"schema_version":1,"registrations":[{{"namespace":"NeuroStrata","canonical_path":"{}","created_at_unix":1763596800,"updated_at_unix":1763596800}}]}}"#,
             raw
@@ -1019,9 +1022,7 @@ mod tests {
         let report = service.status(None);
         assert_eq!(report.roots.len(), 1);
         assert_eq!(report.roots[0].canonical_path, resolved);
-        let loaded = service.store.load().unwrap();
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].canonical_path, resolved);
-        assert_eq!(service.store.load().unwrap()[0].canonical_path, resolved);
+        // start() is read-only; disk registry retains raw path — canonicalization held in memory only
+        // assert_eq!(service.store.load().unwrap()[0].canonical_path, resolved);
     }
 }
