@@ -805,6 +805,25 @@ pub async fn cache_project_root_unless_marked(
         }
         _ => {}
     }
+    // A caller outside the marked checkout (a second clone without the
+    // marker, a scratch folder) must not move a root the marker pinned.
+    match cached_project_root(store, namespace).await {
+        Ok(Some(cached)) => {
+            let cached = std::path::Path::new(&cached);
+            if cached.is_dir() {
+                if let Ok(Some(found)) = crate::root_marker::find_root_marker(cached) {
+                    if found.config.namespace.eq_ignore_ascii_case(namespace) {
+                        return;
+                    }
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!("{e}; the cached project_root of '{namespace}' was left as it is");
+            return;
+        }
+    }
     cache_project_root(store, emb, namespace, project_root).await;
 }
 
@@ -1008,6 +1027,17 @@ pub(crate) mod tests {
         )
         .unwrap();
         cache_project_root_unless_marked(&store, Some(&emb), "example-project", &sub).await;
+        assert_eq!(
+            cached_project_root(&store, "example-project").await.unwrap(),
+            Some(root.clone())
+        );
+
+        // A caller folder outside the marked checkout (no marker of its own)
+        // does not move the cached root either.
+        let elsewhere = base.join("scratch");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let elsewhere = elsewhere.to_string_lossy().into_owned();
+        cache_project_root_unless_marked(&store, Some(&emb), "example-project", &elsewhere).await;
         assert_eq!(
             cached_project_root(&store, "example-project").await.unwrap(),
             Some(root)
@@ -1239,7 +1269,6 @@ pub(crate) mod tests {
             Some(main.join("pkg").to_string_lossy().into_owned())
         );
     }
-
 
     #[test]
     fn a_registry_row_id_is_stable_and_namespaced() {
