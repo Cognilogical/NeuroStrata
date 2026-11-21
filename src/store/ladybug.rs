@@ -6532,6 +6532,19 @@ fn exact_target_exists(conn: &Connection, id: &str) -> Result<bool> {
     Ok(rows.next().is_some())
 }
 
+/// A caller-guaranteed exact target is looked up verbatim in this namespace.
+/// Path/suffix inference could bind a different node that shares the logical
+/// path, which is exactly what `exact_edge_targets` asks to avoid.
+fn exact_target_in_namespace_exists(conn: &Connection, namespace: &str, id: &str) -> Result<bool> {
+    let query = format!(
+        "MATCH (b:Memory) WHERE b.namespace = '{}' AND b.id = '{}' RETURN b.id LIMIT 1",
+        escape_ladybug_string(namespace),
+        escape_ladybug_string(id)
+    );
+    let mut rows = conn.query(&query)?;
+    Ok(rows.next().is_some())
+}
+
 /// The generation currently active for one source (`0` = none published).
 fn active_generation_of_source(conn: &Connection, namespace: &str, source_key: &str) -> u64 {
     let key = crate::parser::ingest::generation_key(namespace, source_key);
@@ -10746,6 +10759,41 @@ impl VectorStore for LadybugStore {
                             emit_write_shape_warning(&namespace, &id, &WriteShapeWarning {
                                 field: format!("metadata.{}", edge.rel_type.to_lowercase()),
                                 why: "target lookup failed".to_string(),
+                                skipped: "this edge materialization".to_string(),
+                            });
+                            continue;
+                        }
+                    }
+                } else if exact_edge_targets {
+                    // The caller guaranteed exact ids, so do not infer a path
+                    // or a generation: materialising must bind what it named
+                    // even when another node shares the logical path (#363).
+                    match exact_target_in_namespace_exists(conn, &namespace, &edge.target_id) {
+                        Ok(true) => edge.target_id.clone(),
+                        Ok(false) => {
+                            deferred_edges.push(crate::traits::EdgeResolutionStatus {
+                                rel_type: edge.rel_type.to_string(),
+                                declared_target: edge.target_id.clone(),
+                                declaration_index: edge.declaration_index,
+                                resolution: crate::traits::TargetResolution::Missing,
+                            });
+                            emit_write_shape_warning(&namespace, &id, &WriteShapeWarning {
+                                field: format!("metadata.{}", edge.rel_type.to_lowercase()),
+                                why: "exact target does not exist yet".to_string(),
+                                skipped: "this edge materialization".to_string(),
+                            });
+                            continue;
+                        }
+                        Err(e) => {
+                            deferred_edges.push(crate::traits::EdgeResolutionStatus {
+                                rel_type: edge.rel_type.to_string(),
+                                declared_target: edge.target_id.clone(),
+                                declaration_index: edge.declaration_index,
+                                resolution: crate::traits::TargetResolution::Failed(e.to_string()),
+                            });
+                            emit_write_shape_warning(&namespace, &id, &WriteShapeWarning {
+                                field: format!("metadata.{}", edge.rel_type.to_lowercase()),
+                                why: "exact target lookup failed".to_string(),
                                 skipped: "this edge materialization".to_string(),
                             });
                             continue;

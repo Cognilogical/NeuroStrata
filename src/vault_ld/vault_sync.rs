@@ -3662,8 +3662,9 @@ mod tests {
     }
 
     /// PR #363: a vault target whose logical path collides with an ingested
-    /// symbol must remain the exact vault-note id. Store-side path resolution
-    /// must not relink the WikiLink to the symbol.
+    /// symbol must remain the exact vault-note id — in the declared metadata
+    /// and in the materialised edge — so export renders one link and the
+    /// reimport fingerprint is stable.
     #[tokio::test]
     async fn vault_targets_survive_symbol_path_collisions() {
         let root =
@@ -3677,16 +3678,19 @@ mod tests {
         let ns = "vault_exact_targets";
         store.init(ns).await.expect("init");
 
+        let generation = store.begin_generation(ns, "code").await.expect("begin");
+        let symbol_id =
+            crate::parser::ingest::generation_scoped_id(ns, generation, "shared-target");
         store
             .upsert(
                 ns,
-                "CollideNs::shared-target",
+                &symbol_id,
                 vec![0.0; 4],
                 crate::traits::MemoryPayload {
                     content: "an ingested symbol".to_string(),
                     user_id: "auto-ingestor".to_string(),
                     memory_type: "symbol".to_string(),
-                    agent_name: None,
+                    agent_name: Some("auto-ingestor".to_string()),
                     location: "shared-target".to_string(),
                     location_lines: "".to_string(),
                     metadata: serde_json::json!({}),
@@ -3694,6 +3698,10 @@ mod tests {
             )
             .await
             .expect("seed colliding symbol");
+        store
+            .publish_generation(ns, "code", generation)
+            .await
+            .expect("publish");
 
         let config = vault_config(&root, &vault, ns);
         let mut linker = note("linker", &["shared-target"]);
@@ -3733,11 +3741,32 @@ mod tests {
             edges
         );
         assert!(
-            !edges
-                .iter()
-                .any(|(_, _, to, _)| to == "CollideNs::shared-target"),
+            !edges.iter().any(|(_, _, to, _)| to == &symbol_id),
             "the ingested symbol must not be linked: {:?}",
             edges
+        );
+
+        export_vault(config.clone(), store.clone())
+            .await
+            .expect("export");
+        let markdown = std::fs::read_to_string(vault.join("linker.md")).expect("read export");
+        assert_eq!(
+            markdown.matches("[[shared-target]]").count(),
+            1,
+            "{markdown}"
+        );
+        assert!(
+            !markdown.contains(&format!("[[{symbol_id}]]")),
+            "export must not render the symbol as a second link: {markdown}"
+        );
+
+        let again = import_vault(config, store, std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("reimport");
+        assert_eq!(
+            again.notes_imported, 0,
+            "the exact-id round-trip must keep the fingerprint stable: {:?}",
+            again.errors
         );
         let _ = std::fs::remove_dir_all(&root);
     }

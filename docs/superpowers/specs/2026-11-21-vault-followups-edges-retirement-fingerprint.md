@@ -30,7 +30,21 @@ and any opportunistic refactor.
 3. Metadata is rebuilt from the prior head minus `IMPORT_OWNED_METADATA_KEYS`,
    then overlaid: `vault_source`, `stub`, `canonical_sha256`, `related`,
    `valid_from`, `supersedes`.
-4. `LadybugStore::upsert` materialises edges from `edge_specs(payload.metadata)`.
+4. `LadybugStore::upsert` canonicalises unqualified edge targets through
+   `KnownIds::resolve` and then materialises edges from
+   `edge_specs(payload.metadata)`.
+
+### Target resolution
+
+`KnownIds` indexes every ingested symbol by its logical path
+(`logical_path_of`: namespace and generation stripped). An unqualified
+declaration that equals such a path resolves to the qualified symbol id. The
+edge write repeats the same inference in `resolve_target_on_write`, which also
+tries the active generation and path suffixes. Vault note ids are unqualified
+`@id` strings and may legitimately equal a symbol's logical path (a note
+`src/lib.rs` and an ingested `src/lib.rs`), so both steps can bind the symbol
+instead of the note. The importer therefore stamps `exact_edge_targets: true`;
+both steps opt out and bind the declared id verbatim.
 
 ### Edge parser
 
@@ -114,10 +128,12 @@ mention-detector edges. Reconciliation is therefore a caller-owned step:
 - `LadybugStore` deletes edges `a-[r:rel_type]->b` where `a.id = id`,
   `a.namespace = namespace`, `r.extractor = 'upsert'`, and `b.id` is not in
   `keep`. An empty `keep` drops the `NOT IN` clause, deleting all of them.
-- `import_vault_with_limits` calls it for every planned head **before** that
-  head's `upsert`, so a declared target that resolves to a different stored id
-  cannot delete the edge the same write just created; the deferred-edge replay
-  reconciles again before its retry upsert.
+- `import_vault_with_limits` calls it for every planned head **after** that
+  head's `upsert` commits, and again after the deferred-edge replay upsert. A
+  failed head upsert therefore leaves the prior edge set intact; the old head
+  and its edges survive together, and a later unchanged reimport is a no-op
+  rather than a skipped repair. Reconciliation is delete-only, so running it
+  after the write reaches the same declared set.
 
 The pass is explicit rather than implicit in `upsert`: an absent `related_to`
 key means "not declared by this write" for ordinary callers, and only the
@@ -144,6 +160,75 @@ never reaches reconciliation). This is bounded by the fact that the orphan was
 created by a pre-fix removal import; an operator can force convergence by
 touching the note. `LadybugStore::upsert` behaviour and the parser are
 untouched, so no other writer changes shape.
+
+---
+
+## 3b. #363 — Vault edges bind the exact note, and retire atomically
+
+### Invariants
+
+1. A WikiLink written by the vault importer binds the note id named in the
+   vault, exactly. A stored `RELATES_TO` edge or `metadata.related_to` entry
+   for a vault-origin head never names an ingested symbol that happens to
+   share the note's logical path. Export renders exactly the parsed link set,
+   adds no second WikiLink, and the next import fingerprint is stable.
+2. Edge reconciliation commits only with a successful head replacement. If the
+   head `upsert` fails, the previous edge set is untouched and the old head
+   remains current; an unchanged reimport of the original note is a no-op, not
+   a skipped repair.
+
+### Mechanism
+
+- The importer stamps `metadata.exact_edge_targets = true` on every planned
+  head. Ordinary memories never carry the flag, so their write-path resolution
+  is unchanged.
+- `LadybugStore::upsert` skips the `KnownIds::resolve` rewrite when the flag is
+  present. Edge materialisation also branches on it: the target is looked up
+  verbatim inside the importer's namespace
+  (`exact_target_in_namespace_exists`) instead of through
+  `resolve_target_on_write`'s generation and suffix inference. A target not yet
+  written defers to the existing replay pass, which retries the same exact
+  lookup.
+- `reconcile_declared_edges` runs after the head `upsert` returns `Ok`, and
+  after the deferred replay `upsert` returns `Ok`; a failed upsert performs no
+  reconciliation. The history row cleanup on failure is unchanged.
+
+Both halves matter: skipping only the `KnownIds` rewrite still leaves the edge
+free to resolve to the same-path symbol during materialisation, after which the
+post-write reconciliation deletes that edge because it does not match the
+declared id.
+
+### Evals (fail on baseline)
+
+- `vault_targets_survive_symbol_path_collisions`
+  - Seed a same-namespace, published symbol `<ns>::<gen>::shared-target` (user
+    `auto-ingestor`, type `symbol`), then import vault notes `shared-target`
+    and `linker` linking `shared-target`.
+  - Assert head `related_to == ["shared-target"]`, the edge ends at the note id
+    and not the symbol id, export renders exactly one `[[shared-target]]` and
+    no symbol link, and the reimport imports `0` notes.
+- `failed_reimport_keeps_existing_edges_with_the_old_head`
+  - Import `linker` → `stale-target`, `kept-target`; edit it to keep only
+    `kept-target`; inject a head-upsert failure for `linker` with a delegating
+    test store.
+  - Assert the import fails, the old head still declares both links, and the
+    `stale-target` edge remains.
+
+### Residual risk
+
+- `exact_edge_targets` is a metadata flag, so a direct store caller can set it
+  to opt a row out of path inference. It grants no authority; it only narrows
+  how that row's own declaration is bound.
+- If the head `upsert` succeeds but the follow-up reconciliation fails, the
+  import reports an error and stale edges remain until the next changed
+  import of that note. A byte-identical reimport stays a no-op (same class as
+  the migration note in §3a), so convergence requires touching the note or
+  running reconciliation explicitly.
+- Reconciliation is a separate statement from the head write; the two are not
+  one transaction. The ordering makes a failed write safe, but a process crash
+  between them leaves either old edges plus new head (retried on the next
+  changed import) or the intended set; it cannot leave deleted edges with the
+  old head.
 
 ---
 
@@ -237,11 +322,14 @@ note whose *real* type changed is versioned.
 - `src/vault_ld/mod.rs` — v2 fingerprint, legacy fingerprint, version const.
 - `src/vault_ld/vault_sync.rs` — `related_to` head key, deferred-edge retry,
   retirement export filter, history-id import guard, `fingerprint_version`
-  stamp, per-head `reconcile_declared_edges` call, updated
+  stamp, `exact_edge_targets` stamp, per-head `reconcile_declared_edges` call
+  after a successful upsert, updated
   `import_reconciles_preserved_edge_fields_with_edited_links`
-  assertion (that key now exists by design).
+  assertion (that key now exists by design), and the #363 evals.
 - `src/traits.rs` — `VectorStore::reconcile_declared_edges` default no-op.
-- `src/store/ladybug.rs` — `extractor = 'upsert'` RELATES_TO reconciler.
+- `src/store/ladybug.rs` — `extractor = 'upsert'` RELATES_TO reconciler,
+  `exact_edge_targets` opt-out from `KnownIds` rewriting and from
+  path-inferring edge materialisation.
 
 ## 7. Risk
 
@@ -251,7 +339,12 @@ note whose *real* type changed is versioned.
   head; both import-owned.
 - Export file set shrinks for namespaces with history: stale files remain on
   disk (additive export), documented above.
-- One extra delete-only statement per planned note before its upsert; it
+- One extra delete-only statement per planned note after its upsert; it
   performs no page writes when the edge set already matches. Caller-scoped, so
   non-vault upserts keep their current behaviour.
-- Parser and `upsert` edge materialization untouched.
+- Vault-origin upserts skip path-based target resolution and use a verbatim
+  namespace lookup instead; ordinary upserts, the parser, and `KnownIds` are
+  untouched.
+- The reconcile and the head write are two statements, not one transaction;
+  the order makes a failed write safe at the cost of a crash window that can
+  leave stale edges with the new head (repaired on the next changed import).
