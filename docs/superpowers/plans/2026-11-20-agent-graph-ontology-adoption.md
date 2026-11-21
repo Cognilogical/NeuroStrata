@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** make explicit graph traversal and ontology operations the obvious, correctly-invoked next step for agents without touching the scratch-pad UI.
+**Goal:** make explicit graph traversal and ontology operations the obvious, correctly-invoked next step for agents without touching the scratch-pad UI (tracked: neurostrata-8jt3).
 
 **Architecture:** one canonical JSON routing contract in `src/task/routing.rs` drives agent-facing prompt text and validation. Tool handlers return schema-valid `next_actions` derived from real results, and post-dispatch private receipts measure follow-through instead of call volume. All response changes are additive; gates remain advisory.
 
