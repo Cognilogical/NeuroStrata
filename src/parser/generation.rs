@@ -102,6 +102,21 @@ pub fn logical_path_of(id: &str) -> &str {
     id
 }
 
+/// Spellings an exact-mode target may bind, in order: the declared id first,
+/// then its own-namespace-stripped alias. Verbatim must win because an exported
+/// note's own id can itself begin with the namespace (`ns::7::path`); stripping
+/// before checking would resolve that note to a different or nonexistent row.
+pub fn exact_target_spellings<'a>(
+    namespace: &str,
+    declared: &'a str,
+) -> impl Iterator<Item = &'a str> {
+    let stripped = declared
+        .strip_prefix(namespace)
+        .and_then(|rest| rest.strip_prefix(NAMESPACE_SEPARATOR))
+        .filter(|rest| !rest.is_empty());
+    std::iter::once(declared).chain(stripped)
+}
+
 /// The lowercase hex SHA-256 of `bytes`, used for `file_sha256` and
 /// `span_sha256` capture.
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -158,6 +173,26 @@ mod tests {
         assert_eq!(ns, "ns");
         assert_eq!(gen, 3);
         assert_eq!(path, "a.rs#functions:main@deadbeef");
+    }
+
+    #[test]
+    fn exact_target_spellings_put_the_verbatim_id_first() {
+        assert_eq!(
+            exact_target_spellings("ns", "ns::7::path").collect::<Vec<_>>(),
+            vec!["ns::7::path", "7::path"]
+        );
+        assert_eq!(
+            exact_target_spellings("ns", "ns::z").collect::<Vec<_>>(),
+            vec!["ns::z", "z"]
+        );
+        assert_eq!(
+            exact_target_spellings("ns", "z").collect::<Vec<_>>(),
+            vec!["z"]
+        );
+        assert_eq!(
+            exact_target_spellings("ns", "other::z").collect::<Vec<_>>(),
+            vec!["other::z"]
+        );
     }
 
     #[test]

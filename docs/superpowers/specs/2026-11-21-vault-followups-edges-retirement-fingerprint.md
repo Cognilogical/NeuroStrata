@@ -241,17 +241,19 @@ that contains `::`. A same-namespace spelling (`<ns>::z`) names the vault note
 stored as the bare id `z`; a target absent at write time defers to the replay
 pass instead of resolving through a symbol that shares the logical path. The
 declared spelling stays in metadata for export, while edge binding, stub
-detection and reconciliation all compare in stored-id form.
+detection and reconciliation share the verbatim-first candidate order (§3e).
 
 #### Mechanism
 
 - `LadybugStore::upsert` checks `exact_edge_targets` first. The declared target
-  is stripped of the importer's own namespace prefix when present, then looked
-  up verbatim with `exact_target_in_namespace_exists`; missing defers, and the
-  earlier qualified branch keeps its inference for ordinary memories only.
+  is looked up verbatim with `exact_target_in_namespace_exists`; only when that
+  is absent is the importer's own namespace prefix stripped and the alias
+  retried (§3e). Missing defers, and the earlier qualified branch keeps its
+  inference for ordinary memories only.
 - `unresolved_wiki_targets` and the reconciliation keep-set in the importer
-  apply the same stored-id form (`stored_edge_target`), so a qualified spelling
-  neither mints a bogus qualified stub nor deletes the edge it just bound.
+  apply the same candidate order (`exact_note_target`, `exact_stored_target`),
+  so a qualified spelling neither mints a bogus alias stub nor deletes the
+  edge it just bound.
 
 #### Eval (failed on `c14f5de0`)
 
@@ -271,13 +273,13 @@ detection and reconciliation all compare in stored-id form.
 
 `relink_edges` replays every live memory's declarations at the end of an
 ingest (`src/parser/ingest.rs:2532`). For a row carrying
-`exact_edge_targets`, replay binds each target verbatim in the importer's
-namespace, stripping an own-namespace prefix exactly as the write path does.
-A target that is not stored in the namespace stays deferred; replay never
-falls back to `KnownIds` path, suffix, or symbol inference. Ordinary memory
-relink resolution is unchanged. Therefore an imported edge `a → z` survives
-an ingest of a same-path symbol `z`: the stored edge set, export links, and
-reimport fingerprint do not change.
+`exact_edge_targets`, replay binds each target by the same verbatim-first
+rule as the write path (§3e): the declared id is checked before an
+own-namespace alias. A target that is not stored in the namespace stays
+deferred; replay never falls back to `KnownIds` path, suffix, or symbol
+inference. Ordinary memory relink resolution is unchanged. Therefore an
+imported edge `a → z` survives an ingest of a same-path symbol `z`: the
+stored edge set, export links, and reimport fingerprint do not change.
 
 #### Mechanism
 
@@ -312,6 +314,64 @@ reimport fingerprint do not change.
 - The existence check uses the namespace rows loaded at replay start, so a
   target written concurrently after that read defers to the next ingest.
   Deferral is safe: the declaration is stored in metadata and retried.
+
+### 3e. Verbatim-first exact targets
+
+#### Invariant
+
+For a head carrying `exact_edge_targets`, the declared target is tried
+verbatim in the importer's namespace before any own-namespace prefix is
+interpreted as an alias. An exported note may legitimately have an `@id`
+that starts with the namespace and carries a generation segment
+(`<ns>::7::path`); it is that note, not the alias `7::path`. The same rule
+governs all four exact-mode paths:
+
+1. **Stub discovery** (`unresolved_wiki_targets` + the import stub loop):
+   a declared target is unresolved only when neither the vault nor the store
+   holds any candidate spelling. Minting uses the spelling the vault
+   declared, so a qualified id never silently becomes a different stub.
+2. **Write materialisation** (`LadybugStore::upsert`): the verbatim id is
+   looked up in the importer's namespace first; the stripped alias is tried
+   only if it is absent; otherwise the edge defers.
+3. **Replay** (`LadybugStore::relink_edges`): the same candidate order
+   against the namespace's stored ids; no candidate means deferred, never a
+   `KnownIds` inference.
+4. **Reconciliation** (the importer's keep-set): the keep-set uses the id
+   the write would bind, not a separately stripped spelling, so it cannot
+   delete the verbatim edge it just created.
+
+The candidate order is centralised in
+`parser::generation::exact_target_spellings`: verbatim first, then the
+own-namespace-stripped alias, never the reverse. Unresolved declarations keep
+the declared spelling.
+
+#### Eval (failed on `c209c4ad`)
+
+- `qualified_note_id_binds_verbatim_before_alias_stripping`
+  - Import vault notes `linker` → `<ns>::7::path` and the note whose `@id`
+    is exactly `<ns>::7::path`.
+  - Assert the import reports no error, the verbatim note exists and no
+    `7::path` stub exists, the `RELATES_TO` edge ends at `<ns>::7::path` and
+    never at `7::path`, export renders exactly one `[[<ns>::7::path]]`, and
+    an unchanged reimport imports `0` notes with an unchanged fingerprint.
+  - On `c209c4ad` normalization rewrote the link to `7::path` before the
+    known-note check: the import minted a `7::path` stub (which then failed
+    its Turtle subject validation) and the real note received no edge.
+
+#### Residual risk
+
+- The store-backed resolution performs one keyed read per candidate spelling
+  for a declaration that is not already a vault note. The result is cached
+  for the import turn; the added reads are bounded by distinct unresolved
+  or store-only targets, not by edge count.
+- If an intermediate import fails after binding a verbatim edge, a later
+  alias-only spelling resolving to a different row can still retire that edge
+  through reconciliation, as with any changed declaration. The keep-set
+  follows the current declaration; it does not preserve old targets.
+- An unresolved declared spelling is used for the stub. For a namespaced id
+  that is not also a valid Turtle subject scheme (for example a namespace
+  containing `_`), stub validation refuses it and reports the error instead
+  of minting an alias; the declaration stays deferred.
 
 ---
 
@@ -413,7 +473,11 @@ note whose *real* type changed is versioned.
 - `src/store/ladybug.rs` — `extractor = 'upsert'` RELATES_TO reconciler,
   `exact_edge_targets` opt-out from `KnownIds` rewriting, from
   path-inferring edge materialisation, and from `relink_edges` declaration
-  replay (§3d).
+  replay (§3d), both using verbatim-first candidate order (§3e).
+- `src/parser/generation.rs` — `exact_target_spellings`, the single
+  verbatim-first alias rule shared by the vault importer and the store
+  (§3e), re-exported through `parser::ingest`.
+- `src/parser/ingest.rs` — re-export only; no parser behaviour change.
 
 ## 7. Risk
 

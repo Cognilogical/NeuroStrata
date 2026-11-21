@@ -656,26 +656,86 @@ pub async fn export_vault_with_limits(
     })
 }
 
-/// A WikiLink may spell this vault's own namespace (`<ns>::z`); the linked
-/// note is stored under its bare id. Edge binding and reconciliation compare
-/// in that stored form while the declared spelling stays for export.
-fn stored_edge_target<'a>(namespace: &str, target: &'a str) -> &'a str {
-    target
-        .strip_prefix(namespace)
-        .and_then(|rest| rest.strip_prefix(crate::parser::ingest::NAMESPACE_SEPARATOR))
-        .unwrap_or(target)
+/// Exact-mode target resolution against the ids in `known`. The declared
+/// spelling wins so an exported id that already starts with the namespace
+/// (`<ns>::7::path`) keeps its own row; only then may the namespace prefix act
+/// as an alias for a bare id (`<ns>::z` → `z`).
+fn exact_note_target(
+    namespace: &str,
+    declared: &str,
+    known: &std::collections::BTreeSet<String>,
+) -> Option<String> {
+    crate::parser::ingest::exact_target_spellings(namespace, declared)
+        .find(|candidate| known.contains(*candidate))
+        .map(str::to_string)
+}
+
+/// Store-backed half of the same rule: try each spelling in order and return
+/// the first row that exists. `None` means every spelling is absent and the
+/// caller must defer or stub the declared spelling.
+async fn exact_stored_target(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    declared: &str,
+    cache: &mut std::collections::HashMap<String, Option<(String, crate::traits::MemoryPayload)>>,
+) -> Result<Option<(String, crate::traits::MemoryPayload)>, String> {
+    if let Some(cached) = cache.get(declared) {
+        return Ok(cached.clone());
+    }
+    let mut found = None;
+    for candidate in crate::parser::ingest::exact_target_spellings(namespace, declared) {
+        match store.get(namespace, candidate).await {
+            Ok(Some((_, payload))) => {
+                found = Some((candidate.to_string(), payload));
+                break;
+            }
+            Ok(None) => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    cache.insert(declared.to_string(), found.clone());
+    Ok(found)
+}
+
+/// The edge ids a head's declarations will actually bind, matching the store's
+/// exact-mode lookup. An unresolved declaration keeps its declared spelling so
+/// a later replay binds the same target the vault named.
+async fn exact_keep_targets(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    declared: &[String],
+    known: &std::collections::BTreeSet<String>,
+    cache: &mut std::collections::HashMap<String, Option<(String, crate::traits::MemoryPayload)>>,
+) -> Vec<String> {
+    let mut keep = Vec::with_capacity(declared.len());
+    for target in declared {
+        if let Some(found) = exact_note_target(namespace, target, known) {
+            keep.push(found);
+            continue;
+        }
+        match exact_stored_target(store, namespace, target, cache).await {
+            Ok(Some((id, _))) => keep.push(id),
+            Ok(None) => keep.push(target.clone()),
+            Err(e) => {
+                warn!("Could not resolve exact edge target {}: {}", target, e);
+                keep.push(target.clone());
+            }
+        }
+    }
+    keep
 }
 
 /// WikiLink targets with no corresponding note in the vault. BTreeSet gives
-/// deterministic order for queryable stub minting.
+/// deterministic order for queryable stub minting. An own-namespace prefix is
+/// an alias only when the bare note exists, so unresolved ids keep the spelling
+/// the vault declared.
 pub fn unresolved_wiki_targets(notes: &[VaultNote], namespace: &str) -> Vec<String> {
-    let known: std::collections::BTreeSet<&str> = notes.iter().map(|n| n.id.as_str()).collect();
+    let known: std::collections::BTreeSet<String> = notes.iter().map(|n| n.id.clone()).collect();
     let mut missing = std::collections::BTreeSet::new();
     for note in notes {
         for target in &note.related {
-            let target = stored_edge_target(namespace, target);
-            if !known.contains(target) {
-                missing.insert(target.to_string());
+            if exact_note_target(namespace, target, &known).is_none() {
+                missing.insert(target.clone());
             }
         }
     }
@@ -937,8 +997,9 @@ pub async fn import_vault_with_limits(
     // In a partial vault a linked memory's file is absent by definition; a
     // placeholder must not replace the live head that still exists.
     let mut mintable = Vec::new();
+    let mut exact_cache = std::collections::HashMap::new();
     for target in unresolved_wiki_targets(&notes, &config.namespace) {
-        match store.get(&config.namespace, &target).await {
+        match exact_stored_target(&store, &config.namespace, &target, &mut exact_cache).await {
             Ok(Some((_, payload))) => {
                 // An existing stub is exactly the state this loop would
                 // produce, so re-import is a silent no-op. A non-stub head
@@ -985,6 +1046,8 @@ pub async fn import_vault_with_limits(
         notes.push(stub);
     }
     notes.sort_by(|a, b| a.id.cmp(&b.id));
+    let known_notes: std::collections::BTreeSet<String> =
+        notes.iter().map(|n| n.id.clone()).collect();
 
     let principal = config.principal.as_deref().unwrap_or("default");
     let now = chrono::Utc::now().timestamp();
@@ -1182,11 +1245,14 @@ pub async fn import_vault_with_limits(
             .and_then(Value::as_array)
             .is_some_and(|targets| !targets.is_empty())
             .then(|| (payload.clone(), item.vector.clone()));
-        let keep: Vec<String> = item
-            .related
-            .iter()
-            .map(|target| stored_edge_target(&config.namespace, target).to_string())
-            .collect();
+        let keep = exact_keep_targets(
+            &store,
+            &config.namespace,
+            &item.related,
+            &known_notes,
+            &mut exact_cache,
+        )
+        .await;
 
         // Materialise the new head before retiring the old head's edges.
         // Reconciliation deletes edges the current head still relies on, so
@@ -1234,20 +1300,25 @@ pub async fn import_vault_with_limits(
     // Every row (and stub) now exists, so a forward reference resolves. A
     // target absent from both the vault and the store stays deferred.
     for (id, vector, payload) in deferred_retry {
-        let keep: Vec<String> = payload
+        let declared: Vec<String> = payload
             .metadata
             .get("related_to")
             .and_then(Value::as_array)
             .map(|targets| {
                 targets
                     .iter()
-                    .filter_map(|t| {
-                        t.as_str()
-                            .map(|t| stored_edge_target(&config.namespace, t).to_string())
-                    })
+                    .filter_map(|t| t.as_str().map(str::to_string))
                     .collect()
             })
             .unwrap_or_default();
+        let keep = exact_keep_targets(
+            &store,
+            &config.namespace,
+            &declared,
+            &known_notes,
+            &mut exact_cache,
+        )
+        .await;
         if let Err(e) = store.upsert(&config.namespace, &id, vector, payload).await {
             errors.push(format!("Failed to relink edges for {}: {}", id, e));
         } else if let Err(e) = store
@@ -1388,6 +1459,16 @@ mod tests {
             unresolved_wiki_targets(&notes, "ns"),
             vec!["missing-1", "missing-2"]
         );
+
+        // A qualified spelling is an alias only when the bare note exists.
+        let alias = vec![note("a", &["ns::z"]), note("z", &[])];
+        assert!(unresolved_wiki_targets(&alias, "ns").is_empty());
+        // With no bare note the declaration stays unresolved in its own spelling.
+        let missing = vec![note("a", &["ns::missing"])];
+        assert_eq!(unresolved_wiki_targets(&missing, "ns"), vec!["ns::missing"]);
+        // A verbatim scoped note id resolves before the prefix is read as an alias.
+        let verbatim = vec![note("a", &["ns::7::path"]), note("ns::7::path", &[])];
+        assert!(unresolved_wiki_targets(&verbatim, "ns").is_empty());
     }
 
     #[test]
@@ -4047,6 +4128,119 @@ mod tests {
                 .metadata["canonical_sha256"],
             prior_sha,
             "the head fingerprint must not churn"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// PR #363: an exported note's own id can carry the namespace and a
+    /// numeric middle segment (`<ns>::7::path`). A WikiLink naming it must
+    /// bind that verbatim row, not treat the prefix as an alias and mint a
+    /// `7::path` stub.
+    #[tokio::test]
+    async fn qualified_note_id_binds_verbatim_before_alias_stripping() {
+        let root =
+            std::env::temp_dir().join(format!("ns-vault-verbatim-id-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        // `ns` is a valid IRI scheme, so the scoped id itself stays a legal
+        // Turtle subject; a longer namespace with `_` would not.
+        let ns = "ns";
+        store.init(ns).await.expect("init");
+        let config = vault_config(&root, &vault, ns);
+
+        let scoped_id = format!("{ns}::7::path");
+        let alias_id = "7::path";
+        let mut linker = note("linker", &[scoped_id.as_str()]);
+        linker.content = "links the scoped note".to_string();
+        linker.canonical_sha256 = linker.fingerprint();
+        let mut target = note(&scoped_id, &[]);
+        target.content = "body of the scoped note".to_string();
+        target.canonical_sha256 = target.fingerprint();
+        std::fs::write(vault.join("linker.md"), linker.to_markdown()).expect("write linker");
+        std::fs::write(vault.join("scoped.md"), target.to_markdown()).expect("write target");
+
+        let result = import_vault(
+            config.clone(),
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("import");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(
+            store
+                .get(ns, &scoped_id)
+                .await
+                .expect("get scoped")
+                .is_some(),
+            "the verbatim note must be imported"
+        );
+        assert!(
+            store.get(ns, alias_id).await.expect("get alias").is_none(),
+            "the namespace prefix must not be read as an alias: no `{alias_id}` stub"
+        );
+        let edges = store.list_edges(ns).await.expect("list edges");
+        assert!(
+            edges.iter().any(|(from, rel, to, _)| from == "linker"
+                && rel == "RELATES_TO"
+                && to == &scoped_id),
+            "the edge must bind the verbatim note id: {:?}",
+            edges
+        );
+        assert!(
+            !edges.iter().any(|(_, _, to, _)| to == alias_id),
+            "no edge may bind the stripped alias: {:?}",
+            edges
+        );
+
+        let mut export_config = config.clone();
+        export_config.vault_path = root.join("exported");
+        export_config.output_dir = root.join("exported");
+        export_vault(export_config, store.clone())
+            .await
+            .expect("export");
+        let markdown =
+            std::fs::read_to_string(root.join("exported").join("linker.md")).expect("read export");
+        assert_eq!(
+            markdown.matches(&format!("[[{scoped_id}]]")).count(),
+            1,
+            "{markdown}"
+        );
+        assert!(
+            !markdown.contains(&format!("[[{alias_id}]]")),
+            "export must keep the verbatim spelling: {markdown}"
+        );
+
+        let prior_sha = store
+            .get(ns, "linker")
+            .await
+            .expect("get head")
+            .expect("head exists")
+            .1
+            .metadata["canonical_sha256"]
+            .clone();
+        let again = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("reimport");
+        assert!(again.errors.is_empty(), "{:?}", again.errors);
+        assert_eq!(
+            again.notes_imported, 0,
+            "the verbatim round-trip must keep the fingerprint stable"
+        );
+        assert_eq!(
+            store
+                .get(ns, "linker")
+                .await
+                .expect("get reimported head")
+                .expect("head exists")
+                .1
+                .metadata["canonical_sha256"],
+            prior_sha,
+            "the linker fingerprint must not churn"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

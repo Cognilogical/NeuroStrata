@@ -10715,19 +10715,44 @@ impl VectorStore for LadybugStore {
                     // The caller guaranteed exact ids, so do not infer a path
                     // or a generation: materialising must bind what it named
                     // even when another node shares the logical path (#363).
-                    // A same-namespace qualified spelling (`<ns>::z`) names
-                    // the note `z`, which is stored bare.
-                    let exact = edge
-                        .target_id
-                        .strip_prefix(&format!(
-                            "{}{}",
-                            namespace,
-                            crate::parser::ingest::NAMESPACE_SEPARATOR
-                        ))
-                        .unwrap_or(&edge.target_id);
-                    match exact_target_in_namespace_exists(conn, &namespace, exact) {
-                        Ok(true) => exact.to_string(),
-                        Ok(false) => {
+                    // The verbatim id is a real note id too (`<ns>::7::path`
+                    // is exported as-is), so it is tried before the namespace
+                    // prefix is read as an alias for a bare id.
+                    let mut found = None;
+                    let mut failure = None;
+                    for candidate in crate::parser::ingest::exact_target_spellings(
+                        &namespace,
+                        &edge.target_id,
+                    ) {
+                        match exact_target_in_namespace_exists(conn, &namespace, candidate) {
+                            Ok(true) => {
+                                found = Some(candidate.to_string());
+                                break;
+                            }
+                            Ok(false) => {}
+                            Err(e) => {
+                                failure = Some(e.to_string());
+                                break;
+                            }
+                        }
+                    }
+                    match (found, failure) {
+                        (Some(found), _) => found,
+                        (None, Some(e)) => {
+                            deferred_edges.push(crate::traits::EdgeResolutionStatus {
+                                rel_type: edge.rel_type.to_string(),
+                                declared_target: edge.target_id.clone(),
+                                declaration_index: edge.declaration_index,
+                                resolution: crate::traits::TargetResolution::Failed(e),
+                            });
+                            emit_write_shape_warning(&namespace, &id, &WriteShapeWarning {
+                                field: format!("metadata.{}", edge.rel_type.to_lowercase()),
+                                why: "exact target lookup failed".to_string(),
+                                skipped: "this edge materialization".to_string(),
+                            });
+                            continue;
+                        }
+                        (None, None) => {
                             deferred_edges.push(crate::traits::EdgeResolutionStatus {
                                 rel_type: edge.rel_type.to_string(),
                                 declared_target: edge.target_id.clone(),
@@ -10737,20 +10762,6 @@ impl VectorStore for LadybugStore {
                             emit_write_shape_warning(&namespace, &id, &WriteShapeWarning {
                                 field: format!("metadata.{}", edge.rel_type.to_lowercase()),
                                 why: "exact target does not exist yet".to_string(),
-                                skipped: "this edge materialization".to_string(),
-                            });
-                            continue;
-                        }
-                        Err(e) => {
-                            deferred_edges.push(crate::traits::EdgeResolutionStatus {
-                                rel_type: edge.rel_type.to_string(),
-                                declared_target: edge.target_id.clone(),
-                                declaration_index: edge.declaration_index,
-                                resolution: crate::traits::TargetResolution::Failed(e.to_string()),
-                            });
-                            emit_write_shape_warning(&namespace, &id, &WriteShapeWarning {
-                                field: format!("metadata.{}", edge.rel_type.to_lowercase()),
-                                why: "exact target lookup failed".to_string(),
                                 skipped: "this edge materialization".to_string(),
                             });
                             continue;
@@ -11866,11 +11877,6 @@ impl VectorStore for LadybugStore {
 
         let namespace_ids: std::collections::HashSet<&str> =
             memories.iter().map(|m| m.id.as_str()).collect();
-        let own_namespace_prefix = format!(
-            "{}{}",
-            namespace,
-            crate::parser::ingest::NAMESPACE_SEPARATOR
-        );
 
         // Grouped by relationship because the type is part of the statement and
         // cannot be a value in it: three groups, so three statements, whatever
@@ -11915,14 +11921,12 @@ impl VectorStore for LadybugStore {
                 .unwrap_or(false);
             for edge in edge_specs(&memory.payload.metadata) {
                 let target = if exact_edge_targets {
-                    let exact = edge
-                        .target_id
-                        .strip_prefix(&own_namespace_prefix)
-                        .unwrap_or(&edge.target_id);
-                    if !namespace_ids.contains(exact) {
-                        continue;
+                    match crate::parser::ingest::exact_target_spellings(namespace, &edge.target_id)
+                        .find(|candidate| namespace_ids.contains(*candidate))
+                    {
+                        Some(found) => found.to_string(),
+                        None => continue,
                     }
-                    exact.to_string()
                 } else {
                     match known.resolve(&edge.target_id) {
                         Some(resolved) => {
