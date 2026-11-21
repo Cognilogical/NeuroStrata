@@ -44,6 +44,7 @@ const MUTATION_PATCH_KEYS: &[&str] = &["patchText", "patch", "patch_text", "diff
 
 /// Patch headers that make a string value worth scanning as a patch.
 const PATCH_MARKERS: &[&str] = &[
+    "*** Begin Patch",
     "*** Update File:",
     "*** Add File:",
     "*** Move to:",
@@ -395,6 +396,9 @@ impl GuardValidator {
         PATCH_MARKERS
             .iter()
             .any(|marker| trimmed.starts_with(marker))
+            // Unified diffs open with `--- a/...`; the `+++` header follows.
+            || ((trimmed.starts_with("--- ") || trimmed.starts_with("Index: "))
+                && text.contains("\n+++ "))
     }
 
     fn should_scan_patch(key: &str, value: &str) -> bool {

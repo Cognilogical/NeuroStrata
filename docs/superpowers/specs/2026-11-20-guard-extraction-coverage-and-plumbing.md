@@ -90,9 +90,10 @@ any added `#!` line, so documentation examples cause false denials.
      `new_source`/`newSource` for NotebookEdit);
    - patch paths/shebangs from decoded string values that are patch-like:
      patch keys (`patchText`, `patch`, `patch_text`, `diff`, `input`) or a
-     value whose trimmed start is a patch header (`*** `, `--- `,
-     `diff --git`). Decoding matters: a patch inside a JSON string has real
-     newlines only after parse.
+     value whose trimmed start is a patch header — `*** Begin Patch`,
+     `*** Update File:`/`*** Add File:`/`*** Move to:`, `diff --git `,
+     `+++ b/`, or a unified `--- a/...` followed by `+++ `. Decoding matters:
+     a patch inside a JSON string has real newlines only after parse.
 2. **Raw patch fallback in addition.** Non-JSON payloads keep the existing
    marker scan. JSON payloads do not need a whole-text scan (escaped
    newlines make it inert), but a decoded patch value is scanned.
@@ -127,6 +128,10 @@ Rust (`src/guard/validator.rs` tests):
     `.md` target passes a `python3` rule;
   - a script patch adding the same line to `scripts/run-tool` fires it;
   - a `.py` path rule still fires on the patch target.
+- `patch_envelopes_and_unified_diffs_extract_targets`
+  - a complete Codex patch (`*** Begin Patch` … `*** End Patch`), a unified
+    diff (`--- a/...` / `+++ b/...`), and both forms under JSON `input` yield
+    their target; the doc-like exclusion still holds inside an envelope.
 
 JS (`plugins/core/test.mjs`, mock daemon records `guardArgs`):
 - `apply_patch raw hook input reaches guard_validate as the patch, not "{}"`
