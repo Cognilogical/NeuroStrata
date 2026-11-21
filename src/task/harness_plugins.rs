@@ -305,6 +305,8 @@ fn installer_hook_parts(
 /// namespace, whatever it is, is kept: it is written to Claude's plugin config
 /// and read back before the assignment is dropped. When that fails, or the
 /// command is not ours, the answer is `None` and the old command stays.
+/// The installer repairs through [`repair_claude_hooks`]; only tests call this.
+#[cfg(test)]
 fn repair_installer_hook_command(
     command: &str,
     abs_runner: &str,
