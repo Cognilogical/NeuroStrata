@@ -273,7 +273,7 @@ Driven through the `WatchEventSource` trait (injectable test/manual adapter) and
 - **Rename handling:** rename normalized to remove+create effects in the coalesced set.
 - **Registration persistence round-trip and fail-closed validation:** serialize/deserialize v1 strict JSON, de-duplication, atomic write/read behavior, and **fail-closed rejection with traced reason** (never silently skipped into active state) for malformed entries, schema violations, and entries failing J6 re-check on load.
 - **Backoff transitions:** 1s→30s exponential progression, cap, and reset on success.
-- **Dirty-during-run behavior:** flush while active marks dirty and schedules follow-up after completion via `IngestTrigger` (no overlapping runs).
+- **Dirty-during-run behavior:** flush while active marks dirty and schedules a subsequent run after completion via `IngestTrigger` (no overlapping runs).
 
 ### 9.2 Integration test (one real watcher)
 
@@ -303,7 +303,7 @@ Driven through the `WatchEventSource` trait (injectable test/manual adapter) and
 2. **Automatic registration:** a successful `neurostrata_ingest_directory` (MCP or daemon `/ingest`) registers `(namespace, canonical_path)` idempotently via core and persists it to `<config-dir>/watch_registrations.json`.
 3. **Event-driven freshness:** an eligible create/modify/delete/rename under a registered root triggers a debounced (300 ms quiet, 2 s max window) coalesced ingest via `IngestTrigger`/`IngestJobs::run`; the resulting graph/state reflects the change without manual re-ingest.
 4. **No parallel path:** watcher-triggered updates occur only through the existing generation ingest path; there is no partial/direct AST mutation path.
-5. **Concurrency safety:** events arriving during an active run do not start overlapping runs; the root becomes/remains dirty and a follow-up skip-fast ingest runs after completion.
+5. **Concurrency safety:** events arriving during an active run do not start overlapping runs; the root becomes/remains dirty and a subsequent skip-fast ingest runs after completion.
 6. **Reconciliation:** restarting the daemon reloads registrations (fail-closed validation + J6 re-check) and performs one full skip-fast ingest per activated root, converging state even if events were missed.
 7. **Failure resilience:** a failed ingest leaves the root dirty, retries with exponential backoff 1s→30s, emits traces, and never crashes the daemon.
 8. **Control & visibility:** `neurostrata_unwatch` removes a registration (persisted) and `neurostrata_watch_status` reports roots with last trigger/result/backoff/dirty state; parity HTTP endpoints exist as thin shims.
